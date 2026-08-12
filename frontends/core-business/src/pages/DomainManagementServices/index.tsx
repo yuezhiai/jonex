@@ -450,13 +450,7 @@ const DomainManagementServices = function DomainManagementServices() {
         const cfg = getServiceStatusMap(t)[v];
         if (!cfg) return <Tag>{v}</Tag>;
         return (
-          <Tag
-            color={v === 'active' ? 'success' : v === 'testing' ? 'warning' : 'error'}
-            style={{ cursor: 'pointer' }}
-            onClick={() => toggleServiceStatus(r)}
-          >
-            {cfg.label}
-          </Tag>
+          <Tag color={v === 'active' ? 'success' : v === 'testing' ? 'warning' : 'error'}>{cfg.label}</Tag>
         );
       },
     },

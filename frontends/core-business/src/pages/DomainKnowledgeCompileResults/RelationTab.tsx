@@ -249,12 +249,6 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
       ),
     },
     {
-      title: t('domainKnowledge.attributeCount'),
-      key: 'attrCount',
-      width: 80,
-      render: (_: unknown, r: RelationInstanceRow) => (r.attributes ? Object.keys(r.attributes).length : 0),
-    },
-    {
       title: t('common.actions'),
       key: 'actions',
       width: 140,

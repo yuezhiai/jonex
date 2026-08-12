@@ -146,6 +146,15 @@ def create_app() -> FastAPI:
         setup_logging(enable_file=True)
         logger.info("API Gateway 本地文件日志已启用")
 
+        # 安全守卫: INTERNAL_API_KEY 必须已从默认哨兵修改
+        _internal_key = config.INTERNAL_API_KEY
+        if not _internal_key or _internal_key == "change-me-in-production":
+            raise RuntimeError(
+                "INTERNAL_API_KEY 未配置或仍为默认哨兵值。"
+                "请在 .env 或环境变量中设置 INTERNAL_API_KEY 为真实随机 key。"
+                "未配置将导致 /internal/* 端点无认证保护。"
+            )
+
     # ==================== 路由注册 ====================
     register_routes(app)
 
@@ -222,12 +231,13 @@ def register_routes(app: FastAPI):
     # ==================== 导入路由模块 ====================
     try:
         from api_gateway.routes import knowledge_base_router, tcadp_router, auth_router, platform_router, ecosystem_router
-        from api_gateway.routes import knowledge_base_ingest_router
+        from api_gateway.routes import knowledge_base_ingest_router, internal_router
         app.include_router(auth_router, prefix="/api/v1/auth", tags=["认证"])
         app.include_router(platform_router, prefix="/api/v1/platform", tags=["平台管理"])
         app.include_router(knowledge_base_router, prefix="/api/v1/knowledge-base", tags=["知识库"])
         app.include_router(knowledge_base_ingest_router, prefix="/api/v1/knowledge-base", tags=["知识库-入站推送"])
         app.include_router(ecosystem_router, tags=["生态管理"])
+        app.include_router(internal_router, prefix="/internal", tags=["内部"])
         app.include_router(tcadp_router)
         logger.info("业务路由模块加载成功")
     except ImportError as e:

@@ -7,6 +7,8 @@ import enUS from 'antd/locale/en_US';
 import { antdTheme } from '@jonex/platform-theme';
 import i18n from '@/locales/i18n';
 import '@/styles/index.scss';
+import '@jonex/platform-theme/theme.css';
+import '@jonex/platform-theme/layout.css';
 import AppRoute from '@/router';
 import { writeAccessToken, writeCachedUser } from '@jonex/shell-sdk';
 

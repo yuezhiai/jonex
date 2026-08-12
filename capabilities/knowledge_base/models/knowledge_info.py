@@ -24,6 +24,11 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     document_count = Column(Integer, default=0)
     status = Column(String(32), default="synced")
     owner_id = Column(String(64))
+    # [jonex] 知识库类型：lightrag（标准检索型：向量+图谱+本体）
+    #                  / openkb（Wiki 编译型：LLM 编译为结构化 Wiki）
+    # 创建时选定，之后不可变（改类型意味着旧数据全部失效）。
+    # 原名 pipeline_type，位于 service_knowledge_bases。
+    kb_type = Column(String(16), nullable=False, default="lightrag")
 
     def to_dict(self, space_name: str = None):
         result = {
@@ -36,6 +41,7 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "document_count": self.document_count or 0,
             "status": self.status,
             "owner_id": self.owner_id,
+            "kb_type": self.kb_type,  # [jonex]
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

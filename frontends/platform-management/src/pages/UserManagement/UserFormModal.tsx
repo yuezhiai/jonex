@@ -95,14 +95,14 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
       width={520}
       destroyOnClose
     >
-      <Form form={form} layout="vertical" style={{ marginTop: 8 }}>
+      <Form form={form} layout="vertical" style={{ marginTop: 8 }} autoComplete="off">
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
           <Form.Item
             name="username"
             label={t('userManagement.username')}
             rules={editing ? [] : [{ required: true, message: t('userManagement.requiredUsername') }]}
           >
-            <Input placeholder={t('userManagement.placeholderUsername')} disabled={!!editing} />
+            <Input placeholder={t('userManagement.placeholderUsername')} disabled={!!editing} autoComplete="off" />
           </Form.Item>
           <Form.Item
             name="display_name"
@@ -117,7 +117,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           label={t('userManagement.email')}
           rules={[{ required: true, message: t('userManagement.requiredEmail'), type: 'email' }]}
         >
-          <Input placeholder={t('userManagement.placeholderEmail')} />
+          <Input type="email" placeholder={t('userManagement.placeholderEmail')} autoComplete="off" />
         </Form.Item>
         <Form.Item
           name="role"
@@ -137,12 +137,12 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             label={t('auth.password')}
             rules={[{ required: true, message: t('userManagement.requiredPassword') }]}
           >
-            <Input.Password placeholder={t('userManagement.placeholderPassword')} />
+            <Input.Password placeholder={t('userManagement.placeholderPassword')} autoComplete="new-password" />
           </Form.Item>
         )}
         {editing && (
           <Form.Item name="new_password" label={t('userManagement.newPassword')}>
-            <Input.Password placeholder={t('userManagement.placeholderNewPassword')} />
+            <Input.Password placeholder={t('userManagement.placeholderNewPassword')} autoComplete="new-password" />
           </Form.Item>
         )}
       </Form>

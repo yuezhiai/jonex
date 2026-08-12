@@ -1,0 +1,144 @@
+.modeSelector {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+
+  .modeSearchButton {
+    height: 48px;
+    padding: 0 20px;
+    font-size: 15px;
+    border-radius: 10px 0 0 10px;
+    border-right: 1px solid rgba(255, 255, 255, 0.25);
+  }
+
+  .modeDropdownTrigger {
+    height: 48px;
+    width: 44px;
+    padding: 0;
+    font-size: 14px;
+    border-radius: 0 10px 10px 0;
+
+    &:global(.ant-btn-primary:disabled) {
+      color: #fff;
+      background: var(--ant-color-primary, #1677ff);
+      border-color: var(--ant-color-primary, #1677ff);
+      opacity: 0.65;
+    }
+  }
+}
+
+.modeDropdown {
+  width: 280px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.modeOption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  outline: none;
+
+  &:hover {
+    background: #f3f6fb;
+  }
+
+  &Active {
+    background: #eff6ff;
+
+    &:hover {
+      background: #e6f0ff;
+    }
+  }
+}
+
+.modeOptionContent {
+  flex: 1;
+  min-width: 0;
+  margin-right: 12px;
+}
+
+.modeOptionTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: #1f2937;
+  line-height: 1.4;
+}
+
+.modeOptionDesc {
+  font-size: 13px;
+  color: #6b7280;
+  line-height: 1.5;
+  margin-top: 2px;
+}
+
+.modeOptionSetting {
+  color: #6b7280;
+  flex-shrink: 0;
+
+  &:hover {
+    color: #2563eb;
+    background: rgba(37, 99, 235, 0.08);
+  }
+}
+
+.configIntro {
+  background: #f0f7ff;
+  color: #4b6a9b;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.configForm {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.configField {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.configFieldInfo {
+  flex: 1;
+  min-width: 0;
+  margin-right: 16px;
+}
+
+.configFieldLabel {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2937;
+  line-height: 1.4;
+}
+
+.configFieldDesc {
+  font-size: 13px;
+  color: #6b7280;
+  line-height: 1.5;
+  margin-top: 2px;
+}
+
+.configFieldControl {
+  flex-shrink: 0;
+}
+
+.configNumber {
+  width: 110px;
+}

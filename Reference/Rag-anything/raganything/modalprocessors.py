@@ -968,20 +968,46 @@ class ImageModalProcessor(BaseModalProcessor):
             if not image_base64:
                 raise RuntimeError(f"Failed to encode image to base64: {image_path}")
 
-            # Call vision model with encoded image
-            response = await self.modal_caption_func(
-                vision_prompt,
-                image_data=image_base64,
-                system_prompt=PROMPTS["IMAGE_ANALYSIS_SYSTEM"],
-            )
-
-            # Parse response (reuse existing logic)
-            enhanced_caption, entity_info = self._parse_response(response, entity_name)
-
-            return enhanced_caption, entity_info
+            # [jonex] Retry VLM call + parse up to 2× covering both
+            # HTTP/connection errors and malformed-JSON / missing-field
+            # errors.  Low-quantization / heretic models occasionally
+            # output bad JSON; transient network issues also happen.
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = await self.modal_caption_func(
+                        vision_prompt,
+                        image_data=image_base64,
+                        system_prompt=PROMPTS["IMAGE_ANALYSIS_SYSTEM"],
+                    )
+                    enhanced_caption, entity_info = self._parse_response(
+                        response, entity_name,
+                    )
+                    return enhanced_caption, entity_info
+                except (json.JSONDecodeError, ValueError) as e:
+                    last_error = e
+                    if attempt < 2:
+                        logger.warning(
+                            "VLM retry %d/2 for %s: %s",
+                            attempt + 1, image_path, e,
+                        )
+                    else:
+                        raise
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        logger.warning(
+                        "VLM call retry %d/2 for %s [%s]: %s",
+                        attempt + 1, image_path, type(e).__name__, e,
+                    )
+                    else:
+                        raise
 
         except Exception as e:
-            logger.error(f"Error generating image description: {e}")
+            logger.error(
+                "Error generating image description [%s]: %s",
+                type(e).__name__, e,
+            )
             # Fallback processing
             fallback_entity = {
                 "entity_name": entity_name

@@ -78,6 +78,7 @@ class AuditLogResponse(BaseModel):
     action: str
     resource: Optional[str] = None
     resource_label: Optional[str] = None
+    resource_name: Optional[str] = None
     resource_id: Optional[str] = None
     status_code: Optional[int] = None
     duration_ms: Optional[int] = None

@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
-import { Modal, Button, Table } from 'antd';
+import { Modal, Button, Table, Tabs } from 'antd';
 import { KeyOutlined, PlusOutlined, CopyOutlined, CheckOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { ColumnsType } from 'antd/es/table';
 import type { DomainServiceItem, ServiceApiKeyItem } from '../../types/domainService';
+import { useStore } from '@/store';
+import McpKeyTab from './McpKeyTab';
 
 interface SrvConfigModalProps {
   open: boolean;
@@ -27,6 +29,13 @@ export default function SrvConfigModal({
   onCancel,
 }: SrvConfigModalProps) {
   const { t } = useTranslation();
+  const { global } = useStore();
+  // 角色判断：MCP Key Tab 仅 admin 可见
+  const userInfo = global.userInfo as Record<string, unknown> | null | undefined;
+  const isAdmin = Array.isArray(userInfo?.roles)
+    ? (userInfo.roles as string[]).includes('admin')
+    : userInfo?.roles === 'admin';
+  const [activeTab, setActiveTab] = useState<string>('apiKey');
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
   const handleCopyKey = async (keyId: string, key: string) => {
@@ -71,63 +80,95 @@ export default function SrvConfigModal({
       footer={<Button onClick={onCancel}>{t('common.cancel')}</Button>}
       width={760}
     >
-      <p style={{ fontSize: 14, color: '#475569', marginBottom: 16 }}>
-        {t('domainManagement.srvConfigDesc', {
-          name: srvConfigTarget?.name || '',
-        })}
-      </p>
-      <div style={{ textAlign: 'right', marginBottom: 12 }}>
-        <Button type="primary" size="small" icon={<PlusOutlined />} loading={creatingKey} onClick={onCreateKey}>
-          {t('domainManagement.addApiKey')}
-        </Button>
-      </div>
-      <Table<ServiceApiKeyItem>
-        columns={[
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
           {
-            title: t('domainManagement.apiKey'),
-            dataIndex: 'key_encrypted',
-            key: 'key_encrypted',
-            width: 360,
-            render: (val: string, record: ServiceApiKeyItem) => (
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <span className="yx-key-text">{val || '—'}</span>
-                {val && (
-                  <Button
-                    type="text"
-                    className={`yx-copy-btn${copiedKeyId === record.id ? ' copied' : ''}`}
-                    title={copiedKeyId === record.id ? t('common.copySuccess') : t('domainManagement.copyApiKey')}
-                    onClick={() => handleCopyKey(record.id, val)}
-                  >
-                    {copiedKeyId === record.id ? <CheckOutlined /> : <CopyOutlined />}
+            key: 'apiKey',
+            label: t('domainManagement.apiKey'),
+            children: (
+              <>
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: 12,
+                  }}
+                >
+                  <p style={{ fontSize: 14, color: '#475569', margin: 0 }}>
+                    {t('domainManagement.srvConfigDesc', {
+                      name: srvConfigTarget?.name || '',
+                    })}
+                  </p>
+                  <Button type="primary" size="small" icon={<PlusOutlined />} loading={creatingKey} onClick={onCreateKey}>
+                    {t('domainManagement.addApiKey')}
                   </Button>
-                )}
-              </span>
+                </div>
+                <Table<ServiceApiKeyItem>
+                  columns={[
+                    {
+                      title: t('domainManagement.apiKey'),
+                      dataIndex: 'key_encrypted',
+                      key: 'key_encrypted',
+                      width: 360,
+                      render: (val: string, record: ServiceApiKeyItem) => (
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <span className="yx-key-text">{val || '—'}</span>
+                          {val && (
+                            <Button
+                              type="text"
+                              className={`yx-copy-btn${copiedKeyId === record.id ? ' copied' : ''}`}
+                              title={copiedKeyId === record.id ? t('common.copySuccess') : t('domainManagement.copyApiKey')}
+                              onClick={() => handleCopyKey(record.id, val)}
+                            >
+                              {copiedKeyId === record.id ? <CheckOutlined /> : <CopyOutlined />}
+                            </Button>
+                          )}
+                        </span>
+                      ),
+                    },
+                    {
+                      title: t('domainManagement.expiresAt'),
+                      dataIndex: 'expires_at',
+                      key: 'expires_at',
+                      width: 120,
+                      render: (val: string | null) => formatDate(val),
+                    },
+                    {
+                      title: t('domainManagement.srvConfigActions'),
+                      key: 'actions',
+                      width: 100,
+                      render: (_: unknown, record: ServiceApiKeyItem) => (
+                        <Button type="text" danger onClick={() => onDeleteKey(record.id)}>
+                          <DeleteOutlined /> {t('common.delete')}
+                        </Button>
+                      ),
+                    },
+                  ]}
+                  dataSource={apiKeys}
+                  rowKey="id"
+                  pagination={false}
+                  size="small"
+                  loading={apiKeysLoading}
+                  locale={{ emptyText: t('common.noApiKey') }}
+                />
+              </>
             ),
           },
-          {
-            title: t('domainManagement.expiresAt'),
-            dataIndex: 'expires_at',
-            key: 'expires_at',
-            width: 120,
-            render: (val: string | null) => formatDate(val),
-          },
-          {
-            title: t('domainManagement.srvConfigActions'),
-            key: 'actions',
-            width: 100,
-            render: (_: unknown, record: ServiceApiKeyItem) => (
-              <Button type="text" danger onClick={() => onDeleteKey(record.id)}>
-                <DeleteOutlined /> {t('common.delete')}
-              </Button>
-            ),
-          },
+          ...(isAdmin
+            ? [
+                {
+                  key: 'mcpKey',
+                  label: t('mcpKeyManagement.tabLabel'),
+                  children: (
+                    <McpKeyTab service={srvConfigTarget} visible={activeTab === 'mcpKey'} />
+                  ),
+                },
+              ]
+            : []),
         ]}
-        dataSource={apiKeys}
-        rowKey="id"
-        pagination={false}
-        size="small"
-        loading={apiKeysLoading}
-        locale={{ emptyText: t('common.noApiKey') }}
       />
     </Modal>
   );

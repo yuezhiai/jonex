@@ -1336,7 +1336,8 @@ class LightRAG:
                 # ── [jonex] Merge positional metadata from dict input ──
                 if raw_chunks:
                     src = raw_chunks[index]
-                    for k in ("page_idx", "line_start", "line_end"):
+                    for k in ("page_idx", "line_start", "line_end", "text_idx",
+                              "char_start", "char_end", "block_type", "entity_hint"):
                         if k in src:
                             chunk_entry[k] = src[k]
                 inserting_chunks[chunk_key] = chunk_entry

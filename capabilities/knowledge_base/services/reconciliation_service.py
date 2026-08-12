@@ -176,13 +176,31 @@ class ReconciliationService:
         waiting = 0
 
         for doc in docs:
-            updated_at = doc.updated_at
-            if updated_at is None:
-                continue
-            if updated_at.tzinfo is not None:
-                # [jonex] P0-2: aware 归一到 naive 本地，避免 aware_utc - naive TypeError
-                updated_at = updated_at.astimezone().replace(tzinfo=None)
-            elapsed_seconds = (now - updated_at).total_seconds()
+            # [jonex] P0-3: 计时基准优先用 parsing_started_at（进入 PARSING/INGESTING 时打点），
+            # 兜底用 updated_at。解耦 TimestampMixin.updated_at onupdate 心跳污染：
+            # _death_candidate 每 30s 写 DB → onupdate 刷新 updated_at → 旧实现永远到不了 SOFT。
+            _pm = dict(doc.extra_metadata or {})
+            started_at_str = _pm.get("parsing_started_at")
+            if started_at_str:
+                try:
+                    started_at = datetime.fromisoformat(str(started_at_str))
+                    if started_at.tzinfo is not None:
+                        started_at = started_at.astimezone().replace(tzinfo=None)
+                    elapsed_seconds = (now - started_at).total_seconds()
+                except (ValueError, TypeError, OSError):
+                    started_at = None
+            else:
+                started_at = None
+
+            if started_at is None:
+                # 兜底：旧文档没有 parsing_started_at，回退到 updated_at
+                updated_at = doc.updated_at
+                if updated_at is None:
+                    continue
+                if updated_at.tzinfo is not None:
+                    updated_at = updated_at.astimezone().replace(tzinfo=None)
+                elapsed_seconds = (now - updated_at).total_seconds()
+
             if elapsed_seconds < SOFT:
                 continue
 
@@ -294,12 +312,13 @@ class ReconciliationService:
                     )
                 async with get_db_session() as session:
                     repo_s = KnowledgeDocumentRepository(session)
-                    await repo_s.set_status(doc, DocStatus.FAILED, error_message=error_msg)
+                    fresh = await repo_s.set_status(doc, DocStatus.FAILED, error_message=error_msg)
                     # #6 计数隔离：INGESTING 失败用独立标记，不动 parsing_retry_count
-                    meta["ingesting_failed"] = True
-                    doc.extra_metadata = meta
-                    session.add(doc)
-                    await session.commit()
+                    # [jonex] P0-新: N2 规范 — set_status 返回 fresh 实例（已装进 session），
+                    # 在 fresh 上写 metadata；禁止 session.add(detached doc)。
+                    fm = dict(fresh.extra_metadata or {})
+                    fm["ingesting_failed"] = True
+                    fresh.extra_metadata = fm
                 logger.warning(
                     "Patrol INGESTING→FAILED (no re-insert): doc_id=%s waited=%.0fmin",
                     doc.id, elapsed_seconds / 60,
@@ -373,20 +392,25 @@ class ReconciliationService:
 
                 async with get_db_session() as session:
                     repo_s = KnowledgeDocumentRepository(session)
-                    await repo_s.set_status(
+                    fresh = await repo_s.set_status(
                         doc, new_status,
                         rag_task_id=rag_result.get("task_id"),
                         rag_doc_ids=rag_result.get("doc_ids") or rag_result.get("document_ids") or [],
                     )
-                    meta["parsing_retry_count"] = retry_count + 1
-                    doc.extra_metadata = meta
-                    session.add(doc)
-                    await session.commit()
+                    # [jonex] P0-新: N2 规范 — set_status 返回 fresh 实例（已装进 session），
+                    # 在 fresh 上写 metadata；禁止 session.add(detached doc)。
+                    fm = dict(fresh.extra_metadata or {})
+                    fm["parsing_retry_count"] = retry_count + 1
+                    # [jonex] P0-b: 重推成功时重置计时锚点，每次 attempt 重新计时。
+                    # 否则 elapsed 早已越过 SOFT/HARD，下一个 patrol 周期立即判超时，
+                    # 3 次重试在 90 秒内烧完，健康大文档被误杀。
+                    fm["parsing_started_at"] = datetime.now().isoformat()
+                    fresh.extra_metadata = fm
 
                 retried += 1
                 logger.info(
                     "Patrol retry queued: doc_id=%s, retry=%d/%d, status=%s",
-                    doc.id, meta["parsing_retry_count"], 3, new_status.value,
+                    doc.id, retry_count + 1, 3, new_status.value,
                 )
 
             except Exception as exc:
@@ -406,8 +430,9 @@ class ReconciliationService:
 
     async def _reconcile_one(self, doc) -> str:
         """Reconcile a single PARSING document. Returns 'updated' | 'skipped'."""
+        # [jonex] R2: task_id 为空 → 走查证链（不再直接 _handle_not_found 一拍即死）
         if not doc.rag_task_id:
-            return await self._handle_not_found(doc)
+            return await self._verify_chain(doc, entry="null_task_id")
 
         try:
             status_info = await get_rag_client().get_task_status(
@@ -420,12 +445,40 @@ class ReconciliationService:
 
         rag_status = status_info.get("status") or status_info.get("state", "")
 
+        # [jonex] P0-2: 白名单清零 —— 只对「在途/健康」状态清零判死计数。
+        # failed / not_found / 未知状态不清零，让 _death_candidate 连续多拍累积到 MAX。
+        # 原实现 rag_status != "not_found" 会把 failed 也清零，导致 task_failed 判死
+        # 计数每 30s 被清零→写1，永远到不了 MAX=3，文档永久卡 PARSING。
+        # not_found 不走这里（进入 _verify_chain → _death_candidate），例外不参与计数。
+        # [jonex] P1-c: TaskStatus 合法值: created / queued / processing / completed
+        # / failed / cancelled
+        _ALIVE_STATES = frozenset({"created", "queued", "processing", "completed"})
+        if rag_status in _ALIVE_STATES:
+            await self._clear_death_verdict(doc)
+
         if rag_status == "completed":
             return await self._handle_completed(doc, status_info)
         elif rag_status == "failed":
             return await self._handle_failed(doc, status_info)
         elif rag_status == "not_found":
-            return await self._handle_not_found(doc)
+            # [jonex] R2: not_found → 也走查证链（不再直接 _handle_not_found）
+            return await self._verify_chain(doc, entry="not_found")
+        elif rag_status == "cancelled":
+            # [jonex] P1-c: cancelled 任务直接落 FAILED。用户主动取消等同于确认放弃，
+            # 不应无限期 keep PARSING 等 patrol 兜底。
+            # 代次 fencing：旧代次 cancelled 不覆盖新代次 doc 状态。
+            task_generation = int(status_info.get("content_generation", 0) or 0)
+            if task_generation < int(getattr(doc, "content_generation", 0) or 0):
+                logger.info(
+                    "Reconcile→skip cancelled(stale generation): doc_id=%s task_gen=%s doc_gen=%s",
+                    doc.id, task_generation, getattr(doc, "content_generation", 0),
+                )
+                return "skipped"
+            logger.info("Reconcile→FAILED(task cancelled): doc_id=%s", doc.id)
+            return await self._finalize_failure(
+                doc, verdict="task_cancelled",
+                error_msg="任务已被取消",
+            )
         else:
             # [jonex] 细粒度落库（设计 §9.5）：task 进入本体抽取（ontology_status=extracting）
             # ⟹ parse+push 已完成 ⟹ 文档已可搜索。把仍处于 PARSING 的文档提前落成
@@ -451,20 +504,30 @@ class ReconciliationService:
                 async with get_db_session() as session:
                     repo = KnowledgeDocumentRepository(session)
                     # 保留 rag_task_id（仍指向 insert 任务）；仅更新 status + rag_doc_ids
-                    await repo.set_status(doc, DocStatus.READY, rag_doc_ids=doc_ids)
+                    # [jonex] N3: 恢复 READY 时清零判死计数（与 set_status 同 session）
+                    fresh = await repo.set_status(doc, DocStatus.READY, rag_doc_ids=doc_ids)
+                    fm = dict(fresh.extra_metadata or {})
+                    fm.pop("death_verdict_count", None)
+                    fm.pop("death_verdict_reason", None)
+                    fm.pop("death_verdict_error", None)
+                    fresh.extra_metadata = fm
                     await repo.set_ontology_status(doc, OntologyStatus.EXTRACTING)
                     await session.commit()
                 logger.info(
                     "Reconcile→READY+EXTRACTING (compiling visible): doc_id=%s", doc.id,
                 )
                 return "updated"
-            # ── [jonex] R1-B：INGESTING 判定（先判 READY 已不命中 → 回退判 INGESTING）──
-            # #5 单轮合并：不命中 READY 才回退判 INGESTING，避免"先置 INGESTING 再等下一轮"
-            if doc.status in (DocStatus.PARSING.value, DocStatus.INGESTING.value):
+            # ── [jonex] R1-B：INGESTING 判定 ──
+            # openkb KB（parse_only）不推 LightRAG，跳过 INGESTING 判定
+            kb_type = (doc.extra_metadata or {}).get("kb_type")
+            if not kb_type:
+                from .kb_type_service import get_kb_type
+                kb_type = await get_kb_type(tenant_id, doc.knowledge_base_id)
+
+            if kb_type != "openkb" and doc.status in (DocStatus.PARSING.value, DocStatus.INGESTING.value):
                 current_step = status_info.get("current_step") or ""
                 progress = status_info.get("progress", 0) or 0
 
-                # 首选：push_chunks 阶段明确信号
                 if current_step == "push_chunks":
                     async with get_db_session() as session:
                         repo = KnowledgeDocumentRepository(session)
@@ -553,15 +616,15 @@ class ReconciliationService:
         worker_total_ms, worker_timings = _normalize_stage_timings(stage_timings_raw)
         pipeline_version = _detect_pipeline_version(stage_timings_raw)
 
-        # [jonex] P1-E schema 版本 fencing：任务用的 schema 版本与文档目标版本不一致 → 丢弃
-        # 本体结果（不 delete_by_document / 不 merge），文档本体保持 PENDING 等目标版本任务。
+        # [jonex] P1-E schema 版本 fencing：任务 schema 版本低于文档目标 → 旧结果，丢弃。
+        # 任务版本 >= 目标版本 → 正常写入（版本升级时 task_ver 可大于 target_ver）。
         task_schema_version = int(status_info.get("schema_version", 0) or 0)
         task_schema_hash = status_info.get("schema_hash") or None
         target_schema_version = getattr(doc, "ontology_target_schema_version", None)
         schema_fenced = bool(
             target_schema_version is not None
             and task_schema_version
-            and task_schema_version != target_schema_version
+            and task_schema_version < target_schema_version  # only fence OLDER results
         )
         if schema_fenced and ont_status == "completed" and ont_data:
             logger.info(
@@ -604,25 +667,46 @@ class ReconciliationService:
                 logger.error("Neo4j ontology write failed for doc %s: %s", doc.id, e)
                 neo4j_ok = False
 
+        # [jonex] kb_type：openkb 管线只解析、不做本体抽取
+        # 优先读 extra_metadata 快照（缓存），再查 knowledge_info 权威源兜底
+        kb_type = (doc.extra_metadata or {}).get("kb_type")
+        if not kb_type:
+            from .kb_type_service import get_kb_type
+            kb_type = await get_kb_type(tenant_id, doc.knowledge_base_id)
+
         # Step 2: PG status update
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
-            await repo.set_status(
+            # [jonex] N3: 恢复 READY 时清零判死计数
+            fresh = await repo.set_status(
                 doc,
                 DocStatus.READY,
                 rag_doc_ids=status_info.get("lightrag_doc_ids") or status_info.get("doc_ids") or [],
             )
+            fm = dict(fresh.extra_metadata or {})
+            fm.pop("death_verdict_count", None)
+            fm.pop("death_verdict_reason", None)
+            fm.pop("death_verdict_error", None)
+            fresh.extra_metadata = fm
 
-            if schema_fenced and ont_status == "completed":
+            if kb_type == "openkb":
+                # openkb 无本体抽取，直接标 READY，避免 reconcile_ontology 无谓重试后置 FAILED
+                await repo.set_ontology_status(doc, OntologyStatus.READY)
+            elif schema_fenced and ont_status == "completed":
                 # 本体结果按目标版本作废：保持 PENDING 等目标版本任务重抽，不写 applied
                 await repo.set_ontology_status(doc, OntologyStatus.PENDING)
             elif ont_status == "completed" and neo4j_ok:
-                # [jonex] P1-E：写图成功后记录已应用的 schema 版本/hash
+                # [jonex] P1-E：写图成功后记录已应用的 schema 版本/hash，
+                # 同时将 target 版本同步到任务版本（编译 schema 升级后 task_ver > target_ver 为正常态）。
                 await repo.set_ontology_status(
                     doc, OntologyStatus.READY,
                     applied_schema_version=(task_schema_version or None),
                     applied_schema_hash=task_schema_hash,
                 )
+                if task_schema_version and (
+                    target_schema_version is None or task_schema_version > target_schema_version
+                ):
+                    doc.ontology_target_schema_version = task_schema_version
             elif ont_status == "failed":
                 await repo.set_ontology_status(doc, OntologyStatus.FAILED, error=ont_error or "本体抽取失败")
             elif not neo4j_ok:
@@ -630,11 +714,17 @@ class ReconciliationService:
 
             await session.commit()
 
+        # ── [jonex] openkb 管线：解析完成 → 推送 OpenKB Wiki 编译 ──
+        if kb_type == "openkb":
+            await self._dispatch_openkb_compile(doc, status_info)
+
         # 端到端墙钟：created_at 为 naive UTC（TimestampMixin: default=datetime.utcnow），
         # 必须用 datetime.utcnow() 作差（详见设计文档 §3.1 #9）。
+        # 端到端墙钟：TimestampMixin 实为 datetime.now（naive 本地时间，见 jonex_core/common/entity.py:24），
+        # 用 datetime.now() 作差保持同口径，避免 utcnow() 导致的 -8h 偏差（P0-2 同类 bug）。
         e2e_ready_ms = None
         if doc.created_at is not None:
-            e2e_ready_ms = int((datetime.utcnow() - doc.created_at).total_seconds() * 1000)
+            e2e_ready_ms = int((datetime.now() - doc.created_at).total_seconds() * 1000)
 
         logger.info("Reconcile→READY: doc_id=%s, chunks=%d", doc.id,
                      len(status_info.get("lightrag_doc_ids") or status_info.get("doc_ids") or []))
@@ -745,74 +835,246 @@ class ReconciliationService:
         if rag_doc_ids:
             async with get_db_session() as session:
                 repo = KnowledgeDocumentRepository(session)
-                await repo.set_status(doc, DocStatus.READY, rag_doc_ids=rag_doc_ids)
+                # [jonex] N3: 恢复 READY 时清零判死计数（与 set_status 同 session）
+                fresh = await repo.set_status(doc, DocStatus.READY, rag_doc_ids=rag_doc_ids)
+                fm = dict(fresh.extra_metadata or {})
+                fm.pop("death_verdict_count", None)
+                fm.pop("death_verdict_reason", None)
+                fm.pop("death_verdict_error", None)
+                fresh.extra_metadata = fm
                 await session.commit()
             logger.info("Reconcile→READY(via failed-task storage fallback): doc_id=%s", doc.id)
             return "updated"
 
+        # [jonex] P1-5: 确定性终态跳过 3 拍确认，直接落 FAILED。
+        # 连续确认是为对抗瞬时不可达（LightRAG 繁忙等），对确定性失败只是白拖 90s。
+        # [jonex] P0-a: error_code 匹配 + error_msg 文本前缀兜底（兼容镜像未更新）。
         error_msg = status_info.get("error") or status_info.get("message") or "RAG 解析失败"
-        worker_total_ms, _ = _normalize_stage_timings(status_info.get("stage_timings"))
+        error_code = status_info.get("error_code") or ""
+
+        _DETERMINISTIC_TEXT_PREFIXES = (
+            "File not found:", "OBJECT_FETCH_FAILED",
+        )
+        _DETERMINISTIC_TERMINAL_CODES = frozenset({
+            "FILE_NOT_FOUND", "OBJECT_FETCH_FAILED",
+            "PROFILE_NOT_FOUND", "PRESET_NOT_FOUND",
+            "MODEL_NOT_FOUND", "CONFIG_INVALID",
+        })
+        if (error_code in _DETERMINISTIC_TERMINAL_CODES
+                or error_msg.startswith(_DETERMINISTIC_TEXT_PREFIXES)):
+            logger.info(
+                "Reconcile→FAILED(deterministic terminal): doc_id=%s error_code=%s error=%s",
+                doc.id, error_code or "(text match)", error_msg,
+            )
+            return await self._finalize_failure(doc, verdict="task_failed", error_msg=error_msg)
+
+        return await self._death_candidate(doc, verdict="task_failed", error_msg=error_msg)
+
+    # ── [jonex] R2 查证链 + R3 连续确认判死器 ──────────────────────
+
+    @staticmethod
+    def _build_idempotency_key(doc) -> str | None:
+        """按 upload_document / reparse_document 同口径生成幂等键，供 R2-b 反查。"""
+        kb_id = doc.knowledge_base_id or (doc.extra_metadata or {}).get("knowledge_base_id", "")
+        gen = getattr(doc, "content_generation", 0) or 0
+        if not kb_id:
+            return None
+        return f"insert:{doc.tenant_id}:{kb_id}:{doc.id}:{gen}"
+
+    @staticmethod
+    async def _clear_death_verdict(doc) -> None:
+        """[jonex] P1-d: 恢复/成功路径清零判死计数+原因+错误。
+
+        只在有残留时才写 DB。调用时机：
+        - _reconcile_one 拿到健康 task 状态（created/queued/processing/completed）
+        - _verify_chain R2-a/b/c 任一路命中
+        - _handle_completed 成功收尾
+        """
+        meta = dict(doc.extra_metadata or {})
+        if "death_verdict_count" not in meta and "death_verdict_reason" not in meta and "death_verdict_error" not in meta:
+            return
+        meta.pop("death_verdict_count", None)
+        meta.pop("death_verdict_reason", None)
+        meta.pop("death_verdict_error", None)
+        async with get_db_session() as session:
+            doc.extra_metadata = meta
+            session.add(doc)
+            await session.commit()
+
+    async def _verify_chain(self, doc, *, entry: str) -> str:
+        """R2 查证链：a（宽限期）→ b（幂等键反查）→ c（storage fallback）→ d（判死候选）。
+
+        入口：entry="null_task_id"（task_id 为空，upload/reparse 空窗期）
+              entry="not_found"（task_id 查询返回 not_found，容器重启丢状态）
+        任一路命中即 skip/updated；全未命中进入 R3 _death_candidate。
+        """
+        doc_id = doc.id
+        meta = dict(doc.extra_metadata or {})
+
+        # ── R2-a: 提交宽限期（submit_started_at 在 GRACE 窗口内 → in-flight skip）──
+        # [jonex] P1-1: 统一用 datetime.now()（naive 本地时间），与写入侧的 datetime.now().isoformat() 口径一致
+        submit_at = meta.get("submit_started_at")
+        if submit_at:
+            try:
+                submitted = datetime.fromisoformat(str(submit_at))
+                grace = int(os.getenv("RECONCILE_SUBMIT_GRACE_SEC", "180"))
+                if (datetime.now() - submitted).total_seconds() < grace:
+                    # [jonex] N3: 任务 in-flight 正常态 → 清零判死计数
+                    # [jonex] N4: elapsed 用 datetime.now()（与 submitted 同口径）
+                    elapsed = (datetime.now() - submitted).total_seconds()
+                    logger.info(
+                        "Reconcile→skip(in-flight grace): doc_id=%s entry=%s elapsed=%.0fs",
+                        doc_id, entry, elapsed,
+                    )
+                    await self._clear_death_verdict(doc)
+                    return "skipped"
+            except (ValueError, TypeError, OSError):
+                pass  # 损坏的时间戳 → 穿透继续
+
+        # ── R2-b: 幂等键反查 atomic-rag 在途任务 → 回填 rag_task_id ──
+        if os.getenv("RECONCILE_IDEMPOTENCY_LOOKUP_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+            ik = self._build_idempotency_key(doc)
+            if ik:
+                try:
+                    result = await get_rag_client().get_task_by_idempotency_key(ik, doc.tenant_id)
+                    if result.get("found"):
+                        async with get_db_session() as session:
+                            repo = KnowledgeDocumentRepository(session)
+                            # [jonex] P1-2: 回填 task_id 后清除锚点
+                            # [jonex] N2: 通过 fresh 实例持久化 metadata 变更
+                            fresh = await repo.set_status(
+                                doc, doc.status, rag_task_id=result["task_id"],
+                            )
+                            # [jonex] P1-2: 清除锚点 + [jonex] N3: 反查到在途任务 → 清零判死计数
+                            fm = dict(fresh.extra_metadata or {})
+                            had_anchor = fm.pop("submit_started_at", None) is not None
+                            had_count = fm.pop("death_verdict_count", None) is not None
+                            if had_anchor or had_count:
+                                fm.pop("death_verdict_reason", None)
+                                fm.pop("death_verdict_error", None)
+                                fresh.extra_metadata = fm
+                            await session.commit()
+                        logger.info(
+                            "Reconcile→backfill task_id(idempotency lookup hit): doc_id=%s "
+                            "task_id=%s entry=%s",
+                            doc_id, result["task_id"], entry,
+                        )
+                        return "updated"
+                except Exception:
+                    pass  # RAG 不可达 → 穿透继续
+
+        # ── R2-c: storage fallback（现有 _verify_via_storage，原样保留）──
+        _t0 = time.perf_counter()
+        rag_doc_ids = await self._verify_via_storage(doc)
+        storage_fallback_ms = int((time.perf_counter() - _t0) * 1000)
+        if rag_doc_ids is not None:
+            async with get_db_session() as session:
+                repo = KnowledgeDocumentRepository(session)
+                # [jonex] N3: 恢复 READY 时清零判死计数（与 set_status 同 session）
+                fresh = await repo.set_status(doc, DocStatus.READY, rag_doc_ids=rag_doc_ids)
+                fm = dict(fresh.extra_metadata or {})
+                fm.pop("death_verdict_count", None)
+                fm.pop("death_verdict_reason", None)
+                fm.pop("death_verdict_error", None)
+                fresh.extra_metadata = fm
+                await session.commit()
+            logger.info("Reconcile→READY(via storage fallback): doc_id=%s entry=%s", doc_id, entry)
+            schedule_emit({
+                "tenant_id": doc.tenant_id,
+                "log_type": "TASK",
+                "action": "document.parse_recover",
+                "outcome": "SUCCESS",
+                "service_name": "knowledge_base",
+                "resource": ResourceType.DOCUMENT.value,
+                "resource_id": str(doc_id),
+                "duration_ms": storage_fallback_ms,
+            })
+            return "updated"
+
+        # ── R2-d: 全未命中 → 进入判死候选（R3 连续确认）──
+        return await self._death_candidate(doc, verdict=f"task_{entry}")
+
+    async def _death_candidate(self, doc, *, verdict: str, error_msg: str | None = None) -> str:
+        """R3: 连续 N 拍同一结论才判死。计数持久化在 extra_metadata。
+
+        error_msg: 仅 task_failed 路径传入真实失败原因；null_task_id/not_found 路径
+        不传 → _finalize_failure 回退 death_verdict_error（跨 verdict 保留）。
+        """
+        MAX = int(os.getenv("RAG_TASK_PROBE_FAIL_MAX", "3"))
+
+        meta = dict(doc.extra_metadata or {})
+        count = meta.get("death_verdict_count", 0)
+        reason = meta.get("death_verdict_reason", "")
+
+        if reason == verdict:
+            count += 1
+        else:
+            # [jonex] P1-d: verdict 切换时清旧 death_verdict_error，
+            # 防止上次 task_failed 的 FILE_NOT_FOUND 串台到这次 task_not_found 文案。
+            count = 1
+            reason = verdict
+            meta.pop("death_verdict_error", None)
+
+        meta["death_verdict_count"] = count
+        meta["death_verdict_reason"] = reason
+
+        # [jonex] P1-4: 保留首个真实错误跨 verdict 切换不丢失。
+        if error_msg:
+            meta["death_verdict_error"] = error_msg
+
+        async with get_db_session() as session:
+            doc.extra_metadata = meta
+            session.add(doc)
+            await session.commit()
+
+        if count >= MAX:
+            return await self._finalize_failure(doc, verdict, error_msg=error_msg)
+
+        logger.info(
+            "Reconcile→death candidate: doc_id=%s verdict=%s count=%d/%d",
+            doc.id, verdict, count, MAX,
+        )
+        return "skipped"
+
+    async def _finalize_failure(self, doc, verdict: str, *, error_msg: str | None = None) -> str:
+        """落定 FAILED：清锚点/判死计数，写入 error_message。
+
+        error_msg 优先级: 传入 > death_verdict_error（跨 verdict 保留）> verdict 分类。
+        """
+        meta = dict(doc.extra_metadata or {})
+
+        # [jonex] P1-4: 优先取传入 error_msg，其次取 death_verdict_error（跨 verdict 保留），
+        # 兜底生成通用文案。防止 verdict 从 task_failed 切到 task_not_found 时真实错误被抹掉。
+        effective_error = error_msg or meta.get("death_verdict_error", "")
+        if effective_error:
+            err = f"{effective_error}（{verdict}）"
+        else:
+            err = f"RAG 任务确认丢失（{verdict}），原 task_id={doc.rag_task_id}，请重新上传"
+
+        meta.pop("submit_started_at", None)
+        meta.pop("death_verdict_count", None)
+        meta.pop("death_verdict_reason", None)
+        meta.pop("death_verdict_error", None)
+
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
-            await repo.set_status(doc, DocStatus.FAILED, error_message=error_msg)
+            # [jonex] N2: set_status 返回 fresh 实例（get_by_id），需在 fresh 上写 metadata
+            # 直接改 doc.extra_metadata 是 detached 操作，不会被持久化
+            fresh = await repo.set_status(doc, DocStatus.FAILED, error_message=err)
+            fresh.extra_metadata = meta
             await session.commit()
-        logger.info("Reconcile->FAILED: doc_id=%s, error=%s", doc.id, error_msg)
+
+        logger.info("Reconcile→FAILED(death confirmed): doc_id=%s verdict=%s", doc.id, verdict)
         schedule_emit({
             "tenant_id": doc.tenant_id,
             "log_type": "TASK",
-            "action": "document.parse_failed",
+            "action": "document.parse_recover",
             "outcome": "FAILED",
             "service_name": "knowledge_base",
             "resource": ResourceType.DOCUMENT.value,
             "resource_id": str(doc.id),
-            "error_message": error_msg[:1000],
-            "duration_ms": worker_total_ms,
+            "error_message": err[:1000],
         })
-        return "updated"
-
-    async def _handle_not_found(self, doc) -> str:
-        """Task state lost (Redis expired / container restart). Try storage fallback."""
-        _t_fallback = time.perf_counter()
-        rag_doc_ids = await self._verify_via_storage(doc)
-        storage_fallback_ms = int((time.perf_counter() - _t_fallback) * 1000)
-        async with get_db_session() as session:
-            repo = KnowledgeDocumentRepository(session)
-            if rag_doc_ids is not None:
-                await repo.set_status(doc, DocStatus.READY, rag_doc_ids=rag_doc_ids)
-                await session.commit()
-                logger.info(
-                    "Reconcile→READY(via storage fallback): doc_id=%s, chunks=%d",
-                    doc.id, len(rag_doc_ids),
-                )
-                schedule_emit({
-                    "tenant_id": doc.tenant_id,
-                    "log_type": "TASK",
-                    "action": "document.parse_recover",
-                    "outcome": "SUCCESS",
-                    "service_name": "knowledge_base",
-                    "resource": ResourceType.DOCUMENT.value,
-                    "resource_id": str(doc.id),
-                    "duration_ms": storage_fallback_ms,
-                })
-            else:
-                err = (
-                    f"RAG 任务状态丢失（可能 atomic-rag 容器已重启），"
-                    f"原 task_id={doc.rag_task_id}，请删除文档后重新上传"
-                )
-                await repo.set_status(doc, DocStatus.FAILED, error_message=err)
-                await session.commit()
-                logger.info("Reconcile→FAILED(task lost): doc_id=%s, task_id=%s", doc.id, doc.rag_task_id)
-                schedule_emit({
-                    "tenant_id": doc.tenant_id,
-                    "log_type": "TASK",
-                    "action": "document.parse_recover",
-                    "outcome": "FAILED",
-                    "service_name": "knowledge_base",
-                    "resource": ResourceType.DOCUMENT.value,
-                    "resource_id": str(doc.id),
-                    "error_message": err[:1000],
-                    "duration_ms": storage_fallback_ms,
-                })
         return "updated"
 
     # ── ontology retry ─────────────────────────────────────────
@@ -1019,6 +1281,308 @@ class ReconciliationService:
         rag_doc_ids = [item["id"] for item in matched if item.get("id")]
         logger.info("Storage fallback hit: doc_id=%s, rag_doc_ids=%s", doc.id, rag_doc_ids)
         return rag_doc_ids
+
+    # ── [jonex] OpenKB compile dispatch ──
+
+    async def _dispatch_openkb_compile(self, doc, status_info: dict):
+        """解析完成后调用 OpenKB compile_parsed_document。
+
+        parsed markdown/assets 由解析任务在共享卷 inputs 上产出，经 task status 透传
+        （parsed_markdown_path / assets_dir，绝对路径）。这里换算为「相对 inputs 卷根」
+        的路径交给 OpenKB，做到跨容器挂载点无关。
+
+        重要：拿不到 parsed markdown 时如实标记失败，绝不把原始二进制文件（PDF/docx）
+        当 markdown 送入编译；编译结果（compiled/failed）写回文档，避免静默成功/失败。
+        """
+        from .openkb_service import KnowledgeCompilerService
+
+        kb_id = (doc.knowledge_base_id or (doc.extra_metadata or {}).get("knowledge_base_id", ""))
+
+        # 解析任务透传的产物路径（绝对路径，位于共享卷 inputs 挂载点内）
+        abs_md = status_info.get("parsed_markdown_path") or ""
+        abs_assets = status_info.get("assets_dir") or ""
+
+        rel_md = self._relativize_input_path(abs_md)
+        rel_assets = self._relativize_input_path(abs_assets)
+
+        if not rel_md:
+            # 没有可用 parsed markdown：如实标记失败，等待解析器把 markdown 落到共享卷并暴露路径
+            await self._record_openkb_status(
+                doc, status="failed",
+                error="OPENKB_NO_PARSED_MARKDOWN: 解析任务未提供 parsed_markdown_path"
+                      "（需解析器把 markdown 落到共享卷 inputs 并经 task status 暴露）",
+            )
+            logger.error(
+                "[jonex] OpenKB compile 跳过：doc=%s 无 parsed_markdown_path（task 未暴露产物路径）",
+                doc.id,
+            )
+            return
+
+        # [jonex] 任务化：claim（列）→ 提交编译任务（容器内后台执行）→ task_id 写列
+        # → 立即返回（不等待编译）。终态（compiled/failed）由 patrol_openkb_compile
+        # 轮询任务状态回写，sidecar 同步超时不再能打断编译。
+        compiler = KnowledgeCompilerService()
+        if not await compiler.claim_compile(doc.tenant_id, doc.id):
+            logger.info("[jonex] OpenKB compile claim 未抢到（已 compiling 或并发双投）doc=%s", doc.id)
+            return
+        try:
+            result = await compiler.submit_compile(
+                kb_name=kb_id,
+                tenant_id=doc.tenant_id,
+                kb_id=kb_id,
+                parsed_artifact={
+                    "document_id": doc.id,
+                    "source_file_path": doc.file_path or "",
+                    "parsed_markdown_path": rel_md,       # 相对 inputs 卷根
+                    "assets_dir": rel_assets,             # 相对 inputs 卷根（可空）
+                    "parser": status_info.get("parser", "mineru"),
+                    "metadata": {
+                        "pages": status_info.get("pages", 0),
+                        "title": doc.file_name or "",
+                        "rag_task_id": doc.rag_task_id,
+                    },
+                },
+            )
+            await compiler.set_task_id(doc.tenant_id, doc.id, result["task_id"])
+            logger.info(
+                "[jonex] OpenKB compile 已提交（任务化）: kb=%s doc=%s task=%s",
+                kb_id, doc.id, result.get("task_id"),
+            )
+        except Exception as exc:
+            # 投递失败必须回滚 claim，否则永久卡 compiling
+            await self._record_openkb_status(doc, status="failed", error=str(exc)[:1000])
+            logger.exception(
+                "[jonex] OpenKB compile 提交失败: kb=%s doc=%s error=%s", kb_id, doc.id, exc,
+            )
+
+    @staticmethod
+    def _relativize_input_path(path: str) -> str:
+        """把共享卷 inputs 上的绝对路径换算为「相对卷根」的路径（跨容器挂载点无关）。
+
+        knowledge_base/atomic-rag 的 inputs 挂载点由 KB_INPUT_DIR 指定（默认 /app/inputs），
+        openkb 挂在 OPENKB_INPUT_ROOT（默认 /app/data/inputs）。传相对路径让两端各自解析。
+        空值返回空串；已是相对路径原样返回。
+        """
+        if not path:
+            return ""
+        root = os.getenv("KB_INPUT_DIR", "/app/inputs").rstrip("/")
+        p = str(path)
+        if p.startswith(root + "/"):
+            return p[len(root) + 1:]
+        return p if not p.startswith("/") else p.lstrip("/")
+
+    async def _record_openkb_status(self, doc, *, status: str, error: str = "", warnings=None):
+        """把 LLM-Wiki 编译状态写回文档（列化），避免静默成功/失败。
+
+        [jonex] 统一语义（与 openkb_service 版一致）：
+        - compiling/compiled/stale → 清除 llm_wiki_compile_error；
+        - compiling/stale → 清除 llm_wiki_compile_warnings；
+        - failed → 写 error（截断 1000），**保留 warnings 不动**；
+        - compiled → 写 warnings（或 None）+ compiled_at（UTC）。
+        """
+        try:
+            async with get_db_session() as session:
+                repo = KnowledgeDocumentRepository(session)
+                fresh = await repo.get_required(doc.id, doc.tenant_id)
+                fresh.llm_wiki_compile_status = status
+                if status in ("compiling", "compiled", "stale"):
+                    fresh.llm_wiki_compile_error = None
+                if status in ("compiling", "stale"):
+                    fresh.llm_wiki_compile_warnings = None
+                if status == "failed" and error:
+                    fresh.llm_wiki_compile_error = error[:1000]
+                if warnings is not None:
+                    fresh.llm_wiki_compile_warnings = warnings or None
+                if status == "compiled":
+                    fresh.llm_wiki_compiled_at = datetime.utcnow()
+                session.add(fresh)
+                await session.commit()
+                # 保持内存态一致（doc.extra_metadata 仍兼容旧 JSONB 读点）
+                meta = dict(fresh.extra_metadata or {})
+                meta["openkb_compile_status"] = status
+                doc.extra_metadata = meta
+        except Exception:
+            logger.warning("记录 LLM-Wiki 编译状态失败 doc=%s", doc.id, exc_info=True)
+
+    async def patrol_openkb_compile(self, limit: int = 50) -> dict:
+        """[jonex] 轮询 OpenKB 编译任务状态并回写 PG；stale 文档补提交；超时判死。
+
+        任务化后编译终态只由这里回写（30s 巡检）：
+        - completed → llm_wiki_compile_status='compiled'（含 warnings / compiled_at）
+        - failed → 'failed'（error 取任务）
+        - running → 按任务 started_at 起算超时（排队时间不算）
+        - pending → 还在 mutation 锁队列排队，不判死（批量上传队尾任务）
+        - task 未知（容器重启清理）→ 判死 failed（error='task lost'）
+        - task_id IS NULL → 只按 requested_at 超时（claim 后 submit 未回写的窗口）
+        env 兼容：OPENKB_COMPILE_TIMEOUT_SEC 优先，回退 OPENKB_RECOMPILE_TIMEOUT_SEC。
+        """
+        TIMEOUT = int(os.getenv("OPENKB_COMPILE_TIMEOUT_SEC",
+                     os.getenv("OPENKB_RECOMPILE_TIMEOUT_SEC", "1800")))
+        from sqlalchemy import text
+
+        # ① compiling 文档（索引查询；带 knowledge_base_id 供分组 invoke）
+        sql = text("""
+            SELECT id, tenant_id, knowledge_base_id, llm_wiki_task_id,
+                   llm_wiki_compile_requested_at
+              FROM knowledge_base.knowledge_documents
+             WHERE is_deleted = 0 AND llm_wiki_compile_status = 'compiling'
+             LIMIT :limit
+        """)
+        async with get_db_session() as session:
+            rows = (await session.execute(sql, {"limit": limit})).all()
+
+        now = datetime.utcnow()
+        compiled = failed = timed_out = 0
+
+        # ② 按 (tenant_id, kb_id) 分组，一组一次 list_compile_tasks
+        by_kb: dict[tuple[str, str], list] = {}
+        for r in rows:
+            by_kb.setdefault((r.tenant_id, r.knowledge_base_id or ""), []).append(r)
+
+        from .openkb_service import KnowledgeCompilerService
+        compiler = KnowledgeCompilerService()
+        for (tenant_id, kb_id), group in by_kb.items():
+            task_map: dict[str, dict] = {}
+            try:
+                res = await compiler.list_compile_tasks(
+                    kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id)
+                for t in (res or {}).get("tasks", []):
+                    task_map[t.get("task_id")] = t
+            except Exception as exc:
+                # 容器不可达：保持现状不判死（对账降级，不误杀）
+                logger.warning("patrol_openkb_compile list_compile_tasks 失败 kb=%s: %s", kb_id, exc)
+                continue
+
+            for r in group:
+                doc_id, task_id = r.id, r.llm_wiki_task_id
+                req_at = r.llm_wiki_compile_requested_at
+                if not task_id:
+                    # claim 后 submit 尚未回写 task_id 的正常窗口：只按 requested_at 超时
+                    if req_at and (now - req_at).total_seconds() > TIMEOUT:
+                        await self._record_openkb_status_by_id(
+                            doc_id, tenant_id, status="failed",
+                            error="OPENKB_COMPILE_TIMEOUT: 编译超时（submit 未回写 task_id），请重试",
+                        )
+                        timed_out += 1
+                    continue
+                task = task_map.get(task_id)
+                if task is None:
+                    # 任务丢失（容器重启 initialize 判死）
+                    await self._record_openkb_status_by_id(
+                        doc_id, tenant_id, status="failed",
+                        error="OPENKB_TASK_LOST: 编译任务丢失（容器重启），请重新编译",
+                    )
+                    failed += 1
+                    continue
+                tstatus = task.get("status")
+                if tstatus == "completed":
+                    await self._record_openkb_status_by_id(
+                        doc_id, tenant_id, status="compiled",
+                        warnings=task.get("warnings") or [],
+                    )
+                    compiled += 1
+                elif tstatus == "failed":
+                    await self._record_openkb_status_by_id(
+                        doc_id, tenant_id, status="failed",
+                        error=task.get("error") or "compile failed",
+                    )
+                    failed += 1
+                elif tstatus == "running":
+                    # ⚠️ 排队时间不算超时：running 才从 started_at 起算
+                    started = task.get("started_at")
+                    try:
+                        started_dt = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                        if started_dt.tzinfo:
+                            started_dt = started_dt.replace(tzinfo=None)
+                        elapsed = (now - started_dt).total_seconds()
+                    except (ValueError, TypeError):
+                        elapsed = 0   # started_at 缺失不判死（保守）
+                    if elapsed > TIMEOUT:
+                        await self._record_openkb_status_by_id(
+                            doc_id, tenant_id, status="failed",
+                            error="OPENKB_COMPILE_TIMEOUT: 编译超时，请重试",
+                        )
+                        timed_out += 1
+                # pending：排队中不判死（批量上传队尾任务，mutation 锁队列）
+
+        # ③ stale 且 ready 的文档补提交（reparse 停在 stale 的兜底）
+        stale_submitted = await self._patrol_stale_recompile(limit=limit)
+
+        return {"checked": len(rows), "compiled": compiled, "failed": failed,
+                "timed_out": timed_out, "stale_submitted": stale_submitted}
+
+    async def _patrol_stale_recompile(self, limit: int = 50) -> int:
+        """[jonex] stale 且 ready 的文档重新提交编译。
+
+        reparse 常规路径会推回 parsing→ready 再触发钩子，但 stale 若由其他路径
+        写入、或 reparse 中途失败停在 ready，文档会永久停在 stale——此处兜底。
+        """
+        from sqlalchemy import text
+
+        sql = text("""
+            SELECT id, tenant_id, knowledge_base_id
+              FROM knowledge_base.knowledge_documents
+             WHERE is_deleted = 0 AND llm_wiki_compile_status = 'stale'
+               AND status = 'ready'
+             LIMIT :limit
+        """)
+        async with get_db_session() as session:
+            rows = (await session.execute(sql, {"limit": limit})).all()
+
+        from .openkb_service import KnowledgeCompilerService, openkb_artifact_path
+        compiler = KnowledgeCompilerService()
+        submitted = 0
+        for r in rows:
+            md = openkb_artifact_path(r.id)
+            if not md.is_file():
+                continue
+            if not await compiler.claim_compile(r.tenant_id, r.id):
+                continue
+            try:
+                result = await compiler.submit_compile(
+                    kb_name=r.knowledge_base_id, tenant_id=r.tenant_id,
+                    kb_id=r.knowledge_base_id,
+                    parsed_artifact={
+                        "document_id": r.id,
+                        "source_file_path": "",
+                        "parsed_markdown_path": f"parsed/{r.id}/content.md",
+                        "assets_dir": f"parsed/{r.id}/assets"
+                        if (md.parent / "assets").is_dir() else "",
+                        "parser": "mineru",
+                        "metadata": {"pages": 0, "title": "", "recompile": True},
+                    },
+                )
+                await compiler.set_task_id(r.tenant_id, r.id, result["task_id"])
+                submitted += 1
+            except Exception as exc:
+                await self._record_openkb_status_by_id(
+                    r.id, r.tenant_id, status="failed",
+                    error=f"OPENKB_STALE_SUBMIT_FAILED: {exc}"[:1000],
+                )
+        return submitted
+
+    async def _record_openkb_status_by_id(self, document_id: str, tenant_id: str, *,
+                                          status: str, error: str = "", warnings=None) -> None:
+        """[jonex] 按 id+tenant 回写 LLM-Wiki 编译状态（列化；巡检无 ORM 对象场景）。"""
+        try:
+            async with get_db_session() as session:
+                repo = KnowledgeDocumentRepository(session)
+                fresh = await repo.get_required(document_id, tenant_id)
+                fresh.llm_wiki_compile_status = status
+                if status in ("compiling", "compiled", "stale"):
+                    fresh.llm_wiki_compile_error = None
+                if status in ("compiling", "stale"):
+                    fresh.llm_wiki_compile_warnings = None
+                if status == "failed" and error:
+                    fresh.llm_wiki_compile_error = error[:1000]
+                if warnings is not None:
+                    fresh.llm_wiki_compile_warnings = warnings or None
+                if status == "compiled":
+                    fresh.llm_wiki_compiled_at = datetime.utcnow()
+                session.add(fresh)
+                await session.commit()
+        except Exception:
+            logger.warning("[jonex] patrol 回写 LLM-Wiki 状态失败 doc=%s", document_id, exc_info=True)
 
 
 __all__ = ["ReconciliationService"]

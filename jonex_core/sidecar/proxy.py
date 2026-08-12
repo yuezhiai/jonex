@@ -39,6 +39,7 @@ class CapabilityProxy:
             "business_domain": self.config.BUSINESS_DOMAIN_URL,
             "rag.lightrag": self.config.ATOMIC_RAG_URL,
             "platform": self.config.PLATFORM_URL,
+            "openkb": self.config.OPENKB_URL,  # [jonex]
         }
 
     @property

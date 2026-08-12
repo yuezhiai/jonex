@@ -41,9 +41,11 @@ const PAGE_SIZE = 10;
 
 interface DocumentLibraryProps {
   kbId: string;
+  /** [jonex] 知识库类型：openkb 时文档状态列按 llm_wiki_compile_status 显示。 */
+  kbType?: string;
 }
 
-export default function DocumentLibrary({ kbId }: DocumentLibraryProps) {
+export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [selectedKeys, setSelectedKeys] = useState<string[]>(['all']);
@@ -263,6 +265,7 @@ export default function DocumentLibrary({ kbId }: DocumentLibraryProps) {
       onDelete: handleDelete,
     },
     accessMethods,
+    kbType,
   );
 
   const sidebarContent = (

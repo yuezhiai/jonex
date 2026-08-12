@@ -233,6 +233,18 @@ class ProcessorMixin:
                     output_dir=output_dir,
                     **kwargs,
                 )
+            elif ext in Parser.TEXT_FORMATS:
+                # [jonex] 纯文本（txt/md/json）本地解析，绕过 MinerU API——
+                # MinerU online 服务端不支持这些类型（v4/file-urls/batch 拒绝），
+                # 且纯文本无需 VLM。base.Parser.parse_text 按空行分段切块。
+                # 此前走 else → doc_parser.parse_document → mineru_online 发 API
+                # → "unsupported file type" 解析失败。
+                content_list = await asyncio.to_thread(
+                    doc_parser.parse_text,
+                    file_path=file_path,
+                    output_dir=output_dir,
+                    **kwargs,
+                )
             else:
                 content_list = await asyncio.to_thread(
                     doc_parser.parse_document,

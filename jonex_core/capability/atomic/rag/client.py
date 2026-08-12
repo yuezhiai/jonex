@@ -55,6 +55,7 @@ class RAGClient(ABC):
         storage_key: Optional[str] = None,
         preset: Optional[str] = None,
         prompt_ids: Optional[list] = None,
+        execution_mode: str = "full",
     ) -> dict:
         """插入文档到 RAG 索引，立即返回 task_id
 
@@ -113,6 +114,32 @@ class RAGClient(ABC):
         knowledge_base_id: str = "",
     ) -> bool:
         """删除文档，返回是否成功。knowledge_base_id 用于定位 LightRAG workspace。"""
+        pass
+
+    @abstractmethod
+    async def delete_batch(
+        self,
+        doc_ids: list[str],
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+        document_id: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        """[jonex] 批量删除文档——一次请求提交全部 doc_ids。
+
+        LightRAG 在单个 background_delete_documents 任务内逐 doc 删除，
+        批末仅执行一次 rebuild_knowledge_from_chunks，将 N×rebuild 降为 1×rebuild，
+        避免逐条删除时每个 doc 各自触发 LLM summarization。
+
+        Args:
+            document_id: [jonex] R4 计量归因——透传 KB 侧文档 ID，
+                         使删除/rebuild 的 LLM 调用能标注到具体文档（X-Jonex-Doc-Id）。
+            trace_id: [jonex] R4 链路追踪——透传调用链 trace_id（X-Jonex-Trace-Id）。
+
+        Returns:
+            {"success": bool, "accepted": [...], "failed": [...]}
+        """
         pass
 
     @abstractmethod
@@ -304,6 +331,7 @@ class LocalRAGClient(RAGClient):
         storage_key: Optional[str] = None,
         preset: Optional[str] = None,
         prompt_ids: Optional[list] = None,
+        execution_mode: str = "full",
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -311,6 +339,8 @@ class LocalRAGClient(RAGClient):
         _extra = {"preset": preset} if preset is not None else {}
         if prompt_ids:
             _extra["prompt_ids"] = prompt_ids
+        if execution_mode and execution_mode != "full":
+            _extra["execution_mode"] = execution_mode
         return await self._adapter.insert(
             file_path=file_path,
             tenant_id=tenant_id,
@@ -383,6 +413,37 @@ class LocalRAGClient(RAGClient):
         return await self._adapter.delete(
             doc_id, tenant_id, knowledge_base_id=knowledge_base_id
         )
+
+    async def delete_batch(
+        self,
+        doc_ids: list[str],
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+        document_id: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        """[jonex] 批量删除——LOCAL 模式下逐条调用 LightRAGAdapter（v1 无批量接口）。
+
+        注意：远程模式应使用 RemoteRAGClient.delete_batch 以合并 rebuild。
+        """
+        tenant_id = require_tenant(tenant_id)
+        await self._ensure_initialized()
+        accepted = []
+        failed = []
+        for doc_id in doc_ids:
+            try:
+                ok = await self._adapter.delete(
+                    doc_id, tenant_id, knowledge_base_id=knowledge_base_id
+                )
+                if ok:
+                    accepted.append(doc_id)
+                else:
+                    failed.append(doc_id)
+            except Exception:
+                logger.warning("LocalRAGClient delete_batch failed for %s", doc_id, exc_info=True)
+                failed.append(doc_id)
+        return {"success": len(failed) == 0, "accepted": accepted, "failed": failed}
 
     async def get_task_status(
         self,
@@ -588,6 +649,8 @@ class RemoteRAGClient(RAGClient):
         prompt_ids: Optional[list] = None,
         schema_version: int = 0,
         schema_hash: str = "",
+        execution_mode: str = "full",
+        idempotency_key: Optional[str] = None,  # [jonex] R1
     ) -> dict:
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
         payload: dict = {
@@ -599,6 +662,8 @@ class RemoteRAGClient(RAGClient):
             "storage_key": storage_key or file_path,
             # [jonex] P1-E：携带 schema 版本，供对账写图前 fencing
             "schema_version": schema_version,
+            # [jonex] OpenKB：parse_only 让 atomic-rag 只解析产出 markdown，不写 LightRAG/Neo4j
+            "execution_mode": execution_mode,
         }
         if schema_hash:
             payload["schema_hash"] = schema_hash
@@ -610,6 +675,8 @@ class RemoteRAGClient(RAGClient):
             payload["preset"] = preset
         if prompt_ids:
             payload["prompt_ids"] = prompt_ids
+        if idempotency_key:                        # [jonex] R1
+            payload["idempotency_key"] = idempotency_key
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -632,6 +699,7 @@ class RemoteRAGClient(RAGClient):
         schema_version: int = 0,
         schema_hash: str = "",
         old_rag_doc_ids: Optional[list] = None,
+        idempotency_key: Optional[str] = None,  # [jonex] R1
     ) -> dict:
         """以 force_reparse=true 重新解析同一文件（atomic-rag action `retry`）。
 
@@ -664,7 +732,19 @@ class RemoteRAGClient(RAGClient):
             payload["preset"] = preset
         if prompt_ids:
             payload["prompt_ids"] = prompt_ids
+        if idempotency_key:                        # [jonex] R1
+            payload["idempotency_key"] = idempotency_key
         resp = await self._invoke(payload, tenant_id)
+        return resp["data"]
+
+    # [jonex] R1：幂等键反查 —— 供 R2-b 查证链使用
+    async def get_task_by_idempotency_key(
+        self, idempotency_key: str, tenant_id: str,
+    ) -> dict:
+        resp = await self._invoke({
+            "action": "get_task_by_idempotency_key",
+            "idempotency_key": idempotency_key,
+        }, tenant_id)
         return resp["data"]
 
     async def query(
@@ -727,6 +807,35 @@ class RemoteRAGClient(RAGClient):
         }
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]["success"]
+
+    async def delete_batch(
+        self,
+        doc_ids: list[str],
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+        document_id: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        """[jonex] 批量删除——单次 Sidecar invoke 提交全部 doc_ids，
+        atomic-rag 批量受理后 LightRAG 仅执行一次 rebuild。
+
+        [jonex] R4：透传 document_id / trace_id，使删除/rebuild 的 LLM
+        调用能正确归因到具体文档与调用链（X-Jonex-Doc-Id / X-Jonex-Trace-Id）。
+        """
+        if not doc_ids:
+            return {"success": True, "accepted": [], "failed": []}
+        payload: dict = {
+            "action": "delete_batch",
+            "doc_ids": list(doc_ids),
+            "knowledge_base_id": knowledge_base_id,
+        }
+        if document_id:
+            payload["document_id"] = document_id
+        if trace_id:
+            payload["trace_id"] = trace_id
+        resp = await self._invoke(payload, tenant_id)
+        return resp["data"]
 
     async def get_task_status(
         self,
@@ -1102,6 +1211,7 @@ class MockRAGClient(RAGClient):
         storage_key: Optional[str] = None,
         preset: Optional[str] = None,
         prompt_ids: Optional[list] = None,
+        execution_mode: str = "full",
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -1167,6 +1277,27 @@ class MockRAGClient(RAGClient):
             self._docs.remove(key)
             return True
         return False
+
+    async def delete_batch(
+        self,
+        doc_ids: list[str],
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+        document_id: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        tenant_id = require_tenant(tenant_id)
+        accepted = []
+        failed = []
+        for doc_id in doc_ids:
+            key = f"{tenant_id}:{doc_id}"
+            if key in self._docs:
+                self._docs.remove(key)
+                accepted.append(doc_id)
+            else:
+                failed.append(doc_id)
+        return {"success": len(failed) == 0, "accepted": accepted, "failed": failed}
 
     async def get_task_status(
         self,

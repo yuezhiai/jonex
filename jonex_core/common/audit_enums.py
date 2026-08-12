@@ -473,6 +473,45 @@ _RESOURCE_TO_ID_FIELD: dict[str, str] = {
     "ontology_query": "query_id",
 }
 
+# ============ ResourceType → DB 名称查询映射 ============
+# 用于 ResourceNameEnricher 查询资源实例的显示名称。
+# 格式：resource_type → (schema, table, id_column, name_column)
+# 仅包含有对应 DB 实体表且存在 display-name 列的 resource_type。
+
+_RESOURCE_NAME_LOOKUP: dict[str, tuple[str, str, str, str]] = {
+    # ---- Platform ----
+    "user": ("platform", "users", "id", "display_name"),
+    "role": ("platform", "roles", "id", "name"),
+    "permission": ("platform", "permissions", "id", "name"),
+    "menu": ("platform", "menus", "id", "name"),
+    "application": ("platform", "applications", "id", "name"),
+    "system_config": ("platform", "system_configs", "id", "config_key"),
+    "task_schedule": ("platform", "task_schedules", "id", "name"),
+    # ---- Knowledge Base ----
+    "space": ("knowledge_base", "spaces", "id", "name"),
+    "knowledge_info": ("knowledge_base", "knowledge_info", "id", "name"),
+    "document": ("knowledge_base", "knowledge_documents", "id", "file_name"),
+    "data_source": ("knowledge_base", "knowledge_data_sources", "id", "name"),
+    "folder": ("knowledge_base", "folders", "id", "name"),
+    "tag": ("knowledge_base", "tags", "id", "name"),
+    "synonym": ("knowledge_base", "ontology_synonyms", "id", "canonical"),
+    "service": ("knowledge_base", "services", "id", "name"),
+    "service_api_key": ("knowledge_base", "service_api_keys", "id", "key_prefix"),
+    "parser_setting": ("knowledge_base", "knowledge_parser_settings", "id", "parser_type"),
+    # ---- Business Domain ----
+    "prompt_template": ("business_domain", "prompt_templates", "id", "name"),
+    "template_domain": ("business_domain", "template_domains", "id", "name"),
+    "template_scenario": ("business_domain", "template_scenarios", "id", "name"),
+    "template_object": ("business_domain", "template_objects", "id", "name"),
+    "template_relation": ("business_domain", "template_relations", "id", "name"),
+    "template_constraint": ("business_domain", "template_constraints", "id", "name"),
+    "provider": ("business_domain", "model_providers", "id", "name"),
+    "adapter": ("business_domain", "adapters", "id", "name"),
+    "parser": ("business_domain", "parser_configs", "id", "name"),
+    "access_method": ("business_domain", "data_access_methods", "id", "name"),
+    "skill": ("business_domain", "skill_catalog", "id", "name"),
+}
+
 # ============ HTTP 方法模板常量 ============
 
 # 非枚举成员，仅供动态拼接 HTTP action 时使用

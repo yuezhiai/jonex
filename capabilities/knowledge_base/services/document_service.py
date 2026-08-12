@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import and_, delete, or_, select
@@ -15,6 +16,7 @@ from jonex_core.common.database import get_db_session
 from jonex_core.common.file_source_util import parse_file_source
 from jonex_core.common.exceptions import (
     InvalidParameterError,
+    PermissionDeniedError,
     ResourceConflictError,
     ResourceNotFoundError,
 )
@@ -217,6 +219,30 @@ class DocumentService:
         return hashlib.md5(data).hexdigest()
 
     @staticmethod
+    async def _find_duplicate(tenant_id: str, kb_id: str, content_hash: str) -> Optional[Any]:
+        """[jonex] 上传去重：同 KB 内返回内容 hash 相同的活跃文档（未删除且非 failed）。
+
+        返回 row（含 id / file_name）或 None。failed / 已删除的文档不算重复，
+        允许解析失败后重新上传重试。
+        """
+        from sqlalchemy import text as _sql_text
+
+        async with get_db_session() as session:
+            row = (
+                await session.execute(
+                    _sql_text(
+                        "SELECT id, file_name FROM knowledge_base.knowledge_documents "
+                        "WHERE tenant_id = :tid AND knowledge_base_id = :kb "
+                        "  AND content_hash = :h "
+                        "  AND is_deleted = 0 AND status <> 'failed' "
+                        "LIMIT 1"
+                    ),
+                    {"tid": tenant_id, "kb": kb_id, "h": content_hash},
+                )
+            ).fetchone()
+        return row
+
+    @staticmethod
     async def _compute_config_fingerprint(
         tenant_id: str, kb_id: str, file_name: str,
     ) -> tuple[str, str, Optional[str], int]:
@@ -294,6 +320,14 @@ class DocumentService:
         # 冗余真实列：文档来源方式（file / api / storage / api_push），文档数统计按此列分组
         data_source_type = metadata.get("source")
 
+        # [jonex] R2-a0: 同事务写入提交锚点 —— 宽限期计时从这里开始
+        # [jonex] P1-1: 统一用 datetime.now()（naive 本地时间），与 DB TimestampMixin / patrol 口径一致
+        metadata["submit_started_at"] = datetime.now().isoformat()
+        # [jonex] P0-3: patrol 计时基准 —— 进入 PARSING 时打点，
+        # 解耦 TimestampMixin.updated_at onupdate 心跳污染（_death_candidate 每 30s
+        # 写一次 DB → onupdate 刷新 updated_at → patrol elapsed 永远到不了 SOFT）。
+        metadata["parsing_started_at"] = datetime.now().isoformat()
+
         storage_key = req.storage_key or req.file_path
         storage_backend = req.storage_backend
         # 未显式指定存储后端时，从环境变量自动推断
@@ -307,6 +341,24 @@ class DocumentService:
             file_path = req.file_path or storage_key
         else:
             file_path = get_object_storage().fs_path(storage_key) or req.file_path or storage_key
+
+        # [jonex] 上传去重：同 KB 内内容 md5 相同的活跃文档已存在则拒绝，避免重复入库。
+        # （fail-open：hash 取不到 → 放行，不因临时存储错误阻塞上传）
+        content_hash = await self._compute_source_hash(storage_backend, storage_key)
+        if content_hash:
+            dup = await self._find_duplicate(tenant_id, req.knowledge_base_id, content_hash)
+            if dup is not None:
+                raise ResourceConflictError(
+                    message=translate(
+                        "err.doc.duplicate",
+                        params={"file_name": dup.file_name},
+                        fallback=f"知识库中已存在相同内容的文档「{dup.file_name}」，请勿重复上传",
+                    ),
+                    details={
+                        "knowledge_base_id": req.knowledge_base_id,
+                        "duplicate_document_id": dup.id,
+                    },
+                )
 
         doc_id = req.doc_id or None  # 预生成 doc_id（COS 直传模式），None 则自动 UUID
         async with get_db_session() as session:
@@ -322,6 +374,7 @@ class DocumentService:
                     knowledge_base_id=req.knowledge_base_id,
                     storage_backend=storage_backend,
                     storage_key=storage_key,
+                    content_hash=content_hash or None,  # [jonex] 上传去重持久化
                     status=DocStatus.PARSING.value,
                     ontology_status=OntologyStatus.PENDING.value,
                     folder_id=req.folder_id,
@@ -392,6 +445,15 @@ class DocumentService:
             # [jonex] 主解析提示词下发：该类目关联了 prompt 配置则带上 prompt_ids
             prompt_ids = [prompt_config_id] if prompt_config_id else []
 
+            # ── [jonex] kb_type 分流 ───
+            kb_type = await self._get_kb_type(tenant_id, req.knowledge_base_id)
+            # [jonex] OpenKB KB 级互斥：openkb 文档只解析产出 markdown，不写 LightRAG/Neo4j
+            execution_mode = "parse_only" if kb_type == "openkb" else "full"
+
+            # [jonex] R1：生成确定性幂等键，insert 响应丢失后重试拿回同一 task_id
+            # [jonex] P2: 与对账侧 _build_idempotency_key 同口径，读 content_generation 而不硬编码 :0
+            gen = getattr(doc, "content_generation", 0) or 0
+            idempotency_key = f"insert:{tenant_id}:{req.knowledge_base_id}:{doc_id}:{gen}"
             rag_result = await get_rag_client().insert(
                 file_path=file_path,
                 tenant_id=tenant_id,
@@ -403,6 +465,8 @@ class DocumentService:
                 preset=preset,                    # KB 按文件类型选择的解析器（v2 preset 链路）
                 prompt_ids=prompt_ids,            # KB 主解析提示词
                 schema_version=schema_version,    # [jonex] P1-E：供对账写图前 fencing
+                execution_mode=execution_mode,    # [jonex] OpenKB parse_only 分流
+                idempotency_key=idempotency_key,  # [jonex] R1
             )
         except Exception as exc:
             logger.exception("Knowledge document ingestion failed: %s", doc_id)
@@ -410,6 +474,11 @@ class DocumentService:
                 repo = KnowledgeDocumentRepository(session)
                 doc = await repo.get_required(doc_id, tenant_id)
                 await repo.set_status(doc, DocStatus.FAILED, error_message=str(exc))
+                # [jonex] R2-a0: 清除提交锚点（已判 FAILED，不可残留掩盖后续故障）
+                # [jonex] N1: SQLAlchemy JSON 列不追踪原地 pop，必须整体重赋值
+                meta = dict(doc.extra_metadata or {})
+                meta.pop("submit_started_at", None)
+                doc.extra_metadata = meta
                 doc_dict = doc.to_dict()
             schedule_emit({
                 "tenant_id": tenant_id,
@@ -436,10 +505,17 @@ class DocumentService:
                 rag_task_id=rag_result.get("task_id"),
                 rag_doc_ids=rag_result.get("doc_ids") or rag_result.get("document_ids") or [],
             )
+            # [jonex] openkb KB 不抽本体：上传时直接标 ontology_status=READY，
+            # 避免对账巡检前 30s 窗口内 ontology_status=PENDING（DB 默认值），
+            # 导致前端显示误导的「知识抽取入库中」。
+            if kb_type == "openkb":
+                await repo.set_ontology_status(doc, OntologyStatus.READY)
             # [jonex] P1-E：记录本文档应归类到的目标 schema 版本
             if schema_version:
                 doc.ontology_target_schema_version = schema_version
-            doc.extra_metadata = {**(doc.extra_metadata or {}), "rag_result": rag_result}
+            doc.extra_metadata = {**(doc.extra_metadata or {}), "rag_result": rag_result, "kb_type": kb_type}
+            # [jonex] R2-a0: 清除提交锚点（task_id 已写回，不再需要宽限期保护）
+            doc.extra_metadata.pop("submit_started_at", None)
             doc_dict = doc.to_dict()
 
         if status == DocStatus.READY:
@@ -486,23 +562,31 @@ class DocumentService:
             "storage_backend": os.getenv("OBJECT_STORAGE_BACKEND", "local"),
         }
 
-    async def get_raw_location(self, tenant_id: str, document_id: str) -> dict:
+    async def get_raw_location(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "") -> dict:
         """获取文档原文位置信息（校验租户归属后返回）。
 
         统一 raw 入口：
         - 对象存储后端（cos）：返回 presigned_url，gateway 302 直跳（天然支持 Range/流式）；
         - local 后端：presigned_url 为空，返回 storage_key，gateway 用 FileResponse
           从共享卷流式返回（支持 Range，音视频可拖动/边下边播，不经 Sidecar 传字节）。
+
+        knowledge_base_id 可为空——仅用于可选 KB 级归属校验；租户级鉴权已由 get_required 保证。
         """
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)
+        if knowledge_base_id and doc.knowledge_base_id != knowledge_base_id:
+            raise PermissionDeniedError(
+                message=f"文档 {document_id} 不属于知识库 {knowledge_base_id}",
+                details={"document_id": document_id, "knowledge_base_id": knowledge_base_id,
+                         "actual_kb": doc.knowledge_base_id},
+            )
         # 按文档自身的 storage_backend 选后端（混合数据时不能用全局 env 单例）
         backend = (doc.storage_backend or "local").strip().lower()
         presigned = ""
         if backend == "cos":
-            presigned = await get_object_storage_for("cos").presigned_url(doc.storage_key, tenant_id)
+            presigned = await get_object_storage_for("cos").presigned_url(doc.storage_key, tenant_id, expires=300)
         return {
             "storage_backend": backend,
             "storage_key": doc.storage_key,
@@ -511,30 +595,83 @@ class DocumentService:
             "presigned_url": presigned or "",
         }
 
-    async def get_raw_url(self, tenant_id: str, document_id: str) -> str:
+    async def get_raw_url(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "",
+                          user_id: Optional[str] = None, username: Optional[str] = None,
+                          ip: Optional[str] = None, mcp_key_id: Optional[str] = None) -> str:
         """获取文档原文的预签名 URL（校验租户归属后签名）。
 
         用于 GET /documents/{id}/raw 端点（302 重定向）。
+
+        knowledge_base_id 可为空——仅用于可选 KB 级归属校验；租户级鉴权已由 get_required 保证。
         """
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)
+        if knowledge_base_id and doc.knowledge_base_id != knowledge_base_id:
+            raise PermissionDeniedError(
+                message=f"文档 {document_id} 不属于知识库 {knowledge_base_id}",
+                details={"document_id": document_id, "knowledge_base_id": knowledge_base_id,
+                         "actual_kb": doc.knowledge_base_id},
+            )
         storage = get_object_storage()
-        return await storage.presigned_url(doc.storage_key, tenant_id)
+        url = await storage.presigned_url(doc.storage_key, tenant_id, expires=300)
+        schedule_emit({
+            "tenant_id": tenant_id,
+            "user_id": user_id or "",
+            "username": username or "",
+            "ip": ip or "",
+            "log_type": "OPERATION",
+            "action": "document.download",
+            "outcome": "SUCCESS",
+            "service_name": "knowledge_base",
+            "resource": ResourceType.DOCUMENT.value,
+            "resource_id": str(document_id),
+            "request_params": {
+                "knowledge_base_id": knowledge_base_id,
+                "mcp_key_id": mcp_key_id,
+            },
+        })
+        return url
 
-    async def get_raw_content(self, tenant_id: str, document_id: str) -> dict:
+    async def get_raw_content(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "",
+                              user_id: Optional[str] = None, username: Optional[str] = None,
+                              ip: Optional[str] = None, mcp_key_id: Optional[str] = None) -> dict:
         """获取文档原文的字节内容（本地回退，无预签名 URL 时使用）。
 
         返回 base64 编码的内容 + 元信息，供 gateway 代理文件下载。
+
+        knowledge_base_id 可为空——仅用于可选 KB 级归属校验；租户级鉴权已由 get_required 保证。
         """
         import base64
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)
+        if knowledge_base_id and doc.knowledge_base_id != knowledge_base_id:
+            raise PermissionDeniedError(
+                message=f"文档 {document_id} 不属于知识库 {knowledge_base_id}",
+                details={"document_id": document_id, "knowledge_base_id": knowledge_base_id,
+                         "actual_kb": doc.knowledge_base_id},
+            )
         storage = get_object_storage()
         raw = await storage.get_bytes(doc.storage_key)
+        schedule_emit({
+            "tenant_id": tenant_id,
+            "user_id": user_id or "",
+            "username": username or "",
+            "ip": ip or "",
+            "log_type": "OPERATION",
+            "action": "document.raw_content",
+            "outcome": "SUCCESS",
+            "service_name": "knowledge_base",
+            "resource": ResourceType.DOCUMENT.value,
+            "resource_id": str(document_id),
+            "request_params": {
+                "knowledge_base_id": knowledge_base_id,
+                "mcp_key_id": mcp_key_id,
+            },
+        })
         return {
             "content": base64.b64encode(raw).decode("ascii"),
             "mime_type": doc.mime_type or "application/octet-stream",
@@ -556,6 +693,12 @@ class DocumentService:
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)
+
+        # ── [jonex] OpenKB 管线：不入 LightRAG，chunks 从共享卷 parsed markdown 读取 ──
+        kb_type = await self._get_kb_type(tenant_id, doc.knowledge_base_id)
+        if kb_type == "openkb":
+            return self._get_openkb_chunks(document_id)
+
         result = await get_rag_client().get_doc_chunks(
             document_id=document_id,
             knowledge_base_id=doc.knowledge_base_id,
@@ -582,6 +725,49 @@ class DocumentService:
             "chunks": enriched,
         }
 
+    def _get_openkb_chunks(self, document_id: str) -> dict:
+        """[jonex] OpenKB 文档的 chunk 视图：读共享卷 parsed markdown 按块返回。
+
+        OpenKB 管线只解析产出 markdown（parse_only），不入 LightRAG，因此 chunks
+        不在 LightRAG。解析产物由 atomic-rag 写到共享卷 inputs/parsed/{doc}/content.md
+        （knowledge-base 亦挂载该卷于 KB_INPUT_DIR），这里直接读取并按空行分块返回，
+        与 LightRAG chunks 返回结构对齐（content + chunk_index + 位置占位）。
+        """
+        import os
+        from pathlib import Path
+
+        inputs_root = os.getenv("KB_INPUT_DIR", "/app/inputs")
+        md_path = Path(inputs_root) / "parsed" / document_id / "content.md"
+        if not md_path.is_file():
+            return {"doc_id": document_id, "total": 0, "chunks": [], "kb_type": "openkb"}
+
+        text = md_path.read_text(encoding="utf-8")
+        blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+        chunks = [
+            {
+                "chunk_id": f"{document_id}#openkb-{i}",
+                "content": b,
+                # 与 LightRAG chunk 结构对齐：前端解析结果页 getChunkTitle 会读取
+                # content_summary 与 file_path，缺字段会 `.match()` 到 undefined 而崩页。
+                # OpenKB 无 file_source 锚点，file_path 仅给出 doc= 归属锚点。
+                "content_summary": b,
+                "file_path": f"doc={document_id}",
+                "chunk_index": i,
+                "time_start": None,
+                "time_end": None,
+                "page_no": None,
+                "char_start": None,
+                "char_end": None,
+            }
+            for i, b in enumerate(blocks)
+        ]
+        return {
+            "doc_id": document_id,
+            "total": len(chunks),
+            "chunks": chunks,
+            "kb_type": "openkb",
+        }
+
     async def get_chunk(self, tenant_id: str, document_id: str, chunk_id: str) -> dict:
         """按 chunk_id 精确直查单片内容（直连 LightRAG text_chunks，不拉整篇列表）。
 
@@ -592,6 +778,19 @@ class DocumentService:
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)  # 租户+归属校验
+
+        # ── [jonex] OpenKB 管线：从共享卷 parsed markdown 取指定块 ──
+        if "#openkb-" in chunk_id:
+            listing = self._get_openkb_chunks(document_id)
+            for c in listing.get("chunks", []):
+                if c["chunk_id"] == chunk_id:
+                    return {"doc_id": document_id, "chunk_id": chunk_id,
+                            "content": c["content"], "chunk_index": c["chunk_index"]}
+            raise ResourceNotFoundError(
+                message=translate("err.kb.chunk_not_found", params={"chunk_id": chunk_id},
+                                  fallback=f"未找到 chunk: {chunk_id}"),
+            )
+
         chunk = await get_rag_client().get_chunk_by_id(
             chunk_id=chunk_id,
             knowledge_base_id=doc.knowledge_base_id,
@@ -650,6 +849,30 @@ class DocumentService:
                 raise ResourceConflictError(message=translate("err.doc.parsing_or_cleaning", fallback="文档正在解析/入库中，请等待完成后再重新解析")  )  # 原消息)
             if doc.status == DocStatus.DELETING.value:
                 raise ResourceConflictError(message=translate("err.doc.deleting_cannot_reparse", fallback="文档正在删除中，无法重新解析")  )  # 原消息)
+            # [jonex] P1：检查是否已有 in-flight 的 RAG 解析任务，防止短时间内重复提交
+            # 导致 old_ids 刚写入就被新 reparse 要求删除（cleanup ↔ index 竞争）。
+            # 即使 KB 侧状态已是 READY/FAILED，只要 RAG 任务仍在跑就不允许新建第二个。
+            if doc.rag_task_id:
+                try:
+                    task_info = await get_rag_client().get_task_status(
+                        doc.rag_task_id, tenant_id,
+                    )
+                    task_status = str((task_info or {}).get("status", "")).lower()
+                    if task_status in ("created", "queued", "processing"):
+                        raise ResourceConflictError(
+                            message=translate(
+                                "err.doc.reparse_in_flight",
+                                fallback="该文档已有正在执行的解析任务，请等待完成后再重新解析",
+                            )
+                        )
+                except ResourceConflictError:
+                    raise
+                except Exception as exc:
+                    # fail-open：查询失败不阻塞正常 reparse，仅打日志
+                    logger.warning(
+                        "P1 reparse idempotency check failed for doc=%s task=%s: %s",
+                        document_id, doc.rag_task_id, exc,
+                    )
             kb_id = doc.knowledge_base_id
             file_path = doc.file_path
             storage_key = doc.storage_key
@@ -657,10 +880,26 @@ class DocumentService:
             file_name = doc.file_name
             # reparse 走严格全量替换：快照旧 rag_doc_ids（权威 old_ids 之一，另一半由 atomic-rag 现查）
             old_rag_doc_ids = list(doc.rag_doc_ids or [])
+
+            # ── [jonex] kb_type 分流：openkb 只重解析产出 markdown，不入 LightRAG/不抽本体 ──
+            # 复用当前 session 直查 KnowledgeInfo（避免嵌套开 session）
+            from ..models.knowledge_info import KnowledgeInfo
+
+            _pt_row = await session.execute(
+                select(KnowledgeInfo.kb_type).where(
+                    KnowledgeInfo.tenant_id == tenant_id,
+                    KnowledgeInfo.id == kb_id,
+                    KnowledgeInfo.is_deleted == 0,
+                )
+            )
+            kb_type = _pt_row.scalar() or "lightrag"
+            is_openkb = kb_type == "openkb"
+
             # [jonex] R1-c：比对源文件内容 md5 + 解析配置指纹，两者都未变化才跳过。
             # 源文件或配置（preset/prompt/schema）任一变更 → 自动放行重解析，无需手动 force。
             # hash 取不到（临时错误）→ fail-open，打 warning 继续走 reparse。
-            stored_hash = (doc.extra_metadata or {}).get("source_content_hash", "")
+            # [jonex] 优先读 content_hash 列（上传去重持久化的单一事实来源），缺失回退旧 extra_metadata
+            stored_hash = (doc.content_hash or "") or (doc.extra_metadata or {}).get("source_content_hash", "")
             stored_cfg_hash = (doc.extra_metadata or {}).get("config_fingerprint", "")
             current_hash = ""
             if not force:
@@ -688,8 +927,20 @@ class DocumentService:
                     )
 
             # R1-c 跳过条件：源文件 AND 解析配置均未变化
-            if (current_hash and stored_hash and current_hash == stored_hash
-                    and cfg_hash and stored_cfg_hash and cfg_hash == stored_cfg_hash):
+            can_skip = bool(current_hash and stored_hash and current_hash == stored_hash
+                            and cfg_hash and stored_cfg_hash and cfg_hash == stored_cfg_hash)
+            # [jonex] openkb：源文件+配置未变也不能无条件 skip —— 若 parsed artifact 丢失
+            # （卷被清理 / 产物开关曾关闭 / 手工删过），skip 会与「重新编译」的
+            # "请先重新解析" 提示形成死循环，用户永远出不去。产物缺失时必须继续解析。
+            if can_skip and is_openkb:
+                from .openkb_service import openkb_artifact_exists
+                if not openkb_artifact_exists(document_id):
+                    can_skip = False
+                    logger.info(
+                        "[jonex] openkb reparse 不跳过：源文件未变但 parsed artifact 缺失 doc=%s",
+                        document_id,
+                    )
+            if can_skip:
                 logger.info(
                     "R1-c skip reparse (source+config unchanged): doc=%s hash=%s",
                     document_id, current_hash[:16],
@@ -714,14 +965,40 @@ class DocumentService:
             new_generation = (doc.content_generation or 0) + 1
             doc.content_generation = new_generation
             doc.status = DocStatus.PARSING.value
-            doc.ontology_status = OntologyStatus.PENDING.value
+            # [jonex] openkb 不抽本体：显式置 READY（而非仅"不置 PENDING"），
+            # 顺带清掉历史脏状态（分流上线前遗留的 PENDING/FAILED），
+            # 避免被本体巡检当成待办反复扫。与对账 _handle_completed 的口径一致。
+            doc.ontology_status = (
+                OntologyStatus.READY.value if is_openkb else OntologyStatus.PENDING.value
+            )
             doc.error_message = None
+            if is_openkb:
+                doc.ontology_error = None
+            # [jonex] R1-c：持久化源文件 hash + 配置指纹到 extra_metadata，供后续 reparse 比对
+            # [jonex] R2-a0: 清除旧 rag_task_id（防对账用旧 id 查到 not_found→判死）
+            # + 写入提交锚点（宽限期从这一刻开始）
+            doc.rag_task_id = None
             # [jonex] R1-c：持久化源文件 hash + 配置指纹到 extra_metadata
             extra = dict(doc.extra_metadata or {})
             if current_hash:
                 extra["source_content_hash"] = current_hash
             if cfg_hash:
                 extra["config_fingerprint"] = cfg_hash
+            # [jonex] openkb：reparse 开始时把编译结果标为 stale（旧 Wiki 已过期），
+            # 避免页面显示旧编译结果。解析完成后由对账 _handle_completed → _dispatch_openkb_compile 自动重新编译。
+            if is_openkb:
+                # 列化为主（migration 008）；JSONB 键仍写一份兼容旧读点（迁移期）
+                doc.llm_wiki_compile_status = "stale"
+                doc.llm_wiki_compile_error = None
+                doc.llm_wiki_compile_warnings = None
+                extra["openkb_compile_status"] = "stale"
+                extra.pop("openkb_compile_error", None)
+                extra.pop("openkb_compile_warnings", None)
+            # [jonex] R2-a0: 提交锚点（同 flush 写入，无额外 DB 写）
+            # [jonex] P1-1: 统一用 datetime.now()（naive 本地时间），与 patrol 口径一致
+            extra["submit_started_at"] = datetime.now().isoformat()
+            # [jonex] P0-3: patrol 计时基准（与 upload_document 同口径）
+            extra["parsing_started_at"] = datetime.now().isoformat()
             doc.extra_metadata = extra
             await session.flush()
             doc_dict = doc.to_dict()
@@ -744,22 +1021,33 @@ class DocumentService:
         if storage_backend == "cos":
             exists = await get_object_storage().head_object(storage_key)
             if not exists:
-                raise ResourceNotFoundError(
-                    message=translate("err.cos.object_deleted", params={"storage_key": storage_key}, fallback=f"COS 对象不存在或已被删除: {storage_key}")  ,  # 原消息
-                    details={"storage_key": storage_key},
-                )
+                # [jonex] 文档此前已置 PARSING，这里直接 raise 会永久卡住（PARSING 又被
+                # 入口互斥拒绝，用户无法重试）。先回写 FAILED 再抛。
+                err = translate("err.cos.object_deleted", params={"storage_key": storage_key},
+                                fallback=f"COS 对象不存在或已被删除: {storage_key}")
+                try:
+                    async with get_db_session() as session:
+                        repo = KnowledgeDocumentRepository(session)
+                        _doc = await repo.get_required(document_id, tenant_id)
+                        await repo.set_status(_doc, DocStatus.FAILED, error_message=err)
+                except Exception:
+                    logger.warning("[jonex] COS 对象缺失但回写 FAILED 失败 doc=%s", document_id, exc_info=True)
+                raise ResourceNotFoundError(message=err, details={"storage_key": storage_key})
 
         # 确保 KB 编译 schema 存在（非阻塞）
         # 若已在指纹计算阶段解析过，优先复用缓存值
         schema = None
-        schema_version = _cached_schema_ver if _cached_schema_ver else 0
-        try:
-            from .ontology_compiler import OntologyCompiler
-            schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id, auto_compile=True)
-            if schema:
-                schema_version = int(schema.get("schema_version", 0) or 0)
-        except Exception as exc:
-            logger.warning("Failed to ensure compiled schema for KB %s: %s", kb_id, exc)
+        # [jonex] openkb 不用 compiled schema；且 auto_compile=True 有副作用（凭空生成 schema），
+        # 必须整段跳过，不能只是取了不传。
+        schema_version = _cached_schema_ver if (not is_openkb and _cached_schema_ver) else 0
+        if not is_openkb:
+            try:
+                from .ontology_compiler import OntologyCompiler
+                schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id, auto_compile=True)
+                if schema:
+                    schema_version = int(schema.get("schema_version", 0) or 0)
+            except Exception as exc:
+                logger.warning("Failed to ensure compiled schema for KB %s: %s", kb_id, exc)
 
         try:
             preset = _cached_preset if _cached_preset else None
@@ -768,22 +1056,26 @@ class DocumentService:
                 preset, prompt_config_id = await self._resolve_parser_preset(tenant_id, kb_id, file_name)
             # [jonex] 主解析提示词下发：重解析同样带上当前配置
             prompt_ids = [prompt_config_id] if prompt_config_id else []
+            # [jonex] openkb：parse_only（只解析产出 markdown，不入 LightRAG、不抽本体）；
+            # 相应地不需要 strict_push / old_rag_doc_ids（LightRAG 里本就没有该文档的 doc）。
+            # [jonex] R1：生成确定性幂等键（reparse 代次递增 → 天然是新键）
+            idempotency_key = f"insert:{tenant_id}:{kb_id}:{document_id}:{new_generation}"
             rag_result = await get_rag_client().retry(
                 file_path=file_path,
                 tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
                 document_id=document_id,
-                ontology_schema=schema,
+                ontology_schema=schema,            # openkb 下恒为 None
                 storage_backend=storage_backend,
                 storage_key=storage_key,
                 preset=preset,
                 prompt_ids=prompt_ids,
-                # [jonex] 阶段4：严格全量替换 + 代次 fencing
-                execution_mode="reparse_strict",
-                strict_push=True,
+                execution_mode="parse_only" if is_openkb else "reparse_strict",
+                strict_push=not is_openkb,
                 content_generation=new_generation,
-                schema_version=schema_version,
-                old_rag_doc_ids=old_rag_doc_ids,
+                schema_version=schema_version,     # openkb 下恒为 0
+                old_rag_doc_ids=[] if is_openkb else old_rag_doc_ids,
+                idempotency_key=idempotency_key,  # [jonex] R1
             )
         except Exception as exc:
             logger.exception("Knowledge document reparse failed: %s", document_id)
@@ -791,6 +1083,11 @@ class DocumentService:
                 repo = KnowledgeDocumentRepository(session)
                 doc = await repo.get_required(document_id, tenant_id)
                 await repo.set_status(doc, DocStatus.FAILED, error_message=str(exc))
+                # [jonex] R2-a0: 清除提交锚点
+                # [jonex] N1: SQLAlchemy JSON 列不追踪原地 pop，必须整体重赋值
+                meta = dict(doc.extra_metadata or {})
+                meta.pop("submit_started_at", None)
+                doc.extra_metadata = meta
                 doc_dict = doc.to_dict()
             schedule_emit({
                 "tenant_id": tenant_id,
@@ -821,6 +1118,8 @@ class DocumentService:
             if schema_version:
                 doc.ontology_target_schema_version = schema_version
             doc.extra_metadata = {**(doc.extra_metadata or {}), "rag_result": rag_result}
+            # [jonex] R2-a0: 清除提交锚点
+            doc.extra_metadata.pop("submit_started_at", None)
             doc_dict = doc.to_dict()
         return doc_dict
 
@@ -945,6 +1244,53 @@ class DocumentService:
                 raise ResourceNotFoundError(message=translate("err.doc.not_found", fallback="知识文档不存在")  )  # 原消息)
             return doc.to_dict()
 
+    async def get_document_status(
+        self,
+        tenant_id: str,
+        document_id: str,
+        kb_ids: list[str],
+    ) -> dict:
+        """查询文档处理状态，供 MCP 上传进度追踪使用。
+
+        轻量级状态查询，校验文档归属在授权的 KB 范围内。不返回完整的 to_dict()，
+        仅返回与上传/解析进度监控相关的字段。
+
+        Args:
+            tenant_id: 租户 ID。
+            document_id: 文档 ID（由 upload_document 返回）。
+            kb_ids: MCP Key 授权访问的 KB ID 列表，文档所属 KB 必须在其中。
+
+        Returns:
+            dict: 状态字段（doc_id、status、ontology_status、error_message、
+                  file_name、file_size、knowledge_base_id、created_at、updated_at）。
+
+        Raises:
+            ResourceNotFoundError: 文档不存在或 KB 不在授权范围内。
+        """
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_by_id(document_id, tenant_id)
+            if doc is None:
+                raise ResourceNotFoundError(
+                    message=translate("err.doc.not_found", fallback="知识文档不存在"),
+                )
+            if doc.knowledge_base_id not in kb_ids:
+                raise ResourceNotFoundError(
+                    message=translate("err.doc.not_found", fallback="知识文档不存在"),
+                )
+            return {
+                "doc_id": doc.id,
+                "status": doc.status,
+                "ontology_status": doc.ontology_status,
+                "error_message": doc.error_message,
+                "file_name": doc.file_name,
+                "file_size": doc.file_size,
+                "knowledge_base_id": doc.knowledge_base_id,
+                "created_at": doc.created_at.isoformat(),
+                "updated_at": doc.updated_at.isoformat(),
+            }
+
     async def delete_document(
         self,
         tenant_id: str,
@@ -988,6 +1334,31 @@ class DocumentService:
                 "Deleting %d LightRAG documents for doc %s: %s",
                 len(rag_doc_ids), document_id, rag_doc_ids[:10],
             )
+            # [jonex] 批量删除：单次 DELETE 提交全部 doc_ids，LightRAG
+            # 在单个 background_delete_documents 内批量处理，批末仅一次
+            # rebuild_knowledge_from_chunks，避免逐条删除时每个 doc 各自
+            # 触发 LLM summarization。
+            try:
+                result = await get_rag_client().delete_batch(
+                    rag_doc_ids, tenant_id=tenant_id, knowledge_base_id=kb_id,
+                    document_id=document_id,
+                )
+                accepted = result.get("accepted", [])
+                failed = result.get("failed", [])
+                if accepted:
+                    logger.info(
+                        "RAG batch delete accepted %d/%d doc_ids for doc %s",
+                        len(accepted), len(rag_doc_ids), document_id,
+                    )
+                if failed:
+                    logger.warning(
+                        "RAG batch delete failed %d doc_ids for doc %s: %s",
+                        len(failed), document_id, failed,
+                    )
+            except Exception:
+                logger.warning(
+                    "RAG batch delete failed for doc %s", document_id, exc_info=True,
+                )
         else:
             logger.warning(
                 "No LightRAG doc_ids found for document %s (file_name=%s), "
@@ -995,13 +1366,27 @@ class DocumentService:
                 document_id, file_name,
             )
 
-        for rag_doc_id in rag_doc_ids:
+        # ── [jonex] kb_type 分流 ──
+        kb_type = await self._get_kb_type(tenant_id, kb_id)
+
+        if kb_type == "openkb":
+            from .openkb_service import KnowledgeCompilerService  # [jonex] lazy import 避免循环依赖
+            compiler = KnowledgeCompilerService()
             try:
-                await get_rag_client().delete(
-                    rag_doc_id, tenant_id=tenant_id, knowledge_base_id=kb_id
+                await compiler.remove_document(
+                    kb_name=kb_id, document_id=document_id,
+                    tenant_id=tenant_id, kb_id=kb_id,
                 )
             except Exception:
-                logger.warning("Failed to delete RAG document %s", rag_doc_id, exc_info=True)
+                logger.warning("Failed to remove OpenKB document %s", document_id, exc_info=True)
+        else:
+            for rag_doc_id in rag_doc_ids:
+                try:
+                    await get_rag_client().delete(
+                        rag_doc_id, tenant_id=tenant_id, knowledge_base_id=kb_id
+                    )
+                except Exception:
+                    logger.warning("Failed to delete RAG document %s", rag_doc_id, exc_info=True)
 
         # 清理 Neo4j 本体图谱中该文档关联的实体节点和关系
         try:
@@ -1146,6 +1531,13 @@ class DocumentService:
             document_id, len(rag_doc_ids),
         )
         return rag_doc_ids
+
+    # ── [jonex] kb_type 查询 → 公共 helper ──
+
+    async def _get_kb_type(self, tenant_id: str, kb_id: str) -> str:
+        """[jonex] 查询 KB 的 kb_type（转调 kb_type_service）。"""
+        from .kb_type_service import get_kb_type
+        return await get_kb_type(tenant_id, kb_id)
 
 
 __all__ = ["DocumentService"]

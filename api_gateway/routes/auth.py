@@ -1,6 +1,7 @@
 """
 Auth 路由 — 纯反代到 Sidecar，零业务逻辑。
 """
+import json
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -19,10 +20,17 @@ async def _proxy_auth(request: Request, path: str):
 
     body = None
     if request.method in ("POST", "PUT", "PATCH"):
-        body = await request.json()
+        raw = await request.body()
+        if raw:
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                raise_from_capability_result(
+                    {"code": 422, "message": "请求体不是有效的 JSON 格式"}
+                )
 
     headers = {
-        "X-API-Key": "jonex_test_gateway",
+        "X-API-Key": config.GATEWAY_API_KEY,
         "X-Request-ID": getattr(request.state, "request_id", ""),
         "X-Forwarded-For": request.client.host if request.client else "",
     }
@@ -43,7 +51,12 @@ async def _proxy_auth(request: Request, path: str):
             else:
                 resp = await client.request(request.method, f"{sidecar_url}/auth/{path}", json=body, headers=headers)
             resp.raise_for_status()
-            return resp.json()
+            try:
+                return resp.json()
+            except Exception:
+                raise_from_capability_result(
+                    {"code": 502, "message": "认证服务返回了非预期的响应格式"}
+                )
         except httpx.HTTPStatusError as e:
             try:
                 detail = e.response.json()
@@ -54,6 +67,10 @@ async def _proxy_auth(request: Request, path: str):
             raise_from_capability_result(
                 {"code": e.response.status_code,
                  "message": detail.get("message", f"认证服务错误: HTTP {e.response.status_code}")}
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            raise_from_capability_result(
+                {"code": 502, "message": f"认证服务不可达: {str(e)}"}
             )
 
 

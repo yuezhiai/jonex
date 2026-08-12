@@ -6,6 +6,7 @@ import {
   CopyOutlined,
   AppstoreAddOutlined,
   FileTextOutlined,
+  ClusterOutlined,
 } from '@ant-design/icons';
 
 /** 侧边栏菜单项 */
@@ -34,6 +35,7 @@ export const IconMap: Record<string, ComponentType> = {
   CopyOutlined,
   AppstoreAddOutlined,
   FileTextOutlined,
+  ClusterOutlined,
 };
 
 interface MenuRoute {

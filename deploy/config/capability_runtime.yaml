@@ -8,3 +8,6 @@ atomic:
   rag.lightrag:
     mode: remote
     # endpoint 留空则自动使用 SIDECAR_URL 环境变量
+  openkb:
+    mode: remote
+    # endpoint 留空走 SIDECAR_URL 默认值

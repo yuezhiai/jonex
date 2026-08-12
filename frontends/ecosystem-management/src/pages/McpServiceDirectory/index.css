@@ -1,0 +1,176 @@
+/* MCP 服务目录页面样式 */
+
+/* 加载 / 居中容器 */
+.mcp-svc-center-box {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 320px;
+}
+
+/* 服务名称 */
+.mcp-svc-name {
+  color: #0b2b5c;
+  font-weight: 600;
+}
+
+/* 测试调用结果块 */
+.mcp-svc-test-result {
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+/* Tab 内容区标题与描述 */
+.mcp-svc-tab-head {
+  margin-bottom: 16px;
+}
+
+/* 详情抽屉分类标题 */
+.mcp-svc-detail-section {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0b2b5c;
+  margin: 0 0 12px;
+}
+
+/* 授权 Key 管理：内联操作面板 */
+.mcp-svc-auth-inline {
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+/* 授权 Key 管理：创建成功明文展示 */
+.mcp-svc-auth-plaintext {
+  background: #fffdf5;
+  border: 1px solid #f5e6c0;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.mcp-svc-tab-head h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0b2b5c;
+  margin: 0 0 4px;
+}
+
+.mcp-svc-tab-head p {
+  font-size: 13px;
+  color: #94a3b8;
+  margin: 0;
+}
+
+/* MCP Key 列表样式（原 McpKeyManagement/index.css，随 MCP Key 并入本页） */
+
+/* 列表容器卡片 */
+.mcp-key-table-card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 16px;
+  border: 1px solid #eef2f6;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.mcp-key-table-card .ant-table {
+  background: transparent;
+}
+
+/* 加载 / 居中容器 */
+.mcp-key-center-box {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 320px;
+}
+
+/* 空态容器 */
+.mcp-key-empty {
+  text-align: center;
+  padding: 80px 0;
+}
+
+/* 弱化文本（空名称、从未使用等） */
+.mcp-key-muted {
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+/* 明文 Key 展示区：密码输入框 + 复制图标 */
+.mcp-key-plaintext {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mcp-key-plaintext-input {
+  flex: 1;
+}
+
+.mcp-key-plaintext-copy {
+  font-size: 16px;
+  color: #3b82f6;
+  cursor: pointer;
+  padding: 4px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.mcp-key-plaintext-copy:hover {
+  border-color: #3b82f6;
+  color: #1d4ed8;
+}
+
+/* 明文弹窗中的键信息行 */
+.mcp-key-info-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  color: #64748b;
+  margin-top: 12px;
+}
+
+.mcp-key-info-line strong {
+  color: #0b2b5c;
+}
+
+/* 撤销 / 重置确认弹窗的图标 */
+.mcp-key-confirm-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: #fef2f2;
+  color: #dc2626;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  margin: 0 auto 12px;
+}
+
+/* WorkBuddy 连接配置引导卡片 */
+.mcp-key-workbuddy-guide {
+  margin-top: 24px;
+}
+
+/* 引导卡片内的 JSON 配置代码块 */
+.mcp-key-workbuddy-guide pre {
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  border: 1px solid #eef2f6;
+  overflow: auto;
+}

@@ -70,6 +70,26 @@ async def delete_service(service_id: str, request: Request):
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
 
 
+@router.post("/domain-services/{service_id}/enable")
+async def enable_service(service_id: str, request: Request):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.enable(service_id, tenant_id)
+        return success_response(data=result, message="领域服务已启用")
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.post("/domain-services/{service_id}/disable")
+async def disable_service(service_id: str, request: Request):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.disable(service_id, tenant_id)
+        return success_response(data=result, message="领域服务已停用")
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
 @router.post("/domain-services/{service_id}/rotate-api-key")
 async def rotate_service_api_key(service_id: str, request: Request):
     tenant_id = extract_tenant_id(request)

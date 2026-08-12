@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from jonex_core.common.config import get_config
 from jonex_core.common.exceptions import (
+    InternalError,
     InvalidApiKeyError,
     InvalidCredentialsError,
+    JonexException,
     PermissionDeniedError,
     TokenExpiredError,
 )
@@ -104,6 +106,12 @@ class AuthService:
                 username=req.username,
             )
             raise
+        except JonexException:
+            # JonexException 子类直接向上传播（已有 i18n message）
+            raise
+        except Exception as e:
+            # 将未预期的异常（如数据库连接失败）包装为 JonexException
+            raise InternalError(message=str(e))
 
     async def _record_login_audit(
         self,

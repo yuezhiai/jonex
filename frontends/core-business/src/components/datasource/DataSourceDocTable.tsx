@@ -91,6 +91,8 @@ interface Props {
   showDelete?: boolean;
   /** 删除回调（确认弹窗由父组件处理） */
   onDelete?: (doc: ManualDocItem) => void;
+  /** [jonex] 知识库类型：openkb 时文档状态列按 llm_wiki_compile_status 显示。 */
+  kbType?: string;
 }
 
 /**
@@ -106,6 +108,7 @@ export default function DataSourceDocTable({
   pageSize = 10,
   showDelete = false,
   onDelete,
+  kbType,
 }: Props) {
   const { t } = useTranslation();
   const resolvedEmptyText = emptyText ?? t('common.noData');
@@ -157,6 +160,9 @@ export default function DataSourceDocTable({
         <DocumentStatusBadge
           docStatus={record.docStatus}
           ontologyStatus={record.ontologyStatus}
+          kbType={kbType}
+          llmWikiCompileStatus={record.llmWikiCompileStatus}
+          llmWikiCompileError={record.llmWikiCompileError}
           errorMessage={record.errorMessage}
           ontologyError={record.ontologyError}
         />

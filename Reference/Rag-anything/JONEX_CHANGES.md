@@ -127,6 +127,41 @@
 3. 跑 `tests/test_custom_parser.py` 校验解析器注册契约。
 4. atomic-rag 侧按 `RAG_PROFILE=slim/full` 重建镜像并做 selfhost 端到端解析验证（见执行计划 §11）。
 
+---
+
+## 七、P1-4 结构感知切分（2026-08-05）
+
+### 目的
+
+对文档解析后的 `content_list` 做结构感知预分段：
+- 版本清单/变更日志条目（`New in … X.Y.Z`）强制同 chunk
+- 表格行回填文档/表标题上下文前缀，提升短行嵌入判别力
+- 标签 `block_type`（list_entry/table_row/heading/text）供检索期过滤
+
+### 改动点
+
+| 文件 | 行 | 改动 |
+|------|-----|------|
+| `raganything/utils.py` | 导入 | 新增 `import os, re` |
+| `raganything/utils.py` | `_classify_block_type()` | 新增函数，检测 block 结构类型 |
+| `raganything/utils.py` | `_enrich_table_row_text()` | 新增函数，为表行回填标题上下文 |
+| `raganything/utils.py` | `structure_aware_chunk()` | 新增函数，结构感知增强入口 |
+| `raganything/utils.py` | `separate_content()` | 调用 `structure_aware_chunk()` 标注 `block_type` |
+
+### 配套
+
+| 文件 | 改动 |
+|------|------|
+| `Reference/LightRAG/lightrag/lightrag.py` | `ainsert_custom_chunks` 元数据合并新增 `block_type`/`entity_hint`/`text_idx`/`char_start`/`char_end` |
+| `deploy/.env.rag` | 新增 `RAG_STRUCTURE_AWARE_CHUNK=false` |
+| `docs/technology-kb-retrieval-quality-rootcause-and-optimization-plan.md` | 方案 §8 P1-4 |
+
+### 升级重放
+
+1. 全局搜索 `P1-4` 定位新增代码
+2. 确认 `RAG_STRUCTURE_AWARE_CHUNK` 开关行为
+3. 重建 `atomic-rag` 镜像验证
+
 
 ## 七、v2 LightRAG 关系响应契约归一化（fix）
 
@@ -349,6 +384,67 @@ v1 `jonex_core/.../lightrag_adapter.py::LightRAGServerClient.query()`，生产�
 
 ---
 
+## 二十一、P0 `_converge_delete` 收敛循环（2026-08-06）
+
+> **取代本文件"四、(2) 2-A"与"(4) review-fix"。**
+> 线上事故根因：`_run_cleanup` 删一次撞 busy（31s 5 次重试耗光）→ `_poll_old_ids_gone`
+> 只 poll 不重删（空等一件从未启动的删除）→ 必然超时 → 文档卡死 60 分钟判 failed。
+> 详见 `docs/rag-reparse-strict-cleanup-busy-plan.md`。
+
+### 修复思路
+
+旧 "删一次 → 只 poll" 改为 **"每轮重新发起 delete + 读一致性确认"**：
+只要 pipeline 一空闲，下一轮 delete 立刻被受理，不再被 31s 的 busy 重试窗口卡死。
+
+```python
+async def _converge_delete(self, task, old_ids):
+    deadline = time.monotonic() + RAG_CLEANUP_MAX_ELAPSED  # 默认 1800s
+    while time.monotonic() < deadline:
+        remaining = old_ids & set(await self._list_doc_ids_by_document(task))
+        if not remaining:
+            return set()               # 收敛成功
+        try:
+            await self._http_client.delete_docs(list(remaining), ...)
+        except Exception:
+            pass                        # busy → 等下一轮重发
+        await asyncio.sleep(RAG_CLEANUP_POLL_DELAY)  # 默认 5s
+    return remaining                    # 超预算 → 交 KB 3-A 兜底
+```
+
+### 改动清单
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | 新增 `_converge_delete(task, old_ids)` | 收敛循环：每轮 `delete_docs` + 查询确认；deadline 按 `per_doc_sec * n` 缩放（`min(1800, max(300, 300 + 2*n))`）；`delete_retry_interval` 控制重发频率避免对 LightRAG 持续轰炸 |
+| 同上 | `_reparse_delete_all_old` | 用 `_converge_delete` 替换旧的 `_run_cleanup` + `_poll_old_ids_gone` |
+| 同上 | `_resume_cleanup` | 同上（容器重启续删路径） |
+| 同上 | ~~`_run_cleanup` / `_poll_old_ids_gone`~~ | **已删除**（共 ~114 行死代码） |
+| `raganything/service/http_lightrag_client.py` | `delete_docs` docstring | 更新注释：`_poll_old_ids_gone` → `_converge_delete` |
+| `capabilities/knowledge_base/services/document_service.py` | `reparse_document` | **P1 幂等**：同一 doc 已有 in-flight RAG 任务时拒绝重复提交，从源头消除 cleanup ↔ index 竞争 |
+
+### 新增环境变量
+
+| 变量 | 默认值 | 作用 |
+|------|--------|------|
+| `RAG_CLEANUP_MAX_ELAPSED` | 1800 | 收敛循环最长运行时间（秒） |
+| `RAG_CLEANUP_POLL_DELAY` | 5 | 每轮 poll 间隔（秒），默认从旧值 2 提升到 5 |
+
+### 设计要点
+
+- **首次立即发起 delete**（不是等第一轮 poll），`last_delete_attempt = -delete_retry_interval`
+- **间隔控制**：`delete_retry_interval = max(poll_delay * 3, 10.0)`，不对同一批持续轰炸
+- **进度更新**：每轮将 `remaining` 写入 `task.delete_pending_ids` 供 KB 对账观察
+- **fail-open**：delete 失败不抛异常，下一轮重试；查询失败 `continue` 等下一轮
+- **超预算**：返回残留集合 → 调用方 `_fail_task` + KB 3-A 动态超时兜底
+
+### KB 侧 P1 幂等（同批次）
+
+`document_service.py` 的 `reparse_document` 入口：若 `doc.rag_task_id` 对应的 RAG 任务
+处于 `created/queued/processing`，直接 `ResourceConflictError` 拒绝，不创建第二个任务。
+查询失败 fail-open（不阻塞正常 reparse）。
+
+---
+
 ## 四、reparse_strict 补偿 cleanup 卡死修复（bugfix，TODO：rag-reparse-strict-cleanup-busy-plan）
 
 > 背景与根因见 `docs/rag-reparse-strict-cleanup-busy-plan.md`。现象：reparse_strict 推送时几个
@@ -366,13 +462,18 @@ v1 `jonex_core/.../lightrag_adapter.py::LightRAGServerClient.query()`，生产�
 要点：降低「几个 chunk 抖动即整体失败 → 全量回滚」的放大；不重复累加计数、尊重 cancel_event、
 关闭开关即回退旧行为。
 
-### (2) 2-A：cleanup 整批删除 + 轮询窗口随量缩放
+### (2) 2-A：cleanup 整批删除 + 轮询窗口随量缩放 ⚠️ 已被 P0 取代
+
+> **该条目已被 P0 `_converge_delete` 收敛循环取代（2026-08-06）。**
+> `_run_cleanup` 和 `_poll_old_ids_gone` 已从 `task_manager.py` 中删除，替换为
+> `_converge_delete`：每轮重新发起 `delete_docs` + 读一致性确认，而非"删一次→只 poll"。
+> 详见下方 [二十一、P0](#二十一p0-converge_delete-收敛循环2026-08-06)。
 
 | 文件 | 位置 | 说明 |
 |------|------|------|
 | `raganything/service/http_lightrag_client.py` | 新增 `delete_docs(doc_ids: list)` | 一次 DELETE 传全部 doc_ids，LightRAG 单 busy 会话内连删；含 busy 退避重试（`RAG_DELETE_BUSY_RETRIES`/`RAG_DELETE_BUSY_DELAY`） |
-| `raganything/service/task_manager.py` | `_run_cleanup` | 改为对每个 pending field 调一次 `delete_docs` 整批删除；整批受理即清空 pending，整批失败保留待兜底；日志打全（count/status/失败保留数） |
-| `raganything/service/task_manager.py` | `_poll_old_ids_gone` | 轮询窗口随 `len(old_ids)` 缩放（`RAG_CLEANUP_POLL_PER_DOC_SEC`，默认 2），避免大批量后台删除必然 poll 超时把 `current_step` 卡在 cleanup；补残留数日志 |
+| ~~`raganything/service/task_manager.py`~~ | ~~`_run_cleanup`~~ | ~~改为对每个 pending field 调一次 `delete_docs` 整批删除~~ → 已删除，由 `_converge_delete` 取代 |
+| ~~`raganything/service/task_manager.py`~~ | ~~`_poll_old_ids_gone`~~ | ~~轮询窗口随 len(old_ids) 缩放~~ → 已删除，由 `_converge_delete` 取代 |
 
 ### (3) 3-A 前置：暴露 cleanup 进度
 
@@ -393,7 +494,15 @@ v1 `jonex_core/.../lightrag_adapter.py::LightRAGServerClient.query()`，生产�
 | `RAG_PUSH_RETRY_TERMINAL_FAILED` | true | 1-A：终态 failed chunk 是否重推 |
 | `RAG_CLEANUP_POLL_PER_DOC_SEC` | 2 | 2-A：cleanup 轮询窗口随删除量缩放系数 |
 
-### (4) review-fix：cleanup poll 超时残留不再乐观置 done/COMPLETED
+### (4) review-fix：cleanup poll 超时残留不再乐观置 done/COMPLETED ⚠️ 已被 P0 取代
+
+> **该条目已被 P0 `_converge_delete` 收敛循环取代（2026-08-06）。**
+> 旧的 `_run_cleanup` + `_poll_old_ids_gone` 删一次→只 poll 的模式已被彻底移除，
+> `_reparse_delete_all_old` 和 `_resume_cleanup` 均改为调用 `_converge_delete`。
+> 详见下方 [二十一、P0](#二十一p0-converge_delete-收敛循环2026-08-06)。
+
+<details>
+<summary>旧描述（仅供参考）</summary>
 
 > Review 指出：`_run_cleanup` 整批受理即乐观清空 pending，若随后 `_poll_old_ids_gone` 超时仍有
 > 旧 doc 残留，原逻辑仍会把 `current_step` 切 `done` 并（调用方）置 COMPLETED → 旧数据残留却暴露
@@ -401,13 +510,15 @@ v1 `jonex_core/.../lightrag_adapter.py::LightRAGServerClient.query()`，生产�
 
 | 文件 | 位置 | 说明 |
 |------|------|------|
-| `raganything/service/task_manager.py` | `_poll_old_ids_gone` | 改为**返回残留集合**（空=已收敛；查询失败/超时残留返回非空） |
-| `raganything/service/task_manager.py` | `_reparse_converge_old` | 返回 bool；poll 残留时恢复 `delete_pending_ids=残留`、保持 `current_step="cleanup"`、返回 False |
-| `raganything/service/task_manager.py` | `_execute_pipeline_http` reparse_strict 分支 | converge 未收敛（False）→ `_fail_task`（保持 cleanup）并 `return`，不进入本体抽取/不置 COMPLETED |
-| `raganything/service/task_manager.py` | `_resume_cleanup` converge 分支 | 重启续删后 poll 残留 → 同样 `_fail_task`（保持 cleanup），不置 COMPLETED |
+| ~~`raganything/service/task_manager.py`~~ | ~~`_poll_old_ids_gone`~~ | 已删除 |
+| ~~`raganything/service/task_manager.py`~~ | ~~`_reparse_converge_old`~~ | 已删除 |
+| `raganything/service/task_manager.py` | `_execute_pipeline_http` reparse_strict 分支 | P0 后保持：converge 未收敛 → `_fail_task`（保持 cleanup）→ 交 KB 3-A 兜底 |
+| `raganything/service/task_manager.py` | `_resume_cleanup` | P0 后保持：续删残留 → `_fail_task`（保持 cleanup），由 `_converge_delete` 引擎驱动 |
 
 效果：旧 doc 未确认删净时任务落 FAILED 且 `current_step=cleanup` 保留 → KB 对账 3-A 动态超时兜底
 （据 `cleanup_total` 计时）→ 文档最终 FAILED、前端可见可重传；残留 orphan 交离线/清库处理。
+
+</details>
 
 ---
 
@@ -440,3 +551,357 @@ v1 `jonex_core/.../lightrag_adapter.py::LightRAGServerClient.query()`，生产�
 ### 15.3 依赖关系
 
 依赖 LightRAG vendored `GET /documents/{doc_id}` 端点。未部署该端点时，`get_document_status` 恒返回 None，dup 三态判定静默退化为 hard_failed（旧行为）。日志中会有 WARNING 提示。
+
+
+---
+
+## 十六、② push 超时确认前复查真实 doc 状态（治本假 RAG_PUSH_TIMEOUT，2026-07-29）
+
+> 现象（线上 doc 495a5358 f_040_3M_2018_10K.pdf，1878 chunk）：`lightrag_doc_status`
+> **processed=2537 / failed=7 / pending=0**（内容其实全跑完），但 PushChunksStage 报
+> `RAG_PUSH_TIMEOUT: 15/1878 chunks 轮询超时未确认（1800.0s）` → strict 回滚 530。
+>
+> 根因：超大文档长尾 chunk 抽取慢，被 `per_chunk_timeout`(900s) 误判超时 → 1-A 重推
+> （round1 306 + round2 87）→ 重推内容重复 → 新 track_id 对应 dup，**永不返回 completed**
+> → 到全局 `RAG_TRACK_TIMEOUT_SECONDS`(1800s) 仍有 15 个未确认 → strict 假失败回滚。
+> **内容其实已 processed，只是 track 确认滞后/重推变 dup。**
+>
+> 修法：strict 判定 `RAG_PUSH_TIMEOUT` 前，对每个 timed_out chunk **按内容复算 doc_id 直接查
+> LightRAG 真实状态**，已 `processed` 则判为已确认（收集 doc_id、移出 timed_out），消除假失败。
+
+### 16.1 改动
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/pipeline/stages.py` | import | `from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding`（新增后者） |
+| 同上 | 新增 `_expected_doc_id(chunk)` | 复算 doc_id：`compute_mdhash_id(sanitize_text_for_encoding(chunk["text"]), prefix="doc-")`，口径与 LightRAG `apipeline_enqueue_documents` 一致（`Reference/LightRAG/lightrag/lightrag.py:1447`） |
+| 同上 | `PushChunksStage.execute` §5 分类，`timed_out` 计算后、`confirmed_count` 前 | 新增复查块：`if require_doc_ids and timed_out:` 遍历 timed_out，`_query_doc_status` 查该 doc；`processed` → `ctx.collected_doc_ids.append(did)` + 移出 timed_out；打 INFO 日志「② 超时确认复查——N 个超时 chunk 实际已 processed 判为已确认」 |
+
+### 16.2 要点与依赖
+
+- 复用 §十五 的 `_query_doc_status` + LightRAG vendored `GET /documents/{doc_id}` 端点；端点未部署时
+  `_query_doc_status` 恒 None → 不会误确认（保守：仍判超时，退化为旧行为）。
+- 仅在 **strict（require_doc_ids）** 且存在 timed_out 时触发；查询量 = 最终 timed_out 数（通常很小）。
+- doc_id 复算口径必须与 LightRAG 同版一致（`sanitize_text_for_encoding` + `compute_mdhash_id(prefix="doc-")`），
+  升级 LightRAG 时若改了内容规整/哈希，需同步本函数。
+
+### 16.3 验证
+
+- `py_compile Reference/Rag-anything/raganything/pipeline/stages.py` 通过。
+- 需重建 `atomic-rag` 镜像生效：`docker compose build atomic-rag && docker compose up -d atomic-rag`。
+- 场景：重跑该大文档 → 日志出现「② 超时确认复查——N 个超时 chunk 实际已 processed」，
+  strict 不再因假超时回滚，文档最终 READY。
+
+升级重放：改动集中在 `stages.py`，以 `# [jonex] ②` / `_expected_doc_id` 标记。
+
+
+---
+
+## 十八、raganything 入库计量 contextvar 透传（Gap A，2026-07-30）
+
+> 关联设计：`docs/llm-usage-log-metering-dimension-gaps-fix-plan.md` §4.1、§11.2。
+> raganything 直连 llm-gateway 的多模态描述 / summary LLM 与 embedding 调用缺 doc_id/trace_id
+> 维度。采用 contextvar 方案：任务入口 set → driver + fallback 闭包每次调用现算注入。
+> 所有改动带 `# [jonex]` 标记。
+
+### 18.1 新增 contextvar 模块
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/jonex_metering_ctx.py` | **新增文件** | `set_ingest_ctx(tenant_id, kb_id, doc_id, trace_id)` / `get_ingest_ctx()` / `reset_ingest_ctx(token)` / `build_ingest_headers()` — 参照 LightRAG `jonex_metering.py` 的 contextvar 模式。`build_ingest_headers()` 从 contextvar 构造 X-Jonex-* 头 dict（scene 固定 `raganything_ingest`） |
+
+### 18.2 任务入口 set/reset
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | `_execute_pipeline_http` 内 `PipelineCtx` 构造完成后、try 前 | `set_ingest_ctx(tenant_id=task.tenant_id, kb_id=task.kb_id, doc_id=task.document_id, trace_id=task.task_id)` |
+| 同上 | `finally` 块最前 | `reset_ingest_ctx(_ingest_token)` |
+
+contextvar 在 `asyncio.create_task` 时复制进子 task，每任务独立 context，并发入库不串租户。
+
+### 18.3 model_factory 计量头改造
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/model_factory.py` | `_build_metering_headers` | 新增 `doc_id` 参数；优先读 `get_ingest_ctx()` contextvar，parameter 作静态兜底；新增 `X-Jonex-Doc-Id` 头 |
+| 同上 | `_metered_llm` | `_build_metering_headers()` **移入 `_llm` 闭包内每次现算**（原 build 时烘焙 → 不能随任务变化 doc_id/trace_id） |
+| 同上 | `_metered_embedding` | 同上，`_build_metering_headers()` 移入 `_embed` 闭包内每次现算 |
+
+> `_bind_with_overrides` 的 `extra_headers` 保持 build 时 tenant/kb 静态烘焙，per-task
+> doc_id/trace_id 由 driver 层 contextvar overlay 覆盖（见 §18.4）。
+
+### 18.4 driver 级 contextvar 叠加（覆盖 registry 主路径）
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/models/drivers/openai.py` | `complete()` headers 构造 | lazy-import `build_ingest_headers`，`headers = {..., **spec.extra_headers, **_build_ingest_h()}` — contextvar 覆盖 bake 时静态值 |
+| `raganything/models/drivers/anthropic.py` | `_send_request()` headers 构造 | 同上，且补回被遗漏的 `**spec.extra_headers`（此前该 driver 完全没发计量头） |
+
+> **设计要点**：`_bind_with_overrides` 是 registry **主路径**（fallback 只在 bind 失败时用），
+> 仅改 fallback 闭包（§18.3）而不改 driver 等于没改。driver 级一处改动同时覆盖 registry + VLM
+> +（理论上）所有经 driver 的调用。
+
+### 18.5 生效前提与验证
+
+- **需重建 atomic-rag 镜像**：`docker compose build atomic-rag && up -d`。
+- 验证：入库一篇文档 → `metering.llm_usage_log` 的 `scene=raganything_ingest` 行
+  `doc_id`/`trace_id` 非空，`request_id` 不再 `auto:`（前缀=task_id）。
+- 风险：若 raganything 多模态/summary 调用走线程池而非 `create_task`，contextvar 可能丢失
+  → doc/trace 仍空但不报错（回退 static 兜底）。需真链路验证 LLM 与 embedding 行维度齐全。
+
+升级重放：全局搜索 `[jonex]` 定位 `jonex_metering_ctx.py` 整文件、`task_manager.py` 的
+`_ingest_token`/`set_ingest_ctx`/`reset_ingest_ctx`、`model_factory.py` 的 `get_ingest_ctx` /
+闭包内 `_build_metering_headers`、`drivers/openai.py` `_build_ingest_h` /
+`drivers/anthropic.py` `_build_ingest_h`/`spec.extra_headers`。
+
+
+## 十九、§13.4 纵深防御：动态超时窗口 + 超时不重推在途 chunk（2026-07-29）
+
+> 配合第十六节 ②，从"源头"减少超大文档长尾被误判超时→重推变 dup 的浪费。
+> 均为纯防御、向后兼容（floor/仅放大；查状态后才决定重推）。1-B 最小回滚仍列 backlog（改一致性契约，单独评审）。
+
+### 17.1 item1 — 轮询窗口按 chunk 数动态下限（floor）
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/pipeline/stages.py` | `PushChunksStage.__init__` | 新增 `self._track_scale_per_chunk`(env `RAG_TRACK_SCALE_PER_CHUNK_SEC`,默认 2)、`self._track_scale_ceil`(env `RAG_TRACK_SCALE_CEIL_SEC`,默认 10800) |
+| 同上 | `execute` `# ── 4.` 前 | 方法级计算 `eff_track_timeout`/`eff_per_chunk_timeout` = `clamp(base, SCALE×total_chunks, CEIL)`；保持 per-chunk = min(track×0.8, …) < global；`SCALE=0` 关闭回退固定值；放大时打 INFO |
+| 同上 | `batch_track_status` 调用 | `max_wait_seconds`/`per_track_timeout_seconds` 改用 `eff_*` |
+| 同上 | §5 `RAG_PUSH_TIMEOUT` 文案 | 秒数改用 `eff_track_timeout` |
+
+效果：1878 chunk → track≈3756s(63min)、per_chunk≈3004s（原固定 1800/900 会把长尾误判超时）；小文档（floor 不触发）保持 1800/900 不变。**仅放大不缩小**，不会让任何场景更早超时。
+
+### 17.2 item2 — 超时 chunk 重推前查真实 doc 状态
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/pipeline/stages.py` | `execute` 重推段（`repush_idx` 构建，替换原 `for _t in timeout_tids` 无脑重推） | 对每个 timeout chunk 复算 doc_id 查状态：`processed`→收集 doc_id 判确认（不重推）；`pending/processing/preprocessed`→原 track 重新入 `new_pending_ids` 继续轮询（不重推、不造 dup）；`failed`/查不到→才 repush。打 INFO「已确认 N、继续轮询 M、待重推 K」 |
+
+复用第十六节 `_expected_doc_id` + `_query_doc_status`。与 ②（最终分类兜底确认）互补：item2 在每轮重推前就拦截在途 chunk，避免制造 dup churn；② 在最终判定前再兜一次。
+
+### 17.3 新增环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `RAG_TRACK_SCALE_PER_CHUNK_SEC` | `2` | 每 chunk 追加的轮询窗口秒数；0=关闭（回退固定 `RAG_TRACK_*`） |
+| `RAG_TRACK_SCALE_CEIL_SEC` | `10800` | 动态窗口绝对上限秒（3h，< HARD 6h） |
+
+### 17.4 验证
+
+- `py_compile stages.py` 通过；需重建 `atomic-rag` 镜像生效。
+- 场景：重跑超大文档 → 日志「§13.4 动态超时窗口 chunks=… track=…s」+「item2 超时复查——已确认/继续轮询/待重推」；
+  长尾在放大窗口内首轮确认、重推与 dup 显著减少；strict 不再假超时回滚。
+
+升级重放：改动集中在 `stages.py`，`# [jonex] §13.4` 标记。1-B 最小回滚未实现（backlog）。
+
+
+## 二十、v2 分阶段耗时埋点（ingest_timing + reconcile_timing 增补，2026-07-30）
+
+> 关联设计：`docs/ingestion-timing-metrics-design.md` §11。
+> 补齐 v2 raganything pipeline 三处缺口：push_chunks 永不 close、worker 侧缺 ingest_timing 日志、
+> 对账侧缺 pipeline_version 维度。所有改动带 `# [jonex] §11` 标记。
+
+### 20.1 Gap A：push_chunks stage 永远不 close（task_manager.py）
+
+**现象**：`ProgressTrackingCallback.on_document_complete` 先 push "done" 再 `_close_stage()`，
+实际关了 "done" 而非 push_chunks。最耗时的推送/抽取段 `ended_at` 恒为 None → `elapsed_seconds` 无值。
+
+**修复**：先 `_close_stage()` 关 push_chunks（由 `on_push_chunks_start` 打开、从未有 `_complete`
+来关），再 push "pipeline_done" 再 close "pipeline_done"。管道中更早的 parse/text_insert/multimodal
+由各自的 `on_*_complete` 逐一 close，不会被误关。
+
+> **P1-2 改名**：stage key 从 `"done"` 改为 `"pipeline_done"`，避免 timeline 中
+> push_chunks → done → ontology_extract 的"done 夹在中间"语义混乱。
+> `ProgressDetail.step_name` 仍保留 `"done"`（前端契约不变）。
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | `ProgressTrackingCallback.on_document_complete` | 先 `self._close_stage()` 再 `self._push_stage("pipeline_done")` 再 `self._close_stage()` |
+
+### 20.2 Gap B：ontology 抽取已有 timeline（无需额外改动）
+
+`_run_ontology_extraction` 早在 v1 就已手动 append `StageTiming(stage="ontology_extract")`，
+并在 finally 内 close（带 `ended_at` / `elapsed_seconds`）。本节复查确认 Gap B 不存在，无需修改。
+
+### 20.3 v2 ingest_timing 结构化日志（task_manager.py）
+
+新增模块级 helper `_log_ingest_timing_v2(task, status, force_ontology_only, error)`：遍历
+`task.timeline` 内白名单 stage 的 `elapsed_seconds`，摊平成 `{stage}_ms` + `worker_total_ms`
+双写到 message（供 grep）+ extra（供 JSON 聚合），含 `pipeline_version=v2` 维度。
+
+**P0 缺口 D 兜底 close**：失败/cancel 路径下回调不触发，当前活跃 stage 的 `ended_at` 为 None。
+`_log_ingest_timing_v2` 开头遍历 timeline 把所有 `ended_at is None` 的 stage 就地 close（以
+`datetime.now(timezone.utc)` 为 ended_at），确保"卡在哪个阶段"数据不丢。
+
+**P1-1 worker_total_ms 口径**：`_QUEUE_KEYS = {"created", "queued"}` 排除排队等待时间，
+`worker_total_s` 仅累加非排队 stage，对齐 v1「worker 从取出任务到结束」语义。created_ms /
+queued_ms 仍保留在 extra 中供排查。
+
+**P2 error 字段**：`error` 参数传递给 `_log_ingest_timing_v2`，失败/cancel 路径写
+`error=getattr(task, "error_message", "")` 或 `error=str(e)[:200]`，成功路径传空字符串。
+message 和 extra 均包含此字段。
+
+白名单 `_V2_TIMING_STAGES` = `{created, queued, parse, text_insert, multimodal, push_chunks,
+ontology_extract, pipeline_done}`。
+
+调用点覆盖 `_execute_pipeline_http` 全部 4 个终端路径与 `_run_ontology_only` 全部 2 个路径：
+
+| 路径 | status | force_ontology_only | error |
+|------|--------|---------------------|-------|
+| `_execute_pipeline_http` doc_id 成功 | `completed` | False | (空) |
+| `_execute_pipeline_http` doc_id=None | `failed` | False | `task.error_message` |
+| `_execute_pipeline_http` except TaskCancelledError | `cancelled` | False | `"task_cancelled"` |
+| `_execute_pipeline_http` except Exception | `failed` | False | `str(e)[:200]` |
+| `_run_ontology_only` 成功 | `completed` | True | (空) |
+| `_run_ontology_only` CONFIG_INVALID | `failed` | True | `task.error_message` |
+
+失败路径在 re-raise 前打日志：P0 兜底 close 保证未关闭 stage 有 ended_at → elapsed_seconds 非零；
+P1-1 口径只计 worker 内耗时；P2 error 字段直写 message + extra。遵循 §3.4 A 方案甲双写约定。
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | 模块级 `_V2_TIMING_STAGES` + `_log_ingest_timing_v2()` | **新增**：v2 timeline → ingest_timing 日志摊平 helper |
+| 同上 | `_execute_pipeline_http` success/failure/cancel/exception | 各路径插 `_log_ingest_timing_v2` |
+| 同上 | `_run_ontology_only` success/CONFIG_INVALID | 各路径插 `_log_ingest_timing_v2(force_ontology_only=True)` |
+
+### 20.4 对账侧 v2 兼容（reconciliation_service.py）
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `capabilities/knowledge_base/services/reconciliation_service.py` | 模块级 `_V2_STAGE_KEYS` | **新增**：v2 stage 白名单 `{created,queued,parse,text_insert,multimodal,push_chunks,ontology_extract,pipeline_done}` — `_normalize_stage_timings` v2 list 形态仅保留白名单内 stage，其余静默跳过 |
+| 同上 | 模块级 `_QUEUE_KEYS` | **新增**：`{created, queued}` — `_normalize_stage_timings` v2 分支排除排队键不算入 `worker_total_ms`（P1-1，与 task_manager 口径一致） |
+| 同上 | `_normalize_stage_timings` v2 分支 | 加入白名单过滤 + 排队键排除 |
+| 同上 | 模块级 `_detect_pipeline_version()` | **新增**：list → `v2`，dict → `v1`，None/empty → None |
+| 同上 | `_handle_completed` reconcile_timing 日志 | 新增 `pipeline_version` 字段（message 内嵌 + extra 结构化），便于大盘按管道版本聚合 |
+
+### 20.5 验证
+
+- `py_compile` 所有改动文件通过。
+- 需重建 `atomic-rag` 镜像并重启 knowledge-base-service 生效：
+  ```bash
+  docker compose build atomic-rag && docker compose up -d atomic-rag knowledge-base-service
+  ```
+- 验证要点（见设计 §11.6）：
+  - 入库一篇文档 → `docker logs jonex-atomic-rag | findstr ingest_timing` 出现
+    `pipeline_version=v2` 且 `push_chunks_ms` / `ontology_extract_ms` 非空
+  - `reconcile_timing` 日志含 `pipeline_version=v2` 及各阶段耗时
+  - 失败场景：`status=failed` 仍含已完成阶段耗时
+
+### 新增环境变量（無）
+
+复用已有 `INGEST_TIMING_ENABLED`（`jonex_core/common/timing.py`），`_log_ingest_timing_v2`
+内部调用 `timing_enabled()` 检查。关闭 → 不产生任何 timing 日志，行为向后兼容。
+
+升级重放：全局搜索 `# [jonex] §11` 定位 `task_manager.py` 的 Gap A 修复 + `_log_ingest_timing_v2`
++ 6 个调用点，以及 `reconciliation_service.py` 的 `_V2_STAGE_KEYS` / `_detect_pipeline_version`
++ `_handle_completed` 的 `pipeline_version` 字段。
+
+---
+
+## [jonex] OpenKB 链路：解析产物落共享卷 + task status 暴露路径
+
+> 目的：让 knowledge_base 的 `pipeline_type=openkb` 分支能拿到「解析出的 markdown + 图片」，交给 OpenKB 容器编译。解析产物原本只落在容器本地 `parser_output_dir`（jonex-rag-storage），openkb 读不到；这里额外把产物写到共享卷 `jonex-rag-inputs`（atomic-rag 挂 `/app/inputs`，openkb 挂 `/app/data/inputs`，同卷不同挂载点）。
+
+改动点（均标 `# [jonex]`）：
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | 新增方法 `TaskManager._write_openkb_artifact(task, ctx)` | 把 `ctx.content_list`（MinerU blocks，img_path 已是绝对路径）序列化为 `content.md`（text/table/equation/image），图片复制到 `assets/`，写到 `{RAG_INPUTS_DIR:-/app/inputs}/parsed/{document_id}/`；相对路径 `parsed/{document_id}/content.md` + `assets` 记入 `task.result_summary.extensions` 与 `task.storage`。best-effort，异常不影响主链路；`RAG_OPENKB_ARTIFACT_ENABLED`（默认 on）可关。 |
+| `raganything/service/task_manager.py` | `_execute_pipeline_http` 内 `task.result_summary = summary` 之后 | 调用 `self._write_openkb_artifact(task, ctx)`。 |
+| `atomic-rag-server-v2.py` | `handle_get_task_status` 返回 data | 顶层新增 `parsed_markdown_path` / `assets_dir`（取自 `task.result_summary.extensions`），供 KB 对账读取。 |
+
+新增环境变量：
+
+- `RAG_INPUTS_DIR`（默认 `/app/inputs`）：共享 inputs 卷在 atomic-rag 容器内的挂载点，OpenKB 产物写此目录下 `parsed/{document_id}/`。
+- `RAG_OPENKB_ARTIFACT_ENABLED`（默认 `true`）：总开关。
+
+消费侧（非本仓）：`capabilities/knowledge_base/services/reconciliation_service.py::_dispatch_openkb_compile` 读 task status 的 `parsed_markdown_path`/`assets_dir`，换成相对 inputs 卷根路径后交 `atomic.openkb.v1 compile_parsed_document`；OpenKB adapter 用 `OPENKB_INPUT_ROOT`（`/app/data/inputs`）解析该相对路径读到同一份文件。
+
+### 追加：`execution_mode=parse_only`（OpenKB KB 级互斥）
+
+为让 `pipeline_type=openkb` 的文档「只解析、不写 LightRAG/Neo4j」，新增 parse-only 执行模式：
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | `_execute_pipeline_http` 分支 | `task.execution_mode == "parse_only"` → 调 `_run_parse_only`，跳过 multimodal/push_chunks/ontology。 |
+| `raganything/service/task_manager.py` | 新增 `_run_parse_only(task, handle)` | 调 `self._pipeline_executor.parse_document(...)` 得 content_list（复用解析缓存），写 `_write_openkb_artifact`，置任务 COMPLETED。不入库、不抽本体。 |
+
+`execution_mode` 已由 `handle_insert`(atomic-rag-server-v2.py L361) → `CreateTaskRequest` → `task.execution_mode` 原样透传，无需改 server。
+
+消费侧（非本仓）：`knowledge_base/services/document_service.py` 对 `pipeline_type=openkb` 文档以 `execution_mode="parse_only"` 调 `insert`；`client.py`(Remote/Local/Mock/abstract) 与 `lightrag_adapter_v2.insert` 已加 `execution_mode` 透传；`reconciliation_service._handle_completed` 对 openkb 文档标 `ontology_status=READY`，避免本体重试循环。
+
+### 修复：handle_insert 透传 execution_mode
+
+`atomic-rag-server-v2.py::handle_insert` 的 `CreateTaskRequest` 此前**未透传 `execution_mode`**（仅 retry handler 透传），导致 `pipeline_type=openkb` 文档虽由 knowledge_base 传了 `execution_mode=parse_only`，到 atomic-rag 后仍按 `full` 执行（照常入 LightRAG + 抽本体）。已补 `execution_mode=params.get("execution_mode", "full") or "full"`，使 parse_only 生效（只解析、落 OpenKB 产物、跳过入库/本体）。
+
+> 相关无关联但同批定位的部署缺陷（不在本仓）：
+> - `deploy/docker/openkb-source.Dockerfile`：capability 依赖此前经 `uv pip install`（UV_SYSTEM_PYTHON）落到 `/usr/local`，运行时用 `/app/.venv` → sqlalchemy 等缺失致 openkb 容器崩溃循环。改为 `uv pip install --python /app/.venv/bin/python` 并补 sqlalchemy/greenlet/asyncpg/neo4j/bcrypt。
+> - `jonex_core/capability/locator.py::_normalize_atomic_id`：0 点短名（`openkb`）漏 `.v1`，致 `get_openkb_client("atomic.openkb.v1")` 回退 LOCAL。改 `count(".") <= 1` 统一补 `.v1`。
+
+### 补充：OpenKB 产物图片引用路径对齐
+
+`_write_openkb_artifact` 序列化 image 块时,markdown 引用从 `assets/<name>` 改为 `images/<document_id>/<name>`。原因:knowledge_base 的 openkb adapter 会把 `assets_dir` 复制到 `wiki/sources/images/<document_id>/`,而 source md 位于 `wiki/sources/<document_id>.md`,故相对引用须为 `images/<document_id>/<name>` 才能在 OpenKB Wiki 中正确显示(符合 OpenKB 短文档图片约定)。adapter 侧同步移除了「图片引用未重写」的 warning。
+## §12 `2026-08-03` — 多模态 chunk 页码缺失修复（方案⑧ 配套）
+
+### 背景
+
+MinerU 解析产出中，图片 item 的 `page_idx` 在顶层 dict（与文本 item 同源），
+但 `separate_content` 将 item 原样放入 `multimodal_items[].original`，只创建了空 `item_info={}`。
+`_collect_multimodal_chunks` / VLM 上下文窗口从 `item_info.get("page_idx")` 取 → `None` →
+`_build_file_source` 不写 `page=` → `to_location` 退化为 `type=chunk`（无页码）。
+同一份文档的文本 chunk 正确拿到了 `page=11`，证明 MinerU 本身产出了页码；只是多模态链路读错了字段。
+
+### 改动
+
+**`raganything/pipeline/stages.py`** — `_collect_multimodal_chunks` L1653
+- `page = item_info.get("page_idx")` 之后加 `original.get("page_idx")` 兜底
+
+**`raganything/modalprocessors.py`** — VLM 上下文窗口 `current_page` L185
+- 同步加 `original.get("page_idx")` 兜底
+
+### 影响
+
+修复前：PDF 图片引用一律退化为 `type=chunk`（无页码）。
+修复后：图片引用与文本引用同源，`type=page` + `page_no` 正确，前端可跳转页码。
+
+### 重建
+
+改动在 vendored `Reference/Rag-anything/**` → 需重建 `atomic-rag` 镜像 + 重抽目标 KB。
+
+升级重放：全局搜索 `# [jonex] §12` 定位两处 `page_idx` 兜底。
+
+
+## §13 `2026-08-10` — COS 文件存在性校验 + error_code 透传 + 失败日志（P0-1 / P0-a）
+
+### 背景
+
+线上文档 `0d1fe634` 的 task 创建瞬间失败 `FILE_NOT_FOUND`：
+`_validate_and_enqueue` 对所有任务做 `os.path.exists(task.file_path)`，但 COS 后端的
+`file_path` 是 storage_key 标识符而非本地路径 → 必返回 False → 误判 FILE_NOT_FOUND。
+
+同时 `_fail_task` 只写 task 字段不写日志 → KB 对账 `_finalize_failure` 读 `status_info.error`
+(`task.error_message`) 时可能拿到空值 → 生成误导性「任务确认丢失」文案掩盖真实错误。
+
+此外 `get_task_status` 响应不包含 `error_code` 字段 → KB 侧 P1-5 确定性终态短路
+（FILE_NOT_FOUND / OBJECT_FETCH_FAILED 直接落 FAILED 跳过 3 拍确认）永远不触发。
+
+### 改动
+
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `raganything/service/task_manager.py` | `_validate_and_enqueue` L1100 | `# [jonex] P0-1`：COS 后端（`storage_backend=="cos"` 且 `storage_key` 非空）跳过 `os.path.exists` 本地路径检查，文件由 pipeline 阶段从 COS 按需下载；非 COS 仍走旧逻辑 |
+| 同上 | `_fail_task` L2240 | `# [jonex] P0-1`：补 `logger.error`（含 task_id / error_code / message），防止 KB 对账拿不到真实错误文案 |
+| `atomic-rag-server-v2.py` | `handle_get_task_status` L299 | `# [jonex] P0-a`：响应 `data` 新增 `"error_code": task.error_code.value if task.error_code else None`，供 KB 侧 P1-5 确定性终态短路使用 |
+
+### KB 侧配套（不在本目录，登记以便追溯）
+
+| 文件 | 改动 |
+|------|------|
+| `capabilities/knowledge_base/services/reconciliation_service.py` | `_handle_failed` P1-5：`error_code` 匹配 + `error_msg` 文本前缀兜底确定性终态直接落 FAILED |
+| 同上 | P0-2/P0-3/P0-新/P0-b/P1-c/P1-d/P1-4 `death_verdict` 全链路整改 |
+
+### 重建
+
+需重建 `atomic-rag` 镜像：`docker compose build atomic-rag && docker compose up -d atomic-rag`。
+
+升级重放：全局搜索 `# [jonex] P0-1` / `# [jonex] P0-a` 定位三处改动。

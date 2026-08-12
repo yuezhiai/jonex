@@ -21,6 +21,7 @@ class DomainService(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     domain_type = Column(String(64))
     status = Column(String(32), default="active")
     api_key_encrypted = Column(String(512))
+    enabled = Column(SmallInteger, default=1)
 
     def to_dict(self, include_kb_ids: list[str] | None = None, space_name: str = "", kb_names: dict[str, str] | None = None):
         kb_ids = include_kb_ids or []
@@ -31,6 +32,7 @@ class DomainService(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "domain_type": self.domain_type,
             "status": self.status,
             "api_key_encrypted": self.api_key_encrypted,
+            "enabled": self.enabled,
             "kb_ids": kb_ids,
             "space_name": space_name,
             "kb_names": [kb_names.get(kid, kid) for kid in kb_ids] if kb_names else kb_ids,
@@ -47,6 +49,7 @@ class ServiceKnowledgeBase(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     service_id = Column(String(64), nullable=False, index=True)
     kb_id = Column(String(64), nullable=False)
+    pipeline_type = Column(String(16), nullable=False, default="lightrag")  # [jonex] lightrag / openkb
 
 
 class ServiceApiKey(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):

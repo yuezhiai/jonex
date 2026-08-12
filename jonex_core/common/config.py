@@ -190,6 +190,7 @@ class AppSettings(BaseSettings):
     # 限流配置
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_PER_MINUTE: int = 100
+    RATE_LIMIT_TENANT_PER_MINUTE: int = 300  # 租户级限流阈值（invoke 链路专用）
 
     # 计量配置
     METERING_ENABLED: bool = True
@@ -229,11 +230,20 @@ class AppSettings(BaseSettings):
     # Sidecar 服务地址
     SIDECAR_URL: str = "http://localhost:8001"
 
+    # Gateway 到 Sidecar 的内部认证 key
+    GATEWAY_API_KEY: str = "jonex_test_gateway"
+
+    # MCP Server 的内部 API Key（用于 /internal/* 端点认证）
+    # 默认值为哨兵字符串；生产部署必须用真实随机 key 覆盖。
+    # Gateway 启动时会在 on_event("startup") 中校验非默认值，拒绝启动。
+    INTERNAL_API_KEY: str = "change-me-in-production"
+
     # 能力服务地址
     KNOWLEDGE_BASE_URL: str = "http://localhost:8003"
     BUSINESS_DOMAIN_URL: str = "http://localhost:8005"
     ATOMIC_RAG_URL: str = "http://localhost:8004"
     PLATFORM_URL: str = "http://localhost:8006"
+    OPENKB_URL: str = "http://localhost:7566"  # [jonex]
 
     @property
     def is_production(self) -> bool:

@@ -145,10 +145,14 @@ class CapabilityLocator:
 
     @staticmethod
     def _normalize_atomic_id(short_id: str) -> str:
-        """`llm.qwen` -> `atomic.llm.qwen.v1`；已经是完整 ID 则原样返回。"""
+        """`llm.qwen` -> `atomic.llm.qwen.v1`；`openkb` -> `atomic.openkb.v1`；已完整 ID 原样返回。
+
+        [jonex] 修复：短名 0 个点（如 `openkb`）此前会漏掉 `.v1`（归一成 `atomic.openkb`），
+        导致 get_spec("atomic.openkb.v1") 查不到而回退 LOCAL。0/1 点统一补 `.v1`。
+        """
         if short_id.startswith("atomic."):
             return short_id if short_id.count(".") >= 3 else f"{short_id}.v1"
-        return f"atomic.{short_id}.v1" if short_id.count(".") == 1 else f"atomic.{short_id}"
+        return f"atomic.{short_id}.v1" if short_id.count(".") <= 1 else f"atomic.{short_id}"
 
     @staticmethod
     def _build_spec(full_id: str, cfg: Dict[str, Any]) -> CapabilitySpec:

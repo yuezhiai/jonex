@@ -36,6 +36,23 @@
 #   - 推理/编码工具链（Ollama、vLLM、Open WebUI、CLINE、OpenRouter、VS Code、Claude Code）
 #   - 无线/通信协议（LoRa、Meshtastic、OcuSync、Wi-Fi、Bluetooth、5G；频段/信号强度/免许可）→ 新增 Protocol
 #   - 量化/推理概念（Q4、FP16）、售价与产品阵容（小米滑板车 6/6 Max/6 Ultra/6 Pro/6 Lite，€799.99）
+#
+# 增补说明（v5）：依据 V2 进阶测评（100 道计算/推理题）失败样本的根因定位
+#   （详见 docs/technology-kb-retrieval-quality-rootcause-and-optimization-plan.md）
+#   针对「版本↔工具包↔GPU↔IDE 依赖链」与「规格表细粒度参数」两类召回短板做本体增强：
+#   1) 新增 SoftwareToolkit 实体（CUDA Toolkit 等版本化依赖目标），把
+#      "Nsight VSE 2025.1.0 → 支持 CUDA Toolkit 12.8" 建成可图查询的显式边，
+#      避免 RAG 在 20+ 条版本清单里靠 top_k 命中特定条目。
+#   2) SoftwareRelease 增补 supported_cuda_toolkit / added_gpu_support /
+#      dropped_gpu_support / deprecated_ide / dropped_ide / is_nonpublic / prior_version，
+#      让"最早支持 13.0""首次加入 GH100""最后支持 VS2019"等成为结构化事实。
+#   3) 新增关系 SUPERSEDES(版本迭代)、ADDED_SUPPORT_FOR / DROPPED_SUPPORT_FOR / DEPRECATES
+#      （版本 → GPU 架构/芯片 / IDE），承载"增/删/弃用"时间线，支持跨版本推理。
+#   4) Product/Component 增补 endurance / payload_rated / payload_limit / control_count 等，
+#      把散落在规格表里的"续航时间 1.5-3h、载荷 8kg(极限12kg)、16 个 pad"抽成显式属性。
+#   ⚠️ 抽取要求（供 OntologyExtractor 提示）：对"版本清单/兼容性表"类文档，
+#      必须**逐条穷举**每个版本条目的 CUDA/GPU/VS/驱动映射，不要只抽头尾几条；
+#      对"规格参数表"必须逐行抽取（含速度/续航/载荷/数量/尺寸），保留单位。
 
 version: 1
 domain: technology
@@ -103,6 +120,13 @@ entity_types:
       - { name: thrust, type: string, required: false, description: "推力（发动机/火箭），如 1.5 million pounds of thrust" }
       - { name: price_range, type: string, required: false, description: "价格区间/参考售价，如 £6,663–£11,115 / Rs. 25.99 Lakh" }
       - { name: operating_temperature, type: string, required: false, description: "工作环境温度，如 -10°C~40°C / -15°C~40°C" }
+      # ── [jonex v5] 规格表细粒度参数（针对 DOC000006/DOC000009 规格表逐行召回失败）──
+      - { name: endurance, type: string, required: false, description: "续航/运行时间（区别于里程 range），如 1.5-3h / 续航时间；充电/供电类可含充电功率" }
+      - { name: payload_rated, type: string, required: false, description: "额定/推荐载荷，如 ≈8kg（与极限载荷区分，避免二者混淆）" }
+      - { name: payload_limit, type: string, required: false, description: "极限/最大载荷，如 ~12kg" }
+      - { name: control_count, type: string, required: false, description: "可操作控件数量，如 16 个编码器 / 16 个 pad(两组各 8，共 16) / 25 键，逐项抽取避免只抽'8 pad'漏掉'共 16'" }
+      - { name: climb_angle, type: string, required: false, description: "最大攀爬坡度角，如 35°" }
+      - { name: joint_count, type: string, required: false, description: "关节/电机数量，如 16 个关节电机" }
 
   - name: Component
     aliases: ["部件", "组件", "配件", "模块", "元件", "零件", "接口", "端口", "芯片", "处理器", "电机", "电池", "充电器", "显示屏", "摄像头", "镜头", "传感器", "激光雷达", "轮胎", "关节电机", "编码器", "旋钮", "踏板"]
@@ -139,6 +163,22 @@ entity_types:
       - { name: recommended_driver, type: string, required: false, description: "推荐配套驱动版本，如 NVIDIA Display Driver 571.96 或更新" }
       - { name: supported_ide, type: string, required: false, description: "支持的 IDE/环境，如 Visual Studio 2022/2026" }
       - { name: is_prerelease, type: boolean, required: false, description: "是否为早期访问/预发布版本" }
+      # ── [jonex v5] 版本↔工具包↔GPU↔IDE 依赖链的结构化属性（针对 DOC000003 跨版本推理失败）──
+      - { name: supported_cuda_toolkit, type: string, required: false, description: "该版本支持的 CUDA Toolkit 版本，如 12.8/12.7/13.0/13.3（逐条穷举，勿只抽头尾）" }
+      - { name: added_gpu_support, type: string, required: false, description: "该版本首次新增支持的 GPU/架构/芯片，如 B100/B200/GB202/GB203(Blackwell)、GH100(Hopper)、AD102/AD103" }
+      - { name: dropped_gpu_support, type: string, required: false, description: "该版本移除/停止支持的 GPU 架构，如 Maxwell/Pascal/Volta" }
+      - { name: deprecated_ide, type: string, required: false, description: "该版本标记弃用（deprecated，尚未移除）的 IDE，如 Visual Studio 2019" }
+      - { name: dropped_ide, type: string, required: false, description: "该版本正式移除（dropped）支持的 IDE，如 Visual Studio 2017/2019" }
+      - { name: is_nonpublic, type: boolean, required: false, description: "是否为非公开发行（如 2024.4.0 仅面向 ISV/OEM）" }
+      - { name: prior_version, type: string, required: false, description: "紧邻的上一个版本号，用于版本时间线与前后代推理" }
+
+  - name: SoftwareToolkit
+    aliases: ["工具包", "SDK", "工具集", "CUDA", "CUDA Toolkit", "Toolkit", "运行时", "开发套件"]
+    attributes:
+      - { name: toolkit_name, type: string, required: false, description: "工具包名称，如 CUDA Toolkit" }
+      - { name: version, type: string, required: false, description: "工具包版本号，如 12.4/12.7/12.8/13.0/13.3（每个 minor 版本单独成实体，便于'哪个版本支持它/最早支持/共有几个'类查询）" }
+      - { name: release_year, type: number, required: false, description: "该工具包版本发布年份，如 2024（供'CUDA 12.7 与 12.4 同为哪年'类问题）" }
+      - { name: vendor, type: string, required: false, description: "发行方，如 NVIDIA" }
 
   # ── 规格 / 功能 / 技术 ───────────────────────────────────
   - name: Specification
@@ -362,6 +402,32 @@ relation_types:
     source: SoftwareRelease
     target: Software
     description: "某版本支持/适配另一软件或工具包（如 Nsight 版本支持 CUDA Toolkit 版本）"
+
+  # ── [jonex v5] 版本 → 工具包/GPU/IDE 的显式依赖链（针对跨版本推理）──
+  - name: SUPPORTS_TOOLKIT
+    source: SoftwareRelease
+    target: SoftwareToolkit
+    description: "某软件版本支持某工具包版本（如 Nsight VSE 2025.1.0 → CUDA Toolkit 12.8）。逐条穷举每个版本的映射，支撑'哪个版本支持 CUDA 12.8/最早支持 13.0'类查询"
+
+  - name: SUPERSEDES
+    source: SoftwareRelease
+    target: SoftwareRelease
+    description: "版本迭代：后一版本紧接前一版本（如 v2.1.39 紧接 v2.1.38；Nsight 2025.1.0 之后为 2025.2.0），支撑版本时间线与'最后/最早支持'推理"
+
+  - name: ADDED_SUPPORT_FOR
+    source: SoftwareRelease
+    target: HardwareArchitecture
+    description: "某版本首次新增对某 GPU 架构/芯片的支持（如 Nsight 2025.1.0 首次加入 Blackwell B100/B200；2022.3.0 首次加入 Hopper GH100、Ada AD102）"
+
+  - name: DROPPED_SUPPORT_FOR
+    source: SoftwareRelease
+    target: Software
+    description: "某版本正式移除对某 IDE/架构的支持（如 Nsight 2025.5.0 移除 Visual Studio 2019 支持）"
+
+  - name: DEPRECATES
+    source: SoftwareRelease
+    target: Software
+    description: "某版本将某 IDE/功能标记为弃用但尚未移除（如 Nsight 2025.1 弃用 VS2019、随后 2025.5.0 才移除），用于区分 deprecated 与 dropped 的时间点"
 
   - name: REQUIRES
     source: Software

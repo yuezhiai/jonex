@@ -651,7 +651,8 @@ class HttpLightRagClient:
           - deletion_started → 整批受理进入后台删除，accepted=全部 doc_ids；
           - 404（workspace 内查无）→ 视为已删除，accepted=全部；
           - busy 重试耗尽 → 抛 LightRAGError(503)，调用方保留 pending 待下次/兜底。
-        真正的完成确认由上层 _poll_old_ids_gone 轮询残留 doc 负责（deletion_started 仅代表受理）。
+        真正的完成确认由上层 _converge_delete 收敛循环负责（每轮重新发起 delete +
+        轮询读一致性，而非旧 _poll_old_ids_gone 的 poll-only 模式）。
 
         [jonex] R4：透传 document_id + trace_id 到 _delete，注入 X-Jonex-* 计量头。
         """

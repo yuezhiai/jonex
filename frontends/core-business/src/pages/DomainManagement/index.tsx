@@ -31,7 +31,7 @@ import { getDomainKnowledgeList } from '../../api/domainKnowledge';
 import DomainFormModal from './DomainFormModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import PermissionModal from './PermissionModal';
-import SrvConfigModal from './SrvConfigModal';
+import ServiceConfigModal from './ServiceConfigModal';
 import './index.scss';
 
 const DomainManagement = function DomainManagement() {
@@ -398,13 +398,7 @@ const DomainManagement = function DomainManagement() {
         const cfg = getServiceStatusMap(t)[v];
         if (!cfg) return <Tag>{v}</Tag>;
         return (
-          <Tag
-            color={v === 'active' ? 'success' : v === 'testing' ? 'warning' : 'error'}
-            style={{ cursor: 'pointer' }}
-            onClick={() => toggleServiceStatus(r)}
-          >
-            {cfg.label}
-          </Tag>
+          <Tag color={v === 'active' ? 'success' : v === 'testing' ? 'warning' : 'error'}>{cfg.label}</Tag>
         );
       },
     },
@@ -415,16 +409,19 @@ const DomainManagement = function DomainManagement() {
       render: (_: unknown, r: DomainServiceItem) => {
         const isActive = r.status === 'active';
         return (
-          <Space>
-            <a className="yx-table-action" onClick={() => toggleServiceStatus(r)}>
+          <Space size={4}>
+            <Button type="link" size="small" onClick={() => openSrvConfig(r)}>
+              {t('domainManagement.srvConfigTitle')}
+            </Button>
+            <Button type="link" size="small" onClick={() => toggleServiceStatus(r)}>
               {isActive ? t('domainManagement.disable') : t('domainManagement.enable')}
-            </a>
-            <a className="yx-table-action" onClick={() => openEdit(r)}>
+            </Button>
+            <Button type="link" size="small" onClick={() => openEdit(r)}>
               {t('common.edit')}
-            </a>
-            <a className="yx-table-action" style={{ color: '#dc2626' }} onClick={() => setDeleteTarget(r)}>
+            </Button>
+            <Button type="link" size="small" danger onClick={() => setDeleteTarget(r)}>
               {t('common.delete')}
-            </a>
+            </Button>
           </Space>
         );
       },
@@ -544,7 +541,7 @@ const DomainManagement = function DomainManagement() {
       />
 
       {/* Service Config Modal */}
-      <SrvConfigModal
+      <ServiceConfigModal
         open={srvConfigOpen}
         srvConfigTarget={srvConfigTarget}
         apiKeys={apiKeys}

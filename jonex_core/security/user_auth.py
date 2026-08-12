@@ -119,3 +119,17 @@ def require_role(*roles: str):
         return current_user
 
     return _check_role
+
+
+def require_admin():
+    """FastAPI 依赖工厂：要求 admin 角色。
+
+    用法::
+
+        @router.post("/mcp-keys")
+        async def create_key(..., _admin: dict = Depends(require_admin)):
+            ...
+
+    非 admin 用户调用返回 403 PermissionDeniedError。
+    """
+    return require_role("admin")

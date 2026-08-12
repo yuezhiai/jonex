@@ -189,7 +189,7 @@ class ParserSettingService:
                 parser_type,
             )
             return None
-        precheck_prompt_template(content)
+        content = precheck_prompt_template(content)
         preset_name, prompt_code, category = target
         created = await get_rag_client().create_prompt(
             tenant_id,
@@ -219,7 +219,7 @@ class ParserSettingService:
             obj.prompt_config_id = None
             return None
 
-        precheck_prompt_template(final_text)
+        final_text = precheck_prompt_template(final_text)
 
         # 有文本但新类目无映射 → 删旧、不建新
         if new_target is None:

@@ -22,8 +22,6 @@ export const antdTheme = {
     fontSizeLG: typography.bodySize,
     lineHeight: 1.6,
     paddingContentHorizontal: 24,
-    boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
-    boxShadowSecondary: '0 4px 12px rgba(59,130,246,0.06)',
   },
   components: {
     Layout: {

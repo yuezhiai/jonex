@@ -157,6 +157,7 @@ export const createColumns = (
   t: TFunction,
   handlers: ActionHandlers,
   accessMethods?: AccessMethodItem[],
+  kbType?: string,
 ): ColumnsType<ManualDocItem> => {
   // 构建 accessType → name 映射
   const typeNameMap = new Map<string, string>(
@@ -246,6 +247,9 @@ export const createColumns = (
         <DocumentStatusBadge
           docStatus={record.docStatus}
           ontologyStatus={record.ontologyStatus}
+          kbType={kbType}
+          llmWikiCompileStatus={record.llmWikiCompileStatus}
+          llmWikiCompileError={record.llmWikiCompileError}
           errorMessage={record.errorMessage}
           ontologyError={record.ontologyError}
         />

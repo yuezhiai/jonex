@@ -1070,9 +1070,10 @@ class MineruOnlineParser(MineruParser):
                 file_path, output_dir=output_dir, method=method, lang=lang, **kwargs
             )
         if ext in self.TEXT_FORMATS:
-            return self._parse_online_file(
-                file_path, output_dir=output_dir, method=method, lang=lang, **kwargs
-            )
+            # [jonex] 纯文本（txt/md/json）本地解析：MinerU online API 服务端
+            # 不支持这些类型（v4/file-urls/batch 返回 unsupported file type）。
+            # base.Parser.parse_text 按空行分段切块，无需 VLM。
+            return self.parse_text(file_path, output_dir=output_dir, **kwargs)
 
         self.logger.warning(
             "Warning: Unsupported file extension '%s', attempting MinerU online parse",

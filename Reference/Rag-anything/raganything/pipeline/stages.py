@@ -31,8 +31,11 @@ from raganything.service.http_lightrag_client import LightRAGError, TrackStatus
 from raganything.utils import (
     extract_text_metadata,
     get_processor_for_type,
+    get_table_body,
     insert_text_content,
     insert_text_content_with_multimodal_content,
+    normalize_table_rows,
+    pack_rows,
     separate_content,
 )
 
@@ -1020,6 +1023,33 @@ def _inject_ns_token(
     return text + f"\n<!--yx:{ns_hash}-->"
 
 
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    """[jonex] §table-chunking: Split over-budget text at newline boundaries.
+
+    When a text/table block exceeds *max_chars*, this splits it into segments
+    that each fit within the budget.  Newlines are preferred as split points
+    when the cut lands in the latter half of the segment (preserving paragraph
+    integrity).  If no suitable newline is found the segment is cut at exactly
+    *max_chars*.
+    """
+    if len(text) <= max_chars:
+        return [text]
+    segments: list[str] = []
+    pos = 0
+    while pos < len(text):
+        end = pos + max_chars
+        if end >= len(text):
+            segments.append(text[pos:])
+            break
+        chunk = text[pos:end]
+        nl = chunk.rfind("\n")
+        if nl > max_chars // 2:
+            end = pos + nl + 1
+        segments.append(text[pos:end])
+        pos = end
+    return segments
+
+
 def _first_present(primary: dict, fallback: dict, *keys: str):
     for key in keys:
         if key in primary and primary[key] is not None:
@@ -1044,21 +1074,26 @@ def _build_file_source(
     char_end: int | None = None,
     table_idx: int | None = None,
     image_idx: int | None = None,
+    row_start: int | None = None,
+    row_end: int | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
 ) -> str:
     """Build a file_source string compatible with v1 parse_file_source().
 
-    Format:
-      kb={kb}|doc={doc}|tenant={t}|file={f}|chunk={idx}
-        |cstart={s}|cend={e}   ← line_start/line_end (MinerU 行号)
-        |char_start={s}|char_end={e}  ← char_start/char_end (parse_text 字符位置)
-        |page={n}
-        |tstart={t}|tend={t}   ← start_time/end_time (视频/音频时间轴)
-        |trace={trace}
+    Format::
 
-    Extra fields (table_idx, image_idx) are appended as key=value pairs —
-    parse_file_source() ignores unknown keys silently.
+        kb={kb}|doc={doc}|tenant={t}|file={f}|chunk={idx}
+          |cstart={s}|cend={e}   ← line_start/line_end (MinerU 行号)
+          |char_start={s}|char_end={e}  ← char_start/char_end (parse_text 字符位置)
+          |page={n}
+          |row_start={n}|row_end={n}   ← [jonex] §table-chunking 表行区间
+          |tstart={t}|tend={t}   ← start_time/end_time (视频/音频时间轴)
+          |table_idx={n}|image_idx={n}|trace={trace}
+
+    Extra fields (table_idx, image_idx, row_start, row_end) are appended as
+    ``key=value`` pairs — ``parse_file_source()`` ignores unknown keys
+    silently, so these are backward-compatible.
     """
     parts = [
         f"kb={kb_id}",
@@ -1075,6 +1110,9 @@ def _build_file_source(
         parts.append(f"char_end={char_end}")
     if page is not None:
         parts.append(f"page={page}")
+    if row_start is not None and row_end is not None:
+        parts.append(f"row_start={row_start}")
+        parts.append(f"row_end={row_end}")
     if start_time is not None and end_time is not None:
         parts.append(f"tstart={start_time:.3f}")
         parts.append(f"tend={end_time:.3f}")
@@ -1195,6 +1233,10 @@ class PushChunksStage(Stage):
                 self._per_chunk_timeout, self._track_timeout,
             )
             self._per_chunk_timeout = self._track_timeout * 0.8
+
+        # [jonex] §table-chunking: reserve ~64 chars for the _inject_ns_token
+        # suffix so the final chunk body does not exceed _chunk_max_chars.
+        self._chunk_body_budget = max(200, self._chunk_max_chars - 64)
 
     async def execute(
         self, ctx: PipelineContext, services: PipelineServices
@@ -1652,49 +1694,132 @@ class PushChunksStage(Stage):
         self, chunks: list[dict], content_list: list[dict],
         tenant_id: str, kb_id: str, document_id: str, file_name: str,
     ) -> None:
-        """Extract text + table chunks from MinerU content_list."""
+        """Extract text + table chunks from MinerU content_list.
+
+        [jonex] §table-chunking: tables are split into row-level chunks
+        (each fitting within the budget, with header repetition) instead
+        of being silently truncated at the budget boundary.
+        """
         for item in content_list:
             t = item.get("type", "text")
-            text = ""
 
             if t == "text":
                 text = item.get("text", "")
             elif t == "table":
-                text = item.get("table_body", "") or item.get("text", "")
+                # [jonex] §table-chunking: normalize HTML / list / markdown
+                # tables into structured rows, then split into budget-sized
+                # segments with header repetition per segment.
+                raw_body = get_table_body(item)
+                header, data_rows = normalize_table_rows(raw_body)
+                if data_rows:
+                    # [jonex] §table-chunking P2: reserve ~64 chars for
+                    row_segments = pack_rows(
+                        data_rows, self._chunk_body_budget, header,
+                    )
+                    for seg_idx, (seg_text, row_start, row_end) in enumerate(
+                        row_segments
+                    ):
+                        # [jonex] §table-chunking P1-1: single oversize
+                        # row → _split_long_text so the segment still
+                        # fits within budget.
+                        if len(seg_text) > self._chunk_max_chars:
+                            logger.warning(
+                                "[jonex] §table-chunking: table row segment "
+                                "exceeds budget (rows=%d:%d, len=%d > max=%d), "
+                                "splitting",
+                                row_start, row_end, len(seg_text),
+                                self._chunk_max_chars,
+                            )
+                            sub_segs = _split_long_text(
+                                seg_text, self._chunk_body_budget,
+                            )
+                        else:
+                            sub_segs = [seg_text]
+
+                        for sub_seg in sub_segs:
+                            page = item.get("page_idx")
+                            table_idx = item.get("table_idx")
+                            fs = _build_file_source(
+                                tenant_id, kb_id, document_id,
+                                file_name,
+                                chunk_index=len(chunks),
+                                page=page,
+                                row_start=row_start,
+                                row_end=row_end,
+                                table_idx=table_idx,
+                            )
+                            text_for_upload = _inject_ns_token(
+                                sub_seg, tenant_id, kb_id,
+                                document_id,
+                            )
+                            chunks.append({
+                                "text": text_for_upload,
+                                "file_source": fs,
+                                "type": "table_row",
+                            })
+                    continue  # Table handled via row-level chunks
+
+                # Fallback: normalization produced nothing → treat raw
+                # content (HTML or otherwise) as plain text below.
+                text = (
+                    raw_body if isinstance(raw_body, str)
+                    else str(raw_body)
+                )
             else:
                 continue
 
             if not text or not text.strip():
                 continue
 
-            # Chunk text if over max size
+            # [jonex] §table-chunking: replace silent truncation
+            # (was ``text[:self._chunk_max_chars]``) with explicit
+            # budget-aware splitting.  Over-budget blocks are split
+            # at newline boundaries and pushed as multiple chunks.
             if len(text) > self._chunk_max_chars:
-                if hasattr(self, '_warned_chunk_size'):
-                    pass
-                text = text[:self._chunk_max_chars]
+                logger.warning(
+                    "[jonex] §table-chunking: block exceeds max_chars "
+                    "(type=%s, len=%d > max=%d), splitting into segments",
+                    t, len(text), self._chunk_max_chars,
+                )
+                text_segments = _split_long_text(text, self._chunk_body_budget)
+            else:
+                text_segments = [text]
 
             page = item.get("page_idx")
-            # MinerU 产出 line_start/line_end → cstart/cend（行号）
             line_start = item.get("line_start")
             line_end = item.get("line_end")
-            # parse_text 产出 char_start/char_end → char_start/char_end（字符位置）
             char_start = item.get("char_start")
             char_end = item.get("char_end")
             table_idx = item.get("table_idx")
 
-            file_source = _build_file_source(
-                tenant_id, kb_id, document_id, file_name,
-                chunk_index=len(chunks),
-                page=page,
-                line_start=line_start,
-                line_end=line_end,
-                char_start=char_start,
-                char_end=char_end,
-                table_idx=table_idx if t == "table" else None,
-            )
-            # [jonex] 注入命名空间 token（对齐 v1），避免跨文档相同文本被全局去重合并
-            text_for_upload = _inject_ns_token(text, tenant_id, kb_id, document_id)
-            chunks.append({"text": text_for_upload, "file_source": file_source, "type": t})
+            for seg_idx, seg in enumerate(text_segments):
+                # Character offsets are only valid for the first segment;
+                # downstream segments cannot compute meaningful offsets
+                # from the truncated text.
+                cs: int | None = None
+                ce: int | None = None
+                if seg_idx == 0:
+                    cs = char_start
+                    ce = char_end
+
+                file_source = _build_file_source(
+                    tenant_id, kb_id, document_id, file_name,
+                    chunk_index=len(chunks),
+                    page=page,
+                    line_start=line_start,
+                    line_end=line_end,
+                    char_start=cs,
+                    char_end=ce,
+                    table_idx=table_idx if t == "table" else None,
+                )
+                text_for_upload = _inject_ns_token(
+                    seg, tenant_id, kb_id, document_id,
+                )
+                chunks.append({
+                    "text": text_for_upload,
+                    "file_source": file_source,
+                    "type": t,
+                })
 
     def _collect_multimodal_chunks(
         self, chunks: list[dict], multimodal_results: list[dict],

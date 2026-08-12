@@ -1,0 +1,180 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openkb"
+dynamic = ["version"]
+description = "OpenKB: Open LLM Knowledge Base, powered by PageIndex"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Kylin", email = "quanqi@pageindex.ai"},
+    {name = "Ray", email = "ray@vectify.ai"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "agents", "document"]
+# All dependencies are pinned exactly (supply-chain caution — e.g. the
+# litellm package-poisoning incident). Bump deliberately after vetting
+# each release.
+# litellm 1.87.2 fixes the chatgpt/* (ChatGPT subscription) provider
+# returning empty Responses output (BerriAI/litellm#25429) and
+# auto-injects GitHub Copilot IDE-auth headers.
+dependencies = [
+    "pageindex==0.3.0.dev3",
+    "markitdown[docx,pptx,xlsx,xls]==0.1.5",
+    "trafilatura==2.0.0",
+    "click==8.4.0",
+    "watchdog==6.0.0",
+    "litellm==1.87.2",
+    "openai-agents==0.17.3",
+    # openai 2.45.0 added a required `cache_write_tokens` field to
+    # InputTokensDetails that openai-agents 0.17.3 does not set, crashing
+    # usage parsing on every response (issue #187). Pin below 2.45 until
+    # openai-agents catches up.
+    "openai==2.44.0",
+    "pyyaml==6.0.3",
+    "python-dotenv==1.2.2",
+    "json-repair==0.59.10",
+    "prompt_toolkit==3.0.52",
+    "rich==15.0.0",
+    "portalocker==3.2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/VectifyAI/OpenKB"
+Homepage = "https://github.com/VectifyAI/OpenKB"
+Issues = "https://github.com/VectifyAI/OpenKB/issues"
+
+[project.scripts]
+openkb = "openkb.cli:cli"
+openkb-web = "openkb.api:main"
+# Backwards-compatible alias for the historical name; same entry point.
+openkb-api = "openkb.api:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "httpx",
+    "ruff==0.9.7",
+    "mypy==1.15.0",
+    "types-PyYAML==6.0.12.20260518",
+]
+# The Knowledge Workbench Web UI is served by this FastAPI server. `web` is the
+# canonical extra; `api` is a backwards-compatible alias so an existing
+# `pip install "openkb[api]"` keeps working.
+web = ["fastapi", "uvicorn", "python-multipart"]
+api = ["openkb[web]"]
+
+[tool.hatch.version]
+source = "vcs"
+
+# The Workbench web bundle (openkb/web) is git-ignored but must ship in the
+# published package. `artifacts` force-includes it into both the sdist and the
+# wheel when present (built by `npm run build`, e.g. in release CI). When it is
+# absent the build still succeeds — the API server just serves no UI.
+[tool.hatch.build]
+artifacts = ["openkb/web/**"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["openkb"]
+
+# Bundle the built-in deck themes + html critic into the wheel so
+# `openkb deck new` / `--critique` / chat `/deck` work right after
+# `pip install` (scan_local_skills also looks under openkb/_skills/).
+[tool.hatch.build.targets.wheel.force-include]
+"skills/openkb-deck-neon" = "openkb/_skills/openkb-deck-neon"
+"skills/openkb-deck-editorial" = "openkb/_skills/openkb-deck-editorial"
+"skills/openkb-html-critic" = "openkb/_skills/openkb-html-critic"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Start conservative (pyflakes + pycodestyle errors + isort); ratchet up later.
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# cli.py deliberately interleaves imports with side-effecting setup code
+# (warning filters that must apply before `markitdown`/`litellm` import,
+# `set_tracing_disabled()` before other agents-SDK usage, an
+# `os.environ.setdefault(...)` that must run before `import litellm`).
+# Reordering to satisfy E402/I001 would risk changing import-time behavior,
+# so both are ignored here rather than fixed.
+#
+# E501 (line-too-long) is scoped to the files whose remaining violations are
+# long string literals (docstrings, CLI help text, prompt templates) that
+# reflowing would either fail to shorten or would alter user-facing text.
+# Everywhere else the 100-column limit is enforced. Shrink this list by
+# rewrapping the literals (or adding targeted `# noqa: E501`) over time.
+"openkb/cli.py" = ["E402", "I001", "E501"]
+"openkb/agent/chat.py" = ["E501"]
+"openkb/agent/compiler.py" = ["E501"]
+"openkb/lint.py" = ["E501"]
+"openkb/schema.py" = ["E501"]
+# Test fixtures asserting exact file contents (frontmatter/index literals);
+# rewrapping the strings would change the data under test.
+"tests/test_cli.py" = ["E501"]
+"tests/test_compiler.py" = ["E501"]
+"tests/test_remove.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["openkb"]
+# Lenient to start (codebase not previously type-checked); ratchet up over time.
+ignore_missing_imports = true
+# numpy's bundled stubs (reached transitively via litellm/openai-agents ->
+# pydantic, not imported by openkb directly) use `type X = ...` alias
+# statements requiring Python 3.12+ parser support — fatal to the whole run
+# (a [syntax] error, not a suppressible diagnostic) when they get parsed. A
+# per-module `follow_imports = "skip"` override was experimentally confirmed
+# NOT to prevent the parse; only the global default reliably avoids reaching
+# that stub, so it stays global rather than scoped narrower.
+follow_imports = "skip"
+
+# Pre-existing untyped-data debt is suppressed PER MODULE below (not
+# globally), so every other module gets full checking for these error codes.
+# Ratchet: fix a module's errors (mostly by giving LLM-JSON payloads proper
+# TypedDict/dataclass shapes), then delete its override block.
+
+[[tool.mypy.overrides]]
+# Loosely-shaped dict/list data parsed from LLM JSON output flows through
+# `Any`-typed helpers: union-attr on Any|None, unannotated accumulator lists,
+# argument/return mismatches against str-typed signatures.
+module = "openkb.agent.compiler"
+disable_error_code = [
+    "arg-type",
+    "dict-item",
+    "operator",
+    "return-value",
+    "union-attr",
+    "var-annotated",
+]
+
+[[tool.mypy.overrides]]
+module = "openkb.cli"
+disable_error_code = ["return-value"]
+
+[[tool.mypy.overrides]]
+module = ["openkb.lint", "openkb.indexer"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = "openkb.skill.workspace"
+disable_error_code = ["type-var"]

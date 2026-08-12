@@ -88,8 +88,43 @@ def decode_ingest_key(plaintext: str) -> dict | None:
     return None
 
 
+def generate_mcp_key() -> str:
+    """生成 MCP Key（yxm_ 前缀 + 32 字节 URL-safe 随机串）。
+
+    格式: yxm_{token_urlsafe(32)}，总长度约 47 字符。
+    调用方自行提取 key_prefix（前 8 位）存入 DB，本函数不负责。
+    """
+    return f"yxm_{secrets.token_urlsafe(32)}"
+
+
+def hash_mcp_key(plaintext: str) -> str:
+    """对 MCP Key 明文做 HMAC-SHA256 哈希（单向，仅存哈希）。
+
+    复用 _sign_payload() 实现，与 hash_ingest_key() 同算法。
+    """
+    return _sign_payload(plaintext)
+
+
+def verify_mcp_key(plaintext: str, stored_hash: str) -> bool:
+    """校验 MCP Key 明文与存储的哈希是否匹配。
+
+    仅做哈希比对（单一职责），不做格式校验（yxm_ 前缀/长度/字符集）。
+    格式校验由调用方在 hash 前独立完成（per D-05）。
+    使用 hmac.compare_digest() 常量时间比较（per D-24/SEC-04）。
+    """
+    if not plaintext or not stored_hash:
+        return False
+    return hmac.compare_digest(hash_mcp_key(plaintext), stored_hash)
+
+
 def _sign_payload(data: str) -> str:
-    secret = get_config().JWT_SECRET.encode()
+    """HMAC-SHA256 签名（与 mcp_server/crypto.py 算法一致，修改前需同步）。"""
+    secret = os.getenv("JWT_SECRET", "").encode()
+    if not secret:
+        raise RuntimeError(
+            "JWT_SECRET 环境变量未配置或为空，无法安全计算哈希。"
+            "请设置 JWT_SECRET 环境变量。"
+        )
     return hmac.new(secret, data.encode(), hashlib.sha256).hexdigest()
 
 
@@ -146,4 +181,7 @@ __all__ = [
     "decode_ingest_key",
     "generate_view_token",
     "verify_view_token",
+    "generate_mcp_key",
+    "hash_mcp_key",
+    "verify_mcp_key",
 ]

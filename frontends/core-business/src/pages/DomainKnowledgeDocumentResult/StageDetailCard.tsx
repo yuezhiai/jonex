@@ -255,7 +255,7 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
 function getChunkTitle(chunk: DocumentChunk): string {
   const firstHeading = chunk.content_summary?.match(/^#\s+(.+)$/m)?.[1];
   if (firstHeading) return firstHeading.replace(/\\/g, '');
-  const fileName = chunk.file_path.match(/file=([^|]+)/)?.[1];
+  const fileName = chunk.file_path?.match(/file=([^|]+)/)?.[1];
   if (fileName) {
     const cleanName = fileName
       .replace(/\.[^.|]+$/u, '')

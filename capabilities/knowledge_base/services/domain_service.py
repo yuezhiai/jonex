@@ -3,6 +3,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import httpx
+import logging
 import uuid
 
 from sqlalchemy import select
@@ -24,6 +27,8 @@ from ..models.domain_service import (
     ServicePermission,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class DomainServiceService:
     """领域服务 CRUD + 知识库关联 + API Key + 配置 + 权限"""
@@ -40,6 +45,7 @@ class DomainServiceService:
                 name=data["name"],
                 description=data.get("description"),
                 domain_type=data.get("domain_type"),
+                enabled=data.get("enabled", 1),
             )
             # Handle KB associations
             kb_ids = data.get("kb_ids", [])
@@ -173,7 +179,7 @@ class DomainServiceService:
         async with get_db_session() as session:
             repo = DomainServiceRepository(session)
             obj = await repo.get_required(service_id, tenant_id)
-            updatable = {"name", "description", "domain_type", "status"}
+            updatable = {"name", "description", "domain_type", "status", "enabled"}
             values = {k: v for k, v in data.items() if k in updatable and v is not None}
             if values:
                 obj = await repo.update(service_id, tenant_id, **values)
@@ -237,6 +243,14 @@ class DomainServiceService:
 
             await session.commit()
             return True
+
+    async def enable(self, service_id: str, tenant_id: str) -> dict:
+        """启用领域服务"""
+        return await self.update(service_id, tenant_id, {"enabled": 1})
+
+    async def disable(self, service_id: str, tenant_id: str) -> dict:
+        """停用领域服务"""
+        return await self.update(service_id, tenant_id, {"enabled": 0})
 
     async def rotate_api_key(self, service_id: str, tenant_id: str) -> dict:
         tenant_id = require_tenant(tenant_id)
@@ -363,9 +377,72 @@ class DomainServiceService:
         async with get_db_session() as session:
             repo = DomainServiceRepository(session)
             await repo.get_required(service_id, tenant_id)
+            kb_ids = await self._get_kb_ids(session, service_id, tenant_id)
+
+        if not kb_ids:
             return {
                 "service_id": service_id,
                 "query": query,
                 "items": [],
                 "total": 0,
+                "references": [],
+                "kb_count": 0,
             }
+
+        from ..services.search_service import SearchService
+
+        async def _search_kb(kb_id: str) -> dict | None:
+            try:
+                return await SearchService().search(
+                    tenant_id=tenant_id,
+                    user_id="mcp",
+                    request={
+                        "knowledge_base_id": kb_id,
+                        "query": query,
+                        "mode": "hybrid",
+                        "top_k": 5,
+                    },
+                    trace_id="",
+                )
+            except (JonexException, httpx.HTTPError, asyncio.TimeoutError) as e:
+                logger.warning(
+                    "DomainService search: KB %s search failed for service %s: %s",
+                    kb_id, service_id, e,
+                )
+                return None
+
+        tasks = [_search_kb(kb_id) for kb_id in kb_ids]
+        results = await asyncio.gather(*tasks)
+
+        all_refs: dict[str, dict] = {}
+        all_items: list = []
+        total: int = 0
+        answers: list[str] = []
+
+        for result in results:
+            if result is None:
+                continue
+            for ref in result.get("references", []):
+                ref_id = ref.get("id")
+                if ref_id and ref_id not in all_refs:
+                    all_refs[ref_id] = ref
+            items = result.get("items", [])
+            if items:
+                all_items.extend(items)
+            total += result.get("total", 0)
+            answer = result.get("answer")
+            if answer:
+                answers.append(str(answer))
+
+        result_dict: dict = {
+            "service_id": service_id,
+            "query": query,
+            "references": list(all_refs.values()),
+            "items": all_items,
+            "total": total,
+            "kb_count": len(kb_ids),
+        }
+        if answers:
+            result_dict["answer"] = "\n\n".join(answers)
+
+        return result_dict

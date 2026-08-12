@@ -197,4 +197,24 @@ __all__ = [
     # 审计日志
     "emit_audit",
     "audit_action",
+    # 用户认证（__getattr__ 懒加载，避免 security → common 循环导入）
+    "require_admin",
+    "require_role",
 ]
+
+
+def __getattr__(name: str):
+    """模块级懒加载，解决 jonex_core.common ↔ jonex_core.security 循环导入。
+
+    common.audit → security.internal_auth → common 是已有循环；
+    若在模块顶层 from jonex_core.security.user_auth import require_admin，
+    会在 security.__init__ 初始化期间再次进入 common → ImportError。
+    用 __getattr__ 将 import 延迟到首次访问时，避开初始化顺序问题。
+    """
+    if name == "require_admin":
+        from jonex_core.security.user_auth import require_admin as _ra
+        return _ra
+    if name == "require_role":
+        from jonex_core.security.user_auth import require_role as _rr
+        return _rr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

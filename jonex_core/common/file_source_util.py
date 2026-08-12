@@ -110,6 +110,10 @@ def parse_file_source(raw: str) -> dict[str, Any]:
         "page_no": _num(kv.get("page"), int),
         "time_start": _num(kv.get("tstart"), float),
         "time_end": _num(kv.get("tend"), float),
+        # [jonex] §table-chunking: row range for table-row-level references
+        "row_start": _num(kv.get("row_start"), int),
+        "row_end": _num(kv.get("row_end"), int),
+        "table_idx": _num(kv.get("table_idx"), int),
     }
 
 
@@ -145,13 +149,28 @@ def classify_media(mime_type: str | None, file_name: str | None) -> str:
 
 
 def to_location(r: dict[str, Any]) -> dict[str, Any]:
-    """按命中片段的可用位置字段决定 location 类型（chunk/char/page/timestamp）。"""
+    """按命中片段的可用位置字段决定 location 类型。
+
+    Priority: timestamp > table_row > page > char > chunk.
+    ``table_row`` is placed before ``page`` because MinerU-produces tables
+    always carry ``page_no=0``, which would otherwise shadow the row-range.
+    """
     text = r.get("text")
     if r.get("time_start") is not None:
         return {
             "type": "timestamp",
             "time_start": r["time_start"],
             "time_end": r.get("time_end"),
+            "chunk_index": r.get("chunk_index"),
+            "text": text,
+        }
+    # [jonex] §table-chunking: row-level positioning for table chunks
+    if r.get("row_start") is not None and r.get("row_end") is not None:
+        return {
+            "type": "table_row",
+            "row_start": r["row_start"],
+            "row_end": r["row_end"],
+            "table_idx": r.get("table_idx"),
             "chunk_index": r.get("chunk_index"),
             "text": text,
         }

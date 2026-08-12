@@ -103,7 +103,11 @@ def base64_caption_adapter(bound: "BoundModel"):
 
         messages.append({"role": "user", "content": content_parts})
         response = await bound.complete(messages, **kwargs)
-        return response.text
+        # [jonex] Some reasoning models (e.g. Qwen3.6 heretic) emit the
+        # generated text in ``reasoning`` but leave ``content`` as an empty
+        # string.  Fall back to reasoning when content is blank so downstream
+        # JSON parsers get a non-empty payload.
+        return response.text.strip() or response.reasoning or ""
 
     wrapper.model_capability = bound.capability  # type: ignore[attr-defined]
     wrapper.vlm_model = bound.spec.model_id  # type: ignore[attr-defined]

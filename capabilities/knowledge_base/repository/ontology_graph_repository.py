@@ -760,6 +760,272 @@ class OntologyGraphRepository:
                 except (json.JSONDecodeError, TypeError):
                     f["relation_source_chunks"] = []
 
+    # ══════════════════════════════════════════════════════════════════
+    # P1-6 图查询模板：时间线 / 枚举 / 计数
+    # ══════════════════════════════════════════════════════════════════
+
+    async def find_release_supporting_toolkit(
+        self, tenant_id: str, kb_id: str, toolkit_version: str,
+    ) -> list[dict]:
+        """反查：哪个 SoftwareRelease 支持指定 ToolKit 版本。
+
+        对应问题："哪个版本支持 CUDA 12.8"
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareToolkit'})
+        WHERE coalesce(t.stub,false)=false AND t.canonical_name CONTAINS $toolkit_version
+        MATCH (sr:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+              -[r:ONT_REL {relation_type:'SUPPORTS_TOOLKIT'}]->(t)
+        WHERE coalesce(sr.stub,false)=false
+        RETURN sr.canonical_name AS name, sr.entity_type AS type,
+               sr.aliases AS aliases, sr.attributes AS attributes,
+               sr.description AS description, sr.confidence AS confidence,
+               sr.kb_id AS kb_id, sr.doc_ids AS doc_ids,
+               sr.source_chunks AS source_chunks,
+               t.canonical_name AS toolkit_name,
+               r.relation_type AS relation_type
+        ORDER BY sr.canonical_name DESC
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "toolkit_version": toolkit_version},
+            )
+            rows = [dict(r) async for r in result]
+        self._deserialize_attrs(rows)
+        return rows
+
+    async def find_earliest_release_for(
+        self, tenant_id: str, kb_id: str, relation_types: list[str], target_name: str,
+    ) -> dict | None:
+        """找最早满足关系的 SoftwareRelease（沿 SUPERSEDES 链取最旧端）。
+
+        链方向：新版本 --[:SUPERSEDES]-> 旧版本。
+        因此"最早"= 无 outgoing SUPERSEDES 的节点（链尾，最旧）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (sr:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+              -[r:ONT_REL]->(target:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(sr.stub,false)=false AND coalesce(target.stub,false)=false
+          AND r.relation_type IN $rel_types AND target.canonical_name = $target_name
+        WITH collect(DISTINCT sr) AS candidates
+        UNWIND candidates AS sr
+        OPTIONAL MATCH (sr)-[:ONT_REL {relation_type:'SUPERSEDES'}]->(older:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+        WHERE older IN candidates
+        WITH sr, older WHERE older IS NULL
+        RETURN sr.canonical_name AS name, sr.entity_type AS type,
+               sr.aliases AS aliases, sr.attributes AS attributes,
+               sr.description AS description, sr.confidence AS confidence,
+               sr.kb_id AS kb_id, sr.doc_ids AS doc_ids,
+               sr.source_chunks AS source_chunks
+        LIMIT 1
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher,
+                {"t": tenant_id, "k": kb_id, "rel_types": relation_types, "target_name": target_name},
+            )
+            record = await result.single()
+        if record:
+            row = dict(record)
+            self._deserialize_attrs([row])
+            return row
+        return None
+
+    async def find_latest_release_for(
+        self, tenant_id: str, kb_id: str, relation_types: list[str], target_name: str,
+    ) -> dict | None:
+        """找最新满足关系的 SoftwareRelease（沿 SUPERSEDES 链取最新端）。
+
+        链方向：新版本 --[:SUPERSEDES]-> 旧版本。
+        因此"最新"= 无 incoming SUPERSEDES 的节点（链首，最新）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (sr:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+              -[r:ONT_REL]->(target:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(sr.stub,false)=false AND coalesce(target.stub,false)=false
+          AND r.relation_type IN $rel_types AND target.canonical_name = $target_name
+        WITH collect(DISTINCT sr) AS candidates
+        UNWIND candidates AS sr
+        OPTIONAL MATCH (newer:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+                       -[:ONT_REL {relation_type:'SUPERSEDES'}]->(sr)
+        WHERE newer IN candidates
+        WITH sr, newer WHERE newer IS NULL
+        RETURN sr.canonical_name AS name, sr.entity_type AS type,
+               sr.aliases AS aliases, sr.attributes AS attributes,
+               sr.description AS description, sr.confidence AS confidence,
+               sr.kb_id AS kb_id, sr.doc_ids AS doc_ids,
+               sr.source_chunks AS source_chunks
+        LIMIT 1
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher,
+                {"t": tenant_id, "k": kb_id, "rel_types": relation_types, "target_name": target_name},
+            )
+            record = await result.single()
+        if record:
+            row = dict(record)
+            self._deserialize_attrs([row])
+            return row
+        return None
+
+    async def find_last_supporting_before_drop(
+        self, tenant_id: str, kb_id: str, software_name: str,
+    ) -> dict | None:
+        """找「最后支持某 Software 的版本」。
+
+        策略：找到执行 DROPPED_SUPPORT_FOR 的版本，沿 SUPERSEDES 链反向
+        （即取该版本的前驱），即为"最后支持"的版本。
+
+        对应问题："最后支持 VS2019 的版本"
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (drop:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+              -[:ONT_REL {relation_type:'DROPPED_SUPPORT_FOR'}]->(sw:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(drop.stub,false)=false AND coalesce(sw.stub,false)=false
+          AND sw.canonical_name = $sw_name
+        MATCH (last_support:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareRelease'})
+              -[:ONT_REL {relation_type:'SUPERSEDES'}]->(drop)
+        WHERE coalesce(last_support.stub,false)=false
+        RETURN last_support.canonical_name AS name, last_support.entity_type AS type,
+               last_support.aliases AS aliases, last_support.attributes AS attributes,
+               last_support.description AS description, last_support.confidence AS confidence,
+               last_support.kb_id AS kb_id, last_support.doc_ids AS doc_ids,
+               last_support.source_chunks AS source_chunks,
+               drop.canonical_name AS dropped_by
+        LIMIT 1
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "sw_name": software_name},
+            )
+            record = await result.single()
+        if record:
+            row = dict(record)
+            self._deserialize_attrs([row])
+            return row
+        return None
+
+    async def find_first_release_adding(
+        self, tenant_id: str, kb_id: str, gpu_or_arch: str,
+    ) -> dict | None:
+        """找首次加入某 GPU 架构支持的 SoftwareRelease。
+
+        先查所有有 ADDED_SUPPORT_FOR 边的版本，再取其中最早的那个
+        （沿 SUPERSEDES 链取最旧端）。
+
+        对应问题："首次支持 GH100 的版本"
+        """
+        return await self.find_earliest_release_for(
+            tenant_id, kb_id,
+            relation_types=["ADDED_SUPPORT_FOR"],
+            target_name=gpu_or_arch,
+        )
+
+    async def count_toolkit_versions(
+        self, tenant_id: str, kb_id: str, version_lo: str = "", version_hi: str = "",
+    ) -> int:
+        """统计 SoftwareToolkit 实体数量（支持版本号范围过滤，数值化比较）。
+
+        因为 canonical_name 格式如 "CUDA Toolkit 12.8"，而 lo/hi 是裸版本号
+        "12.4"/"13.3"，不能直接做字符串比较（前缀不同 + 字典序 "12.10" < "12.9" 错误）。
+        改为：提取 canonical_name 最后的空格分隔 token 作为版本号 →
+        按 '.' 拆分转换为整数元组做数值化区间比较。
+
+        对应问题："12.4→13.3 共几个 CUDA 版本"
+        """
+        tenant_id = require_tenant(tenant_id)
+        params: dict = {"t": tenant_id, "k": kb_id}
+
+        # 在 Python 侧预解析 lo/hi 为数值对，传给 Cypher 做逐位数值比较
+        def _parse_ver(v: str) -> tuple[int, int] | None:
+            parts = v.strip().split(".")
+            if len(parts) >= 2:
+                try:
+                    return (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    return None
+            return None
+
+        lo_pair = _parse_ver(version_lo) if version_lo else None
+        hi_pair = _parse_ver(version_hi) if version_hi else None
+
+        # 基础 Cypher：提取版本号 → 拆分为整数元组
+        cypher = """
+        MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareToolkit'})
+        WHERE coalesce(t.stub,false)=false
+        WITH t, split(t.canonical_name, ' ')[-1] AS version_str
+        WITH t, [x IN split(version_str, '.') | toInteger(x)] AS v
+        WHERE size(v) >= 2
+        """
+
+        # 版本号区间过滤（数值化比较）
+        if lo_pair and hi_pair:
+            cypher += """
+            AND (
+              v[0] > $lo_major OR (v[0] = $lo_major AND v[1] >= $lo_minor)
+            )
+            AND (
+              v[0] < $hi_major OR (v[0] = $hi_major AND v[1] <= $hi_minor)
+            )
+            """
+            params["lo_major"] = lo_pair[0]
+            params["lo_minor"] = lo_pair[1]
+            params["hi_major"] = hi_pair[0]
+            params["hi_minor"] = hi_pair[1]
+        elif lo_pair:
+            cypher += """
+            AND (v[0] > $lo_major OR (v[0] = $lo_major AND v[1] >= $lo_minor))
+            """
+            params["lo_major"] = lo_pair[0]
+            params["lo_minor"] = lo_pair[1]
+        elif hi_pair:
+            cypher += """
+            AND (v[0] < $hi_major OR (v[0] = $hi_major AND v[1] <= $hi_minor))
+            """
+            params["hi_major"] = hi_pair[0]
+            params["hi_minor"] = hi_pair[1]
+
+        cypher += "\nRETURN count(t) AS c"
+
+        async with self._driver.session() as session:
+            result = await session.run(cypher, params)
+            record = await result.single()
+            return record["c"] if record else 0
+
+    async def get_toolkit_release_year(
+        self, tenant_id: str, kb_id: str, toolkit_version: str,
+    ) -> dict | None:
+        """获取 SoftwareToolkit 的发布年份。
+
+        属性存储在 JSON 字段 attributes 中，key='release_year'。
+
+        对应问题："12.7 与 12.4 同属哪一年"
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:'SoftwareToolkit'})
+        WHERE coalesce(t.stub,false)=false AND t.canonical_name CONTAINS $toolkit_version
+        RETURN t.canonical_name AS name, t.entity_type AS type,
+               t.attributes AS attributes, t.confidence AS confidence,
+               t.kb_id AS kb_id
+        LIMIT 1
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "toolkit_version": toolkit_version},
+            )
+            record = await result.single()
+        if record:
+            row = dict(record)
+            self._deserialize_attrs([row])
+            return row
+        return None
+
     async def get_kb_graph(
         self,
         tenant_id: str,

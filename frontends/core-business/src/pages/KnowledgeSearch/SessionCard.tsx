@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, Button, Spin } from 'antd';
+import { Card, Button, Spin, message } from 'antd';
 import {
   SearchOutlined,
   StopOutlined,
@@ -23,10 +23,12 @@ import type {
   KnowledgeReferenceLocation,
   ReasoningStep,
   SearchFeedbackType,
-  ReasoningTrace,
 } from '@/types/knowledgeSearch';
+import type { OntologyInstanceRow } from '@/types/domainKnowledge';
 import type { SearchSession } from './index';
-
+import { getOntologyInstances } from '@/api/domainKnowledge';
+import OntologyEntityDrawer from './OntologyEntityDrawer';
+import RagRecallDrawer, { type RagRecallItem } from './RagRecallDrawer';
 // ── Helper: 时间戳格式化 ──
 function formatTimestamp(sec?: number | null): string {
   if (sec == null || Number.isNaN(sec)) return '';
@@ -102,7 +104,21 @@ function ReasoningChip({
 }
 
 // ── 推理步骤详情 ──
-function StepDetail({ step, t }: { step: any; t: (key: string, opts?: any) => string }) {
+function StepDetail({
+  step,
+  t,
+  onEntityClick,
+  onRecallClick,
+  references,
+  onOpenReference,
+}: {
+  step: any;
+  t: (key: string, opts?: any) => string;
+  onEntityClick?: (hit: { name: string; score?: number; kb_id?: string }) => void;
+  onRecallClick?: (item: RagRecallItem, rank: number, score?: number | null) => void;
+  references?: any[];
+  onOpenReference?: (ref: any) => void;
+}) {
   if (!step.detail) return null;
   const d = step.detail as Record<string, any>;
 
@@ -129,23 +145,29 @@ function StepDetail({ step, t }: { step: any; t: (key: string, opts?: any) => st
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {hits.map((h, idx) => (
-              <span
+              <Button
                 key={idx}
+                size="small"
+                type="default"
+                onClick={() => onEntityClick?.(h)}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 6,
                   fontSize: 12,
                   background: '#f7f5fe',
-                  border: '1px solid #ece9fb',
+                  borderColor: '#ece9fb',
                   borderRadius: 6,
                   padding: '2px 8px',
+                  height: 'auto',
                 }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = '#efeafc')}
+                onMouseLeave={(e) => (e.currentTarget.style.background = '#f7f5fe')}
               >
                 <span style={{ fontWeight: 600, color: '#4c1d95' }}>{h.name}</span>
                 <span style={{ fontSize: 11, color: '#a78bda' }}>score {fmtScore(h.score)}</span>
                 {h.kb_id && <span style={{ fontSize: 10, color: '#b6bdc7' }}>{h.kb_id}</span>}
-              </span>
+              </Button>
             ))}
           </div>
         </>,
@@ -189,9 +211,14 @@ function StepDetail({ step, t }: { step: any; t: (key: string, opts?: any) => st
     case 'rag_fallback': {
       const ok: string[] = Array.isArray(d.kb_ok) ? d.kb_ok : [];
       const failed: string[] = Array.isArray(d.kb_failed) ? d.kb_failed : [];
-      if (ok.length === 0 && failed.length === 0) return null;
+      const recalls: RagRecallItem[] = Array.isArray(d.recalls) ? d.recalls : [];
+      const scores: number[] = Array.isArray(d.p1_5?.prellm_rerank_top_scores)
+        ? d.p1_5.prellm_rerank_top_scores
+        : [];
+      const hasContent = ok.length > 0 || failed.length > 0 || recalls.length > 0;
+      if (!hasContent) return null;
       return wrap(
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {ok.length > 0 && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
               <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('knowledgeSearch.hitKbs')}</span>
@@ -212,7 +239,145 @@ function StepDetail({ step, t }: { step: any; t: (key: string, opts?: any) => st
               ))}
             </div>
           )}
+          {recalls.length > 0 && (
+            <div>
+              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+                {t('knowledgeSearch.recallChunks')}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {recalls.map((item, idx) => {
+                  const rank = idx + 1;
+                  const score = item.score ?? scores[idx];
+                  return (
+                    <Button
+                      key={item.chunk_id || idx}
+                      size="small"
+                      type="default"
+                      onClick={() => onRecallClick?.(item, rank, score ?? null)}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        fontSize: 12,
+                        background: '#f0f9ff',
+                        borderColor: '#bae6fd',
+                        borderRadius: 6,
+                        padding: '2px 8px',
+                        height: 'auto',
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = '#e0f2fe')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = '#f0f9ff')}
+                    >
+                      <span style={{ fontWeight: 600, color: '#0369a1' }}>
+                        {t('knowledgeSearch.chunkTag', { rank: String(rank).padStart(3, '0') })}
+                      </span>
+                      <span style={{ fontSize: 11, color: '#38bdf8' }}>
+                        {score != null ? `${t('knowledgeSearch.relevanceShort')} ${fmtScore(score)}` : ''}
+                      </span>
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>,
+      );
+    }
+    case 'openkb_query': {
+      const turns: any[] = Array.isArray(d.turns) ? d.turns : [];
+      // [jonex] 构建 wiki_path → reference 索引，供路径可点开
+      const refByPath: Record<string, any> = {};
+      if (references && onOpenReference) {
+        for (const r of references) {
+          if (r.wiki_path) refByPath[r.wiki_path] = r;
+        }
+      }
+      const renderCall = (c: any, idx: number) => {
+        const wikiPath: string = c.args?.path || '';
+        const ref = wikiPath ? refByPath[wikiPath] : undefined;
+        const canOpen = Boolean(ref && onOpenReference);
+        return (
+          <div key={idx} style={{ display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 12 }}>
+            <ReasoningChip tone="primary">{c.tool}</ReasoningChip>
+            {canOpen ? (
+              <a
+                onClick={(e) => { e.preventDefault(); onOpenReference!(ref); }}
+                style={{ color: '#4c1d95', cursor: 'pointer', wordBreak: 'break-all' as const, textDecoration: 'underline' }}
+              >
+                {wikiPath}
+              </a>
+            ) : (
+              <span style={{ color: '#4c1d95', wordBreak: 'break-all' as const }}>
+                {c.args?.path || c.args?.doc_name || c.args?.image_path || '—'}
+              </span>
+            )}
+            {c.output_chars != null && (
+              <span style={{ fontSize: 10, color: '#b6bdc7' }}>{c.output_chars} chars</span>
+            )}
+          </div>
+        );
+      };
+      if (turns.length === 0) {
+        // fallback to flat tool_calls for backward compat
+        const flat: any[] = Array.isArray(d.tool_calls) ? d.tool_calls : [];
+        if (flat.length === 0) return null;
+        return wrap(
+          <>
+            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+              {t('knowledgeSearch.wikiBrowsed', { count: flat.length })}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 240, overflowY: 'auto' as const }}>
+              {flat.map((c, idx) => renderCall(c, idx))}
+            </div>
+            {d.tool_calls_truncated && (
+              <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+                {t('knowledgeSearch.wikiTruncated', { shown: flat.length, total: d.tool_calls_total })}
+              </div>
+            )}
+          </>,
+        );
+      }
+      return wrap(
+        <>
+          <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+            {t('knowledgeSearch.wikiTurns', { turns: turns.length, calls: d.tool_calls_total })}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' as const }}>
+            {turns.map((turn: any, ti: number) => (
+              <div key={ti}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: turn.calls?.length ? 2 : 0 }}>
+                  <ReasoningChip tone="primary">
+                    {/* [jonex] 后端 turn.index 从 0 开始（len(turns) 递增），
+                        展示"第几轮"需 +1；无 index 时用数组位置 ti 兜底同样 +1。
+                        注意不能写 turn.index ?? ti + 1——那会在有 index 时显示 0 起始。 */}
+                    {t('knowledgeSearch.wikiTurn', { index: (turn.index ?? ti) + 1 })}
+                  </ReasoningChip>
+                  {turn.llm_ms != null && (
+                    <span style={{ fontSize: 10, color: '#b6bdc7' }}>
+                      {turn.llm_ms >= 1000
+                        ? `${(turn.llm_ms / 1000).toFixed(1)}s`
+                        : `${turn.llm_ms}ms`}
+                    </span>
+                  )}
+                </div>
+                {turn.thinking && (
+                  <div
+                    style={{ fontSize: 11, color: '#64748b', marginBottom: turn.calls?.length ? 4 : 0, lineHeight: 1.5 }}
+                    title={turn.thinking}
+                  >
+                    {turn.thinking.length > 120 ? turn.thinking.slice(0, 120) + '…' : turn.thinking}
+                  </div>
+                )}
+                {(turn.calls || []).map((c: any, ci: number) => renderCall(c, ci))}
+              </div>
+            ))}
+          </div>
+          {d.tool_calls_truncated && (
+            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+              {t('knowledgeSearch.wikiTruncated', { shown: turns.reduce((s: number, t: any) => s + (t.calls?.length || 0), 0), total: d.tool_calls_total })}
+            </div>
+          )}
+        </>,
       );
     }
     default:
@@ -483,6 +648,55 @@ export default function SessionCard({
   const hasContent = hasThink || hasAnswerContent;
   const statusLabel = getSearchStatusLabel(session.status, t);
 
+  const [entityDrawerOpen, setEntityDrawerOpen] = React.useState(false);
+  const [entityDrawerLoading, setEntityDrawerLoading] = React.useState(false);
+  const [drawerEntity, setDrawerEntity] = React.useState<OntologyInstanceRow | null>(null);
+
+  const [ragRecallOpen, setRagRecallOpen] = React.useState(false);
+  const [ragRecallItem, setRagRecallItem] = React.useState<RagRecallItem | null>(null);
+  const [ragRecallRank, setRagRecallRank] = React.useState(1);
+  const [ragRecallScore, setRagRecallScore] = React.useState<number | null>(null);
+
+  const openEntityDrawer = async (hit: { name: string; score?: number; kb_id?: string }) => {
+    if (!hit.kb_id) {
+      message.warning(t('knowledgeSearch.entityKbMissing'));
+      return;
+    }
+    setDrawerEntity(null);
+    setEntityDrawerLoading(true);
+    setEntityDrawerOpen(true);
+    try {
+      const res = await getOntologyInstances({
+        kbId: hit.kb_id,
+        keyword: hit.name,
+        page: 1,
+        pageSize: 1,
+      });
+      const item = res.items[0];
+      if (item) {
+        setDrawerEntity(item);
+      } else {
+        message.warning(t('knowledgeSearch.entityNotFound'));
+      }
+    } catch (e) {
+      message.error(t('knowledgeSearch.entityLoadError'));
+    } finally {
+      setEntityDrawerLoading(false);
+    }
+  };
+
+  const entityAttributeEntries = React.useMemo(() => {
+    if (!drawerEntity?.attributes) return [];
+    return Object.entries(drawerEntity.attributes).map(([key, value]) => ({ key, value }));
+  }, [drawerEntity]);
+
+  const openRagRecallDrawer = (item: RagRecallItem, rank: number, score?: number | null) => {
+    setRagRecallItem(item);
+    setRagRecallRank(rank);
+    setRagRecallScore(score ?? null);
+    setRagRecallOpen(true);
+  };
+
   return (
     <Card style={{ borderRadius: 12, marginBottom: 20 }} styles={{ body: { padding: '20px 24px' } }}>
       {/* Header */}
@@ -658,93 +872,103 @@ export default function SessionCard({
       )}
 
       {/* Reasoning chain */}
-      {(session.reasoning?.steps?.length ?? 0) > 0 && (
-        <div
-          style={{
-            background: '#fbfaff',
-            border: '1px solid #ece9fb',
-            borderRadius: 10,
-            padding: '12px 16px',
-            marginBottom: 16,
-          }}
-        >
-          <button
-            onClick={() => onToggleReasoning(session.id)}
-            style={{
-              width: '100%',
-              padding: 0,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              justifyContent: 'flex-start',
-              height: 'auto',
-              lineHeight: 'inherit',
-              border: 'none',
-              background: 'transparent',
-              cursor: 'pointer',
-              fontSize: 13,
-            }}
-          >
-            {reasoningExpanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
-            <NodeIndexOutlined style={{ color: '#8b5cf6' }} />
-            <span style={{ fontSize: 13, fontWeight: 600, color: '#6d28d9' }}>
-              {t('knowledgeSearch.reasoningProcess')}
-            </span>
-            <span style={{ fontSize: 12, color: '#a78bda' }}>
-              {t('knowledgeSearch.steps', {
-                count: session.reasoning!.steps.length,
-                source: session.reasoning!.final_source,
-              })}
-              {session.reasoning!.total_ms != null ? ` · ${session.reasoning!.total_ms}ms` : ''}
-            </span>
-          </button>
-          {reasoningExpanded && (
-            <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {session.reasoning!.steps.map((step: ReasoningStep, i: number) => {
-                const meta = reasoningStatusMeta(step.status, t);
-                return (
-                  <div key={`${step.stage}-${i}`} style={{ display: 'flex', gap: 10 }}>
-                    <div
-                      style={{
-                        width: 22,
-                        height: 22,
-                        borderRadius: '50%',
-                        flexShrink: 0,
-                        background: meta.bg,
-                        color: meta.color,
-                        fontSize: 11,
-                        fontWeight: 700,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                      }}
-                    >
-                      {i + 1}
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: '#334155' }}>{step.title}</span>
-                        <span
+      {(() => {
+        const reasoning = session.reasoning;
+        return (
+          (reasoning?.steps?.length ?? 0) > 0 && (
+            <div
+              style={{
+                background: '#fbfaff',
+                border: '1px solid #ece9fb',
+                borderRadius: 10,
+                padding: '12px 16px',
+                marginBottom: 16,
+              }}
+            >
+              <button
+                onClick={() => onToggleReasoning(session.id)}
+                style={{
+                  width: '100%',
+                  padding: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  justifyContent: 'flex-start',
+                  height: 'auto',
+                  lineHeight: 'inherit',
+                  border: 'none',
+                  background: 'transparent',
+                  cursor: 'pointer',
+                  fontSize: 13,
+                }}
+              >
+                {reasoningExpanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
+                <NodeIndexOutlined style={{ color: '#8b5cf6' }} />
+                <span style={{ fontSize: 13, fontWeight: 600, color: '#6d28d9' }}>
+                  {t('knowledgeSearch.reasoningProcess')}
+                </span>
+                <span style={{ fontSize: 12, color: '#a78bda' }}>
+                  {t('knowledgeSearch.steps', {
+                    count: reasoning!.steps.length,
+                    source: reasoning!.final_source,
+                  })}
+                  {reasoning!.total_ms != null ? ` · ${reasoning!.total_ms}ms` : ''}
+                </span>
+              </button>
+              {reasoningExpanded && (
+                <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {reasoning!.steps.map((step: ReasoningStep, i: number) => {
+                    const meta = reasoningStatusMeta(step.status, t);
+                    return (
+                      <div key={`${step.stage}-${i}`} style={{ display: 'flex', gap: 10 }}>
+                        <div
                           style={{
-                            fontSize: 11,
-                            color: meta.color,
+                            width: 22,
+                            height: 22,
+                            borderRadius: '50%',
+                            flexShrink: 0,
                             background: meta.bg,
-                            borderRadius: 4,
-                            padding: '0 6px',
+                            color: meta.color,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
                           }}
                         >
-                          {meta.label}
-                        </span>
-                        {step.duration_ms != null && (
-                          <span style={{ fontSize: 11, color: '#a3adbb' }}>{step.duration_ms}ms</span>
-                        )}
-                      </div>
-                      {step.summary && (
-                        <div style={{ fontSize: 12, color: '#64748b', marginTop: 2, lineHeight: 1.6 }}>
-                          {step.summary}
+                          {i + 1}
                         </div>
-                      )}
-                      <StepDetail step={step} t={t} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: 13, fontWeight: 600, color: '#334155' }}>{step.title}</span>
+                            <span
+                              style={{
+                                fontSize: 11,
+                                color: meta.color,
+                                background: meta.bg,
+                                borderRadius: 4,
+                                padding: '0 6px',
+                              }}
+                            >
+                              {meta.label}
+                            </span>
+                            {step.duration_ms != null && (
+                              <span style={{ fontSize: 11, color: '#a3adbb' }}>{step.duration_ms}ms</span>
+                            )}
+                          </div>
+                          {step.summary && (
+                            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2, lineHeight: 1.6 }}>
+                              {step.summary}
+                            </div>
+                          )}
+                          <StepDetail
+                            step={step}
+                            t={t}
+                            onEntityClick={openEntityDrawer}
+                            onRecallClick={openRagRecallDrawer}
+                            references={session.references}
+                            onOpenReference={onOpenReference}
+                          />
                     </div>
                   </div>
                 );
@@ -752,7 +976,9 @@ export default function SessionCard({
             </div>
           )}
         </div>
-      )}
+          )
+        );
+      })()}
 
       {/* Answer */}
       {(responseBody || running) && (
@@ -945,6 +1171,22 @@ export default function SessionCard({
           <div style={{ marginTop: 10, color: '#94a3b8', fontSize: 13 }}>{t('knowledgeSearch.searchingKnowledge')}</div>
         </div>
       )}
+
+      <OntologyEntityDrawer
+        open={entityDrawerOpen}
+        loading={entityDrawerLoading}
+        entity={drawerEntity}
+        attributeEntries={entityAttributeEntries}
+        onClose={() => setEntityDrawerOpen(false)}
+      />
+
+      <RagRecallDrawer
+        open={ragRecallOpen}
+        item={ragRecallItem}
+        rank={ragRecallRank}
+        score={ragRecallScore}
+        onClose={() => setRagRecallOpen(false)}
+      />
     </Card>
   );
 }

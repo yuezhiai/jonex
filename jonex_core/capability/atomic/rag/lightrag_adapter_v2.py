@@ -223,10 +223,16 @@ class LightRAGAdapterV2(BaseRAGCapability):
         p = dict(payload)
         p["action"] = action
         try:
-            # W3：COS 输入本地化——在能力侧把 cos 对象下载到本地，下游 atomic-rag 统一按本地文件解析。
+            # [jonex] R7-2b：COS 下载异步化 —— 默认移入任务 pipeline（_execute_pipeline_http 的
+            # FetchObject 段），invoke 毫秒级返回。设 RAG_COS_FETCH_IN_TASK=false 回退同步路径。
             # 仅 insert/retry（整文件重解析）需要文件；retry_ontology_extract 只读 :9621 存储，无需下载。
             if action in ("insert", "retry"):
-                p = await self._localize_input(p, tenant_id)
+                if os.getenv("RAG_COS_FETCH_IN_TASK", "true").lower() in ("1", "true", "yes", "on"):
+                    # 新路径：透传 storage_backend=cos + storage_key，下载在任务 pipeline 内完成
+                    pass
+                else:
+                    # 旧路径（回退）：同步下载 COS 对象到本地
+                    p = await self._localize_input(p, tenant_id)
             return await handler(
                 p, tenant_id,
                 task_manager=self._tm, config_resolver=self._cr,
@@ -323,8 +329,8 @@ class LightRAGAdapterV2(BaseRAGCapability):
         }
         if preset:
             payload["preset"] = preset
-        # 兼容 LOCAL 直连传入的 document_id / storage_backend / storage_key
-        for k in ("document_id", "storage_backend", "storage_key"):
+        # 兼容 LOCAL 直连传入的 document_id / storage_backend / storage_key / execution_mode
+        for k in ("document_id", "storage_backend", "storage_key", "execution_mode"):
             if kwargs.get(k) is not None:
                 payload[k] = kwargs[k]
         return self._unwrap(await self._dispatch("insert", payload, tenant_id), "insert")
@@ -352,6 +358,34 @@ class LightRAGAdapterV2(BaseRAGCapability):
         payload = {"doc_id": doc_id, "knowledge_base_id": knowledge_base_id}
         data = self._unwrap(await self._dispatch("delete", payload, tenant_id), "delete")
         return bool((data or {}).get("success"))
+
+    async def delete_batch(
+        self,
+        doc_ids: list[str],
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+        document_id: str = "",
+        trace_id: str = "",
+    ) -> dict:
+        """[jonex] 批量删除——单次 dispatch 提交全部 doc_ids，
+        LightRAG 仅执行一次 rebuild_knowledge_from_chunks。
+
+        [jonex] R4：透传 document_id / trace_id，
+        使删除/rebuild 的 LLM 调用能正确归因。
+        """
+        payload: dict = {
+            "doc_ids": list(doc_ids),
+            "knowledge_base_id": knowledge_base_id,
+        }
+        if document_id:
+            payload["document_id"] = document_id
+        if trace_id:
+            payload["trace_id"] = trace_id
+        data = self._unwrap(
+            await self._dispatch("delete_batch", payload, tenant_id), "delete_batch",
+        )
+        return data or {"success": False, "accepted": [], "failed": doc_ids}
 
     async def get_task_status(self, task_id: str, tenant_id: str) -> dict:
         # 注意：not_found 时 handler 返回 success=False；此处直接回传 data（含 status=not_found），

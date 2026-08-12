@@ -55,6 +55,19 @@ export interface SaveKnowledgeSearchHistoryPayload {
   topK?: number;
 }
 
+/** 严格模式配置项（随搜索请求下发，普通/深度共用前 5 项，深度额外含后 2 项） */
+export interface KnowledgeSearchStrictConfig {
+  strict_mode: boolean;
+  strict_max_attempts: number;
+  strict_min_score: number;
+  strict_require_reference: boolean;
+  strict_require_grounded: boolean;
+  /** 深度检索专属 */
+  max_subqueries: number;
+  /** 深度检索专属 */
+  allow_common_sense: boolean;
+}
+
 export interface KnowledgeSearchStreamParams {
   query: string;
   mode?: KnowledgeSearchMode;
@@ -62,6 +75,10 @@ export interface KnowledgeSearchStreamParams {
   domainId?: string;
   /** 知识库 ID 列表，至少一个 */
   kbIds?: string[];
+  /** 是否深度检索：true 时调用 /search/deep，默认 /search/ontology */
+  deep?: boolean;
+  /** 严格模式配置（缺省时后端使用默认值） */
+  strictConfig?: KnowledgeSearchStrictConfig;
 }
 
 /** 引用位置（与后端 SourceLocation 对齐） */
@@ -86,6 +103,7 @@ export interface KnowledgeReference {
   file_size?: number | null;
   media_type: 'text' | 'pdf' | 'audio' | 'video' | 'image' | 'other';
   raw_url?: string | null;
+  wiki_path?: string | null;  // [jonex] OpenKB wiki 页路径
   locations: KnowledgeReferenceLocation[];
 }
 

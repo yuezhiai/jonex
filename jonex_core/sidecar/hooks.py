@@ -11,6 +11,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+import redis.asyncio as aioredis
+
 import httpx
 
 from jonex_core.common.config import get_config
@@ -32,21 +34,79 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """限流器 — 按 tenant/user/api 维度计数，默认 no-op"""
+    """限流器 — 基于 redis.asyncio 的租户级 Fixed Window 实现"""
+
+    KEY_PREFIX = "rate_limit:tenant"
 
     def __init__(self):
         self.config = get_config()
+        self._redis: aioredis.Redis | None = None
+        self._pool: aioredis.ConnectionPool | None = None
 
-    async def check(self, tenant_id: str, api_path: str, user_id: Optional[str] = None) -> bool:
+    async def _get_redis(self) -> aioredis.Redis:
+        """Lazy init Redis 连接池与客户端"""
+        if self._redis is None:
+            redis_url = self.config.REDIS_URL or "redis://redis:6379/0"
+            self._pool = aioredis.ConnectionPool.from_url(
+                redis_url,
+                max_connections=self.config.REDIS_MAX_CONNECTIONS,
+                decode_responses=True,
+                socket_connect_timeout=self.config.REDIS_CONNECT_TIMEOUT,
+                socket_keepalive=True,
+            )
+            self._redis = aioredis.Redis.from_pool(self._pool)
+            logger.info("RateLimiter Redis 连接池已初始化: %s", redis_url)
+        return self._redis
+
+    async def check(self, tenant_id: str, api_path: str, user_id: Optional[str] = None) -> tuple[bool, int]:
         """
-        检查是否允许请求。返回 True 表示放行，False 表示限流。
+        检查是否允许请求。返回 (allowed, retry_after_seconds)。
 
-        占位实现：始终放行。
-        TODO: Redis 计数器 + 滑动窗口算法。
+        Fixed Window 算法：同一分钟窗口内统计 tenant_id 维度请求数，
+        超过 RATE_LIMIT_TENANT_PER_MINUTE 阈值时拒绝。
+
+        api_path 和 user_id 保留签名兼容性，不在限流 key 中使用。
+
+        Redis 故障时降级放行（fail-open）：记录 ERROR 日志并返回 (True, 0)，
+        避免 Redis 不可达导致全站 500。
         """
         if not self.config.RATE_LIMIT_ENABLED:
-            return True
-        return True
+            return (True, 0)
+
+        limit = self.config.RATE_LIMIT_TENANT_PER_MINUTE
+        window = int(time.time() / 60)
+        key = f"{self.KEY_PREFIX}:{tenant_id}:invoke:{window}"
+
+        try:
+            redis = await self._get_redis()
+            current = await redis.incr(key)
+            if current == 1:
+                await redis.expire(key, 120)
+        except Exception as exc:
+            logger.error(
+                "RateLimiter Redis 操作失败，降级放行: tenant=%s key=%s error=%s",
+                tenant_id, key, exc,
+            )
+            return (True, 0)
+
+        retry_after = 60 - int(time.time()) % 60
+        allowed = current <= limit
+
+        if not allowed:
+            logger.warning(
+                "RateLimiter 触发: tenant=%s window=%s count=%d limit=%d",
+                tenant_id, window, current, limit,
+            )
+
+        return (allowed, retry_after)
+
+    async def close(self) -> None:
+        """释放 Redis 连接池与客户端"""
+        if self._redis is not None:
+            await self._redis.aclose()
+            self._redis = None
+            self._pool = None
+            logger.info("RateLimiter Redis 连接池已关闭")
 
 
 class MeteringCollector:
@@ -138,12 +198,17 @@ class AuditForwarder:
     # 排除路径前缀
     _EXCLUDED_PREFIXES = ("auth/", "health")
 
+    _BASE_BACKOFF = 1.0       # 初始退避 1 秒
+    _MAX_BACKOFF = 60.0       # 最大退避 60 秒
+
     def __init__(self):
         self.config = get_config()
         self._buffer: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._bg_task: Optional[asyncio.Task] = None
         self._running = False
+        self._consecutive_failures = 0
+        self._next_retry_at: float = 0.0
         # 关键动作关键字（小写），用于过滤 invoke 能力调用
         self._key_action_keywords = [
             kw.strip().lower()
@@ -254,13 +319,26 @@ class AuditForwarder:
                 asyncio.ensure_future(self._flush())
 
     async def _flush(self):
-        """批量推送缓冲条目到 platform ingest"""
+        """批量推送缓冲条目到 platform ingest
+
+        先 POST 再清除缓冲区；失败时保留数据并使用指数退避重试，
+        避免静默丢弃审计数据。
+        """
+        # 指数退避窗口内跳过本次 flush
+        now = time.monotonic()
+        if self._next_retry_at > 0 and now < self._next_retry_at:
+            return
+
         async with self._lock:
+            if not self._buffer:
+                return
             batch = list(self._buffer)
             self._buffer.clear()
+
         if not batch:
             return
 
+        success = False
         try:
             internal_auth = get_internal_auth()
             token = internal_auth.generate_token("sidecar")
@@ -277,8 +355,31 @@ class AuditForwarder:
                         "[AuditForwarder] ingest 返回 %s: %s",
                         resp.status_code, resp.text,
                     )
+                else:
+                    success = True
         except Exception:
-            logger.exception("[AuditForwarder] 推送审计日志失败")
+            logger.exception(
+                "[AuditForwarder] 推送审计日志失败，保留 %d 条待下次重试",
+                len(batch),
+            )
+
+        if success:
+            self._consecutive_failures = 0
+            self._next_retry_at = 0.0
+        else:
+            # 失败：将 batch 恢复到缓冲区前端，优先重试旧数据
+            async with self._lock:
+                self._buffer[:0] = batch
+            self._consecutive_failures += 1
+            backoff = min(
+                self._BASE_BACKOFF * (2 ** (self._consecutive_failures - 1)),
+                self._MAX_BACKOFF,
+            )
+            self._next_retry_at = now + backoff
+            logger.warning(
+                "[AuditForwarder] 连续失败 %d 次，下次重试在 %.1fs 后",
+                self._consecutive_failures, backoff,
+            )
 
     async def start_periodic_flush(self):
         """启动定时 flush 后台任务"""

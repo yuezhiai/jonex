@@ -1,0 +1,757 @@
+# ============================================================
+# 砂之船奥莱（超大型奥特莱斯商业综合体）· 服装搭配与商业活动本体定义（TBox）
+# ============================================================
+# 领域：奥特莱斯零售运营 / 品牌与门店 / 大促与年庆活动 / 服装单品与穿搭搭配
+# 适用语料：探店与穿搭类短视频 + 图文（小红书/抖音/视频号）、活动海报与规则页、
+#          品牌折扣清单、会员权益说明、商场运营与业绩公告（含 Sasseur REIT 公告）。
+#
+# 结构参考 deploy/config/ontology/technology.yaml 与 default.yaml：
+#   - entity_types：实体类型（name / aliases / attributes）
+#   - relation_types：关系类型（name / source / target / description）
+#   - attribute.type 取值：string | text | number | date | enum | boolean
+#   - OntologyRegistry 初始化时加载，供 OntologyExtractor 在 LLM 抽取阶段使用。
+#
+# 领域事实锚点（来自公开资料，用于对齐实体命名与消歧）：
+#   - 砂之船集团以国际化大型奥特莱斯商业运营为核心，主打「艺术商业」基因，
+#     单项目常以「砂之船艺术商业广场」形态出现，由奥特莱斯、意大利购物村、
+#     儿童世界、国际美食休闲街等多个主题 mall 组成复合体
+#     （来源：[砂之船校园招聘介绍](http://campus.51job.com/sasseur/index.htm)、
+#      [兰州砂之船公司简介](http://www.zhaopin.com/companydetail/CZ844560370.htm)，内容已改写以符合授权要求）。
+#   - 砂之船房地产投资信托（Sasseur REIT）2018 年 3 月于新交所主板上市，为亚洲首只奥莱 REIT，
+#     初始组合含 4 个奥莱：重庆两江、重庆璧山、合肥、昆明；母公司体系内另有更多在营奥莱
+#     （来源：[Sasseur REIT 官网](https://www.sasseurreit.com/)）。
+#   - 典型年度营销节点：年庆大促（Anniversary Sales）、国庆黄金周、Red Festival、年末大促
+#     （来源：[KGI FY25 研究报告](https://www.kgieworld.sg/securities/resources/ck/files/docs/research/SASSEUR%20REIT%20FY25%20UPDATE%20REPORT.pdf)、
+#      [Sasseur REIT 年庆销售公告报道](https://www.tipranks.com/news/company-announcements/sasseur-reit-reports-robust-sales-growth-at-anniversary-event)、
+#      [黄金周销售公告](https://links.sgx.com/1.0.0/corporate-announcements/CQNRTJ1E7NT09E57/821867_Sasseur_REIT_Achieves_Record_RMB276.1_Million_Sales.pdf)，内容已改写以符合授权要求）。
+#   ⚠️ 以上仅用于本体命名与别名对齐，不作为 ABox 事实写入；具体门店/折扣/价格一律以入库语料为准。
+#
+# ⚠️ 抽取要求（供 OntologyExtractor 提示，直接对应本领域的召回短板）：
+#   1) 「折扣与优惠规则」必须**逐条穷举**：同一活动下不同品牌/品类/楼层的折扣不同，
+#      不要只抽一句「全场低至 3 折」；满减门槛、封顶、是否可叠加、券的有效期、
+#      是否会员专享、线上线下适用范围，每条都要成为独立 Promotion 实体。
+#   2) 「价格」必须区分 original_price（吊牌价/专柜价）与 outlet_price（奥莱价/到手价），
+#      并保留币种与单位；出现「叠加券后到手」时用 final_price 记录，避免三者混淆。
+#   3) 「穿搭 Look」必须按**部位穷举单品**（外套/上装/下装/鞋/包/配饰），
+#      每件单品尽量补齐品类、品牌、颜色、面料、廓形、尺码建议，缺失留空而非猜测。
+#   4) 「时间」区分活动周期（start_date/end_date）与视频内时间点（时间戳类信息不入本体）。
+#   5) 「适配性结论」（显瘦/挡风/适合梨形身材/黄皮友好）必须落到 StylingRule 或
+#      SUITABLE_FOR_* 关系上，不要只写进自由文本，否则无法图查询。
+#   6) 「业绩与客流数字」统一进 Metric（含 period/scope/yoy_growth），
+#      并标注 accuracy_mark，区分官方口径与博主估算。
+
+version: 1
+domain: sasseur_fashion
+
+entity_types:
+  # ── 主体：集团 / 品牌 / 人 ───────────────────────────────
+  - name: Organization
+    aliases: ["公司", "集团", "企业", "运营方", "管理公司", "开发商", "业主", "投资信托", "REIT", "品牌方", "代理商", "经销商", "MCN", "机构", "赞助商", "合作方"]
+    attributes:
+      - { name: legal_name, type: string, required: false, description: "法定全称或官方名称，如砂之船（集团）控股有限公司" }
+      - { name: org_type, type: enum, required: false, description: "类型：group/operator/landlord/reit/brand_owner/agent/distributor/mcn/agency/sponsor/media" }
+      - { name: business_model, type: text, required: false, description: "商业模式或经营理念描述，如艺术商业 / (1+N)×数据 / EMA 租约模式" }
+      - { name: country, type: string, required: false, description: "所属国家/地区" }
+      - { name: listing_venue, type: string, required: false, description: "上市地与代码，如 SGX Mainboard / CRPU.SI" }
+      - { name: listing_date, type: date, required: false, description: "上市或成立日期" }
+      - { name: portfolio_size, type: string, required: false, description: "管理项目规模，如组合内 4 个奥莱 / 体系内 19 个奥莱" }
+      - { name: website, type: string, required: false, description: "官方网站或官方账号" }
+
+  - name: Brand
+    aliases: ["品牌", "牌子", "商标", "入驻品牌", "签约品牌", "国际品牌", "国潮品牌", "运动品牌", "奢侈品牌", "轻奢品牌", "设计师品牌", "买手品牌"]
+    attributes:
+      - { name: brand_en, type: string, required: false, description: "品牌英文/原文名，如 Nike/COACH/MaxMara，用于消歧与别名合并" }
+      - { name: brand_tier, type: enum, required: false, description: "定位层级：luxury/light_luxury/designer/international_sports/national_trend/mass/fast_fashion/kids/outdoor" }
+      - { name: category_focus, type: string, required: false, description: "主营品类，如女装/男装/运动鞋服/箱包/童装/家居" }
+      - { name: country_of_origin, type: string, required: false, description: "品牌来源国/地区" }
+      - { name: price_band, type: string, required: false, description: "价格带，如 300-800 元 / 千元级 / 万元级" }
+      - { name: typical_discount, type: string, required: false, description: "该品牌在奥莱的常规折扣区间，如 5-7 折 / 低至 2 折" }
+      - { name: is_anchor_tenant, type: boolean, required: false, description: "是否为主力店/品牌（对客流有带动作用）" }
+      - { name: target_audience, type: string, required: false, description: "目标客群，如 25-35 岁都市女性 / 亲子家庭 / 户外爱好者" }
+
+  - name: Person
+    aliases: ["人", "人物", "博主", "达人", "网红", "KOL", "主播", "造型师", "买手", "设计师", "店长", "导购", "嘉宾", "艺人", "主持人", "模特", "顾客", "消费者"]
+    attributes:
+      - { name: role, type: enum, required: false, description: "角色：blogger/kol/host/stylist/buyer/designer/store_manager/sales/guest/celebrity/model/customer/executive" }
+      - { name: platform, type: string, required: false, description: "活跃平台，如小红书/抖音/视频号/B站" }
+      - { name: follower_count, type: string, required: false, description: "粉丝量级，如 12.6 万" }
+      - { name: content_style, type: string, required: false, description: "内容风格，如平价穿搭/通勤通勤穿搭/奥莱捡漏/亲子探店" }
+      - { name: height, type: string, required: false, description: "身高（含单位），穿搭参考用，如 162cm" }
+      - { name: weight, type: string, required: false, description: "体重（含单位），穿搭参考用，如 52kg" }
+      - { name: usual_size, type: string, required: false, description: "日常尺码，如上身 M / 下身 27 码 / 鞋 38" }
+      - { name: affiliation, type: string, required: false, description: "所属机构/品牌/商场" }
+
+  # ── 场所：综合体 / 分区 / 门店 ───────────────────────────
+  - name: Mall
+    aliases: ["商场", "奥莱", "奥特莱斯", "购物中心", "商业综合体", "商业广场", "艺术商业广场", "购物村", "项目", "门店集群", "outlets"]
+    attributes:
+      - { name: mall_type, type: enum, required: false, description: "类型：outlet/shopping_village/art_commercial_plaza/mall/kids_mall/food_street/complex" }
+      - { name: city, type: string, required: false, description: "所在城市，如重庆/合肥/昆明/南京/长沙/兰州" }
+      - { name: district, type: string, required: false, description: "所在区域或商圈，如两江新区/璧山/望城区/江北新区" }
+      - { name: address, type: string, required: false, description: "详细地址" }
+      - { name: opening_date, type: date, required: false, description: "开业日期（年庆届数推算的基准）" }
+      - { name: gross_leasable_area, type: string, required: false, description: "可租面积/建筑面积（含单位），如 约 310,241 ㎡（组合合计）" }
+      - { name: floor_count, type: string, required: false, description: "楼层数或楼层区间，如 B1-4F" }
+      - { name: brand_count, type: string, required: false, description: "入驻品牌数量，如 400+ 品牌" }
+      - { name: occupancy_rate, type: string, required: false, description: "出租率，如 98.5% / 100%" }
+      - { name: positioning, type: text, required: false, description: "定位与业态构成描述，如奥莱+意大利购物村+儿童世界+美食街四大主题 mall" }
+      - { name: transport, type: text, required: false, description: "交通与停车信息，如地铁 X 号线/免费停车 2 小时/摆渡车班次" }
+      - { name: opening_hours, type: string, required: false, description: "营业时间，如 10:00-22:00，大促期间延长至 23:00" }
+      - { name: annual_sales, type: string, required: false, description: "年度销售额（含币种），如 RMB 2.x 十亿" }
+
+  - name: Zone
+    aliases: ["分区", "业态分区", "主题馆", "楼层", "区域", "馆", "街区", "中庭", "广场", "意大利购物村", "儿童世界", "美食街", "运动馆", "潮流馆", "艺术中心"]
+    attributes:
+      - { name: zone_type, type: enum, required: false, description: "类型：luxury/womenswear/menswear/sports/outdoor/kids/accessories/beauty/food/entertainment/art/atrium/service" }
+      - { name: floor, type: string, required: false, description: "所在楼层，如 1F/2F/B1" }
+      - { name: theme, type: string, required: false, description: "主题定位，如意大利购物村 / 国际美食休闲街" }
+      - { name: brand_mix, type: text, required: false, description: "该分区主要品牌构成描述" }
+      - { name: navigation_tip, type: text, required: false, description: "逛店动线建议，如先 2F 运动再下 1F 女装，避开中庭人流" }
+
+  - name: Store
+    aliases: ["门店", "店铺", "专卖店", "专柜", "旗舰店", "集合店", "折扣店", "工厂店", "快闪店", "店中店", "柜台"]
+    attributes:
+      - { name: store_type, type: enum, required: false, description: "类型：flagship/standard/multi_brand/factory_outlet/pop_up/shop_in_shop/counter" }
+      - { name: floor, type: string, required: false, description: "所在楼层" }
+      - { name: unit_no, type: string, required: false, description: "铺位号，如 1F-A012" }
+      - { name: area, type: string, required: false, description: "店铺面积（含单位）" }
+      - { name: opening_date, type: date, required: false, description: "开业/入驻日期" }
+      - { name: stock_depth, type: text, required: false, description: "货品深度与断码情况，如尺码齐全 / 仅剩 S 与 XL / 上季款为主" }
+      - { name: service_note, type: text, required: false, description: "服务信息，如可改裤长、支持退换、试衣间排队约 10 分钟" }
+
+  - name: Location
+    aliases: ["地点", "位置", "城市", "区县", "商圈", "地铁站", "停车场", "周边"]
+    attributes:
+      - { name: location_type, type: enum, required: false, description: "类型：city/district/business_circle/station/parking/landmark" }
+      - { name: address, type: string, required: false, description: "地址或所在区域" }
+      - { name: distance_note, type: string, required: false, description: "距离/耗时描述，如距市区 25km、地铁转摆渡约 40 分钟" }
+
+  # ── 活动：大促 / 年庆 / 现场活动 / 优惠 / 会员 ────────────
+  - name: Campaign
+    aliases: ["活动", "大促", "促销活动", "营销活动", "年庆", "周年庆", "店庆", "奥莱节", "购物节", "折扣季", "清仓", "黄金周", "双十一", "年末大促", "开季活动", "招商活动"]
+    attributes:
+      - { name: campaign_name, type: string, required: false, description: "活动官方名称，如「X 周年庆」「奥莱节」「红五月」「Red Festival」" }
+      - { name: campaign_type, type: enum, required: false, description: "类型：anniversary/outlet_festival/holiday/season_sale/clearance/member_day/new_store_opening/livestream/joint_marketing" }
+      - { name: edition, type: string, required: false, description: "届数/期数，如第 12 届 / 2026 春季场" }
+      - { name: start_date, type: date, required: false, description: "开始日期" }
+      - { name: end_date, type: date, required: false, description: "结束日期" }
+      - { name: duration, type: string, required: false, description: "持续时长，如 10 天 / 国庆 7 天假期" }
+      - { name: theme, type: string, required: false, description: "活动主题，如「艺术生活节」「秋冬焕新」" }
+      - { name: slogan, type: string, required: false, description: "活动口号/主视觉文案" }
+      - { name: scope, type: enum, required: false, description: "覆盖范围：single_mall/multi_mall/nationwide/online_only/omni_channel" }
+      - { name: participating_brand_count, type: string, required: false, description: "参与品牌数量，如 300+ 品牌参与" }
+      - { name: headline_discount, type: string, required: false, description: "主打折扣表述，如「低至 2 折」「折上 8 折」" }
+      - { name: channels, type: string, required: false, description: "投放与参与渠道，如小程序/公众号/抖音直播/门店现场" }
+      - { name: target_audience, type: string, required: false, description: "目标客群" }
+      - { name: first_day_sales, type: string, required: false, description: "首日销售额（含币种），如 RMB 233.9 百万" }
+      - { name: total_sales, type: string, required: false, description: "活动期总销售额（含币种）" }
+      - { name: yoy_growth, type: string, required: false, description: "同比增幅，如 +30% / 近 28%" }
+      - { name: footfall, type: string, required: false, description: "客流量，如 单日 12 万人次" }
+      - { name: is_recurring, type: boolean, required: false, description: "是否为年度固定节点（年庆/黄金周为 true）" }
+
+  - name: Event
+    aliases: ["现场活动", "演出", "演艺", "秀", "时装秀", "走秀", "发布会", "展览", "艺术展", "快闪", "工作坊", "亲子活动", "抽奖", "直播", "签售", "见面会", "沙龙", "打卡"]
+    attributes:
+      - { name: event_type, type: enum, required: false, description: "类型：fashion_show/exhibition/pop_up/workshop/performance/lottery/livestream/meetup/kids_activity/checkin_photo/press_conference" }
+      - { name: date, type: date, required: false, description: "举办日期" }
+      - { name: time_slot, type: string, required: false, description: "场次时间，如 每日 15:00 与 19:30 两场" }
+      - { name: venue, type: string, required: false, description: "举办地点，如中庭 / 1F 意大利购物村广场" }
+      - { name: host, type: string, required: false, description: "主办/承办方" }
+      - { name: guest, type: string, required: false, description: "嘉宾/艺人/达人" }
+      - { name: attendance, type: string, required: false, description: "参与人数/观演人数" }
+      - { name: participation_rule, type: text, required: false, description: "参与规则，如消费满 500 元可换取一次抽奖资格" }
+      - { name: reward, type: text, required: false, description: "奖品/礼品，如限量帆布袋、100 元无门槛券" }
+
+  - name: Promotion
+    aliases: ["优惠", "折扣", "满减", "券", "优惠券", "代金券", "礼券", "满赠", "返现", "折上折", "会员价", "特价", "秒杀", "第二件半价", "积分兑换", "以旧换新"]
+    attributes:
+      - { name: promo_type, type: enum, required: false, description: "类型：discount/threshold_off/coupon/gift_with_purchase/cashback/second_item/flash_sale/points_redeem/trade_in/member_price/bundle" }
+      - { name: discount_expression, type: string, required: false, description: "折扣或优惠原始表述（保留原文），如「低至 3 折」「满 1000 减 300」「折后再 8 折」" }
+      - { name: threshold, type: string, required: false, description: "门槛，如单笔满 1000 元 / 累计满 3 件" }
+      - { name: cap, type: string, required: false, description: "封顶或限制，如每人限领 2 张 / 单笔最高减 500 元" }
+      - { name: applicable_scope, type: text, required: false, description: "适用范围，如指定女装品牌 / 不含黄金珠宝与折扣商品" }
+      - { name: excluded_scope, type: text, required: false, description: "除外范围（单独抽取，避免与适用范围混淆）" }
+      - { name: stackable, type: boolean, required: false, description: "是否可与其他优惠叠加" }
+      - { name: valid_period, type: string, required: false, description: "有效期，如 3.8-3.15 / 领取后 7 天内" }
+      - { name: channel, type: enum, required: false, description: "领取或使用渠道：offline/miniprogram/app/livestream/third_party/wechat" }
+      - { name: member_only, type: boolean, required: false, description: "是否会员专享" }
+      - { name: quantity_limit, type: string, required: false, description: "数量限制/库存，如限量 500 份，先到先得" }
+
+  - name: MembershipTier
+    aliases: ["会员", "会员等级", "等级", "银卡", "金卡", "白金卡", "黑卡", "VIP", "SVIP", "积分体系"]
+    attributes:
+      - { name: tier_name, type: string, required: false, description: "等级名称" }
+      - { name: upgrade_threshold, type: string, required: false, description: "升级门槛，如年度累计消费 20000 元" }
+      - { name: points_rate, type: string, required: false, description: "积分倍率，如 1 元 1 分 / 大促期间 3 倍积分" }
+      - { name: benefits, type: text, required: false, description: "权益清单，如生日券、专属折扣、免费停车、休息室、优先入场" }
+      - { name: validity, type: string, required: false, description: "有效期与保级规则" }
+
+  - name: Metric
+    aliases: ["指标", "数据", "业绩", "销售额", "客流", "出租率", "坪效", "客单价", "转化率", "同比", "环比", "会员数", "增长率"]
+    attributes:
+      - { name: metric_name, type: string, required: false, description: "指标名称，如销售额/客流量/出租率/客单价/坪效/会员数/排队时长/停车费" }
+      - { name: value, type: string, required: false, description: "数值（含单位与币种），如 RMB 276.1 百万 / 98.5% / 12 万人次" }
+      - { name: unit, type: string, required: false, description: "计量单位" }
+      - { name: period, type: string, required: false, description: "统计周期，如 2024 年国庆 7 天 / 1Q2026 / 年庆首日" }
+      - { name: scope, type: string, required: false, description: "统计范围，如 4 店合计 / 重庆两江店 / 某品牌门店" }
+      - { name: yoy_growth, type: string, required: false, description: "同比变化，如 +28% / -4.6%" }
+      - { name: baseline, type: string, required: false, description: "对比基准，如较 2019 年疫情前 +55%" }
+      - { name: source, type: enum, required: false, description: "来源：official/announcement/research_report/media/blogger_estimate" }
+      - { name: accuracy_mark, type: enum, required: false, description: "精度：exact/rounded/estimate" }
+
+  - name: Award
+    aliases: ["奖项", "荣誉", "获奖", "评选", "榜单"]
+    attributes:
+      - { name: award_name, type: string, required: false, description: "奖项名称" }
+      - { name: awarding_body, type: string, required: false, description: "颁奖机构" }
+      - { name: year, type: number, required: false, description: "获奖年份" }
+      - { name: category, type: string, required: false, description: "奖项类别" }
+
+  # ── 穿搭：单品 / 配饰 / 面料 / 颜色 / 图案 ────────────────
+  - name: ApparelItem
+    aliases: ["单品", "服装", "衣服", "上装", "下装", "外套", "大衣", "羽绒服", "夹克", "风衣", "西装", "衬衫", "T恤", "针织衫", "毛衣", "卫衣", "马甲", "裤子", "牛仔裤", "西裤", "裙子", "半裙", "连衣裙", "套装", "内搭", "打底"]
+    attributes:
+      - { name: category, type: string, required: false, description: "品类大类，如外套/上装/下装/连衣裙/套装/内搭" }
+      - { name: subcategory, type: string, required: false, description: "细分品类，如羊毛大衣/工装夹克/阔腿牛仔裤/百褶半裙" }
+      - { name: gender, type: enum, required: false, description: "适用性别：women/men/unisex/kids" }
+      - { name: age_group, type: string, required: false, description: "适用年龄段，如 25-35 / 中年 / 童装 110-140cm" }
+      - { name: silhouette, type: string, required: false, description: "廓形，如 H 型/A 型/X 型/O 型/茧型/oversize/收腰" }
+      - { name: fit, type: enum, required: false, description: "合身度：slim/regular/relaxed/oversize/tailored" }
+      - { name: length, type: string, required: false, description: "长度，如短款/常规/中长款/过膝/及踝，或具体衣长 92cm" }
+      - { name: neckline, type: string, required: false, description: "领型，如圆领/V 领/翻领/立领/一字领/西装领" }
+      - { name: sleeve_type, type: string, required: false, description: "袖型，如落肩袖/插肩袖/泡泡袖/无袖/七分袖" }
+      - { name: waist_rise, type: string, required: false, description: "腰位，如高腰/中腰/低腰，或前裆长" }
+      - { name: closure, type: string, required: false, description: "门襟/闭合方式，如双排扣/暗门襟/拉链/系带" }
+      - { name: season_fit, type: string, required: false, description: "适穿季节，如春秋/冬季/四季" }
+      - { name: temperature_range, type: string, required: false, description: "适穿温度区间，如 5-12℃（挡风但不抗零下）" }
+      - { name: original_price, type: string, required: false, description: "吊牌价/专柜价（含币种），务必与奥莱价区分" }
+      - { name: outlet_price, type: string, required: false, description: "奥莱标价（含币种）" }
+      - { name: final_price, type: string, required: false, description: "叠加券后到手价（含币种）" }
+      - { name: discount, type: string, required: false, description: "折扣力度，如 3.5 折 / 相当于 65% off" }
+      - { name: size_range, type: string, required: false, description: "在售尺码，如 S-XL（M 已断码）" }
+      - { name: size_advice, type: string, required: false, description: "尺码建议，如版型偏小建议大一码 / 肩宽偏窄" }
+      - { name: sku, type: string, required: false, description: "款号/条码，如 21FW-CT0384" }
+      - { name: season_code, type: string, required: false, description: "上市季，如 25AW / 26SS（奥莱多为过季款，需标明）" }
+      - { name: is_past_season, type: boolean, required: false, description: "是否过季/往季款（奥莱货品结构关键属性）" }
+      - { name: care_instruction, type: string, required: false, description: "洗护要求，如仅可干洗 / 可机洗低温" }
+      - { name: highlight, type: text, required: false, description: "亮点与卖点，如内衬加厚、可拆卸帽子、免烫易打理" }
+      - { name: flaw_note, type: text, required: false, description: "缺点/瑕疵提示，如面料易起球、腰围偏大需搭腰带" }
+
+  - name: Accessory
+    aliases: ["配饰", "配件", "包", "包包", "手袋", "托特包", "斜挎包", "鞋", "鞋子", "靴子", "运动鞋", "高跟鞋", "帽子", "围巾", "腰带", "皮带", "眼镜", "墨镜", "首饰", "项链", "耳饰", "手表", "袜子", "丝巾", "手套"]
+    attributes:
+      - { name: accessory_type, type: enum, required: false, description: "类型：bag/shoes/hat/scarf/belt/eyewear/jewelry/watch/socks/gloves/hair_accessory" }
+      - { name: subcategory, type: string, required: false, description: "细分，如托特包/乐福鞋/切尔西靴/贝雷帽" }
+      - { name: material, type: string, required: false, description: "主材，如牛皮/羊皮/帆布/PU/合金" }
+      - { name: color, type: string, required: false, description: "颜色描述" }
+      - { name: size_or_capacity, type: string, required: false, description: "尺寸或容量，如 30×22×12cm / 可装 A4 与 13 寸电脑" }
+      - { name: heel_height, type: string, required: false, description: "鞋跟高度（鞋类），如 3cm 粗跟 / 平底" }
+      - { name: comfort_note, type: text, required: false, description: "舒适度与实穿反馈，如久走不累 / 需磨合 / 后跟磨脚" }
+      - { name: original_price, type: string, required: false, description: "吊牌价（含币种）" }
+      - { name: outlet_price, type: string, required: false, description: "奥莱价（含币种）" }
+      - { name: discount, type: string, required: false, description: "折扣力度" }
+      - { name: functional_role, type: string, required: false, description: "在整套 Look 中的作用，如提亮点缀/收束比例/通勤装载" }
+
+  - name: Material
+    aliases: ["面料", "材质", "成分", "布料", "羊毛", "羊绒", "棉", "亚麻", "真丝", "涤纶", "尼龙", "皮革", "牛仔", "灯芯绒", "羽绒", "针织", "醋酸", "莱赛尔", "混纺"]
+    attributes:
+      - { name: material_type, type: string, required: false, description: "材质类别，如天然纤维/化学纤维/皮革/混纺" }
+      - { name: composition, type: string, required: false, description: "成分配比（原文保留），如 羊毛 90% 羊绒 10% / 90 白鸭绒" }
+      - { name: weight_or_fill, type: string, required: false, description: "克重或充绒量，如 320g/㎡ / 充绒 180g / 蓬松度 800" }
+      - { name: texture, type: string, required: false, description: "手感与肌理，如挺括/柔软/垂顺/粗糙" }
+      - { name: warmth, type: string, required: false, description: "保暖性，如可抗 -10℃ / 秋季偏薄" }
+      - { name: breathability, type: string, required: false, description: "透气性" }
+      - { name: drape, type: string, required: false, description: "垂坠感（影响廓形表现）" }
+      - { name: wrinkle_resistance, type: string, required: false, description: "抗皱性/免烫性" }
+      - { name: pilling_risk, type: string, required: false, description: "起球风险" }
+      - { name: care_level, type: string, required: false, description: "打理难度，如需干洗/可机洗" }
+      - { name: is_sustainable, type: boolean, required: false, description: "是否环保/可持续材质（再生纤维等）" }
+
+  - name: Color
+    aliases: ["颜色", "色彩", "配色", "色系", "主色", "辅色", "点缀色", "莫兰迪色", "低饱和", "高饱和", "撞色", "同色系"]
+    attributes:
+      - { name: color_name, type: string, required: false, description: "颜色名称，如燕麦色/雾霾蓝/焦糖棕/正红" }
+      - { name: color_family, type: string, required: false, description: "所属色系，如中性色/大地色/蓝色系/黑白灰" }
+      - { name: hex, type: string, required: false, description: "近似色值，如 #C8B69B（可缺省）" }
+      - { name: tone, type: enum, required: false, description: "色调倾向：warm/cool/neutral" }
+      - { name: saturation, type: string, required: false, description: "饱和度描述，如低饱和/高饱和" }
+      - { name: brightness, type: string, required: false, description: "明度描述，如高明度/深色" }
+      - { name: pairing_role, type: enum, required: false, description: "在配色中的角色：main/secondary/accent/base" }
+      - { name: season_palette, type: string, required: false, description: "四季色彩型适配，如春季型/冬季型" }
+
+  - name: Pattern
+    aliases: ["图案", "花纹", "印花", "条纹", "格纹", "波点", "千鸟格", "碎花", "提花", "刺绣", "迷彩", "字母Logo", "纯色"]
+    attributes:
+      - { name: pattern_type, type: string, required: false, description: "图案类型" }
+      - { name: scale, type: string, required: false, description: "图案大小，如细条纹/大格纹（影响显瘦与视觉重量）" }
+      - { name: visual_effect, type: text, required: false, description: "视觉效果，如竖条纹显高、大面积格纹显宽" }
+      - { name: pairing_note, type: text, required: false, description: "混搭建议，如同图案不叠穿、图案单品全身仅一件" }
+
+  # ── 穿搭：风格 / 成套 Look / 场合 / 身材 / 规则 ───────────
+  - name: StyleGenre
+    aliases: ["风格", "穿搭风格", "调性", "通勤风", "极简风", "法式", "静奢风", "美拉德", "多巴胺", "山系", "户外风", "学院风", "复古风", "新中式", "街头", "机能风", "甜酷", "OldMoney"]
+    attributes:
+      - { name: style_name, type: string, required: false, description: "风格名称" }
+      - { name: keywords, type: string, required: false, description: "风格关键词，如低饱和、廓形、质感面料" }
+      - { name: typical_items, type: text, required: false, description: "典型单品组合，如西装外套 + 直筒西裤 + 乐福鞋" }
+      - { name: color_tendency, type: string, required: false, description: "常用色彩倾向" }
+      - { name: popular_period, type: string, required: false, description: "流行时段，如 2024 秋冬起走热" }
+      - { name: suitable_occasion, type: string, required: false, description: "适配场合概述" }
+
+  - name: Outfit
+    aliases: ["搭配", "穿搭", "造型", "Look", "整套", "套装搭配", "一日穿搭", "OOTD", "搭配方案", "叠穿"]
+    attributes:
+      - { name: outfit_name, type: string, required: false, description: "搭配名称/标题，如「奥莱 800 元通勤三件套」" }
+      - { name: look_code, type: string, required: false, description: "编号，如 LOOK-03" }
+      - { name: style, type: string, required: false, description: "整体风格（同时用 HAS_STYLE 关系建边）" }
+      - { name: occasion, type: string, required: false, description: "适用场合（同时用 SUITABLE_FOR_OCCASION 建边）" }
+      - { name: season, type: string, required: false, description: "适穿季节" }
+      - { name: temperature_range, type: string, required: false, description: "适穿温度区间，如 8-15℃" }
+      - { name: item_count, type: number, required: false, description: "单品数量（含配饰），用于核对是否逐件抽全" }
+      - { name: layering_level, type: string, required: false, description: "叠穿层数，如三层（内搭+针织+大衣）" }
+      - { name: color_scheme, type: string, required: false, description: "配色方案，如同色系深浅叠加 / 三色内" }
+      - { name: total_original_price, type: string, required: false, description: "整套吊牌价合计（含币种）" }
+      - { name: total_price, type: string, required: false, description: "整套到手价合计（含币种）" }
+      - { name: budget_level, type: string, required: false, description: "预算档位，如 500 元内 / 千元级" }
+      - { name: highlight, type: text, required: false, description: "整套亮点与穿着效果，如上短下长拉腿、腰线上提显高" }
+      - { name: source, type: enum, required: false, description: "来源：blogger/brand_lookbook/store_display/campaign_poster/user_share" }
+
+  - name: Occasion
+    aliases: ["场合", "场景", "用途", "通勤", "上班", "约会", "逛街", "旅行", "度假", "宴会", "婚礼", "年会", "面试", "健身", "亲子出行", "看展", "露营", "接送孩子"]
+    attributes:
+      - { name: occasion_type, type: enum, required: false, description: "类型：work/business/date/casual/travel/party/wedding/interview/sport/outdoor/family/exhibition/annual_meeting" }
+      - { name: formality, type: enum, required: false, description: "正式度：formal/business_casual/smart_casual/casual/sporty" }
+      - { name: dress_code, type: text, required: false, description: "着装要求，如需有领上装、避免过短下装" }
+      - { name: indoor_outdoor, type: enum, required: false, description: "室内外：indoor/outdoor/mixed" }
+      - { name: activity_intensity, type: string, required: false, description: "活动强度，如久站久走 / 长时间坐姿" }
+      - { name: duration, type: string, required: false, description: "持续时长，如全天 8 小时" }
+      - { name: weather_note, type: string, required: false, description: "天气与环境提示，如室内空调足需可脱卸外层" }
+
+  - name: BodyType
+    aliases: ["身材", "体型", "身型", "梨形", "苹果形", "沙漏型", "H型身材", "倒三角", "小个子", "高个子", "微胖", "骨架大", "肩宽", "腰粗", "腿粗"]
+    attributes:
+      - { name: shape, type: string, required: false, description: "体型分类，如梨形/苹果形/沙漏型/H 型/倒三角/X 型" }
+      - { name: height_range, type: string, required: false, description: "身高区间，如 155cm 以下 / 160-168cm" }
+      - { name: weight_range, type: string, required: false, description: "体重区间" }
+      - { name: proportion_feature, type: string, required: false, description: "比例特征，如上短下长、腰位偏低、五头身" }
+      - { name: common_concern, type: text, required: false, description: "常见修饰诉求，如显高、显瘦、遮胃、修饰手臂、平衡肩宽" }
+      - { name: recommended_silhouette, type: string, required: false, description: "推荐廓形" }
+      - { name: avoid_silhouette, type: string, required: false, description: "不建议廓形" }
+
+  - name: SkinTone
+    aliases: ["肤色", "色彩季型", "冷白皮", "暖黄皮", "小麦色", "黑皮", "春季型", "夏季型", "秋季型", "冬季型"]
+    attributes:
+      - { name: undertone, type: enum, required: false, description: "底调：cool/warm/neutral" }
+      - { name: depth, type: string, required: false, description: "深浅，如白皙/中等/偏深" }
+      - { name: suitable_palette, type: text, required: false, description: "适配色彩，如燕麦、驼、雾霾蓝" }
+      - { name: avoid_palette, type: text, required: false, description: "慎选色彩，如荧光黄、明黄" }
+
+  - name: StylingRule
+    aliases: ["搭配规则", "搭配技巧", "穿搭法则", "三色原则", "上短下长", "腰线上提", "内扎外松", "同色系叠穿", "避坑", "雷区", "注意事项"]
+    attributes:
+      - { name: rule_name, type: string, required: false, description: "规则名称，如三色原则、上短下长" }
+      - { name: rule_type, type: enum, required: false, description: "类别：color/proportion/layering/material/pattern/fit/accessory/occasion" }
+      - { name: statement, type: text, required: false, description: "规则表述（原话优先），如全身颜色控制在三色以内" }
+      - { name: rationale, type: text, required: false, description: "原理说明，如缩短上半身视觉长度以拉高腰线" }
+      - { name: do_or_dont, type: enum, required: false, description: "取向：do（推荐做法）/dont（避坑）" }
+      - { name: applicable_body_type, type: string, required: false, description: "适用体型" }
+      - { name: applicable_occasion, type: string, required: false, description: "适用场合" }
+      - { name: confidence, type: string, required: false, description: "确定性/普适度，如通用 / 因人而异" }
+
+  - name: SizeSpec
+    aliases: ["尺码", "码数", "尺寸表", "版型数据", "净尺寸", "肩宽", "胸围", "腰围", "臀围", "衣长", "裤长"]
+    attributes:
+      - { name: size_label, type: string, required: false, description: "尺码标识，如 S/M/L/165/88A/27 码/38 号" }
+      - { name: size_system, type: enum, required: false, description: "尺码体系：CN/EU/US/UK/JP/IT/FR/international" }
+      - { name: bust, type: string, required: false, description: "胸围（含单位）" }
+      - { name: waist, type: string, required: false, description: "腰围（含单位）" }
+      - { name: hip, type: string, required: false, description: "臀围（含单位）" }
+      - { name: shoulder, type: string, required: false, description: "肩宽（含单位）" }
+      - { name: length, type: string, required: false, description: "衣长/裤长（含单位）" }
+      - { name: fit_note, type: text, required: false, description: "版型偏差说明，如整体偏大半码、袖长偏短" }
+
+  - name: Season
+    aliases: ["季节", "季", "节令", "春夏", "秋冬", "换季", "开季", "节点", "春节", "五一", "国庆", "双十一", "圣诞", "跨年", "七夕", "母亲节", "儿童节"]
+    attributes:
+      - { name: season_code, type: string, required: false, description: "季标或节点标识，如 25AW/26SS/2026 春节" }
+      - { name: period, type: string, required: false, description: "对应时间区间，如 2026-02-15 至 2026-02-22" }
+      - { name: climate, type: string, required: false, description: "气候特征，如日均 8-15℃、多风" }
+      - { name: retail_significance, type: text, required: false, description: "零售意义，如清库存主战场 / 上新窗口 / 礼赠高峰" }
+
+  - name: Trend
+    aliases: ["趋势", "流行趋势", "潮流", "爆款", "热门单品", "流行色", "流行元素", "秀场趋势", "种草"]
+    attributes:
+      - { name: trend_name, type: string, required: false, description: "趋势名称，如廓形西装回归、勃艮第红" }
+      - { name: trend_type, type: enum, required: false, description: "类型：color/silhouette/material/style/item/pattern" }
+      - { name: season, type: string, required: false, description: "对应季节/季标" }
+      - { name: source, type: string, required: false, description: "来源，如四大时装周/社媒热度/平台成交数据" }
+      - { name: heat_level, type: string, required: false, description: "热度，如搜索量同比 +120%" }
+      - { name: lifecycle_stage, type: enum, required: false, description: "生命周期：emerging/rising/peak/declining" }
+      - { name: representative_item, type: string, required: false, description: "代表单品" }
+
+  - name: Concept
+    aliases: ["概念", "术语", "定义", "分类", "客群", "标签", "打法", "模式"]
+    attributes: []
+
+relation_types:
+  # ── 主体与场所归属 ───────────────────────────────────────
+  - name: OPERATES
+    source: Organization
+    target: Mall
+    description: "机构运营/管理某奥莱项目（如砂之船集团运营砂之船艺术商业广场各项目）"
+
+  - name: OWNS_ASSET
+    source: Organization
+    target: Mall
+    description: "机构持有某项目资产权益（如 Sasseur REIT 持有重庆两江、重庆璧山、合肥、昆明四个奥莱）"
+
+  - name: LOCATED_IN
+    source: Mall
+    target: Location
+    description: "项目位于某城市/商圈/地段"
+
+  - name: HAS_ZONE
+    source: Mall
+    target: Zone
+    description: "项目包含某主题馆/业态分区/楼层（如意大利购物村、儿童世界、国际美食休闲街）"
+
+  - name: HAS_STORE
+    source: Mall
+    target: Store
+    description: "项目内设有某门店"
+
+  - name: STORE_IN_ZONE
+    source: Store
+    target: Zone
+    description: "门店位于某分区/楼层，用于动线与逛店路线推理"
+
+  - name: STORE_OF_BRAND
+    source: Store
+    target: Brand
+    description: "门店隶属于某品牌（品牌 × 项目的具体落位）"
+
+  - name: BRAND_OWNED_BY
+    source: Brand
+    target: Organization
+    description: "品牌归属于某集团/代理商/经销商"
+
+  - name: ANCHOR_TENANT_OF
+    source: Brand
+    target: Mall
+    description: "品牌是某项目的主力店/招牌品牌"
+
+  - name: COMPETES_WITH
+    source: Mall
+    target: Mall
+    description: "同城或跨城项目之间的竞争关系（如同城奥莱对比）"
+
+  - name: WORKS_AT
+    source: Person
+    target: Organization
+    description: "人员任职于某机构/品牌/运营方"
+
+  - name: AWARDED
+    source: Organization
+    target: Award
+    description: "机构/项目获得某奖项或荣誉"
+
+  # ── 活动、优惠与会员 ─────────────────────────────────────
+  - name: HELD_AT
+    source: Campaign
+    target: Mall
+    description: "活动在某项目举办（跨店活动需对每个参与项目分别建边）"
+
+  - name: HAS_SUB_EVENT
+    source: Campaign
+    target: Event
+    description: "大促包含具体现场活动/演艺/展览/抽奖等子活动"
+
+  - name: HOSTS_EVENT
+    source: Mall
+    target: Event
+    description: "项目举办某现场活动（不隶属大促时使用）"
+
+  - name: PARTICIPATES_IN
+    source: Brand
+    target: Campaign
+    description: "品牌参与某活动（逐个品牌建边，支撑「哪些品牌参加了年庆」类查询）"
+
+  - name: FEATURES_PERSON
+    source: Event
+    target: Person
+    description: "活动出现某嘉宾/艺人/达人/主持人"
+
+  - name: OFFERS_PROMOTION
+    source: Campaign
+    target: Promotion
+    description: "活动提供某项优惠机制（一个活动通常挂多条 Promotion，必须逐条穷举）"
+
+  - name: BRAND_OFFERS_PROMOTION
+    source: Brand
+    target: Promotion
+    description: "品牌自有优惠（区别于商场统一优惠，避免把品牌折扣误挂到全场）"
+
+  - name: PROMOTION_APPLIES_TO
+    source: Promotion
+    target: ApparelItem
+    description: "优惠适用于某单品/品类（含除外情形请写入 excluded_scope）"
+
+  - name: PROMOTION_EXCLUSIVE_TO
+    source: Promotion
+    target: MembershipTier
+    description: "优惠为某会员等级专享"
+
+  - name: HAS_MEMBERSHIP_TIER
+    source: Mall
+    target: MembershipTier
+    description: "项目/运营方设有某会员等级"
+
+  - name: SUCCEEDS_EDITION
+    source: Campaign
+    target: Campaign
+    description: "活动届次接续（如第 12 届年庆紧接第 11 届），支撑同比与届数推理"
+
+  - name: SCHEDULED_IN
+    source: Campaign
+    target: Season
+    description: "活动落在某季节/节令节点（如国庆黄金周、跨年、换季清仓）"
+
+  - name: ACHIEVED_METRIC
+    source: Campaign
+    target: Metric
+    description: "活动取得某业绩指标（销售额/客流/同比），period 与 scope 必须写清"
+
+  - name: MALL_METRIC
+    source: Mall
+    target: Metric
+    description: "项目层面的经营指标（出租率/年销售额/客单价/坪效）"
+
+  - name: BRAND_METRIC
+    source: Brand
+    target: Metric
+    description: "品牌层面的表现指标（如某品牌大促期间销售翻倍）"
+
+  # ── 单品构成与属性 ─────────────────────────────────────
+  - name: SOLD_BY_BRAND
+    source: ApparelItem
+    target: Brand
+    description: "单品属于某品牌"
+
+  - name: AVAILABLE_AT
+    source: ApparelItem
+    target: Store
+    description: "单品在某门店在售（含断码情况写入 Store.stock_depth 或单品 size_range）"
+
+  - name: MADE_OF
+    source: ApparelItem
+    target: Material
+    description: "单品使用某面料/材质（多成分时逐个建边）"
+
+  - name: HAS_COLOR
+    source: ApparelItem
+    target: Color
+    description: "单品具有某颜色（多色可选时逐色建边）"
+
+  - name: HAS_PATTERN
+    source: ApparelItem
+    target: Pattern
+    description: "单品带某图案/花纹"
+
+  - name: HAS_SIZE_SPEC
+    source: ApparelItem
+    target: SizeSpec
+    description: "单品具有某尺码及其净尺寸数据"
+
+  - name: ACCESSORY_MADE_OF
+    source: Accessory
+    target: Material
+    description: "配饰使用某材质"
+
+  - name: SUBSTITUTE_OF
+    source: ApparelItem
+    target: ApparelItem
+    description: "平替关系：以更低价位实现相近效果（奥莱语料高频，需保留价差理由）"
+
+  - name: UPGRADE_OF
+    source: ApparelItem
+    target: ApparelItem
+    description: "升级款/同系列更高定位替代（区别于平替方向）"
+
+  # ── 搭配与适配 ─────────────────────────────────────────
+  - name: INCLUDES_ITEM
+    source: Outfit
+    target: ApparelItem
+    description: "整套搭配包含某服装单品（按部位逐件穷举：外套/上装/下装/内搭）"
+
+  - name: INCLUDES_ACCESSORY
+    source: Outfit
+    target: Accessory
+    description: "整套搭配包含某配饰（鞋/包/帽/围巾/首饰逐件建边）"
+
+  - name: MATCHES_WITH
+    source: ApparelItem
+    target: ApparelItem
+    description: "单品之间可互搭（如高腰阔腿裤配短款针织），是搭配推荐的核心边"
+
+  - name: PAIRS_WITH_ACCESSORY
+    source: ApparelItem
+    target: Accessory
+    description: "单品与配饰的搭配组合（如西装外套配乐福鞋）"
+
+  - name: CLASHES_WITH
+    source: ApparelItem
+    target: ApparelItem
+    description: "不建议同穿的组合（避坑类结论必须显式建边，别只留在文本里）"
+
+  - name: HAS_STYLE
+    source: Outfit
+    target: StyleGenre
+    description: "整套搭配呈现某风格"
+
+  - name: ITEM_FITS_STYLE
+    source: ApparelItem
+    target: StyleGenre
+    description: "单品契合某风格（用于按风格选品）"
+
+  - name: SUITABLE_FOR_OCCASION
+    source: Outfit
+    target: Occasion
+    description: "搭配适用于某场合（通勤/约会/宴会/旅行等）"
+
+  - name: ITEM_SUITABLE_FOR_OCCASION
+    source: ApparelItem
+    target: Occasion
+    description: "单品适用于某场合"
+
+  - name: SUITABLE_FOR_BODY
+    source: Outfit
+    target: BodyType
+    description: "搭配适合某体型（含显高/显瘦等修饰目标）"
+
+  - name: ITEM_SUITABLE_FOR_BODY
+    source: ApparelItem
+    target: BodyType
+    description: "单品适合某体型；不适合的情形请用 NOT_SUITABLE_FOR_BODY"
+
+  - name: NOT_SUITABLE_FOR_BODY
+    source: ApparelItem
+    target: BodyType
+    description: "单品不建议某体型选择（如短款廓形上衣不利于苹果形遮胃）"
+
+  - name: COLOR_SUITS_SKIN_TONE
+    source: Color
+    target: SkinTone
+    description: "颜色适配某肤色/色彩季型"
+
+  - name: COLOR_PAIRS_WITH
+    source: Color
+    target: Color
+    description: "颜色之间的配色关系（同色系/邻近色/撞色），承载配色方案推理"
+
+  - name: FOLLOWS_RULE
+    source: Outfit
+    target: StylingRule
+    description: "搭配遵循某搭配法则（如三色原则、上短下长）"
+
+  - name: VIOLATES_RULE
+    source: Outfit
+    target: StylingRule
+    description: "搭配违背某法则（用于反面案例与避坑说明）"
+
+  - name: RULE_APPLIES_TO_BODY
+    source: StylingRule
+    target: BodyType
+    description: "搭配法则针对某体型生效"
+
+  - name: FOR_SEASON
+    source: Outfit
+    target: Season
+    description: "搭配适用于某季节/节令"
+
+  - name: ITEM_FOR_SEASON
+    source: ApparelItem
+    target: Season
+    description: "单品适穿季节（配合 temperature_range 使用）"
+
+  # ── 趋势、内容与活动的连接 ───────────────────────────────
+  - name: REFLECTS_TREND
+    source: Outfit
+    target: Trend
+    description: "搭配体现某流行趋势"
+
+  - name: ITEM_REFLECTS_TREND
+    source: ApparelItem
+    target: Trend
+    description: "单品体现某流行趋势/爆款元素"
+
+  - name: TREND_IN_SEASON
+    source: Trend
+    target: Season
+    description: "趋势属于某季节/季标"
+
+  - name: RECOMMENDED_BY
+    source: Outfit
+    target: Person
+    description: "搭配由某博主/造型师/店长推荐（区分推荐主体，便于溯源）"
+
+  - name: STYLED_FROM_CAMPAIGN
+    source: Outfit
+    target: Campaign
+    description: "搭配来自某次活动/大促现场（如年庆探店成套搭配）"
+
+  - name: SHOT_AT
+    source: Outfit
+    target: Mall
+    description: "搭配在某项目/门店拍摄或选购完成"
+
+  - name: TARGETS_AUDIENCE
+    source: Campaign
+    target: Concept
+    description: "活动面向某客群标签（如亲子家庭、Z 世代、通勤白领）"
+
+  - name: RELATES_TO
+    source: Concept
+    target: Concept
+    description: "概念之间的关联（兜底关系，避免强塞到具体关系上）"
+
+constraints:
+  - type: required_attribute
+    entity: Campaign
+    attribute: campaign_name
+    severity: warning
+
+  - type: required_attribute
+    entity: Promotion
+    attribute: discount_expression
+    severity: warning
+
+  - type: required_attribute
+    entity: ApparelItem
+    attribute: category
+    severity: warning
+
+  - type: required_attribute
+    entity: Outfit
+    attribute: occasion
+    severity: warning
+
+  - type: required_attribute
+    entity: Mall
+    attribute: city
+    severity: warning
+
+  - type: required_attribute
+    entity: Metric
+    attribute: value
+    severity: warning
+
+disambiguation:
+  case_insensitive: true
+  alias_merge: true
+  # 常见歧义处理约定（供抽取阶段参考）：
+  #   - 「砂之船」单独出现时按上下文判定指集团（Organization）还是具体项目（Mall）；
+  #     出现城市/区县限定（重庆两江、璧山、合肥、昆明、南京江北、长沙望城等）一律建成 Mall。
+  #   - 「意大利购物村」「儿童世界」「国际美食休闲街」是同一综合体下的 Zone，不要建成独立 Mall。
+  #   - 「年庆」「周年庆」「店庆」归一到同一 Campaign（campaign_type=anniversary），届数写入 edition。
+  #   - 品牌中英文名（如 COACH / 蔻驰）通过 Brand.brand_en 合并，别建两个实体。
+  #   - 「折扣」若描述整场活动写入 Campaign.headline_discount，若为具体规则一律建 Promotion 实体。

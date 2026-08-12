@@ -102,9 +102,11 @@ class OpenAIDriver(BaseModelDriver):
         choice = (raw.get("choices") or [{}])[0]
         msg = choice.get("message", {})
         text = msg.get("content", "") or ""
-        reasoning = (
-            msg.get("reasoning_content") if cap.supports_thinking else None
-        )
+        # [jonex] Some backends (ollama heretic, llama.cpp) emit reasoning
+        # under ``reasoning`` (no underscore) instead of the OpenAI-standard
+        # ``reasoning_content``.  Always extract when available so downstream
+        # adapters (base64_caption_adapter) can fall back when content=="".
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or None
         finish_reason = choice.get("finish_reason", "")
 
         # Content filter: empty text + content_filter → error, not silent

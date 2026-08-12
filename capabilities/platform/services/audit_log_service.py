@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from jonex_core.common.audit_resource_enricher import ResourceNameEnricher
 from jonex_core.common.logger import get_logger
 from jonex_core.common.tenant import require_tenant
 
@@ -391,6 +392,12 @@ class AuditLogService:
                 item.action, item.resource
             )
             items_with_label.append(log)
+
+        # 资源名称富化
+        if items_with_label and self.session:
+            enricher = ResourceNameEnricher(self.session)
+            await enricher.enrich_batch(items_with_label)
+
         return AuditLogListResponse(
             total=total,
             items=items_with_label,
@@ -439,6 +446,12 @@ class AuditLogService:
                 item.action, item.resource
             )
             items_with_label.append(log)
+
+        # 资源名称富化
+        if items_with_label and self.session:
+            enricher = ResourceNameEnricher(self.session)
+            await enricher.enrich_batch(items_with_label)
+
         return AuditLogListResponse(
             total=total,
             items=items_with_label,

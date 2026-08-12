@@ -25,6 +25,15 @@ logger = logging.getLogger("llm_gateway")
 # 预留：按 model 名细化到多上游的映射表
 MODEL_ROUTE_OVERRIDES: dict[str, str] = {}
 
+# [jonex] 上游模型名别名映射：某些客户端（如 LiteLLM）会做内部模型别名转换，
+# 导致发往 LLM Gateway 的 model 名与上游实际注册的 model 名不一致。
+# 此表将入站 model 名映射为上游兼容名称后转发。
+# 示例：OpenKB 的 LiteLLM 把 deepseek-v4-flash-202605→gpt-5.4，
+# 但腾讯 TokenHub 只认 deepseek-v4-flash-202605。
+MODEL_ALIAS_MAP: dict[str, str] = {
+    "gpt-5.4": "deepseek-v4-flash-202605",
+}
+
 
 def _upstream_path(request_path: str) -> str:
     """将网关请求路径映射到上游 API 路径（不含 /v1，host 基地址已包含）。"""
@@ -67,6 +76,17 @@ def upstream_headers(upstream_key: str, request: Request) -> dict[str, str]:
         headers["User-Agent"] = ua
 
     return headers
+
+
+def _apply_model_alias(body: dict) -> None:
+    """将入站 model 名按 MODEL_ALIAS_MAP 映射为上游兼容名称。"""
+    if not isinstance(body, dict):
+        return
+    model = body.get("model")
+    if model and model in MODEL_ALIAS_MAP:
+        new_model = MODEL_ALIAS_MAP[model]
+        logger.info("模型别名映射 | %s → %s", model, new_model)
+        body["model"] = new_model
 
 
 def _maybe_disable_thinking(path: str, body: dict, ctx: MeteringContext) -> None:
@@ -167,8 +187,8 @@ async def proxy_nonstream(
     host, key = resolve_upstream(request.url.path, body)
     cfg = get_config()
 
+    _apply_model_alias(body)
     _maybe_disable_thinking(request.url.path, body, ctx)
-
     url = f"{host}{_upstream_path(request.url.path)}"
     logger.info("转发上游(非流式) | req_id=%s url=%s model=%s", ctx.request_id, url, body.get("model"))
 
@@ -277,8 +297,8 @@ async def proxy_stream(
     host, key = resolve_upstream(request.url.path, body)
     cfg = get_config()
 
+    _apply_model_alias(body)
     _maybe_disable_thinking(request.url.path, body, ctx)
-
     # dict 合并 stream_options，仅补 include_usage 不覆盖（循环外只做一次）
     body["stream_options"] = {
         **body.get("stream_options", {}),

@@ -71,6 +71,7 @@ export function defineAppConfig({ appId, scope, port }: DefineAppConfigOptions) 
           '@': `${pathSrc}`,
           '@jonex/shell-sdk': path.resolve(__dirname, 'shared/shell-sdk/src/index.ts'),
           '@jonex/platform-theme': path.resolve(__dirname, 'shared/platform-theme/src'),
+          '@jonex/shared-lib': path.resolve(__dirname, 'shared/shared-lib/src/index.ts'),
         },
       },
       build: {

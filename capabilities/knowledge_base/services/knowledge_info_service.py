@@ -20,6 +20,20 @@ class KnowledgeInfoService:
         space_id = data["space_id"]
         kb_name = data["name"]
 
+        # [jonex] kb_type 白名单校验：裸 dict 透传无类型校验，非法值会静默降级
+        from .kb_type_service import DEFAULT_KB_TYPE, VALID_KB_TYPES
+        raw_kb_type = (data.get("kb_type") or "").strip() or DEFAULT_KB_TYPE
+        if raw_kb_type not in VALID_KB_TYPES:
+            from jonex_core.common.exceptions import InvalidParameterError
+            from jonex_core.common.i18n import translate
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.invalid_kb_type",
+                    params={"value": raw_kb_type, "valid": ", ".join(sorted(VALID_KB_TYPES))},
+                    fallback=f"知识库类型不合法：{raw_kb_type}，可选值：{', '.join(sorted(VALID_KB_TYPES))}",
+                ),
+            )
+
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
             obj = await repo.create(
@@ -31,6 +45,7 @@ class KnowledgeInfoService:
                 data_source_types=data.get("data_source_types", []),
                 status=data.get("status", "synced"),
                 owner_id=data.get("owner_id"),
+                kb_type=raw_kb_type,  # [jonex]
             )
 
             # ── 自动绑定：确保该 space 下的知识库对知识检索可见 ──
@@ -97,6 +112,22 @@ class KnowledgeInfoService:
             )
             data = obj.to_dict(space_name=space_name)
             data["document_count"] = doc_count_map.get(obj.id, 0)
+
+        # [jonex] openkb 管线：本体统计走 OpenKB Wiki（Neo4j 里恒空，读了会误报 0）
+        if data.get("kb_type") == "openkb":
+            from .openkb_service import KnowledgeCompilerService
+            try:
+                graph = await KnowledgeCompilerService().get_graph(
+                    kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
+                ) or {}
+                data["entity_count"] = len(graph.get("entities") or [])
+                data["relation_count"] = len(graph.get("relationships") or [])
+                data["ontology_degraded"] = False
+            except Exception:  # noqa: BLE001
+                data["entity_count"] = 0
+                data["relation_count"] = 0
+                data["ontology_degraded"] = True
+            return data
 
         # 集成本体 kb 维度统计：本体实例数 / 关系数 / 降级标记。
         # get_kb_statistics 自带 Neo4j 优雅降级（不可用时计数为 0 + degraded=True）；
@@ -172,6 +203,19 @@ class KnowledgeInfoService:
 
     async def update(self, kb_id: str, tenant_id: str, data: dict) -> dict:
         tenant_id = require_tenant(tenant_id)
+        # [jonex] kb_type 创建后不可变：改类型意味着旧数据全部失效（openkb→lightrag
+        # 要清空 Wiki 重推 LightRAG；lightrag→openkb 要清空 Neo4j 重编译），
+        # 没有安全的原地切换路径。如需更换请新建知识库。
+        # 连旧名 pipeline_type 一起拦：防止调用方误以为旧名仍有效
+        if "kb_type" in data or "pipeline_type" in data:
+            from jonex_core.common.exceptions import InvalidParameterError
+            from jonex_core.common.i18n import translate
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.kb_type_immutable",
+                    fallback="知识库类型创建后不可修改，如需更换请新建知识库",
+                ),
+            )
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
             await repo.get_required(kb_id, tenant_id)

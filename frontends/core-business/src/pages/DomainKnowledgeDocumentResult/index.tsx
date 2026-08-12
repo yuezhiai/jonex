@@ -18,8 +18,9 @@ import {
   reparseDocument,
   retryDocumentOntology,
   getDocumentViewTicket,
+  getDomainKnowledgeDetail,
 } from '@/api/domainKnowledge';
-import type { ManualDocItem, OntologyInstanceSummary, RelationInstanceSummary } from '@/types/domainKnowledge';
+import type { ManualDocItem, OntologyInstanceSummary, RelationInstanceSummary, KnowledgeBaseType } from '@/types/domainKnowledge';
 import StageDetailCard from './StageDetailCard';
 import CompileResultPanel from './CompileResultPanel';
 import type { ProcessingStage } from './StageDetailCard';
@@ -33,6 +34,25 @@ function getDocStatusText(t: (key: string) => string): Record<string, string> {
     parsing: t('domainKnowledge.docStatus.parsing'),
     pending: t('domainKnowledge.docStatus.pending'),
   };
+}
+
+/** [jonex] openkb 文档头部状态：解析完成（ready）后按 llm_wiki_compile_status
+ *  细化——ready 只代表解析完成，LLM-Wiki 编译是独立异步状态，
+ *  不能用 lightrag 的「入库·解析·编译」文案误导用户。 */
+function openkbDocStatusText(doc: ManualDocItem, t: (key: string) => string): string {
+  if (doc.status !== 'ready') return getDocStatusText(t)[doc.status] || doc.status;
+  switch (doc.llmWikiCompileStatus) {
+    case 'compiled':
+      return t('domainKnowledge.docStatus.openkbCompiled');
+    case 'compiling':
+      return t('domainKnowledge.docStatus.openkbCompiling');
+    case 'failed':
+      return t('domainKnowledge.docStatus.openkbCompileFailed');
+    case 'stale':
+      return t('domainKnowledge.docStatus.openkbCompileStale');
+    default:
+      return t('domainKnowledge.docStatus.openkbNotCompiled');
+  }
 }
 
 const DOC_STATUS_COLOR: Record<string, string> = {
@@ -53,6 +73,7 @@ export default function DomainKnowledgeDocumentResult() {
   const [recompileLoading, setRecompileLoading] = useState(false);
   const [entityTypes, setEntityTypes] = useState<OntologyInstanceSummary[] | null>(null);
   const [relationTypes, setRelationTypes] = useState<RelationInstanceSummary[] | null>(null);
+  const [kbType, setKbType] = useState<KnowledgeBaseType>('lightrag');
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [videoOpen, setVideoOpen] = useState(false);
   const [videoTimeStart, setVideoTimeStart] = useState<number | null>(null);
@@ -64,15 +85,43 @@ export default function DomainKnowledgeDocumentResult() {
       .then(setDoc)
       .catch(() => message.error(t('domainKnowledge.documentDetailLoadFailed')))
       .finally(() => setLoading(false));
+  }, [id, docId, t]);
 
+  // [jonex] 取 KB 详情拿 kbType，前端据此对「编译结果」Tab 分流渲染
+  useEffect(() => {
+    if (!id) return;
+    getDomainKnowledgeDetail(id)
+      .then((detail) => setKbType(detail.kbType || 'lightrag'))
+      .catch(() => setKbType('lightrag'));
+  }, [id]);
+
+  // [jonex] 编译状态轮询：任务化后终态由对账巡检回写（最长 30s 延迟），
+  // 前端每 10s 刷新文档详情直到 compiled/failed。仅 openkb KB 轮询
+  // （lightrag 文档 llmWikiCompileStatus 恒 undefined，不加门会永不停）。
+  // 必须传 t——缺省时 mapBackendDoc 的状态展示串会变成 i18n key 原文。
+  useEffect(() => {
+    if (!id || !docId || kbType !== 'openkb') return;
+    const status = doc?.llmWikiCompileStatus;
+    if (status === 'compiled' || status === 'failed') return;   // 终态停止轮询
+    const timer = setInterval(() => {
+      getManualDocumentDetail(id, docId, t)
+        .then((d) => setDoc((prev) => ({ ...prev, ...d })))
+        .catch(() => {});
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [id, docId, kbType, t, doc?.llmWikiCompileStatus]);
+
+  // 本体类型列表只服务于 lightrag 的 OntologyTab/RelationTab 类型筛选；
+  // openkb 管线不跑本体抽取，跳过无效请求。
+  useEffect(() => {
+    if (!id || kbType === 'openkb') return;
     getOntologyEntityTypes(id)
       .then((res) => setEntityTypes(res.items))
       .catch(() => {});
-
     getOntologyRelationTypes(id)
       .then((res) => setRelationTypes(res.items))
       .catch(() => {});
-  }, [id, docId, t]);
+  }, [id, kbType]);
 
   // 视频文档：页面加载时自动获取播放 URL
   useEffect(() => {
@@ -140,6 +189,9 @@ export default function DomainKnowledgeDocumentResult() {
         <CompileResultPanel
           kbId={id}
           docId={docId}
+          kbType={kbType}
+          compileStatus={doc?.llmWikiCompileStatus}
+          llmWikiCompileError={doc?.llmWikiCompileError}
           activeSubNav={activeSubNav}
           onSubNavChange={setActiveSubNav}
           entityTypes={entityTypes}
@@ -208,7 +260,9 @@ export default function DomainKnowledgeDocumentResult() {
                       background: DOC_STATUS_COLOR[doc?.status || ''] || '#94a3b8',
                     }}
                   >
-                    {getDocStatusText(t)[doc?.status || ''] || doc?.status || t('common.unknown')}
+                    {kbType === 'openkb'
+                      ? (doc ? openkbDocStatusText(doc, t) : t('common.unknown'))
+                      : getDocStatusText(t)[doc?.status || ''] || doc?.status || t('common.unknown')}
                   </Tag>
                 </Space>
 

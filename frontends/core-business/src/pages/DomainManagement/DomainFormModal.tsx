@@ -84,7 +84,7 @@ export default function DomainFormModal({
         >
           <Input placeholder={t('rules.placeholder')} />
         </Form.Item>
-        <Form.Item name="kb_ids" label={t('domainManagement.kb')}>
+        <Form.Item name="kb_ids" label={t('domainManagement.kb')} extra={t('domainManagement.kbHint')}>
           <Checkbox.Group style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
             {availableKbs.map((kb) => (
               <Checkbox key={kb.id} value={kb.id}>
@@ -92,7 +92,6 @@ export default function DomainFormModal({
               </Checkbox>
             ))}
           </Checkbox.Group>
-          <div className="yx-form-hint">{t('domainManagement.kbHint')}</div>
         </Form.Item>
         <Form.Item name="status" label={t('domainManagement.status')} valuePropName="checked">
           <Switch checkedChildren={t('status.active')} unCheckedChildren={t('status.inactive')} />

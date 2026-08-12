@@ -11,9 +11,15 @@ from jonex_core.security.internal_auth import (
     get_internal_auth,
     verify_internal_service,
 )
+from jonex_core.security.user_auth import (
+    require_admin,
+    require_role,
+)
 
 __all__ = [
     "InternalAuth",
     "get_internal_auth",
     "verify_internal_service",
+    "require_admin",
+    "require_role",
 ]

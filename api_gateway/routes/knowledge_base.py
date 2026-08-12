@@ -38,8 +38,11 @@ from capabilities.knowledge_base.dtos import (
     OntologyNeighborRequest,
     OntologyRelationListRequest,
     OntologyRetryRequest,
+    LlmWikiSearchRequest,
+    MixSearchRequest,
     OntologySearchRequest,
     OntologyStatsRequest,
+    DeepSearchRequest,
     ParseResultDocumentListRequest,
     ParseResultEntityListRequest,
     ParseResultGraphRequest,
@@ -681,6 +684,44 @@ async def search_ontology(request: Request, payload: OntologySearchRequest):
     return success_response(data=result)
 
 
+# ── [jonex] openkb 分流 — 新增端点 ──
+
+@router.post("/search/llmwiki", summary="OpenKB Wiki 检索（只查 openkb 管线）")
+async def search_llmwiki(request: Request, payload: LlmWikiSearchRequest):
+    """只查 OpenKB Wiki 编译产物的检索端点。含 lightrag KB 时显式报错，指路 /search/mix。"""
+    result = await _call_kb_capability(
+        request,
+        "search_llmwiki",
+        _schema_payload(payload),
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.post("/search/mix", summary="混合管线检索统一入口（分流器）")
+async def search_mix(request: Request, payload: MixSearchRequest):
+    """统一检索入口：按 pipeline_type 分组扇出到 LightRAG / OpenKB，支持混合选库。"""
+    result = await _call_kb_capability(
+        request,
+        "search_mix",
+        _schema_payload(payload),
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.post("/search/deep", summary="深度查询（意图路由 + 分解编排 + 汇总计算）")
+async def search_deep(request: Request, payload: DeepSearchRequest):
+    """深度查询：simple 问题直连本体优先，complex 问题走分解-取证-汇总编排。"""
+    result = await _call_kb_capability(
+        request,
+        "deep_query",
+        _schema_payload(payload),
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
 @router.post("/qa/ask", summary="问答查询（基于 RAG）")
 async def qa_ask(
     request: Request,
@@ -1134,6 +1175,37 @@ async def get_parse_result_graph(
     return success_response(data=result)
 
 
+# ── [jonex] OpenKB Wiki 阅读模式（编译结果页）──
+
+
+@router.get("/parse-results/wiki-page", summary="读取 OpenKB Wiki 页面内容")
+async def get_parse_result_wiki_page(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+    path: str = Query(..., min_length=1, max_length=256, description="wiki 相对路径，如 entities/xxx"),
+):
+    """读取单个 Wiki 页面 markdown（实体/概念/摘要页正文）。"""
+    result = await _call_kb_capability(
+        request, "get_wiki_page",
+        {"knowledge_base_id": knowledge_base_id, "path": path},
+    )
+    return success_response(data=result)
+
+
+@router.get("/parse-results/wiki-contents", summary="列出 OpenKB Wiki 页面树（按文档过滤）")
+async def get_parse_result_wiki_contents(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+    document_id: str = Query(..., min_length=1, max_length=64, description="文档 ID，按文档过滤编译产物"),
+):
+    """列出文档级 Wiki 页面树（摘要/实体/概念三组，sources 归属过滤）。"""
+    result = await _call_kb_capability(
+        request, "list_wiki_contents",
+        {"knowledge_base_id": knowledge_base_id, "document_id": document_id},
+    )
+    return success_response(data=result)
+
+
 @router.get("/documents/{document_id}/parse-result", summary="获取单文档解析结果")
 async def get_document_parse_result(
     request: Request,
@@ -1318,6 +1390,20 @@ async def delete_service(request: Request, service_id: str):
     """删除指定领域服务"""
     result = await _call_kb_capability(request, "delete_service", {"service_id": service_id})
     return success_response(data=result)
+
+
+@router.post("/services/{service_id}/enable", summary="启用领域服务")
+async def enable_service(request: Request, service_id: str):
+    """启用指定领域服务"""
+    result = await _call_kb_capability(request, "enable_service", {"service_id": service_id})
+    return success_response(data=result, message="领域服务已启用")
+
+
+@router.post("/services/{service_id}/disable", summary="停用领域服务")
+async def disable_service(request: Request, service_id: str):
+    """停用指定领域服务"""
+    result = await _call_kb_capability(request, "disable_service", {"service_id": service_id})
+    return success_response(data=result, message="领域服务已停用")
 
 
 @router.get("/services/{service_id}/permissions", summary="获取领域服务权限")

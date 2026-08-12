@@ -305,3 +305,81 @@ CREATE TABLE IF NOT EXISTS metering.llm_usage_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_daily_tenant
     ON metering.llm_usage_daily (tenant_id, day_local);
+
+-- MCP Key 鉴权表（v1.2 MCP Server）
+-- v1.3 Phase 07: 新增 expires_at（有效期）、org_id（归属组织）
+CREATE TABLE IF NOT EXISTS platform.mcp_keys (
+    id              VARCHAR(64) PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    name            VARCHAR(255) NOT NULL DEFAULT '',
+    key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
+    key_hash        VARCHAR(64) NOT NULL,
+    permissions     VARCHAR(512) NOT NULL DEFAULT 'read',
+    allowed_kb_ids  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_by      VARCHAR(128),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ,
+    org_id          VARCHAR(64),
+    revoked_at      TIMESTAMPTZ,
+    last_used_at    TIMESTAMPTZ,
+    last_used_ip    VARCHAR(64),
+    is_deleted      INT NOT NULL DEFAULT 0,
+    UNIQUE(key_hash)
+);
+
+CREATE INDEX idx_mcp_keys_tenant_active
+    ON platform.mcp_keys(tenant_id)
+    WHERE revoked_at IS NULL;
+
+-- MCP Key ↔ 领域服务映射中间表（v1.3 Phase 2 B2 前置）
+-- v1.3 Phase 07: 新增 permission_level（权限级别）
+CREATE TABLE IF NOT EXISTS platform.mcp_key_service_mappings (
+    mcp_key_id        VARCHAR(64) NOT NULL,
+    service_id        VARCHAR(64) NOT NULL,
+    permission_level  VARCHAR(16) NOT NULL DEFAULT 'call',
+    PRIMARY KEY(mcp_key_id, service_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mk_sv_mapping_key
+    ON platform.mcp_key_service_mappings(mcp_key_id);
+
+CREATE INDEX IF NOT EXISTS idx_mk_sv_mapping_service
+    ON platform.mcp_key_service_mappings(service_id);
+
+-- MCP Key 归属组织表（v1.3 Phase 07）
+CREATE TABLE IF NOT EXISTS platform.mcp_organizations (
+    id          VARCHAR(64) PRIMARY KEY,
+    tenant_id   VARCHAR(64) NOT NULL,
+    name        VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_deleted  INT NOT NULL DEFAULT 0,
+    UNIQUE(tenant_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_orgs_tenant
+    ON platform.mcp_organizations(tenant_id);
+
+-- MCP 服务发布状态表
+-- 独立存储 MCP 发布状态，避免跨 capability 修改 knowledge_base schema
+CREATE TABLE IF NOT EXISTS platform.mcp_service_publish (
+    id              VARCHAR(64) PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    service_id      VARCHAR(64) NOT NULL,
+    is_published    INT NOT NULL DEFAULT 0,
+    published_at    TIMESTAMPTZ,
+    published_by    VARCHAR(64),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ,
+    UNIQUE(tenant_id, service_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_tenant
+    ON platform.mcp_service_publish(tenant_id);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_service
+    ON platform.mcp_service_publish(service_id);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_tenant_published
+    ON platform.mcp_service_publish(tenant_id)
+    WHERE is_published = 1;

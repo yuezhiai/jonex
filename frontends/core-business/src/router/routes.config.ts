@@ -63,7 +63,6 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'domain-space',
           element: DomainSpace,
           title: T('domainSpace.management'),
-          menu: { icon: 'BlockOutlined', order: 2, roles: ['admin', 'user'] },
         },
         { path: 'domain-space/new', element: DomainSpaceCreate, title: T('domainSpace.create') },
         { path: 'domain-space/:id/settings', element: DomainSpaceSettings, title: T('route.domainSpaceSettings') },

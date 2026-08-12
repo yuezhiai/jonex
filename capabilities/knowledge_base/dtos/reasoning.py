@@ -16,6 +16,14 @@ STAGE_FUSION = "fusion"
 STAGE_RETRIEVAL_RERANK = "retrieval_rerank"   # LightRAG 检索期重排（召回后、送 LLM 前）
 STAGE_REF_RETRIEVE = "ref_retrieve"            # 本体成功后取 chunk 引用（RAG 检索，不含生成）
 STAGE_RERANK = "rerank"                        # 平台引用期重排（LLM 答完后，多 KB fallback 引用）
+STAGE_OPENKB_QUERY = "openkb_query"            # [jonex] OpenKB Wiki 检索
+STAGE_TIMELINE_GRAPH = "timeline_graph"       # 图查询模板（时间线/枚举/计数意图走结构化图查询）
+STAGE_STRICT_ATTEMPT = "strict_attempt"        # 严格模式·单次尝试
+STAGE_STRICT_VERIFY = "strict_verify"           # 严格模式·最终校验
+STAGE_INTENT_CLASSIFY = "intent_classify"       # 深度查询·意图分类
+STAGE_QUERY_PLAN = "query_plan"                 # 深度查询·查询分解规划
+STAGE_SUBQUERY = "subquery"                     # 深度查询·子查询取证
+STAGE_SYNTHESIS = "synthesis"                   # 深度查询·汇总与计算
 
 # ── 状态标识 ──
 STATUS_RUNNING = "running"
@@ -37,5 +45,5 @@ class ReasoningStep(BaseModel):
 class ReasoningTrace(BaseModel):
     """完整的推理链轨迹"""
     steps: list[ReasoningStep] = Field(default_factory=list)
-    final_source: str = "rag"                             # ontology | rag | none
+    final_source: str = "rag"                             # ontology | rag | llm-wiki | mixed | none
     total_ms: Optional[int] = None

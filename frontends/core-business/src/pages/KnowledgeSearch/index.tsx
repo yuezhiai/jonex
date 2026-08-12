@@ -32,11 +32,13 @@ import {
   streamKnowledgeSearch,
   submitSearchFeedback,
   cancelSearchFeedback,
+  DEFAULT_FAST_STRICT_CONFIG,
 } from '@/api/knowledgeSearch';
 import { useDocumentViewer } from '@/components/DocumentViewer';
 import type {
   KnowledgeSearchOverview,
   KnowledgeSearchDomain,
+  KnowledgeSearchStrictConfig,
   KnowledgeSearchHistoryItem,
   KnowledgeSearchRunStatus,
   KnowledgeReference,
@@ -337,6 +339,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
   const { global } = useStore();
   const [query, setQuery] = useState('');
   const [selectedDomain, setSelectedDomain] = useState('all');
+  const [deepSearch, setDeepSearch] = useState(false);
+  const [strictConfig, setStrictConfig] = useState<KnowledgeSearchStrictConfig>(DEFAULT_FAST_STRICT_CONFIG);
 
   const [overview, setOverview] = useState<KnowledgeSearchOverview | null>(null);
   const [domains, setDomains] = useState<KnowledgeSearchDomain[]>([]);
@@ -489,6 +493,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         topK: 5,
         domainId,
         kbIds,
+        deep: deepSearch,
+        strictConfig,
       };
       let streamError: Error | null = null;
       let accumulatedAnswer = '';
@@ -620,7 +626,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [query, selectedDomain, getSelectedKbIds],
+    [query, selectedDomain, getSelectedKbIds, deepSearch, strictConfig],
   );
 
   const handleHistoryClick = useCallback(
@@ -870,6 +876,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
         visibleDomains={visibleDomains}
         query={query}
         isSearching={isSearching}
+        deepSearch={deepSearch}
+        onDeepSearchChange={setDeepSearch}
+        strictConfig={strictConfig}
+        onStrictConfigChange={setStrictConfig}
         onDomainChange={handleDomainChange}
         onQueryChange={setQuery}
         onSearch={() => void handleSearch()}

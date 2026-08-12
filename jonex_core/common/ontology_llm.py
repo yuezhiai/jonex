@@ -35,8 +35,15 @@ async def answer_from_facts(
     kb_id: Optional[str] = None,
     user_id: Optional[str] = None,
     trace_id: Optional[str] = None,
+    allow_common_sense: bool = False,
 ) -> str:
-    """根据本体实体 + 邻居事实回答，不足返回 "INSUFFICIENT"。"""
+    """根据本体实体 + 邻居事实回答，不足返回 "INSUFFICIENT"。
+
+    Args:
+        allow_common_sense: [jonex] P2-7 放宽常识边界。
+            为 True 时允许模型在已取到确定领域事实的基础上，叠加通用常识/数学
+            （物理常量、semver 语义、单位换算），但必须标注假设。
+    """
     client = _get_client()
     model = os.getenv("ONTOLOGY_LLM_MODEL", "deepseek-v4-flash-202605")
 
@@ -51,6 +58,21 @@ async def answer_from_facts(
         "once via different relation paths; treat them as distinct evidence. Prefer "
         "lower-hop facts; use higher-hop facts only as supporting context."
     )
+    # [jonex] P2-7 放宽常识边界：允许叠加通用常识/数学，但必须标注假设
+    if allow_common_sense:
+        common_sense_append = os.getenv("ONTOLOGY_ANSWER_COMMON_SENSE_APPEND", "")
+        if not common_sense_append:
+            common_sense_append = (
+                "\n\nIf the question can be answered by applying well-known physical constants "
+                "(e.g. specific heat of water ≈ 4186 J/(kg·K), boiling point of water ≈ 100°C), "
+                "basic math, or standard semantics (e.g. semver version ordering), you may do so "
+                "on top of the provided domain facts. HOWEVER, you MUST: "
+                "1) explicitly state the assumption (e.g. \"Assuming c≈4186 J/(kg·K)\"), "
+                "2) never fabricate product parameters, hardware specs, or domain facts, "
+                "3) clearly separate which parts of the answer come from provided facts "
+                "and which come from general knowledge."
+            )
+        system_prompt += common_sense_append
 
     facts_text = json.dumps(
         {"entities": hits, "relations": facts}, ensure_ascii=False,

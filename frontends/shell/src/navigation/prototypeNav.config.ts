@@ -128,14 +128,21 @@ export const prototypeNavConfig: NavSection[] = [
         key: 'eco-adapter-group',
         label: 'navigation.ecoAdapter',
         icon: BlockOutlined,
-        hidden: true,
+        hidden: false,
         children: [
           {
             key: 'adapter-management',
             label: 'navigation.adapterList',
             appId: 'ecosystem-management',
             internalPath: 'adapter-management',
-            hidden: true,
+            hidden: false,
+          },
+          {
+            key: 'mcp-service-directory',
+            label: 'navigation.mcpServiceDirectory',
+            appId: 'ecosystem-management',
+            internalPath: 'mcp-service-directory',
+            icon: ClusterOutlined,
           },
         ],
       },

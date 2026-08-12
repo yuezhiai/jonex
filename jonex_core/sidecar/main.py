@@ -32,6 +32,7 @@ from jonex_core.sidecar.hooks import (
 )
 from jonex_core.common.audit_enums import _ACTION_TO_RESOURCE, _RESOURCE_TO_ID_FIELD
 from jonex_core.common import (
+    error_response,
     register_exception_handlers,
     install_locale_middleware,
     MissingApiKeyError,
@@ -176,6 +177,39 @@ def _platform_path_requires_tenant(path: str) -> bool:
     )
 
 
+def _build_anon_rate_limit_key(request) -> str:
+    """为未认证请求构建限流 key（基于客户端 IP）。
+
+    未认证路径（如 /auth/login、/auth/exchange-ticket）没有租户上下文，
+    不能使用共享的 "system" key（会被单一攻击者耗尽 300/min 额度）。
+    改用客户端 IP 作为限流维度，每个 IP 独立计数。
+
+    使用固定前缀 "anon:ip:" 以便在 Redis keys 中区别于普通租户 key。
+
+    ═══════════════════════════════════════════════════════════════════════
+    SECURITY NOTE: X-Forwarded-For 信任假设
+    ───────────────────────────────────────────────────────────────────────
+    本函数取 X-Forwarded-For 第一段作为客户端 IP 用于限流 key。
+    安全前提是前置反向代理（Nginx/Traefik/Caddy）已正确设置该头，
+    且 Sidecar 不接受来自公网的直连请求。
+
+    若攻击者可直连 Sidecar 端口，则可通过伪造 X-Forwarded-For 头
+    任意切换限流 key，绕过匿名 IP 限流。
+
+    加固方向（未实施，供后续参考）：
+      - 在反向代理层设 X-Real-IP 并 strip 入站 X-Forwarded-For
+      - 或在 Nginx 侧配置 trusted proxies CIDR，仅信任上游代理 IP
+      - 或在 jonex_core/common/config.py 增加 TRUSTED_PROXIES 配置，
+        类似 uvicorn --proxy-headers --forwarded-allow-ips 机制
+    ═══════════════════════════════════════════════════════════════════════
+    """
+    client_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    return f"anon:ip:{client_ip}"
+
+
 def _resolve_platform_tenant(
     request: Request,
     body: dict[str, Any] | None,
@@ -232,6 +266,42 @@ def _resolve_invoke_tenant_optional(
         return None
 
 
+async def _record_platform_metrics(
+    metering_tenant_id: str,
+    path: str,
+    request: Request,
+    status_code: int,
+    start: float,
+    audit_user_id: str,
+    audit_username: str,
+    client_ip: str,
+):
+    """记录 platform 代理的计量与审计"""
+    latency = (time.time() - start) * 1000
+    metering = get_metering()
+    await metering.record(
+        metering_tenant_id,
+        path,
+        latency,
+        status_code,
+    )
+    # TODO: REST proxy 路径暂不从 URL 路径参数提取 resource_id。
+    # 后续可从 path 中解析 ID 字段（如 "platform/spaces/{space_id}"）。
+    # 当前 resource_id 仅在 /invoke 路径中填充。
+    await get_audit_forwarder().collect(
+        tenant_id=metering_tenant_id,
+        method=request.method,
+        path=path,
+        status_code=status_code,
+        latency_ms=latency,
+        trace_id=getattr(request.state, "request_id", ""),
+        user_id=audit_user_id,
+        username=audit_username,
+        ip=client_ip,
+        service_name="sidecar",
+    )
+
+
 async def _proxy_to_platform(request: Request, path: str, auth: dict | None = None):
     """转发请求到 platform 容器"""
     config = get_config()
@@ -247,9 +317,17 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
         auth=auth,
         require=_platform_path_requires_tenant(path),
     )
-    metering_tenant_id = tenant_id or "system"
+    metering_tenant_id = tenant_id or _build_anon_rate_limit_key(request)
 
-    await limiter.check(metering_tenant_id, path)
+    allowed, retry_after = await limiter.check(metering_tenant_id, path)
+    if not allowed:
+        resp = error_response(
+            code=429,
+            message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+            status_code=429,
+        )
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
 
     headers = {
         "X-Request-ID": getattr(request.state, "request_id", ""),
@@ -282,50 +360,16 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
             status_code = resp.status_code
             resp.raise_for_status()
             result = resp.json()
-            await metering.record(
-                metering_tenant_id,
-                path,
-                (time.time() - start) * 1000,
-                status_code,
-            )
-            # TODO: REST proxy 路径暂不从 URL 路径参数提取 resource_id。
-            # 后续可从 path 中解析 ID 字段（如 "platform/spaces/{space_id}"）。
-            # 当前 resource_id 仅在 /invoke 路径中填充。
-            await get_audit_forwarder().collect(
-                tenant_id=metering_tenant_id,
-                method=request.method,
-                path=path,
-                status_code=status_code,
-                latency_ms=(time.time() - start) * 1000,
-                trace_id=getattr(request.state, "request_id", ""),
-                user_id=audit_user_id,
-                username=audit_username,
-                ip=client_ip,
-                service_name="sidecar",
+            await _record_platform_metrics(
+                metering_tenant_id, path, request, status_code, start,
+                audit_user_id, audit_username, client_ip,
             )
             return result
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
-            await metering.record(
-                metering_tenant_id,
-                path,
-                (time.time() - start) * 1000,
-                status_code,
-            )
-            # TODO: REST proxy 路径暂不从 URL 路径参数提取 resource_id。
-            # 后续可从 path 中解析 ID 字段（如 "platform/spaces/{space_id}"）。
-            # 当前 resource_id 仅在 /invoke 路径中填充。
-            await get_audit_forwarder().collect(
-                tenant_id=metering_tenant_id,
-                method=request.method,
-                path=path,
-                status_code=status_code,
-                latency_ms=(time.time() - start) * 1000,
-                trace_id=getattr(request.state, "request_id", ""),
-                user_id=audit_user_id,
-                username=audit_username,
-                ip=client_ip,
-                service_name="sidecar",
+            await _record_platform_metrics(
+                metering_tenant_id, path, request, status_code, start,
+                audit_user_id, audit_username, client_ip,
             )
             try:
                 detail = e.response.json()
@@ -335,6 +379,14 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
                 return JSONResponse(content=detail, status_code=e.response.status_code)
             raise CapabilityInvokeError(
                 message=translate("err.capability.upstream_error", params={"status": str(e.response.status_code)}, fallback=detail.get("message", f"平台服务错误: HTTP {e.response.status_code}")),
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            await _record_platform_metrics(
+                metering_tenant_id, path, request, 502, start,
+                audit_user_id, audit_username, client_ip,
+            )
+            raise CapabilityInvokeError(
+                message=translate("err.capability.unreachable", fallback=f"平台服务不可达: {str(e)}"),
             )
 
 
@@ -379,6 +431,14 @@ class SidecarApp:
                 logger.info("[Sidecar] AuditForwarder 已停止并 flush")
             except Exception:
                 logger.exception("[Sidecar] AuditForwarder 停止失败")
+
+        @self.app.on_event("shutdown")
+        async def _stop_rate_limiter():
+            try:
+                await get_rate_limiter().close()
+                logger.info("[Sidecar] RateLimiter Redis 连接池已关闭")
+            except Exception:
+                logger.exception("[Sidecar] RateLimiter 关闭失败")
 
     def _setup_routes(self):
         """设置路由"""
@@ -518,7 +578,15 @@ class SidecarApp:
             # 从 capability_id 提取服务名用于熔断
             service_name = invoke_request.capability_id.split(".")[1] if "." in invoke_request.capability_id else invoke_request.capability_id
 
-            await limiter.check(tenant_id, invoke_request.capability_id, user_id)
+            allowed, retry_after = await limiter.check(tenant_id, invoke_request.capability_id, user_id)
+            if not allowed:
+                resp = error_response(
+                    code=429,
+                    message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+                    status_code=429,
+                )
+                resp.headers["Retry-After"] = str(retry_after)
+                return resp
 
             if not await breaker.before_call(service_name):
                 raise CapabilityInvokeError(message=translate("err.capability.circuit_open", params={"service_name": service_name}, fallback=f"服务 {service_name} 已熔断，请稍后重试"))

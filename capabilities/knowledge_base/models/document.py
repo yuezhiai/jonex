@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, Column, Integer, String, Text
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
@@ -53,6 +53,8 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     file_path = Column(String(1024), nullable=False)
     file_size = Column(BigInteger, nullable=False, default=0)
     mime_type = Column(String(128), nullable=True)
+    # 源文件内容 md5（上传去重 + reparse 跳过），非安全用途
+    content_hash = Column(String(32), nullable=True, index=True)
     knowledge_base_id = Column(String(128), nullable=False, index=True)
 
     storage_backend = Column(String(16), nullable=False, default="local")
@@ -80,6 +82,17 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     ontology_applied_schema_hash = Column(String(32), nullable=True)
 
     extra_metadata = Column(JSONB, nullable=False, default=dict)
+
+    # [jonex] LLM-Wiki 编译状态列化（原 extra_metadata JSONB → 真实列，migration 008）
+    # 时区口径：llm_wiki_compile_requested_at 用 datetime.utcnow()（naive UTC），
+    # 与 TimestampMixin 的 created_at（naive 本地时间）口径不同是有意的——
+    # 编译超时判定按 UTC 单调时间（P0-2 同坑，见 reconciliation_service.py:723）
+    llm_wiki_compile_status = Column(String(32), nullable=True, index=True)   # NULL/compiling/compiled/stale/failed
+    llm_wiki_compile_error = Column(Text, nullable=True)
+    llm_wiki_compile_warnings = Column(JSONB, nullable=True)                  # 编译警告列表
+    llm_wiki_compile_requested_at = Column(DateTime, nullable=True)
+    llm_wiki_compiled_at = Column(DateTime, nullable=True)
+    llm_wiki_task_id = Column(String(128), nullable=True, index=True)
 
     # 文档来源方式（冗余真实列）：api / api_push / storage / file，统计按此列分组
     folder_id = Column(String(64), nullable=True, index=True)
@@ -110,6 +123,9 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
             "ontology_applied_schema_hash": self.ontology_applied_schema_hash,
             "folder_id": self.folder_id,
             "data_source_type": self.data_source_type,
+            # [jonex] LLM-Wiki 编译状态（顶层字段，对齐 status/ontology_status）
+            "llm_wiki_compile_status": self.llm_wiki_compile_status,
+            "llm_wiki_compile_error": self.llm_wiki_compile_error,
             "metadata": self.extra_metadata or {},
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),

@@ -17,6 +17,8 @@
 # ── 前端构建阶段（WebUI）──
 FROM --platform=$BUILDPLATFORM oven/bun:1.3.14-alpine AS frontend-builder
 WORKDIR /app
+# [jonex] bun 默认走 registry.npmjs.org 国内不稳（mermaid tarball 提取失败），切 npmmirror 源
+RUN printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > /root/.bunfig.toml
 COPY Reference/LightRAG/lightrag_webui/ ./lightrag_webui/
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     cd lightrag_webui \

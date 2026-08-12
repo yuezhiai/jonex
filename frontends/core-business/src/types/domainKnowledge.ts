@@ -18,6 +18,11 @@ export interface DomainKnowledgeItem {
   updatedAt: string;
   ownerName?: string;
   description?: string;
+  /**
+   * [jonex] 知识库类型。创建时选定后不可变。
+   * 列表标签与编辑弹窗的只读展示依赖它；后端缺省/未知时按 lightrag 处理。
+   */
+  kbType?: KnowledgeBaseType;
 }
 
 export interface DomainKnowledgeListParams {
@@ -74,6 +79,9 @@ export const statusColorMap: Record<DomainKnowledgeStatus, string> = {
   disabled: 'default',
 };
 
+/** 知识库类型。lightrag=标准检索型（向量+图谱）；openkb=Wiki 编译型（LLM 编译） */
+export type KnowledgeBaseType = 'lightrag' | 'openkb';
+
 // ─── Detail Page Types ──────────────────────────────────
 
 export interface DomainKnowledgeDetail {
@@ -89,6 +97,11 @@ export interface DomainKnowledgeDetail {
   updatedAt: string;
   /** Neo4j 不可用时为 true，实体/关系数被降级为 0（非真实为 0） */
   ontologyDegraded?: boolean;
+  /**
+   * 处理管线。openkb 的知识库不跑本体抽取，「编译结果」Tab 需换成只读 Wiki 视图。
+   * 后端缺省/未知时按 lightrag 处理。
+   */
+  kbType?: KnowledgeBaseType;
 }
 
 export interface DataSourceConfig {
@@ -562,6 +575,10 @@ export interface ManualDocItem {
   errorMessage?: string;
   /** 编译失败原因。 */
   ontologyError?: string;
+  /** [jonex] LLM-Wiki 编译状态：NULL/compiling/compiled/stale/failed（顶层字段 llm_wiki_compile_status）。 */
+  llmWikiCompileStatus?: string;
+  /** [jonex] LLM-Wiki 编译失败原因（顶层字段 llm_wiki_compile_error）。 */
+  llmWikiCompileError?: string;
   knowledgeBaseId: string;
   dataSourceType?: string;
   tags?: string[];
@@ -919,4 +936,61 @@ export interface YamlImportResult {
   errors?: string[];
   schema_version?: number;
   status?: string;
+}
+
+// ── OpenKB Wiki 只读视图（parse-results/* 数据源）──
+
+/** Wiki 实体/概念行（GET parse-results/entities） */
+export interface WikiEntityRow {
+  id: string;
+  name: string;
+  /** OpenKB 自由生成的类型，如 Work / Organization；非本体 schema 的 entity_type */
+  type: string;
+  description: string;
+  /** 该实体在 wikilinks 图中的度数 */
+  relationsCount: number;
+}
+
+/** Wiki 关系行（GET parse-results/relationships） */
+export interface WikiRelationshipRow {
+  id: string;
+  source: string;
+  target: string;
+  description: string;
+}
+
+/** Wiki 图谱数据（GET parse-results/graph） */
+export interface WikiGraphData {
+  nodes: { id: string; name: string; type: string; description: string }[];
+  edges: { id: string; source: string; target: string }[];
+}
+
+// ── [jonex] Wiki 阅读模式（编译结果页）──
+
+/** Wiki 页面内容（GET parse-results/wiki-page） */
+export interface WikiPageContent {
+  path: string;
+  section: 'summaries' | 'concepts' | 'entities';
+  name: string;
+  title: string;
+  type: string;
+  description: string;
+  sources: string[];
+  content: string;
+}
+
+/** Wiki 页面树条目（后端已结构化，含显示名——不是裸 stem） */
+export interface WikiPageItem {
+  stem: string;
+  title: string;
+  type: string;
+  description: string;
+}
+
+/** Wiki 页面树（GET parse-results/wiki-contents；字段已 camelCase 映射） */
+export interface WikiContents {
+  summaries: WikiPageItem[];
+  concepts: WikiPageItem[];
+  entities: WikiPageItem[];
+  documentId: string;
 }

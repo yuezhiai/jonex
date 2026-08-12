@@ -53,6 +53,12 @@ COMMENT ON COLUMN knowledge_base.knowledge_documents.extra_metadata IS '业务�
 COMMENT ON COLUMN knowledge_base.knowledge_documents.storage_backend IS '对象存储后端：local / cos';
 COMMENT ON COLUMN knowledge_base.knowledge_documents.storage_key IS '对象存储 key（local 后端等同 file_path）';
 COMMENT ON COLUMN knowledge_base.knowledge_documents.is_deleted IS '软删除标记：0 正常，1 删除';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_status IS 'LLM-Wiki 编译状态：NULL/compiling/compiled/stale/failed';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_error IS 'LLM-Wiki 编译失败原因';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_warnings IS 'LLM-Wiki 编译警告列表（JSONB 数组）';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_requested_at IS 'LLM-Wiki 编译请求时刻（patrol 超时基准，UTC）';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compiled_at IS 'LLM-Wiki 编译完成时刻';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_task_id IS 'OpenKB 容器编译任务 ID（对齐 rag_task_id），供对账巡检轮询';
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.id IS '检索历史 ID';
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.tenant_id IS '租户 ID，所有普通请求必须按租户隔离';
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.user_id IS '发起检索的用户 ID';

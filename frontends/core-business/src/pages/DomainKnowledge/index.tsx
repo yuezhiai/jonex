@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Input, Button, message, Empty, Spin, Dropdown } from 'antd';
+import { Input, Button, message, Empty, Spin, Dropdown, Tag } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
@@ -17,7 +17,11 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '@/store';
 import { SPACE_URL_PARAM } from '@jonex/shell-sdk';
-import type { DomainKnowledgeItem, DomainKnowledgePermissionMember } from '@/types/domainKnowledge';
+import type {
+  DomainKnowledgeItem,
+  DomainKnowledgePermissionMember,
+  KnowledgeBaseType,
+} from '@/types/domainKnowledge';
 import {
   getDomainKnowledgeList,
   getDomainKnowledgePermissions,
@@ -162,7 +166,11 @@ const DomainKnowledge = function DomainKnowledge() {
   }, [global.spacesLoaded, global.currentSpaceId, page, keyword]);
 
   // ── create handler ───────────────────────────────────
-  const handleCreate = async (values: { name: string; description?: string }) => {
+  const handleCreate = async (values: {
+    name: string;
+    description?: string;
+    kb_type?: KnowledgeBaseType;
+  }) => {
     setCreateSubmitting(true);
     try {
       const data = {
@@ -171,10 +179,11 @@ const DomainKnowledge = function DomainKnowledge() {
         description: values.description?.trim() || undefined,
       };
       if (editingKb) {
+        // [jonex] 编辑时绝不能带 kb_type：类型创建后不可变，后端会抛 err.kb.kb_type_immutable
         await updateKnowledgeInfo(editingKb.id, data);
         message.success(t('domainKnowledge.knowledgeBaseUpdated'));
       } else {
-        await createKnowledgeInfo(data);
+        await createKnowledgeInfo({ ...data, kb_type: values.kb_type ?? 'lightrag' });
         message.success(t('domainKnowledge.knowledgeBaseCreated'));
       }
       setCreateOpen(false);
@@ -360,8 +369,19 @@ const DomainKnowledge = function DomainKnowledge() {
                     <DatabaseOutlined />
                   </div>
                   <div className="kb-card-info">
-                    <div className="kb-card-name" onClick={() => navigate(`/domain-knowledge/${item.id}`)}>
-                      {item.name}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                      <div className="kb-card-name" onClick={() => navigate(`/domain-knowledge/${item.id}`)}>
+                        {item.name}
+                      </div>
+                      {/* [jonex] 知识库类型标签：两种类型行为差别大（引用溯源/编译结果页），需可一眼区分 */}
+                      <Tag
+                        color={item.kbType === 'openkb' ? 'purple' : 'blue'}
+                        style={{ marginInlineEnd: 0, flexShrink: 0, fontSize: 12 }}
+                      >
+                        {item.kbType === 'openkb'
+                          ? t('domainKnowledge.kbTypeOpenkb')
+                          : t('domainKnowledge.kbTypeLightrag')}
+                      </Tag>
                     </div>
                     <div className="kb-card-meta">
                       <span>
@@ -394,7 +414,7 @@ const DomainKnowledge = function DomainKnowledge() {
                           key: 'tracking',
                           icon: <LineChartOutlined />,
                           label: t('route.tracking'),
-                          onClick: () => message.info(t('domainKnowledge.trackingComingSoon')),
+                          onClick: () => navigate(`/domain-knowledge/${item.id}/tracking`),
                         },
                         {
                           key: 'edit',

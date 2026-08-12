@@ -226,6 +226,7 @@ export default function DomainSpace() {
         <Input
           prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
           placeholder={t('domainSpace.searchPlaceholder')}
+          allowClear
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           style={{ width: 280 }}

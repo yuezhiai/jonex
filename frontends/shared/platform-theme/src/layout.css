@@ -423,9 +423,7 @@
 .yx-data-table tbody tr:hover {
   background: var(--yx-row-hover);
 }
-.yx-data-table tbody tr:last-child td {
-  border-bottom: none;
-}
+
 .yx-data-table code {
   font-size: 12px;
   background: var(--yx-row-border);
@@ -693,11 +691,7 @@
   border-color: var(--yx-accent);
   color: #fff;
 }
-.ant-btn-primary:hover {
-  background: var(--yx-accent-hover) !important;
-  border-color: var(--yx-accent-hover) !important;
-  color: #fff !important;
-}
+
 .ant-btn-primary:active {
   background: var(--yx-brand-blue) !important;
   border-color: var(--yx-brand-blue) !important;
@@ -717,9 +711,7 @@
   color: #dc2626;
   border-color: #fecaca;
 }
-.ant-btn-dangerous:hover {
-  background: #fee2e2 !important;
-}
+
 .ant-btn-sm {
   padding: 5px 12px;
   font-size: 12px;
@@ -813,9 +805,7 @@
 .ant-table-wrapper .ant-table-tbody > tr:hover > td {
   background: var(--yx-row-hover);
 }
-.ant-table-wrapper .ant-table-tbody > tr:last-child > td {
-  border-bottom: none;
-}
+
 
 /* ===== antd Tabs Overrides ===== */
 .ant-tabs-nav::before {

@@ -62,7 +62,18 @@ from .reference import (
     SourceLocation,
     SourceReference,
 )
-from .search import EnhancedSearchResponse, OntologySearchRequest, OntologySearchResponse, SearchRequest, SearchResponse
+from .search import (
+    LlmWikiSearchRequest,
+    MixSearchRequest,
+    DeepSearchRequest,
+    DeepSearchResponse,
+    EnhancedSearchResponse,
+    OntologySearchRequest,
+    OntologySearchResponse,
+    ReliabilityInfo,
+    SearchRequest,
+    SearchResponse,
+)
 from .search_feedback import (
     CancelSearchFeedbackRequest,
     ListSearchFeedbackRequest,
@@ -89,6 +100,8 @@ __all__ = [
     "DataSourceListResponse",
     "DataSourceResponse",
     "DataSourceUpdateRequest",
+    "DeepSearchRequest",
+    "DeepSearchResponse",
     "DeleteOntologyInstanceRequest",
     "DeleteOntologyRelationRequest",
     "DocumentDeleteResponse",
@@ -104,6 +117,8 @@ __all__ = [
     "DocumentScopeRequest",
     "DocumentUploadRequest",
     "EnhancedSearchResponse",
+    "LlmWikiSearchRequest",
+    "MixSearchRequest",
     "OntologyEntitySearchRequest",
     "OntologyInstanceListRequest",
     "OntologyGraphRequest",
@@ -123,6 +138,7 @@ __all__ = [
     "ParseResultScopeRequest",
     "ReasoningStep",
     "ReasoningTrace",
+    "ReliabilityInfo",
     "ReferenceResolveRequest",
     "CancelSearchFeedbackRequest",
     "ListSearchFeedbackRequest",

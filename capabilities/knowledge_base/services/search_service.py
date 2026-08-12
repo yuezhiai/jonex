@@ -9,27 +9,36 @@ import time
 from typing import Any
 
 from jonex_core.capability.atomic.rag.client import get_rag_client
+from .openkb_service import KnowledgeCompilerService  # [jonex]
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import InvalidParameterError, ResourceNotFoundError
 from jonex_core.common.i18n import translate
 from jonex_core.common.file_source_util import classify_media, parse_file_source, to_location
 from jonex_core.common.neo4j_client import get_neo4j_driver
-from jonex_core.common.object_storage import get_object_storage
+from jonex_core.common.object_storage import build_object_key, get_object_storage
 from jonex_core.common.ontology_embedding import embed
 from jonex_core.common.ontology_llm import answer_from_facts, fuse_rag_answers
 from jonex_core.common.tenant import require_tenant
 
-from ..dtos import OntologySearchRequest, SearchHistoryCreateRequest, SearchRequest
+from ..dtos import LlmWikiSearchRequest, MixSearchRequest, DeepSearchRequest, DeepSearchResponse, OntologySearchRequest, ReliabilityInfo, SearchHistoryCreateRequest, SearchRequest
 from ..dtos.reasoning import (
     STAGE_FACT_LOOKUP,
     STAGE_FUSION,
+    STAGE_INTENT_CLASSIFY,
     STAGE_LLM_ANSWER,
     STAGE_ONTOLOGY_MATCH,
+    STAGE_OPENKB_QUERY,
+    STAGE_QUERY_PLAN,
     STAGE_RAG_FALLBACK,
     STAGE_REF_RETRIEVE,
     STAGE_RERANK,
     STAGE_RETRIEVAL_RERANK,
     STAGE_ROUTE_DECISION,
+    STAGE_STRICT_ATTEMPT,
+    STAGE_STRICT_VERIFY,
+    STAGE_SUBQUERY,
+    STAGE_SYNTHESIS,
+    STAGE_TIMELINE_GRAPH,
 )
 from ..repository import OntologyGraphRepository
 from ..repository.document_repository import KnowledgeDocumentRepository
@@ -111,6 +120,75 @@ ONTOLOGY_RAG_FUSION_TOPN = max(1, int(os.getenv("ONTOLOGY_RAG_FUSION_TOPN", "3")
 # ── 方案③：并发限流 — 多 KB 并行查询信号量上限（3a）──
 ONTOLOGY_RAG_MAX_CONCURRENCY = max(1, int(os.getenv("ONTOLOGY_RAG_MAX_CONCURRENCY", "7")))
 
+# ── [jonex] OpenKB 多 KB 检索并发上限（D7）──
+OPENKB_SEARCH_MAX_CONCURRENCY = max(1, int(os.getenv("OPENKB_SEARCH_MAX_CONCURRENCY", "3")))
+
+# ── [jonex] OpenKB references 不依赖 with_reasoning（D11）──
+OPENKB_REFERENCES_ENABLED = os.getenv("OPENKB_REFERENCES_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+
+# ── [jonex] OpenKB trace 截断上限（D8）──
+OPENKB_TRACE_MAX_CALLS = max(1, int(os.getenv("OPENKB_TRACE_MAX_CALLS", "80")))
+# ── §10 深度查询配置 ──
+_DEEP_QUERY_ENABLED = os.getenv("DEEP_QUERY_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+_DEEP_MAX_SUBQUERIES = max(1, min(10, int(os.getenv("DEEP_MAX_SUBQUERIES", "6"))))
+_DEEP_SUBQUERY_CONCURRENCY = max(1, min(10, int(os.getenv("DEEP_SUBQUERY_CONCURRENCY", "5"))))
+_DEEP_TOTAL_BUDGET = float(os.getenv("DEEP_TOTAL_BUDGET", "180"))
+
+# ── §9 严格模式配置 ──
+_STRICT_MODE_ENABLED = os.getenv("STRICT_MODE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+_STRICT_MAX_ATTEMPTS_CAP = max(1, min(3, int(os.getenv("STRICT_MAX_ATTEMPTS_CAP", "3"))))
+_STRICT_MIN_SCORE = float(os.getenv("STRICT_MIN_SCORE", "0.8"))
+_STRICT_ATTEMPT_TIMEOUT = float(os.getenv("STRICT_ATTEMPT_TIMEOUT", "60"))
+_STRICT_TOTAL_BUDGET = float(os.getenv("STRICT_TOTAL_BUDGET", "150"))
+# 可靠性分权重
+_STRICT_W_NON_REFUSAL = float(os.getenv("STRICT_WEIGHT_NON_REFUSAL", "0.35"))
+_STRICT_W_REFERENCE = float(os.getenv("STRICT_WEIGHT_REFERENCE", "0.15"))
+_STRICT_W_GROUNDED = float(os.getenv("STRICT_WEIGHT_GROUNDED", "0.30"))
+_STRICT_W_CONSISTENCY = float(os.getenv("STRICT_WEIGHT_CONSISTENCY", "0.20"))
+
+# 拒答模板检测（正则）
+_REFUSAL_PATTERNS = [
+    re.compile(r"无法确定|无法回答|cannot\s+determine|cannot\s+answer", re.IGNORECASE),
+    re.compile(r"not\s+enough\s+information|does\s+not\s+contain|没有.*信息|不包含", re.IGNORECASE),
+    re.compile(r"^INSUFFICIENT$", re.MULTILINE),
+    re.compile(r"没有.*提及|未.*提及|未.*提供|not\s+mentioned|not\s+provided", re.IGNORECASE),
+]
+
+# 升级档位（可配，默认 3 档）
+_STRICT_ESCALATION: list[dict] = [
+    {"top_k": 5, "neighbor_depth": 3, "route_score_min": 1.0, "label": "基线"},
+    {"top_k": 15, "neighbor_depth": 3, "route_score_min": 0.7, "label": "加召回"},
+    {"top_k": 25, "neighbor_depth": 3, "route_score_min": 0.5, "label": "全量"},
+]
+
+# ── P1-5 RAG 召回后处理配置 ──
+# 送 LLM 融合前的 chunk 级重排（经 llm-gateway /v1/rerank，与 LightRAG 的 RERANK_BINDING 同源）
+RAG_PRELLM_RERANK_ENABLED = os.getenv(
+    "RAG_PRELLM_RERANK_ENABLED", "false"
+).lower() in ("1", "true", "yes", "on")
+RAG_PRELLM_RERANK_TOPK = max(1, int(os.getenv("RAG_PRELLM_RERANK_TOPK", "8")))
+# 主体一致性过滤：从 query 抽取主体实体，对 doc_id/file_name 做一致性检查
+RAG_SUBJECT_FILTER_ENABLED = os.getenv(
+    "RAG_SUBJECT_FILTER_ENABLED", "false"
+).lower() in ("1", "true", "yes", "on")
+
+# ── P1-6 图查询模板：时间线/枚举/计数意图检测 ──
+_TIMELINE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("find_release_for_toolkit", re.compile(r"哪个版本.*(?:支持|适配).*(\d+\.\d+)")),
+    ("find_release_for_toolkit", re.compile(r"what\s+(?:version|release).*(?:support|work).*(\d+\.\d+)", re.IGNORECASE)),
+    ("earliest", re.compile(r"最早|earliest|first\s+(?:version|release|支持)")),
+    ("latest", re.compile(r"最后|latest|last\s+(?:version|release|支持)")),
+    ("first_added", re.compile(r"首次(?:支持|加入)|first\s+(?:added|支持|加入)")),
+    ("count_versions", re.compile(r"共几个|how\s+many\s+(?:versions|版本)|几个版本", re.IGNORECASE)),
+    ("release_year", re.compile(r"哪一年|what\s+year|release\s+year|发布年份|release year", re.IGNORECASE)),
+    ("last_before_drop", re.compile(r"最后(?:一个)?支持.*的版本|last\s+(?:version|release).*(?:support|before.*dropped)", re.IGNORECASE)),
+]
+
+# 版本号抽取：从 query 里取数字版本号（如 CUDA 12.8 → 12.8）
+_VERSION_RE = re.compile(r"\b(\d+\.\d+)\b")
+
 
 def _evict_stale_entries() -> None:
     """淘汰过期条目；超容量时按时间戳淘汰最旧条目。"""
@@ -181,6 +259,12 @@ class SearchService:
         tenant_id = require_tenant(tenant_id)
         req = SearchRequest(**_payload(request))
         start = time.perf_counter()
+
+        # ── [jonex] kb_type 分流 ──
+        kb_type = await self._get_kb_type(tenant_id, req.knowledge_base_id)
+        if kb_type == "openkb":
+            return await self._search_openkb(tenant_id, user_id, req)
+
         detailed = await get_rag_client().query_detailed(
             query=req.query,
             tenant_id=tenant_id,
@@ -483,6 +567,351 @@ class SearchService:
             )
         return instances
 
+    @staticmethod
+    def _detect_timeline_intent(query: str) -> dict | None:
+        """检测时间线/枚举/计数意图。
+
+        Returns:
+            {"intent": str, "params": dict} | None
+        """
+        if not query:
+            return None
+        versions = _VERSION_RE.findall(query)
+        for intent_key, pattern in _TIMELINE_PATTERNS:
+            m = pattern.search(query)
+            if m:
+                params: dict = {}
+                # 提取版本号（如有）
+                if versions:
+                    params["version"] = versions[0]
+                    if len(versions) >= 2:
+                        params["version_lo"] = versions[0]
+                        params["version_hi"] = versions[1]
+                # 对 find_release_for_toolkit 提取 toolkit 版本号
+                if intent_key == "find_release_for_toolkit" and m.lastindex is not None:
+                    try:
+                        params["toolkit_version"] = m.group(1)
+                    except IndexError:
+                        if versions:
+                            params["toolkit_version"] = versions[0]
+                return {"intent": intent_key, "params": params}
+        # 兜底：仅有版本号但没有明确意图词 → 不匹配（让通用流程处理）
+        return None
+
+    async def _execute_graph_query(
+        self,
+        gdao: OntologyGraphRepository,
+        tenant_id: str,
+        kb_id: str,
+        timeline: dict,
+        collector: ReasoningCollector | None = None,
+    ) -> list[dict] | None:
+        """执行图查询模板，返回兼容 neighbors() 格式的 facts，空则返回 None。
+
+        返回的每条 fact 结构与 neighbors() 兼容：
+            {source, target, target_type, target_entity, relation_type,
+             relation_chain, relation_source_chunks, path, direction, hop}
+        """
+        intent = timeline["intent"]
+        params = timeline.get("params", {})
+        t = time.perf_counter()
+        rows: list[dict] = []
+        template_name = ""
+        cypher_desc = ""
+
+        try:
+            if intent == "find_release_for_toolkit":
+                tv = params.get("toolkit_version") or params.get("version", "")
+                if not tv:
+                    return None
+                template_name = "find_release_supporting_toolkit"
+                cypher_desc = f"MATCH (sw:SoftwareRelease)-[:SUPPORTS_TOOLKIT]->(:SoftwareToolkit{{{tv}}})"
+                rows = await gdao.find_release_supporting_toolkit(tenant_id, kb_id, tv)
+
+            elif intent == "earliest":
+                target = params.get("version") or _VERSION_RE.sub("", params.get("query_hint", "")).strip()
+                if not target:
+                    return None
+                template_name = "find_earliest_release_for"
+                cypher_desc = f"沿 SUPERSEDES 链取最早满足关系的 SoftwareRelease"
+                rec = await gdao.find_earliest_release_for(
+                    tenant_id, kb_id,
+                    relation_types=["SUPPORTS_TOOLKIT", "SUPPORTS"],
+                    target_name=target,
+                )
+                if rec:
+                    rows = [rec]
+
+            elif intent == "latest":
+                target = params.get("version", "")
+                if not target:
+                    return None
+                template_name = "find_latest_release_for"
+                cypher_desc = f"沿 SUPERSEDES 链取最新满足关系的 SoftwareRelease"
+                rec = await gdao.find_latest_release_for(
+                    tenant_id, kb_id,
+                    relation_types=["SUPPORTS_TOOLKIT", "SUPPORTS"],
+                    target_name=target,
+                )
+                if rec:
+                    rows = [rec]
+
+            elif intent == "first_added":
+                target = params.get("version", "")
+                if not target:
+                    return None
+                template_name = "find_first_release_adding"
+                cypher_desc = f"沿 SUPERSEDES 链取首次 ADDED_SUPPORT_FOR({target}) 的版本"
+                rec = await gdao.find_first_release_adding(tenant_id, kb_id, target)
+                if rec:
+                    rows = [rec]
+
+            elif intent == "last_before_drop":
+                target = params.get("version", "")
+                if not target:
+                    return None
+                template_name = "find_last_supporting_before_drop"
+                cypher_desc = f"MATCH (drop:SoftwareRelease)-[:DROPPED_SUPPORT_FOR]->({target})<-[:SUPERSEDES]-(last)"
+                rec = await gdao.find_last_supporting_before_drop(tenant_id, kb_id, target)
+                if rec:
+                    rows = [rec]
+
+            elif intent == "count_versions":
+                lo = params.get("version_lo", "")
+                hi = params.get("version_hi", "")
+                template_name = "count_toolkit_versions"
+                cypher_desc = f"MATCH (t:SoftwareToolkit) WHERE version∈[{lo},{hi}] RETURN count(t)"
+                count = await gdao.count_toolkit_versions(tenant_id, kb_id, lo, hi)
+                if count > 0:
+                    # 构造计数结果 facts（兼容 answer_from_facts）
+                    rows = [{
+                        "source": "graph_query",
+                        "target": f"{lo}→{hi}" if lo and hi else "all",
+                        "target_type": "count_result",
+                        "target_entity": {"name": "count_result", "type": "count_result",
+                                          "aliases": [], "description": f"共 {count} 个版本",
+                                          "attributes": {"count": count, "version_lo": lo, "version_hi": hi},
+                                          "confidence": 1.0, "kb_id": kb_id,
+                                          "doc_ids": [], "source_chunks": []},
+                        "relation_type": "COUNT",
+                        "relation_chain": ["COUNT"],
+                        "relation_source_chunks": [],
+                        "path": ["graph_query", f"{count}"],
+                        "direction": "outgoing",
+                        "hop": 1,
+                    }]
+
+            elif intent == "release_year":
+                tv = params.get("toolkit_version") or params.get("version", "")
+                if not tv:
+                    return None
+                template_name = "get_toolkit_release_year"
+                cypher_desc = f"MATCH (t:SoftwareToolkit{{{tv}}}) RETURN t.release_year"
+                rec = await gdao.get_toolkit_release_year(tenant_id, kb_id, tv)
+                if rec:
+                    rows = [rec]
+
+            else:
+                return None
+
+        except Exception as e:
+            logger.warning("[ontology] 图查询模板执行失败 intent=%s: %s", intent, e)
+            if collector:
+                collector.step(
+                    STAGE_TIMELINE_GRAPH, "图查询模板",
+                    status="failed",
+                    summary=f"图查询模板 {template_name} 执行失败: {e}",
+                    t_start=t,
+                )
+            return None
+
+        if not rows:
+            if collector:
+                collector.step(
+                    STAGE_TIMELINE_GRAPH, "图查询模板",
+                    status="skipped",
+                    summary=f"意图={intent}，图查询模板 {template_name} 未命中，降级通用流程",
+                    detail={"intent": intent, "template": template_name, "cypher": cypher_desc, "hits": 0},
+                    t_start=t,
+                )
+            return None
+
+        # 转换成 facts 格式（兼容 answer_from_facts）
+        facts: list[dict] = []
+        for row in rows:
+            name = row.get("name", "")
+            etype = row.get("type", "")
+            if not name or not etype:
+                continue
+            fact = {
+                "source": "graph_query",
+                "target": name,
+                "target_type": etype,
+                "target_entity": {
+                    "name": name,
+                    "type": etype,
+                    "aliases": row.get("aliases", []),
+                    "description": row.get("description", ""),
+                    "attributes": row.get("attributes", {}),
+                    "confidence": row.get("confidence", 1.0),
+                    "kb_id": row.get("kb_id", kb_id),
+                    "doc_ids": row.get("doc_ids", []),
+                    "source_chunks": row.get("source_chunks", []),
+                },
+                "relation_type": row.get("relation_type", intent),
+                "relation_chain": [row.get("relation_type", intent)],
+                "relation_source_chunks": row.get("relation_source_chunks", []),
+                "path": ["graph_query", name],
+                "direction": "outgoing",
+                "hop": 1,
+            }
+            facts.append(fact)
+
+        if collector:
+            collector.step(
+                STAGE_TIMELINE_GRAPH, "图查询模板",
+                summary=(
+                    f"意图「{intent}」命中图查询模板 {template_name}，"
+                    f"取到 {len(facts)} 条事实"
+                ),
+                detail={
+                    "intent": intent,
+                    "template": template_name,
+                    "cypher": cypher_desc,
+                    "params": params,
+                    "hits": len(facts),
+                    "top_fact": facts[0].get("target") if facts else None,
+                },
+                t_start=t,
+            )
+
+        return facts
+
+    @staticmethod
+    def _extract_subject_entity(query: str) -> list[str]:
+        """从 query 中抽取主体实体名称（产品名/型号/版本名等），用于主体一致性过滤。
+
+        策略：轻量规则（零 LLM 成本），抽取英文专名和中文产品名。
+        """
+        if not query:
+            return []
+        subjects: list[str] = []
+        # 英文产品名+型号：Go2-W, GH100, B200, Nsight VSE, CUDA 12.8
+        model_re = re.compile(
+            r"\b([A-Z][a-zA-Z0-9]*(?:\s*[-\s]\s*[A-Z]?[a-zA-Z0-9]+)*)\b"
+        )
+        for m in model_re.finditer(query):
+            token = m.group(1).strip()
+            # 过滤掉太短的 token 和常见停用词
+            if len(token) >= 2 and token.lower() not in (
+                "the", "a", "an", "is", "of", "in", "for", "to", "vs", "or",
+                "how", "what", "when", "which", "does", "can", "many", "last",
+            ):
+                subjects.append(token)
+        # 中文产品名
+        cn_re = re.compile(r"([一-鿿]{2,8}(?:型号|系列|版本|规格)?)")
+        for m in cn_re.finditer(query):
+            token = m.group(1).strip()
+            if len(token) >= 2:
+                subjects.append(token)
+        return list(dict.fromkeys(subjects))  # 去重保序
+
+    def _apply_subject_filter(
+        self,
+        raw_refs: list[dict],
+        subjects: list[str],
+        doc_map: dict[str, Any],
+    ) -> tuple[list[dict], int]:
+        """主体一致性过滤：对 raw_refs 按 doc_id 的 file_name 与 query 主体做匹配。
+
+        Returns:
+            (filtered_refs, removed_count): 过滤后的 refs 和被移除的数量
+        """
+        if not subjects or not raw_refs:
+            return raw_refs, 0
+        # 为每个 doc_id 预计算一致性布尔标记
+        doc_match: dict[str, bool] = {}
+        removed = 0
+        filtered: list[dict] = []
+        for r in raw_refs:
+            did = r.get("doc_id")
+            if not did:
+                filtered.append(r)
+                continue
+            if did not in doc_match:
+                d = doc_map.get(did)
+                fname = (d.file_name if d else "") or ""
+                # 检查文件名是否包含任一主体名（大小写不敏感）
+                fname_lower = fname.lower()
+                doc_match[did] = any(s.lower() in fname_lower for s in subjects)
+            if doc_match[did]:
+                filtered.append(r)
+            else:
+                removed += 1
+        return filtered, removed
+
+    async def _prellm_rerank_chunks(
+        self,
+        query: str,
+        raw_refs: list[dict],
+        tenant_id: str,
+        kb_id: str = "",
+        trace_id: str | None = None,
+        user_id: str = "",
+    ) -> list[dict]:
+        """送 LLM 融合前的 chunk 级重排：用 reranker 对原始 chunk 文本打分。
+
+        Args:
+            query: 用户查询
+            raw_refs: LightRAG 返回的原始 reference 列表（每项含 text 字段）
+            tenant_id, kb_id, trace_id, user_id: 计量/追踪
+
+        Returns:
+            按 relevance 降序排列的 raw_refs（top-K 保留，其余移除）
+        """
+        from jonex_core.common.rerank import rerank
+
+        if not raw_refs or len(raw_refs) <= RAG_PRELLM_RERANK_TOPK:
+            return raw_refs
+
+        # 提取每个 ref 的代表文本（chunk 原文）
+        texts: list[str] = []
+        indices: list[int] = []
+        for i, r in enumerate(raw_refs):
+            txt = r.get("text") or r.get("content") or ""
+            if txt:
+                texts.append(txt[:1024])
+                indices.append(i)
+
+        if len(texts) <= RAG_PRELLM_RERANK_TOPK:
+            return raw_refs
+
+        try:
+            results = await rerank(
+                query, texts, tenant_id=tenant_id,
+                kb_id=kb_id or None, trace_id=trace_id, user_id=user_id,
+            )
+            if not results:
+                return raw_refs
+            score_by_idx = {x["index"]: x.get("relevance_score", 0.0) for x in results}
+            # 标注 relevance 分数
+            for i in range(len(raw_refs)):
+                raw_refs[i]["relevance"] = score_by_idx.get(
+                    next((j for j, idx in enumerate(indices) if idx == i), -1), 0.0
+                )
+            # 按 relevance 降序排序，取 top-K
+            ranked = sorted(raw_refs, key=lambda r: r.get("relevance", 0.0), reverse=True)
+            logger.info(
+                "[prellm_rerank] query=%s top3_scores=%s total=%d kept=%d",
+                query[:80],
+                [round(r.get("relevance", 0), 3) for r in ranked[:3]],
+                len(raw_refs), min(len(ranked), RAG_PRELLM_RERANK_TOPK),
+            )
+            return ranked[:RAG_PRELLM_RERANK_TOPK]
+        except Exception as e:
+            logger.warning("[prellm_rerank] 重排失败（回退原序）: %s", e)
+            return raw_refs
+
     def _log_rag_timing(
         self, tenant_id: str, rag_multi_ms: int | None, fusion_ms: int | None,
         kb_ok: int, kb_total: int, kb_failed: list[str],
@@ -682,7 +1111,7 @@ class SearchService:
 
         # ── 召回明细：埋点前预查 doc_map（与后续 _build_references 共用，避免重复 DB 查询）──
         recall_doc_ids: list[str] = []
-        if ONTOLOGY_RAG_RECALL_DETAIL_ENABLED and collector and all_raw_refs:
+        if all_raw_refs:
             recall_doc_ids = [r.get("doc_id") for r in all_raw_refs if r.get("doc_id")]
         doc_map: dict[str, Any] = {}
         if recall_doc_ids:
@@ -692,6 +1121,37 @@ class SearchService:
                 # （非 relationship / 非 deferred），session 关闭后读取安全
                 docs = await repo.get_by_ids(list(set(recall_doc_ids)), tenant_id)
             doc_map = {d.id: d for d in docs}
+
+        # ── [jonex] P1-5 主体一致性过滤 ──
+        # 分层局限：本层过滤/重排作用在 LightRAG 已生成答案之后的引用上，
+        # 可改善展示引用与融合排序，但不改单个 KB 内部已被污染的答案。
+        # 若同 KB 内召回了不相关 chunk 并已影响 LightRAG 生成的答案，
+        # 需在 LightRAG 检索侧做主体过滤才能真正纠正（见 L3）。
+        subject_filtered_count = 0
+        if RAG_SUBJECT_FILTER_ENABLED and all_raw_refs:
+            subjects = self._extract_subject_entity(req.query)
+            if subjects:
+                all_raw_refs, subject_filtered_count = self._apply_subject_filter(
+                    all_raw_refs, subjects, doc_map,
+                )
+                logger.info(
+                    "[subject_filter] query=%r subjects=%s filtered=%d remaining=%d",
+                    req.query[:80], subjects, subject_filtered_count, len(all_raw_refs),
+                )
+
+        # ── [jonex] P1-5 送 LLM 前 chunk 级重排 ──
+        prellm_reranked = False
+        prellm_rerank_scores: list[float] = []
+        if RAG_PRELLM_RERANK_ENABLED and all_raw_refs and len(all_raw_refs) > RAG_PRELLM_RERANK_TOPK:
+            original_count = len(all_raw_refs)
+            all_raw_refs = await self._prellm_rerank_chunks(
+                req.query, all_raw_refs,
+                tenant_id=tenant_id,
+                kb_id=kb_ids[0] if kb_ids else "",
+                trace_id=trace_id, user_id=user_id,
+            )
+            prellm_reranked = len(all_raw_refs) < original_count
+            prellm_rerank_scores = [round(r.get("relevance", 0), 4) for r in all_raw_refs[:5]]
 
         allowed = set(kb_ids)
         recalls: list[dict] = []
@@ -716,48 +1176,61 @@ class SearchService:
 
         if collector:
             collector.step(
-                STAGE_RAG_FALLBACK, "RAG 多库检索",
-                summary=f"{len(per_kb)}/{len(kb_ids)} 个知识库返回有效答案，召回 {len(recalls)} 个片段",
+                STAGE_RAG_FALLBACK, "OntoRAG 多库检索",
+                summary=f"{len(per_kb)}/{len(kb_ids)} 个知识库返回有效答案，召回 {len(recalls)} 个片段"
+                        + (f"，主体过滤移除 {subject_filtered_count} 个" if subject_filtered_count else ""),
                 detail={
                     "kb_ok": [p["kb_id"] for p in per_kb],
                     "kb_failed": kb_failed,
                     "recall_count": len(recalls),
                     "recalls": recalls,
+                    "p1_5": {
+                        "subject_filter_enabled": RAG_SUBJECT_FILTER_ENABLED,
+                        "subject_filtered_count": subject_filtered_count,
+                        "prellm_rerank_enabled": RAG_PRELLM_RERANK_ENABLED,
+                        "prellm_reranked": prellm_reranked,
+                        "prellm_rerank_topk": RAG_PRELLM_RERANK_TOPK,
+                        "prellm_rerank_top_scores": prellm_rerank_scores[:3] if prellm_rerank_scores else [],
+                    },
                 },
                 t_start=t_rag,
             )
-            # 检索期 rerank（LightRAG 内部：召回后、送 LLM 前）实测检测：
-            # gateway 被 LightRAG 调用 rerank 时写 Redis 标记，这里按 query 哈希回读，
-            # 得到本次查询「是否真的触发了 rerank 调用」（best-effort，检测不可用则回退配置态）。
+            # 检索期 rerank（LightRAG 内部 + P1-5 平台侧：召回后、送 LLM 前）实测检测
             hit = await self._detect_retrieval_rerank_hit(req.query, since_epoch=t_fallback_epoch)
+            rerank_summary_parts: list[str] = []
+            if prellm_reranked:
+                rerank_summary_parts.append(
+                    f"P1-5 平台 chunk 重排（{len(all_raw_refs)} 条经 gateway reranker）"
+                )
             if hit is True:
-                collector.step(
-                    STAGE_RETRIEVAL_RERANK, "检索期重排（LightRAG）",
-                    summary=(f"已触发（实测）：本次 fallback 检测到 LightRAG 在送 LLM 前调用了 "
-                             f"rerank（经 llm-gateway，覆盖 {len(per_kb)} 个 KB 检索）"),
-                    detail={"triggered": True, "detected": True, "where": "lightrag_internal",
-                            "phase": "retrieval", "kb_count": len(per_kb)},
-                )
+                rerank_summary_parts.append("OntoRAG 内部 rerank 已触发")
             elif RAG_RETRIEVAL_RERANK_ENABLED:
-                collector.step(
-                    STAGE_RETRIEVAL_RERANK, "检索期重排（LightRAG）",
-                    status="skipped" if hit is False else "done",
-                    summary=("已配置但本次未检测到 rerank 调用"
-                             "（可能无召回结果 / enable_rerank=false / rerank 异常回退原序）"
-                             if hit is False else
-                             "已配置（命中检测暂不可用，无法确认本次是否实际调用）"),
-                    detail={"triggered": False if hit is False else None,
-                            "configured": True, "detected": hit is not None,
-                            "where": "lightrag_internal", "phase": "retrieval"},
-                )
+                rerank_summary_parts.append("OntoRAG rerank 已配置但本次未触发")
             else:
-                collector.step(
-                    STAGE_RETRIEVAL_RERANK, "检索期重排（LightRAG）", status="skipped",
-                    summary=("未启用：LightRAG 未配置检索期 rerank（RERANK_BINDING=null），"
-                             "召回结果未在送 LLM 前重排"),
-                    detail={"triggered": False, "configured": False,
-                            "where": "lightrag_internal", "phase": "retrieval"},
-                )
+                rerank_summary_parts.append("OntoRAG rerank 未配置")
+
+            collector.step(
+                STAGE_RETRIEVAL_RERANK, "检索期重排",
+                summary="；".join(rerank_summary_parts),
+                detail={
+                    "triggered": bool(prellm_reranked) or bool(hit),
+                    "p1_5_platform_rerank": {
+                        "enabled": RAG_PRELLM_RERANK_ENABLED,
+                        "triggered": prellm_reranked,
+                        "topk": RAG_PRELLM_RERANK_TOPK,
+                    },
+                    "lightrag_rerank": {
+                        "enabled": RAG_RETRIEVAL_RERANK_ENABLED,
+                        "triggered": hit is True,
+                    },
+                    "subject_filter": {
+                        "enabled": RAG_SUBJECT_FILTER_ENABLED,
+                        "filtered": subject_filtered_count,
+                    },
+                    "where": "platform_pre_llm",
+                    "phase": "retrieval",
+                },
+            )
 
         if not per_kb:
             if collector:
@@ -937,6 +1410,700 @@ class SearchService:
         )
         return sorted_refs
 
+    # ══════════════════════════════════════════════════════════════════
+    # §9 严格模式
+    # ══════════════════════════════════════════════════════════════════
+
+    def _verify_answer(
+        self,
+        answer: str,
+        references: list[dict],
+        query: str,
+        ontology_instances: list[dict],
+        facts: list[dict] | None,
+        prior_answers: list[str] | None = None,
+        min_score: float = 0.8,
+    ) -> dict:
+        """校验单次尝试的答案质量，返回 checks dict 与加权 score。
+
+        Returns:
+            {"checks": {...}, "score": float, "passed": bool, "unmet": [...]}
+        """
+        checks: dict[str, float] = {}
+
+        # 1) non_refusal：命中拒答模板
+        refusal = False
+        for pat in _REFUSAL_PATTERNS:
+            if pat.search(answer):
+                refusal = True
+                break
+        checks["non_refusal"] = 0.0 if refusal else 1.0
+
+        # 2) has_reference
+        checks["has_reference"] = 1.0 if references else 0.0
+
+        # 3) grounded：关键数值 token 是否可在证据中找到
+        grounded = 0.0
+        key_tokens: list[str] = re.findall(
+            r"\b\d+\.?\d*\s*(?:m/s²?|km/h|kg|mm|cm|m|g|W|V|A|°C|%|倍)\b", answer,
+        )
+        if not key_tokens:
+            key_tokens = re.findall(r"\b\d+\.?\d+\b", answer)
+        if key_tokens:
+            # 收集所有证据文本：chunk references + ontology facts + ontology instances
+            evidence_texts: list[str] = []
+            for r in references:
+                for loc in r.get("locations", []):
+                    if loc.get("text"):
+                        evidence_texts.append(loc["text"])
+            if facts:
+                for f in facts:
+                    te = f.get("target_entity", {})
+                    desc = te.get("description", "")
+                    attrs = str(te.get("attributes", {}))
+                    if desc:
+                        evidence_texts.append(desc)
+                    if attrs:
+                        evidence_texts.append(attrs)
+            # [jonex] L5 补上 ontology_instances（query_with_ontology 返回体不含 facts，
+            # 但含 ontology_instances——其 description/attributes 同样是有效证据）
+            for inst in ontology_instances:
+                desc = inst.get("description", "")
+                attrs = str(inst.get("attributes", {}))
+                if desc:
+                    evidence_texts.append(desc)
+                if attrs and attrs != "{}":
+                    evidence_texts.append(attrs)
+            # ── 空格/单位归一化：去除数值与单位之间的空格 ──
+            def _norm(s: str) -> str:
+                """归一化：去除数值与单位间的空格、多余空白（如 '316 mm'→'316mm'）"""
+                s = re.sub(r"(\d)\s+(mm|cm|m|km|kg|g|W|V|A|°C|%|倍)", r"\1\2", s)
+                s = re.sub(r"\s+", " ", s)
+                return s.strip()
+            evidence_normalized = _norm(" ".join(evidence_texts))
+            found = sum(1 for t in key_tokens if _norm(t) in evidence_normalized)
+            grounded = found / len(key_tokens) if key_tokens else 1.0
+        else:
+            grounded = 1.0  # 无关键数值则该项满分
+        checks["grounded"] = grounded
+
+        # 4) consistency：多次尝试答案的关键结论一致性
+        if prior_answers and len(prior_answers) >= 1:
+            # 简单归一化：提取所有答案的数值做比较
+            all_numbers: list[set[str]] = []
+            for ans in [answer] + list(prior_answers):
+                all_numbers.append(set(re.findall(r"\b\d+\.?\d*\b", ans)))
+            if len(all_numbers) >= 2:
+                overlap = len(all_numbers[0] & all_numbers[-1])
+                total = max(len(all_numbers[0] | all_numbers[-1]), 1)
+                checks["consistency"] = overlap / total
+            else:
+                checks["consistency"] = 0.5  # single-shot 固定 0.5
+        else:
+            checks["consistency"] = 0.5
+
+        # 加权求和
+        score = (
+            _STRICT_W_NON_REFUSAL * checks["non_refusal"]
+            + _STRICT_W_REFERENCE * checks["has_reference"]
+            + _STRICT_W_GROUNDED * checks["grounded"]
+            + _STRICT_W_CONSISTENCY * checks["consistency"]
+        )
+        score = min(max(score, 0.0), 1.0)
+        # [jonex] 使用请求的 strict_min_score 而非进程常量 _STRICT_MIN_SCORE
+        passed = score >= min_score
+        unmet = [k for k, v in checks.items() if v < 0.6]
+
+        return {
+            "checks": checks,
+            "score": score,
+            "passed": passed,
+            "unmet": unmet,
+        }
+
+    @staticmethod
+    def _build_reliability(verify_result: dict, attempts: int, min_score: float = 0.8) -> dict:
+        """构造 ReliabilityInfo 序列化 dict（§9.2、§9.7 文案）。"""
+        verdict = "verified" if verify_result["passed"] else "best_effort"
+        if verdict == "verified":
+            statement = (
+                f"本答案经严格校验通过（可靠性 {verify_result['score']:.2f}，"
+                f"第 {attempts} 次尝试达标）：非拒答、含原文引用、关键数据可溯源。"
+            )
+        else:
+            unmet_str = "、".join(verify_result.get("unmet", [])) or "无"
+            statement = (
+                f"本答案为 {attempts} 次严格校验中置信度最高的一次"
+                f"（可靠性 {verify_result['score']:.2f}，未达 {min_score} 阈值）。"
+                f"未满足项：{unmet_str}。建议结合下方引用人工核对。"
+            )
+        return {
+            "verdict": verdict,
+            "score": round(verify_result["score"], 4),
+            "attempts": attempts,
+            "passed": verify_result["passed"],
+            "checks": verify_result["checks"],
+            "statement": statement,
+            "unmet": verify_result.get("unmet", []),
+        }
+
+    # ══════════════════════════════════════════════════════════════════
+    # §10 深度查询
+    # ══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _classify_intent(query: str) -> dict:
+        """意图分类器（规则版，零 LLM 成本）。
+
+        Returns:
+            {"intent": "simple" | "complex", "ops": [...], "subjects": [...]}
+        """
+        if not query:
+            return {"intent": "simple", "ops": [], "subjects": []}
+
+        # complex 触发词（中文 + 英文）— 注意 "how many" / "共几个" 归类到 count
+        # 而非 compute（compute 负责乘除/百分比/换算类）
+        complex_triggers = [
+            "计算", "多少倍", "百分比", "相差", "对比", "相比",
+            "为什么", "意味着", "推断", "共几个", "最早", "最后", "首次",
+            "换算", "密度", "占比", "平均", "合计", "哪年",
+            "how much", "how many", "compare", "versus", "vs",
+            "why", "imply", "derive", "convert", "total", "ratio", "average",
+        ]
+        ops: list[str] = []
+        q_lower = query.lower()
+        for t in complex_triggers:
+            if t.lower() in q_lower:
+                if t in ("计算", "多少倍", "百分比", "换算", "密度", "占比", "平均",
+                         "how much", "convert", "total", "ratio", "average"):
+                    ops.append("compute")
+                elif t in ("对比", "相比", "compare", "versus", "vs"):
+                    ops.append("compare")
+                elif t in ("共几个", "how many", "count"):
+                    ops.append("count")
+                elif t in ("为什么", "why"):
+                    ops.append("reason")
+                elif t in ("最早", "最后", "首次"):
+                    ops.append("timeline")
+        ops = list(dict.fromkeys(ops))
+        subjects = SearchService._extract_subject_entity(query)
+
+        # ── 兜底：无触发词但含多实体/数值 → 可能为复杂对比/分析 ──
+        if ops:
+            intent = "complex"
+        else:
+            # 统计 query 中的数值和实体名词数量
+            num_count = len(re.findall(r"\b\d+\.?\d*\b", query))
+            entity_count = len(subjects)
+            if num_count >= 2 and entity_count >= 2:
+                # 含多个数值+多实体但无触发词 → 例如 "which shows the smaller variation"
+                intent = "complex"
+            else:
+                intent = "simple"
+
+        return {"intent": intent, "ops": ops, "subjects": subjects}
+
+    async def _plan_subqueries(
+        self, query: str, tenant_id: str, user_id: str, trace_id: str | None,
+        max_subqueries: int = 6,
+    ) -> dict:
+        """LLM 规划器：将复杂查询分解为子查询列表（§10.3 ①）。
+
+        Returns:
+            {"sub_questions": [{"id": "q1", "ask": "...", "expect": "..."}],
+             "aggregation": {"op": "compute|compare|count|reason|none", "instruction": "..."}}
+        """
+        from jonex_core.common.ontology_llm import _get_client
+        import json as _json
+
+        client = _get_client()
+        model = os.getenv("ONTOLOGY_LLM_MODEL", "deepseek-v4-flash-202605")
+
+        system_prompt = (
+            "You are a query planner for a technical knowledge base. "
+            "Decompose a complex question into simple sub-questions, each answerable "
+            "by a single fact lookup (no computation within sub-queries). "
+            f"At most {max_subqueries} sub-questions.\n\n"
+            "Output ONLY valid JSON, no markdown, no explanation:\n"
+            '{"sub_questions":[{"id":"q1","ask":"...","expect":"short label"}],'
+            '"aggregation":{"op":"...","instruction":"..."}}\n\n'
+            'op must be one of: compute | compare | count | reason | convert | none\n\n'
+            "=== EXAMPLES ===\n\n"
+            "Q: How much energy to heat 1.8L water from 25C to 73C?\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"specific heat capacity of water","expect":"water_specific_heat"},{"id":"q2","ask":"heat energy formula Q=mcΔT","expect":"heat_formula"}],"aggregation":{"op":"compute","instruction":"Q = 1.8kg * c * (73-25)K, report in kJ"}}\n\n'
+            "Q: compare H100 vs A6000 inference speed\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"H100 inference tokens per second","expect":"h100_tokens_per_sec"},{"id":"q2","ask":"A6000 inference tokens per second","expect":"a6000_tokens_per_sec"}],"aggregation":{"op":"compare","instruction":"Calculate ratio H100/A6000 and state which is faster"}}\n\n'
+            "Q: Go2-W max distance at top speed over full endurance\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"Go2-W top speed","expect":"go2w_top_speed"},{"id":"q2","ask":"Go2-W maximum endurance time","expect":"go2w_endurance_max"}],"aggregation":{"op":"compute","instruction":"distance = speed * endurance_hours, report in km"}}\n\n'
+            "Q: how many CUDA versions from 12.4 to 13.3\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"list all CUDA Toolkit versions between 12.4 and 13.3","expect":"cuda_versions_list"}],"aggregation":{"op":"count","instruction":"Count distinct minor versions from 12.4 to 13.3 inclusive"}}\n\n'
+            "Q: Go2-W rated payload as percentage of self-weight\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"Go2-W self weight","expect":"go2w_weight"},{"id":"q2","ask":"Go2-W rated payload capacity","expect":"go2w_payload_rated"}],"aggregation":{"op":"compute","instruction":"percentage = payload/weight * 100, report as %"}}\n\n'
+            "Q: Is 10kg within Go2-W payload limit?\n"
+            'A: {"sub_questions":[{"id":"q1","ask":"Go2-W rated load and maximum limit load","expect":"go2w_payload_specs"}],"aggregation":{"op":"reason","instruction":"Compare 10kg against rated load and limit load, state if within limits"}}\n\n'
+            "Q: convert Go2-W 2.5m/s to km/h\n"
+            'A: {"sub_questions":[],"aggregation":{"op":"convert","instruction":"2.5 m/s * 3.6 = 9 km/h"}}\n\n'
+            "=== END EXAMPLES ===\n\n"
+            "RULES:\n"
+            "- Each sub-question MUST be a simple fact lookup (one entity, one attribute)\n"
+            "- NEVER include computation/arithmetic in sub-question text\n"
+            "- If the question is a simple unit conversion with no fact lookup needed, return empty sub_questions with op=convert\n"
+            "- If only one fact is needed (e.g. 'count X' or 'is Y within Z'), use 1 sub-question\n"
+            "- Output ONLY the JSON object, no surrounding text, no ``` fences"
+        )
+        extra_headers = {
+            "X-Jonex-Tenant-Id": tenant_id or "unknown",
+            "X-Jonex-Scene": "query_plan",
+            "X-Jonex-Trace-Id": trace_id or f"plan:{__import__('uuid').uuid4().hex}",
+        }
+        if user_id:
+            extra_headers["X-Jonex-User-Id"] = user_id
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Query: {query}"},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+                extra_headers=extra_headers,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            # 剥离 markdown 代码块（```json ... ``` 或 ``` ... ```）
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            text = text.strip()
+            # 提取第一个完整 JSON 对象（匹配最外层花括号）
+            json_match = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text)
+            if json_match:
+                return _json.loads(json_match.group(0))
+            logger.warning("[deep] 规划器返回不可解析的 JSON: %s", text[:200])
+            return {"sub_questions": [], "aggregation": {"op": "none", "instruction": ""}}
+        except Exception as e:
+            logger.warning("[deep] 规划器失败: %s", e)
+            return {"sub_questions": [], "aggregation": {"op": "none", "instruction": ""}}
+
+    @staticmethod
+    def _extract_fact(sub_result: dict, sub_query: dict) -> dict:
+        """从子查询结果中提取关键事实（§10.3 ②）。
+
+        Returns:
+            {"sub_id": str, "value": str|None, "source": str, "grounded": bool,
+             "answer": str, "ref_count": int, "refs": list[dict]}
+        """
+        answer = sub_result.get("answer", "")
+        source = sub_result.get("source", "rag")
+        refs = sub_result.get("references", [])
+        value = None
+        # 尝试从 answer 中提取结构化值（数值 + 单位）
+        val_match = re.search(r"(\d+\.?\d*\s*(?:[A-Za-z%°/²³]+\s*)+)", answer)
+        if val_match:
+            value = val_match.group(1).strip()
+        grounded = source == "ontology" or bool(refs)
+        return {
+            "sub_id": sub_query.get("id", ""),
+            "value": value,
+            "source": source,
+            "grounded": grounded,
+            "answer": answer[:500],
+            "ref_count": len(refs),
+            "refs": refs,  # 子查询原始引用，供 deep 汇总
+        }
+
+    async def _synthesize(
+        self, query: str, facts: list[dict], aggregation: dict,
+        tenant_id: str, user_id: str, trace_id: str | None,
+        allow_common_sense: bool = True,
+    ) -> str:
+        """LLM 汇总器：基于取证要素 + aggregation 指令生成最终答案（§10.3 ③）。"""
+        from jonex_core.common.ontology_llm import _get_client
+        import json as _json
+
+        client = _get_client()
+        model = os.getenv("ONTOLOGY_LLM_MODEL", "deepseek-v4-flash-202605")
+
+        op = aggregation.get("op", "none")
+        instruction = aggregation.get("instruction", "")
+
+        system_prompt = (
+            "You are an expert technical analyst. Synthesize a clear, accurate answer "
+            "based on the provided facts gathered from sub-queries. "
+            f"The aggregation operation is: {op}. Instructions: {instruction}. "
+            "Present a step-by-step derivation: list each fact used, the formula or logic, "
+            "and the final conclusion."
+        )
+        if allow_common_sense:
+            system_prompt += (
+                " You may apply well-known physical constants, math formulas, or standard "
+                "conventions on TOP of the provided facts. Explicitly state any assumption "
+                "(e.g. 'Assuming c=4186 J/(kg·K)'). NEVER fabricate product parameters."
+            )
+
+        extra_headers = {
+            "X-Jonex-Tenant-Id": tenant_id or "unknown",
+            "X-Jonex-Scene": "deep_synthesis",
+            "X-Jonex-Trace-Id": trace_id or f"synth:{__import__('uuid').uuid4().hex}",
+        }
+        if user_id:
+            extra_headers["X-Jonex-User-Id"] = user_id
+        # [jonex] L2 剥离 refs（含预签名 URL、chunk 原文）再送 LLM，避免 token 浪费与 URL 泄漏
+        facts_lean = [
+            {k: v for k, v in f.items() if k != "refs"}
+            for f in facts
+        ]
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",
+                     "content": f"Query: {query}\n\nFacts:\n{_json.dumps(facts_lean, ensure_ascii=False)}\n\nAggregation: {_json.dumps(aggregation)}"},
+                ],
+                temperature=0.2,
+                max_tokens=2048,
+                extra_headers=extra_headers,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning("[deep] 汇总器失败: %s", e)
+            return f"基于 {len(facts)} 个要素：{', '.join(f.get('value', f.get('answer', '')[:100]) for f in facts)}"
+
+    async def deep_query(
+        self,
+        tenant_id: str,
+        user_id: str,
+        request: DeepSearchRequest | dict,
+        trace_id: str | None = None,
+    ) -> dict:
+        """深度查询入口（§10.3）：意图分类 → 规划 → 并发取证 → 汇总。
+
+        simple 问题直接委托 query_with_ontology（复用现有单次核心）。
+        complex 问题走「分解-取证-汇总」三段编排。
+        可选叠加 strict_mode 做最外层质量门禁。
+        """
+        req = DeepSearchRequest(**_payload(request))
+        # ── 进程总闸 ──
+        if not _DEEP_QUERY_ENABLED:
+            return {
+                "answer": "深度查询功能未启用，请使用 /search/ontology 进行查询。",
+                "source": "deep_disabled",
+                "references": [],
+                "ontology_instances": [],
+                "rag_used": False,
+                "knowledge_base_ids": [],
+                "reasoning": None,
+                "reliability": None,
+                "plan_summary": None,
+                "facts_summary": [],
+            }
+        kb_ids = await self._resolve_kb_ids(tenant_id, req)
+        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+
+        # ── 意图分类 ──
+        intent = self._classify_intent(req.query)
+        collector.step(
+            STAGE_INTENT_CLASSIFY, "意图识别",
+            summary=f"intent={intent['intent']} ops={intent.get('ops', [])}",
+            detail=intent,
+        )
+
+        # simple → 直连现有核心
+        if intent["intent"] == "simple":
+            sub_req = req.copy(update={
+                "with_reasoning": req.with_reasoning,
+                "strict_mode": False,  # 防止复进入 strict 循环
+            })
+            result = await self.query_with_ontology(
+                tenant_id, user_id, sub_req, trace_id,
+            )
+            # 合并 deep 分类步骤到内层 reasoning
+            if result.get("reasoning") and isinstance(result["reasoning"], dict):
+                inner_steps = result["reasoning"].get("steps", [])
+                result["reasoning"]["steps"] = collector._steps + inner_steps
+                result["reasoning"]["deep_intent"] = "simple"
+            else:
+                result["reasoning"] = collector.build(result.get("source", "unknown"))
+            return result
+
+        # ── complex：规划 ──
+        t_plan = time.perf_counter()
+        plan = await self._plan_subqueries(
+            req.query, tenant_id, user_id, trace_id,
+            max_subqueries=req.max_subqueries,
+        )
+        sub_questions = plan.get("sub_questions", [])
+        aggregation = plan.get("aggregation", {"op": "none", "instruction": ""})
+        collector.step(
+            STAGE_QUERY_PLAN, "查询分解",
+            summary=f"拆成 {len(sub_questions)} 个子查询，聚合={aggregation.get('op', 'none')}",
+            detail={"sub_questions": sub_questions, "aggregation": aggregation},
+            t_start=t_plan,
+        )
+
+        if not sub_questions:
+            # 规划失败 → 降级到普通查询
+            fallback = await self.query_with_ontology(
+                tenant_id, user_id, req, trace_id,
+            )
+            fallback["source"] = "deep_degraded"
+            return fallback
+
+        # ── 并发取证 ──
+        sem = asyncio.Semaphore(_DEEP_SUBQUERY_CONCURRENCY)  # 子查询并发上限
+
+        async def _run_one(sq: dict) -> dict:
+            async with sem:
+                t_s = time.perf_counter()
+                sub = DeepSearchRequest(
+                    query=sq.get("ask", ""), mode="hybrid",
+                    top_k=max(req.top_k, 10),
+                    knowledge_base_ids=req.knowledge_base_ids,
+                    save_history=False, with_reasoning=False,
+                    strict_mode=False,
+                )
+                try:
+                    r = await self.query_with_ontology(
+                        tenant_id, user_id, sub, trace_id,
+                    )
+                    fact = self._extract_fact(r, sq)
+                    collector.step(
+                        STAGE_SUBQUERY, f"子查询·{sq.get('id', '?')}",
+                        status="done" if fact.get("value") or fact.get("answer") else "skipped",
+                        summary=f"{sq.get('ask', '')} → {fact.get('value') or fact.get('answer', '')[:100]}",
+                        detail={"value": fact.get("value"), "source": fact.get("source"),
+                                "grounded": fact.get("grounded"),
+                                "ref_count": fact.get("ref_count")},
+                        t_start=t_s,
+                    )
+                    return fact
+                except Exception as e:
+                    logger.warning("[deep] 子查询失败 id=%s: %s", sq.get("id"), e)
+                    return {"sub_id": sq.get("id", ""), "value": None, "source": "error",
+                            "grounded": False, "answer": "", "ref_count": 0}
+
+        t_subq = time.perf_counter()
+        tasks = [_run_one(sq) for sq in sub_questions]
+        facts = await asyncio.gather(*tasks)
+        t_subq_ms = int((time.perf_counter() - t_subq) * 1000)
+        logger.info("[deep] 子查询完成 count=%d ms=%d", len(facts), t_subq_ms)
+
+        # ── 汇总 ──
+        t_synth = time.perf_counter()
+        answer = await self._synthesize(
+            req.query, facts, aggregation,
+            tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
+            allow_common_sense=req.allow_common_sense,
+        )
+        collector.step(
+            STAGE_SYNTHESIS, "汇总与计算",
+            summary=f"基于 {sum(1 for f in facts if f.get('value') or f.get('answer'))}/{len(facts)} 个要素完成 {aggregation.get('op', '?')}",
+            detail={"facts": [{"id": f["sub_id"], "value": f.get("value")} for f in facts],
+                    "aggregation_op": aggregation.get("op")},
+            t_start=t_synth,
+        )
+
+        # 合并引用（去重：按 doc_id + chunk_index）
+        all_refs: list[dict] = []
+        seen_refs: set[tuple] = set()
+        all_onto: list[dict] = []
+        for f in facts:
+            if f.get("source") == "ontology":
+                all_onto.append({"name": f.get("value", ""), "source": "subquery"})
+            for ref in f.get("refs", []):
+                key = (ref.get("doc_id", ""), ref.get("chunk_index", -1))
+                if key not in seen_refs:
+                    seen_refs.add(key)
+                    all_refs.append(ref)
+
+        # ── [jonex] §10.4 deep 专用校验（要素级 grounded）──
+        reliability = None
+        if req.strict_mode and _STRICT_MODE_ENABLED:
+            # deep 模式用要素级 grounded：检查每个子查询取到的要素是否可溯源
+            elem_grounded = sum(1 for f in facts if f.get("grounded")) / max(len(facts), 1)
+            elem_coverage = sum(1 for f in facts if f.get("value") or f.get("answer")) / max(len(sub_questions), 1)
+            # 汇总答案非拒答检测
+            refusal = any(pat.search(answer) for pat in _REFUSAL_PATTERNS)
+            checks = {
+                "non_refusal": 0.0 if refusal else 1.0,
+                "has_reference": float(bool(all_refs)),
+                "grounded": elem_grounded,
+                "element_coverage": elem_coverage,
+                "computation_transparent": 1.0 if re.search(r"(?:代入|公式|计算|推导|=|≈)", answer) else 0.5,
+                "consistency": 0.5,
+            }
+            score = (
+                _STRICT_W_NON_REFUSAL * checks["non_refusal"]
+                + _STRICT_W_REFERENCE * checks["has_reference"]
+                + _STRICT_W_GROUNDED * checks["grounded"]
+                + 0.1 * checks["element_coverage"]
+                + 0.1 * checks["computation_transparent"]
+                + 0.15 * checks["consistency"]
+            )
+            score = min(max(score, 0.0), 1.0)
+            verify_result = {"checks": checks, "score": score, "passed": score >= req.strict_min_score, "unmet": [k for k, v in checks.items() if v < 0.6]}
+            reliability = self._build_reliability(verify_result, 1, min_score=req.strict_min_score)  # deep 单次编排视为 1 次尝试
+
+        return {
+            "answer": answer,
+            "source": "deep",
+            "references": all_refs or [],
+            "ontology_instances": all_onto,
+            "rag_used": any(f.get("source") == "rag" for f in facts),
+            "knowledge_base_ids": kb_ids,
+            "reasoning": collector.build("deep"),
+            "reliability": reliability,
+            "plan_summary": {
+                "sub_queries": len(sub_questions),
+                "completed": sum(1 for f in facts if f.get("value") or f.get("answer")),
+                "aggregation": aggregation.get("op", "none"),
+            },
+            "facts_summary": [
+                {"id": f["sub_id"], "value": f.get("value"), "source": f.get("source"),
+                 "grounded": f.get("grounded")}
+                for f in facts
+            ],
+        }
+
+    async def query_with_ontology_strict(
+        self,
+        tenant_id: str,
+        user_id: str,
+        request: OntologySearchRequest | dict,
+        trace_id: str | None = None,
+    ) -> dict:
+        """严格模式：多次升级重试 + 质量校验 + 可靠性说明（§9.6）。"""
+        req = OntologySearchRequest(**_payload(request))
+        t_all = time.perf_counter()
+        cap = min(req.strict_max_attempts, _STRICT_MAX_ATTEMPTS_CAP)
+
+        attempts: list[tuple[dict, dict]] = []  # (result, verify)
+        best: tuple[dict, dict] | None = None
+        prior_answers: list[str] = []
+
+        # 推理链
+        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+
+        for i in range(cap):
+            gear = _STRICT_ESCALATION[min(i, len(_STRICT_ESCALATION) - 1)]
+            t_i = time.perf_counter()
+            label = gear.get("label", f"第{i + 1}次")
+
+            # 构造升级参数（必须复位 strict_mode=False 防止无限递归）
+            sub_req = req.copy(update={
+                "top_k": gear["top_k"],
+                "with_reasoning": req.with_reasoning,
+                "strict_mode": False,
+                "_route_score_min_override": gear.get("route_score_min", ONTOLOGY_ROUTE_SCORE_MIN),
+                "_neighbor_depth_override": gear.get("neighbor_depth", ONTOLOGY_NEIGHBOR_DEPTH),
+            })
+
+            try:
+                result = await asyncio.wait_for(
+                    self.query_with_ontology(
+                        tenant_id, user_id, sub_req, trace_id,
+                    ),
+                    timeout=_STRICT_ATTEMPT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                collector.step(
+                    STAGE_STRICT_ATTEMPT, f"严格模式·第{i + 1}次尝试（{label}）",
+                    status="failed",
+                    summary=f"尝试超时（{_STRICT_ATTEMPT_TIMEOUT}s），进入下一档",
+                    t_start=t_i,
+                )
+                continue
+
+            # 校验
+            chk = self._verify_answer(
+                result["answer"], result.get("references", []), req.query,
+                result.get("ontology_instances", []),
+                result.get("facts") if isinstance(result, dict) else None,
+                prior_answers=prior_answers,
+                min_score=req.strict_min_score,
+            )
+            prior_answers.append(result["answer"])
+
+            collector.step(
+                STAGE_STRICT_ATTEMPT, f"严格模式·第{i + 1}次尝试（{label}）",
+                status="done",
+                summary=(
+                    f"source={result.get('source', '?')} "
+                    f"可靠性={chk['score']:.2f} "
+                    f"{'达标' if chk['passed'] else '未达标'}"
+                ),
+                detail={
+                    "gear": gear,
+                    "checks": chk["checks"],
+                    "score": chk["score"],
+                    "answer_preview": result["answer"][:200],
+                    "ref_count": len(result.get("references", [])),
+                },
+                t_start=t_i,
+            )
+
+            attempts.append((result, chk))
+            if best is None or chk["score"] > best[1]["score"]:
+                best = (result, chk)
+
+            if chk["passed"]:
+                collector.step(
+                    STAGE_STRICT_VERIFY, "严格校验通过",
+                    status="done",
+                    summary=f"第{i + 1}次达标（{chk['score']:.2f} ≥ {req.strict_min_score}），提前返回",
+                )
+                break
+
+            if time.perf_counter() - t_all > _STRICT_TOTAL_BUDGET:
+                collector.step(
+                    STAGE_STRICT_VERIFY, "严格校验中止",
+                    status="failed",
+                    summary="超总预算，返回当前最优",
+                )
+                break
+
+        if best is None:
+            # 全部超时 → 返回空结果
+            return {
+                "answer": "严格模式：所有尝试均超时，请稍后重试或关闭 strict_mode。",
+                "source": "none",
+                "references": [],
+                "ontology_instances": [],
+                "rag_used": False,
+                "knowledge_base_ids": [],
+                "reasoning": collector.build("none"),
+                "reliability": {
+                    "verdict": "best_effort",
+                    "score": 0.0,
+                    "attempts": cap,
+                    "passed": False,
+                    "checks": {},
+                    "statement": "所有尝试均超时。",
+                    "unmet": ["timeout"],
+                },
+            }
+
+        result, chk = best
+        result["reliability"] = self._build_reliability(chk, len(attempts), min_score=req.strict_min_score)
+        # 合并 reasoning：strict 外层步骤在前 → 最佳那次的内层步骤在后
+        strict_steps = collector._steps  # strict_attempt × N + strict_verify
+        inner_reasoning = result.get("reasoning") or {}
+        inner_steps = inner_reasoning.get("steps", [])
+        merged = {
+            "final_source": result.get("source", "unknown"),
+            "total_ms": int((time.perf_counter() - t_all) * 1000),
+            "strict": {
+                "attempts": len(attempts),
+                "verdict": result["reliability"]["verdict"],
+                "score": chk["score"],
+                "budget_ms": int(_STRICT_TOTAL_BUDGET * 1000),
+                "used_ms": int((time.perf_counter() - t_all) * 1000),
+            },
+            "steps": strict_steps + inner_steps,
+        }
+        result["reasoning"] = merged
+        return result
+
     async def query_with_ontology(
         self,
         tenant_id: str,
@@ -958,6 +2125,18 @@ class SearchService:
         4. 分低或 INSUFFICIENT 时降级 RAG（多 KB 并行 + LLM 融合）
         """.format(ONTOLOGY_VECTOR_SCORE_MIN, ONTOLOGY_ROUTE_SCORE_MIN)
         req = OntologySearchRequest(**_payload(request))
+        # ── [jonex] §9 严格模式分派 ──
+        if req.strict_mode and _STRICT_MODE_ENABLED:
+            return await self.query_with_ontology_strict(
+                tenant_id, user_id, request, trace_id,
+            )
+        # ── [jonex] M3 支持 strict escalation 按请求覆盖检索参数 ──
+        raw = request if isinstance(request, dict) else _payload(request)
+        _route_override = float(raw.get("_route_score_min_override", ONTOLOGY_ROUTE_SCORE_MIN))
+        _neighbor_depth_override = int(raw.get("_neighbor_depth_override", ONTOLOGY_NEIGHBOR_DEPTH))
+        _route_min = max(0.0, min(_route_override, ONTOLOGY_ROUTE_SCORE_MIN))
+        _nb_depth = max(1, min(_neighbor_depth_override, ONTOLOGY_NEIGHBOR_DEPTH_MAX))
+
         kb_ids = await self._resolve_kb_ids(tenant_id, req)
         gdao = OntologyGraphRepository(get_neo4j_driver())
 
@@ -986,7 +2165,7 @@ class SearchService:
             )
         except Exception as e:
             collector.step(STAGE_ONTOLOGY_MATCH, "本体实体匹配",
-                           status="failed", summary="本体检索失败，降级 RAG", t_start=t)
+                           status="failed", summary="本体检索失败，降级 OntoRAG", t_start=t)
             logger.warning("[ontology] 本体检索失败，降级 RAG: %s", e)
 
         # ── 阶段 2：路由决策（采集点②）──
@@ -1004,7 +2183,7 @@ class SearchService:
                 src = hit.get("source", "")
                 vs = hit.get("vscore", 0)
                 fs = hit.get("ft_score", hit.get("score", 0))
-                if src in ("exact", "prefix") or vs >= ONTOLOGY_VECTOR_SCORE_MIN or fs >= ONTOLOGY_ROUTE_SCORE_MIN:
+                if src in ("exact", "prefix") or vs >= ONTOLOGY_VECTOR_SCORE_MIN or fs >= _route_min:
                     go_ontology = True
                     matched = hit
                     break
@@ -1016,17 +2195,17 @@ class SearchService:
             route_reason = (
                 f"source={top_source}" if top_source in ("exact", "prefix")
                 else f"vscore={top_vscore} ≥ {ONTOLOGY_VECTOR_SCORE_MIN}" if top_vscore >= ONTOLOGY_VECTOR_SCORE_MIN
-                else f"ft_score={top_ftscore} ≥ {ONTOLOGY_ROUTE_SCORE_MIN}" if top_ftscore >= ONTOLOGY_ROUTE_SCORE_MIN
+                else f"ft_score={top_ftscore} ≥ {_route_min}" if top_ftscore >= _route_min
                 else f"分数均不足（top-{len(top_n)} max_vscore={max((h.get('vscore',0) for h in top_n), default=0):.2f} max_ftscore={max((h.get('ft_score',h.get('score',0)) for h in top_n), default=0):.2f}）"
             )
             collector.step(
                 STAGE_ROUTE_DECISION, "路由决策",
                 summary=(f"走本体路径（{route_reason}）"
                          if go_ontology else
-                         f"降级 RAG（{route_reason}）"),
+                         f"降级 OntoRAG（{route_reason}）"),
                 detail={"source": top_source, "vscore": top_vscore, "ft_score": top_ftscore,
                         "vscore_threshold": ONTOLOGY_VECTOR_SCORE_MIN,
-                        "ftscore_threshold": ONTOLOGY_ROUTE_SCORE_MIN,
+                        "ftscore_threshold": _route_min,
                         "route": "ontology" if go_ontology else "rag"},
             )
             if go_ontology:
@@ -1037,54 +2216,73 @@ class SearchService:
                     req.query, top_name, top_kb_id, top_source, top_vscore, top_ftscore,
                 )
 
+                # ── [jonex] P1-6 时间线/枚举/计数意图 → 图查询模板 ──
+                top_type = matched.get("type", "")
+                timeline = self._detect_timeline_intent(req.query)
+                graph_facts = None
+                if timeline and top_type in (
+                    "SoftwareRelease", "SoftwareToolkit", "HardwareArchitecture", "Software",
+                ):
+                    # 把 top_name 作为 fallback 版本号参数注入意图检测
+                    if not timeline["params"].get("version"):
+                        timeline["params"]["query_hint"] = req.query
+                        # 从 top_name 推测版本号（如 "CUDA Toolkit 12.8" → "12.8"）
+                        v_match = _VERSION_RE.search(top_name)
+                        if v_match:
+                            timeline["params"]["version"] = v_match.group(1)
+                    graph_facts = await self._execute_graph_query(
+                        gdao, tenant_id, top_kb_id, timeline, collector=collector,
+                    )
+
                 # ── 阶段 3：邻域取证（采集点③，独立 try）──
                 t = time.perf_counter()
-                facts = None
-                try:
-                    neighbor_data = await asyncio.wait_for(
-                        gdao.neighbors(
-                            tenant_id, top_kb_id, top_name,
-                            limit=ONTOLOGY_NEIGHBOR_LIMIT,
-                            depth=ONTOLOGY_NEIGHBOR_DEPTH,
-                            per_hop_limit=ONTOLOGY_NEIGHBOR_PER_HOP_LIMIT,
-                        ),
-                        timeout=ONTOLOGY_NEIGHBOR_TIMEOUT,
-                    )
-                    facts = neighbor_data.get("facts", [])
-                    neighbor_depth = neighbor_data.get("depth", 1)
-                    collector.step(
-                        STAGE_FACT_LOOKUP, "邻域事实检索",
-                        summary=(
-                            f"取到 {len(facts)} 条事实"
-                            + (f"（{neighbor_depth} 跳）"
-                               if neighbor_depth > 1 else "（1 跳）")
-                        ),
-                        detail={
-                            "entity": top_name,
-                            "kb_id": top_kb_id,
-                            "fact_count": len(facts),
-                            "depth": neighbor_depth,
-                            "hop_distribution": neighbor_data.get("hop_distribution", {}),
-                            "truncated": neighbor_data.get("truncated", False),
-                            "facts": facts,
-                        },
-                        t_start=t,
-                    )
-                except asyncio.TimeoutError:
-                    collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
-                                   summary="邻域查询超时，降级 RAG", t_start=t)
-                    logger.warning("[ontology] 邻域查询超时（%ds），降级 RAG", ONTOLOGY_NEIGHBOR_TIMEOUT)
-                except Exception as e:
-                    collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
-                                   summary="邻域检索失败，降级 RAG", t_start=t)
-                    logger.warning("[ontology] 邻域检索失败，降级 RAG: %s", e)
+                facts = graph_facts  # P1-6 图查询模板已取到 fact 则跳过 neighbors()
+                if facts is None:
+                    try:
+                        neighbor_data = await asyncio.wait_for(
+                            gdao.neighbors(
+                                tenant_id, top_kb_id, top_name,
+                                limit=ONTOLOGY_NEIGHBOR_LIMIT,
+                                depth=_nb_depth,
+                                per_hop_limit=ONTOLOGY_NEIGHBOR_PER_HOP_LIMIT,
+                            ),
+                            timeout=ONTOLOGY_NEIGHBOR_TIMEOUT,
+                        )
+                        facts = neighbor_data.get("facts", [])
+                        neighbor_depth = neighbor_data.get("depth", 1)
+                        collector.step(
+                            STAGE_FACT_LOOKUP, "邻域事实检索",
+                            summary=(
+                                f"取到 {len(facts)} 条事实"
+                                + (f"（{neighbor_depth} 跳）"
+                                   if neighbor_depth > 1 else "（1 跳）")
+                            ),
+                            detail={
+                                "entity": top_name,
+                                "kb_id": top_kb_id,
+                                "fact_count": len(facts),
+                                "depth": neighbor_depth,
+                                "hop_distribution": neighbor_data.get("hop_distribution", {}),
+                                "truncated": neighbor_data.get("truncated", False),
+                                "facts": facts,
+                            },
+                            t_start=t,
+                        )
+                    except asyncio.TimeoutError:
+                        collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
+                                       summary="邻域查询超时，降级 OntoRAG", t_start=t)
+                        logger.warning("[ontology] 邻域查询超时（%ds），降级 RAG", ONTOLOGY_NEIGHBOR_TIMEOUT)
+                    except Exception as e:
+                        collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
+                                       summary="邻域检索失败，降级 OntoRAG", t_start=t)
+                        logger.warning("[ontology] 邻域检索失败，降级 RAG: %s", e)
 
                 # ── 阶段 4：本体作答（采集点④，独立 try）──
                 if facts is not None:
                     # 方案④b：事实量预判 — 低于阈值直接跳过本体作答
                     if ONTOLOGY_MIN_FACTS > 0 and len(facts) < ONTOLOGY_MIN_FACTS:
                         collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="skipped",
-                                       summary=f"事实不足（{len(facts)} < {ONTOLOGY_MIN_FACTS}），降级 RAG")
+                                       summary=f"事实不足（{len(facts)} < {ONTOLOGY_MIN_FACTS}），降级 OntoRAG")
                         logger.info(
                             "[ontology] 事实量预判跳过作答 facts=%d min=%d query=%r",
                             len(facts), ONTOLOGY_MIN_FACTS, req.query,
@@ -1093,6 +2291,11 @@ class SearchService:
                 if facts is not None:
                     t = time.perf_counter()
                     try:
+                        # [jonex] P2-7: 图查询模板取到的事实 → 放宽常识边界
+                        _from_graph_template = bool(
+                            graph_facts and facts
+                            and any(f.get("source") == "graph_query" for f in facts[:1])
+                        )
                         llm_answer = await asyncio.wait_for(
                             answer_from_facts(
                                 req.query, ontology_instances, facts,
@@ -1100,6 +2303,7 @@ class SearchService:
                                 kb_id=top_kb_id,
                                 user_id=user_id,
                                 trace_id=trace_id,
+                                allow_common_sense=_from_graph_template,
                             ),
                             timeout=ONTOLOGY_ANSWER_TIMEOUT,   # [jonex] 方案④ 可调超时
                         )
@@ -1111,14 +2315,14 @@ class SearchService:
                                            summary="基于本体事实生成答案", t_start=t)
                         else:
                             collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="skipped",
-                                           summary="事实不足（INSUFFICIENT），降级 RAG", t_start=t)
+                                           summary="事实不足（INSUFFICIENT），降级 OntoRAG", t_start=t)
                     except asyncio.TimeoutError:
                         collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="failed",
-                                       summary=f"本体 LLM 超时（{ONTOLOGY_ANSWER_TIMEOUT}s），降级 RAG", t_start=t)
+                                       summary=f"本体 LLM 超时（{ONTOLOGY_ANSWER_TIMEOUT}s），降级 OntoRAG", t_start=t)
                         logger.warning("[ontology] 本体 LLM 回答超时（%ds），降级 RAG", ONTOLOGY_ANSWER_TIMEOUT)
                     except Exception as e:
                         collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="failed",
-                                       summary="本体作答失败，降级 RAG", t_start=t)
+                                       summary="本体作答失败，降级 OntoRAG", t_start=t)
                         logger.warning("[ontology] 本体问答失败，降级 RAG: %s", e)
             else:
                 logger.info(
@@ -1150,6 +2354,564 @@ class SearchService:
             "rag_used": rag_used,
             "knowledge_base_ids": kb_ids,
             "reasoning": collector.build(source),
+        }
+
+    # ── [jonex] OpenKB 分流 — 批量管线查询、search_llmwiki、search_mix ──
+
+    async def _build_openkb_references(
+        self, tenant_id: str, per_kb_traces: list[tuple[str, list[dict]]],
+    ) -> list[dict]:
+        """[jonex] 从 agent 的 wiki 浏览轨迹反解出引用。
+
+        per_kb_traces: [(kb_id, turns), ...] 其中 turns 是 _extract_run_trace 产出。
+        只有 summaries/ 与 sources/ 下的页面能对应到 Jonex 文档。
+        entities/concepts 页不做为引用（无对应 PG 文档）。
+        """
+        import uuid as _uuid
+        from ..dtos.reference import SourceReference
+
+        # ① 收集所有可能的 document_id（去重保序）
+        seen: set[str] = set()
+        ref_sources: list[tuple[str, str, str]] = []  # (doc_id, wiki_path, kb_id)
+        for kb_id, turns in per_kb_traces:
+            for turn in (turns or []):
+                for call in (turn.get("calls") or []):
+                    path = (call.get("args") or {}).get("path", "")
+                if not path:
+                    continue
+                # summaries/xxx.md 或 sources/xxx.md → stem 可能是 uuid
+                for prefix in ("summaries/", "sources/"):
+                    if path.startswith(prefix):
+                        stem = path[len(prefix):].removesuffix(".md")
+                        try:
+                            doc_id = str(_uuid.UUID(stem))
+                        except (ValueError, AttributeError):
+                            continue
+                        if doc_id not in seen:
+                            seen.add(doc_id)
+                            ref_sources.append((doc_id, path, kb_id))
+                        break
+
+        if not ref_sources:
+            return []
+
+        # ② 批量查 PG
+        doc_ids = [r[0] for r in ref_sources]
+        async with get_db_session() as session:
+            from ..repository.document_repository import KnowledgeDocumentRepository
+            repo = KnowledgeDocumentRepository(session)
+            docs = await repo.get_by_ids(doc_ids, tenant_id)
+        doc_map = {d.id: d for d in docs}
+
+        # ③ 富化（照 _build_references 的口径，但不走它的 chunk 入参）
+        storage = get_object_storage()
+        out: list[dict] = []
+        for doc_id, wiki_path, kb_id in ref_sources:
+            d = doc_map.get(doc_id)
+            if d is None:
+                continue
+            raw_url: str | None = None
+            try:
+                raw_url = await storage.get_presigned_url(
+                    d.storage_key or build_object_key(kb_id, d.id, d.file_name or ""),
+                )
+            except Exception:
+                raw_url = None
+            ref = SourceReference(
+                doc_id=doc_id,
+                kb_id=kb_id,
+                file_name=d.file_name or "",
+                mime_type=d.mime_type,
+                file_size=d.file_size,
+                media_type=classify_media(d.mime_type, d.file_name),
+                raw_url=raw_url,
+                wiki_path=wiki_path,
+            )
+            out.append(ref.dict())
+        return out
+
+    @staticmethod
+    def _is_openkb_effective_answer(answer: str | None) -> bool:
+        """[jonex] 判断 OpenKB run_query 的返回是否算有效答案（D9）。
+
+        无效：None / 空串 / 仅空白 / 命中 no-answer 文案特征。
+        判据故意保守：宁可把兜底文案当成有效答案透出，也不要把正常答案误判成无答案。
+        """
+        if answer is None:
+            return False
+        if not answer.strip():
+            return False
+        # 保守：只把明确的固定 no-answer 文案视为无效，
+        # 不包含通用关键词（避免正常答案含"没有找到"被判无效）。
+        no_answer_markers = (
+            "I'm sorry",
+            "I am sorry",
+            "Sorry, I'm not able",
+            "Sorry, I am not able",
+            "[no-context]",
+        )
+        stripped = answer.strip()
+        for marker in no_answer_markers:
+            if stripped.startswith(marker):
+                return False
+        return True
+
+    async def _get_kb_types(self, tenant_id: str, kb_ids: list[str]) -> dict[str, str]:
+        """[jonex] 批量查询 KB 的 kb_type（转调公共 helper）。"""
+        from .kb_type_service import get_kb_types
+        return await get_kb_types(tenant_id, kb_ids)
+
+    async def search_llmwiki(
+        self,
+        tenant_id: str,
+        user_id: str,
+        request: LlmWikiSearchRequest | dict,
+        trace_id: str | None = None,
+    ) -> dict:
+        """[jonex] OpenKB Wiki 检索（只查 openkb 管线，D3 异管线拒绝）。"""
+        tenant_id = require_tenant(tenant_id)
+        req = LlmWikiSearchRequest(**_payload(request))
+        t_total = time.perf_counter()
+
+        # 1. KB 解析 + 租户校验
+        kb_ids = await self._resolve_kb_ids(tenant_id, req)
+
+        # 2. 管线校验：必须全部为 openkb
+        pipeline_map = await self._get_kb_types(tenant_id, kb_ids)
+        invalid_ids = [k for k in kb_ids if pipeline_map.get(k) != "openkb"]
+        if invalid_ids:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.search.kb_pipeline_mismatch_llmwiki",
+                    params={"kb_ids": ", ".join(invalid_ids)},
+                    fallback=f"知识库 {', '.join(invalid_ids)} 使用 LightRAG 管线，请改用 /search/ontology 或统一入口 /search/mix",
+                ),
+                details={"invalid_kb_ids": invalid_ids, "expected_pipeline": "openkb"},
+            )
+
+        # 3. 推理链采集器
+        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+
+        # 4. 多 KB 并行查询 OpenKB（信号量限流）
+        compiler = KnowledgeCompilerService()
+        _sem = asyncio.Semaphore(OPENKB_SEARCH_MAX_CONCURRENCY)
+        _trace_by_kb: list[tuple[str, list[dict]]] = []  # [jonex] 收集各 KB 的 wiki 浏览轨迹
+
+        # [jonex] D11: references 依赖 trace，不受 with_reasoning 开关控制
+        _want_trace = collector.enabled or OPENKB_REFERENCES_ENABLED
+
+        async def _query_one_okb(kid: str) -> tuple[str, object, int]:
+            _t0 = time.perf_counter()
+            async with _sem:
+                try:
+                    _res = await compiler.search_compiled_knowledge(
+                        kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
+                        return_trace=_want_trace,
+                    )
+                    return (kid, _res, int((time.perf_counter() - _t0) * 1000))
+                except Exception as e:
+                    return (kid, e, int((time.perf_counter() - _t0) * 1000))
+
+        tasks = [_query_one_okb(kid) for kid in kb_ids]
+        results = await asyncio.gather(*tasks)
+
+        per_kb: list[dict] = []
+        kb_failed: list[str] = []
+        kb_no_answer: list[str] = []
+        for kid, res, kb_ms in results:
+            if isinstance(res, Exception):
+                logger.warning("[openkb] query 失败 kb=%s: %s", kid, res)
+                kb_failed.append(kid)
+                collector.step(
+                    STAGE_OPENKB_QUERY, f"LLM Wiki 检索 · {kid}",
+                    status="failed",
+                    summary="LLM Wiki 查询异常",
+                    detail={"kb_id": kid, "error": str(res)[:200], "duration_ms": kb_ms},
+                )
+                continue
+            answer = res.get("answer") if isinstance(res, dict) else str(res)
+            trace_data = res.get("trace") if isinstance(res, dict) else None
+            _turns = list((trace_data or {}).get("turns") or [])
+            _turn_count = (trace_data or {}).get("turn_count", len(_turns))
+            _llm_total_ms = (trace_data or {}).get("llm_total_ms")
+            # [jonex] D8 截断：按跨轮 calls 总数截断，保留所有轮及 thinking/llm_ms，只截 calls
+            _calls_total = sum(len(t.get("calls", [])) for t in _turns)
+            _truncated = _calls_total > OPENKB_TRACE_MAX_CALLS
+            if _truncated:
+                _remaining = OPENKB_TRACE_MAX_CALLS
+                for t in _turns:
+                    _tc = t.get("calls", [])
+                    if len(_tc) <= _remaining:
+                        _remaining -= len(_tc)
+                    else:
+                        t["calls"] = _tc[:_remaining]
+                        _remaining = 0
+            if not self._is_openkb_effective_answer(answer):
+                logger.info("[openkb] 无效答案 kb=%s answer_preview=%r", kid, (answer or "")[:80])
+                kb_no_answer.append(kid)
+                collector.step(
+                    STAGE_OPENKB_QUERY, f"LLM Wiki 检索 · {kid}",
+                    status="skipped",
+                    summary="未找到有效答案",
+                    detail={
+                        "kb_id": kid,
+                        "answer_preview": (answer or "")[:200],
+                        "turns": _turns,
+                        "turn_count": _turn_count,
+                        "duration_ms": kb_ms,
+                    },
+                )
+                continue
+            per_kb.append({"kb_id": kid, "answer": answer, "source": "llm-wiki"})
+            _trace_by_kb.append((kid, _turns))
+            _detail: dict = {
+                "kb_id": kid,
+                "answer_preview": answer[:200],
+                "turns": _turns,
+                "turn_count": _turn_count,
+                "llm_total_ms": _llm_total_ms,
+                "duration_ms": kb_ms,
+            }
+            if _truncated:
+                _detail["tool_calls_truncated"] = True
+                _detail["tool_calls_total"] = _calls_total
+            _summary_calls = sum(len(t.get("calls", [])) for t in _turns)
+            collector.step(
+                STAGE_OPENKB_QUERY, f"LLM Wiki 检索 · {kid}",
+                summary=f"返回有效答案（{_turn_count} 轮，{_summary_calls} 次工具调用）",
+                detail=_detail,
+            )
+
+        # 6. 无有效答案 → source="none"
+        if not per_kb:
+            answer = translate(
+                "msg.search.openkb_no_answer",
+                fallback="未在 Wiki 知识库中找到相关信息，请尝试调整查询。",
+            )
+            source = "none"
+            rag_used = False
+        elif len(per_kb) == 1:
+            answer = per_kb[0]["answer"]
+            source = "llm-wiki"
+            rag_used = False
+            collector.step(STAGE_FUSION, "多答案融合", status="skipped",
+                           summary="仅 1 个有效答案，无需融合")
+        else:
+            # 多 KB 融合（同 _rag_fallback_multi 的 top-N 策略）
+            per_kb_fused = per_kb[:ONTOLOGY_RAG_FUSION_TOPN]
+            t_fuse = time.perf_counter()
+            answer = await fuse_rag_answers(
+                req.query, per_kb_fused,
+                tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
+            )
+            fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
+            collector.step(STAGE_FUSION, "多答案融合",
+                           summary=f"融合 {len(per_kb_fused)} 个知识库的 Wiki 答案",
+                           t_start=t_fuse)
+            source = "llm-wiki"
+            rag_used = False
+
+        # 7. 组装响应（references 从 wiki 浏览轨迹反解，ontology_instances 仍空）
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        _references = await self._build_openkb_references(tenant_id, _trace_by_kb) if _trace_by_kb else []
+        result = {
+            "answer": answer,
+            "source": source,
+            "references": _references,
+            "ontology_instances": [],
+            "rag_used": rag_used,
+            "knowledge_base_ids": kb_ids,
+            "reasoning": collector.build(source),
+            "references_available": bool(_references),
+            "ontology_instances_available": False,
+        }
+
+        # 8. 保存检索历史（D8: 多 KB knowledge_base_id=""）
+        if req.save_history:
+            await self._history.save_history(
+                tenant_id, user_id,
+                SearchHistoryCreateRequest(
+                    query=req.query,
+                    knowledge_base_id="" if len(kb_ids) > 1 else kb_ids[0],
+                    mode=req.mode,
+                    top_k=req.top_k,
+                    domain_space_id=req.domain_space_id,
+                    answer_preview=answer[:300],
+                    duration_ms=total_ms,
+                    metadata={
+                        "knowledge_base_ids": kb_ids,
+                        "source": source,
+                        "pipeline": "llm-wiki",
+                    },
+                ),
+            )
+
+        return result
+
+    async def search_mix(
+        self,
+        tenant_id: str,
+        user_id: str,
+        request: MixSearchRequest | dict,
+        trace_id: str | None = None,
+    ) -> dict:
+        """[jonex] 混合管线检索统一入口（分流器，D4）。
+
+        按 pipeline_type 分组扇出到 LightRAG / OpenKB，支持混合选库。
+        """
+        tenant_id = require_tenant(tenant_id)
+        req = MixSearchRequest(**_payload(request))
+        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        t_total = time.perf_counter()
+
+        # 1. 用原始 kb_ids 查管线类型（不做去重/上限/租户校验，交给下游）
+        raw_ids = list(dict.fromkeys(
+            k.strip() for k in req.knowledge_base_ids if k and k.strip()
+        ))
+        if not raw_ids:
+            raise InvalidParameterError(
+                message=translate("err.search.kb_required",
+                                  fallback="请至少指定一个知识库（knowledge_base_ids 不能为空）"),
+            )
+
+        pipeline_map = await self._get_kb_types(tenant_id, raw_ids)
+        lightrag_ids = [k for k in raw_ids if pipeline_map.get(k) != "openkb"]
+        openkb_ids = [k for k in raw_ids if pipeline_map.get(k) == "openkb"]
+
+        # 2. 路由决策（reasoning 阶段①）
+        collector.step(
+            STAGE_ROUTE_DECISION, "分流决策",
+            summary=f"lightrag={len(lightrag_ids)} KB, openkb={len(openkb_ids)} KB",
+            detail={
+                "pipeline_groups": {"lightrag": lightrag_ids, "llm-wiki": openkb_ids},
+                "lightrag_count": len(lightrag_ids),
+                "openkb_count": len(openkb_ids),
+            },
+        )
+
+        # 3. 全 lightrag → 委托 query_with_ontology
+        if not openkb_ids:
+            req_ont = OntologySearchRequest(
+                query=req.query, mode=req.mode, top_k=req.top_k,
+                knowledge_base_ids=lightrag_ids,
+                save_history=req.save_history,
+                with_reasoning=req.with_reasoning,
+                domain_space_id=req.domain_space_id,
+                strict_mode=req.strict_mode,
+                strict_max_attempts=req.strict_max_attempts,
+                strict_min_score=req.strict_min_score,
+                strict_require_reference=req.strict_require_reference,
+                strict_require_grounded=req.strict_require_grounded,
+            )
+            return await self.query_with_ontology(tenant_id, user_id, req_ont, trace_id=trace_id)
+
+        # 4. 全 openkb → 委托 search_llmwiki
+        if not lightrag_ids:
+            req_wiki = LlmWikiSearchRequest(
+                query=req.query, mode=req.mode, top_k=req.top_k,
+                knowledge_base_ids=openkb_ids,
+                save_history=req.save_history,
+                with_reasoning=req.with_reasoning,
+                domain_space_id=req.domain_space_id,
+            )
+            return await self.search_llmwiki(tenant_id, user_id, req_wiki, trace_id=trace_id)
+
+        # 5. 混合 → 两侧并行，子调用强制 save_history=False（D8.1）
+        async def _run_lightrag() -> dict | Exception:
+            try:
+                req_ont = OntologySearchRequest(
+                    query=req.query, mode=req.mode, top_k=req.top_k,
+                    knowledge_base_ids=lightrag_ids,
+                    save_history=False,
+                    with_reasoning=req.with_reasoning,
+                    domain_space_id=req.domain_space_id,
+                    strict_mode=req.strict_mode,
+                    strict_max_attempts=req.strict_max_attempts,
+                    strict_min_score=req.strict_min_score,
+                    strict_require_reference=req.strict_require_reference,
+                    strict_require_grounded=req.strict_require_grounded,
+                )
+                return await self.query_with_ontology(
+                    tenant_id, user_id, req_ont, trace_id=trace_id,
+                )
+            except Exception as e:
+                return e
+
+        async def _run_openkb() -> dict | Exception:
+            try:
+                req_wiki = LlmWikiSearchRequest(
+                    query=req.query, mode=req.mode, top_k=req.top_k,
+                    knowledge_base_ids=openkb_ids,
+                    save_history=False,
+                    with_reasoning=req.with_reasoning,
+                    domain_space_id=req.domain_space_id,
+                )
+                return await self.search_llmwiki(tenant_id, user_id, req_wiki, trace_id=trace_id)
+            except Exception as e:
+                return e
+
+        lr_result, okb_result = await asyncio.gather(_run_lightrag(), _run_openkb())
+
+        # 6. 判定两侧成败
+        lr_ok = isinstance(lr_result, dict)
+        okb_ok = isinstance(okb_result, dict)
+        lr_answer = (lr_result.get("answer") or "") if lr_ok else ""
+        okb_answer = (okb_result.get("answer") or "") if okb_ok else ""
+        # source="rag" 时 references + ontology_instances 双空 = RAG 未找到任何实质内容
+        #（"抱歉，所有知识库..."兜底），此时应视为无效，避免把空结果当有效答案参与融合
+        lr_effective = lr_ok and (
+            lr_result.get("source") == "ontology"
+            or bool(lr_result.get("references"))
+            or bool(lr_result.get("ontology_instances"))
+        )
+        okb_effective = okb_ok and okb_result.get("source") not in ("none", "")
+
+        # [jonex] D9: 合并子链路的推理步骤。
+        # 子调用已按 with_reasoning 产出 reasoning，不合并则用户混选时看不到 wiki 浏览过程。
+        # 按管线分组（lightrag → llm-wiki），不按时间交错。
+        if collector.enabled:
+            for _side, _res in (("lightrag", lr_result), ("llm-wiki", okb_result)):
+                if not isinstance(_res, dict):
+                    continue
+                _sub = (_res.get("reasoning") or {}).get("steps") or []
+                for _s in _sub:
+                    collector.step(
+                        _s.get("stage", ""),
+                        f"[{_side}] {_s.get('title', '')}",
+                        status=_s.get("status", "done"),
+                        summary=_s.get("summary"),
+                        detail=_s.get("detail"),
+                    )
+
+        # 7. 融合
+        if lr_effective and okb_effective:
+            # 两侧都有效 → 融合
+            per_kb = [
+                {"kb_id": kid, "answer": lr_answer, "source": lr_result.get("source", "rag")}
+                for kid in lightrag_ids[:1]  # 融合只取各侧一个代表答案
+            ]
+            per_kb.append({
+                "kb_id": openkb_ids[0], "answer": okb_answer, "source": "llm-wiki",
+            })
+            t_fuse = time.perf_counter()
+            answer = await fuse_rag_answers(
+                req.query, per_kb,
+                tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
+            )
+            fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
+            collector.step(STAGE_FUSION, "多答案融合",
+                           summary=f"融合 lightrag + openkb 两侧答案", t_start=t_fuse)
+            source = "mixed"
+            references = lr_result.get("references") or []
+            ontology_instances = lr_result.get("ontology_instances") or []
+            rag_used = lr_result.get("rag_used", False)
+            references_available = bool(references)
+            ontology_instances_available = bool(ontology_instances)
+        elif lr_effective:
+            # 仅 lightrag 成功
+            answer = lr_answer
+            source = lr_result.get("source", "rag")
+            references = lr_result.get("references") or []
+            ontology_instances = lr_result.get("ontology_instances") or []
+            rag_used = lr_result.get("rag_used", False)
+            references_available = bool(references)
+            ontology_instances_available = bool(ontology_instances)
+            collector.step(
+                STAGE_FUSION, "多答案融合", status="skipped",
+                summary="仅 lightrag 侧有效，openkb 侧失败/无答案",
+                detail={"partial_failed": True, "failed_pipeline": "llm-wiki",
+                        "error": str(okb_result) if not okb_ok else "no_answer"},
+            )
+        elif okb_effective:
+            # 仅 openkb 成功
+            answer = okb_answer
+            source = okb_result.get("source", "llm-wiki")
+            references = []
+            ontology_instances = []
+            rag_used = False
+            references_available = False
+            ontology_instances_available = False
+            collector.step(
+                STAGE_FUSION, "多答案融合", status="skipped",
+                summary="仅 openkb 侧有效，lightrag 侧失败/无答案",
+                detail={"partial_failed": True, "failed_pipeline": "lightrag",
+                        "error": str(lr_result) if not lr_ok else "no_answer"},
+            )
+        else:
+            # 两侧都无有效答案
+            answer = translate(
+                "msg.search.openkb_no_answer",
+                fallback="未在知识库中找到相关信息，请尝试调整查询。",
+            )
+            source = "none"
+            references = []
+            ontology_instances = []
+            rag_used = False
+            references_available = False
+            ontology_instances_available = False
+
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        result = {
+            "answer": answer,
+            "source": source,
+            "references": references,
+            "ontology_instances": ontology_instances,
+            "rag_used": rag_used,
+            "knowledge_base_ids": raw_ids,
+            "reasoning": collector.build(source),
+            "references_available": references_available,
+            "ontology_instances_available": ontology_instances_available,
+        }
+
+        # 8. 统一保存检索历史（D8.1：混合模式只写 1 条）
+        if req.save_history:
+            await self._history.save_history(
+                tenant_id, user_id,
+                SearchHistoryCreateRequest(
+                    query=req.query,
+                    knowledge_base_id="",  # 混合/多 KB
+                    mode=req.mode,
+                    top_k=req.top_k,
+                    domain_space_id=req.domain_space_id,
+                    answer_preview=answer[:300],
+                    duration_ms=total_ms,
+                    metadata={
+                        "knowledge_base_ids": raw_ids,
+                        "pipeline_groups": {"lightrag": lightrag_ids, "llm-wiki": openkb_ids},
+                        "source": source,
+                    },
+                ),
+            )
+
+        return result
+
+    # ── [jonex] OpenKB kb_type 分流（/search 用，单 KB）──
+
+    async def _get_kb_type(self, tenant_id: str, kb_id: str) -> str:
+        """[jonex] 查询 KB 的 kb_type（转调公共 helper）。"""
+        from .kb_type_service import get_kb_type
+        return await get_kb_type(tenant_id, kb_id)
+
+    async def _search_openkb(self, tenant_id: str, user_id: str, req) -> dict:
+        """openkb 管线查询 — 调用 OpenKB /query 而非 LightRAG。"""
+        compiler = KnowledgeCompilerService()
+        result = await compiler.search_compiled_knowledge(
+            kb_name=req.knowledge_base_id,
+            tenant_id=tenant_id,
+            kb_id=req.knowledge_base_id,
+            question=req.query,
+        )
+        return {
+            "query": req.query,
+            "answer": result.get("answer", ""),
+            "mode": req.mode,
+            "top_k": req.top_k,
+            "references": [],
+            "metadata": {
+                "knowledge_base_id": req.knowledge_base_id,
+                "kb_type": "openkb",
+                "duration_ms": 0,
+            },
         }
 
 

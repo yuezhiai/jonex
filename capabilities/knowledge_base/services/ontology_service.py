@@ -21,14 +21,45 @@ class OntologyService:
         document_id: str,
         knowledge_base_id: str,
     ) -> dict:
-        """手动重抽本体（ontology-only）。
+        """手动重抽本体（ontology-only）/ OpenKB 重新编译。
 
         [jonex] P0-B：统一走「领取 → 提交 → 拿到有效 task_id → EXTRACTING + retry_count++」协议：
         - 不再凭 queued 就置 READY（会导致对账不再扫、新结果永不落 Neo4j）；
         - 提交成功才写回新 `rag_task_id`、置 EXTRACTING、++retry，由对账 EXTRACTING 分支收尾；
         - 提交失败 / 未拿到 task_id：不改状态、不 ++retry，不遗留无 rag_task_id 的 EXTRACTING。
+
+        [jonex] openkb 管线：先校验文档归属，再按 doc 上的真实 KB 查 pipeline_type。
+        若为 openkb → 委托 KnowledgeCompilerService.recompile_openkb（原子 claim + 异步投递，立即返回）。
         """
         tenant_id = require_tenant(tenant_id)
+
+        # ── [jonex] 先校验文档归属，再按 doc 上的真实 KB 查 pipeline_type ──
+        # 不能直接信请求里的 knowledge_base_id：传错 KB id 会走错分支，或返回
+        # 误导性的「无可用 compiled schema」。
+        # 本块同时取出 lightrag 分支需要的 file_path / content_generation，
+        # 下游复用，替代原来第二次 doc 查询。
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_by_id(document_id, tenant_id)
+            if doc is None or doc.knowledge_base_id != knowledge_base_id:
+                raise ResourceNotFoundError(
+                    message=translate("err.doc.not_found", fallback="知识文档不存在"),
+                )
+            real_kb_id = doc.knowledge_base_id
+            file_path = doc.file_path or ""                                  # lightrag 用
+            content_generation = int(getattr(doc, "content_generation", 0) or 0)  # lightrag 用（fencing）
+            doc_status = doc.status                                          # openkb 互斥用
+            title = doc.file_name or ""                                      # openkb 用
+
+        # openkb 的「重新编译」= 重跑 OpenKB Wiki 编译，不抽本体、不写 Neo4j
+        if await self._get_kb_type(tenant_id, real_kb_id) == "openkb":
+            from .openkb_service import KnowledgeCompilerService
+            return await KnowledgeCompilerService().recompile_openkb(
+                tenant_id, document_id, real_kb_id,
+                doc_status=doc_status, source_file_path=file_path, title=title,
+            )
+
+        # ── 以下为 lightrag 原有逻辑 ──
 
         # ontology-only 必须携带 compiled schema，否则 atomic-rag 无法归类
         schema = None
@@ -45,18 +76,9 @@ class OntologyService:
 
         if schema is None:
             raise InvalidParameterError(
-                message=translate("err.ontology.no_compiled_schema", fallback="该知识库无可用 compiled schema，请先编译本体 schema 后再重试")  ,  # 原消息
+                message=translate("err.ontology.no_compiled_schema", fallback="该知识库无可用 compiled schema，请先编译本体 schema 后再重试"),
                 details={"knowledge_base_id": knowledge_base_id, "document_id": document_id},
             )
-
-        async with get_db_session() as session:
-            repo = KnowledgeDocumentRepository(session)
-            doc = await repo.get_by_id(document_id, tenant_id)
-            if doc is None or doc.knowledge_base_id != knowledge_base_id:
-                raise ResourceNotFoundError(message=translate("err.doc.not_found", fallback="知识文档不存在")  )  # 原消息)
-            file_path = doc.file_path
-            # 携带当前代次，供对账写图前 fencing（reparse 后代次变化则本结果作废）
-            content_generation = int(getattr(doc, "content_generation", 0) or 0)
 
         # 提交 ontology-only 任务（不在此处 ++retry / 置 EXTRACTING）
         try:
@@ -125,7 +147,7 @@ class OntologyService:
 
         if schema is None:
             raise InvalidParameterError(
-                message=translate("err.ontology.no_compiled_schema", fallback="该知识库无可用 compiled schema，请先编译本体 schema 后再重试")  ,  # 原消息
+                message=translate("err.ontology.no_compiled_schema", fallback="该知识库无可用 compiled schema，请先编译本体 schema 后再重试"),
                 details={"knowledge_base_id": knowledge_base_id},
             )
 
@@ -141,6 +163,13 @@ class OntologyService:
             await session.commit()
 
         return {**stats, "schema_version": schema_version}
+
+    # ── [jonex] kb_type 查询 ──
+
+    async def _get_kb_type(self, tenant_id: str, kb_id: str) -> str:
+        """[jonex] 查询 KB 的 kb_type（转调公共 helper）。"""
+        from .kb_type_service import get_kb_type
+        return await get_kb_type(tenant_id, kb_id)
 
 
 __all__ = ["OntologyService"]

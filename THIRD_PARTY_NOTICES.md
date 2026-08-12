@@ -26,6 +26,17 @@ The full license text is available at `Reference/LightRAG/LICENSE`.
 
 The full license text is available at `Reference/Rag-anything/LICENSE`.
 
+## OpenKB
+
+--Upstream project: <https://github.com/VectifyAI/OpenKB>
+- Vendored version: `0.4.5`
+- Local path: `Reference/OpenKB/
+- License:   Apache 2.0
+- Upstream copyright: Copyright (c) 2026  Vectify AI
+- Local modifications: maintained directly in the vendored source tree and repository history
+
+The full license text is available at `Reference/OpenKB/LICENSE`.
+
 ## Package dependencies
 
 Python and JavaScript dependencies installed from package registries remain under their respective upstream licenses. Consult `pyproject.toml`, `uv.lock`, workspace `package.json` files, and `frontends/pnpm-lock.yaml` for the resolved dependency set.

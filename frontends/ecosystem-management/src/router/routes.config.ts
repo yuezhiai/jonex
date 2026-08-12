@@ -9,6 +9,7 @@ const AdapterManagement = loadableComponent(() => import('@/pages/AdapterManagem
 const BusinessMarketplace = loadableComponent(() => import('@/pages/BusinessMarketplace'));
 const Skills = loadableComponent(() => import('@/pages/Skills'));
 const TemplateDomains = loadableComponent(() => import('@/pages/TemplateDomains'));
+const McpServiceDirectory = loadableComponent(() => import('@/pages/McpServiceDirectory'));
 const TemplateScenarios = loadableComponent(() => import('@/pages/TemplateScenarios'));
 const TemplateObjects = loadableComponent(() => import('@/pages/TemplateObjects'));
 const TemplateRelations = loadableComponent(() => import('@/pages/TemplateRelations'));
@@ -32,22 +33,28 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           menu: { icon: 'BlockOutlined', order: 1, roles: ['admin', 'user'] },
         },
         {
+          path: 'mcp-service-directory',
+          element: McpServiceDirectory,
+          title: 'navigation.mcpServiceDirectory',
+          menu: { icon: 'ClusterOutlined', order: 2, roles: ['admin', 'user'] },
+        },
+        {
           path: 'business-marketplace',
           element: BusinessMarketplace,
           title: 'navigation.businessMarketplace',
-          menu: { icon: 'ShopOutlined', order: 2, roles: ['admin', 'user'] },
+          menu: { icon: 'ShopOutlined', order: 4, roles: ['admin', 'user'] },
         },
         {
           path: 'skills',
           element: Skills,
           title: 'navigation.skills',
-          menu: { icon: 'ThunderboltOutlined', order: 3, roles: ['admin', 'user'] },
+          menu: { icon: 'ThunderboltOutlined', order: 5, roles: ['admin', 'user'] },
         },
         {
           path: 'template-domains',
           element: TemplateDomains,
           title: 'navigation.templateDomains',
-          menu: { icon: 'CopyOutlined', order: 4, roles: ['admin', 'user'] },
+          menu: { icon: 'CopyOutlined', order: 6, roles: ['admin', 'user'] },
         },
         { path: 'template-scenarios', element: TemplateScenarios, title: 'navigation.templateScenarios' },
         { path: 'template-objects', element: TemplateObjects, title: 'navigation.templateObjects' },
@@ -56,7 +63,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           path: 'prompt-templates',
           element: PromptTemplates,
           title: 'navigation.promptTemplates',
-          menu: { icon: 'FileTextOutlined', order: 5, roles: ['admin', 'user'] },
+          menu: { icon: 'FileTextOutlined', order: 7, roles: ['admin', 'user'] },
         },
       ],
     },

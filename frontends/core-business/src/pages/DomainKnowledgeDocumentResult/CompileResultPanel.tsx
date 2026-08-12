@@ -1,15 +1,22 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card } from 'antd';
 import { RobotOutlined, ShareAltOutlined, ApartmentOutlined } from '@ant-design/icons';
 import OntologyTab from '@/pages/DomainKnowledgeCompileResults/OntologyTab';
 import RelationTab from '@/pages/DomainKnowledgeCompileResults/RelationTab';
 import GraphTab from '@/pages/DomainKnowledgeCompileResults/GraphTab';
-import type { OntologyInstanceSummary, RelationInstanceSummary } from '@/types/domainKnowledge';
+import WikiPageBrowser from '@/pages/DomainKnowledgeCompileResults/WikiPageBrowser';
+import WikiGraphTab from '@/pages/DomainKnowledgeCompileResults/WikiGraphTab';
+import type { OntologyInstanceSummary, RelationInstanceSummary, KnowledgeBaseType } from '@/types/domainKnowledge';
 
 interface CompileResultPanelProps {
   kbId: string;
-  docId?: string;
+  /** [jonex] 收紧为必传：index.tsx useParams 解构默认 ''，运行时恒为 string。 */
+  docId: string;
+  kbType?: KnowledgeBaseType;
+  /** [jonex] LLM-Wiki 编译状态（llm_wiki_compile_status），未编译文档的引导用。 */
+  compileStatus?: string;
+  llmWikiCompileError?: string;
   activeSubNav: string;
   onSubNavChange: (key: string) => void;
   entityTypes: OntologyInstanceSummary[] | null;
@@ -19,18 +26,37 @@ interface CompileResultPanelProps {
 export default function CompileResultPanel({
   kbId,
   docId,
+  kbType = 'lightrag',
+  compileStatus,
+  llmWikiCompileError,
   activeSubNav,
   onSubNavChange,
   entityTypes,
   relationTypes,
 }: CompileResultPanelProps) {
   const { t } = useTranslation();
+  const isOpenKB = kbType === 'openkb';
 
-  const navItems = [
-    { key: 'ontology', label: t('domainKnowledge.ontologyInstances'), icon: <RobotOutlined /> },
-    { key: 'relation', label: t('domainKnowledge.relationInstances'), icon: <ShareAltOutlined /> },
-    { key: 'graph', label: t('domainKnowledge.graphBreadcrumb'), icon: <ApartmentOutlined /> },
-  ];
+  // [jonex] openkb 分支只有 ontology/graph 两个子导航 key（relation 被移除）。
+  // kbType 是异步加载的：页面挂载瞬间还是默认 lightrag（三 Tab），用户若在
+  // 此时点了 relation，kbType 返回 openkb 后 navItems 变两个 key，
+  // activeSubNav==='relation' 无处命中 → 空白。必须自动回退到 ontology。
+  useEffect(() => {
+    if (isOpenKB && activeSubNav === 'relation') {
+      onSubNavChange('ontology');
+    }
+  }, [isOpenKB, activeSubNav, onSubNavChange]);
+
+  const navItems = isOpenKB
+    ? [
+        { key: 'ontology', label: t('compile.wikiPages'), icon: <RobotOutlined /> },
+        { key: 'graph', label: t('compile.wikiGraph'), icon: <ApartmentOutlined /> },
+      ]
+    : [
+        { key: 'ontology', label: t('domainKnowledge.ontologyInstances'), icon: <RobotOutlined /> },
+        { key: 'relation', label: t('domainKnowledge.relationInstances'), icon: <ShareAltOutlined /> },
+        { key: 'graph', label: t('domainKnowledge.graphBreadcrumb'), icon: <ApartmentOutlined /> },
+      ];
 
   return (
     <Card
@@ -82,18 +108,28 @@ export default function CompileResultPanel({
         </div>
 
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          {activeSubNav === 'ontology' && (
-            <OntologyTab kbId={kbId} docId={docId} data={entityTypes} title={t('domainKnowledge.ontologyInstances')} />
-          )}
-          {activeSubNav === 'relation' && (
-            <RelationTab
-              kbId={kbId}
-              docId={docId}
-              data={relationTypes}
-              title={t('domainKnowledge.relationInstances')}
-            />
-          )}
-          {activeSubNav === 'graph' && <GraphTab kbId={kbId} />}
+          {activeSubNav === 'ontology' &&
+            (isOpenKB ? (
+              <WikiPageBrowser
+                kbId={kbId}
+                docId={docId}
+                compileStatus={compileStatus}
+                llmWikiCompileError={llmWikiCompileError}
+              />
+            ) : (
+              <OntologyTab kbId={kbId} docId={docId} data={entityTypes} title={t('domainKnowledge.ontologyInstances')} />
+            ))}
+          {activeSubNav === 'relation' &&
+            !isOpenKB && (
+              <RelationTab
+                kbId={kbId}
+                docId={docId}
+                data={relationTypes}
+                title={t('domainKnowledge.relationInstances')}
+              />
+            )}
+          {activeSubNav === 'graph' &&
+            (isOpenKB ? <WikiGraphTab kbId={kbId} docId={docId} /> : <GraphTab kbId={kbId} />)}
         </div>
       </div>
     </Card>

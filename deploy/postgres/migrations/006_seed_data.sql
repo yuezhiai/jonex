@@ -6,19 +6,19 @@
 
 -- 开发租户
 INSERT INTO platform.tenants (id, name, description, plan_type)
-VALUES ('tenant_jonex_demo', '悦溪演示租户', '本地开发与演示租户', 'free')
+VALUES ('tenant_jonex_demo', '悦溪默认租户', '默认租户', 'free')
 ON CONFLICT (id) DO NOTHING;
 
 -- 多租户登录测试租户
 INSERT INTO platform.tenants (id, name, description, plan_type)
 VALUES
-    ('tenant_jonex_alpha', '悦溪 Alpha 测试租户', '用于多租户登录选择流程测试', 'free'),
-    ('tenant_jonex_beta', '悦溪 Beta 测试租户', '用于多租户登录选择流程测试', 'free')
+    ('tenant_jonex_alpha', '悦溪 Alpha 租户', '用于多租户登录选择流程', 'free'),
+    ('tenant_jonex_beta', '悦溪 Beta 租户', '用于多租户登录选择流程', 'free')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试 API Key
 INSERT INTO platform.api_keys (tenant_id, api_key, name, rate_limit)
-VALUES ('tenant_jonex_demo', 'jonex_test_key', '测试用 API Key', 1000)
+VALUES ('tenant_jonex_demo', 'jonex_test_key', '示例 API Key', 1000)
 ON CONFLICT (api_key) DO NOTHING;
 
 -- 管理员用户 (password: admin123)
@@ -35,7 +35,7 @@ INSERT INTO platform.users (tenant_id, username, password_hash, display_name, ro
 VALUES
     ('tenant_jonex_demo', 'multi_same_pass',
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
-     '同名同密用户 - 演示租户', 'admin'),
+     '同名同密用户 - 租户', 'admin'),
     ('tenant_jonex_alpha', 'multi_same_pass',
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
      '同名同密用户 - Alpha 租户', 'admin');
@@ -47,7 +47,7 @@ INSERT INTO platform.users (tenant_id, username, password_hash, display_name, ro
 VALUES
     ('tenant_jonex_demo', 'multi_one_match',
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
-     '单租户密码匹配用户 - 演示租户', 'admin'),
+     '单租户密码匹配用户 - 租户', 'admin'),
     ('tenant_jonex_alpha', 'multi_one_match',
      '$2b$12$A9CcGiSS0l31Ejy8CJNCyeyiIigzyr3hZjzuhpp3PBA9EkbrZyw6O',
      '单租户密码匹配用户 - Alpha 租户', 'admin');
@@ -58,7 +58,7 @@ INSERT INTO platform.users (tenant_id, username, password_hash, display_name, ro
 VALUES
     ('tenant_jonex_beta', 'tenant_header_user',
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
-     '指定租户登录测试用户 - Beta 租户', 'admin');
+     '指定租户登录用户 - Beta 租户', 'admin');
 
 
 -- 基础角色
@@ -652,16 +652,16 @@ ON CONFLICT (id) DO NOTHING;
 -- 领域空间种子数据
 -- ============================================================
 INSERT INTO knowledge_base.spaces (id, tenant_id, name, description, status, knowledge_base_count, service_count) VALUES
-    ('space_demo_test', 'tenant_jonex_demo', '测试空间', '测试空间', 'active', 0, 0)
+    ('space_demo_test', 'tenant_jonex_demo', '默认空间', '默认空间', 'active', 0, 0)
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================
 -- 知识库种子数据
 -- ============================================================
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id) VALUES
-    ('kb_demo_internet', 'tenant_jonex_demo', 'space_demo_test', '互联网知识库', '互联网本体抽取演示知识库', '["file"]'::jsonb, 0, 'synced', '1'),
-    ('kb_demo_credit_risk', 'tenant_jonex_demo', 'space_demo_test', '信贷风控知识库', '金融行业信贷风控本体抽取演示', '["file"]'::jsonb, 0, 'synced', '1'),
-    ('kb_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗知识库', '医疗病历智能解析本体抽取演示', '["file"]'::jsonb, 0, 'synced', '1')
+    ('kb_demo_internet', 'tenant_jonex_demo', 'space_demo_test', '互联网知识库', '互联网本体抽取知识库', '["file"]'::jsonb, 0, 'synced', '1'),
+    ('kb_demo_credit_risk', 'tenant_jonex_demo', 'space_demo_test', '信贷风控知识库', '金融行业信贷风控本体抽取', '["file"]'::jsonb, 0, 'synced', '1'),
+    ('kb_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗知识库', '医疗病历智能解析本体抽取', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
 
 -- 内置「文件上传」数据源（每个知识库默认拥有一条 file 类型数据源实例，
@@ -680,17 +680,50 @@ ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
-    ('svc_demo_internet', 'tenant_jonex_demo', 'space_demo_test', '互联网测试领域服务', '互联网测试领域服务', '测试', 'active', 'sk-baseline-0123456789abcdef0123456789abcdef'),
-    ('svc_demo_credit', 'tenant_jonex_demo', 'space_demo_test', '信贷风控领域服务', '信贷风控测试领域服务', '金融', 'active', 'sk-credit-0123456789abcdef0123456789abcdef'),
-    ('svc_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗领域服务', '医疗病历解析测试领域服务', '医疗', 'active', 'sk-medical-0123456789abcdef0123456789abcdef')
+    ('svc_demo_internet', 'tenant_jonex_demo', 'space_demo_test', '互联网领域服务', '互联网领域服务', '', 'active', 'sk-baseline-0123456789abcdef0123456789abcdef'),
+    ('svc_demo_credit', 'tenant_jonex_demo', 'space_demo_test', '信贷风控领域服务', '信贷风控领域服务', '金融', 'active', 'sk-credit-0123456789abcdef0123456789abcdef'),
+    ('svc_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗领域服务', '医疗病历解析领域服务', '医疗', 'active', 'sk-medical-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
 VALUES
-    ('skb_demo_internet', 'tenant_jonex_demo', 'svc_demo_internet', 'kb_demo_internet'),
-    ('skb_demo_credit', 'tenant_jonex_demo', 'svc_demo_credit', 'kb_demo_credit_risk'),
-    ('skb_demo_medical', 'tenant_jonex_demo', 'svc_demo_medical', 'kb_demo_medical')
+    ('skb_demo_internet', 'tenant_jonex_demo', 'svc_demo_internet', 'kb_demo_internet', 'lightrag'),
+    ('skb_demo_credit', 'tenant_jonex_demo', 'svc_demo_credit', 'kb_demo_credit_risk', 'lightrag'),
+    ('skb_demo_medical', 'tenant_jonex_demo', 'svc_demo_medical', 'kb_demo_medical', 'lightrag')
+ON CONFLICT (id) DO NOTHING;
+
+-- [jonex] OpenKB 知识库种子数据
+INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id, kb_type)
+VALUES
+    ('kb_demo_openkb', 'tenant_jonex_demo', 'space_demo_test', 'llm-wiki 知识库',
+     '基于 llm-wiki 编译的知识库',
+     '["file"]'::jsonb, 0, 'synced', 'user_demo_admin', 'openkb')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO knowledge_base.knowledge_data_sources
+    (id, tenant_id, knowledge_base_id, access_method_id, access_type, name, config_json, sync_mode, status)
+VALUES
+    ('ds_openkb_default', 'tenant_jonex_demo', 'kb_demo_openkb', NULL, 'file',
+     '默认文件上传',
+     '{}'::jsonb, 'manual', 'active')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
+VALUES
+    ('svc_demo_openkb', 'tenant_jonex_demo', 'space_demo_test', 'llm-wiki 编译服务',
+     'llm-wiki 知识库',
+     'knowledge_compiler', 'active', '')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
+VALUES
+    ('skb_demo_openkb', 'tenant_jonex_demo', 'svc_demo_openkb', 'kb_demo_openkb', 'openkb')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
+VALUES
+    ('sak_openkb_main', 'tenant_jonex_demo', 'svc_demo_openkb', 'sk', 'sk-openkb-0123456789abcdef0123456789abcdef', '2027-12-31'::timestamp, 1)
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试用 API Key
@@ -1243,7 +1276,7 @@ ON CONFLICT (id) DO NOTHING;
 -- 硬件互联网财报知识库种子数据
 -- ============================================================
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id) VALUES
-    ('kb_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报知识库', '硬件互联网上市公司财报结构化抽取演示（基于小米集团2025年度报告）', '["file"]'::jsonb, 0, 'synced', '1')
+    ('kb_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报知识库', '硬件互联网上市公司财报结构化抽（基于小米集团2025年度报告）', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
 
 -- 内置「文件上传」数据源
@@ -1256,13 +1289,13 @@ ON CONFLICT (id) DO NOTHING;
 -- 领域服务
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
-    ('svc_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报领域服务', '硬件互联网财报解析测试领域服务', '硬件互联网', 'active', 'sk-hwfin-0123456789abcdef0123456789abcdef')
+    ('svc_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报领域服务', '硬件互联网财报解析领域服务', '硬件互联网', 'active', 'sk-hwfin-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
 VALUES
-    ('skb_demo_hwfin', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'kb_demo_hw_inet_finance')
+    ('skb_demo_hwfin', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'kb_demo_hw_inet_finance', 'lightrag')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试用 API Key
@@ -1922,7 +1955,7 @@ ON CONFLICT (id) DO NOTHING;
 -- AI大模型技术报告知识库种子数据
 -- ============================================================
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id) VALUES
-    ('kb_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告知识库', 'AI大模型技术报告结构化抽取演示（基于小米MiMo-V2-Flash技术报告）', '["file"]'::jsonb, 0, 'synced', '1')
+    ('kb_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告知识库', 'AI大模型技术报告结构化抽取（基于小米MiMo-V2-Flash技术报告）', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
 
 -- 内置「文件上传」数据源
@@ -1953,16 +1986,27 @@ VALUES
     ('ds_demo_llm_api_push', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'dam_api_push_demo', 'api_push', 'API 开放（推送）', '{"allowed_ext": ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "md", "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "opus", "amr", "mp4", "avi", "mov", "mkv", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp"], "max_file_mb": 50, "ingest_key_hash": "7f2c677abaa4838cbb8ebcf8da0634262c6135c2df4abeabca8be659d24f4c49"}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
 
+-- 内置解析器设置（document/txt/image/audio/video 五类，开箱即用；上传按文件后缀路由到对应解析器）
+INSERT INTO knowledge_base.knowledge_parser_settings
+    (id, tenant_id, knowledge_base_id, parser_type, parser_config_id, prompt_config_id, status, is_deleted)
+VALUES
+    ('ps_demo_llmtr_document', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'document', 'document_parse',      NULL, 'active', 0),
+    ('ps_demo_llmtr_txt',     'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'txt',      'text_parse',          NULL, 'active', 0),
+    ('ps_demo_llmtr_image',   'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'image',    'image_parse',         NULL, 'active', 0),
+    ('ps_demo_llmtr_audio',   'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'audio',    'audio_transcribe',    NULL, 'active', 0),
+    ('ps_demo_llmtr_video',   'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'video',    'video_full_pipeline', NULL, 'active', 0)
+ON CONFLICT (id) DO NOTHING;
+
 -- 领域服务
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
-    ('svc_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告领域服务', 'AI大模型技术报告解析测试领域服务', 'AI大模型', 'active', 'sk-llmtr-0123456789abcdef0123456789abcdef')
+    ('svc_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告领域服务', 'AI大模型技术报告解析领域服务', 'AI大模型', 'active', 'sk-llmtr-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
 VALUES
-    ('skb_demo_llmtr', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'kb_demo_llm_tech_report')
+    ('skb_demo_llmtr', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'kb_demo_llm_tech_report', 'lightrag')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试用 API Key
@@ -2349,7 +2393,7 @@ INSERT INTO jonex.knowledge_base.knowledge_data_sources (id, tenant_id, knowledg
 
 INSERT INTO jonex.knowledge_base.services (id, tenant_id, space_id, "name", description, domain_type, status, api_key_encrypted, created_at, updated_at, is_deleted) VALUES('68bb7dd208c54f45ac31b6fbb5d655f5', 'tenant_jonex_demo', 'space_demo_test', '金融开源数据集服务', NULL, NULL, 'active', NULL, '2026-07-23 06:14:29.743', '2026-07-23 06:14:29.743', 0);
 
-INSERT INTO jonex.knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, created_at, updated_at, is_deleted) VALUES('0fc886a5083646e188e7e1c84a95b7f7', 'tenant_jonex_demo', '68bb7dd208c54f45ac31b6fbb5d655f5', 'b11dd30de0994178a3a4e388e6cf816e', '2026-07-23 06:14:29.748', '2026-07-23 06:14:29.748', 0);
+INSERT INTO jonex.knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type, created_at, updated_at, is_deleted) VALUES('0fc886a5083646e188e7e1c84a95b7f7', 'tenant_jonex_demo', '68bb7dd208c54f45ac31b6fbb5d655f5', 'b11dd30de0994178a3a4e388e6cf816e', 'lightrag', '2026-07-23 06:14:29.748', '2026-07-23 06:14:29.748', 0);
 
 
 INSERT INTO jonex.knowledge_base.ontology_compiled_schemas (tenant_id, knowledge_base_id, template_domain_id, template_scenario_id, source_type, source_version, source_hash, schema_version, entity_types, relation_types, "constraints", disambiguation, prompt_schema, schema_mode, sync_status, edited_at, edited_by, status, compiled_at, created_at, updated_at) VALUES('tenant_jonex_demo', 'b11dd30de0994178a3a4e388e6cf816e', NULL, NULL, 'yaml_default', 1, NULL, 1, '[{"name": "Organization", "status": "active", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false, "description": "", "display_name": "legal_name", "is_primary_key": false, "source_attribute_id": null}, {"name": "industry", "type": "string", "required": false, "description": "", "display_name": "industry", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Organization", "source_object_id": null}, {"name": "Person", "status": "active", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false, "description": "", "display_name": "title", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Person", "source_object_id": null}, {"name": "Location", "status": "active", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false, "description": "", "display_name": "address", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Location", "source_object_id": null}, {"name": "Product", "status": "active", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false, "description": "", "display_name": "model", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Product", "source_object_id": null}, {"name": "Concept", "status": "active", "aliases": ["概念", "术语", "定义"], "attributes": [], "description": "", "requirement": "", "display_name": "Concept", "source_object_id": null}, {"name": "Method", "status": "active", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": [], "description": "", "requirement": "", "display_name": "Method", "source_object_id": null}, {"name": "Event", "status": "active", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false, "description": "", "display_name": "date", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Event", "source_object_id": null}]', '[{"name": "BELONGS_TO", "source": "Person", "status": "active", "target": "Organization", "aliases": [], "cardinality": "custom", "description": "", "display_name": "BELONGS_TO", "source_relation_id": null}, {"name": "PRODUCES", "source": "Organization", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PRODUCES", "source_relation_id": null}, {"name": "LOCATED_AT", "source": "Organization", "status": "active", "target": "Location", "aliases": [], "cardinality": "custom", "description": "", "display_name": "LOCATED_AT", "source_relation_id": null}, {"name": "WORKS_WITH", "source": "Person", "status": "active", "target": "Person", "aliases": [], "cardinality": "custom", "description": "", "display_name": "WORKS_WITH", "source_relation_id": null}, {"name": "USES", "source": "Organization", "status": "active", "target": "Method", "aliases": [], "cardinality": "custom", "description": "", "display_name": "USES", "source_relation_id": null}, {"name": "RELATES_TO", "source": "Concept", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "RELATES_TO", "source_relation_id": null}, {"name": "PART_OF", "source": "Concept", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PART_OF", "source_relation_id": null}, {"name": "HAS_FEATURE", "source": "Product", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "HAS_FEATURE", "source_relation_id": null}]', '[]', '{"alias_merge": true, "case_insensitive": true}', '{"entity_types": [{"name": "Organization", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false}, {"name": "industry", "type": "string", "required": false}]}, {"name": "Person", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false}]}, {"name": "Location", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false}]}, {"name": "Product", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false}]}, {"name": "Concept", "aliases": ["概念", "术语", "定义"], "attributes": []}, {"name": "Method", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": []}, {"name": "Event", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false}]}], "relation_types": [{"name": "BELONGS_TO", "source": "Person", "target": "Organization"}, {"name": "PRODUCES", "source": "Organization", "target": "Product"}, {"name": "LOCATED_AT", "source": "Organization", "target": "Location"}, {"name": "WORKS_WITH", "source": "Person", "target": "Person"}, {"name": "USES", "source": "Organization", "target": "Method"}, {"name": "RELATES_TO", "source": "Concept", "target": "Concept"}, {"name": "PART_OF", "source": "Concept", "target": "Product"}, {"name": "HAS_FEATURE", "source": "Product", "target": "Concept"}]}', 'template_seeded', 'synced', NULL, NULL, 'active', '2026-07-23 13:09:04.065', '2026-07-23 05:09:04.067', '2026-07-23 05:09:04.067');

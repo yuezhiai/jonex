@@ -41,3 +41,20 @@ from capabilities.platform.dtos.misc import (
     TaskScheduleResponse,
     TaskScheduleListResponse,
 )
+from capabilities.platform.dtos.mcp_key_dto import (
+    McpKeyCreateRequest,
+    McpKeyResponse,
+    McpKeyCreateResponse,
+    McpKeyListResponse,
+    McpKeyResetRequest,
+)
+from capabilities.platform.dtos.mcp_service_dto import (
+    McpServiceListRequest,
+    McpServiceResponse,
+    McpServiceListResponse,
+    PublishRequest,
+    TestCallRequest,
+    TestCallResponse,
+    AuthorizedKeyResponse,
+    AuthorizedKeyListResponse,
+)

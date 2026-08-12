@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_info (
     document_count INTEGER DEFAULT 0,
     status VARCHAR(32) DEFAULT 'synced',
     owner_id VARCHAR(64),
+    kb_type VARCHAR(16) NOT NULL DEFAULT 'lightrag',  -- [jonex] 知识库类型 lightrag / openkb
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS knowledge_base.services (
     domain_type VARCHAR(64),
     status VARCHAR(32) DEFAULT 'active',
     api_key_encrypted VARCHAR(512),
+    enabled SMALLINT DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS knowledge_base.service_knowledge_bases (
     tenant_id VARCHAR(64) NOT NULL,
     service_id VARCHAR(64) NOT NULL,
     kb_id VARCHAR(64) NOT NULL,
+    pipeline_type VARCHAR(16) NOT NULL DEFAULT 'lightrag',  -- [jonex] lightrag / openkb；存量 KB 默认 lightrag
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
@@ -175,6 +178,17 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_documents (
     extra_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     data_source_type VARCHAR(32),          -- 文档来源方式：api / api_push / storage / file（统计按此列分组）
     folder_id VARCHAR(64),
+    -- [jonex] LLM-Wiki 编译状态列化（update/010_llm_wiki_compile.sql 同款；全新库直接建列）
+    -- 时区口径：llm_wiki_compile_requested_at 用 UTC（与 created_at 的本地时间口径
+    -- 不同是有意的——编译超时判定按 UTC 单调时间）
+    llm_wiki_compile_status VARCHAR(32),          -- NULL/compiling/compiled/stale/failed
+    llm_wiki_compile_error TEXT,
+    llm_wiki_compile_warnings JSONB,              -- 编译警告列表
+    llm_wiki_compile_requested_at TIMESTAMP,      -- patrol 超时基准（UTC）
+    llm_wiki_compiled_at TIMESTAMP,
+    llm_wiki_task_id VARCHAR(128),                -- OpenKB 容器编译任务 ID（对齐 rag_task_id）
+    -- [jonex] 源文件内容 hash（update/011_document_content_hash.sql 同款；全新库直接建列）
+    content_hash VARCHAR(32),                     -- 源文件内容 md5（上传去重 + reparse 跳过，md5 仅比对非安全用途）
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT NOT NULL DEFAULT 0
@@ -200,6 +214,26 @@ CREATE INDEX IF NOT EXISTS idx_kb_doc_tenant_kb_type
 CREATE INDEX IF NOT EXISTS idx_kb_doc_ontology_outdated
     ON knowledge_base.knowledge_documents(tenant_id, knowledge_base_id, ontology_status, ontology_applied_schema_version)
     WHERE is_deleted = 0;
+-- 同 KB 内容去重加速（update/011_document_content_hash.sql 同款；全新库直接建索引）
+CREATE INDEX IF NOT EXISTS idx_kb_doc_content_hash
+    ON knowledge_base.knowledge_documents (tenant_id, knowledge_base_id, content_hash)
+    WHERE is_deleted = 0 AND status <> 'failed';
+-- LLM-Wiki 编译巡检（patrol_openkb_compile）高频查询索引：只覆盖 compiling
+CREATE INDEX IF NOT EXISTS idx_kb_doc_llm_wiki_compiling
+    ON knowledge_base.knowledge_documents(tenant_id, llm_wiki_compile_status)
+    WHERE llm_wiki_compile_status = 'compiling';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_status
+  IS 'LLM-Wiki 编译状态：NULL/compiling/compiled/stale/failed';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_error
+  IS 'LLM-Wiki 编译失败原因';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_warnings
+  IS 'LLM-Wiki 编译警告列表（JSONB 数组）';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compile_requested_at
+  IS 'LLM-Wiki 编译请求时刻（patrol 超时基准，UTC）';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_compiled_at
+  IS 'LLM-Wiki 编译完成时刻';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_task_id
+  IS 'OpenKB 容器编译任务 ID（对齐 rag_task_id），供对账巡检轮询';
 
 -- ------------------------------------------------------------
 -- 检索历史表（按 tenant+user+query+knowledge_base 去重，软删除）

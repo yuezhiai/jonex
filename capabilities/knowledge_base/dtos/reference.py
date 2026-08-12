@@ -18,13 +18,17 @@ except ImportError:
 class SourceLocation(BaseModel):
     """知识来源在原文档中的精确位置。"""
 
-    type: str = "chunk"  # chunk | char | page | timestamp
+    type: str = "chunk"  # chunk | char | page | timestamp | table_row
     chunk_index: Optional[int] = None
     char_start: Optional[int] = None
     char_end: Optional[int] = None
     page_no: Optional[int] = None
     time_start: Optional[float] = None
     time_end: Optional[float] = None
+    # [jonex] §table-chunking: table row-level positioning
+    row_start: Optional[int] = None
+    row_end: Optional[int] = None
+    table_idx: Optional[int] = None
     text: Optional[str] = None  # 命中片段的原文文本（RAG 链路带 chunk content 时填充）
 
 
@@ -42,6 +46,7 @@ class SourceReference(BaseModel):
     file_size: Optional[int] = None
     media_type: str = "other"  # text | pdf | audio | video | image | other
     raw_url: Optional[str] = None  # COS 预签名 URL（P0 阶段为 null，P3 COS 改造后可用）
+    wiki_path: Optional[str] = None  # [jonex] OpenKB wiki 页路径（如 summaries/<uuid>.md）
     locations: List[SourceLocation] = Field(default_factory=list)
 
 
@@ -56,6 +61,10 @@ class ParsedRef(BaseModel):
     page_no: Optional[int] = None
     time_start: Optional[float] = None
     time_end: Optional[float] = None
+    # [jonex] §table-chunking
+    row_start: Optional[int] = None
+    row_end: Optional[int] = None
+    table_idx: Optional[int] = None
 
 
 class ReferenceResolveRequest(BaseModel):

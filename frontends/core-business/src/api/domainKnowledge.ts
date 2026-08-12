@@ -64,6 +64,13 @@ import type {
   UpdateOntologyRelationResponse,
   DeleteOntologyRelationResponse,
   YamlImportResult,
+  KnowledgeBaseType,
+  WikiEntityRow,
+  WikiRelationshipRow,
+  WikiGraphData,
+  WikiPageContent,
+  WikiPageItem,
+  WikiContents,
 } from '@/types/domainKnowledge';
 import { request, getData, postData, putData, deleteData } from './request';
 import axios from 'axios';
@@ -121,6 +128,8 @@ interface BackendKBItem {
   relation_count?: number;
   /** Neo4j 不可用时为 true，本体计数降级为 0（基础知识库能力不受影响） */
   ontology_degraded?: boolean;
+  /** [jonex] 知识库类型：lightrag / openkb（仅 get 详情返回） */
+  kb_type?: string;
 }
 
 interface BackendKBListResponse {
@@ -143,6 +152,8 @@ export async function createKnowledgeInfo(data: {
   space_id: string;
   description?: string;
   data_source_types?: string[];
+  /** [jonex] 知识库类型，创建时选定后不可变；缺省由后端落 lightrag */
+  kb_type?: KnowledgeBaseType;
 }): Promise<DomainKnowledgeItem> {
   const backendItem = await getData<BackendKBItem>(request.post('/knowledge-base/knowledge-info', data));
   return mapKBItem(backendItem);
@@ -179,6 +190,8 @@ function mapKBItem(item: BackendKBItem): DomainKnowledgeItem {
     updatedAt: item.updated_at ? formatLocalDateTime(item.updated_at) : '—',
     ownerName: item.owner_id || undefined,
     description: item.description || undefined,
+    // [jonex] 知识库类型：列表/创建/更新响应都带，编辑弹窗与列表标签依赖它
+    kbType: (item.kb_type as KnowledgeBaseType) || 'lightrag',
   };
 }
 
@@ -226,6 +239,7 @@ export async function getDomainKnowledgeDetail(kbId: string): Promise<DomainKnow
     status: (info.status as DomainKnowledgeStatus) || 'synced',
     updatedAt: info.updated_at ? formatLocalDateTime(info.updated_at) : '—',
     ontologyDegraded: info.ontology_degraded ?? false,
+    kbType: (info.kb_type as KnowledgeBaseType) || 'lightrag',
   };
 }
 
@@ -447,7 +461,11 @@ interface BackendDocItem {
   ontology_error?: string;
   created_at?: string;
   updated_at?: string;
-  extra_metadata?: Record<string, unknown>;
+  /** [jonex] 后端 to_dict 输出键名是 metadata（非 extra_metadata）——历史 bug 修正。 */
+  metadata?: Record<string, unknown>;
+  /** [jonex] LLM-Wiki 编译状态（顶层字段，migration 008 列化）。 */
+  llm_wiki_compile_status?: string;
+  llm_wiki_compile_error?: string;
   data_source_type?: string;
   mime_type?: string;
 }
@@ -481,7 +499,9 @@ function getDocStatusText(docStatus: string, t: (key: string) => string): string
 }
 
 function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, t: (key: string) => string): ManualDocItem {
-  const meta = doc.extra_metadata || {};
+  // [jonex] 修正历史 bug：后端 to_dict 输出键是 metadata（非 extra_metadata），
+  // 此前 meta 恒为空对象（uploader 等字段全空）。顺带提取 OpenKB 编译状态。
+  const meta = doc.metadata || {};
   return {
     id: doc.id,
     name: doc.file_name,
@@ -502,6 +522,9 @@ function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, t: (key: st
     ontologyStatus: doc.ontology_status,
     errorMessage: doc.error_message,
     ontologyError: doc.ontology_error,
+    // [jonex] LLM-Wiki 编译状态（顶层字段；metadata 兼容旧 JSONB 读点）
+    llmWikiCompileStatus: doc.llm_wiki_compile_status || (meta.openkb_compile_status as string) || undefined,
+    llmWikiCompileError: doc.llm_wiki_compile_error || (meta.openkb_compile_error as string) || undefined,
     knowledgeBaseId,
     dataSourceType: doc.data_source_type,
     mimeType: doc.mime_type,
@@ -556,6 +579,7 @@ export async function uploadManualDocument(
   file: File,
   folderId?: string,
   t?: (key: string) => string,
+  onUploadProgress?: (progressEvent: any) => void,
 ): Promise<ManualDocItem> {
   const _t = t || ((key: string) => key);
   // if (useMock) return mockUploadManualDocument(knowledgeBaseId, file)  // 对接后端接口，不使用 mock
@@ -567,9 +591,12 @@ export async function uploadManualDocument(
     formData.append('folder_id', folderId);
   }
 
+  // [jonex] R7: 上传接口单独放大 timeout 到 300s，避免大文件触发全局 30s 超时
   const result = await getData<BackendDocItem>(
     request.post('/knowledge-base/documents/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000,  // 5 min
+      onUploadProgress,
     }),
   );
 
@@ -1924,4 +1951,133 @@ export async function importCompiledSchemaYaml(
       headers: { 'Content-Type': 'multipart/form-data' },
     }),
   );
+}
+
+// ── [jonex] OpenKB Wiki 只读视图取数（复用 parse-results/* 路由）──
+
+interface BackendWikiEntityItem {
+  id: string;
+  name: string;
+  type: string;
+  description: string;
+  relations_count?: number;
+}
+
+interface BackendWikiRelationshipItem {
+  id: string;
+  source_entity: string;
+  target_entity: string;
+  description: string;
+}
+
+interface BackendWikiPage<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+/** Wiki 实体/概念列表（openkb 管线专用） */
+export function getWikiEntities(params: {
+  kbId: string;
+  page: number;
+  pageSize: number;
+  keyword?: string;
+  entityType?: string;
+}): Promise<PaginationResult<WikiEntityRow>> {
+  const query: Record<string, string | number> = {
+    knowledge_base_id: params.kbId,
+    page: params.page,
+    page_size: params.pageSize,
+  };
+  if (params.keyword) query.keyword = params.keyword;
+  if (params.entityType) query.entity_type = params.entityType;
+
+  return getData<BackendWikiPage<BackendWikiEntityItem>>(
+    request.get('/knowledge-base/parse-results/entities', { params: query }),
+  ).then((res) => ({
+    list: (res.items || []).map((it) => ({
+      id: it.id || it.name,
+      name: it.name || '',
+      type: it.type || '',
+      description: it.description || '',
+      relationsCount: it.relations_count ?? 0,
+    })),
+    pagination: { page: res.page, pageSize: res.page_size, total: res.total },
+  }));
+}
+
+/** Wiki 关系列表（openkb 管线专用） */
+export function getWikiRelationships(params: {
+  kbId: string;
+  page: number;
+  pageSize: number;
+  keyword?: string;
+}): Promise<PaginationResult<WikiRelationshipRow>> {
+  const query: Record<string, string | number> = {
+    knowledge_base_id: params.kbId,
+    page: params.page,
+    page_size: params.pageSize,
+  };
+  if (params.keyword) query.keyword = params.keyword;
+
+  return getData<BackendWikiPage<BackendWikiRelationshipItem>>(
+    request.get('/knowledge-base/parse-results/relationships', { params: query }),
+  ).then((res) => ({
+    list: (res.items || []).map((it) => ({
+      id: it.id || `${it.source_entity}->${it.target_entity}`,
+      source: it.source_entity || '',
+      target: it.target_entity || '',
+      description: it.description || '',
+    })),
+    pagination: { page: res.page, pageSize: res.page_size, total: res.total },
+  }));
+}
+
+/** Wiki 图谱（openkb 管线专用） */
+export function getWikiGraph(kbId: string, limit = 200, documentId?: string): Promise<WikiGraphData> {
+  return getData<{
+    nodes?: { id: string; name: string; type: string; description: string }[];
+    edges?: { id: string; source: string; target: string }[];
+  }>(
+    request.get('/knowledge-base/parse-results/graph', {
+      params: { knowledge_base_id: kbId, limit, document_id: documentId || '' },
+    }),
+  ).then((res) => ({
+    nodes: res.nodes || [],
+    edges: res.edges || [],
+  }));
+}
+
+// ── [jonex] Wiki 阅读模式（编译结果页）──
+
+/** 读取 Wiki 页面内容（openkb 管线专用；后端字段本已是 camelCase 结构，直接透传） */
+export function getWikiPage(kbId: string, path: string): Promise<WikiPageContent> {
+  return getData<WikiPageContent>(
+    request.get('/knowledge-base/parse-results/wiki-page', {
+      params: { knowledge_base_id: kbId, path },
+    }),
+  );
+}
+
+/** 后端原始结构（snake_case，不入组件） */
+interface BackendWikiContents {
+  summaries: WikiPageItem[];
+  concepts: WikiPageItem[];
+  entities: WikiPageItem[];
+  document_id: string;
+}
+
+/** Wiki 页面树（openkb 管线专用，必传 documentId 按文档过滤编译产物） */
+export function getWikiContents(kbId: string, documentId: string): Promise<WikiContents> {
+  return getData<BackendWikiContents>(
+    request.get('/knowledge-base/parse-results/wiki-contents', {
+      params: { knowledge_base_id: kbId, document_id: documentId },
+    }),
+  ).then((res) => ({
+    summaries: res.summaries || [],
+    concepts: res.concepts || [],
+    entities: res.entities || [],
+    documentId: res.document_id || '',
+  }));
 }

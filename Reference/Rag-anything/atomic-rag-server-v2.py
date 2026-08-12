@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -38,6 +39,43 @@ from raganything.service.prompt_config_manager import (
     PromptConfigCreate,
     PromptConfigUpdate,
 )
+
+# ---------------------------------------------------------------------------
+# auto-escape helper — preserves {placeholder} while escaping literal { }
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_RE = re.compile(
+    r"\{([a-zA-Z_][a-zA-Z0-9_]*)(\.[a-zA-Z_][a-zA-Z0-9_]*|\[[0-9]+\])*\}",
+)
+
+
+def _auto_escape_braces(content: str, allowed_placeholders: set[str]) -> str:
+    """Auto-escape literal { } to {{ }} while preserving {ident}-style placeholders.
+
+    Any brace-enclosed string whose inner name matches *allowed_placeholders*
+    (or the generic ``ident`` / ``ident.attr`` / ``ident[idx]`` pattern) is
+    preserved; all other braces are escaped via doubling.
+    """
+    sentinel_map: dict[str, str] = {}
+    counter = 0
+
+    def _save(m: re.Match) -> str:
+        nonlocal counter
+        inner = m.group(1)
+        if inner not in allowed_placeholders:
+            # Not a known placeholder — leave as-is; will be escaped below
+            return m.group(0)
+        key = f"\x00PH\x00{counter}\x00"
+        counter += 1
+        sentinel_map[key] = m.group(0)
+        return key
+
+    content = _PLACEHOLDER_RE.sub(_save, content)
+    content = content.replace("{", "{{").replace("}", "}}")
+    for key, original in sentinel_map.items():
+        content = content.replace(key, original)
+    return content
+
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -89,6 +127,31 @@ class InvokeRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# [jonex] R1：幂等键公共匹配函数 —— 遍历 _tasks（从 repo 恢复）按 idempotency_key
+# 匹配在途任务；找到非终态任务则复用，否则创建新任务。比 _idempotency 内存字典更可靠
+#（后者随容器重启丢失）。insert/retry/retry_ontology_extract 三处共用。
+# ---------------------------------------------------------------------------
+
+async def _reuse_or_create(task_manager, idempotency_key: str | None,
+                           req, tenant_id: str) -> tuple:
+    """按幂等键查找或用 req 创建任务。返回 (task_id, status, is_reused: bool)。"""
+    from raganything.service.models import TERMINAL_STATES
+
+    if idempotency_key:
+        for t in task_manager._tasks.values():
+            if t.idempotency_key != idempotency_key:
+                continue
+            if t.status in TERMINAL_STATES:
+                continue  # 终态允许新建 attempt
+            # 非终态在途任务 → 复用
+            return (t.task_id, t.status.value, True)
+
+    result = await task_manager.create(req, tenant_id, idempotency_key=idempotency_key)
+    task_id = result.task_id if hasattr(result, "task_id") else ""
+    return (task_id, "pending", False)
+
+
+# ---------------------------------------------------------------------------
 # Action handlers — 全部走新 TaskManager
 # ---------------------------------------------------------------------------
 
@@ -102,6 +165,8 @@ async def handle_insert(params: dict, tenant_id: str, task_manager, **kwargs):
 
     preset = params.get("preset")
     mode = TaskMode.PRESET if preset else TaskMode.INLINE
+
+    idempotency_key = params.get("idempotency_key")  # [jonex] R1
 
     req = CreateTaskRequest(
         mode=mode,
@@ -135,17 +200,22 @@ async def handle_insert(params: dict, tenant_id: str, task_manager, **kwargs):
         # [jonex] 主解析提示词下发（KB 关联的 prompt 配置 id）
         prompt_ids=params.get("prompt_ids") or [],
         # ── Reparse / recompile execution control ──
+        # [jonex] OpenKB：透传 execution_mode（parse_only 时只解析、不入库/不抽本体）
+        execution_mode=params.get("execution_mode", "full") or "full",
         schema_version=int(params.get("schema_version", 0) or 0),
         schema_hash=params.get("schema_hash", "") or "",
     )
 
-    result = await task_manager.create(req, tenant_id)
-    task_id = result.task_id if hasattr(result, "task_id") else ""
+    # [jonex] R1：幂等键复用 —— 同一 (doc, generation) 返回同一 task_id
+    task_id, status, is_reused = await _reuse_or_create(
+        task_manager, idempotency_key, req, tenant_id,
+    )
 
     return {
         "success": True, "code": 0, "message": "success",
-        "data": {"task_id": task_id, "status": "pending",
-                 "file_path": file_path, "tenant_id": tenant_id},
+        "data": {"task_id": task_id, "status": status,
+                 "file_path": file_path, "tenant_id": tenant_id,
+                 "reused": is_reused},  # [jonex] R1：告知 kb 侧是否为复用
     }
 
 
@@ -181,6 +251,29 @@ async def handle_delete(params: dict, tenant_id: str, task_manager, **kwargs):
             "data": {"success": success}}
 
 
+@ActionRegistry.register("delete_batch")
+async def handle_delete_batch(params: dict, tenant_id: str, task_manager, **kwargs):
+    """[jonex] 批量删除——单次提交全部 doc_ids，LightRAG 仅执行一次 rebuild。"""
+    doc_ids = params.get("doc_ids", [])
+    if not doc_ids or not isinstance(doc_ids, list):
+        raise HTTPException(400, "doc_ids 不能为空且必须是数组")
+
+    result = await task_manager.delete_docs(
+        doc_ids=doc_ids, tenant_id=tenant_id,
+        kb_id=params.get("knowledge_base_id", ""),
+        document_id=params.get("document_id", ""),
+        trace_id=params.get("trace_id", ""),
+    )
+    accepted = result.get("accepted", [])
+    accepted_set = set(accepted)
+    failed = [d for d in doc_ids if d not in accepted_set]
+    return {"success": True, "code": 0, "message": "success",
+            "data": {"success": len(failed) == 0,
+                     "accepted": accepted,
+                     "failed": failed,
+                     "status": result.get("status", "")}}
+
+
 @ActionRegistry.register("get_task_status")
 async def handle_get_task_status(params: dict, tenant_id: str, task_manager, **kwargs):
     """查询任务状态 → 新 TaskManager.get()"""
@@ -205,6 +298,8 @@ async def handle_get_task_status(params: dict, tenant_id: str, task_manager, **k
             "status": task.status.value,
             "progress": task.progress,
             "error": task.error_message,
+            # [jonex] P0-a: 透传 error_code，供 KB 对账 P1-5 确定性终态短路使用
+            "error_code": task.error_code.value if task.error_code else None,
             "lightrag_doc_ids": lightrag_doc_ids,
             "failed_chunk_count": task.failed_chunk_count,
             "total_chunk_count": task.total_chunk_count,
@@ -246,6 +341,15 @@ async def handle_get_task_status(params: dict, tenant_id: str, task_manager, **k
             "storage": (
                 task.storage.model_dump(mode="json")
                 if task.storage else None
+            ),
+            # [jonex] OpenKB parsed artifact 相对路径（供 KB→OpenKB 编译；相对 inputs 卷根）
+            "parsed_markdown_path": (
+                (task.result_summary.extensions or {}).get("parsed_markdown_path", "")
+                if task.result_summary else ""
+            ),
+            "assets_dir": (
+                (task.result_summary.extensions or {}).get("assets_dir", "")
+                if task.result_summary else ""
             ),
         },
     }
@@ -317,15 +421,14 @@ async def handle_retry(params: dict, tenant_id: str, task_manager, **kwargs):
     preset = params.get("preset")
     mode = TaskMode.PRESET if preset else TaskMode.INLINE
 
+    idempotency_key = params.get("idempotency_key")  # [jonex] R1
+
     req = CreateTaskRequest(
         mode=mode,
         file_path=file_path or mps_video_url or "unknown",
         preset=preset,
         output_dir=params.get("output_dir"),
         profile=params.get("profile"),
-        # 不透传 modalities：None 会触发 pydantic 校验失败（list[str] 不接受 None）。
-        # 不设则用 default_factory；且 PRESET 模式下 model_fields_set 不含 modalities，
-        # ConfigResolver._extract_overrides 会剔除它 → 采用 preset yaml 的 modalities。
         **({"modalities": params["modalities"]} if params.get("modalities") is not None else {}),
         webhook_url=params.get("webhook_url"),
         llm=params.get("llm"),
@@ -356,14 +459,40 @@ async def handle_retry(params: dict, tenant_id: str, task_manager, **kwargs):
         schema_hash=params.get("schema_hash", "") or "",
     )
 
-    result = await task_manager.create(req, tenant_id)
-    task_id = result.task_id if hasattr(result, "task_id") else ""
+    # [jonex] R1：幂等键复用
+    task_id, status, is_reused = await _reuse_or_create(
+        task_manager, idempotency_key, req, tenant_id,
+    )
 
     return {
         "success": True, "code": 0, "message": "success",
-        "data": {"task_id": task_id, "status": "pending",
+        "data": {"task_id": task_id, "status": status,
                  "file_path": file_path, "tenant_id": tenant_id,
-                 "force_reparse": True},
+                 "force_reparse": True,
+                 "reused": is_reused},  # [jonex] R1
+    }
+
+
+# [jonex] R1：幂等键反查 —— 供 KB 对账 R2-b 查证链使用
+@ActionRegistry.register("get_task_by_idempotency_key")
+async def handle_get_task_by_idempotency_key(params: dict, tenant_id: str,
+                                              task_manager, **kwargs):
+    """按幂等键查找在途任务，返回 {task_id, status} 或 not_found。"""
+    idempotency_key = params.get("idempotency_key", "")
+    if not idempotency_key:
+        raise HTTPException(400, "idempotency_key 不能为空")
+
+    for t in task_manager._tasks.values():
+        if t.idempotency_key == idempotency_key:
+            return {
+                "success": True, "code": 0, "message": "success",
+                "data": {"task_id": t.task_id, "status": t.status.value,
+                         "found": True},
+            }
+
+    return {
+        "success": True, "code": 0, "message": "success",
+        "data": {"found": False},
     }
 
 
@@ -398,24 +527,43 @@ def _allowed_placeholders(prompt_code: str) -> set[str] | None:
     return fields if found else None
 
 
-def _validate_prompt_template(prompt_code: str, content: str) -> None:
+def _validate_prompt_template(prompt_code: str, content: str) -> str:
     """保存前校验用户 prompt 模板：括号成对 + 占位符在白名单内。违规抛 HTTPException(400)。
 
     权威校验点（KB 侧亦做轻量预检，最终以此为准）。
+    若检测到 JSON 字面大括号（字段名非 Python 合法标识符），自动转义 literal { }
+    为 {{ }}，保留已知占位符。返回最终应落库的内容（已转义，如需要）。
     """
     if not isinstance(content, str) or not content.strip():
         raise HTTPException(400, "prompt content 不能为空")
-    # 1) 括号语法（未成对/非法会抛 ValueError）
+    # 1) 括号语法 + 自动转义检测
     used: set[str] = set()
+    needs_escape = False
     try:
         for _lit, field, _spec, _conv in string.Formatter().parse(content):
             if field is not None and field != "":
+                # Fields like '"key"' (from JSON) are not valid Python identifiers
+                if not field.isidentifier():
+                    needs_escape = True
                 used.add(field.split(".")[0].split("[")[0])
-    except ValueError as e:
-        raise HTTPException(
-            400,
-            f"prompt 模板大括号非法：{e}。字面大括号请写成 {{{{ }}}}，占位符仅限允许字段。",
-        )
+    except ValueError:
+        needs_escape = True  # unbalanced braces → try auto-escape
+
+    if needs_escape:
+        # Try auto-escape: preserve known placeholders, escape everything else
+        allowed = _allowed_placeholders(prompt_code)
+        content = _auto_escape_braces(content, allowed or set())
+        used = set()
+        try:
+            for _lit, field, _spec, _conv in string.Formatter().parse(content):
+                if field is not None and field != "":
+                    used.add(field.split(".")[0].split("[")[0])
+        except ValueError as e:
+            raise HTTPException(
+                400,
+                f"prompt 模板大括号非法：{e}。字面大括号请写成 {{{{ }}}}，占位符仅限允许字段。",
+            )
+
     # 2) 占位符白名单
     allowed = _allowed_placeholders(prompt_code)
     if allowed is not None:
@@ -426,6 +574,7 @@ def _validate_prompt_template(prompt_code: str, content: str) -> None:
                 f"prompt 含不允许的占位符 {sorted(illegal)}；{prompt_code} 允许："
                 f"{sorted(allowed) or '（无占位符）'}",
             )
+    return content
 
 
 def _require_pcm(kwargs: dict):
@@ -443,18 +592,18 @@ async def handle_create_prompt(params: dict, tenant_id: str, task_manager, **kwa
     content = params.get("content", "")
     if not prompt_code:
         raise HTTPException(400, "prompt_code 不能为空")
-    _validate_prompt_template(prompt_code, content)
+    content = _validate_prompt_template(prompt_code, content)
 
     item = pcm.create(
         tenant_id,
         PromptConfigCreate(
             prompt_code=prompt_code,
+            content=content,
             preset_name=params.get("preset_name", "") or "",
             display_name=params.get("display_name", "") or "",
             description=params.get("description", "") or "",
             category=params.get("category", "analysis") or "analysis",
             language=params.get("language", "zh") or "zh",
-            content=content,
         ),
         created_by=params.get("created_by", "kb") or "kb",
     )
@@ -475,13 +624,16 @@ async def handle_update_prompt(params: dict, tenant_id: str, task_manager, **kwa
         existing = pcm.get(tenant_id, prompt_id)
         code = params.get("prompt_code") or (existing.prompt_code if existing else "")
         if code:
-            _validate_prompt_template(code, content)
+            content = _validate_prompt_template(code, content)
 
     fields = {}
     for k in ("prompt_code", "preset_name", "display_name", "description",
               "category", "language", "content"):
         if params.get(k) is not None:
             fields[k] = params[k]
+    # Use the potentially-escaped content
+    if content is not None:
+        fields["content"] = content
 
     item = pcm.update(
         tenant_id, prompt_id, PromptConfigUpdate(**fields),

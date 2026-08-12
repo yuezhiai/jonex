@@ -11,6 +11,7 @@ import type {
   KnowledgeSearchHistoryItem,
   KnowledgeSearchMode,
   KnowledgeSearchOverview,
+  KnowledgeSearchStrictConfig,
   KnowledgeSearchStreamHandlers,
   KnowledgeSearchStreamMeta,
   KnowledgeSearchStreamParams,
@@ -27,6 +28,7 @@ type NormalizedSearchParams = {
   topK: number;
   domainId: string;
   kbIds: string[];
+  strictConfig?: KnowledgeSearchStrictConfig;
 };
 
 interface RawKnowledgeSearchHistoryItem {
@@ -65,6 +67,7 @@ function normalizeSearchParams(params: KnowledgeSearchStreamParams): NormalizedS
     topK: params.topK ?? 5,
     domainId: params.domainId ?? 'all',
     kbIds: params.kbIds ?? [],
+    strictConfig: params.strictConfig,
   };
 }
 
@@ -86,6 +89,37 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
     topK: item.topK ?? item.top_k,
   };
 }
+
+/** 严格模式默认配置（普通 / 深度检索共用前 5 项，深度额外含后 2 项） */
+export const DEFAULT_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
+  strict_mode: false,
+  strict_max_attempts: 3,
+  strict_min_score: 0.8,
+  strict_require_reference: true,
+  strict_require_grounded: true,
+  max_subqueries: 6,
+  allow_common_sense: true,
+};
+
+export const DEFAULT_FAST_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
+  strict_mode: true,
+  strict_max_attempts: 1,
+  strict_min_score: 0.7,
+  strict_require_reference: true,
+  strict_require_grounded: true,
+  max_subqueries: 3,
+  allow_common_sense: false,
+};
+
+export const DEFAULT_DEEP_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
+  strict_mode: true,
+  strict_max_attempts: 3,
+  strict_min_score: 0.8,
+  strict_require_reference: true,
+  strict_require_grounded: true,
+  max_subqueries: 6,
+  allow_common_sense: true,
+};
 
 export async function getKnowledgeSearchOverview(): Promise<KnowledgeSearchOverview> {
   // if (useMock) return mockKnowledgeSearchOverview
@@ -154,14 +188,32 @@ export async function streamKnowledgeSearch(
 
   const token = readAccessToken();
   const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || '/api/v1';
-  const url = new URL(`${baseUrl}/knowledge-base/search/ontology`, window.location.origin);
+  // 快速检索走混合管线统一入口 /search/mix（按 kb_type 分流 lightrag / openkb）；
+  // 深度检索仍走 /search/deep（暂不支持 openkb，见 docs/openkb/llmwiki-reasoning）
+  const endpoint = params.deep ? '/knowledge-base/search/deep' : '/knowledge-base/search/mix';
+  const url = new URL(`${baseUrl}${endpoint}`, window.location.origin);
 
+  const deep = params.deep === true;
+  const strict = normalized.strictConfig;
   const body: Record<string, unknown> = {
     query: normalized.query,
     mode: normalized.mode,
     top_k: normalized.topK,
     with_reasoning: true,
   };
+  if (strict) {
+    // 严格模式参数（普通 / 深度检索共用）
+    body.strict_mode = strict.strict_mode;
+    body.strict_max_attempts = strict.strict_max_attempts;
+    body.strict_min_score = strict.strict_min_score;
+    body.strict_require_reference = strict.strict_require_reference;
+    body.strict_require_grounded = strict.strict_require_grounded;
+    if (deep) {
+      // 深度检索额外配置
+      body.max_subqueries = strict.max_subqueries;
+      body.allow_common_sense = strict.allow_common_sense;
+    }
+  }
   if (normalized.domainId && normalized.domainId !== 'all') {
     body.domain_id = normalized.domainId;
   }

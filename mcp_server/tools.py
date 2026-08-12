@@ -1,0 +1,853 @@
+#!/usr/bin/python3
+# -*- coding:utf-8 -*-
+"""MCP Server - Tool 处理器 + Gateway HTTP 客户端。
+
+单一文件包含 4 个逻辑块：
+  1. HTTP 客户端 getter（参照 db._pool 模式）
+  2. call_gateway() — POST Gateway /internal/kb/invoke
+  3. tool handler 函数（由 app.py 通过 @mcp.tool() 注册）
+  4. __all__ 导出
+
+约束：
+  - 零 import jonex_core——所有 KB 交互通过 HTTP 调 Gateway
+  - Tool handler 签名不含 request、tenant_id、mcp_key_id——从 contextvar 获取
+"""
+import logging
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import httpx
+
+from auth import McpAuthContext, McpAuthError, require_kb_scope, require_mcp_auth
+from config import settings
+from db import get_pool, get_service_permission_level
+
+logger = logging.getLogger("mcp.tools")
+
+
+# New imports for upload_document tool (Phase 10)
+import base64
+import os
+import re
+
+# ============================================================================
+# Block 0: 异常类
+# ============================================================================
+
+
+class McpToolError(Exception):
+    """MCP Tool 执行异常——参数校验、上游服务、限流等非鉴权错误。
+
+    与 McpAuthError 语义严格分离：
+      - McpAuthError: 仅鉴权/授权失败（auth.py 内部，被中间件捕获返回 401）
+      - McpToolError: tool 执行层面的所有非鉴权错误（参数校验、Gateway 故障、限流等）
+
+    code 使用 JSON-RPC error code（MCP 协议标准）。
+    data 用于传递结构化错误上下文（如 retry_after 秒数）。
+    """
+
+    def __init__(self, code: int, message: str, data: dict | None = None):
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(message)
+
+
+# ============================================================================
+# Block 1: HTTP 客户端 getter（参照 db._pool 模式）
+# ============================================================================
+
+_http_client: httpx.AsyncClient | None = None
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """获取已初始化的 httpx 客户端（lifespan 中由 app.py 注入）。
+
+    参照 db.get_pool() 模式：模块级变量 + None 校验守卫。
+
+    Returns:
+        httpx.AsyncClient: 共享的异步 HTTP 客户端
+
+    Raises:
+        RuntimeError: 客户端未初始化（lifespan 尚未执行或已关闭）
+    """
+    if _http_client is None:
+        raise RuntimeError("HTTP client not initialized")
+    return _http_client
+
+
+def set_http_client(client: httpx.AsyncClient | None) -> None:
+    """设置模块级 HTTP 客户端（由 app.py lifespan 调用）。"""
+    global _http_client
+    _http_client = client
+
+
+# ============================================================================
+# Block 2: call_gateway() — POST Gateway /internal/kb/invoke
+# ============================================================================
+
+async def call_gateway(
+    action: str,
+    tenant_id: str,
+    mcp_key_id: str,
+    data: dict | None = None,
+) -> dict:
+    """向 Gateway /internal/kb/invoke 发送请求，返回 capability 响应 data 部分。
+
+    异常统一转换为 McpToolError(code=-32000, message="知识库服务暂不可用")，
+    消息脱敏，不暴露 Gateway URL、堆栈、内部错误详情。
+
+    Args:
+        action: capability action 名称（list_knowledge_info/search/get_raw_url）
+        tenant_id: 租户 ID（从 McpAuthContext 获取）
+        mcp_key_id: MCP Key ID（从 McpAuthContext 获取，用于审计）
+        data: action 所需参数（可选）
+
+    Returns:
+        dict: capability 响应数据
+
+    Raises:
+        McpToolError(code=-32000): 知识库服务不可用（HTTP 错误 / 超时 / 传输错误 / 业务失败）
+    """
+    client = await get_http_client()
+    try:
+        resp = await client.post(
+            "/internal/kb/invoke",
+            json={
+                "action": action,
+                "tenant_id": tenant_id,
+                "mcp_key_id": mcp_key_id,
+                "data": data or {},
+            },
+            headers={
+                "X-Internal-API-Key": settings.INTERNAL_API_KEY,
+                "X-Tenant-ID": tenant_id,
+            },
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as e:
+        # SEC-03: Sidecar 429 限流 → MCP JSON-RPC error（含 retry_after）
+        if e.response.status_code == 429:
+            retry_after_raw = e.response.headers.get("Retry-After", "60")
+            try:
+                retry_after = int(retry_after_raw)
+            except (ValueError, TypeError):
+                # HTTP-date 格式: "Thu, 01 Jan 2026 00:00:00 GMT"
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after_raw).replace(
+                        tzinfo=timezone.utc
+                    )
+                    retry_after = max(
+                        0, int((retry_dt - datetime.now(timezone.utc)).total_seconds())
+                    )
+                except (ValueError, TypeError):
+                    retry_after = 60
+            raise McpToolError(
+                code=_ERROR_RATE_LIMITED,
+                message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+                data={"retry_after": retry_after},
+            )
+        if 400 <= e.response.status_code < 500:
+            # 认证/授权失败（401/403）→ 不应触发管线 fallback
+            if e.response.status_code in (401, 403):
+                raise McpToolError(
+                    code=_ERROR_AUTH,
+                    message="认证失败或权限不足",
+                )
+            # 其他客户端错误（400/404/422）→ 参数或管线问题，允许上游 safe-fallback
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="知识库服务请求参数有误",
+            )
+        # 500+ → 服务端错误
+        logger.error(
+            "Gateway HTTP error: action=%s tenant_id=%s status=%d",
+            action,
+            tenant_id,
+            e.response.status_code,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        logger.error(
+            "Gateway transport error: action=%s tenant_id=%s type=%s",
+            action,
+            tenant_id,
+            type(e).__name__,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    except httpx.RequestError as e:
+        # Catch-all for any httpx errors not covered above
+        logger.error(
+            "Gateway request error: action=%s tenant_id=%s type=%s",
+            action,
+            tenant_id,
+            type(e).__name__,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+    # 业务失败：响应 code 非 0
+    if isinstance(result, dict) and result.get("code", 0) != 0:
+        biz_code = result.get("code")
+        logger.error(
+            "Gateway business error: action=%s tenant_id=%s code=%s",
+            action,
+            tenant_id,
+            biz_code,
+        )
+        # 1xxx = 通用参数/管线不匹配错误，映射为 INVALID_PARAMS 以便上游安全 fallback
+        mcp_code = _ERROR_INVALID_PARAMS if isinstance(biz_code, int) and 1000 <= biz_code < 2000 else _ERROR_INTERNAL
+        raise McpToolError(code=mcp_code, message="知识库服务暂不可用")
+
+    # 提取 data 字段（标准 success_response 格式），否则返回原始结果
+    if isinstance(result, dict) and "data" in result:
+        return result["data"]
+    return result
+
+
+# ============================================================================
+# Block 3: 3 个 tool handler 函数 + C3 交集校验
+# ============================================================================
+
+
+# ── Service 级权限层级: write(2) > call(1) > read(0) ──
+_PERMISSION_LEVEL_RANK = {"read": 0, "call": 1, "write": 2}
+
+
+async def _check_service_scope(
+    auth: McpAuthContext, service_id: str, required_permission: str = "call"
+) -> list[str]:
+    """C3: 校验 service 下的 KB 与 Key 的 allowed_kb_ids 有交集，并检查权限级别。
+
+    权限级别层级（向下兼容）：
+      - write: 仅 "write" 可通过（最高权限，包含 call + read）
+      - call:  "call" 或 "write" 可通过
+      - read:  "read" / "call" / "write" 可通过（最低 service 级权限，与 Key 级命名对齐）
+      - 映射不存在时 raise McpAuthError(401, "不在授权范围内")
+
+    如果 allowed_kb_ids 为空（falsy），表示"所有 KB 都允许"，跳过交集检查返回空列表。
+    否则获取 service 的 kb_ids，计算交集，交集为空时 raise McpAuthError(401)。
+
+    Returns:
+        list[str]: 交集列表（allowed_kb_ids ∩ service kb_ids），为空时表示跳过检查
+    """
+    pool = await get_pool()
+    perm_level = await get_service_permission_level(pool, auth.key_id, service_id)
+
+    if perm_level is None:
+        raise McpAuthError(401, "不在授权范围内")
+
+    # "*" 全能力通配：跳过所有权限检查（对应前端"全部"选项）
+    if perm_level == "*":
+        pass
+    else:
+        required_rank = _PERMISSION_LEVEL_RANK.get(required_permission, 0)
+        actual_rank = _PERMISSION_LEVEL_RANK.get(perm_level, -1)
+        if actual_rank < required_rank:
+            _LABELS: dict[str, str] = {"write": "可写入", "call": "可调用", "read": "仅查看"}
+            raise McpAuthError(
+                403,
+                f"需要'{_LABELS.get(required_permission, required_permission)}'权限，"
+                f"当前为'{_LABELS.get(perm_level, perm_level)}'权限",
+            )
+
+    if not auth.allowed_kb_ids:
+        return []
+
+    service_detail = await call_gateway(
+        "get_service",
+        auth.tenant_id,
+        auth.key_id,
+        {"service_id": service_id},
+    )
+    kb_ids = service_detail.get("kb_ids", [])
+    intersection = list(set(auth.allowed_kb_ids) & set(kb_ids))
+
+    if not intersection:
+        raise McpAuthError(401, "不在授权范围内")
+
+    return intersection
+
+
+def _validate_file_name(file_name: str) -> str:
+    """Validate file_name for safety: non-empty, no path traversal characters.
+
+    Args:
+        file_name: The uploaded file name from MCP client (untrusted).
+
+    Returns:
+        str: Trimmed safe file name.
+
+    Raises:
+        McpToolError(code=-32602): file_name empty or contains path traversal chars.
+    """
+    name = file_name.strip()
+    if not name:
+        raise McpToolError(code=-32602, message="file_name 为必填参数，不能为空")
+    if _PATH_TRAVERSAL_RE.search(name) or "/" in name or "\\" in name:
+        raise McpToolError(code=-32602, message="file_name 包含非法字符（路径穿越拒绝）")
+    if not _VALID_FILENAME_RE.match(name):
+        raise McpToolError(code=-32602, message="file_name 包含非法字符")
+    return name
+
+
+async def upload_document(
+    service_id: str,
+    file_name: str,
+    file_content_base64: str,
+    knowledge_base_id: str,
+    mime_type: str = "",
+) -> dict:
+    """Upload a document to a knowledge base via MCP.
+
+    Receives base64-encoded file content, validates parameters, authenticates
+    with "write" permission, checks KB scope, then sends a multipart POST to
+    the Gateway /internal/kb/documents/upload endpoint.
+
+    Args:
+        service_id: Domain service ID.
+        file_name: Original file name (untrusted, validated for traversal).
+        file_content_base64: Base64-encoded file content (max ~67MB encoded).
+        knowledge_base_id: Target knowledge base ID.
+        mime_type: Optional MIME type (default: "").
+
+    Returns:
+        dict: Document metadata (doc_id, file_name, knowledge_base_id, status).
+
+    Raises:
+        McpToolError(code=-32602): Parameter validation / base64 decode failure.
+        McpAuthError(401): Not authenticated / missing "write" permission / KB not in scope.
+        McpToolError(code=-32000): Gateway error / timeout / transport failure.
+    """
+    # Step 1 — Parameter non-empty validation
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not knowledge_base_id or not knowledge_base_id.strip():
+        raise McpToolError(code=-32602, message="knowledge_base_id 为必填参数，不能为空")
+    if not file_content_base64:
+        raise McpToolError(code=-32602, message="file_content_base64 为必填参数，不能为空")
+
+    # Step 2 — file_name security validation
+    file_name = _validate_file_name(file_name)
+
+    # Step 3 — base64 size pre-check (before decode, per D3)
+    max_size_mb = int(os.getenv("MCP_UPLOAD_MAX_SIZE_MB", "50"))
+    max_encoded = int(max_size_mb * 1024 * 1024 * 4 / 3) + 1024  # +1KB buffer tolerance
+    if len(file_content_base64) > max_encoded:
+        raise McpToolError(
+            code=-32602,
+            message=f"文件大小超过限制 ({max_size_mb}MB)。base64 编码后长度: {len(file_content_base64)}",
+        )
+
+    # Step 4 — base64 decode
+    try:
+        file_content = base64.b64decode(file_content_base64, validate=True)
+    except (ValueError, TypeError) as e:
+        # binascii.Error is a subclass of both ValueError and base64.Error in Python 3
+        raise McpToolError(
+            code=-32602, message="file_content_base64 解码失败，需为有效 base64 编码"
+        ) from e
+
+    # Step 5 — Auth + scope check (require "write" permission at service level)
+    auth = require_mcp_auth("write")  # per D2 — mandatory "write" permission
+    intersection = await _check_service_scope(auth, service_id, "write")
+    kb_id = knowledge_base_id.strip()
+    if intersection and kb_id not in intersection:
+        raise McpAuthError(401, "不在授权范围内")
+
+    # Step 6 — Multipart POST to Gateway
+    client = await get_http_client()
+    try:
+        resp = await client.post(
+            "/internal/kb/documents/upload",
+            files={"file": (file_name, file_content, mime_type or "application/octet-stream")},
+            data={
+                "file_name": file_name,
+                "knowledge_base_id": kb_id,
+                "mcp_key_id": auth.key_id,
+                "mime_type": mime_type,
+            },
+            headers={
+                "X-Internal-API-Key": settings.INTERNAL_API_KEY,
+                "X-Tenant-ID": auth.tenant_id,
+                "X-MCP-Key-ID": auth.key_id,
+            },
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as e:
+        if 400 <= e.response.status_code < 500:
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="知识库服务请求参数有误",
+            )
+        logger.error(
+            "Gateway HTTP error on upload: tenant_id=%s key_id=%s status=%d",
+            auth.tenant_id,
+            auth.key_id,
+            e.response.status_code,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        logger.error(
+            "Gateway transport error on upload: tenant_id=%s key_id=%s type=%s",
+            auth.tenant_id,
+            auth.key_id,
+            type(e).__name__,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    except httpx.RequestError as e:
+        logger.error(
+            "Gateway request error on upload: tenant_id=%s key_id=%s type=%s",
+            auth.tenant_id,
+            auth.key_id,
+            type(e).__name__,
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+    # Business failure: response code != 0
+    if isinstance(result, dict) and result.get("code", 0) != 0:
+        logger.error(
+            "Gateway business error on upload: tenant_id=%s key_id=%s code=%s",
+            auth.tenant_id,
+            auth.key_id,
+            result.get("code"),
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+    return result.get("data", result)
+
+
+async def get_upload_status(service_id: str, document_id: str) -> dict:
+    """Query document processing status after upload via MCP.
+
+    Returns status, ontology_status, error_message, and other metadata
+    to let MCP clients track upload progress through the async pipeline
+    (PENDING → PARSING → INGESTING → READY / FAILED).
+
+    Args:
+        service_id: Domain service ID.
+        document_id: Document ID (returned by upload_document).
+
+    Returns:
+        dict: Document status fields (doc_id, status, ontology_status,
+              error_message, file_name, file_size, knowledge_base_id,
+              created_at, updated_at).
+
+    Raises:
+        McpAuthError(401): Not authenticated / service not in scope.
+        McpToolError(code=-32602): Parameter validation failure.
+        McpToolError(code=-32000): Gateway error / service has no KBs.
+    """
+    # Step 1 — Parameter non-empty validation
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not document_id or not document_id.strip():
+        raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
+
+    # Step 2 — Auth + scope check (write-level: status tracking is part of upload lifecycle)
+    auth = require_mcp_auth("read")
+    intersection = await _check_service_scope(auth, service_id, required_permission="write")
+
+    # Step 3 — Determine KB IDs to check (follow read_source pattern)
+    if intersection:
+        kb_ids_to_check = intersection
+    else:
+        # allowed_kb_ids empty = all KBs allowed, need service's full KB list
+        service_detail = await call_gateway(
+            "get_service",
+            auth.tenant_id,
+            auth.key_id,
+            {"service_id": service_id},
+        )
+        kb_ids_to_check = service_detail.get("kb_ids", [])
+
+    if not kb_ids_to_check:
+        raise McpToolError(code=-32000, message="服务下无可用知识库")
+
+    # Step 4 — Call Gateway (returns document status or raises ResourceNotFoundError)
+    return await call_gateway(
+        "get_document_status",
+        auth.tenant_id,
+        auth.key_id,
+        {
+            "document_id": document_id.strip(),
+            "kb_ids": kb_ids_to_check,
+        },
+    )
+
+
+async def list_domain_services() -> dict:
+    """列出 MCP Key 对应租户下所有领域服务。
+
+    Action: list_services
+    Guard: require_mcp_auth("read") only（不需要 service scope）
+
+    Returns:
+        dict: 含 items（领域服务列表）、total（总数）字段
+    """
+    auth = require_mcp_auth("read")
+    result = await call_gateway(
+        "list_services",
+        auth.tenant_id,
+        auth.key_id,
+    )
+    # 上游标准返回 {items: [...], total: N}
+    if isinstance(result, dict) and "items" in result:
+        return {
+            "items": result["items"],
+            "total": result.get("total", len(result["items"])),
+        }
+    # 格式意外 → 记录并报错
+    logger.error("list_services 返回意外格式: %s", type(result).__name__)
+    raise McpToolError(code=-32000, message="领域服务列表返回格式异常")
+
+
+# ── JSON-RPC 错误码常量（per JSON-RPC 2.0 spec + MCP extension） ──
+_ERROR_INVALID_PARAMS = -32602  # 参数校验失败（JSON-RPC standard）
+_ERROR_INTERNAL = -32000  # 内部服务错误
+_ERROR_RATE_LIMITED = -32001  # 限流（自定义 MCP extension）
+_ERROR_AUTH = -32002  # 认证/授权失败（401/403 → 禁止管线 fallback）
+
+# Phase 11: LLM-Wiki 检索开关（Feature Flag，默认开启）
+SEARCH_LLMWIKI_ENABLED = os.getenv("SEARCH_LLMWIKI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+_VALID_SEARCH_MODES = frozenset({"naive", "local", "global", "hybrid", "mix"})
+# mix → hybrid 别名兼容（与 capabilities/knowledge_base/dtos/search.py 保持一致）
+_SEARCH_MODE_ALIASES = {"mix": "hybrid"}
+
+# Upload document validation constants
+_VALID_FILENAME_RE = re.compile(r'^[\w一-鿿.-]+$')  # Safe filename characters
+_PATH_TRAVERSAL_RE = re.compile(r'\.\./|\.\.\\')  # Path traversal detection
+
+
+async def list_documents(
+    service_id: str,
+    file_name: str = "",
+) -> dict:
+    """列出领域服务下所有知识库的文档。以领域服务为入口，自动解析所属知识库。
+
+    Action: list_documents
+    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="read")
+
+    解决「文件名 → document_id」桥接缺口：MCP 客户端无需先到 REST API 查文档列表再回来调用 read_source。
+    支持可选的 file_name 关键词过滤（模糊匹配文件名和文件路径）。
+
+    Args:
+        service_id: 领域服务 ID
+        file_name: 可选的文件名关键词过滤（最多 255 字符）
+
+    Returns:
+        dict: 含 items（文档列表，每项含 id、file_name、knowledge_base_id、status 等）、total 字段
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（空 service_id / file_name 超长）
+        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库
+    """
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    file_name = file_name.strip()
+    if len(file_name) > 255:
+        raise McpToolError(code=-32602, message="file_name 长度不能超过 255 字符")
+    auth = require_mcp_auth("read")
+    intersection = await _check_service_scope(auth, service_id, required_permission="read")
+    if intersection:
+        kb_ids_to_query = intersection
+    else:
+        service_detail = await call_gateway(
+            "get_service", auth.tenant_id, auth.key_id, {"service_id": service_id},
+        )
+        kb_ids_to_query = service_detail.get("kb_ids", [])
+    if not kb_ids_to_query:
+        raise McpToolError(code=-32000, message="服务下无可用知识库")
+    all_items: list[dict] = []
+    for kb_id in kb_ids_to_query:
+        try:
+            data: dict[str, str] = {"knowledge_base_id": kb_id}
+            if file_name:
+                data["keyword"] = file_name
+            result = await call_gateway(
+                "list_documents", auth.tenant_id, auth.key_id, data,
+            )
+            all_items.extend(result.get("items", []))
+        except McpToolError:
+            continue
+    return {"items": all_items, "total": len(all_items)}
+
+
+async def _validate_search_params(
+    service_id: str,
+    query: str,
+    mode: str,
+    top_k: int,
+) -> tuple[str, str, "McpAuthContext"]:
+    """统一的搜索参数校验 + 鉴权。
+
+    校验顺序：mode 规范化 → service_id/query 非空 → query 长度 → mode 白名单 → top_k 范围 → 鉴权。
+
+    Returns:
+        (normalized_query, normalized_mode, auth): 规范化后的 query、mode 和鉴权上下文
+
+    Raises:
+        McpToolError(code=-32602): 参数校验失败
+        McpAuthError(401): 未认证 / service 不在授权范围
+    """
+    mode = mode.lower()
+    mode = _SEARCH_MODE_ALIASES.get(mode, mode)
+
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not query or not query.strip():
+        raise McpToolError(code=-32602, message="query 为必填参数，不能为空")
+    if len(query) > 2000:
+        raise McpToolError(code=-32602, message="query 长度不能超过 2000 字符")
+    if mode not in _VALID_SEARCH_MODES:
+        raise McpToolError(
+            code=-32602,
+            message=f"mode 必须为 {sorted(_VALID_SEARCH_MODES)} 之一，当前值: {mode}",
+        )
+    if not 1 <= top_k <= 100:
+        raise McpToolError(code=-32602, message="top_k 必须在 1-100 之间")
+
+    auth = require_mcp_auth("read")
+    await _check_service_scope(auth, service_id, required_permission="call")
+
+    return query.strip(), mode, auth
+
+
+async def search_ontology(
+    service_id: str,
+    query: str,
+    mode: str = "hybrid",
+    top_k: int = 5,
+    strict_mode: bool = False,
+) -> dict:
+    """本体优先检索——实体匹配→1-hop 邻域→RAG fallback。
+
+    Action: query_with_ontology
+    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+
+    三步检索管线：1) 实体匹配 2) 1-hop 邻居遍历 3) RAG 融合。
+    支持严格模式（strict_mode=True），多次验证循环确保可靠性。
+
+    Args:
+        service_id: 领域服务 ID
+        query: 搜索查询（最多 2000 字符）
+        mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
+        top_k: 返回结果数（默认 5，1-100）
+        strict_mode: 是否启用严格模式多次验证（默认 False）
+
+    Returns:
+        dict: 搜索结果，含 answer、references、reasoning 字段
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
+        McpToolError(code=-32000): 知识库服务不可用
+    """
+    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
+    return await call_gateway(
+        "query_with_ontology",
+        auth.tenant_id,
+        auth.key_id,
+        {
+            "service_id": service_id,
+            "query": query_norm,
+            "mode": mode_norm,
+            "top_k": top_k,
+            "strict_mode": strict_mode,
+        },
+    )
+
+
+async def search_service(
+    service_id: str,
+    query: str,
+    mode: str = "hybrid",
+    top_k: int = 5,
+) -> dict:
+    """[已废弃] 语义搜索领域服务下的所有知识库。
+
+    自 2026-08-10 起废弃，请使用 search_ontology 替代。
+    此别名仅用于向后兼容，将在后续版本中移除。
+    """
+    logger.warning("search_service is deprecated, use search_ontology instead")
+    return await search_ontology(service_id, query, mode, top_k, strict_mode=False)
+
+
+async def search_deep(
+    service_id: str,
+    query: str,
+    mode: str = "hybrid",
+    top_k: int = 5,
+    strict_mode: bool = False,
+) -> dict:
+    """深度查询——多轮分解→子问题查询→归并答案。
+
+    Action: deep_query
+    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+
+    将复杂问题分解为多个子问题，依次查询后归并生成综合答案。
+    支持严格模式（strict_mode=True），多次验证循环确保可靠性。
+
+    Args:
+        service_id: 领域服务 ID
+        query: 搜索查询（最多 2000 字符）
+        mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
+        top_k: 返回结果数（默认 5，1-100）
+        strict_mode: 是否启用严格模式多次验证（默认 False）
+
+    Returns:
+        dict: 搜索结果，含 answer、references、reasoning 字段
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
+        McpToolError(code=-32000): 知识库服务不可用
+    """
+    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
+    return await call_gateway(
+        "deep_query",
+        auth.tenant_id,
+        auth.key_id,
+        {
+            "service_id": service_id,
+            "query": query_norm,
+            "mode": mode_norm,
+            "top_k": top_k,
+            "strict_mode": strict_mode,
+        },
+    )
+
+
+async def search_llmwiki(
+    service_id: str,
+    query: str,
+    mode: str = "hybrid",
+    top_k: int = 5,
+) -> dict:
+    """OpenKB Wiki 检索——仅适用于 OpenKB 管线知识库，不适用于 LightRAG 管线。
+
+    Action: search_llmwiki (fallback: query_with_ontology)
+    Guard: SEARCH_LLMWIKI_ENABLED flag + require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+
+    通过 OpenKB 编译产物进行 Wiki 风格检索。
+    若管线不匹配（code=-32602），自动 fallback 到 query_with_ontology。
+    不支持 strict_mode（OpenKB 编译产物无严格模式语义）。
+
+    Args:
+        service_id: 领域服务 ID
+        query: 搜索查询（最多 2000 字符）
+        mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
+        top_k: 返回结果数（默认 5，1-100）
+
+    Returns:
+        dict: 搜索结果，含 answer、references、reasoning 字段
+
+    Raises:
+        McpToolError(code=-32000): LLM-Wiki 检索未开放（feature flag 关闭） / 知识库服务不可用
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
+    """
+    if not SEARCH_LLMWIKI_ENABLED:
+        raise McpToolError(code=-32000, message="LLM-Wiki 检索暂未开放")
+    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
+    payload = {
+        "service_id": service_id,
+        "query": query_norm,
+        "mode": mode_norm,
+        "top_k": top_k,
+    }
+    try:
+        return await call_gateway("search_llmwiki", auth.tenant_id, auth.key_id, payload)
+    except McpToolError as e:
+        if e.code == -32602:
+            logger.info(
+                "search_llmwiki 管线不匹配，自动回退到 search_ontology: service_id=%s",
+                service_id,
+            )
+            return await call_gateway("query_with_ontology", auth.tenant_id, auth.key_id, payload)
+        raise
+
+
+async def read_source(
+    service_id: str,
+    document_id: str,
+) -> dict:
+    """获取文档源文件的预签名 URL。以领域服务为入口，自动解析文档所属知识库。
+
+    Action: get_raw_url
+    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id)
+
+    不经过 MCP 传输大文件内容——仅返回预签名 URL。
+
+    遍历 service 下的所有 KB，依次尝试查找文档，找到后返回预签名 URL。
+    若文档不在任何 KB 中，raise McpToolError。
+
+    Args:
+        service_id: 领域服务 ID
+        document_id: 文档 ID
+
+    Returns:
+        dict: 含 url 字段（文档预签名下载 URL）
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32000): 文档不属于该服务下的任何知识库
+    """
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not document_id or not document_id.strip():
+        raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
+    auth = require_mcp_auth("read")
+    intersection = await _check_service_scope(auth, service_id, required_permission="call")
+
+    if intersection:
+        kb_ids_to_try = intersection
+    else:
+        # allowed_kb_ids 为空 = 全部允许，需要获取 service 的所有 kb_ids
+        service_detail = await call_gateway(
+            "get_service",
+            auth.tenant_id,
+            auth.key_id,
+            {"service_id": service_id},
+        )
+        kb_ids_to_try = service_detail.get("kb_ids", [])
+
+    for kb_id in kb_ids_to_try:
+        try:
+            return await call_gateway(
+                "get_raw_url",
+                auth.tenant_id,
+                auth.key_id,
+                {
+                    "knowledge_base_id": kb_id,
+                    "document_id": document_id,
+                },
+            )
+        except McpToolError:
+            continue
+
+    raise McpToolError(code=-32000, message="文档不属于该服务下的任何知识库")
+
+
+# ============================================================================
+# Block 4: __all__ 导出
+# ============================================================================
+
+__all__ = [
+    "call_gateway",
+    "get_http_client",
+    "_check_service_scope",
+    "_validate_file_name",
+    "get_upload_status",
+    "list_documents",
+    "list_domain_services",
+    "read_source",
+    "search_deep",
+    "search_llmwiki",
+    "search_ontology",
+    "search_service",   # deprecated, 向后兼容别名
+    "upload_document",
+]

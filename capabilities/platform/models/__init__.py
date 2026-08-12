@@ -12,6 +12,8 @@ from capabilities.platform.models.system_config import SystemConfig
 from capabilities.platform.models.audit_log import AuditLog
 from capabilities.platform.models.audit_enums import LogType, Outcome, LogLevel, AuditAction, ResourceType
 from capabilities.platform.models.task_schedule import TaskSchedule
+from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping, McpOrganization
+from capabilities.platform.models.mcp_service import McpServicePublish
 
 __all__ = [
     "User",
@@ -32,4 +34,8 @@ __all__ = [
     "AuditAction",
     "ResourceType",
     "TaskSchedule",
+    "McpKey",
+    "McpKeyServiceMapping",
+    "McpOrganization",
+    "McpServicePublish",
 ]

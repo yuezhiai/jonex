@@ -35,11 +35,16 @@ export interface PhaseDisplay {
 
 /**
  * 后端两字段 → 单一线性 phase。传入的是后端原始值（status / ontology_status）。
+ * openkb 文档额外传 kbType + llm_wiki_compile_status：其 ontology_status 被强制
+ * ready 表示「不需要本体抽取」，不能当「编译完成」——openkb 编译状态以
+ * llm_wiki 为准（kbType 显式判断，避免依赖「llmWikiCompileStatus 有值」的隐式约定）。
  * 返回 null 表示列表不展示（如 deleted 软删除）。
  */
 export function deriveDocPhase(
   status: string | undefined | null,
   ontologyStatus: string | undefined | null,
+  llmWikiCompileStatus?: string | null,
+  kbType?: string | null,
 ): DocPhase | null {
   switch (status) {
     case 'pending':
@@ -55,6 +60,22 @@ export function deriveDocPhase(
     case 'deleted':
       return null;
     case 'ready':
+      // [jonex] openkb 文档：llm_wiki_compile_status 是编译状态唯一事实来源
+      // （NULL/compiling/compiled/stale/failed；ontology_status 恒 ready）
+      if (kbType === 'openkb' && llmWikiCompileStatus) {
+        switch (llmWikiCompileStatus) {
+          case 'compiled':
+            return 'compiled';
+          case 'compiling':
+            return 'compiling';
+          case 'failed':
+            return 'compile_failed';
+          case 'stale':
+            return 'pending_compile'; // 已过期，需重新编译
+          default:
+            return 'pending_compile'; // NULL：未编译
+        }
+      }
       switch (ontologyStatus) {
         case 'pending':
           return 'pending_compile';

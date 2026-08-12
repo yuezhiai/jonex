@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.db
+.DS_Store
+.env
+
+# Knowledge base test artifacts
+raw/
+wiki/
+.openkb/
+output/
+kbs/
+
+# Local only
+docs/internal/
+.claude/
+
+# Heavy test-input documents for the examples (the old blanket `docs/` rule
+# used to catch this dir at any depth; the anchored `docs/internal/` above
+# does not). The PDFs already tracked on main stay tracked — this only stops
+# new drops from being swept into commits.
+examples/docs/
+
+# Built Workbench web bundle (regenerate with `cd frontend && npm install && npm run build`).
+# Shipped inside the wheel via hatchling `artifacts`, never committed to git.
+/openkb/web/
+web/

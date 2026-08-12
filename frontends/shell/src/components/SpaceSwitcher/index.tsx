@@ -10,19 +10,21 @@ const S: Record<string, React.CSSProperties> = {
   switcher: {
     display: 'flex',
     alignItems: 'center',
-    padding: '8px 12px',
-    margin: '0 8px 8px',
+    paddingRight: 12,
+    margin: 8,
     background: '#f1f5f9',
     borderRadius: 8,
     gap: 6,
   },
   trigger: {
+    height: 42,
     flex: 1,
     display: 'flex',
     alignItems: 'center',
     gap: 6,
     cursor: 'pointer',
     minWidth: 0,
+    padding: 12,
   },
   name: {
     flex: 1,
@@ -114,6 +116,15 @@ const SpaceSwitcher: React.FC<SpaceSwitcherProps> = ({ collapsed }) => {
     };
   }, [reloadSpaces]);
 
+  // iframe 挂载的子应用内点击不冒泡到父文档，antd Dropdown 的 document 外部点击检测监听不到；
+  // 监听 window blur（点击 iframe 时父窗口失焦）自动收起下拉
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    const onBlur = () => setDropdownOpen(false);
+    window.addEventListener('blur', onBlur);
+    return () => window.removeEventListener('blur', onBlur);
+  }, [dropdownOpen]);
+
   const currentName = spaces.find((s: ShellSpaceItem) => s.id === currentId)?.name || t('shell.selectSpace');
 
   const handleSelect = (spaceId: string) => {
@@ -157,12 +168,27 @@ const SpaceSwitcher: React.FC<SpaceSwitcherProps> = ({ collapsed }) => {
       ),
       onClick: handleAddSpace,
     },
+    {
+      key: 'manage-space',
+      label: (
+        <span>
+          <SettingOutlined style={{ marginRight: 6 }} />
+          {t('navigation.domainSpaceManagement')}
+        </span>
+      ),
+      onClick: () => {
+        setDropdownOpen(false);
+        navigate('/apps/core-business/domain-space');
+      },
+    },
   ];
 
   return (
     <div style={S.switcher}>
       <Dropdown
-        menu={{ items }}
+        menu={{
+          items,
+        }}
         open={dropdownOpen}
         onOpenChange={setDropdownOpen}
         trigger={['click']}

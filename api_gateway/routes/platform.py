@@ -1,6 +1,7 @@
 """
 平台管理路由 — 纯反代到 Sidecar，零业务逻辑。
 """
+import json
 import httpx
 from fastapi import APIRouter, Query, Request
 
@@ -18,10 +19,17 @@ async def _proxy_platform(request: Request, path: str):
 
     body = None
     if request.method in ("POST", "PUT", "PATCH"):
-        body = await request.json()
+        raw = await request.body()
+        if raw:
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                raise_from_capability_result(
+                    {"code": 422, "message": "请求体不是有效的 JSON 格式"}
+                )
 
     headers = {
-        "X-API-Key": "jonex_test_gateway",
+        "X-API-Key": config.GATEWAY_API_KEY,
         "X-Request-ID": getattr(request.state, "request_id", ""),
         "X-Forwarded-For": request.client.host if request.client else "",
     }
@@ -362,3 +370,141 @@ async def delete_task_schedule(task_id: int, request: Request):
 async def trigger_task_schedule(task_id: int, request: Request):
     """立即触发指定任务调度执行"""
     return await _proxy_platform(request, f"task-schedules/{task_id}/trigger")
+
+
+# ==================== MCP Key 管理 ====================
+
+@router.post("/mcp-keys", summary="创建 MCP Key")
+async def create_mcp_key(request: Request):
+    """创建新的 MCP Key"""
+    return await _proxy_platform(request, "mcp-keys")
+
+
+@router.get("/mcp-keys", summary="获取 MCP Key 列表")
+async def list_mcp_keys(request: Request):
+    """获取租户下所有 MCP Key（含已撤销）"""
+    return await _proxy_platform(request, "mcp-keys")
+
+
+@router.get("/mcp-keys/{key_id}", summary="获取 MCP Key 详情")
+async def get_mcp_key(key_id: str, request: Request):
+    """获取指定 MCP Key 的详细信息"""
+    return await _proxy_platform(request, f"mcp-keys/{key_id}")
+
+
+@router.post("/mcp-keys/{key_id}/revoke", summary="撤销 MCP Key")
+async def revoke_mcp_key(key_id: str, request: Request):
+    """撤销指定 MCP Key（设置 revoked_at）"""
+    return await _proxy_platform(request, f"mcp-keys/{key_id}/revoke")
+
+
+@router.put("/mcp-keys/{key_id}", summary="编辑 MCP Key")
+async def update_mcp_key(key_id: str, request: Request):
+    """编辑 MCP Key 元数据（不重置 Key，不生成新明文）"""
+    return await _proxy_platform(request, f"mcp-keys/{key_id}")
+
+
+@router.delete("/mcp-keys/{key_id}", summary="删除 MCP Key")
+async def delete_mcp_key(key_id: str, request: Request):
+    """软删除 MCP Key（设置 is_deleted=1）"""
+    return await _proxy_platform(request, f"mcp-keys/{key_id}")
+
+
+@router.post("/mcp-keys/{key_id}/reset", summary="重置 MCP Key")
+async def reset_mcp_key(key_id: str, request: Request):
+    """重置指定 MCP Key（撤销旧 Key + 生成新 Key）"""
+    return await _proxy_platform(request, f"mcp-keys/{key_id}/reset")
+
+
+# ==================== MCP 组织管理 ====================
+
+@router.post("/mcp-organizations", summary="创建组织")
+async def create_organization(request: Request):
+    """创建新的 MCP 组织"""
+    return await _proxy_platform(request, "mcp-organizations")
+
+
+@router.get("/mcp-organizations", summary="获取组织列表")
+async def list_organizations(request: Request):
+    """获取租户下所有 MCP 组织"""
+    return await _proxy_platform(request, "mcp-organizations")
+
+
+@router.put("/mcp-organizations/{org_id}", summary="编辑组织")
+async def update_organization(org_id: str, request: Request):
+    """编辑 MCP 组织名称或描述"""
+    return await _proxy_platform(request, f"mcp-organizations/{org_id}")
+
+
+@router.delete("/mcp-organizations/{org_id}", summary="删除组织")
+async def delete_organization(org_id: str, request: Request):
+    """软删除 MCP 组织"""
+    return await _proxy_platform(request, f"mcp-organizations/{org_id}")
+
+
+# ==================== MCP 服务目录 ====================
+
+
+@router.get("/mcp-services", summary="获取 MCP 服务列表")
+async def list_mcp_services(request: Request):
+    """E6: 获取领域服务列表（含 MCP 发布状态、关联 KB 数量）"""
+    return await _proxy_platform(request, "mcp-services")
+
+
+@router.get("/mcp-services/{service_id}", summary="获取 MCP 服务详情")
+async def get_mcp_service_detail(service_id: str, request: Request):
+    """查询单个领域服务详情（含发布状态、启用状态、关联 KB）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}")
+
+
+@router.post("/mcp-services/sync", summary="同步领域服务")
+async def sync_mcp_services(request: Request):
+    """E11: 手动从 domain service 同步最新服务列表"""
+    return await _proxy_platform(request, "mcp-services/sync")
+
+
+@router.post("/mcp-services/{service_id}/publish", summary="发布 MCP 服务")
+async def publish_service(service_id: str, request: Request):
+    """E7: 发布领域服务标记为 MCP 可见"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/publish")
+
+
+@router.post("/mcp-services/{service_id}/unpublish", summary="取消发布 MCP 服务")
+async def unpublish_service(service_id: str, request: Request):
+    """E8: 取消发布领域服务"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/unpublish")
+
+
+@router.post("/mcp-services/{service_id}/test-call", summary="测试调用 MCP 服务")
+async def test_call_service(service_id: str, request: Request):
+    """E9: 测试调用领域服务（一期模拟 RAG）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/test-call")
+
+
+@router.get("/mcp-services/{service_id}/authorized-keys", summary="查看授权 Key")
+async def get_authorized_keys(service_id: str, request: Request):
+    """E10: 查看某服务的已授权 MCP Key 列表"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/authorized-keys")
+
+
+# ==================== MCP 服务配置 — 从领域服务视角管理 Key ====================
+
+
+@router.post("/mcp-services/{service_id}/keys")
+async def _add_key_to_service(service_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys")
+
+
+@router.post("/mcp-services/{service_id}/keys/new")
+async def _create_key_for_service(service_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys/new")
+
+
+@router.patch("/mcp-services/{service_id}/keys/{key_id}")
+async def _update_key_permission(service_id: str, key_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys/{key_id}")
+
+
+@router.delete("/mcp-services/{service_id}/keys/{key_id}")
+async def _remove_key_from_service(service_id: str, key_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys/{key_id}")

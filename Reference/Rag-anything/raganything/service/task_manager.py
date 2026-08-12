@@ -159,6 +159,7 @@ ERROR_CLASSIFICATION: list[tuple[str, ErrorCode | str]] = [
     (r"lightrag.*error|LightRAG",                      ErrorCode.LIGHTRAG_ERROR),
     (r"parse.*error|MinerU|docling|paddle",            ErrorCode.PARSER_ERROR),
     (r"invalid.*config|config.*invalid",               ErrorCode.CONFIG_INVALID),
+    (r"OBJECT_FETCH_FAILED",                           ErrorCode.OBJECT_FETCH_FAILED),
 ]
 
 
@@ -656,8 +657,12 @@ class TaskManager:
         # [jonex] 主解析提示词覆盖：pipeline 消费 prompt_ids 时用（B2）
         self._pcm = prompt_config_manager
         self._shutting_down = False
+        # [jonex] P0-B：后台 fire-and-forget task 强引用集合。asyncio.create_task 的
+        # 返回值若不保存，task 可能被 GC 回收导致协程执行中途消失（任务永久停在 created）。
+        self._bg_tasks: set[asyncio.Task] = set()
 
         from raganything.service.task_repository import TaskRepository
+        self._base_dir = base_dir
         self._repo = TaskRepository(base_dir=base_dir)
 
         self._worker_tasks: list[asyncio.Task] = []
@@ -667,6 +672,46 @@ class TaskManager:
 
     def set_config_resolver(self, resolver):
         self._config_resolver = resolver
+
+    # ── [jonex] P0：后台任务与 handle 兜底 ───────────────────────────
+
+    def _spawn_bg(self, coro, *, name: str = "") -> asyncio.Task:
+        """创建后台 task 并保存强引用，done 后自动移除。
+
+        直接用裸 asyncio.create_task 时事件循环只弱引用 task，GC 可能在协程
+        挂起期间回收它，协程静默中止且不留日志。done 回调同时把取消/异常
+        显式打出来，避免 fire-and-forget 里的失败永远看不到。
+        """
+        t = asyncio.create_task(coro, name=name or None)
+        self._bg_tasks.add(t)
+
+        def _done(fut: asyncio.Task) -> None:
+            self._bg_tasks.discard(fut)
+            if fut.cancelled():
+                logger.warning("后台任务被取消: %s", fut.get_name())
+                return
+            exc = fut.exception()
+            if exc is not None:
+                logger.error(
+                    "后台任务异常: %s: %s", fut.get_name(), exc, exc_info=exc,
+                )
+
+        t.add_done_callback(_done)
+        return t
+
+    def _ensure_handle(self, task_id: str) -> TaskHandle:
+        """幂等获取/重建 TaskHandle。
+
+        重启恢复路径（start()）不经过 create()，历史实现只恢复 _tasks + _queue
+        而不重建 _handles，导致 _worker_loop 取到任务后因 `not handle` 静默丢弃
+        （task_done + continue，零日志），任务永久停在 created / progress=0。
+        cancel() 同样依赖 handle 才能置 cancel_event。此处统一兜底重建。
+        """
+        handle = self._handles.get(task_id)
+        if handle is None:
+            handle = TaskHandle(lambda: self._release_slot(task_id))
+            self._handles[task_id] = handle
+        return handle
 
     async def start(self):
         hostname = socket.gethostname().split(".")[0]
@@ -680,6 +725,9 @@ class TaskManager:
                 logger.warning(f"Recovered stuck ontology task {task_id}, resetting to pending")
                 task.ontology_status = "pending"
             if task.status not in TERMINAL_STATES:
+                # [jonex] P0-A：恢复路径必须重建 handle，否则 worker 静默丢弃、
+                # cancel 也失效（详见 _ensure_handle 注释）。
+                self._ensure_handle(task_id)
                 # ── [jonex] 阶段4 P0-J：cleanup 阶段只恢复清理，不重跑解析管线 ──
                 if getattr(task, "current_step", "") == "cleanup":
                     logger.info(
@@ -687,7 +735,7 @@ class TaskManager:
                         f"(delete_pending={len(task.delete_pending_ids or [])}, "
                         f"compensate_pending={len(task.compensate_pending_ids or [])})"
                     )
-                    asyncio.create_task(self._resume_cleanup(task))
+                    self._spawn_bg(self._resume_cleanup(task), name=f"resume-cleanup-{task_id}")
                     continue
                 # ── v2 HTTP mode: resume track polling if needed ──
                 if task.pending_track_ids:
@@ -695,7 +743,9 @@ class TaskManager:
                         f"Recovered task {task_id} with {len(task.pending_track_ids)} "
                         f"pending tracks, resuming polling"
                     )
-                    asyncio.create_task(self._resume_track_polling(task))
+                    self._spawn_bg(
+                        self._resume_track_polling(task), name=f"resume-poll-{task_id}"
+                    )
                 elif (not hasattr(task, 'pending_track_ids')
                       and not hasattr(task, 'lightrag_doc_ids')
                       and self._http_client is not None):
@@ -707,6 +757,17 @@ class TaskManager:
                     self._fail_task(task, ErrorCode.INTERNAL_ERROR,
                                     "任务版本不兼容，请重新提交")
                 else:
+                    # [jonex] P0-A：状态归一到 QUEUED。恢复态可能是 created/queued/
+                    # processing，而 STATE_TRANSITIONS 不允许 created→processing、
+                    # processing→processing，worker 会打 "Invalid transition" 并让
+                    # 状态与实际执行脱节。同时占回一个 slot（worker finally 释放）。
+                    task.status = TaskStatus.QUEUED
+                    task.queued_at = datetime.now(timezone.utc)
+                    task.updated_at = task.queued_at
+                    task.worker_id = None
+                    self._active_slots += 1
+                    self._repo.save(task)
+                    logger.info(f"Recovered task {task_id} re-queued for processing")
                     self._queue.put_nowait(task_id)
         if recovered:
             logger.info(f"Recovered {len(recovered)} tasks from disk")
@@ -820,6 +881,22 @@ class TaskManager:
             )
         raise RuntimeError("HTTP mode not configured")
 
+    async def delete_docs(
+        self, doc_ids: list[str], tenant_id: str, *,
+        kb_id: str = "", document_id: str = "", trace_id: str = "",
+    ) -> dict:
+        """[jonex] 批量删除——单次 DELETE 提交全部 doc_ids，LightRAG 仅执行一次 rebuild。
+
+        Returns:
+            {"status": "deletion_started", "accepted": [...]}
+        """
+        if self._http_client is not None:
+            return await self._http_client.delete_docs(
+                doc_ids, tenant_id=tenant_id, kb_id=kb_id,
+                document_id=document_id, trace_id=trace_id,
+            )
+        raise RuntimeError("HTTP mode not configured")
+
     async def get_document_chunks(
         self, doc_id: str, tenant_id: str, *, kb_id: str = "",
     ) -> dict | None:
@@ -870,6 +947,34 @@ class TaskManager:
                 tenant_id=tenant_id, kb_id=kb_id, document_id=doc_id,
             )
         return None
+
+    # [jonex] R7-2b: COS 下载缓存目录（与 lightrag_adapter_v2._cos_cache_dir 同口径）
+    def _cos_cache_dir(self) -> str:
+        base = (
+            os.getenv("RAG_COS_CACHE_DIR")
+            or os.path.join(
+                os.getenv("KB_INPUT_DIR") or os.getenv("WORKING_DIR") or self._base_dir,
+                "_cos_cache",
+            )
+        )
+        os.makedirs(base, exist_ok=True)
+        return base
+
+    # [jonex] P0-1: COS 缓存 TTL 清理（兜底：异常退出残留、finally 漏删的孤儿文件）
+    def _sweep_cos_cache(self) -> None:
+        ttl = int(os.getenv("RAG_COS_CACHE_TTL_SEC", "86400"))
+        now = time.time()
+        try:
+            d = self._cos_cache_dir()
+            for name in os.listdir(d):
+                fp = os.path.join(d, name)
+                try:
+                    if os.path.isfile(fp) and now - os.path.getmtime(fp) > ttl:
+                        os.remove(fp)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     async def create(
         self, req: CreateTaskRequest, tenant_id: str, idempotency_key: str | None = None
@@ -935,7 +1040,10 @@ class TaskManager:
         )
 
         # ── Async validate → enqueue ───────────────────────────────
-        asyncio.create_task(self._validate_and_enqueue(task, req))
+        # [jonex] P0-B：必须保存强引用，裸 create_task 可能被 GC 中途回收
+        self._spawn_bg(
+            self._validate_and_enqueue(task, req), name=f"enqueue-{task.task_id}"
+        )
 
         return CreateTaskResponse(
             task_id=task.task_id,
@@ -1051,7 +1159,12 @@ class TaskManager:
             # Validate file path
             # [jonex] P0-A.2: ontology_only 不本地化 COS、不需要原文件 → 跳过文件存在性校验，
             # 直接进入"按 document_id 读 LightRAG 实体/关系 → 抽本体"。
-            if task.execution_mode != "ontology_only" and not os.path.exists(task.file_path):
+            # [jonex] P0-1: COS 后端文件不检查本地路径（file_path 是 storage_key 标识符，
+            # 实际文件由 pipeline 阶段从 COS 下载），避免误判 FILE_NOT_FOUND。
+            needs_local = task.execution_mode != "ontology_only" and not (
+                task.storage_backend == "cos" and task.storage_key
+            )
+            if needs_local and not os.path.exists(task.file_path):
                 self._fail_task(task, ErrorCode.FILE_NOT_FOUND, f"File not found: {task.file_path}")
                 handle.release_slot()
                 return
@@ -1088,6 +1201,17 @@ class TaskManager:
             task.queued_at = datetime.now(timezone.utc)
             await self._queue.put(task.task_id)
 
+        except asyncio.CancelledError:
+            # [jonex] P0-B：CancelledError 是 BaseException，历史实现漏抓 →
+            # 任务停在 created 且 slot 永不释放（累积后 42901 拒新任务）。
+            logger.warning(
+                "Validate/enqueue cancelled for %s, marking FAILED", task.task_id
+            )
+            self._fail_task(
+                task, ErrorCode.INTERNAL_ERROR, "任务入队被中断，请重新提交"
+            )
+            handle.release_slot()
+            raise
         except Exception as e:
             logger.error(f"Validate/enqueue failed for {task.task_id}: {e}")
             self._fail_task(task, _classify_error(e), str(e))
@@ -1104,10 +1228,22 @@ class TaskManager:
                 continue
 
             task = self._tasks.get(task_id)
-            handle = self._handles.get(task_id)
-            if not task or not handle:
+            if task is None:
+                # [jonex] P0-A：唯一可丢弃的情形（任务已被 cleanup 清除），必须留日志
+                logger.warning(
+                    "Worker %s: task %s not in registry, dropped from queue",
+                    worker_id, task_id,
+                )
                 self._queue.task_done()
                 continue
+            # [jonex] P0-A：handle 缺失（重启恢复等路径）不再静默 continue，兜底重建，
+            # 否则任务永久停在 created 且无任何日志。
+            if task_id not in self._handles:
+                logger.warning(
+                    "Worker %s: handle missing for task %s (recovered task?), rebuilding",
+                    worker_id, task_id,
+                )
+            handle = self._ensure_handle(task_id)
 
             task.worker_id = worker_id
             self._transition(task, TaskStatus.PROCESSING)
@@ -1151,6 +1287,91 @@ class TaskManager:
             "Configure LIGHTRAG_API_URL to enable HTTP mode."
         )
 
+    def _write_openkb_artifact(self, task: TaskInfo, ctx) -> None:
+        """[jonex] 将解析出的 markdown + 图片落到共享 inputs 卷 parsed/{document_id}/，
+        并把「相对 inputs 卷根」的路径记入 task.result_summary.extensions，
+        经 get_task_status 暴露给 knowledge_base → OpenKB 编译。
+
+        - gated：RAG_OPENKB_ARTIFACT_ENABLED（默认 on）；关闭则不产出。
+        - 输入：ctx.content_list（MinerU blocks，img_path 已被 mineru 改写为绝对路径）。
+        - 幂等：按 document_id 覆盖写。
+        - 任何异常都不影响主入库链路（best-effort，仅告警）。
+        """
+        if os.getenv("RAG_OPENKB_ARTIFACT_ENABLED", "true").lower() not in ("1", "true", "yes", "on"):
+            return
+        document_id = getattr(task, "document_id", "") or ""
+        content_list = getattr(ctx, "content_list", None)
+        if not document_id or not content_list:
+            return
+        try:
+            inputs_root = os.getenv("RAG_INPUTS_DIR", "/app/inputs")
+            out_dir = Path(inputs_root) / "parsed" / document_id
+            assets_dir = out_dir / "assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+
+            md_parts: list[str] = []
+            has_assets = False
+            for item in content_list:
+                if not isinstance(item, dict):
+                    continue
+                t = item.get("type", "text")
+                if t == "text":
+                    txt = (item.get("text") or "").strip()
+                    if txt:
+                        md_parts.append(txt)
+                elif t == "equation":
+                    txt = (item.get("text") or "").strip()
+                    if txt:
+                        md_parts.append(f"$$\n{txt}\n$$")
+                elif t == "table":
+                    caption = (item.get("table_caption") or "")
+                    if isinstance(caption, list):
+                        caption = " ".join(str(c) for c in caption)
+                    body = item.get("table_body") or item.get("text") or ""
+                    if isinstance(body, list):
+                        body = "\n".join(
+                            "\t".join(str(c) for c in row if c is not None)
+                            for row in body if row
+                        )
+                    block = ((caption.strip() + "\n") if caption.strip() else "") + str(body).strip()
+                    if block.strip():
+                        md_parts.append(block)
+                elif t == "image":
+                    img = item.get("img_path") or ""
+                    caption = item.get("img_caption") or ""
+                    if isinstance(caption, list):
+                        caption = " ".join(str(c) for c in caption)
+                    if img and os.path.isfile(img):
+                        dst_name = os.path.basename(img)
+                        try:
+                            shutil.copy2(img, assets_dir / dst_name)
+                            has_assets = True
+                            # [jonex] 引用路径对齐 OpenKB 短文档约定：source md 在 wiki/sources/{doc}.md，
+                            # 图片经 adapter 复制到 wiki/sources/images/{doc}/，故相对引用为 images/{doc}/{name}
+                            md_parts.append(f"![{caption}](images/{document_id}/{dst_name})")
+                        except Exception:
+                            logger.warning("[jonex] OpenKB artifact 图片复制失败: %s", img)
+
+            md_text = "\n\n".join(md_parts).strip() + "\n"
+            (out_dir / "content.md").write_text(md_text, encoding="utf-8")
+
+            rel_md = f"parsed/{document_id}/content.md"
+            rel_assets = f"parsed/{document_id}/assets" if has_assets else ""
+
+            task.storage = StorageInfo(root=str(out_dir), mineru_dir=str(out_dir))
+            if task.result_summary is None:
+                task.result_summary = ResultSummary(doc_id=document_id)
+            task.result_summary.extensions["parsed_markdown_path"] = rel_md
+            task.result_summary.extensions["assets_dir"] = rel_assets
+            logger.info(
+                "[jonex] OpenKB artifact written: doc=%s md=%s assets=%s blocks=%d",
+                document_id, rel_md, rel_assets or "(none)", len(md_parts),
+            )
+        except Exception:
+            logger.warning(
+                "[jonex] OpenKB artifact write failed doc=%s", document_id, exc_info=True,
+            )
+
     def _resolve_task_prompt_overrides(self, task: TaskInfo):
         """[jonex] B2: 按 task.prompt_ids 解析主解析提示词覆盖（PromptOverride）。
 
@@ -1182,6 +1403,57 @@ class TaskManager:
             by_code[item.prompt_code] = item.content
         return PromptOverride(by_code=by_code) if by_code else None
 
+    async def _fetch_cos_object(self, task: TaskInfo) -> str | None:
+        """[jonex] R7-2b: 任务 pipeline 前从 COS 异步下载文件到本地临时路径。
+
+        full / parse_only 执行模式共用（parse_only 即 OpenKB 管线）。返回
+        本地临时文件路径，调用方负责 finally 清理；非 COS 后端返回 None；
+        下载失败抛 OBJECT_FETCH_FAILED（可被 _classify_error 识别）。
+        """
+        if not (task.storage_backend == "cos" and task.storage_key):
+            return None
+
+        import uuid as _uuid
+        _cos_cache = self._cos_cache_dir()
+        # [jonex] P0-1: sweep 兜底清残留（异常退出时 TTL 过期 → 下一次下载前清理）
+        self._sweep_cos_cache()
+        _base_name = os.path.basename(task.file_path or task.storage_key) or "cos_object"
+        local_path = os.path.join(_cos_cache, f"{_uuid.uuid4().hex}_{_base_name}")
+        try:
+            from jonex_core.common.object_storage import get_object_storage
+            await get_object_storage().get_to_path(task.storage_key, local_path)
+            logger.info(
+                "FetchObject: COS 下载完成 key=%s → %s task=%s",
+                task.storage_key, local_path, task.task_id,
+            )
+            task.file_path = local_path
+            # 下游 pipeline 统一按本地文件处理
+            # 不修改 task.storage_backend（保留 cos 语义给终态 finally 判断是否清理）
+        except Exception as _e:
+            logger.exception(
+                "FetchObject: COS 下载失败 key=%s task=%s",
+                task.storage_key, task.task_id,
+            )
+            # [jonex] P0-1: 下载失败不留残留空文件
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+            # 抛一个能被 _classify_error 识别为 OBJECT_FETCH_FAILED 的异常
+            raise RuntimeError(f"OBJECT_FETCH_FAILED: COS 对象下载失败 key={task.storage_key}: {_e}") from _e
+
+        # [jonex] MPS 视频路径：视频文件需保留 COS URL 供 MPS backend 使用
+        # [jonex] P2: 改用 storage_key 判扩展名（本地名是 {uuid}_{basename}，可能丢扩展名）
+        _ext = os.path.splitext(task.storage_key)[1].lower()
+        if _ext in {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.mpg', '.mpeg', '.3gp'}:
+            _bucket = os.getenv("COS_BUCKET", "")
+            _region = os.getenv("COS_REGION", "")
+            if _bucket and _region:
+                task.mps_video_url = f"https://{_bucket}.cos.{_region}.myqcloud.com/{task.storage_key}"
+                logger.info("FetchObject: MPS COS URL set for video task=%s", task.task_id)
+        return local_path
+
     async def _execute_pipeline_http(self, task: TaskInfo, handle: TaskHandle):
         """HTTP mode pipeline execution."""
         # Check cancellation before starting
@@ -1196,9 +1468,39 @@ class TaskManager:
             await self._run_ontology_only(task, handle)
             return
 
+        # ── [jonex] parse_only 执行模式（OpenKB 管线）──
+        # 只解析产出 markdown 供 OpenKB 编译，跳过 multimodal/push_chunks/ontology，
+        # 不写 LightRAG/Neo4j（KB 级互斥，避免与 OpenKB 双写）。
+        # [jonex] R7-2b-fix: parse_only 同样需要先从 COS 拉取文件（与 full 模式共用
+        # _fetch_cos_object），否则 file_path 是 storage_key（相对 COS key）本地不存在，
+        # parse_document 直接 FileNotFoundError。
+        if task.execution_mode == "parse_only":
+            _cos_temp_path: str | None = None  # [jonex] P0-1: 供 finally 清理
+            if task.storage_backend == "cos" and task.storage_key:
+                _cos_temp_path = await self._fetch_cos_object(task)
+            try:
+                await self._run_parse_only(task, handle)
+            finally:
+                # [jonex] P0-1: 清理 COS 临时文件（即时释放，task-owned temp）
+                if _cos_temp_path:
+                    try:
+                        if os.path.exists(_cos_temp_path):
+                            os.remove(_cos_temp_path)
+                            logger.debug("FetchObject: cleaned COS temp %s task=%s", _cos_temp_path, task.task_id)
+                    except OSError:
+                        logger.warning("FetchObject: failed to clean COS temp %s", _cos_temp_path)
+            return
+
         # Register progress callback
         progress_cb = ProgressTrackingCallback(task, handle)
         self._pipeline_executor.callback_manager.register(progress_cb)
+
+        # ── [jonex] R7-2b: FetchObject —— pipeline 前异步下载 COS 对象 ──
+        # 把 COS 下载从同步 HTTP 请求路径（insert/retry invoke）移到异步任务 pipeline，
+        # invoke 立刻返回 task_id，空窗期压到毫秒级。
+        _cos_temp_path: str | None = None  # [jonex] P0-1: 供 finally 清理
+        if task.storage_backend == "cos" and task.storage_key:
+            _cos_temp_path = await self._fetch_cos_object(task)
 
         # ── PipelineContext (base) — per-task context ──
         # 用 raganything.pipeline.base.PipelineContext（dataclass，字段齐全），
@@ -1319,6 +1621,10 @@ class TaskManager:
 
                 task.result_summary = summary
 
+                # [jonex] OpenKB 产物落盘：把 parsed markdown+图片写到共享 inputs 卷，
+                # 供 knowledge_base → OpenKB 编译读取（相对路径经 get_task_status 暴露）。
+                self._write_openkb_artifact(task, ctx)
+
                 # [jonex] R1-b：旧 doc 已在推前删除，此处无需 converge。
 
                 # ── Ontology extraction (by document_id filter) ──
@@ -1411,6 +1717,14 @@ class TaskManager:
         finally:
             # [jonex] Gap A2: 还原 contextvar，避免污染同一事件循环的下一任务
             reset_ingest_ctx(_ingest_token)
+            # [jonex] P0-1: 清理 COS 临时文件（即时释放，task-owned temp）
+            if _cos_temp_path:
+                try:
+                    if os.path.exists(_cos_temp_path):
+                        os.remove(_cos_temp_path)
+                        logger.debug("FetchObject: cleaned COS temp %s task=%s", _cos_temp_path, task.task_id)
+                except OSError:
+                    logger.warning("FetchObject: failed to clean COS temp %s", _cos_temp_path)
             self._pipeline_executor.callback_manager.unregister(progress_cb)
             task.updated_at = datetime.now(timezone.utc)
             self._repo.save(task)
@@ -1459,14 +1773,14 @@ class TaskManager:
         return list(old_ids)
 
     async def _reparse_delete_all_old(self, task: TaskInfo) -> bool:
-        """[jonex] R1-b：推新前删全文档的全部旧 LightRAG doc（按 document_id），确定性替换。
+        """[jonex] R1-b + P0：推新前删全文档的全部旧 LightRAG doc（按 document_id），确定性替换。
 
-        删除全部 old_rag_doc_ids（而非 old−new 差集），从源头消除「内容非确定 →
-        old−new ≈ old → 全量删除风暴」。删除后轮询确认旧 doc 不可见再继续推新。
+        P0 收敛循环：每轮重新发起 delete + 读一致性确认，只要 pipeline 空闲就能被受理，
+        不再出现「删一次被 busy 拒绝 → 只剩空 poll」的死局。
 
         返回：
         - True：无需删 / 已删净 → 调用方可继续 parse+push；
-        - False：轮询超时仍有残留 → 保持 current_step="cleanup"，交调用方判失败 +
+        - False：超预算仍有残留 → 保持 current_step="cleanup"，交调用方判失败 +
           KB 对账 3-A 动态超时兜底。
         """
         old = set(task.old_rag_doc_ids or [])
@@ -1476,9 +1790,8 @@ class TaskManager:
         task.delete_pending_ids = list(old)
         task.cleanup_total = len(old)  # [jonex] 3-A：记录初始待删总量
         self._repo.save(task)
-        await self._run_cleanup(task)
-        # 读一致性（P0-3 option a）：轮询确认旧 doc 不可见，再进入推新
-        residual = await self._poll_old_ids_gone(task, old)
+
+        residual = await self._converge_delete(task, old)
         if residual:
             task.delete_pending_ids = list(residual)
             task.current_step = "cleanup"
@@ -1497,90 +1810,102 @@ class TaskManager:
         )
         return True
 
-    async def _run_cleanup(self, task: TaskInfo) -> None:
-        """删除 delete_pending_ids（差集删旧）与 compensate_pending_ids（失败补偿）。
+    async def _converge_delete(self, task: TaskInfo, old_ids: set[str]) -> set[str]:
+        """[jonex] P0：收敛删除循环 —— 每轮重新发起 delete + 读一致性确认。
 
-        删成功即从列表移除并持久化 → 容器重启可续跑（只删剩余，不重跑解析管线）。
+        与旧「删一次→只 poll」的关键区别：每轮 poll 前重新尝试 delete_docs。
+        只要 pipeline 一空闲，下一轮 delete 立刻被受理，而不是空等一件没发生的事。
 
-        [jonex] 2-A：改为**整批删除**——一次 delete_docs(doc_ids=[...]) 让 LightRAG 在单个 busy
-        会话内连删，避免逐个 id 各自抢 busy 锁被反复拒（服务持续繁忙）。整批受理
-        （deletion_started）即视为已发起、清空该 field；整批仍 busy/失败则**保留 pending 不动**
-        （不逐个降级），交由 _poll_old_ids_gone 收敛 + KB 对账 3-A 动态超时兜底。
+        Args:
+            task: 当前任务
+            old_ids: 目标删除集合（old_rag_doc_ids）
+
+        Returns:
+            残留集合（空 = 收敛成功），非空时调用方判 failed 交 KB 3-A 兜底
         """
-        for field in ("delete_pending_ids", "compensate_pending_ids"):
-            ids = list(getattr(task, field, []) or [])
-            if not ids:
-                continue
-            logger.info(
-                f"[jonex][2-A] cleanup 批量删除开始 task={task.task_id} field={field} count={len(ids)}"
-            )
-            try:
-                resp = await self._http_client.delete_docs(
-                    ids, tenant_id=task.tenant_id, kb_id=task.kb_id,
-                    document_id=task.document_id or "", trace_id=task.task_id,
-                )
-                status = str((resp or {}).get("status", "")).lower()
-                # deletion_started / 未知非 busy 状态 → 整批已受理，清空 pending
-                setattr(task, field, [])
-                self._repo.save(task)
-                logger.info(
-                    f"[jonex][2-A] cleanup 批量删除已受理 task={task.task_id} field={field} "
-                    f"count={len(ids)} status={status or 'ok'}"
-                )
-            except Exception as e:
-                # 整批仍 busy/失败：保留 pending，等待下次续删 / 兜底判死
-                logger.warning(
-                    f"[jonex][2-A] cleanup 批量删除失败（保留 {len(ids)} 待删）"
-                    f" task={task.task_id} field={field}: {e}"
-                )
-
-    async def _poll_old_ids_gone(self, task: TaskInfo, old_ids: set[str]) -> set[str]:
-        """轮询确认旧 doc 已从 LightRAG 不可见（delete_doc 后台异步删除的收敛确认）。
-
-        bounded：最多 RAG_CLEANUP_POLL_TRIES(+按量缩放) 次、每次间隔 RAG_CLEANUP_POLL_DELAY 秒。
-        返回残留集合（空 set = 已收敛）；查询失败/超时残留时返回非空，调用方据此判失败并兜底。
-        """
-        base_tries = int(os.getenv("RAG_CLEANUP_POLL_TRIES", "15"))
-        delay = float(os.getenv("RAG_CLEANUP_POLL_DELAY", "2"))
-        # [jonex] 2-A：轮询窗口随删除量缩放——整批后台删除 N 个 doc（每个含 O(剩余chunk) 的
-        # KG rebuild）耗时正比于 N，固定 30s(15×2) 对大批量必然超时并把 current_step 卡在
-        # cleanup。按 per-doc 预留时间放大 tries，使窗口 ≈ base + per_doc_sec × N。
-        per_doc_sec = float(os.getenv("RAG_CLEANUP_POLL_PER_DOC_SEC", "2"))
         n = max(0, len(old_ids))
-        scaled = base_tries + int((per_doc_sec * n) / max(0.1, delay))
-        tries = max(base_tries, scaled)
-        logger.info(
-            "[jonex][2-A] cleanup poll start task=%s old_ids=%d tries=%d delay=%.1fs window≈%.0fs",
-            task.task_id, n, tries, delay, tries * delay,
+        if n == 0:
+            return set()
+
+        max_elapsed = float(os.getenv("RAG_CLEANUP_MAX_ELAPSED", "1800"))
+        poll_delay = float(os.getenv("RAG_CLEANUP_POLL_DELAY", "5"))
+        per_doc_sec = float(os.getenv("RAG_CLEANUP_POLL_PER_DOC_SEC", "2"))
+
+        # 总量级缩放 deadline：min 防止误算导致无限等
+        scaled_elapsed = min(
+            max_elapsed,
+            max(300.0, 300.0 + per_doc_sec * n),
         )
-        residual: set[str] = set(old_ids)
-        for _ in range(max(1, tries)):
+        deadline = time.monotonic() + scaled_elapsed
+        delete_retry_interval = max(poll_delay * 3, 10.0)
+        # 首次立即发起 delete
+        last_delete_attempt = -delete_retry_interval
+
+        logger.info(
+            "[jonex][P0] converge delete start task=%s old_ids=%d max_elapsed=%.0fs "
+            "poll_delay=%.1fs retry_interval=%.1fs",
+            task.task_id, n, scaled_elapsed, poll_delay, delete_retry_interval,
+        )
+
+        remaining: set[str] = set(old_ids)
+        while time.monotonic() < deadline:
+            # 1. 查询当前仍可见的旧 doc
             try:
                 current = set(await self._list_doc_ids_by_document(task))
             except Exception as e:
-                logger.warning("cleanup poll query failed task=%s: %s", task.task_id, e)
-                return set(old_ids)  # 查询失败 → 保守视为未收敛（残留=全部）
-            residual = old_ids & current
-            if not residual:
+                logger.warning(
+                    "[jonex][P0] converge query failed task=%s: %s，等下一轮",
+                    task.task_id, e,
+                )
+                await asyncio.sleep(poll_delay)
+                continue
+
+            remaining = old_ids & current
+            if not remaining:
                 logger.info(
-                    "[jonex][2-A] cleanup poll 收敛 task=%s: 旧 doc 已全部不可见", task.task_id,
+                    "[jonex][P0] converge delete 收敛 task=%s: 旧 doc 已全部不可见",
+                    task.task_id,
                 )
                 return set()
-            await asyncio.sleep(delay)
+
+            # 2. 更新 task 进度供 KB 对账观察
+            task.delete_pending_ids = list(remaining)
+            self._repo.save(task)
+
+            # 3. 重新发起 delete（间隔控制，不对同一批持续轰炸）
+            now = time.monotonic()
+            if now - last_delete_attempt >= delete_retry_interval:
+                try:
+                    await self._http_client.delete_docs(
+                        list(remaining), tenant_id=task.tenant_id, kb_id=task.kb_id,
+                        document_id=task.document_id or "", trace_id=task.task_id,
+                    )
+                    logger.info(
+                        "[jonex][P0] converge delete 重新发起删除 task=%s remaining=%d",
+                        task.task_id, len(remaining),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[jonex][P0] converge delete 本轮 delete 失败 task=%s "
+                        "remaining=%d: %s",
+                        task.task_id, len(remaining), e,
+                    )
+                last_delete_attempt = now
+
+            await asyncio.sleep(poll_delay)
+
         logger.warning(
-            "[jonex][2-A] cleanup poll timeout task=%s: 旧 doc 仍可见 %d 个，保留 cleanup 状态待收敛",
-            task.task_id, len(residual),
+            "[jonex][P0] converge delete timeout task=%s: 残留=%d/%d (%.0fs)，交 3-A 兜底",
+            task.task_id, len(remaining), n, scaled_elapsed,
         )
-        return residual
+        return remaining
 
     async def _resume_cleanup(self, task: TaskInfo) -> None:
-        """[jonex] R1-b P0-J：容器重启后只恢复 cleanup（续删剩余旧 doc），不重跑解析管线。
+        """[jonex] R1-b P0-J + P0：容器重启后只恢复 cleanup（续删剩余旧 doc），不重跑解析管线。
 
-        R1-b 下所有待删条目均为旧 doc（推前全删），不再区分 compensate/converge。
-        删净 + 轮询读一致性后置 COMPLETED（KB 对账落 Neo4j）。
+        P0 收敛循环：每轮重新发起 delete，不会因首次被 busy 拒绝就永久卡死。
         """
         try:
-            await self._run_cleanup(task)
             # R1-b：全部 old_rag_doc_ids 即为待删集合
             delete_set = set(task.old_rag_doc_ids or [])
             if not delete_set:
@@ -1589,11 +1914,9 @@ class TaskManager:
                 task.current_step = "done"
                 self._repo.save(task)
                 return
-            residual = await self._poll_old_ids_gone(task, delete_set)
+
+            residual = await self._converge_delete(task, delete_set)
             if residual:
-                # 重启续删后旧 doc 仍未确认删净 → 判失败，
-                # 保持 current_step=cleanup（_fail_task R5-c 检测 pending 非空不复位），
-                # 由 KB 对账 3-A 动态超时兜底。
                 task.delete_pending_ids = list(residual)
                 self._fail_task(
                     task, ErrorCode.LIGHTRAG_ERROR,
@@ -1610,6 +1933,58 @@ class TaskManager:
             self._repo.save(task)
         except Exception as e:
             logger.error(f"Resume cleanup failed for {task.task_id}: {e}")
+
+    # ── [jonex] parse-only execution (OpenKB 管线) ───────────────────
+
+    async def _run_parse_only(self, task: TaskInfo, handle: TaskHandle) -> None:
+        """[jonex] 只解析执行 — 产出 markdown 供 OpenKB 编译，不写 LightRAG/Neo4j。
+
+        用于 pipeline_type=openkb 的文档：调用 parser 得到 content_list（复用解析缓存），
+        序列化 markdown + 图片到共享卷（_write_openkb_artifact，路径经 get_task_status
+        暴露），跳过 multimodal/push_chunks/ontology。实现 KB 级互斥，避免与 OpenKB 双写。
+        """
+        if handle.cancel_event.is_set():
+            raise TaskCancelledError()
+
+        ctx = PipelineCtx(
+            file_path=task.file_path,
+            file_name=task.name,
+            tenant_id=task.tenant_id,
+            kb_id=task.kb_id,
+            doc_id=task.document_id or "",
+            document_id=task.document_id or "",
+            cancel_event=handle.cancel_event,
+            config_snapshot=task.config_snapshot or {},
+            parser_type=(task.config_snapshot or {}).get("parser", ""),
+        )
+        ctx.started_at = time.time()
+
+        task.current_step = "parse"
+        task.progress = 0.3
+        self._repo.save(task)
+
+        # 仅解析（复用 parse cache）；不入库、不抽本体
+        content_list, _doc_id = await self._pipeline_executor.parse_document(
+            task.file_path,
+            (task.config_snapshot or {}).get("output_dir") or None,
+            (task.config_snapshot or {}).get("parse_method") or None,
+        )
+        ctx.content_list = content_list
+
+        # 写 OpenKB 产物（markdown+图片 → 共享卷；相对路径经 result_summary 暴露）
+        self._write_openkb_artifact(task, ctx)
+
+        if task.result_summary is None:
+            task.result_summary = ResultSummary(doc_id=task.document_id or "")
+        task.status = TaskStatus.COMPLETED
+        task.progress = 1.0
+        task.current_step = "done"
+        self._repo.save(task)
+        _log_ingest_timing_v2(task, "completed")
+        logger.info(
+            "[jonex] Task %s completed (parse_only): doc=%s blocks=%d",
+            task.task_id, task.document_id, len(content_list or []),
+        )
 
     # ── Ontology-only execution (P0-A) ──────────────────────────────
 
@@ -2106,6 +2481,15 @@ class TaskManager:
         if error_code:
             task.error_code = error_code
         task.updated_at = datetime.now(timezone.utc)
+        # [jonex] P0-C：queued/processing 迁移原先不落盘，磁盘 JSON 长期停在
+        # created，排障时无法区分「未入队 / 排队中 / 正在跑」。此处统一持久化。
+        try:
+            self._repo.save(task)
+        except Exception:
+            logger.warning(
+                "Persist transition failed: task=%s status=%s", task.task_id, target,
+                exc_info=True,
+            )
 
     def _fail_task(self, task: TaskInfo, error_code: ErrorCode, message: str):
         # [jonex] R5-c：原子复位 current_step —— cleanup 完成（pending 为空）后
@@ -2125,6 +2509,12 @@ class TaskManager:
         task.error_message = message
         task.completed_at = datetime.now(timezone.utc)
         task.updated_at = datetime.now(timezone.utc)
+        # [jonex] P0-1: 显式记录失败（含 task_id / error_code / message），
+        # 防止 KB 对账 _finalize_failure 拿到空 error 后写误导性「任务丢失」文案。
+        logger.error(
+            "Task failed: task_id=%s error_code=%s error_message=%s",
+            task.task_id, error_code.value if hasattr(error_code, "value") else error_code, message,
+        )
         try:
             self._repo.save(task)
         except Exception:
@@ -2224,7 +2614,11 @@ class TaskManager:
 
         task.webhook_delivered = True  # mark delivered to avoid double-send
 
-        asyncio.create_task(self._deliver_webhook(task.task_id, webhook_url, task))
+        # [jonex] P0-B：保存强引用，避免 webhook 投递协程被 GC 中途回收
+        self._spawn_bg(
+            self._deliver_webhook(task.task_id, webhook_url, task),
+            name=f"webhook-{task.task_id}",
+        )
 
     async def _deliver_webhook(
         self, task_id: str, url: str, task: TaskInfo

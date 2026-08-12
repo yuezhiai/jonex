@@ -145,7 +145,7 @@ export default function DomainKnowledgeBlank() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0 }}>
-        <DocumentLibrary kbId={id} />
+        <DocumentLibrary kbId={id} kbType={detail?.kbType} />
       </div>
     </div>
   );
