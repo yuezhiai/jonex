@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@ant-design/cssinjs": "^2.1.2",
     "@ant-design/icons": "^6.2.3",
     "@jonex/i18n-resources": "workspace:*",
     "@jonex/shell-sdk": "workspace:*",

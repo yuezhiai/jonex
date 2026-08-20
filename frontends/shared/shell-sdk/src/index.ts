@@ -16,6 +16,7 @@ export { createStandaloneShellContext } from './createStandaloneShellContext';
 export { EMBED_QUERY_PARAM, isEmbedded } from './embed';
 export * from './spaceContext';
 export * from './authStorage';
+export { isPlatformAdmin } from './platformAdmin';
 export * from './authRedirect';
 export { bootstrapStandaloneAuth } from './authBootstrap';
 export type { AuthBootstrapOptions, AuthBootstrapResult } from './authBootstrap';

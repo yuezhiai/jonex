@@ -14,6 +14,11 @@ def _value(status: str | DocStatus | OntologyStatus | None) -> str | None:
     return status.value if hasattr(status, "value") else status
 
 
+# 未分类文件夹哨兵值：folder_id 查询/计数时用于指代 folder_id IS NULL 的文档。
+# 真实 folder_id 为 uuid4().hex（32 位 hex），不会与该值冲突。
+UNCLASSIFIED_SENTINEL = "__unclassified__"
+
+
 class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
     model = KnowledgeDocument
 
@@ -261,6 +266,28 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         )
         rows = await self.session.execute(stmt)
         return {row[0]: row[1] for row in rows.all()}
+
+    async def count_by_folder(self, tenant_id: str, knowledge_base_id: str) -> dict[str, int]:
+        """按文件夹统计某 KB 未删除文档数（目录树 document_count）。
+
+        返回 {folder_id: count}；未分类（folder_id IS NULL）归入 UNCLASSIFIED_SENTINEL。
+        无文档的文件夹不出现（调用方按 0 兜底）。
+        """
+        stmt = (
+            select(KnowledgeDocument.folder_id, func.count())
+            .where(
+                *self._tenant_conditions(tenant_id),
+                *self._soft_delete_conditions(),
+                KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+            )
+            .group_by(KnowledgeDocument.folder_id)
+        )
+        rows = await self.session.execute(stmt)
+        result: dict[str, int] = {}
+        for folder_id, cnt in rows.all():
+            key = folder_id if folder_id is not None else UNCLASSIFIED_SENTINEL
+            result[key] = int(cnt)
+        return result
 
     async def get_by_ids(self, doc_ids: list[str], tenant_id: str) -> list[KnowledgeDocument]:
         """批量按 id 查询（带 tenant_id 与 is_deleted==0），用于 references 富化。

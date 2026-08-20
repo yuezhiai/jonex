@@ -101,7 +101,7 @@ class DataSourceService:
         if access_type == "api_push":
             plain = generate_ingest_key(tenant_id=tenant_id, kb_id=kb_id, ds_id=ds_id)
             cfg["ingest_key_hash"] = hash_ingest_key(plain)
-            cfg.setdefault("allowed_ext", ["pdf","doc","docx","ppt","pptx","xls","xlsx","txt","md","jpg","jpeg","png","gif","bmp","tiff","tif","webp","mp3","wav","flac","aac","m4a","ogg","wma","opus","amr","mp4","avi","mov","mkv","flv","wmv","webm","m4v","mpg","mpeg","3gp"])
+            cfg.setdefault("allowed_ext", ["pdf","doc","docx","ppt","pptx","xls","xlsx","txt","md","html","htm","xhtml","jpg","jpeg","png","gif","bmp","tiff","tif","webp","mp3","wav","flac","aac","m4a","ogg","wma","opus","amr","mp4","avi","mov","mkv","flv","wmv","webm","m4v","mpg","mpeg","3gp"])
             cfg.setdefault("max_file_mb", 50)
 
         async with get_db_session() as session:

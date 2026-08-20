@@ -230,7 +230,7 @@ function LoginPage() {
           </Form.Item>
         </Form>
 
-        <div
+        {/* <div
           style={{
             padding: '10px 14px',
             background: colors.rowHover,
@@ -240,7 +240,7 @@ function LoginPage() {
           }}
         >
           {t('shell.testAccount')}
-        </div>
+        </div> */}
       </Card>
     </div>
   );

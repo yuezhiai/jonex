@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Input, Space, message, Spin, Modal, Typography, Alert } from 'antd';
 import { ArrowLeftOutlined, ApiOutlined, KeyOutlined } from '@ant-design/icons';
@@ -11,6 +12,7 @@ import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
 export default function DomainKnowledgeDatasourceApiPush() {
   const { t } = useTranslation();
   const { id, dsId } = useParams();
+  const { canWrite } = useKbPermission(id);
   const navigate = useNavigate();
 
   const [ds, setDs] = useState<DataSourceInstance | null>(null);
@@ -106,7 +108,12 @@ export default function DomainKnowledgeDatasourceApiPush() {
               <span>{t('domainKnowledge.apiPush.receivedDocs', { count: ds?.documentCount ?? 0 })}</span>
             </div>
           </div>
-          <Button icon={<KeyOutlined />} onClick={onResetKey}>
+          <Button
+            icon={<KeyOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={onResetKey}
+          >
             {t('domainKnowledge.apiPush.resetKey')}
           </Button>
         </Card>

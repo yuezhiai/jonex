@@ -39,9 +39,13 @@ function unwrap<T>(p: ApiEnvelope<T>): T {
   return p.data as T;
 }
 
-export async function listRoles(page = 1, pageSize = 100): Promise<RoleListResponse> {
+export async function listRoles(page = 1, pageSize = 100, targetTenantId?: string): Promise<RoleListResponse> {
   const r = await apiClient.get<ApiEnvelope<RoleListResponse>>('/api/v1/platform/roles', {
-    params: { page, page_size: pageSize },
+    params: {
+      page,
+      page_size: pageSize,
+      ...(targetTenantId ? { target_tenant_id: targetTenantId } : {}),
+    },
   });
   return unwrap(r.data);
 }
@@ -81,4 +85,8 @@ export async function setRolePermissions(roleId: number, permissionIds: number[]
 export async function listRoleUsers(roleId: number): Promise<number[]> {
   const r = await apiClient.get<ApiEnvelope<{ user_ids: number[] }>>(`/api/v1/platform/roles/${roleId}/users`);
   return unwrap(r.data).user_ids;
+}
+
+export async function setRoleUsers(roleId: number, userIds: number[]): Promise<void> {
+  await apiClient.put(`/api/v1/platform/roles/${roleId}/users`, { user_ids: userIds });
 }

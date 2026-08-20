@@ -22,6 +22,12 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser {
   const tenantId = raw.tenant_id || raw.tenantId;
   const tenantName = raw.tenant_name || raw.tenantName;
   const roles: string[] = Array.isArray(raw.roles) ? (raw.roles as string[]) : raw.role ? [raw.role as string] : [];
+  // 幂等：同时兜底 snake_case（后端原始）与 camelCase（已归一化对象二次进入）
+  const isPlatformAdmin =
+    raw.is_platform_admin === true || (raw as Record<string, unknown>).isPlatformAdmin === true;
+  const isTenantAdmin =
+    raw.is_tenant_admin === true || (raw as Record<string, unknown>).isTenantAdmin === true;
+  const permissions: string[] = Array.isArray(raw.permissions) ? (raw.permissions as string[]) : [];
   return {
     id,
     username,
@@ -29,7 +35,10 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser {
     tenantId: tenantId ? String(tenantId) : undefined,
     tenantName: tenantName ? String(tenantName) : undefined,
     roles,
-  } as ShellUser;
+    isPlatformAdmin,
+    isTenantAdmin,
+    permissions,
+  };
 }
 
 export function setTokens(access: string, refresh: string): void {

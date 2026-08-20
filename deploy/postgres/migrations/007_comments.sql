@@ -264,3 +264,21 @@ COMMENT ON VIEW metering.v_llm_usage_detail   IS 'LLM 计量明细可读视图�
 COMMENT ON VIEW metering.v_llm_usage_by_doc   IS 'LLM 计量按文档汇总（call_count/tokens/avg_latency）';
 COMMENT ON VIEW metering.v_llm_usage_by_trace IS 'LLM 计量按链路 trace 汇总';
 COMMENT ON VIEW metering.v_llm_usage_daily    IS 'LLM 计量按天汇总（趋势/对账）';
+-- LLM-Wiki Schema 编译设置（kb_type=openkb 的编译配置权威源，方案 docs/llmwiki-schema-settings-execution-plan.md）
+COMMENT ON TABLE knowledge_base.llm_wiki_schemas IS 'LLM-Wiki Schema 编译设置表（留档模型：active/archived，每 KB 单 active；Jonex DB 权威源，OpenKB 文件系统为运行时投影）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.tenant_id IS '租户 ID';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.knowledge_base_id IS '知识库业务 ID（kb_type=openkb）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.schema_version IS 'Schema 业务版本：每次保存递增，留档历史版本';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.status IS '留档状态：active（当前生效）/ archived（历史留档）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.sync_status IS 'apply_schema 同步状态：synced / apply_failed（与 status 的留档语义分开）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.schema_name IS 'Schema 名称（默认 default）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.language IS 'KB 语言（默认 zh-CN，投影进 OpenKB config.yaml）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.model IS 'LLM 模型（可选；None = 走 OpenKB 默认/全局继承）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.entity_types IS '实体类型受控词表（JSONB：code/name/description/examples；编译时超出词表的 type 回落 other）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.concept_types IS '概念类型词表（JSONB：code/name/description；无硬校验，仅渲染进 AGENTS.md 作分类引导）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.agents_md_extra IS '用户自定义追加块（多行 markdown，渲染时原样拼到 AGENTS.md 末尾）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.agents_md IS '最终渲染的 AGENTS.md 全文（内置段 + 词表段 + 自定义块，确定性渲染）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.config_snapshot IS '投影给 OpenKB 的完整配置快照（排障/回放用）';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.edited_by IS '最近编辑人';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.edited_at IS '最近编辑时间';
+COMMENT ON COLUMN knowledge_base.llm_wiki_schemas.applied_at IS '最近一次 apply_schema 成功投影时间';

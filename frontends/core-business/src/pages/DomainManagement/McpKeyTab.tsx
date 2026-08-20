@@ -97,9 +97,9 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
   };
 
   const handleGoToKeyManagement = () => {
-    // 跳转到生态管理 MCP 服务目录，并定位到 MCP Key Tab
+    // 跳转到生态管理 MCP 服务目录，并定位到「服务访问 Key」视图（area=domain + view=access）
     const target = window.top?.location ?? window.location;
-    target.href = '/apps/ecosystem-management/mcp-service-directory?tab=keys';
+    target.href = '/apps/ecosystem-management/mcp-service-directory?area=domain&view=access';
   };
 
   const columns: ColumnsType<AuthKeyItem> = [

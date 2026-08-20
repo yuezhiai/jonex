@@ -117,6 +117,24 @@ class LightRAGAdapterV2(BaseRAGCapability):
         from raganything.raganything import RAGAnything
         from raganything.config import RAGAnythingConfig
 
+        # [jonex] §table-grid-v2 L4.2: 摘要/描述 prompt 语言（受 RAG_PROMPT_LANG
+        # 控制，默认 zh——线上 104/1063 个英文表格摘要正是未切中文的产物）。
+        # set_prompt_language 是进程级全局，必须在 RAGAnything 消费 PROMPTS 之前调用；
+        # 影响所有模态（图片/公式/音视频），dev 全模态回归后再上生产（§6 风险表）。
+        from raganything.prompt_manager import set_prompt_language
+
+        prompt_lang = os.getenv("RAG_PROMPT_LANG", "zh")
+        try:
+            set_prompt_language(prompt_lang)
+            logger.info(
+                "[jonex] §table-grid-v2 L4.2: prompt 语言切换为 %s", prompt_lang,
+            )
+        except Exception:
+            logger.warning(
+                "[jonex] §table-grid-v2 L4.2: prompt 语言 %s 不可用，保持默认（en）",
+                prompt_lang,
+            )
+
         # config 目录：默认相对 raganything 包所在目录（容器内 /opt/raganything），可 env 覆盖
         rag_base = os.path.dirname(os.path.dirname(os.path.abspath(raganything.__file__)))
         profiles_dir = os.getenv("RAG_PROFILES_DIR") or os.path.join(rag_base, "config", "profiles")
@@ -335,6 +353,9 @@ class LightRAGAdapterV2(BaseRAGCapability):
                 payload[k] = kwargs[k]
         return self._unwrap(await self._dispatch("insert", payload, tenant_id), "insert")
 
+    # [jonex] 注：方案 A 的 only_need_context 透传**未**在本 v2 兼容路径实现
+    # （生产链路走 lightrag_adapter.py 的 v1 路径，本类仅兼容保留，
+    # 见 docs/rag-subject-filter-and-answer-source-remediation-plan.md §6.4）。
     async def query(
         self,
         query: str,
@@ -358,6 +379,21 @@ class LightRAGAdapterV2(BaseRAGCapability):
         payload = {"doc_id": doc_id, "knowledge_base_id": knowledge_base_id}
         data = self._unwrap(await self._dispatch("delete", payload, tenant_id), "delete")
         return bool((data or {}).get("success"))
+
+    async def delete_orphan_chunk(
+        self,
+        chunk_id: str,
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+    ) -> bool:
+        """[jonex] O7：孤儿 chunk 强制清理（action delete_orphan_chunk）。"""
+        payload = {"chunk_id": chunk_id, "knowledge_base_id": knowledge_base_id}
+        data = self._unwrap(
+            await self._dispatch("delete_orphan_chunk", payload, tenant_id),
+            "delete_orphan_chunk",
+        )
+        return bool((data or {}).get("deleted"))
 
     async def delete_batch(
         self,

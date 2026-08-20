@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { Table, Space, Modal, message } from 'antd';
 import { EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
@@ -15,6 +16,7 @@ interface FeedbackListProps {
 const PAGE_SIZE = 10;
 
 export default function FeedbackList({ kbId, feedbackType, title }: FeedbackListProps) {
+  const { canWrite } = useKbPermission(kbId);
   const { t } = useTranslation();
   const [data, setData] = useState<SearchFeedbackItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -188,16 +190,17 @@ export default function FeedbackList({ kbId, feedbackType, title }: FeedbackList
           <Space size={12}>
             <a
               className="yx-table-action"
+              style={canWrite ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
               title={record.adopted ? t('compile.feedback.cancelAdopt') : t('compile.feedback.adopt')}
-              onClick={() => handleToggleAdopt(record)}
+              onClick={() => canWrite && handleToggleAdopt(record)}
             >
               <EditOutlined />
             </a>
             <a
               className="yx-table-action"
-              style={{ color: '#ef4444' }}
+              style={canWrite ? { color: '#ef4444' } : { color: '#ef4444', opacity: 0.4, cursor: 'not-allowed' }}
               title={t('common.delete')}
-              onClick={() => handleDelete(record)}
+              onClick={() => canWrite && handleDelete(record)}
             >
               <DeleteOutlined />
             </a>

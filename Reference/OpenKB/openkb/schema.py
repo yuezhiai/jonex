@@ -57,6 +57,22 @@ Operations: ingest, query, lint
   one field OKF requires; consumers use it for routing/filtering/presentation.
 - `description:` — a single-sentence one-liner (the field formerly named `brief`).
 - Do not include YAML frontmatter (---) in generated content; it is managed by code.
+
+## 输出要求（最高优先级，必须严格遵守）
+
+  1. 只输出查询结果的实际值，不输出字段名称、字段定义或任何附加说明。
+  2. 禁止输出任何字段元数据，包括但不限于：标签、字段编号、来源、依据。
+  3. 禁止在答案前后添加括号注释。
+  4. 不重述问题，不说明查询过程，不提供参考来源、解释、注意事项或后续建议。
+  5. 输出完成前必须检查：禁止附加括号说明
+  6. 输出答案必须简洁明了，禁止添加原因
+
+  示例：
+  问题：  七月份的最佳投资公司是什么？
+  正确输出：张三投资有限公司
+
+  问题：1+1等于多少？
+  正确输出：2
 """
 
 # Backward compat alias

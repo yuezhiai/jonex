@@ -39,6 +39,14 @@ export interface KnowledgeSearchHistoryItem {
   durationMs?: number;
   mode?: 'hybrid';
   topK?: number;
+  /** [jonex] 历史快照：完整答案原始文本（含 <think> 标记），点击历史直接展示 */
+  answer?: string;
+  /** [jonex] 历史快照：引用快照（raw_url 已剥离，展示时重新富化） */
+  references?: KnowledgeReference[];
+  /** [jonex] 历史快照：推理链（ReasoningTrace），点击历史直接展示推理过程 */
+  reasoning?: ReasoningTrace | null;
+  /** [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件） */
+  strictConfig?: KnowledgeSearchStrictConfig | null;
 }
 
 export interface SaveKnowledgeSearchHistoryPayload {
@@ -53,6 +61,12 @@ export interface SaveKnowledgeSearchHistoryPayload {
   durationMs?: number;
   mode?: 'hybrid';
   topK?: number;
+  /** [jonex] 历史快照：完整答案 + 引用 + 推理链 */
+  answer?: string;
+  references?: KnowledgeReference[];
+  reasoning?: ReasoningTrace | null;
+  /** [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件） */
+  strictConfig?: KnowledgeSearchStrictConfig | null;
 }
 
 /** 严格模式配置项（随搜索请求下发，普通/深度共用前 5 项，深度额外含后 2 项） */
@@ -83,13 +97,17 @@ export interface KnowledgeSearchStreamParams {
 
 /** 引用位置（与后端 SourceLocation 对齐） */
 export interface KnowledgeReferenceLocation {
-  type: 'chunk' | 'char' | 'page' | 'timestamp' | 'document';
+  type: 'chunk' | 'char' | 'page' | 'timestamp' | 'document' | 'image';
   chunk_index?: number | null;
   char_start?: number | null;
   char_end?: number | null;
   page_no?: number | null;
   time_start?: number | null;
   time_end?: number | null;
+  /** [jonex] §image-refs：图片位置——文档内嵌图片的模态序号（全局枚举） */
+  image_idx?: number | null;
+  /** [jonex] §image-refs：图片资产预览地址（预签名 URL；local 后端/未上传为空，前端降级） */
+  asset_url?: string | null;
   /** 命中片段原文文本（RAG 链路带 chunk content 时有值） */
   text?: string | null;
 }

@@ -17,3 +17,4 @@ class Menu(TimestampMixin, SoftDeleteMixin, Base):
     sort_order = Column(SmallInteger, default=0)
     visible = Column(SmallInteger, default=1)
     status = Column(SmallInteger, default=1)
+    permission_code = Column(String(128))

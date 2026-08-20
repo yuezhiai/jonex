@@ -25,6 +25,10 @@ interface SearchHistorySidebarProps {
   onHistoryClick: (item: KnowledgeSearchHistoryItem, index: number) => void;
   onDeleteHistory: (id: string, index: number) => void;
   onClearHistory: () => void;
+  // [jonex] 历史分页："查看更多"按钮（已加载条数 < 总数时展示）
+  hasMore?: boolean;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
 }
 
 export default function SearchHistorySidebar({
@@ -33,6 +37,9 @@ export default function SearchHistorySidebar({
   onHistoryClick,
   onDeleteHistory,
   onClearHistory,
+  hasMore,
+  onLoadMore,
+  loadingMore,
 }: SearchHistorySidebarProps) {
   const { t } = useTranslation();
 
@@ -48,6 +55,10 @@ export default function SearchHistorySidebar({
         overflow: 'hidden',
         position: 'sticky',
         top: 28,
+        // 固定高度：顶部吸顶 28px + 底部留白 272px，内容区内部上下滚动
+        height: 'calc(100vh - 300px)',
+        display: 'flex',
+        flexDirection: 'column',
       }}
     >
       <div
@@ -60,6 +71,7 @@ export default function SearchHistorySidebar({
           display: 'flex',
           alignItems: 'center',
           gap: 8,
+          flexShrink: 0,
         }}
       >
         <HistoryOutlined />
@@ -76,11 +88,23 @@ export default function SearchHistorySidebar({
         )}
       </div>
       {history.length === 0 ? (
-        <div style={{ padding: '40px 20px', textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '40px 20px',
+            textAlign: 'center',
+            color: '#94a3b8',
+            fontSize: 13,
+          }}
+        >
           {t('knowledgeSearch.noSearchHistory')}
         </div>
       ) : (
-        history.map((h, i) => (
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+          {history.map((h, i) => (
           <div
             key={h.id}
             style={{
@@ -132,7 +156,15 @@ export default function SearchHistorySidebar({
               ×
             </Button>
           </div>
-        ))
+          ))}
+          {hasMore && (
+            <div style={{ padding: '12px 20px', textAlign: 'center' }}>
+              <Button type="link" size="small" loading={loadingMore} onClick={onLoadMore}>
+                {t('knowledgeSearch.loadMore')}
+              </Button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

@@ -26,10 +26,21 @@ from capabilities.platform.dtos.mcp_service_dto import (
     McpServiceResponse,
     TestCallRequest,
     TestCallResponse,
+    ToolConfigRequest,
 )
-from capabilities.platform.repository.mcp_service_repository import McpServiceRepository
+from capabilities.platform.repository.mcp_service_repository import (
+    McpServiceRepository,
+    SYSTEM_SERVICE_DESCRIPTION,
+    SYSTEM_SERVICE_ID,
+    SYSTEM_SERVICE_NAME,
+    SYSTEM_SERVICE_TOOL,
+)
 from jonex_core.common import get_config
-from jonex_core.common.exceptions import ResourceNotFoundError
+from jonex_core.common.exceptions import (
+    OperationNotSupportedError,
+    ResourceConflictError,
+    ResourceNotFoundError,
+)
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 from jonex_core.security.user_auth import get_user_auth
@@ -89,6 +100,29 @@ class McpServiceService:
             logger.warning("JWT decode failed in _extract_username, falling back to test_token: %s", e)
             return "test_token"
 
+    def _build_system_service_item(self, row) -> McpServiceResponse:
+        """构造系统服务目录条目（无 space/KB/status，固定 tool + 抽象描述）。"""
+        return McpServiceResponse(
+            id=SYSTEM_SERVICE_ID,
+            name=SYSTEM_SERVICE_NAME,
+            description=None,
+            domain_type=None,
+            space_id="",
+            space_name="",
+            status="",
+            enabled=1,
+            kb_count=0,
+            kb_names=[],
+            is_published=True,
+            published_at=None,
+            published_by=None,
+            last_call_at=None,
+            created_at=row.created_at,
+            tool=SYSTEM_SERVICE_TOOL,
+            tool_description=SYSTEM_SERVICE_DESCRIPTION,
+            service_type="system",
+        )
+
     def _determine_key_status(self, revoked_at, expires_at) -> str:
         """判断 MCP Key 状态。
 
@@ -143,6 +177,12 @@ class McpServiceService:
             status_filter=req.status if hasattr(req, "status") else None,
         )
 
+        # DS-05 / K10：列表时兜底 upsert stub。对 knowledge_base 存在但发布表
+        # 无桩记录的服务，补齐 is_published=0 桩，保证前端移除「同步服务」按钮后
+        # 未发布服务仍可见且可被 publish/unpublish 命中改写。
+        service_ids = [row.get("id") for row in rows if row.get("id")]
+        await self.repo.ensure_publish_stubs(tenant_id, service_ids)
+
         items: list[McpServiceResponse] = []
         for row in rows:
             # ⚠️ LEFT JOIN 软删除空间/脏数据时 sp.name、s.space_id 等可能为 NULL。
@@ -164,8 +204,19 @@ class McpServiceService:
                 published_at=row.get("published_at"),
                 published_by=row.get("published_by"),
                 created_at=row.get("created_at"),
+                tool=row.get("tool"),
+                tool_description=row.get("tool_description"),
+                service_type=row.get("service_type") or "domain",
             )
             items.append(item)
+
+        # WRITE-03 / DIR-02：系统服务条目懒 seed + 目录可见。
+        # 固定内置条目不受 search 过滤；无 space 归属 → space_id 过滤时排除；
+        # 已发布条目 → unpublished 视图排除。
+        status_filter = req.status if hasattr(req, "status") else None
+        if req.space_id is None and status_filter != "unpublished":
+            system_row = await self.repo.ensure_system_service(tenant_id)
+            items.append(self._build_system_service_item(system_row))
 
         return McpServiceListResponse(items=items, total=len(items))
 
@@ -206,7 +257,53 @@ class McpServiceService:
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
             enabled=int(row.get("enabled")) if row.get("enabled") is not None else 1,
+            tool=row.get("tool"),
+            tool_description=row.get("tool_description"),
+            service_type=row.get("service_type") or "domain",
         )
+
+    async def save_tool_config(
+        self, tenant_id: str, service_id: str, req: ToolConfigRequest
+    ) -> dict:
+        """保存领域服务的 MCP Tool 配置（DS-03）。
+
+        1. 校验 service 在 knowledge_base.services 中存在且属于当前租户
+        2. 同租户内 Tool 名唯一性校验（跨租户同名不冲突）
+        3. 落库 platform.mcp_service_publish（tool / tool_description）
+        """
+        tenant_id = require_tenant(tenant_id)
+        if service_id == SYSTEM_SERVICE_ID:
+            raise OperationNotSupportedError(
+                message=translate(
+                    "err.mcp_service.system_tool_immutable",
+                    fallback="系统服务 Tool 不可编辑",
+                    params={"service_id": service_id},
+                ),
+                details={"service_id": service_id},
+            )
+        await self._assert_service_exists(tenant_id, service_id)
+
+        existing = await self.repo.get_by_tool(tenant_id, req.tool)
+        if existing is not None and existing.service_id != service_id:
+            raise ResourceConflictError(
+                message=translate(
+                    "err.mcp_service.tool_conflict",
+                    fallback="Tool 名称已存在: {tool}",
+                    params={"tool": req.tool},
+                ),
+                details={"tool": req.tool, "service_id": existing.service_id},
+            )
+
+        record = await self.repo.save_tool_config(
+            tenant_id, service_id, req.tool, req.tool_description
+        )
+        await self.session.flush()
+
+        return {
+            "service_id": service_id,
+            "tool": record.tool,
+            "tool_description": record.tool_description,
+        }
 
     async def publish(
         self, tenant_id: str, service_id: str, authorization_header: str | None = None
@@ -372,7 +469,7 @@ class McpServiceService:
     ) -> AuthorizedKeyListResponse:
         """查询已授权给指定 service 的 MCP Key 列表。
 
-        JOIN 3 表：mcp_key_service_mappings + mcp_keys + mcp_organizations。
+        JOIN 2 表：mcp_key_service_mappings + mcp_keys。
         返回脱敏后的 Key 数据（仅 key_prefix，不暴露 key_hash）。
         """
         tenant_id = require_tenant(tenant_id)
@@ -387,8 +484,6 @@ class McpServiceService:
                 key_name=row.key_name,
                 key_prefix=row.key_prefix,
                 permission_level=row.permission_level,
-                org_name=row.org_name,
-                org_id=row.org_id,
                 key_status=self._determine_key_status(row.revoked_at, row.expires_at),
             )
             items.append(item)
@@ -539,13 +634,17 @@ class McpServiceService:
         now = _datetime.now(_timezone.utc)
         key_id = _uuid.uuid4().hex
 
+        # KEY-07 Fix 1：权限从 req.permission_level 派生（最小权限，不放大）。
+        # 仅 permission_level == "call" 时写 "call"；其余（view/未知）一律兜底 "view"。
+        permissions = "call" if req.permission_level == "call" else "view"
+
         new_key = McpKey(
             id=key_id,
             tenant_id=tenant_id,
             name=req.name,
             key_prefix=prefix,
             key_hash=key_hash_val,
-            permissions="read",
+            permissions=permissions,
             allowed_kb_ids=[],
             created_by=username,
             created_at=now,

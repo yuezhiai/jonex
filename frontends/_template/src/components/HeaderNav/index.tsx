@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import i18next from 'i18next';
 import { useNavigate, useLocation, useMatches } from 'react-router-dom';
 import { useStore } from '@/store';
-import { findMenuPathKeys, getMenuItemsByRole } from '@/utils/menu';
+import { findMenuPathKeys, getMenuItemsByPermission } from '@/utils/menu';
 import { getAvatarText, clearLocalStorageExcept } from '@/utils/utils';
 import { buildLoginRedirectUrl, clearAuthStorage } from '@jonex/shell-sdk';
 import { safeMessage } from '@/utils/safeMessage';
@@ -41,10 +41,11 @@ export default function HeaderNav({ type = null, previous = '', title = '', prev
       setDrawerOpen(false);
     }
   });
-  const userRoles: string = Array.isArray(userInfo?.roles)
-    ? (userInfo?.roles as string[]).join(',')
-    : (userInfo?.roles as string) || '';
-  const menuItems = useMemo(() => getMenuItemsByRole(getMenuFromRoutes(getRoutes(), t), userRoles), [t]);
+  const userPermissions: string[] = Array.isArray(userInfo?.permissions) ? userInfo?.permissions : [];
+  const menuItems = useMemo(
+    () => getMenuItemsByPermission(getMenuFromRoutes(getRoutes(), t), userPermissions),
+    [t, userPermissions],
+  );
 
   const rolesOptions = {
     admin: t('auth.admin'),

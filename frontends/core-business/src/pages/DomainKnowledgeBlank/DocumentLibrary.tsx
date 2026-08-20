@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { useNavigate } from 'react-router-dom';
-import { Input, Button, Table, Space, Modal, Dropdown, message, Menu } from 'antd';
+import { Input, Button, Table, Space, Modal, Dropdown, message, Menu, Badge } from 'antd';
 import {
   SearchOutlined,
   PlusOutlined,
@@ -25,6 +26,7 @@ import {
   reparseDocument,
   retryDocumentOntology,
   deleteManualDocument,
+  batchMoveDocuments,
 } from '@/api/domainKnowledge';
 import { listAccessMethods } from '@/api/dataSource';
 import type { ManualDocItem, FolderItem } from '@/types/domainKnowledge';
@@ -34,6 +36,7 @@ import { useDocumentViewer } from '@/components/DocumentViewer';
 import DocumentStatusFilter from '@/components/DocumentStatusFilter';
 import UploadModal from './UploadModal';
 import FolderNameModal from './FolderNameModal';
+import MoveDocModal from './MoveDocModal';
 import TagModal from './TagModal';
 import './index.scss';
 
@@ -46,6 +49,7 @@ interface DocumentLibraryProps {
 }
 
 export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) {
+  const { canWrite } = useKbPermission(kbId);
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [selectedKeys, setSelectedKeys] = useState<string[]>(['all']);
@@ -67,6 +71,17 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
   const [statusFilter, setStatusFilter] = useState<DocPhase[]>([]);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [tagDoc, setTagDoc] = useState<ManualDocItem | null>(null);
+  // 受控行选中（批量移动按钮可用性 + 移动目标文档集）
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [moveModal, setMoveModal] = useState<{
+    open: boolean;
+    mode: 'single' | 'batch';
+    doc?: ManualDocItem;
+  }>({ open: false, mode: 'single' });
+  const [moveLoading, setMoveLoading] = useState(false);
+  // 拖拽迁移状态（表格行 → 侧栏目录）：当前拖拽的文档 id + 悬停的 drop 目标（'all' = 根目录 / folder id）
+  const [draggingDocId, setDraggingDocId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
   const [accessMethods, setAccessMethods] = useState<AccessMethodItem[]>([]);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -163,9 +178,10 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
     fetchList();
   }, [fetchList, reloadFlag]);
 
-  // 关键词、文件夹或状态变化时，重置页码
+  // 关键词、文件夹或状态变化时，重置页码并清空行选中（避免批量移动作用于当前数据集之外的旧选中）
   useEffect(() => {
     setPage(1);
+    setSelectedRowKeys([]);
   }, [keyword, selectedKeys, statusFilter]);
 
   // 卸载时清理防抖定时器
@@ -254,6 +270,104 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
     [kbId, t],
   );
 
+  const handleMove = useCallback((record: ManualDocItem) => {
+    setMoveModal({ open: true, mode: 'single', doc: record });
+  }, []);
+
+  const handleMoveOk = async (folderId: string | null) => {
+    const docIds =
+      moveModal.mode === 'batch'
+        ? selectedRowKeys.map(String)
+        : moveModal.doc
+          ? [moveModal.doc.id]
+          : [];
+    if (!docIds.length) return;
+    setMoveLoading(true);
+    try {
+      await batchMoveDocuments(kbId, docIds, folderId);
+      // 接口成功即提示，不显示移动数量
+      message.success(t('common.moveSuccess'));
+      setMoveModal({ open: false, mode: 'single' });
+      setSelectedRowKeys([]);
+      fetchFolders();
+      setReloadFlag((f) => f + 1);
+    } catch (err: any) {
+      // 直接显示接口报错信息（request 层 toApiError 已提取后端 message）
+      message.error(err?.message);
+    } finally {
+      setMoveLoading(false);
+    }
+  };
+
+  // ===== 拖拽迁移（表格行 → 侧栏目录，HTML5 DnD）=====
+  const handleRowDragStart = useCallback(
+    (record: ManualDocItem) => (e: React.DragEvent<HTMLElement>) => {
+      e.dataTransfer.effectAllowed = 'move';
+      setDraggingDocId(record.id);
+    },
+    [],
+  );
+
+  const handleRowDragEnd = useCallback(() => {
+    setDraggingDocId(null);
+    setDropTargetId(null);
+  }, []);
+
+  const handleDragMove = useCallback(
+    async (targetFolderId: string | null) => {
+      if (!draggingDocId) return;
+      try {
+        await batchMoveDocuments(kbId, [draggingDocId], targetFolderId);
+        message.success(t('common.moveSuccess'));
+        fetchFolders();
+        setReloadFlag((f) => f + 1);
+      } catch (err: any) {
+        message.error(err?.message);
+      } finally {
+        setDraggingDocId(null);
+        setDropTargetId(null);
+      }
+    },
+    [draggingDocId, kbId, t, fetchFolders],
+  );
+
+  const handleFolderDrop = useCallback(
+    (targetFolderId: string | null) => (e: React.DragEvent<HTMLElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!draggingDocId) return;
+      setDropTargetId(null);
+      const doc = data.find((d) => d.id === draggingDocId);
+      if (!doc) return;
+      // 拖到文档当前所在目录（含同为根目录）→ 不发请求，提示
+      if ((doc.folder_id ?? null) === targetFolderId) {
+        message.info(t('common.moveInCurrentFolder'));
+        return;
+      }
+      handleDragMove(targetFolderId);
+    },
+    [draggingDocId, data, t, handleDragMove],
+  );
+
+  const handleDropTargetDragOver = useCallback(
+    (key: string | null) => (e: React.DragEvent<HTMLElement>) => {
+      // dragover 必须 preventDefault 才允许 drop；stopPropagation 避免干扰 Menu onSelect
+      e.preventDefault();
+      e.stopPropagation();
+      setDropTargetId((cur) => (cur !== key ? key : cur));
+    },
+    [],
+  );
+
+  const handleDropTargetDragLeave = useCallback(
+    (key: string | null) => (e: React.DragEvent<HTMLElement>) => {
+      // 子元素间移动会触发父级 dragleave，用 contains 判断是否真正离开
+      if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+      setDropTargetId((cur) => (cur === key ? null : cur));
+    },
+    [],
+  );
+
   const columns = createColumns(
     t,
     {
@@ -263,9 +377,11 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
       onReparse: handleReparse,
       onRecompile: handleRecompile,
       onDelete: handleDelete,
+      onMove: handleMove,
     },
     accessMethods,
     kbType,
+    canWrite,
   );
 
   const sidebarContent = (
@@ -279,6 +395,8 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
           type="text"
           icon={<PlusOutlined />}
           size="small"
+          disabled={!canWrite}
+          title={canWrite ? undefined : t('domainSpace.noManagePermission')}
           onClick={() => {
             setFolderModalMode('create');
             setFolderModalValue('');
@@ -296,7 +414,13 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
             key: 'all',
             icon: <FolderOutlined />,
             label: (
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+              <div
+                style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}
+                className={`doc-library-drop-target${dropTargetId === 'all' ? ' doc-library-drop-target--active' : ''}`}
+                onDragOver={handleDropTargetDragOver('all')}
+                onDragLeave={handleDropTargetDragLeave('all')}
+                onDrop={handleFolderDrop(null)}
+              >
                 <span>{t('common.allDocuments')}</span>
                 <span
                   style={{
@@ -326,10 +450,19 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
                 label: (
                   <div
                     style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}
+                    className={`doc-library-drop-target${dropTargetId === f.id ? ' doc-library-drop-target--active' : ''}`}
+                    onDragOver={handleDropTargetDragOver(f.id)}
+                    onDragLeave={handleDropTargetDragLeave(f.id)}
+                    onDrop={handleFolderDrop(f.id)}
                   >
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>
                       {f.name}
                     </span>
+                    <Badge
+                      count={f.document_count ?? 0}
+                      showZero
+                      style={{ backgroundColor: '#f0f0f0', color: '#595959', boxShadow: 'none', marginRight: 4 }}
+                    />
                     <Dropdown
                       menu={{
                         items: [
@@ -337,8 +470,10 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
                             key: 'rename',
                             icon: <EditOutlined />,
                             label: t('common.rename'),
+                            disabled: !canWrite,
                             onClick: ({ domEvent }) => {
                               domEvent.stopPropagation();
+                              if (!canWrite) return;
                               setFolderModalMode('rename');
                               setEditingFolderId(f.id);
                               setFolderModalValue(f.name);
@@ -350,8 +485,10 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
                             icon: <DeleteOutlined />,
                             label: t('common.delete'),
                             danger: true,
+                            disabled: !canWrite,
                             onClick: ({ domEvent }) => {
                               domEvent.stopPropagation();
+                              if (!canWrite) return;
                               handleDeleteFolder(f.id, f.name);
                             },
                           },
@@ -397,11 +534,24 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
             <Button icon={<ReloadOutlined />} onClick={() => fetchList()}>
               {t('common.refresh')}
             </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setModalOpen(true)}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              disabled={!canWrite}
+              title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => setModalOpen(true)}
+            >
               {t('common.addDocument')}
             </Button>
             <Button icon={<SyncOutlined />} onClick={() => navigate(`/domain-knowledge/${kbId}/compile-results`)}>
               {t('common.fullCompileResults')}
+            </Button>
+            <Button
+              icon={<FolderOutlined />}
+              disabled={selectedRowKeys.length === 0}
+              onClick={() => setMoveModal({ open: true, mode: 'batch' })}
+            >
+              {t('common.batchMove')}
             </Button>
           </Space>
         </div>
@@ -417,12 +567,21 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
             total,
             showSizeChanger: false,
             showTotal: (total) => t('common.totalItems', { total }),
-            onChange: (p) => setPage(p),
+            onChange: (p) => {
+              setPage(p);
+              setSelectedRowKeys([]);
+            },
           }}
-          rowSelection={{ type: 'checkbox' }}
+          onRow={(record) => ({
+            draggable: true,
+            onDragStart: handleRowDragStart(record),
+            onDragEnd: handleRowDragEnd,
+          })}
+          rowClassName={(record) => (draggingDocId === record.id ? 'doc-library-row--dragging' : '')}
+          rowSelection={{ type: 'checkbox', selectedRowKeys, onChange: setSelectedRowKeys }}
           size="middle"
           className="doc-library-table"
-          scroll={{ y: 400, x: 1100 }}
+          scroll={{ x: 1100 }}
         />
       </div>
       <UploadModal kbId={kbId} open={modalOpen} onClose={() => setModalOpen(false)} onSuccess={handleUploadSuccess} />
@@ -444,6 +603,15 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
           setTagModalOpen(false);
           setTagDoc(null);
         }}
+      />
+      <MoveDocModal
+        open={moveModal.open}
+        title={moveModal.mode === 'single' ? t('common.moveDocTitle') : t('common.moveBatchTitle')}
+        folders={folders}
+        disabledFolderId={moveModal.mode === 'single' ? moveModal.doc?.folder_id ?? null : undefined}
+        confirmLoading={moveLoading}
+        onOk={handleMoveOk}
+        onCancel={() => setMoveModal({ open: false, mode: 'single' })}
       />
       {viewer}
     </div>

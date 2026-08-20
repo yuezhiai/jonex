@@ -3,12 +3,15 @@ import { useTranslation } from 'react-i18next';
 import { Button, Tag, message, Spin, Result } from 'antd';
 import { EditOutlined, TeamOutlined, PlusOutlined } from '@ant-design/icons';
 import { listRoles, listPermissions, type RoleItem, type PermissionItem } from '../../api/roles';
+import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sdk';
 import PermissionEditModal, { type PermissionEditModalRef } from './PermissionEditModal';
+import RoleUserAssignModal, { type RoleUserAssignModalRef } from './RoleUserAssignModal';
 import NewRoleModal, { type NewRoleModalRef } from './NewRoleModal';
 
 const BUILT_IN_ROLE_KEYS: Record<string, string> = {
   admin: 'systemAdmin',
   user: 'user',
+  平台管理员: 'platformAdmin',
   系统管理员: 'systemAdmin',
   领域服务管理员: 'domainServiceAdmin',
   知识编辑者: 'knowledgeEditor',
@@ -27,11 +30,14 @@ function roleCopy(role: RoleItem, t: (key: string) => string) {
 
 export default function RolePermission() {
   const { t } = useTranslation();
+  const cachedUser = readCachedUser<ShellUser>();
+  const isPlatformAdminFlag = isPlatformAdmin(cachedUser);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [perms, setPerms] = useState<PermissionItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const permModalRef = useRef<PermissionEditModalRef>(null);
+  const userAssignModalRef = useRef<RoleUserAssignModalRef>(null);
   const newRoleModalRef = useRef<NewRoleModalRef>(null);
 
   const load = useCallback(async () => {
@@ -79,7 +85,9 @@ export default function RolePermission() {
       </div>
       <Spin spinning={loading}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 20 }}>
-          {roles.map((r) => {
+          {roles
+            .filter((r) => isPlatformAdminFlag || r.is_system !== 1) // 非平台管理员不可见系统角色（平台管理员）
+            .map((r) => {
             const isAdmin = r.is_system === 1;
             const display = roleCopy(r, t);
             return (
@@ -118,6 +126,9 @@ export default function RolePermission() {
                   )}
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
+                  <Button size="small" icon={<TeamOutlined />} onClick={() => userAssignModalRef.current?.open(r)}>
+                    {t('rolePermission.assignUsers')}
+                  </Button>
                   <Button
                     type="primary"
                     size="small"
@@ -134,6 +145,7 @@ export default function RolePermission() {
       </Spin>
 
       <PermissionEditModal ref={permModalRef} perms={perms} onSaved={load} />
+      <RoleUserAssignModal ref={userAssignModalRef} onSaved={load} />
       <NewRoleModal ref={newRoleModalRef} onCreated={load} />
     </div>
   );

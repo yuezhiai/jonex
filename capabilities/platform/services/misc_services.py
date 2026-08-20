@@ -64,9 +64,11 @@ FRONTEND_ICON_BY_APP_CODE = {
     "ecosystem-management": "AppstoreOutlined",
 }
 
-FRONTEND_ROLES_BY_APP_CODE = {
-    "platform-management": ["admin"],
-}
+# 应用可见性（RBAC 语义）：所有应用对所有登录用户可见（roles 为空 = 不限制）。
+# 页面/功能级权限统一由权限码控制（后端 require_permission 403 + 菜单过滤
+# + 前端 is_platform_admin 布尔——后端按 platform:admin 码计算）。
+# 不用角色名做判定：角色名是租户可变数据，不属于判定契约。
+FRONTEND_ROLES_BY_APP_CODE: dict[str, list[str]] = {}
 
 
 # ============ 应用管理 ============
@@ -149,7 +151,7 @@ class ApplicationService:
         standalone_url = f"{standalone_base}/"
         remote_entry = f"/remotes/{code}/assets/remoteEntry.js"
         version_url = f"/remotes/{code}/version.json"
-        roles = FRONTEND_ROLES_BY_APP_CODE.get(code, ["admin", "user"])
+        roles = FRONTEND_ROLES_BY_APP_CODE.get(code, [])
         scope = FRONTEND_SCOPE_BY_APP_CODE.get(code, self._to_camel_case(code))
 
         return FrontendManifestEntry(
@@ -197,9 +199,9 @@ class PermissionService:
         self.session = session
         self.repo = PermissionRepository(session)
 
-    async def list_permissions(self, offset: int = 0, limit: int = 100) -> PermissionListResponse:
-        items = await self.repo.list_all_sorted(offset, limit)
-        total = await self.repo.count_shared()
+    async def list_permissions(self, offset: int = 0, limit: int = 100, scope: str | None = None) -> PermissionListResponse:
+        items = await self.repo.list_all_sorted(offset, limit, scope=scope)
+        total = await self.repo.count_all(scope=scope)
         return PermissionListResponse(
             total=total,
             items=[PermissionResponse.from_orm(p) for p in items],
@@ -300,6 +302,61 @@ class TaskScheduleService:
 
 # ============ 租户管理 ============
 
+async def seed_tenant_roles(session, tenant_id: str) -> None:
+    """新租户预设角色播种：4 角色 + scope='tenant' 权限映射（与 demo 模板同构，不含平台码）。
+
+    与 015 第 4/5 步逻辑同构；由 TenantService.create 复用。
+    **is_system 一律置 0**（已决策）：仅 demo 租户的系统管理员受系统角色保护；
+    租户自己的「系统管理员」是普通角色，可改权限/可删。
+    """
+    from sqlalchemy import select
+
+    from capabilities.platform.models.role import Role
+    from capabilities.platform.models.role_permission import RolePermission
+    from capabilities.platform.models.permission import Permission
+
+    template = (
+        await session.execute(
+            select(Role.name, Role.description, Role.is_system).where(
+                Role.tenant_id == "tenant_jonex_demo",
+                Role.is_deleted == 0,
+                Role.name.in_(["系统管理员", "领域服务管理员", "知识编辑者", "观察者"]),
+            )
+        )
+    ).all()
+
+    for name, description, _is_system in template:
+        role = Role(tenant_id=tenant_id, name=name, description=description, is_system=0)
+        session.add(role)
+        await session.flush()
+        # 复制 demo 同名角色的 role_permissions（仅 scope='tenant'）
+        demo_role_id = (
+            await session.execute(
+                select(Role.id).where(
+                    Role.tenant_id == "tenant_jonex_demo", Role.name == name, Role.is_deleted == 0
+                )
+            )
+        ).scalar_one()
+        rows = (
+            await session.execute(
+                select(RolePermission.permission_id).where(
+                    RolePermission.tenant_id == "tenant_jonex_demo",
+                    RolePermission.role_id == demo_role_id,
+                )
+            )
+        ).scalars().all()
+        for pid in rows:
+            perm_scope = (
+                await session.execute(
+                    select(Permission.scope).where(Permission.id == pid)
+                )
+            ).scalar_one_or_none()
+            if perm_scope == "platform":
+                continue
+            session.add(RolePermission(tenant_id=tenant_id, role_id=role.id, permission_id=pid))
+    await session.flush()
+
+
 class TenantService:
     def __init__(self, db: AsyncSession):
         from capabilities.platform.repository.tenant_repository import TenantRepository
@@ -341,6 +398,8 @@ class TenantService:
         )
         self.repo.session.add(t)
         await self.repo.session.flush()
+        # 新租户创建即播种预设角色（与租户行同一事务，commit 时一并落库）
+        await seed_tenant_roles(self.repo.session, req.id)
         return self._to_dict(t)
 
     async def update(self, tenant_id: str, req) -> dict:

@@ -272,11 +272,26 @@
         }
       },
       "graph": {
-        "cardiovascular": { "name": "Cardiovascular Disease", "type": "Disease" },
-        "aspirin": { "name": "Aspirin", "type": "Drug" },
-        "hypertension": { "name": "Hypertension", "type": "Condition" },
-        "supplyChainFinance": { "name": "Supply Chain Finance", "type": "Business" },
-        "intelligentRisk": { "name": "Intelligent Risk Control", "type": "Technology" }
+        "cardiovascular": {
+          "name": "Cardiovascular Disease",
+          "type": "Disease"
+        },
+        "aspirin": {
+          "name": "Aspirin",
+          "type": "Drug"
+        },
+        "hypertension": {
+          "name": "Hypertension",
+          "type": "Condition"
+        },
+        "supplyChainFinance": {
+          "name": "Supply Chain Finance",
+          "type": "Business"
+        },
+        "intelligentRisk": {
+          "name": "Intelligent Risk Control",
+          "type": "Technology"
+        }
       }
     }
   },
@@ -412,6 +427,10 @@
     "loadFailed": "Load failed",
     "loadPermsFailed": "Failed to load permissions",
     "permsUpdated": "Permissions updated",
+    "assignUsers": "Assign Users",
+    "assignUsersTitle": "Assign Users - {{name}}",
+    "loadUsersFailed": "Failed to load users",
+    "usersUpdated": "User assignment updated",
     "builtInRoles": {
       "systemAdmin": {
         "name": "System Administrator",
@@ -432,16 +451,41 @@
       "observer": {
         "name": "Observer",
         "description": "Read-only access to search and view knowledge"
+      },
+      "platformAdmin": {
+        "name": "Platform Administrator",
+        "description": "Platform-level highest privilege: all permission codes (including platform-scope cross-tenant codes), bound only to the demo tenant admin account"
       }
     },
     "builtInPermissions": {
-      "tenant": { "read": "View Tenants", "write": "Manage Tenants" },
-      "user": { "read": "View Users", "write": "Manage Users" },
-      "role": { "read": "View Roles", "write": "Manage Roles" },
-      "knowledge": { "read": "View Knowledge", "write": "Edit Knowledge" },
-      "service": { "read": "View Services", "write": "Manage Services" },
-      "model": { "read": "View Models", "write": "Manage Models" },
-      "system": { "read": "View System Configuration", "write": "Manage System Configuration" }
+      "tenant": {
+        "read": "View Tenants",
+        "write": "Manage Tenants"
+      },
+      "user": {
+        "read": "View Users",
+        "write": "Manage Users"
+      },
+      "role": {
+        "read": "View Roles",
+        "write": "Manage Roles"
+      },
+      "knowledge": {
+        "read": "View Knowledge",
+        "write": "Edit Knowledge"
+      },
+      "service": {
+        "read": "View Services",
+        "write": "Manage Services"
+      },
+      "model": {
+        "read": "View Models",
+        "write": "Manage Models"
+      },
+      "system": {
+        "read": "View System Configuration",
+        "write": "Manage System Configuration"
+      }
     }
   },
   "dataSource": {
@@ -592,15 +636,17 @@
     "placeholderNewPassword": "Leave blank to keep current password",
     "placeholderPassword": "Please set password",
     "placeholderUsername": "Login username",
-    "requiredPassword": "Please enter a password",
-    "requiredUsername": "Please enter a username",
     "requiredDisplayName": "Please enter display name",
     "requiredEmail": "Please enter an email",
+    "requiredPassword": "Please enter a password",
     "requiredRole": "Please select a role",
+    "requiredTenant": "Please select a tenant",
+    "requiredUsername": "Please enter a username",
     "role": "Role",
     "roleUser": "Regular User",
     "saveFailed": "Save failed",
     "searchUsers": "Search users...",
+    "tenant": "Tenant",
     "tenantList": "Tenant List",
     "title": "Users",
     "updated": "Updated",

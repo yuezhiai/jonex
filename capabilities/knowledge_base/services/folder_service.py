@@ -9,7 +9,7 @@ from jonex_core.common.exceptions import ResourceConflictError, ResourceNotFound
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
-from ..repository.document_repository import KnowledgeDocumentRepository
+from ..repository.document_repository import KnowledgeDocumentRepository, UNCLASSIFIED_SENTINEL
 from ..repository.folder_repository import FolderRepository
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
 
@@ -22,15 +22,25 @@ class FolderService:
         await KnowledgeInfoRepository(session).get_required(kb_id, tenant_id)
 
     async def list_folders(self, tenant_id: str, knowledge_base_id: str) -> dict:
-        """列出 KB 下所有未删文件夹（按 D-07/D-08 排序）。"""
+        """列出 KB 下所有未删文件夹，附带各目录文档数与未分类文档数。"""
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             await self._ensure_kb(session, knowledge_base_id, tenant_id)
             repo = FolderRepository(session)
             items = await repo.list_by_kb(tenant_id, knowledge_base_id)
+            counts = await KnowledgeDocumentRepository(session).count_by_folder(
+                tenant_id, knowledge_base_id
+            )
+            uncategorized = counts.pop(UNCLASSIFIED_SENTINEL, 0)
+            result_items = []
+            for f in items:
+                d = f.to_dict()
+                d["document_count"] = counts.get(f.id, 0)
+                result_items.append(d)
             return {
-                "items": [f.to_dict() for f in items],
-                "total": len(items),
+                "items": result_items,
+                "total": len(result_items),
+                "uncategorized_count": uncategorized,
             }
 
     async def create_folder(self, tenant_id: str, data: dict) -> dict:

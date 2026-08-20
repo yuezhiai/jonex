@@ -5,9 +5,10 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from jonex_core.common.exceptions import ResourceNotFoundError, ResourceConflictError
+from jonex_core.common.exceptions import ResourceNotFoundError, ResourceConflictError, PermissionDeniedError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
+from jonex_core.security.permission import invalidate_users_permissions
 from capabilities.platform.models.role import Role
 from capabilities.platform.repository.permission_repository import PermissionRepository
 from capabilities.platform.repository.role_repository import RoleRepository
@@ -114,13 +115,24 @@ class RoleService:
         )  # 原消息: 角色不存在: {role_id}
         return list(await self.role_perm_repo.get_permission_ids(tenant_id, role_id))
 
-    async def set_permissions(self, tenant_id: str, role_id: int, permission_ids: list[int]) -> None:
+    async def set_permissions(
+        self,
+        tenant_id: str,
+        role_id: int,
+        permission_ids: list[int],
+        operator_permissions: set[str] | None = None,
+    ) -> None:
         tenant_id = require_tenant(tenant_id)
         role = await self.repo.get_by_id(role_id, tenant_id)
         if not role or role.is_deleted:
             raise ResourceNotFoundError(
             message=translate("err.role.not_found", params={"role_id": str(role_id)}, fallback=f"角色不存在: {role_id}")
         )  # 原消息: 角色不存在: {role_id}
+
+        if role.is_system == 1:
+            raise PermissionDeniedError(
+                message=translate("err.role.system_role_immutable", fallback="系统角色不可修改权限")
+            )
 
         normalized_permission_ids = list(dict.fromkeys(permission_ids))
         for permission_id in normalized_permission_ids:
@@ -129,13 +141,31 @@ class RoleService:
                 raise ResourceNotFoundError(
                 message=translate("err.permission.not_found", params={"permission_id": str(permission_id)}, fallback=f"权限不存在: {permission_id}")
             )  # 原消息: 权限不存在: {permission_id}
+            # 权限码驱动：仅当前操作者持有 platform:admin 时可授予平台级权限码
+            if getattr(permission, "scope", "tenant") == "platform" and "platform:admin" not in (operator_permissions or set()):
+                raise PermissionDeniedError(
+                    message=translate("err.permission.platform_scope_forbidden", fallback="平台级权限仅平台管理员可授予")
+                )
 
-        await self.role_perm_repo.set_permissions(
-            tenant_id,
-            role_id,
-            normalized_permission_ids,
-        )
+        await self.role_perm_repo.set_permissions(tenant_id, role_id, normalized_permission_ids)
+        # 角色维度失效：服务层用自身 session 取该角色用户 ids（勿在内核另开连接）
+        user_ids = list(await self.user_role_repo.get_users_for_role(tenant_id, role_id))
+        await invalidate_users_permissions(tenant_id, user_ids)
         logger.info(f"设置角色权限: role_id={role_id}, perms={normalized_permission_ids}")
+
+    async def set_users(self, tenant_id: str, role_id: int, user_ids: list[int]) -> None:
+        """分配角色的用户集合（delete-then-insert）。"""
+        tenant_id = require_tenant(tenant_id)
+        role = await self.repo.get_by_id(role_id, tenant_id)
+        if not role or role.is_deleted:
+            raise ResourceNotFoundError(
+            message=translate("err.role.not_found", params={"role_id": str(role_id)}, fallback=f"角色不存在: {role_id}")
+        )  # 原消息: 角色不存在: {role_id}
+
+        normalized_user_ids = list(dict.fromkeys(user_ids))
+        await self.user_role_repo.set_users_for_role(tenant_id, role_id, normalized_user_ids)
+        await invalidate_users_permissions(tenant_id, normalized_user_ids)
+        logger.info(f"设置角色用户: role_id={role_id}, users={normalized_user_ids}")
 
     async def get_users(self, tenant_id: str, role_id: int) -> list[int]:
         tenant_id = require_tenant(tenant_id)

@@ -11,6 +11,7 @@ from .ontology_service import OntologyService
 from .ontology_synonym_service import OntologySynonymService
 from .parse_result_service import ParseResultService
 from .parser_setting_service import ParserSettingService
+from .llm_wiki_schema_service import LlmWikiSchemaService
 from .reconciliation_service import ReconciliationService
 from .search_feedback_service import SearchFeedbackService
 from .search_history_service import SearchHistoryService
@@ -33,6 +34,7 @@ class KnowledgeBaseService:
         self.ontology = OntologyService()
         self.reconciliation = ReconciliationService()
         self.compiler = OntologyCompiler()
+        self.llm_wiki_schemas = LlmWikiSchemaService()
         self.synonyms = OntologySynonymService()
 
 

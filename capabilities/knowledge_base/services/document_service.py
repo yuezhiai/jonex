@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -22,13 +23,29 @@ from jonex_core.common.exceptions import (
 )
 from jonex_core.common.i18n import translate
 from jonex_core.common.neo4j_client import get_neo4j_driver
-from jonex_core.common.object_storage import build_object_key, get_object_storage, get_object_storage_for
+from jonex_core.common.object_storage import (
+    build_asset_key,  # [jonex] §image-refs P2-2: 图片资产对象键
+    build_object_key,
+    get_object_storage,
+    get_object_storage_for,
+)
 from jonex_core.common.tenant import require_tenant
 
 from ..models import DocStatus, DocumentTag, KnowledgeDocument, OntologyStatus
 from ..models.data_source import KnowledgeDataSource
-from ..repository import FolderRepository, KnowledgeDocumentRepository, OntologyGraphRepository
-from ..dtos import DocumentListRequest, DocumentScopeRequest, DocumentUploadRequest, SetDocumentFolderRequest
+from ..repository import (
+    FolderRepository,
+    KnowledgeDocumentRepository,
+    OntologyGraphRepository,
+    UNCLASSIFIED_SENTINEL,
+)
+from ..dtos import (
+    BatchMoveDocumentsRequest,
+    DocumentListRequest,
+    DocumentScopeRequest,
+    DocumentUploadRequest,
+    SetDocumentFolderRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +75,48 @@ _PHASE_PREDICATE = {
     ),
 }
 
+# [jonex] openkb 文档的编译状态谓词：openkb 不抽本体（ontology_status 恒 READY，
+# reconciliation 强制），编译状态唯一事实来源是 llm_wiki_compile_status
+# （NULL=未编译 / stale=已过期待重编 / compiling / compiled / failed）。
+# 解析类 phase（pending_parse/parsing/ingesting/parse_failed）与 lightrag 一致（status 列语义相同），
+# 仅覆盖编译 4 个 phase。供 list_documents / documents_stats 按 kb_type 分流使用。
+_OPENKB_PHASE_PREDICATE = {
+    **_PHASE_PREDICATE,
+    "pending_compile": lambda: and_(
+        KnowledgeDocument.status == DocStatus.READY.value,
+        or_(
+            KnowledgeDocument.llm_wiki_compile_status.is_(None),
+            KnowledgeDocument.llm_wiki_compile_status == "stale",
+        ),
+    ),
+    "compiling": lambda: and_(
+        KnowledgeDocument.status == DocStatus.READY.value,
+        KnowledgeDocument.llm_wiki_compile_status == "compiling",
+    ),
+    "compiled": lambda: and_(
+        KnowledgeDocument.status == DocStatus.READY.value,
+        KnowledgeDocument.llm_wiki_compile_status == "compiled",
+    ),
+    "compile_failed": lambda: and_(
+        KnowledgeDocument.status == DocStatus.READY.value,
+        KnowledgeDocument.llm_wiki_compile_status == "failed",
+    ),
+}
 
-def _phase_condition(phases: Optional[list[str]]):
-    """多值 phase → OR-of-AND 谓词；无有效 phase 返回 None。"""
+
+def _phase_condition(phases: Optional[list[str]], predicates: Optional[dict] = None):
+    """多值 phase → OR-of-AND 谓词；无有效 phase 返回 None。
+
+    predicates 默认 lightrag 语义（_PHASE_PREDICATE）；openkb KB 由调用方传入
+    _OPENKB_PHASE_PREDICATE（编译 phase 按 llm_wiki_compile_status 过滤）。
+    """
     if not phases:
         return None
-    preds = [_PHASE_PREDICATE[p]() for p in phases if p in _PHASE_PREDICATE]
-    if not preds:
+    preds = predicates if predicates is not None else _PHASE_PREDICATE
+    conds = [preds[p]() for p in phases if p in preds]
+    if not conds:
         return None
-    return or_(*preds) if len(preds) > 1 else preds[0]
+    return or_(*conds) if len(conds) > 1 else conds[0]
 
 
 def _file_ext(file_name: str) -> str:
@@ -106,6 +156,51 @@ def _audit_user_id(user_id: Optional[str]) -> Optional[int]:
     if user_id and user_id.isdigit():
         return int(user_id)
     return None
+
+
+# ── [jonex] §table-grid-v2 O7: 新旧格式 chunk 指纹 ──
+# （docs/table-parsing-retrieval-governance-plan.md §11.3：表格格式一变，
+#   content_doc_id 全变；reparse_strict 删除失败时新旧格式会在向量库共存，
+#   检索结果混入旧格式碎片且很难察觉。）
+
+_STALE_COL_RE = re.compile(r"col_\d+")
+# C2 的硬切残片形态多样：完整 <table>、以及被 token 硬切出的 <td/<th 行片
+# （如「>\n</tr><tr>\n<td>泰国</td>」）。只认开标签，</tr> 等闭合标签在代码
+# 示例里太常见，不纳入。
+_STALE_RAW_TABLE_RE = re.compile(r"<table|<td|<th", re.IGNORECASE)
+
+
+def _is_stale_table_chunk(content: str, file_path: str) -> tuple[bool, str]:
+    """O7 格式指纹：判定一个 chunk 是否属「旧格式表格」残留。
+
+    新格式表格 chunk 必带 ``table_sig=``（file_source 旁路，§20 写入）——
+    即使 L2 表头推断兜底产出了 ``col_N`` 列名，也不判旧格式。
+    旧格式指纹：file_source 无 ``table_sig`` 且（正文含 ``col_`` 占位 或
+    裸 ``<table`` 标签残片）。
+
+    豁免（本地 reparse 实测校准，2026-08-14）：
+    - ``ctype=table_summary``：摘要文本描述「列名清单：col_0、col_1…」会含
+      col_N 字样，属正常文字而非占位残留；
+    - 正文含 ``data-jonex-native`` 标记：xlsx 主轨产出的新格式 fallback
+      HTML（单行表归一化无数据 → 裸 HTML 入库，是既定行为）。
+
+    Returns:
+        ``(is_stale, reason)``，reason ∈ ``""`` / ``"col_placeholder"`` /
+        ``"raw_html_table"``。
+    """
+    parsed = parse_file_source(file_path) if file_path else {}
+    if parsed.get("table_sig"):
+        return False, ""
+    if parsed.get("chunk_type") == "table_summary":
+        return False, ""
+    content = content or ""
+    if "data-jonex-native" in content:
+        return False, ""
+    if _STALE_COL_RE.search(content):
+        return True, "col_placeholder"
+    if _STALE_RAW_TABLE_RE.search(content):
+        return True, "raw_html_table"
+    return False, ""
 
 
 class DocumentService:
@@ -176,7 +271,6 @@ class DocumentService:
                         "FROM knowledge_base.knowledge_parser_settings ps "
                         "JOIN business_domain.parser_configs pc "
                         "  ON pc.id = ps.parser_config_id "
-                        " AND pc.tenant_id = ps.tenant_id "
                         " AND pc.is_deleted = 0 "
                         " AND pc.status = 'active' "
                         "WHERE ps.tenant_id = :tid "
@@ -268,9 +362,9 @@ class DocumentService:
                 row = (await session.execute(
                     _sql_text(
                         "SELECT updated_at FROM business_domain.parser_configs "
-                        "WHERE id = :id AND tenant_id = :tid"
+                        "WHERE id = :id"
                     ),
-                    {"id": preset, "tid": tenant_id},
+                    {"id": preset},
                 )).fetchone()
                 if row and row.updated_at:
                     parser_ts = row.updated_at.isoformat()
@@ -595,6 +689,57 @@ class DocumentService:
             "presigned_url": presigned or "",
         }
 
+    async def get_asset_raw_location(self, tenant_id: str, document_id: str,
+                                     image_idx: int, ext: str = "",
+                                     knowledge_base_id: str = "") -> dict:
+        """[jonex] §image-refs P2-2: 获取文档内嵌图片资产的原文位置信息。
+
+        与 get_raw_location 同构的租户归属校验（get_required + 可选 KB 校验）：
+        - cos：返回 presigned_url，gateway 302 直跳；
+        - local：presigned_url 为空，返回 storage_key，gateway 用 FileResponse
+          从共享卷流式返回。
+
+        对象键由 build_asset_key(tenant, doc.kb, document_id, image_idx, ext)
+        派生；ext 经白名单归一（非白名单按 png），空 ext 抛 InvalidParameterError
+        （不存在该资产的合法键——未上传/上传失败时检索侧本就不会给出 aext）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_required(document_id, tenant_id)
+        if knowledge_base_id and doc.knowledge_base_id != knowledge_base_id:
+            raise PermissionDeniedError(
+                message=f"文档 {document_id} 不属于知识库 {knowledge_base_id}",
+                details={"document_id": document_id, "knowledge_base_id": knowledge_base_id,
+                         "actual_kb": doc.knowledge_base_id},
+            )
+        try:
+            key = build_asset_key(
+                tenant_id, doc.knowledge_base_id, document_id, image_idx, ext,
+            )
+        except ValueError as exc:
+            raise InvalidParameterError(
+                message=f"图片资产扩展名无效: {document_id}/img_{image_idx}",
+                details={"document_id": document_id, "image_idx": image_idx},
+            ) from exc
+        # [jonex] review 修正（§image-refs）：资产后端与文档原文后端解耦——
+        # 上传（AssetUploadStage）与检索富化（_build_references）都走平台全局
+        # 后端 get_object_storage()，raw 端点必须同源。若按 doc.storage_backend
+        # 选后端，后端从 local 切 cos 后 reparse 历史文档（storage_backend 仍
+        # local）会出现「资产实际在 cos、端点走 local」的错配 404。
+        # 全局后端为 local 时 presigned_url 恒为空串，gateway 自动落 FileResponse。
+        storage = get_object_storage()
+        backend = os.getenv("OBJECT_STORAGE_BACKEND", "local").strip().lower()
+        presigned = await storage.presigned_url(key, tenant_id, expires=300) or ""
+        safe_ext = key.rsplit(".", 1)[-1].lower()  # 白名单归一后的扩展名
+        return {
+            "storage_backend": backend,
+            "storage_key": key,
+            "mime_type": f"image/{safe_ext}",
+            "file_name": f"img_{image_idx}.{safe_ext}",
+            "presigned_url": presigned or "",
+        }
+
     async def get_raw_url(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "",
                           user_id: Optional[str] = None, username: Optional[str] = None,
                           ip: Optional[str] = None, mcp_key_id: Optional[str] = None) -> str:
@@ -718,6 +863,12 @@ class DocumentService:
                 "char_start": parsed.get("char_start"),
                 "char_end": parsed.get("char_end"),
                 "chunk_index": parsed.get("chunk_index"),
+                # [jonex] §table-ctypes / L4.1: 表格元数据旁路透出
+                "chunk_type": parsed.get("chunk_type"),
+                "table_sig": parsed.get("table_sig"),
+                "table_cols": parsed.get("table_cols"),
+                "row_start": parsed.get("row_start"),
+                "row_end": parsed.get("row_end"),
             })
         return {
             "doc_id": result.get("doc_id", document_id),
@@ -726,6 +877,143 @@ class DocumentService:
         }
 
     def _get_openkb_chunks(self, document_id: str) -> dict:
+        """[jonex] OpenKB 文档的 chunk 视图：读共享卷 parsed markdown 按块返回。
+
+        OpenKB 管线只解析产出 markdown（parse_only），不入 LightRAG，因此 chunks
+        不在 LightRAG。解析产物由 atomic-rag 写到共享卷 inputs/parsed/{doc}/content.md
+        （knowledge-base 亦挂载该卷于 KB_INPUT_DIR），这里直接读取并按空行分块返回，
+        与 LightRAG chunks 返回结构对齐（content + chunk_index + 位置占位）。
+
+        [jonex] 回归修复（2026-08-14）：8697e5c1（rag-table 治理）误将此方法替换为
+        scan_stale_chunks，而 get_document_chunks/get_chunk 的调用未同步——
+        openkb 文档 chunks 查询抛 AttributeError。恢复原实现。
+        """
+        import os
+        from pathlib import Path
+
+        inputs_root = os.getenv("KB_INPUT_DIR", "/app/inputs")
+        md_path = Path(inputs_root) / "parsed" / document_id / "content.md"
+        if not md_path.is_file():
+            return {"doc_id": document_id, "total": 0, "chunks": [], "kb_type": "openkb"}
+
+        text = md_path.read_text(encoding="utf-8")
+        blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+        chunks = [
+            {
+                "chunk_id": f"{document_id}#openkb-{i}",
+                "content": b,
+                # 与 LightRAG chunk 结构对齐：前端解析结果页依赖 content_summary/file_path
+                # （getChunkTitle 会读取二者）。OpenKB 无 file_source 锚点，file_path 置空串
+                # 而非缺省，避免前端 `.match()` 到 undefined。
+                "content_summary": b,
+                "file_path": f"doc={document_id}",
+                "chunk_index": i,
+                "time_start": None,
+                "time_end": None,
+                "page_no": None,
+                "char_start": None,
+                "char_end": None,
+            }
+            for i, b in enumerate(blocks)
+        ]
+        return {
+            "doc_id": document_id,
+            "total": len(chunks),
+            "chunks": chunks,
+            "kb_type": "openkb",
+        }
+
+    async def scan_stale_chunks(self, tenant_id: str, document_id: str) -> dict:
+        """[jonex] §table-grid-v2 O7: reparse 后置残留扫描。
+
+        按 ``doc=<document_id>`` 扫 LightRAG chunk 列表，用格式指纹
+        （:func:`_is_stale_table_chunk`）统计旧格式表格 chunk 残留。
+        reparse_strict 删除旧 doc 失败时新旧格式共存，本扫描是唯一可观测通道。
+        """
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_required(document_id, tenant_id)
+
+        result = await get_rag_client().get_doc_chunks(
+            document_id=document_id,
+            knowledge_base_id=doc.knowledge_base_id,
+            tenant_id=tenant_id,
+        )
+        chunks = result.get("chunks") or []
+        stale = []
+        for c in chunks:
+            is_stale, reason = _is_stale_table_chunk(
+                c.get("content", ""), c.get("file_path", ""),
+            )
+            if is_stale:
+                stale.append({
+                    "chunk_id": c.get("chunk_id"),
+                    "reason": reason,
+                    "preview": (c.get("content") or "")[:120],
+                })
+        return {
+            "doc_id": document_id,
+            "total": len(chunks),
+            "stale_chunk_count": len(stale),
+            "stale_chunks": stale,
+        }
+
+    async def purge_stale_chunks(self, tenant_id: str, document_id: str) -> dict:
+        """[jonex] §table-grid-v2 O7: 按格式指纹定点清理旧格式 chunk。
+
+        避免整篇重推（reparse 的代价是 LLM 抽取全量重跑）；只删命中指纹的
+        chunk（chunk 即 LightRAG doc，逐 chunk_id delete）。并发上限 5。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scan = await self.scan_stale_chunks(tenant_id, document_id)
+        stale_ids = [
+            s.get("chunk_id") for s in scan.get("stale_chunks", [])
+            if s.get("chunk_id")
+        ]
+        if not stale_ids:
+            return {
+                "doc_id": document_id,
+                "purged": 0,
+                "failed": 0,
+                "total": scan.get("total", 0),
+            }
+
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_required(document_id, tenant_id)
+
+        rag = get_rag_client()
+        sem = asyncio.Semaphore(5)
+        results: list[tuple[str, bool]] = []
+
+        async def _purge_one(chunk_id: str) -> None:
+            async with sem:
+                try:
+                    # [jonex] O7 主路径：孤儿清理（同步删 text_chunks/向量/
+                    # full_docs，返回真实结果）。doc 级删除是 fire-and-forget
+                    # （HTTP 立即返回 deletion_started，后台 not found 无感知），
+                    # 不能作为定点清理的判据。
+                    ok = await rag.delete_orphan_chunk(
+                        chunk_id, tenant_id,
+                        knowledge_base_id=doc.knowledge_base_id,
+                    )
+                    results.append((chunk_id, bool(ok)))
+                except Exception as exc:  # noqa: BLE001 — 单 chunk 失败不阻断批量
+                    logger.warning(
+                        "O7 purge-stale chunk %s failed: %s", chunk_id, exc,
+                    )
+                    results.append((chunk_id, False))
+
+        await asyncio.gather(*[_purge_one(cid) for cid in stale_ids])
+        failed = [cid for cid, ok in results if not ok]
+        return {
+            "doc_id": document_id,
+            "purged": len(stale_ids) - len(failed),
+            "failed": len(failed),
+            "failed_chunk_ids": failed,
+            "total": scan.get("total", 0),
+        }
         """[jonex] OpenKB 文档的 chunk 视图：读共享卷 parsed markdown 按块返回。
 
         OpenKB 管线只解析产出 markdown（parse_only），不入 LightRAG，因此 chunks
@@ -982,6 +1270,14 @@ class DocumentService:
             extra = dict(doc.extra_metadata or {})
             if current_hash:
                 extra["source_content_hash"] = current_hash
+                # [jonex] 列回填：content_hash 列是去重查询的单一事实来源
+                # （_find_duplicate 只查列）——存量文档列恒 NULL 时去重对它失效。
+                # reparse 重算后顺带写列，之后该文档重新纳入同 KB 去重范围
+                doc.content_hash = current_hash
+            elif not doc.content_hash and extra.get("source_content_hash"):
+                # 无 current_hash（force 或 hash 计算失败 fail-open）但 extra 有旧值：
+                # 免重算迁移到列（旧值来自上一次成功的 reparse 计算，可信）
+                doc.content_hash = extra["source_content_hash"]
             if cfg_hash:
                 extra["config_fingerprint"] = cfg_hash
             # [jonex] openkb：reparse 开始时把编译结果标为 stale（旧 Wiki 已过期），
@@ -991,6 +1287,9 @@ class DocumentService:
                 doc.llm_wiki_compile_status = "stale"
                 doc.llm_wiki_compile_error = None
                 doc.llm_wiki_compile_warnings = None
+                # [jonex] 清旧编译 task_id：stale 窗口内读到的 task_id 是陈旧的
+                # （对应旧 Wiki 的编译任务）；补提交时 claim_compile 会重写
+                doc.llm_wiki_task_id = None
                 extra["openkb_compile_status"] = "stale"
                 extra.pop("openkb_compile_error", None)
                 extra.pop("openkb_compile_warnings", None)
@@ -1128,8 +1427,13 @@ class DocumentService:
         req = DocumentListRequest(**_payload(request))
         offset = (req.page - 1) * req.page_size
 
+        # [jonex] openkb KB：编译 phase 按 llm_wiki_compile_status 过滤（_OPENKB_PHASE_PREDICATE），
+        # 否则 ontology_status 恒 READY → compiled 全命中 / compiling、compile_failed 筛不到
+        kb_type = await self._get_kb_type(tenant_id, req.knowledge_base_id)
+        predicates = _OPENKB_PHASE_PREDICATE if kb_type == "openkb" else _PHASE_PREDICATE
+
         conditions = []
-        phase_cond = _phase_condition(req.phase)
+        phase_cond = _phase_condition(req.phase, predicates)
         if phase_cond is not None:
             # phase 优先：线性状态多选，翻译为 (status, ontology_status) 谓词
             conditions.append(phase_cond)
@@ -1146,7 +1450,9 @@ class DocumentService:
                     KnowledgeDocument.file_path.ilike(pattern),
                 )
             )
-        if req.folder_id:
+        if req.folder_id == UNCLASSIFIED_SENTINEL:
+            conditions.append(KnowledgeDocument.folder_id.is_(None))
+        elif req.folder_id:
             conditions.append(KnowledgeDocument.folder_id == req.folder_id)
         conditions.append(KnowledgeDocument.knowledge_base_id == req.knowledge_base_id)
 
@@ -1178,6 +1484,11 @@ class DocumentService:
         req = DocumentScopeRequest(**_payload(request))
         base = [KnowledgeDocument.knowledge_base_id == req.knowledge_base_id]
 
+        # [jonex] openkb KB：四桶按 llm_wiki_compile_status 判定（ontology_status 恒 READY
+        # 不可用）；lightrag 维持 ontology_status 语义。与 _OPENKB_PHASE_PREDICATE 同源。
+        kb_type = await self._get_kb_type(tenant_id, req.knowledge_base_id)
+        is_openkb = kb_type == "openkb"
+
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
 
@@ -1186,37 +1497,68 @@ class DocumentService:
 
             # 互斥四桶（相加 = total）：每个文档恰好落进一桶，避免嵌套指标的对账困惑。
             # 处理中：待解析/解析中/入库中/待编译/编译中（还在跑）
-            processing = await _count([
-                or_(
-                    KnowledgeDocument.status.in_([
-                        DocStatus.PENDING.value,
-                        DocStatus.PARSING.value,
-                        DocStatus.INGESTING.value,
-                    ]),
+            if is_openkb:
+                processing = await _count([
+                    or_(
+                        KnowledgeDocument.status.in_([
+                            DocStatus.PENDING.value,
+                            DocStatus.PARSING.value,
+                            DocStatus.INGESTING.value,
+                        ]),
+                        and_(
+                            KnowledgeDocument.status == DocStatus.READY.value,
+                            or_(
+                                KnowledgeDocument.llm_wiki_compile_status.is_(None),
+                                KnowledgeDocument.llm_wiki_compile_status == "stale",
+                                KnowledgeDocument.llm_wiki_compile_status == "compiling",
+                            ),
+                        ),
+                    )
+                ])
+                completed = await _count([
                     and_(
                         KnowledgeDocument.status == DocStatus.READY.value,
-                        KnowledgeDocument.ontology_status.in_([
-                            OntologyStatus.PENDING.value,
-                            OntologyStatus.EXTRACTING.value,
+                        KnowledgeDocument.llm_wiki_compile_status == "compiled",
+                    )
+                ])
+                compile_failed = await _count([
+                    and_(
+                        KnowledgeDocument.status == DocStatus.READY.value,
+                        KnowledgeDocument.llm_wiki_compile_status == "failed",
+                    )
+                ])
+            else:
+                processing = await _count([
+                    or_(
+                        KnowledgeDocument.status.in_([
+                            DocStatus.PENDING.value,
+                            DocStatus.PARSING.value,
+                            DocStatus.INGESTING.value,
                         ]),
-                    ),
-                )
-            ])
-            # 已完成：解析+图谱都就绪
-            completed = await _count([
-                and_(
-                    KnowledgeDocument.status == DocStatus.READY.value,
-                    KnowledgeDocument.ontology_status == OntologyStatus.READY.value,
-                )
-            ])
-            # 编译失败：可搜索但图谱未建成
-            compile_failed = await _count([
-                and_(
-                    KnowledgeDocument.status == DocStatus.READY.value,
-                    KnowledgeDocument.ontology_status == OntologyStatus.FAILED.value,
-                )
-            ])
-            # 解析失败：不可用
+                        and_(
+                            KnowledgeDocument.status == DocStatus.READY.value,
+                            KnowledgeDocument.ontology_status.in_([
+                                OntologyStatus.PENDING.value,
+                                OntologyStatus.EXTRACTING.value,
+                            ]),
+                        ),
+                    )
+                ])
+                # 已完成：解析+图谱都就绪
+                completed = await _count([
+                    and_(
+                        KnowledgeDocument.status == DocStatus.READY.value,
+                        KnowledgeDocument.ontology_status == OntologyStatus.READY.value,
+                    )
+                ])
+                # 编译失败：可搜索但图谱未建成
+                compile_failed = await _count([
+                    and_(
+                        KnowledgeDocument.status == DocStatus.READY.value,
+                        KnowledgeDocument.ontology_status == OntologyStatus.FAILED.value,
+                    )
+                ])
+            # 解析失败：不可用（两类型语义一致）
             parse_failed = await _count([KnowledgeDocument.status == DocStatus.FAILED.value])
 
         # total 定义为四桶之和，恒等可对账（deleting/deleted 不计入）。
@@ -1389,11 +1731,14 @@ class DocumentService:
                     logger.warning("Failed to delete RAG document %s", rag_doc_id, exc_info=True)
 
         # 清理 Neo4j 本体图谱中该文档关联的实体节点和关系
-        try:
-            gdao = OntologyGraphRepository(get_neo4j_driver())
-            await gdao.delete_by_document(tenant_id, document_id)
-        except Exception:
-            logger.warning("Neo4j cleanup failed for document %s", document_id, exc_info=True)
+        # [jonex] openkb 文档从不写 Neo4j（parse_only 管线），跳过——纯多余调用
+        # （每次删除省一次 Neo4j 往返；Neo4j 不可用时也不再产生无关 warning）
+        if kb_type != "openkb":
+            try:
+                gdao = OntologyGraphRepository(get_neo4j_driver())
+                await gdao.delete_by_document(tenant_id, document_id)
+            except Exception:
+                logger.warning("Neo4j cleanup failed for document %s", document_id, exc_info=True)
 
         # 清理对象存储中的原始上传文件（COS / Local）
         if storage_key:
@@ -1465,6 +1810,52 @@ class DocumentService:
             doc.folder_id = folder_id
             await session.commit()
             return doc.to_dict()
+
+    async def batch_set_document_folder(
+        self, tenant_id: str, req: BatchMoveDocumentsRequest | dict
+    ) -> dict:
+        """批量设置文档文件夹归属（整体事务回滚 + 幂等跳过）。
+
+        - folder_id 非空：校验目标目录存在且属于同一 KB，否则整批拒绝；
+        - folder_id 为 None：批量移出到「未分类」；
+        - 已在目标目录的文档计入 skipped_count，不报错；
+        - 任一文档不存在/跨 KB 时整批回滚，details.document_id 指出具体项。
+        """
+        tenant_id = require_tenant(tenant_id)
+        data = _payload(req)
+        knowledge_base_id = data["knowledge_base_id"]
+        folder_id = data.get("folder_id")
+        document_ids = list(dict.fromkeys(data["document_ids"]))  # 保序去重
+
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+
+            # 目标目录校验（非空才校验；None = 移出到未分类）
+            if folder_id:
+                folder = await FolderRepository(session).get_required(folder_id, tenant_id)
+                if folder.knowledge_base_id != knowledge_base_id:
+                    raise ResourceNotFoundError(
+                        message=translate("err.folder.not_belong_to_kb", fallback="文件夹不属于该知识库"),
+                        details={"folder_id": folder_id, "knowledge_base_id": knowledge_base_id},
+                    )
+
+            moved = 0
+            skipped = 0
+            for doc_id in document_ids:
+                doc = await repo.get_by_id(doc_id, tenant_id)  # get_by_id 已过滤 is_deleted=0
+                if doc is None or doc.knowledge_base_id != knowledge_base_id:
+                    raise ResourceNotFoundError(
+                        message=translate("err.doc.not_found", fallback="知识文档不存在"),
+                        details={"document_id": doc_id, "knowledge_base_id": knowledge_base_id},
+                    )
+                if doc.folder_id == folder_id:
+                    skipped += 1
+                    continue
+                doc.folder_id = folder_id
+                moved += 1
+
+            await session.commit()
+            return {"moved_count": moved, "skipped_count": skipped, "folder_id": folder_id}
 
     async def _lookup_rag_doc_ids(
         self,

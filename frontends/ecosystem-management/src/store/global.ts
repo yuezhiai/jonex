@@ -10,7 +10,7 @@ interface GlobalState {
 
 export const useGlobalStore = create<GlobalState>((set) => ({
   locale: getItem<string>('locale') || 'zh',
-  userInfo: getItem<Record<string, unknown>>('userInfo') || null,
+  userInfo: getItem<Record<string, unknown>>('jonex_user') || null,
 
   setLocale: (lang) => {
     set({ locale: lang });
@@ -19,6 +19,6 @@ export const useGlobalStore = create<GlobalState>((set) => ({
 
   setUserInfo: (data) => {
     set({ userInfo: data });
-    setItem('userInfo', data);
+    setItem('jonex_user', data);
   },
 }));

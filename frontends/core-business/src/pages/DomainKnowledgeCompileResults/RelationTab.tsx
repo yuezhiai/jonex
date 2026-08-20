@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { Table, Button, Space, Popconfirm, message, Input } from 'antd';
 import { EditOutlined, DeleteOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
@@ -18,6 +19,7 @@ interface RelationTabProps {
 }
 
 export default function RelationTab({ kbId, docId, data, title: propTitle }: RelationTabProps) {
+  const { canWrite } = useKbPermission(kbId);
   const { t } = useTranslation();
   const title = propTitle ?? t('compile.relationType');
 
@@ -255,17 +257,32 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
       align: 'center',
       render: (_: unknown, record: RelationInstanceRow) => (
         <Space size="small">
-          <Button type="text" size="small" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            type="text"
+            size="small"
+            icon={<EditOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => openEdit(record)}
+          >
             {t('common.edit')}
           </Button>
           <Popconfirm
             title={t('common.confirmDelete')}
             description={t('common.deleteRelationConfirm')}
+            disabled={!canWrite}
             onConfirm={() => handleDelete(record)}
             okText={t('common.confirm')}
             cancelText={t('common.cancel')}
           >
-            <Button type="text" size="small" danger icon={<DeleteOutlined />}>
+            <Button
+              type="text"
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              disabled={!canWrite}
+              title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            >
               {t('common.delete')}
             </Button>
           </Popconfirm>
@@ -303,7 +320,14 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
             }}
             allowClear
           />
-          <Button type="primary" size="small" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlusOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={openCreate}
+          >
             {t('compile.relation.createBtn')}
           </Button>
         </div>

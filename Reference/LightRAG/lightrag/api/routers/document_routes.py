@@ -4108,6 +4108,43 @@ def create_document_routes(
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
+    # ── [jonex] §table-grid-v2 O7: 孤儿 chunk 强制清理 ──────────────────
+    # reparse 删除未收敛的残留 chunk 在 doc_status 中无记录（doc 级删除
+    # 「Document xxx not found」直接返回，text_chunks/向量永不清理）。
+    # 本端点按 chunk_id 直删三层存储，不依赖 doc_status。
+
+    @router.delete(
+        "/chunks/{chunk_id}",
+        dependencies=[Depends(combined_auth)],
+        summary="[jonex] O7 按 chunk_id 强制清理孤儿 chunk（不依赖 doc_status）",
+    )
+    async def delete_orphan_chunk(
+        chunk_id: str,
+        http_request: Request = None,  # [jonex] workspace 解析
+    ):
+        rag = await _resolve_rag(http_request)
+        deleted: dict[str, bool] = {
+            "text_chunks": False, "vector": False, "full_docs": False,
+        }
+        for label, storage in (
+            ("text_chunks", rag.text_chunks),
+            ("vector", rag.chunks_vdb),
+            ("full_docs", rag.full_docs),
+        ):
+            try:
+                await storage.delete([chunk_id])
+                deleted[label] = True
+            except Exception as e:  # noqa: BLE001 — 分层清理尽力而为
+                logger.warning(
+                    "[jonex] O7 orphan chunk %s delete %s failed: %s",
+                    chunk_id, label, e,
+                )
+        return {
+            "status": "success",
+            "chunk_id": chunk_id,
+            "deleted": deleted,
+        }
+
     return router
 
 

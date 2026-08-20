@@ -85,7 +85,7 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
         g6Graph = new G6Graph({
           container: containerRef.current,
           width: containerRef.current.clientWidth,
-          height: Math.max(500, window.innerHeight - 380),
+          height: containerRef.current.clientHeight,
           layout: {
             type: 'force',
             preventOverlap: true,
@@ -154,7 +154,7 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
     const handleResize = () => {
       if (graphRef.current && containerRef.current) {
         try {
-          graphRef.current.setSize(containerRef.current.clientWidth, Math.max(500, window.innerHeight - 380));
+          graphRef.current.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
         } catch {
           // ignore
         }
@@ -166,7 +166,7 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
 
   if (loading) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 400 }}>
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 'calc(100vh - 290px)' }}>
         <Spin />
       </div>
     );
@@ -174,7 +174,7 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
 
   if (!data || !data.nodes.length) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 400 }}>
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 'calc(100vh - 290px)' }}>
         <Empty description={t('compile.emptyWikiGraph')} />
       </div>
     );
@@ -185,7 +185,8 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
       ref={containerRef}
       style={{
         width: '100%',
-        height: Math.max(500, window.innerHeight - 380),
+        height: 'calc(100vh - 290px)',
+        minHeight: 500,
         background: '#fafbfc',
         borderTop: '1px solid #f1f5f9',
       }}

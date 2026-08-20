@@ -29,7 +29,17 @@ export function writeRefreshToken(token?: string | null): void {
 }
 
 export function readCachedUser<T = unknown>(): T | null {
-  const raw = getStorage()?.getItem(JONEX_USER_KEY) || getStorage()?.getItem(LEGACY_USER_INFO_KEY);
+  const storage = getStorage();
+  if (!storage) return null;
+  let raw = storage.getItem(JONEX_USER_KEY);
+  if (raw === null) {
+    // 一次性迁移：历史遗留的 userInfo 旧键 → jonex_user（读后即迁并清除旧键）
+    raw = storage.getItem(LEGACY_USER_INFO_KEY);
+    if (raw !== null) {
+      storage.setItem(JONEX_USER_KEY, raw);
+      storage.removeItem(LEGACY_USER_INFO_KEY);
+    }
+  }
   if (!raw) return null;
   try {
     return JSON.parse(raw) as T;
@@ -39,9 +49,11 @@ export function readCachedUser<T = unknown>(): T | null {
 }
 
 export function writeCachedUser(user: unknown): void {
-  const raw = JSON.stringify(user);
-  getStorage()?.setItem(JONEX_USER_KEY, raw);
-  getStorage()?.setItem(LEGACY_USER_INFO_KEY, raw);
+  const storage = getStorage();
+  if (!storage) return;
+  // 统一只写 jonex_user；顺带清除历史残留的 userInfo 旧键
+  storage.setItem(JONEX_USER_KEY, JSON.stringify(user));
+  storage.removeItem(LEGACY_USER_INFO_KEY);
 }
 
 export function clearAuthStorage(options: { keepLocale?: boolean } = {}): void {

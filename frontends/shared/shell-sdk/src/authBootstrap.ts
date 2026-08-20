@@ -62,6 +62,12 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser | null {
   const tenantId = raw.tenant_id || raw.tenantId;
   const tenantName = raw.tenant_name || raw.tenantName;
   const roles = Array.isArray(raw.roles) ? raw.roles.map(String) : raw.role ? [String(raw.role)] : [];
+  // 幂等：同时兜底 snake_case（后端原始）与 camelCase（已归一化对象二次进入）
+  const isPlatformAdmin =
+    raw.is_platform_admin === true || (raw as Record<string, unknown>).isPlatformAdmin === true;
+  const isTenantAdmin =
+    raw.is_tenant_admin === true || (raw as Record<string, unknown>).isTenantAdmin === true;
+  const permissions: string[] = Array.isArray(raw.permissions) ? raw.permissions.map(String) : [];
 
   return {
     id: String(id),
@@ -70,6 +76,9 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser | null {
     tenantId: tenantId ? String(tenantId) : undefined,
     tenantName: tenantName ? String(tenantName) : undefined,
     roles,
+    isPlatformAdmin,
+    isTenantAdmin,
+    permissions,
   };
 }
 

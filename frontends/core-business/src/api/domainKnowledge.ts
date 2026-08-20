@@ -192,29 +192,49 @@ function mapKBItem(item: BackendKBItem): DomainKnowledgeItem {
     description: item.description || undefined,
     // [jonex] 知识库类型：列表/创建/更新响应都带，编辑弹窗与列表标签依赖它
     kbType: (item.kb_type as KnowledgeBaseType) || 'lightrag',
+    // 权限字段（KB 权限：管理权 + 写权限 + 授权共享标识）
+    can_manage_permissions: (item as unknown as Record<string, unknown>).can_manage_permissions === true,
+    can_write: (item as unknown as Record<string, unknown>).can_write === true,
+    grant_shared: (item as unknown as Record<string, unknown>).grant_shared === true,
   };
 }
 
-// TODO: KB 级权限后端暂未实现，先用 mock
-const _permMembers: DomainKnowledgePermissionMember[] = [
-  { userId: 'mock_perm_1', name: '张明远', dept: '技术部', avatarText: '张', avatarColor: '#3b82f6', role: 'manage' },
-  { userId: 'mock_perm_2', name: '李婷', dept: '产品部', avatarText: '李', avatarColor: '#10b981', role: 'view' },
-  { userId: 'mock_perm_3', name: '王建国', dept: '风控部', avatarText: '王', avatarColor: '#f59e0b', role: 'view' },
-];
+/** KB 授权成员（后端 kb_permissions 表；display_name 后端 join，前端不再拉 /users 拼名字） */
+interface BackendKbPermission {
+  user_id: string;
+  role: 'viewer' | 'editor';
+  display_name: string | null;
+  created_at: string | null;
+}
 
 export async function getDomainKnowledgePermissions(
   knowledgeBaseId: string,
   keyword?: string,
 ): Promise<{ knowledgeBaseId: string; members: DomainKnowledgePermissionMember[] }> {
-  const filtered = keyword ? _permMembers.filter((m) => m.name.includes(keyword)) : _permMembers;
-  return { knowledgeBaseId, members: filtered };
+  const result = await getData<{ permissions: BackendKbPermission[] }>(
+    request.get(`/knowledge-base/knowledge-info/${knowledgeBaseId}/permissions`),
+  );
+  let members: DomainKnowledgePermissionMember[] = (result.permissions ?? []).map((p) => ({
+    userId: p.user_id,
+    name: p.display_name || p.user_id.slice(0, 8),
+    dept: '',
+    avatarText: (p.display_name || p.user_id).charAt(0).toUpperCase(),
+    avatarColor: '#94a3b8',
+    role: p.role === 'editor' ? 'editor' : 'viewer',
+  }));
+  if (keyword) members = members.filter((m) => m.name.includes(keyword));
+  return { knowledgeBaseId, members };
 }
 
 export async function saveDomainKnowledgePermissions(
-  _knowledgeBaseId: string,
-  _payload: DomainKnowledgePermissionPayload,
+  knowledgeBaseId: string,
+  payload: DomainKnowledgePermissionPayload,
 ): Promise<boolean> {
-  // TODO: KB 级权限后端暂未实现，mock 直接返回成功
+  await getData(
+    request.put(`/knowledge-base/knowledge-info/${knowledgeBaseId}/permissions`, {
+      permissions: payload.members.map((m) => ({ user_id: m.userId, role: m.role })),
+    }),
+  );
   return true;
 }
 
@@ -240,6 +260,8 @@ export async function getDomainKnowledgeDetail(kbId: string): Promise<DomainKnow
     updatedAt: info.updated_at ? formatLocalDateTime(info.updated_at) : '—',
     ontologyDegraded: info.ontology_degraded ?? false,
     kbType: (info.kb_type as KnowledgeBaseType) || 'lightrag',
+    can_manage_permissions: (info as unknown as Record<string, unknown>).can_manage_permissions === true,
+    can_write: (info as unknown as Record<string, unknown>).can_write === true,
   };
 }
 
@@ -468,6 +490,7 @@ interface BackendDocItem {
   llm_wiki_compile_error?: string;
   data_source_type?: string;
   mime_type?: string;
+  folder_id?: string | null;
 }
 
 interface BackendDocListResponse {
@@ -525,9 +548,12 @@ function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, t: (key: st
     // [jonex] LLM-Wiki 编译状态（顶层字段；metadata 兼容旧 JSONB 读点）
     llmWikiCompileStatus: doc.llm_wiki_compile_status || (meta.openkb_compile_status as string) || undefined,
     llmWikiCompileError: doc.llm_wiki_compile_error || (meta.openkb_compile_error as string) || undefined,
+    // [jonex] 管线类型：metadata.kb_type（upload/reparse 时写入）——与 doc 详情同一次请求到达
+    kbType: (meta.kb_type as KnowledgeBaseType) || undefined,
     knowledgeBaseId,
     dataSourceType: doc.data_source_type,
     mimeType: doc.mime_type,
+    folder_id: doc.folder_id ?? null,
     mediaType: doc.mime_type && doc.mime_type.includes('video') ? 'video' : 'document',
   };
 }
@@ -574,12 +600,17 @@ export async function getManualDocList(
   };
 }
 
+export interface UploadDocumentOptions {
+  onUploadProgress?: (e: { loaded: number; total?: number }) => void;
+  signal?: AbortSignal;
+}
+
 export async function uploadManualDocument(
   knowledgeBaseId: string,
   file: File,
   folderId?: string,
   t?: (key: string) => string,
-  onUploadProgress?: (progressEvent: any) => void,
+  options?: UploadDocumentOptions,
 ): Promise<ManualDocItem> {
   const _t = t || ((key: string) => key);
   // if (useMock) return mockUploadManualDocument(knowledgeBaseId, file)  // 对接后端接口，不使用 mock
@@ -596,7 +627,8 @@ export async function uploadManualDocument(
     request.post('/knowledge-base/documents/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 300000,  // 5 min
-      onUploadProgress,
+      onUploadProgress: options?.onUploadProgress,
+      signal: options?.signal,
     }),
   );
 
@@ -1378,7 +1410,6 @@ export async function saveEngineSetting(kbId: string, semanticModel: string): Pr
 /** 获取全局解析器配置列表（business_domain 全局 parser_configs） */
 export interface ParserConfigItem {
   id: string;
-  tenant_id: string;
   name: string;
   parser_type: string;
   file_types: string[];
@@ -1847,7 +1878,7 @@ export async function deleteOntologyRelation(
 // 文件夹
 export function getFolderList(kbId: string): Promise<FolderListResponse> {
   return getData<FolderListResponse>(
-    request.get('/knowledge-base/knowledge-base/folders', {
+    request.get('/knowledge-base/folders', {
       params: {
         knowledge_base_id: kbId,
       },
@@ -1856,7 +1887,7 @@ export function getFolderList(kbId: string): Promise<FolderListResponse> {
 }
 
 export function createFolder(kbId: string, name: string): Promise<FolderItem> {
-  return postData<FolderItem>('/knowledge-base/knowledge-base/folders', {
+  return postData<FolderItem>('/knowledge-base/folders', {
     knowledge_base_id: kbId,
     name,
   });
@@ -1865,7 +1896,7 @@ export function createFolder(kbId: string, name: string): Promise<FolderItem> {
 export function renameFolder(folderId: string, kbId: string, name: string): Promise<FolderItem> {
   return getData<FolderItem>(
     request.patch(
-      `/knowledge-base/knowledge-base/folders/${folderId}`,
+      `/knowledge-base/folders/${folderId}`,
       { name },
       {
         params: { knowledge_base_id: kbId },
@@ -1876,10 +1907,29 @@ export function renameFolder(folderId: string, kbId: string, name: string): Prom
 
 export async function deleteFolder(folderId: string, kbId: string): Promise<void> {
   await getData(
-    request.delete(`/knowledge-base/knowledge-base/folders/${folderId}`, {
+    request.delete(`/knowledge-base/folders/${folderId}`, {
       params: { knowledge_base_id: kbId },
     }),
   );
+}
+
+export interface BatchMoveResult {
+  moved_count: number;
+  skipped_count: number;
+  folder_id: string | null;
+}
+
+/** 批量移动文档到指定目录；folderId 传 null 表示移出到未分类。 */
+export function batchMoveDocuments(
+  knowledgeBaseId: string,
+  documentIds: string[],
+  folderId: string | null,
+): Promise<BatchMoveResult> {
+  return putData<BatchMoveResult>('/knowledge-base/documents/folder', {
+    knowledge_base_id: knowledgeBaseId,
+    document_ids: documentIds,
+    folder_id: folderId,
+  });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1892,7 +1942,7 @@ export interface TagItem {
 
 export function getKnowledgeBaseTags(kbId: string): Promise<TagItem[]> {
   return getData<{ items: TagItem[] }>(
-    request.get('/knowledge-base/knowledge-base/tags', {
+    request.get('/knowledge-base/tags', {
       params: { knowledge_base_id: kbId },
     }),
   ).then((res) => res.items);
@@ -1903,7 +1953,7 @@ export function createKnowledgeBaseTag(data: {
   name: string;
   color: string;
 }): Promise<TagItem> {
-  return postData<TagItem>('/knowledge-base/knowledge-base/tags', data);
+  return postData<TagItem>('/knowledge-base/tags', data);
 }
 
 export function getDocumentTags(documentId: string, kbId: string): Promise<TagItem[]> {
@@ -2036,14 +2086,13 @@ export function getWikiRelationships(params: {
 
 /** Wiki 图谱（openkb 管线专用） */
 export function getWikiGraph(kbId: string, limit = 200, documentId?: string): Promise<WikiGraphData> {
+  // [jonex] documentId 缺省/空 = KB 级全库图谱（compile-results 页）；省略参数避免空串语义
+  const params: Record<string, unknown> = { knowledge_base_id: kbId, limit };
+  if (documentId) params.document_id = documentId;
   return getData<{
     nodes?: { id: string; name: string; type: string; description: string }[];
     edges?: { id: string; source: string; target: string }[];
-  }>(
-    request.get('/knowledge-base/parse-results/graph', {
-      params: { knowledge_base_id: kbId, limit, document_id: documentId || '' },
-    }),
-  ).then((res) => ({
+  }>(request.get('/knowledge-base/parse-results/graph', { params })).then((res) => ({
     nodes: res.nodes || [],
     edges: res.edges || [],
   }));
@@ -2068,12 +2117,13 @@ interface BackendWikiContents {
   document_id: string;
 }
 
-/** Wiki 页面树（openkb 管线专用，必传 documentId 按文档过滤编译产物） */
-export function getWikiContents(kbId: string, documentId: string): Promise<WikiContents> {
+/** Wiki 页面树（openkb 管线专用；documentId 缺省/空 = KB 级全库，compile-results 页用） */
+export function getWikiContents(kbId: string, documentId?: string): Promise<WikiContents> {
+  // [jonex] documentId 空时省略参数（Gateway 缺省 = KB 级全库）
+  const params: Record<string, unknown> = { knowledge_base_id: kbId };
+  if (documentId) params.document_id = documentId;
   return getData<BackendWikiContents>(
-    request.get('/knowledge-base/parse-results/wiki-contents', {
-      params: { knowledge_base_id: kbId, document_id: documentId },
-    }),
+    request.get('/knowledge-base/parse-results/wiki-contents', { params }),
   ).then((res) => ({
     summaries: res.summaries || [],
     concepts: res.concepts || [],

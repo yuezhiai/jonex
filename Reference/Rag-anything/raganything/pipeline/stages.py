@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -29,14 +30,24 @@ from raganything.pipeline_mode import PipelineMode
 from raganything.router import ParserRegistry
 from raganything.service.http_lightrag_client import LightRAGError, TrackStatus
 from raganything.utils import (
+    DEFAULT_COLUMN_THRESHOLD,
+    _render_caption_line,
+    _table_grid_v2_enabled,
+    _valid_caption,
+    extract_embedded_tables,
     extract_text_metadata,
+    fmt_row,
     get_processor_for_type,
     get_table_body,
     insert_text_content,
     insert_text_content_with_multimodal_content,
+    make_header_block,
+    normalize_table_grid,
     normalize_table_rows,
     pack_rows,
+    pack_text_blocks,
     separate_content,
+    split_row_by_cells,
 )
 
 
@@ -111,6 +122,12 @@ class ParseStage(Stage):
         # [jonex] #4: transient error retry config
         self._retry_max = int(os.getenv("RAG_PARSE_RETRY_MAX", "3"))
         self._retry_base = float(os.getenv("RAG_PARSE_RETRY_BASE_SEC", "2.0"))
+        # [jonex] §table-grid-v2 L3: 启动打印生效值（§5 防「以为回退了其实没回退」）
+        logger.info(
+            "[jonex] §table-grid-v2 L3: XLSX_NATIVE_NORMALIZE=%s "
+            "（true=openpyxl 表格主轨+MinerU 图片轨 / false=xlsx 全量交 MinerU）",
+            _xlsx_native_normalize_enabled(),
+        )
 
     async def execute(
         self, ctx: PipelineContext, services: PipelineServices
@@ -149,6 +166,14 @@ class ParseStage(Stage):
                     return StageResult(error="Task cancelled after cache hit")
 
                 content_list, doc_id = cached
+                # [jonex] §table-grid-v2 L3: 缓存命中同样执行 xlsx 双路合并
+                # （merge 幂等：已含 native 指纹时原样放行）。合并后重算
+                # doc_id 保持内容标识一致。
+                if _xlsx_native_normalize_enabled() and ext in (".xlsx", ".xls"):
+                    content_list, _dropped = _merge_xlsx_native_tables(
+                        content_list, path,
+                    )
+                    doc_id = _generate_doc_id(content_list)
                 if services.logger:
                     services.logger.info(f"Using cached parsing result for: {ctx.file_path}")
                 if services.event_bus:
@@ -185,6 +210,19 @@ class ParseStage(Stage):
 
         if not content_list:
             return StageResult(error="Parsing failed: No content was extracted")
+
+        # [jonex] §table-grid-v2 L3: xlsx 双路合并（openpyxl 表格主轨 +
+        # MinerU 图片/公式轨；MinerU 表格项丢弃）。合并后再生成 doc_id。
+        dropped_tables = 0
+        if _xlsx_native_normalize_enabled() and ext in (".xlsx", ".xls"):
+            content_list, dropped_tables = _merge_xlsx_native_tables(
+                content_list, path,
+            )
+        if dropped_tables:
+            # O4 口径：MinerU 表格项丢弃数量透出到 table_stats
+            ctx.table_stats["mineru_table_dropped"] = (
+                ctx.table_stats.get("mineru_table_dropped", 0) + dropped_tables
+            )
 
         doc_id = _generate_doc_id(content_list)
 
@@ -1050,6 +1088,131 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
     return segments
 
 
+def _load_table_tokenizer():
+    """[jonex] §table-grid-v2 O1: lazily load a tokenizer with the same
+    encoding LightRAG uses for its second-pass chunking (tiktoken
+    gpt-4o-mini).
+
+    Returns ``None`` when tiktoken/LightRAG is unavailable (e.g. unit tests
+    without the dependency) — the oversize assertion then no-ops.
+    """
+    try:
+        from lightrag.utils import TiktokenTokenizer
+
+        return TiktokenTokenizer("gpt-4o-mini")
+    except Exception as exc:  # noqa: BLE001 — 断言能力缺失不能影响推送
+        logger.warning(
+            "[jonex] §table-grid-v2 O1: tokenizer 加载失败（%s），"
+            "表格 chunk 超限断言跳过", exc,
+        )
+        return None
+
+
+def _count_col_unnamed(header: list[str]) -> int:
+    """[jonex] §table-grid-v2 O4: count ``col_N`` fallback columns in a header."""
+    return sum(1 for c in header if re.fullmatch(r"col_\d+", c))
+
+
+# file_source 总长预算（字符）。LightRAG 删除文档时按 file_path 去 inputs 目录
+# 删文件，Linux 文件名上限 255 字节（UTF-8 中文 3 字节/字）——留 240 字符
+# 保守预算（≈ 720 字节内？不对：240 ASCII 字符 ≈ 240 字节；中文按 3 字节会超
+# 255，但 file_source 主体是 ASCII（id/键名），旁路字段截断后中文占比小）。
+_FILE_SOURCE_MAX_CHARS = 240
+
+
+def _truncate_source_field(value: str, max_chars: int) -> str:
+    """旁路字段截断：超限保留前 max_chars 字 + …"""
+    if not value or len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "…"
+
+
+_CAPTION_PREV_BLOCK_MAX_DIST = 3     # 向前搜索的最大 block 距离（L4.1 防误抓）
+_CAPTION_PREV_BLOCK_MAX_LEN = 60     # prev block 作为标题的长度上限（字）
+_CAPTION_SENTENCE_END = "。！？；."   # 句末符——正文结尾而非标题
+
+
+def _table_signature(header: list[str]) -> str:
+    """[jonex] §table-grid-v2 L4.1: 列名签名（table_sig 旁路）。"""
+    return hashlib.md5("|".join(header).encode()).hexdigest()[:8]
+
+
+def _resolve_table_caption(
+    item: dict, content_list: list[dict], idx: int,
+    file_name: str, sheet_hint: str | None = None,
+) -> tuple[str, str]:
+    """[jonex] §table-grid-v2 L4.1: 表标题 4 级来源链。
+
+    1. ``table_caption``（经 ``_valid_caption`` 校验——空值/字面量 "None"/
+       超 60 字一律无效，防止写出「【表】None」）；
+    2. 向前最近的 text block，须同时满足：距离 ≤ 3 个 block、长度 ≤ 60 字、
+       不以句末符结尾（正文尾巴不是标题）、不含换行；
+    3. sheet 名（xlsx 主轨预留，通常已在级别 1 命中）；
+    4. 文件名（兜底，保证标题永不缺失）。
+
+    Returns ``(caption, source_level)``，source_level ∈
+    ``caption / prev_block / sheet / filename``（计入 table_stats.caption_source）。
+    """
+    cap = _valid_caption(item.get("table_caption"))
+    if cap:
+        return cap, "caption"
+    for j in range(
+        idx - 1,
+        max(-1, idx - 1 - _CAPTION_PREV_BLOCK_MAX_DIST),
+        -1,
+    ):
+        prev = content_list[j]
+        if prev.get("type") != "text":
+            continue
+        txt = (prev.get("text") or "").strip()
+        if not txt:
+            continue
+        if len(txt) > _CAPTION_PREV_BLOCK_MAX_LEN:
+            continue
+        if txt[-1] in _CAPTION_SENTENCE_END:
+            continue
+        if "\n" in txt:
+            continue
+        return txt, "prev_block"
+    if sheet_hint:
+        return sheet_hint, "sheet"
+    return file_name, "filename"
+
+
+def _xlsx_native_normalize_enabled() -> bool:
+    """[jonex] §table-grid-v2 L3: read the XLSX_NATIVE_NORMALIZE switch.
+
+    Unset → openpyxl 主轨 + MinerU 图片轨（default true）；显式 ``false`` →
+    xlsx 全量交 MinerU（旧行为）。见 plan §5 灰度表。
+    """
+    return os.getenv("XLSX_NATIVE_NORMALIZE", "true").lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _merge_xlsx_native_tables(
+    content_list: list[dict], path: str,
+) -> tuple[list[dict], int]:
+    """[jonex] §table-grid-v2 L3: xlsx 双路合并（幂等）。
+
+    openpyxl 主轨产出表格 item，MinerU 只保留非表格项。跨包依赖平台侧
+    ``jonex_core.capability.atomic.rag.spreadsheet_normalizer``（atomic-rag
+    容器内 jonex_core 已 COPY；ImportError 时静默回退 MinerU 全量，保证
+    上游升级时不炸）。
+    """
+    try:
+        from jonex_core.capability.atomic.rag.spreadsheet_normalizer import (
+            merge_native_tables,
+        )
+    except ImportError:
+        logger.warning(
+            "[jonex] §table-grid-v2 L3: jonex_core.spreadsheet_normalizer 不可用，"
+            "xlsx 双路合并跳过（回退 MinerU 全量）"
+        )
+        return content_list, 0
+    return merge_native_tables(content_list, path)
+
+
 def _first_present(primary: dict, fallback: dict, *keys: str):
     for key in keys:
         if key in primary and primary[key] is not None:
@@ -1074,10 +1237,21 @@ def _build_file_source(
     char_end: int | None = None,
     table_idx: int | None = None,
     image_idx: int | None = None,
+    asset_ext: str | None = None,
     row_start: int | None = None,
     row_end: int | None = None,
+    cell_start: int | None = None,
+    cell_end: int | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    ctype: str | None = None,
+    table_sig: str | None = None,
+    table_cols: str | None = None,
+    notes: str | None = None,
+    entity_hint: str | None = None,
+    page_end: int | None = None,
+    pspans: str | None = None,
+    stats: dict | None = None,
 ) -> str:
     """Build a file_source string compatible with v1 parse_file_source().
 
@@ -1090,10 +1264,18 @@ def _build_file_source(
           |row_start={n}|row_end={n}   ← [jonex] §table-chunking 表行区间
           |tstart={t}|tend={t}   ← start_time/end_time (视频/音频时间轴)
           |table_idx={n}|image_idx={n}|trace={trace}
+          |ctype={type}|table_sig={hash}|table_cols={cols}|notes={notes}
+            ← [jonex] §table-ctypes / §table-grid-v2 L4.1
+            chunk 类型与表格元数据旁路（table-parsing-retrieval-governance-plan.md
+            改动 37；值内的 | 转义为空格，防止破坏分隔结构）
+          |ehint={entity_hint}
+            ← [jonex] 第五批 改动 20（方案 C 入库通道）：表格 chunk 的主体
+            实体提示（= L4.1 表标题 heading），检索期主体一致性过滤的信号源
+            （与 ctype 同机制，零 vendored 改动）
 
-    Extra fields (table_idx, image_idx, row_start, row_end) are appended as
-    ``key=value`` pairs — ``parse_file_source()`` ignores unknown keys
-    silently, so these are backward-compatible.
+    Extra fields (table_idx, image_idx, row_start, row_end, ctype, …) are
+    appended as ``key=value`` pairs — ``parse_file_source()`` ignores unknown
+    keys silently, so these are backward-compatible.
     """
     parts = [
         f"kb={kb_id}",
@@ -1110,9 +1292,28 @@ def _build_file_source(
         parts.append(f"char_end={char_end}")
     if page is not None:
         parts.append(f"page={page}")
+    if page_end is not None and page_end != page:
+        # [jonex] §block-packing 2d: 跨页包末页（仅打包路径写）
+        parts.append(f"page_end={page_end}")
+    if pspans:
+        # [jonex] §block-packing 2d: 页边界表（offset@page;…，60 字符上限）。
+        # 截断会留下半截 entry（resolve 跳过、中间页丢失），与 240 防御
+        # 丢段共用 pspans_truncated 观测口径（review 低优先）。
+        truncated = _truncate_source_field(pspans, 60)
+        if len(truncated) != len(pspans) and stats is not None:
+            stats["pspans_truncated"] = (
+                stats.get("pspans_truncated", 0) + 1
+            )
+        parts.append(f"pspans={truncated}")
     if row_start is not None and row_end is not None:
         parts.append(f"row_start={row_start}")
         parts.append(f"row_end={row_end}")
+        # [jonex] §C1-bis §19.5①: 行内格区间（0-based 右开），写入条件
+        # 跟随 row 区间——只对 table_row chunk 有意义，且只在行内切分
+        # （split_row_by_cells）真正发生时非 None。
+        if cell_start is not None and cell_end is not None:
+            parts.append(f"cell_start={cell_start}")
+            parts.append(f"cell_end={cell_end}")
     if start_time is not None and end_time is not None:
         parts.append(f"tstart={start_time:.3f}")
         parts.append(f"tend={end_time:.3f}")
@@ -1120,8 +1321,61 @@ def _build_file_source(
         parts.append(f"table_idx={table_idx}")
     if image_idx is not None:
         parts.append(f"image_idx={image_idx}")
+    if asset_ext is not None:
+        # [jonex] §image-refs P0-5/P1-3: 资产扩展名旁路（P1 上传成功的
+        # 图片才写；ext 白名单由 normalize_asset_ext 保证，此处直写）
+        parts.append(f"aext={asset_ext}")
+    if ctype is not None:
+        parts.append(f"ctype={ctype}")
+    if table_sig is not None:
+        parts.append(f"table_sig={table_sig}")
+    if table_cols is not None:
+        table_cols = _truncate_source_field(table_cols, 60)
+        parts.append(f"table_cols={str(table_cols).replace('|', ' ')}")
+    if notes is not None:
+        notes = _truncate_source_field(notes, 40)
+        parts.append(f"notes={str(notes).replace('|', ' ')}")
+    if entity_hint is not None:
+        # [jonex] 改动 20：ehint= 主体实体提示（表格标题 heading）
+        entity_hint = _truncate_source_field(str(entity_hint), 40)
+        parts.append(f"ehint={entity_hint.replace('|', ' ')}")
     parts.append(f"trace={trace_id}")
-    return "|".join(parts)
+    # [jonex] §table-grid-v2 修复：file_source 被 LightRAG 当作「文件路径」
+    # 使用（删除文档时按 file_path 去 inputs 目录删文件），Linux 文件名上限
+    # 255 字节。元数据旁路（table_cols/notes）膨胀后超限 → [Errno 36] File
+    # name too long → 删除失败 → reparse 收敛循环不收敛（线上实测）。
+    # 构建后总长防御：超预算再截 table_cols（完整列名在 chunk 正文里已有，
+    # self-describing 格式，旁路截断不丢信息）。
+    source = "|".join(parts)
+    if len(source) > _FILE_SOURCE_MAX_CHARS:
+        over = len(source) - _FILE_SOURCE_MAX_CHARS
+        # 从 table_cols 段榨出空间（定位并截断）
+        idx = source.find("table_cols=")
+        if idx >= 0:
+            end = source.find("|", idx)
+            end = end if end >= 0 else len(source)
+            tc_len = end - idx
+            keep = max(8, tc_len - over - 1)
+            source = source[:idx + len("table_cols=") + keep] + "…" + source[end:]
+        # [jonex] §C1-bis §19.5①: 仍超限则丢弃 cell_* 段——行级锚点
+        # 仍在，只丢行内格区间；cell 段晚于 table_cols 加入，优先牺牲。
+        if len(source) > _FILE_SOURCE_MAX_CHARS:
+            source = source.replace(f"|cell_start={cell_start}", "")
+            source = source.replace(f"|cell_end={cell_end}", "")
+        # [jonex] §block-packing 2d: 仍超限则丢弃 pspans 段并计数——
+        # pspans 是精度增强项，丢弃后降级到 page/page_end 粗锚点，
+        # 不影响正确性。
+        if len(source) > _FILE_SOURCE_MAX_CHARS and pspans:
+            idx = source.find("|pspans=")
+            if idx >= 0:
+                end = source.find("|", idx + 1)
+                end = end if end >= 0 else len(source)
+                source = source[:idx] + source[end:]
+                if stats is not None:
+                    stats["pspans_truncated"] = (
+                        stats.get("pspans_truncated", 0) + 1
+                    )
+    return source
 
 
 # ── [jonex] P0-1 dup-failed helper functions ──────────────────────────
@@ -1189,6 +1443,94 @@ def _expected_doc_id(chunk: dict) -> str:
     return compute_mdhash_id(sanitize_text_for_encoding(text), prefix="doc-")
 
 
+class AssetUploadStage(Stage):
+    """[jonex] §image-refs P1-2: 把文档内嵌图片上传到平台对象存储。
+
+    设计要点（image-reference-chain-execution-plan.md §4.1 / §5 P1）：
+    - 复用 multimodal_results 的 item["index"] 做对象键，不另起枚举
+      （与 PushChunksStage._collect_multimodal_chunks 同源，key 才不错位）；
+    - gate：RAG_ASSET_UPLOAD_ENABLED（默认 on），best-effort——单张失败只
+      WARNING，不阻塞主链路（doc 仍 READY）；
+    - 上传结果 {image_idx: ext} 经 StageResult.asset_exts 回传 ctx，
+      PushChunksStage 据此在 file_source 写 aext=（P1-3，上传失败的图片
+      不写，检索侧据此判定无 URL 可取）。
+    """
+
+    async def execute(
+        self, ctx: PipelineContext, services: PipelineServices
+    ) -> StageResult:
+        if os.getenv("RAG_ASSET_UPLOAD_ENABLED", "true").lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return StageResult()
+
+        results = ctx.multimodal_results or []
+        if not results:
+            return StageResult()
+
+        # 平台侧依赖（jonex_core 对象存储）——非平台环境（standalone 研究用 /
+        # 镜像未打包 jonex_core）整体跳过，best-effort 不阻塞主链路
+        try:
+            from jonex_core.common.object_storage import (
+                build_asset_key,
+                get_object_storage,
+                normalize_asset_ext,
+            )
+
+            storage = get_object_storage()
+        except Exception as exc:  # noqa: BLE001
+            if services.logger:
+                services.logger.warning(
+                    "[jonex] §image-refs: jonex_core 对象存储不可用，跳过图片资产上传: %s",
+                    exc,
+                )
+            return StageResult()
+
+        asset_exts: dict[int, str] = {}
+        # [jonex] review 修正：doc 锚点与 PushChunksStage 同源——
+        # ctx.document_id 为空时兜底 ctx.doc_id（与 chunk 侧
+        # `ctx.document_id or ctx.doc_id or ""` 同一表达式），
+        # 否则上传 key 的 doc 段是空串、file_source 的 doc= 却落到
+        # ctx.doc_id，检索侧推导的 key 与实际 key 分叉（§4.1 同源约束）。
+        doc_anchor = ctx.document_id or ctx.doc_id or ""
+        if not doc_anchor:
+            # 两侧兜底后仍为空 → doc 段空串的 key 无法回链检索侧，
+            # 上传无意义，整体跳过（比上传一个无人能定位的 key 更安全）
+            if services.logger:
+                services.logger.warning(
+                    "[jonex] §image-refs: document_id/doc_id 均为空，跳过图片资产上传（无文档锚点）"
+                )
+            return StageResult()
+        for item in results:
+            if item.get("content_type", item.get("type", "image")) != "image":
+                continue
+            image_idx = item.get("index")
+            if image_idx is None:
+                continue
+            img_path = (item.get("original") or {}).get("img_path") or ""
+            if not img_path or not os.path.isfile(img_path):
+                continue
+            ext = normalize_asset_ext(os.path.splitext(img_path)[1].lstrip(".")) or "png"
+            try:
+                key = build_asset_key(
+                    ctx.tenant_id, ctx.kb_id, doc_anchor, image_idx, ext,
+                )
+                await storage.put_bytes(
+                    key, Path(img_path).read_bytes(), content_type=f"image/{ext}",
+                )
+                asset_exts[image_idx] = ext
+            except Exception as exc:  # noqa: BLE001
+                if services.logger:
+                    services.logger.warning(
+                        "[jonex] §image-refs: 图片资产上传失败 idx=%s path=%s: %s",
+                        image_idx, img_path, exc,
+                    )
+
+        if not asset_exts:
+            return StageResult()
+        return StageResult(asset_exts=asset_exts)
+
+
 class PushChunksStage(Stage):
     """HTTP mode: collect all text + multimodal chunks → push to :9621/documents/text.
 
@@ -1205,6 +1547,31 @@ class PushChunksStage(Stage):
     def __init__(self):
         self._push_concurrency = int(os.getenv("RAG_HTTP_PUSH_CONCURRENCY", "8"))
         self._chunk_max_chars = int(os.getenv("RAG_CHUNK_MAX_CHARS", "12000"))
+        # [jonex] §table-grid-v2: 启动打印生效值，避免「以为回退了其实没回退」
+        # （table-parsing-retrieval-governance-plan.md §5）。
+        logger.info(
+            "[jonex] §table-grid-v2: RAG_TABLE_GRID_V2=%s "
+            "（true=网格化+表头推断新路径 / false=旧 normalize_table_rows）",
+            _table_grid_v2_enabled(),
+        )
+        # [jonex] §table-grid-v2 O1: 表格专用切块预算（字符）。只作用于表格分支与
+        # pack_rows；文本链路仍用 _chunk_max_chars（RAG_CHUNK_MAX_CHARS，12000）
+        # 由 LightRAG 按 token+overlap 切分，行为不变。
+        self._table_chunk_max_chars = int(os.getenv("RAG_TABLE_CHUNK_MAX_CHARS", "900"))
+        self._table_chunk_body_budget = max(200, self._table_chunk_max_chars - 64)
+        # 表格 chunk 超限断言阈值（token）：与 LightRAG 端 CHUNK_SIZE 对齐
+        # （.env.rag 的 CHUNK_SIZE，默认 1200）。推送前用 tokenizer 实测每个
+        # 表格 chunk，超过 → WARNING + table_stats.oversize_table_chunks。
+        self._lightrag_chunk_size = int(os.getenv("RAG_LIGHTRAG_CHUNK_SIZE", "1200"))
+        self._table_tokenizer = _load_table_tokenizer()
+        logger.info(
+            "[jonex] §table-grid-v2 O1: RAG_TABLE_CHUNK_MAX_CHARS=%d "
+            "（表格专用预算，文本链路仍用 RAG_CHUNK_MAX_CHARS=%d）；"
+            "超限断言阈值=%d token（tokenizer %s）",
+            self._table_chunk_max_chars, self._chunk_max_chars,
+            self._lightrag_chunk_size,
+            "可用" if self._table_tokenizer else "不可用（断言跳过）",
+        )
         self._track_timeout = float(os.getenv("RAG_TRACK_TIMEOUT_SECONDS", "1800"))   # 全局安全网
         self._per_chunk_timeout = float(os.getenv("RAG_TRACK_PER_CHUNK_TIMEOUT_SECONDS", "900"))
         self._per_chunk_max_retries = int(os.getenv("RAG_TRACK_PER_CHUNK_MAX_RETRIES", "2"))
@@ -1238,6 +1605,30 @@ class PushChunksStage(Stage):
         # suffix so the final chunk body does not exceed _chunk_max_chars.
         self._chunk_body_budget = max(200, self._chunk_max_chars - 64)
 
+        # [jonex] §block-packing 文本块级打包
+        # （text-block-packing-chunk-governance-plan.md §4 改动 2a）。
+        self._text_pack_enabled = os.getenv(
+            "RAG_TEXT_BLOCK_PACKING", "true"
+        ).lower() in ("1", "true", "yes", "on")
+        # 与表格链路 _table_chunk_body_budget=836 同构：配置层只暴露一个字符预算，
+        # token 换算前置固化进默认值（1260 = 900 token × 1.4，o200k_base 实测校准，
+        # 见方案 §3.1「字符↔token 换算系数」）。冲刷前另有 tokenizer 实测断言兜底。
+        self._text_pack_budget = int(os.getenv("RAG_TEXT_PACK_CHARS", "1260"))
+        self._text_pack_max_tokens = int(os.getenv("RAG_TEXT_PACK_MAX_TOKENS", "1200"))
+        self._text_pack_heading_max_len = int(
+            os.getenv("RAG_TEXT_PACK_HEADING_MAX_LEN", "40")
+        )
+        self._text_pack_drop_noise = os.getenv(
+            "RAG_TEXT_PACK_DROP_NOISE", "true"
+        ).lower() in ("1", "true", "yes", "on")
+        logger.info(
+            "[jonex] §block-packing: RAG_TEXT_BLOCK_PACKING=%s "
+            "budget=%d chars max=%d tokens heading_max_len=%d drop_noise=%s",
+            self._text_pack_enabled, self._text_pack_budget,
+            self._text_pack_max_tokens, self._text_pack_heading_max_len,
+            self._text_pack_drop_noise,
+        )
+
     async def execute(
         self, ctx: PipelineContext, services: PipelineServices
     ) -> StageResult:
@@ -1260,10 +1651,15 @@ class PushChunksStage(Stage):
 
         # ── 1. Collect all chunks ───────────────────────────────────
         chunks: list[dict] = []
+        # [jonex] §table-grid-v2 O4: 表格处理可观测统计，透出到任务结果
+        # （task_manager 汇总进 result_summary.extensions["table_stats"]）。
+        table_stats: dict = {}
+        ctx.table_stats = table_stats
         self._collect_text_chunks(chunks, ctx.content_list or [], tenant_id, kb_id,
-                                  document_id, file_name)
+                                  document_id, file_name, stats=table_stats)
         self._collect_multimodal_chunks(chunks, ctx.multimodal_results or [],
-                                        tenant_id, kb_id, document_id, file_name)
+                                        tenant_id, kb_id, document_id, file_name,
+                                        asset_exts=ctx.asset_exts)
 
         total_chunks = len(chunks)
         if total_chunks == 0:
@@ -1693,93 +2089,571 @@ class PushChunksStage(Stage):
     def _collect_text_chunks(
         self, chunks: list[dict], content_list: list[dict],
         tenant_id: str, kb_id: str, document_id: str, file_name: str,
+        stats: dict | None = None,
     ) -> None:
         """Extract text + table chunks from MinerU content_list.
 
         [jonex] §table-chunking: tables are split into row-level chunks
         (each fitting within the budget, with header repetition) instead
         of being silently truncated at the budget boundary.
+
+        [jonex] §table-grid-v2 O4: *stats* (``ctx.table_stats``) collects
+        observability counters — ``tables_total`` / ``tables_normalized`` /
+        ``tables_fallback`` / ``rows_total`` / ``cols_unnamed`` /
+        ``oversize_table_chunks`` / ``header_levels`` 分布 — surfaced in
+        the task result summary.
         """
+        stats = stats if stats is not None else {}
+
+        # ── [jonex] §block-packing 阶段 A：caption 预解析（必须严格早于
+        # 打包与噪声丢弃——L4.1 的 prev_block 判据（≤60 字短块）在打包后
+        # 会被合并成大包或丢弃，见方案 §5.1）。判据、入参、返回值与现状
+        # 完全一致，只是把调用时机提前；输入是未经修改的原始 content_list。
+        # 仅打包开启时执行：开关关闭走 1:1 原路径，表格分支现场解析即可
+        # （结果一致），避免向 content_list 写入 _resolved_caption /
+        # _caption_source 污染原数据（review 低优先）。
+        if self._text_pack_enabled and _table_grid_v2_enabled():
+            self._prefill_table_captions(content_list, file_name)
+
+        if not self._text_pack_enabled:
+            # ── 打包开关关闭：原逐块 1:1 路径，行为与改造前完全一致
+            # （灰度回退通道，见方案 §6）。
+            for item_idx, item in enumerate(content_list):
+                t = item.get("type", "text")
+
+                if t == "text":
+                    text = item.get("text", "")
+                    if not text or not text.strip():
+                        continue
+                    # [jonex] §table-grid-v2 O2: 内嵌表格探测——md 文档里的
+                    # HTML/管道表格混在 text block 里，从未走表格分支，被
+                    # LightRAG 按 token 从标签中间硬切。拆段后表格片段走
+                    # normalize_table_grid 表格分支；前后文本单独成 chunk
+                    # （同时是 L4.1 表标题的 prev_block 候选）。
+                    embedded = (
+                        extract_embedded_tables(text)
+                        if _table_grid_v2_enabled()
+                        else [{"kind": "text", "text": text}]
+                    )
+                    if len(embedded) > 1:
+                        embedded_table_idx = item.get("table_idx", 0)
+                        for seg in embedded:
+                            if seg["kind"] == "table":
+                                self._emit_table_chunks(
+                                    chunks, stats, item, seg["text"],
+                                    tenant_id, kb_id, document_id, file_name,
+                                    table_idx_override=embedded_table_idx,
+                                    content_list=content_list,
+                                    item_idx=item_idx,
+                                )
+                                embedded_table_idx += 1
+                            elif seg["text"] and seg["text"].strip():
+                                # 拆段后字符偏移不再精确，锚点只保留 page
+                                self._emit_text_chunks(
+                                    chunks, item, seg["text"],
+                                    tenant_id, kb_id, document_id, file_name,
+                                    ctype="text", with_char_offsets=False,
+                                )
+                        continue
+                    self._emit_text_chunks(
+                        chunks, item, text,
+                        tenant_id, kb_id, document_id, file_name,
+                        ctype=t,
+                    )
+                elif t == "table":
+                    self._emit_table_chunks(
+                        chunks, stats, item, get_table_body(item),
+                        tenant_id, kb_id, document_id, file_name,
+                        content_list=content_list, item_idx=item_idx,
+                    )
+                else:
+                    continue
+            return
+
+        # ── [jonex] §block-packing 阶段 B/C：文本块打包 + 硬边界冲刷。
+        # 全文档短块（≤20 字）出现次数预扫一次，供 C3 高重复页眉页脚
+        # 判定（阈值 ≥3，见方案 §8）。
+        repeat_index: dict[str, int] = {}
         for item in content_list:
+            if item.get("type") != "text":
+                continue
+            t = (item.get("text") or "").strip()
+            if 0 < len(t) <= 20:
+                repeat_index[t] = repeat_index.get(t, 0) + 1
+
+        # [jonex] §block-packing review P1：包头状态（cur_heads/head_pages/
+        # heads_fresh）外提为方法局部状态，经 carry 在多次 pack_text_blocks
+        # 调用间传递——标题跨 table/image/equation 硬边界继承，硬边界后的
+        # 首个文本包同样带【章 / 节】包头。
+        pack_carry: dict = {}
+        pending: list[dict] = []
+        for item_idx, item in enumerate(content_list):
             t = item.get("type", "text")
 
             if t == "text":
                 text = item.get("text", "")
-            elif t == "table":
-                # [jonex] §table-chunking: normalize HTML / list / markdown
-                # tables into structured rows, then split into budget-sized
-                # segments with header repetition per segment.
-                raw_body = get_table_body(item)
-                header, data_rows = normalize_table_rows(raw_body)
-                if data_rows:
-                    # [jonex] §table-chunking P2: reserve ~64 chars for
-                    row_segments = pack_rows(
-                        data_rows, self._chunk_body_budget, header,
-                    )
-                    for seg_idx, (seg_text, row_start, row_end) in enumerate(
-                        row_segments
-                    ):
-                        # [jonex] §table-chunking P1-1: single oversize
-                        # row → _split_long_text so the segment still
-                        # fits within budget.
-                        if len(seg_text) > self._chunk_max_chars:
-                            logger.warning(
-                                "[jonex] §table-chunking: table row segment "
-                                "exceeds budget (rows=%d:%d, len=%d > max=%d), "
-                                "splitting",
-                                row_start, row_end, len(seg_text),
-                                self._chunk_max_chars,
+                if not text or not text.strip():
+                    continue
+                embedded = (
+                    extract_embedded_tables(text)
+                    if _table_grid_v2_enabled()
+                    else [{"kind": "text", "text": text}]
+                )
+                if len(embedded) > 1:
+                    # O2 内嵌表格：表段是硬边界——先冲刷 pending 再走表格
+                    # 分支；拆出的文本段只有 page 锚点（§5.2 降级态），
+                    # 按块进 pending 参与打包。
+                    embedded_table_idx = item.get("table_idx", 0)
+                    for seg in embedded:
+                        if seg["kind"] == "table":
+                            self._flush_text_pack(
+                                chunks, pending, tenant_id, kb_id,
+                                document_id, file_name, stats, repeat_index,
+                                pack_carry,
                             )
-                            sub_segs = _split_long_text(
-                                seg_text, self._chunk_body_budget,
+                            pending = []
+                            self._emit_table_chunks(
+                                chunks, stats, item, seg["text"],
+                                tenant_id, kb_id, document_id, file_name,
+                                table_idx_override=embedded_table_idx,
+                                content_list=content_list,
+                                item_idx=item_idx,
                             )
-                        else:
-                            sub_segs = [seg_text]
-
-                        for sub_seg in sub_segs:
-                            page = item.get("page_idx")
-                            table_idx = item.get("table_idx")
-                            fs = _build_file_source(
-                                tenant_id, kb_id, document_id,
-                                file_name,
-                                chunk_index=len(chunks),
-                                page=page,
-                                row_start=row_start,
-                                row_end=row_end,
-                                table_idx=table_idx,
-                            )
-                            text_for_upload = _inject_ns_token(
-                                sub_seg, tenant_id, kb_id,
-                                document_id,
-                            )
-                            chunks.append({
-                                "text": text_for_upload,
-                                "file_source": fs,
-                                "type": "table_row",
+                            embedded_table_idx += 1
+                        elif seg["text"] and seg["text"].strip():
+                            pending.append({
+                                "text": seg["text"],
+                                "page_idx": item.get("page_idx"),
                             })
-                    continue  # Table handled via row-level chunks
-
-                # Fallback: normalization produced nothing → treat raw
-                # content (HTML or otherwise) as plain text below.
-                text = (
-                    raw_body if isinstance(raw_body, str)
-                    else str(raw_body)
+                    continue
+                pending.append(item)
+            elif t == "table":
+                # 硬边界：先冲刷文本包再走既有表格分支
+                self._flush_text_pack(
+                    chunks, pending, tenant_id, kb_id, document_id,
+                    file_name, stats, repeat_index, pack_carry,
+                )
+                pending = []
+                self._emit_table_chunks(
+                    chunks, stats, item, get_table_body(item),
+                    tenant_id, kb_id, document_id, file_name,
+                    content_list=content_list, item_idx=item_idx,
                 )
             else:
-                continue
+                # image/equation 等：不产出 chunk，但作为硬边界打断
+                # 相邻文本块的打包（方案 §3.2 C1）。
+                self._flush_text_pack(
+                    chunks, pending, tenant_id, kb_id, document_id,
+                    file_name, stats, repeat_index, pack_carry,
+                )
+                pending = []
+        self._flush_text_pack(
+            chunks, pending, tenant_id, kb_id, document_id,
+            file_name, stats, repeat_index, pack_carry,
+        )
 
-            if not text or not text.strip():
-                continue
+    def _prefill_table_captions(
+        self, content_list: list[dict], file_name: str,
+    ) -> None:
+        """[jonex] §block-packing 阶段 A：在原始块序上预先解析表格 caption。
 
-            # [jonex] §table-chunking: replace silent truncation
-            # (was ``text[:self._chunk_max_chars]``) with explicit
-            # budget-aware splitting.  Over-budget blocks are split
-            # at newline boundaries and pushed as multiple chunks.
+        打包/噪声丢弃会改变表格前的短文本块形态，L4.1 的 prev_block 判据
+        （≤60 字短块）在打包后必然失效（方案 §5.1）。预解析只搬移时机：
+        调用现有 _resolve_table_caption、判据常量一个不改、输入是未经任何
+        修改的原始 content_list，因此输出与打包功能上线前逐字节相同。
+        """
+        for idx, item in enumerate(content_list):
+            t = item.get("type", "text")
+            if t == "table":
+                cap, src = _resolve_table_caption(
+                    item, content_list, idx, file_name,
+                )
+                item["_resolved_caption"] = cap
+                item["_caption_source"] = src
+            elif t == "text" and len(extract_embedded_tables(
+                item.get("text", "")
+            )) > 1:
+                # O2 内嵌表格：text 块含表格片段的同样按其 idx 预解析
+                cap, src = _resolve_table_caption(
+                    item, content_list, idx, file_name,
+                )
+                item["_resolved_caption"] = cap
+                item["_caption_source"] = src
+
+    def _flush_text_pack(
+        self, chunks: list[dict], blocks: list[dict],
+        tenant_id: str, kb_id: str, document_id: str, file_name: str,
+        stats: dict, repeat_index: dict[str, int],
+        carry: dict | None = None,
+    ) -> None:
+        """[jonex] §block-packing: pending 文本块 → pack_text_blocks →
+        逐包 _emit_text_chunks(pack=...)，同时写观测计数器（方案 §4 改动 2e）。
+
+        *carry* 为跨硬边界的包头状态（review P1），由 _collect_text_chunks
+        持有、每次调用传回并在 pack_text_blocks 内原地更新；同时承载
+        「每文档前 20 个被丢弃块采样」进度（noise_sampled 键，§3.2）。
+        """
+        if not blocks:
+            return
+        stats["blocks_total"] = stats.get("blocks_total", 0) + len(blocks)
+        packs, dropped = pack_text_blocks(
+            blocks, self._text_pack_budget,
+            heading_max_len=self._text_pack_heading_max_len,
+            drop_noise=self._text_pack_drop_noise,
+            repeat_index=repeat_index,
+            carry=carry,
+        )
+        if dropped:
+            stats["blocks_dropped_noise"] = (
+                stats.get("blocks_dropped_noise", 0) + len(dropped)
+            )
+            # [jonex] §block-packing 3.2: 每文档记录前 20 个被丢弃块的原文
+            # 与命中判据（§6 P1 灰度门槛人工核对用；pack_text_blocks 以
+            # (text, reason) 对返回）。
+            sampled = 0
+            if carry is not None:
+                sampled = carry.get("noise_sampled", 0)
+            to_sample = dropped[: max(0, 20 - sampled)]
+            if to_sample:
+                logger.warning(
+                    "[jonex] §block-packing: %d noise block(s) dropped from "
+                    "%s — sample(first %d): %r",
+                    len(dropped), file_name, len(to_sample),
+                    [(t.replace("\n", "\\n")[:60], r) for t, r in to_sample],
+                )
+                if carry is not None:
+                    carry["noise_sampled"] = sampled + len(to_sample)
+        if packs:
+            old_n = stats.get("packs_total", 0)
+            new_n = old_n + len(packs)
+            stats["packs_total"] = new_n
+            stats["blocks_packed"] = stats.get("blocks_packed", 0) + sum(
+                p["block_count"] for p in packs
+            )
+            stats["packs_cross_page"] = stats.get("packs_cross_page", 0) + sum(
+                1 for p in packs if p.get("pspans")
+            )
+            pack_chars = sum(len(p["text"]) for p in packs)
+            old_avg = stats.get("avg_pack_chars", 0)
+            stats["avg_pack_chars"] = round(
+                (old_avg * old_n + pack_chars) / new_n
+            )
+        for pack in packs:
+            # item 传 {}：打包路径锚点全部取自 pack 元数据，item 不消费
+            # （review 低优先，避免把 pack 本体当 item 引起误读）。
+            self._emit_text_chunks(
+                chunks, {}, pack["text"], tenant_id, kb_id,
+                document_id, file_name, ctype="text", pack=pack, stats=stats,
+            )
+
+    def _emit_table_chunks(
+        self, chunks: list[dict], stats: dict, item: dict,
+        raw_body, tenant_id: str, kb_id: str, document_id: str,
+        file_name: str, table_idx_override: int | None = None,
+        content_list: list[dict] | None = None,
+        item_idx: int = 0,
+    ) -> None:
+        """[jonex] §table-grid-v2: table → row-level chunks.
+
+        Shared by the ``type=="table"`` content branch and O2 embedded-table
+        segments (which pass ``table_idx_override``).  On normalization
+        failure the raw body falls back to plain-text emission with a
+        WARNING + ``tables_fallback`` counter (O4 — no more silent
+        degradation).
+
+        [jonex] §table-grid-v2 L4.1: resolves the table caption via
+        ``_resolve_table_caption`` (4-level source chain) and passes it to
+        ``pack_rows`` (one-line ``【表】`` context header); column signature /
+        list / notes ride in ``file_source`` (table_sig/table_cols/notes),
+        not in the body.
+        """
+        # [jonex] §table-grid-v2 O4: 表格项计数（含 fallback 与 col_N
+        # 占位可观测——此前 normalize 失败静默降级，无人知晓）。
+        stats["tables_total"] = stats.get("tables_total", 0) + 1
+        # [jonex] §table-grid-v2 L1/L2: 默认走网格化 + 表头推断新路径；
+        # RAG_TABLE_GRID_V2=false 回退旧 normalize_table_rows。
+        # meta（header_levels/notes/n_cols）在 L4.1（步 10）写入
+        # file_source 与 pack_rows 上下文头时消费。
+        if _table_grid_v2_enabled():
+            header, data_rows, meta = normalize_table_grid(raw_body)
+        else:
+            header, data_rows = normalize_table_rows(raw_body)
+            meta = {}
+        stats["cols_unnamed"] = stats.get("cols_unnamed", 0) + _count_col_unnamed(header)
+        # L3 兜底轨命中数（Excel 序列号 → 日期），随 meta 透出
+        stats["dates_heuristic"] = (
+            stats.get("dates_heuristic", 0) + meta.get("dates_heuristic", 0)
+        )
+        # O4-bis: B 型错位（左移）嫌疑行数——col_ 归零后唯一能暴露
+        # rowspan 标注不完整错位的可观测信号
+        stats["suspect_left_shift"] = (
+            stats.get("suspect_left_shift", 0)
+            + meta.get("suspect_left_shift", 0)
+        )
+        # [jonex] §18.3 观测口径：表头层级分布（header_levels=0 即表头
+        # 推断失败、全列 col_N 的根因信号）。仅统计 grid-v2 路径——
+        # 旧 normalize_table_rows 无 meta，混入会污染 0 档语义。
+        if _table_grid_v2_enabled():
+            hl_counter = stats.setdefault("header_levels", {})
+            hl = str(meta.get("header_levels", 0) or 0)
+            hl_counter[hl] = hl_counter.get(hl, 0) + 1
+        if data_rows:
+            stats["tables_normalized"] = stats.get("tables_normalized", 0) + 1
+            stats["rows_total"] = stats.get("rows_total", 0) + len(data_rows)
+            # [jonex] §table-grid-v2 L4.1: 表标题 4 级来源链（有效性校验 +
+            # 防误抓约束）；命中层级计入 table_stats.caption_source。
+            # 列名清单/签名/表前说明走 file_source 旁路，不占正文 embedding。
+            caption = None
+            table_sig = None
+            table_cols = None
+            notes = None
+            if _table_grid_v2_enabled():
+                if "_resolved_caption" in item:
+                    # [jonex] §block-packing 阶段 A 已预解析（打包前在
+                    # 原始块序上解析，结果与现场解析一致）
+                    caption = item["_resolved_caption"]
+                    caption_source = item["_caption_source"]
+                else:
+                    caption, caption_source = _resolve_table_caption(
+                        item, content_list or [], item_idx, file_name,
+                    )
+                src_counter = stats.setdefault("caption_source", {})
+                src_counter[caption_source] = (
+                    src_counter.get(caption_source, 0) + 1
+                )
+                table_sig = _table_signature(header)
+                # 列名 join 用 unit separator（\x1f）：file_source 按 | 分割
+                # 键值对，列名本身可能含空格/顿号，join 分隔符必须与键值
+                # 分隔符（|）和可见标点都无冲突（O4-bis 修正，此前
+                # "|".join + replace('|',' ') 在列名含空格时边界不可区分）。
+                table_cols = "\x1f".join(header)
+                notes = " ".join(meta.get("notes") or []) or None
+            # [jonex] §table-grid-v2 O1: 表格专用预算（RAG_TABLE_CHUNK_MAX_CHARS）。
+            # 表格行是语义原子，平台切分后不再被 LightRAG 二次硬切；
+            # 文本链路仍用 _chunk_body_budget（RAG_CHUNK_MAX_CHARS-64）。
+            row_segments = pack_rows(
+                data_rows, self._table_chunk_body_budget, header,
+                caption=caption,
+            )
+            for seg_idx, (seg_text, row_start, row_end) in enumerate(
+                row_segments
+            ):
+                page = item.get("page_idx")
+                table_idx = (
+                    table_idx_override
+                    if table_idx_override is not None
+                    else item.get("table_idx")
+                )
+                # [jonex] §C1-bis: 单行超表格预算 → 按单元格边界切分，
+                # 替代 _split_long_text 盲切（阈值此前误用文本链路的
+                # 12000，且 _split_long_text 对无换行表格行退化为精确
+                # 字符位截断，把单元格切碎）。pack_rows 单行超预算时
+                # 恒为 1 行段（row_end - row_start == 1）。
+                if (
+                    len(seg_text) > self._table_chunk_max_chars
+                    and row_end - row_start == 1
+                ):
+                    # [jonex] §C1-bis §19.6: 超长行观测——判断「数据形态
+                    # （长文本备注列）」vs「T1 归一化缺陷（多行误合成一行）」。
+                    stats["oversize_rows"] = (
+                        stats.get("oversize_rows", 0) + 1
+                    )
+                    if stats["oversize_rows"] <= 5:
+                        logger.warning(
+                            "[jonex] §C1-bis oversize_rows sample "
+                            "(table_idx=%s, row=%d, len=%d): %.200s",
+                            table_idx, row_start, len(seg_text), seg_text,
+                        )
+                    # 与 pack_rows 同口径重算渲染上下文（§19.4：
+                    # 列名有条件补、表标题无条件补）。
+                    n_cols = max(len(r) for r in data_rows)
+                    if header:
+                        n_cols = max(n_cols, len(header))
+                    use_markdown = n_cols <= DEFAULT_COLUMN_THRESHOLD
+                    padded_header = list(header) + [
+                        f"col_{i}" for i in range(len(header), n_cols)
+                    ]
+                    header_block = make_header_block(
+                        padded_header, n_cols, use_markdown,
+                    )
+                    # §19.4 硬约束：continuation 传格式化字符串、
+                    # 行号 1-based（row_start 是 0-based）。
+                    cap_line = (
+                        _render_caption_line(
+                            caption, self._table_chunk_body_budget,
+                            f"第 {row_start + 1} 行",
+                        )
+                        if caption
+                        else ""
+                    )
+                    row_text = fmt_row(
+                        data_rows[row_start], padded_header, n_cols,
+                        use_markdown,
+                    )
+                    sub_rows = split_row_by_cells(
+                        row_text, self._table_chunk_body_budget,
+                        header_block=header_block, caption_line=cap_line,
+                    )
+                elif len(seg_text) > self._chunk_max_chars:
+                    # 多行段超文本预算（O1 断言观测的异常形态）：
+                    # 保留 _split_long_text 兜底，不按单元格边界切。
+                    sub_rows = [
+                        (t, None, None)
+                        for t in _split_long_text(
+                            seg_text, self._chunk_body_budget,
+                        )
+                    ]
+                else:
+                    sub_rows = [(seg_text, None, None)]
+
+                for sub_idx, (sub_seg, cell_start, cell_end) in enumerate(
+                    sub_rows
+                ):
+                    # [jonex] §C1-bis §19.3: cells_hard_cut——非尾段段末
+                    # 不含 " | " 即发生字符硬切（正常按边界切的段末恒以
+                    # 分隔符结尾；硬切点不可能恰好落在分隔符终点，无歧义）。
+                    if (
+                        sub_idx < len(sub_rows) - 1
+                        and not sub_seg.endswith(" | ")
+                    ):
+                        stats["cells_hard_cut"] = (
+                            stats.get("cells_hard_cut", 0) + 1
+                        )
+                    fs = _build_file_source(
+                        tenant_id, kb_id, document_id,
+                        file_name,
+                        chunk_index=len(chunks),
+                        page=page,
+                        row_start=row_start,
+                        row_end=row_end,
+                        table_idx=table_idx,
+                        ctype="table_row",
+                        table_sig=table_sig,
+                        table_cols=table_cols,
+                        notes=notes,
+                        # [jonex] 改动 20：表标题 heading 作为主体实体提示
+                        # 入库（方案 C 通道，file_source ehint= 键）
+                        entity_hint=caption,
+                        cell_start=cell_start,
+                        cell_end=cell_end,
+                    )
+                    text_for_upload = _inject_ns_token(
+                        sub_seg, tenant_id, kb_id,
+                        document_id,
+                    )
+                    # [jonex] §table-grid-v2 O1: 超限断言——用与
+                    # LightRAG 二次切分同口径的 tokenizer 实测，超过
+                    # CHUNK_SIZE 会被 LightRAG 硬切（表头/锚点错位），
+                    # 打 WARNING 并计数，是「二次切分是否真的被消除」
+                    # 的直接观测指标。
+                    if self._table_tokenizer is not None:
+                        try:
+                            n_tokens = len(self._table_tokenizer.encode(
+                                text_for_upload
+                            ))
+                        except Exception:
+                            n_tokens = 0
+                        if n_tokens > self._lightrag_chunk_size:
+                            stats["oversize_table_chunks"] = (
+                                stats.get("oversize_table_chunks", 0) + 1
+                            )
+                            logger.warning(
+                                "[jonex] §table-grid-v2 O1: 表格 chunk "
+                                "超过 LightRAG 二次切分阈值 "
+                                "(%d > %d tokens, rows=%d:%d)，将触发硬切；"
+                                "建议下调 RAG_TABLE_CHUNK_MAX_CHARS",
+                                n_tokens, self._lightrag_chunk_size,
+                                row_start, row_end,
+                            )
+                    chunks.append({
+                        "text": text_for_upload,
+                        "file_source": fs,
+                        "type": "table_row",
+                    })
+            return  # Table handled via row-level chunks
+
+        # [jonex] §table-grid-v2 O4: fallback 不再静默——打 WARNING
+        # 并计数（此前 normalize 失败无告警无计数，问题被完全隐藏）。
+        stats["tables_fallback"] = stats.get("tables_fallback", 0) + 1
+        logger.warning(
+            "[jonex] §table-grid-v2 O4: 表格归一化失败，回退原始文本 "
+            "(tables_fallback=%d)",
+            stats["tables_fallback"],
+        )
+        # Fallback: normalization produced nothing → treat raw
+        # content (HTML or otherwise) as plain text.
+        text = raw_body if isinstance(raw_body, str) else str(raw_body)
+        self._emit_text_chunks(
+            chunks, item, text, tenant_id, kb_id, document_id, file_name,
+            ctype="table", table_idx=item.get("table_idx"),
+        )
+
+    def _emit_text_chunks(
+        self, chunks: list[dict], item: dict, text: str,
+        tenant_id: str, kb_id: str, document_id: str, file_name: str,
+        ctype: str = "text", table_idx: int | None = None,
+        with_char_offsets: bool = True,
+        pack: dict | None = None,
+        stats: dict | None = None,
+    ) -> None:
+        """Plain-text chunk emission with budget-aware splitting.
+
+        [jonex] §table-chunking: replace silent truncation
+        (was ``text[:self._chunk_max_chars]``) with explicit
+        budget-aware splitting.  Over-budget blocks are split
+        at newline boundaries and pushed as multiple chunks.
+
+        [jonex] §block-packing 改动 2c: *pack* 存在时锚点（page / page_end /
+        pspans / char / line 范围）从包元数据取而非单个 item；冲刷前
+        tokenizer 实测断言（复用表格链路 tokenizer），超 _text_pack_max_tokens
+        时按换算阈值 _split_long_text(text, int(max_tokens × 1.4)) 兜底切分
+        ——必须显式传换算阈值：原路径传 _chunk_body_budget（11936 字符）会
+        把断言架空。切出的续段只保留 page，不带 pspans。*pack* 为 None 时
+        行为与改造前完全一致。
+        """
+        stats = stats if stats is not None else {}
+        if pack is not None:
+            # 打包路径：字符预算已在 pack_text_blocks 内控制，此处做
+            # tokenizer 实测断言兜底（1260 字符 × 1.4 系数在 o200k_base
+            # 下实测 ≈ 840 token，正常不应触发）。
+            tokenizer = self._table_tokenizer
+            over_budget = False
+            if tokenizer is not None:
+                try:
+                    over_budget = (
+                        len(tokenizer.encode(text)) > self._text_pack_max_tokens
+                    )
+                except Exception:  # noqa: BLE001 — 断言失败不能影响推送
+                    over_budget = False
+            if over_budget:
+                logger.warning(
+                    "[jonex] §block-packing: pack exceeds max_tokens "
+                    "(len=%d chars > %d tokens), splitting at converted "
+                    "char budget",
+                    len(text), self._text_pack_max_tokens,
+                )
+                stats["oversize_text_chunks"] = (
+                    stats.get("oversize_text_chunks", 0) + 1
+                )
+                text_segments = _split_long_text(
+                    text, max_chars=int(self._text_pack_max_tokens * 1.4)
+                )
+            else:
+                text_segments = [text]
+
+            page = pack.get("page_start")
+            page_end = pack.get("page_end")
+            pspans = pack.get("pspans")
+            line_start = pack.get("line_start")
+            line_end = pack.get("line_end")
+            char_start = pack.get("char_start")
+            char_end = pack.get("char_end")
+        else:
             if len(text) > self._chunk_max_chars:
                 logger.warning(
                     "[jonex] §table-chunking: block exceeds max_chars "
                     "(type=%s, len=%d > max=%d), splitting into segments",
-                    t, len(text), self._chunk_max_chars,
+                    ctype, len(text), self._chunk_max_chars,
                 )
                 text_segments = _split_long_text(text, self._chunk_body_budget)
             else:
@@ -1790,40 +2664,64 @@ class PushChunksStage(Stage):
             line_end = item.get("line_end")
             char_start = item.get("char_start")
             char_end = item.get("char_end")
-            table_idx = item.get("table_idx")
+            page_end = None
+            pspans = None
 
-            for seg_idx, seg in enumerate(text_segments):
-                # Character offsets are only valid for the first segment;
-                # downstream segments cannot compute meaningful offsets
-                # from the truncated text.
-                cs: int | None = None
-                ce: int | None = None
-                if seg_idx == 0:
-                    cs = char_start
-                    ce = char_end
+        for seg_idx, seg in enumerate(text_segments):
+            is_first = seg_idx == 0
+            # Character offsets are only valid for the first segment;
+            # downstream segments cannot compute meaningful offsets
+            # from the truncated text.
+            cs: int | None = None
+            ce: int | None = None
+            if is_first and with_char_offsets:
+                cs = char_start
+                ce = char_end
+            if is_first:
+                seg_page_end = page_end
+                seg_pspans = pspans
+                seg_line_start = line_start
+                seg_line_end = line_end
+            elif pack is not None:
+                # 打包路径续段：锚点降级只保留 page（方案 2c）
+                seg_page_end = None
+                seg_pspans = None
+                seg_line_start = None
+                seg_line_end = None
+            else:
+                # 原路径续段：line 锚点沿用现状，仅 char 范围失效
+                seg_page_end = None
+                seg_pspans = None
+                seg_line_start = line_start
+                seg_line_end = line_end
 
-                file_source = _build_file_source(
-                    tenant_id, kb_id, document_id, file_name,
-                    chunk_index=len(chunks),
-                    page=page,
-                    line_start=line_start,
-                    line_end=line_end,
-                    char_start=cs,
-                    char_end=ce,
-                    table_idx=table_idx if t == "table" else None,
-                )
-                text_for_upload = _inject_ns_token(
-                    seg, tenant_id, kb_id, document_id,
-                )
-                chunks.append({
-                    "text": text_for_upload,
-                    "file_source": file_source,
-                    "type": t,
-                })
+            file_source = _build_file_source(
+                tenant_id, kb_id, document_id, file_name,
+                chunk_index=len(chunks),
+                page=page,
+                page_end=seg_page_end,
+                pspans=seg_pspans,
+                line_start=seg_line_start,
+                line_end=seg_line_end,
+                char_start=cs,
+                char_end=ce,
+                table_idx=table_idx,
+                ctype=ctype,
+                stats=stats,
+            )
+            text_for_upload = _inject_ns_token(
+                seg, tenant_id, kb_id, document_id,
+            )
+            chunks.append({
+                "text": text_for_upload,
+                "file_source": file_source,
+                "type": ctype,
+            })
 
     def _collect_multimodal_chunks(
         self, chunks: list[dict], multimodal_results: list[dict],
         tenant_id: str, kb_id: str, document_id: str, file_name: str,
+        asset_exts: dict[int, str] | None = None,
     ) -> None:
         """Extract image/audio/video description chunks from VLM results.
 
@@ -1842,7 +2740,13 @@ class PushChunksStage(Stage):
 
             # ── 1. Main summary chunk (MapReduce output) ──────────
             description = item.get("description", "")
-            if description and description.strip():
+            # [jonex] §table-grid-v2 L4.2 纵深防御：LLM 摘要响应解析偶发返回
+            # 嵌套 dict（如 detailed_description 被输出成子对象）——此处兜底
+            # 序列化，避免 'dict' object has no attribute 'strip' 炸掉整条
+            # pipeline。根修在 TableModalProcessor._parse_table_response。
+            if isinstance(description, dict):
+                description = json.dumps(description, ensure_ascii=False)
+            if description and isinstance(description, str) and description.strip():
                 start_time = _first_present(item, item_info, "start_time")
                 end_time = _first_present(item, item_info, "end_time")
                 # 若 item 层无时间数据，从 _audio_segments 推导整个视频的时间范围
@@ -1856,11 +2760,33 @@ class PushChunksStage(Stage):
                     chunk_index=len(chunks),
                     page=page,
                     image_idx=image_idx if content_type == "image" else None,
+                    # [jonex] §image-refs P1-3: 资产上传成功才写 aext=
+                    # （上传失败的图片不写，检索侧据此判定无 URL 可取）
+                    asset_ext=(
+                        (asset_exts or {}).get(image_idx)
+                        if content_type == "image"
+                        else None
+                    ),
                     start_time=start_time,
                     end_time=end_time,
+                    # 表格摘要的 ctype 用 table_summary（与明细行 table_row 区分，
+                    # 供检索侧双路召回使用）；其余模态沿用 content_type
+                    ctype=("table_summary" if content_type == "table" else content_type),
                 )
+                # [jonex] §table-grid-v2 L4.2: 摘要正文前缀「表格概览：」，
+                # 与明细行的「表格明细：【表】」在 embedding 空间区分开
+                # （与 ctype 双保险：前缀负责向量层面、ctype 负责过滤层面）。
+                summary_text = description
+                if content_type == "table":
+                    summary_text = f"表格概览：{description}"
+                elif content_type == "image":
+                    # [jonex] §image-refs P0-5: 图片描述正文前缀，与表格摘要的
+                    # 「表格概览：」同构——让图片 chunk 在 embedding 空间与
+                    # 普通文本 chunk 可区分（与 ctype 双保险：前缀负责向量
+                    # 层面、ctype 负责过滤层面）。
+                    summary_text = f"图片描述：{description}"
                 chunks.append({
-                    "text": _inject_ns_token(description, tenant_id, kb_id, document_id),
+                    "text": _inject_ns_token(summary_text, tenant_id, kb_id, document_id),
                     "file_source": file_source,
                     "type": content_type,
                 })
@@ -1877,6 +2803,7 @@ class PushChunksStage(Stage):
                     chunk_index=len(chunks),
                     start_time=frame_time,
                     end_time=frame_time,
+                    ctype="video_frame",
                 )
                 chunks.append({
                     "text": _inject_ns_token(
@@ -1907,6 +2834,7 @@ class PushChunksStage(Stage):
                     chunk_index=len(chunks),
                     start_time=s_start,
                     end_time=s_end,
+                    ctype="audio_segment",
                 )
                 chunks.append({
                     "text": _inject_ns_token(seg_text, tenant_id, kb_id, document_id),

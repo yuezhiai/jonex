@@ -23,7 +23,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           path: 'home',
           element: Home,
           title: 'navigation.home',
-          menu: { icon: 'HomeOutlined', order: 1, roles: ['admin', 'user'] },
+          menu: { icon: 'HomeOutlined', order: 1 },
         },
       ],
     },

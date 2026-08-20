@@ -40,9 +40,11 @@ interface Props {
   onEdit: (r: OntologyRelationDef) => void;
   onDelete: (r: OntologyRelationDef) => void;
   onPrompt: (r: OntologyRelationDef) => void;
+  canWrite?: boolean;
 }
 
 export default function OntologyRelationSection({
+  canWrite = false,
   data,
   loading,
   onCreate,
@@ -138,10 +140,15 @@ export default function OntologyRelationSection({
       width: 250,
       render: (_, r) => (
         <span>
-          <a className="yx-table-action" onClick={() => onEdit(r)}>
+          <a className="yx-table-action" style={canWrite ? undefined : { opacity: 0.4, cursor: "not-allowed" }}
+            onClick={() => canWrite && onEdit(r)}>
             <EditOutlined /> {t('common.edit')}
           </a>
-          <a className="yx-table-action" style={{ color: '#ef4444' }} onClick={() => onDelete(r)}>
+          <a
+            className="yx-table-action"
+            style={canWrite ? { color: '#ef4444' } : { color: '#ef4444', opacity: 0.4, cursor: 'not-allowed' }}
+            onClick={() => canWrite && onDelete(r)}
+          >
             <DeleteOutlined /> {t('common.delete')}
           </a>
           {/* 提示词功能暂未实现先隐藏 */}
@@ -158,10 +165,16 @@ export default function OntologyRelationSection({
           <ShareAltOutlined style={{ color: '#8b5cf6' }} /> {t('compile.relation.sectionTitle')}
         </h3>
         <div style={{ display: 'flex', gap: 8 }}>
-          <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}>
+          <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
             {t('compile.relation.createBtn')}
           </Button>
-          <Button icon={<ImportOutlined />} style={{ fontSize: 13 }} onClick={onImport}>
+          <Button icon={<ImportOutlined />} style={{ fontSize: 13 }} onClick={onImport}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
             {t('compile.relation.importBtn')}
           </Button>
         </div>

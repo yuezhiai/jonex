@@ -4,6 +4,7 @@ from typing import List
 
 from raganything.pipeline.base import Stage
 from raganything.pipeline.stages import (
+    AssetUploadStage,
     EntityExtractStage,
     EntityMergeStage,
     FileValidateStage,
@@ -82,6 +83,10 @@ def create_http_pipeline():
         .add_stage("validate", FileValidateStage())
         .add_stage("parse", ParseStage())
         .add_stage("multimodal", MultimodalStage(mode=PipelineMode.STANDALONE))
+        # [jonex] §image-refs P1-2: 图片资产上传（multimodal 之后、push_chunks
+        # 之前——aext 必须赶在 chunk 写入 file_source 前就位；best-effort，
+        # RAG_ASSET_UPLOAD_ENABLED 关闭时为空转）
+        .add_stage("asset_upload", AssetUploadStage())
         .add_stage("push_chunks", PushChunksStage())
         .build()
     )

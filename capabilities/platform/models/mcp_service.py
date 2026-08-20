@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, Integer, String, TIMESTAMP, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, TIMESTAMP, UniqueConstraint
 from sqlalchemy.sql import func
 
 from jonex_core.common.database import Base
@@ -26,5 +26,8 @@ class McpServicePublish(Base):
     is_published = Column(Integer, nullable=False, default=0)
     published_at = Column(TIMESTAMP(timezone=True))
     published_by = Column(String(64))
+    tool = Column(String(128))
+    tool_description = Column(Text)
+    service_type = Column(String(32), nullable=False, default="domain")
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())

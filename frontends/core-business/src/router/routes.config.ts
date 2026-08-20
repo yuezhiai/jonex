@@ -57,7 +57,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'knowledge-search',
           element: KnowledgeSearch,
           title: T('knowledgeSearch.pageTitle'),
-          menu: { icon: 'SearchOutlined', order: 1, roles: ['admin', 'user'] },
+          menu: { icon: 'SearchOutlined', order: 1, permissionCode: 'knowledge:read' },
         },
         {
           path: 'domain-space',
@@ -71,7 +71,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'domain-knowledge',
           element: DomainKnowledge,
           title: T('domainKnowledge.management'),
-          menu: { icon: 'DatabaseOutlined', order: 3, roles: ['admin', 'user'] },
+          menu: { icon: 'DatabaseOutlined', order: 3, permissionCode: 'knowledge:read' },
         },
         { path: 'domain-knowledge/:id', element: DomainKnowledgeBlank, title: T('domainKnowledge.detail') },
         {
@@ -151,7 +151,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'domain-management',
           element: DomainManagement,
           title: T('domainManagement.title'),
-          menu: { icon: 'ClusterOutlined', order: 4, roles: ['admin'] },
+          menu: { icon: 'ClusterOutlined', order: 4, permissionCode: 'service:read' },
         },
         { path: 'domain-management/services', element: DomainManagementServices, title: T('route.services') },
         { path: 'domain-management/search', element: DomainManagementSearch, title: T('route.domainManagementSearch') },

@@ -39,7 +39,7 @@ interface Props {
   onImport: () => void;
   onEdit: (item: OntologyObjectDef) => void;
   onDelete: (item: OntologyObjectDef) => void;
-  onPrompt: (item: OntologyObjectDef) => void;
+  onPrompt: (item: OntologyObjectDef) => void;  canWrite?: boolean;
 }
 
 function AttrInlineTable({ attrs, t }: { attrs: OntologyAttribute[]; t: (key: string, opts?: any) => string }) {
@@ -89,6 +89,7 @@ function AttrInlineTable({ attrs, t }: { attrs: OntologyAttribute[]; t: (key: st
 }
 
 export default function OntologyObjectSection({
+  canWrite = false,
   data,
   loading,
   onCreate,
@@ -134,10 +135,15 @@ export default function OntologyObjectSection({
       width: 250,
       render: (_, record) => (
         <span>
-          <a className="yx-table-action" onClick={() => onEdit(record)}>
+          <a className="yx-table-action" style={canWrite ? undefined : { opacity: 0.4, cursor: "not-allowed" }}
+            onClick={() => canWrite && onEdit(record)}>
             <EditOutlined /> {t('common.edit')}
           </a>
-          <a className="yx-table-action" style={{ color: '#ef4444' }} onClick={() => onDelete(record)}>
+          <a
+            className="yx-table-action"
+            style={canWrite ? { color: '#ef4444' } : { color: '#ef4444', opacity: 0.4, cursor: 'not-allowed' }}
+            onClick={() => canWrite && onDelete(record)}
+          >
             <DeleteOutlined /> {t('common.delete')}
           </a>
           {/* 提示词功能暂未实现先隐藏 */}
@@ -154,10 +160,16 @@ export default function OntologyObjectSection({
           <AppstoreOutlined style={{ color: '#3b82f6' }} /> {t('compile.tabObjectDef')}
         </h3>
         <div style={{ display: 'flex', gap: 8 }}>
-          <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}>
+          <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
             {t('compile.object.createBtn')}
           </Button>
-          <Button icon={<ImportOutlined />} style={{ fontSize: 13 }} onClick={onImport}>
+          <Button icon={<ImportOutlined />} style={{ fontSize: 13 }} onClick={onImport}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
             {t('compile.object.importBtn')}
           </Button>
         </div>

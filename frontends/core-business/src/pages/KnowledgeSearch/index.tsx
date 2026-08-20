@@ -27,6 +27,7 @@ import {
   getKnowledgeSearchDomains,
   getKnowledgeSearchHistory,
   saveKnowledgeSearchHistory,
+  resolveKnowledgeReferences,
   deleteKnowledgeSearchHistory,
   clearKnowledgeSearchHistory,
   streamKnowledgeSearch,
@@ -98,6 +99,8 @@ export interface SearchSession {
   source?: string;
   references?: KnowledgeReference[];
   reasoning?: ReasoningTrace | null;
+  /** [jonex] 本次搜索实际使用的检索条件（再次搜索时复用） */
+  strictConfig?: KnowledgeSearchStrictConfig | null;
 }
 
 function parseThink(raw: string): { think: string; answer: string; thinking: boolean } {
@@ -345,6 +348,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
   const [overview, setOverview] = useState<KnowledgeSearchOverview | null>(null);
   const [domains, setDomains] = useState<KnowledgeSearchDomain[]>([]);
   const [history, setHistory] = useState<KnowledgeSearchHistoryItem[]>([]);
+  // [jonex] 历史分页："查看更多"按页追加，loaded < total 时显示更多按钮
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
 
   const [activeSearch, setActiveSearch] = useState<SearchSession | null>(null);
   const [pageLoading, setPageLoading] = useState(true);
@@ -384,6 +391,12 @@ const KnowledgeSearch = function KnowledgeSearch() {
   // 查看原文：全部走统一弹层；视频/音频带时间锚点时定位到时间点
   const openReference = useCallback(
     (ref: KnowledgeReference, loc?: KnowledgeReferenceLocation) => {
+      // [jonex] §image-refs P3-2: image location 且有 asset_url → 直开原图；
+      // 无 asset_url（local 后端/未上传）回落文档级打开
+      if (loc?.type === 'image' && loc.asset_url) {
+        window.open(loc.asset_url, '_blank', 'noopener');
+        return;
+      }
       openDocument({
         docId: ref.doc_id,
         fileName: ref.file_name,
@@ -428,10 +441,12 @@ const KnowledgeSearch = function KnowledgeSearch() {
         }
 
         if (historyResult.status === 'fulfilled') {
-          setHistory(historyResult.value);
+          setHistory(historyResult.value.items);
+          setHistoryTotal(historyResult.value.total);
         } else {
           failedLabels.push(t('knowledgeSearch.historyLabel'));
           setHistory([]);
+          setHistoryTotal(0);
         }
 
         setPageError('');
@@ -472,7 +487,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
   );
 
   const handleSearch = useCallback(
-    async (nextQuery?: string, options?: { keepHistoryActive?: boolean; domainId?: string }) => {
+    async (
+      nextQuery?: string,
+      options?: { keepHistoryActive?: boolean; domainId?: string; strictConfig?: KnowledgeSearchStrictConfig | null },
+    ) => {
       const trimmedQuery = (nextQuery ?? query).trim();
       if (!trimmedQuery) return;
 
@@ -482,6 +500,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
 
       const sessionId = Date.now().toString();
       const domainId = options?.domainId ?? selectedDomain;
+      // [jonex] 复用历史检索条件：优先用历史快照的 strictConfig，否则用当前面板配置
+      const effectiveStrictConfig = options?.strictConfig ?? strictConfig;
       const kbIds = getSelectedKbIds(domainId);
       if (kbIds.length === 0) {
         message.warning(t('knowledgeSearch.noKbWarning'));
@@ -494,7 +514,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
         domainId,
         kbIds,
         deep: deepSearch,
-        strictConfig,
+        strictConfig: effectiveStrictConfig,
       };
       let streamError: Error | null = null;
       let accumulatedAnswer = '';
@@ -510,6 +530,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         rawAnswer: '',
         status: 'searching',
         errorMessage: '',
+        // [jonex] 检索条件快照：随本次会话保存，再次搜索时复用当时条件
+        strictConfig: effectiveStrictConfig,
       });
 
       try {
@@ -605,6 +627,12 @@ const KnowledgeSearch = function KnowledgeSearch() {
           resultCount: refCount,
           status: 'done',
           durationMs: Date.now() - startTime,
+          // [jonex] 检索历史快照：完整答案 + 引用 + 推理链落库，点击历史直接展示（不重新检索）
+          answer: accumulatedAnswer,
+          references: finalReferences,
+          reasoning: reasoningRef.current as ReasoningTrace | null,
+          // [jonex] 检索条件快照：保存实际使用的 strictConfig，点击历史再次搜索时复用
+          strictConfig: effectiveStrictConfig,
         })
           .then((item) => {
             if (!options?.keepHistoryActive) {
@@ -634,9 +662,44 @@ const KnowledgeSearch = function KnowledgeSearch() {
       setQuery(item.query);
       setActiveHistoryIndex(index);
       if (item.domainId) setSelectedDomain(item.domainId);
+      // [jonex] 历史快照：有 answer/references 时直接展示历史结果，不重新检索；
+      // 旧数据无快照则回退为重新检索
+      const hasSnapshot = Boolean(item.answer) || (item.references?.length ?? 0) > 0;
+      if (hasSnapshot) {
+        abortRef.current?.abort();
+        abortRef.current = null;
+        setSessionVote(null);
+        const sessionId = `history-${item.id}`;
+        setActiveSearch({
+          id: sessionId,
+          query: item.query,
+          domainId: item.domainId ?? selectedDomain,
+          rawAnswer: item.answer ?? '',
+          status: 'done',
+          errorMessage: '',
+          references: item.references ?? [],
+          reasoning: item.reasoning ?? null,
+          // [jonex] 检索条件快照：点击历史再次搜索时复用当时的 strictConfig
+          strictConfig: item.strictConfig ?? null,
+        });
+        // 快照里的 raw_url 已剥离且会过期，按 doc_id/locations 重新富化
+        if (item.references?.length) {
+          resolveKnowledgeReferences(item.references)
+            .then((resolved) => {
+              setActiveSearch((prev) =>
+                prev?.id === sessionId ? { ...prev, references: resolved } : prev,
+              );
+            })
+            .catch(() => {
+              // resolve 失败时保留快照引用（doc_id 仍可打开原文，仅 raw_url 为空）
+            });
+        }
+        return;
+      }
       void handleSearch(item.query, {
         keepHistoryActive: true,
         domainId: item.domainId ?? selectedDomain,
+        strictConfig: item.strictConfig ?? undefined,
       });
     },
     [handleSearch, selectedDomain],
@@ -734,9 +797,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
           setHistory((prev) => prev.filter((h) => h.id !== id));
           if (activeHistoryIndex === index) setActiveHistoryIndex(null);
         })
-        .catch(() => {});
+        .catch(() => message.error(t('knowledgeSearch.operationFailed')));
     },
-    [activeHistoryIndex],
+    [activeHistoryIndex, t],
   );
 
   const handleClearHistory = useCallback(() => {
@@ -750,12 +813,35 @@ const KnowledgeSearch = function KnowledgeSearch() {
         clearKnowledgeSearchHistory('')
           .then(() => {
             setHistory([]);
+            setHistoryTotal(0);
+            setHistoryPage(1);
             setActiveHistoryIndex(null);
           })
-          .catch(() => {});
+          .catch(() => message.error(t('knowledgeSearch.operationFailed')));
       },
     });
-  }, []);
+  }, [t]);
+
+  // [jonex] 历史"查看更多"：按页追加，去重后置底；已加载条数达总数后隐藏按钮
+  const loadMoreHistory = useCallback(async () => {
+    if (historyLoadingMore) return;
+    const nextPage = historyPage + 1;
+    setHistoryLoadingMore(true);
+    try {
+      const result = await getKnowledgeSearchHistory('', global.currentSpaceId ?? undefined, nextPage, 20);
+      setHistory((prev) => {
+        const existing = new Set(prev.map((h) => h.id));
+        const fresh = (result.items ?? []).filter((h) => !existing.has(h.id));
+        return [...prev, ...fresh];
+      });
+      setHistoryTotal(result.total);
+      setHistoryPage(nextPage);
+    } catch {
+      message.warning(t('knowledgeSearch.operationFailed'));
+    } finally {
+      setHistoryLoadingMore(false);
+    }
+  }, [historyLoadingMore, historyPage, global.currentSpaceId, t]);
 
   const getDomainName = useCallback(
     (domainId?: string) => domains.find((d) => d.id === domainId)?.name ?? t('knowledgeSearch.allDomain'),
@@ -846,7 +932,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
         onToggleReasoning={(id) => setReasoningExpandedMap((prev) => ({ ...prev, [id]: !prev[id] }))}
         onToggleRefs={(id) => setRefsExpandedMap((prev) => ({ ...prev, [id]: !prev[id] }))}
         onStop={handleStopSearch}
-        onReSearch={(query, domainId) => void handleSearch(query, { domainId })}
+        onReSearch={(query, domainId) =>
+          void handleSearch(query, { domainId, strictConfig: activeSearch?.strictConfig ?? undefined })
+        }
         onClear={handleClearSearch}
         onVote={handleVoteAnswer}
         onOpenReference={openReference}
@@ -894,6 +982,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
           onHistoryClick={handleHistoryClick}
           onDeleteHistory={handleDeleteHistory}
           onClearHistory={handleClearHistory}
+          hasMore={history.length < historyTotal}
+          onLoadMore={() => void loadMoreHistory()}
+          loadingMore={historyLoadingMore}
         />
       </div>
 

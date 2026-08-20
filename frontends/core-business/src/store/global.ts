@@ -28,7 +28,7 @@ interface GlobalState {
 }
 
 export const useGlobalStore = create<GlobalState>((set, get) => ({
-  userInfo: getItem<Record<string, unknown>>('userInfo') || null,
+  userInfo: getItem<Record<string, unknown>>('jonex_user') || null,
 
   // ── 领域空间状态 ──
   spaces: [],
@@ -39,7 +39,7 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
 
   setUserInfo: (data) => {
     set({ userInfo: data });
-    setItem('userInfo', data);
+    setItem('jonex_user', data);
   },
 
   setCurrentSpaceId: (id, opts = {}) => {

@@ -22,6 +22,12 @@ class SearchHistoryCreateRequest(BaseModel):
     reference_count: int = Field(default=0, ge=0, alias="referenceCount")
     result_count: int = Field(default=0, ge=0, alias="resultCount")
     duration_ms: Optional[int] = Field(default=None, ge=0, alias="durationMs")
+    # [jonex] 检索历史快照：完整答案 + 引用快照 + 推理链快照（点击历史直接展示，不重新检索）
+    answer: Optional[str] = None
+    references: Optional[list] = Field(default_factory=list)
+    reasoning: Optional[dict] = None
+    # [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件）
+    strict_config: Optional[dict] = Field(default=None, alias="strictConfig")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     class Config:
@@ -61,6 +67,9 @@ class SearchHistoryResponse(BaseModel):
     result_count: int = 0
     duration_ms: Optional[int] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    answer: Optional[str] = None
+    references: list = Field(default_factory=list)
+    reasoning: Optional[dict] = None
     searched_at: Optional[datetime | str] = None
     created_at: Optional[datetime | str] = None
     updated_at: Optional[datetime | str] = None

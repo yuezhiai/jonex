@@ -42,3 +42,12 @@ class UserRoleRepository(BaseRepository[UserRole]):
             )
         )
         return result.scalars().all()
+
+    async def set_users_for_role(self, tenant_id: str, role_id: int, user_ids: list[int]) -> None:
+        tenant_id = require_tenant(tenant_id)
+        await self.session.execute(
+            delete(UserRole).where(UserRole.tenant_id == tenant_id, UserRole.role_id == role_id)
+        )
+        for uid in user_ids:
+            self.session.add(UserRole(tenant_id=tenant_id, role_id=role_id, user_id=uid))
+        await self.session.flush()

@@ -52,6 +52,7 @@ import {
   type ParserConfigItem,
 } from '@/api/domainKnowledge';
 import CompileTab from './compile/CompileTab';
+import LlmWikiSchemaTab from './llmWikiSchema/LlmWikiSchemaTab';
 import SynonymTab from './synonym/SynonymTab';
 import DataSourceTab from './DataSourceTab';
 import ResultTab from './ResultTab';
@@ -143,15 +144,7 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
     };
     return t(map[status] || status);
   };
-  const permissionMemberName = (member: DomainKnowledgePermissionMember) => {
-    const keyById: Record<string, string> = {
-      mock_perm_1: 'domainKnowledge.demoPermissionMembers.engineer',
-      mock_perm_2: 'domainKnowledge.demoPermissionMembers.productManager',
-      mock_perm_3: 'domainKnowledge.demoPermissionMembers.riskManager',
-    };
-    const key = keyById[member.userId];
-    return key ? t(key) : member.name;
-  };
+  const permissionMemberName = (member: DomainKnowledgePermissionMember) => member.name;
 
   // ── detail header ────────────────────────────────────
   const [detail, setDetail] = useState<DomainKnowledgeDetailType | null>(null);
@@ -219,7 +212,24 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
     }, 300);
   };
 
-  const handlePermRoleChange = (userId: string, role: 'view' | 'manage') => {
+  const handlePermAddMember = (user: import('@/api/user').PlatformUser) => {
+    setPermissionMembers((prev) => {
+      if (prev.some((m) => m.userId === String(user.id))) return prev;
+      return [
+        ...prev,
+        {
+          userId: String(user.id),
+          name: user.display_name || user.username,
+          dept: '',
+          avatarText: (user.display_name || user.username).charAt(0).toUpperCase(),
+          avatarColor: '#94a3b8',
+          role: 'viewer',
+        },
+      ];
+    });
+  };
+
+  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor') => {
     setPermissionMembers((prev) => prev.map((m) => (m.userId === userId ? { ...m, role } : m)));
   };
 
@@ -328,6 +338,7 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
           <DataSourceTab
             dataSources={dataSources}
             dataSourcesLoading={dataSourcesLoading}
+            canWrite={detail?.can_write ?? false}
             onAdd={() => setAddDsOpen(true)}
             onEdit={(ds) => openEditModal(ds)}
             onReload={reloadDataSources}
@@ -335,13 +346,17 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
         );
 
       case 'parse':
-        return <ParserConfigContent kbId={id} spaceId={currentSpaceId} />;
+        return <ParserConfigContent kbId={id} spaceId={currentSpaceId} canWrite={detail?.can_write ?? false} />;
 
       case 'compile':
-        return <CompileTab kbId={id!} />;
+        // [jonex] 管线分流（方案 §10）：openkb KB 显示 LLM-Wiki Schema 设置；
+        // detail?.kbType 已随 KB 详情加载（无额外请求）；未到达前按 lightrag 渲染
+        return detail?.kbType === 'openkb'
+          ? <LlmWikiSchemaTab kbId={id!} canWrite={detail?.can_write ?? false} />
+          : <CompileTab kbId={id!} canWrite={detail?.can_write ?? false} />;
 
       case 'synonym':
-        return <SynonymTab kbId={id!} />;
+        return <SynonymTab kbId={id!} canWrite={detail?.can_write ?? false} />;
 
       case 'result':
         return (
@@ -369,7 +384,9 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
             members={permissionMembers}
             loading={permissionLoading}
             saving={permissionSaving}
+            canManage={detail?.can_manage_permissions ?? false}
             memberName={permissionMemberName}
+            onAdd={handlePermAddMember}
             onRoleChange={handlePermRoleChange}
             onRemove={(userId) => setPermissionMembers((prev) => prev.filter((m) => m.userId !== userId))}
             onSave={handleSavePermissions}

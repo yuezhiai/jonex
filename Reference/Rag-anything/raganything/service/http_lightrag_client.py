@@ -570,6 +570,28 @@ class HttpLightRagClient:
             logger.warning(f"Poll track {track_id} failed: {e}")
             return TrackStatus(state="processing", error=str(e))
 
+    async def delete_orphan_chunk(
+        self, chunk_id: str, *, tenant_id: str, kb_id: str,
+    ) -> bool:
+        """[jonex] O7: DELETE /documents/chunks/{chunk_id} — 孤儿 chunk 强制清理。
+
+        doc_status 无记录的残留 chunk（reparse 删除未收敛），doc 级删除会
+        not found 直接返回。本端点按 chunk_id 直删 text_chunks/向量/full_docs，
+        不依赖 doc_status。
+        """
+        try:
+            data = await self._delete(
+                f"/documents/chunks/{chunk_id}", tenant_id, kb_id, body=None,
+            )
+            return bool(data and data.get("status") == "success")
+        except LightRAGError as e:
+            if e.code == 404:
+                return True  # 已不存在视为清理完成
+            logger.warning(
+                "LightRAG delete_orphan_chunk(%s) failed: %s", chunk_id, e,
+            )
+            return False
+
     async def delete_doc(
         self, doc_id: str, *, tenant_id: str, kb_id: str,
     ) -> bool:

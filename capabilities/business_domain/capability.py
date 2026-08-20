@@ -10,7 +10,8 @@ from jonex_core.capability.models import (
     CapabilityResponse,
     CapabilityType,
 )
-from jonex_core.common.exceptions import TenantIsolationError, JonexException
+from jonex_core.common.exceptions import TenantIsolationError, JonexException, PermissionDeniedError
+from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
 from capabilities.business_domain.services import (
@@ -20,6 +21,70 @@ from capabilities.business_domain.services import (
 from capabilities.business_domain.services.prompt_template_service import PromptTemplateService
 
 logger = logging.getLogger(__name__)
+
+
+_ACTION_PERMISSIONS = {
+    "create_access_method": "engine:write",
+    "update_access_method": "engine:write",
+    "create_parser": "engine:write",
+    "update_parser": "engine:write",
+    "create_provider": "engine:write",
+    "update_provider": "engine:write",
+    "test_provider": "engine:write",
+    "create_adapter": "adapter:write",
+    "update_adapter": "adapter:write",
+    "connect_adapter": "adapter:write",
+    "disconnect_adapter": "adapter:write",
+    "enable_skill": "skill:write",
+    "disable_skill": "skill:write",
+    "create_template_domain": "template:write",
+    "update_template_domain": "template:write",
+    "delete_template_domain": "template:write",
+    "create_template_scenario": "template:write",
+    "update_template_scenario": "template:write",
+    "delete_template_scenario": "template:write",
+    "create_template_object": "template:write",
+    "update_template_object": "template:write",
+    "delete_template_object": "template:write",
+    "create_template_relation": "template:write",
+    "update_template_relation": "template:write",
+    "delete_template_relation": "template:write",
+    "create_prompt_template": "prompt:write",
+    "update_prompt_template": "prompt:write",
+    "delete_prompt_template": "prompt:write",
+    "copy_prompt_template": "prompt:write",
+    "rollback_prompt_template": "prompt:write",
+    "create_template_constraint": "template:write",
+    "update_template_constraint": "template:write",
+    "delete_template_constraint": "template:write",
+    "import_template_ontology_yaml": "template:write",
+    "export_template_ontology_yaml": "template:write",
+}
+
+
+async def _check_action_permission(request) -> None:
+    """invoke dispatch 前置校验：action 映射权限码 → 用户权限集合判定。
+
+    user_id 口径（安全决策，已定案）：
+    - CapabilityRequest.user_id 是 Optional[str]（gateway 仅在 JWT 可解时透传 sub；
+      测试 token 解不出 JWT → user_id 为 None，不是 "0"）。
+    - 无 user_id → 放行（不拦截）：能到达 capability 的请求已过 Sidecar 认证，
+      权限码校验是租户内细化授权而非边界防线；测试 token 依赖此口径。
+    """
+    action = request.payload.get("action")
+    code = _ACTION_PERMISSIONS.get(action)
+    if not code:
+        return
+    if not request.user_id:
+        return
+    from jonex_core.security.permission import get_user_permissions
+
+    tenant_id = request.tenant_id
+    perms = await get_user_permissions(tenant_id, int(request.user_id))
+    if code not in perms:
+        raise PermissionDeniedError(
+            message=translate("err.auth.insufficient_permission", params={"required": code}, fallback=f"权限不足：需要权限 {code}")
+        )
 
 
 class BusinessDomainCapability(BaseCapability):
@@ -49,16 +114,16 @@ class BusinessDomainCapability(BaseCapability):
         pt = self._prompt_template
         return {
             # ── 引擎管理 ──
-            "list_access_methods":    lambda r, d: e.list_access_methods(r.tenant_id, d.get("offset", 0), d.get("limit", 20)),
-            "create_access_method":   lambda r, d: e.create_access_method(r.tenant_id, d),
-            "update_access_method":   lambda r, d: e.update_access_method(d["method_id"], r.tenant_id, d),
-            "list_parsers":           lambda r, d: e.list_parsers(r.tenant_id, d.get("offset", 0), d.get("limit", 20)),
-            "create_parser":          lambda r, d: e.create_parser(r.tenant_id, d),
-            "update_parser":          lambda r, d: e.update_parser(d["parser_id"], r.tenant_id, d),
-            "list_providers":         lambda r, d: e.list_providers(r.tenant_id, d.get("offset", 0), d.get("limit", 20)),
-            "create_provider":        lambda r, d: e.create_provider(r.tenant_id, d),
-            "update_provider":        lambda r, d: e.update_provider(d["provider_id"], r.tenant_id, d),
-            "test_provider":          lambda r, d: e.test_provider(d["provider_id"], r.tenant_id),
+            "list_access_methods":    lambda r, d: e.list_access_methods(d.get("offset", 0), d.get("limit", 20)),
+            "create_access_method":   lambda r, d: e.create_access_method(d),
+            "update_access_method":   lambda r, d: e.update_access_method(d["method_id"], d),
+            "list_parsers":           lambda r, d: e.list_parsers(d.get("offset", 0), d.get("limit", 20)),
+            "create_parser":          lambda r, d: e.create_parser(d),
+            "update_parser":          lambda r, d: e.update_parser(d["parser_id"], d),
+            "list_providers":         lambda r, d: e.list_providers(d.get("offset", 0), d.get("limit", 20)),
+            "create_provider":        lambda r, d: e.create_provider(d),
+            "update_provider":        lambda r, d: e.update_provider(d["provider_id"], d),
+            "test_provider":          lambda r, d: e.test_provider(d["provider_id"]),
             # ── 生态适配器 ──
             "list_adapters":          lambda r, d: a.list(r.tenant_id, d.get("offset", 0), d.get("limit", 20)),
             "create_adapter":         lambda r, d: a.create(r.tenant_id, d),
@@ -173,6 +238,7 @@ class BusinessDomainCapability(BaseCapability):
 
         try:
             request.tenant_id = require_tenant(request.tenant_id)
+            await _check_action_permission(request)   # ← 新增
             result = await handler(request, data)
             return CapabilityResponse.ok(request.request_id, result)
         except TenantIsolationError as e:

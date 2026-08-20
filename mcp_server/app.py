@@ -5,8 +5,8 @@
 
 知识库 MCP Tool 服务，提供：
 - MCP Streamable HTTP 传输
-- MCP Key 鉴权中间件（Phase 2）
-- knowledge_base 搜索/读取 tool handler（Phase 4）
+- MCP Key 鉴权中间件
+- knowledge_base 搜索/读取 tool handler
 """
 import contextlib
 import logging
@@ -83,6 +83,16 @@ async def search_llmwiki(
 
 
 @mcp.tool()
+async def search_mix(
+    service_id: str, query: str, mode: str = "hybrid", top_k: int = 5,
+) -> dict:
+    """混合管线检索统一入口——同时查询 LightRAG 和 OpenKB 管线知识库。
+    自动按 pipeline_type 分组扇出，支持混合选库。
+    搜索模式：naive / local / global / hybrid（默认 hybrid）。"""
+    return await tools.search_mix(service_id, query, mode, top_k)
+
+
+@mcp.tool()
 async def read_source(service_id: str, document_id: str) -> dict:
     """获取文档源文件的预签名 URL。以领域服务为入口，自动解析文档所属知识库。"""
     return await tools.read_source(service_id, document_id)
@@ -118,10 +128,10 @@ async def lifespan(app: Starlette):
     await create_pool()
     _client = httpx.AsyncClient(
         base_url=settings.GATEWAY_URL,
-        timeout=30,
+        timeout=120,
     )
     tools.set_http_client(_client)
-    # Phase 11: OpenKB 健康检查——控制 SEARCH_LLMWIKI_ENABLED 运行时开关 (D-08)
+    # OpenKB 健康检查——控制 SEARCH_LLMWIKI_ENABLED 运行时开关
     health_ok = await check_openkb_health(settings.OPENKB_HEALTH_URL, client=_client)
     if not health_ok:
         tools.SEARCH_LLMWIKI_ENABLED = False
@@ -158,7 +168,7 @@ app = Starlette(
 #   - 对所有请求生效（含未认证请求），按 key_id 或 "unknown" 限流
 #   - _get_key_id() 优先从 contextvar 读取；若 contextvar 为 None（鉴权未到达），
 #     降级为 "unknown" key（同源限流，避免 key_id=None 导致所有请求合并计数）
-#   - 置于鉴权外层：防止攻击者无限制暴力尝试无效 key（per P0 jonex-0o3）
+#   - 置于鉴权外层：防止攻击者无限制暴力尝试无效 key
 app = McpRateLimitMiddleware(
     app,
     storage_uri=settings.REDIS_URL.replace("redis://", "async+redis://"),

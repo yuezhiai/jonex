@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -51,6 +52,9 @@ class McpServiceResponse(BaseModel):
     published_by: str | None = None
     last_call_at: datetime | None = None
     created_at: datetime | None = None
+    tool: str | None = None
+    tool_description: str | None = None
+    service_type: str = "domain"
 
 
 class McpServiceListResponse(BaseModel):
@@ -72,6 +76,23 @@ class McpServiceDetailResponse(McpServiceResponse):
     enabled: int = 1
     kb_ids: list[str] = []
     updated_at: datetime | None = None
+
+
+class ToolConfigRequest(BaseModel):
+    """保存领域服务 MCP Tool 配置请求（DS-03）
+
+    tool 命名仅支持英文字母、数字、下划线（^[A-Za-z0-9_]+$）；
+    同租户内唯一性在 Service 层校验（DTO 层只做格式校验）。
+    """
+
+    tool: str = Field(..., max_length=128)
+    tool_description: Optional[str] = Field(default=None)
+
+    @validator("tool")
+    def validate_tool(cls, v):
+        if not re.fullmatch(r"^[A-Za-z0-9_]+$", v):
+            raise ValueError("tool 仅支持英文字母、数字、下划线")
+        return v
 
 
 class PublishRequest(BaseModel):
@@ -108,16 +129,14 @@ class TestCallResponse(BaseModel):
 class AuthorizedKeyResponse(BaseModel):
     """已授权 Key 响应（E10 Key 列表项）
 
-    来自 platform.mcp_keys JOIN mcp_key_service_mappings JOIN mcp_organizations。
+    来自 platform.mcp_keys JOIN mcp_key_service_mappings。
     """
 
     key_id: str
     key_name: str
     key_prefix: str
     permission_level: str
-    org_name: str | None = None
     key_status: str
-    org_id: str | None = None
 
 
 class AuthorizedKeyListResponse(BaseModel):

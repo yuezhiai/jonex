@@ -44,6 +44,9 @@ import type { ServiceFormModalHandle } from './ServiceFormModal';
 const DomainManagementServices = function DomainManagementServices() {
   const { t } = useTranslation();
   const { global } = useStore();
+
+  // 空间管理权限（owner/租户管理员）：服务增删改、启停、配置、API key 均为管理动作
+  const canManageServices = global.currentSpace?.can_write_space ?? false;
   const [searchParams, setSearchParams] = useSearchParams();
 
   // ── Data state ──
@@ -462,19 +465,48 @@ const DomainManagementServices = function DomainManagementServices() {
         const isActive = r.status === 'active';
         return (
           <Space>
-            <a className="yx-table-action" onClick={() => toggleServiceStatus(r)}>
+            <a
+              className="yx-table-action"
+              style={canManageServices ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => canManageServices && toggleServiceStatus(r)}
+            >
               {isActive ? t('domainManagement.disable') : t('domainManagement.enable')}
             </a>
-            <a className="yx-table-action" onClick={() => openPermModal(r)}>
+            <a
+              className="yx-table-action"
+              style={canManageServices ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => canManageServices && openPermModal(r)}
+            >
               <TeamOutlined style={{ fontSize: 11 }} /> {t('domainManagement.perm')}
             </a>
-            <a className="yx-table-action" onClick={() => openSrvConfig(r)}>
+            <a
+              className="yx-table-action"
+              style={canManageServices ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => canManageServices && openSrvConfig(r)}
+            >
               <KeyOutlined style={{ fontSize: 11 }} /> {t('domainManagement.config')}
             </a>
-            <a className="yx-table-action" onClick={() => serviceFormRef.current?.openEdit(r)}>
+            <a
+              className="yx-table-action"
+              style={canManageServices ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => canManageServices && serviceFormRef.current?.openEdit(r)}
+            >
               {t('common.edit')}
             </a>
-            <a className="yx-table-action" style={{ color: '#dc2626' }} onClick={() => setDeleteTarget(r)}>
+            <a
+              className="yx-table-action"
+              style={
+                canManageServices
+                  ? { color: '#dc2626' }
+                  : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
+              }
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => canManageServices && setDeleteTarget(r)}
+            >
               {t('common.delete')}
             </a>
           </Space>
@@ -526,7 +558,13 @@ const DomainManagementServices = function DomainManagementServices() {
             style={{ width: 240 }}
           />
           <Select value={typeFilter} onChange={setTypeFilter} style={{ width: 140 }} options={typeOptions} />
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => serviceFormRef.current?.openCreate()}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={!canManageServices}
+            title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => serviceFormRef.current?.openCreate()}
+          >
             {t('domainManagementServices.createService')}
           </Button>
         </div>

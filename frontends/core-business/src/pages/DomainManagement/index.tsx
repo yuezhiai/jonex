@@ -127,6 +127,9 @@ const DomainManagement = function DomainManagement() {
   });
 
   // ── CRUD handlers ──
+  // 空间管理权限（owner/租户管理员）：服务增删改、启停、配置均为管理动作（设计 2026-08-19）
+  const canManageServices = global.currentSpace?.can_write_space ?? false;
+
   const openCreate = () => {
     setEditing(null);
     setFormOpen(true);
@@ -410,16 +413,41 @@ const DomainManagement = function DomainManagement() {
         const isActive = r.status === 'active';
         return (
           <Space size={4}>
-            <Button type="link" size="small" onClick={() => openSrvConfig(r)}>
+            <Button
+              type="link"
+              size="small"
+              disabled={!canManageServices}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => openSrvConfig(r)}
+            >
               {t('domainManagement.srvConfigTitle')}
             </Button>
-            <Button type="link" size="small" onClick={() => toggleServiceStatus(r)}>
+            <Button
+              type="link"
+              size="small"
+              disabled={!canManageServices}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => toggleServiceStatus(r)}
+            >
               {isActive ? t('domainManagement.disable') : t('domainManagement.enable')}
             </Button>
-            <Button type="link" size="small" onClick={() => openEdit(r)}>
+            <Button
+              type="link"
+              size="small"
+              disabled={!canManageServices}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => openEdit(r)}
+            >
               {t('common.edit')}
             </Button>
-            <Button type="link" size="small" danger onClick={() => setDeleteTarget(r)}>
+            <Button
+              type="link"
+              size="small"
+              danger
+              disabled={!canManageServices}
+              title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => setDeleteTarget(r)}
+            >
               {t('common.delete')}
             </Button>
           </Space>
@@ -477,7 +505,13 @@ const DomainManagement = function DomainManagement() {
             onChange={(e) => setSearch(e.target.value)}
             style={{ width: 280 }}
           />
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={!canManageServices}
+            title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
+            onClick={openCreate}
+          >
             {t('domainManagement.create')}
           </Button>
         </div>

@@ -377,6 +377,7 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
         padding: 20,
         display: 'flex',
         flexDirection: 'column',
+        overflowY: 'scroll',
       }}
     >
       {/* 工具栏 */}
@@ -480,7 +481,9 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
               zIndex: 10,
             }}
           >
-            <Spin tip={t('knowledgeGraph.loadingGraph')}>
+            <Spin
+              description={<div style={{ width: 200, textAlign: 'center' }}>{t('knowledgeGraph.loadingGraph')}</div>}
+            >
               <div style={{ padding: 16 }} />
             </Spin>
           </div>

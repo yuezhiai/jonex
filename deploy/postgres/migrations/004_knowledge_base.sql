@@ -42,6 +42,24 @@ CREATE INDEX IF NOT EXISTS idx_kb_spp_tenant ON knowledge_base.space_permissions
 CREATE INDEX IF NOT EXISTS idx_kb_spp_is_deleted ON knowledge_base.space_permissions(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_kb_spp_space ON knowledge_base.space_permissions(space_id);
 CREATE INDEX IF NOT EXISTS idx_kb_spp_user ON knowledge_base.space_permissions(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_spp_unique_member ON knowledge_base.space_permissions(tenant_id, space_id, user_id) WHERE is_deleted = 0;
+
+-- 知识库授权成员（KB 级叠加授权：viewer/editor，设计 2026-08-20-kb-permission-design）
+CREATE TABLE IF NOT EXISTS knowledge_base.kb_permissions (
+    id VARCHAR(64) PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    kb_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    role VARCHAR(32) NOT NULL DEFAULT 'viewer',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted SMALLINT DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_kb_perms_tenant ON knowledge_base.kb_permissions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_kb_perms_is_deleted ON knowledge_base.kb_permissions(is_deleted);
+CREATE INDEX IF NOT EXISTS idx_kb_perms_kb ON knowledge_base.kb_permissions(kb_id);
+CREATE INDEX IF NOT EXISTS idx_kb_perms_user ON knowledge_base.kb_permissions(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_perms_unique_member ON knowledge_base.kb_permissions(tenant_id, kb_id, user_id) WHERE is_deleted = 0;
 
 -- ------------------------------------------------------------
 -- 知识库信息管理
@@ -92,7 +110,6 @@ CREATE TABLE IF NOT EXISTS knowledge_base.service_knowledge_bases (
     tenant_id VARCHAR(64) NOT NULL,
     service_id VARCHAR(64) NOT NULL,
     kb_id VARCHAR(64) NOT NULL,
-    pipeline_type VARCHAR(16) NOT NULL DEFAULT 'lightrag',  -- [jonex] lightrag / openkb；存量 KB 默认 lightrag
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
@@ -187,6 +204,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_documents (
     llm_wiki_compile_requested_at TIMESTAMP,      -- patrol 超时基准（UTC）
     llm_wiki_compiled_at TIMESTAMP,
     llm_wiki_task_id VARCHAR(128),                -- OpenKB 容器编译任务 ID（对齐 rag_task_id）
+    -- [jonex] LLM-Wiki Schema 版本 fencing（update/013_llm_wiki_schema_columns.sql 同款；全新库直接建列）
+    llm_wiki_target_schema_version INTEGER,       -- 本次应使用的 LLM-Wiki Schema 版本（claim 时写入）
+    llm_wiki_applied_schema_version INTEGER,      -- 实际完成编译的版本（patrol completed 回写）
     -- [jonex] 源文件内容 hash（update/011_document_content_hash.sql 同款；全新库直接建列）
     content_hash VARCHAR(32),                     -- 源文件内容 md5（上传去重 + reparse 跳过，md5 仅比对非安全用途）
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -218,6 +238,11 @@ CREATE INDEX IF NOT EXISTS idx_kb_doc_ontology_outdated
 CREATE INDEX IF NOT EXISTS idx_kb_doc_content_hash
     ON knowledge_base.knowledge_documents (tenant_id, knowledge_base_id, content_hash)
     WHERE is_deleted = 0 AND status <> 'failed';
+-- LLM-Wiki Schema 过期文档扫描（update/013_llm_wiki_schema_columns.sql 同款；全新库直接建索引）
+CREATE INDEX IF NOT EXISTS idx_kb_doc_llm_wiki_schema_outdated
+    ON knowledge_base.knowledge_documents (tenant_id, knowledge_base_id)
+    WHERE is_deleted = 0
+      AND llm_wiki_applied_schema_version IS DISTINCT FROM llm_wiki_target_schema_version;
 -- LLM-Wiki 编译巡检（patrol_openkb_compile）高频查询索引：只覆盖 compiling
 CREATE INDEX IF NOT EXISTS idx_kb_doc_llm_wiki_compiling
     ON knowledge_base.knowledge_documents(tenant_id, llm_wiki_compile_status)
@@ -236,7 +261,7 @@ COMMENT ON COLUMN knowledge_base.knowledge_documents.llm_wiki_task_id
   IS 'OpenKB 容器编译任务 ID（对齐 rag_task_id），供对账巡检轮询';
 
 -- ------------------------------------------------------------
--- 检索历史表（按 tenant+user+query+knowledge_base 去重，软删除）
+-- 检索历史表（按 tenant+user 隔离，软删除；同 query 可保留多条，超出 200 由 save 链路 trim 清理）
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_search_history (
     id VARCHAR(64) PRIMARY KEY,
@@ -254,19 +279,21 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_search_history (
     result_count INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER,
     extra_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- [jonex] 检索历史快照列：点击历史直接展示历史结果，不重新检索
+    -- answer      完整答案原始文本（含 <think> 标记，展示时前端 parseThink/parseReferences 解析）
+    -- references  引用快照（JSONB，落库前剥离过期的 raw_url，展示时经 resolve 端点重新富化）
+    -- reasoning   推理链快照（ReasoningTrace: steps/final_source/total_ms）
+    answer TEXT,
+    "references" JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reasoning JSONB,
     searched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT NOT NULL DEFAULT 0
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_search_history_query_kb
-    ON knowledge_base.knowledge_search_history(
-        tenant_id,
-        user_id,
-        query_hash,
-        knowledge_base_id
-    );
+-- [jonex] 追加策略：不建 (tenant_id,user_id,query_hash,knowledge_base_id) 唯一索引，
+-- 同一问题可保留多条历史（新结果不覆盖旧记录），超 200 条由 save 链路 trim_for_user 清理。
 CREATE INDEX IF NOT EXISTS idx_kb_hist_tenant_user_time
     ON knowledge_base.knowledge_search_history(tenant_id, user_id, searched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_kb_hist_tenant_user_deleted
@@ -520,3 +547,50 @@ CREATE TABLE IF NOT EXISTS knowledge_base.document_tags (
 CREATE INDEX IF NOT EXISTS idx_kb_doc_tags_tag
     ON knowledge_base.document_tags (tag_id);
 COMMENT ON TABLE knowledge_base.document_tags IS '文档与标签的多对多关联，级联删除。';
+
+-- ------------------------------------------------------------
+-- LLM-Wiki Schema 编译设置表（kb_type=openkb 的编译配置权威源）
+-- 方案：docs/llmwiki-schema-settings-execution-plan.md
+-- 留档模型：每次保存递增 schema_version，旧 active 行转 archived；
+-- partial unique index 只约束 active（每 KB 单 active），archived 留历史。
+-- sync_status 与 status 分开：status 是留档语义，sync_status 是 apply_schema
+-- 同步状态（synced / apply_failed）。
+-- 时间列用 TIMESTAMP（naive），与 knowledge_base 域内现状一致。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS knowledge_base.llm_wiki_schemas (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    knowledge_base_id VARCHAR(128) NOT NULL,
+
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(32) NOT NULL DEFAULT 'active',   -- active / archived
+    sync_status VARCHAR(32) NOT NULL DEFAULT 'synced',  -- synced / apply_failed
+
+    schema_name VARCHAR(128) NOT NULL DEFAULT 'default',
+    language VARCHAR(32) NOT NULL DEFAULT 'zh-CN',
+    model VARCHAR(128),
+
+    entity_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+    concept_types JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 概念类型词表（AGENTS.md 引导，无硬校验）
+    -- [jonex] 用户自定义追加块（多行 markdown，渲染时原样拼到 AGENTS.md 末尾）
+    -- 页面规则/编译规则等均由该块承载
+    agents_md_extra TEXT NOT NULL DEFAULT '',
+
+    agents_md TEXT NOT NULL,
+    config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    edited_by VARCHAR(128),
+    edited_at TIMESTAMP,
+    applied_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 每个 KB 最多一条 active（部分唯一索引）；历史版本留档为 archived 不受限
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_wiki_schema_active
+    ON knowledge_base.llm_wiki_schemas (tenant_id, knowledge_base_id)
+    WHERE status = 'active';
+
+-- active 查询加速（编译触发点/保存 CAS 主路径）
+CREATE INDEX IF NOT EXISTS idx_llm_wiki_schema_kb
+    ON knowledge_base.llm_wiki_schemas (tenant_id, knowledge_base_id, schema_version);

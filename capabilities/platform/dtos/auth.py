@@ -24,6 +24,10 @@ class UserInfo(BaseModel):
     tenant_id: str
     tenant_name: Optional[str] = None
     role: str
+    roles: list[str] = []
+    is_platform_admin: bool = False
+    is_tenant_admin: bool = False
+    permissions: list[str] = []
 
 
 class LoginResponse(BaseModel):

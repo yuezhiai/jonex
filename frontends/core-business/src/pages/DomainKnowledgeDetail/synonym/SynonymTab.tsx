@@ -44,9 +44,11 @@ function csvCell(value: string): string {
 
 interface Props {
   kbId: string;
+  /** KB 写权限（权限矩阵） */
+  canWrite?: boolean;
 }
 
-export default function SynonymTab({ kbId }: Props) {
+export default function SynonymTab({ kbId, canWrite = false }: Props) {
   const { t } = useTranslation();
   const { data, total, page, pageSize, loading, error, refresh, setPage } = useSynonyms(kbId);
   const [formModal, setFormModal] = useState<{ open: boolean; editing: SynonymGroup | null }>({
@@ -141,7 +143,11 @@ export default function SynonymTab({ kbId }: Props) {
       width: 160,
       render: (_, record) => (
         <span>
-          <a className="yx-table-action" onClick={() => setFormModal({ open: true, editing: record })}>
+          <a
+            className="yx-table-action"
+            style={canWrite ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+            onClick={() => canWrite && setFormModal({ open: true, editing: record })}
+          >
             <EditOutlined /> {t('common.edit')}
           </a>
           <Popconfirm
@@ -150,9 +156,13 @@ export default function SynonymTab({ kbId }: Props) {
             okText={t('synonym.deleteOkText')}
             cancelText={t('common.cancel')}
             okButtonProps={{ danger: true }}
+            disabled={!canWrite}
             onConfirm={() => handleDelete(record)}
           >
-            <a className="yx-table-action" style={{ color: '#ef4444' }}>
+            <a
+              className="yx-table-action"
+              style={canWrite ? { color: '#ef4444' } : { color: '#ef4444', opacity: 0.4, cursor: 'not-allowed' }}
+            >
               <DeleteOutlined /> {t('common.delete')}
             </a>
           </Popconfirm>
@@ -168,13 +178,24 @@ export default function SynonymTab({ kbId }: Props) {
           <SwapOutlined style={{ color: '#3b82f6' }} /> {t('synonym.title')}
         </h3>
         <Space>
-          <Button icon={<ImportOutlined />} onClick={() => setImportOpen(true)}>
+          <Button
+            icon={<ImportOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => setImportOpen(true)}
+          >
             {t('synonym.import')}
           </Button>
           <Button icon={<ExportOutlined />} loading={exporting} onClick={handleExport}>
             {t('synonym.export')}
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setFormModal({ open: true, editing: null })}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => setFormModal({ open: true, editing: null })}
+          >
             {t('synonym.create')}
           </Button>
         </Space>

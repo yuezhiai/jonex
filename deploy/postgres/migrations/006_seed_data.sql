@@ -61,31 +61,21 @@ VALUES
      '指定租户登录用户 - Beta 租户', 'admin');
 
 
--- 基础角色
-INSERT INTO platform.roles (tenant_id, name, description, is_system)
-VALUES ('tenant_jonex_demo', 'admin', '系统管理员角色', 1)
+-- 空间权限演示账号（设计 2026-08-19-space-permission-design：默认空间成员演示）
+-- password: admin123
+INSERT INTO platform.users (tenant_id, username, password_hash, display_name, role)
+VALUES
+    ('tenant_jonex_demo', 'editor_demo',
+     '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
+     '演示知识编辑者', 'user'),
+    ('tenant_jonex_demo', 'viewer_demo',
+     '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
+     '演示观察者', 'user')
 ON CONFLICT DO NOTHING;
 
-INSERT INTO platform.roles (tenant_id, name, description, is_system)
-VALUES ('tenant_jonex_demo', 'user', '普通用户角色', 1)
-ON CONFLICT DO NOTHING;
-
--- 默认权限
-INSERT INTO platform.permissions (code, name, resource, action) VALUES
-    ('platform:user:read', '查看用户', 'user', 'read'),
-    ('platform:user:write', '管理用户', 'user', 'write'),
-    ('platform:role:read', '查看角色', 'role', 'read'),
-    ('platform:role:write', '管理角色', 'role', 'write'),
-    ('platform:menu:read', '查看菜单', 'menu', 'read'),
-    ('platform:menu:write', '管理菜单', 'menu', 'write'),
-    ('platform:app:read', '查看应用', 'application', 'read'),
-    ('platform:app:write', '管理应用', 'application', 'write'),
-    ('platform:config:read', '查看配置', 'system_config', 'read'),
-    ('platform:config:write', '管理配置', 'system_config', 'write'),
-    ('platform:audit:read', '查看审计日志', 'audit_log', 'read'),
-    ('platform:task:read', '查看任务', 'task_schedule', 'read'),
-    ('platform:task:write', '管理任务', 'task_schedule', 'write')
-ON CONFLICT (code) DO NOTHING;
+-- 旧 platform:* 权限种子已废弃移除（RBAC 系统前遗留；无 id 分配曾占用序列 id 1-13，
+-- 导致 RBAC 显式 id 1-14 基础码块被 ON CONFLICT 跳过；无端点消费、无映射引用）。
+-- 权限码统一由下方 RBAC 三批种子提供。
 
 -- RBAC 权限（带显式 id，供角色-权限映射引用）
 INSERT INTO platform.permissions (id, code, name, resource, action, description) VALUES
@@ -105,38 +95,191 @@ INSERT INTO platform.permissions (id, code, name, resource, action, description)
     (14, 'system:write', '管理系统配置', 'system', 'write', '修改系统配置')
 ON CONFLICT (id) DO NOTHING;
 
--- 预设角色
+-- 显式 id 插入不推进序列：立即对齐，防后续无 id 的 INSERT 撞主键
+SELECT setval('platform.permissions_id_seq', (SELECT MAX(id) FROM platform.permissions), true);
+
+-- 预设角色（语义：平台管理员 = 平台级最高权限仅 admin 绑定；系统管理员 = 租户内管理员）
 INSERT INTO platform.roles (id, tenant_id, name, description, is_system) VALUES
-    (1, 'tenant_jonex_demo', '系统管理员', '拥有平台全部管理权限，包括系统配置、用户管理、租户管理、模型管理等所有功能模块', 1),
-    (2, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置，可创建和管理领域空间', 0),
-    (3, 'tenant_jonex_demo', '知识编辑者', '负责知识的编辑、上传和维护，可管理知识库中的文档和数据', 0),
-    (4, 'tenant_jonex_demo', '观察者', '仅可检索和查看知识，不具备编辑和管理权限，适用于只读访问场景', 0)
+    (1, 'tenant_jonex_demo', '平台管理员', '平台级最高权限：全部权限码（含平台面跨租户码），仅 demo 租户 admin 账号绑定', 1),
+    (2, 'tenant_jonex_demo', '系统管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
+    (3, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/系统管理员创建后授权管理（空间权限收紧，2026-08-19）', 0),
+    (4, 'tenant_jonex_demo', '知识编辑者', '负责知识的编辑、上传和维护，可管理知识库中的文档和数据', 0),
+    (5, 'tenant_jonex_demo', '观察者', '仅可检索和查看知识，不具备编辑和管理权限，适用于只读访问场景', 0)
 ON CONFLICT (id) DO NOTHING;
 
--- 角色-权限关联
+-- 显式 id 插入不推进序列：立即对齐，防后续无 id 的角色播种撞主键
+SELECT setval('platform.roles_id_seq', (SELECT MAX(id) FROM platform.roles), true);
+
+-- RBAC 权限系统：平台面权限码（scope='platform'；其中 7 个 code 与上方旧 platform:* 种子重名，
+-- 依赖 ON CONFLICT DO UPDATE 把 scope 收敛为 platform）
+INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
+    ('platform:admin', '平台管理员', 'platform', 'admin', '平台管理员标识码（is_platform_admin 判定）', 'platform'),
+    ('platform:tenant:read', '查看全部租户', 'tenant', 'read', '平台级：租户列表/详情/计数', 'platform'),
+    ('platform:tenant:write', '管理租户', 'tenant', 'write', '平台级：创建/编辑/删除租户', 'platform'),
+    ('platform:user:all', '跨租户查看全部用户', 'user', 'all', '平台级：/users/all', 'platform'),
+    ('platform:menu:read', '查看菜单', 'menu', 'read', '平台级：全量菜单树', 'platform'),
+    ('platform:menu:write', '管理菜单', 'menu', 'write', '平台级：菜单写', 'platform'),
+    ('platform:application:read', '查看应用', 'application', 'read', '平台级：应用注册管理', 'platform'),
+    ('platform:application:write', '管理应用', 'application', 'write', '平台级：应用写', 'platform'),
+    ('platform:config:read', '查看配置', 'system_config', 'read', '平台级：系统配置', 'platform'),
+    ('platform:config:write', '管理配置', 'system_config', 'write', '平台级：配置写', 'platform'),
+    ('platform:audit:read', '查看审计日志', 'audit_log', 'read', '平台级：审计日志', 'platform'),
+    ('platform:task:read', '查看任务', 'task_schedule', 'read', '平台级：任务调度', 'platform'),
+    ('platform:task:write', '管理任务', 'task_schedule', 'write', '平台级：任务写', 'platform')
+ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
+
+-- 兜底：旧种子 6 条废弃 platform:* 码（platform:user/role/app:*）无同名新码覆盖，
+-- scope 会停在 DEFAULT 'tenant'——显式收敛，防非特权租户枚举/绑定
+UPDATE platform.permissions SET scope = 'platform'
+WHERE code LIKE 'platform:%' AND scope <> 'platform';
+
+-- RBAC 权限系统：租户业务权限码（scope='tenant'，新增 10 个；user/role/knowledge/service/model 已在 id 1-14）
+INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
+    ('engine:read', '查看引擎目录', 'engine', 'read', '接入方式/解析器/模型目录查看', 'tenant'),
+    ('engine:write', '管理引擎目录', 'engine', 'write', '接入方式/解析器/模型目录管理', 'tenant'),
+    ('adapter:read', '查看适配器', 'adapter', 'read', '生态适配器查看', 'tenant'),
+    ('adapter:write', '管理适配器', 'adapter', 'write', '生态适配器管理', 'tenant'),
+    ('skill:read', '查看技能', 'skill', 'read', '技能查看', 'tenant'),
+    ('skill:write', '管理技能', 'skill', 'write', '技能启用/停用', 'tenant'),
+    ('template:read', '查看模板', 'template', 'read', '模板系统查看', 'tenant'),
+    ('template:write', '管理模板', 'template', 'write', '模板系统编辑', 'tenant'),
+    ('prompt:read', '查看提示词模板', 'prompt', 'read', '提示词模板查看', 'tenant'),
+    ('prompt:write', '管理提示词模板', 'prompt', 'write', '提示词模板编辑', 'tenant'),
+    ('mcp:read', '查看 MCP 服务', 'mcp', 'read', 'MCP 服务目录与 Key 查看', 'tenant'),
+    ('mcp:write', '管理 MCP 服务', 'mcp', 'write', 'MCP 服务发布与 Key 管理', 'tenant')
+ON CONFLICT (code) DO NOTHING;
+
+-- 角色-权限关联（基础矩阵：平台管理员/系统管理员全 14 码；领域服务管理员/知识编辑者/观察者按矩阵）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id) VALUES
     ('tenant_jonex_demo', 1, 1), ('tenant_jonex_demo', 1, 2), ('tenant_jonex_demo', 1, 3),
     ('tenant_jonex_demo', 1, 4), ('tenant_jonex_demo', 1, 5), ('tenant_jonex_demo', 1, 6),
     ('tenant_jonex_demo', 1, 7), ('tenant_jonex_demo', 1, 8), ('tenant_jonex_demo', 1, 9),
     ('tenant_jonex_demo', 1, 10), ('tenant_jonex_demo', 1, 11), ('tenant_jonex_demo', 1, 12),
     ('tenant_jonex_demo', 1, 13), ('tenant_jonex_demo', 1, 14),
-    ('tenant_jonex_demo', 2, 3), ('tenant_jonex_demo', 2, 5), ('tenant_jonex_demo', 2, 7),
-    ('tenant_jonex_demo', 2, 9), ('tenant_jonex_demo', 2, 10),
-    ('tenant_jonex_demo', 3, 7), ('tenant_jonex_demo', 3, 8),
-    ('tenant_jonex_demo', 4, 3), ('tenant_jonex_demo', 4, 5), ('tenant_jonex_demo', 4, 7),
-    ('tenant_jonex_demo', 4, 9), ('tenant_jonex_demo', 4, 11), ('tenant_jonex_demo', 4, 13)
+    ('tenant_jonex_demo', 2, 1), ('tenant_jonex_demo', 2, 2), ('tenant_jonex_demo', 2, 3),
+    ('tenant_jonex_demo', 2, 4), ('tenant_jonex_demo', 2, 5), ('tenant_jonex_demo', 2, 6),
+    ('tenant_jonex_demo', 2, 7), ('tenant_jonex_demo', 2, 8), ('tenant_jonex_demo', 2, 9),
+    ('tenant_jonex_demo', 2, 10), ('tenant_jonex_demo', 2, 11), ('tenant_jonex_demo', 2, 12),
+    ('tenant_jonex_demo', 2, 13), ('tenant_jonex_demo', 2, 14),
+    ('tenant_jonex_demo', 3, 3), ('tenant_jonex_demo', 3, 7),
+    ('tenant_jonex_demo', 3, 9), ('tenant_jonex_demo', 3, 10),
+    ('tenant_jonex_demo', 4, 7), ('tenant_jonex_demo', 4, 8), ('tenant_jonex_demo', 4, 9),
+    ('tenant_jonex_demo', 5, 7), ('tenant_jonex_demo', 5, 9)
 ON CONFLICT DO NOTHING;
 
--- 默认菜单
-INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order) VALUES
-    (1, 0, '平台管理', '/platform', 'SettingOutlined', NULL, 1),
-    (2, 1, '用户管理', '/platform/users', 'UserOutlined', NULL, 1),
-    (3, 1, '角色管理', '/platform/roles', 'TeamOutlined', NULL, 2),
-    (4, 1, '菜单管理', '/platform/menus', 'MenuOutlined', NULL, 3),
-    (5, 1, '应用管理', '/platform/applications', 'AppstoreOutlined', NULL, 4),
-    (6, 1, '系统配置', '/platform/configs', 'SettingOutlined', NULL, 5),
-    (7, 1, '审计日志', '/platform/audit-logs', 'FileTextOutlined', NULL, 6),
-    (8, 1, '任务调度', '/platform/tasks', 'ClockCircleOutlined', NULL, 7)
+-- demo 预设角色 × 新增业务码矩阵（平台管理员/系统管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT 'tenant_jonex_demo', r.id, p.id
+FROM platform.roles r
+JOIN platform.permissions p ON p.code IN (
+    'engine:read','engine:write','adapter:read','adapter:write','skill:read','skill:write',
+    'template:read','template:write','prompt:read','prompt:write','mcp:read','mcp:write'
+)
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.is_deleted = 0
+  AND r.name IN ('平台管理员', '系统管理员', '领域服务管理员')
+ON CONFLICT DO NOTHING;
+
+-- demo 平台管理员补全部平台面码（平台码只给平台管理员角色）
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT r.tenant_id, r.id, p.id
+FROM platform.roles r
+JOIN platform.permissions p ON p.scope = 'platform'
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '平台管理员' AND r.is_deleted = 0
+ON CONFLICT DO NOTHING;
+
+-- 平台管理员 + 系统管理员补全部租户业务码（兜底幂等）
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT r.tenant_id, r.id, p.id
+FROM platform.roles r
+JOIN platform.permissions p ON p.scope = 'tenant'
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '系统管理员') AND r.is_deleted = 0
+ON CONFLICT DO NOTHING;
+
+-- 每租户预设角色播种（demo 已显式插入 id 1-4；其他租户按 demo 模板复制，is_system=0）
+INSERT INTO platform.roles (tenant_id, name, description, is_system)
+SELECT t.id, r.name, r.description, 0
+FROM platform.tenants t
+CROSS JOIN (SELECT name, description FROM platform.roles
+            WHERE tenant_id = 'tenant_jonex_demo' AND is_deleted = 0
+              AND name IN ('系统管理员','领域服务管理员','知识编辑者','观察者')) r
+WHERE t.id <> 'tenant_jonex_demo' AND t.is_deleted = 0
+ON CONFLICT DO NOTHING;
+
+-- 每租户角色-权限映射播种（按角色 name 对齐 demo 模板；仅 scope='tenant' 码）
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT t.id, nr.id, rp.permission_id
+FROM platform.roles nr
+JOIN platform.tenants t ON nr.tenant_id = t.id AND t.is_deleted = 0
+JOIN platform.roles dr ON dr.tenant_id = 'tenant_jonex_demo' AND dr.name = nr.name AND dr.is_deleted = 0
+JOIN platform.role_permissions rp ON rp.tenant_id = 'tenant_jonex_demo' AND rp.role_id = dr.id
+JOIN platform.permissions p ON p.id = rp.permission_id
+WHERE t.id <> 'tenant_jonex_demo' AND p.scope = 'tenant'
+ON CONFLICT DO NOTHING;
+
+-- 用户-角色绑定种子（语义：平台级仅 demo 租户的 admin 账号；其余 role='admin' 为租户内管理员）
+-- 6a. 平台级：仅 demo 租户 username='admin' → 「平台管理员」
+INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
+SELECT u.tenant_id, u.id, r.id
+FROM platform.users u
+JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
+WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin' AND u.is_deleted = 0
+  AND r.name = '平台管理员'
+ON CONFLICT DO NOTHING;
+
+-- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「系统管理员」（无平台码）
+INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
+SELECT u.tenant_id, u.id, r.id
+FROM platform.users u
+JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
+WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '系统管理员'
+  AND NOT (u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin')
+ON CONFLICT DO NOTHING;
+
+-- 6c. role='user' → 「观察者」
+INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
+SELECT u.tenant_id, u.id, r.id
+FROM platform.users u
+JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
+WHERE u.role = 'user' AND u.is_deleted = 0 AND r.name = '观察者'
+ON CONFLICT DO NOTHING;
+
+-- 6d. 空间权限演示：editor_demo → 「知识编辑者」（叠加 6c 的「观察者」，权限码取并集）
+INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
+SELECT u.tenant_id, u.id, r.id
+FROM platform.users u
+JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
+WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_deleted = 0
+  AND r.name = '知识编辑者'
+ON CONFLICT DO NOTHING;
+
+-- 默认菜单（三大应用分组；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
+INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, permission_code) VALUES
+    -- 核心功能分组（直接项，无中间组）
+    (1, 0, 'navigation.coreBusiness', NULL, 'HomeOutlined', NULL, 1, NULL),
+    (2, 1, 'navigation.knowledgeSearch', '/apps/core-business/knowledge-search', 'SearchOutlined', NULL, 1, 'knowledge:read'),
+    (3, 1, 'navigation.domainKnowledge', '/apps/core-business/domain-knowledge', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
+    (4, 1, 'navigation.domainManagement', '/apps/core-business/domain-management', 'ClusterOutlined', NULL, 3, 'service:read'),
+    -- 平台分组 → 引擎管理组（可折叠）
+    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 2, NULL),
+    (6, 5, 'navigation.engineManagement', NULL, 'ApiOutlined', NULL, 1, NULL),
+    (7, 6, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
+    (8, 6, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
+    -- 平台分组 → 提示词模板（直接项）
+    (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 2, 'prompt:read'),
+    -- 平台分组 → 管理后台组（可折叠）
+    (10, 5, 'navigation.administration', NULL, 'SettingOutlined', NULL, 3, NULL),
+    (11, 10, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
+    (12, 10, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
+    (13, 10, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
+    (14, 10, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 4, 'platform:config:read'),
+    (15, 10, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 5, 'platform:audit:read'),
+    -- 集成分组 → 集成适配器组（可折叠）
+    (16, 0, 'navigation.ecosystemManagement', NULL, 'GlobalOutlined', NULL, 3, NULL),
+    (17, 16, 'navigation.ecoAdapter', NULL, 'BlockOutlined', NULL, 1, NULL),
+    (18, 17, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'),
+    (19, 17, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:read'),
+    -- 集成分组 → 领域模板（直接项）
+    (20, 16, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 2, 'template:read')
 ON CONFLICT DO NOTHING;
 
 -- 默认应用注册
@@ -323,12 +466,12 @@ ON CONFLICT (id) DO NOTHING;
 -- 模型供应商种子数据
 -- ============================================================
 
-INSERT INTO business_domain.model_providers (id, tenant_id, name, provider_type, model_type, model_name, latency_ms, token_limit, vector_dimension, call_count, success_rate, status, config_json)
+INSERT INTO business_domain.model_providers (id, name, provider_type, model_type, model_name, latency_ms, token_limit, vector_dimension, call_count, success_rate, status, config_json)
 VALUES
-    ('provider_demo_gpt4o', 'tenant_jonex_demo', 'GPT-4o', 'llm', '对话模型', 'gpt-4o', 1200, 128000, NULL, 12458, 99, 'active', '{"vendor":"OpenAI"}'::jsonb),
-    ('provider_demo_claude', 'tenant_jonex_demo', 'Claude Opus 4', 'llm', '对话模型', 'claude-opus-4', 1800, 200000, NULL, 8234, 99, 'active', '{"vendor":"Anthropic"}'::jsonb),
-    ('provider_demo_text2vec', 'tenant_jonex_demo', 'text2vec-large', 'embedding', '向量模型', 'text2vec-large-chinese', 300, NULL, 768, 56892, 100, 'active', '{"vendor":"本地部署"}'::jsonb),
-    ('provider_demo_reranker', 'tenant_jonex_demo', 'bge-reranker', 'reranker', '重排序模型', 'bge-reranker-v2-m3', 500, NULL, NULL, 23456, 99, 'active', '{"vendor":"本地部署","batch_size":64}'::jsonb)
+    ('provider_demo_gpt4o', 'GPT-4o', 'llm', '对话模型', 'gpt-4o', 1200, 128000, NULL, 12458, 99, 'active', '{"vendor":"OpenAI"}'::jsonb),
+    ('provider_demo_claude', 'Claude Opus 4', 'llm', '对话模型', 'claude-opus-4', 1800, 200000, NULL, 8234, 99, 'active', '{"vendor":"Anthropic"}'::jsonb),
+    ('provider_demo_text2vec', 'text2vec-large', 'embedding', '向量模型', 'text2vec-large-chinese', 300, NULL, 768, 56892, 100, 'active', '{"vendor":"本地部署"}'::jsonb),
+    ('provider_demo_reranker', 'bge-reranker', 'reranker', '重排序模型', 'bge-reranker-v2-m3', 500, NULL, NULL, 23456, 99, 'active', '{"vendor":"本地部署","batch_size":64}'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================
@@ -343,30 +486,30 @@ ON CONFLICT (id) DO NOTHING;
 --   AUDIO_FORMATS  = .mp3 .wav .m4a .ogg .flac .wma .aac .opus .amr
 --   VIDEO_FORMATS  = .mp4 .avi .mov .mkv .flv .wmv .webm .m4v .mpg .mpeg .3gp
 
-INSERT INTO business_domain.parser_configs (id, tenant_id, name, parser_type, file_types, config_json, status)
+INSERT INTO business_domain.parser_configs (id, name, parser_type, file_types, config_json, status)
 VALUES
-    ('video_full_pipeline', 'tenant_jonex_demo', '视频解析器-VLM', 'video',
+    ('video_full_pipeline', '视频解析器-VLM', 'video',
      '["MP4","AVI","MOV","MKV","FLV","WMV","WEBM","M4V","MPG","MPEG","3GP"]'::jsonb,
      '{"version":"v2.3.0","process_count":1245,"display_fields":[{"label":"关键帧提取","value":"智能模式"},{"label":"分辨率限制","value":"1080p"}]}'::jsonb, 'active'),
-    ('video_mps', 'tenant_jonex_demo', '视频解析器-MPS', 'video',
+    ('video_mps', '视频解析器-MPS', 'video',
      '["MP4","AVI","MOV","MKV","FLV","WMV","WEBM","M4V","MPG","MPEG","3GP"]'::jsonb,
      '{"version":"v2.3.0","process_count":1245,"display_fields":[{"label":"关键帧提取","value":"智能模式"},{"label":"分辨率限制","value":"1080p"}]}'::jsonb, 'active'),
-    ('audio_transcribe', 'tenant_jonex_demo', '音频解析器', 'audio',
+    ('audio_transcribe', '音频解析器', 'audio',
      '["MP3","WAV","FLAC","AAC","M4A","OGG","WMA","OPUS","AMR"]'::jsonb,
      '{"version":"v2.1.2","process_count":3678,"display_fields":[{"label":"转写模型","value":"通用转写模型"},{"label":"输出格式","value":"SRT"}]}'::jsonb, 'active'),
-    ('image_parse', 'tenant_jonex_demo', '图像解析器', 'image',
+    ('image_parse', '图像解析器', 'image',
      '["JPG","JPEG","PNG","GIF","BMP","TIFF","TIF","WEBP"]'::jsonb,
      '{"version":"v1.9.5","process_count":5432,"display_fields":[{"label":"OCR 引擎","value":"内置 OCR"},{"label":"图像压缩","value":"高质量"}]}'::jsonb, 'active'),
-    ('document_parse', 'tenant_jonex_demo', '文档解析器', 'document',
+    ('document_parse', '文档解析器', 'document',
      '["PDF","DOC","DOCX","PPT","PPTX","XLS","XLSX"]'::jsonb,
      '{"version":"v3.0.1","process_count":12890,"display_fields":[{"label":"排版保留","value":"启用"},{"label":"表格提取","value":"智能提取"}]}'::jsonb, 'active'),
-    ('text_parse', 'tenant_jonex_demo', '文本解析器', 'txt',
+    ('text_parse', '文本解析器', 'txt',
      '["TXT","MD"]'::jsonb,
      '{"version":"v3.0.1","process_count":12890,"display_fields":[{"label":"排版保留","value":"启用"},{"label":"表格提取","value":"智能提取"}]}'::jsonb, 'active'),
-    ('parser_demo_web', 'tenant_jonex_demo', '网页解析器', 'web',
+    ('parser_demo_web', '网页解析器', 'web',
      '["HTML","HTM","XHTML"]'::jsonb,
      '{"version":"--","process_count":0,"display_fields":[{"label":"渲染模式","value":"静态渲染"},{"label":"抓取深度","value":"--"}]}'::jsonb, 'inactive'),
-    ('parser_demo_cad', 'tenant_jonex_demo', 'CAD 解析器', 'cad',
+    ('parser_demo_cad', 'CAD 解析器', 'cad',
      '["DWG","DXF","STEP"]'::jsonb,
      '{"version":"--","process_count":0,"display_fields":[{"label":"精度等级","value":"标准"},{"label":"图层提取","value":"全部"}]}'::jsonb, 'inactive')
 ON CONFLICT (id) DO NOTHING;
@@ -375,12 +518,12 @@ ON CONFLICT (id) DO NOTHING;
 -- 数据接入方式种子数据（原型 4 个 + API 开放推送）
 -- ============================================================
 
-INSERT INTO business_domain.data_access_methods (id, tenant_id, name, access_type, config_json, status) VALUES
-    ('dam_demo_api', 'tenant_jonex_demo', 'API 接入（拉取）', 'api', '{"description":"通过 REST/gRPC 接口接入数据"}'::jsonb, 'active'),
-    ('dam_api_push_demo', 'tenant_jonex_demo', 'API 开放（推送）', 'api_push', '{"description":"外部系统通过 OpenAPI 推送文档入库"}'::jsonb, 'active'),
-    ('dam_demo_storage', 'tenant_jonex_demo', '文件存储直连', 'storage', '{"description":"NAS/S3/MinIO/OSS 等"}'::jsonb, 'active'),
-    ('dam_demo_file', 'tenant_jonex_demo', '文件上传', 'file', '{"description":"PDF/DOCX/CSV/JSON 等"}'::jsonb, 'active'),
-    ('dam_demo_mqtt', 'tenant_jonex_demo', 'MQTT 接入', 'mqtt', '{"description":"物联网消息队列接入"}'::jsonb, 'inactive')
+INSERT INTO business_domain.data_access_methods (id, name, access_type, config_json, status) VALUES
+    ('dam_demo_api', 'API 接入（拉取）', 'api', '{"description":"通过 REST/gRPC 接口接入数据"}'::jsonb, 'active'),
+    ('dam_api_push_demo', 'API 开放（推送）', 'api_push', '{"description":"外部系统通过 OpenAPI 推送文档入库"}'::jsonb, 'active'),
+    ('dam_demo_storage', '文件存储直连', 'storage', '{"description":"NAS/S3/MinIO/OSS 等"}'::jsonb, 'active'),
+    ('dam_demo_file', '文件上传', 'file', '{"description":"PDF/DOCX/CSV/JSON 等"}'::jsonb, 'active'),
+    ('dam_demo_mqtt', 'MQTT 接入', 'mqtt', '{"description":"物联网消息队列接入"}'::jsonb, 'inactive')
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================
@@ -651,9 +794,20 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 -- 领域空间种子数据
 -- ============================================================
-INSERT INTO knowledge_base.spaces (id, tenant_id, name, description, status, knowledge_base_count, service_count) VALUES
-    ('space_demo_test', 'tenant_jonex_demo', '默认空间', '默认空间', 'active', 0, 0)
+INSERT INTO knowledge_base.spaces (id, tenant_id, name, description, status, knowledge_base_count, service_count, owner_id) VALUES
+    ('space_demo_test', 'tenant_jonex_demo', '默认空间', '默认空间', 'active', 0, 0, '1')
 ON CONFLICT (id) DO NOTHING;
+
+-- 默认空间成员种子（演示空间权限：owner 不落 space_permissions，见设计 §2）
+INSERT INTO knowledge_base.space_permissions (id, tenant_id, space_id, user_id, role, created_at, updated_at)
+SELECT 'spp_demo_editor', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'manager', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  FROM platform.users u
+ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_deleted = 0
+UNION ALL
+SELECT 'spp_demo_viewer', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'viewer', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  FROM platform.users u
+ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'viewer_demo' AND u.is_deleted = 0
+ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- 知识库种子数据
@@ -686,11 +840,11 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
-    ('skb_demo_internet', 'tenant_jonex_demo', 'svc_demo_internet', 'kb_demo_internet', 'lightrag'),
-    ('skb_demo_credit', 'tenant_jonex_demo', 'svc_demo_credit', 'kb_demo_credit_risk', 'lightrag'),
-    ('skb_demo_medical', 'tenant_jonex_demo', 'svc_demo_medical', 'kb_demo_medical', 'lightrag')
+    ('skb_demo_internet', 'tenant_jonex_demo', 'svc_demo_internet', 'kb_demo_internet'),
+    ('skb_demo_credit', 'tenant_jonex_demo', 'svc_demo_credit', 'kb_demo_credit_risk'),
+    ('skb_demo_medical', 'tenant_jonex_demo', 'svc_demo_medical', 'kb_demo_medical')
 ON CONFLICT (id) DO NOTHING;
 
 -- [jonex] OpenKB 知识库种子数据
@@ -716,9 +870,9 @@ VALUES
      'knowledge_compiler', 'active', '')
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
-    ('skb_demo_openkb', 'tenant_jonex_demo', 'svc_demo_openkb', 'kb_demo_openkb', 'openkb')
+    ('skb_demo_openkb', 'tenant_jonex_demo', 'svc_demo_openkb', 'kb_demo_openkb')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
@@ -1293,9 +1447,9 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
-    ('skb_demo_hwfin', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'kb_demo_hw_inet_finance', 'lightrag')
+    ('skb_demo_hwfin', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'kb_demo_hw_inet_finance')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试用 API Key
@@ -2004,9 +2158,9 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- 领域服务和知识库关联关系
-INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type)
+INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
-    ('skb_demo_llmtr', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'kb_demo_llm_tech_report', 'lightrag')
+    ('skb_demo_llmtr', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'kb_demo_llm_tech_report')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试用 API Key
@@ -2393,7 +2547,7 @@ INSERT INTO jonex.knowledge_base.knowledge_data_sources (id, tenant_id, knowledg
 
 INSERT INTO jonex.knowledge_base.services (id, tenant_id, space_id, "name", description, domain_type, status, api_key_encrypted, created_at, updated_at, is_deleted) VALUES('68bb7dd208c54f45ac31b6fbb5d655f5', 'tenant_jonex_demo', 'space_demo_test', '金融开源数据集服务', NULL, NULL, 'active', NULL, '2026-07-23 06:14:29.743', '2026-07-23 06:14:29.743', 0);
 
-INSERT INTO jonex.knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, pipeline_type, created_at, updated_at, is_deleted) VALUES('0fc886a5083646e188e7e1c84a95b7f7', 'tenant_jonex_demo', '68bb7dd208c54f45ac31b6fbb5d655f5', 'b11dd30de0994178a3a4e388e6cf816e', 'lightrag', '2026-07-23 06:14:29.748', '2026-07-23 06:14:29.748', 0);
+INSERT INTO jonex.knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, created_at, updated_at, is_deleted) VALUES('0fc886a5083646e188e7e1c84a95b7f7', 'tenant_jonex_demo', '68bb7dd208c54f45ac31b6fbb5d655f5', 'b11dd30de0994178a3a4e388e6cf816e', '2026-07-23 06:14:29.748', '2026-07-23 06:14:29.748', 0);
 
 
 INSERT INTO jonex.knowledge_base.ontology_compiled_schemas (tenant_id, knowledge_base_id, template_domain_id, template_scenario_id, source_type, source_version, source_hash, schema_version, entity_types, relation_types, "constraints", disambiguation, prompt_schema, schema_mode, sync_status, edited_at, edited_by, status, compiled_at, created_at, updated_at) VALUES('tenant_jonex_demo', 'b11dd30de0994178a3a4e388e6cf816e', NULL, NULL, 'yaml_default', 1, NULL, 1, '[{"name": "Organization", "status": "active", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false, "description": "", "display_name": "legal_name", "is_primary_key": false, "source_attribute_id": null}, {"name": "industry", "type": "string", "required": false, "description": "", "display_name": "industry", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Organization", "source_object_id": null}, {"name": "Person", "status": "active", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false, "description": "", "display_name": "title", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Person", "source_object_id": null}, {"name": "Location", "status": "active", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false, "description": "", "display_name": "address", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Location", "source_object_id": null}, {"name": "Product", "status": "active", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false, "description": "", "display_name": "model", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Product", "source_object_id": null}, {"name": "Concept", "status": "active", "aliases": ["概念", "术语", "定义"], "attributes": [], "description": "", "requirement": "", "display_name": "Concept", "source_object_id": null}, {"name": "Method", "status": "active", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": [], "description": "", "requirement": "", "display_name": "Method", "source_object_id": null}, {"name": "Event", "status": "active", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false, "description": "", "display_name": "date", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Event", "source_object_id": null}]', '[{"name": "BELONGS_TO", "source": "Person", "status": "active", "target": "Organization", "aliases": [], "cardinality": "custom", "description": "", "display_name": "BELONGS_TO", "source_relation_id": null}, {"name": "PRODUCES", "source": "Organization", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PRODUCES", "source_relation_id": null}, {"name": "LOCATED_AT", "source": "Organization", "status": "active", "target": "Location", "aliases": [], "cardinality": "custom", "description": "", "display_name": "LOCATED_AT", "source_relation_id": null}, {"name": "WORKS_WITH", "source": "Person", "status": "active", "target": "Person", "aliases": [], "cardinality": "custom", "description": "", "display_name": "WORKS_WITH", "source_relation_id": null}, {"name": "USES", "source": "Organization", "status": "active", "target": "Method", "aliases": [], "cardinality": "custom", "description": "", "display_name": "USES", "source_relation_id": null}, {"name": "RELATES_TO", "source": "Concept", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "RELATES_TO", "source_relation_id": null}, {"name": "PART_OF", "source": "Concept", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PART_OF", "source_relation_id": null}, {"name": "HAS_FEATURE", "source": "Product", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "HAS_FEATURE", "source_relation_id": null}]', '[]', '{"alias_merge": true, "case_insensitive": true}', '{"entity_types": [{"name": "Organization", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false}, {"name": "industry", "type": "string", "required": false}]}, {"name": "Person", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false}]}, {"name": "Location", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false}]}, {"name": "Product", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false}]}, {"name": "Concept", "aliases": ["概念", "术语", "定义"], "attributes": []}, {"name": "Method", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": []}, {"name": "Event", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false}]}], "relation_types": [{"name": "BELONGS_TO", "source": "Person", "target": "Organization"}, {"name": "PRODUCES", "source": "Organization", "target": "Product"}, {"name": "LOCATED_AT", "source": "Organization", "target": "Location"}, {"name": "WORKS_WITH", "source": "Person", "target": "Person"}, {"name": "USES", "source": "Organization", "target": "Method"}, {"name": "RELATES_TO", "source": "Concept", "target": "Concept"}, {"name": "PART_OF", "source": "Concept", "target": "Product"}, {"name": "HAS_FEATURE", "source": "Product", "target": "Concept"}]}', 'template_seeded', 'synced', NULL, NULL, 'active', '2026-07-23 13:09:04.065', '2026-07-23 05:09:04.067', '2026-07-23 05:09:04.067');

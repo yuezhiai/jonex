@@ -198,6 +198,24 @@ make init-db
 docker exec -i jonex-postgres psql -U jonex -d jonex < postgres/migrations/004_knowledge_base.sql
 ```
 
+### 增量 DDL（存量库迭代，不重建数据）
+
+生产/已初始化的数据库在后续版本迭代时，表结构或字段变更不会自动应用（`/docker-entrypoint-initdb.d` 只在数据卷首次初始化执行）。所有增量变更沉淀为 `postgres/update/NNN_*.sql`，按编号顺序幂等执行，同时同步进 `postgres/migrations/`（全新库直接建齐，无需执行 update/）。
+
+```bash
+# 一键应用全部增量 DDL（幂等，可重复执行）
+make db-migrate
+# 或直接：
+bash deploy/postgres/update/apply.sh
+# 单个脚本：
+docker exec -i jonex-postgres psql -U jonex -d jonex < postgres/update/016_mcp_key_lifecycle.sql
+```
+
+约定：
+
+- `update/` 脚本面向存量库，全部用 `IF [NOT] EXISTS` / `ON CONFLICT DO NOTHING` / 幂等数据迁移，重复执行安全。
+- 新增表结构时同时改 `migrations/` 对应全量 DDL，保证全新库与存量库最终态一致。
+
 ## GPU 加速（可选）
 
 宿主机有 NVIDIA GPU 且已安装 `nvidia-container-toolkit` 时，叠加 `docker-compose.gpu.yml` 为 atomic-rag 启用 GPU：
@@ -266,6 +284,62 @@ curl "http://localhost:8000/api/v1/knowledge-base/documents/search/enhanced?quer
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j 连接地址 |
 | `NEO4J_USERNAME` | `neo4j` | Neo4j 用户名 |
 | `NEO4J_PASSWORD` | `jonex_neo4j_123` | Neo4j 密码 |
+
+### RAG 召回后处理变量（[jonex] rag-subject-filter 方案）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_PRELLM_RERANK_ENABLED` | `false` | 送 LLM 前 chunk 级重排（经 llm-gateway /v1/rerank） |
+| `RAG_PRELLM_RERANK_TOPK` | `8` | 重排后保留 top-K |
+| `RAG_SUBJECT_FILTER_ENABLED` | `false` | 主体一致性信号总开关（方案 B 语义：软加权，永不删除候选） |
+| `RAG_SUBJECT_WEIGHT` | `0.25` | 主体分权重 λ：`final = (1-λ)×rerank相关性 + λ×主体分` |
+| `RAG_PLATFORM_ANSWER_ENABLED` | `false` | 方案 A 总开关：true 时 LightRAG 降为 retriever、平台侧 `answer_from_chunks` 作答（灰度） |
+| `RAG_ANSWER_MAX_CONTEXT_CHARS` | `12000` | 送 `answer_from_chunks` 的 chunk 文本总长上限（硬截） |
+
+> `RAG_STRUCTURE_AWARE_CHUNK` 已从 `.env.rag*` 移除：① 死代码（不在推送链路上，见表格治理方案 O5）；
+> ② 配置位置错误——读取方 raganything 跑在 atomic-rag（env 源为 `deploy/.env`），
+> 而 `.env.rag` 只被 lightrag 容器加载，该变量从未在任何环境真正生效过。
+> 表标题回填能力由 `RAG_TABLE_GRID_V2` 的 `_resolve_table_caption` 接管。
+
+> 模块级 `os.getenv`，改动后需重启 `knowledge-base-service`。
+
+### 表格解析与切块治理变量（[jonex] table-parsing-retrieval-governance 方案）
+
+⚠️ **配置位置**：以下变量由 **atomic-rag（raganything）进程**读取（compose `env_file: .env`），
+须配在 `deploy/.env`（本地调试配 `.env.local`）；**不要**放进 `.env.rag*`（lightrag 容器专用，读不到）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_TABLE_GRID_V2` | `true`（未设置即生效） | 表格 L1 网格化 + L2 表头推断总开关；显式 `false` 回退旧 `normalize_table_rows`（首行即表头） |
+| `TABLE_HEADER_MAX_LEN` | `40` | 表头长文本剔除阈值（字符）：超过或含句末符 → 判为表前说明写入 notes |
+| `RAG_TABLE_CHUNK_MAX_CHARS` | `900` | 表格专用切块预算（字符，O1）：仅表格分支生效；文本链路仍用 `RAG_CHUNK_MAX_CHARS`（12000）由 LightRAG 按 token+overlap 切。tokenizer 校准：`scripts/calibrate_table_chunk_budget.py` |
+| `RAG_LIGHTRAG_CHUNK_SIZE` | `1200` | 表格 chunk 超限断言阈值（token）：推送前 tokenizer 实测，超过 → WARNING + `table_stats.oversize_table_chunks`。**须与 `.env.rag` 的 `CHUNK_SIZE` 一致** |
+| `XLSX_NATIVE_NORMALIZE` | `true` | xlsx 双路合并（L3）：openpyxl 表格主轨（日期/百分比/货币按 number_format 精确渲染）+ MinerU 图片/公式轨；false 全量交 MinerU |
+| `RAG_PROMPT_LANG` | `zh` | 解析/摘要 prompt 语言（L4.2）：zh 中文模板（表格摘要列主体名+列名+行数、禁臆测）/ en 英文。进程级全局，影响所有模态 |
+| `RAG_ASSET_UPLOAD_ENABLED` | `true` | 图片资产上传总开关（[jonex] image-refs 方案，不在表格治理范围内、同属 atomic-rag env）：入库时把文档图片上传到对象存储、file_source 携带 `aext`；`false` 只停资产上传，不阻塞主链路。设计见 `docs/image-reference-chain-execution-plan.md` |
+
+改动后需重建 atomic-rag 镜像（`docker compose build atomic-rag`）并重启；
+`PushChunksStage` 启动日志会打印开关生效值（防「以为回退了其实没回退」）。
+
+### 文本块打包变量（[jonex] text-block-packing 方案）
+
+⚠️ **配置位置**：同表格变量，由 **atomic-rag（raganything）进程**读取（compose `env_file: .env`），
+须配在 `deploy/.env`（本地调试配 `.env.local`）；不要放进 `.env.rag*`。
+设计见 `docs/text-block-packing-chunk-governance-plan.md`。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_TEXT_BLOCK_PACKING` | `true`（未设置即生效） | 文本块打包总开关：相邻文本块按预算打包（标题作包头、跨页包记 pspans）；显式 `false` 回退逐块 1:1（灰度回退通道） |
+| `RAG_TEXT_PACK_CHARS` | `1260` | 文本包字符预算（含包头）= 900 token × 1.4 系数固化（o200k_base 实测校准） |
+| `RAG_TEXT_PACK_MAX_TOKENS` | `1200` | 文本包 token 红线：冲刷前 tokenizer 实测断言，超过 → WARNING + `oversize_text_chunks` 并按换算阈值兜底切分。**须与 `.env.rag` 的 `CHUNK_SIZE` 一致**（持平则不触发 LightRAG 二次切分） |
+| `RAG_TEXT_PACK_HEADING_MAX_LEN` | `40` | heading 判定长度上限（C5 判据；C4 编号模式另有 `max(2×该值, 80)` 闸门） |
+| `RAG_TEXT_PACK_DROP_NOISE` | `true` | 噪声块（页码/重复页眉）丢弃开关；`false` 改为吸附进包（零信息损失保守模式）。丢弃时每文档采样 WARNING 前 20 块原文+判据 |
+
+另有一个**由 knowledge-base-service 进程读取**（同 compose `env_file: .env`）的配套变量——文本块打包方案的检索侧页段精算（片段级页码，设计见计划文档 §10）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RAG_REF_PAGE_SCORING_ENABLED` | `true` | 跨页打包 chunk 的引用页精算开关：true 时按 pspans 把 chunk 全文切页段、对 query 做关键词打分，取最高分页作 page_no（语义「与 query 最相关」）；false 或精算失败（无命中/完整性防御）回落 chunk 起点页，与改造前一致 |
 
 ## 数据备份
 

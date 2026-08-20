@@ -63,16 +63,21 @@ class SearchHistoryService:
         domain = data.pop("domain", None)
         domain_id = data.pop("domain_id", None)
         domain_space_id = data.pop("domain_space_id", None)
+        strict_config = data.pop("strict_config", None)
         if domain:
             metadata["domain"] = domain
         if domain_id:
             metadata["domain_id"] = domain_id
+        if strict_config:
+            metadata["strict_config"] = strict_config
         if domain_space_id:
             data["domain_space_id"] = domain_space_id
         data["extra_metadata"] = metadata
         async with get_db_session() as session:
             repo = KnowledgeSearchHistoryRepository(session)
             history = await repo.upsert_for_user(tenant_id, user_id, data)
+            # [jonex] 超过 MAX_HISTORY_PER_USER 自动清理最早记录
+            await repo.trim_for_user(tenant_id, user_id)
             return history.to_dict()
 
     async def delete_history(

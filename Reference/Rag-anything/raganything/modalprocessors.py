@@ -1287,7 +1287,13 @@ class TableModalProcessor(BaseModalProcessor):
             description = response_data.get("detailed_description", "")
             entity_data = response_data.get("entity_info", {})
 
-            if not description or not entity_data:
+            # [jonex] §table-grid-v2 L4.2: LLM 可能把 detailed_description 输出成
+            # 嵌套 JSON dict（列名清单等分点被写成子对象）——校验必须含类型检查，
+            # 否则 dict 一路传到 _collect_multimodal_chunks 的 .strip() 直接炸掉
+            # 整条 pipeline（线上 'dict' object has no attribute 'strip'）。
+            if not description or not isinstance(description, str):
+                raise ValueError("Missing required fields in response")
+            if not entity_data or not isinstance(entity_data, dict):
                 raise ValueError("Missing required fields in response")
 
             if not all(
@@ -1307,6 +1313,8 @@ class TableModalProcessor(BaseModalProcessor):
             logger.error(f"Error parsing table analysis response: {e}")
             logger.debug(f"Raw response: {response}")
             cleaned = self._strip_thinking_tags(response)
+            if not isinstance(cleaned, str):
+                cleaned = str(cleaned)
             fallback_entity = {
                 "entity_name": entity_name
                 if entity_name
@@ -1778,6 +1786,7 @@ class AsrModalProcessor(BaseModalProcessor):
         segments = self._segment_with_overlap(asr_result)
         global_summary, entity_info = await self._recursive_mapreduce(
             segments, entity_name, item_info, audio_path, asr_result,
+            prompt_overrides=prompt_overrides,  # [jonex] 透传：_recursive_mapreduce 内部 _final_synthesize 需要
         )
 
         audio_source_id = asr_result.get("audio_sha256", "")[:12]
@@ -1980,7 +1989,8 @@ class AsrModalProcessor(BaseModalProcessor):
         return text[:limit] if len(text) > limit else text
 
     async def _recursive_mapreduce(self, segments, entity_name, item_info,
-                                   audio_path, asr_result):
+                                   audio_path, asr_result,
+                                   prompt_overrides=None):  # [jonex] 修复 NameError：_final_synthesize 需要该参数（调用处 1779 已透传）
         batch_size = (getattr(self._config, "audio_summarize_batch_size", 8)
                       if self._config else 8)
         max_batches = (getattr(self._config, "audio_summarize_max_batches", 20)

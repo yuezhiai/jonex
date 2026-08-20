@@ -80,6 +80,7 @@ class RAGClient(ABC):
         knowledge_base_id: str,
         trace_id: str = "",          # [jonex] 计量链路追踪
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> str:
         """RAG 查询，返回回答字符串（不含引用信息）
 
@@ -98,10 +99,14 @@ class RAGClient(ABC):
         knowledge_base_id: str,
         trace_id: str = "",
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> dict:
         """RAG 查询，返回 {"answer": str, "references": list[dict]} 详细结果。
 
         references 中的每项为 parse_file_source 解析后的结构化引用片段。
+
+        only_need_context=True 时 LightRAG 提前返回 chunk 上下文、不调生成 LLM，
+        此时 answer 字段是上下文字符串而非答案（调用方需自行作答）。
         """
         pass
 
@@ -114,6 +119,18 @@ class RAGClient(ABC):
         knowledge_base_id: str = "",
     ) -> bool:
         """删除文档，返回是否成功。knowledge_base_id 用于定位 LightRAG workspace。"""
+        pass
+
+    @abstractmethod
+    async def delete_orphan_chunk(
+        self,
+        chunk_id: str,
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+    ) -> bool:
+        """[jonex] O7：按 chunk_id 强制清理孤儿 chunk（doc_status 无记录的
+        reparse 残留），不依赖 doc 级删除。"""
         pass
 
     @abstractmethod
@@ -363,6 +380,7 @@ class LocalRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",          # [jonex] 计量链路追踪
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> str:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -375,6 +393,7 @@ class LocalRAGClient(RAGClient):
             knowledge_base_id=knowledge_base_id,
             trace_id=trace_id,          # [jonex] 计量链路追踪
             user_id=user_id,            # [jonex] 计量上下文
+            only_need_context=only_need_context,
         )
 
     async def query_detailed(
@@ -387,6 +406,7 @@ class LocalRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -399,6 +419,7 @@ class LocalRAGClient(RAGClient):
             knowledge_base_id=knowledge_base_id,
             trace_id=trace_id,
             user_id=user_id,            # [jonex] 计量上下文
+            only_need_context=only_need_context,
         )
 
     async def delete(
@@ -412,6 +433,19 @@ class LocalRAGClient(RAGClient):
         await self._ensure_initialized()
         return await self._adapter.delete(
             doc_id, tenant_id, knowledge_base_id=knowledge_base_id
+        )
+
+    async def delete_orphan_chunk(
+        self,
+        chunk_id: str,
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+    ) -> bool:
+        tenant_id = require_tenant(tenant_id)
+        await self._ensure_initialized()
+        return await self._adapter.delete_orphan_chunk(
+            chunk_id, tenant_id, knowledge_base_id=knowledge_base_id
         )
 
     async def delete_batch(
@@ -757,11 +791,12 @@ class RemoteRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",          # [jonex] 计量链路追踪
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> str:
         result = await self.query_detailed(
             query=query, tenant_id=tenant_id, mode=mode, top_k=top_k,
             knowledge_base_id=knowledge_base_id, trace_id=trace_id,
-            user_id=user_id,
+            user_id=user_id, only_need_context=only_need_context,
         )
         return result["answer"]
 
@@ -775,6 +810,7 @@ class RemoteRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> dict:
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
         payload: dict = {
@@ -785,6 +821,7 @@ class RemoteRAGClient(RAGClient):
             "knowledge_base_id": knowledge_base_id,
             "trace_id": trace_id,
             "user_id": user_id,
+            "only_need_context": only_need_context,   # [jonex] 方案 A 透传
         }
         resp = await self._invoke(payload, tenant_id)
         data = resp["data"]
@@ -807,6 +844,21 @@ class RemoteRAGClient(RAGClient):
         }
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]["success"]
+
+    async def delete_orphan_chunk(
+        self,
+        chunk_id: str,
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+    ) -> bool:
+        payload = {
+            "action": "delete_orphan_chunk",
+            "chunk_id": chunk_id,
+            "knowledge_base_id": knowledge_base_id,
+        }
+        resp = await self._invoke(payload, tenant_id)
+        return bool((resp.get("data") or {}).get("deleted"))
 
     async def delete_batch(
         self,
@@ -1241,6 +1293,7 @@ class MockRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",          # [jonex] 计量链路追踪（Mock 忽略）
         user_id: str = "",           # [jonex] 计量上下文（Mock 忽略）
+        only_need_context: bool = False,  # [jonex] 方案 A（Mock 吸收形参，行为不变）
     ) -> str:
         require_tenant(tenant_id)
         require_knowledge_base(knowledge_base_id)
@@ -1256,6 +1309,7 @@ class MockRAGClient(RAGClient):
         knowledge_base_id: str,
         trace_id: str = "",
         user_id: str = "",           # [jonex] 计量上下文（Mock 忽略）
+        only_need_context: bool = False,  # [jonex] 方案 A（Mock 吸收形参，行为不变）
     ) -> dict:
         require_tenant(tenant_id)
         require_knowledge_base(knowledge_base_id)
@@ -1277,6 +1331,18 @@ class MockRAGClient(RAGClient):
             self._docs.remove(key)
             return True
         return False
+
+    async def delete_orphan_chunk(
+        self,
+        chunk_id: str,
+        tenant_id: str,
+        *,
+        knowledge_base_id: str = "",
+    ) -> bool:
+        # Mock：与 delete 同口径（按 id 移除即视为清理成功）
+        return await self.delete(
+            chunk_id, tenant_id, knowledge_base_id=knowledge_base_id,
+        )
 
     async def delete_batch(
         self,

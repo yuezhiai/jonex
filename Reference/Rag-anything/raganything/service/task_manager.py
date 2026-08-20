@@ -837,7 +837,10 @@ class TaskManager:
         enrichment with COS presigned URLs and DB lookups.
         """
         if self._http_client is not None:
-            from jonex_core.common.file_source_util import parse_file_source
+            from jonex_core.common.file_source_util import (
+                normalize_chunk_content,
+                parse_file_source,
+            )
             result = await self._http_client.query(
                 query, mode=mode, top_k=top_k,
                 tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id,
@@ -850,14 +853,14 @@ class TaskManager:
                     if not parsed:
                         continue
                     # LightRAG content is the chunk text array for this file_path.
-                    content = r.get("content")
-                    raw_text = None
-                    if isinstance(content, list) and content:
-                        raw_text = "\n\n".join(c for c in content if c)
-                    elif isinstance(content, str) and content:
-                        raw_text = content
-                    if raw_text:
-                        parsed["text"] = raw_text.strip()
+                    # [jonex] §10 L1：归一化抽为共享纯函数（与 LOCAL lightrag_adapter
+                    # 同构）；顺带修复 ns token 泄漏——REMOTE 此前只 strip、
+                    # 未清 `<!--yx:…-->`，与 LOCAL 行为对齐为统一清理。
+                    text, chunk_texts = normalize_chunk_content(r.get("content"))
+                    if text:
+                        parsed["text"] = text
+                    if chunk_texts:
+                        parsed["chunk_texts"] = chunk_texts
                     # [jonex] 透传 chunk_ids：LightRAG reference 已带 chunk_ids（与 content 数组对齐）。
                     # 本平台 file_source 按 chunk 唯一，取首个作单值 chunk_id；全量存 chunk_ids。
                     chunk_ids = r.get("chunk_ids") or []
@@ -1337,6 +1340,15 @@ class TaskManager:
                     if block.strip():
                         md_parts.append(block)
                 elif t == "image":
+                    # [jonex] VLM 描述段（_textualize_multimodal 产出）写在图片引用前，
+                    # 编译时 LLM 上下文连贯（描述 + 图片引用）；无描述（OCR/caption 兜底）
+                    # 则只有图片引用
+                    vlm_desc = item.get("description") or ""
+                    if isinstance(vlm_desc, list):
+                        vlm_desc = " ".join(str(c) for c in vlm_desc)
+                    vlm_desc = str(vlm_desc).strip()
+                    if vlm_desc:
+                        md_parts.append(vlm_desc)
                     img = item.get("img_path") or ""
                     caption = item.get("img_caption") or ""
                     if isinstance(caption, list):
@@ -1351,6 +1363,14 @@ class TaskManager:
                             md_parts.append(f"![{caption}](images/{document_id}/{dst_name})")
                         except Exception:
                             logger.warning("[jonex] OpenKB artifact 图片复制失败: %s", img)
+                elif t in ("video", "audio"):
+                    # [jonex] 转写正文（_textualize_multimodal 的产出，含时间戳）写进 content.md
+                    desc = item.get("description") or item.get("transcription") or ""
+                    if isinstance(desc, list):
+                        desc = " ".join(str(c) for c in desc)
+                    desc = str(desc).strip()
+                    if desc:
+                        md_parts.append(desc)
 
             md_text = "\n\n".join(md_parts).strip() + "\n"
             (out_dir / "content.md").write_text(md_text, encoding="utf-8")
@@ -1371,6 +1391,276 @@ class TaskManager:
             logger.warning(
                 "[jonex] OpenKB artifact write failed doc=%s", document_id, exc_info=True,
             )
+
+    async def _textualize_multimodal(self, task: TaskInfo, handle: TaskHandle,
+                                     content_list: list) -> None:
+        """[jonex] 多模态文本化（parse_only 专用）：视频/音频转写正文挂回 block。
+
+        与 full 模式 MultimodalStage（stages.py:343）同逻辑，但取数不同：
+        full 从 original_item 的 _audio_segments 逐段建 chunk；parse_only 把
+        逐场景文本（含时间戳）拼接后写入 item["description"]（供 artifact 分支）。
+        - ⚠️ 取数：`_audio_segments` **三条后端路径都会写**（MPS
+          `video_processor.py:235`、`_analyze_via_local` `:427`、audio
+          `modalprocessors.py:1792`）——不局限于 COS+MPS；转写正文从它取，
+          `desc`（全局摘要）仅兜底
+        - 视频 MPS：注入 task.mps_video_url（仅 COS 存储时 FetchObject 设置，
+          task_manager.py:1361-1369）；本地存储时**提前短路**（见下），不白等长超时
+        - 图片：VLM 增强描述（对齐 full 模式 modalprocessors.py:894 generate_description_only）；
+          失败/空**不写占位**（图片有 MinerU OCR 文本 + 原生 caption 兜底，避免污染），
+          只记 warning 信号——与 video/audio（必须留痕）的差异见 image 分支注释
+        - 失败/配置关闭：video/audio 写占位文本（**粗粒度原因**，异常原文只进日志——安全），
+          不阻断 parse_only；占位同时写机器可读信号（_record_multimodal_warning）
+        - 转写缓存：按 document_id 读/写 parsed/{doc}/transcript.json——reparse/重编译
+          重跑 parse_only 时命中缓存跳过转写（省 MPS/ASR 费用）；失败/占位不写缓存
+        """
+        from raganything.utils import get_processor_for_type
+
+        processors = getattr(self._pipeline_executor, "modal_processors", None)
+        if not processors:
+            return
+        # [jonex] 配置门：enable_video_processing / enable_audio_processing 关闭时
+        # modal_processors["video"] 仍存在（build_all 构建）但 backends 空/未接线
+        # （raganything.py:410-425）——显式检查并跳过，避免撞 generic 或失败误报。
+        # 实读 config 真实值（ENABLE_VIDEO_PROCESSING / ENABLE_AUDIO_PROCESSING env 控制，
+        # **默认 True**，config.py:56=audio / :134=video）；False 兜底仅当 _cfg 缺失时
+        # 生效（几乎不发生）。实际值 log 一次（info），排查时一眼看出是配置关的还是
+        # 代码判错——否则属性名变更会**静默永久关闭**转写，只剩一条 warning
+        _cfg = getattr(self._pipeline_executor, "config", None)
+        enabled = {
+            "video": bool(getattr(_cfg, "enable_video_processing", False)) if _cfg else False,
+            "audio": bool(getattr(_cfg, "enable_audio_processing", False)) if _cfg else False,
+            "image": bool(getattr(_cfg, "enable_image_processing", False)) if _cfg else False,
+        }
+        logger.info(
+            "[jonex] multimodal 转写配置门：video=%s audio=%s image=%s（ENABLE_VIDEO/AUDIO/IMAGE_PROCESSING）",
+            enabled.get("video"), enabled.get("audio"), enabled.get("image"),
+        )
+
+        generic = processors.get("generic")
+        mps_url = getattr(task, "mps_video_url", "") or ""
+        # prompt_overrides 解析一次（循环外）——RAG_PROMPT_STRICT 时缺配置 fail-fast
+        # （_resolve_task_prompt_overrides docstring），不能放 try 内被吞成 warning
+        prompt_overrides = self._resolve_task_prompt_overrides(task)
+
+        # [jonex] 转写缓存（重复转写防护）：reparse/重编译会重跑 parse_only → 每次重付
+        # MPS/ASR 费用（视频分钟级 + 云计费）。按 document_id 读 parsed/{doc}/transcript.json
+        # （与 content.md 同目录，天然随 document_id 幂等，与 _write_openkb_artifact
+        # 的覆盖写同一语义），命中即跳过转写直接挂回。只缓存**真实转写正文**
+        # （_cacheable），失败/占位不写——reparse 时重试转写，符合用户重试预期
+        transcript_cache: dict = {}
+        _inputs_root = os.getenv("RAG_INPUTS_DIR", "/app/inputs")
+        _cache_path = Path(_inputs_root) / "parsed" / (task.document_id or "") / "transcript.json"
+        try:
+            if _cache_path.is_file():
+                transcript_cache = json.loads(_cache_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            transcript_cache = {}
+
+        _t_cn = {"video": "视频", "audio": "音频", "image": "图片"}
+        for item in content_list:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type", "")
+            if t not in ("video", "audio", "image"):
+                continue
+            # 取消检查（每 item）：分钟级 MPS 等待期间用户取消必须生效
+            if handle.cancel_event.is_set():
+                raise TaskCancelledError()
+            if not enabled.get(t, False):
+                logger.warning("[jonex] %s 转写已配置关闭（enable_%s_processing=false）——跳过",
+                               _t_cn.get(t, t), t)
+                continue
+            proc = get_processor_for_type(processors, t)
+            # ⚠️ get_processor_for_type 对未注册类型兜底 generic（utils.py:540）——
+            #    必须显式排除，否则静默用 generic 产出与内容无关的描述
+            if proc is None or proc is generic:
+                logger.warning("[jonex] 无 %s 专用 processor（generic 兜底）——跳过转写", t)
+                continue
+            if t in transcript_cache:
+                # [jonex] 命中缓存：跳过转写（省一次 MPS/ASR 费用），直接挂回
+                item["description"] = str(transcript_cache[t])
+                continue
+            _cacheable = False
+            body = ""
+            modal_content: dict = {}   # except 兜底可安全访问（processor 写回的 _audio_segments 在副本上）
+            try:
+                modal_content = dict(item)   # 独立 dict：processor 原地写 _audio_segments
+                if t == "video":
+                    # [jonex] backend 判据（已核实 processor_builder.py:124-133）：
+                    # _video_backends 非空 = MPS 路径（MPS_ENABLED=true）；空 = 内置
+                    # local 路径（ffmpeg+ASR，镜像已含 ffmpeg）。MPS 路径必须 COS URL：
+                    # mps_video_url 仅在 COS 存储时设置，本地存储为空 → mps_input 回落
+                    # 容器内本地路径交给腾讯云 MPS → 长超时失败（video_processor.py:173-174）。
+                    # 提前短路写占位，不白等（_select_backend 只返回 "mps" 或 None，无 local 兜底）。
+                    # 不缓存——reparse 换 COS 存储后应重试转写
+                    _backends = getattr(proc, "_video_backends", None)
+                    if _backends and not mps_url:
+                        body = ("该视频的转写已跳过：MPS 视频分析需要 COS 存储的 URL，"
+                                "当前为本地存储（无 mps_video_url），MPS 不可用。")
+                        self._record_multimodal_warning(task, "video_mps_no_cos_url", body)
+                    else:
+                        if _backends:
+                            # 仅 MPS 路径注入 COS URL；local 路径（_backends 空）不需要
+                            modal_content["mps_video_url"] = mps_url
+                        desc, _entity = await proc.generate_description_only(
+                            modal_content=modal_content, content_type=t,
+                            prompt_overrides=prompt_overrides,
+                        )
+                        # 取数：优先 _audio_segments（逐场景转写正文），desc（全局摘要）兜底
+                        segments = modal_content.get("_audio_segments") or []
+                        if segments:
+                            body = "\n".join(
+                                self._fmt_segment(s) for s in segments if s.get("text")
+                            )
+                        else:
+                            body = str(desc or "").strip()
+                        _cacheable = True
+                elif t == "image":
+                    # [jonex] 图片 VLM 描述（对齐 full 模式 MultimodalStage：
+                    # modalprocessors.py:894 generate_description_only → enhanced_caption）。
+                    # 与 video/audio 的差异：图片有 MinerU OCR 文本 + 原生 caption 兜底
+                    # （text block 已进 content.md），VLM 失败/空**不写占位**——避免污染
+                    # 有 OCR 的内容；纯图片无文字（空洞场景）靠 warning 信号可查。
+                    # 缓存：真实描述才 _cacheable（省 VLM 费用）；失败/空不缓存
+                    desc, _entity = await proc.generate_description_only(
+                        modal_content=dict(item), content_type=t,
+                        prompt_overrides=prompt_overrides,
+                    )
+                    body = str(desc or "").strip()
+                    if body:
+                        _cacheable = True
+                    else:
+                        # VLM 返回空（VLM 不可用/模型拒绝）：不写占位，记 warning
+                        self._record_multimodal_warning(
+                            task, "image_vlm_empty", "图片 VLM 描述为空",
+                        )
+                else:  # audio
+                    # 独立 dict（与 video 同因）：processor 原地写 _audio_segments
+                    modal_content = dict(item)
+                    desc, _entity = await proc.generate_description_only(
+                        modal_content=modal_content, content_type=t,
+                        prompt_overrides=prompt_overrides,
+                    )
+                    segments = modal_content.get("_audio_segments") or []
+                    if segments:
+                        body = "\n".join(
+                            self._fmt_segment(s) for s in segments if s.get("text")
+                        )
+                    else:
+                        body = str(desc or "").strip()
+                    _cacheable = True
+            except Exception as exc:
+                # ⚠️ 安全：占位只写粗粒度原因——异常原文可能带 COS URL/签名 token/
+                # 内部域名/bucket 名，会随 content.md → OpenKB 编译 → **被索引**并可能
+                # 出现在知识搜索回答里（对齐 llm-wiki-compile-async-plan 的
+                # 「不把 str(exc) 透给前端」规矩，此处更严重：落盘+持久）。异常名与
+                # 详情只进日志。video/audio 失败也写占位——否则回到「空摘要」原始 bug，
+                # 用户看到 compiled 但内容空，无法判断是转写挂了
+                logger.warning(
+                    "[jonex] %s 转写失败（%s）task=%s",
+                    _t_cn.get(t, t), type(exc).__name__, task.task_id, exc_info=True,
+                )
+                if t == "image":
+                    # 图片有 OCR/caption 兜底：VLM 失败不写占位（避免污染），只记 warning
+                    self._record_multimodal_warning(task, "image_vlm_failed", "图片 VLM 描述失败")
+                else:
+                    # [jonex] 防御：ASR/MPS 可能已写 _audio_segments（转写正文成功、
+                    # 全局摘要等后续步骤抛错——如 vendored _recursive_mapreduce NameError）。
+                    # 有正文则用正文兜底**不丢转写**（已付的转写费用不白费），只记 warning；
+                    # 无正文才写「失败」占位
+                    segments = modal_content.get("_audio_segments") or []
+                    seg_body = "\n".join(
+                        self._fmt_segment(s) for s in segments if s.get("text")
+                    )
+                    if seg_body:
+                        body = seg_body
+                        _cacheable = True
+                        self._record_multimodal_warning(
+                            task, f"{t}_summary_failed", "转写正文已提取，但全局摘要生成失败",
+                        )
+                    else:
+                        reason = self._classify_transcribe_error(exc)
+                        body = f"该{_t_cn.get(t, t)}的转写失败（{reason}），暂无可提取文本。"
+                        self._record_multimodal_warning(task, f"{t}_transcribe_failed", body)
+            if not body:
+                if t == "image":
+                    # 图片空描述：不写占位（OCR/caption 兜底），warning 已记
+                    pass
+                else:
+                    # 兜底：转写成功但内容为空（无语音/空 scenes）——写占位
+                    body = f"该{_t_cn.get(t, t)}内容无可提取的文本（无语音或转写为空）。"
+                    self._record_multimodal_warning(task, f"{t}_empty_content", body)
+            item["description"] = body
+            if _cacheable:
+                transcript_cache[t] = body
+            # 进度（每 item 后 save）：多视频文档逐个推进；单视频（最常见）只有一个
+            # video block——save 发生在 MPS 等待结束后，等待期间无中间写入。判死无风险
+            # （探活按任务状态判 alive，与 save 无关）。短路/失败分支都落到此处统一
+            # 收尾（warnings 随 result_summary 保存，不丢；worker 异常路径也 save）；
+            # 缓存命中在 try 前 continue（无转写，无进度更新）
+            task.progress = min(0.9, task.progress + 0.1)
+            self._repo.save(task)
+
+        # 循环结束写转写缓存（覆盖写，与 content.md 同幂等语义）
+        if transcript_cache:
+            try:
+                _cache_path.parent.mkdir(parents=True, exist_ok=True)
+                _cache_path.write_text(
+                    json.dumps(transcript_cache, ensure_ascii=False), encoding="utf-8",
+                )
+            except Exception:
+                logger.warning(
+                    "[jonex] transcript 缓存写入失败 %s", _cache_path, exc_info=True,
+                )
+
+    def _record_multimodal_warning(self, task: TaskInfo, wtype: str, message: str) -> None:
+        """[jonex] 转写失败/跳过/空内容的机器可读信号：写入 result_summary.extensions，
+        **经 atomic-rag-server-v2.py 任务状态接口暴露**（extensions 是显式白名单，
+        需新增 multimodal_warnings key）——knowledge-base 只拿状态 JSON，拿不到 task
+        对象；对账从 status_info 读入写入文档 extra_metadata["multimodal_warnings"]。
+        否则任务 completed + 文档 compiled 全绿，唯一痕迹是 Wiki 正文的一句话。
+        ⚠️ 不写 llm_wiki_compile_warnings：该列属编译侧，compiling/stale 时会被清空
+        ——对账 READY 写入会在编译开始时丢失。解析侧/编译侧两个警告来源并列展示。
+        """
+        if task.result_summary is None:
+            task.result_summary = ResultSummary(doc_id=task.document_id or "")
+        warns = task.result_summary.extensions.setdefault("multimodal_warnings", [])
+        warns.append({"type": wtype, "message": message})
+
+    @staticmethod
+    def _classify_transcribe_error(exc: Exception) -> str:
+        """[jonex] 异常 → 粗粒度原因（安全：异常原文可能含 COS URL/签名 token，绝不进 content.md）。
+
+        优先按异常**类型名**判定（覆盖 asyncio.TimeoutError / httpx.TimeoutException /
+        httpx.ConnectError 等超时连接类；ConfigError / ConfigurationError 类 → 配置缺失）；
+        其余一律「转写服务不可用」——**不拼 str(exc)** 参与匹配（异常文本可能含中文/URL，
+        匹配不可预期），也避免 `KeyError: 'missing_field'` / `FileNotFoundError` 被误归
+        「配置缺失」误导排查。异常名与完整 str(exc) 只进日志。
+        """
+        _name = type(exc).__name__
+        if "Timeout" in _name or "ConnectError" in _name:
+            return "转写超时"
+        if "Config" in _name and "Error" in _name:
+            return "配置缺失"
+        return "转写服务不可用"
+
+    @staticmethod
+    def _fmt_segment(s: dict) -> str:
+        """[jonex] segment → "[mm:ss-mm:ss] text"；st/et 任一缺失时省略时间前缀；
+        超过 1 小时进位为 "[hh:mm:ss-…]"。"""
+        st, et = s.get("start_time"), s.get("end_time")
+        text = str(s.get("text", "")).strip()
+        if st is None or et is None:
+            return text
+
+        def _fmt(v):
+            if isinstance(v, (int, float)):
+                total = int(v)
+                if total >= 3600:
+                    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+                return f"{total // 60:02d}:{total % 60:02d}"
+            return str(v)
+        return f"[{_fmt(st)}-{_fmt(et)}] {text}".strip()
 
     def _resolve_task_prompt_overrides(self, task: TaskInfo):
         """[jonex] B2: 按 task.prompt_ids 解析主解析提示词覆盖（PromptOverride）。
@@ -1618,6 +1908,15 @@ class TaskManager:
                 summary.text_blocks = _tb
                 summary.table_blocks = _tab
                 summary.code_blocks = _cod
+
+                # ── [jonex] §table-grid-v2 O4: 表格处理统计透出 ──
+                # （tables_total/tables_normalized/tables_fallback/rows_total/
+                # cols_unnamed/oversize_table_chunks）。cols_unnamed>0 意味着
+                # 仍有 col_N 占位列名（表头推断失败），KB 侧可据此留文档级告警。
+                _table_stats = getattr(ctx, "table_stats", None) or {}
+                if _table_stats:
+                    summary.extensions = dict(summary.extensions or {})
+                    summary.extensions["table_stats"] = _table_stats
 
                 task.result_summary = summary
 
@@ -1971,7 +2270,16 @@ class TaskManager:
         )
         ctx.content_list = content_list
 
-        # 写 OpenKB 产物（markdown+图片 → 共享卷；相对路径经 result_summary 暴露）
+        # [jonex] 多模态文本化：视频/音频转写（parse_only 之前跳过 multimodal → 产物空洞）。
+        # 转写前置推进进度 + 置 current_step——注意：knowledge-base API/DTO 未暴露
+        # current_step/progress，前端不可见；价值 = 原子侧状态可读 + 对账探活日志。
+        # 判死无风险（探活按任务状态判 alive，与 save 无关）。
+        task.current_step = "multimodal"
+        task.progress = 0.5
+        self._repo.save(task)
+        await self._textualize_multimodal(task, handle, content_list)
+
+        # 写 OpenKB 产物（markdown+图片 → 共享卷；含转写正文；相对路径经 result_summary 暴露）
         self._write_openkb_artifact(task, ctx)
 
         if task.result_summary is None:
@@ -2179,6 +2487,21 @@ class TaskManager:
                 edge_based=True if force_edge_based else None,
             )
 
+            # ── [jonex] §table-grid-v2 步14：Row-as-Object 表格对象抽取 ──
+            # ctx.content_list 可用（常规 insert 链路）时，对表格做确定性映射
+            # （一行 = 一个对象，列名 = 属性），产出并入 ontology_data。
+            # 失败降级：仅打日志，不影响 LightRAG 抽取结果。
+            if ctx.content_list:
+                try:
+                    await self._merge_table_objects(
+                        ctx, scope, result, compiled_schema=compiled_schema,
+                    )
+                except Exception as exc:  # noqa: BLE001 — 表格对象失败不阻断本体
+                    logger.warning(
+                        "Table objects extraction failed for %s: %s",
+                        task.task_id, exc,
+                    )
+
             # ④ Save results to task
             task.ontology_status = "completed" if result.ok else "failed"
             task.ontology_data = {
@@ -2192,6 +2515,9 @@ class TaskManager:
                         "confidence": e.confidence,
                         "source_chunks": e.source_chunks,
                         "extraction_method": e.extraction_method,
+                        # [jonex] 改动 18：row_as_object 的 upsert 键随 ont_data 透传
+                        "table_sig": e.table_sig,
+                        "pk_value": e.pk_value,
                     }
                     for e in result.entities
                 ],
@@ -2234,6 +2560,188 @@ class TaskManager:
                     if last.started_at:
                         last.elapsed_seconds = (now - last.started_at).total_seconds()
             self._repo.save(task)
+
+    async def _merge_table_objects(self, ctx, scope: dict, result,
+                                   compiled_schema=None) -> None:
+        """[jonex] §table-grid-v2 步14：Row-as-Object 表格对象抽取。
+
+        对 content_list 的每个 table item：重跑网格化（与 push 阶段同函数
+        保证一致性）→ 表级判定（LLM/缓存/规则，含表头判定模型化）→ 列名
+        →TBox 属性映射（§10.2.4 第二次 LLM）→ 行级对象实例 + 分组关系，
+        并入 ExtractionResult（extraction_method=row_as_object，attributes
+        结构化，不走 200 截断）。
+        """
+        import hashlib as _hashlib
+
+        from jonex_core.capability.atomic.rag.ontology_extractor import (
+            ExtractedEntity,
+            ExtractedRelation,
+        )
+        from jonex_core.capability.atomic.rag.table_object_extractor import (
+            TableObjectExtractor,
+            _compose_header_parts,
+            apply_header_verdict,
+        )
+        from raganything.utils import (
+            _table_grid_v2_enabled,
+            get_table_body,
+            normalize_table_grid,
+            normalize_table_rows,
+        )
+
+        max_rows = int(os.getenv("TABLE_OBJECT_MAX_ROWS", "2000"))
+        extractor = TableObjectExtractor()
+        file_name = ctx.file_name or ""
+        # §10.2.4 可选标准属性词表：compiled schema 各实体类型的属性名并集
+        tbox_attributes: list | None = None
+        if compiled_schema:
+            try:
+                tbox_attributes = sorted({
+                    str(a.get("name", ""))
+                    for et in (compiled_schema.get("entity_types") or [])
+                    for a in (et.get("attributes") or [])
+                    if a.get("name")
+                }) or None
+            except Exception as exc:  # noqa: BLE001 — 词表是提示项，失败不阻塞
+                logger.warning("Row-as-Object: tbox_attributes 提取失败: %s", exc)
+
+        table_entities: list = []
+        table_relations: list = []
+        for item in ctx.content_list or []:
+            if item.get("type") != "table":
+                continue
+            raw_body = get_table_body(item)
+            if _table_grid_v2_enabled():
+                header, data_rows, meta = normalize_table_grid(raw_body)
+            else:
+                header, data_rows = normalize_table_rows(raw_body)
+            if not data_rows or not header:
+                continue
+
+            caption = item.get("table_caption")
+            if isinstance(caption, list):
+                caption = "、".join(
+                    str(c) for c in caption if str(c).strip()
+                )
+            caption = (caption or "").strip() or file_name
+
+            verdict = await extractor.analyze_table(
+                caption, header, data_rows, scope=scope,
+                tbox_attributes=tbox_attributes,
+            )
+            # §10.2.3 层级关系：多级表头父级链（属性组），无额外表头时为空
+            header_parts: list | None = None
+            # [jonex] §table-grid-v2 步14 补缺：消费表级判定的表头/说明行
+            # 结论。此前 header_row_indices / note_row_indices 只校验不消费
+            # （对象抽取仍用规则表头）——模型认为 data_rows 中还有表头行
+            # （多级表头漏识别）或说明行（长文本漏吸净）时，重建列名与
+            # 对象行，行锚点经 row_map 保持与原 data_rows 对齐。
+            if verdict.source != "rules":
+                header2, rows2, row_map = apply_header_verdict(
+                    header, data_rows, verdict,
+                )
+                if header2 != header:
+                    # 属性组父级链（与 apply_header_verdict 同拼接口径，
+                    # 同样过滤越界行号）
+                    header_parts = _compose_header_parts(
+                        [header]
+                        + [
+                            data_rows[i]
+                            for i in verdict.header_row_indices
+                            if 0 <= i < len(data_rows)
+                        ],
+                        len(header2),
+                    )
+                    # 主键/限定列按列位置重映射（多级拼接不改变列序）
+                    pos = {name: i for i, name in enumerate(header)}
+                    verdict.pk_columns = [
+                        header2[pos[c]] for c in verdict.pk_columns if c in pos
+                    ]
+                    verdict.qualifier_columns = [
+                        header2[pos[c]]
+                        for c in verdict.qualifier_columns
+                        if c in pos
+                    ]
+                    logger.info(
+                        "Row-as-Object: 表「%s」应用表头判定：列名 %d 列重拼 "
+                        "（+%d 表头行）、剔除 %d 说明行",
+                        caption[:40], len(header2),
+                        len(verdict.header_row_indices),
+                        len(verdict.note_row_indices),
+                    )
+                header, data_rows = header2, rows2
+            else:
+                row_map = list(range(len(data_rows)))
+
+            if not verdict.pk_columns:
+                logger.info(
+                    "Row-as-Object: 表「%s」主键识别失败，跳过对象抽取",
+                    caption[:40],
+                )
+                continue
+
+            table_sig = _hashlib.md5(
+                "|".join(header).encode()
+            ).hexdigest()[:8]
+            objects = extractor.build_objects(
+                caption, header, data_rows[:max_rows], verdict,
+                table_sig=table_sig,
+                table_idx=item.get("table_idx"),
+                row_indices=row_map[:max_rows],
+                header_parts=header_parts,
+            )
+            relations = extractor.build_group_relations(
+                header, data_rows[:max_rows], objects, verdict,
+            )
+            for obj in objects:
+                table_entities.append(ExtractedEntity(
+                    canonical_name=obj.canonical_name,
+                    entity_type=obj.entity_type,
+                    aliases=obj.aliases,
+                    attributes=obj.attributes,
+                    description="",
+                    confidence=1.0,
+                    source_chunks=obj.source_chunks,
+                    extraction_method="row_as_object",
+                    table_sig=obj.table_sig,   # [jonex] 改动 18 upsert 键
+                    pk_value=obj.pk_value,     # [jonex] 改动 18 upsert 键
+                ))
+            for rel in relations:
+                table_relations.append(ExtractedRelation(
+                    source_name=rel["source_name"],
+                    source_type=rel["source_type"],
+                    target_name=rel["target_name"],
+                    target_type=rel["target_type"],
+                    relation_type=rel["relation_type"],
+                ))
+            logger.info(
+                "Row-as-Object: 表「%s」→ %d 对象 + %d 分组关系 "
+                "(pk=%s, verdict=%s)",
+                caption[:40], len(objects), len(relations),
+                "、".join(verdict.pk_columns), verdict.source,
+            )
+
+        if table_entities:
+            # O6：同名去重——表格对象（结构化 attributes）优先于 LightRAG
+            # 文本实体；别名也占位（防止同名别名实体残留）。
+            table_names = set()
+            for e in table_entities:
+                table_names.add(e.canonical_name)
+                table_names.update(e.aliases)
+            result.entities = [
+                e for e in result.entities
+                if not (
+                    e.extraction_method != "row_as_object"
+                    and (
+                        e.canonical_name in table_names
+                        or any(a in table_names for a in e.aliases)
+                    )
+                )
+            ]
+            result.entities.extend(table_entities)
+            result.relations.extend(table_relations)
+            # 表格对象保证 ok（与 LightRAG 零实体互不依赖）
+            result.ok = True
 
     # ── Result summary (HTTP mode) ──────────────────────────────────
 

@@ -27,6 +27,7 @@ from pydantic.v1 import BaseModel
 from jonex_core.common.object_storage import build_object_key, get_object_storage, get_object_storage_for
 from capabilities.knowledge_base.dtos import (
     AddDocumentTagRequest,
+    BatchMoveDocumentsRequest,
     CreateOntologyInstanceRequest,
     DocumentParseResultRequest,
     DocumentScopeRequest,
@@ -417,6 +418,34 @@ async def get_chunk(request: Request, document_id: str, chunk_id: str):
     return success_response(data=result)
 
 
+# ── [jonex] §table-grid-v2 O7: 新旧格式残留扫描与定点清理 ──
+
+
+@router.get("/documents/{document_id}/stale-chunks", summary="扫描新旧格式 chunk 残留（O7）")
+async def scan_stale_chunks(request: Request, document_id: str):
+    """按格式指纹扫描文档的旧格式表格 chunk 残留（col_ 占位 / 裸 HTML 残片）。
+
+    reparse 后旧 doc 删除失败时新旧格式在向量库共存，本接口是唯一可观测通道。
+    返回 {doc_id, total, stale_chunk_count, stale_chunks}。
+    """
+    result = await _call_kb_capability(
+        request, "scan_stale_chunks", {"document_id": document_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/documents/{document_id}/purge-stale-chunks", summary="定点清理旧格式 chunk（O7）")
+async def purge_stale_chunks(request: Request, document_id: str):
+    """按格式指纹定点删除旧格式 chunk，避免整篇重推（reparse 的 LLM 抽取全量重跑）。
+
+    返回 {doc_id, purged, failed, total}。
+    """
+    result = await _call_kb_capability(
+        request, "purge_stale_chunks", {"document_id": document_id},
+    )
+    return success_response(data=result)
+
+
 class ReparseRequest(BaseModel):
     force: bool = False
 
@@ -469,10 +498,21 @@ async def set_document_folder(
     return success_response(data=result)
 
 
+@router.put("/documents/folder", summary="批量设置文档所属文件夹")
+async def batch_set_document_folder(request: Request, body: BatchMoveDocumentsRequest):
+    """批量把多个文档移动到目标文件夹；folder_id 为 null 时移出到未分类。"""
+    result = await _call_kb_capability(
+        request,
+        "batch_set_document_folder",
+        _schema_payload(body),
+    )
+    return success_response(data=result, message="文档已移动")
+
+
 # ── 文件夹 CRUD ──────────────────────────────────────────
 
 
-@router.get("/knowledge-base/folders", summary="列出知识库文件夹")
+@router.get("/folders", summary="列出知识库文件夹")
 async def list_folders(
     request: Request,
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
@@ -486,14 +526,14 @@ async def list_folders(
     return success_response(data=result)
 
 
-@router.post("/knowledge-base/folders", summary="创建文件夹")
+@router.post("/folders", summary="创建文件夹")
 async def create_folder(request: Request, body: FolderCreateRequest):
     """在知识库中创建文件夹（同知识库内名称唯一）。"""
     result = await _call_kb_capability(request, "create_folder", _schema_payload(body))
     return success_response(data=result, message="文件夹已创建")
 
 
-@router.patch("/knowledge-base/folders/{folder_id}", summary="重命名文件夹")
+@router.patch("/folders/{folder_id}", summary="重命名文件夹")
 async def rename_folder(
     request: Request,
     folder_id: str,
@@ -506,7 +546,7 @@ async def rename_folder(
     return success_response(data=result, message="文件夹已重命名")
 
 
-@router.delete("/knowledge-base/folders/{folder_id}", summary="删除文件夹")
+@router.delete("/folders/{folder_id}", summary="删除文件夹")
 async def delete_folder(
     request: Request,
     folder_id: str,
@@ -524,7 +564,7 @@ async def delete_folder(
 # ── 标签 CRUD ─────────────────────────────────────────────
 
 
-@router.get("/knowledge-base/tags", summary="列出知识库标签")
+@router.get("/tags", summary="列出知识库标签")
 async def list_tags(
     request: Request,
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
@@ -538,14 +578,14 @@ async def list_tags(
     return success_response(data=result)
 
 
-@router.post("/knowledge-base/tags", summary="创建标签")
+@router.post("/tags", summary="创建标签")
 async def create_tag(request: Request, body: TagCreateRequest):
     """在知识库中创建标签（同知识库内名称唯一）。"""
     result = await _call_kb_capability(request, "create_tag", _schema_payload(body))
     return success_response(data=result, message="标签已创建")
 
 
-@router.put("/knowledge-base/tags/{tag_id}", summary="更新标签")
+@router.put("/tags/{tag_id}", summary="更新标签")
 async def update_tag(
     request: Request,
     tag_id: str,
@@ -557,7 +597,7 @@ async def update_tag(
     return success_response(data=result, message="标签已更新")
 
 
-@router.delete("/knowledge-base/tags/{tag_id}", summary="删除标签")
+@router.delete("/tags/{tag_id}", summary="删除标签")
 async def delete_tag(
     request: Request,
     tag_id: str,
@@ -1192,17 +1232,17 @@ async def get_parse_result_wiki_page(
     return success_response(data=result)
 
 
-@router.get("/parse-results/wiki-contents", summary="列出 OpenKB Wiki 页面树（按文档过滤）")
+@router.get("/parse-results/wiki-contents", summary="列出 OpenKB Wiki 页面树（按文档过滤，缺省=KB 级）")
 async def get_parse_result_wiki_contents(
     request: Request,
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
-    document_id: str = Query(..., min_length=1, max_length=64, description="文档 ID，按文档过滤编译产物"),
+    document_id: Optional[str] = Query(default=None, max_length=64, description="文档 ID；缺省/空=KB 级全库 Wiki"),
 ):
-    """列出文档级 Wiki 页面树（摘要/实体/概念三组，sources 归属过滤）。"""
-    result = await _call_kb_capability(
-        request, "list_wiki_contents",
-        {"knowledge_base_id": knowledge_base_id, "document_id": document_id},
-    )
+    """列出 Wiki 页面树（摘要/实体/概念三组）：document_id 缺省 = KB 级全库（compile-results 页）。"""
+    payload: dict = {"knowledge_base_id": knowledge_base_id}
+    if document_id:
+        payload["document_id"] = document_id
+    result = await _call_kb_capability(request, "list_wiki_contents", payload)
     return success_response(data=result)
 
 
@@ -1239,6 +1279,80 @@ async def retry_ontology_extract(
             "document_id": document_id,
             "knowledge_base_id": payload.knowledge_base_id,
         },
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# [jonex] LLM-Wiki Schema 编译设置（方案 llmwiki-schema-settings-execution-plan §9）
+# 风格对齐现有本体 API 的查询参数式（不引入路径参数新风格）
+# ════════════════════════════════════════════════════════════
+
+@router.get("/llm-wiki/schema", summary="获取 LLM-Wiki Schema（缺省自动创建默认）")
+async def get_llm_wiki_schema(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "get_llm_wiki_schema",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.put("/llm-wiki/schema", summary="保存 LLM-Wiki Schema（CAS 留档 + apply 投影）")
+async def save_llm_wiki_schema(
+    request: Request,
+    payload: dict[str, Any] = Body(..., description="SaveLlmWikiSchemaRequest"),
+):
+    result = await _call_kb_capability(
+        request, "save_llm_wiki_schema", payload,
+    )
+    return success_response(data=result)
+
+
+@router.post("/llm-wiki/schema/apply", summary="同步 LLM-Wiki Schema 到 OpenKB 引擎")
+async def apply_llm_wiki_schema(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "apply_llm_wiki_schema",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/llm-wiki/schema/export", summary="导出 LLM-Wiki Schema YAML")
+async def export_llm_wiki_schema_yaml(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "export_llm_wiki_schema_yaml",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/llm-wiki/schema/import", summary="导入 LLM-Wiki Schema YAML（CAS 全量替换）")
+async def import_llm_wiki_schema_yaml(
+    request: Request,
+    payload: dict[str, Any] = Body(..., description="ImportLlmWikiSchemaRequest"),
+):
+    result = await _call_kb_capability(
+        request, "import_llm_wiki_schema_yaml", payload,
+    )
+    return success_response(data=result)
+
+
+@router.post("/llm-wiki/schema/recompile-outdated", summary="全库重编译过期文档（一次性提交）")
+async def recompile_llm_wiki_schema_outdated(
+    request: Request,
+    payload: dict[str, Any] = Body(..., description="RecompileOutdatedRequest"),
+):
+    result = await _call_kb_capability(
+        request, "recompile_llm_wiki_schema_outdated_documents", payload,
     )
     return success_response(data=result)
 
@@ -1285,6 +1399,20 @@ async def update_knowledge_info(request: Request, kb_id: str, payload: dict = Bo
 @router.delete("/knowledge-info/{kb_id}", summary="删除知识库")
 async def delete_knowledge_info(request: Request, kb_id: str):
     result = await _call_kb_capability(request, "delete_knowledge_info", {"kb_id": kb_id})
+    return success_response(data=result)
+
+
+@router.get("/knowledge-info/{kb_id}/permissions", summary="知识库授权成员列表")
+async def get_kb_permissions(request: Request, kb_id: str):
+    result = await _call_kb_capability(request, "get_kb_permissions", {"kb_id": kb_id})
+    return success_response(data=result)
+
+
+@router.put("/knowledge-info/{kb_id}/permissions", summary="设置知识库授权成员")
+async def set_kb_permissions(request: Request, kb_id: str, payload: dict = Body(...)):
+    """设置指定知识库的授权成员（editor/viewer 叠加授权）"""
+    payload["kb_id"] = kb_id
+    result = await _call_kb_capability(request, "set_kb_permissions", payload)
     return success_response(data=result)
 
 
@@ -2169,4 +2297,52 @@ async def get_raw_document(
         filename=loc.get("file_name") or None,
         content_disposition_type="inline",  # 内联预览而非强制下载
         headers={"X-Content-Type-Options": "nosniff"},  # 同源场景禁 MIME 嗅探，配合 html/svg 降级防 XSS
+    )
+
+
+@ingest_router.get("/documents/{document_id}/assets/{image_idx}", summary="图片资产查看（token 或 JWT 鉴权；302 / 本地流式）")
+async def get_raw_document_asset(
+    request: Request,
+    document_id: str,
+    image_idx: int,
+    ext: Optional[str] = Query(None, description="图片扩展名（检索侧 aext 旁路值；缺省按白名单兜底 png）"),
+    token: Optional[str] = Query(None, description="短时查看 token（图片 <img> 直连用）"),
+):
+    """[jonex] §image-refs P2-4: 获取文档内嵌图片资产原文。
+
+    鉴权与 ``/documents/{document_id}/raw`` 同口径（token 或 JWT 二选一）；
+    能力层校验租户归属并派生对象键（build_asset_key：ext 白名单归一、
+    image_idx 强校验为整数）。后端分流：
+    - cos：302 预签名 URL（``<img>`` 标签跨域加载不受 CORS 限制，无需同源代理态）；
+    - local：FileResponse 从共享卷流式返回。
+    """
+    if token:
+        info = verify_view_token(token)
+        if not info or info.get("doc_id") != document_id:
+            raise InvalidApiKeyError(message=translate("err.kb.view_ticket_invalid", fallback="查看票据无效或已过期"))
+        tenant_id = info["tenant_id"]
+    else:
+        tenant_id = extract_tenant_id(request)
+
+    loc = await _call_kb_capability(
+        request, "get_asset_raw_location",
+        {"document_id": document_id, "image_idx": image_idx, "ext": ext or ""},
+        tenant_id=tenant_id,
+    )
+    presigned = loc.get("presigned_url")
+    if presigned:
+        # COS：浏览器直连，<img> 加载无 CORS 门槛
+        return RedirectResponse(url=presigned, status_code=302)
+
+    storage_key = loc.get("storage_key")
+    backend = (loc.get("storage_backend") or "local").strip().lower()
+    fs_path = get_object_storage_for(backend).fs_path(storage_key) if storage_key else None
+    if not fs_path or not os.path.exists(fs_path):
+        raise InvalidParameterError(message=translate("err.kb.document_source_unavailable", fallback="文档原文不存在或不可访问"))
+    return FileResponse(
+        path=fs_path,
+        media_type=_safe_inline_media_type(loc.get("mime_type")),
+        filename=loc.get("file_name") or None,
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
     )

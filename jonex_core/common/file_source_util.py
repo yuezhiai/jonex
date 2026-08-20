@@ -108,12 +108,43 @@ def parse_file_source(raw: str) -> dict[str, Any]:
         "char_start": _num(kv.get("cstart"), int),
         "char_end": _num(kv.get("cend"), int),
         "page_no": _num(kv.get("page"), int),
+        # [jonex] §block-packing: 跨页打包 chunk 的末页（仅打包 chunk 写入；
+        # 旧 chunk 无此键 → None）
+        "page_end": _num(kv.get("page_end"), int),
+        # [jonex] §block-packing: 页边界表（offset@page;…，仅跨页打包
+        # chunk 写入）；检索侧按命中片段 offset 精算页码（见
+        # resolve_page_by_offset）
+        "pspans": kv.get("pspans") or None,
         "time_start": _num(kv.get("tstart"), float),
         "time_end": _num(kv.get("tend"), float),
         # [jonex] §table-chunking: row range for table-row-level references
         "row_start": _num(kv.get("row_start"), int),
         "row_end": _num(kv.get("row_end"), int),
+        # [jonex] §C1-bis §19.5①: 行内切分子段的格区间（0-based 右开），
+        # 仅当行内切分发生（split_row_by_cells）时写入；旧 chunk 无此键 → None
+        "cell_start": _num(kv.get("cell_start"), int),
+        "cell_end": _num(kv.get("cell_end"), int),
         "table_idx": _num(kv.get("table_idx"), int),
+        # [jonex] §image-refs: 图片 chunk 的模态序号（image_idx=，写入侧见
+        # raganything stages.py _build_file_source）与资产扩展名旁路（aext=，
+        # 仅 P1 资产上传成功的图片写入）；旧 chunk 无此键 → None
+        "image_idx": _num(kv.get("image_idx"), int),
+        "asset_ext": kv.get("aext") or None,
+        # [jonex] §table-ctypes: chunk 类型与表格元数据旁路
+        # （table-parsing-retrieval-governance-plan.md 改动 36。
+        #   ctype=table_row / table_summary / text / image / audio / video / …，
+        #   供检索侧双路召回与低质过滤使用；旧 chunk 无此键 → None）
+        "chunk_type": kv.get("ctype") or None,
+        "table_sig": kv.get("table_sig") or None,
+        # 列名清单以 \x1f（unit separator）分隔（写入侧 join 用 \x1f，
+        # 与键值分隔符 | 和可见标点都无冲突）；展示时按需 split("\x1f")
+        "table_cols": kv.get("table_cols") or None,
+        # [jonex] §table-grid-v2 L4.1: 表前说明（notes）旁路，不进正文
+        "notes": kv.get("notes") or None,
+        # [jonex] 第五批 改动 20（方案 C 入库通道）：表格 chunk 的主体
+        # 实体提示（= 表标题 heading，写入侧 ehint= 键），检索期主体
+        # 一致性过滤的信号源；旧 chunk 无此键 → None
+        "entity_hint": kv.get("ehint") or None,
     }
 
 
@@ -148,12 +179,90 @@ def classify_media(mime_type: str | None, file_name: str | None) -> str:
     return "other"
 
 
+# ── chunk 内容归一化 ─────────────────────────────────────────
+
+# 入库时注入的命名空间隔离标记（写入侧见 raganything stages.py ns_token，
+# 格式 `<!--yx:[a-f0-9]{8}-->`），LOCAL/REMOTE 查询链路统一在此清理。
+_NS_TOKEN_RE = re.compile(r"\s*<!--yx:[0-9a-f]+-->\s*")
+
+
+def normalize_chunk_content(content: Any) -> tuple[str | None, list[str]]:
+    """[jonex] §10 L1：把 LightRAG references 的 content 归一化为
+    (全文, 逐条 chunk 文本)。
+
+    content 为 list[str]（同一 file_path 聚合的多 chunk 文本数组，与
+    chunk_ids 对齐，见 vendored query_routes.py [jonex] 透出）或 str。
+    返回：
+
+    - ``text``：合并全文（逐条清理 ns token 后**过滤空条**再以
+      ``\\n\\n`` 连接、整体 strip），供前端「关联原文」展示；无法
+      提取时为 None。过滤空条是刻意的：text 要与包原文逐字符对齐
+      （pspans 坐标基准），空条贡献的 ``\\n\\n`` 会让坐标整体偏移
+      （review P2 修正，2026-08-20）
+    - ``chunk_texts``：逐条清理 ns token 的文本列表，长度恒等于入参
+      list（**不过滤**，空条保持位置），供页段精算等逐 chunk 对齐消费
+
+    空列表 / 空串 / None / 清洗后全空 → ``(None, [])``（list 入参
+    清洗后全空时 chunk_texts 仍保留原长，仅 text 为 None）。
+    """
+    if isinstance(content, list):
+        cleaned = [
+            _NS_TOKEN_RE.sub("", c).strip() if isinstance(c, str) else ""
+            for c in content
+        ]
+        text = "\n\n".join(c for c in cleaned if c).strip() or None
+        return text, cleaned
+    if isinstance(content, str) and content:
+        cleaned = _NS_TOKEN_RE.sub("", content).strip()
+        if not cleaned:
+            return None, []
+        return cleaned, [cleaned]
+    return None, []
+
+
+def resolve_page_by_offset(pspans: str, offset: int) -> int | None:
+    """[jonex] §block-packing: 按 chunk 内字符 offset 在 pspans 页边界表
+    中定位页号。
+
+    pspans 格式 ``offset@page;offset@page;…``（首 entry 恒为 ``0@{标题页}``，
+    写入侧见 ``pack_text_blocks``）。空串 / 格式非法 / offset 为负时返回
+    None，由调用方回落到 page 粗锚点；offset 落在末 entry 之后时返回末
+    entry 页号（该页延伸到 chunk 尾）。
+    """
+    if not pspans or offset < 0:
+        return None
+    entries: list[tuple[int, int]] = []
+    for seg in pspans.split(";"):
+        if "@" not in seg:
+            continue
+        a, _, b = seg.partition("@")
+        try:
+            off = int(a)
+            page = int(b)
+        except ValueError:
+            continue
+        entries.append((off, page))
+    if not entries:
+        return None
+    entries.sort(key=lambda e: e[0])
+    hit: int | None = None
+    for off, page in entries:
+        if off <= offset:
+            hit = page
+        else:
+            break
+    return hit
+
+
 def to_location(r: dict[str, Any]) -> dict[str, Any]:
     """按命中片段的可用位置字段决定 location 类型。
 
-    Priority: timestamp > table_row > page > char > chunk.
+    Priority: timestamp > table_row > image > page > char > chunk.
     ``table_row`` is placed before ``page`` because MinerU-produces tables
     always carry ``page_no=0``, which would otherwise shadow the row-range.
+    ``image`` is likewise placed before ``page`` (see image-reference-chain
+    execution plan P0-2) — image chunks usually carry ``page_no`` too, which
+    would shadow the image index.
     """
     text = r.get("text")
     if r.get("time_start") is not None:
@@ -166,7 +275,7 @@ def to_location(r: dict[str, Any]) -> dict[str, Any]:
         }
     # [jonex] §table-chunking: row-level positioning for table chunks
     if r.get("row_start") is not None and r.get("row_end") is not None:
-        return {
+        loc = {
             "type": "table_row",
             "row_start": r["row_start"],
             "row_end": r["row_end"],
@@ -174,13 +283,36 @@ def to_location(r: dict[str, Any]) -> dict[str, Any]:
             "chunk_index": r.get("chunk_index"),
             "text": text,
         }
-    if r.get("page_no") is not None:
+        # [jonex] §C1-bis §19.5①: 行内格区间透出（行内切分子段才有），
+        # 优先级不变——table_row 仍在 page 之前。
+        if r.get("cell_start") is not None and r.get("cell_end") is not None:
+            loc["cell_start"] = r["cell_start"]
+            loc["cell_end"] = r["cell_end"]
+        return loc
+    # [jonex] §image-refs P0-2: 图片级定位（置于 page 之前——图片 chunk 通常
+    # 带 page_no，会遮蔽 image_idx；与 table_row 的既有教训同型）。
+    # asset_ext 不在此透出：它是检索侧推导对象键的中间量（见 search_service
+    # _build_references 的 asset_url 富化）。
+    if r.get("image_idx") is not None:
         return {
+            "type": "image",
+            "image_idx": r["image_idx"],
+            "page_no": r.get("page_no"),
+            "chunk_index": r.get("chunk_index"),
+            "text": text,
+        }
+    if r.get("page_no") is not None:
+        loc = {
             "type": "page",
             "page_no": r["page_no"],
             "chunk_index": r.get("chunk_index"),
             "text": text,
         }
+        # [jonex] §block-packing: 跨页打包 chunk 的末页透出（前端可展示
+        # 页范围；旧 chunk 无 page_end 不写该字段，前端零改动）
+        if r.get("page_end") is not None:
+            loc["page_end"] = r["page_end"]
+        return loc
     if r.get("char_start") is not None:
         return {
             "type": "char",
@@ -195,6 +327,8 @@ def to_location(r: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "build_file_source",
     "classify_media",
+    "normalize_chunk_content",
     "parse_file_source",
+    "resolve_page_by_offset",
     "to_location",
 ]

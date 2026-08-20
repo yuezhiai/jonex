@@ -44,7 +44,8 @@ services:
   # PostgreSQL 数据库
   # ============================================================
   postgres:
-    image: postgres:15-alpine
+    # 勿改回 alpine 版：musl 编译的 postgres 在 CentOS 7（内核 3.10）写 pg_wal 失败，initdb 无法完成
+    image: postgres:15
     container_name: jonex-postgres
     hostname: postgres
     networks:

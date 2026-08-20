@@ -22,7 +22,12 @@ export interface DomainKnowledgeItem {
    * [jonex] 知识库类型。创建时选定后不可变。
    * 列表标签与编辑弹窗的只读展示依赖它；后端缺省/未知时按 lightrag 处理。
    */
-  kbType?: KnowledgeBaseType;
+  kbType?: KnowledgeBaseType;  /** 授权共享标识：仅真正靠 KB 授权才看到的 KB 为 true */
+  grant_shared?: boolean;
+  /** 该 KB 的权限管理权 */
+  can_manage_permissions?: boolean;
+  /** KB 写权限（额外含授权 editor）——列表页编辑/操作按钮依据 */
+  can_write?: boolean;
 }
 
 export interface DomainKnowledgeListParams {
@@ -45,7 +50,7 @@ export interface PaginationResult<T> {
   };
 }
 
-export type DomainKnowledgePermissionRole = 'view' | 'manage';
+export type DomainKnowledgePermissionRole = 'viewer' | 'editor';
 
 export interface DomainKnowledgePermissionMember {
   userId: string;
@@ -101,7 +106,10 @@ export interface DomainKnowledgeDetail {
    * 处理管线。openkb 的知识库不跑本体抽取，「编译结果」Tab 需换成只读 Wiki 视图。
    * 后端缺省/未知时按 lightrag 处理。
    */
-  kbType?: KnowledgeBaseType;
+  kbType?: KnowledgeBaseType;  /** 该 KB 的权限管理权（空间 owner/manager 或租户管理员）——权限 tab 只读态依据 */
+  can_manage_permissions: boolean;
+  /** KB 写权限（额外含授权 editor）——详情页各 tab 写操作按钮依据 */
+  can_write: boolean;
 }
 
 export interface DataSourceConfig {
@@ -499,6 +507,8 @@ export interface FolderItem {
   knowledge_base_id: string;
   is_preset: boolean;
   sort_order: number;
+  /** 该目录下的文档数（is_deleted=0），来自 GET /folders 每项 document_count。 */
+  document_count?: number;
   created_by: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -579,7 +589,13 @@ export interface ManualDocItem {
   llmWikiCompileStatus?: string;
   /** [jonex] LLM-Wiki 编译失败原因（顶层字段 llm_wiki_compile_error）。 */
   llmWikiCompileError?: string;
+  /** [jonex] 管线类型 lightrag/openkb（后端 extra_metadata.kb_type，upload/reparse 时写入）。
+      详情页用它随 doc 详情同一次请求到达，消除独立 KB 详情请求慢/失败的竞态窗口
+      （「编译结果 tab 首次显示空本体、刷新后才切 Wiki」问题的根因）。 */
+  kbType?: KnowledgeBaseType;
   knowledgeBaseId: string;
+  /** 文档当前所在目录 id；null/缺省 = 未分类（用于单选迁移禁选当前目录）。 */
+  folder_id?: string | null;
   dataSourceType?: string;
   tags?: string[];
   /** 后端原始 mime_type（如 application/pdf, video/mp4）。 */
@@ -993,4 +1009,70 @@ export interface WikiContents {
   concepts: WikiPageItem[];
   entities: WikiPageItem[];
   documentId: string;
+}
+
+// ── [jonex] LLM-Wiki Schema 编译设置（方案 llmwiki-schema-settings-execution-plan §4）──
+
+export interface LlmWikiConceptTypeItem {
+  code: string;        // 小写 ASCII（[a-z0-9 _-]）
+  name: string;
+  description?: string;
+}
+
+export interface LlmWikiEntityTypeItem {
+  code: string;        // 小写 ASCII（[a-z0-9 _-]），前端必须校验
+  name: string;
+  description?: string;
+  examples?: string[];
+}
+
+/** active LLM-Wiki Schema（后端 get_schema 返回） */
+export interface LlmWikiSchema {
+  id: number;
+  knowledge_base_id: string;
+  schema_version: number;
+  status: 'active' | 'archived';
+  sync_status: 'synced' | 'apply_failed';
+  schema_name: string;
+  language: string;
+  model?: string | null;
+  entity_types: LlmWikiEntityTypeItem[];
+  concept_types: LlmWikiConceptTypeItem[];
+  /** 用户自定义追加块（多行 markdown，渲染时原样拼到 AGENTS.md 末尾） */
+  agents_md_extra: string;
+  agents_md: string;
+  edited_by?: string;
+  edited_at?: string;
+  applied_at?: string;
+  created_at?: string;
+  updated_at?: string;
+  /** 保存响应附带：本次 schema 变更影响的过期文档数 */
+  affected_documents?: number;
+}
+
+export interface SaveLlmWikiSchemaPayload {
+  knowledge_base_id: string;
+  expected_schema_version: number;
+  schema_name?: string;
+  language?: string;
+  model?: string | null;
+  entity_types: LlmWikiEntityTypeItem[];
+  concept_types: LlmWikiConceptTypeItem[];
+  /** 用户自定义追加块（多行 markdown，渲染时原样拼到 AGENTS.md 末尾） */
+  agents_md_extra: string;
+}
+
+export interface ImportLlmWikiSchemaPayload {
+  knowledge_base_id: string;
+  expected_schema_version: number;
+  yaml_text: string;
+  dry_run?: boolean;
+}
+
+export interface RecompileOutdatedResult {
+  matched: number;
+  submitted: number;
+  skipped: number;
+  failed: number;
+  schema_version: number;
 }

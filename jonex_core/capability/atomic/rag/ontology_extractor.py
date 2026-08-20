@@ -38,6 +38,8 @@ class ExtractedEntity:
     confidence: float = 1.0
     source_chunks: List[Dict[str, Any]] = field(default_factory=list)
     extraction_method: str = "llm_guided"  # [jonex] llm_guided / pre_classified / endpoint_backfill（P2C 兜底）
+    table_sig: str = ""             # [jonex] Row-as-Object：表列名签名（改动 18 upsert 键）
+    pk_value: str = ""              # [jonex] Row-as-Object：主键值（改动 18 upsert 键）
 
 
 @dataclass
@@ -58,6 +60,27 @@ class ExtractionResult:
     errors: List[str] = field(default_factory=list)
     raw_llm_response: Optional[str] = None
     ok: bool = True                 # [jonex] 产出 ≥1 实体即 True；全批失败/零产出才 False
+
+
+def _is_table_chunk_entity(entity: dict) -> bool:
+    """[jonex] O6：判定 LightRAG 实体是否来自表格 chunk。
+
+    实体的 file_path 是 chunk 的 file_source；ctype=table_row/table 即
+    表格 chunk（Row-as-Object 已确定性接管表格实体，通用抽取结果丢弃）。
+    """
+    fp = entity.get("file_path") or ""
+    if not fp or "ctype=" not in fp:
+        return False
+    try:
+        from jonex_core.common.file_source_util import parse_file_source
+
+        parsed = parse_file_source(fp)
+        return parsed.get("chunk_type") in ("table_row", "table")
+    except (NameError, AttributeError, ImportError):
+        raise  # 代码 bug，不掩盖
+    except Exception as exc:  # noqa: BLE001 — 解析失败按非表格处理
+        logger.debug("O6 _is_table_chunk_entity 解析降级: %s", exc)
+        return False
 
 
 # ============================================================
@@ -322,6 +345,18 @@ class OntologyExtractor:
         schema, ontology_json = await self._resolve_schema(compiled_schema, scope)
         if not ontology_json:
             return ExtractionResult(ok=False, errors=["无可用 ontology schema，跳过本体抽取"])
+
+        # [jonex] O6（§11.2）：表格 chunk 来源的 LightRAG 实体丢弃——表格实体
+        # 由 Row-as-Object 确定性生成（attributes 结构化、按行独立实例），
+        # 通用文本抽取对表格的低质结果不占 200 截断名额、不造成同名污染。
+        _drop_table_entities = os.getenv(
+            "TABLE_OBJECT_FILTER_LIGHTRAG_TABLE_ENTITIES", "true",
+        ).lower() in ("1", "true", "yes", "on")
+        if _drop_table_entities and lightrag_entities:
+            lightrag_entities = [
+                e for e in lightrag_entities
+                if not _is_table_chunk_entity(e)
+            ]
 
         # Phase 4：过滤 + 排序 + 裁剪
         max_entities = int(os.getenv("ONTOLOGY_EXTRACT_MAX_ENTITIES", "200"))

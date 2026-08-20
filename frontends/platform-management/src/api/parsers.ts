@@ -16,7 +16,6 @@ export interface ParserListResponse {
 
 export interface ParserItem {
   id: string;
-  tenant_id: string;
   name: string;
   parser_type: string;
   file_types: string[];

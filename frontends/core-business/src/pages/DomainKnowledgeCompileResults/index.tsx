@@ -3,15 +3,28 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Button, Card, Tag, Tabs, Space, Spin } from 'antd';
 import { ArrowLeftOutlined, DatabaseOutlined } from '@ant-design/icons';
-import type { OntologyStatistics, OntologyInstanceSummary, RelationInstanceSummary } from '@/types/domainKnowledge';
-import { getOntologyStatistics, getOntologyEntityTypes, getOntologyRelationTypes } from '@/api/domainKnowledge';
+import type {
+  OntologyStatistics,
+  OntologyInstanceSummary,
+  RelationInstanceSummary,
+  KnowledgeBaseType,
+} from '@/types/domainKnowledge';
+import {
+  getOntologyStatistics,
+  getOntologyEntityTypes,
+  getOntologyRelationTypes,
+  getDomainKnowledgeDetail,
+  getWikiContents,
+} from '@/api/domainKnowledge';
 import { getSearchFeedbackStats } from '@/api/knowledgeSearch';
 import type { SearchFeedbackStats } from '@/types/knowledgeSearch';
-import { buildTabs, buildStats } from './config';
-import type { TabConfig } from './config';
+import { buildTabs, buildStats, buildOpenkbTabs, buildOpenkbStats } from './config';
+import type { TabConfig, WikiStats } from './config';
 import OntologyTab from './OntologyTab';
 import RelationTab from './RelationTab';
 import GraphTab from './GraphTab';
+import WikiPageBrowser from './WikiPageBrowser';
+import WikiGraphTab from './WikiGraphTab';
 import LikeTab from './LikeTab';
 import DislikeTab from './DislikeTab';
 
@@ -34,11 +47,30 @@ export default function DomainKnowledgeCompileResults() {
   const [entityTypes, setEntityTypes] = useState<OntologyInstanceSummary[] | null>(null);
   const [relationTypes, setRelationTypes] = useState<RelationInstanceSummary[] | null>(null);
   const [feedbackStats, setFeedbackStats] = useState<SearchFeedbackStats | null>(null);
+  // [jonex] openkb 分流：kbType 决定展示 Wiki 页面/图谱（本体数据为空）；
+  // wikiStats = getWikiContents(kbId, "") 全库三类页数（stats 卡片 + tab count 同源）
+  const [kbType, setKbType] = useState<KnowledgeBaseType>('lightrag');
+  const [wikiStats, setWikiStats] = useState<WikiStats>({ summaries: 0, concepts: 0, entities: 0 });
+  const isOpenKB = kbType === 'openkb';
 
-  // 进入页面请求统计 + 本体实例 + 关系实例 + 反馈统计
+  // [jonex] kbType 异步加载：挂载瞬间默认 lightrag（activeTab='ontology' 对 openkb 无效），
+  // kbType 返回 openkb 后把 activeTab 对齐到 openkb 的有效 key（'wikiPages'/'wikiGraph'），
+  // 覆盖首次默认 'ontology' 与用户误点 relation 的场景——首次进入即显示 Wiki 页面树
+  useEffect(() => {
+    if (isOpenKB && !['wikiPages', 'wikiGraph'].includes(activeTab)) {
+      setActiveTab('wikiPages');
+    }
+  }, [isOpenKB, activeTab]);
+
+  // 进入页面请求统计 + 本体实例 + 关系实例 + 反馈统计 + kbType
   useEffect(() => {
     if (!id) return;
     setStatsLoading(true);
+
+    getDomainKnowledgeDetail(id)
+      .then((detail) => setKbType(detail.kbType || 'lightrag'))
+      .catch(() => setKbType('lightrag'));
+
     getOntologyStatistics(id)
       .then(setStatsData)
       .catch(() => {})
@@ -57,13 +89,48 @@ export default function DomainKnowledgeCompileResults() {
       .catch(() => {});
   }, [id]);
 
-  const tabs = useMemo(
-    () => (statsData ? buildTabs(t, statsData, feedbackStats?.like_count, feedbackStats?.dislike_count) : []),
-    [statsData, feedbackStats, t],
+  // [jonex] openkb：加载全库 Wiki 内容统计（document_id 空 = KB 级）
+  useEffect(() => {
+    if (!id || kbType !== 'openkb') return;
+    getWikiContents(id, '')
+      .then((res) => {
+        setWikiStats({
+          summaries: res.summaries?.length ?? 0,
+          concepts: res.concepts?.length ?? 0,
+          entities: res.entities?.length ?? 0,
+        });
+      })
+      .catch(() => {});
+  }, [id, kbType]);
+
+  const tabs = useMemo(() => {
+    if (!statsData) return [];
+    return isOpenKB
+      ? buildOpenkbTabs(t, wikiStats)
+      : buildTabs(t, statsData, feedbackStats?.like_count, feedbackStats?.dislike_count);
+  }, [isOpenKB, statsData, feedbackStats, wikiStats, t]);
+  const stats = useMemo(
+    () =>
+      statsData
+        ? isOpenKB
+          ? buildOpenkbStats(t, statsData.source_file_count, wikiStats)
+          : buildStats(t, statsData)
+        : [],
+    [isOpenKB, statsData, wikiStats, t],
   );
-  const stats = useMemo(() => (statsData ? buildStats(t, statsData) : []), [statsData, t]);
 
   const tabContent = useMemo(() => {
+    if (isOpenKB) {
+      switch (activeTab) {
+        case 'wikiPages':
+          // 全库模式：docId 空 = KB 级；不传 compileStatus（无单一文档编译状态）
+          return <WikiPageBrowser kbId={id} docId="" />;
+        case 'wikiGraph':
+          return <WikiGraphTab kbId={id} docId="" />;
+        default:
+          return null;
+      }
+    }
     switch (activeTab) {
       case 'ontology':
         return <OntologyTab kbId={id} data={entityTypes} />;
@@ -78,7 +145,7 @@ export default function DomainKnowledgeCompileResults() {
       default:
         return null;
     }
-  }, [activeTab, id, entityTypes, relationTypes]);
+  }, [activeTab, id, entityTypes, relationTypes, isOpenKB]);
 
   return (
     <div>
@@ -215,6 +282,7 @@ export default function DomainKnowledgeCompileResults() {
           borderRadius: 12,
           border: '1px solid #eef2f6',
           boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          overflow: 'hidden',
         }}
         styles={{ body: { padding: 0 } }}
       >
@@ -227,8 +295,7 @@ export default function DomainKnowledgeCompileResults() {
           }))}
           style={{ padding: '0 20px' }}
         />
-
-        {tabContent}
+        <div>{tabContent}</div>
       </Card>
     </div>
   );

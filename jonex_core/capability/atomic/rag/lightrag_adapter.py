@@ -41,6 +41,7 @@ from jonex_core.common.i18n import translate
 from jonex_core.common.file_source_util import (
     build_file_source,
     lightrag_workspace,
+    normalize_chunk_content,
     parse_file_source,
 )
 from jonex_core.common.cache import get_redis_client
@@ -541,8 +542,13 @@ class LightRAGServerClient:
         tenant_id: str = "",          # [jonex] 计量上下文
         trace_id: str = "",           # [jonex] 计量上下文
         user_id: str = "",            # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> dict:
-        """查询 LightRAG，返回 {"answer": str, "references": list[dict]}。"""
+        """查询 LightRAG，返回 {"answer": str, "references": list[dict]}。
+
+        only_need_context=True 时 LightRAG 提前返回 chunk 上下文、不调生成 LLM，
+        此时 answer 字段是上下文字符串而非答案（docstring 明示，调用方自行作答）。
+        """
         # LightRAG /query 的 QueryRequest.query 有 min_length=3 硬校验，
         # 短于 3 个字符必然返回 HTTP 422。这里前置拦截，转为语义明确的参数
         # 错误（4xxx），避免无谓的网络往返与误导性的上游 5xxx 错误。
@@ -566,6 +572,7 @@ class LightRAGServerClient:
                     "top_k": top_k,
                     "include_references": True,
                     "include_chunk_content": True,   # [jonex] 让 references 带 chunk 原文文本
+                    "only_need_context": only_need_context,  # [jonex] 方案 A 透传
                 },
                 headers=_jonex_query_headers(           # [jonex] 透传计量头
                     tenant_id=tenant_id,
@@ -585,14 +592,13 @@ class LightRAGServerClient:
                 # LightRAG content 为同一 file_path 下的 chunk 文本数组（本平台 file_source
                 # 按 chunk 唯一，通常仅 1 条）。合并为原文段文本，供前端展示「关联原文」。
                 # 去除入库时注入的命名空间隔离标记 <!--yx:HASH-->，避免泄漏给前端。
-                content = r.get("content")
-                raw_text = None
-                if isinstance(content, list) and content:
-                    raw_text = "\n\n".join(c for c in content if c)
-                elif isinstance(content, str) and content:
-                    raw_text = content
-                if raw_text:
-                    parsed["text"] = re.sub(r"\s*<!--yx:[0-9a-f]+-->\s*", "", raw_text).strip()
+                # [jonex] §10 L1：归一化抽为共享纯函数（与 REMOTE task_manager
+                # 同构），chunk_texts 逐条保留、与 chunk_ids 下标对齐（供页段精算）。
+                text, chunk_texts = normalize_chunk_content(r.get("content"))
+                if text:
+                    parsed["text"] = text
+                if chunk_texts:
+                    parsed["chunk_texts"] = chunk_texts
                 # [jonex] 透传 chunk_ids：LightRAG 一个 reference_id 可聚合多个 chunk
                 chunk_ids = r.get("chunk_ids") or []
                 if chunk_ids:
@@ -1347,6 +1353,10 @@ class LightRAGAdapter(BaseRAGCapability):
                 trace_id=request.payload.get("trace_id") or request.request_id or "",
                 # [jonex] Gap B: 从 request 提取 user_id，透传给 LightRAG 计量
                 user_id=request.user_id or request.payload.get("user_id") or "",
+                # [jonex] 方案 A：只召回不生成（平台取回作答权）
+                only_need_context=bool(
+                    request.payload.get("only_need_context", False)
+                ),
             )
             return CapabilityResponse.ok(
                 request_id=request.request_id, data=detailed
@@ -1518,6 +1528,7 @@ class LightRAGAdapter(BaseRAGCapability):
         knowledge_base_id: str,
         trace_id: str = "",          # [jonex] 计量链路追踪
         user_id: str = "",           # [jonex] 计量上下文
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> str:
         require_tenant(tenant_id)
         knowledge_base_id = _require_knowledge_base_id(knowledge_base_id)
@@ -1529,6 +1540,7 @@ class LightRAGAdapter(BaseRAGCapability):
             tenant_id=tenant_id,          # [jonex] 计量上下文
             trace_id=trace_id,            # [jonex] 计量链路追踪
             user_id=user_id,
+            only_need_context=only_need_context,
         )
         return result["answer"] if isinstance(result, dict) else result
 
@@ -1542,8 +1554,12 @@ class LightRAGAdapter(BaseRAGCapability):
         knowledge_base_id: str,
         trace_id: str = "",
         user_id: str = "",
+        only_need_context: bool = False,  # [jonex] 方案 A：只召回不生成
     ) -> dict:
-        """返回 {"answer": str, "references": list[dict]} 详细结果。"""
+        """返回 {"answer": str, "references": list[dict]} 详细结果。
+
+        only_need_context=True 时 answer 为 chunk 上下文字符串而非答案。
+        """
         require_tenant(tenant_id)
         knowledge_base_id = _require_knowledge_base_id(knowledge_base_id)
         return await self._client.query(
@@ -1554,6 +1570,7 @@ class LightRAGAdapter(BaseRAGCapability):
             tenant_id=tenant_id,
             trace_id=trace_id,
             user_id=user_id,
+            only_need_context=only_need_context,
         )
 
     async def delete(self, doc_id: str, tenant_id: str, *, knowledge_base_id: str = "") -> bool:

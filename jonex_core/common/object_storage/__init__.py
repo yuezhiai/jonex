@@ -39,6 +39,59 @@ def build_object_key(
 
 
 
+# [jonex] §image-refs P1-1: 文档内嵌资产（图片等）扩展名白名单。
+# aext 经 file_source 字符串旁路，理论上可被构造值注入——白名单化保证
+# 它永不成为路径注入面（非白名单一律按 png 处理）。
+_ASSET_EXT_WHITELIST = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+
+
+def normalize_asset_ext(ext: str | None) -> str | None:
+    """资产扩展名白名单化（image-reference-chain-execution-plan.md P1-1）。
+
+    - 空值 → ``None``（调用方跳过上传/富化）；
+    - 白名单外（含 ``../../etc/passwd`` 等路径穿越样本）→ 按 ``png``
+      处理并打 WARNING。
+    """
+    if not ext:
+        return None
+    name = str(ext).strip().strip(".").lower()
+    if name in _ASSET_EXT_WHITELIST:
+        return name
+    logger.warning("资产扩展名不在白名单，按 png 处理: %r", ext)
+    return "png"
+
+
+def build_asset_key(
+    tenant_id: str,
+    knowledge_base_id: str,
+    doc_id: str,
+    image_idx: int,
+    ext: str | None,
+) -> str:
+    """图片等文档内嵌资产的对象键（image-reference-chain-execution-plan.md §4.2）。
+
+    形如 ``{COS_KEY_PREFIX}/kb/{tenant}/{kb}/{doc}/assets/img_{idx}.{ext}``
+    —— 与 build_object_key 的文档键同前缀同层级，便于按文档前缀批量清理。
+
+    ext 经 normalize_asset_ext 白名单化；空值抛 ValueError（调用方应在
+    有资产时再调用，见 P2-1「ext 缺失则跳过」的口径）。
+    image_idx 强制为整数并抛 ValueError：raw 端点的入参来自请求 payload，
+    不校验会允许 ``img_../../evil`` 之类路径穿越对象键。
+    """
+    safe_ext = normalize_asset_ext(ext)
+    if not safe_ext:
+        raise ValueError("asset ext 为空，调用前应先判定有值")
+    try:
+        idx = int(image_idx)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"image_idx 必须为整数: {image_idx!r}") from exc
+    prefix = os.getenv("COS_KEY_PREFIX", "jonex").strip("/")
+    return (
+        f"{prefix}/kb/{tenant_id}/{knowledge_base_id}/{doc_id}"
+        f"/assets/img_{idx}.{safe_ext}"
+    )
+
+
 @lru_cache(maxsize=1)
 def get_object_storage():
     """获取对象存储实例（单例，lru_cache 保证进程内复用）。
@@ -82,4 +135,10 @@ def get_object_storage_for(backend: str | None):
     return LocalObjectStorage()
 
 
-__all__ = ["get_object_storage", "get_object_storage_for", "build_object_key"]
+__all__ = [
+    "build_asset_key",
+    "build_object_key",
+    "get_object_storage",
+    "get_object_storage_for",
+    "normalize_asset_ext",
+]

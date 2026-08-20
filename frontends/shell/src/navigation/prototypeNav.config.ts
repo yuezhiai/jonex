@@ -90,6 +90,7 @@ export const prototypeNavConfig: NavSection[] = [
             label: 'navigation.tenantManagement',
             appId: 'platform-management',
             internalPath: 'tenant-management',
+            adminOnly: true,
           },
           {
             key: 'user-management',

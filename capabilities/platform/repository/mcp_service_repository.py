@@ -19,9 +19,17 @@ from sqlalchemy import func, select, text as sa_text
 from sqlalchemy import and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping, McpOrganization
+from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
 from capabilities.platform.models.mcp_service import McpServicePublish
 from jonex_core.common.tenant import require_tenant
+
+
+# 系统内置写服务条目（WRITE-03 / DIR-02 / K7-B3）——系统服务条目的唯一事实源，
+# service 层 import 这些常量构造目录条目与不可编辑守卫。
+SYSTEM_SERVICE_ID = "system.knowledge_document_write"
+SYSTEM_SERVICE_TOOL = "knowledge_document_write"
+SYSTEM_SERVICE_NAME = "知识写入"
+SYSTEM_SERVICE_DESCRIPTION = "向授权知识库写入文档"
 
 
 # 跨 schema 基础查询 SQL —— 列表与详情共用。
@@ -43,6 +51,9 @@ _SERVICE_BASE_SQL = """
         COALESCE(p.is_published, 0) AS is_published,
         p.published_at,
         p.published_by,
+        p.tool,
+        p.tool_description,
+        p.service_type,
         sp.name AS space_name
     FROM knowledge_base.services s
     LEFT JOIN LATERAL (
@@ -174,6 +185,56 @@ class McpServiceRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_tool(
+        self, tenant_id: str, tool: str
+    ) -> Optional[McpServicePublish]:
+        """按 tool 名查询当前租户的发布记录（用于同租户内 Tool 名唯一性校验）。
+
+        返回 McpServicePublish | None。
+        """
+        tenant_id = require_tenant(tenant_id)
+        result = await self.session.execute(
+            select(McpServicePublish).where(
+                McpServicePublish.tenant_id == tenant_id,
+                McpServicePublish.tool == tool,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def save_tool_config(
+        self,
+        tenant_id: str,
+        service_id: str,
+        tool: str,
+        tool_description: Optional[str],
+    ) -> McpServicePublish:
+        """保存服务的 MCP Tool 配置。
+
+        已有发布记录则更新 tool / tool_description；否则创建 is_published=0 桩记录。
+        返回更新后的 McpServicePublish。
+        """
+        tenant_id = require_tenant(tenant_id)
+        existing = await self.get_publish_status(tenant_id, service_id)
+
+        if existing:
+            existing.tool = tool
+            existing.tool_description = tool_description
+            await self.session.flush()
+            return existing
+
+        record = McpServicePublish(
+            id=_uuid.uuid4().hex,
+            tenant_id=tenant_id,
+            service_id=service_id,
+            is_published=0,
+            tool=tool,
+            tool_description=tool_description,
+            created_at=datetime.now(timezone.utc),
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
     async def upsert_publish(
         self,
         tenant_id: str,
@@ -203,6 +264,75 @@ class McpServiceRepository:
             is_published=is_published,
             published_at=datetime.now(timezone.utc) if is_published else None,
             published_by=published_by,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def ensure_publish_stubs(
+        self, tenant_id: str, service_ids: list[str]
+    ) -> int:
+        """批量兜底 upsert 未发布服务桩记录（DS-05 / K10）。
+
+        对 knowledge_base 存在但 platform.mcp_service_publish 无记录的服务，
+        写 is_published=0 桩记录（published_at/published_by 均为空）。
+        一次 select 预查缺桩集合，避免逐条 get_publish_status 的 N+1；
+        复用 UNIQUE(tenant_id, service_id) 兜底幂等。
+
+        返回本次新增的桩记录数量。
+        """
+        tenant_id = require_tenant(tenant_id)
+        if not service_ids:
+            return 0
+
+        result = await self.session.execute(
+            select(McpServicePublish.service_id).where(
+                McpServicePublish.tenant_id == tenant_id,
+                McpServicePublish.service_id.in_(service_ids),
+            )
+        )
+        existing_ids = set(result.scalars().all())
+
+        missing = [sid for sid in service_ids if sid not in existing_ids]
+        for sid in missing:
+            self.session.add(
+                McpServicePublish(
+                    id=_uuid.uuid4().hex,
+                    tenant_id=tenant_id,
+                    service_id=sid,
+                    is_published=0,
+                    published_at=None,
+                    published_by=None,
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+
+        if missing:
+            await self.session.flush()
+
+        return len(missing)
+
+    async def ensure_system_service(self, tenant_id: str) -> McpServicePublish:
+        """幂等 upsert 系统服务条目。service_type='system'、tool 固定、is_published=1。
+
+        复用 get_publish_status 的 UNIQUE(tenant_id, service_id) 语义，
+        「先查后插」实现幂等，不引入 ON CONFLICT / raw SQL。
+        """
+        tenant_id = require_tenant(tenant_id)
+        existing = await self.get_publish_status(tenant_id, SYSTEM_SERVICE_ID)
+        if existing is not None:
+            return existing
+        record = McpServicePublish(
+            id=_uuid.uuid4().hex,
+            tenant_id=tenant_id,
+            service_id=SYSTEM_SERVICE_ID,
+            is_published=1,
+            published_at=None,
+            published_by=None,
+            tool=SYSTEM_SERVICE_TOOL,
+            tool_description=SYSTEM_SERVICE_DESCRIPTION,
+            service_type="system",
+            created_at=datetime.now(timezone.utc),
         )
         self.session.add(record)
         await self.session.flush()
@@ -251,10 +381,9 @@ class McpServiceRepository:
     ) -> list[tuple]:
         """查询已授权给指定 service 的 MCP Key 列表。
 
-        JOIN platform.mcp_key_service_mappings + platform.mcp_keys，
-        LEFT JOIN platform.mcp_organizations。
+        JOIN platform.mcp_key_service_mappings + platform.mcp_keys。
         返回 list of tuples (key_id, key_name, key_prefix, permission_level,
-        revoked_at, expires_at, org_name, org_id)。
+        revoked_at, expires_at)。
         """
         tenant_id = require_tenant(tenant_id)
 
@@ -266,8 +395,6 @@ class McpServiceRepository:
                 McpKeyServiceMapping.permission_level,
                 McpKey.revoked_at,
                 McpKey.expires_at,
-                McpOrganization.name.label("org_name"),
-                McpOrganization.id.label("org_id"),
             )
             .select_from(McpKeyServiceMapping)
             .join(
@@ -276,14 +403,6 @@ class McpServiceRepository:
                     McpKeyServiceMapping.mcp_key_id == McpKey.id,
                     McpKey.tenant_id == tenant_id,
                     McpKey.is_deleted == 0,
-                ),
-            )
-            .outerjoin(
-                McpOrganization,
-                and_(
-                    McpKey.org_id == McpOrganization.id,
-                    McpOrganization.tenant_id == tenant_id,
-                    McpOrganization.is_deleted == 0,
                 ),
             )
             .where(

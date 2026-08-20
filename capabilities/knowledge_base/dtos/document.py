@@ -74,6 +74,12 @@ class SetDocumentFolderRequest(BaseModel):
     folder_id: Optional[str] = Field(default=None, max_length=64)
 
 
+class BatchMoveDocumentsRequest(BaseModel):
+    knowledge_base_id: str = Field(..., min_length=1, max_length=128)
+    document_ids: list[str] = Field(..., min_length=1)
+    folder_id: Optional[str] = Field(default=None, max_length=64)
+
+
 class DocumentDeleteResponse(BaseModel):
     id: str
     deleted: bool = True

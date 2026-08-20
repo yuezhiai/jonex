@@ -115,6 +115,16 @@ class RemoteOpenKBClient(OpenKBClient):
             **parsed_artifact,
         }, tenant_id, kb_id)
 
+    async def apply_schema(self, kb_name, tenant_id, kb_id, *,
+                           schema_version: int, config: dict, agents_md: str):
+        """[jonex] 投影 LLM-Wiki Schema 到 OpenKB（方案 §8）。"""
+        return await self._invoke("apply_schema", {
+            "kb": kb_name,
+            "schema_version": schema_version,
+            "config": config,
+            "agents_md": agents_md,
+        }, tenant_id, kb_id)
+
     async def remove_document(self, kb_name, document_id, tenant_id, kb_id):
         """删除 OpenKB 中指定 document_id 的编译输入和派生索引记录。"""
         return await self._invoke("remove_document", {
@@ -193,6 +203,7 @@ _MOCK_TRACE = [
 class MockOpenKBClient(OpenKBClient):
     async def init_kb(self, *a, **kw): return {"kb": "mock", "created": True}
     async def compile_parsed_document(self, *a, **kw): return {"status": "compiled"}
+    async def apply_schema(self, *a, **kw): return {"applied": True, "schema_version": kw.get("schema_version", 1)}
     async def remove_document(self, *a, **kw): return {"status": "removed"}
     async def delete_kb(self, *a, **kw): return {"status": "deleted"}
     async def query(self, *a, **kw):

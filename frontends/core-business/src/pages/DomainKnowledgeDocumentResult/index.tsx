@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { Button, Card, Space, Tag, Tabs, Spin, Typography, message } from 'antd';
 import {
   ArrowLeftOutlined,
@@ -65,6 +66,8 @@ export default function DomainKnowledgeDocumentResult() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { id = '', docId = '' } = useParams<{ id: string; docId: string }>();
+  // KB 写权限（权限矩阵）：重新解析/重新编译按钮依据
+  const { canWrite } = useKbPermission(id || undefined);
   const [doc, setDoc] = useState<ManualDocItem | null>(null);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('parse');
@@ -87,13 +90,21 @@ export default function DomainKnowledgeDocumentResult() {
       .finally(() => setLoading(false));
   }, [id, docId, t]);
 
-  // [jonex] 取 KB 详情拿 kbType，前端据此对「编译结果」Tab 分流渲染
+  // [jonex] kbType 双来源：doc 详情 metadata.kb_type 优先（与 doc 同一次请求到达，
+  // 无竞态——此前独立请求慢/失败时 kbType 停在 lightrag，「编译结果」tab 显示
+  // 空本体、刷新后才切 Wiki）；独立 KB 详情请求仅作兜底（旧文档无 kb_type 键）。
   useEffect(() => {
-    if (!id) return;
+    if (doc?.kbType) setKbType(doc.kbType);
+  }, [doc?.kbType]);
+
+  useEffect(() => {
+    if (!id || doc?.kbType) return;  // doc 已带 kb_type（同一次请求到达）：无需兜底
     getDomainKnowledgeDetail(id)
       .then((detail) => setKbType(detail.kbType || 'lightrag'))
-      .catch(() => setKbType('lightrag'));
-  }, [id]);
+      .catch(() => {
+        // 兜底请求失败：保持默认 lightrag；doc.kbType 存在时上面 effect 已纠正
+      });
+  }, [id, doc?.kbType]);
 
   // [jonex] 编译状态轮询：任务化后终态由对账巡检回写（最长 30s 延迟），
   // 前端每 10s 刷新文档详情直到 compiled/failed。仅 openkb KB 轮询
@@ -147,9 +158,19 @@ export default function DomainKnowledgeDocumentResult() {
     setRecompileLoading(true);
     try {
       await retryDocumentOntology(id, docId);
-      message.success(t('domainKnowledge.recompileTriggered'));
+      // [jonex] openkb KB 的「重新编译」= 重跑 Wiki 编译，提示文案与本体重抽区分
+      message.success(
+        kbType === 'openkb'
+          ? t('domainKnowledge.wikiRecompileTriggered')
+          : t('domainKnowledge.recompileTriggered'),
+      );
     } catch (err: any) {
-      message.error(err?.message || t('domainKnowledge.retryOntologyFailed'));
+      message.error(
+        err?.message
+          || (kbType === 'openkb'
+            ? t('domainKnowledge.wikiRecompileFailed')
+            : t('domainKnowledge.retryOntologyFailed')),
+      );
     } finally {
       setRecompileLoading(false);
     }
@@ -286,6 +307,8 @@ export default function DomainKnowledgeDocumentResult() {
                 icon={<ReloadOutlined />}
                 style={{ borderRadius: 8 }}
                 loading={reparseLoading}
+                disabled={!canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
                 onClick={handleReparse}
               >
                 {t('domainKnowledge.reparse')}
@@ -294,6 +317,8 @@ export default function DomainKnowledgeDocumentResult() {
                 icon={<BuildOutlined />}
                 style={{ borderRadius: 8 }}
                 loading={recompileLoading}
+                disabled={!canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
                 onClick={handleRecompile}
               >
                 {t('domainKnowledge.recompile')}

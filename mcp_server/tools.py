@@ -12,23 +12,27 @@
   - 零 import jonex_core——所有 KB 交互通过 HTTP 调 Gateway
   - Tool handler 签名不含 request、tenant_id、mcp_key_id——从 contextvar 获取
 """
+import base64
 import logging
+import os
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
 
-from auth import McpAuthContext, McpAuthError, require_kb_scope, require_mcp_auth
+from auth import (
+    McpAuthContext,
+    McpAuthError,
+    require_kb_scope,
+    require_mcp_auth,
+    require_write_scope,
+)
 from config import settings
 from db import get_pool, get_service_permission_level
 
 logger = logging.getLogger("mcp.tools")
 
-
-# New imports for upload_document tool (Phase 10)
-import base64
-import os
-import re
 
 # ============================================================================
 # Block 0: 异常类
@@ -210,8 +214,12 @@ async def call_gateway(
 # ============================================================================
 
 
-# ── Service 级权限层级: write(2) > call(1) > read(0) ──
-_PERMISSION_LEVEL_RANK = {"read": 0, "call": 1, "write": 2}
+# ── Service 级权限层级: call(1) > view(0)（write 已移交写 Key）──
+_PERMISSION_LEVEL_RANK = {"view": 0, "call": 1}
+
+# 遗留 service 映射权限值降级（write/*/read → call/view，
+# 与 capabilities/platform/services/mcp_key_service.py::_normalize_key_permissions 一致）
+_LEGACY_PERMISSION_LEVEL_MAP = {"write": "call", "read": "view", "*": "call"}
 
 
 async def _check_service_scope(
@@ -219,17 +227,19 @@ async def _check_service_scope(
 ) -> list[str]:
     """C3: 校验 service 下的 KB 与 Key 的 allowed_kb_ids 有交集，并检查权限级别。
 
-    权限级别层级（向下兼容）：
-      - write: 仅 "write" 可通过（最高权限，包含 call + read）
-      - call:  "call" 或 "write" 可通过
-      - read:  "read" / "call" / "write" 可通过（最低 service 级权限，与 Key 级命名对齐）
+    权限级别层级（向下兼容，收敛为 call/view 两级）：
+      - call:  需 "call"（含降级后的遗留 write/*）
+      - view:  "view" 或 "call" 可通过
       - 映射不存在时 raise McpAuthError(401, "不在授权范围内")
+
+    遗留值降级迁移：write→call、read→view、*→call（写权限已移交写 Key，
+    * 不再全通配）。未知值落到 rank -1 → 403（安全默认拒绝）。
 
     如果 allowed_kb_ids 为空（falsy），表示"所有 KB 都允许"，跳过交集检查返回空列表。
     否则获取 service 的 kb_ids，计算交集，交集为空时 raise McpAuthError(401)。
 
     Returns:
-        list[str]: 交集列表（allowed_kb_ids ∩ service kb_ids），为空时表示跳过检查
+        list[str]: 交集列表（allowed_kb_ids ∩ service kb ids），为空时表示跳过检查
     """
     pool = await get_pool()
     perm_level = await get_service_permission_level(pool, auth.key_id, service_id)
@@ -237,19 +247,18 @@ async def _check_service_scope(
     if perm_level is None:
         raise McpAuthError(401, "不在授权范围内")
 
-    # "*" 全能力通配：跳过所有权限检查（对应前端"全部"选项）
-    if perm_level == "*":
-        pass
-    else:
-        required_rank = _PERMISSION_LEVEL_RANK.get(required_permission, 0)
-        actual_rank = _PERMISSION_LEVEL_RANK.get(perm_level, -1)
-        if actual_rank < required_rank:
-            _LABELS: dict[str, str] = {"write": "可写入", "call": "可调用", "read": "仅查看"}
-            raise McpAuthError(
-                403,
-                f"需要'{_LABELS.get(required_permission, required_permission)}'权限，"
-                f"当前为'{_LABELS.get(perm_level, perm_level)}'权限",
-            )
+    # 遗留值降级迁移：write→call、read→view、*→call（与 key 级归一化规则一致）
+    perm_level = _LEGACY_PERMISSION_LEVEL_MAP.get(perm_level, perm_level)
+
+    required_rank = _PERMISSION_LEVEL_RANK.get(required_permission, 0)
+    actual_rank = _PERMISSION_LEVEL_RANK.get(perm_level, -1)
+    if actual_rank < required_rank:
+        _LABELS: dict[str, str] = {"call": "可调用", "view": "仅查看"}
+        raise McpAuthError(
+            403,
+            f"需要'{_LABELS.get(required_permission, required_permission)}'权限，"
+            f"当前为'{_LABELS.get(perm_level, perm_level)}'权限",
+        )
 
     if not auth.allowed_kb_ids:
         return []
@@ -260,6 +269,14 @@ async def _check_service_scope(
         auth.key_id,
         {"service_id": service_id},
     )
+    # Space 纵深防御：读路径第二道空间闸门。双非空才校验——auth.space_id 为空的
+    # 遗留 Key、或历史 service 未绑定 space_id 时跳过，保持现状不误伤。
+    if (
+        auth.space_id
+        and service_detail.get("space_id")
+        and service_detail["space_id"] != auth.space_id
+    ):
+        raise McpAuthError(401, "不在授权范围内")
     kb_ids = service_detail.get("kb_ids", [])
     intersection = list(set(auth.allowed_kb_ids) & set(kb_ids))
 
@@ -289,6 +306,18 @@ def _validate_file_name(file_name: str) -> str:
     if not _VALID_FILENAME_RE.match(name):
         raise McpToolError(code=-32602, message="file_name 包含非法字符")
     return name
+
+
+def _grant_mode_for_kb(auth: McpAuthContext, kb_id: str) -> str | None:
+    """返回写 Key 对指定 kb 的授权模式："all" | "specified" | None（未授权）。
+
+    方案 1：specified 目录级授权暂不支持 MCP 上传/查状态，
+    handler 据此显式拒绝，避免「能建不能用」的静默失效与目录级越权。
+    """
+    for g in auth.grants:
+        if g.get("kb") == kb_id:
+            return g.get("mode")
+    return None
 
 
 async def upload_document(
@@ -348,12 +377,17 @@ async def upload_document(
             code=-32602, message="file_content_base64 解码失败，需为有效 base64 编码"
         ) from e
 
-    # Step 5 — Auth + scope check (require "write" permission at service level)
-    auth = require_mcp_auth("write")  # per D2 — mandatory "write" permission
-    intersection = await _check_service_scope(auth, service_id, "write")
+    # Step 5 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
+    # 写 Key 无 mcp_key_service_mappings，_check_service_scope 恒 401；写入范围由 grants 表达。
+    auth = require_mcp_auth("write")  # 只看 key_type=write
     kb_id = knowledge_base_id.strip()
-    if intersection and kb_id not in intersection:
-        raise McpAuthError(401, "不在授权范围内")
+    # 方案 1：specified 目录级写入暂不支持 MCP 上传，显式拒绝而非静默 401
+    if _grant_mode_for_kb(auth, kb_id) == "specified":
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="目录级写入（specified 模式）暂不支持 MCP 上传，请改用 all 模式写 Key",
+        )
+    require_write_scope(auth, kb_id)  # grants 级：kb 在 grants 且 mode=all，否则 401
 
     # Step 6 — Multipart POST to Gateway
     client = await get_http_client()
@@ -426,7 +460,7 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
     (PENDING → PARSING → INGESTING → READY / FAILED).
 
     Args:
-        service_id: Domain service ID.
+        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
         document_id: Document ID (returned by upload_document).
 
     Returns:
@@ -435,9 +469,9 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
               created_at, updated_at).
 
     Raises:
-        McpAuthError(401): Not authenticated / service not in scope.
+        McpAuthError(401): Not authenticated / not a write key.
         McpToolError(code=-32602): Parameter validation failure.
-        McpToolError(code=-32000): Gateway error / service has no KBs.
+        McpToolError(code=-32000): Gateway error / write key grants empty.
     """
     # Step 1 — Parameter non-empty validation
     if not service_id or not service_id.strip():
@@ -445,27 +479,21 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
     if not document_id or not document_id.strip():
         raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
 
-    # Step 2 — Auth + scope check (write-level: status tracking is part of upload lifecycle)
-    auth = require_mcp_auth("read")
-    intersection = await _check_service_scope(auth, service_id, required_permission="write")
-
-    # Step 3 — Determine KB IDs to check (follow read_source pattern)
-    if intersection:
-        kb_ids_to_check = intersection
-    else:
-        # allowed_kb_ids empty = all KBs allowed, need service's full KB list
-        service_detail = await call_gateway(
-            "get_service",
-            auth.tenant_id,
-            auth.key_id,
-            {"service_id": service_id},
-        )
-        kb_ids_to_check = service_detail.get("kb_ids", [])
+    # Step 2 — Auth + scope（写 Key 专属：上传生命周期，service_id 保留签名但不再用于定位）
+    auth = require_mcp_auth("write")  # 只看 key_type=write
+    # 方案 1：specified 目录级不支持 MCP，仅 all 模式 kb 可查上传状态，
+    # 剔除 specified 的 kb，避免平铺 grants[].kb 导致目录级隔离被突破（越权读他人文档状态）。
+    kb_ids_to_check = [
+        g["kb"] for g in auth.grants if g.get("mode") == "all" and g.get("kb")
+    ]
 
     if not kb_ids_to_check:
-        raise McpToolError(code=-32000, message="服务下无可用知识库")
+        raise McpToolError(
+            code=_ERROR_INTERNAL,
+            message="写 Key 未授权可查询的知识库（specified 目录级暂不支持 MCP）",
+        )
 
-    # Step 4 — Call Gateway (returns document status or raises ResourceNotFoundError)
+    # Step 3 — Call Gateway (returns document status or raises ResourceNotFoundError)
     return await call_gateway(
         "get_document_status",
         auth.tenant_id,
@@ -481,16 +509,20 @@ async def list_domain_services() -> dict:
     """列出 MCP Key 对应租户下所有领域服务。
 
     Action: list_services
-    Guard: require_mcp_auth("read") only（不需要 service scope）
+    Guard: require_mcp_auth("view") only（不需要 service scope）
 
     Returns:
         dict: 含 items（领域服务列表）、total（总数）字段
     """
-    auth = require_mcp_auth("read")
+    auth = require_mcp_auth("view")
+    data = {}
+    if auth.space_id:
+        data["space_id"] = auth.space_id
     result = await call_gateway(
         "list_services",
         auth.tenant_id,
         auth.key_id,
+        data,
     )
     # 上游标准返回 {items: [...], total: N}
     if isinstance(result, dict) and "items" in result:
@@ -509,8 +541,19 @@ _ERROR_INTERNAL = -32000  # 内部服务错误
 _ERROR_RATE_LIMITED = -32001  # 限流（自定义 MCP extension）
 _ERROR_AUTH = -32002  # 认证/授权失败（401/403 → 禁止管线 fallback）
 
-# Phase 11: LLM-Wiki 检索开关（Feature Flag，默认开启）
+# NOTE: SEARCH_LLMWIKI_ENABLED 是进程级状态。多 worker 场景下各 worker 独立进行
+# 健康检查，可能在不同时刻得出不同结论（部分 worker 启用、部分禁用）。
+# 当前影响较小（仅控制一个可选 search tool）；若需严格一致性，可考虑 Redis 等共享存储。
+# LLM-Wiki 检索开关（Feature Flag，默认开启）
 SEARCH_LLMWIKI_ENABLED = os.getenv("SEARCH_LLMWIKI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+
+def is_search_llmwiki_enabled() -> bool:
+    """返回 search_llmwiki 是否可用（线程安全读取模块级状态）。
+
+    该标志由 lifespan 健康检查设置，多 worker 下各 worker 独立。
+    """
+    return SEARCH_LLMWIKI_ENABLED
 
 _VALID_SEARCH_MODES = frozenset({"naive", "local", "global", "hybrid", "mix"})
 # mix → hybrid 别名兼容（与 capabilities/knowledge_base/dtos/search.py 保持一致）
@@ -528,7 +571,7 @@ async def list_documents(
     """列出领域服务下所有知识库的文档。以领域服务为入口，自动解析所属知识库。
 
     Action: list_documents
-    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="read")
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="view")
 
     解决「文件名 → document_id」桥接缺口：MCP 客户端无需先到 REST API 查文档列表再回来调用 read_source。
     支持可选的 file_name 关键词过滤（模糊匹配文件名和文件路径）。
@@ -550,8 +593,8 @@ async def list_documents(
     file_name = file_name.strip()
     if len(file_name) > 255:
         raise McpToolError(code=-32602, message="file_name 长度不能超过 255 字符")
-    auth = require_mcp_auth("read")
-    intersection = await _check_service_scope(auth, service_id, required_permission="read")
+    auth = require_mcp_auth("view")
+    intersection = await _check_service_scope(auth, service_id, required_permission="view")
     if intersection:
         kb_ids_to_query = intersection
     else:
@@ -581,13 +624,13 @@ async def _validate_search_params(
     query: str,
     mode: str,
     top_k: int,
-) -> tuple[str, str, "McpAuthContext"]:
+) -> tuple[str, str, "McpAuthContext", list[str]]:
     """统一的搜索参数校验 + 鉴权。
 
     校验顺序：mode 规范化 → service_id/query 非空 → query 长度 → mode 白名单 → top_k 范围 → 鉴权。
 
     Returns:
-        (normalized_query, normalized_mode, auth): 规范化后的 query、mode 和鉴权上下文
+        (normalized_query, normalized_mode, auth, kb_ids): 规范化后的 query、mode、鉴权上下文和授权的 kb_ids 交集（空列表 = 全部允许）
 
     Raises:
         McpToolError(code=-32602): 参数校验失败
@@ -600,6 +643,7 @@ async def _validate_search_params(
         raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
     if not query or not query.strip():
         raise McpToolError(code=-32602, message="query 为必填参数，不能为空")
+    query = query.strip()
     if len(query) > 2000:
         raise McpToolError(code=-32602, message="query 长度不能超过 2000 字符")
     if mode not in _VALID_SEARCH_MODES:
@@ -610,10 +654,10 @@ async def _validate_search_params(
     if not 1 <= top_k <= 100:
         raise McpToolError(code=-32602, message="top_k 必须在 1-100 之间")
 
-    auth = require_mcp_auth("read")
-    await _check_service_scope(auth, service_id, required_permission="call")
+    auth = require_mcp_auth("view")
+    kb_ids = await _check_service_scope(auth, service_id, required_permission="call")
 
-    return query.strip(), mode, auth
+    return query, mode, auth, kb_ids
 
 
 async def search_ontology(
@@ -626,7 +670,7 @@ async def search_ontology(
     """本体优先检索——实体匹配→1-hop 邻域→RAG fallback。
 
     Action: query_with_ontology
-    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
 
     三步检索管线：1) 实体匹配 2) 1-hop 邻居遍历 3) RAG 融合。
     支持严格模式（strict_mode=True），多次验证循环确保可靠性。
@@ -646,19 +690,17 @@ async def search_ontology(
         McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
         McpToolError(code=-32000): 知识库服务不可用
     """
-    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
-    return await call_gateway(
-        "query_with_ontology",
-        auth.tenant_id,
-        auth.key_id,
-        {
-            "service_id": service_id,
-            "query": query_norm,
-            "mode": mode_norm,
-            "top_k": top_k,
-            "strict_mode": strict_mode,
-        },
-    )
+    query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
+    payload: dict = {
+        "service_id": service_id,
+        "query": query_norm,
+        "mode": mode_norm,
+        "top_k": top_k,
+        "strict_mode": strict_mode,
+    }
+    if kb_ids:
+        payload["knowledge_base_ids"] = kb_ids
+    return await call_gateway("query_with_ontology", auth.tenant_id, auth.key_id, payload)
 
 
 async def search_service(
@@ -686,7 +728,7 @@ async def search_deep(
     """深度查询——多轮分解→子问题查询→归并答案。
 
     Action: deep_query
-    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
 
     将复杂问题分解为多个子问题，依次查询后归并生成综合答案。
     支持严格模式（strict_mode=True），多次验证循环确保可靠性。
@@ -706,19 +748,17 @@ async def search_deep(
         McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
         McpToolError(code=-32000): 知识库服务不可用
     """
-    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
-    return await call_gateway(
-        "deep_query",
-        auth.tenant_id,
-        auth.key_id,
-        {
-            "service_id": service_id,
-            "query": query_norm,
-            "mode": mode_norm,
-            "top_k": top_k,
-            "strict_mode": strict_mode,
-        },
-    )
+    query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
+    payload: dict = {
+        "service_id": service_id,
+        "query": query_norm,
+        "mode": mode_norm,
+        "top_k": top_k,
+        "strict_mode": strict_mode,
+    }
+    if kb_ids:
+        payload["knowledge_base_ids"] = kb_ids
+    return await call_gateway("deep_query", auth.tenant_id, auth.key_id, payload)
 
 
 async def search_llmwiki(
@@ -730,7 +770,7 @@ async def search_llmwiki(
     """OpenKB Wiki 检索——仅适用于 OpenKB 管线知识库，不适用于 LightRAG 管线。
 
     Action: search_llmwiki (fallback: query_with_ontology)
-    Guard: SEARCH_LLMWIKI_ENABLED flag + require_mcp_auth("read") + _check_service_scope(auth, service_id, required_permission="call")
+    Guard: SEARCH_LLMWIKI_ENABLED flag + require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
 
     通过 OpenKB 编译产物进行 Wiki 风格检索。
     若管线不匹配（code=-32602），自动 fallback 到 query_with_ontology。
@@ -752,23 +792,66 @@ async def search_llmwiki(
     """
     if not SEARCH_LLMWIKI_ENABLED:
         raise McpToolError(code=-32000, message="LLM-Wiki 检索暂未开放")
-    query_norm, mode_norm, auth = await _validate_search_params(service_id, query, mode, top_k)
-    payload = {
+    query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
+    payload: dict = {
         "service_id": service_id,
         "query": query_norm,
         "mode": mode_norm,
         "top_k": top_k,
     }
+    if kb_ids:
+        payload["knowledge_base_ids"] = kb_ids
     try:
         return await call_gateway("search_llmwiki", auth.tenant_id, auth.key_id, payload)
     except McpToolError as e:
-        if e.code == -32602:
+        # 管线不匹配 (-32602) 或 OpenKB 运行时不可用 (-32000) → fallback 到 search_ontology
+        if e.code in (-32602, _ERROR_INTERNAL):
             logger.info(
-                "search_llmwiki 管线不匹配，自动回退到 search_ontology: service_id=%s",
+                "search_llmwiki 不可用（code=%s），自动回退到 search_ontology: service_id=%s",
+                e.code,
                 service_id,
             )
             return await call_gateway("query_with_ontology", auth.tenant_id, auth.key_id, payload)
         raise
+
+
+async def search_mix(
+    service_id: str,
+    query: str,
+    mode: str = "hybrid",
+    top_k: int = 5,
+) -> dict:
+    """混合管线检索统一入口——同时查询 LightRAG 和 OpenKB 管线知识库。
+
+    Action: search_mix
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
+
+    自动按 pipeline_type 分组扇出到 LightRAG / OpenKB，支持混合选库。
+    无论 OpenKB 是否可用，均正常返回（纯 LightRAG 知识库不受影响）。
+
+    Args:
+        service_id: 领域服务 ID
+        query: 搜索查询（最多 2000 字符）
+        mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
+        top_k: 返回结果数（默认 5，1-100）
+
+    Returns:
+        dict: 搜索结果，含 answer、references、reasoning 字段
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
+    """
+    query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
+    payload: dict = {
+        "service_id": service_id,
+        "query": query_norm,
+        "mode": mode_norm,
+        "top_k": top_k,
+    }
+    if kb_ids:
+        payload["knowledge_base_ids"] = kb_ids
+    return await call_gateway("search_mix", auth.tenant_id, auth.key_id, payload)
 
 
 async def read_source(
@@ -778,7 +861,7 @@ async def read_source(
     """获取文档源文件的预签名 URL。以领域服务为入口，自动解析文档所属知识库。
 
     Action: get_raw_url
-    Guard: require_mcp_auth("read") + _check_service_scope(auth, service_id)
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id)
 
     不经过 MCP 传输大文件内容——仅返回预签名 URL。
 
@@ -800,7 +883,7 @@ async def read_source(
         raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
     if not document_id or not document_id.strip():
         raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
-    auth = require_mcp_auth("read")
+    auth = require_mcp_auth("view")
     intersection = await _check_service_scope(auth, service_id, required_permission="call")
 
     if intersection:

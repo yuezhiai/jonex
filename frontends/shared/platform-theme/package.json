@@ -26,5 +26,8 @@
   },
   "devDependencies": {
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@ant-design/cssinjs": "^2.1.2"
   }
 }

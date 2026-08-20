@@ -36,10 +36,10 @@ interface Props {
   loading: boolean;
   onCreate: () => void;
   onEdit: (item: OntologyConstraint) => void;
-  onDelete: (item: OntologyConstraint) => void;
+  onDelete: (item: OntologyConstraint) => void;  canWrite?: boolean;
 }
 
-export default function OntologyConstraintSection({ data, loading, onCreate, onEdit, onDelete }: Props) {
+export default function OntologyConstraintSection({ data, loading, canWrite = false, onCreate, onEdit, onDelete }: Props) {
   const { t } = useTranslation();
   const columns: ColumnsType<OntologyConstraint> = [
     {
@@ -92,10 +92,15 @@ export default function OntologyConstraintSection({ data, loading, onCreate, onE
       width: 160,
       render: (_, record) => (
         <span>
-          <a className="yx-table-action" onClick={() => onEdit(record)}>
+          <a className="yx-table-action" style={canWrite ? undefined : { opacity: 0.4, cursor: "not-allowed" }}
+            onClick={() => canWrite && onEdit(record)}>
             <EditOutlined /> {t('common.edit')}
           </a>
-          <a className="yx-table-action" style={{ color: '#ef4444' }} onClick={() => onDelete(record)}>
+          <a
+            className="yx-table-action"
+            style={canWrite ? { color: '#ef4444' } : { color: '#ef4444', opacity: 0.4, cursor: 'not-allowed' }}
+            onClick={() => canWrite && onDelete(record)}
+          >
             <DeleteOutlined /> {t('common.delete')}
           </a>
         </span>
@@ -109,7 +114,10 @@ export default function OntologyConstraintSection({ data, loading, onCreate, onE
         <h3 style={h3Style}>
           <ControlOutlined style={{ color: '#3b82f6' }} /> {t('compile.constraint.sectionTitle')}
         </h3>
-        <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}>
+        <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
           {t('compile.constraint.createBtn')}
         </Button>
       </div>

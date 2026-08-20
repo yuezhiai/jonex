@@ -2,8 +2,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Space, Tag, Spin, Empty } from 'antd';
 import { FileTextOutlined, RightOutlined, PlayCircleOutlined } from '@ant-design/icons';
-import ReactMarkdown from 'react-markdown';
 import { getDocumentChunks } from '@/api/domainKnowledge';
+import MarkdownContent from '@/components/MarkdownContent';
 import type { DocumentChunk } from '@/types/domainKnowledge';
 
 function formatTimeRange(timeStart: number, timeEnd: number | null): string {
@@ -98,7 +98,7 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
                   borderRadius: 12,
                   overflow: 'hidden',
                   background: '#fff',
-                  height: 'calc(100vh - 440px)',
+                  height: 'calc(100vh - 305px)',
                   minHeight: 200,
                 }}
               >
@@ -229,14 +229,8 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
                           )}
                         </div>
                       </div>
-                      <div
-                        style={{
-                          fontSize: 14,
-                          color: '#334155',
-                          lineHeight: 1.8,
-                        }}
-                      >
-                        <ReactMarkdown>{selectedChunk.content_summary}</ReactMarkdown>
+                      <div style={{ marginBottom: 12 }}>
+                        <MarkdownContent content={selectedChunk.content_summary ?? ''} />
                       </div>
                     </>
                   )}

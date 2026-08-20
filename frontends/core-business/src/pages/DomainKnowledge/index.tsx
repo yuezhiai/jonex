@@ -263,7 +263,7 @@ const DomainKnowledge = function DomainKnowledge() {
     debouncedPermSearch(val);
   };
 
-  const handlePermRoleChange = (userId: string, role: 'view' | 'manage') => {
+  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor') => {
     setPermissionMembers((prev) => prev.map((m) => (m.userId === userId ? { ...m, role } : m)));
   };
 
@@ -339,7 +339,13 @@ const DomainKnowledge = function DomainKnowledge() {
             }}
             style={{ width: 280, lineHeight: 'normal' }}
           />
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreateModal}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={!global.currentSpaceId || !global.currentSpace?.can_write_space}
+            title={global.currentSpaceId ? undefined : t('domainKnowledge.notSelected')}
+            onClick={openCreateModal}
+          >
             {t('domainKnowledge.newKnowledgeBase')}
           </Button>
         </div>
@@ -353,7 +359,13 @@ const DomainKnowledge = function DomainKnowledge() {
           /* Empty State */
           <div style={{ textAlign: 'center', padding: '80px 0' }}>
             <Empty description={t('domainKnowledge.emptyDescription')}>
-              <Button type="primary" icon={<PlusOutlined />} onClick={openCreateModal}>
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                disabled={!global.currentSpaceId || !global.currentSpace?.can_write_space}
+                title={global.currentSpaceId ? undefined : t('domainKnowledge.notSelected')}
+                onClick={openCreateModal}
+              >
                 {t('domainKnowledge.newKnowledgeBase')}
               </Button>
             </Empty>
@@ -420,7 +432,8 @@ const DomainKnowledge = function DomainKnowledge() {
                           key: 'edit',
                           icon: <EditOutlined />,
                           label: t('common.edit'),
-                          onClick: () => openEditModal(item),
+                          disabled: !item.can_write,
+                          onClick: () => item.can_write && openEditModal(item),
                         },
                         { type: 'divider' },
                         {
@@ -428,7 +441,8 @@ const DomainKnowledge = function DomainKnowledge() {
                           icon: <DeleteOutlined />,
                           label: t('common.delete'),
                           danger: true,
-                          onClick: () => setDeletingKb(item),
+                          disabled: !item.can_manage_permissions,
+                          onClick: () => item.can_manage_permissions && setDeletingKb(item),
                         },
                       ],
                     }}
@@ -447,6 +461,11 @@ const DomainKnowledge = function DomainKnowledge() {
                 {/* Card Tags Row */}
                 <div className="kb-card-tags">
                   <div className="source-tags">
+                    {item.grant_shared && (
+                      <Tag color="purple" style={{ marginRight: 6 }}>
+                        {t('kbPermission.grantShared')}
+                      </Tag>
+                    )}
                     {(item.dataSourceTypes && item.dataSourceTypes.length > 0 ? item.dataSourceTypes : ['file']).map(
                       (type) => (
                         <span key={type} className="source-tag">

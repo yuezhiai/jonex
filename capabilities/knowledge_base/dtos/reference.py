@@ -18,7 +18,7 @@ except ImportError:
 class SourceLocation(BaseModel):
     """知识来源在原文档中的精确位置。"""
 
-    type: str = "chunk"  # chunk | char | page | timestamp | table_row
+    type: str = "chunk"  # chunk | char | page | timestamp | table_row | image
     chunk_index: Optional[int] = None
     char_start: Optional[int] = None
     char_end: Optional[int] = None
@@ -29,6 +29,14 @@ class SourceLocation(BaseModel):
     row_start: Optional[int] = None
     row_end: Optional[int] = None
     table_idx: Optional[int] = None
+    # [jonex] §C1-bis §19.5①: 行内切分子段的格区间（0-based 右开）
+    cell_start: Optional[int] = None
+    cell_end: Optional[int] = None
+    # [jonex] §image-refs P0-3: 图片级定位（type="image" 时有效）
+    image_idx: Optional[int] = None
+    # [jonex] §image-refs P0-3/P2-1: 图片本体的访问 URL（COS 预签名；
+    # local 后端为空串，走 gateway 图片 raw 路由；无 aext 的存量 chunk 为 None）
+    asset_url: Optional[str] = None
     text: Optional[str] = None  # 命中片段的原文文本（RAG 链路带 chunk content 时填充）
 
 
@@ -65,6 +73,15 @@ class ParsedRef(BaseModel):
     row_start: Optional[int] = None
     row_end: Optional[int] = None
     table_idx: Optional[int] = None
+    # [jonex] §C1-bis §19.5①: 行内切分子段的格区间（0-based 右开）
+    cell_start: Optional[int] = None
+    cell_end: Optional[int] = None
+    # [jonex] §image-refs P0-3: image_idx 供 type="image" 定位；
+    # asset_ext 是推导对象键的中间量（不进 SourceLocation，只在回传
+    # 请求侧存在——前端把检索返回的 refs 原样回传时保留，否则 resolve
+    # 推不出 asset_url）
+    image_idx: Optional[int] = None
+    asset_ext: Optional[str] = None
 
 
 class ReferenceResolveRequest(BaseModel):

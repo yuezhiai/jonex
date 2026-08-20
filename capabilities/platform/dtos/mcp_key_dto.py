@@ -7,8 +7,8 @@ except ImportError:
     from pydantic import BaseModel, Field, validator
 
 
-VALID_PERMISSIONS = {"read", "write", "*"}
-VALID_SERVICE_PERMISSION_LEVELS = {"call", "view", "write", "*"}
+VALID_PERMISSIONS = {"call", "view"}
+VALID_SERVICE_PERMISSION_LEVELS = {"call", "view"}
 
 
 class ServicePermissionItem(BaseModel):
@@ -33,14 +33,21 @@ class ServicePermissionItem(BaseModel):
 
 
 class McpKeyCreateRequest(BaseModel):
-    """创建 MCP Key 请求——permissions 白名单仅允许 read 和 *"""
+    """创建 MCP Key 请求——permissions 白名单仅允许 call / view"""
 
     name: str = Field(default="", max_length=255)
-    permissions: list[str] = Field(default=["read"])
+    space_id: str = Field(..., max_length=64)
+    permissions: list[str] = Field(default=["view"])
     allowed_kb_ids: list[str] = Field(default=[])
     service_ids: list[str] = Field(default=[])
     service_permissions: list[ServicePermissionItem] = Field(default=[])
     expires_at: datetime | None = Field(default=None)
+
+    @validator("space_id")
+    def validate_space_id(cls, v):
+        if not v or not v.strip():
+            raise ValueError("space_id 不能为空")
+        return v.strip()
 
     @validator("name")
     def strip_name(cls, v):
@@ -52,7 +59,7 @@ class McpKeyCreateRequest(BaseModel):
 
     @validator("permissions")
     def validate_permissions(cls, v):
-        """白名单校验：仅接受 'read' 和 '*'"""
+        """白名单校验：仅接受 call / view"""
         for perm in v:
             if perm not in VALID_PERMISSIONS:
                 raise ValueError(
@@ -94,7 +101,9 @@ class McpKeyResponse(BaseModel):
 
     id: str
     name: str
+    note: str | None = None
     key_prefix: str
+    space_id: str | None = None
     permissions: list[str]
     allowed_kb_ids: list[str]
     service_ids: list[str] = []
@@ -103,8 +112,9 @@ class McpKeyResponse(BaseModel):
     created_at: datetime | None = None
     revoked_at: datetime | None = None
     expires_at: datetime | None = None
+    disabled_at: datetime | None = None
+    status: str = "active"
     last_used_at: datetime | None = None
-    org_id: str | None = None
 
     class Config:
         orm_mode = True
@@ -128,6 +138,7 @@ class McpKeyCreateResponse(BaseModel):
     plaintext: str
     name: str
     key_prefix: str
+    space_id: str | None = None
     permissions: list[str]
     allowed_kb_ids: list[str]
     service_ids: list[str] = []
@@ -153,11 +164,21 @@ class _McpKeyUpsertFields(BaseModel):
     """
 
     name: Optional[str] = None
+    space_id: Optional[str] = None
     permissions: Optional[list[str]] = None
     allowed_kb_ids: Optional[list[str]] = None
     service_ids: Optional[list[str]] = None
     service_permissions: Optional[list[ServicePermissionItem]] = Field(default=None)
     expires_at: Optional[datetime] = None
+
+    @validator("space_id")
+    def validate_space_id_upsert(cls, v):
+        """space_id 非空校验——v 为 None（未传入）时跳过校验"""
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("space_id 不能为空")
+        return v.strip()
 
     @validator("permissions")
     def validate_permissions(cls, v):
@@ -208,6 +229,16 @@ class McpKeyResetRequest(_McpKeyUpsertFields):
     """重置 MCP Key 请求体——所有字段可选，不传则继承旧 Key 对应值"""
 
 
+class McpKeyRecreateRequest(BaseModel):
+    """重新创建 MCP Key 请求——可选覆盖新 Key 的 expires_at（不传默认 12 个月）。
+
+    继承原 Key 的 service_permissions / service_ids 授权，生成全新明文 Key，
+    旧 Key 保留历史（不撤销）。区别于「启用」（toggle 恢复原 Key）。
+    """
+
+    expires_at: Optional[datetime] = None
+
+
 class McpKeyUpdateRequest(_McpKeyUpsertFields):
     """编辑 MCP Key 请求——所有字段可选，不传则保持原值"""
 
@@ -215,57 +246,4 @@ class McpKeyUpdateRequest(_McpKeyUpsertFields):
 class McpKeyListResponse(BaseModel):
     """列表响应——含 total 计数"""
     items: list[McpKeyResponse]
-    total: int
-
-
-class McpOrganizationResponse(BaseModel):
-    """MCP Key 归属组织响应"""
-
-    id: str
-    name: str
-    description: str | None = None
-    created_at: datetime
-
-    class Config:
-        orm_mode = True
-
-
-class McpOrganizationCreateRequest(BaseModel):
-    """创建 MCP Key 组织请求"""
-
-    name: str = Field(..., max_length=255)
-    description: str | None = Field(default=None)
-
-    @validator("name")
-    def strip_name(cls, v):
-        """自动 strip 空白：空字符串 → 拒绝"""
-        if isinstance(v, str):
-            stripped = v.strip()
-            if stripped == "":
-                raise ValueError("组织名称不能为空")
-            return stripped
-        return v
-
-
-class McpOrganizationUpdateRequest(BaseModel):
-    """编辑 MCP Key 组织请求——所有字段可选"""
-
-    name: str | None = Field(default=None, max_length=255)
-    description: str | None = Field(default=None)
-
-    @validator("name")
-    def strip_name(cls, v):
-        """name 非 None 时自动 strip，空字符串 → 拒绝"""
-        if v is not None and isinstance(v, str):
-            stripped = v.strip()
-            if stripped == "":
-                raise ValueError("组织名称不能为空")
-            return stripped
-        return v
-
-
-class McpOrganizationListResponse(BaseModel):
-    """组织列表响应——含 total 计数"""
-
-    items: list[McpOrganizationResponse]
     total: int

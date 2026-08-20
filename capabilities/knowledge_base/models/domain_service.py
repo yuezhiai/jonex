@@ -49,7 +49,7 @@ class ServiceKnowledgeBase(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     service_id = Column(String(64), nullable=False, index=True)
     kb_id = Column(String(64), nullable=False)
-    pipeline_type = Column(String(16), nullable=False, default="lightrag")  # [jonex] lightrag / openkb
+    # [jonex] pipeline_type 已迁移重命名为 knowledge_info.kb_type（008 迁移），此列已从表删除
 
 
 class ServiceApiKey(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):

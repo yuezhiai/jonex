@@ -2,10 +2,11 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
 import { ConfigProvider, Spin } from 'antd';
+import { StyleProvider } from '@ant-design/cssinjs';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
 import { LANGUAGE_STORAGE_KEY } from '@jonex/i18n-resources';
-import { antdTheme } from '@jonex/platform-theme';
+import { antdTheme, sharedCache } from '@jonex/platform-theme';
 import Login from './pages/Login';
 import AppShellLayout from './components/AppShellLayout';
 import Dashboard from './pages/Dashboard';
@@ -109,18 +110,22 @@ function App() {
   }, [i18n]);
 
   return (
-    <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route element={<AuthenticatedLayout />}>
-            <Route index element={<Dashboard />} />
-            <Route path="apps/:appId/*" element={<AppHost />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </ConfigProvider>
+    // StyleProvider 统一共享 cssinjs cache（跨所有应用同一 instanceId）：
+    // 避免 MF 切换子项目时组件 token 变量 <style>（.antd.ant-dropdown-css-var）被误删
+    <StyleProvider cache={sharedCache}>
+      <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route element={<AuthenticatedLayout />}>
+              <Route index element={<Dashboard />} />
+              <Route path="apps/:appId/*" element={<AppHost />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </ConfigProvider>
+    </StyleProvider>
   );
 }
 

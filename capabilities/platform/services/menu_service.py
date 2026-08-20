@@ -50,6 +50,7 @@ class MenuService:
             app_id=req.app_id,
             sort_order=req.sort_order,
             visible=req.visible,
+            permission_code=req.permission_code,
         )
         self.session.add(menu)
         await self.session.flush()

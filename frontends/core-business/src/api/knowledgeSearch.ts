@@ -7,8 +7,10 @@ import {
   clearMockKnowledgeSearchHistory,
 } from '../mocks/knowledgeSearchHistoryStore';
 import type {
+  KnowledgeReference,
   KnowledgeSearchDomain,
   KnowledgeSearchHistoryItem,
+  ReasoningTrace,
   KnowledgeSearchMode,
   KnowledgeSearchOverview,
   KnowledgeSearchStrictConfig,
@@ -53,10 +55,15 @@ interface RawKnowledgeSearchHistoryItem {
   mode?: string;
   top_k?: number;
   topK?: number;
+  answer?: string;
+  references?: KnowledgeReference[];
+  reasoning?: ReasoningTrace | null;
+  strictConfig?: KnowledgeSearchStrictConfig | null;
   metadata?: {
     domain?: string;
     domain_id?: string;
     domainId?: string;
+    strict_config?: KnowledgeSearchStrictConfig | null;
   };
 }
 
@@ -87,6 +94,10 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
     durationMs: item.durationMs ?? item.duration_ms,
     mode: item.mode === 'hybrid' ? 'hybrid' : undefined,
     topK: item.topK ?? item.top_k,
+    answer: item.answer,
+    references: item.references,
+    reasoning: item.reasoning,
+    strictConfig: item.strictConfig ?? (metadata.strict_config as KnowledgeSearchStrictConfig | null | undefined),
   };
 }
 
@@ -134,17 +145,53 @@ export async function getKnowledgeSearchDomains(spaceId?: string): Promise<Knowl
   return [{ id: 'all', name: '', description: '' }, ...items];
 }
 
+/** 检索历史分页查询：按时间倒序，返回列表与总数（支持"查看更多"翻页） */
 export async function getKnowledgeSearchHistory(
   knowledgeBaseId: string,
   domainSpaceId?: string,
-): Promise<KnowledgeSearchHistoryItem[]> {
-  // if (useMock) return listMockKnowledgeSearchHistory()
-  const params: Record<string, string> = { knowledge_base_id: knowledgeBaseId };
+  page: number = 1,
+  pageSize: number = 20,
+): Promise<{ items: KnowledgeSearchHistoryItem[]; total: number }> {
+  // if (useMock) return { items: listMockKnowledgeSearchHistory(), total: ... }
+  const params: Record<string, string | number> = { knowledge_base_id: knowledgeBaseId, page, page_size: pageSize };
   if (domainSpaceId) params.domain_space_id = domainSpaceId;
-  const result = await getData<{ items: RawKnowledgeSearchHistoryItem[] }>(
+  const result = await getData<{ items: RawKnowledgeSearchHistoryItem[]; total: number }>(
     request.get('/knowledge-base/search/history', { params }),
   );
-  return (result.items ?? []).map(normalizeHistoryItem);
+  return { items: (result.items ?? []).map(normalizeHistoryItem), total: result.total ?? 0 };
+}
+
+/** [jonex] 历史快照引用重新富化：按 doc_id/locations 重新生成预签名 URL（快照里 raw_url 会过期，展示时调用） */
+export async function resolveKnowledgeReferences(
+  refs: KnowledgeReference[],
+): Promise<KnowledgeReference[]> {
+  if (!refs.length) return [];
+  const parsed: Array<Record<string, unknown>> = [];
+  for (const r of refs) {
+    if (!r.doc_id) continue;
+    const locs = r.locations?.length ? r.locations : [undefined];
+    for (const loc of locs) {
+      const row = loc as { row_start?: number; row_end?: number; table_idx?: number } | undefined;
+      parsed.push({
+        doc_id: r.doc_id,
+        kb_id: r.kb_id ?? undefined,
+        chunk_index: loc?.chunk_index ?? undefined,
+        char_start: loc?.char_start ?? undefined,
+        char_end: loc?.char_end ?? undefined,
+        page_no: loc?.page_no ?? undefined,
+        time_start: loc?.time_start ?? undefined,
+        time_end: loc?.time_end ?? undefined,
+        row_start: row?.row_start ?? undefined,
+        row_end: row?.row_end ?? undefined,
+        table_idx: row?.table_idx ?? undefined,
+      });
+    }
+  }
+  if (!parsed.length) return [];
+  const result = await getData<{ references?: KnowledgeReference[] }>(
+    request.post('/knowledge-base/documents/references/resolve', { refs: parsed }),
+  );
+  return result.references ?? [];
 }
 
 export async function saveKnowledgeSearchHistory(

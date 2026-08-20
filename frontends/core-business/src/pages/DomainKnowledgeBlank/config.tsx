@@ -9,6 +9,7 @@ import {
   ReloadOutlined,
   BuildOutlined,
   DeleteOutlined,
+  FolderOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
@@ -110,7 +111,7 @@ export const statusOptions = (t: TFunction) => [
   },
 ];
 
-const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFunction): MenuProps['items'] => [
+const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFunction, canWrite: boolean): MenuProps['items'] => [
   {
     key: 'view',
     icon: <EyeOutlined />,
@@ -121,26 +122,36 @@ const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFuncti
     key: 'tag',
     icon: <TagOutlined />,
     label: t('common.tag'),
-    onClick: () => handlers.onTag(record),
+    disabled: !canWrite,
+    onClick: () => canWrite && handlers.onTag(record),
   },
   {
     key: 'reparse',
     icon: <ReloadOutlined />,
     label: t('common.reparse'),
-    onClick: () => handlers.onReparse(record),
+    disabled: !canWrite,
+    onClick: () => canWrite && handlers.onReparse(record),
   },
   {
     key: 'recompile',
     icon: <BuildOutlined />,
     label: t('common.recompile'),
-    onClick: () => handlers.onRecompile(record),
+    disabled: !canWrite,
+    onClick: () => canWrite && handlers.onRecompile(record),
+  },
+  {
+    key: 'move',
+    icon: <FolderOutlined />,
+    label: t('common.move'),
+    onClick: () => handlers.onMove(record),
   },
   {
     key: 'delete',
     icon: <DeleteOutlined style={{ color: '#ef4444' }} />,
     label: t('common.delete'),
     style: { color: '#ef4444' },
-    onClick: () => handlers.onDelete(record),
+    disabled: !canWrite,
+    onClick: () => canWrite && handlers.onDelete(record),
   },
 ];
 
@@ -150,6 +161,7 @@ interface ActionHandlers {
   onViewResult: (record: ManualDocItem) => void;
   onReparse: (record: ManualDocItem) => void;
   onRecompile: (record: ManualDocItem) => void;
+  onMove: (record: ManualDocItem) => void;
   onDelete: (record: ManualDocItem) => void;
 }
 
@@ -158,6 +170,7 @@ export const createColumns = (
   handlers: ActionHandlers,
   accessMethods?: AccessMethodItem[],
   kbType?: string,
+  canWrite = false,
 ): ColumnsType<ManualDocItem> => {
   // 构建 accessType → name 映射
   const typeNameMap = new Map<string, string>(
@@ -261,7 +274,7 @@ export const createColumns = (
       width: 80,
       align: 'center',
       render: (_: unknown, record: ManualDocItem) => (
-        <Dropdown menu={{ items: actionItems(record, handlers, t) }} trigger={['click']} placement="bottomRight">
+        <Dropdown menu={{ items: actionItems(record, handlers, t, canWrite) }} trigger={['click']} placement="bottomRight">
           <Button type="text" icon={<MoreOutlined />} size="small" />
         </Dropdown>
       ),

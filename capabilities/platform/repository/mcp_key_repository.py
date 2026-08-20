@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
 from capabilities.platform.repository.base import BaseRepository
+from jonex_core.common.exceptions import InvalidParameterError
 from jonex_core.common.tenant import require_tenant
 
 
@@ -85,6 +86,8 @@ class McpKeyServiceMappingRepository:
     无 BaseRepository 父类——该表无 tenant_id、无软删除，
     关联由应用层全量替换管理。
     """
+
+    _VALID_PERMISSION_LEVELS = frozenset({"call", "view"})
 
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -183,6 +186,11 @@ class McpKeyServiceMappingRepository:
         self, key_id: str, service_id: str, permission_level: str = "call"
     ) -> None:
         """添加单条 Key↔Service 映射。存在冲突（同 key_id+service_id）则更新 permission_level。"""
+        if permission_level not in self._VALID_PERMISSION_LEVELS:
+            raise InvalidParameterError(
+                f"无效的权限级别: {permission_level!r}，"
+                f"必须为 {sorted(self._VALID_PERMISSION_LEVELS)} 之一"
+            )
         from sqlalchemy import insert as sa_insert
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -218,6 +226,11 @@ class McpKeyServiceMappingRepository:
         self, key_id: str, service_id: str, permission_level: str
     ) -> bool:
         """更新单条映射的 permission_level。返回 True 表示更新成功。"""
+        if permission_level not in self._VALID_PERMISSION_LEVELS:
+            raise InvalidParameterError(
+                f"无效的权限级别: {permission_level!r}，"
+                f"必须为 {sorted(self._VALID_PERMISSION_LEVELS)} 之一"
+            )
         from sqlalchemy import update as sa_update
 
         result = await self.session.execute(

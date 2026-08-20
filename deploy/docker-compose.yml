@@ -47,7 +47,8 @@ services:
   # 基础设施 - PostgreSQL 数据库
   # ============================================================
   postgres:
-    image: postgres:15-alpine
+    # 勿改回 alpine 版：musl 编译的 postgres 在 CentOS 7（内核 3.10）写 pg_wal 失败，initdb 无法完成
+    image: postgres:15
     container_name: jonex-postgres
     hostname: postgres
     networks:
@@ -227,8 +228,16 @@ services:
       ONTOLOGY_LLM_MODEL: ${ONTOLOGY_LLM_MODEL:-deepseek-v4-flash-202605}
       # RAG fallback 引用重排（方案 B2）：总开关默认关闭（灰度）；client 经 llm-gateway
       ONTOLOGY_RAG_FALLBACK_RERANK_ENABLED: ${ONTOLOGY_RAG_FALLBACK_RERANK_ENABLED:-false}
+      # [jonex] 方案 A：平台取回作答权（LightRAG 降为 retriever），总开关默认关（灰度）；
+      # 新路径失败当次自动回退旧链路（rag-subject-filter 方案 §6.6）
+      RAG_PLATFORM_ANSWER_ENABLED: ${RAG_PLATFORM_ANSWER_ENABLED:-false}
+      RAG_ANSWER_MAX_CONTEXT_CHARS: ${RAG_ANSWER_MAX_CONTEXT_CHARS:-12000}
+      # [jonex] 方案 B：主体一致性软加权（λ，仅 RAG_SUBJECT_FILTER_ENABLED=true 时生效）
+      RAG_SUBJECT_WEIGHT: ${RAG_SUBJECT_WEIGHT:-0.25}
       # LightRAG 检索期 rerank 配置态（仅供 reasoning 展示，须与 .env.rag 的 RERANK_BINDING 一致）
       RAG_RETRIEVAL_RERANK_ENABLED: ${RAG_RETRIEVAL_RERANK_ENABLED:-false}
+      # [jonex] §block-packing §10 L2：跨页打包 chunk 引用页精算（页段打分，默认开）
+      RAG_REF_PAGE_SCORING_ENABLED: ${RAG_REF_PAGE_SCORING_ENABLED:-true}
       RERANK_BINDING_HOST: ${RERANK_BINDING_HOST:-http://llm-gateway:8787/v1}
       RERANK_BINDING_API_KEY: ${RERANK_BINDING_API_KEY:-gw_lightrag}
       RERANK_MODEL: ${RERANK_MODEL:-awenleven/Qwen3-Reranker-4B:Q4_K_M}
@@ -779,6 +788,21 @@ services:
       WHISPER_MODEL: ${WHISPER_MODEL:-base}        # whisper 模型: tiny / base / small / medium / large
       RAG_TEXT_CHUNK_CHARS: ${RAG_TEXT_CHUNK_CHARS:-12000}
       RAG_REQUIRE_DOC_IDS: ${RAG_REQUIRE_DOC_IDS:-true}
+      # [jonex] 表格解析与切块治理（docs/table-parsing-retrieval-governance-plan.md §5/§9.2）
+      RAG_TABLE_GRID_V2: ${RAG_TABLE_GRID_V2:-true}              # L1 网格化 + L2 表头推断总开关
+      TABLE_HEADER_MAX_LEN: ${TABLE_HEADER_MAX_LEN:-40}          # 表头长文本剔除阈值（字符）
+      RAG_TABLE_CHUNK_MAX_CHARS: ${RAG_TABLE_CHUNK_MAX_CHARS:-900}   # 表格专用切块预算（字符，O1）
+      RAG_LIGHTRAG_CHUNK_SIZE: ${RAG_LIGHTRAG_CHUNK_SIZE:-1200}  # 表格 chunk 超限断言阈值（token，须与 .env.rag CHUNK_SIZE 一致）
+      XLSX_NATIVE_NORMALIZE: ${XLSX_NATIVE_NORMALIZE:-true}      # xlsx 双路合并（L3）：openpyxl 表格主轨 + MinerU 图片轨
+      RAG_PROMPT_LANG: ${RAG_PROMPT_LANG:-zh}                    # 解析/摘要 prompt 语言（L4.2）
+      # [jonex] §block-packing 文本块级打包（docs/text-block-packing-chunk-governance-plan.md §3）
+      RAG_TEXT_BLOCK_PACKING: ${RAG_TEXT_BLOCK_PACKING:-true}    # 总开关（false 完全回退逐块 1:1）
+      RAG_TEXT_PACK_CHARS: ${RAG_TEXT_PACK_CHARS:-1260}          # 字符预算主控（= 900 token × 1.4）
+      RAG_TEXT_PACK_MAX_TOKENS: ${RAG_TEXT_PACK_MAX_TOKENS:-1200}    # 硬上限断言（token，须与 .env.rag CHUNK_SIZE 一致）
+      RAG_TEXT_PACK_HEADING_MAX_LEN: ${RAG_TEXT_PACK_HEADING_MAX_LEN:-40}    # heading-like 判定长度上限（字符）
+      RAG_TEXT_PACK_DROP_NOISE: ${RAG_TEXT_PACK_DROP_NOISE:-true}    # 噪声丢弃（C2/C3）；false=零信息损失
+      # [jonex] §image-refs 图片资产上传（docs/image-reference-chain-execution-plan.md P1-4）
+      RAG_ASSET_UPLOAD_ENABLED: ${RAG_ASSET_UPLOAD_ENABLED:-true}    # 图片资产上传总开关（false 只停资产上传与 aext 旁路，不阻塞主链路）
       RAG_TRACK_TIMEOUT_SECONDS: ${RAG_TRACK_TIMEOUT_SECONDS:-1800}
       RAG_TRACK_POLL_CONCURRENCY: ${RAG_TRACK_POLL_CONCURRENCY:-8}
       # [jonex] reparse cleanup 收敛循环（rag-reparse-strict-cleanup-busy-plan）
@@ -831,6 +855,7 @@ services:
       COS_BUCKET: ${COS_BUCKET:-}
       COS_KEY_PREFIX: ${COS_KEY_PREFIX:-jonex}
       COS_PRESIGN_EXPIRES: ${COS_PRESIGN_EXPIRES:-900}
+      KB_INPUT_DIR: /app/inputs               # local 后端资产写入目录（与 jonex-rag-inputs 卷一致）
       # MPS（腾讯云媒体处理）视频智能分析：MPS_ENABLED=true 且视频存储在 COS 时，
       # 视频解析走 MPS（取代 ffmpeg+whisper ASR）。
       # 凭证/桶/地域未单独配置时，atomic-rag 内部回落复用 COS_*（同账号同桶场景只需开 MPS_ENABLED）。

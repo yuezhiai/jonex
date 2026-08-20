@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { Form, Modal, Input, Radio, Tag, Space } from 'antd';
+import { Form, Modal, Input, Radio, Tag, Space, Alert } from 'antd';
 import { PlusOutlined, EditOutlined, LockOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { DomainKnowledgeItem, KnowledgeBaseType } from '@/types/domainKnowledge';
@@ -144,6 +144,16 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
         <Form.Item name="description" label={t('domainKnowledge.description')}>
           <Input.TextArea rows={3} placeholder={t('domainKnowledge.descPlaceholder')} />
         </Form.Item>
+
+        {/* [jonex] 新建 KB 默认配置说明（仅创建模式） */}
+        {!isEdit && (
+          <Alert
+            type="info"
+            showIcon
+            message={t('domainKnowledge.kbDefaultConfigHint')}
+            style={{ marginBottom: 8 }}
+          />
+        )}
       </Form>
     </Modal>
   );

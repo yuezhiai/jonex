@@ -20,6 +20,7 @@ from .document_tag import (
     SetDocumentTagsRequest,
 )
 from .document import (
+    BatchMoveDocumentsRequest,
     DocumentDeleteResponse,
     DocumentListRequest,
     DocumentListResponse,
@@ -104,6 +105,7 @@ __all__ = [
     "DeepSearchResponse",
     "DeleteOntologyInstanceRequest",
     "DeleteOntologyRelationRequest",
+    "BatchMoveDocumentsRequest",
     "DocumentDeleteResponse",
     "FolderCreateRequest",
     "FolderListQuery",

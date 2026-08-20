@@ -68,10 +68,30 @@ class UserService:
         tenant_id = require_tenant(tenant_id)
         items = await self.repo.list_by_tenant(tenant_id, offset, limit)
         total = await self.repo.count_by_tenant(tenant_id)
-        return UserListResponse(
-            total=total,
-            items=[UserResponse.from_orm(u) for u in items],
-        )
+        # 批量查 RBAC 绑定角色名（单 SQL，避免 N+1）——列表角色列与编辑弹窗（get_roles）同源
+        role_name_map: dict[int, list[str]] = {u.id: [] for u in items}
+        if items:
+            from sqlalchemy import select
+
+            from capabilities.platform.models.role import Role
+            from capabilities.platform.models.user_role import UserRole
+
+            rows = await self.session.execute(
+                select(UserRole.user_id, Role.name)
+                .join(Role, Role.id == UserRole.role_id)
+                .where(
+                    UserRole.tenant_id == tenant_id,
+                    UserRole.user_id.in_([u.id for u in items]),
+                    Role.is_deleted == 0,
+                )
+                .order_by(Role.id)
+            )
+            for user_id, role_name in rows.all():
+                role_name_map.setdefault(user_id, []).append(role_name)
+        responses = [UserResponse.from_orm(u) for u in items]
+        for r in responses:
+            r.role_names = role_name_map.get(r.id, [])
+        return UserListResponse(total=total, items=responses)
 
     async def update(self, tenant_id: str, user_id: int, req: UserUpdateRequest) -> UserResponse:
         tenant_id = require_tenant(tenant_id)
@@ -107,6 +127,25 @@ class UserService:
         )  # 原消息: 用户不存在: {user_id}
         return list(await self.user_role_repo.get_role_ids(tenant_id, user_id))
 
+    async def get_role_names(self, tenant_id: str, user_id: int) -> list[str]:
+        """用户角色名列表（登录/JWT 用）。"""
+        tenant_id = require_tenant(tenant_id)
+        role_ids = list(await self.user_role_repo.get_role_ids(tenant_id, user_id))
+        if not role_ids:
+            return []
+        from sqlalchemy import select
+
+        from capabilities.platform.models.role import Role
+
+        result = await self.session.execute(
+            select(Role.name).where(
+                Role.id.in_(role_ids),
+                Role.tenant_id == tenant_id,
+                Role.is_deleted == 0,
+            )
+        )
+        return list(result.scalars().all())
+
     async def set_roles(self, tenant_id: str, user_id: int, role_ids: list[int]) -> None:
         tenant_id = require_tenant(tenant_id)
         user = await self.repo.get_by_id(user_id, tenant_id)
@@ -126,10 +165,38 @@ class UserService:
         await self.user_role_repo.set_roles(tenant_id, user_id, normalized_role_ids)
         logger.info(f"设置用户角色: user_id={user_id}, roles={normalized_role_ids}")
 
+        from jonex_core.security.permission import invalidate_user_permissions
+
+        await invalidate_user_permissions(tenant_id, user_id)
+
     async def list_all_users(self) -> list:
         """跨租户查询所有用户（管理员视角）。返回 UserResponse 列表。"""
         users = await self.repo.list_all_shared(0, 10000)
-        return [self._to_response(u) for u in users if not u.is_deleted]
+        active = [u for u in users if not u.is_deleted]
+        # 批量补 RBAC 绑定角色名（与 list_users 同口径：跨租户按 (tenant_id, user_id) 对单 SQL）
+        role_name_map: dict[tuple[str, int], list[str]] = {}
+        if active:
+            from sqlalchemy import select, tuple_
+
+            from capabilities.platform.models.role import Role
+            from capabilities.platform.models.user_role import UserRole
+
+            pairs = [(u.tenant_id, u.id) for u in active]
+            rows = await self.session.execute(
+                select(UserRole.tenant_id, UserRole.user_id, Role.name)
+                .join(Role, Role.id == UserRole.role_id)
+                .where(
+                    tuple_(UserRole.tenant_id, UserRole.user_id).in_(pairs),
+                    Role.is_deleted == 0,
+                )
+                .order_by(Role.id)
+            )
+            for t, uid, name in rows.all():
+                role_name_map.setdefault((t, uid), []).append(name)
+        responses = [self._to_response(u) for u in active]
+        for r in responses:
+            r.role_names = role_name_map.get((r.tenant_id, r.id), [])
+        return responses
 
     def _to_response(self, user) -> dict:
         from capabilities.platform.dtos.platform import UserResponse

@@ -134,6 +134,8 @@ type TemplateTarget = 'prompt' | 'summaryPrompt' | 'tagPrompt';
 interface ParserConfigContentProps {
   kbId?: string;
   spaceId?: string | null;
+  /** KB 写权限（权限矩阵） */
+  canWrite?: boolean;
 }
 
 const preprocessOptions = [
@@ -304,7 +306,7 @@ function templateDesc(template: PromptTemplateListItem, t: (key: string) => stri
   );
 }
 
-export function ParserConfigContent({ kbId, spaceId }: ParserConfigContentProps) {
+export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserConfigContentProps) {
   const { t } = useTranslation();
   const params = useParams<{ id: string }>();
   const resolvedKbId = kbId || params.id || '';
@@ -591,7 +593,7 @@ export function ParserConfigContent({ kbId, spaceId }: ParserConfigContentProps)
             type="primary"
             className="parser-config-add"
             onClick={openAddModal}
-            disabled={loading || !resolvedKbId}
+            disabled={loading || !resolvedKbId || !canWrite}
           >
             <PlusOutlined />
             {t('parserConfig.addSetting')}
@@ -665,11 +667,22 @@ export function ParserConfigContent({ kbId, spaceId }: ParserConfigContentProps)
               width: 180,
               render: (_: unknown, record: ParserConfigRow) => (
                 <div className="parser-config-actions">
-                  <Button type="text" onClick={() => openEditModal(record)}>
+                  <Button
+                    type="text"
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                    onClick={() => openEditModal(record)}
+                  >
                     {t('parserConfig.settingsButton')}
                   </Button>
                   <span />
-                  <Button type="text" danger onClick={() => setDeleteTarget(record)}>
+                  <Button
+                    type="text"
+                    danger
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                    onClick={() => setDeleteTarget(record)}
+                  >
                     {t('common.delete')}
                   </Button>
                 </div>
@@ -872,7 +885,13 @@ export function ParserConfigContent({ kbId, spaceId }: ParserConfigContentProps)
               <Button className="parser-modal-cancel" onClick={closeFormModal}>
                 {t('common.cancel')}
               </Button>
-              <Button type="primary" className="parser-modal-save" onClick={() => void saveForm()} disabled={saving}>
+              <Button
+                type="primary"
+                className="parser-modal-save"
+                onClick={() => void saveForm()}
+                disabled={saving || !canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+              >
                 <SaveFilled />
                 {saving ? t('parserConfig.saving') : t('common.save')}
               </Button>
@@ -895,7 +914,13 @@ export function ParserConfigContent({ kbId, spaceId }: ParserConfigContentProps)
               <Button className="parser-modal-cancel" onClick={() => setDeleteTarget(null)}>
                 {t('common.cancel')}
               </Button>
-              <Button danger className="parser-modal-danger" onClick={() => void confirmDelete()} disabled={saving}>
+              <Button
+                danger
+                className="parser-modal-danger"
+                onClick={() => void confirmDelete()}
+                disabled={saving || !canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+              >
                 {t('common.confirmDelete')}
               </Button>
             </div>

@@ -57,6 +57,7 @@ async def check_openkb_health(
                 logger.warning(
                     "OpenKB 健康检查失败 (attempt %d/%d)，%ds 后重试: %s",
                     attempt + 1, _OPENKB_HEALTH_RETRIES, _OPENKB_HEALTH_RETRY_DELAY, e,
+                    exc_info=True,
                 )
                 await asyncio.sleep(_OPENKB_HEALTH_RETRY_DELAY)
             else:

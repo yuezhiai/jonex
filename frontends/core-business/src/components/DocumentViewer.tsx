@@ -2,6 +2,7 @@ import React, { useCallback, useState } from 'react';
 import { Modal, message } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { getDocumentViewTicket } from '@/api/domainKnowledge';
+import MarkdownContent from '@/components/MarkdownContent';
 
 // 全平台统一的文档查看器：音视频/图片/PDF/文本全部在弹层内预览，
 // 视频/音频支持按时间点定位（time_start）。底层统一走 getDocumentViewTicket
@@ -45,6 +46,8 @@ interface ViewerState {
   name: string;
   timeStart?: number | null;
   timeEnd?: number | null;
+  /** md/markdown 文件拉取的原文文本（非空则用 MarkdownContent 渲染，而非 iframe） */
+  content?: string;
 }
 
 const INITIAL: ViewerState = { open: false, kind: 'other', url: '', name: '' };
@@ -60,8 +63,10 @@ export function useDocumentViewer() {
     const kind = opts.mediaType ?? inferMediaType(opts.fileName);
     const timeStart = opts.timeStart ?? null;
     const timeEnd = opts.timeEnd ?? null;
+    // md / markdown 文件：拉取原文用 MarkdownContent 渲染（保留格式）
+    const isMarkdown = /\.(md|markdown)$/i.test(opts.fileName || '');
     getDocumentViewTicket(opts.docId)
-      .then(({ url }) => {
+      .then(async ({ url }) => {
         const sep = url.includes('?') ? '&' : '?';
         let finalUrl = url;
         if (kind === 'video' || kind === 'audio') {
@@ -72,6 +77,19 @@ export function useDocumentViewer() {
         } else if (kind === 'pdf' || kind === 'text' || kind === 'other') {
           // iframe 内嵌：走同源代理，规避 COS 跨域 CSP(frame-src) / X-Frame-Options
           finalUrl = `${url}${sep}proxy=1`;
+        }
+        // md 文件：先尝试拉取原文文本，用 MarkdownContent 渲染（失败则降级 iframe）
+        if (isMarkdown && (kind === 'text' || kind === 'other')) {
+          try {
+            const resp = await fetch(finalUrl);
+            if (resp.ok) {
+              const text = await resp.text();
+              setState({ open: true, kind, url: finalUrl, name: opts.fileName, timeStart, timeEnd, content: text });
+              return;
+            }
+          } catch {
+            /* 拉取失败，降级 iframe */
+          }
         }
         // image 直连即可
         setState({ open: true, kind, url: finalUrl, name: opts.fileName, timeStart, timeEnd });
@@ -91,7 +109,9 @@ export function useDocumentViewer() {
     }
   };
 
-  const isFrame = state.kind === 'pdf' || state.kind === 'text' || state.kind === 'other';
+  // md 已用 MarkdownContent 渲染（content 非空），不再计入 iframe 布局
+  const isFrame =
+    (state.kind === 'pdf' || state.kind === 'text' || state.kind === 'other') && state.content == null;
   const viewer = (
     <Modal
       open={state.open}
@@ -121,6 +141,11 @@ export function useDocumentViewer() {
       ) : state.kind === 'image' ? (
         <div style={{ textAlign: 'center' }}>
           <img src={state.url} alt={state.name} style={{ maxWidth: '100%', maxHeight: '70vh' }} />
+        </div>
+      ) : state.content != null ? (
+        // md / markdown 文件：MarkdownContent 渲染（保留标题/表格/代码等格式）
+        <div style={{ padding: 24, maxHeight: '80vh', overflow: 'auto' }}>
+          <MarkdownContent content={state.content} />
         </div>
       ) : (
         // pdf / text / other：iframe 内嵌预览（浏览器按 Content-Type 渲染）

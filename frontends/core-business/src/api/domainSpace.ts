@@ -27,11 +27,18 @@ export async function deleteSpace(spaceId: string): Promise<void> {
 }
 
 /** 获取空间权限列表 */
-export async function getSpacePermissions(spaceId: string): Promise<SpacePermission[]> {
-  const result = await getData<{ permissions: SpacePermission[] }>(
+export interface SpaceOwnerInfo {
+  user_id: string;
+  display_name: string | null;
+}
+
+export async function getSpacePermissions(
+  spaceId: string,
+): Promise<{ permissions: SpacePermission[]; owner: SpaceOwnerInfo | null }> {
+  const result = await getData<{ permissions: SpacePermission[]; owner: SpaceOwnerInfo | null }>(
     request.get(`/knowledge-base/spaces/${spaceId}/permissions`),
   );
-  return result.permissions ?? [];
+  return { permissions: result.permissions ?? [], owner: result.owner ?? null };
 }
 
 /** 更新空间权限 */

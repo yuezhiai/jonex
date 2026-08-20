@@ -27,14 +27,14 @@ interface RouteConfigItem {
 
 interface MenuItem {
   path?: string;
-  roles?: string[];
+  permissionCode?: string;
 }
 
 interface AuthLoaderOptions {
   basename: string;
   mode: string;
   shellContext?: {
-    user?: { roles?: string[]; role?: string };
+    user?: { permissions?: string[] };
   } | null;
 }
 
@@ -93,9 +93,9 @@ const createAuthLoader =
       const user = shellContext?.user;
 
       if (user) {
-        const userRoles: string[] = user.roles || (user.role ? [user.role] : []);
+        const userPerms: string[] = user.permissions || [];
         const menuItem = getMenuFromRoutes(getRoutes(), (s: string) => s).find((item) => item.path === path);
-        if (menuItem && !menuItem?.roles?.some((role) => userRoles?.includes(role))) {
+        if (menuItem?.permissionCode && !userPerms.includes(menuItem.permissionCode)) {
           return redirect('/error?page=403');
         }
       }
@@ -113,15 +113,9 @@ const createAuthLoader =
     }
 
     const userInfo = readCachedUser<Record<string, any>>() || {};
-    const userRoles: string[] = Array.isArray(userInfo?.roles)
-      ? userInfo.roles
-      : userInfo?.roles
-        ? userInfo.roles.split(',')
-        : userInfo?.role
-          ? [userInfo.role]
-          : [];
+    const userPerms: string[] = Array.isArray(userInfo?.permissions) ? userInfo.permissions : [];
     const menuItem = getMenuFromRoutes(getRoutes(), (s: string) => s).find((item) => item.path === path);
-    if (menuItem && !menuItem?.roles?.some((role) => userRoles?.includes(role))) {
+    if (menuItem?.permissionCode && !userPerms.includes(menuItem.permissionCode)) {
       return redirect('/error?page=403');
     }
 

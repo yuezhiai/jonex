@@ -94,6 +94,10 @@ memory-bank
 CLAUDE.md
 .planning/
 claude_ignore
+
+# Test files — keep local, never commit
+mcp_server/tests/
+tests/unit/
 .beads
 
 # Google Jules
@@ -131,7 +135,6 @@ data/
 *.zip
 
 # ===== uv 包管理器 =====
-uv.lock
 # 例外：uv.lock 纳入版本控制，供团队/CI/镜像构建共用同一份（uv 官方推荐），
 # 保证依赖解析可复现
 !/uv.lock
@@ -192,6 +195,9 @@ yuexi.ps1.bak
 frontends/dev-gateway/package-lock.json
 !deploy/.env.example
 !deploy/.env.rag.example
+!mcp_server/.env.mcp.example
+!deploy/.env.mcp.example
+!deploy/.env.openkb.example
 
 # ===== Reference 引用项目（排除非项目文件） =====
 Reference/Rag-anything/.github/
@@ -205,6 +211,9 @@ Reference/Rag-anything/.claude/
 # 会 COPY 并 uv sync --frozen，否则首次 clone 后构建镜像会因缺文件报错）
 !Reference/LightRAG/uv.lock
 Reference/LightRAG/.git/
+
+# OpenKB 源码集成 — 同上，openkb-source.Dockerfile 构建需要 uv.lock
+!Reference/OpenKB/uv.lock
 Reference/LightRAG/.github/
 Reference/LightRAG/.venv/
 Reference/LightRAG/venv/
@@ -249,3 +258,9 @@ AGENTS.md
 
 # Husky 内部框架文件
 .husky/_/
+CLAUDE.md.orig
+
+# ===== Superpowers（SDD 运行账本与规格/计划文档，不入库） =====
+# 仅根级：Reference/ 引用仓库的历史 superpowers 文档不受影响
+/.superpowers/
+/docs/superpowers/

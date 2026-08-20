@@ -14,3 +14,4 @@ class Permission(TimestampMixin, Base):
     resource = Column(String(128), nullable=False)
     action = Column(String(64), nullable=False)
     description = Column(String(512))
+    scope = Column(String(16), default="tenant")

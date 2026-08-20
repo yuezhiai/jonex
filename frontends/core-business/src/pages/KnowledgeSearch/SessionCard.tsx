@@ -11,6 +11,7 @@ import {
   NodeIndexOutlined,
   BulbOutlined,
   FileTextOutlined,
+  PictureOutlined,
   LikeOutlined,
   LikeFilled,
   DislikeOutlined,
@@ -18,6 +19,7 @@ import {
   LoadingOutlined,
 } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
+import MarkdownContent from '@/components/MarkdownContent';
 import type {
   KnowledgeReference,
   KnowledgeReferenceLocation,
@@ -48,6 +50,122 @@ function getMediaLabel(type: string, t: (key: string) => string): string {
     image: 'knowledgeSearch.mediaTypeImage',
   };
   return t(map[type] || 'knowledgeSearch.mediaTypeOther');
+}
+
+// ── [jonex] §image-refs P3-2: 图片资产（answer 图片条 / 卡片缩略图共用） ──
+interface ImageAsset {
+  docId: string;
+  imageIdx: number;
+  assetUrl: string;
+  pageNo?: number | null;
+  description?: string;
+}
+
+/** 从引用集合提取图片资产：筛 locations[].type === 'image' 且 asset_url
+ *  非空，按 (doc_id, image_idx) 去重；描述文本剥「图片描述：」前缀。
+ *  与答案同源（_rag_platform_answer 的 references 与 prompt 同源，见
+ *  image-reference-chain-execution-plan.md P3 设计决策）。 */
+function collectImageAssets(references?: KnowledgeReference[] | null): ImageAsset[] {
+  const seen = new Set<string>();
+  const out: ImageAsset[] = [];
+  for (const ref of references || []) {
+    for (const loc of ref.locations || []) {
+      if (loc.type !== 'image' || !loc.asset_url || loc.image_idx == null) continue;
+      const key = `${ref.doc_id}:${loc.image_idx}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        docId: ref.doc_id,
+        imageIdx: loc.image_idx,
+        assetUrl: loc.asset_url,
+        pageNo: loc.page_no,
+        description: (loc.text || '').replace(/^图片描述：/, '').trim(),
+      });
+    }
+  }
+  return out;
+}
+
+// ── [jonex] §image-refs P3-2: 单张图片资产缩略图（loading 骨架 / 失败降级 / 页码角标） ──
+function ImageAssetThumb({
+  asset,
+  compact = false,
+  t,
+  onOpen,
+}: {
+  asset: ImageAsset;
+  compact?: boolean;
+  t: (key: string, opts?: any) => string;
+  onOpen?: (asset: ImageAsset) => void;
+}) {
+  const [state, setState] = React.useState<'loading' | 'ok' | 'error'>('loading');
+  const size = compact ? 72 : 96;
+  return (
+    <div
+      style={{
+        width: size,
+        flexShrink: 0,
+        border: '1px solid #e8edf5',
+        borderRadius: 8,
+        overflow: 'hidden',
+        background: '#fff',
+        cursor: state === 'ok' ? 'pointer' : 'default',
+      }}
+      title={asset.description || undefined}
+    >
+      <div
+        style={{
+          width: size,
+          height: size,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          position: 'relative',
+        }}
+        onClick={state === 'ok' ? () => onOpen?.(asset) : undefined}
+      >
+        {state === 'loading' && <Spin size="small" />}
+        {state !== 'error' && (
+          <img
+            src={asset.assetUrl}
+            alt={asset.description || `img_${asset.imageIdx}`}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              position: 'absolute',
+              inset: 0,
+              opacity: state === 'ok' ? 1 : 0,
+            }}
+            onLoad={() => setState('ok')}
+            onError={() => setState('error')}
+          />
+        )}
+        {state === 'error' && (
+          <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', padding: '0 6px', lineHeight: 1.5 }}>
+            {t('knowledgeSearch.imageLoadFailed')}
+          </div>
+        )}
+        {state === 'ok' && asset.pageNo != null && (
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 3,
+              right: 3,
+              fontSize: 10,
+              color: '#fff',
+              background: 'rgba(15,23,42,0.55)',
+              borderRadius: 3,
+              padding: '0 4px',
+              lineHeight: 1.6,
+            }}
+          >
+            {t('knowledgeSearch.imagePage', { page: asset.pageNo })}
+          </span>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ── Helper: 推理链状态元 ──
@@ -648,6 +766,15 @@ export default function SessionCard({
   const hasContent = hasThink || hasAnswerContent;
   const statusLabel = getSearchStatusLabel(session.status, t);
 
+  // [jonex] §image-refs P3-2: 答案旁图片资产（与 prompt 同源的 references 中筛出）
+  const imageAssets = React.useMemo(
+    () => collectImageAssets(session.references),
+    [session.references],
+  );
+  const openImageAsset = React.useCallback((asset: ImageAsset) => {
+    window.open(asset.assetUrl, '_blank', 'noopener');
+  }, []);
+
   const [entityDrawerOpen, setEntityDrawerOpen] = React.useState(false);
   const [entityDrawerLoading, setEntityDrawerLoading] = React.useState(false);
   const [drawerEntity, setDrawerEntity] = React.useState<OntologyInstanceRow | null>(null);
@@ -1042,6 +1169,58 @@ export default function SessionCard({
         </div>
       )}
 
+      {/* [jonex] §image-refs P3-2: 答案相关图片条（answer 下方、References 上方） */}
+      {imageAssets.length > 0 && (
+        <div
+          style={{
+            background: '#fdfdff',
+            border: '1px solid #e8edf5',
+            borderRadius: 10,
+            padding: '12px 16px',
+            marginBottom: 16,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 13,
+              fontWeight: 600,
+              color: '#6366f1',
+              marginBottom: 10,
+            }}
+          >
+            <PictureOutlined />
+            {t('knowledgeSearch.answerImages', { count: imageAssets.length })}
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {imageAssets.map((a) => (
+              <div
+                key={`${a.docId}-${a.imageIdx}`}
+                style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center', maxWidth: 96 }}
+              >
+                <ImageAssetThumb asset={a} t={t} onOpen={openImageAsset} />
+                {a.description && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: '#64748b',
+                      textAlign: 'center',
+                      lineHeight: 1.4,
+                      maxWidth: 96,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    {a.description.length > 48 ? `${a.description.slice(0, 48)}…` : a.description}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* References */}
       {(session.references?.length ?? 0) > 0 && (
         <div
@@ -1084,6 +1263,13 @@ export default function SessionCard({
                   (l: KnowledgeReferenceLocation) => l.type === 'timestamp' && l.time_start != null,
                 );
                 const snippet = locs.find((l: KnowledgeReferenceLocation) => l.text)?.text || '';
+                // [jonex] §image-refs P3-2: 本卡片内可直开的图片 location
+                // （有 asset_url 才给 location 级打开，无则回落文档级）
+                const imageLocs = locs.filter(
+                  (l: KnowledgeReferenceLocation) => l.type === 'image' && l.asset_url && l.image_idx != null,
+                );
+                // md 文件命中片段：用 MarkdownContent 渲染保留格式，其余纯文本
+                const isMarkdownRef = /\.(md|markdown)$/i.test(ref.file_name || '');
                 return (
                   <div
                     key={`${ref.doc_id}-${i}`}
@@ -1125,7 +1311,7 @@ export default function SessionCard({
                       <a
                         className="yx-table-action"
                         style={{ marginLeft: 'auto', fontSize: 12, flexShrink: 0 }}
-                        onClick={() => onOpenReference(ref, tsLoc || locs[0])}
+                        onClick={() => onOpenReference(ref, imageLocs[0] || tsLoc || locs[0])}
                       >
                         {ref.media_type === 'video'
                           ? tsLoc
@@ -1138,24 +1324,58 @@ export default function SessionCard({
                               : t('knowledgeSearch.viewOriginal')}
                       </a>
                     </div>
-                    {snippet && (
-                      <div
-                        style={{
-                          marginTop: 8,
-                          fontSize: 13,
-                          color: '#475569',
-                          lineHeight: 1.7,
-                          background: '#fafcff',
-                          borderRadius: 6,
-                          padding: '8px 10px',
-                          maxHeight: 120,
-                          overflow: 'auto',
-                          whiteSpace: 'pre-wrap',
-                        }}
-                      >
-                        {snippet}
+                    {/* [jonex] §image-refs P3-2: 卡片内图片缩略图（location 级打开原图） */}
+                    {imageLocs.length > 0 && (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                        {imageLocs.map((l: KnowledgeReferenceLocation) => (
+                          <ImageAssetThumb
+                            key={`${ref.doc_id}-${l.image_idx}`}
+                            compact
+                            asset={{
+                              docId: ref.doc_id,
+                              imageIdx: l.image_idx!,
+                              assetUrl: l.asset_url!,
+                              pageNo: l.page_no,
+                              description: (l.text || '').replace(/^图片描述：/, '').trim(),
+                            }}
+                            t={t}
+                            onOpen={openImageAsset}
+                          />
+                        ))}
                       </div>
                     )}
+                    {snippet &&
+                      (isMarkdownRef ? (
+                        <div
+                          style={{
+                            marginTop: 8,
+                            background: '#fafcff',
+                            borderRadius: 6,
+                            padding: '8px 10px',
+                            maxHeight: 240,
+                            overflow: 'auto',
+                          }}
+                        >
+                          <MarkdownContent content={snippet} />
+                        </div>
+                      ) : (
+                        <div
+                          style={{
+                            marginTop: 8,
+                            fontSize: 13,
+                            color: '#475569',
+                            lineHeight: 1.7,
+                            background: '#fafcff',
+                            borderRadius: 6,
+                            padding: '8px 10px',
+                            maxHeight: 120,
+                            overflow: 'auto',
+                            whiteSpace: 'pre-wrap',
+                          }}
+                        >
+                          {snippet}
+                        </div>
+                      ))}
                   </div>
                 );
               })}

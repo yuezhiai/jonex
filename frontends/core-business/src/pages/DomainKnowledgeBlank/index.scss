@@ -35,6 +35,7 @@
   &-menu {
     flex: 1;
     overflow-y: auto;
+    overflow-x: hidden;  // [jonex] 兜底：内容超宽时不出横向滚动条（长文件夹名 ellipsis 由组件内 minWidth:0 保证）
     border-inline-end: none !important;
 
     .ant-menu-item {
@@ -86,6 +87,14 @@
     .ant-menu-item:hover .doc-library-nav-more {
       opacity: 1;
     }
+
+    // 拖拽迁移：悬停目录高亮（表格行拖入）
+    .doc-library-drop-target--active {
+      background: #eff6ff !important;
+      outline: 1px dashed #3b82f6;
+      outline-offset: -1px;
+      border-radius: 8px;
+    }
   }
 
   // 右侧表格区域
@@ -99,6 +108,12 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  // 拖拽迁移：拖拽中的表格行
+  &-row--dragging {
+    opacity: 0.6;
+    background: #f8fafc;
   }
 
   &-toolbar {

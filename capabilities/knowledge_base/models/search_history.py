@@ -57,6 +57,13 @@ class KnowledgeSearchHistory(Base, TenantMixin, TimestampMixin, SoftDeleteMixin)
     result_count = Column(Integer, nullable=False, default=0)
     duration_ms = Column(Integer, nullable=True)
     extra_metadata = Column(JSONB, nullable=False, default=dict)
+    # [jonex] 检索历史快照：点击历史直接展示历史结果（不重新检索）
+    # answer      完整答案原始文本（含 <think> 标记，展示时前端 parseThink/parseReferences 解析）
+    # references  引用快照（JSONB，落库前剥离过期的 raw_url，展示时经 resolve 端点重新富化）
+    # reasoning   推理链快照（ReasoningTrace: steps/final_source/total_ms）
+    answer = Column(Text, nullable=True)
+    references = Column(JSONB, nullable=False, default=list)
+    reasoning = Column(JSONB, nullable=True)
     searched_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
 
     def to_dict(self) -> dict:
@@ -76,6 +83,9 @@ class KnowledgeSearchHistory(Base, TenantMixin, TimestampMixin, SoftDeleteMixin)
             "result_count": self.result_count,
             "duration_ms": self.duration_ms,
             "metadata": self.extra_metadata or {},
+            "answer": self.answer,
+            "references": self.references or [],
+            "reasoning": self.reasoning,
             "searched_at": _iso(self.searched_at),
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),

@@ -1,18 +1,69 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
-import { Button, Layout, Dropdown } from 'antd';
+import { Button, Layout, Dropdown, Spin } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { LogoutOutlined, MenuFoldOutlined, MenuUnfoldOutlined, HomeOutlined, RightOutlined } from '@ant-design/icons';
+import * as Icons from '@ant-design/icons';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { getUser, logout } from '../../api/auth';
 import { fetchAppManifest, getEnabledApps } from '../../api/manifest';
+import { fetchMyMenus } from '../../api/menus';
+import type { MenuNode } from '../../api/menus';
 import SpaceSwitcher from '../SpaceSwitcher';
 import LocaleSwitcher from '../LocaleSwitcher';
 import type { AppManifestEntry } from '@jonex/shell-sdk';
 import { colors } from '@jonex/platform-theme/tokens';
-import { prototypeNavConfig } from '../../navigation/prototypeNav.config';
-import { getExpandedKeys, getBreadcrumbItems } from '../../navigation/navUtils';
-import type { PrototypeNavItem, NavSection } from '../../navigation/navTypes';
 import { userDisplayName } from '../../utils/userDisplay';
+
+interface BreadcrumbItem {
+  title: string;
+  path: string;
+}
+
+/** 当前路由是否命中菜单项 path（含子路由） */
+const isPathActive = (path: string | null, pathname: string): boolean =>
+  !!path && (pathname === path || pathname.startsWith(path + '/'));
+
+/** 子树内是否存在命中 pathname 的叶子节点 */
+const subtreeActive = (node: MenuNode, pathname: string): boolean => {
+  if (node.children?.length) return node.children.some((child) => subtreeActive(child, pathname));
+  return isPathActive(node.path, pathname);
+};
+
+/** 收集 pathname 所在子树经过的全部分组 key（用于默认展开） */
+const collectActiveGroupKeys = (nodes: MenuNode[], pathname: string): string[] => {
+  const keys: string[] = [];
+  for (const node of nodes) {
+    if (node.children?.length) {
+      if (subtreeActive(node, pathname)) keys.push(String(node.id));
+      keys.push(...collectActiveGroupKeys(node.children, pathname));
+    }
+  }
+  return keys;
+};
+
+/** 在菜单树中查找匹配 pathname 的叶子节点及其祖先链 */
+const findMenuLeafChain = (
+  nodes: MenuNode[],
+  pathname: string,
+  ancestors: MenuNode[] = [],
+): { chain: MenuNode[]; leaf: MenuNode } | null => {
+  for (const node of nodes) {
+    if (node.children?.length) {
+      const found = findMenuLeafChain(node.children, pathname, [...ancestors, node]);
+      if (found) return found;
+    } else if (isPathActive(node.path, pathname)) {
+      return { chain: ancestors, leaf: node };
+    }
+  }
+  return null;
+};
+
+/** antd 图标名（如 'SearchOutlined'）→ 图标组件实例 */
+const renderMenuIcon = (iconName: string | null): React.ReactNode => {
+  if (!iconName) return null;
+  const IconCmp = (Icons as unknown as Record<string, React.ComponentType | undefined>)[iconName];
+  return IconCmp ? <IconCmp /> : null;
+};
 
 export default function AppShellLayout({ children }: { children: React.ReactNode }) {
   const { t, i18n } = useTranslation();
@@ -22,6 +73,8 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
   const [apps, setApps] = useState<AppManifestEntry[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [menus, setMenus] = useState<MenuNode[]>([]);
+  const [menuLoading, setMenuLoading] = useState(true);
 
   const userRoles = useMemo<string[]>(() => {
     return user?.roles ?? ((user as any)?.role ? [(user as any).role as string] : []);
@@ -35,54 +88,31 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
       .catch(() => {});
   }, [userRoles]);
 
+  // 侧边栏菜单来自后端 /menus/my（按用户权限码过滤后的菜单树）
+  useEffect(() => {
+    fetchMyMenus()
+      .then(setMenus)
+      .catch(() => setMenus([]))
+      .finally(() => setMenuLoading(false));
+  }, []);
+
   const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
   useEffect(() => {
     if (isMobile) setSidebarCollapsed(true);
   }, [isMobile]);
 
-  // Auto-expand groups based on current route
+  // 默认展开当前路由所在组：menus 首次加载即初始化；后续只合并不收回手动状态
   useEffect(() => {
-    const keys = getExpandedKeys(location.pathname);
-    setExpandedKeys((prev) => {
-      const merged = new Set([...prev, ...keys]);
-      return Array.from(merged);
-    });
-  }, [location.pathname]);
+    if (!menus.length) return;
+    const keys = collectActiveGroupKeys(menus, location.pathname);
+    if (keys.length) {
+      setExpandedKeys((prev) => Array.from(new Set([...prev, ...keys])));
+    }
+  }, [location.pathname, menus]);
 
   const toggleGroup = useCallback((key: string) => {
     setExpandedKeys((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }, []);
-
-  const isItemActive = (item: PrototypeNavItem): boolean => {
-    if (!item.appId || !item.internalPath) return false;
-    const expected = `/apps/${item.appId}/${item.internalPath}`;
-    if (location.pathname === expected || location.pathname.startsWith(expected + '/')) {
-      return true;
-    }
-    // 同时检查 matchPaths 中的额外路径
-    if (item.matchPaths) {
-      return item.matchPaths.some(({ appId, internalPath }) => {
-        const p = `/apps/${appId}/${internalPath}`;
-        return location.pathname === p || location.pathname.startsWith(p + '/');
-      });
-    }
-    return false;
-  };
-
-  const isAnyChildActive = (item: PrototypeNavItem): boolean => {
-    if (item.children) {
-      return item.children.some((c) => isItemActive(c));
-    }
-    return isItemActive(item);
-  };
-
-  const isGroupExpanded = (key: string): boolean => expandedKeys.includes(key);
-
-  const navigateToItem = (item: PrototypeNavItem) => {
-    if (item.appId && item.internalPath) {
-      navigate(`/apps/${item.appId}/${item.internalPath}`);
-    }
-  };
 
   const currentAppId = useMemo(() => {
     const match = location.pathname.match(/^\/apps\/([^/]+)/);
@@ -103,73 +133,92 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
     ],
   };
 
-  const breadcrumbItems = useMemo(() => getBreadcrumbItems(location.pathname), [location.pathname]);
+  const breadcrumbItems = useMemo<BreadcrumbItem[]>(() => {
+    const home: BreadcrumbItem = { title: t('navigation.home'), path: '/' };
+    const found = findMenuLeafChain(menus, location.pathname);
+    if (!found) return [home];
+    const items: BreadcrumbItem[] = [home];
+    for (const ancestor of found.chain) {
+      items.push({ title: t(ancestor.name), path: '#' });
+    }
+    items.push({ title: t(found.leaf.name), path: found.leaf.path ?? '#' });
+    return items;
+  }, [menus, location.pathname, t]);
 
   const sidebarWidth = sidebarCollapsed ? 64 : 240;
 
-  const renderNavIcon = (Icon: React.ComponentType | undefined, className?: string) => {
-    if (!Icon) return <span className={className || 'yx-sub-dot'} />;
-    return (
-      <span className={className || 'yx-nav-icon'}>
-        <Icon />
-      </span>
-    );
-  };
-
-  const renderNavItem = (item: PrototypeNavItem, isSubItem = false) => {
-    const ItemTag = isSubItem ? 'div' : 'a';
-    const active = isItemActive(item);
-
-    if (isSubItem) {
-      const hasTag = !!item.tag;
-      return (
-        <div
-          key={item.key}
-          className={`yx-sub-item${active ? ' active' : ''}`}
-          onClick={() => navigateToItem(item)}
-          style={{ cursor: 'pointer' }}
-        >
-          <span className="yx-sub-dot" />
-          <span>{t(item.label)}</span>
-          {item.tag && <span className="yx-tag-future">{item.tag}</span>}
-        </div>
-      );
-    }
-
+  // 直接导航项（旧版 yx-nav-item 视觉：图标 + 名称）
+  const renderDirectItem = (node: MenuNode) => {
+    const active = isPathActive(node.path, location.pathname);
+    const icon = renderMenuIcon(node.icon);
     return (
       <a
-        key={item.key}
+        key={node.id}
         className={`yx-nav-item${active ? ' active' : ''}`}
         onClick={(e) => {
           e.preventDefault();
-          navigateToItem(item);
+          if (node.path) navigate(node.path);
         }}
         style={{ cursor: 'pointer', textDecoration: 'none' }}
       >
-        {renderNavIcon(item.icon as React.ComponentType)}
-        {!sidebarCollapsed && <span>{t(item.label)}</span>}
-        {!sidebarCollapsed && item.tag && <span className="yx-tag-future">{t(item.tag)}</span>}
+        {icon ? <span className="yx-nav-icon">{icon}</span> : <span className="yx-sub-dot" />}
+        {!sidebarCollapsed && <span>{t(node.name)}</span>}
       </a>
     );
   };
 
-  const renderNavGroup = (item: PrototypeNavItem) => {
-    const expanded = isGroupExpanded(item.key);
-    const hasActiveChild = isAnyChildActive(item);
+  // 组内子项（旧版 yx-sub-item 视觉：圆点 + 名称）
+  const renderSubItem = (node: MenuNode) => {
+    const active = isPathActive(node.path, location.pathname);
+    return (
+      <div
+        key={node.id}
+        className={`yx-sub-item${active ? ' active' : ''}`}
+        onClick={() => {
+          if (node.path) navigate(node.path);
+        }}
+        style={{ cursor: 'pointer' }}
+      >
+        <span className="yx-sub-dot" />
+        <span>{t(node.name)}</span>
+      </div>
+    );
+  };
+
+  // 中间组（旧版 yx-nav-group 视觉：组头可折叠 + 箭头）
+  const renderGroupNode = (node: MenuNode) => {
+    const key = String(node.id);
+    const expanded = expandedKeys.includes(key);
+    const children = node.children ?? [];
+    const hasActiveChild = children.some((child) => subtreeActive(child, location.pathname));
+    const icon = renderMenuIcon(node.icon);
 
     return (
-      <div key={item.key} className={`yx-nav-group${expanded ? ' open' : ''}`}>
+      <div key={key} className={`yx-nav-group${expanded ? ' open' : ''}`}>
         <div
           className={`yx-nav-group-header${hasActiveChild && !expanded ? ' active' : ''}`}
-          onClick={() => toggleGroup(item.key)}
+          onClick={() => toggleGroup(key)}
         >
-          {renderNavIcon(item.icon as React.ComponentType)}
-          {!sidebarCollapsed && <span>{t(item.label)}</span>}
+          {icon ? <span className="yx-nav-icon">{icon}</span> : <span className="yx-sub-dot" />}
+          {!sidebarCollapsed && <span>{t(node.name)}</span>}
           {!sidebarCollapsed && <RightOutlined className="yx-nav-arrow" />}
         </div>
-        <div className="yx-sub-menu">
-          {item.children?.filter((child) => !child.hidden).map((child) => renderNavItem(child, true))}
-        </div>
+        <div className="yx-sub-menu">{children.map(renderSubItem)}</div>
+      </div>
+    );
+  };
+
+  // 顶层分组：section 标签 + 子节点（组或直接项）
+  const renderMenuNode = (node: MenuNode): React.ReactNode => {
+    const children = node.children ?? [];
+    return (
+      <div key={node.id} style={{ marginBottom: 4 }}>
+        {!sidebarCollapsed && children.length > 0 && (
+          <div className="yx-nav-section">{t(node.name)}</div>
+        )}
+        {children.map((child) =>
+          child.children?.length ? renderGroupNode(child) : renderDirectItem(child),
+        )}
       </div>
     );
   };
@@ -211,19 +260,13 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
         <SpaceSwitcher collapsed={sidebarCollapsed} />
 
         <nav style={{ flex: 1, overflowY: 'auto', padding: '12px 0' }}>
-          {prototypeNavConfig.map((section) => (
-            <div key={section.key} style={{ marginBottom: 4 }}>
-              {!sidebarCollapsed && <div className="yx-nav-section">{t(section.label)}</div>}
-              {section.items
-                .filter((item) => {
-                  if (item.hidden) return false;
-                  // 组内全部隐藏则组也不显示
-                  if (item.children?.length && item.children.every((c) => c.hidden)) return false;
-                  return true;
-                })
-                .map((item) => (item.children ? renderNavGroup(item) : renderNavItem(item)))}
+          {menuLoading ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '32px 0' }}>
+              <Spin size="small" />
             </div>
-          ))}
+          ) : (
+            menus.map(renderMenuNode)
+          )}
         </nav>
       </aside>
 
@@ -267,7 +310,7 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
                           <HomeOutlined style={{ marginRight: 4 }} />
                         </>
                       )}
-                      {t(item.title)}
+                      {item.title}
                     </a>
                   ) : (
                     <span
@@ -281,7 +324,7 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
                           <HomeOutlined style={{ marginRight: 4 }} />
                         </>
                       )}
-                      {t(item.title)}
+                      {item.title}
                     </span>
                   )}
                 </span>

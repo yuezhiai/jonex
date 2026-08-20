@@ -221,7 +221,7 @@ deploy:
 
 | 服务 | 镜像 | 容器内端口 | 数据持久化 | 备注 |
 |------|------|-----------|-----------|------|
-| PostgreSQL | `postgres:15-alpine` | 5432 | `jonex-postgres-data` | LTS → 2027-11；含 platform / knowledge_base / ontology 三个 schema |
+| PostgreSQL | `postgres:15`（Debian 版，非 alpine：musl 版在 CentOS 7 内核 3.10 上写 WAL 失败） | 5432 | `jonex-postgres-data` | LTS → 2027-11；含 platform / knowledge_base / ontology 三个 schema |
 | Redis | `redis:7-alpine` | 6379 | `jonex-redis-data` | 服务发现注册中心 / 缓存 / 分布式锁；⚠️ 4.0 已 EOL，禁止降级 |
 | etcd | `quay.io/coreos/etcd:v3.5.18` | 2379 | `jonex-etcd-data` | Milvus 元数据，硬性要求 ≥3.5.0 |
 | MinIO | `minio/minio:RELEASE.2025-04-22T22-12-26Z` | 9000 / 9001 | `jonex-minio-data` | Milvus 对象存储，需 S3 v4 签名 |
@@ -338,7 +338,7 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 
 | 卷 | gateway | knowledge-base | atomic-rag | lightrag |
 |---|---|---|---|---|
-| `jonex-rag-inputs` | 写（上传落盘） | 读（元数据） | 读（解析输入） | 读（reference） |
+| `jonex-rag-inputs` | 写（上传落盘） | 读（元数据） | 读写（解析输入 + 图片资产写入，local 后端） | 读（reference） |
 | `jonex-rag-storage` | — | — | 写（解析中间产物） | 读（RAG workspace） |
 | `jonex-rag-models` | — | — | 读写（模型缓存） | — |
 

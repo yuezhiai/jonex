@@ -16,7 +16,6 @@ export interface ModelProviderListResponse {
 
 export interface ModelProviderItem {
   id: string;
-  tenant_id: string;
   name: string;
   provider_type: string;
   model_type: string | null;

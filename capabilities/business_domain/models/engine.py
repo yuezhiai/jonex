@@ -7,10 +7,10 @@ from sqlalchemy import Column, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
-from jonex_core.common.entity import SoftDeleteMixin, TenantMixin, TimestampMixin
+from jonex_core.common.entity import SoftDeleteMixin, TimestampMixin
 
 
-class DataAccessMethod(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
+class DataAccessMethod(TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "data_access_methods"
     __table_args__ = {"schema": "business_domain"}
 
@@ -22,7 +22,7 @@ class DataAccessMethod(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     def to_dict(self):
         return {
-            "id": self.id, "tenant_id": self.tenant_id,
+            "id": self.id,
             "name": self.name, "access_type": self.access_type,
             "description": (self.config_json or {}).get("description", ""),
             "config_json": self.config_json or {},
@@ -32,7 +32,7 @@ class DataAccessMethod(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
         }
 
 
-class ParserConfig(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
+class ParserConfig(TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "parser_configs"
     __table_args__ = {"schema": "business_domain"}
 
@@ -45,7 +45,7 @@ class ParserConfig(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     def to_dict(self):
         return {
-            "id": self.id, "tenant_id": self.tenant_id,
+            "id": self.id,
             "name": self.name, "parser_type": self.parser_type,
             "file_types": self.file_types or [],
             "config_json": self.config_json or {},
@@ -55,7 +55,7 @@ class ParserConfig(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
         }
 
 
-class ModelProvider(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
+class ModelProvider(TimestampMixin, SoftDeleteMixin, Base):
     __tablename__ = "model_providers"
     __table_args__ = {"schema": "business_domain"}
 
@@ -76,7 +76,7 @@ class ModelProvider(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     def to_dict(self):
         return {
-            "id": self.id, "tenant_id": self.tenant_id,
+            "id": self.id,
             "name": self.name, "provider_type": self.provider_type,
             "model_type": self.model_type,
             "endpoint": self.endpoint,

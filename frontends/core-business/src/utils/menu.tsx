@@ -56,25 +56,18 @@ export function findMenuPathKeys(menuData: MenuItem[] = [], path: string) {
   return result;
 }
 
-export function getMenuItemsByRole(
+export function getMenuItemsByPermission(
   menuConfigData: MenuItem[],
-  roles: string = '',
+  permissions: string[] = [],
   tFn?: (key: string) => string,
 ): RenderedMenuItem[] {
-  const roleList = Array.isArray(roles)
-    ? roles
-    : String(roles || '')
-        .split(',')
-        .map((r) => r.trim())
-        .filter(Boolean);
-
-  const hasRoleAccess = (item: MenuItem) => {
-    if (!item.roles || item.roles.length === 0) return true;
-    return item.roles.some((role) => roleList.includes(role));
+  const hasPermAccess = (item: MenuItem) => {
+    if (!item.permissionCode) return true;
+    return permissions.includes(item.permissionCode);
   };
 
   const filterAndRender = (menus: MenuItem[]): RenderedMenuItem[] => {
-    return menus.filter(hasRoleAccess).map((item) => {
+    return menus.filter(hasPermAccess).map((item) => {
       const Icon = item.icon ? IconMap[item.icon] : null;
       const menuItem: RenderedMenuItem = {
         key: item.path || item.key,

@@ -15,6 +15,10 @@ class UserCreateRequest(BaseModel):
     display_name: Optional[str] = None
     email: Optional[str] = None
     role: str = "user"
+    # 跨租户创建用户时指定目标租户（端点有 user:write 权限码守卫）
+    target_tenant_id: Optional[str] = None
+    # RBAC 角色绑定：创建后绑定的角色 id（目标租户内的角色；为空则不绑定，users.role 保持默认 'user'）
+    role_id: Optional[int] = None
 
 
 class UserUpdateRequest(BaseModel):
@@ -22,6 +26,8 @@ class UserUpdateRequest(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     status: Optional[int] = None
+    # [jonex] 跨租户编辑目标租户（路由层解析，service 不落实体）
+    target_tenant_id: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -35,6 +41,9 @@ class UserResponse(BaseModel):
     last_login_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # RBAC 绑定角色名（user_roles join roles；与编辑弹窗 get_roles 同源）。
+    # users.role 是历史列（admin/user），仅作兜底展示。
+    role_names: list[str] = []
 
     class Config:
         orm_mode = True
@@ -79,8 +88,14 @@ class RolePermissionsRequest(BaseModel):
     permission_ids: list[int]
 
 
+class RoleUsersRequest(BaseModel):
+    user_ids: list[int] = Field(default_factory=list)
+
+
 class UserRolesRequest(BaseModel):
     role_ids: list[int]
+    # [jonex] 跨租户绑定目标租户（路由层解析）
+    target_tenant_id: Optional[str] = None
 
 
 # ============ 权限 ============
@@ -112,6 +127,7 @@ class MenuCreateRequest(BaseModel):
     app_id: Optional[int] = None
     sort_order: int = 0
     visible: int = 1
+    permission_code: Optional[str] = None
 
 
 class MenuUpdateRequest(BaseModel):
@@ -122,6 +138,7 @@ class MenuUpdateRequest(BaseModel):
     sort_order: Optional[int] = None
     visible: Optional[int] = None
     status: Optional[int] = None
+    permission_code: Optional[str] = None
 
 
 class MenuResponse(BaseModel):
@@ -134,6 +151,7 @@ class MenuResponse(BaseModel):
     sort_order: int
     visible: int
     status: int
+    permission_code: Optional[str] = None
     children: list["MenuResponse"] = []
 
     class Config:

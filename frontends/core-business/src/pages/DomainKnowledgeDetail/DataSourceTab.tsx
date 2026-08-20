@@ -10,6 +10,8 @@ import type { DataSourceConfig } from '@/types/domainKnowledge';
 interface DataSourceTabProps {
   dataSources: DataSourceConfig[];
   dataSourcesLoading: boolean;
+  /** KB 写权限（权限矩阵）：空间 owner/manager/租户管理员 或 授权 editor */
+  canWrite?: boolean;
   onAdd: () => void;
   onEdit: (ds: DataSourceConfig) => void;
   onReload: () => void;
@@ -18,6 +20,7 @@ interface DataSourceTabProps {
 export default function DataSourceTab({
   dataSources,
   dataSourcesLoading,
+  canWrite = false,
   onAdd,
   onEdit,
   onReload,
@@ -31,7 +34,14 @@ export default function DataSourceTab({
         <h3 className="yx-kb-section-title">
           <ApiOutlined className="yx-kb-icon-blue" /> {t('domainKnowledge.configuredDataSources')}
         </h3>
-        <Button type="primary" className="yx-kb-section-add-btn" icon={<PlusOutlined />} onClick={onAdd}>
+        <Button
+          type="primary"
+          className="yx-kb-section-add-btn"
+          icon={<PlusOutlined />}
+          disabled={!canWrite}
+          title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          onClick={onAdd}
+        >
           {t('domainKnowledge.addDataSource')}
         </Button>
       </div>
@@ -78,8 +88,10 @@ export default function DataSourceTab({
               </div>
               <span
                 className="yx-kb-ds-link-edit"
+                style={canWrite ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!canWrite) return;
                   onEdit(ds);
                 }}
               >
@@ -87,8 +99,10 @@ export default function DataSourceTab({
               </span>
               <span
                 className="yx-kb-ds-link-del"
+                style={canWrite ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!canWrite) return;
                   Modal.confirm({
                     title: t('domainKnowledge.deleteDataSourceTitle'),
                     content: t('domainKnowledge.deleteDataSourceContent', { name: ds.name }),

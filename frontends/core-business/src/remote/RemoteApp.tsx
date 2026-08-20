@@ -2,9 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nextProvider, useTranslation } from 'react-i18next';
 import { ConfigProvider } from 'antd';
+import { StyleProvider } from '@ant-design/cssinjs';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
-import { antdTheme } from '@jonex/platform-theme';
+import { antdTheme, sharedCache } from '@jonex/platform-theme';
 import i18n from '@/locales/i18n';
 import '@/styles/index.scss';
 import '@jonex/platform-theme/theme.css';
@@ -27,9 +28,11 @@ function AntdLocaleGate({ children }: { children: React.ReactNode }) {
   const antdLocale = appI18n.language === 'en' ? enUS : zhCN;
   // cssVar 关闭：见 App.tsx 说明。避免懒加载切换后 popup z-index 变量丢失导致弹层被盖住。
   return (
-    <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
-      {children}
-    </ConfigProvider>
+    <StyleProvider cache={sharedCache}>
+      <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+        {children}
+      </ConfigProvider>
+    </StyleProvider>
   );
 }
 

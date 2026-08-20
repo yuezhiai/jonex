@@ -19,10 +19,10 @@ def create_platform_router() -> APIRouter:
     from capabilities.platform.api.mcp_key_api import router as mcp_router
     router.include_router(mcp_router, prefix="/platform", tags=["MCP Key 管理"])
 
-    from capabilities.platform.api.mcp_organization_api import router as mcp_org_router
-    router.include_router(mcp_org_router, prefix="/platform", tags=["MCP 组织管理"])
-
     from capabilities.platform.api.mcp_service_api import router as mcp_svc_router
     router.include_router(mcp_svc_router, prefix="/platform", tags=["MCP 服务目录"])
+
+    from capabilities.platform.api.mcp_write_key_api import router as mcp_write_key_router
+    router.include_router(mcp_write_key_router, prefix="/platform", tags=["MCP 知识写入 Key"])
 
     return router

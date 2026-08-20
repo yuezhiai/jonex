@@ -351,6 +351,11 @@ async def handle_get_task_status(params: dict, tenant_id: str, task_manager, **k
                 (task.result_summary.extensions or {}).get("assets_dir", "")
                 if task.result_summary else ""
             ),
+            # [jonex] 多模态转写警告（失败/跳过/空内容的机器可读信号，_record_multimodal_warning 写入）
+            "multimodal_warnings": (
+                (task.result_summary.extensions or {}).get("multimodal_warnings", [])
+                if task.result_summary else []
+            ),
         },
     }
 
@@ -698,6 +703,35 @@ async def handle_update_chunk(params: dict, tenant_id: str, task_manager, **kwar
             expected_content_hash=expected_hash,
         )
         return {"success": True, "code": 0, "message": "success", "data": result}
+    except Exception as e:
+        code = getattr(e, "code", 500)
+        return {"success": False, "code": code, "message": str(e), "data": None}
+
+
+@ActionRegistry.register("delete_orphan_chunk")
+async def handle_delete_orphan_chunk(params: dict, tenant_id: str, task_manager, **kwargs):
+    """[jonex] O7：孤儿 chunk 强制清理 — 经 :9621 DELETE /documents/chunks/{chunk_id}。
+
+    reparse 删除未收敛的残留 chunk 在 doc_status 无记录，doc 级删除会
+    not found 直接返回；本 action 按 chunk_id 直删 text_chunks/向量/full_docs。
+    """
+    http_client = getattr(task_manager, "_http_client", None)
+    if http_client is None:
+        raise HTTPException(500, "HTTP client not available")
+
+    chunk_id = params.get("chunk_id", "")
+    if not chunk_id:
+        raise HTTPException(400, "chunk_id 不能为空")
+    kb_id = params.get("knowledge_base_id", "")
+
+    try:
+        ok = await http_client.delete_orphan_chunk(
+            chunk_id, tenant_id=tenant_id, kb_id=kb_id,
+        )
+        return {
+            "success": True, "code": 0, "message": "success",
+            "data": {"chunk_id": chunk_id, "deleted": ok},
+        }
     except Exception as e:
         code = getattr(e, "code", 500)
         return {"success": False, "code": code, "message": str(e), "data": None}

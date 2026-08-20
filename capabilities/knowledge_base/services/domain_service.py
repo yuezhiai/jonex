@@ -100,8 +100,17 @@ class DomainServiceService:
 
     @staticmethod
     async def _get_kb_ids(session, service_id: str, tenant_id: str) -> list[str]:
+        from ..models.knowledge_info import KnowledgeInfo
+
         result = await session.execute(
-            select(ServiceKnowledgeBase.kb_id).where(
+            select(ServiceKnowledgeBase.kb_id)
+            .select_from(ServiceKnowledgeBase)
+            .join(
+                KnowledgeInfo,
+                (ServiceKnowledgeBase.kb_id == KnowledgeInfo.id)
+                & (KnowledgeInfo.is_deleted == 0),
+            )
+            .where(
                 ServiceKnowledgeBase.service_id == service_id,
                 ServiceKnowledgeBase.tenant_id == tenant_id,
                 ServiceKnowledgeBase.is_deleted == 0,
@@ -109,14 +118,21 @@ class DomainServiceService:
         )
         return [row[0] for row in result.all()]
 
-    async def list(self, tenant_id: str, space_id: str = None, offset: int = 0, limit: int = 20) -> dict:
+    async def list(self, tenant_id: str, space_id: str = None, offset: int = 0, limit: int = 20,
+                   user_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
+        from .space_permission_service import get_visible_space_ids
+
         async with get_db_session() as session:
             from ..models.space import Space
             from ..models.knowledge_info import KnowledgeInfo
 
             repo = DomainServiceRepository(session)
             conditions = [DomainService.space_id == space_id] if space_id else []
+            # [jonex] 空间隔离：不传 space_id 的租户级列表也只返回可见空间的服务
+            visible = await get_visible_space_ids(tenant_id, user_id)
+            if visible is not None:
+                conditions.append(DomainService.space_id.in_(visible))
             items = await repo.list_all(tenant_id, offset, limit, extra_conditions=conditions)
             total = await repo.count(tenant_id, extra_conditions=conditions)
 
@@ -125,7 +141,14 @@ class DomainServiceService:
             kb_map: dict[str, list[str]] = {}
             if service_ids:
                 result = await session.execute(
-                    select(ServiceKnowledgeBase.service_id, ServiceKnowledgeBase.kb_id).where(
+                    select(ServiceKnowledgeBase.service_id, ServiceKnowledgeBase.kb_id)
+                    .select_from(ServiceKnowledgeBase)
+                    .join(
+                        KnowledgeInfo,
+                        (ServiceKnowledgeBase.kb_id == KnowledgeInfo.id)
+                        & (KnowledgeInfo.is_deleted == 0),
+                    )
+                    .where(
                         ServiceKnowledgeBase.service_id.in_(service_ids),
                         ServiceKnowledgeBase.tenant_id == tenant_id,
                         ServiceKnowledgeBase.is_deleted == 0,

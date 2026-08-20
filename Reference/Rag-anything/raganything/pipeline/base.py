@@ -61,6 +61,18 @@ class PipelineContext:
     duplicated_chunk_count: int = 0
     total_pushed_count: int = 0
 
+    # ── [jonex] §table-grid-v2 O4: 表格处理可观测统计 ──
+    # tables_total / tables_normalized / tables_fallback / rows_total /
+    # cols_unnamed / oversize_table_chunks；由 PushChunksStage 收集，
+    # task_manager 汇总进 result_summary.extensions["table_stats"]。
+    table_stats: dict = field(default_factory=dict)
+
+    # ── [jonex] §image-refs P1-3: 资产上传结果 {image_idx: ext} ──
+    # AssetUploadStage 产出，PushChunksStage._collect_multimodal_chunks 据此
+    # 在图片 chunk 的 file_source 写 aext=（上传失败的图片不写，检索侧据此
+    # 判定无 URL 可取）。
+    asset_exts: dict = field(default_factory=dict)
+
     @property
     def duration_seconds(self) -> float:
         if self.completed_at > 0 and self.started_at > 0:
@@ -104,6 +116,8 @@ class StageResult:
     multimodal_results: Optional[List[Dict[str, Any]]] = None
     chunk_results: Optional[List[Any]] = None
     error: Optional[str] = None
+    # [jonex] §image-refs P1-3: 资产上传结果 {image_idx: ext}（key 为 int 枚举序号）
+    asset_exts: Optional[Dict[int, str]] = None
 
 
 # ── Pipeline result ───────────────────────────────────────────────────

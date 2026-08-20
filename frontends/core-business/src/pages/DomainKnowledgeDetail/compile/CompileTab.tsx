@@ -53,7 +53,7 @@ import PromptViewModal from './PromptViewModal';
 import TemplateImportModal from './TemplateImportModal';
 
 interface Props {
-  kbId: string;
+  kbId: string;  canWrite?: boolean;
 }
 
 const EMPTY_TARGET_OPTIONS: ConstraintTargetOptions = {
@@ -62,7 +62,7 @@ const EMPTY_TARGET_OPTIONS: ConstraintTargetOptions = {
   relation: [],
 };
 
-export default function CompileTab({ kbId }: Props) {
+export default function CompileTab({ kbId, canWrite = false }: Props) {
   const { t } = useTranslation();
 
   function buildObjectPrompt(o: OntologyObjectDef): string {
@@ -480,6 +480,7 @@ export default function CompileTab({ kbId }: Props) {
       label: t('compile.tabObjectDef'),
       children: (
         <OntologyObjectSection
+                canWrite={canWrite}
           data={objects}
           loading={loadingObjects}
           onCreate={() => setObjectModal({ open: true, editing: null })}
@@ -502,6 +503,7 @@ export default function CompileTab({ kbId }: Props) {
       label: t('compile.tabRelationDef'),
       children: (
         <OntologyRelationSection
+                canWrite={canWrite}
           data={relations}
           loading={loadingRelations}
           onCreate={() => setRelationModal({ open: true, editing: null })}
@@ -524,6 +526,7 @@ export default function CompileTab({ kbId }: Props) {
       label: t('compile.tabConstraintDef'),
       children: (
         <OntologyConstraintSection
+                canWrite={canWrite}
           data={constraints}
           loading={loadingConstraints}
           onCreate={() => setConstraintModal({ open: true, editing: null })}
@@ -541,7 +544,12 @@ export default function CompileTab({ kbId }: Props) {
         <Button icon={<span>&#x1F4E4;</span>} loading={yamlExporting} onClick={handleExportYaml}>
           {t('compile.exportYaml')}
         </Button>
-        <Button icon={<span>&#x1F4E5;</span>} onClick={handleImportYamlClick}>
+        <Button
+          icon={<span>&#x1F4E5;</span>}
+          disabled={!canWrite}
+          title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          onClick={handleImportYamlClick}
+        >
           {t('compile.importYaml')}
         </Button>
         <input

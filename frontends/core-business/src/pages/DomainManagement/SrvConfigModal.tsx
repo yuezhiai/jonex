@@ -30,11 +30,12 @@ export default function SrvConfigModal({
 }: SrvConfigModalProps) {
   const { t } = useTranslation();
   const { global } = useStore();
-  // 角色判断：MCP Key Tab 仅 admin 可见
+  // 权限码判断：MCP Key Tab 仅服务管理员（service:write）可见
   const userInfo = global.userInfo as Record<string, unknown> | null | undefined;
-  const isAdmin = Array.isArray(userInfo?.roles)
-    ? (userInfo.roles as string[]).includes('admin')
-    : userInfo?.roles === 'admin';
+  const userPermissions: string[] = Array.isArray(userInfo?.permissions)
+    ? (userInfo.permissions as string[])
+    : [];
+  const isAdmin = userPermissions.includes('service:write');
   const [activeTab, setActiveTab] = useState<string>('apiKey');
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 

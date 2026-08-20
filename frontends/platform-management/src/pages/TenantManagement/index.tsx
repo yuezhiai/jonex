@@ -2,12 +2,15 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Input, Button, Table, Tag, Spin, Result } from 'antd';
 import { SearchOutlined, PlusOutlined, EditOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
+import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sdk';
 import { listTenants, type TenantItem } from '../../api/tenants';
 import { tenantDisplay } from '../../utils/tenantDisplay';
 import TenantFormModal, { type TenantFormModalRef } from './TenantFormModal';
 
 export default function TenantManagement() {
   const { t } = useTranslation();
+  const user = readCachedUser<ShellUser>();
+  const isAdmin = isPlatformAdmin(user);
   const [tenants, setTenants] = useState<TenantItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -28,8 +31,8 @@ export default function TenantManagement() {
   }, [t]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (isAdmin) load();
+  }, [load, isAdmin]);
 
   const filtered = tenants.filter((tenant) => {
     const display = tenantDisplay(tenant, t);
@@ -91,6 +94,11 @@ export default function TenantManagement() {
       ),
     },
   ];
+
+  if (!isAdmin)
+    return (
+      <Result status="403" title="403" subTitle={t('error.403')} />
+    );
 
   if (error)
     return (

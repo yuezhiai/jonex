@@ -6,14 +6,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 
 from jonex_core.common.exceptions import InvalidParameterError, JonexException
 from jonex_core.common.i18n import translate
 from jonex_core.common.response import error_response, success_response
 from jonex_core.common.tenant import extract_tenant_id
+from jonex_core.security.user_auth import get_current_user
 
 from ..dtos import (
+    BatchMoveDocumentsRequest,
     DocumentParseResultRequest,
     DocumentScopeRequest,
     OntologyRetryRequest,
@@ -164,6 +166,19 @@ async def set_document_folder(
     try:
         result = await _service.documents.set_document_folder(tenant_id, document_id, body)
         return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.put("/documents/folder", summary="批量设置文档所属文件夹")
+async def batch_set_document_folder(
+    request: Request,
+    body: BatchMoveDocumentsRequest,
+):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.documents.batch_set_document_folder(tenant_id, body)
+        return success_response(data=result, message="文档已移动")
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
 
@@ -734,6 +749,36 @@ async def update_knowledge_info(kb_id: str, request: Request):
     try:
         result = await _service.knowledge_infos.update(kb_id, tenant_id, body)
         return success_response(data=result, message="知识库已更新")
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/knowledge-info/{kb_id}/permissions", summary="知识库授权成员列表")
+async def get_kb_permissions(
+    kb_id: str, request: Request, current: dict = Depends(get_current_user)
+):
+    """双入口兜底（设计 §3）：REST 解析用户后传入 service；invoke 走 dispatch 判定。"""
+    tenant_id = extract_tenant_id(request)
+    user_id = str(current.get("user_id", "")) or None
+    try:
+        result = await _service.knowledge_infos.get_permissions(kb_id, tenant_id, user_id=user_id)
+        return success_response(data={"permissions": result})
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.put("/knowledge-info/{kb_id}/permissions", summary="设置知识库授权成员")
+async def set_kb_permissions(
+    kb_id: str, request: Request, current: dict = Depends(get_current_user)
+):
+    body = await request.json()
+    tenant_id = extract_tenant_id(request)
+    user_id = str(current.get("user_id", "")) or None
+    try:
+        await _service.knowledge_infos.set_permissions(
+            kb_id, tenant_id, body.get("permissions", []), user_id=user_id
+        )
+        return success_response(message="知识库权限已更新")
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
 

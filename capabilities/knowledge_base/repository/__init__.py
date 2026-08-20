@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """Knowledge Base repository exports."""
 
-from .document_repository import KnowledgeDocumentRepository
+from .document_repository import KnowledgeDocumentRepository, UNCLASSIFIED_SENTINEL
 from .data_source_repository import KnowledgeDataSourceRepository
 from .document_tag_repository import DocumentTagRepository
 from .domain_service_repository import (
@@ -38,4 +38,5 @@ __all__ = [
     "ServicePermissionRepository",
     "SpacePermissionRepository",
     "SpaceRepository",
+    "UNCLASSIFIED_SENTINEL",
 ]

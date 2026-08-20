@@ -77,12 +77,18 @@ class OpenkbCapability(BaseCapability):
             "remove_document", "delete_kb", "list_graph",
             "read_page", "list_wiki_contents",
             "get_compile_status", "list_compile_tasks",
+            "apply_schema",
         }:
             return False
 
         if action == "compile_parsed_document":
             data = request.payload.get("data") or {}
             return bool(data.get("document_id") and data.get("parsed_markdown_path"))
+
+        if action == "apply_schema":
+            data = request.payload.get("data") or {}
+            return bool(data.get("schema_version") is not None
+                        and str(data.get("agents_md") or "").strip())
 
         if action == "remove_document":
             data = request.payload.get("data") or {}
@@ -136,6 +142,7 @@ class OpenkbCapability(BaseCapability):
                 "list_wiki_contents": self._handle_list_contents,
                 "get_compile_status": self._handle_get_compile_status,
                 "list_compile_tasks": self._handle_list_compile_tasks,
+                "apply_schema": self._handle_apply_schema,
             }
             handler = handlers[action]
             result_data = await handler(kb_dir, kb_name, data)
@@ -219,6 +226,82 @@ class OpenkbCapability(BaseCapability):
 
         return {"kb": kb_name, "created": created, "message": "KB initialized"}
 
+    def _ensure_kb_initialized(self, kb_dir) -> bool:
+        """[jonex] 幂等初始化 KB 目录（apply_schema 复用；返回是否新建）。
+
+        与 _handle_init 同口径：已初始化则跳过 initialize_kb，避免 FileExistsError。
+        """
+        import os
+
+        from openkb.cli import initialize_kb
+
+        created = not (kb_dir / ".openkb").is_dir()
+        if created:
+            initialize_kb(kb_dir, model=os.getenv("OPENKB_LLM_MODEL"))
+        return created
+
+    async def _handle_apply_schema(self, kb_dir, kb_name, data):
+        """[jonex] LLM-Wiki Schema 投影（方案 llmwiki-schema-settings-execution-plan §8）。
+
+        - ⚠️ 必须复用 `_mutation_lock_for`（红线）：apply 写 AGENTS.md 与
+          `_run_compile_task` 读 AGENTS.md（compiler 实时读盘）必须经同一把锁
+          互斥——新建第二个锁字典会绕过 §6 的版本 fencing。
+        - 空值语义：model/language/entity_types 显式 None 或 [] = 移除键
+          （走 OpenKB 默认/全局继承）；空字符串非法（保存侧已拒，此处防御跳过）。
+        - schema_hash 输入用合并后的最终 config（current），不用入参快照。
+        - apply 后校验磁盘 AGENTS.md 与 jonex_schema.json hash 一致（§8.2 检测点）。
+        """
+        import hashlib as _hashlib
+        import json as _json
+
+        from openkb.config import load_config, save_config
+        from openkb.locks import atomic_write_json, atomic_write_text
+
+        schema_version = int(data["schema_version"])
+        config = data.get("config") or {}
+        agents_md = data["agents_md"]
+
+        async with await self._mutation_lock_for(kb_dir):
+            self._ensure_kb_initialized(kb_dir)
+
+            config_path = kb_dir / ".openkb" / "config.yaml"
+            current = load_config(config_path)
+            for _k in ("model", "language", "entity_types"):
+                if _k in config:
+                    _v = config[_k]
+                    if _v is None or _v == []:
+                        current.pop(_k, None)
+                    elif _v != "":
+                        current[_k] = _v
+                    # _v == ""：非法，保存侧（DTO 校验）已拒绝，这里防御性跳过
+            save_config(config_path, current)
+
+            wiki_dir = kb_dir / "wiki"
+            wiki_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(wiki_dir / "AGENTS.md", agents_md)
+
+            schema_hash = _hashlib.sha256(
+                (agents_md + "\n" + _json.dumps(
+                    current, ensure_ascii=False, sort_keys=True)).encode("utf-8")
+            ).hexdigest()
+            atomic_write_json(kb_dir / ".openkb" / "jonex_schema.json", {
+                "schema_version": schema_version,
+                "schema_hash": schema_hash,
+                "applied_at": _now_iso(),
+                "source": "jonex.llm_wiki_schemas",
+            })
+
+            # [jonex] §8.2 检测点：apply 后立即读盘校验（锁内无并发窗口）
+            _disk_md = (wiki_dir / "AGENTS.md").read_text(encoding="utf-8")
+            if _disk_md != agents_md:
+                logger.warning(
+                    "[jonex] apply_schema 后 AGENTS.md 校验不一致（被外部覆盖）kb=%s ver=%s",
+                    kb_name, schema_version,
+                )
+                atomic_write_text(wiki_dir / "AGENTS.md", agents_md)
+
+        return {"applied": True, "schema_version": schema_version}
+
     async def _handle_compile_parsed_document(self, kb_dir, kb_name, data):
         """[jonex] 任务化：校验产物 → 登记任务 → 后台编译，立即返回 {task_id}。
 
@@ -257,11 +340,15 @@ class OpenkbCapability(BaseCapability):
                 save_config(config_path, config)
 
         # ② 登记任务（KB 级 tasks/ 目录，原子写）
+        # [jonex] LLM-Wiki Schema fencing（方案 §8.1）：task 文件记录
+        # wiki_schema_version（submit 时写入目标版本）——patrol 靠它回写
+        # llm_wiki_applied_schema_version
         task_id = f"t_{uuid4().hex}"
         self._write_task(kb_dir, task_id, {
             "task_id": task_id, "document_id": document_id,
             "status": "pending", "error": None, "warnings": [],
             "created_at": _now_iso(), "started_at": None, "updated_at": _now_iso(),
+            "wiki_schema_version": data.get("wiki_schema_version"),
         })
 
         # ③ 后台执行（事件循环内 create_task；防 GC 用模块级集合持有）
@@ -281,20 +368,60 @@ class OpenkbCapability(BaseCapability):
             try:
                 self._update_task(kb_dir, task_id, status="running",
                                   started_at=_now_iso())
+                # [jonex] 防线②（方案 §6）：执行开始时再核对磁盘 jonex_schema.json
+                # 版本——防 submit 与执行之间 schema 又变了。不一致直接 task 置
+                # failed（请求早已返回，无同步错误可回）。
+                _want_ver = data.get("wiki_schema_version")
+                if _want_ver is not None:
+                    try:
+                        import json as _json
+
+                        _sj = _json.loads(
+                            (kb_dir / ".openkb" / "jonex_schema.json")
+                            .read_text(encoding="utf-8"))
+                        _disk_ver = int(_sj.get("schema_version") or 0)
+                    except Exception:
+                        _disk_ver = None
+                    if _disk_ver is None:
+                        self._update_task(
+                            kb_dir, task_id, status="failed",
+                            error="SCHEMA_NOT_APPLIED: jonex_schema.json 缺失，请先同步 LLM-Wiki Schema")
+                        return
+                    if _disk_ver != _want_ver:
+                        self._update_task(
+                            kb_dir, task_id, status="failed",
+                            error=f"SCHEMA_VERSION_MISMATCH: 目标 {_want_ver} != 磁盘 {_disk_ver}")
+                        return
                 bundle = self._build_metering_bundle(kb_dir)
-                result = await self._compile_parsed_markdown(
-                    kb_dir=kb_dir,
-                    document_id=data["document_id"],
-                    parsed_markdown_path=Path(data["parsed_markdown_path"]),
-                    assets_dir=Path(data["assets_dir"]) if data.get("assets_dir") else None,
-                    metadata=data.get("metadata") or {},
-                    bundle=bundle,
+                # [jonex] vendored compile_short_doc 内部为**同步** litellm.completion
+                # （compiler.py:2253/2351/2096/1634），直接 await 会阻塞主事件循环 →
+                # 编译期间的提交/查询请求全部排队 → sidecar 120s 代理超时 500。
+                # 编译整体丢线程池（子线程独立事件循环跑 async 编译），
+                # 主循环保持可响应；mutation 锁仍在主循环持有（asyncio.Lock 非线程安全）。
+                result = await asyncio.to_thread(
+                    self._compile_parsed_markdown_sync, kb_dir,
+                    data["document_id"], Path(data["parsed_markdown_path"]),
+                    Path(data["assets_dir"]) if data.get("assets_dir") else None,
+                    data.get("metadata") or {}, bundle,
                 )
                 self._update_task(kb_dir, task_id, status="completed",
                                   warnings=result.get("warnings", []))
             except Exception as exc:  # noqa: BLE001
                 self._update_task(kb_dir, task_id, status="failed",
                                   error=str(exc)[:1000])
+
+    def _compile_parsed_markdown_sync(self, kb_dir, document_id, parsed_markdown_path,
+                                      assets_dir, metadata, bundle) -> dict:
+        """[jonex] 同步包装：子线程独立事件循环跑 async 编译。
+
+        供 asyncio.to_thread 使用——内部同步 LLM 调用只阻塞子线程循环，
+        不阻塞主事件循环（openkb 提交/查询请求）。
+        """
+        return asyncio.run(self._compile_parsed_markdown(
+            kb_dir=kb_dir, document_id=document_id,
+            parsed_markdown_path=parsed_markdown_path,
+            assets_dir=assets_dir, metadata=metadata, bundle=bundle,
+        ))
 
     async def _handle_get_compile_status(self, kb_dir, kb_name, data):
         """[jonex] 查询单个编译任务状态；未知 task → 404。"""
@@ -337,6 +464,8 @@ class OpenkbCapability(BaseCapability):
                     "error": task.get("error"),
                     "warnings": task.get("warnings") or [],
                     "updated_at": task.get("updated_at"),
+                    # [jonex] §8.1：patrol 靠它回写 llm_wiki_applied_schema_version
+                    "wiki_schema_version": task.get("wiki_schema_version"),
                 })
         return {"tasks": out}
 
@@ -590,9 +719,14 @@ class OpenkbCapability(BaseCapability):
 
             bundle = self._build_metering_bundle(kb_dir)
             results = []
+            # [jonex] 红线（方案 §8.2 防护 1）：**禁止透传 refresh_schema**——
+            # iter_recompile(refresh_schema=True) 会把 apply_schema 投影的
+            # AGENTS.md 静默覆盖回英文内置版（只留 .bak），版本 fencing 被绕过。
+            # 任何未来改动都不得给本调用加 refresh_schema 参数。
             async for event in iter_recompile(
                 kb_dir, data.get("doc_name"),
                 all_docs=data.get("all_docs", False), bundle=bundle,
+                refresh_schema=False,
             ):
                 if event.get("event") == "final":
                     results.append(event)

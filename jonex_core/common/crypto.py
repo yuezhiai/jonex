@@ -97,10 +97,21 @@ def generate_mcp_key() -> str:
     return f"yxm_{secrets.token_urlsafe(32)}"
 
 
+def generate_write_key() -> str:
+    """生成知识写入 Key（yxm_ 前缀 + 32 字节 URL-safe 随机串）。
+
+    格式: yxm_{token_urlsafe(32)}，总长度约 47 字符。
+    运行时真实前缀统一 yxm_（per PRD §8.4），mcpw_ 仅为 UI 脱敏展示前缀。
+    调用方自行提取 key_prefix 存入 DB，本函数不负责。
+    """
+    return f"yxm_{secrets.token_urlsafe(32)}"
+
+
 def hash_mcp_key(plaintext: str) -> str:
     """对 MCP Key 明文做 HMAC-SHA256 哈希（单向，仅存哈希）。
 
     复用 _sign_payload() 实现，与 hash_ingest_key() 同算法。
+    前缀无关（yxm_ / mcpw_ 均适用）。
     """
     return _sign_payload(plaintext)
 
@@ -184,4 +195,5 @@ __all__ = [
     "generate_mcp_key",
     "hash_mcp_key",
     "verify_mcp_key",
+    "generate_write_key",
 ]

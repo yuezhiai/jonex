@@ -573,6 +573,14 @@ async def create_access_method(request: Request, payload: dict = Body(...)):
     return success_response(data=result)
 
 
+@ecosystem_router.patch("/data-access-methods/{method_id}", summary="更新数据接入方式")
+async def update_access_method(request: Request, method_id: str, payload: dict = Body(...)):
+    """更新指定数据接入方式"""
+    payload["method_id"] = method_id
+    result = await _call_bd_capability(request, "update_access_method", payload)
+    return success_response(data=result)
+
+
 # ════════════════════════════════════════════════════════════
 # 提示词模板 /api/v1/ecosystem/prompt-templates
 # ════════════════════════════════════════════════════════════

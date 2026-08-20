@@ -9,7 +9,6 @@
 -- 引擎管理 - 数据接入方式
 CREATE TABLE IF NOT EXISTS business_domain.data_access_methods (
     id VARCHAR(64) PRIMARY KEY,
-    tenant_id VARCHAR(64) NOT NULL,
     name VARCHAR(255) NOT NULL,
     access_type VARCHAR(32) NOT NULL,
     config_json JSONB DEFAULT '{}'::jsonb,
@@ -18,13 +17,11 @@ CREATE TABLE IF NOT EXISTS business_domain.data_access_methods (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dam_tenant ON business_domain.data_access_methods(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_dam_is_deleted ON business_domain.data_access_methods(is_deleted);
 
 -- 引擎管理 - 解析器配置
 CREATE TABLE IF NOT EXISTS business_domain.parser_configs (
     id VARCHAR(64) PRIMARY KEY,
-    tenant_id VARCHAR(64) NOT NULL,
     name VARCHAR(255) NOT NULL,
     parser_type VARCHAR(32) NOT NULL,
     file_types JSONB DEFAULT '[]'::jsonb,
@@ -34,13 +31,11 @@ CREATE TABLE IF NOT EXISTS business_domain.parser_configs (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_pc_tenant ON business_domain.parser_configs(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_pc_is_deleted ON business_domain.parser_configs(is_deleted);
 
 -- 引擎管理 - 模型提供商
 CREATE TABLE IF NOT EXISTS business_domain.model_providers (
     id VARCHAR(64) PRIMARY KEY,
-    tenant_id VARCHAR(64) NOT NULL,
     name VARCHAR(255) NOT NULL,
     provider_type VARCHAR(32) NOT NULL,
     model_type VARCHAR(32),
@@ -58,7 +53,6 @@ CREATE TABLE IF NOT EXISTS business_domain.model_providers (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_mp_tenant ON business_domain.model_providers(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_mp_is_deleted ON business_domain.model_providers(is_deleted);
 
 -- 生态适配器

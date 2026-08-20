@@ -29,6 +29,7 @@ from ..models import KnowledgeDocument, KnowledgeInfo
 from ..repository import KnowledgeDocumentRepository, OntologyGraphRepository
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
 from .document_service import _payload
+from .reconciliation_service import _stub_ratio_alert  # [jonex] 改动 52（S2）
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +63,24 @@ class OntologyQueryService:
         try:
             instance_count = await gdao.count_entities(tenant_id, kb_id)
             relation_count = await gdao.count_relations(tenant_id, kb_id)
+            # [jonex] 改动 52（S2）：stub 占比随统计接口暴露，KB 详情可见
+            stub_stats = await gdao.stub_entity_stats(tenant_id, kb_id)
             ontology_degraded = False
         except _NEO4J_DOWN_ERRORS as e:
             # Neo4j 不可用：本体计数降级为 0，仍返回 PG 侧源文件数等基础统计
             logger.warning("[ontology] 统计降级：Neo4j 不可用 kb=%s err=%s", kb_id, e)
             instance_count = 0
             relation_count = 0
+            stub_stats = {"total": 0, "stub": 0, "ratio": 0.0}
             ontology_degraded = True
+
+        stub_alert = _stub_ratio_alert(stub_stats["total"], stub_stats["stub"])
+        if stub_alert:
+            logger.warning(
+                "[ontology] stub 实体占比超阈值 kb=%s ratio=%.1f%% stub=%d total=%d",
+                kb_id, stub_stats["ratio"] * 100,
+                stub_stats["stub"], stub_stats["total"],
+            )
 
         return {
             "knowledge_base_id": kb_id,
@@ -78,6 +90,10 @@ class OntologyQueryService:
             "ontology_instance_count": instance_count,
             "ontology_relation_count": relation_count,
             "ontology_degraded": ontology_degraded,
+            # [jonex] 改动 52（S2）：抽取管线质量信号（stub = 无描述且无属性的空壳）
+            "stub_entity_count": stub_stats["stub"],
+            "stub_entity_ratio": round(stub_stats["ratio"], 4),
+            "stub_ratio_alert": stub_alert,
         }
 
     async def list_instances(self, tenant_id: str, request) -> dict:

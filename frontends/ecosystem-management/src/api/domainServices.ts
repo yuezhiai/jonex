@@ -1,10 +1,14 @@
 import apiClient from './client';
+import type { McpKeyItem, McpKeyCreateResult } from './mcpKeys';
 
 // ══ 服务视角 Key 管理 + 启用/停用 类型（来源 /api/v1/platform/mcp-services/{id}/keys 与 /api/v1/knowledge-base/services/{id}/enable|disable）══
 
+/** 服务级权限级别：view/call/write/* 依次增强 */
+export type ServicePermissionLevel = 'view' | 'call' | 'write' | '*';
+
 export interface AddKeyRequest {
   key_id: string; // 已有 MCP Key ID
-  permission_level?: 'call' | 'view'; // 默认 "call"
+  permission_level?: ServicePermissionLevel; // 默认 "call"
 }
 
 export interface AddKeyResponse {
@@ -15,7 +19,7 @@ export interface AddKeyResponse {
 
 export interface CreateKeyForServiceRequest {
   name: string; // Key 名称（必填，trim 后非空）
-  permission_level?: 'call' | 'view'; // 默认 "call"
+  permission_level?: ServicePermissionLevel; // 默认 "call"
   description?: string | null; // 描述
   expires_at?: string | null; // 过期时间（ISO datetime）
 }
@@ -32,7 +36,7 @@ export interface CreateKeyForServiceResponse {
 }
 
 export interface UpdatePermissionRequest {
-  permission_level: 'call' | 'view'; // 必填
+  permission_level: ServicePermissionLevel; // 必填
 }
 
 export interface UpdatePermissionResponse {
@@ -101,7 +105,7 @@ export async function createKeyForService(
   return unwrapEnvelope(resp.data);
 }
 
-/** 切换服务授权 Key 的权限（call ↔ view） */
+/** 切换服务授权 Key 的权限（view → call → write → * 依序循环） */
 export async function updateKeyPermission(
   serviceId: string,
   keyId: string,
@@ -118,6 +122,30 @@ export async function updateKeyPermission(
 export async function removeKeyFromService(serviceId: string, keyId: string): Promise<RemoveKeyResponse> {
   const resp = await apiClient.delete<ApiEnvelope<RemoveKeyResponse>>(
     `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}`,
+  );
+  return unwrapEnvelope(resp.data);
+}
+
+/**
+ * 停用/启用 Key（可逆，恢复原 Key，key_id 不变；非 reset 换新）。
+ * service_id 仅为契约兼容，key_id 唯一定位。
+ */
+export async function toggleKeyStatus(serviceId: string, keyId: string): Promise<McpKeyItem> {
+  const resp = await apiClient.post<ApiEnvelope<McpKeyItem>>(
+    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}/toggle`,
+  );
+  return unwrapEnvelope(resp.data);
+}
+
+/** 重新创建 Key（已过期 Key），返回一次性明文 plaintext */
+export async function recreateKey(
+  serviceId: string,
+  keyId: string,
+  data?: { expires_at?: string | null },
+): Promise<McpKeyCreateResult> {
+  const resp = await apiClient.post<ApiEnvelope<McpKeyCreateResult>>(
+    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}/recreate`,
+    data ?? {},
   );
   return unwrapEnvelope(resp.data);
 }

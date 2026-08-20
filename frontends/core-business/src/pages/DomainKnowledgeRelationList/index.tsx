@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
 import { Input, Table, Breadcrumb, message, Button, Modal } from 'antd';
 import {
@@ -26,6 +27,7 @@ const PAGE_SIZE = 10;
 export default function DomainKnowledgeRelationList() {
   const { t } = useTranslation();
   const { id, relationName } = useParams<{ id: string; relationName: string }>();
+  const { canWrite } = useKbPermission(id);
   const navigate = useNavigate();
   const decodedName = decodeURIComponent(relationName || '');
 
@@ -253,10 +255,25 @@ export default function DomainKnowledgeRelationList() {
       fixed: 'right' as const,
       render: (_: unknown, row: RelationInstanceRow) => (
         <div style={{ display: 'flex', gap: 8 }}>
-          <Button type="link" size="small" icon={<EditOutlined />} onClick={() => modalRef.current?.openEdit(row)}>
+          <Button
+            type="link"
+            size="small"
+            icon={<EditOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => modalRef.current?.openEdit(row)}
+          >
             {t('common.edit')}
           </Button>
-          <Button type="link" size="small" danger icon={<DeleteOutlined />} onClick={() => handleDelete(row)}>
+          <Button
+            type="link"
+            size="small"
+            danger
+            icon={<DeleteOutlined />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => handleDelete(row)}
+          >
             {t('common.delete')}
           </Button>
         </div>
@@ -360,7 +377,13 @@ export default function DomainKnowledgeRelationList() {
                 setPage(1);
               }}
             />
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => modalRef.current?.openCreate()}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              disabled={!canWrite}
+              title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => modalRef.current?.openCreate()}
+            >
               {t('domainKnowledge.newRelation')}
             </Button>
           </div>

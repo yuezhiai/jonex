@@ -7,34 +7,66 @@ export type McpKeyPermission = 'view' | 'call' | 'write';
 
 export interface McpKeyCreatePayload {
   name?: string;
+  /** 用途描述 */
+  note?: string | null;
+  /** 领域空间 ID（必填，后端校验归属当前租户） */
+  space_id: string;
   permissions?: McpKeyPermission[];
   allowed_kb_ids?: string[];
-  /** 可访问的领域服务 ID 列表 */
+  /** 可访问的领域服务 ID 列表（由勾选服务派生） */
   service_ids?: string[];
+  /** 各领域服务授权级别（call/view 两值） */
+  service_permissions?: Array<{ service_id: string; permission_level: string }>;
+  /** 有效期（ISO datetime；null = 永久有效） */
+  expires_at?: string | null;
 }
 
 export interface McpKeyResetPayload {
   name?: string | null;
+  /** 领域空间 ID（可选覆盖，重置后沿用旧值） */
+  space_id?: string | null;
   permissions?: McpKeyPermission[] | null;
   allowed_kb_ids?: string[] | null;
   service_ids?: string[] | null;
+  /** 有效期（ISO datetime；null = 永久有效） */
+  expires_at?: string | null;
 }
 
 export interface McpKeyUpdatePayload {
   name?: string;
+  /** 用途描述 */
+  note?: string | null;
+  /** 领域空间 ID（可选；创建时选定后编辑态只读） */
+  space_id?: string;
   permissions?: McpKeyPermission[];
   allowed_kb_ids?: string[];
   service_ids?: string[];
+  service_permissions?: Array<{ service_id: string; permission_level: string }>;
+  /** 有效期（ISO datetime；null = 永久有效） */
+  expires_at?: string | null;
 }
 
 export interface McpKeyItem {
   id: string;
   name: string;
+  /** 用途描述 */
+  note?: string | null;
   key_prefix: string;
+  /** 领域空间 ID（历史 Key 可能为空） */
+  space_id: string | null;
   permissions: McpKeyPermission[];
+  /** 「领域范围」，前端不再展示/编辑（分期保留） */
   allowed_kb_ids: string[];
   /** 可访问的领域服务 ID 列表 */
   service_ids: string[];
+  /** 各领域服务的授权级别（detail 返回：service_id + permission_level） */
+  service_permissions?: Array<{ service_id: string; permission_level: string }>;
+  /** 有效期（null = 永久有效） */
+  expires_at?: string | null;
+  /** 停用时间（非空 = 停用态） */
+  disabled_at?: string | null;
+  /** 4 态逻辑派生：active / disabled / expired / revoked */
+  status?: string;
   created_by: string | null;
   created_at: string | null;
   revoked_at: string | null;
@@ -46,6 +78,7 @@ export interface McpKeyCreateResult {
   plaintext: string;
   name: string;
   key_prefix: string;
+  space_id: string | null;
   permissions: string[];
   allowed_kb_ids: string[];
   service_ids: string[];

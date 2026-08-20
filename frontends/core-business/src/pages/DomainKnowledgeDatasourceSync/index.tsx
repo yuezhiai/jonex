@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Input, Space, message, Spin } from 'antd';
 import { ArrowLeftOutlined, CloudOutlined, SyncOutlined } from '@ant-design/icons';
@@ -11,6 +12,7 @@ import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
 export default function DomainKnowledgeDatasourceSync() {
   const { t } = useTranslation();
   const { id, dsId } = useParams();
+  const { canWrite } = useKbPermission(id);
   const navigate = useNavigate();
 
   const [ds, setDs] = useState<DataSourceInstance | null>(null);
@@ -121,7 +123,14 @@ export default function DomainKnowledgeDatasourceSync() {
               <span>{t('domainKnowledge.docsWithCount', { count: ds?.documentCount ?? 0 })}</span>
             </div>
           </div>
-          <Button type="primary" icon={<SyncOutlined />} loading={syncing} onClick={onSync}>
+          <Button
+            type="primary"
+            icon={<SyncOutlined />}
+            loading={syncing}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+            onClick={onSync}
+          >
             {t('domainKnowledge.sync.instantSync')}
           </Button>
         </Card>

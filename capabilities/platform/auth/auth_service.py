@@ -22,6 +22,7 @@ from capabilities.platform.repository.user_repository import UserRepository
 from capabilities.platform.repository.tenant_repository import TenantRepository
 from capabilities.platform.models.user import User
 from capabilities.platform.models.login_ticket import LoginTicket
+from capabilities.platform.services.user_service import UserService
 from jonex_core.security.user_auth import get_user_auth
 from capabilities.platform.dtos.auth import (
     LoginFlowResponse,
@@ -147,6 +148,7 @@ class AuthService:
         user: User,
         update_last_login: bool = False,
         inactive_tenant_message: str | None = None,
+        fallback_roles: list[str] | None = None,
     ) -> LoginResponse:
         if inactive_tenant_message is None:
             inactive_tenant_message = translate("err.auth.user_not_found_or_disabled", fallback="用户不存在或已禁用")  # 原消息: 用户不存在或已禁用
@@ -155,8 +157,18 @@ class AuthService:
         if not tenant:
             raise InvalidApiKeyError(message=inactive_tenant_message)
 
-        access_token = self.user_auth.create_access_token(user)
-        refresh_token = self.user_auth.create_refresh_token(user)
+        # 优先重查 DB 拿最新角色名（防旧 token 滞留绕过权限撤销）；仅 DB 查询异常时兜底。
+        try:
+            role_names = await UserService(self.session).get_role_names(user.tenant_id, user.id)
+        except Exception:
+            logger.warning(f"查询用户角色失败，回退兜底角色: user_id={user.id}", exc_info=True)
+            role_names = fallback_roles if fallback_roles is not None else ([user.role] if user.role else [])
+
+        from jonex_core.security.permission import get_user_permissions
+
+        perms = await get_user_permissions(user.tenant_id, user.id)
+        access_token = self.user_auth.create_access_token(user, role_names)
+        refresh_token = self.user_auth.create_refresh_token(user, role_names)
 
         if update_last_login:
             user.last_login_at = datetime.utcnow()
@@ -175,6 +187,10 @@ class AuthService:
                 tenant_id=user.tenant_id,
                 tenant_name=tenant.name,
                 role=user.role,
+                roles=role_names,
+                is_platform_admin=("platform:admin" in perms),
+                is_tenant_admin=("user:write" in perms),
+                permissions=sorted(perms),
             ),
         )
 
@@ -201,6 +217,12 @@ class AuthService:
         if not tenant:
             raise InvalidApiKeyError(message=translate("err.auth.user_not_found_or_disabled", fallback="用户不存在或已禁用"))  # 原消息: 用户不存在或已禁用
 
+        role_names = await UserService(self.session).get_role_names(user.tenant_id, user.id)
+
+        from jonex_core.security.permission import get_user_permissions
+
+        perms = await get_user_permissions(user.tenant_id, user.id)
+
         return UserInfo(
             user_id=user.id,
             username=user.username,
@@ -208,6 +230,10 @@ class AuthService:
             tenant_id=user.tenant_id,
             tenant_name=tenant.name,
             role=user.role,
+            roles=role_names,
+            is_platform_admin=("platform:admin" in perms),
+            is_tenant_admin=("user:write" in perms),
+            permissions=sorted(perms),
         )
 
     async def refresh(self, token: str) -> LoginResponse:
@@ -231,7 +257,9 @@ class AuthService:
         if not user:
             raise InvalidApiKeyError(message=translate("err.auth.user_not_found_or_disabled", fallback="用户不存在或已禁用"))  # 原消息: 用户不存在或已禁用
 
-        return await self._build_login_response(user)
+        # 主路径由 _build_login_response 重查 DB 拿最新角色；仅 DB 查询异常时兜底旧 token roles。
+        fallback_roles = payload.get("roles") or ([payload.get("role")] if payload.get("role") else [])
+        return await self._build_login_response(user, fallback_roles=fallback_roles)
 
     async def create_login_ticket(
         self, req: LoginTicketRequest, token: str, client_ip: str = None, user_agent: str = None

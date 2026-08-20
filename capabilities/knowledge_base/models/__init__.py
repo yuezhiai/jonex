@@ -8,6 +8,13 @@
 """
 
 from .document import DocStatus, KnowledgeDocument, OntologyStatus
+from .llm_wiki_schema import (
+    LlmWikiSchema,
+    STATUS_ACTIVE,
+    STATUS_ARCHIVED,
+    SYNC_APPLY_FAILED,
+    SYNC_SYNCED,
+)
 from .data_source import KnowledgeDataSource
 from .folder import Folder
 from .tag import DocumentTag, Tag
@@ -19,6 +26,7 @@ from .domain_service import (
     ServicePermission,
 )
 from .knowledge_info import KnowledgeInfo
+from .kb_permission import KbPermission
 from .ontology_synonym import OntologySynonym
 from .parser_setting import KnowledgeParserSetting
 from .search_feedback import KnowledgeSearchFeedback
@@ -37,6 +45,7 @@ __all__ = [
     "KnowledgeParserSetting",
     "KnowledgeSearchFeedback",
     "KnowledgeSearchHistory",
+    "KbPermission",
     "OntologyStatus",
     "OntologySynonym",
     "ServiceApiKey",

@@ -5,6 +5,7 @@ import {
   Tag,
   Typography,
   Input,
+  Select,
   Empty,
   Space,
   Button,
@@ -12,33 +13,16 @@ import {
   Result,
   Modal,
   message,
-  Card,
-  Alert,
 } from 'antd';
 import { PlusOutlined, SearchOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { listMcpKeys, deleteMcpKey, revokeMcpKey, type McpKeyItem } from '@/api/mcpKeys';
-import { McpKeyModals, type McpKeyModalsHandle } from './McpKeyModals';
-import apiClient from '@/api/client';
+import { listMcpKeys, deleteMcpKey, type McpKeyItem } from '@/api/mcpKeys';
+import { toggleKeyStatus } from '@/api/domainServices';
+import { McpKeyDrawer, type McpKeyDrawerHandle } from './McpKeyDrawer';
+import { RecreateKeyModal, type RecreateKeyModalHandle } from './RecreateKeyModal';
 import { listMcpServices } from '@/api/mcpServices';
-import KeyDetailDrawer, { type KeyDetailDrawerHandle } from './KeyDetailDrawer';
+import { listSpaces } from '@/api/spaces';
 import './index.css';
-
-// MCP Server 地址：优先环境变量注入（构建时替换），本地开发默认 localhost:8002
-const mcpServerUrl = (import.meta as any).env?.VITE_MCP_SERVER_URL || 'http://localhost:8002/mcp';
-
-// WorkBuddy 连接配置的 JSON 示例（供一键复制）
-const workbuddyJsonConfig = `{
-  "mcpServers": {
-    "jonex-knowledge": {
-      "url": "${mcpServerUrl}",
-      "transport": "streamable-http",
-      "headers": {
-        "Authorization": "Bearer YOUR_MCP_KEY"
-      }
-    }
-  }
-}`;
 
 const defaultFormatDate = (d: string | null): string => {
   if (!d) return '-';
@@ -49,7 +33,23 @@ const defaultFormatDate = (d: string | null): string => {
   }
 };
 
-/** MCP 服务目录 — MCP Key 列表 Tab（含完整列表管理能力） */
+/** 4 态派生：expired > disabled > revoked > active（后端 status 优先） */
+const deriveStatus = (r: McpKeyItem): 'active' | 'disabled' | 'expired' | 'revoked' => {
+  if (r.status === 'disabled' || r.status === 'expired' || r.status === 'revoked') return r.status;
+  if (r.expires_at && new Date(r.expires_at).getTime() < Date.now()) return 'expired';
+  if (r.disabled_at) return 'disabled';
+  if (r.revoked_at) return 'revoked';
+  return 'active';
+};
+
+/** 存量 write/* 遗留权限（需降级角标） */
+const hasLegacyPermission = (r: McpKeyItem): boolean => {
+  if ((r.permissions || []).some((p) => p === 'write' || (p as string) === '*')) return true;
+  if ((r.service_permissions || []).some((s) => s.permission_level === 'write' || s.permission_level === '*')) return true;
+  return false;
+};
+
+/** 服务访问 Key 列表 Tab（Phase 16：4 态列/筛选/note/遗留角标/重新创建） */
 export default function McpKeysTab() {
   const { t } = useTranslation();
   const [keys, setKeys] = useState<McpKeyItem[]>([]);
@@ -57,22 +57,14 @@ export default function McpKeysTab() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  // 是否有 Key（控制 WorkBuddy 引导显隐）
-  const [hasKeys, setHasKeys] = useState(false);
-  // 知识库 / 领域服务下拉选项（供 Key 创建/编辑弹窗使用）
-  const [kbOptions, setKbOptions] = useState<{ label: string; value: string }[]>([]);
-  const [serviceOptions, setServiceOptions] = useState<{ label: string; value: string }[]>([]);
+  const [statusFilter, setStatusFilter] = useState('');
+  // 领域空间下拉选项（供 Key 创建弹窗使用）
+  const [spaceOptions, setSpaceOptions] = useState<{ label: string; value: string }[]>([]);
   // 领域服务 ID → 名称映射（列表展示用，来源全量服务确保都能映射名称）
   const [serviceNameMap, setServiceNameMap] = useState<Map<string, string>>(new Map());
-  // 知识库 ID → 名称映射（列表展示用）
-  const kbNameMap = useMemo(() => {
-    const map = new Map<string, string>();
-    kbOptions.forEach((o) => map.set(o.value, o.label));
-    return map;
-  }, [kbOptions]);
 
-  const modalsRef = useRef<McpKeyModalsHandle>(null);
-  const detailDrawerRef = useRef<KeyDetailDrawerHandle>(null);
+  const keyDrawerRef = useRef<McpKeyDrawerHandle>(null);
+  const recreateRef = useRef<RecreateKeyModalHandle>(null);
 
   /** 加载 Key 列表 */
   const loadKeys = useCallback(async () => {
@@ -82,7 +74,6 @@ export default function McpKeysTab() {
       const result = await listMcpKeys();
       setKeys(result.items || []);
       setLoaded(true);
-      setHasKeys((result.items || []).length > 0);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('mcpKeyManagement.loadFailed'));
     } finally {
@@ -94,24 +85,8 @@ export default function McpKeysTab() {
     if (!loaded) loadKeys();
   }, [loaded, loadKeys]);
 
-  // 知识库 / 领域服务下拉选项
+  // 领域服务名称映射（含未发布服务，确保 service_ids 都能显示名称）
   useEffect(() => {
-    // 知识库范围选项（GET /knowledge-base/knowledge-info）
-    apiClient
-      .get('/api/v1/knowledge-base/knowledge-info')
-      .then((resp) => {
-        const data = (
-          resp.data as {
-            data?: { items?: Array<{ id: string; name: string }>; list?: Array<{ id: string; name: string }> };
-          }
-        )?.data;
-        const items = data?.items ?? data?.list ?? [];
-        setKbOptions(items.map((kb) => ({ label: kb.name ?? kb.id, value: kb.id })));
-      })
-      .catch(() => {
-        // 失败静默，下拉为空
-      });
-    // 全部领域服务 → 列表名称映射（含未发布服务，确保 service_ids 都能显示名称）
     listMcpServices()
       .then((result) => {
         const map = new Map<string, string>();
@@ -121,26 +96,30 @@ export default function McpKeysTab() {
       .catch(() => {
         // 失败静默，映射为空
       });
-    // 已发布领域服务选项（service_ids 下拉范围）
-    listMcpServices({ status: 'published' })
-      .then((result) => {
-        setServiceOptions(result.items.map((s) => ({ label: s.name, value: s.id })));
+  }, []);
+
+  // 领域空间下拉选项（供 Key 创建弹窗）
+  useEffect(() => {
+    listSpaces()
+      .then((items) => {
+        setSpaceOptions(items.map((s) => ({ label: s.name ?? s.id, value: s.id })));
       })
       .catch(() => {
         // 失败静默，下拉为空
       });
   }, []);
 
-  // 搜索过滤（客户端按名称 / 前缀过滤）
+  // 搜索 + 状态筛选（客户端过滤）
   const filtered = useMemo(() => {
     const q = search.trim().toLocaleLowerCase();
-    if (!q) return keys;
-    return keys.filter((k) =>
-      `${k.name || ''} ${k.key_prefix || ''} yxm_${k.key_prefix || ''}`.toLocaleLowerCase().includes(q),
-    );
-  }, [keys, search]);
+    return keys.filter((k) => {
+      if (q && !`${k.name || ''} ${k.key_prefix || ''}`.toLocaleLowerCase().includes(q)) return false;
+      if (statusFilter && deriveStatus(k) !== statusFilter) return false;
+      return true;
+    });
+  }, [keys, search, statusFilter]);
 
-  // ── 删除 / 停用确认 ──
+  // ── 删除确认 ──
   const confirmDelete = (record: McpKeyItem) => {
     Modal.confirm({
       title: t('mcpKeyManagement.deleteTitle'),
@@ -160,6 +139,18 @@ export default function McpKeysTab() {
     });
   };
 
+  /** 停用/启用（toggle 可逆，恢复原 Key） */
+  const handleToggle = async (record: McpKeyItem) => {
+    const serviceId = record.service_ids?.[0] || '';
+    try {
+      await toggleKeyStatus(serviceId, record.id);
+      message.success(t('mcpKeyManagement.toggleSuccess'));
+      loadKeys();
+    } catch (err: unknown) {
+      message.error(err instanceof Error ? err.message : t('mcpKeyManagement.operationFailed'));
+    }
+  };
+
   const confirmDisable = (record: McpKeyItem) => {
     Modal.confirm({
       title: t('mcpKeyManagement.disableTitle'),
@@ -167,28 +158,57 @@ export default function McpKeysTab() {
       okText: t('mcpKeyManagement.disableBtn'),
       cancelText: t('common.cancel'),
       okButtonProps: { danger: true },
-      onOk: async () => {
-        try {
-          await revokeMcpKey(record.id);
-          message.success(t('mcpKeyManagement.disableSuccess'));
-          await loadKeys();
-        } catch (err: unknown) {
-          message.error(err instanceof Error ? err.message : t('mcpKeyManagement.operationFailed'));
-        }
-      },
+      onOk: () => handleToggle(record),
     });
   };
 
-  /** 权限 Tag 渲染（多分支用 switch 提升可读性） */
-  const renderPermissionTag = (p: string) => {
-    switch (p) {
-      case 'view':
-        return <Tag color="gold">{t('mcpKeyManagement.permissionView')}</Tag>;
-      case 'call':
-        return <Tag color="blue">{t('mcpKeyManagement.permissionCall')}</Tag>;
+  /** 4 态状态渲染 */
+  const renderStatus = (record: McpKeyItem) => {
+    switch (deriveStatus(record)) {
+      case 'disabled':
+        return <Tag>{t('mcpKeyManagement.disabledStatus')}</Tag>;
+      case 'expired':
+        return <Tag color="orange">{t('mcpKeyManagement.expiredStatus')}</Tag>;
+      case 'revoked':
+        return <Tag color="error">{t('mcpKeyManagement.revokedStatus')}</Tag>;
       default:
-        return <Tag color="green">{t('mcpKeyManagement.permissionWrite')}</Tag>;
+        return <Tag color="success">{t('mcpKeyManagement.activeStatus')}</Tag>;
     }
+  };
+
+  /** 权限渲染：精确映射 view=金/call=蓝/write=绿/*=紫，存量 write/* 保留遗留角标 */
+  const renderPermissions = (record: McpKeyItem) => {
+    const legacy = hasLegacyPermission(record);
+    const perms = record.permissions || [];
+    if (perms.length === 0 && !legacy) return <span style={{ color: '#94a3b8' }}>-</span>;
+    const tags = perms.map((p) => {
+      // 存量 Key 的 permissions 可能含 '*'（全部），McpKeyPermission 类型不含，显式转 string
+      const perm = p as string;
+      switch (perm) {
+        case 'view':
+          return <Tag color="gold">{t('mcpKeyManagement.permissionView')}</Tag>;
+        case 'call':
+          return <Tag color="blue">{t('mcpKeyManagement.permissionCall')}</Tag>;
+        case 'write':
+          return <Tag color="green">{t('mcpKeyManagement.permissionWrite')}</Tag>;
+        case '*':
+          return <Tag color="purple">{t('mcpKeyManagement.permissionAll')}</Tag>;
+        default:
+          return <Tag>{p}</Tag>;
+      }
+    });
+    if (legacy) {
+      tags.push(
+        <Tag color="orange" key="legacy">
+          {t('mcpKeyManagement.legacyPermissionTag')}
+        </Tag>,
+      );
+    }
+    return (
+      <Space size={4} wrap>
+        {tags}
+      </Space>
+    );
   };
 
   const columns: ColumnsType<McpKeyItem> = [
@@ -203,41 +223,8 @@ export default function McpKeysTab() {
       title: t('mcpKeyManagement.keyPrefix'),
       dataIndex: 'key_prefix',
       key: 'key_prefix',
-      width: 120,
-      render: (v: string) => <Typography.Text code>yxm_{v}</Typography.Text>,
-    },
-    {
-      title: t('mcpKeyManagement.permissions'),
-      dataIndex: 'permissions',
-      key: 'permissions',
-      width: 120,
-      render: (_: unknown, record: McpKeyItem) => (
-        <span>
-          {(record.permissions || []).map((p) => (
-            <span key={p}>{renderPermissionTag(p)}</span>
-          ))}
-        </span>
-      ),
-    },
-    {
-      title: t('mcpKeyManagement.allowedKb'),
-      dataIndex: 'allowed_kb_ids',
-      key: 'allowed_kb_ids',
-      width: 160,
-      render: (_: unknown, record: McpKeyItem) => {
-        const allowed = record.allowed_kb_ids || [];
-        if (allowed.length === 0) return <Tag>{t('mcpKeyManagement.allKb')}</Tag>;
-        return (
-          <span>
-            {allowed.slice(0, 3).map((id) => (
-              <Tag key={id} style={{ marginBottom: 2 }}>
-                {kbNameMap.get(id) || id}
-              </Tag>
-            ))}
-            {allowed.length > 3 && <Tag style={{ marginBottom: 2 }}>+{allowed.length - 3}</Tag>}
-          </span>
-        );
-      },
+      width: 140,
+      render: (v: string) => (v ? <Typography.Text code>{v}</Typography.Text> : '-'),
     },
     {
       title: t('mcpKeyManagement.serviceScopeLabel'),
@@ -248,62 +235,73 @@ export default function McpKeysTab() {
         const ids = record.service_ids || [];
         if (ids.length === 0) return <Tag>{t('mcpKeyManagement.allServices')}</Tag>;
         return (
-          <span>
+          <Space size={4} wrap>
             {ids.slice(0, 2).map((id) => (
-              <Tag key={id} style={{ marginBottom: 2 }}>
-                {serviceNameMap.get(id) || id}
-              </Tag>
+              <Tag key={id}>{serviceNameMap.get(id) || id}</Tag>
             ))}
-            {ids.length > 2 && <Tag style={{ marginBottom: 2 }}>+{ids.length - 2}</Tag>}
-          </span>
+            {ids.length > 2 && <Tag>+{ids.length - 2}</Tag>}
+          </Space>
         );
       },
     },
     {
-      title: t('mcpKeyManagement.createdAt'),
-      dataIndex: 'created_at',
-      key: 'created_at',
+      title: t('mcpKeyManagement.expiryLabel'),
+      dataIndex: 'expires_at',
+      key: 'expires_at',
       width: 110,
-      render: (v: string | null) => defaultFormatDate(v),
+      render: (v: string | null) => (v ? defaultFormatDate(v) : t('mcpKeyManagement.expiryForever')),
+    },
+    {
+      title: t('mcpKeyManagement.noteLabel'),
+      dataIndex: 'note',
+      key: 'note',
+      width: 160,
+      render: (v: string | null | undefined) => v || <span style={{ color: '#94a3b8' }}>-</span>,
+    },
+    {
+      title: t('mcpKeyManagement.permissions'),
+      key: 'permissions',
+      width: 130,
+      render: (_: unknown, record: McpKeyItem) => renderPermissions(record),
     },
     {
       title: t('mcpKeyManagement.status'),
-      dataIndex: 'revoked_at',
       key: 'status',
-      width: 90,
-      render: (_: unknown, record: McpKeyItem) =>
-        record.revoked_at ? (
-          <Tag color="error">{t('mcpKeyManagement.revokedStatus')}</Tag>
-        ) : (
-          <Tag color="success">{t('mcpKeyManagement.activeStatus')}</Tag>
-        ),
+      width: 100,
+      render: (_: unknown, record: McpKeyItem) => renderStatus(record),
     },
     {
       title: t('mcpKeyManagement.actions'),
       key: 'actions',
-      width: 180,
-      render: (_: unknown, record: McpKeyItem) => (
-        <Space size={0}>
-          <Button type="link" size="small" onClick={() => detailDrawerRef.current?.open(record)}>
-            {t('mcpKeyManagement.detailBtn')}
-          </Button>
-          <Button type="link" size="small" onClick={() => modalsRef.current?.openEdit(record)}>
-            {t('mcpKeyManagement.editBtn')}
-          </Button>
-          <Button type="link" size="small" danger onClick={() => confirmDelete(record)}>
-            {t('mcpKeyManagement.deleteBtn')}
-          </Button>
-          {record.revoked_at ? (
-            <Button type="link" size="small" onClick={() => modalsRef.current?.openEnable(record)}>
-              {t('mcpKeyManagement.enableBtn')}
+      width: 220,
+      render: (_: unknown, record: McpKeyItem) => {
+        const status = deriveStatus(record);
+        return (
+          <Space size={0}>
+            <Button type="link" size="small" onClick={() => keyDrawerRef.current?.openEdit(record)}>
+              {t('mcpKeyManagement.editBtn')}
             </Button>
-          ) : (
-            <Button type="link" size="small" danger onClick={() => confirmDisable(record)}>
-              {t('mcpKeyManagement.disableBtn')}
+            <Button type="link" size="small" danger onClick={() => confirmDelete(record)}>
+              {t('mcpKeyManagement.deleteBtn')}
             </Button>
-          )}
-        </Space>
-      ),
+            {status === 'active' && (
+              <Button type="link" size="small" danger onClick={() => confirmDisable(record)}>
+                {t('mcpKeyManagement.disableBtn')}
+              </Button>
+            )}
+            {status === 'disabled' && (
+              <Button type="link" size="small" onClick={() => handleToggle(record)}>
+                {t('mcpKeyManagement.enableBtn')}
+              </Button>
+            )}
+            {status === 'expired' && (
+              <Button type="link" size="small" onClick={() => recreateRef.current?.open(record)}>
+                {t('mcpKeyManagement.recreateBtn')}
+              </Button>
+            )}
+          </Space>
+        );
+      },
     },
   ];
 
@@ -333,21 +331,36 @@ export default function McpKeysTab() {
 
   return (
     <div>
-      {/* 工具栏：搜索 + 刷新 / 创建 */}
+      {/* 工具栏：搜索 + 状态筛选 + 刷新 / 创建 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <Input
-          allowClear
-          prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
-          placeholder={t('mcpKeyManagement.searchPlaceholder')}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{ width: 220 }}
-        />
+        <Space size={12} wrap>
+          <Input
+            allowClear
+            prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+            placeholder={t('mcpKeyManagement.searchPlaceholder')}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ width: 220 }}
+          />
+          <Select
+            value={statusFilter || undefined}
+            onChange={(v) => setStatusFilter(v || '')}
+            placeholder={t('mcpKeyManagement.statusAll')}
+            allowClear
+            style={{ width: 120 }}
+            options={[
+              { value: 'active', label: t('mcpKeyManagement.activeStatus') },
+              { value: 'disabled', label: t('mcpKeyManagement.disabledStatus') },
+              { value: 'expired', label: t('mcpKeyManagement.expiredStatus') },
+              { value: 'revoked', label: t('mcpKeyManagement.revokedStatus') },
+            ]}
+          />
+        </Space>
         <Space>
           <Button icon={<ReloadOutlined />} onClick={loadKeys}>
             {t('common.refresh')}
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => modalsRef.current?.openCreate()}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => keyDrawerRef.current?.open()}>
             {t('mcpKeyManagement.createBtn')}
           </Button>
         </Space>
@@ -355,7 +368,7 @@ export default function McpKeysTab() {
 
       {keys.length === 0 ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('mcpKeyManagement.emptyText')}>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => modalsRef.current?.openCreate()}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => keyDrawerRef.current?.open()}>
             {t('mcpKeyManagement.createFirst')}
           </Button>
         </Empty>
@@ -373,47 +386,9 @@ export default function McpKeysTab() {
         />
       )}
 
-      {/* 创建 / 编辑 / 启用 弹窗 */}
-      <McpKeyModals
-        ref={modalsRef}
-        onSuccess={loadKeys}
-        knowledgeBaseOptions={kbOptions}
-        serviceOptions={serviceOptions}
-      />
-
-      {/* WorkBuddy 连接配置引导（仅当存在 Key 时展示） */}
-      {hasKeys && (
-        <div className="mcp-key-workbuddy-guide">
-          <Card title={t('mcpKeyManagement.workbuddyGuideTitle')}>
-            <Typography.Paragraph type="secondary">
-              {t('mcpKeyManagement.workbuddyGuideDesc')}
-            </Typography.Paragraph>
-            <Typography.Paragraph
-              copyable={{
-                text: workbuddyJsonConfig,
-                tooltips: [t('mcpKeyManagement.workbuddyGuideCopyConfig'), t('mcpKeyManagement.workbuddyGuideCopied')],
-              }}
-            >
-              {t('mcpKeyManagement.workbuddyGuideConfigLabel')}
-            </Typography.Paragraph>
-            <pre className="mcp-key-workbuddy-json">
-              <Typography.Text
-                code
-                copyable={{
-                  text: workbuddyJsonConfig,
-                  tooltips: [t('mcpKeyManagement.workbuddyGuideCopyConfig'), t('mcpKeyManagement.workbuddyGuideCopied')],
-                }}
-              >
-                {workbuddyJsonConfig}
-              </Typography.Text>
-            </pre>
-            <Alert type="info" showIcon message={t('mcpKeyManagement.workbuddyGuideNote')} />
-          </Card>
-        </div>
-      )}
-
-      {/* 详情抽屉 */}
-      <KeyDetailDrawer ref={detailDrawerRef} />
+      {/* 创建 / 编辑 / 重新创建 抽屉 */}
+      <McpKeyDrawer ref={keyDrawerRef} onSuccess={loadKeys} spaceOptions={spaceOptions} />
+      <RecreateKeyModal ref={recreateRef} onSuccess={loadKeys} />
     </div>
   );
 }

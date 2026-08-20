@@ -30,3 +30,6 @@ tencentcloud-sdk-python>=3.0.0
 
 # ========== 视频处理辅助（xxhash 用于视频指纹计算）
 xxhash>=3.0.0
+
+# ========== [jonex] §table-grid-v2 L3：xlsx 前置规范化主轨（spreadsheet_normalizer）
+openpyxl>=3.1.0,<4.0.0

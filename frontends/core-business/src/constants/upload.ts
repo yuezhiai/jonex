@@ -14,3 +14,15 @@ export const EXTENSIONS_NO_DOT =
 /** UI 展示用格式字符串（大写 · 分隔） */
 export const FORMAT_DISPLAY =
   'PDF · DOC · DOCX · PPT · PPTX · XLS · XLSX · TXT · MD · JPG · JPEG · PNG · GIF · BMP · TIFF · TIF · WEBP · MP3 · WAV · FLAC · AAC · M4A · OGG · WMA · OPUS · AMR · MP4 · AVI · MOV · MKV · FLV · WMV · WEBM · M4V · MPG · MPEG · 3GP';
+
+/** 单文件大小上限 500MB（与 common.uploadMaxSize、nginx client_max_body_size 对齐） */
+export const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+
+/** 批量上传：并发个数上限（配合字节预算调度，见 utils/batchUpload.ts） */
+export const BATCH_UPLOAD_MAX_PARALLEL = 3;
+
+/** 批量上传：在途字节预算上限 500MB（与单文件上限对齐，约束 Gateway 峰值内存增量） */
+export const BATCH_UPLOAD_MAX_INFLIGHT_BYTES = 500 * 1024 * 1024;
+
+/** 批量上传：单次最大文件数（来源：RATE_LIMIT_TENANT_PER_MINUTE = 300） */
+export const BATCH_UPLOAD_MAX_FILES = 50;

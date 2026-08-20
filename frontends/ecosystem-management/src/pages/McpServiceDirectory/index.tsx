@@ -1,27 +1,34 @@
-import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, Tabs } from 'antd';
+import { useSearchParams } from 'react-router-dom';
 import { colors, radius } from '@jonex/platform-theme/tokens';
-import McpServicesTab from './McpServicesTab';
-import McpKeysTab from './McpKeysTab';
+import McpDomainServicesTab from './McpDomainServicesTab';
+import McpWriteKeysTab from './McpWriteKeysTab';
 
 /**
- * MCP 服务目录 — 页面外壳
+ * MCP 服务管理 — 页面外壳
  *
- * 描述下方以 Tab 聚合两个列表能力：
- * - MCP 服务：发布 / 取消发布 / 测试调用 / 授权 Key
- * - MCP Key：原 MCP Key 管理页面的列表能力（含 WorkBuddy 引导）
+ * 两个 Tab（URL ?area 参数驱动，hosted MemoryRouter 下亦生效）：
+ * - area=domain（默认）：MCP领域服务（卡片头：服务目录 / 服务访问Key 视图切换）
+ * - area=write：MCP知识写入（知识写入 Key 管理，Phase 17 WRITE-01/02/03）
  */
 export default function McpServiceDirectory() {
   const { t } = useTranslation();
-  // 支持从 URL 参数定位到指定 Tab（如 ?tab=keys 直接定位到 MCP Key）
-  const [activeTab, setActiveTab] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      if (params.get('tab') === 'keys') return 'keys';
-    }
-    return 'services';
-  });
+  const [searchParams, setSearchParams] = useSearchParams();
+  const activeTab = searchParams.get('area') === 'write' ? 'write' : 'domain';
+
+  /** Tab 切换同步 URL ?area 参数（replace，保留其他 query 如 view） */
+  const handleTabChange = (key: string) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (key === 'write') next.set('area', 'write');
+        else next.delete('area');
+        return next;
+      },
+      { replace: true },
+    );
+  };
 
   return (
     <div>
@@ -37,33 +44,17 @@ export default function McpServiceDirectory() {
       <Card style={{ borderRadius: radius.card }}>
         <Tabs
           activeKey={activeTab}
-          onChange={setActiveTab}
+          onChange={handleTabChange}
           items={[
             {
-              key: 'services',
-              label: t('mcpServiceDirectory.tabServices'),
-              children: (
-                <div>
-                  <div className="mcp-svc-tab-head">
-                    <h2>{t('mcpServiceDirectory.tabServicesTitle')}</h2>
-                    <p>{t('mcpServiceDirectory.tabServicesDesc')}</p>
-                  </div>
-                  <McpServicesTab />
-                </div>
-              ),
+              key: 'domain',
+              label: t('mcpServiceDirectory.tabDomainServices'),
+              children: <McpDomainServicesTab />,
             },
             {
-              key: 'keys',
-              label: t('mcpServiceDirectory.tabKeys'),
-              children: (
-                <div>
-                  <div className="mcp-svc-tab-head">
-                    <h2>{t('mcpServiceDirectory.tabKeysTitle')}</h2>
-                    <p>{t('mcpServiceDirectory.tabKeysDesc')}</p>
-                  </div>
-                  <McpKeysTab />
-                </div>
-              ),
+              key: 'write',
+              label: t('mcpServiceDirectory.tabWrite'),
+              children: <McpWriteKeysTab />,
             },
           ]}
         />

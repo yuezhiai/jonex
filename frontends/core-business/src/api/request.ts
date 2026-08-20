@@ -2,10 +2,27 @@ import axios from 'axios';
 import { readAccessToken, clearAuthStorage } from '@jonex/shell-sdk';
 
 export interface ApiResponse<T> {
+  request_id?: string;
+  success?: boolean;
   code: number;
   message: string;
   data: T;
-  traceId?: string;
+  error_details?: Record<string, any>;
+  timestamp?: string;
+}
+
+export interface ApiError extends Error {
+  bizCode?: number;
+  requestId?: string;
+  errorDetails?: Record<string, any>;
+}
+
+function toApiError(body: ApiResponse<unknown> | undefined, fallback: string): ApiError {
+  const e = new Error(body?.message || fallback) as ApiError;
+  e.bizCode = body?.code;
+  e.requestId = body?.request_id;
+  e.errorDetails = body?.error_details;
+  return e;
 }
 
 export const request = axios.create({
@@ -27,7 +44,7 @@ request.interceptors.response.use(
   (response) => {
     const body = response.data as ApiResponse<unknown>;
     if (body.code !== 0) {
-      return Promise.reject(new Error(body.message || 'Request failed'));
+      return Promise.reject(toApiError(body, 'Request failed'));
     }
     return response;
   },
@@ -43,10 +60,11 @@ request.interceptors.response.use(
           window.location.href = `/login?redirect=${encodeURIComponent(window.location.href)}`;
         }
       }
-      // 提取后端错误消息，让调用方 err.message 拿到真正的错误原因
-      const backendMsg = (error.response?.data as ApiResponse<unknown>)?.message;
-      if (backendMsg) {
-        return Promise.reject(new Error(backendMsg));
+      // 提取后端错误消息与结构化字段（bizCode / errorDetails），让调用方 err.message
+      // 拿到真正的错误原因，同时能靠 bizCode / errorDetails 区分错误类型
+      const body = error.response?.data as ApiResponse<unknown> | undefined;
+      if (body?.message) {
+        return Promise.reject(toApiError(body, 'Request failed'));
       }
     }
     return Promise.reject(error);

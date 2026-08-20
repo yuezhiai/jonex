@@ -7,6 +7,9 @@ export interface ShellUser {
   tenantId?: string;
   tenantName?: string;
   roles: string[];
+  isPlatformAdmin: boolean;
+  isTenantAdmin: boolean;
+  permissions: string[];
 }
 
 export interface ShellNavigateOptions {

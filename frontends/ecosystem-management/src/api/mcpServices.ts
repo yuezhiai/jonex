@@ -3,12 +3,18 @@ import apiClient from './client';
 // ══ MCP 服务目录类型（来源 /api/v1/platform/mcp-services，契约见 Phase 08 移交文档）══
 
 export interface McpServiceItem {
-  id: string; // 领域服务 ID
+  id: string; // 领域服务 ID（系统服务为固定合成 ID system.knowledge_document_write）
   name: string; // 服务名称
+  /** MCP Tool 名称。领域服务走 tool_name，系统服务走 tool（Phase 17） */
+  tool_name?: string | null;
+  /** 系统服务内置条目的 Tool 名（service_type === 'system' 时非空，固定不可改） */
+  tool?: string | null;
+  /** 'domain'（领域服务）| 'system'（系统内置服务，如 knowledge_document_write） */
+  service_type?: string;
   description: string | null; // 服务描述
   domain_type: string | null; // 领域类型（如 knowledge_base）
-  space_id: string; // 所属空间 ID
-  space_name: string; // 所属空间名称
+  space_id: string; // 所属空间 ID（系统服务为空串）
+  space_name: string; // 所属空间名称（系统服务为空串）
   status: string;
   kb_count: number; // 关联知识库数量
   kb_names: string[]; // 关联知识库名称列表
@@ -45,11 +51,11 @@ export interface TestCallResponse {
 export interface AuthorizedKeyItem {
   key_id: string; // Key ID
   key_name: string; // Key 名称
-  key_prefix: string; // Key 前缀（脱敏，形如 yxm_xxxx）
-  permission_level: string; // 权限等级（'read' | '*'）
-  org_name: string | null; // 所属组织名称
-  key_status: string; // Key 状态（'active' | 'revoked'）
-  org_id: string | null; // 组织 ID
+  key_prefix: string; // Key 前缀（脱敏）
+  permission_level: string; // 服务级权限等级（'call' | 'view'）
+  key_status: string; // Key 状态（'active' | 'revoked' 等）
+  /** TODO: 待确认点 #1 —— 后端 AuthorizedKeyResponse 是否透出 expires_at（服务侧授权表有效期列） */
+  expires_at?: string | null;
 }
 
 export interface AuthorizedKeyListResponse {

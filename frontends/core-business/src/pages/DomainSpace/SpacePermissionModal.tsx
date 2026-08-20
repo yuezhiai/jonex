@@ -2,7 +2,7 @@ import React, { useState, useCallback, forwardRef, useImperativeHandle, useRef, 
 import { useTranslation } from 'react-i18next';
 import { Modal, Input, Button, Spin, message } from 'antd';
 import { TeamOutlined, SearchOutlined, UserAddOutlined, CloseOutlined } from '@ant-design/icons';
-import { getSpacePermissions, updateSpacePermissions } from '../../api/domainSpace';
+import { getSpacePermissions, updateSpacePermissions, type SpaceOwnerInfo } from '../../api/domainSpace';
 import { userToPermMember, type PermMember } from '../../types/domainService';
 import { listUsers, type PlatformUser } from '../../api/user';
 import type { DomainSpace } from '../../types/domainSpace';
@@ -22,6 +22,8 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
     const [open, setOpen] = useState(false);
     const [permSpace, setPermSpace] = useState<DomainSpace | null>(null);
     const [permMembers, setPermMembers] = useState<PermMember[]>([]);
+    // 空间创建者（owner 不落 space_permissions，后端响应层合成只读信息）
+    const [permOwner, setPermOwner] = useState<SpaceOwnerInfo | null>(null);
     const [permSearch, setPermSearch] = useState('');
     const [permLoading, setPermLoading] = useState(false);
     const [permSaving, setPermSaving] = useState(false);
@@ -43,35 +45,23 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
           setUserSelectOpen(false);
           setUserSearchText('');
           try {
-            const perms = await getSpacePermissions(space.id);
-            if (perms.length > 0) {
-              let userMap: Map<string, PlatformUser> = new Map();
-              try {
-                const userResult = await listUsers(1, 100);
-                for (const u of userResult.items) {
-                  userMap.set(String(u.id), u);
-                }
-              } catch {
-                /* 用户列表加载失败不影响权限展示 */
-              }
-              const members: PermMember[] = perms.map((p) => {
-                const uid = String(p.user_id);
-                const user = userMap.get(uid);
-                return user
-                  ? userToPermMember(user, p.role === 'manager' ? 'manager' : 'viewer')
-                  : {
-                      id: uid,
-                      name: t('domainSpace.userPrefix', { id: uid.slice(0, 8) }),
-                      department: '',
-                      avatar: uid.charAt(0).toUpperCase(),
-                      avatarColor: '#94a3b8',
-                      role: (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager',
-                    };
-              });
-              setPermMembers(members);
-            } else {
-              setPermMembers([]);
-            }
+            const { permissions: perms, owner } = await getSpacePermissions(space.id);
+            setPermOwner(owner);
+            // 成员展示名直接来自后端 join 的 display_name（viewer/知识编辑者无 user:read，
+            // 前端拉 /users 会 403）；不再拉全量用户拼名字
+            const members: PermMember[] = perms.map((p) => {
+              const uid = String(p.user_id);
+              const name = p.display_name || t('domainSpace.userPrefix', { id: uid.slice(0, 8) });
+              return {
+                id: uid,
+                name,
+                department: '',
+                avatar: name.charAt(0).toUpperCase(),
+                avatarColor: '#94a3b8',
+                role: (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager',
+              };
+            });
+            setPermMembers(members);
           } catch {
             message.error(t('common.loadFailed'));
             setPermMembers([]);
@@ -96,13 +86,16 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
       return () => document.removeEventListener('mousedown', handler);
     }, [userSelectOpen]);
 
+    // 只读态：owner 或 service:write 持有者才可编辑（后端最终校验）
+    const canManage = permSpace?.can_manage_permissions ?? false;
+
     const handleClose = () => {
       setOpen(false);
       setUserSelectOpen(false);
     };
 
     const handlePermSave = async () => {
-      if (!permSpace) return;
+      if (!permSpace || !canManage) return;
       setPermSaving(true);
       try {
         await updateSpacePermissions(
@@ -175,12 +168,14 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
         okText={t('domainSpace.savePermission')}
         cancelText={t('common.cancel')}
         width={600}
+        okButtonProps={{ disabled: !canManage }}
       >
         <p style={{ fontSize: 14, color: '#475569', marginBottom: 12 }}>
           {t('domainSpace.setMemberPermission', { name: permSpace?.name || '' })}
         </p>
 
-        {/* 添加成员区域 */}
+        {/* 添加成员区域（仅可管理权限者可见） */}
+        {canManage && (
         <div ref={userSelectRef} style={{ position: 'relative', marginBottom: 12 }}>
           <Button
             icon={<UserAddOutlined />}
@@ -254,6 +249,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
             </div>
           )}
         </div>
+        )}
 
         {/* 已有成员搜索 */}
         <Input
@@ -270,12 +266,38 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
             <div style={{ textAlign: 'center', padding: 24 }}>
               <Spin />
             </div>
-          ) : filteredPermMembers.length === 0 ? (
+          ) : filteredPermMembers.length === 0 && !permOwner ? (
             <div style={{ textAlign: 'center', padding: 24, color: '#94a3b8', fontSize: 13 }}>
               {permSearch ? t('domainSpace.noMatchMember') : t('domainSpace.noMembers')}
             </div>
           ) : (
-            filteredPermMembers.map((member) => (
+            <>
+            {/* 创建者（owner）：只读展示，不落 space_permissions、不可删/改角色 */}
+            {permOwner && (
+              <div className="yx-perm-user-row">
+                <div className="yx-perm-avatar" style={{ background: '#3b82f6' }}>
+                  {(permOwner.display_name || permOwner.user_id).charAt(0).toUpperCase()}
+                </div>
+                <div className="yx-perm-user-info" style={{ flex: 1 }}>
+                  <div className="yx-perm-user-name">
+                    {permOwner.display_name || `ID: ${permOwner.user_id.slice(0, 8)}`}
+                  </div>
+                  <div className="yx-perm-user-dept">{t('domainSpace.ownerLabel')}</div>
+                </div>
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: '#3b82f6',
+                    background: '#eff6ff',
+                    padding: '2px 10px',
+                    borderRadius: 10,
+                  }}
+                >
+                  {t('domainSpace.ownerLabel')}
+                </span>
+              </div>
+            )}
+            {filteredPermMembers.map((member) => (
               <div key={member.id} className="yx-perm-user-row">
                 <div className="yx-perm-avatar" style={{ background: member.avatarColor }}>
                   {member.avatar}
@@ -291,6 +313,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                       name={`perm-${member.id}`}
                       value="viewer"
                       checked={member.role === 'viewer'}
+                      disabled={!canManage}
                       onChange={() => {
                         setPermMembers((prev) =>
                           prev.map((m) => (m.id === member.id ? { ...m, role: 'viewer' as const } : m)),
@@ -305,6 +328,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                       name={`perm-${member.id}`}
                       value="manager"
                       checked={member.role === 'manager'}
+                      disabled={!canManage}
                       onChange={() => {
                         setPermMembers((prev) =>
                           prev.map((m) => (m.id === member.id ? { ...m, role: 'manager' as const } : m)),
@@ -314,6 +338,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                     {t('permission.manage')}
                   </label>
                 </div>
+                {canManage && (
                 <Button
                   type="text"
                   className="yx-perm-remove-btn"
@@ -328,8 +353,11 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                 >
                   <CloseOutlined />
                 </Button>
+                )}
               </div>
             ))
+            }
+            </>
           )}
         </div>
       </Modal>

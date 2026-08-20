@@ -16,7 +16,6 @@ export interface DataAccessListResponse {
 
 export interface DataAccessItem {
   id: string;
-  tenant_id: string;
   name: string;
   access_type: string;
   description?: string | null;

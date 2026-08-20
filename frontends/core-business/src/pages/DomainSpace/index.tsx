@@ -34,6 +34,8 @@ export default function DomainSpace() {
   const [editing, setEditing] = useState<DomainSpace | null>(null);
   const permRef = useRef<SpacePermissionModalHandle>(null);
   const [deleting, setDeleting] = useState<DomainSpace | null>(null);
+  // 租户级创建权限（后端按 service:write 计算）
+  const [canCreateSpace, setCanCreateSpace] = useState(false);
 
   const loadSpaces = useCallback(async () => {
     setLoading(true);
@@ -41,6 +43,7 @@ export default function DomainSpace() {
     try {
       const result = await listSpaces(0, 100);
       setSpaces(result.items);
+      setCanCreateSpace(result.can_create_space ?? false);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('common.loadFailed'));
     } finally {
@@ -161,13 +164,18 @@ export default function DomainSpace() {
         );
       },
     },
-    // 权限设置-当前先隐藏，实现不够
+    // 权限设置（无管理权时置灰禁用——后端最终校验）
     {
       title: t('domainSpace.permissionSettings'),
       key: 'permission',
       width: 110,
       render: (_: unknown, r: DomainSpace) => (
-        <span className="yx-perm-badge" onClick={() => permRef.current?.open(r)}>
+        <span
+          className="yx-perm-badge"
+          style={r.can_manage_permissions ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+          title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+          onClick={() => r.can_manage_permissions && permRef.current?.open(r)}
+        >
           <TeamOutlined style={{ fontSize: 11, marginRight: 4 }} />
           {t('domainSpace.setPermission')}
         </span>
@@ -179,10 +187,24 @@ export default function DomainSpace() {
       width: 120,
       render: (_: unknown, r: DomainSpace) => (
         <Space>
-          <a className="yx-table-action" onClick={() => openEdit(r)}>
+          <a
+            className="yx-table-action"
+            style={r.can_manage_permissions ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+            title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => r.can_manage_permissions && openEdit(r)}
+          >
             {t('common.edit')}
           </a>
-          <a className="yx-table-action" style={{ color: '#dc2626' }} onClick={() => setDeleting(r)}>
+          <a
+            className="yx-table-action"
+            style={
+              r.can_manage_permissions
+                ? { color: '#dc2626' }
+                : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
+            }
+            title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+            onClick={() => r.can_manage_permissions && setDeleting(r)}
+          >
             {t('common.delete')}
           </a>
         </Space>
@@ -231,9 +253,11 @@ export default function DomainSpace() {
           onChange={(e) => setSearch(e.target.value)}
           style={{ width: 280 }}
         />
-        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
-          {t('domainSpace.create')}
-        </Button>
+        {canCreateSpace && (
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+            {t('domainSpace.create')}
+          </Button>
+        )}
       </div>
 
       {/* 表格 */}

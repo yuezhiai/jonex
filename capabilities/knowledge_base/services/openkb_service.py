@@ -117,6 +117,7 @@ class KnowledgeCompilerService:
     async def recompile_document(
         self, kb_name: str, tenant_id: str, kb_id: str, document_id: str,
         *, source_file_path: str = "", title: str = "", parser: str = "mineru",
+        wiki_schema_version: int | None = None,
     ) -> dict:
         """[jonex] 按共享卷上已有的解析产物重新编译（不重新解析）。
 
@@ -125,6 +126,10 @@ class KnowledgeCompilerService:
         不依赖 atomic-rag task status（内存态、重启即丢）。
 
         产物不存在时抛 ResourceNotFoundError（调用方已前置校验过，这里是兜底）。
+
+        [jonex] wiki_schema_version：编译绑定的 LLM-Wiki Schema 版本（方案 §6）——
+        透传进 parsed_artifact，adapter 写进 task 文件供 patrol 回写 applied；
+        None = 未启用 schema fencing（存量 KB 无 schema，与旧行为一致）。
         """
         md_abs = openkb_artifact_path(document_id)
         if not md_abs.is_file():
@@ -143,16 +148,20 @@ class KnowledgeCompilerService:
             if (md_abs.parent / "assets").is_dir() else ""
         )
 
+        artifact = {
+            "document_id": document_id,
+            "source_file_path": source_file_path,
+            "parsed_markdown_path": rel_md,
+            "assets_dir": rel_assets,
+            "parser": parser,
+            "metadata": {"pages": 0, "title": title, "recompile": True},
+        }
+        if wiki_schema_version is not None:
+            artifact["wiki_schema_version"] = wiki_schema_version
+
         return await self.compile_document(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
-            parsed_artifact={
-                "document_id": document_id,
-                "source_file_path": source_file_path,
-                "parsed_markdown_path": rel_md,
-                "assets_dir": rel_assets,
-                "parser": parser,
-                "metadata": {"pages": 0, "title": title, "recompile": True},
-            },
+            parsed_artifact=artifact,
         )
 
     # ── [jonex] 重新编译编排（从 ontology_service.retry_extract 调用）──
@@ -186,8 +195,14 @@ class KnowledgeCompilerService:
                 details={"document_id": document_id},
             )
 
+        # ── [jonex] LLM-Wiki Schema fencing（方案 §6）：读 active 版本 → claim
+        # 绑定 target → task 文件带同一版本（防线①：KB 侧按 DB sync 状态核对；
+        # 无 schema 返回 None = 未启用 fencing，按旧行为不带版本编译）──
+        target_ver = await self.get_active_schema_version(tenant_id, kb_id)
+
         # ── 原子 claim（列）：状态非 compiling 才抢到（防并发双投）──
-        if not await self.claim_compile(tenant_id, document_id):
+        if not await self.claim_compile(tenant_id, document_id,
+                                        target_schema_version=target_ver):
             raise ResourceConflictError(
                 message=translate("err.openkb.already_compiling",
                                   fallback="该文档正在编译中，请等待完成后再重试"),
@@ -201,6 +216,7 @@ class KnowledgeCompilerService:
                 kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
                 document_id=document_id,
                 source_file_path=source_file_path, title=title,
+                wiki_schema_version=target_ver,
             )
             await self.set_task_id(tenant_id, document_id, result["task_id"])
         except Exception as exc:
@@ -216,7 +232,19 @@ class KnowledgeCompilerService:
             doc = await repo.get_required(document_id, tenant_id)
             return doc.to_dict()
 
-    async def claim_compile(self, tenant_id: str, document_id: str) -> bool:
+    async def get_active_schema_version(self, tenant_id: str, kb_id: str) -> int | None:
+        """[jonex] 读 KB 当前 active LLM-Wiki Schema 版本（编译绑定用，方案 §6）。
+
+        无 schema（存量 KB 未进过编译设置）返回 None——调用方按「未启用
+        schema fencing」处理（不带版本编译，与旧行为一致）。
+        """
+        from ..repository.llm_wiki_schema_repository import LlmWikiSchemaRepository
+
+        row = await LlmWikiSchemaRepository().get_active(tenant_id, kb_id)
+        return row.schema_version if row else None
+
+    async def claim_compile(self, tenant_id: str, document_id: str, *,
+                            target_schema_version: int | None = None) -> bool:
         """[jonex] 原子抢占编译权（列化）：状态非 compiling 才置 compiling。
 
         返回 True 表示抢到。用 DB 条件更新而非「先读后写」，避免并发双投。
@@ -224,27 +252,53 @@ class KnowledgeCompilerService:
         ⚠️ 必须一并清 llm_wiki_task_id / error / warnings——重编译是同一文档的
         第二次尝试，残留的旧 task_id 会让 patrol 读到旧任务 completed 而误回写
         compiled（阻塞三）。requested_at 用 UTC（datetime.utcnow），供 patrol 判超时。
+
+        [jonex] LLM-Wiki Schema fencing（方案 §6）：target_schema_version 传入时
+        同 UPDATE 写 llm_wiki_target_schema_version——claim 成功即绑定本次编译的
+        目标版本（task 文件写同一版本，patrol 回写 applied 时 fencing 闭环）。
         """
         from sqlalchemy import text
 
-        sql = text("""
-            UPDATE knowledge_base.knowledge_documents
-               SET llm_wiki_compile_status = 'compiling',
-                   llm_wiki_compile_requested_at = :now,
-                   llm_wiki_task_id = NULL,
-                   llm_wiki_compile_error = NULL,
-                   llm_wiki_compile_warnings = NULL
-             WHERE id = :doc_id
-               AND tenant_id = :tenant_id
-               AND is_deleted = 0
-               AND coalesce(llm_wiki_compile_status, '') <> 'compiling'
-        """)
-        async with get_db_session() as session:
-            result = await session.execute(sql, {
+        if target_schema_version is not None:
+            sql = text("""
+                UPDATE knowledge_base.knowledge_documents
+                   SET llm_wiki_compile_status = 'compiling',
+                       llm_wiki_compile_requested_at = :now,
+                       llm_wiki_task_id = NULL,
+                       llm_wiki_compile_error = NULL,
+                       llm_wiki_compile_warnings = NULL,
+                       llm_wiki_target_schema_version = :target_ver
+                 WHERE id = :doc_id
+                   AND tenant_id = :tenant_id
+                   AND is_deleted = 0
+                   AND coalesce(llm_wiki_compile_status, '') <> 'compiling'
+            """)
+            params: dict = {
                 "doc_id": document_id,
                 "tenant_id": tenant_id,
                 "now": datetime.utcnow(),
-            })
+                "target_ver": target_schema_version,
+            }
+        else:
+            sql = text("""
+                UPDATE knowledge_base.knowledge_documents
+                   SET llm_wiki_compile_status = 'compiling',
+                       llm_wiki_compile_requested_at = :now,
+                       llm_wiki_task_id = NULL,
+                       llm_wiki_compile_error = NULL,
+                       llm_wiki_compile_warnings = NULL
+                 WHERE id = :doc_id
+                   AND tenant_id = :tenant_id
+                   AND is_deleted = 0
+                   AND coalesce(llm_wiki_compile_status, '') <> 'compiling'
+            """)
+            params = {
+                "doc_id": document_id,
+                "tenant_id": tenant_id,
+                "now": datetime.utcnow(),
+            }
+        async with get_db_session() as session:
+            result = await session.execute(sql, params)
             await session.commit()
             return (result.rowcount or 0) > 0
 

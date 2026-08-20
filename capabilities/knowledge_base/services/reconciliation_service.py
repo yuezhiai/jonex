@@ -21,6 +21,7 @@ from jonex_core.common.neo4j_client import get_neo4j_driver
 
 from ..models import DocStatus, OntologyStatus
 from ..repository import KnowledgeDocumentRepository, OntologyGraphRepository
+from .document_service import DocumentService  # [jonex] O7 残留扫描复用
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,117 @@ _V2_STAGE_KEYS = frozenset({
 
 # [jonex] P1-1：created/queued 是排队等待，不算入 worker 端到端耗时
 _QUEUE_KEYS = frozenset({"created", "queued"})
+
+
+# [jonex] §10.2.3 引用关系：候选值长度上限（实体名不长，超长自由文本不可能命中）
+_REF_CANDIDATE_MAX_LEN = 40
+# 单文档引用候选值上限（防超大表把 UNWIND 参数打到离谱）
+_REF_CANDIDATE_CAP = 3000
+
+# [jonex] 改动 52（S2）：KB 级 stub 实体占比告警阈值（§14.3 建议 30%）；
+# 超阈值 = 抽取管线异常信号（关系端点大量捏造空壳），修管线而不是静默保留。
+_STUB_ENTITY_RATIO_WARN_THRESHOLD = 0.30
+# 告警最小实体数：小 KB 样本不足，避免噪声
+_STUB_ENTITY_RATIO_MIN_TOTAL = 10
+
+
+def _stub_ratio_alert(total: int, stub: int,
+                      threshold: float = _STUB_ENTITY_RATIO_WARN_THRESHOLD,
+                      min_total: int = _STUB_ENTITY_RATIO_MIN_TOTAL) -> bool:
+    """纯函数：KB 级 stub 占比是否超阈值（total 过小时不告警）。"""
+    return total >= min_total and stub > 0 and (stub / total) > threshold
+
+
+def _table_reference_candidates(entities: list[dict]) -> list[str]:
+    """收集 row_as_object 表格实体的引用候选值（去重 + 上限保护）。
+
+    attributes 含属性组（§10.2.3 层级关系）时取叶子字符串。
+    """
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def push(v: str) -> None:
+        v = v.strip()
+        if not v or len(v) > _REF_CANDIDATE_MAX_LEN or v in seen:
+            return
+        seen.add(v)
+        values.append(v)
+
+    for ent in entities or []:
+        if ent.get("extraction_method") != "row_as_object":
+            continue
+        attrs = ent.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            continue
+        for v in attrs.values():
+            if isinstance(v, dict):
+                for v2 in v.values():
+                    if isinstance(v2, str):
+                        push(v2)
+            elif isinstance(v, str):
+                push(v)
+        if len(values) >= _REF_CANDIDATE_CAP:
+            break
+    return values
+
+
+def _build_table_reference_relations(
+    entities: list[dict], hits: dict[str, tuple[str, str]],
+) -> list[dict]:
+    """[jonex] §10.2.3 引用关系：列值精确命中 KB 内其他实体 → 建边。
+
+    仅处理 row_as_object 表格实体；命中目标为实体自身（canonical_name
+    相同，含命中自身别名）时跳过（自引用）。关系类型 = 该列名（
+    column_mapping 已在 build_objects 落成标准键名）；源 = 行实体，
+    目标 = 命中的正式实体，source_chunks 沿用行锚点。
+    """
+    rels: list[dict] = []
+    seen: set[tuple] = set()
+    for ent in entities or []:
+        if ent.get("extraction_method") != "row_as_object":
+            continue
+        source_name = ent.get("canonical_name") or ""
+        if not source_name:
+            continue
+        source_type = ent.get("entity_type") or "unknown"
+        source_chunks = ent.get("source_chunks") or []
+
+        def emit(col: str, value: str) -> None:
+            value = value.strip()
+            if not value or len(value) > _REF_CANDIDATE_MAX_LEN:
+                return
+            hit = hits.get(value)
+            if not hit:
+                return
+            tgt_type, tgt_name = hit
+            if tgt_name == source_name:
+                return  # 自引用（含命中自身别名）
+            sig = (source_name, tgt_name, col)
+            if sig in seen:
+                return
+            seen.add(sig)
+            rels.append({
+                "source_name": source_name,
+                "source_type": source_type,
+                "target_name": tgt_name,
+                "target_type": tgt_type,
+                "relation_type": col or "引用",
+                "confidence": 1.0,
+                "source_chunks": source_chunks,
+            })
+
+        attrs = ent.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            continue
+        for col, v in attrs.items():
+            if isinstance(v, dict):
+                for leaf_col, leaf_v in v.items():
+                    if isinstance(leaf_v, str):
+                        emit(leaf_col, leaf_v)
+            elif isinstance(v, str):
+                emit(col, v)
+
+    return rels
 
 
 def _normalize_stage_timings(raw):
@@ -522,7 +634,7 @@ class ReconciliationService:
             kb_type = (doc.extra_metadata or {}).get("kb_type")
             if not kb_type:
                 from .kb_type_service import get_kb_type
-                kb_type = await get_kb_type(tenant_id, doc.knowledge_base_id)
+                kb_type = await get_kb_type(doc.tenant_id, doc.knowledge_base_id)
 
             if kb_type != "openkb" and doc.status in (DocStatus.PARSING.value, DocStatus.INGESTING.value):
                 current_step = status_info.get("current_step") or ""
@@ -653,26 +765,72 @@ class ReconciliationService:
                 hash_cache = await gdao.get_embedding_hashes(doc.tenant_id, kb_id)
                 for ent in ont_data.get("entities", []):
                     await gdao.merge_entity(doc.tenant_id, kb_id, doc.id, ent, hash_cache=hash_cache)
+                # [jonex] §10.2.3 引用关系：表格对象列值精确命中 KB 内其他
+                # 实体 → 建边（源=行实体，关系类型=列标准属性名）。实体全部
+                # 写图后批量查命中，再并入关系写入（复用 merge_relation 端点
+                # 解析，两端均为正式实体不会捏造 stub）；失败降级只丢关系。
+                ref_rels: list = []
+                try:
+                    candidates = _table_reference_candidates(
+                        ont_data.get("entities", []),
+                    )
+                    hits = await gdao.find_reference_hits(
+                        doc.tenant_id, kb_id, candidates,
+                    )
+                    ref_rels = _build_table_reference_relations(
+                        ont_data.get("entities", []), hits,
+                    )
+                except Exception as exc:  # noqa: BLE001 — 引用关系失败不阻断写图
+                    logger.warning(
+                        "Table reference relations skipped (degraded): doc_id=%s err=%s",
+                        doc.id, exc,
+                    )
                 for rel in ont_data.get("relations", []):
+                    await gdao.merge_relation(doc.tenant_id, kb_id, doc.id, rel)
+                for rel in ref_rels:
                     await gdao.merge_relation(doc.tenant_id, kb_id, doc.id, rel)
                 neo4j_write_ms = int((time.perf_counter() - _t_neo4j) * 1000)
                 logger.info(
-                    "Ontology written: doc_id=%s, entities=%d, relations=%d",
+                    "Ontology written: doc_id=%s, entities=%d, relations=%d, "
+                    "ref_relations=%d",
                     doc.id,
                     len(ont_data.get("entities", [])),
                     len(ont_data.get("relations", [])),
+                    len(ref_rels),
                 )
             except Exception as e:
                 neo4j_write_ms = int((time.perf_counter() - _t_neo4j) * 1000)
                 logger.error("Neo4j ontology write failed for doc %s: %s", doc.id, e)
                 neo4j_ok = False
 
+            # [jonex] 改动 52（S2）：写图成功后做 KB 级 stub 占比聚合，
+            # 超阈值告警（抽取管线异常信号）。聚合失败只降级记日志，
+            # 不影响文档 READY 流转。
+            if neo4j_ok:
+                try:
+                    stub_stats = await gdao.stub_entity_stats(
+                        doc.tenant_id, kb_id,
+                    )
+                    if _stub_ratio_alert(stub_stats["total"], stub_stats["stub"]):
+                        logger.warning(
+                            "Ontology stub entity ratio over threshold: kb_id=%s "
+                            "doc_id=%s total=%d stub=%d ratio=%.1f%%",
+                            kb_id, doc.id,
+                            stub_stats["total"], stub_stats["stub"],
+                            stub_stats["ratio"] * 100,
+                        )
+                except Exception as exc:  # noqa: BLE001 — 观测信号，失败不阻断
+                    logger.warning(
+                        "Stub entity ratio aggregation failed (degraded): "
+                        "kb_id=%s err=%s", kb_id, exc,
+                    )
+
         # [jonex] kb_type：openkb 管线只解析、不做本体抽取
         # 优先读 extra_metadata 快照（缓存），再查 knowledge_info 权威源兜底
         kb_type = (doc.extra_metadata or {}).get("kb_type")
         if not kb_type:
             from .kb_type_service import get_kb_type
-            kb_type = await get_kb_type(tenant_id, doc.knowledge_base_id)
+            kb_type = await get_kb_type(doc.tenant_id, doc.knowledge_base_id)
 
         # Step 2: PG status update
         async with get_db_session() as session:
@@ -687,6 +845,41 @@ class ReconciliationService:
             fm.pop("death_verdict_count", None)
             fm.pop("death_verdict_reason", None)
             fm.pop("death_verdict_error", None)
+            # [jonex] 多模态转写警告（原子侧 _record_multimodal_warning → server-v2 状态
+            # 接口白名单 → status_info）：**覆盖写**，reparse 后不累积重复条目（无警告时
+            # 清掉旧 key，reparse 成功后旧失败警告不残留）。与编译侧 llm_wiki_compile_warnings
+            # 并列两个来源——不写该列（编译侧 compiling/stale 会清空，对账 READY 写入
+            # 会在编译开始时丢失）。
+            mw = status_info.get("multimodal_warnings") or []
+            if mw:
+                fm["multimodal_warnings"] = mw
+            else:
+                fm.pop("multimodal_warnings", None)
+            # [jonex] §table-grid-v2 O7: 新旧格式 chunk 残留扫描（读操作，失败不
+            # 阻塞收尾）。残留 > 0 → extra_metadata 留警告（前端文档详情可见）；
+            # 无残留 → 清掉旧 key（reparse 成功后旧警告不残留）。openkb 跳过。
+            if kb_type != "openkb":
+                try:
+                    scan = await DocumentService().scan_stale_chunks(
+                        doc.tenant_id, doc.id,
+                    )
+                    stale_count = scan.get("stale_chunk_count") or 0
+                    if stale_count:
+                        fm["stale_chunks_detected"] = {
+                            "count": stale_count,
+                            "chunk_ids": [
+                                s.get("chunk_id")
+                                for s in scan.get("stale_chunks", [])
+                                if s.get("chunk_id")
+                            ][:20],
+                            "scanned_at": datetime.now().isoformat(),
+                        }
+                    else:
+                        fm.pop("stale_chunks_detected", None)
+                except Exception as exc:  # noqa: BLE001 — 扫描失败不影响状态收尾
+                    logger.warning(
+                        "O7 stale-chunk scan failed for doc %s: %s", doc.id, exc,
+                    )
             fresh.extra_metadata = fm
 
             if kb_type == "openkb":
@@ -1322,26 +1515,33 @@ class ReconciliationService:
         # → 立即返回（不等待编译）。终态（compiled/failed）由 patrol_openkb_compile
         # 轮询任务状态回写，sidecar 同步超时不再能打断编译。
         compiler = KnowledgeCompilerService()
-        if not await compiler.claim_compile(doc.tenant_id, doc.id):
+        # [jonex] LLM-Wiki Schema fencing（方案 §6）：读 active 版本 → claim 绑定
+        # target → task 文件带同一版本（patrol 回写 applied 闭环）
+        target_ver = await compiler.get_active_schema_version(doc.tenant_id, kb_id)
+        if not await compiler.claim_compile(doc.tenant_id, doc.id,
+                                            target_schema_version=target_ver):
             logger.info("[jonex] OpenKB compile claim 未抢到（已 compiling 或并发双投）doc=%s", doc.id)
             return
         try:
+            _artifact = {
+                "document_id": doc.id,
+                "source_file_path": doc.file_path or "",
+                "parsed_markdown_path": rel_md,       # 相对 inputs 卷根
+                "assets_dir": rel_assets,             # 相对 inputs 卷根（可空）
+                "parser": status_info.get("parser", "mineru"),
+                "metadata": {
+                    "pages": status_info.get("pages", 0),
+                    "title": doc.file_name or "",
+                    "rag_task_id": doc.rag_task_id,
+                },
+            }
+            if target_ver is not None:
+                _artifact["wiki_schema_version"] = target_ver
             result = await compiler.submit_compile(
                 kb_name=kb_id,
                 tenant_id=doc.tenant_id,
                 kb_id=kb_id,
-                parsed_artifact={
-                    "document_id": doc.id,
-                    "source_file_path": doc.file_path or "",
-                    "parsed_markdown_path": rel_md,       # 相对 inputs 卷根
-                    "assets_dir": rel_assets,             # 相对 inputs 卷根（可空）
-                    "parser": status_info.get("parser", "mineru"),
-                    "metadata": {
-                        "pages": status_info.get("pages", 0),
-                        "title": doc.file_name or "",
-                        "rag_task_id": doc.rag_task_id,
-                    },
-                },
+                parsed_artifact=_artifact,
             )
             await compiler.set_task_id(doc.tenant_id, doc.id, result["task_id"])
             logger.info(
@@ -1479,6 +1679,8 @@ class ReconciliationService:
                     await self._record_openkb_status_by_id(
                         doc_id, tenant_id, status="compiled",
                         warnings=task.get("warnings") or [],
+                        # [jonex] §8.1：task 文件带出的版本 → applied 回写（fencing 闭环）
+                        applied_schema_version=task.get("wiki_schema_version"),
                     )
                     compiled += 1
                 elif tstatus == "failed":
@@ -1536,21 +1738,28 @@ class ReconciliationService:
             md = openkb_artifact_path(r.id)
             if not md.is_file():
                 continue
-            if not await compiler.claim_compile(r.tenant_id, r.id):
+            # [jonex] LLM-Wiki Schema fencing（方案 §6）：补提交同样带版本
+            _tver = await compiler.get_active_schema_version(r.tenant_id,
+                                                             r.knowledge_base_id)
+            if not await compiler.claim_compile(r.tenant_id, r.id,
+                                                target_schema_version=_tver):
                 continue
             try:
+                _artifact = {
+                    "document_id": r.id,
+                    "source_file_path": "",
+                    "parsed_markdown_path": f"parsed/{r.id}/content.md",
+                    "assets_dir": f"parsed/{r.id}/assets"
+                    if (md.parent / "assets").is_dir() else "",
+                    "parser": "mineru",
+                    "metadata": {"pages": 0, "title": "", "recompile": True},
+                }
+                if _tver is not None:
+                    _artifact["wiki_schema_version"] = _tver
                 result = await compiler.submit_compile(
                     kb_name=r.knowledge_base_id, tenant_id=r.tenant_id,
                     kb_id=r.knowledge_base_id,
-                    parsed_artifact={
-                        "document_id": r.id,
-                        "source_file_path": "",
-                        "parsed_markdown_path": f"parsed/{r.id}/content.md",
-                        "assets_dir": f"parsed/{r.id}/assets"
-                        if (md.parent / "assets").is_dir() else "",
-                        "parser": "mineru",
-                        "metadata": {"pages": 0, "title": "", "recompile": True},
-                    },
+                    parsed_artifact=_artifact,
                 )
                 await compiler.set_task_id(r.tenant_id, r.id, result["task_id"])
                 submitted += 1
@@ -1562,8 +1771,13 @@ class ReconciliationService:
         return submitted
 
     async def _record_openkb_status_by_id(self, document_id: str, tenant_id: str, *,
-                                          status: str, error: str = "", warnings=None) -> None:
-        """[jonex] 按 id+tenant 回写 LLM-Wiki 编译状态（列化；巡检无 ORM 对象场景）。"""
+                                          status: str, error: str = "", warnings=None,
+                                          applied_schema_version: int | None = None) -> None:
+        """[jonex] 按 id+tenant 回写 LLM-Wiki 编译状态（列化；巡检无 ORM 对象场景）。
+
+        applied_schema_version：编译 completed 时回写 llm_wiki_applied_schema_version
+        （§8.1 版本 fencing 闭环）；值为 None 时不改动该列。
+        """
         try:
             async with get_db_session() as session:
                 repo = KnowledgeDocumentRepository(session)
@@ -1579,6 +1793,8 @@ class ReconciliationService:
                     fresh.llm_wiki_compile_warnings = warnings or None
                 if status == "compiled":
                     fresh.llm_wiki_compiled_at = datetime.utcnow()
+                if applied_schema_version is not None:
+                    fresh.llm_wiki_applied_schema_version = applied_schema_version
                 session.add(fresh)
                 await session.commit()
         except Exception:

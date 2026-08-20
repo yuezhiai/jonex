@@ -15,7 +15,7 @@ export interface MenuItem {
   path?: string;
   icon?: string;
   label: string;
-  roles?: string[];
+  permissionCode?: string;
   children?: MenuItem[];
 }
 
@@ -23,7 +23,7 @@ export interface MenuItem {
 export interface RouteMenuMeta {
   icon?: string;
   order?: number;
-  roles?: string[];
+  permissionCode?: string;
   hidden?: boolean;
 }
 
@@ -62,6 +62,6 @@ export function getMenuFromRoutes(routes: Array<{ children?: MenuRoute[] }>, t: 
       path: `/${r.path}`,
       icon: r.menu?.icon,
       label: r.title ? t(r.title) : r.path || '',
-      roles: r.menu?.roles,
+      permissionCode: r.menu?.permissionCode,
     }));
 }

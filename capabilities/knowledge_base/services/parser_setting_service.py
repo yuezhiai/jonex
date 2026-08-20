@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 # 解析器类目的展示排序（仅用于列表排序，非枚举约束；未列出的类目排在最后按字母序）
 PARSER_TYPE_ORDER = ["document", "txt", "image", "audio", "video", "web", "cad"]
 
+# parser_type -> 平台推荐解析器 parser_config_id（新建 KB 自动初始化时关联）。
+# 与 business_domain.parser_configs 种子数据（006_seed_data.sql）保持一致；
+# video 选 video_full_pipeline（VLM，系统默认管线），非 video_mps（可选增强）。
+RECOMMENDED_PARSER_BY_TYPE: dict[str, str] = {
+    "document": "document_parse",
+    "txt": "text_parse",
+    "image": "image_parse",
+    "audio": "audio_transcribe",
+    "video": "video_full_pipeline",
+}
+
 
 class ParserSettingService:
     """知识库解析引擎设置 CRUD（按 parser_type 类目组织）。"""
@@ -278,9 +289,9 @@ class ParserSettingService:
             await session.execute(
                 text(
                     "SELECT parser_type, status FROM business_domain.parser_configs "
-                    "WHERE id = :pid AND tenant_id = :tid AND is_deleted = 0"
+                    "WHERE id = :pid AND is_deleted = 0"
                 ),
-                {"pid": parser_config_id, "tid": tenant_id},
+                {"pid": parser_config_id},
             )
         ).first()
         if row is None:
@@ -309,14 +320,14 @@ class ParserSettingService:
 
     async def _load_parsers(self, session, tenant_id: str, *, active_only: bool) -> list[dict[str, Any]]:
         status_clause = "AND status = 'active'" if active_only else ""
+        # parser_configs 已平台共享化（无 tenant_id 列），全租户共读同一目录
         result = await session.execute(text(f"""
             SELECT id, name, parser_type, file_types, config_json, status
               FROM business_domain.parser_configs
-             WHERE tenant_id = :tenant_id
-               AND is_deleted = 0
+             WHERE is_deleted = 0
                {status_clause}
              ORDER BY created_at ASC
-        """), {"tenant_id": tenant_id})
+        """))
         return [dict(row._mapping) for row in result]
 
     @staticmethod
@@ -415,4 +426,4 @@ class ParserSettingService:
         return str(value)
 
 
-__all__ = ["ParserSettingService"]
+__all__ = ["ParserSettingService", "RECOMMENDED_PARSER_BY_TYPE"]

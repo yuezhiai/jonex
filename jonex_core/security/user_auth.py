@@ -17,6 +17,7 @@ from fastapi import Depends, Header
 from jonex_core.common.config import get_config
 from jonex_core.common.exceptions import TokenExpiredError, PermissionDeniedError
 from jonex_core.common.i18n import translate
+from jonex_core.common.tenant import require_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +39,25 @@ class UserAuth:
     def verify_password(self, password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(password.encode(), password_hash.encode())
 
-    def _create_token(self, user, expires_delta: timedelta, token_type: str) -> str:
+    def _create_token(self, user, roles: list[str] | None, expires_delta: timedelta, token_type: str) -> str:
         now = datetime.now(timezone.utc)
         payload = {
             "sub": str(user.id),
             "tenant_id": user.tenant_id,
             "username": user.username,
             "role": user.role,
+            "roles": roles or [],
             "type": token_type,
             "exp": now + expires_delta,
             "iat": now,
         }
         return jwt.encode(payload, self.secret, algorithm=self.algorithm)
 
-    def create_access_token(self, user) -> str:
-        return self._create_token(user, timedelta(hours=self.access_expire_hours), "user")
+    def create_access_token(self, user, roles: list[str] | None = None) -> str:
+        return self._create_token(user, roles, timedelta(hours=self.access_expire_hours), "user")
 
-    def create_refresh_token(self, user) -> str:
-        return self._create_token(user, timedelta(days=self.refresh_expire_days), "refresh")
+    def create_refresh_token(self, user, roles: list[str] | None = None) -> str:
+        return self._create_token(user, roles, timedelta(days=self.refresh_expire_days), "refresh")
 
     def decode_token(self, token: str) -> dict:
         try:
@@ -94,10 +96,24 @@ def get_user_auth() -> UserAuth:
 
 
 async def get_current_user(authorization: str = Header(...)) -> dict:
-    """FastAPI 依赖：从 Bearer token 解析当前用户（仅在 Sidecar 中使用）"""
+    """FastAPI 依赖：从 Bearer token 解析当前用户（Sidecar / platform 共用）。
+
+    platform 侧 require_admin 收严后，mcp_* 30 端点经此依赖做 JWT 校验。
+    本地调试/演示用测试 token ``jonex_test_{tenant_id}`` 无法 JWT 解码，
+    此处特判映射为 admin 用户兜底（与 Sidecar ``_tenant_from_authorization`` 一致），
+    否则本地调试所有 admin 端点一律 401。
+    """
     if not authorization.startswith("Bearer "):
         raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
     token = authorization[7:]
+    if token.startswith("jonex_test_"):
+        return {
+            "user_id": 0,
+            "tenant_id": require_tenant(token.removeprefix("jonex_test_")),
+            "username": "test_token",
+            "role": "admin",
+            "roles": ["admin"],
+        }
     auth = get_user_auth()
     payload = auth.decode_token(token)
     return {
@@ -105,24 +121,30 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
         "tenant_id": payload["tenant_id"],
         "username": payload["username"],
         "role": payload["role"],
+        "roles": payload.get("roles") or ([payload.get("role")] if payload.get("role") else []),
     }
 
 
 def require_role(*roles: str):
-    """FastAPI 依赖工厂：校验用户角色"""
+    """FastAPI 依赖工厂（sync）：校验用户角色（roles 数组口径）。"""
 
     async def _check_role(current_user: dict = Depends(get_current_user)):
-        if current_user["role"] not in roles:
+        user_roles = set(current_user.get("roles") or [])
+        if not (user_roles & set(roles)):
             raise PermissionDeniedError(
-                message=translate("err.auth.insufficient_role", params={"required": ', '.join(roles), "current": current_user['role']}, fallback=f"需要角色: {', '.join(roles)}，当前角色: {current_user['role']}")
+                message=translate(
+                    "err.auth.insufficient_role",
+                    params={"required": ", ".join(roles), "current": ", ".join(user_roles)},
+                    fallback=f"需要角色: {', '.join(roles)}",
+                )
             )
         return current_user
 
     return _check_role
 
 
-def require_admin():
-    """FastAPI 依赖工厂：要求 admin 角色。
+async def require_admin(current_user: dict = Depends(get_current_user)):
+    """依赖本身（非工厂）：roles 数组含 'admin' 或「系统管理员」角色名放行。
 
     用法::
 
@@ -132,4 +154,13 @@ def require_admin():
 
     非 admin 用户调用返回 403 PermissionDeniedError。
     """
-    return require_role("admin")
+    user_roles = set(current_user.get("roles") or [])
+    if not (user_roles & {"admin", "系统管理员"}):
+        raise PermissionDeniedError(
+            message=translate(
+                "err.auth.insufficient_role",
+                params={"required": "admin/系统管理员", "current": ", ".join(user_roles)},
+                fallback="需要角色: admin/系统管理员",
+            )
+        )
+    return current_user

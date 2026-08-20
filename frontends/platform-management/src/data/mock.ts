@@ -114,7 +114,7 @@ export const MOCK_USERS: User[] = [
     username: 'admin',
     displayName: '系统管理员',
     email: 'admin@jonex.ai',
-    roles: ['admin'],
+    roles: ['系统管理员'],
     tenantName: '默认租户',
     status: 'active',
     lastLogin: '2026-05-23 08:30',

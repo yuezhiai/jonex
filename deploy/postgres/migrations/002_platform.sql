@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS platform.permissions (
     resource VARCHAR(128) NOT NULL,
     action VARCHAR(64) NOT NULL,
     description VARCHAR(512),
+    scope VARCHAR(16) NOT NULL DEFAULT 'tenant',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -126,6 +127,7 @@ CREATE TABLE IF NOT EXISTS platform.role_permissions (
 CREATE INDEX IF NOT EXISTS idx_rp_tenant ON platform.role_permissions(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_rp_role ON platform.role_permissions(role_id);
 CREATE INDEX IF NOT EXISTS idx_rp_perm ON platform.role_permissions(permission_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_role_permissions ON platform.role_permissions(tenant_id, role_id, permission_id);
 
 -- 用户-角色关联表
 CREATE TABLE IF NOT EXISTS platform.user_roles (
@@ -140,6 +142,7 @@ CREATE TABLE IF NOT EXISTS platform.user_roles (
 CREATE INDEX IF NOT EXISTS idx_ur_tenant ON platform.user_roles(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_ur_user ON platform.user_roles(user_id);
 CREATE INDEX IF NOT EXISTS idx_ur_role ON platform.user_roles(role_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_roles ON platform.user_roles(tenant_id, user_id, role_id);
 
 -- 菜单表
 CREATE TABLE IF NOT EXISTS platform.menus (
@@ -152,6 +155,7 @@ CREATE TABLE IF NOT EXISTS platform.menus (
     sort_order SMALLINT DEFAULT 0,
     visible SMALLINT DEFAULT 1,
     status SMALLINT DEFAULT 1,
+    permission_code VARCHAR(128),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted SMALLINT DEFAULT 0
@@ -307,19 +311,22 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_daily_tenant
     ON metering.llm_usage_daily (tenant_id, day_local);
 
 -- MCP Key 鉴权表（v1.2 MCP Server）
--- v1.3 Phase 07: 新增 expires_at（有效期）、org_id（归属组织）
+-- v1.3 Phase 07: 新增 expires_at（有效期）
+-- v1.4 Phase 16: 新增 note（用途描述）、disabled_at（停用态）；下线组织维度（D8）
 CREATE TABLE IF NOT EXISTS platform.mcp_keys (
     id              VARCHAR(64) PRIMARY KEY,
     tenant_id       VARCHAR(64) NOT NULL,
     name            VARCHAR(255) NOT NULL DEFAULT '',
+    note            VARCHAR(512),
     key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
     key_hash        VARCHAR(64) NOT NULL,
-    permissions     VARCHAR(512) NOT NULL DEFAULT 'read',
+    permissions     VARCHAR(512) NOT NULL DEFAULT 'view',
     allowed_kb_ids  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    space_id        VARCHAR(64),
     created_by      VARCHAR(128),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at      TIMESTAMPTZ,
-    org_id          VARCHAR(64),
+    disabled_at     TIMESTAMPTZ,
     revoked_at      TIMESTAMPTZ,
     last_used_at    TIMESTAMPTZ,
     last_used_ip    VARCHAR(64),
@@ -330,6 +337,9 @@ CREATE TABLE IF NOT EXISTS platform.mcp_keys (
 CREATE INDEX idx_mcp_keys_tenant_active
     ON platform.mcp_keys(tenant_id)
     WHERE revoked_at IS NULL;
+
+CREATE INDEX idx_mcp_keys_space
+    ON platform.mcp_keys(space_id);
 
 -- MCP Key ↔ 领域服务映射中间表（v1.3 Phase 2 B2 前置）
 -- v1.3 Phase 07: 新增 permission_level（权限级别）
@@ -346,20 +356,6 @@ CREATE INDEX IF NOT EXISTS idx_mk_sv_mapping_key
 CREATE INDEX IF NOT EXISTS idx_mk_sv_mapping_service
     ON platform.mcp_key_service_mappings(service_id);
 
--- MCP Key 归属组织表（v1.3 Phase 07）
-CREATE TABLE IF NOT EXISTS platform.mcp_organizations (
-    id          VARCHAR(64) PRIMARY KEY,
-    tenant_id   VARCHAR(64) NOT NULL,
-    name        VARCHAR(255) NOT NULL,
-    description TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    is_deleted  INT NOT NULL DEFAULT 0,
-    UNIQUE(tenant_id, name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_mcp_orgs_tenant
-    ON platform.mcp_organizations(tenant_id);
-
 -- MCP 服务发布状态表
 -- 独立存储 MCP 发布状态，避免跨 capability 修改 knowledge_base schema
 CREATE TABLE IF NOT EXISTS platform.mcp_service_publish (
@@ -369,6 +365,9 @@ CREATE TABLE IF NOT EXISTS platform.mcp_service_publish (
     is_published    INT NOT NULL DEFAULT 0,
     published_at    TIMESTAMPTZ,
     published_by    VARCHAR(64),
+    tool            VARCHAR(128),
+    tool_description TEXT,
+    service_type    VARCHAR(32) NOT NULL DEFAULT 'domain',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ,
     UNIQUE(tenant_id, service_id)
@@ -383,3 +382,60 @@ CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_service
 CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_tenant_published
     ON platform.mcp_service_publish(tenant_id)
     WHERE is_published = 1;
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_pub_tool
+    ON platform.mcp_service_publish(tenant_id, tool)
+    WHERE tool IS NOT NULL;
+
+-- 领域服务 API Key 表（v1.4 Phase 15 DS-04）
+-- 明文 Key 仅在创建响应一次性返回，绝不落库（无明文列，仅存 key_hash）
+-- service_id 对应 knowledge_base.services.id；expires_at = NULL 表示永久有效
+CREATE TABLE IF NOT EXISTS platform.mcp_service_api_keys (
+    id          VARCHAR(64) PRIMARY KEY,
+    tenant_id   VARCHAR(64) NOT NULL,
+    service_id  VARCHAR(64) NOT NULL,
+    name        VARCHAR(255) NOT NULL DEFAULT '',
+    key_prefix  VARCHAR(32)  NOT NULL DEFAULT '',
+    key_hash    VARCHAR(64)  NOT NULL,
+    expires_at  TIMESTAMPTZ,
+    revoked_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_deleted  INT NOT NULL DEFAULT 0,
+    UNIQUE(key_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_tenant
+    ON platform.mcp_service_api_keys(tenant_id);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_service
+    ON platform.mcp_service_api_keys(tenant_id, service_id);
+
+-- 知识写入 Key 表（v1.4 Phase 17 WRITE-01）
+-- 明文 Key 仅在创建响应一次性返回，绝不落库（无明文列，仅存 key_hash）
+-- grants JSONB 存写入范围 [{kb, mode(all|specified), directories[]}]；
+-- space_id 由 grants[0].kb 反推、kb_id = grants[0].kb 冗余索引（17-02 计算）
+CREATE TABLE IF NOT EXISTS platform.mcp_write_keys (
+    id              VARCHAR(64) PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    name            VARCHAR(255) NOT NULL DEFAULT '',
+    key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
+    key_hash        VARCHAR(64) NOT NULL,
+    grants          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    space_id        VARCHAR(64),
+    kb_id           VARCHAR(64),
+    disabled_at     TIMESTAMPTZ,
+    revoked_at      TIMESTAMPTZ,
+    revoked_by      VARCHAR(128),
+    expires_at      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(128),
+    updated_at      TIMESTAMPTZ,
+    is_deleted      INT NOT NULL DEFAULT 0,
+    UNIQUE(key_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_tenant
+    ON platform.mcp_write_keys(tenant_id);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_kb
+    ON platform.mcp_write_keys(tenant_id, kb_id);

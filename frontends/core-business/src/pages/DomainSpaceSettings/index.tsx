@@ -13,7 +13,13 @@ import {
   InfoCircleOutlined,
 } from '@ant-design/icons';
 import { emitSpacesInvalidated } from '@jonex/shell-sdk';
-import { getSpace, updateSpace, getSpacePermissions, updateSpacePermissions } from '../../api/domainSpace';
+import {
+  getSpace,
+  updateSpace,
+  getSpacePermissions,
+  updateSpacePermissions,
+  type SpaceOwnerInfo,
+} from '../../api/domainSpace';
 import type { DomainSpace } from '../../types/domainSpace';
 import { userToPermMember, type PermMember } from '../../types/domainService';
 import { listUsers, type PlatformUser } from '../../api/user';
@@ -31,6 +37,9 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // 空间管理权限（owner/租户管理员）：基本信息保存、成员管理、删除空间统一按此控制
+  const canManage = space?.can_manage_permissions ?? false;
+
   // 基本信息
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -38,6 +47,8 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
 
   // 权限成员
   const [permMembers, setPermMembers] = useState<PermMember[]>([]);
+  // 空间创建者（owner 不落 space_permissions，后端响应层合成只读信息）
+  const [permOwner, setPermOwner] = useState<SpaceOwnerInfo | null>(null);
   const [permLoading, setPermLoading] = useState(false);
   const [permSaving, setPermSaving] = useState(false);
   const [permSearch, setPermSearch] = useState('');
@@ -73,41 +84,30 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
     if (!id) return;
     setPermLoading(true);
     try {
-      const perms = await getSpacePermissions(id);
-      if (perms.length > 0) {
-        const userMap = new Map<string, PlatformUser>();
-        try {
-          const userResult = await listUsers(1, 100);
-          for (const u of userResult.items) userMap.set(String(u.id), u);
-        } catch {
-          /* 用户名解析失败不影响展示 */
-        }
-        setPermMembers(
-          perms.map((p) => {
-            const uid = String(p.user_id);
-            const user = userMap.get(uid);
-            const role = (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager';
-            return user
-              ? userToPermMember(user, role)
-              : {
-                  id: uid,
-                  name: t('domainSpace.userPrefix', { id: uid.slice(0, 8) }),
-                  department: '',
-                  avatar: uid.charAt(0).toUpperCase(),
-                  avatarColor: '#94a3b8',
-                  role,
-                };
-          }),
-        );
-      } else {
-        setPermMembers([]);
-      }
+      const { permissions: perms, owner } = await getSpacePermissions(id);
+      setPermOwner(owner);
+      // 成员展示名直接来自后端 join 的 display_name（viewer/知识编辑者无 user:read）
+      setPermMembers(
+        perms.map((p) => {
+          const uid = String(p.user_id);
+          const name = p.display_name || t('domainSpace.userPrefix', { id: uid.slice(0, 8) });
+          const role = (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager';
+          return {
+            id: uid,
+            name,
+            department: '',
+            avatar: name.charAt(0).toUpperCase(),
+            avatarColor: '#94a3b8',
+            role,
+          };
+        }),
+      );
     } catch {
       setPermMembers([]);
     } finally {
       setPermLoading(false);
     }
-  }, [id]);
+  }, [id, t]);
 
   useEffect(() => {
     loadSpace();
@@ -286,7 +286,14 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
             />
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, paddingTop: 8 }}>
-            <Button type="primary" icon={<SaveOutlined />} loading={savingInfo} onClick={handleSaveInfo}>
+            <Button
+              type="primary"
+              icon={<SaveOutlined />}
+              loading={savingInfo}
+              disabled={!canManage}
+              title={canManage ? undefined : t('domainSpace.noManagePermission')}
+              onClick={handleSaveInfo}
+            >
               {t('common.save')}
             </Button>
           </div>
@@ -315,6 +322,8 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
           <div ref={userSelectRef} style={{ position: 'relative', marginBottom: 12 }}>
             <Button
               icon={<UserAddOutlined />}
+              disabled={!canManage}
+              title={canManage ? undefined : t('domainSpace.noManagePermission')}
               onClick={() => {
                 const willOpen = !userSelectOpen;
                 setUserSelectOpen(willOpen);
@@ -400,12 +409,38 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
               <div style={{ textAlign: 'center', padding: 24 }}>
                 <Spin />
               </div>
-            ) : filteredPermMembers.length === 0 ? (
+            ) : filteredPermMembers.length === 0 && !permOwner ? (
               <div style={{ textAlign: 'center', padding: 24, color: '#94a3b8', fontSize: 13 }}>
                 {permSearch ? t('domainSpace.noMatchMember') : t('domainSpace.noMembers')}
               </div>
             ) : (
-              filteredPermMembers.map((member) => (
+              <>
+              {/* 创建者（owner）：只读展示，不落 space_permissions、不可删/改角色 */}
+              {permOwner && (
+                <div className="yx-perm-user-row">
+                  <div className="yx-perm-avatar" style={{ background: '#3b82f6' }}>
+                    {(permOwner.display_name || permOwner.user_id).charAt(0).toUpperCase()}
+                  </div>
+                  <div className="yx-perm-user-info" style={{ flex: 1 }}>
+                    <div className="yx-perm-user-name">
+                      {permOwner.display_name || `ID: ${permOwner.user_id.slice(0, 8)}`}
+                    </div>
+                    <div className="yx-perm-user-dept">{t('domainSpace.ownerLabel')}</div>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: '#3b82f6',
+                      background: '#eff6ff',
+                      padding: '2px 10px',
+                      borderRadius: 10,
+                    }}
+                  >
+                    {t('domainSpace.ownerLabel')}
+                  </span>
+                </div>
+              )}
+              {filteredPermMembers.map((member) => (
                 <div key={member.id} className="yx-perm-user-row">
                   <div className="yx-perm-avatar" style={{ background: member.avatarColor }}>
                     {member.avatar}
@@ -421,6 +456,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                         name={`perm-${member.id}`}
                         value="viewer"
                         checked={member.role === 'viewer'}
+                        disabled={!canManage}
                         onChange={() => setMemberRole(member.id, 'viewer')}
                       />
                       {t('permission.view')}
@@ -431,11 +467,13 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                         name={`perm-${member.id}`}
                         value="manager"
                         checked={member.role === 'manager'}
+                        disabled={!canManage}
                         onChange={() => setMemberRole(member.id, 'manager')}
                       />
                       {t('permission.manage')}
                     </label>
                   </div>
+                  {canManage && (
                   <Button
                     type="text"
                     className="yx-perm-remove-btn"
@@ -445,12 +483,22 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                   >
                     <CloseOutlined />
                   </Button>
+                  )}
                 </div>
               ))
+              }
+              </>
             )}
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Button type="primary" icon={<SaveOutlined />} loading={permSaving} onClick={handleSavePermissions}>
+            <Button
+              type="primary"
+              icon={<SaveOutlined />}
+              loading={permSaving}
+              disabled={!canManage}
+              title={canManage ? undefined : t('domainSpace.noManagePermission')}
+              onClick={handleSavePermissions}
+            >
               {t('domainSpace.savePermission')}
             </Button>
           </div>
@@ -489,7 +537,14 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
               </p>
               <p style={{ fontSize: 13, color: '#64748b' }}>{t('domainSpace.deleteWarning')}</p>
             </div>
-            <Button danger type="primary" icon={<DeleteOutlined />} onClick={() => deleteRef.current?.open(space.name)}>
+            <Button
+              danger
+              type="primary"
+              icon={<DeleteOutlined />}
+              disabled={!canManage}
+              title={canManage ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => deleteRef.current?.open(space.name)}
+            >
               {t('domainSpace.deleteSpaceBtn')}
             </Button>
           </div>

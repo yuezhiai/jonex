@@ -20,8 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jonex_core.common.database import get_db
 from jonex_core.common.response import success_response
 from jonex_core.common.tenant import extract_tenant_id
-from jonex_core.common import require_admin
+from jonex_core.security.permission import require_permission
 from capabilities.platform.services.mcp_service import McpServiceService
+from capabilities.platform.services.mcp_service_api_key_service import McpServiceApiKeyService
+from capabilities.platform.dtos.mcp_service_api_key_dto import (
+    ApiKeyCreateRequest,
+    ApiKeyCreateResponse,
+)
 from capabilities.platform.dtos.mcp_service_dto import (
     AuthorizedKeyListResponse,
     AuthorizedKeyResponse,
@@ -34,6 +39,7 @@ from capabilities.platform.dtos.mcp_service_dto import (
     ServiceKeyPermissionUpdateRequest,
     TestCallRequest,
     TestCallResponse,
+    ToolConfigRequest,
 )
 
 router = APIRouter()
@@ -52,7 +58,7 @@ async def list_mcp_services(
     space_id: str | None = Query(default=None, max_length=64),
     status: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:read")),
 ):
     """E6: 领域服务列表（含 MCP 发布状态、关联 KB 数量）。
 
@@ -73,7 +79,7 @@ async def get_mcp_service_detail(
     service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:read")),
 ):
     """查询单个领域服务详情。
 
@@ -88,11 +94,30 @@ async def get_mcp_service_detail(
     )
 
 
+@router.put("/mcp-services/{service_id}/tool")
+async def save_tool_config(
+    service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
+    req: ToolConfigRequest = Body(..., description="Tool 配置（tool 名称 + 描述）"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_permission("mcp:write")),
+):
+    """DS-03: 保存领域服务的 MCP Tool 配置。
+
+    tool 命名仅支持英文字母、数字、下划线（DTO 层正则校验），
+    同租户内唯一（Service 层校验）。
+    """
+    tenant_id = extract_tenant_id(request)
+    svc = McpServiceService(db)
+    result = await svc.save_tool_config(tenant_id, service_id, req)
+    return success_response(data=result, message="Tool 配置已保存")
+
+
 @router.post("/mcp-services/sync")
 async def sync_mcp_services(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
     """E11: 手动从 knowledge_base 同步领域服务列表到 platform 发布表。
 
@@ -111,30 +136,36 @@ async def sync_mcp_services(
 # ==================== MCP 服务配置（从领域服务视角管理 Key） ====================
 
 
-@router.post("/mcp-services/{service_id}/keys")
+@router.post("/mcp-services/{service_id}/keys", deprecated=True)
 async def add_key_to_service(
     service_id: str = Path(..., description="领域服务 ID"),
     req: ServiceKeyAddRequest = Body(..., description="Key ID 和权限级别"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
-    """新增: 将已有 MCP Key 添加到领域服务授权列表"""
+    """新增: 将已有 MCP Key 添加到领域服务授权列表
+
+    @deprecated 服务侧 Key 管理已收口到 /mcp-keys（MCP Key 管理），本端点保留内部兼容，请勿新增调用。
+    """
     tenant_id = extract_tenant_id(request)
     svc = McpServiceService(db)
     result = await svc.add_key_to_service(tenant_id, service_id, req)
     return success_response(data=result, message="已添加授权")
 
 
-@router.post("/mcp-services/{service_id}/keys/new")
+@router.post("/mcp-services/{service_id}/keys/new", deprecated=True)
 async def create_key_for_service(
     service_id: str = Path(..., description="领域服务 ID"),
     req: ServiceKeyCreateRequest = Body(..., description="新 Key 参数"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
-    """新增: 创建新 MCP Key 并自动关联到领域服务"""
+    """新增: 创建新 MCP Key 并自动关联到领域服务
+
+    @deprecated 服务侧 Key 管理已收口到 /mcp-keys（MCP Key 管理），本端点保留内部兼容，请勿新增调用。
+    """
     tenant_id = extract_tenant_id(request)
     authorization_header = request.headers.get("Authorization")
     svc = McpServiceService(db)
@@ -144,16 +175,19 @@ async def create_key_for_service(
     return success_response(data=result, message="MCP Key 创建成功")
 
 
-@router.patch("/mcp-services/{service_id}/keys/{key_id}")
+@router.patch("/mcp-services/{service_id}/keys/{key_id}", deprecated=True)
 async def update_key_permission(
     service_id: str = Path(..., description="领域服务 ID"),
     key_id: str = Path(..., description="MCP Key ID"),
     req: ServiceKeyPermissionUpdateRequest = Body(...),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
-    """新增: 切换 Key 对领域服务的权限级别"""
+    """新增: 切换 Key 对领域服务的权限级别
+
+    @deprecated 服务侧 Key 管理已收口到 /mcp-keys（MCP Key 管理），本端点保留内部兼容，请勿新增调用。
+    """
     tenant_id = extract_tenant_id(request)
     svc = McpServiceService(db)
     result = await svc.update_key_permission(
@@ -162,15 +196,18 @@ async def update_key_permission(
     return success_response(data=result, message="权限已更新")
 
 
-@router.delete("/mcp-services/{service_id}/keys/{key_id}")
+@router.delete("/mcp-services/{service_id}/keys/{key_id}", deprecated=True)
 async def remove_key_from_service(
     service_id: str = Path(..., description="领域服务 ID"),
     key_id: str = Path(..., description="MCP Key ID"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
-    """新增: 移除 Key 对领域服务的授权"""
+    """新增: 移除 Key 对领域服务的授权
+
+    @deprecated 服务侧 Key 管理已收口到 /mcp-keys（MCP Key 管理），本端点保留内部兼容，请勿新增调用。
+    """
     tenant_id = extract_tenant_id(request)
     svc = McpServiceService(db)
     result = await svc.remove_key_from_service(tenant_id, service_id, key_id)
@@ -182,7 +219,7 @@ async def publish_service(
     service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
     """E7: 发布领域服务，标记为 MCP 可见。
 
@@ -200,7 +237,7 @@ async def unpublish_service(
     service_id: str = Path(..., description="领域服务 ID"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
     """E8: 取消发布领域服务。
 
@@ -219,18 +256,18 @@ async def test_call_service(
     req: TestCallRequest = Body(..., description="测试调用参数"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:write")),
 ):
-    """E9: 测试调用领域服务（一期模拟 RAG 回答）。
+    """E9: 测试调用领域服务。
 
-    不进行真实的 Sidecar invoke 调用，直接返回模拟回答。
+    通过 Sidecar invoke 真实调用 knowledge_base 的 search_service 返回 RAG 回答。
     """
     tenant_id = extract_tenant_id(request)
     svc = McpServiceService(db)
     result = await svc.test_call(tenant_id, service_id, req)
     return success_response(
         data=result.dict(),
-        message="测试调用完成（模拟）",
+        message="测试调用完成",
     )
 
 
@@ -239,7 +276,7 @@ async def get_authorized_keys(
     service_id: str = Path(..., description="领域服务 ID"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
-    _admin: dict = Depends(require_admin),
+    _admin: dict = Depends(require_permission("mcp:read")),
 ):
     """E10: 查看某服务的已授权 MCP Key 列表。
 
@@ -252,3 +289,60 @@ async def get_authorized_keys(
         data=result.dict(),
         message="查询成功",
     )
+
+
+# ==================== 领域服务 API Key（DS-04） ====================
+
+
+@router.post("/mcp-services/{service_id}/api-keys")
+async def create_service_api_key(
+    service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
+    req: ApiKeyCreateRequest = Body(..., description="API Key 创建参数"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_permission("mcp:write")),
+):
+    """DS-04: 为领域服务创建 API Key，一次性返回明文（yxm_ 前缀）。
+
+    明文仅在此响应中出现一次，后续无法通过任何 API 再次获取。
+    """
+    tenant_id = extract_tenant_id(request)
+    authorization_header = request.headers.get("Authorization")
+    svc = McpServiceApiKeyService(db)
+    result = await svc.create(tenant_id, service_id, req, authorization_header)
+    return success_response(
+        data=result.dict(),
+        message="领域服务 API Key 已创建",
+    )
+
+
+@router.get("/mcp-services/{service_id}/api-keys")
+async def list_service_api_keys(
+    service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_permission("mcp:read")),
+):
+    """DS-04: 查询某领域服务的 API Key 列表（脱敏，仅 key_prefix，不含 key_hash/明文）。"""
+    tenant_id = extract_tenant_id(request)
+    svc = McpServiceApiKeyService(db)
+    items = await svc.list(tenant_id, service_id)
+    return success_response(
+        data={"items": [item.dict() for item in items], "total": len(items)},
+        message="查询成功",
+    )
+
+
+@router.delete("/mcp-services/{service_id}/api-keys/{key_id}")
+async def revoke_service_api_key(
+    service_id: str = Path(..., description="领域服务 ID (knowledge_base.services.id)"),
+    key_id: str = Path(..., description="领域服务 API Key ID (32 字符 hex)"),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_permission("mcp:write")),
+):
+    """DS-04: 撤销领域服务 API Key（设置 revoked_at，状态派生为 revoked）。"""
+    tenant_id = extract_tenant_id(request)
+    svc = McpServiceApiKeyService(db)
+    await svc.revoke(tenant_id, service_id, key_id)
+    return success_response(message="领域服务 API Key 已撤销")

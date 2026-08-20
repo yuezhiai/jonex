@@ -16,6 +16,7 @@ from jonex_core.common.exceptions import ResourceNotFoundError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import extract_tenant_id
 from jonex_core.security.internal_auth import verify_internal_service
+from jonex_core.security.permission import require_permission
 
 from capabilities.platform.dtos.audit import AuditEntryBatch
 from capabilities.platform.services.audit_log_service import AuditLogService
@@ -37,6 +38,7 @@ async def list_audit_logs(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
     db=Depends(get_db),
+    _p: dict = Depends(require_permission("platform:audit:read")),
 ):
     """获取当前租户的审计日志分页列表"""
     tenant_id = extract_tenant_id(request)
@@ -61,6 +63,7 @@ async def list_audit_logs(
 async def list_audit_actions(
     request: Request,
     db=Depends(get_db),
+    _p: dict = Depends(require_permission("platform:audit:read")),
 ):
     """返回当前租户审计日志中已使用（去重、排序）的操作类型列表。
 
@@ -76,6 +79,7 @@ async def list_audit_actions(
 async def list_audit_resource_types(
     request: Request,
     db=Depends(get_db),
+    _p: dict = Depends(require_permission("platform:audit:read")),
 ):
     """返回当前租户审计日志中已使用（去重、排序）的资源类型列表。
 
@@ -92,6 +96,7 @@ async def get_audit_log_detail(
     request: Request,
     log_id: int,
     db=Depends(get_db),
+    _p: dict = Depends(require_permission("platform:audit:read")),
 ):
     """获取单条审计日志详情（含 response_body / error_stack）"""
     tenant_id = extract_tenant_id(request)

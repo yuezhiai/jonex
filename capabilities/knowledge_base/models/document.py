@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """Knowledge Base document entities."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
@@ -34,11 +34,16 @@ class OntologyStatus(str, Enum):
     FAILED = "failed"
 
 
+# 服务器本地时区，与 TimestampMixin 的 datetime.now()（naive 本地时间）落库口径一致。
+# 序列化出口据此补齐真实时区偏移（如 +08:00），避免 naive 值被硬标成 UTC 导致前端 +8h 偏差。
+_LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
 def _iso(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=_LOCAL_TZ)
     return value.isoformat()
 
 
@@ -93,6 +98,9 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     llm_wiki_compile_requested_at = Column(DateTime, nullable=True)
     llm_wiki_compiled_at = Column(DateTime, nullable=True)
     llm_wiki_task_id = Column(String(128), nullable=True, index=True)
+    # [jonex] LLM-Wiki Schema 版本 fencing（方案 llmwiki-schema-settings-execution-plan §6）
+    llm_wiki_target_schema_version = Column(Integer, nullable=True)
+    llm_wiki_applied_schema_version = Column(Integer, nullable=True)
 
     # 文档来源方式（冗余真实列）：api / api_push / storage / file，统计按此列分组
     folder_id = Column(String(64), nullable=True, index=True)
@@ -126,6 +134,9 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
             # [jonex] LLM-Wiki 编译状态（顶层字段，对齐 status/ontology_status）
             "llm_wiki_compile_status": self.llm_wiki_compile_status,
             "llm_wiki_compile_error": self.llm_wiki_compile_error,
+            # [jonex] LLM-Wiki Schema 版本 fencing（applied < target = 过期，方案 §6）
+            "llm_wiki_target_schema_version": self.llm_wiki_target_schema_version,
+            "llm_wiki_applied_schema_version": self.llm_wiki_applied_schema_version,
             "metadata": self.extra_metadata or {},
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),

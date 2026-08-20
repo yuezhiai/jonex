@@ -118,7 +118,7 @@ async def list_all_users(request: Request):
 async def list_users(
     request: Request,
     page: int = Query(1, ge=1, description="页码"),
-    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    page_size: int = Query(20, ge=1, le=500, description="每页条数"),
 ):
     """获取平台用户分页列表"""
     return await _proxy_platform(request, "users")
@@ -208,6 +208,12 @@ async def set_role_permissions(role_id: int, request: Request):
     return await _proxy_platform(request, f"roles/{role_id}/permissions")
 
 
+@router.get("/roles/{role_id}/users", summary="获取角色用户")
+async def get_role_users(role_id: int, request: Request):
+    """获取指定角色已分配的用户"""
+    return await _proxy_platform(request, f"roles/{role_id}/users")
+
+
 # ==================== 权限管理 ====================
 
 @router.get("/permissions", summary="获取权限列表")
@@ -226,6 +232,12 @@ async def list_permissions(
 async def get_menus(request: Request):
     """获取平台菜单树结构"""
     return await _proxy_platform(request, "menus")
+
+
+@router.get("/menus/my", summary="获取当前用户可见菜单树")
+async def get_my_menus(request: Request):
+    """按当前用户权限码过滤的菜单树（登录可见）"""
+    return await _proxy_platform(request, "menus/my")
 
 
 @router.post("/menus", summary="创建菜单")
@@ -416,30 +428,43 @@ async def reset_mcp_key(key_id: str, request: Request):
     return await _proxy_platform(request, f"mcp-keys/{key_id}/reset")
 
 
-# ==================== MCP 组织管理 ====================
-
-@router.post("/mcp-organizations", summary="创建组织")
-async def create_organization(request: Request):
-    """创建新的 MCP 组织"""
-    return await _proxy_platform(request, "mcp-organizations")
+# ==================== MCP 知识写入 Key ====================
 
 
-@router.get("/mcp-organizations", summary="获取组织列表")
-async def list_organizations(request: Request):
-    """获取租户下所有 MCP 组织"""
-    return await _proxy_platform(request, "mcp-organizations")
+@router.post("/mcp-write-keys", summary="创建知识写入 Key")
+async def create_mcp_write_key(request: Request):
+    """创建知识写入 Key（一次性返回明文 mcpw_... Key，HTTP 201）"""
+    return await _proxy_platform(request, "mcp-write-keys")
 
 
-@router.put("/mcp-organizations/{org_id}", summary="编辑组织")
-async def update_organization(org_id: str, request: Request):
-    """编辑 MCP 组织名称或描述"""
-    return await _proxy_platform(request, f"mcp-organizations/{org_id}")
+@router.get("/mcp-write-keys", summary="获取知识写入 Key 列表")
+async def list_mcp_write_keys(request: Request):
+    """获取租户下所有知识写入 Key 元数据（含已撤销，脱敏）"""
+    return await _proxy_platform(request, "mcp-write-keys")
 
 
-@router.delete("/mcp-organizations/{org_id}", summary="删除组织")
-async def delete_organization(org_id: str, request: Request):
-    """软删除 MCP 组织"""
-    return await _proxy_platform(request, f"mcp-organizations/{org_id}")
+@router.get("/mcp-write-keys/{key_id}", summary="获取知识写入 Key 详情")
+async def get_mcp_write_key(key_id: str, request: Request):
+    """获取单个知识写入 Key 详细信息（脱敏）"""
+    return await _proxy_platform(request, f"mcp-write-keys/{key_id}")
+
+
+@router.put("/mcp-write-keys/{key_id}", summary="编辑知识写入 Key")
+async def update_mcp_write_key(key_id: str, request: Request):
+    """编辑知识写入 Key 元数据（不重置 Key，不生成新明文）"""
+    return await _proxy_platform(request, f"mcp-write-keys/{key_id}")
+
+
+@router.post("/mcp-write-keys/{key_id}/toggle", summary="停用/启用知识写入 Key")
+async def toggle_mcp_write_key(key_id: str, request: Request):
+    """停用/启用知识写入 Key（可逆，key 不变）"""
+    return await _proxy_platform(request, f"mcp-write-keys/{key_id}/toggle")
+
+
+@router.post("/mcp-write-keys/{key_id}/revoke", summary="撤销知识写入 Key")
+async def revoke_mcp_write_key(key_id: str, request: Request):
+    """撤销知识写入 Key（设置 revoked_at，不可逆）"""
+    return await _proxy_platform(request, f"mcp-write-keys/{key_id}/revoke")
 
 
 # ==================== MCP 服务目录 ====================
@@ -487,6 +512,12 @@ async def get_authorized_keys(service_id: str, request: Request):
     return await _proxy_platform(request, f"mcp-services/{service_id}/authorized-keys")
 
 
+@router.put("/mcp-services/{service_id}/tool", summary="保存领域服务 Tool 配置")
+async def save_tool_config(service_id: str, request: Request):
+    """DS-03: 保存领域服务的 MCP Tool 配置（tool 名称 + 描述）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/tool")
+
+
 # ==================== MCP 服务配置 — 从领域服务视角管理 Key ====================
 
 
@@ -508,3 +539,34 @@ async def _update_key_permission(service_id: str, key_id: str, request: Request)
 @router.delete("/mcp-services/{service_id}/keys/{key_id}")
 async def _remove_key_from_service(service_id: str, key_id: str, request: Request):
     return await _proxy_platform(request, f"mcp-services/{service_id}/keys/{key_id}")
+
+
+@router.post("/mcp-services/{service_id}/keys/{key_id}/toggle")
+async def _toggle_key_for_service(service_id: str, key_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys/{key_id}/toggle")
+
+
+@router.post("/mcp-services/{service_id}/keys/{key_id}/recreate")
+async def _recreate_key_for_service(service_id: str, key_id: str, request: Request):
+    return await _proxy_platform(request, f"mcp-services/{service_id}/keys/{key_id}/recreate")
+
+
+# ==================== 领域服务 API Key（DS-04） ====================
+
+
+@router.post("/mcp-services/{service_id}/api-keys", summary="创建领域服务 API Key")
+async def create_service_api_key(service_id: str, request: Request):
+    """DS-04: 为领域服务创建 API Key（一次性返回明文 yxm_...）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/api-keys")
+
+
+@router.get("/mcp-services/{service_id}/api-keys", summary="查询领域服务 API Key 列表")
+async def list_service_api_keys(service_id: str, request: Request):
+    """DS-04: 查询某领域服务的 API Key 列表（脱敏）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/api-keys")
+
+
+@router.delete("/mcp-services/{service_id}/api-keys/{key_id}", summary="撤销领域服务 API Key")
+async def revoke_service_api_key(service_id: str, key_id: str, request: Request):
+    """DS-04: 撤销领域服务 API Key（设置 revoked_at）"""
+    return await _proxy_platform(request, f"mcp-services/{service_id}/api-keys/{key_id}")

@@ -27,25 +27,20 @@ const BasicLayout = () => {
   const VITE_LOGIN = (import.meta as any).env?.VITE_LOGIN || '/login';
   const VITE_APP_ID = (import.meta as any).env?.VITE_APP_ID || 'core-business';
 
-  const roleList = useMemo(() => {
-    if (!userInfo?.roles) return [];
-    if (Array.isArray(userInfo.roles)) return userInfo.roles;
-    return String(userInfo.roles)
-      .split(',')
-      .map((r) => r.trim())
-      .filter(Boolean);
-  }, [userInfo?.roles]);
+  const userPermissions = useMemo(
+    () => (Array.isArray(userInfo?.permissions) ? (userInfo?.permissions as string[]) : []),
+    [userInfo?.permissions],
+  );
 
   // 方案二：菜单从路由配置生成（routes.config.ts 的 menu 元数据）
   const allMenuItems = useMemo(() => getMenuFromRoutes(getRoutes(), t), [t]);
 
   const visibleMenuItems = useMemo(() => {
     return allMenuItems.filter((item) => {
-      if (!item.roles || item.roles.length === 0) return true;
-      if (roleList.length === 0) return true;
-      return item.roles.some((role) => roleList.includes(role));
+      if (!item.permissionCode) return true;
+      return userPermissions.includes(item.permissionCode);
     });
-  }, [allMenuItems, roleList]);
+  }, [allMenuItems, userPermissions]);
 
   const currentTitle = useMemo(() => {
     const routeMatches = matchRoutes(getRoutes() as any[], location);

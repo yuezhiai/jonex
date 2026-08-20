@@ -59,7 +59,8 @@ async def get_pool() -> asyncpg.Pool:
 async def get_service_permission_level(pool, key_id: str, service_id: str) -> str | None:
     """查询 mcp_key_service_mappings 的 permission_level。
 
-    返回 "write" / "call" / "read" / None（映射不存在）。层级: write > call > read。
+    返回 "call" / "view" / None（映射不存在）。层级: call > view。
+    （write 已移交写 Key，per jonex-29l，mapping 层不再返回 write）
 
     Args:
         pool: asyncpg 连接池

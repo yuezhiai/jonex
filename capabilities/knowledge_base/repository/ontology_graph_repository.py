@@ -17,6 +17,26 @@ from jonex_core.common.tenant import require_tenant
 logger = logging.getLogger(__name__)
 
 
+def _row_object_merge_key(entity: dict) -> Optional[dict]:
+    """[jonex] 改动 18（§10.2.5）：row_as_object 实体的增量 upsert 键。
+
+    表格对象按 ``(tenant_id, kb_id, table_signature, 主键值)`` upsert——
+    同一张表（列名签名相同）改一行不必全表重建；跨文档同模板的表
+    自然合并（doc_ids 累积）。非表格对象返回 None（沿用
+    ``(entity_type, canonical_name)`` 通用 MERGE 键）。
+    """
+    if (
+        entity.get("extraction_method") == "row_as_object"
+        and entity.get("table_sig")
+        and entity.get("pk_value")
+    ):
+        return {
+            "table_sig": entity["table_sig"],
+            "pk_value": entity["pk_value"],
+        }
+    return None
+
+
 class OntologyGraphRepository:
     """Ontology graph storage backed by Neo4j."""
 
@@ -58,37 +78,54 @@ class OntologyGraphRepository:
                     embedding = vec
                     embedding_hash_val = new_hash
 
-        cypher = """
-        MERGE (e:OntologyEntity {
-            tenant_id:$tenant_id, kb_id:$kb_id,
-            entity_type:$entity_type, canonical_name:$canonical_name
-        })
-        ON CREATE SET
-            e.aliases=$aliases, e.aliases_text=$aliases_text,
-            e.attributes=$attributes, e.confidence=$confidence,
-            e.description=$description,
-            e.doc_ids=[$doc_id], e.source_chunks=$source_chunks,
-            e.lightrag_doc_ids=$lightrag_doc_ids, e.extraction_method=$extraction_method,
-            e.embedding=$embedding, e.embedding_hash=$embedding_hash,
-            e.stub=false, e.created_at=timestamp(), e.updated_at=timestamp()
-        ON MATCH SET
-            e.aliases=$aliases, e.aliases_text=$aliases_text, e.attributes=$attributes,
-            e.description=CASE WHEN size($description) > size(coalesce(e.description,''))
-                THEN $description ELSE e.description END,
-            e.confidence=CASE WHEN $confidence>coalesce(e.confidence,0) THEN $confidence ELSE e.confidence END,
-            e.doc_ids=apoc.coll.toSet(coalesce(e.doc_ids,[])+[$doc_id]),
-            e.source_chunks=$source_chunks,
-            e.lightrag_doc_ids=apoc.coll.toSet(coalesce(e.lightrag_doc_ids,[])+$lightrag_doc_ids),
-            e.embedding=CASE WHEN $embedding IS NOT NULL THEN $embedding ELSE e.embedding END,
-            e.embedding_hash=CASE WHEN $embedding IS NOT NULL THEN $embedding_hash ELSE e.embedding_hash END,
-            e.stub=false, e.updated_at=timestamp()
-        """
+        # [jonex] 改动 18：表格对象按 (tenant, kb, table_sig, pk_value) upsert，
+        # 键不含 entity_type/canonical_name——类型判定或限定值变化时最新一版
+        # 覆盖旧版（同一行 upsert 语义）；非表格对象沿用通用 MERGE 键。
+        table_key = _row_object_merge_key(entity)
+        if table_key is not None:
+            merge_clause = (
+                "MERGE (e:OntologyEntity {tenant_id:$tenant_id, kb_id:$kb_id, "
+                "table_sig:$table_sig, pk_value:$pk_value})"
+            )
+            type_set = "e.entity_type=$entity_type, e.canonical_name=$canonical_name, "
+        else:
+            merge_clause = (
+                "MERGE (e:OntologyEntity {tenant_id:$tenant_id, kb_id:$kb_id, "
+                "entity_type:$entity_type, canonical_name:$canonical_name})"
+            )
+            type_set = ""
+        cypher = (
+            merge_clause + "\n"
+            "ON CREATE SET\n"
+            + type_set
+            + "e.aliases=$aliases, e.aliases_text=$aliases_text,\n"
+            "    e.attributes=$attributes, e.confidence=$confidence,\n"
+            "    e.description=$description,\n"
+            "    e.doc_ids=[$doc_id], e.source_chunks=$source_chunks,\n"
+            "    e.lightrag_doc_ids=$lightrag_doc_ids, e.extraction_method=$extraction_method,\n"
+            "    e.embedding=$embedding, e.embedding_hash=$embedding_hash,\n"
+            "    e.stub=false, e.created_at=timestamp(), e.updated_at=timestamp()\n"
+            "ON MATCH SET\n"
+            + type_set
+            + "e.aliases=$aliases, e.aliases_text=$aliases_text, e.attributes=$attributes,\n"
+            "    e.description=CASE WHEN size($description) > size(coalesce(e.description,''))\n"
+            "        THEN $description ELSE e.description END,\n"
+            "    e.confidence=CASE WHEN $confidence>coalesce(e.confidence,0) THEN $confidence ELSE e.confidence END,\n"
+            "    e.doc_ids=apoc.coll.toSet(coalesce(e.doc_ids,[])+[$doc_id]),\n"
+            "    e.source_chunks=$source_chunks,\n"
+            "    e.lightrag_doc_ids=apoc.coll.toSet(coalesce(e.lightrag_doc_ids,[])+$lightrag_doc_ids),\n"
+            "    e.embedding=CASE WHEN $embedding IS NOT NULL THEN $embedding ELSE e.embedding END,\n"
+            "    e.embedding_hash=CASE WHEN $embedding IS NOT NULL THEN $embedding_hash ELSE e.embedding_hash END,\n"
+            "    e.stub=false, e.updated_at=timestamp()\n"
+        )
         params = {
             "tenant_id": tenant_id,
             "kb_id": kb_id,
             "doc_id": doc_id,
             "canonical_name": entity["canonical_name"],
             "entity_type": entity["entity_type"],
+            "table_sig": entity.get("table_sig", ""),
+            "pk_value": entity.get("pk_value", ""),
             "aliases": entity.get("aliases", []),
             "aliases_text": " ".join(entity.get("aliases", [])),
             "attributes": json.dumps(entity.get("attributes", {}), ensure_ascii=False),
@@ -166,6 +203,43 @@ class OntologyGraphRepository:
         }
         async with self._driver.session() as session:
             await session.run(cypher, params)
+
+    async def find_reference_hits(
+        self, tenant_id: str, kb_id: str, values: list[str],
+    ) -> dict[str, tuple[str, str]]:
+        """[jonex] §10.2.3 引用关系：候选值批量精确命中查找。
+
+        返回 ``{值: (entity_type, canonical_name)}``——值精确命中 KB 内某
+        非 stub 实体的 canonical_name 或 aliases。多命中时 canonical_name
+        优先、confidence 降序取一（与 _resolve_endpoint 同优先级口径）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        values = [v for v in values if v]
+        if not values:
+            return {}
+        cypher = """
+        UNWIND $values AS v
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(e.stub,false)=false
+          AND (e.canonical_name=v OR v IN coalesce(e.aliases,[]))
+        WITH v, e
+        ORDER BY v, (CASE WHEN e.canonical_name=v THEN 0 ELSE 1 END),
+                 coalesce(e.confidence,0) DESC
+        WITH v, collect(e)[0] AS best
+        RETURN v AS value, best.entity_type AS entity_type,
+               best.canonical_name AS canonical_name
+        """
+        hits: dict[str, tuple[str, str]] = {}
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "values": values},
+            )
+            async for record in result:
+                hits[record["value"]] = (
+                    record["entity_type"] or "Unknown",
+                    record["canonical_name"],
+                )
+        return hits
 
     async def _resolve_entity_type(
         self,
@@ -528,6 +602,30 @@ class OntologyGraphRepository:
             result = await session.run(cypher, {"t": tenant_id, "k": kb_id})
             record = await result.single()
             return record["c"] if record else 0
+
+    async def stub_entity_stats(self, tenant_id: str, kb_id: str) -> dict:
+        """[jonex] 改动 52：KB 级 stub 实体聚合，返回
+        ``{total: int, stub: int, ratio: float}``（total=0 时 ratio=0）。
+
+        stub 节点 = 关系端点兜底创建的空壳（merge_relation 的 ON CREATE SET
+        ``stub=true, description='', attributes='{}'``），是抽取管线异常的
+        可观测信号；供写图后告警与 KB 统计接口使用。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+        RETURN count(e) AS total,
+               sum(CASE WHEN coalesce(e.stub,false) THEN 1 ELSE 0 END) AS stub
+        """
+        async with self._driver.session() as session:
+            result = await session.run(cypher, {"t": tenant_id, "k": kb_id})
+            record = await result.single()
+            if not record:
+                return {"total": 0, "stub": 0, "ratio": 0.0}
+            total = int(record["total"] or 0)
+            stub = int(record["stub"] or 0)
+            return {"total": total, "stub": stub,
+                    "ratio": (stub / total) if total else 0.0}
 
     async def count_relations(self, tenant_id: str, kb_id: str) -> int:
         """统计 kb 内本体关系数量（两端均为非 stub 正式实体）。"""

@@ -43,6 +43,9 @@ _HTMLTableRowExtractor = _utils._HTMLTableRowExtractor
 normalize_table_rows = _utils.normalize_table_rows
 pack_rows = _utils.pack_rows
 format_table_body = _utils.format_table_body
+fmt_row = _utils.fmt_row
+make_header_block = _utils.make_header_block
+split_row_by_cells = _utils.split_row_by_cells
 
 
 # ── _HTMLTableRowExtractor ────────────────────────────────────────────────
@@ -319,3 +322,125 @@ class TestFormatTableBodyHTML:
         """HTML that doesn't contain a recognizable table stays as-is."""
         result = format_table_body("<div>not a table</div>")
         assert result == "<div>not a table</div>"
+
+
+# ── split_row_by_cells (§C1-bis) ─────────────────────────────────────────
+
+
+def _self_describing_row(n_cols: int, cell_len: int) -> str:
+    """构造 self-describing 行文本：每格 ``列i: xxxx``，格长约 cell_len + 4。"""
+    header = [f"列{i}" for i in range(n_cols)]
+    padded = list(header) + [f"col_{i}" for i in range(len(header), n_cols)]
+    value = "值" * cell_len
+    row = [value] * n_cols
+    return fmt_row(row, padded, n_cols, use_markdown=False)
+
+
+class TestSplitRowByCells:
+    def test_empty_and_fit_rows(self):
+        assert split_row_by_cells("", 100) == []
+        segs = split_row_by_cells("短行", 100)
+        assert segs == [("短行", 0, 1)]
+
+    def test_cuts_at_cell_boundaries(self):
+        """§19.8 按单元格切：每格 50 字符 × 10 列，切点都落在 `` | `` 边界。"""
+        row_text = _self_describing_row(10, cell_len=50)
+        assert len(row_text) > 500  # 超长行（§19.8 的 3000 字符场景同构缩小）
+        segs = split_row_by_cells(row_text, budget=200)
+        assert len(segs) > 1, "超预算行必须被切成多段"
+        for seg_text, _, _ in segs:
+            assert len(seg_text) <= 200, f"段超预算: {len(seg_text)}"
+        # 非尾段切点都落在单元格边界（body 以 " | " 结尾）
+        for seg_text, _, _ in segs[:-1]:
+            assert seg_text.endswith(" | "), f"切点不在单元格边界: {seg_text[-20:]!r}"
+        # 每段可完整解析出「列名: 值」对（无单元格被切碎）：
+        # self-describing 格式下按 " | " 拆分出的格数 == cell 区间长度
+        # （非尾段末尾的空串来自边界切点，过滤掉）
+        for seg_text, cell_start, cell_end in segs:
+            cells = [c for c in seg_text.split(" | ") if c]
+            assert len(cells) == cell_end - cell_start, (
+                f"格数 {len(cells)} != 区间长度 {cell_end - cell_start}"
+            )
+        # cell 区间互不重叠且连续，覆盖 0..n_cells
+        assert segs[0][1] == 0
+        assert segs[-1][2] == 10
+        for prev, nxt in zip(segs, segs[1:]):
+            assert prev[2] == nxt[1], f"cell 区间断裂: {prev[2]} != {nxt[1]}"
+
+    def test_self_describing_no_column_names_added(self):
+        """§19.8 self-describing 不补列名：header_block 传空时续段无列名块。"""
+        row_text = _self_describing_row(10, cell_len=50)
+        segs = split_row_by_cells(row_text, budget=200)
+        # 续段不能以 markdown 表头（"| 列名 |"）开头——不补列名
+        for seg_text, _, _ in segs[1:]:
+            assert not seg_text.startswith("| 列0 |")
+        # 每格仍带自己的「列名: 」前缀（self-describing 天然自描述）
+        first_cells = [c for c in segs[0][0].split(" | ") if c]
+        assert all(": " in c for c in first_cells)
+
+    def test_markdown_adds_header_block(self):
+        """§19.8 markdown 补列名：每个子段都含 header_block。"""
+        header = [f"列{i}" for i in range(5)]
+        hb = make_header_block(header, 5, use_markdown=True)
+        row = ["值" * 400, "v2", "v3", "v4", "v5"]  # 第一格 400 字符
+        row_text = fmt_row(row, header, 5, use_markdown=True)
+        # 整行 422 字符、hb 62 字符 → budget=480 时 body_budget=417 < 422，
+        # 且第一格边界（405）完整落在窗口内 → 按格切、不硬切。
+        segs = split_row_by_cells(row_text, budget=480, header_block=hb)
+        assert len(segs) > 1
+        for seg_text, _, _ in segs:
+            assert seg_text.startswith(hb + "\n"), "续段缺失 markdown 表头块"
+            assert len(seg_text) <= 480
+
+    def test_caption_unconditionally_prefixed(self):
+        """§19.8 caption 无条件补：每段首行含表标题 + 续段标记。"""
+        row_text = _self_describing_row(10, cell_len=50)
+        caption_line = "表格明细：【测试表】（续：第 1 行）\n"
+        segs = split_row_by_cells(
+            row_text, budget=300, caption_line=caption_line,
+        )
+        assert len(segs) > 1
+        for seg_text, _, _ in segs:
+            assert seg_text.startswith(caption_line), "段缺失表标题"
+            assert len(seg_text) <= 300
+
+    def test_single_cell_exceeds_budget_hard_cut(self):
+        """§19.8 单个单元格超预算：退化字符硬切（非尾段段末不含 `` | ``）。"""
+        row_text = "列A: " + "x" * 1500
+        segs = split_row_by_cells(row_text, budget=400)
+        assert len(segs) > 1
+        for seg_text, _, _ in segs[:-1]:
+            assert not seg_text.endswith(" | "), "硬切段不可能以单元格边界结尾"
+        # 单格被劈：所有段 cell 区间都是 [0, 1)
+        assert all((s, e) == (0, 1) for _, s, e in segs)
+        for seg_text, _, _ in segs:
+            assert len(seg_text) <= 400
+
+    def test_cell_ranges_contiguous(self):
+        """§19.8 cell 区间锚点：多段切分时区间互不重叠且连续。"""
+        row_text = _self_describing_row(10, cell_len=50)
+        # 每格 54 字符（"列i: " + 50），每段装 3 格 → 区间 [0,3) [3,6) [6,9) [9,10)
+        segs = split_row_by_cells(row_text, budget=170)
+        assert len(segs) >= 3
+        assert segs[0][1] == 0
+        assert segs[-1][2] == 10
+        for prev, nxt in zip(segs, segs[1:]):
+            assert prev[2] == nxt[1]
+            assert prev[1] < prev[2] <= nxt[1]  # 单调推进且无重叠
+
+    def test_prefix_accounted_in_budget(self):
+        """header_block + caption_line 计入每段预算（§19.4）。"""
+        row_text = _self_describing_row(10, cell_len=50)
+        header = [f"列{i}" for i in range(5)]
+        hb = make_header_block(header, 5, use_markdown=True)
+        caption_line = "表格明细：【测试表】（续：第 1 行）\n"
+        prefix_len = len(caption_line) + len(hb) + 1
+        segs = split_row_by_cells(
+            row_text, budget=prefix_len + 180,
+            header_block=hb, caption_line=caption_line,
+        )
+        for seg_text, _, _ in segs:
+            assert len(seg_text) <= prefix_len + 180, (
+                f"段超预算: {len(seg_text)} > {prefix_len + 180}"
+            )
+            assert seg_text.startswith(caption_line + hb + "\n")
