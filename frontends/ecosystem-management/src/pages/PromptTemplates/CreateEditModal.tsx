@@ -44,7 +44,6 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
         content: getCurrentContent(template),
         status: template.status,
         version_remark: '',
-        target_version: '',
       });
     }
   }, [open, mode, template, form]);
@@ -119,12 +118,8 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
               <Input placeholder={t('promptTemplate.versionRemarkPlaceholder')} maxLength={512} />
             </Form.Item>
 
-            <Form.Item
-              name="target_version"
-              label={t('promptTemplate.targetVersion')}
-              extra={t('promptTemplate.targetVersionExtra')}
-            >
-              <Input placeholder={t('promptTemplate.targetVersionPlaceholder')} maxLength={32} />
+            <Form.Item label={t('promptTemplate.currentVersion')}>
+              <Input value={`v${template?.current_version || '1'}`} disabled />
             </Form.Item>
           </>
         )}
@@ -135,7 +130,27 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
 
         <Form.Item
           name="content"
-          label={t('promptTemplate.content')}
+          label={
+            mode === 'edit' ? (
+              <>
+                {t('promptTemplate.content')}
+                <span
+                  style={{
+                    marginLeft: 8,
+                    fontSize: 12,
+                    fontWeight: 'normal',
+                    color: 'rgba(0, 0, 0, 0.45)',
+                  }}
+                >
+                  {t('promptTemplate.contentVersionHintPrefix')}
+                  <span style={{ color: '#ff4d4f' }}>+1</span>
+                  {t('promptTemplate.contentVersionHintSuffix')}
+                </span>
+              </>
+            ) : (
+              t('promptTemplate.content')
+            )
+          }
           rules={[{ required: true, message: t('promptTemplate.contentRequired') }]}
           extra={t('promptTemplate.variableHint', {
             variable: '{{variable}}',

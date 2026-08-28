@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS business_domain.template_domains (
     id VARCHAR(64) PRIMARY KEY,
     tenant_id VARCHAR(64) NOT NULL,
     name VARCHAR(255) NOT NULL,
+    name_en VARCHAR(255),
     description TEXT,
     status VARCHAR(32) DEFAULT 'inactive',
     version INTEGER DEFAULT 1,
@@ -264,7 +265,7 @@ CREATE TABLE IF NOT EXISTS business_domain.prompt_templates (
     scope           VARCHAR(16) NOT NULL DEFAULT 'domain', -- system | domain
     description     TEXT,
     status          VARCHAR(16) NOT NULL DEFAULT '启用',   -- 启用 | 停用
-    current_version VARCHAR(32) NOT NULL DEFAULT '1.0',
+    current_version VARCHAR(32) NOT NULL DEFAULT '1',
     versions_json   JSONB NOT NULL DEFAULT '[]'::jsonb,   -- [{version, content, updated_by, updated_at, remark}]
     created_by      VARCHAR(128),
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

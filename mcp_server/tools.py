@@ -12,7 +12,6 @@
   - 零 import jonex_core——所有 KB 交互通过 HTTP 调 Gateway
   - Tool handler 签名不含 request、tenant_id、mcp_key_id——从 contextvar 获取
 """
-import base64
 import logging
 import os
 import re
@@ -29,7 +28,6 @@ from auth import (
     require_write_scope,
 )
 from config import settings
-from db import get_pool, get_service_permission_level
 
 logger = logging.getLogger("mcp.tools")
 
@@ -225,7 +223,7 @@ _LEGACY_PERMISSION_LEVEL_MAP = {"write": "call", "read": "view", "*": "call"}
 async def _check_service_scope(
     auth: McpAuthContext, service_id: str, required_permission: str = "call"
 ) -> list[str]:
-    """C3: 校验 service 下的 KB 与 Key 的 allowed_kb_ids 有交集，并检查权限级别。
+    """C3: 校验 service 下的服务级权限级别。
 
     权限级别层级（向下兼容，收敛为 call/view 两级）：
       - call:  需 "call"（含降级后的遗留 write/*）
@@ -235,14 +233,15 @@ async def _check_service_scope(
     遗留值降级迁移：write→call、read→view、*→call（写权限已移交写 Key，
     * 不再全通配）。未知值落到 rank -1 → 403（安全默认拒绝）。
 
-    如果 allowed_kb_ids 为空（falsy），表示"所有 KB 都允许"，跳过交集检查返回空列表。
-    否则获取 service 的 kb_ids，计算交集，交集为空时 raise McpAuthError(401)。
+    统一 Key 重构后，KB 范围不再由 allowed_kb_ids 表达——空间隔离已在授权期
+    由 mcp_key_service 强制（create/update 只允许把 Key 空间内的服务写进映射），
+    故此处只做服务级权限检查，恒返回 []（空 = 全部 KB 允许），调用方自行获取
+    service 的 kb_ids。
 
     Returns:
-        list[str]: 交集列表（allowed_kb_ids ∩ service kb ids），为空时表示跳过检查
+        list[str]: 恒为 []（表示「全部 KB 允许」，调用方自行获取 service 的 kb_ids）
     """
-    pool = await get_pool()
-    perm_level = await get_service_permission_level(pool, auth.key_id, service_id)
+    perm_level = auth.service_permissions.get(service_id)
 
     if perm_level is None:
         raise McpAuthError(401, "不在授权范围内")
@@ -260,30 +259,7 @@ async def _check_service_scope(
             f"当前为'{_LABELS.get(perm_level, perm_level)}'权限",
         )
 
-    if not auth.allowed_kb_ids:
-        return []
-
-    service_detail = await call_gateway(
-        "get_service",
-        auth.tenant_id,
-        auth.key_id,
-        {"service_id": service_id},
-    )
-    # Space 纵深防御：读路径第二道空间闸门。双非空才校验——auth.space_id 为空的
-    # 遗留 Key、或历史 service 未绑定 space_id 时跳过，保持现状不误伤。
-    if (
-        auth.space_id
-        and service_detail.get("space_id")
-        and service_detail["space_id"] != auth.space_id
-    ):
-        raise McpAuthError(401, "不在授权范围内")
-    kb_ids = service_detail.get("kb_ids", [])
-    intersection = list(set(auth.allowed_kb_ids) & set(kb_ids))
-
-    if not intersection:
-        raise McpAuthError(401, "不在授权范围内")
-
-    return intersection
+    return []
 
 
 def _validate_file_name(file_name: str) -> str:
@@ -314,37 +290,43 @@ def _grant_mode_for_kb(auth: McpAuthContext, kb_id: str) -> str | None:
     方案 1：specified 目录级授权暂不支持 MCP 上传/查状态，
     handler 据此显式拒绝，避免「能建不能用」的静默失效与目录级越权。
     """
-    for g in auth.grants:
+    for g in auth.write_grants:
         if g.get("kb") == kb_id:
             return g.get("mode")
     return None
 
 
-async def upload_document(
+async def confirm_upload(
     service_id: str,
     file_name: str,
-    file_content_base64: str,
     knowledge_base_id: str,
+    storage_key: str,
+    doc_id: str = "",
     mime_type: str = "",
 ) -> dict:
-    """Upload a document to a knowledge base via MCP.
+    """Confirm a COS direct upload and trigger parsing/indexing via MCP.
 
-    Receives base64-encoded file content, validates parameters, authenticates
-    with "write" permission, checks KB scope, then sends a multipart POST to
-    the Gateway /internal/kb/documents/upload endpoint.
+    直传闭环的确认步骤（真实文件上传推荐走这条链路）：
+      1) 先调 generate_upload_url 拿预签名 PUT URL + storage_key；
+      2) 客户端把字节直传对象存储；
+      3) 再调本工具传 storage_key 确认入库并触发解析/索引。
+
+    原 base64 内联路径已移除——它受模型输出墙限制仅支持几 KB 级文本，
+    对真实文档不适用。
 
     Args:
-        service_id: Domain service ID.
+        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
         file_name: Original file name (untrusted, validated for traversal).
-        file_content_base64: Base64-encoded file content (max ~67MB encoded).
         knowledge_base_id: Target knowledge base ID.
+        storage_key: COS storage key（generate_upload_url 返回），直传后确认入库。
+        doc_id: generate_upload_url 返回的文档 ID（可选，确认入库元数据）。
         mime_type: Optional MIME type (default: "").
 
     Returns:
         dict: Document metadata (doc_id, file_name, knowledge_base_id, status).
 
     Raises:
-        McpToolError(code=-32602): Parameter validation / base64 decode failure.
+        McpToolError(code=-32602): Parameter validation failure.
         McpAuthError(401): Not authenticated / missing "write" permission / KB not in scope.
         McpToolError(code=-32000): Gateway error / timeout / transport failure.
     """
@@ -353,33 +335,15 @@ async def upload_document(
         raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
     if not knowledge_base_id or not knowledge_base_id.strip():
         raise McpToolError(code=-32602, message="knowledge_base_id 为必填参数，不能为空")
-    if not file_content_base64:
-        raise McpToolError(code=-32602, message="file_content_base64 为必填参数，不能为空")
+    if not storage_key or not storage_key.strip():
+        raise McpToolError(code=-32602, message="storage_key 为必填参数，不能为空")
 
     # Step 2 — file_name security validation
     file_name = _validate_file_name(file_name)
 
-    # Step 3 — base64 size pre-check (before decode, per D3)
-    max_size_mb = int(os.getenv("MCP_UPLOAD_MAX_SIZE_MB", "50"))
-    max_encoded = int(max_size_mb * 1024 * 1024 * 4 / 3) + 1024  # +1KB buffer tolerance
-    if len(file_content_base64) > max_encoded:
-        raise McpToolError(
-            code=-32602,
-            message=f"文件大小超过限制 ({max_size_mb}MB)。base64 编码后长度: {len(file_content_base64)}",
-        )
-
-    # Step 4 — base64 decode
-    try:
-        file_content = base64.b64decode(file_content_base64, validate=True)
-    except (ValueError, TypeError) as e:
-        # binascii.Error is a subclass of both ValueError and base64.Error in Python 3
-        raise McpToolError(
-            code=-32602, message="file_content_base64 解码失败，需为有效 base64 编码"
-        ) from e
-
-    # Step 5 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
+    # Step 3 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
     # 写 Key 无 mcp_key_service_mappings，_check_service_scope 恒 401；写入范围由 grants 表达。
-    auth = require_mcp_auth("write")  # 只看 key_type=write
+    auth = require_mcp_auth("write")  # 写授权看 write_grants
     kb_id = knowledge_base_id.strip()
     # 方案 1：specified 目录级写入暂不支持 MCP 上传，显式拒绝而非静默 401
     if _grant_mode_for_kb(auth, kb_id) == "specified":
@@ -389,67 +353,100 @@ async def upload_document(
         )
     require_write_scope(auth, kb_id)  # grants 级：kb 在 grants 且 mode=all，否则 401
 
-    # Step 6 — Multipart POST to Gateway
-    client = await get_http_client()
-    try:
-        resp = await client.post(
-            "/internal/kb/documents/upload",
-            files={"file": (file_name, file_content, mime_type or "application/octet-stream")},
-            data={
-                "file_name": file_name,
-                "knowledge_base_id": kb_id,
-                "mcp_key_id": auth.key_id,
-                "mime_type": mime_type,
-            },
-            headers={
-                "X-Internal-API-Key": settings.INTERNAL_API_KEY,
-                "X-Tenant-ID": auth.tenant_id,
-                "X-MCP-Key-ID": auth.key_id,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    except httpx.HTTPStatusError as e:
-        if 400 <= e.response.status_code < 500:
-            raise McpToolError(
-                code=_ERROR_INVALID_PARAMS,
-                message="知识库服务请求参数有误",
-            )
-        logger.error(
-            "Gateway HTTP error on upload: tenant_id=%s key_id=%s status=%d",
-            auth.tenant_id,
-            auth.key_id,
-            e.response.status_code,
-        )
-        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
-    except (httpx.TimeoutException, httpx.TransportError) as e:
-        logger.error(
-            "Gateway transport error on upload: tenant_id=%s key_id=%s type=%s",
-            auth.tenant_id,
-            auth.key_id,
-            type(e).__name__,
-        )
-        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
-    except httpx.RequestError as e:
-        logger.error(
-            "Gateway request error on upload: tenant_id=%s key_id=%s type=%s",
-            auth.tenant_id,
-            auth.key_id,
-            type(e).__name__,
-        )
-        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    # Step 4 — 确认入库（直传闭环）
+    # [jonex] S3 兼容：storage_backend 跟随平台全局配置，不硬编码 cos——
+    # 否则 S3 部署下上传的文档被标成 cos，后续取原文会用错客户端。
+    _backend = (os.getenv("OBJECT_STORAGE_BACKEND", "local") or "local").strip().lower()
+    data: dict = {
+        "knowledge_base_id": kb_id,
+        "storage_key": storage_key,
+        "file_name": file_name,
+        "storage_backend": _backend if _backend in ("cos", "s3") else "cos",
+    }
+    if doc_id:
+        data["doc_id"] = doc_id
+    if mime_type:
+        data["mime_type"] = mime_type
+    return await call_gateway(
+        "upload_document",
+        auth.tenant_id,
+        auth.key_id,
+        data,
+    )
 
-    # Business failure: response code != 0
-    if isinstance(result, dict) and result.get("code", 0) != 0:
-        logger.error(
-            "Gateway business error on upload: tenant_id=%s key_id=%s code=%s",
-            auth.tenant_id,
-            auth.key_id,
-            result.get("code"),
-        )
-        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
 
-    return result.get("data", result)
+async def generate_upload_url(
+    service_id: str,
+    knowledge_base_id: str,
+    file_name: str,
+    content_type: str = "",
+    file_size: int = 0,
+) -> dict:
+    """Generate a COS presigned upload URL for direct-to-storage upload.
+
+    Returns a presigned PUT URL so MCP clients can upload large files directly
+    to object storage (e.g. ``curl -X PUT --upload-file <file> <upload_url>``).
+    After the bytes are uploaded, call confirm_upload to confirm and trigger
+    parsing/indexing.
+
+    Args:
+        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
+        knowledge_base_id: Target knowledge base ID.
+        file_name: Original file name (untrusted, validated for traversal).
+        content_type: Optional MIME type (default: "").
+        file_size: Optional byte size to upload (default: 0 = unknown). When > 0,
+            the size is validated against the server cap and signed into the
+            Content-Length header, locking the exact byte count of the PUT.
+
+    Returns:
+        dict: {doc_id, storage_key, upload_url, storage_backend}.
+
+    Raises:
+        McpToolError(code=-32602): Parameter validation failure.
+        McpAuthError(401): Not authenticated / missing "write" permission / KB not in scope.
+        McpToolError(code=-32000): Gateway error / timeout / transport failure.
+    """
+    # Step 1 — Parameter non-empty validation
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not knowledge_base_id or not knowledge_base_id.strip():
+        raise McpToolError(code=-32602, message="knowledge_base_id 为必填参数，不能为空")
+    if not file_name or not file_name.strip():
+        raise McpToolError(code=-32602, message="file_name 为必填参数，不能为空")
+    if file_size < 0:
+        raise McpToolError(code=-32602, message="file_size 不能为负数")
+
+    # Step 2 — file_name security validation（路径穿越 / 非法字符）
+    file_name = _validate_file_name(file_name)
+
+    # Step 3 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
+    # 写 Key 无 mcp_key_service_mappings，_check_service_scope 恒 401；写入范围由 grants 表达。
+    auth = require_mcp_auth("write")  # 写授权看 write_grants
+    kb_id = knowledge_base_id.strip()
+    # 方案 1：specified 目录级写入暂不支持 MCP 直传，显式拒绝而非静默 401
+    if _grant_mode_for_kb(auth, kb_id) == "specified":
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="目录级写入（specified 模式）暂不支持 MCP 直传，请改用 all 模式写 Key",
+        )
+    require_write_scope(auth, kb_id)  # grants 级：kb 在 grants 且 mode=all，否则 401
+
+    # Step 4 — Invoke capability generate_upload_url via Gateway
+    data: dict = {
+        "knowledge_base_id": kb_id,
+        "file_name": file_name,
+    }
+    if content_type:
+        data["content_type"] = content_type.strip()
+    if file_size and file_size > 0:
+        data["file_size"] = file_size
+
+    return await call_gateway(
+        "generate_upload_url",
+        auth.tenant_id,
+        auth.key_id,
+        data,
+    )
 
 
 async def get_upload_status(service_id: str, document_id: str) -> dict:
@@ -461,7 +458,7 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
 
     Args:
         service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
-        document_id: Document ID (returned by upload_document).
+        document_id: Document ID (returned by confirm_upload).
 
     Returns:
         dict: Document status fields (doc_id, status, ontology_status,
@@ -480,11 +477,11 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
         raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
 
     # Step 2 — Auth + scope（写 Key 专属：上传生命周期，service_id 保留签名但不再用于定位）
-    auth = require_mcp_auth("write")  # 只看 key_type=write
+    auth = require_mcp_auth("write")  # 写授权看 write_grants
     # 方案 1：specified 目录级不支持 MCP，仅 all 模式 kb 可查上传状态，
     # 剔除 specified 的 kb，避免平铺 grants[].kb 导致目录级隔离被突破（越权读他人文档状态）。
     kb_ids_to_check = [
-        g["kb"] for g in auth.grants if g.get("mode") == "all" and g.get("kb")
+        g["kb"] for g in auth.write_grants if g.get("mode") == "all" and g.get("kb")
     ]
 
     if not kb_ids_to_check:
@@ -509,10 +506,13 @@ async def list_domain_services() -> dict:
     """列出 MCP Key 对应租户下所有领域服务。
 
     Action: list_services
-    Guard: require_mcp_auth("view") only（不需要 service scope）
+    Guard: require_mcp_auth("view") + 按 Key 授权 service_permissions 过滤目录
+
+    只返回该 Key 可访问（service_permissions 授权范围内）的服务及其库，
+    避免目录枚举平铺未授权库、agent 一问即 403。
 
     Returns:
-        dict: 含 items（领域服务列表）、total（总数）字段
+        dict: 含 items（领域服务列表，已按授权过滤）、total（过滤后总数）字段
     """
     auth = require_mcp_auth("view")
     data = {}
@@ -526,10 +526,13 @@ async def list_domain_services() -> dict:
     )
     # 上游标准返回 {items: [...], total: N}
     if isinstance(result, dict) and "items" in result:
-        return {
-            "items": result["items"],
-            "total": result.get("total", len(result["items"])),
-        }
+        authorized_ids = set(auth.service_permissions.keys())
+        items = [
+            item
+            for item in result["items"]
+            if isinstance(item, dict) and item.get("id") in authorized_ids
+        ]
+        return {"items": items, "total": len(items)}
     # 格式意外 → 记录并报错
     logger.error("list_services 返回意外格式: %s", type(result).__name__)
     raise McpToolError(code=-32000, message="领域服务列表返回格式异常")
@@ -555,12 +558,15 @@ def is_search_llmwiki_enabled() -> bool:
     """
     return SEARCH_LLMWIKI_ENABLED
 
+
 _VALID_SEARCH_MODES = frozenset({"naive", "local", "global", "hybrid", "mix"})
 # mix → hybrid 别名兼容（与 capabilities/knowledge_base/dtos/search.py 保持一致）
 _SEARCH_MODE_ALIASES = {"mix": "hybrid"}
 
 # Upload document validation constants
-_VALID_FILENAME_RE = re.compile(r'^[\w一-鿿.-]+$')  # Safe filename characters
+# 合法文件名字符：字母数字下划线、中日韩汉字、点、连字符，以及括号/空格/方括号
+# （半角 () [] 与全角（）均允许，路径穿越仍由 _PATH_TRAVERSAL_RE 与斜杠检查拦截）
+_VALID_FILENAME_RE = re.compile(r'^[\w一-鿿.()\[\]（） -]+$')  # Safe filename characters
 _PATH_TRAVERSAL_RE = re.compile(r'\.\./|\.\.\\')  # Path traversal detection
 
 
@@ -732,6 +738,7 @@ async def search_deep(
 
     将复杂问题分解为多个子问题，依次查询后归并生成综合答案。
     支持严格模式（strict_mode=True），多次验证循环确保可靠性。
+    常规查询请优先使用 search_ontology（本体检索）或 search_llmwiki（OpenKB 检索）。
 
     Args:
         service_id: 领域服务 ID
@@ -744,9 +751,9 @@ async def search_deep(
         dict: 搜索结果，含 answer、references、reasoning 字段
 
     Raises:
+        McpToolError(code=-32000): 知识库服务不可用
         McpAuthError(401): 未认证 / service 不在授权范围
         McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
-        McpToolError(code=-32000): 知识库服务不可用
     """
     query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
     payload: dict = {
@@ -769,11 +776,11 @@ async def search_llmwiki(
 ) -> dict:
     """OpenKB Wiki 检索——仅适用于 OpenKB 管线知识库，不适用于 LightRAG 管线。
 
-    Action: search_llmwiki (fallback: query_with_ontology)
+    Action: search_llmwiki (fallback: search_mix)
     Guard: SEARCH_LLMWIKI_ENABLED flag + require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
 
     通过 OpenKB 编译产物进行 Wiki 风格检索。
-    若管线不匹配（code=-32602），自动 fallback 到 query_with_ontology。
+    若管线不匹配（code=-32602），自动 fallback 到 search_mix。
     不支持 strict_mode（OpenKB 编译产物无严格模式语义）。
 
     Args:
@@ -804,14 +811,15 @@ async def search_llmwiki(
     try:
         return await call_gateway("search_llmwiki", auth.tenant_id, auth.key_id, payload)
     except McpToolError as e:
-        # 管线不匹配 (-32602) 或 OpenKB 运行时不可用 (-32000) → fallback 到 search_ontology
+        # 管线不匹配 (-32602，服务含 lightrag 库) 或 OpenKB 运行时不可用 (-32000)
+        # → fallback 到 search_mix 统一入口（按 kb_type 分组扇出，正确处理混合库）
         if e.code in (-32602, _ERROR_INTERNAL):
             logger.info(
-                "search_llmwiki 不可用（code=%s），自动回退到 search_ontology: service_id=%s",
+                "search_llmwiki 不可用（code=%s），自动回退到 search_mix: service_id=%s",
                 e.code,
                 service_id,
             )
-            return await call_gateway("query_with_ontology", auth.tenant_id, auth.key_id, payload)
+            return await call_gateway("search_mix", auth.tenant_id, auth.key_id, payload)
         raise
 
 
@@ -924,6 +932,8 @@ __all__ = [
     "get_http_client",
     "_check_service_scope",
     "_validate_file_name",
+    "confirm_upload",
+    "generate_upload_url",
     "get_upload_status",
     "list_documents",
     "list_domain_services",
@@ -932,5 +942,4 @@ __all__ = [
     "search_llmwiki",
     "search_ontology",
     "search_service",   # deprecated, 向后兼容别名
-    "upload_document",
 ]

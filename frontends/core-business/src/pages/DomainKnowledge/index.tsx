@@ -16,23 +16,20 @@ import {
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '@/store';
+import { useQuota } from '@/hooks/useQuota';
 import { SPACE_URL_PARAM } from '@jonex/shell-sdk';
 import type {
   DomainKnowledgeItem,
-  DomainKnowledgePermissionMember,
   KnowledgeBaseType,
 } from '@/types/domainKnowledge';
 import {
   getDomainKnowledgeList,
-  getDomainKnowledgePermissions,
-  saveDomainKnowledgePermissions,
   createKnowledgeInfo,
   updateKnowledgeInfo,
   deleteKnowledgeInfo,
 } from '@/api/domainKnowledge';
 import { listAccessMethods } from '@/api/dataSource';
 import { accessTypeDisplayName } from '@/utils/dataSourceDisplay';
-import PermissionModal from './PermissionModal';
 import CreateEditModal from './CreateEditModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import './index.scss';
@@ -44,6 +41,11 @@ const DomainKnowledge = function DomainKnowledge() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // 租户级配额：知识库数量上限（达限禁用新建按钮；新建/删除后重新拉取刷新 used）
+  const { getQuota, isReached, reload: reloadQuota } = useQuota();
+  const kbQuota = getQuota('tenantKnowledgeBaseLimit');
+  const kbReached = isReached('tenantKnowledgeBaseLimit');
 
   // ── filter state ────────────────────────────────────
   const [keywordInput, setKeywordInput] = useState('');
@@ -70,14 +72,6 @@ const DomainKnowledge = function DomainKnowledge() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
-
-  // ── permission modal state ───────────────────────────
-  const [permOpen, setPermOpen] = useState(false);
-  const [permLoading, setPermLoading] = useState(false);
-  const [permSaving, setPermSaving] = useState(false);
-  const [currentKb, setCurrentKb] = useState<DomainKnowledgeItem | null>(null);
-  const [permissionMembers, setPermissionMembers] = useState<DomainKnowledgePermissionMember[]>([]);
-  const [permissionKeyword, setPermissionKeyword] = useState('');
 
   // ── create modal state ────────────────────────────────
   const [createOpen, setCreateOpen] = useState(false);
@@ -189,6 +183,7 @@ const DomainKnowledge = function DomainKnowledge() {
       setCreateOpen(false);
       setEditingKb(null);
       fetchList(1, keyword);
+      if (!editingKb) reloadQuota(); // 新建会改变知识库数量配额 used，编辑不改变
     } catch (err: any) {
       message.error(
         err?.message || (editingKb ? t('domainKnowledge.updateFailed') : t('domainKnowledge.createFailed')),
@@ -216,73 +211,11 @@ const DomainKnowledge = function DomainKnowledge() {
       message.success(t('common.deleteSuccess'));
       setDeletingKb(null);
       fetchList(1, keyword);
+      reloadQuota(); // 删除会释放知识库数量配额 used
     } catch (err: any) {
       message.error(err?.message || t('common.deleteFailed'));
     } finally {
       setDeleteSubmitting(false);
-    }
-  };
-
-  // ── permission modal ─────────────────────────────────
-  const openPermModal = async (kb: DomainKnowledgeItem) => {
-    setCurrentKb(kb);
-    setPermissionKeyword('');
-    setPermOpen(true);
-    setPermLoading(true);
-    try {
-      const data = await getDomainKnowledgePermissions(kb.id);
-      setPermissionMembers(data.members);
-    } catch {
-      message.error(t('domainKnowledge.fetchPermissionMembersFailed'));
-    } finally {
-      setPermLoading(false);
-    }
-  };
-
-  const debouncedPermSearch = useCallback(
-    (kw: string) => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(async () => {
-        if (!currentKb) return;
-        setPermLoading(true);
-        try {
-          const data = await getDomainKnowledgePermissions(currentKb.id, kw || undefined);
-          setPermissionMembers(data.members);
-        } catch {
-          // silent
-        } finally {
-          setPermLoading(false);
-        }
-      }, 300);
-    },
-    [currentKb],
-  );
-
-  const handlePermKeywordChange = (val: string) => {
-    setPermissionKeyword(val);
-    debouncedPermSearch(val);
-  };
-
-  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor') => {
-    setPermissionMembers((prev) => prev.map((m) => (m.userId === userId ? { ...m, role } : m)));
-  };
-
-  const handleSavePermissions = async () => {
-    if (!currentKb) return;
-    setPermSaving(true);
-    try {
-      await saveDomainKnowledgePermissions(currentKb.id, {
-        members: permissionMembers.map((m) => ({
-          userId: m.userId,
-          role: m.role,
-        })),
-      });
-      message.success(t('domainKnowledge.savePermissionSuccess'));
-      setPermOpen(false);
-    } catch (err: any) {
-      message.error(err?.message || t('domainKnowledge.savePermissionFailed'));
-    } finally {
-      setPermSaving(false);
     }
   };
 
@@ -339,15 +272,22 @@ const DomainKnowledge = function DomainKnowledge() {
             }}
             style={{ width: 280, lineHeight: 'normal' }}
           />
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            disabled={!global.currentSpaceId || !global.currentSpace?.can_write_space}
-            title={global.currentSpaceId ? undefined : t('domainKnowledge.notSelected')}
-            onClick={openCreateModal}
-          >
-            {t('domainKnowledge.newKnowledgeBase')}
-          </Button>
+          {!global.currentSpaceId ? (
+            <span style={{ color: '#f97316', fontSize: 13 }}>{t('domainKnowledge.notSelected')}</span>
+          ) : kbReached ? (
+            <span style={{ color: '#f97316', fontSize: 13 }}>
+              {t('common.quotaKbReached', { limit: kbQuota?.limit ?? 0 })}
+            </span>
+          ) : (
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              disabled={!global.currentSpace?.can_write_space}
+              onClick={openCreateModal}
+            >
+              {t('domainKnowledge.newKnowledgeBase')}
+            </Button>
+          )}
         </div>
 
         {/* Loading State */}
@@ -359,15 +299,24 @@ const DomainKnowledge = function DomainKnowledge() {
           /* Empty State */
           <div style={{ textAlign: 'center', padding: '80px 0' }}>
             <Empty description={t('domainKnowledge.emptyDescription')}>
-              <Button
-                type="primary"
-                icon={<PlusOutlined />}
-                disabled={!global.currentSpaceId || !global.currentSpace?.can_write_space}
-                title={global.currentSpaceId ? undefined : t('domainKnowledge.notSelected')}
-                onClick={openCreateModal}
-              >
-                {t('domainKnowledge.newKnowledgeBase')}
-              </Button>
+              {!global.currentSpaceId ? (
+                <div style={{ color: '#f97316', fontSize: 13, marginBottom: 12 }}>
+                  {t('domainKnowledge.notSelected')}
+                </div>
+              ) : kbReached ? (
+                <div style={{ color: '#f97316', fontSize: 13, marginBottom: 12 }}>
+                  {t('common.quotaKbReached', { limit: kbQuota?.limit ?? 0 })}
+                </div>
+              ) : (
+                <Button
+                  type="primary"
+                  icon={<PlusOutlined />}
+                  disabled={!global.currentSpace?.can_write_space}
+                  onClick={openCreateModal}
+                >
+                  {t('domainKnowledge.newKnowledgeBase')}
+                </Button>
+              )}
             </Empty>
           </div>
         ) : (
@@ -510,19 +459,6 @@ const DomainKnowledge = function DomainKnowledge() {
           </div>
         )}
       </div>
-
-      <PermissionModal
-        open={permOpen}
-        currentKb={currentKb}
-        members={permissionMembers}
-        keyword={permissionKeyword}
-        loading={permLoading}
-        saving={permSaving}
-        onKeywordChange={handlePermKeywordChange}
-        onRoleChange={handlePermRoleChange}
-        onSave={handleSavePermissions}
-        onCancel={() => setPermOpen(false)}
-      />
 
       <CreateEditModal
         open={createOpen}

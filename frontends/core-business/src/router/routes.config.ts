@@ -31,6 +31,7 @@ const DomainKnowledgeRelationList = loadableComponent(() => import('@/pages/Doma
 const DomainManagement = loadableComponent(() => import('@/pages/DomainManagement'));
 const DomainManagementServices = loadableComponent(() => import('@/pages/DomainManagementServices'));
 const DomainManagementSearch = loadableComponent(() => import('@/pages/DomainManagementSearch'));
+const ErrorPage = loadableComponent(() => import('@/pages/Error'));
 const NotFound = loadableComponent(() => import('@/pages/NotFound'));
 
 export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key: string) => string) {
@@ -157,6 +158,8 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
         { path: 'domain-management/search', element: DomainManagementSearch, title: T('route.domainManagementSearch') },
       ],
     },
+    // 权限守卫 redirect 目标：?page=403 显示 403（顶层无布局壳，与 404 视觉统一）
+    { path: 'error', element: ErrorPage, title: T('error.403') },
     { path: '*', element: NotFound, title: T('common.pageNotFound') },
   ];
 }

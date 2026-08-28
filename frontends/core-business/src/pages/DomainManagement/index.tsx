@@ -14,23 +14,17 @@ import {
   listServiceApiKeys,
   createServiceApiKey,
   deleteServiceApiKey,
-  getServicePermissions,
-  setServicePermissions,
 } from '../../api/domainService';
 import {
   getServiceStatusMap,
-  userToPermMember,
   type DomainServiceItem,
   type DomainServiceFormData,
   type KnowledgeBaseOption,
-  type PermMember,
   type ServiceApiKeyItem,
 } from '../../types/domainService';
-import { listUsers, type PlatformUser } from '../../api/user';
 import { getDomainKnowledgeList } from '../../api/domainKnowledge';
 import DomainFormModal from './DomainFormModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
-import PermissionModal from './PermissionModal';
 import ServiceConfigModal from './ServiceConfigModal';
 import './index.scss';
 
@@ -49,14 +43,6 @@ const DomainManagement = function DomainManagement() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<DomainServiceItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<DomainServiceItem | null>(null);
-
-  // Permission modal
-  const [permOpen, setPermOpen] = useState(false);
-  const [permTarget, setPermTarget] = useState<DomainServiceItem | null>(null);
-  const [permSearch, setPermSearch] = useState('');
-  const [permMembers, setPermMembers] = useState<PermMember[]>([]);
-  const [permLoading, setPermLoading] = useState(false);
-  const [permSaving, setPermSaving] = useState(false);
 
   // Service Config modal (multi-key)
   const [srvConfigOpen, setSrvConfigOpen] = useState(false);
@@ -195,80 +181,6 @@ const DomainManagement = function DomainManagement() {
     }
   };
 
-  // ── Permission modal ──
-  const openPermModal = async (item: DomainServiceItem) => {
-    setPermTarget(item);
-    setPermSearch('');
-    setPermOpen(true);
-    setPermLoading(true);
-    try {
-      const result = await getServicePermissions(item.id);
-      const perms = result?.permissions ?? [];
-      if (Array.isArray(perms) && perms.length > 0) {
-        // 尝试加载用户列表以解析名称
-        let userMap: Map<string, PlatformUser> = new Map();
-        try {
-          const userResult = await listUsers(1, 100);
-          for (const u of userResult.items) {
-            userMap.set(String(u.id), u);
-          }
-        } catch {
-          /* 用户列表加载失败不影响权限展示 */
-        }
-        const members: PermMember[] = perms.map((p) => {
-          const uid = String(p.user_id);
-          const user = userMap.get(uid);
-          return user
-            ? userToPermMember(user, p.role === 'manager' ? 'manager' : 'viewer')
-            : {
-                id: uid,
-                name: t('domainManagement.userPrefix', { id: uid.slice(0, 8) }),
-                department: '',
-                avatar: uid.charAt(0).toUpperCase(),
-                avatarColor: '#94a3b8',
-                role: (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager',
-              };
-        });
-        setPermMembers(members);
-      } else {
-        setPermMembers([]);
-      }
-    } catch {
-      setPermMembers([]);
-    } finally {
-      setPermLoading(false);
-    }
-  };
-
-  const handlePermSave = async () => {
-    if (!permTarget) return;
-    setPermSaving(true);
-    try {
-      const permissions = permMembers.map((m) => ({
-        user_id: m.id,
-        role: m.role,
-      }));
-      await setServicePermissions(permTarget.id, permissions);
-      message.success(t('common.saveSuccess'));
-      setPermOpen(false);
-    } catch (err: unknown) {
-      message.error(err instanceof Error ? err.message : t('common.saveFailed'));
-    } finally {
-      setPermSaving(false);
-    }
-  };
-
-  const addPermMember = (user: PlatformUser) => {
-    setPermMembers((prev) => {
-      if (prev.some((m) => m.id === String(user.id))) return prev;
-      return [...prev, userToPermMember(user, 'viewer')];
-    });
-  };
-
-  const removePermMember = (userId: string) => {
-    setPermMembers((prev) => prev.filter((m) => m.id !== userId));
-  };
-
   // ── Service Config modal (multi-key) ──
   const openSrvConfig = async (item: DomainServiceItem) => {
     setSrvConfigTarget(item);
@@ -380,18 +292,6 @@ const DomainManagement = function DomainManagement() {
         </div>
       ),
     },
-    // 权限当前先注释
-    // {
-    //   title: '权限设置',
-    //   key: 'perm',
-    //   width: 110,
-    //   render: (_: unknown, r: DomainServiceItem) => (
-    //     <span className="yx-perm-badge" onClick={() => openPermModal(r)}>
-    //       <TeamOutlined style={{ fontSize: 11 }} />
-    //       设置权限
-    //     </span>
-    //   ),
-    // },
     {
       title: t('domainManagement.status'),
       dataIndex: 'status',
@@ -552,26 +452,6 @@ const DomainManagement = function DomainManagement() {
         submitting={submitting}
         onCancel={() => setDeleteTarget(null)}
         onConfirm={handleDelete}
-      />
-
-      {/* Permission Modal */}
-      <PermissionModal
-        open={permOpen}
-        permTarget={permTarget}
-        permMembers={permMembers}
-        permSearch={permSearch}
-        permLoading={permLoading}
-        permSaving={permSaving}
-        onPermSearchChange={setPermSearch}
-        onRoleChange={(userId, role) => {
-          setPermMembers((prev) => prev.map((m) => (m.id === userId ? { ...m, role } : m)));
-        }}
-        onRemoveMember={removePermMember}
-        onAddMember={addPermMember}
-        onSave={handlePermSave}
-        onCancel={() => {
-          setPermOpen(false);
-        }}
       />
 
       {/* Service Config Modal */}

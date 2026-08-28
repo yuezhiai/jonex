@@ -5,11 +5,14 @@
 单一文件包含 5 个逻辑块：
   1. McpAuthContext dataclass + contextvar
   2. McpAuthError 异常类
-  3. 函数式 Repository：find_by_key_hash / update_last_used
+  3. 函数式 Repository：find_by_key_hash / find_service_permissions / update_last_used
   4. ASGI 中间件 McpAuthMiddleware
-  5. 守卫函数：require_mcp_auth / require_kb_scope
+  5. 守卫函数：require_mcp_auth / require_kb_scope / require_write_scope
 
 纯 ASGI 中间件（不使用 BaseHTTPMiddleware——与 Streamable HTTP 不兼容）。
+
+统一 Key 体系：鉴权单查 platform.mcp_keys（含 write_grants 列），服务级权限由
+platform.mcp_key_service_mappings 预载进 ctx.service_permissions。
 """
 import asyncio
 import logging
@@ -34,12 +37,14 @@ class McpAuthContext:
 
     通过 contextvar 注入，请求结束后 finally 块中 reset() 清理。
     """
+
     key_id: str
     tenant_id: str
-    key_type: str = "service"            # "service" | "write"（来源表）
-    permissions: list[str] = field(default_factory=lambda: ["view"])
     allowed_kb_ids: list[str] = field(default_factory=list)
-    grants: list[dict] = field(default_factory=list)   # 写 Key 原始 grants（目录级范围）
+    # 统一 Key 知识写入授权（三态语义：None/[]/非空，此处已归一化为 [] 表示无写入）
+    write_grants: list[dict] = field(default_factory=list)
+    # service_id → permission_level（call|view），由中间件预载自 mcp_key_service_mappings
+    service_permissions: dict[str, str] = field(default_factory=dict)
     space_id: str | None = None
 
 
@@ -87,23 +92,22 @@ class McpAuthError(Exception):
 # ============================================================================
 
 async def find_by_key_hash(key_hash: str) -> dict | None:
-    """查找有效的 MCP Key 记录（未撤销/未停用/未过期/未删除）。
+    """查找有效的统一 MCP Key 记录（未撤销/未停用/未过期/未删除）。
 
     使用参数化查询 $1，状态过滤（revoked_at/disabled_at/expires_at/is_deleted）
     通过 WHERE 子句隐式完成，只放行 active 状态的 Key。
-    permissions 列为逗号分隔 VARCHAR，读取后 split 为 list。
-    allowed_kb_ids 为 JSONB，asyncpg 自动反序列化为 list。
+    allowed_kb_ids / write_grants 为 JSONB，asyncpg 自动反序列化为 list。
 
     Args:
         key_hash: MCP Key 的 HMAC-SHA256 hash（64 字符 hex）
 
     Returns:
-        dict: {'id', 'tenant_id', 'permissions', 'allowed_kb_ids'} 或 None
+        dict: {'id', 'tenant_id', 'allowed_kb_ids', 'space_id', 'write_grants'} 或 None
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, tenant_id, permissions, allowed_kb_ids, space_id
+            """SELECT id, tenant_id, allowed_kb_ids, space_id, write_grants
                FROM platform.mcp_keys
                WHERE key_hash = $1
                  AND revoked_at IS NULL
@@ -117,34 +121,27 @@ async def find_by_key_hash(key_hash: str) -> dict | None:
     return dict(row)
 
 
-async def find_write_key_by_hash(key_hash: str) -> dict | None:
-    """查找有效的知识写入 Key 记录（platform.mcp_write_keys，未撤销/未停用/未过期/未删除）。
+async def find_service_permissions(key_id: str) -> dict[str, str]:
+    """预载 Key 的服务级权限映射（service_id → permission_level）。
 
-    查表 hash 判别：写 Key 的鉴权依据是 key_hash 查表，
-    不依赖明文前缀。状态过滤（revoked_at/disabled_at/expires_at/is_deleted）
-    通过 WHERE 子句隐式完成。grants 为 JSONB，asyncpg 自动反序列化为 list[dict]。
+    统一 Key 体系下服务级权限唯一真源是 mcp_key_service_mappings 中间表。
+    鉴权中间件一次查出全部映射，供守卫函数按 service_id 判定 call/view。
 
     Args:
-        key_hash: 写 Key 的 HMAC-SHA256 hash（64 字符 hex）
+        key_id: MCP Key 的 ID
 
     Returns:
-        dict: {'id', 'tenant_id', 'grants', 'space_id', 'kb_id'} 或 None
+        dict[str, str]: {service_id: permission_level}，无映射返回空 dict
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """SELECT id, tenant_id, grants, space_id, kb_id
-               FROM platform.mcp_write_keys
-               WHERE key_hash = $1
-                 AND revoked_at IS NULL
-                 AND disabled_at IS NULL
-                 AND is_deleted = 0
-                 AND (expires_at IS NULL OR expires_at > NOW())""",
-            key_hash,
+        rows = await conn.fetch(
+            """SELECT service_id, permission_level
+               FROM platform.mcp_key_service_mappings
+               WHERE mcp_key_id = $1""",
+            key_id,
         )
-    if row is None:
-        return None
-    return dict(row)
+    return {row["service_id"]: row["permission_level"] for row in rows}
 
 
 async def update_last_used(key_id: str, ip: str) -> None:
@@ -182,10 +179,10 @@ class McpAuthMiddleware:
     3. 提取 Bearer token（兼容 X-MCP-Key header）
     4. 格式校验（yxm_ 前缀 + 长度检查）
     5. hash
-    6. DB 查表
-    7. revoked_at 检查（SQL WHERE 隐式完成）
+    6. 单查 mcp_keys（统一 Key）
+    7. 状态过滤（revoked/disabled/expired/deleted，SQL WHERE 隐式完成）
     8. tenant 状态校验
-    9. permissions 解析 + allowed_kb_ids
+    9. 预载 service_permissions + 组装 ctx
     10. contextvar 注入 + fire-and-forget last_used 更新
     11. try/finally 清理 contextvar
     12. 异常处理：catch McpAuthError → 401 JSON 响应
@@ -217,41 +214,27 @@ class McpAuthMiddleware:
             self._validate_key_format(raw_key)            # Step 4
             key_hash = hash_mcp_key(raw_key)               # Step 5
 
-            # Step 6-7: 查表 hash 判别（先写 Key 表 → 再普通 Key 表）
-            write_record = await find_write_key_by_hash(key_hash)
-            if write_record is not None:
-                self._validate_tenant(write_record["tenant_id"])
-                grants = write_record["grants"] or []
-                ctx = McpAuthContext(
-                    key_id=write_record["id"],
-                    tenant_id=write_record["tenant_id"],
-                    key_type="write",
-                    permissions=["write"],
-                    allowed_kb_ids=[g["kb"] for g in grants if g.get("kb")],
-                    grants=grants,
-                    space_id=write_record.get("space_id"),
-                )
-            else:
-                record = await find_by_key_hash(key_hash)
-                if record is None:
-                    raise McpAuthError(401, "认证失败")
+            # Step 6-7: 单查 mcp_keys（统一 Key，含 write_grants）
+            record = await find_by_key_hash(key_hash)
+            if record is None:
+                raise McpAuthError(401, "认证失败")
 
-                self._validate_tenant(record["tenant_id"])     # Step 8
-                permissions = self._parse_permissions(record["permissions"])  # Step 9
-                allowed_kb_ids = record["allowed_kb_ids"] or []  # NULL defense
+            self._validate_tenant(record["tenant_id"])     # Step 8
 
-                ctx = McpAuthContext(
-                    key_id=record["id"],
-                    tenant_id=record["tenant_id"],
-                    key_type="service",
-                    permissions=permissions,
-                    allowed_kb_ids=allowed_kb_ids,
-                    space_id=record.get("space_id"),
-                )
+            # Step 9: 预载服务级权限 + 组装 ctx
+            service_permissions = await find_service_permissions(record["id"])
+            ctx = McpAuthContext(
+                key_id=record["id"],
+                tenant_id=record["tenant_id"],
+                allowed_kb_ids=record["allowed_kb_ids"] or [],
+                write_grants=record.get("write_grants") or [],
+                service_permissions=service_permissions,
+                space_id=record.get("space_id"),
+            )
 
-            # Step 10: fire-and-forget last_used 更新（写 Key 无 last_used 列 → 跳过）
+            # Step 10: fire-and-forget last_used 更新（统一 Key 均落在 mcp_keys）
             ip = self._extract_client_ip(scope)
-            asyncio.create_task(_update_last_used_fire(ctx.key_id, ctx.key_type, ip))
+            asyncio.create_task(_update_last_used_fire(ctx.key_id, ip))
 
             # Step 11: contextvar 注入 → try/finally 清理（set/reset 严格配对）
             token = McpAuthContext.set(ctx)
@@ -326,26 +309,6 @@ class McpAuthMiddleware:
         if tenant_id.strip() in _DEFAULT_TENANT_IDS:
             raise McpAuthError(401, "认证失败")
 
-    def _parse_permissions(self, permissions_str: str) -> list[str]:
-        """解析逗号分隔的 permissions 字符串为 list，并归一化遗留值。
-
-        permissions 列是 VARCHAR(512)，如 'read' 或 'read,write'。
-        遗留值归一化（与 platform 侧 _normalize_key_permissions 一致）：
-          - read → view（旧 read 语义 = 仅查看）
-          - write / * → call（含调用能力，降级不丢失）
-        去重后返回；未知值原样保留（由 require_mcp_auth 层级判定安全默认拒绝）。
-        """
-        parts = [p.strip() for p in permissions_str.split(",") if p.strip()]
-        normalized: list[str] = []
-        for p in parts:
-            if p == "read":
-                p = "view"
-            elif p in ("write", "*"):
-                p = "call"
-            if p not in normalized:
-                normalized.append(p)
-        return normalized
-
     def _extract_client_ip(self, scope: Scope) -> str:
         """从 scope['client'] 提取客户端 IP 地址。"""
         client = scope.get("client")
@@ -385,8 +348,13 @@ def require_mcp_auth(permission: str = "view") -> McpAuthContext:
 
     供 tool handler 调用。
 
+    统一 Key 体系下的判定语义：
+      - "write"：看 write_grants 是否非空（写授权唯一真源）；
+      - "view"/"call"：看 service_permissions 是否有任一服务授权（每服务 call/view
+        粒度由 _check_service_scope 按 service_id 判定）。
+
     Args:
-        permission: 所需权限（默认 "view"）。合法值 view/call/write，其中 call 蕴含 view；支持通配符 "*"。
+        permission: 所需权限（默认 "view"）。合法值 view/call/write。
 
     Returns:
         McpAuthContext: 当前请求的鉴权上下文
@@ -399,14 +367,13 @@ def require_mcp_auth(permission: str = "view") -> McpAuthContext:
     if ctx is None:
         raise McpAuthError(401, "需要认证")
     if permission == "write":
-        # 写授权只看 key_type——普通 Key 即使残留 "write" 字符串也不放行
-        if ctx.key_type != "write":
+        # 写授权只看 write_grants 非空——统一后无独立写 Key 类型
+        if not ctx.write_grants:
             raise McpAuthError(401, "权限不足")
         return ctx
-    # call 蕴含 view：permissions=["call"] 的 Key 可查看
-    if permission == "view" and "call" in ctx.permissions:
-        return ctx
-    if permission not in ctx.permissions and "*" not in ctx.permissions:
+    # view/call：有任一服务级授权即放行（无 service_id 工具如 list_domain_services）
+    # 纯写 Key（write_grants 非空但 service_permissions 空）在此被拒
+    if not ctx.service_permissions:
         raise McpAuthError(401, "权限不足")
     return ctx
 
@@ -433,22 +400,22 @@ def require_write_scope(
     knowledge_base_id: str,
     directory_id: str | None = None,
 ) -> None:
-    """校验写入范围（grants 级）——仅供写 Key 使用。
+    """校验写入范围（write_grants 级）——仅供写授权 Key 使用。
 
-    写 Key 无 mcp_key_service_mappings，写入范围由 grants 表达：
+    写入范围由 write_grants 表达：
       - mode=="all"：该 kb 全目录放行；
       - mode=="specified"：directory_id 命中 directories 放行；
-      - kb 不在 grants 中：拒绝。
+      - kb 不在 write_grants 中：拒绝。
 
     Args:
-        auth: 当前请求的鉴权上下文（调用方 require_mcp_auth("write") 已保证 key_type=="write"）
+        auth: 当前请求的鉴权上下文（调用方 require_mcp_auth("write") 已保证 write_grants 非空）
         knowledge_base_id: 目标知识库 ID
         directory_id: 目标目录 ID（specified 模式必须提供）
 
     Raises:
         McpAuthError(401): 不在写入授权范围内
     """
-    for g in auth.grants:
+    for g in auth.write_grants:
         if g.get("kb") == knowledge_base_id:
             if g.get("mode") == "all":
                 return
@@ -461,14 +428,12 @@ def require_write_scope(
 # Fire-and-forget helper
 # ============================================================================
 
-async def _update_last_used_fire(key_id: str, key_type: str, ip: str) -> None:
+async def _update_last_used_fire(key_id: str, ip: str) -> None:
     """Fire-and-forget 更新 last_used。
 
-    按 key_type 分流：写 Key 无 last_used 列，直接跳过。
+    统一 Key 全部落在 mcp_keys（含 last_used_at/last_used_ip 列），无需按来源表分流。
     写 DB 失败静默丢弃，不阻塞鉴权主路径。
     """
-    if key_type == "write":
-        return
     try:
         await update_last_used(key_id, ip)
     except Exception:
@@ -482,7 +447,7 @@ __all__ = [
     "McpAuthError",
     "McpAuthMiddleware",
     "find_by_key_hash",
-    "find_write_key_by_hash",
+    "find_service_permissions",
     "update_last_used",
     "require_mcp_auth",
     "require_kb_scope",

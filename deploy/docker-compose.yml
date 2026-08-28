@@ -241,7 +241,7 @@ services:
       RERANK_BINDING_HOST: ${RERANK_BINDING_HOST:-http://llm-gateway:8787/v1}
       RERANK_BINDING_API_KEY: ${RERANK_BINDING_API_KEY:-gw_lightrag}
       RERANK_MODEL: ${RERANK_MODEL:-awenleven/Qwen3-Reranker-4B:Q4_K_M}
-      # 对象存储（腾讯云 COS），默认 local
+      # 对象存储（local / 腾讯云 COS / S3 兼容），默认 local
       OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-local}
       COS_REGION: ${COS_REGION:-}
       COS_SECRET_ID: ${COS_SECRET_ID:-}
@@ -249,6 +249,15 @@ services:
       COS_BUCKET: ${COS_BUCKET:-}
       COS_KEY_PREFIX: ${COS_KEY_PREFIX:-jonex}
       COS_PRESIGN_EXPIRES: ${COS_PRESIGN_EXPIRES:-900}
+      # [jonex] S3 兼容：本服务 head_object/head_object_size（确认对象存在、读大小做配额）
+      # 与 get_raw_location 生成预签名 URL 都要初始化 S3 客户端，缺变量会 ValueError。
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-auto}
+      S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       KB_INPUT_DIR: /app/inputs               # 与 gateway/atomic-rag 共享上传文件（local 后端原文查看/读取）
     env_file:
       - .env
@@ -406,6 +415,8 @@ services:
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       LOGIN_TICKET_EXPIRE_SECONDS: ${LOGIN_TICKET_EXPIRE_SECONDS:-60}
       AUTH_ALLOWED_REDIRECT_URIS: ${AUTH_ALLOWED_REDIRECT_URIS:-{}}
+      # Sidecar → 能力服务 invoke 超时（秒）；OpenKB agent 慢查询可超 120s
+      SIDECAR_PROXY_TIMEOUT: ${SIDECAR_PROXY_TIMEOUT:-300}
       WORKERS: 4
     env_file:
       - .env
@@ -456,18 +467,27 @@ services:
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       SIDECAR_URL: http://sidecar:8000
+      # 网关 → Sidecar 代理超时（秒）；需 ≥ Sidecar 的 SIDECAR_PROXY_TIMEOUT
+      GATEWAY_SIDECAR_TIMEOUT: ${GATEWAY_SIDECAR_TIMEOUT:-300}
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       KB_INPUT_DIR: /app/inputs               # 与 atomic-rag 容器共享路径
       AUTH_CORS_ORIGINS: ${AUTH_CORS_ORIGINS:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
-      # 对象存储（腾讯云 COS），仅网关上传用，默认 local
+      # 对象存储（local / 腾讯云 COS / S3 兼容），仅网关上传用，默认 local
       OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-local}
       COS_KEY_PREFIX: ${COS_KEY_PREFIX:-jonex}
       COS_REGION: ${COS_REGION:-}
       COS_SECRET_ID: ${COS_SECRET_ID:-}
       COS_SECRET_KEY: ${COS_SECRET_KEY:-}
       COS_BUCKET: ${COS_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-auto}
+      S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       # 网关对外公开地址（用于构造文档下载等公开 URL），生产环境需覆盖为实际 IP/域名
       GATEWAY_PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_BASE_URL:-http://localhost:8000}
     volumes:
@@ -555,6 +575,12 @@ services:
       dockerfile: deploy/docker/frontend-gateway.Dockerfile
     container_name: jonex-frontend-gateway
     hostname: frontend-gateway
+    environment:
+      # [jonex] CSP 中 img-src / media-src 允许的对象存储来源（302 直跳预览用）。
+      # 不设则按 OBJECT_STORAGE_BACKEND 取默认：cos 自动用 *.myqcloud.com，
+      # s3 无法推导会启动告警，local 留空。填法见 .env.example 第 14 节。
+      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-local}
+      CSP_STORAGE_ORIGIN: ${CSP_STORAGE_ORIGIN:-}
     networks:
       - jonex-network
     ports:
@@ -585,6 +611,8 @@ services:
     build:
       context: ..
       dockerfile: frontends/shell/Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-shell-frontend
     hostname: shell-frontend
     networks:
@@ -611,6 +639,8 @@ services:
     build:
       context: ..
       dockerfile: frontends/core-business/Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-core-business-frontend
     hostname: core-business-frontend
     networks:
@@ -636,6 +666,8 @@ services:
     build:
       context: ..
       dockerfile: frontends/platform-management/Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-platform-management-frontend
     hostname: platform-management-frontend
     networks:
@@ -661,6 +693,8 @@ services:
     build:
       context: ..
       dockerfile: frontends/ecosystem-management/Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-ecosystem-management-frontend
     hostname: ecosystem-management-frontend
     networks:
@@ -688,6 +722,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/docker/lightrag-source.Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-lightrag
     hostname: lightrag
     image: jonex-lightrag-source
@@ -734,6 +770,7 @@ services:
       dockerfile: deploy/docker/atomic-rag.Dockerfile
       args:
         MINERU_SOURCE: ${MINERU_SOURCE:-modelscope}
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
         # 依赖胖瘦：full（默认，三种 RAG_PARSER 都能真跑）/ slim（仅 online/selfhost，省 ~3.9GB）
         # 打瘦身包：RAG_PROFILE=slim docker compose build atomic-rag
         RAG_PROFILE: ${RAG_PROFILE:-full}
@@ -750,11 +787,6 @@ services:
       SERVICE_PORT: "8000"
       SERVICE_ENDPOINT: http://atomic-rag:8000   # start_capability.py 服务发现注册用 hostname
       TZ: Asia/Shanghai
-      # ---- atomic-rag adapter 版本开关（形态a）----
-      # 默认 v1=LightRAGAdapter；W3(COS worker 本地化) 完成前不默认 v2（否则 COS 文档回退）。
-      # 测试/验证时显式设 ATOMIC_RAG_VERSION=v2 启用 LightRAGAdapterV2。
-      ATOMIC_RAG_VERSION: ${ATOMIC_RAG_VERSION:-v2}
-
       # ---- raganything 解析器配置 ----
       # 本文件为通用基线，不强制 GPU。GPU 加速请叠加 docker-compose.gpu.yml；Mac 开发叠加 docker-compose.mac.yml。
       RAG_PARSER: ${RAG_PARSER:-mineru}            # 解析引擎: mineru / docling / paddleocr
@@ -772,9 +804,19 @@ services:
       WORKER_COUNT: ${WORKER_COUNT:-4}
       # [jonex] 任务队列容量（总槽位 = WORKER_COUNT + 此值，满则入库请求返回 429）。
       TASK_QUEUE_CAPACITY: ${TASK_QUEUE_CAPACITY:-100}
-      # [jonex] 单文档内多模态描述 LLM 并发（scene=raganything_ingest），原硬编码 2。
-      # 实际并发 ≈ WORKER_COUNT × 此值，调高需权衡上游 RPM（如 200 次/分钟）与抽取并发额度。
+      # [jonex] 单文档内多模态描述 LLM 并发（scene=raganything_ingest：表格/公式/音频等
+      # LLM 快任务），原硬编码 2。实际并发 ≈ WORKER_COUNT × 此值，调高需权衡上游 RPM
+      # （如 200 次/分钟）与抽取并发额度。图片（VLM）不在此列，见 MAX_PARALLEL_VLM。
       MAX_PARALLEL_MULTIMODAL: ${MAX_PARALLEL_MULTIMODAL:-4}
+      # [jonex] VLM 独立限流（§image-refs 排查衍生）：单文档内图片/视频关键帧并发，
+      # 直连远端 VLM（不经 llm-gateway），thinking 模型单次 4~105s，槽位有限。
+      # 并发过高会排队超过 VLM 超时（RAG_VLM_TIMEOUT）触发 ReadTimeout 重试风暴。
+      MAX_PARALLEL_VLM: ${MAX_PARALLEL_VLM:-2}
+      # [jonex] 单次 VLM 调用超时（秒）：驱动默认 120s 对 thinking 模型太紧。
+      RAG_VLM_TIMEOUT: ${RAG_VLM_TIMEOUT:-300}
+      # [jonex] VLM 思考深度（none/low/medium/high）：默认 none 关闭思考
+      # （实测关闭后单图 4~105s→约 3s、token 1.2 万→160，且低量化下思考易带幻觉）。
+      RAG_VLM_REASONING_EFFORT: ${RAG_VLM_REASONING_EFFORT:-none}
       MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}  # MinerU 模型下载源开关（含 VLM/hybrid 后端）：modelscope 国内可达免代理；huggingface 需外网/代理。这是真正生效的开关
       # mineru_online 解析密钥：不写入 preset/镜像，统一从 env 读取（preset 若显式配置则优先）
       MINERU_API_TOKEN: ${MINERU_API_TOKEN:-}
@@ -803,6 +845,8 @@ services:
       RAG_TEXT_PACK_DROP_NOISE: ${RAG_TEXT_PACK_DROP_NOISE:-true}    # 噪声丢弃（C2/C3）；false=零信息损失
       # [jonex] §image-refs 图片资产上传（docs/image-reference-chain-execution-plan.md P1-4）
       RAG_ASSET_UPLOAD_ENABLED: ${RAG_ASSET_UPLOAD_ENABLED:-true}    # 图片资产上传总开关（false 只停资产上传与 aext 旁路，不阻塞主链路）
+      # [jonex] §image-refs 图片版面主题锚点（docs/image-reference-accuracy-fix-plan.md E 方案 P0-6）
+      RAG_IMAGE_ANCHOR_ENABLED: ${RAG_IMAGE_ANCHOR_ENABLED:-true}   # false 完全回退旧行为（描述无锚点）
       RAG_TRACK_TIMEOUT_SECONDS: ${RAG_TRACK_TIMEOUT_SECONDS:-1800}
       RAG_TRACK_POLL_CONCURRENCY: ${RAG_TRACK_POLL_CONCURRENCY:-8}
       # [jonex] reparse cleanup 收敛循环（rag-reparse-strict-cleanup-busy-plan）
@@ -847,7 +891,7 @@ services:
       ONTOLOGY_ENTITY_DESC_MAXLEN: ${ONTOLOGY_ENTITY_DESC_MAXLEN:-1000}
       # schema relation_types 覆盖稀疏时，对 LightRAG 已有边落通用 RELATED_TO 边保证图非空（默认关）
       ONTOLOGY_KEEP_UNTYPED_EDGES: ${ONTOLOGY_KEEP_UNTYPED_EDGES:-false}
-      # 对象存储（腾讯云 COS），默认 local
+      # 对象存储（local / 腾讯云 COS / S3 兼容），默认 local
       OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-local}
       COS_REGION: ${COS_REGION:-}
       COS_SECRET_ID: ${COS_SECRET_ID:-}
@@ -855,6 +899,15 @@ services:
       COS_BUCKET: ${COS_BUCKET:-}
       COS_KEY_PREFIX: ${COS_KEY_PREFIX:-jonex}
       COS_PRESIGN_EXPIRES: ${COS_PRESIGN_EXPIRES:-900}
+      # [jonex] S3 兼容：task_manager._fetch_cos_object 在 pipeline 前需下载 s3 对象到本地，
+      # 走 get_object_storage_for("s3").get_to_path()，缺变量会 ValueError 导致解析失败。
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-auto}
+      S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       KB_INPUT_DIR: /app/inputs               # local 后端资产写入目录（与 jonex-rag-inputs 卷一致）
       # MPS（腾讯云媒体处理）视频智能分析：MPS_ENABLED=true 且视频存储在 COS 时，
       # 视频解析走 MPS（取代 ffmpeg+whisper ASR）。
@@ -898,6 +951,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/docker/openkb-source.Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: jonex-openkb
     hostname: openkb
     image: jonex-openkb-source
@@ -923,37 +978,37 @@ services:
       llm-gateway:
         condition: service_started
 
-  # ============================================================
-  # MCP Server - 知识库 MCP Tool 注册与鉴权
-  # ============================================================
-  # 配置文件：deploy/.env.mcp（MCP Server 专用，与平台主配置分离）
-  # MCP Server 仅容器间通信——AI 客户端经 Nginx 反向代理到达，
-  # Nginx 通过 jonex-network 内部路由到 mcp-server:8002
-  # Phase 2 MCP Key 鉴权中间件就绪前不对外暴露端口
-  mcp-server:
-    build:
-      context: ..
-      dockerfile: mcp_server/Dockerfile
-    container_name: jonex-mcp-server
-    hostname: mcp-server
-    networks:
-      - jonex-network
-    ports:
-      - "8002:8002"
-    env_file:
-      - .env.mcp                    # 仅 mcp-server 加载此文件
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  # # ============================================================
+  # # MCP Server - 知识库 MCP Tool 注册与鉴权
+  # # ============================================================
+  # # 配置文件：deploy/.env.mcp（MCP Server 专用，与平台主配置分离）
+  # # MCP Server 仅容器间通信——AI 客户端经 Nginx 反向代理到达，
+  # # Nginx 通过 jonex-network 内部路由到 mcp-server:8002
+  # # Phase 2 MCP Key 鉴权中间件就绪前不对外暴露端口
+  # mcp-server:
+  #   build:
+  #     context: ..
+  #     dockerfile: mcp_server/Dockerfile
+  #   container_name: jonex-mcp-server
+  #   hostname: mcp-server
+  #   networks:
+  #     - jonex-network
+  #   ports:
+  #     - "8002:8002"
+  #   env_file:
+  #     - .env.mcp                    # 仅 mcp-server 加载此文件
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 30s
+  #   restart: unless-stopped
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
 
   # ============================================================
   # Neo4j - 本体图数据库（社区版，单 database）

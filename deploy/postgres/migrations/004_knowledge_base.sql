@@ -134,21 +134,6 @@ CREATE INDEX IF NOT EXISTS idx_kb_sc_tenant ON knowledge_base.service_configs(te
 CREATE INDEX IF NOT EXISTS idx_kb_sc_is_deleted ON knowledge_base.service_configs(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_kb_sc_service ON knowledge_base.service_configs(service_id);
 
--- 领域服务权限
-CREATE TABLE IF NOT EXISTS knowledge_base.service_permissions (
-    id VARCHAR(64) PRIMARY KEY,
-    tenant_id VARCHAR(64) NOT NULL,
-    service_id VARCHAR(64) NOT NULL,
-    user_id VARCHAR(64) NOT NULL,
-    role VARCHAR(32) NOT NULL DEFAULT 'viewer',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted SMALLINT DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_kb_svcp_tenant ON knowledge_base.service_permissions(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_kb_svcp_is_deleted ON knowledge_base.service_permissions(is_deleted);
-CREATE INDEX IF NOT EXISTS idx_kb_svcp_service ON knowledge_base.service_permissions(service_id);
-
 -- 领域服务 API Key 管理
 CREATE TABLE IF NOT EXISTS knowledge_base.service_api_keys (
     id VARCHAR(64) PRIMARY KEY,
@@ -514,6 +499,64 @@ CREATE INDEX IF NOT EXISTS idx_kb_feedback_session
 
 CREATE INDEX IF NOT EXISTS idx_kb_feedback_user_id
     ON knowledge_base.knowledge_search_feedback (user_id);
+
+-- ------------------------------------------------------------
+-- 回答级反馈（answer feedback）：按问答记录 history_id 锚定
+-- 主表保存最新反馈 + 上下文快照；事件表只增不改（operation_id 幂等）
+-- 锚点 history_id = knowledge_base.knowledge_search_history.id
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback (
+    id              VARCHAR(64) PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    user_id         VARCHAR(128) NOT NULL,
+    history_id      VARCHAR(64) NOT NULL,
+    query           TEXT NOT NULL,
+    answer          TEXT,
+    feedback_type   VARCHAR(16) NOT NULL,
+    feedback_reason VARCHAR(32),
+    feedback_comment VARCHAR(300),
+    domain_space_id VARCHAR(64),
+    knowledge_base_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source          VARCHAR(64),
+    mode            VARCHAR(32),
+    source_missing_reason VARCHAR(64),
+    version         INTEGER NOT NULL DEFAULT 0,
+    adopted         BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_deleted      SMALLINT NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_answer_feedback_history
+    ON knowledge_base.knowledge_answer_feedback (history_id);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_tenant_user
+    ON knowledge_base.knowledge_answer_feedback (tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_tenant_time
+    ON knowledge_base.knowledge_answer_feedback (tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_kb_ids
+    ON knowledge_base.knowledge_answer_feedback USING GIN (knowledge_base_ids);
+
+CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback_event (
+    id              VARCHAR(64) PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    history_id      VARCHAR(64) NOT NULL,
+    feedback_id     VARCHAR(64),
+    user_id         VARCHAR(128) NOT NULL,
+    operation_id    VARCHAR(64) NOT NULL,
+    version         INTEGER NOT NULL,
+    feedback_type   VARCHAR(16),
+    feedback_reason VARCHAR(32),
+    feedback_comment VARCHAR(300),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_answer_feedback_event_operation
+    ON knowledge_base.knowledge_answer_feedback_event (operation_id);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_event_history
+    ON knowledge_base.knowledge_answer_feedback_event (history_id, version DESC);
+
+COMMENT ON TABLE knowledge_base.knowledge_answer_feedback IS '检索问答用户反馈主记录：按问答记录 history_id 唯一，保存最新反馈状态与上下文快照';
+COMMENT ON TABLE knowledge_base.knowledge_answer_feedback_event IS '检索问答用户反馈变更事件：只增不改，operation_id 幂等，保留每次变更';
 
 -- ------------------------------------------------------------
 -- 标签（KB 级，同 KB 内名称唯一）

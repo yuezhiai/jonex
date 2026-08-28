@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal, Input, Button, message } from 'antd';
 import { CopyOutlined } from '@ant-design/icons';
+import copy from 'copy-to-clipboard';
 
 interface Props {
   open: boolean;
@@ -14,12 +15,9 @@ interface Props {
 export default function PromptViewModal({ open, title, desc, content, onClose }: Props) {
   const { t } = useTranslation();
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      message.success(t('compile.promptModal.copySuccess'));
-    } catch {
-      message.error(t('compile.promptModal.copyFailed'));
-    }
+    const ok = await copy(content);
+    if (ok) message.success(t('compile.promptModal.copySuccess'));
+    else message.error(t('compile.promptModal.copyFailed'));
   };
   return (
     <Modal

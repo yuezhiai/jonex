@@ -11,16 +11,15 @@ import {
 } from '@ant-design/icons';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
-  getSearchFeedbackList,
-  getSearchFeedbackStats,
-  toggleSearchFeedbackAdopted,
-  cancelSearchFeedback,
+  getAnswerFeedbackList,
+  getAnswerFeedbackStats,
+  toggleAnswerFeedbackAdopted,
+  deleteAnswerFeedback,
 } from '@/api/knowledgeSearch';
 import type {
-  SearchFeedbackItem,
-  SearchFeedbackListResponse,
-  SearchFeedbackStats,
-  SearchFeedbackType,
+  AnswerFeedbackListItem,
+  AnswerFeedbackListResponse,
+  AnswerFeedbackStats,
 } from '@/types/knowledgeSearch';
 import FeedbackViewModal from './FeedbackViewModal';
 
@@ -43,10 +42,10 @@ export default function KnowledgeTracking() {
   const [activeTab, setActiveTab] = useState<TabKey>('all');
 
   // 数据
-  const [feedbackData, setFeedbackData] = useState<SearchFeedbackListResponse | null>(null);
-  const [stats, setStats] = useState<SearchFeedbackStats | null>(null);
+  const [feedbackData, setFeedbackData] = useState<AnswerFeedbackListResponse | null>(null);
+  const [stats, setStats] = useState<AnswerFeedbackStats | null>(null);
 
-  const [viewItem, setViewItem] = useState<SearchFeedbackItem | null>(null);
+  const [viewItem, setViewItem] = useState<AnswerFeedbackListItem | null>(null);
 
   // 知识库名称（从 URL 参数或从第一条记录获取）
   const kbName = searchParams.get('name') || t('tracking.knowledgeBase');
@@ -58,8 +57,8 @@ export default function KnowledgeTracking() {
     try {
       const feedbackType = activeTab === 'all' ? undefined : activeTab;
       const [listResult, statsResult] = await Promise.all([
-        getSearchFeedbackList(knowledgeBaseId, { feedbackType, page: 1, pageSize: 50 }),
-        getSearchFeedbackStats(knowledgeBaseId),
+        getAnswerFeedbackList(knowledgeBaseId, { feedbackType, page: 1, pageSize: 50 }),
+        getAnswerFeedbackStats(knowledgeBaseId),
       ]);
       setFeedbackData(listResult);
       setStats(statsResult);
@@ -74,9 +73,9 @@ export default function KnowledgeTracking() {
     void loadData();
   }, [loadData]);
 
-  const handleToggleAdopt = useCallback(async (item: SearchFeedbackItem) => {
+  const handleToggleAdopt = useCallback(async (item: AnswerFeedbackListItem) => {
     try {
-      await toggleSearchFeedbackAdopted(item.id);
+      await toggleAnswerFeedbackAdopted(item.id);
       // 更新本地数据
       setFeedbackData((prev) => {
         if (!prev) return prev;
@@ -86,12 +85,12 @@ export default function KnowledgeTracking() {
         };
       });
       message.success(t(item.adopted ? 'compile.cancelAdopted' : 'compile.adopted'));
-    } catch {
-      message.error(t('common.operationFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.operationFailed'));
     }
   }, []);
 
-  const handleView = useCallback((item: SearchFeedbackItem) => {
+  const handleView = useCallback((item: AnswerFeedbackListItem) => {
     setViewItem(item);
   }, []);
 
@@ -100,7 +99,7 @@ export default function KnowledgeTracking() {
   }, []);
 
   /** 删除单条反馈记录 */
-  const handleDeleteFeedback = useCallback(async (item: SearchFeedbackItem) => {
+  const handleDeleteFeedback = useCallback(async (item: AnswerFeedbackListItem) => {
     Modal.confirm({
       title: t('compile.feedback.deleteFeedback'),
       content: t('compile.confirmDeleteFeedback', { query: item.query }),
@@ -109,11 +108,7 @@ export default function KnowledgeTracking() {
       cancelText: t('common.cancel'),
       onOk: async () => {
         try {
-          await cancelSearchFeedback({
-            sessionId: item.session_id,
-            feedbackType: item.feedback_type,
-            kbIds: [item.knowledge_base_id],
-          });
+          await deleteAnswerFeedback(item.id);
           // 更新本地数据：移除该项
           setFeedbackData((prev) => {
             if (!prev) return prev;
@@ -130,8 +125,8 @@ export default function KnowledgeTracking() {
             };
           });
           message.success(t('tracking.feedbackDeleted'));
-        } catch {
-          message.error(t('common.deleteFailed'));
+        } catch (err: any) {
+          message.error(err?.message || t('common.deleteFailed'));
         }
       },
     });
@@ -293,7 +288,7 @@ export default function KnowledgeTracking() {
     const columns = [
       {
         title: t('tracking.columnTime'),
-        dataIndex: 'searched_at',
+        dataIndex: 'created_at',
         key: 'time',
         width: 150,
         render: (val: string | null) => (
@@ -322,7 +317,7 @@ export default function KnowledgeTracking() {
       },
       {
         title: t('tracking.columnAnswer'),
-        dataIndex: 'answer_preview',
+        dataIndex: 'answer',
         key: 'answer',
         width: '35%',
         render: (val: string | null) => (
@@ -345,24 +340,32 @@ export default function KnowledgeTracking() {
         title: t('common.type'),
         dataIndex: 'feedback_type',
         key: 'type',
-        width: 130,
-        render: (val: string) => (
-          <span
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 4,
-              padding: '2px 10px',
-              borderRadius: 6,
-              fontSize: 12,
-              fontWeight: 500,
-              background: val === 'like' ? '#ecfdf5' : '#fef2f2',
-              color: val === 'like' ? '#059669' : '#dc2626',
-            }}
-          >
-            {val === 'like' ? <LikeOutlined /> : <DislikeOutlined />}
-            {val === 'like' ? t('knowledgeSearch.helpful') : t('knowledgeSearch.unhelpful')}
-          </span>
+        width: 160,
+        render: (val: string, record: AnswerFeedbackListItem) => (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: '2px 10px',
+                borderRadius: 6,
+                fontSize: 12,
+                fontWeight: 500,
+                background: val === 'like' ? '#ecfdf5' : '#fef2f2',
+                color: val === 'like' ? '#059669' : '#dc2626',
+                alignSelf: 'flex-start',
+              }}
+            >
+              {val === 'like' ? <LikeOutlined /> : <DislikeOutlined />}
+              {val === 'like' ? t('knowledgeSearch.helpful') : t('knowledgeSearch.unhelpful')}
+            </span>
+            {val === 'dislike' && record.feedback_reason ? (
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                {t(`knowledgeSearch.feedbackReason_${record.feedback_reason}`)}
+              </span>
+            ) : null}
+          </div>
         ),
       },
       {
@@ -389,7 +392,7 @@ export default function KnowledgeTracking() {
         title: t('common.actions'),
         key: 'actions',
         width: 120,
-        render: (_: unknown, record: SearchFeedbackItem) => (
+        render: (_: unknown, record: AnswerFeedbackListItem) => (
           <div style={{ display: 'flex', gap: 6 }}>
             <Button
               onClick={() => handleView(record)}
@@ -448,7 +451,7 @@ export default function KnowledgeTracking() {
     ];
 
     return (
-      <Table<SearchFeedbackItem>
+      <Table<AnswerFeedbackListItem>
         columns={columns}
         dataSource={items}
         rowKey="id"

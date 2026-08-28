@@ -49,8 +49,8 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           });
           setInstances(res.items);
           setTotal(res.total);
-        } catch {
-          message.error(t('common.loadFailed'));
+        } catch (err: any) {
+          message.error(err?.message || t('common.loadFailed'));
         } finally {
           setLoading(false);
         }

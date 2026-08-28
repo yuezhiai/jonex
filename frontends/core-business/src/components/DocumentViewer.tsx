@@ -70,12 +70,14 @@ export function useDocumentViewer() {
         const sep = url.includes('?') ? '&' : '?';
         let finalUrl = url;
         if (kind === 'video' || kind === 'audio') {
-          // 音视频：直连 COS（Range 流式最优），带时间锚点 fragment 定位
+          // 音视频：302 直连对象存储（Range 流式最优），带时间锚点 fragment 定位。
+          // 直连来源须在 CSP media-src 白名单内（部署项 CSP_STORAGE_ORIGIN）。
           if (timeStart != null) {
             finalUrl = `${url}#t=${timeStart}${timeEnd != null ? `,${timeEnd}` : ''}`;
           }
         } else if (kind === 'pdf' || kind === 'text' || kind === 'other') {
-          // iframe 内嵌：走同源代理，规避 COS 跨域 CSP(frame-src) / X-Frame-Options
+          // iframe 内嵌：走网关同源代理，规避跨域 CSP(frame-src) / 上游 X-Frame-Options。
+          // 同源 → 与后端是 cos 还是 s3 无关，无需 CSP 白名单。
           finalUrl = `${url}${sep}proxy=1`;
         }
         // md 文件：先尝试拉取原文文本，用 MarkdownContent 渲染（失败则降级 iframe）
@@ -91,7 +93,7 @@ export function useDocumentViewer() {
             /* 拉取失败，降级 iframe */
           }
         }
-        // image 直连即可
+        // image：302 直连对象存储即可（来源须在 CSP img-src 白名单内）
         setState({ open: true, kind, url: finalUrl, name: opts.fileName, timeStart, timeEnd });
       })
       .catch((err: any) => message.error(err?.message || t('common.openDocumentFailed')));

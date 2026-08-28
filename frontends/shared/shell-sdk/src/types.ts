@@ -10,6 +10,8 @@ export interface ShellUser {
   isPlatformAdmin: boolean;
   isTenantAdmin: boolean;
   permissions: string[];
+  impersonated?: boolean;
+  originalTenantId?: string;
 }
 
 export interface ShellNavigateOptions {

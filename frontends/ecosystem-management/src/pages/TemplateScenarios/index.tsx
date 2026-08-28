@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { Alert, Button, Menu, message, Modal, Select, Table, Tag } from 'antd';
+import { Alert, Button, Menu, message, Modal, Select, Table, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
   ArrowLeftOutlined,
@@ -117,15 +117,15 @@ export default function TemplateScenarios() {
   const [importLoading, setImportLoading] = useState(false);
 
   const domainNameMap = useMemo(() => {
-    return new Map(domains.map((domain) => [domain.id, getTemplateDomainDisplay(domain, t).name]));
-  }, [domains, t]);
+    return new Map(domains.map((domain) => [domain.id, getTemplateDomainDisplay(domain, t, english).name]));
+  }, [domains, t, english]);
 
   const domainOptions = useMemo(() => {
     return domains.map((domain) => ({
-      label: getTemplateDomainDisplay(domain, t).name,
+      label: getTemplateDomainDisplay(domain, t, english).name,
       value: domain.id,
     }));
-  }, [domains, t]);
+  }, [domains, t, english]);
 
   const selectedScene = useMemo(() => {
     return scenes.find((scene) => scene.id === selectedSceneId) ?? null;
@@ -732,7 +732,7 @@ export default function TemplateScenarios() {
                         t('templateScenarios.noSceneDescription')}
                     </p>
                   </div>
-                  <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     <Button icon={<ExportOutlined />} onClick={handleExportYaml}>
                       {t('templateScenarios.exportYaml')}
                     </Button>

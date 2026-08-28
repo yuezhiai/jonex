@@ -604,6 +604,15 @@ wheels = [
 ]
 
 [[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.109.2"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -934,6 +943,7 @@ dependencies = [
     { name = "jsonpath-ng" },
     { name = "neo4j" },
     { name = "openai" },
+    { name = "openpyxl" },
     { name = "pydantic", extra = ["dotenv"] },
     { name = "pyjwt" },
     { name = "python-dateutil" },
@@ -943,6 +953,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "redis" },
     { name = "sqlalchemy" },
+    { name = "tencentcloud-sdk-python-sts" },
     { name = "uvicorn" },
 ]
 
@@ -981,6 +992,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "neo4j", specifier = ">=5.25.0,<6.0.0" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "openpyxl", specifier = ">=3.1.0,<4.0.0" },
     { name = "pydantic", extras = ["dotenv"], specifier = ">=1.10.0,<2.0.0" },
     { name = "pyjwt", specifier = ">=2.8.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0" },
@@ -992,6 +1004,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "redis", specifier = ">=5.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.25" },
+    { name = "tencentcloud-sdk-python-sts", specifier = ">=3.0.1459" },
     { name = "uvicorn", specifier = ">=0.27.0" },
 ]
 provides-extras = ["dev"]
@@ -1327,6 +1340,18 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/40/36/4c926a91554483977608951360c18c2e911592785eb87a6437813f6123f7/openai-2.41.1.tar.gz", hash = "sha256:23d617a0432457ad844973bee8f540be9da90894f7c5686852d2d365da058f57", size = 783584, upload-time = "2026-06-10T16:10:37.667Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/20/74/925d7b3892927e9804aaf58d374a45dc28e4420ff90e992272b77286343e/openai-2.41.1-py3-none-any.whl", hash = "sha256:a939565f350cb7443cb843b801b88c716ac8024b492fb94ca269d5f6b1bbefd6", size = 1353380, upload-time = "2026-06-10T16:10:35.756Z" },
+]
+
+[[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050", size = 186464, upload-time = "2024-06-28T14:03:44.161Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2", size = 250910, upload-time = "2024-06-28T14:03:41.161Z" },
 ]
 
 [[package]]
@@ -1819,6 +1844,30 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/be/47/1bba49d42d63f4453f0a64a20acbf2d0bd2f5a8cde6a166ee66c074a08f8/starlette-0.36.3.tar.gz", hash = "sha256:90a671733cfb35771d8cc605e0b679d23b992f8dcfad48cc60b38cb29aeb7080", size = 2842113, upload-time = "2024-02-04T18:16:24.95Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/eb/f7/372e3953b6e6fbfe0b70a1bb52612eae16e943f4288516480860fcd4ac41/starlette-0.36.3-py3-none-any.whl", hash = "sha256:13d429aa93a61dc40bf503e8c801db1f1bca3dc706b10ef2434a36123568f044", size = 71481, upload-time = "2024-02-04T18:16:21.392Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-common"
+version = "3.1.161"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/67/39/f4dbf73ba48eeb7ef75dc58b99e321b6df275fc55190497532876c3f5d39/tencentcloud_sdk_python_common-3.1.161.tar.gz", hash = "sha256:b770b30a0ca9d89eef648b80d9f208858dfb8e4ee4edafb4950e2bc36b4686e3", size = 22676, upload-time = "2026-08-19T20:19:11.543Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/de/a9/55333f6f1cd3926011e3db094fa26a436086e5f57762637b11294d5c907f/tencentcloud_sdk_python_common-3.1.161-py2.py3-none-any.whl", hash = "sha256:5916ad6f28ae45f6b9ff5e99f9011838139fb8564ddce970f78b27dbb0a8662f", size = 34275, upload-time = "2026-08-19T20:19:10.136Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-sts"
+version = "3.0.1459"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "tencentcloud-sdk-python-common" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/35/ea/d4f9e21176c97cedda454cc0b5943056ae59a6639475567e5c8ebebcbf4b/tencentcloud-sdk-python-sts-3.0.1459.tar.gz", hash = "sha256:b4c410634a9df56a130a99d2acb7e6b126b264e434601db187ca2f0e34bb735f", size = 10108, upload-time = "2025-09-15T09:35:02.185Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/63/34/7bd5b1daa419207968e026d46ce05a0029272ff34f66c052b5392813e2a1/tencentcloud_sdk_python_sts-3.0.1459-py2.py3-none-any.whl", hash = "sha256:296aa9b1607e013c3cca7c4a829b77d2a105a55bc8ccaf5e705dfed97acd6ec5", size = 12594, upload-time = "2025-09-15T09:35:00.562Z" },
 ]
 
 [[package]]

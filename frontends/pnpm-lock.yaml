@@ -156,6 +156,9 @@ importers:
       classnames:
         specifier: ^2.5.1
         version: 2.5.1
+      copy-to-clipboard:
+        specifier: ^4.0.2
+        version: 4.0.2
       dayjs:
         specifier: ^1.11.13
         version: 1.11.20
@@ -268,6 +271,9 @@ importers:
       classnames:
         specifier: ^2.5.1
         version: 2.5.1
+      copy-to-clipboard:
+        specifier: ^4.0.2
+        version: 4.0.2
       dayjs:
         specifier: ^1.11.13
         version: 1.11.20
@@ -332,6 +338,9 @@ importers:
       '@jonex/platform-theme':
         specifier: workspace:*
         version: link:../shared/platform-theme
+      '@jonex/shared-lib':
+        specifier: workspace:*
+        version: link:../shared/shared-lib
       '@jonex/shell-sdk':
         specifier: workspace:*
         version: link:../shared/shell-sdk
@@ -425,6 +434,9 @@ importers:
       '@ant-design/icons':
         specifier: ^6.2.3
         version: 6.2.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+      '@jonex/shell-sdk':
+        specifier: workspace:*
+        version: link:../shell-sdk
       antd:
         specifier: ^6.4.3
         version: 6.4.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -468,6 +480,9 @@ importers:
       '@jonex/platform-theme':
         specifier: workspace:*
         version: link:../shared/platform-theme
+      '@jonex/shared-lib':
+        specifier: workspace:*
+        version: link:../shared/shared-lib
       '@jonex/shell-sdk':
         specifier: workspace:*
         version: link:../shared/shell-sdk
@@ -2133,6 +2148,9 @@ packages:
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
 
+  copy-to-clipboard@4.0.2:
+    resolution: {integrity: sha512-gklSft7IuhriZKHKpuoA1fpJSLPNgvUMWMo5BlnzAJm0zNKnznoSv23IjtNqclx8eKi6ZcdvFFzYEER/+U1LoQ==}
+
   cosmiconfig-typescript-loader@6.3.0:
     resolution: {integrity: sha512-Akr82WH1Wfqatyiqpj8HDkO2o2KmJRu1FhKfSNJP3K4IdXwHfEyL7MOb62i1AGQVLtIQM+iCE9CGOtrfhR+mmA==}
     engines: {node: '>=v18'}
@@ -2453,6 +2471,7 @@ packages:
   eslint@9.39.5:
     resolution: {integrity: sha512-DgZS62aPLXKlnxILS/AYCoRvHaZeXceIzlXPkkGGzJWSow1aEk0lbTlxUSlyjC8jcaKxAdOnTDz+o1JFSBsyjw==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -5720,6 +5739,8 @@ snapshots:
       argue-cli: 3.1.0
 
   convert-source-map@2.0.0: {}
+
+  copy-to-clipboard@4.0.2: {}
 
   cosmiconfig-typescript-loader@6.3.0(@types/node@26.1.2)(cosmiconfig@9.0.2(typescript@5.9.3))(typescript@5.9.3):
     dependencies:

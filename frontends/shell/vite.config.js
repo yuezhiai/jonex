@@ -15,6 +15,9 @@ export default defineConfig({
     alias: {
       '@jonex/shell-sdk': path.resolve(__dirname, '../shared/shell-sdk/src/index.ts'),
       '@jonex/platform-theme': path.resolve(__dirname, '../shared/platform-theme/src'),
+      // 指向 src 而非 dist：Docker 构建上下文里 shared-lib 的 dist 被 .dockerignore 排除，
+      // 与 vite.base.config 统一走源码编译
+      '@jonex/shared-lib': path.resolve(__dirname, '../shared/shared-lib/src/index.ts'),
     },
   },
   plugins: [

@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface UserItem {
   id: number;
@@ -42,53 +35,46 @@ export interface UserUpdatePayload {
   email?: string;
   role?: string;
   status?: number;
-}
-
-function unwrap<T>(p: ApiEnvelope<T>): T {
-  if (!p?.success) throw new Error(p?.message || 'Request failed');
-  return p.data as T;
+  /** [jonex] 可选改密：非空时后端重哈希写入 password_hash；留空/不传则不改密码 */
+  new_password?: string;
 }
 
 export async function listAllUsers(): Promise<UserListResponse> {
-  const r = await apiClient.get<ApiEnvelope<UserListResponse>>('/api/v1/platform/users/all');
-  return unwrap(r.data);
+  return apiClient.get<UserListResponse>('/platform/users/all');
 }
 
 export async function listUsers(page = 1, pageSize = 100): Promise<UserListResponse> {
-  const r = await apiClient.get<ApiEnvelope<UserListResponse>>('/api/v1/platform/users', {
+  return apiClient.get<UserListResponse>('/platform/users', {
     params: { page, page_size: pageSize },
   });
-  return unwrap(r.data);
 }
 
 export async function createUser(data: UserCreatePayload): Promise<UserItem> {
-  const r = await apiClient.post<ApiEnvelope<UserItem>>('/api/v1/platform/users', data);
-  return unwrap(r.data);
+  return apiClient.post<UserItem>('/platform/users', data);
 }
 
 export async function updateUser(id: number, data: UserUpdatePayload, targetTenantId?: string): Promise<UserItem> {
-  const r = await apiClient.patch<ApiEnvelope<UserItem>>(`/api/v1/platform/users/${id}`, {
+  return apiClient.patch<UserItem>(`/platform/users/${id}`, {
     ...data,
     ...(targetTenantId ? { target_tenant_id: targetTenantId } : {}),
   });
-  return unwrap(r.data);
 }
 
 export async function deleteUser(id: number): Promise<void> {
-  await apiClient.delete(`/api/v1/platform/users/${id}`);
+  await apiClient.delete<null>(`/platform/users/${id}`);
 }
 
 /** 用户当前绑定的角色 id 列表（RBAC 多角色） */
 export async function getUserRoles(userId: number, targetTenantId?: string): Promise<number[]> {
-  const r = await apiClient.get<ApiEnvelope<{ role_ids: number[] }>>(`/api/v1/platform/users/${userId}/roles`, {
+  const data = await apiClient.get<{ role_ids: number[] }>(`/platform/users/${userId}/roles`, {
     params: targetTenantId ? { target_tenant_id: targetTenantId } : undefined,
   });
-  return unwrap(r.data).role_ids;
+  return data.role_ids;
 }
 
 /** 更新用户角色绑定（delete-then-insert） */
 export async function setUserRoles(userId: number, roleIds: number[], targetTenantId?: string): Promise<void> {
-  await apiClient.put(`/api/v1/platform/users/${userId}/roles`, {
+  await apiClient.put<null>(`/platform/users/${userId}/roles`, {
     role_ids: roleIds,
     ...(targetTenantId ? { target_tenant_id: targetTenantId } : {}),
   });

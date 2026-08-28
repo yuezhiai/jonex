@@ -18,9 +18,6 @@ export interface MenuNode {
  * 父节点无可见子节点时被裁剪。
  */
 export async function fetchMyMenus(): Promise<MenuNode[]> {
-  const resp = await apiClient.get<{ success: boolean; data?: { items?: MenuNode[] } }>(
-    '/api/v1/platform/menus/my',
-  );
-  const payload = resp.data;
-  return payload?.data?.items ?? [];
+  const data = await apiClient.get<{ items: MenuNode[] }>('/platform/menus/my');
+  return data?.items ?? [];
 }

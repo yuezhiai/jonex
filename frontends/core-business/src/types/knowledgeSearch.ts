@@ -14,6 +14,8 @@ export interface KnowledgeSearchOverview {
 export interface KnowledgeSearchDomain {
   id: string;
   name: string;
+  /** 检索范围维度：领域空间（space）或领域服务（service） */
+  kind: 'space' | 'service';
   description?: string;
   domain_type?: string;
   status?: string;
@@ -147,6 +149,8 @@ export interface KnowledgeSearchStreamMeta {
   references?: KnowledgeReference[];
   reasoning?: ReasoningTrace | null;
   rag_used?: boolean;
+  /** [jonex] answer-feedback 锚点：后端检索响应下发的检索历史记录 id（回放历史用 history item id） */
+  history_id?: string;
 }
 
 export interface KnowledgeSearchStreamHandlers {
@@ -223,4 +227,96 @@ export interface CancelSearchFeedbackParams {
   sessionId: string;
   feedbackType: SearchFeedbackType;
   kbIds: string[];
+}
+
+// ── answer-feedback（回答反馈，锚点 history_id，operation_id 幂等 + version 版本化） ──────────
+
+/** 点踩原因枚举（dislike 必填其一） */
+export type FeedbackReason =
+  | 'inaccurate'
+  | 'not_answered'
+  | 'incomplete'
+  | 'wrong_reference'
+  | 'missing_knowledge'
+  | 'other';
+
+/** 回答反馈主记录（回显 / 提交响应共用） */
+export interface AnswerFeedbackRecord {
+  id: string;
+  history_id: string;
+  operation_id?: string | null;
+  /** 版本号：每个 history_id 从 1 开始递增，服务端丢弃旧 version（superseded） */
+  version: number;
+  feedback_type: SearchFeedbackType;
+  feedback_reason?: FeedbackReason | null;
+  feedback_comment?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** 提交回答反馈的参数 */
+export interface SubmitAnswerFeedbackParams {
+  /** 检索历史记录 id（检索响应返回 / 历史项 id） */
+  historyId: string;
+  /** 操作幂等 id：新操作生成 uuid，重试复用 */
+  operationId: string;
+  /** 版本号：每个 history_id 从 1 开始，成功 +1 */
+  version: number;
+  feedbackType: SearchFeedbackType;
+  /** dislike 必填 */
+  feedbackReason?: FeedbackReason | null;
+  /** 补充说明，≤300 字 */
+  feedbackComment?: string;
+}
+
+/** 提交回答反馈后的响应 */
+export interface SubmitAnswerFeedbackResponse {
+  feedback: AnswerFeedbackRecord;
+  /** 是否覆盖了旧 version 的反馈 */
+  superseded: boolean;
+  /** 是否幂等命中（同一 operation_id 重试） */
+  idempotent: boolean;
+}
+
+/** 回答反馈回显响应（GET ?history_id=，无反馈时 feedback 为 null） */
+export interface AnswerFeedbackEchoResponse {
+  feedback: AnswerFeedbackRecord | null;
+}
+
+/** 回答反馈列表项（按知识库聚合查询，情况追踪页使用） */
+export interface AnswerFeedbackListItem {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  history_id: string;
+  query: string;
+  answer: string | null;
+  feedback_type: SearchFeedbackType;
+  feedback_reason: FeedbackReason | null;
+  feedback_comment: string | null;
+  knowledge_base_ids: string[];
+  source: string | null;
+  mode: string | null;
+  source_missing_reason: string | null;
+  adopted: boolean;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** 回答反馈列表响应 */
+export interface AnswerFeedbackListResponse {
+  items: AnswerFeedbackListItem[];
+  total: number;
+  like_count: number;
+  dislike_count: number;
+  page: number;
+  page_size: number;
+}
+
+/** 回答反馈统计 */
+export interface AnswerFeedbackStats {
+  total: number;
+  like_count: number;
+  dislike_count: number;
 }

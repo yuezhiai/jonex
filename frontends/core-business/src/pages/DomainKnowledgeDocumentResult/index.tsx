@@ -86,7 +86,7 @@ export default function DomainKnowledgeDocumentResult() {
     setLoading(true);
     getManualDocumentDetail(id, docId, t)
       .then(setDoc)
-      .catch(() => message.error(t('domainKnowledge.documentDetailLoadFailed')))
+      .catch((err: any) => message.error(err?.message || t('domainKnowledge.documentDetailLoadFailed')))
       .finally(() => setLoading(false));
   }, [id, docId, t]);
 

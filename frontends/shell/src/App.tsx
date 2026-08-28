@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
 import { ConfigProvider, Spin } from 'antd';
@@ -15,17 +15,17 @@ import { getAccessToken } from './api/auth';
 import type { ReactNode } from 'react';
 
 function RequireAuth({ children }: { children: ReactNode }) {
-  const { t } = useTranslation();
   const [authChecked, setAuthChecked] = useState(false);
 
+  // token 过期（jonex:token-expired 事件 / 轮询兜底 / 路由守卫）只处理一次：
+  // 页面并发请求同时 401 时会收到多个事件，全部挡掉只跳转一次。
+  // 「会话已过期」提示统一在登录页展示（?expired=1），这里不重复提示。
+  const redirectingRef = useRef(false);
   const goLogin = useCallback(() => {
-    import('antd').then(({ message }) => {
-      message.error(t('auth.sessionExpired'));
-      setTimeout(() => {
-        window.location.href = `/login?redirect=${encodeURIComponent(window.location.href)}`;
-      }, 60);
-    });
-  }, [t]);
+    if (redirectingRef.current) return;
+    redirectingRef.current = true;
+    window.location.href = `/login?redirect=${encodeURIComponent(window.location.href)}&expired=1`;
+  }, []);
 
   useEffect(() => {
     if (getAccessToken()) {

@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface TemplateListResponse<T> {
   items: T[];
@@ -17,6 +10,7 @@ export interface TemplateListResponse<T> {
 export interface TemplateDomain {
   id: string;
   name: string;
+  name_en?: string;
   description?: string | null;
   status: 'active' | 'inactive' | 'archived' | string;
   scenario_count?: number;
@@ -101,118 +95,82 @@ export interface SaveTemplateRelationPayload {
   relation_type: string;
 }
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
+// ── API（apiClient.get<T> 已解包，返回 data）──
 
 export async function fetchTemplateDomains(offset = 0, limit = 20): Promise<TemplateListResponse<TemplateDomain>> {
-  const resp = await apiClient.get<ApiEnvelope<TemplateListResponse<TemplateDomain>>>(
-    '/api/v1/ecosystem/templates/domains',
-    { params: { offset, limit } },
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.get<TemplateListResponse<TemplateDomain>>('/ecosystem/templates/domains', {
+    params: { offset, limit },
+  });
 }
 
 export async function fetchTemplateScenarios(domainId?: string): Promise<TemplateListResponse<TemplateScenario>> {
-  const resp = await apiClient.get<ApiEnvelope<TemplateListResponse<TemplateScenario>>>(
-    '/api/v1/ecosystem/templates/scenarios',
-    { params: { domain_id: domainId || undefined, limit: 100 } },
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.get<TemplateListResponse<TemplateScenario>>('/ecosystem/templates/scenarios', {
+    params: { domain_id: domainId || undefined, limit: 100 },
+  });
 }
 
 export async function createTemplateScenario(data: SaveTemplateScenarioPayload): Promise<TemplateScenario> {
-  const resp = await apiClient.post<ApiEnvelope<TemplateScenario>>('/api/v1/ecosystem/templates/scenarios', data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<TemplateScenario>('/ecosystem/templates/scenarios', data);
 }
 
 export async function updateTemplateScenario(
   scenarioId: string,
   data: Partial<SaveTemplateScenarioPayload>,
 ): Promise<TemplateScenario> {
-  const resp = await apiClient.patch<ApiEnvelope<TemplateScenario>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<TemplateScenario>(`/ecosystem/templates/scenarios/${scenarioId}`, data);
 }
 
 export async function deleteTemplateScenario(scenarioId: string): Promise<void> {
-  const resp = await apiClient.delete<ApiEnvelope<void>>(`/api/v1/ecosystem/templates/scenarios/${scenarioId}`);
-  unwrapEnvelope(resp.data);
+  await apiClient.delete<null>(`/ecosystem/templates/scenarios/${scenarioId}`);
 }
 
 export async function fetchTemplateObjects(scenarioId: string): Promise<TemplateListResponse<TemplateObject>> {
-  const resp = await apiClient.get<ApiEnvelope<TemplateListResponse<TemplateObject>>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/objects`,
-    { params: { limit: 100 } },
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.get<TemplateListResponse<TemplateObject>>(`/ecosystem/templates/scenarios/${scenarioId}/objects`, {
+    params: { limit: 100 },
+  });
 }
 
 export async function createTemplateObject(
   scenarioId: string,
   data: SaveTemplateObjectPayload,
 ): Promise<TemplateObject> {
-  const resp = await apiClient.post<ApiEnvelope<TemplateObject>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/objects`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<TemplateObject>(`/ecosystem/templates/scenarios/${scenarioId}/objects`, data);
 }
 
 export async function updateTemplateObject(
   objectId: string,
   data: Partial<SaveTemplateObjectPayload>,
 ): Promise<TemplateObject> {
-  const resp = await apiClient.patch<ApiEnvelope<TemplateObject>>(
-    `/api/v1/ecosystem/templates/objects/${objectId}`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<TemplateObject>(`/ecosystem/templates/objects/${objectId}`, data);
 }
 
 export async function deleteTemplateObject(objectId: string): Promise<void> {
-  const resp = await apiClient.delete<ApiEnvelope<void>>(`/api/v1/ecosystem/templates/objects/${objectId}`);
-  unwrapEnvelope(resp.data);
+  await apiClient.delete<null>(`/ecosystem/templates/objects/${objectId}`);
 }
 
 export async function fetchTemplateRelations(scenarioId: string): Promise<TemplateListResponse<TemplateRelation>> {
-  const resp = await apiClient.get<ApiEnvelope<TemplateListResponse<TemplateRelation>>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/relations`,
+  return apiClient.get<TemplateListResponse<TemplateRelation>>(
+    `/ecosystem/templates/scenarios/${scenarioId}/relations`,
     { params: { limit: 100 } },
   );
-  return unwrapEnvelope(resp.data);
 }
 
 export async function createTemplateRelation(
   scenarioId: string,
   data: SaveTemplateRelationPayload,
 ): Promise<TemplateRelation> {
-  const resp = await apiClient.post<ApiEnvelope<TemplateRelation>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/relations`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<TemplateRelation>(`/ecosystem/templates/scenarios/${scenarioId}/relations`, data);
 }
 
 export async function updateTemplateRelation(
   relationId: string,
   data: Partial<SaveTemplateRelationPayload>,
 ): Promise<TemplateRelation> {
-  const resp = await apiClient.patch<ApiEnvelope<TemplateRelation>>(
-    `/api/v1/ecosystem/templates/relations/${relationId}`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<TemplateRelation>(`/ecosystem/templates/relations/${relationId}`, data);
 }
 
 export async function deleteTemplateRelation(relationId: string): Promise<void> {
-  const resp = await apiClient.delete<ApiEnvelope<void>>(`/api/v1/ecosystem/templates/relations/${relationId}`);
-  unwrapEnvelope(resp.data);
+  await apiClient.delete<null>(`/ecosystem/templates/relations/${relationId}`);
 }
 
 // ── Template Constraints ───────────────────────────────────
@@ -241,38 +199,28 @@ export interface SaveTemplateConstraintPayload {
 }
 
 export async function fetchTemplateConstraints(scenarioId: string): Promise<TemplateListResponse<TemplateConstraint>> {
-  const resp = await apiClient.get<ApiEnvelope<TemplateListResponse<TemplateConstraint>>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/constraints`,
+  return apiClient.get<TemplateListResponse<TemplateConstraint>>(
+    `/ecosystem/templates/scenarios/${scenarioId}/constraints`,
     { params: { limit: 100 } },
   );
-  return unwrapEnvelope(resp.data);
 }
 
 export async function createTemplateConstraint(
   scenarioId: string,
   data: SaveTemplateConstraintPayload,
 ): Promise<TemplateConstraint> {
-  const resp = await apiClient.post<ApiEnvelope<TemplateConstraint>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/constraints`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<TemplateConstraint>(`/ecosystem/templates/scenarios/${scenarioId}/constraints`, data);
 }
 
 export async function updateTemplateConstraint(
   constraintId: string,
   data: Partial<SaveTemplateConstraintPayload>,
 ): Promise<TemplateConstraint> {
-  const resp = await apiClient.patch<ApiEnvelope<TemplateConstraint>>(
-    `/api/v1/ecosystem/templates/constraints/${constraintId}`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<TemplateConstraint>(`/ecosystem/templates/constraints/${constraintId}`, data);
 }
 
 export async function deleteTemplateConstraint(constraintId: string): Promise<void> {
-  const resp = await apiClient.delete<ApiEnvelope<void>>(`/api/v1/ecosystem/templates/constraints/${constraintId}`);
-  unwrapEnvelope(resp.data);
+  await apiClient.delete<null>(`/ecosystem/templates/constraints/${constraintId}`);
 }
 
 // ── YAML Import/Export ───────────────────────────────────
@@ -295,10 +243,9 @@ export interface YamlImportResult {
 export async function exportScenarioOntologyYaml(
   scenarioId: string,
 ): Promise<{ filename: string; yaml_text: string; warnings: string[] }> {
-  const resp = await apiClient.get<
-    ApiEnvelope<{ filename: string; yaml_text: string; warnings: string[] }>
-  >(`/api/v1/ecosystem/templates/scenarios/${scenarioId}/ontology-yaml/export`)
-  return unwrapEnvelope(resp.data)
+  return apiClient.get<{ filename: string; yaml_text: string; warnings: string[] }>(
+    `/ecosystem/templates/scenarios/${scenarioId}/ontology-yaml/export`,
+  )
 }
 
 export async function importScenarioOntologyYaml(
@@ -308,10 +255,9 @@ export async function importScenarioOntologyYaml(
 ): Promise<YamlImportResult> {
   const fd = new FormData()
   fd.append('file', file)
-  const resp = await apiClient.post<ApiEnvelope<YamlImportResult>>(
-    `/api/v1/ecosystem/templates/scenarios/${scenarioId}/ontology-yaml/import?dry_run=${dryRun}&mode=merge`,
+  return apiClient.post<YamlImportResult>(
+    `/ecosystem/templates/scenarios/${scenarioId}/ontology-yaml/import?dry_run=${dryRun}&mode=merge`,
     fd,
     { headers: { 'Content-Type': 'multipart/form-data' } },
   )
-  return unwrapEnvelope(resp.data)
 }

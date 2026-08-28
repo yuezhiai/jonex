@@ -1,18 +1,19 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
-import { Button, Layout, Dropdown, Spin } from 'antd';
+import { Button, Layout, Dropdown, Spin, Alert } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { LogoutOutlined, MenuFoldOutlined, MenuUnfoldOutlined, HomeOutlined, RightOutlined } from '@ant-design/icons';
 import * as Icons from '@ant-design/icons';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
-import { getUser, logout } from '../../api/auth';
+import { getUser, logout, exitImpersonation } from '../../api/auth';
 import { fetchAppManifest, getEnabledApps } from '../../api/manifest';
 import { fetchMyMenus } from '../../api/menus';
 import type { MenuNode } from '../../api/menus';
 import SpaceSwitcher from '../SpaceSwitcher';
 import LocaleSwitcher from '../LocaleSwitcher';
+import TenantImpersonationSwitcher from '../TenantImpersonationSwitcher';
 import type { AppManifestEntry } from '@jonex/shell-sdk';
 import { colors } from '@jonex/platform-theme/tokens';
-import { userDisplayName } from '../../utils/userDisplay';
+import { userDisplayName, userRoleLabel } from '../../utils/userDisplay';
 
 interface BreadcrumbItem {
   title: string;
@@ -75,6 +76,7 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [menus, setMenus] = useState<MenuNode[]>([]);
   const [menuLoading, setMenuLoading] = useState(true);
+  const [exiting, setExiting] = useState(false);
 
   const userRoles = useMemo<string[]>(() => {
     return user?.roles ?? ((user as any)?.role ? [(user as any).role as string] : []);
@@ -333,6 +335,7 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+            <TenantImpersonationSwitcher user={user} />
             <LocaleSwitcher />
             {/* TODO: 搜索和通知功能暂未实现，先隐藏 */}
 
@@ -375,7 +378,7 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
                       >
                         {userDisplayName(user, t)}
                       </span>
-                      <span style={{ fontSize: 12, color: colors.textMuted }}>{t('auth.admin')}</span>
+                      <span style={{ fontSize: 12, color: colors.textMuted }}>{userRoleLabel(user, t)}</span>
                     </div>
                   )}
                 </div>
@@ -383,6 +386,36 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
             )}
           </div>
         </header>
+
+        {user?.impersonated && (
+          <Alert
+            type="warning"
+            showIcon
+            banner
+            message={
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                {t('impersonation.banner', { tenant: user.tenantName || user.tenantId })}
+                <Button
+                  type="link"
+                  size="small"
+                  loading={exiting}
+                  onClick={async () => {
+                    setExiting(true);
+                    try {
+                      await exitImpersonation();
+                    } catch {
+                      // 失败已由响应拦截器 toast
+                    } finally {
+                      setExiting(false);
+                    }
+                  }}
+                >
+                  {t('impersonation.exit')}
+                </Button>
+              </span>
+            }
+          />
+        )}
 
         {/* Content */}
         <main className="yx-content">{children}</main>

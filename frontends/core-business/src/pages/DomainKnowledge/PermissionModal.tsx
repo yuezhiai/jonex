@@ -12,7 +12,7 @@ interface PermissionModalProps {
   loading: boolean;
   saving: boolean;
   onKeywordChange: (val: string) => void;
-  onRoleChange: (userId: string, role: 'viewer' | 'editor') => void;
+  onRoleChange: (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => void;
   onSave: () => void;
   onCancel: () => void;
 }
@@ -67,9 +67,13 @@ export default function PermissionModal({
                   <div className="yx-perm-user-dept">{u.dept}</div>
                 </div>
                 <div className="yx-perm-radio">
-                  {(['viewer', 'editor'] as const).map((role) => {
+                  {(['viewer', 'editor', 'kb_manager'] as const).map((role) => {
                     const isActive = checked === role;
-                    const label = role === 'viewer' ? t('permission.view') : t('permission.manage');
+                    const label = t({
+                      viewer: 'permission.view',
+                      editor: 'permission.edit',
+                      kb_manager: 'permission.kbManage',
+                    }[role]);
                     return (
                       <label key={role} className={isActive ? 'is-checked' : ''}>
                         <input

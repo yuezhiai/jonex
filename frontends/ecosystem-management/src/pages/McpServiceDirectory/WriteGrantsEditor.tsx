@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Select, Radio, Space, Spin, Tag, Typography } from 'antd';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
-import type { WriteGrant } from '@/api/mcpWriteKeys';
+import type { WriteGrant } from '@/api/mcpKeys';
 import { listKbFolders, type KbFolderItem, type KnowledgeBaseBrief } from '@/api/spaces';
 
 interface WriteGrantsEditorProps {
@@ -73,10 +73,16 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
     return kbList.find((k) => k.id === firstKb)?.space_id ?? null;
   }, [grants, kbList]);
 
-  /** KB 选择器选项：参照空间过滤 + 保留当前行已选值（跨 space 时仍可显示） */
+  /** KB 选择器选项：参照空间过滤 + 排除其他行已占用 KB + 保留当前行已选值 */
   const kbOptionsFor = (index: number, currentKb: string) => {
+    // 其他行已占用的知识库 ID（排除当前行自身、kb 非空才算占用）
+    const usedKbIds = grants
+      .filter((g, i) => i !== index && g.kb)
+      .map((g) => g.kb);
+
     const options = kbList
-      .filter((k) => !refSpace || k.space_id === refSpace)
+      .filter((k) => !refSpace || k.space_id === refSpace) // 原同空间过滤
+      .filter((k) => !usedKbIds.includes(k.id)) // 新增：排除其他行占用
       .map((k) => {
         const spaceName = k.space_id ? spaceNameMap?.[k.space_id] : null;
         return {
@@ -84,7 +90,9 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
           label: spaceName ? `${k.name}（${spaceName}）` : k.name,
         };
       });
-    // 当前行已选值不在过滤结果中时追加（避免编辑回填跨 space 时 Select 显示原始 id）
+    // ⚠️ append 兜底块必须原样保留：从 kbList 全集查找、不受同空间 filter 限制，
+    // 覆盖跨空间回填（currentKb 属其他空间时仍能显示）与 currentKb 恰被 usedKbIds
+    // 命中（编辑回填已有行时仍能显示）两种情况。
     if (currentKb && !options.some((o) => o.value === currentKb)) {
       const cur = kbList.find((k) => k.id === currentKb);
       if (cur) {
@@ -99,7 +107,7 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
       <div style={{ marginBottom: 8 }}>
         <Space size={4} wrap>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {t('mcpWriteKeys.grantsHint')}
+            {t('mcpKeyManagement.grantsHint')}
           </Typography.Text>
           {refSpace && spaceNameMap?.[refSpace] && (
             <Tag color="blue" style={{ fontSize: 12 }}>
@@ -110,7 +118,7 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
       </div>
 
       {grants.length === 0 ? (
-        <Typography.Text type="secondary">{t('mcpWriteKeys.grantsEmpty')}</Typography.Text>
+        <Typography.Text type="secondary">{t('mcpKeyManagement.grantsEmpty')}</Typography.Text>
       ) : (
         grants.map((g, index) => {
           const folders = folderMap[g.kb] ?? [];
@@ -122,11 +130,11 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
               style={{ marginBottom: 12 }}
               title={
                 <Space size={8}>
-                  <Typography.Text>{t('mcpWriteKeys.grantItem', { index: index + 1 })}</Typography.Text>
+                  <Typography.Text>{t('mcpKeyManagement.grantItem', { index: index + 1 })}</Typography.Text>
                   {g.mode === 'all' ? (
-                    <Tag color="success">{t('mcpWriteKeys.modeAll')}</Tag>
+                    <Tag color="success">{t('mcpKeyManagement.modeAll')}</Tag>
                   ) : (
-                    <Tag color="processing">{t('mcpWriteKeys.modeSpecified')}</Tag>
+                    <Tag color="processing">{t('mcpKeyManagement.modeSpecified')}</Tag>
                   )}
                 </Space>
               }
@@ -145,11 +153,11 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <div>
                   <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
-                    {t('mcpWriteKeys.kbLabel')}
+                    {t('mcpKeyManagement.kbLabel')}
                   </Typography.Text>
                   <Select
                     style={{ width: '100%' }}
-                    placeholder={t('mcpWriteKeys.kbPlaceholder')}
+                    placeholder={t('mcpKeyManagement.kbPlaceholder')}
                     value={g.kb || undefined}
                     disabled={disabled}
                     onChange={(kb) => updateGrant(index, { kb, directories: [] })}
@@ -160,21 +168,21 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
                 </div>
                 <div>
                   <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
-                    {t('mcpWriteKeys.modeLabel')}
+                    {t('mcpKeyManagement.modeLabel')}
                   </Typography.Text>
                   <Radio.Group
                     value={g.mode}
                     disabled={disabled}
                     onChange={(e) => updateGrant(index, { mode: e.target.value })}
                   >
-                    <Radio value="all">{t('mcpWriteKeys.modeAllDesc')}</Radio>
-                    <Radio value="specified">{t('mcpWriteKeys.modeSpecifiedDesc')}</Radio>
+                    <Radio value="all">{t('mcpKeyManagement.modeAllDesc')}</Radio>
+                    <Radio value="specified">{t('mcpKeyManagement.modeSpecifiedDesc')}</Radio>
                   </Radio.Group>
                 </div>
                 {g.mode === 'specified' && (
                   <div>
                     <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
-                      {t('mcpWriteKeys.directoriesLabel')}
+                      {t('mcpKeyManagement.directoriesLabel')}
                     </Typography.Text>
                     {loading ? (
                       <Spin size="small" />
@@ -182,13 +190,13 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
                       <Select
                         mode="multiple"
                         style={{ width: '100%' }}
-                        placeholder={t('mcpWriteKeys.directoriesPlaceholder')}
+                        placeholder={t('mcpKeyManagement.directoriesPlaceholder')}
                         value={g.directories}
                         disabled={disabled || !g.kb}
                         onChange={(dirs) => updateGrant(index, { directories: dirs })}
                         options={folders.map((f: KbFolderItem) => ({ value: f.id, label: f.name }))}
                         maxTagCount={3}
-                        notFoundContent={t('mcpWriteKeys.directoriesEmpty')}
+                        notFoundContent={t('mcpKeyManagement.directoriesEmpty')}
                       />
                     )}
                   </div>
@@ -201,14 +209,14 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
 
       {!disabled && (
         <Button type="dashed" block icon={<PlusOutlined />} onClick={addGrant}>
-          {t('mcpWriteKeys.addGrant')}
+          {t('mcpKeyManagement.addGrant')}
         </Button>
       )}
 
       {/* 提示当前选择的 KB 名称（辅助确认写入范围） */}
       {grants.length > 0 && (
         <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
-          {grants.map((g, i) => `${i + 1}. ${g.kb ? kbNameMap.get(g.kb) ?? g.kb : t('mcpWriteKeys.kbUnselected')}（${g.mode === 'all' ? t('mcpWriteKeys.modeAll') : `${g.directories.length} ${t('mcpWriteKeys.directoryUnit')}`}）`).join('；')}
+          {grants.map((g, i) => `${i + 1}. ${g.kb ? kbNameMap.get(g.kb) ?? g.kb : t('mcpKeyManagement.kbUnselected')}（${g.mode === 'all' ? t('mcpKeyManagement.modeAll') : `${g.directories.length} ${t('mcpKeyManagement.directoryUnit')}`}）`).join('；')}
         </Typography.Paragraph>
       )}
     </div>

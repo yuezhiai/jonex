@@ -56,7 +56,7 @@
     "signInDescription": "访问您的管理仪表板",
     "welcomeBack": "欢迎回来",
     "neddHelp": "需要帮助访问您的账户？",
-    "systemAdmin": "系统管理员",
+    "systemAdmin": "租户管理员",
     "admin": "管理员",
     "user": "用户",
     "orContinueEmail": "或继续使用邮箱登录",

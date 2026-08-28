@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface SystemConfigItem {
   id: number;
@@ -16,19 +9,12 @@ export interface SystemConfigItem {
   description: string | null;
 }
 
-function unwrap<T>(p: ApiEnvelope<T>): T {
-  if (!p?.success) throw new Error(p?.message || 'Request failed');
-  return p.data as T;
-}
-
 export async function listSystemConfigs(): Promise<{ items: SystemConfigItem[] }> {
-  const r = await apiClient.get<ApiEnvelope<{ items: SystemConfigItem[] }>>('/api/v1/platform/system-configs');
-  return unwrap(r.data);
+  return apiClient.get<{ items: SystemConfigItem[] }>('/platform/system-configs');
 }
 
 export async function updateSystemConfig(key: string, value: string): Promise<SystemConfigItem> {
-  const r = await apiClient.put<ApiEnvelope<SystemConfigItem>>(`/api/v1/platform/system-configs/${key}`, {
+  return apiClient.put<SystemConfigItem>(`/platform/system-configs/${key}`, {
     config_value: value,
   });
-  return unwrap(r.data);
 }

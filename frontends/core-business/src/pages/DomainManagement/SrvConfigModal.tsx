@@ -2,9 +2,9 @@ import React, { useState } from 'react';
 import { Modal, Button, Table, Tabs } from 'antd';
 import { KeyOutlined, PlusOutlined, CopyOutlined, CheckOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import type { ColumnsType } from 'antd/es/table';
+import copy from 'copy-to-clipboard';
 import type { DomainServiceItem, ServiceApiKeyItem } from '../../types/domainService';
-import { useStore } from '@/store';
+import { usePermission } from '@jonex/shared-lib';
 import McpKeyTab from './McpKeyTab';
 
 interface SrvConfigModalProps {
@@ -29,33 +29,16 @@ export default function SrvConfigModal({
   onCancel,
 }: SrvConfigModalProps) {
   const { t } = useTranslation();
-  const { global } = useStore();
   // 权限码判断：MCP Key Tab 仅服务管理员（service:write）可见
-  const userInfo = global.userInfo as Record<string, unknown> | null | undefined;
-  const userPermissions: string[] = Array.isArray(userInfo?.permissions)
-    ? (userInfo.permissions as string[])
-    : [];
-  const isAdmin = userPermissions.includes('service:write');
+  const { hasPerm } = usePermission();
+  const isAdmin = hasPerm('service:write');
   const [activeTab, setActiveTab] = useState<string>('apiKey');
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
   const handleCopyKey = async (keyId: string, key: string) => {
-    try {
-      await navigator.clipboard.writeText(key);
-      setCopiedKeyId(keyId);
-      setTimeout(() => setCopiedKeyId(null), 2000);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = key;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      setCopiedKeyId(keyId);
-      setTimeout(() => setCopiedKeyId(null), 2000);
-    }
+    await copy(key);
+    setCopiedKeyId(keyId);
+    setTimeout(() => setCopiedKeyId(null), 2000);
   };
 
   const formatDate = (dateStr: string | null): string => {

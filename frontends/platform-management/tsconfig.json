@@ -3,7 +3,8 @@
   "compilerOptions": {
     "paths": {
       "@/*": ["./src/*"],
-      "@jonex/shell-sdk": ["../shared/shell-sdk/src/index.ts"]
+      "@jonex/shell-sdk": ["../shared/shell-sdk/src/index.ts"],
+      "@jonex/shared-lib": ["../shared/shared-lib/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],

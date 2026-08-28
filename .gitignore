@@ -264,3 +264,14 @@ CLAUDE.md.orig
 # 仅根级：Reference/ 引用仓库的历史 superpowers 文档不受影响
 /.superpowers/
 /docs/superpowers/
+poc
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/
+
+# 本地 dolt 全局配置重定向（沙箱内 HOME 规避用，非项目状态）
+.bd-home/
+.codex
+.agents
+.pnpm-store
+deploy/.env-aws

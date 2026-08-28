@@ -1,5 +1,5 @@
 import React, { forwardRef, useImperativeHandle, useState } from 'react';
-import { Form, Input, Modal, Select, message } from 'antd';
+import { Form, Input, Modal, message } from 'antd';
 import { useTranslation } from 'react-i18next';
 import {
   createTenant,
@@ -27,7 +27,7 @@ const TenantFormModal = forwardRef<TenantFormModalRef, { onSaved: () => void }>(
   useImperativeHandle(ref, () => ({
     openCreate() {
       setEditing(null);
-      form.setFieldsValue({ id: '', name: '', description: '', plan_type: 'free' });
+      form.setFieldsValue({ id: '', name: '', description: '' });
       setModalOpen(true);
     },
     openEdit(item: TenantItem) {
@@ -36,7 +36,6 @@ const TenantFormModal = forwardRef<TenantFormModalRef, { onSaved: () => void }>(
         id: item.id,
         name: item.name,
         description: item.description || '',
-        plan_type: item.plan_type,
       });
       setModalOpen(true);
     },
@@ -45,21 +44,22 @@ const TenantFormModal = forwardRef<TenantFormModalRef, { onSaved: () => void }>(
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      // 租户 ID 与名称去除首尾空格后提交
+      const tenantId = (values.id ?? '').trim();
+      const tenantName = (values.name ?? '').trim();
       setSubmitting(true);
       if (editing) {
         const payload: TenantUpdatePayload = {
-          name: values.name,
+          name: tenantName,
           description: values.description,
-          plan_type: values.plan_type,
         };
         await updateTenant(editing.id, payload);
         message.success(t('tenantManagement.updated'));
       } else {
         const payload: TenantCreatePayload = {
-          id: values.id,
-          name: values.name,
+          id: tenantId,
+          name: tenantName,
           description: values.description,
-          plan_type: values.plan_type,
         };
         await createTenant(payload);
         message.success(t('tenantManagement.created'));
@@ -91,7 +91,8 @@ const TenantFormModal = forwardRef<TenantFormModalRef, { onSaved: () => void }>(
           <Form.Item
             name="id"
             label={t('tenantManagement.tenantId')}
-            rules={[{ required: true, message: t('tenantManagement.requiredTenantId') }]}
+            rules={[{ required: true, whitespace: true, message: t('tenantManagement.requiredTenantId') }]}
+            getValueFromEvent={(e) => e.target.value.replace(/\s+/g, '')}
           >
             <Input placeholder={t('tenantManagement.placeholderTenantId')} />
           </Form.Item>
@@ -99,21 +100,13 @@ const TenantFormModal = forwardRef<TenantFormModalRef, { onSaved: () => void }>(
         <Form.Item
           name="name"
           label={t('tenantManagement.name')}
-          rules={[{ required: true, message: t('tenantManagement.requiredName') }]}
+          rules={[{ required: true, whitespace: true, message: t('tenantManagement.requiredName') }]}
+          getValueFromEvent={(e) => e.target.value.replace(/\s+/g, '')}
         >
           <Input placeholder={t('tenantManagement.placeholderName')} />
         </Form.Item>
         <Form.Item name="description" label={t('tenantManagement.description')}>
           <Input placeholder={t('tenantManagement.placeholderDescription')} />
-        </Form.Item>
-        <Form.Item name="plan_type" label={t('tenantManagement.plan')}>
-          <Select
-            options={[
-              { label: t('tenantManagement.planFree'), value: 'free' },
-              { label: t('tenantManagement.planPro'), value: 'pro' },
-              { label: t('tenantManagement.planEnterprise'), value: 'enterprise' },
-            ]}
-          />
         </Form.Item>
       </Form>
     </Modal>

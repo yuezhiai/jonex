@@ -48,7 +48,8 @@ async def list_documents(service_id: str, file_name: str = "") -> dict:
 async def search_ontology(
     service_id: str, query: str, mode: str = "hybrid", top_k: int = 5, strict_mode: bool = False,
 ) -> dict:
-    """本体优先检索——实体匹配→1-hop 邻域→RAG fallback。
+    """语义搜索——检索领域服务下知识库的相关内容，作为通用搜索入口。
+    适用于常规问答、文档检索、知识查询。
     搜索模式：naive / local / global / hybrid（默认 hybrid）。
     支持严格模式（strict_mode=True）多次验证循环确保可靠性。"""
     return await tools.search_ontology(service_id, query, mode, top_k, strict_mode)
@@ -66,7 +67,9 @@ async def search_service(
 async def search_deep(
     service_id: str, query: str, mode: str = "hybrid", top_k: int = 5, strict_mode: bool = False,
 ) -> dict:
-    """深度查询——多轮分解→子问题查询→归并答案。
+    """[实验性，需配置启用] 深度多轮查询——将复杂问题拆解为子问题逐一检索后汇总归并。
+    仅适用于需要多步推理的复杂分析场景，常规搜索请优先使用 search_ontology。
+    当前可能因 DEEP_QUERY_ENABLED 未启用而不可用。
     搜索模式：naive / local / global / hybrid（默认 hybrid）。
     支持严格模式（strict_mode=True）多次验证循环确保可靠性。"""
     return await tools.search_deep(service_id, query, mode, top_k, strict_mode)
@@ -76,7 +79,8 @@ async def search_deep(
 async def search_llmwiki(
     service_id: str, query: str, mode: str = "hybrid", top_k: int = 5,
 ) -> dict:
-    """OpenKB Wiki 检索——仅适用于 OpenKB 管线知识库，不适用于 LightRAG 管线。
+    """Wiki 知识检索——从 OpenKB 编译的 Wiki 知识库中检索。
+    仅适用于 OpenKB 管线知识库，通用搜索请优先使用 search_ontology。
     搜索模式：naive / local / global / hybrid（默认 hybrid）。
     不支持严格模式（OpenKB 编译产物无严格模式语义）。"""
     return await tools.search_llmwiki(service_id, query, mode, top_k)
@@ -86,8 +90,8 @@ async def search_llmwiki(
 async def search_mix(
     service_id: str, query: str, mode: str = "hybrid", top_k: int = 5,
 ) -> dict:
-    """混合管线检索统一入口——同时查询 LightRAG 和 OpenKB 管线知识库。
-    自动按 pipeline_type 分组扇出，支持混合选库。
+    """混合检索——自动识别知识库管线类型（LightRAG / OpenKB）并扇出并行检索。
+    适用于包含多种管线知识库的领域服务，通用搜索请优先使用 search_ontology。
     搜索模式：naive / local / global / hybrid（默认 hybrid）。"""
     return await tools.search_mix(service_id, query, mode, top_k)
 
@@ -99,16 +103,21 @@ async def read_source(service_id: str, document_id: str) -> dict:
 
 
 @mcp.tool()
-async def upload_document(
+async def confirm_upload(
     service_id: str,
     file_name: str,
-    file_content_base64: str,
     knowledge_base_id: str,
+    storage_key: str,
+    doc_id: str = "",
     mime_type: str = "",
 ) -> dict:
-    """上传文档到指定知识库。文档将经过解析和索引后支持语义搜索。"""
-    return await tools.upload_document(
-        service_id, file_name, file_content_base64, knowledge_base_id, mime_type
+    """确认 COS 直传结果并触发解析索引（直传闭环最后一步）。
+
+    先调 generate_upload_url 拿预签名 PUT URL + storage_key，客户端直传对象存储后，
+    再调本工具传 storage_key 确认入库并触发解析，否则文档不会进入检索。
+    上传后异步解析，用 get_upload_status 查询处理进度。"""
+    return await tools.confirm_upload(
+        service_id, file_name, knowledge_base_id, storage_key, doc_id, mime_type
     )
 
 
@@ -116,8 +125,28 @@ async def upload_document(
 async def get_upload_status(service_id: str, document_id: str) -> dict:
     """查询已上传文档的处理状态。返回 status（pending/parsing/ingesting/ready/failed）、
     ontology_status（pending/extracting/ready/failed）、error_message 等字段。
-    用于追踪 upload_document 后的异步解析进度。"""
+    用于追踪 confirm_upload 后的异步解析进度。"""
     return await tools.get_upload_status(service_id, document_id)
+
+
+@mcp.tool()
+async def generate_upload_url(
+    service_id: str,
+    knowledge_base_id: str,
+    file_name: str,
+    content_type: str = "",
+    file_size: int = 0,
+) -> dict:
+    """生成 COS 预签名上传 URL，用于文件直传（替代 base64 内联上传）。
+    返回 {doc_id, storage_key, upload_url, storage_backend}。
+    客户端 curl -X PUT --upload-file <file> <upload_url> 直传 COS 后，
+    必须调用 confirm_upload 确认入库并触发解析索引，否则文档不会进入检索。
+    处理进度用 get_upload_status 查询。
+    file_size 为待上传字节数（可选，默认 0 表示未知）：传 >0 时服务端校验上限并
+    将 Content-Length 签入预签名，锁死精确大小。"""
+    return await tools.generate_upload_url(
+        service_id, knowledge_base_id, file_name, content_type, file_size
+    )
 
 
 async def health(request) -> JSONResponse:

@@ -67,7 +67,7 @@
     "signInDescription": "访问您的管理仪表板",
     "welcomeBack": "欢迎回来",
     "neddHelp": "需要帮助访问您的账户？",
-    "systemAdmin": "系统管理员",
+    "systemAdmin": "租户管理员",
     "admin": "管理员",
     "user": "用户",
     "orContinueEmail": "或继续使用邮箱登录",
@@ -138,7 +138,7 @@
     "homeCardOperationLogDesc": "操作日志与审计追踪"
   },
   "users": {
-    "roleAdmin": "系统管理员",
+    "roleAdmin": "租户管理员",
     "roleUser": "普通用户"
   },
   "tenants": {
@@ -433,8 +433,8 @@
     "usersUpdated": "用户分配已更新",
     "builtInRoles": {
       "systemAdmin": {
-        "name": "系统管理员",
-        "description": "拥有平台全部管理权限，包括系统配置、用户管理、租户管理和模型管理等功能模块"
+        "name": "租户管理员",
+        "description": "租户内管理员：拥有本租户全部业务权限（不含平台级权限）"
       },
       "user": {
         "name": "普通用户",
@@ -537,16 +537,13 @@
     "userLabel": "用户："
   },
   "systemConfig": {
-    "adminEmail": "管理员邮箱",
-    "autoBackup": "启用自动备份（每天 04:00）",
-    "backupPath": "备份路径",
     "basicSettings": "基本设置",
     "changedItems": "已修改 {{count}} 项",
     "changesSaved": "已保存 {{count}} 项配置",
     "changesSavedWithFail": "已保存 {{done}} 项，{{fail}} 项失败",
     "chinese": "简体中文",
     "defaultLanguage": "默认语言",
-    "description": "配置平台基本参数、安全策略、存储和通知",
+    "description": "配置平台基本参数与安全策略",
     "english": "English",
     "lockAfter3": "3 次后锁定",
     "lockAfter5": "5 次后锁定",
@@ -555,25 +552,15 @@
     "logoUrl": "Logo URL",
     "noChanges": "没有变更",
     "noLock": "不锁定",
-    "notificationSettings": "通知设置",
     "passwordMinLength": "密码最小长度（位）",
     "platformName": "平台名称",
     "resetToDefault": "恢复默认",
     "resetToDefaultMsg": "已恢复默认值，点击保存生效",
     "saveAll": "保存全部配置",
     "securitySettings": "安全设置",
-    "senderEmail": "发件人邮箱",
     "sessionTimeout": "会话超时（分钟）",
-    "smtpPort": "SMTP 端口",
-    "smtpServer": "SMTP 服务器",
-    "storageLimit": "存储容量上限（GB）",
-    "storagePath": "数据存储路径",
-    "storageSettings": "存储设置",
-    "storageUsed": "已用容量",
     "timezone": "时区",
-    "title": "系统配置",
-    "twoFactorAuth": "启用两步验证",
-    "webhookUrl": "Webhook URL"
+    "title": "系统配置"
   },
   "tenantManagement": {
     "createTenant": "新建租户",
@@ -631,6 +618,7 @@
     "enabled": "已启用",
     "newPassword": "新密码（留空不修改）",
     "operationFailed": "操作失败",
+    "passwordTooShort": "密码至少 6 位",
     "placeholderDisplayName": "显示姓名",
     "placeholderEmail": "电子邮箱",
     "placeholderNewPassword": "留空不修改密码",
@@ -652,7 +640,7 @@
     "updated": "已更新",
     "username": "用户名",
     "builtInUsers": {
-      "systemAdmin": "系统管理员",
+      "systemAdmin": "平台管理员",
       "multiSameDemo": "同名同密用户 - 演示租户",
       "multiSameAlpha": "同名同密用户 - Alpha 租户",
       "oneMatchDemo": "单租户密码匹配用户 - 演示租户",

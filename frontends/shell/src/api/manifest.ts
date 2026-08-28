@@ -2,7 +2,7 @@ import type { AppManifest, AppManifestEntry } from '@jonex/shell-sdk';
 import { isManifestV2 } from '@jonex/shell-sdk';
 import { apiClient } from './auth';
 
-const PLATFORM_MANIFEST_URL = '/api/v1/platform/frontend/apps';
+const PLATFORM_MANIFEST_URL = '/platform/frontend/apps';
 const FALLBACK_MANIFEST_URL = '/app-manifest.json';
 
 let cachedManifest: AppManifest | null = null;
@@ -18,10 +18,12 @@ export async function fetchAppManifest(): Promise<AppManifest> {
   let data: AppManifest | null = null;
 
   try {
-    data = await loadManifest(PLATFORM_MANIFEST_URL);
+    // 平台清单走后端统一请求入口（apiClient.get<T> 解包返回 manifest 本体）
+    data = await apiClient.get<AppManifest>(PLATFORM_MANIFEST_URL);
   } catch (error) {
     console.warn('[shell] platform manifest unavailable, using local fallback', error);
-    data = await loadManifest(FALLBACK_MANIFEST_URL);
+    // 本地静态 fallback 不走 apiClient（baseURL=/api/v1 会错误拼前缀），用 fetch 直读
+    data = await loadManifestFallback();
   }
 
   if (!isManifestV2(data)) {
@@ -33,10 +35,12 @@ export async function fetchAppManifest(): Promise<AppManifest> {
   return cachedManifest;
 }
 
-async function loadManifest(url: string): Promise<AppManifest> {
-  const resp = await apiClient.get<{ data?: AppManifest } & AppManifest>(url);
-  const payload = resp.data;
-  return (payload?.data ?? payload) as AppManifest;
+async function loadManifestFallback(): Promise<AppManifest> {
+  const res = await fetch(FALLBACK_MANIFEST_URL);
+  if (!res.ok) {
+    throw new Error(`Failed to load fallback manifest (HTTP ${res.status})`);
+  }
+  return res.json();
 }
 
 export function getEnabledApps(manifest: AppManifest, userRoles: string[]): AppManifestEntry[] {

@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface AuditLogItem {
   id: number;
@@ -36,11 +29,6 @@ export interface AuditActionOption {
   label_en: string;
 }
 
-function unwrap<T>(p: ApiEnvelope<T>): T {
-  if (!p?.success) throw new Error(p?.message || 'Request failed');
-  return p.data as T;
-}
-
 export async function listAuditLogs(
   params: {
     page?: number;
@@ -53,18 +41,15 @@ export async function listAuditLogs(
     end_time?: string;
   } = {},
 ): Promise<AuditLogListResponse> {
-  const r = await apiClient.get<ApiEnvelope<AuditLogListResponse>>('/api/v1/platform/audit-logs', { params });
-  return unwrap(r.data);
+  return apiClient.get<AuditLogListResponse>('/platform/audit-logs', { params });
 }
 
 export async function getAuditLog(id: number): Promise<AuditLogItem> {
-  const r = await apiClient.get<ApiEnvelope<AuditLogItem>>(`/api/v1/platform/audit-logs/${id}`);
-  return unwrap(r.data);
+  return apiClient.get<AuditLogItem>(`/platform/audit-logs/${id}`);
 }
 
 export async function listAuditActions(): Promise<AuditActionOption[]> {
-  const r = await apiClient.get<ApiEnvelope<{ actions: AuditActionOption[] }>>('/api/v1/platform/audit-logs/actions');
-  const data = unwrap(r.data);
+  const data = await apiClient.get<{ actions: AuditActionOption[] }>('/platform/audit-logs/actions');
   return data?.actions ?? [];
 }
 
@@ -75,10 +60,7 @@ export interface AuditResourceType {
 }
 
 export async function listAuditResourceTypes(): Promise<AuditResourceType[]> {
-  const r = await apiClient.get<ApiEnvelope<{ resources: AuditResourceType[] }>>(
-    '/api/v1/platform/audit-logs/resource-types',
-  );
-  const data = unwrap(r.data);
+  const data = await apiClient.get<{ resources: AuditResourceType[] }>('/platform/audit-logs/resource-types');
   return data?.resources ?? [];
 }
 

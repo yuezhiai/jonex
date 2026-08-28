@@ -38,8 +38,8 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
           });
           setRows(res.list);
           setTotal(res.pagination.total);
-        } catch {
-          message.error(t('common.loadFailed'));
+        } catch (err: any) {
+          message.error(err?.message || t('common.loadFailed'));
         } finally {
           setLoading(false);
         }

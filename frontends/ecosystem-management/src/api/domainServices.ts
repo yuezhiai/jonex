@@ -1,5 +1,4 @@
-import apiClient from './client';
-import type { McpKeyItem, McpKeyCreateResult } from './mcpKeys';
+import apiClient from './request';
 
 // ══ 服务视角 Key 管理 + 启用/停用 类型（来源 /api/v1/platform/mcp-services/{id}/keys 与 /api/v1/knowledge-base/services/{id}/enable|disable）══
 
@@ -66,31 +65,11 @@ export interface DomainServiceResponse {
   updated_at: string | null;
 }
 
-// ══ 统一解包：与 mcpServices.ts 一致，兼容 { success } 与 { code } 双信封 ══
-
-interface ApiEnvelope<T> {
-  success?: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
-
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (payload?.success === false || (typeof payload?.code === 'number' && payload.code !== 0)) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
-
-// ══ API ══
+// ══ API（apiClient.get<T> 已解包，返回 data）══
 
 /** 添加已有 Key 到服务授权 */
 export async function addKeyToService(serviceId: string, data: AddKeyRequest): Promise<AddKeyResponse> {
-  const resp = await apiClient.post<ApiEnvelope<AddKeyResponse>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<AddKeyResponse>(`/platform/mcp-services/${serviceId}/keys`, data);
 }
 
 /** 创建新 Key + 自动关联到服务（返回一次性明文，仅此时可获取） */
@@ -98,11 +77,7 @@ export async function createKeyForService(
   serviceId: string,
   data: CreateKeyForServiceRequest,
 ): Promise<CreateKeyForServiceResponse> {
-  const resp = await apiClient.post<ApiEnvelope<CreateKeyForServiceResponse>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys/new`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<CreateKeyForServiceResponse>(`/platform/mcp-services/${serviceId}/keys/new`, data);
 }
 
 /** 切换服务授权 Key 的权限（view → call → write → * 依序循环） */
@@ -111,57 +86,20 @@ export async function updateKeyPermission(
   keyId: string,
   data: UpdatePermissionRequest,
 ): Promise<UpdatePermissionResponse> {
-  const resp = await apiClient.patch<ApiEnvelope<UpdatePermissionResponse>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}`,
-    data,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<UpdatePermissionResponse>(`/platform/mcp-services/${serviceId}/keys/${keyId}`, data);
 }
 
 /** 移除单服务授权（仅移除映射，不删除/撤销 Key 本身） */
 export async function removeKeyFromService(serviceId: string, keyId: string): Promise<RemoveKeyResponse> {
-  const resp = await apiClient.delete<ApiEnvelope<RemoveKeyResponse>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}`,
-  );
-  return unwrapEnvelope(resp.data);
-}
-
-/**
- * 停用/启用 Key（可逆，恢复原 Key，key_id 不变；非 reset 换新）。
- * service_id 仅为契约兼容，key_id 唯一定位。
- */
-export async function toggleKeyStatus(serviceId: string, keyId: string): Promise<McpKeyItem> {
-  const resp = await apiClient.post<ApiEnvelope<McpKeyItem>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}/toggle`,
-  );
-  return unwrapEnvelope(resp.data);
-}
-
-/** 重新创建 Key（已过期 Key），返回一次性明文 plaintext */
-export async function recreateKey(
-  serviceId: string,
-  keyId: string,
-  data?: { expires_at?: string | null },
-): Promise<McpKeyCreateResult> {
-  const resp = await apiClient.post<ApiEnvelope<McpKeyCreateResult>>(
-    `/api/v1/platform/mcp-services/${serviceId}/keys/${keyId}/recreate`,
-    data ?? {},
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.delete<RemoveKeyResponse>(`/platform/mcp-services/${serviceId}/keys/${keyId}`);
 }
 
 /** 启用领域服务 */
 export async function enableDomainService(serviceId: string): Promise<DomainServiceResponse> {
-  const resp = await apiClient.post<ApiEnvelope<DomainServiceResponse>>(
-    `/api/v1/knowledge-base/services/${serviceId}/enable`,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<DomainServiceResponse>(`/knowledge-base/services/${serviceId}/enable`);
 }
 
 /** 停用领域服务 */
 export async function disableDomainService(serviceId: string): Promise<DomainServiceResponse> {
-  const resp = await apiClient.post<ApiEnvelope<DomainServiceResponse>>(
-    `/api/v1/knowledge-base/services/${serviceId}/disable`,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<DomainServiceResponse>(`/knowledge-base/services/${serviceId}/disable`);
 }

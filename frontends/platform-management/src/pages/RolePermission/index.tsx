@@ -12,7 +12,7 @@ const BUILT_IN_ROLE_KEYS: Record<string, string> = {
   admin: 'systemAdmin',
   user: 'user',
   平台管理员: 'platformAdmin',
-  系统管理员: 'systemAdmin',
+  租户管理员: 'systemAdmin',
   领域服务管理员: 'domainServiceAdmin',
   知识编辑者: 'knowledgeEditor',
   观察者: 'observer',

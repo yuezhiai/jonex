@@ -80,7 +80,6 @@ COMMENT ON TABLE knowledge_base.space_permissions IS '领域空间权限表';
 COMMENT ON TABLE knowledge_base.services IS '领域服务表';
 COMMENT ON TABLE knowledge_base.service_knowledge_bases IS '领域服务-知识库关联表';
 COMMENT ON TABLE knowledge_base.service_configs IS '领域服务配置表';
-COMMENT ON TABLE knowledge_base.service_permissions IS '领域服务权限表';
 COMMENT ON TABLE knowledge_base.service_api_keys IS '领域服务 API Key 管理表';
 
 -- knowledge_base: 数据源 + 本体模板绑定/编译

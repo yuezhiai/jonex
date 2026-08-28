@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface AdapterListResponse {
   items: AdapterItem[];
@@ -54,39 +47,27 @@ export function getAdapterStatusLabel(status: string, t: (key: string) => string
 
 export const ADAPTER_TYPE_OPTIONS: string[] = ['dingtalk', 'wechat_work', 'feishu'];
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
-
 export async function listAdapters(offset = 0, limit = 100): Promise<AdapterListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<AdapterListResponse>>('/api/v1/ecosystem/adapters', {
+  return apiClient.get<AdapterListResponse>('/ecosystem/adapters', {
     params: { offset, limit },
   });
-  return unwrapEnvelope(resp.data);
 }
 
 export async function createAdapter(data: SaveAdapterPayload): Promise<AdapterItem> {
-  const resp = await apiClient.post<ApiEnvelope<AdapterItem>>('/api/v1/ecosystem/adapters', data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<AdapterItem>('/ecosystem/adapters', data);
 }
 
 export async function updateAdapter(
   id: string,
   data: Partial<SaveAdapterPayload & { status: string }>,
 ): Promise<AdapterItem> {
-  const resp = await apiClient.patch<ApiEnvelope<AdapterItem>>(`/api/v1/ecosystem/adapters/${id}`, data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<AdapterItem>(`/ecosystem/adapters/${id}`, data);
 }
 
 export async function connectAdapter(id: string): Promise<AdapterItem> {
-  const resp = await apiClient.post<ApiEnvelope<AdapterItem>>(`/api/v1/ecosystem/adapters/${id}/connect`);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<AdapterItem>(`/ecosystem/adapters/${id}/connect`);
 }
 
 export async function disconnectAdapter(id: string): Promise<AdapterItem> {
-  const resp = await apiClient.post<ApiEnvelope<AdapterItem>>(`/api/v1/ecosystem/adapters/${id}/disconnect`);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<AdapterItem>(`/ecosystem/adapters/${id}/disconnect`);
 }

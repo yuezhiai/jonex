@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface TenantListResponse {
   items: TenantItem[];
@@ -37,35 +30,26 @@ export interface TenantUpdatePayload {
   status?: number;
 }
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) throw new Error(payload?.message || 'Request failed');
-  return payload.data as T;
-}
-
 export async function listTenants(page = 1, pageSize = 100): Promise<TenantListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<TenantListResponse>>('/api/v1/platform/tenants', {
+  return apiClient.get<TenantListResponse>('/platform/tenants', {
     params: { page, page_size: pageSize },
   });
-  return unwrapEnvelope(resp.data);
 }
 
 export async function createTenant(data: TenantCreatePayload): Promise<TenantItem> {
-  const resp = await apiClient.post<ApiEnvelope<TenantItem>>('/api/v1/platform/tenants', data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<TenantItem>('/platform/tenants', data);
 }
 
 export async function updateTenant(id: string, data: TenantUpdatePayload): Promise<TenantItem> {
-  const resp = await apiClient.patch<ApiEnvelope<TenantItem>>(`/api/v1/platform/tenants/${id}`, data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<TenantItem>(`/platform/tenants/${id}`, data);
 }
 
 export async function deleteTenant(id: string): Promise<void> {
-  await apiClient.delete<ApiEnvelope<null>>(`/api/v1/platform/tenants/${id}`);
+  await apiClient.delete<null>(`/platform/tenants/${id}`);
 }
 
 export async function getTenantUserCounts(): Promise<Record<string, number>> {
-  const r = await apiClient.get<ApiEnvelope<Record<string, number>>>('/api/v1/platform/tenants/user-counts');
-  return unwrapEnvelope(r.data) as Record<string, number>;
+  return apiClient.get<Record<string, number>>('/platform/tenants/user-counts');
 }
 
 export function getPlanTypeLabel(t: (key: string) => string, plan: string): string {

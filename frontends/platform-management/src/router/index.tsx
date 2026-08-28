@@ -38,7 +38,7 @@ interface AuthLoaderOptions {
   } | null;
 }
 
-const whiteList = ['/home', '/404', '/403'];
+const whiteList = ['/home', '/404', '/403', '/error'];
 const VITE_LOGIN = (import.meta as any).env?.VITE_LOGIN || '/login';
 const VITE_APP_ID = (import.meta as any).env?.VITE_APP_ID || 'platform-management';
 const STANDALONE_BASENAME = (import.meta as any).env?.VITE_STANDALONE_BASE || '/';

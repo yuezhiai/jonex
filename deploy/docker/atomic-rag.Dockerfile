@@ -20,12 +20,21 @@ FROM python:3.12.13-slim AS base
 
 WORKDIR /app
 
+# 构建源镜像开关：false=国内源（腾讯云 apt/pip），true=国外官方源（deb.debian.org / pypi.org）
+ARG USE_OVERSEAS_MIRROR=false
+
 # 时区
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
 
-# 替换腾讯源
-RUN sed -i 's|^URIs: http://deb.debian.org/debian|URIs: http://mirrors.cloud.tencent.com/debian|' /etc/apt/sources.list.d/debian.sources
-RUN sed -i 's|^URIs: http://deb.debian.org/debian-security|URIs: http://mirrors.cloud.tencent.com/debian-security|' /etc/apt/sources.list.d/debian.sources
+# 替换腾讯源；国外源构建时跳过。
+# trixie-updates 组件腾讯云镜像未同步（无 Release 文件），apt update 会失败，故从 Suites 中移除。
+RUN if [ "$USE_OVERSEAS_MIRROR" != "true" ]; then \
+        sed -i \
+            -e 's|^URIs: http://deb.debian.org/debian$|URIs: http://mirrors.cloud.tencent.com/debian|' \
+            -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: http://mirrors.cloud.tencent.com/debian-security|' \
+            -e 's| trixie-updates||g' \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi
 
 # ── 第 1 层：系统依赖（apt 缓存复用）──
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -42,9 +51,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# pip 源配置（腾讯云镜像加速，与 apt 源保持一致）
-RUN pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple \
-    && pip config set global.trusted-host mirrors.cloud.tencent.com
+# pip 源配置：国内=腾讯云镜像；国外=官方 PyPI
+RUN if [ "$USE_OVERSEAS_MIRROR" = "true" ]; then \
+        pip config set global.index-url https://pypi.org/simple; \
+    else \
+        pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple \
+        && pip config set global.trusted-host mirrors.cloud.tencent.com; \
+    fi
     
 # 大包（torch / CUDA wheel / scipy 等）易因镜像源读超时断流：
 # 把超时与重试写进 pip config，覆盖下面全部 4 个 pip install 层，

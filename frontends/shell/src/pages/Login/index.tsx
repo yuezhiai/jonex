@@ -1,17 +1,16 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
 function logoSrc(lng: string) {
   return lng === 'en' ? '/logo-en.svg' : '/logo.svg';
 }
-import { Form, Input, Button, Card, Select, message } from 'antd';
+import { Form, Input, Button, Card, message } from 'antd';
 import { UserOutlined, LockOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { login, setTokens, setUser, createLoginTicket } from '../../api/auth';
-import type { TenantOption } from '../../api/auth';
 import { isAllowedRedirect } from '@jonex/shell-sdk';
 import { colors, radius } from '@jonex/platform-theme/tokens';
-import { tenantDisplayName, userDisplayName } from '../../utils/userDisplay';
+import { userDisplayName } from '../../utils/userDisplay';
 
 function getRedirectParam(): string | null {
   const params = new URLSearchParams(window.location.search);
@@ -62,27 +61,32 @@ async function requestLoginTicket(appId: string, redirectUri: string, state: str
 interface LoginValues {
   username: string;
   password: string;
-  tenantId?: string;
+  tenantId: string;
 }
 
 function LoginPage() {
   const { t, i18n } = useTranslation();
   const [form] = Form.useForm<LoginValues>();
   const [loading, setLoading] = useState(false);
-  const [tenantOptions, setTenantOptions] = useState<TenantOption[]>([]);
   const navigate = useNavigate();
+
+  // token 失效跳转（/login?expired=1）后在登录页展示提示，避免被页面跳转吞掉。
+  // 提示后清理 URL 参数，防止登录页刷新时重复弹出。
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('expired') === '1') {
+      message.error(t('auth.sessionExpired'));
+      params.delete('expired');
+      const url = new URL(window.location.href);
+      url.search = params.toString();
+      window.history.replaceState({}, '', url.toString());
+    }
+  }, [t]);
 
   const onFinish = async (values: LoginValues) => {
     setLoading(true);
     try {
       const result = await login(values.username, values.password, values.tenantId);
-      if (result.status === 'tenant_selection_required') {
-        setTenantOptions(result.tenant_options);
-        form.setFieldValue('tenantId', undefined);
-        message.info(t('shell.selectTenantToContinue'));
-        return;
-      }
-
       setTokens(result.access_token, result.refresh_token);
       setUser(result.user as unknown as Record<string, unknown>);
       message.success(t('shell.welcome', { name: userDisplayName(result.user, t) }));
@@ -102,13 +106,6 @@ function LoginPage() {
       setLoading(false);
     }
   };
-
-  function handleValuesChange(changedValues: Partial<LoginValues>) {
-    if ('username' in changedValues || 'password' in changedValues) {
-      setTenantOptions([]);
-      form.setFieldValue('tenantId', undefined);
-    }
-  }
 
   async function handleRedirect(redirectTo: string) {
     const redirectUrl = new URL(redirectTo);
@@ -177,10 +174,17 @@ function LoginPage() {
           name="login"
           form={form}
           onFinish={onFinish}
-          onValuesChange={handleValuesChange}
           autoComplete="off"
           size="large"
         >
+          <Form.Item name="tenantId" rules={[{ required: true, message: t('shell.enterTenantId') }]}>
+            <Input
+              placeholder={t('shell.enterTenantId')}
+              autoComplete="off"
+              style={{ borderRadius: radius.btn, height: 44 }}
+            />
+          </Form.Item>
+
           <Form.Item name="username" rules={[{ required: true, message: t('shell.enterUsername') }]}>
             <Input
               prefix={<UserOutlined style={{ color: colors.textMuted }} />}
@@ -197,19 +201,6 @@ function LoginPage() {
             />
           </Form.Item>
 
-          {tenantOptions.length > 0 && (
-            <Form.Item name="tenantId" rules={[{ required: true, message: t('shell.selectTenant') }]}>
-              <Select
-                placeholder={t('shell.selectTenantPlaceholder')}
-                style={{ textAlign: 'left' }}
-                options={tenantOptions.map((tenant) => ({
-                  value: tenant.tenant_id,
-                  label: tenantDisplayName(tenant, t),
-                }))}
-              />
-            </Form.Item>
-          )}
-
           <Form.Item style={{ marginBottom: 12 }}>
             <Button
               type="primary"
@@ -225,7 +216,7 @@ function LoginPage() {
                 borderColor: colors.accent,
               }}
             >
-              {tenantOptions.length > 0 ? t('shell.continueLogin') : t('auth.login')}
+              {t('auth.login')}
             </Button>
           </Form.Item>
         </Form>

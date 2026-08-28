@@ -1,6 +1,6 @@
-import axios from 'axios';
+import { createRequest } from '@jonex/shared-lib';
+import type { ApiClient } from '@jonex/shared-lib';
 import type { ShellUser } from '@jonex/shell-sdk';
-import i18n from '../locales/i18n';
 import {
   JONEX_REFRESH_TOKEN_KEY,
   readAccessToken,
@@ -8,6 +8,8 @@ import {
   readCachedUser,
   writeCachedUser,
   clearAuthStorage,
+  backupAuthForImpersonation,
+  restoreAuthFromImpersonation,
 } from '@jonex/shell-sdk';
 
 const LOCALE_KEY = 'locale';
@@ -28,6 +30,8 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser {
   const isTenantAdmin =
     raw.is_tenant_admin === true || (raw as Record<string, unknown>).isTenantAdmin === true;
   const permissions: string[] = Array.isArray(raw.permissions) ? (raw.permissions as string[]) : [];
+  const impersonated = raw.impersonated === true;
+  const originalTenantId = raw.original_tenant_id || raw.originalTenantId;
   return {
     id,
     username,
@@ -38,6 +42,8 @@ function normalizeUser(raw: Record<string, unknown>): ShellUser {
     isPlatformAdmin,
     isTenantAdmin,
     permissions,
+    impersonated: impersonated || undefined,
+    originalTenantId: originalTenantId ? String(originalTenantId) : undefined,
   };
 }
 
@@ -88,58 +94,9 @@ export function isAuthenticated(): boolean {
   return !!getAccessToken();
 }
 
-export const apiClient = axios.create({
-  baseURL: '/',
-  timeout: 30000,
-});
-
-apiClient.interceptors.request.use((config) => {
-  const token = getAccessToken();
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  const locale = localStorage.getItem('jonex_locale') || 'en';
-  config.headers['X-Lang'] = locale === 'en' ? 'en-US' : 'zh-CN';
-  return config;
-});
-
-apiClient.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (axios.isAxiosError(error)) {
-      if (error.response?.status === 401) {
-        import('antd').then(({ message }) => {
-          message.error(i18n.t('auth.sessionExpired'));
-        });
-      }
-      const raw = error.response?.data as Record<string, unknown> | undefined;
-      const backendMsg = raw?.message || raw?.detail || raw?.error;
-      if (typeof backendMsg === 'string') {
-        return Promise.reject(new Error(backendMsg));
-      }
-    }
-    return Promise.reject(error);
-  },
-);
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code: number;
-  message: string;
-  data?: T;
-}
-
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload.success || !payload.data) {
-    throw new Error(payload.message || 'Request failed');
-  }
-  return payload.data;
-}
-
-export interface TenantOption {
-  tenant_id: string;
-  tenant_name: string;
-}
+// 拦截器不提示错误，错误提示由页面 catch 统一处理（message.error(err?.message || fallback)）；
+// 401 过期由 RequireAuth 的 jonex:token-expired 监听与轮询兜底统一跳转。
+export const apiClient: ApiClient = createRequest({ baseURL: '/api/v1' });
 
 export interface AuthenticatedLoginResult {
   status: 'authenticated';
@@ -150,43 +107,77 @@ export interface AuthenticatedLoginResult {
   user: ShellUser;
 }
 
-export interface TenantSelectionLoginResult {
-  status: 'tenant_selection_required';
-  tenant_options: TenantOption[];
-}
-
-export type LoginFlowResult = AuthenticatedLoginResult | TenantSelectionLoginResult;
-
 export interface LoginTicketResult {
   ticket: string;
   expires_in?: number;
 }
 
-export async function login(username: string, password: string, tenantId?: string): Promise<LoginFlowResult> {
-  const resp = await apiClient.post<ApiEnvelope<LoginFlowResult>>(
-    '/api/v1/auth/login',
+export async function login(username: string, password: string, tenantId: string): Promise<AuthenticatedLoginResult> {
+  const result = await apiClient.post<AuthenticatedLoginResult>(
+    '/auth/login',
     { username, password },
-    tenantId ? { headers: { 'X-Tenant-ID': tenantId } } : undefined,
+    { headers: { 'X-Tenant-ID': tenantId } },
   );
-  const result = unwrapEnvelope(resp.data);
-  if (result.status === 'authenticated') {
-    return { ...result, user: normalizeUser(result.user as unknown as Record<string, unknown>) };
-  }
-  return result;
+  return { ...result, user: normalizeUser(result.user as unknown as Record<string, unknown>) };
 }
 
 export async function fetchCurrentUser(): Promise<ShellUser> {
-  const resp = await apiClient.get<ApiEnvelope<Record<string, unknown>>>('/api/v1/auth/me');
-  return normalizeUser(unwrapEnvelope(resp.data));
+  const raw = await apiClient.get<Record<string, unknown>>('/auth/me');
+  return normalizeUser(raw);
+}
+
+export interface TenantListItem {
+  id: string;
+  name: string;
+}
+
+export interface ImpersonateResult {
+  token: string;
+  target_tenant_id: string;
+  target_tenant_name?: string;
+}
+
+export async function listTenants(): Promise<{ items: TenantListItem[]; total: number }> {
+  return apiClient.get<{ items: TenantListItem[]; total: number }>('/platform/tenants', {
+    params: { page: 1, page_size: 100 },
+  });
+}
+
+export async function impersonate(targetTenantId: string): Promise<ImpersonateResult> {
+  return apiClient.post<ImpersonateResult>('/auth/impersonate', {
+    target_tenant_id: targetTenantId,
+  });
+}
+
+export async function endImpersonation(): Promise<void> {
+  await apiClient.post<null>('/auth/impersonate/end');
+}
+
+/** 切换到目标租户：备份原 token → 写模拟 token → 刷新用户缓存 → 整页重载 */
+export async function switchTenant(targetTenantId: string): Promise<void> {
+  const result = await impersonate(targetTenantId);
+  backupAuthForImpersonation();
+  writeAccessToken(result.token);
+  const freshUser = await fetchCurrentUser();
+  writeCachedUser(freshUser);
+  window.location.reload();
+}
+
+/** 退出模拟：记审计 → 还原原 token → 刷新用户缓存 → 整页重载 */
+export async function exitImpersonation(): Promise<void> {
+  await endImpersonation();
+  restoreAuthFromImpersonation();
+  const freshUser = await fetchCurrentUser();
+  writeCachedUser(freshUser);
+  window.location.reload();
 }
 
 export async function createLoginTicket(appId: string, redirectUri: string, state: string): Promise<LoginTicketResult> {
-  const resp = await apiClient.post<ApiEnvelope<LoginTicketResult>>('/api/v1/auth/login-ticket', {
+  return apiClient.post<LoginTicketResult>('/auth/login-ticket', {
     appId,
     redirectUri,
     state,
   });
-  return unwrapEnvelope(resp.data);
 }
 
 export function logout(): void {

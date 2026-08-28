@@ -28,12 +28,13 @@ const DomainFormModal = forwardRef<DomainFormModalHandle, DomainFormModalProps>(
           setEditingDomain(domain);
           form.setFieldsValue({
             name: domain.name,
+            name_en: domain.name_en || '',
             description: domain.description || '',
             status: domain.status,
           });
         } else {
           setEditingDomain(null);
-          form.setFieldsValue({ name: '', description: '', status: 'active' });
+          form.setFieldsValue({ name: '', name_en: '', description: '', status: 'active' });
         }
         setModalOpen(true);
       },
@@ -48,6 +49,7 @@ const DomainFormModal = forwardRef<DomainFormModalHandle, DomainFormModalProps>(
       if (editingDomain) {
         await updateDomain(editingDomain.id, {
           name: values.name.trim(),
+          name_en: values.name_en?.trim() || undefined,
           description: values.description?.trim() || undefined,
           status: values.status,
         });
@@ -55,6 +57,7 @@ const DomainFormModal = forwardRef<DomainFormModalHandle, DomainFormModalProps>(
       } else {
         await createDomain({
           name: values.name.trim(),
+          name_en: values.name_en?.trim() || undefined,
           description: values.description?.trim() || undefined,
           status: values.status,
         });
@@ -62,9 +65,9 @@ const DomainFormModal = forwardRef<DomainFormModalHandle, DomainFormModalProps>(
       }
       setModalOpen(false);
       onSuccess?.();
-    } catch (e) {
+    } catch (e: any) {
       if (e && typeof e === 'object' && 'errorFields' in e) return;
-      message.error(t('common.operationFailed'));
+      message.error(e?.message || t('common.operationFailed'));
     } finally {
       setSaving(false);
     }
@@ -89,6 +92,9 @@ const DomainFormModal = forwardRef<DomainFormModalHandle, DomainFormModalProps>(
           rules={[{ required: true, message: t('templateDomains.nameWarning') }]}
         >
           <Input placeholder={t('templateDomains.namePlaceholder')} />
+        </Form.Item>
+        <Form.Item name="name_en" label={t('templateDomains.nameEnLabel')}>
+          <Input placeholder={t('templateDomains.nameEnPlaceholder')} />
         </Form.Item>
         <Form.Item name="description" label={t('common.description')}>
           <Input.TextArea placeholder={t('templateDomains.descPlaceholder')} rows={3} />

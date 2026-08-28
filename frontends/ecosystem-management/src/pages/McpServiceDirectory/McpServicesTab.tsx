@@ -1,12 +1,11 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Table, Tag, Input, Select, Button, Tooltip, Space, Empty, Result } from 'antd';
-import { SyncOutlined, ReloadOutlined } from '@ant-design/icons';
+import { ReloadOutlined } from '@ant-design/icons';
 import type { TableProps } from 'antd';
-import { listMcpServices, syncMcpServices } from '@/api/mcpServices';
+import { listMcpServices } from '@/api/mcpServices';
 import { listSpaces } from '@/api/spaces';
 import type { McpServiceItem } from '@/api/mcpServices';
-import { safeMessage } from '@/utils/safeMessage';
 import McpServiceDetailDrawer, { type McpServiceDetailDrawerHandle } from './McpServiceDetailDrawer';
 import './index.css';
 
@@ -28,9 +27,10 @@ interface McpServicesTabProps {
 export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
   const { t } = useTranslation();
   const [items, setItems] = useState<McpServiceItem[]>([]);
-  const [syncing, setSyncing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 接口 HTTP status（403=权限不足时错误态换用权限图标，而非报错图标） */
+  const [errorStatus, setErrorStatus] = useState<number | undefined>(undefined);
 
   // 筛选条件
   const [search, setSearch] = useState('');
@@ -44,30 +44,44 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
 
   const hasFilter = Boolean(search || spaceId);
 
-  /** 加载列表（携带当前筛选条件） */
+  /** 客户端筛选：按搜索词（名称 / Tool / 空间名）与领域空间过滤 */
+  const filtered = useMemo(() => {
+    const q = search.trim().toLocaleLowerCase();
+    return items.filter((item) => {
+      if (
+        q &&
+        !`${item.name || ''} ${item.tool || ''} ${item.space_name || ''}`.toLocaleLowerCase().includes(q)
+      ) {
+        return false;
+      }
+      if (spaceId && item.space_id !== spaceId) return false;
+      return true;
+    });
+  }, [items, search, spaceId]);
+
+  /** 加载列表（一次拉全量，筛选在客户端完成） */
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const result = await listMcpServices({
-        search: search || undefined,
-        space_id: spaceId || undefined,
-      });
+      const result = await listMcpServices();
       setItems(result.items);
     } catch (err: unknown) {
       // 接口报错：渲染内联 Result 错误态 + 重试按钮（与 McpKeysTab 一致）
+      // 权限不足(403)时错误态换用权限图标而非报错图标
       setError(err instanceof Error ? err.message : t('mcpServiceDirectory.loadFailed'));
+      setErrorStatus(typeof (err as { status?: number } | null)?.status === 'number' ? (err as { status?: number }).status : undefined);
       setItems([]);
     } finally {
       setLoading(false);
     }
-  }, [search, spaceId]);
+  }, []);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  /** 搜索输入防抖：输入停止 300ms 后才同步到查询条件，触发重新查询 */
+  /** 搜索输入防抖：输入停止 300ms 后才同步到查询条件，触发客户端过滤 */
   useEffect(() => {
     const timer = setTimeout(() => setSearch(searchInput.trim()), 300);
     return () => clearTimeout(timer);
@@ -81,20 +95,6 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
         // 失败静默，下拉仅剩「全部领域空间」
       });
   }, []);
-
-  /** 手动从 knowledge_base 同步服务到发布表 */
-  const handleSync = async () => {
-    setSyncing(true);
-    try {
-      const result = await syncMcpServices();
-      safeMessage.success(t('mcpServiceDirectory.syncSuccess', { count: result.synced_count }));
-      load();
-    } catch (err: unknown) {
-      safeMessage.error(err instanceof Error ? err.message : t('mcpServiceDirectory.syncFailed'));
-    } finally {
-      setSyncing(false);
-    }
-  };
 
   const columns: TableProps<McpServiceItem>['columns'] = [
     {
@@ -110,32 +110,45 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
           >
             {name}
           </Button>
-          {record.service_type === 'system' && (
-            <Tag color="blue">{t('mcpServiceDirectory.systemService')}</Tag>
-          )}
         </Space>
       ),
     },
     {
+      title: t('mcpServiceDirectory.colCapabilityType'),
+      key: 'capability_type',
+      width: 100,
+      render: (_: unknown, record: McpServiceItem) =>
+        record.service_type === 'system' ? (
+          <Tag color="blue">{t('mcpServiceDirectory.capabilityWrite')}</Tag>
+        ) : (
+          <Tag>{t('mcpServiceDirectory.capabilityDomain')}</Tag>
+        ),
+    },
+    {
       title: t('mcpServiceDirectory.colToolName'),
       key: 'tool_name',
-      render: (_: unknown, record: McpServiceItem) => {
-        // 领域服务走 tool_name，系统服务内置条目走 tool（固定不可改）
-        const tool = record.tool_name || record.tool;
-        return tool ? <span>{tool}</span> : <span style={{ color: '#94a3b8' }}>-</span>;
-      },
+      render: (_: unknown, record: McpServiceItem) =>
+        record.tool ? <span>{record.tool}</span> : <span style={{ color: '#94a3b8' }}>-</span>,
     },
     {
-      title: t('mcpServiceDirectory.colSpace'),
-      dataIndex: 'space_name',
-      key: 'space_name',
-      render: (v: string) => v || '-',
+      title: t('mcpServiceDirectory.colSource'),
+      key: 'source',
+      width: 120,
+      render: (_: unknown, record: McpServiceItem) =>
+        record.service_type === 'system' ? (
+          <span>{t('mcpServiceDirectory.sourceBuiltin')}</span>
+        ) : (
+          record.space_name || '-'
+        ),
     },
     {
-      title: t('mcpServiceDirectory.colKb'),
-      dataIndex: 'kb_names',
-      key: 'kb_names',
+      title: t('mcpServiceDirectory.colResourceScope'),
+      key: 'resource_scope',
       render: (_: unknown, record: McpServiceItem) => {
+        // 知识写入（system）无预授权知识库，资源范围由 Key 授权决定
+        if (record.service_type === 'system') {
+          return <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.scopeByKey')}</span>;
+        }
         const names = record.kb_names || [];
         if (names.length === 0) return <span style={{ color: '#94a3b8' }}>-</span>;
         const shown = names.slice(0, 3);
@@ -158,9 +171,16 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
       title: t('mcpServiceDirectory.colStatus'),
       dataIndex: 'is_published',
       key: 'is_published',
-      render: (v: boolean) =>
+      render: (v: boolean, record: McpServiceItem) =>
         v ? (
-          <Tag color="success">{t('mcpServiceDirectory.statusPublished')}</Tag>
+          <Space size={4} wrap>
+            <Tag color="success">{t('mcpServiceDirectory.statusPublished')}</Tag>
+            {record.enabled === 0 && (
+              <Tooltip title={t('mcpServiceDirectory.statusUnavailableTip')}>
+                <Tag color="orange">{t('mcpServiceDirectory.statusUnavailable')}</Tag>
+              </Tooltip>
+            )}
+          </Space>
         ) : (
           <Tag>{t('mcpServiceDirectory.statusUnpublished')}</Tag>
         ),
@@ -169,16 +189,30 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
       title: t('mcpServiceDirectory.colLastCall'),
       dataIndex: 'last_call_at',
       key: 'last_call_at',
-      render: (v: string | null) => formatDate(v),
+      width: 150,
+      render: (v: string | null) =>
+        v ? formatDate(v) : <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.neverCalled')}</span>,
+    },
+    {
+      title: t('mcpServiceDirectory.colActions'),
+      key: 'actions',
+      width: 90,
+      render: (_: unknown, record: McpServiceItem) => (
+        <Button type="link" size="small" onClick={() => detailDrawerRef.current?.open(record)}>
+          {t('mcpServiceDirectory.viewDetail')}
+        </Button>
+      ),
     },
   ];
 
   // ── 错误态覆盖：接口失败时渲染 Result + 重试按钮 ──
+  // 权限不足(403)时使用 antd 内置 403 权限图标，而非报错图标
   if (error) {
+    const forbidden = errorStatus === 403;
     return (
       <Result
-        status="error"
-        title={t('mcpServiceDirectory.loadFailed')}
+        status={forbidden ? '403' : 'error'}
+        title={forbidden ? t('mcpServiceDirectory.forbiddenTitle') : t('mcpServiceDirectory.loadFailed')}
         subTitle={error}
         extra={
           <Button type="primary" icon={<ReloadOutlined />} onClick={load}>
@@ -220,18 +254,14 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
             options={spaceOptions}
           />
         </div>
-        <Button icon={<SyncOutlined />} loading={syncing} onClick={handleSync}>
-          {t('mcpServiceDirectory.sync')}
-        </Button>
       </div>
 
       <Table
         rowKey="id"
         columns={columns}
-        dataSource={items}
+        dataSource={filtered}
         pagination={{ pageSize: 10 }}
         scroll={{ x: 'max-content' }}
-        bordered
         loading={loading}
         locale={{
           emptyText: hasFilter ? (

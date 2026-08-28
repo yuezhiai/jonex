@@ -539,29 +539,35 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
 
   return (
     <div>
-      {/* YAML 导出/导入工具栏 */}
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-        <Button icon={<span>&#x1F4E4;</span>} loading={yamlExporting} onClick={handleExportYaml}>
-          {t('compile.exportYaml')}
-        </Button>
-        <Button
-          icon={<span>&#x1F4E5;</span>}
-          disabled={!canWrite}
-          title={canWrite ? undefined : t('domainSpace.noManagePermission')}
-          onClick={handleImportYamlClick}
-        >
-          {t('compile.importYaml')}
-        </Button>
-        <input
-          ref={yamlFileInputRef}
-          type="file"
-          accept=".yaml,.yml"
-          style={{ display: 'none' }}
-          onChange={handleYamlFileSelected}
-        />
-      </div>
-
-      <Tabs activeKey={activeSubTab} onChange={setActiveSubTab} items={tabItems} />
+      <Tabs
+        activeKey={activeSubTab}
+        onChange={setActiveSubTab}
+        items={tabItems}
+        tabBarExtraContent={{
+          right: (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Button icon={<span>&#x1F4E4;</span>} loading={yamlExporting} onClick={handleExportYaml}>
+                {t('compile.exportYaml')}
+              </Button>
+              <Button
+                icon={<span>&#x1F4E5;</span>}
+                disabled={!canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                onClick={handleImportYamlClick}
+              >
+                {t('compile.importYaml')}
+              </Button>
+              <input
+                ref={yamlFileInputRef}
+                type="file"
+                accept=".yaml,.yml"
+                style={{ display: 'none' }}
+                onChange={handleYamlFileSelected}
+              />
+            </div>
+          ),
+        }}
+      />
 
       {/* 编译步骤设置、编译设置暂时隐藏（保留代码以便后续再开） */}
       {false && (

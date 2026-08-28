@@ -1,5 +1,7 @@
 import { readAccessToken } from '@jonex/shell-sdk';
 import { request, getData } from './request';
+import { getDomainKnowledgeSpaces, getDomainKnowledgeList } from './domainKnowledge';
+import type { DomainServiceItem } from '../types/domainService';
 import {
   listMockKnowledgeSearchHistory,
   saveMockKnowledgeSearchHistory,
@@ -22,6 +24,11 @@ import type {
   CancelSearchFeedbackParams,
   SubmitSearchFeedbackParams,
   SubmitSearchFeedbackResponse,
+  SubmitAnswerFeedbackParams,
+  SubmitAnswerFeedbackResponse,
+  AnswerFeedbackEchoResponse,
+  AnswerFeedbackListResponse,
+  AnswerFeedbackStats,
 } from '../types/knowledgeSearch';
 
 type NormalizedSearchParams = {
@@ -72,7 +79,7 @@ function normalizeSearchParams(params: KnowledgeSearchStreamParams): NormalizedS
     query: params.query,
     mode: params.mode ?? 'mix',
     topK: params.topK ?? 5,
-    domainId: params.domainId ?? 'all',
+    domainId: params.domainId ?? '',
     kbIds: params.kbIds ?? [],
     strictConfig: params.strictConfig,
   };
@@ -113,7 +120,7 @@ export const DEFAULT_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
 };
 
 export const DEFAULT_FAST_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
-  strict_mode: true,
+  strict_mode: false,
   strict_max_attempts: 1,
   strict_min_score: 0.7,
   strict_require_reference: true,
@@ -123,7 +130,7 @@ export const DEFAULT_FAST_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
 };
 
 export const DEFAULT_DEEP_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
-  strict_mode: true,
+  strict_mode: false,
   strict_max_attempts: 3,
   strict_min_score: 0.8,
   strict_require_reference: true,
@@ -138,11 +145,54 @@ export async function getKnowledgeSearchOverview(): Promise<KnowledgeSearchOverv
 }
 
 export async function getKnowledgeSearchDomains(spaceId?: string): Promise<KnowledgeSearchDomain[]> {
-  const params: Record<string, string | number> = { limit: 100 };
-  if (spaceId) params.space_id = spaceId;
-  const result = await getData<{ items: KnowledgeSearchDomain[] }>(request.get('/knowledge-base/services', { params }));
-  const items = result.items ?? [];
-  return [{ id: 'all', name: '', description: '' }, ...items];
+  // [jonex] 检索维度 = 当前领域空间 + 领域服务（双维度并存）：
+  // - 空间：只保留「当前领域空间」一项（跟随全局空间切换器），兜底覆盖该空间全部 KB
+  //   （含未挂服务的新建 KB）；
+  // - 服务：scope="search" 只返回「有可访问 KB 的服务」，保留按服务精确圈定。
+  const [spaces, kbResult, servicesResult] = await Promise.all([
+    getDomainKnowledgeSpaces(),
+    getDomainKnowledgeList({ page: 1, pageSize: 100 }),
+    getData<{ items: DomainServiceItem[] }>(
+      request.get('/knowledge-base/services', { params: { limit: 100, scope: 'search' } }),
+    ),
+  ]);
+
+  const kbBySpace = new Map<string, { id: string; name: string }[]>();
+  kbResult.list.forEach((kb) => {
+    const bucket = kbBySpace.get(kb.spaceId) ?? [];
+    bucket.push({ id: kb.id, name: kb.name });
+    kbBySpace.set(kb.spaceId, bucket);
+  });
+
+  // 空间维度只生成「当前领域空间」一项，不列出所有空间（产品：空间是默认范围，非可枚举筛选）
+  const spaceItems: KnowledgeSearchDomain[] = (() => {
+    if (!spaceId) return [];
+    const currentSpace = spaces.find((s) => s.id === spaceId);
+    if (!currentSpace) return [];
+    const kbs = kbBySpace.get(currentSpace.id) ?? [];
+    return [
+      {
+        id: currentSpace.id,
+        name: currentSpace.name,
+        kind: 'space',
+        space_id: currentSpace.id,
+        kb_ids: kbs.map((k) => k.id),
+        kb_names: kbs.map((k) => k.name),
+      },
+    ];
+  })();
+
+  const serviceItems: KnowledgeSearchDomain[] = (servicesResult.items ?? []).map((svc) => ({
+    id: svc.id,
+    name: svc.name,
+    kind: 'service',
+    space_id: svc.space_id,
+    space_name: svc.space_name,
+    kb_ids: svc.kb_ids ?? [],
+    kb_names: svc.kb_names ?? [],
+  }));
+
+  return [...spaceItems, ...serviceItems];
 }
 
 /** 检索历史分页查询：按时间倒序，返回列表与总数（支持"查看更多"翻页） */
@@ -249,21 +299,21 @@ export async function streamKnowledgeSearch(
     with_reasoning: true,
   };
   if (strict) {
-    // 严格模式参数（普通 / 深度检索共用）
+    // 严格模式参数（普通 / 深度检索共用）：strict_mode 关闭时仅传开关，不传其它严格参数
     body.strict_mode = strict.strict_mode;
-    body.strict_max_attempts = strict.strict_max_attempts;
-    body.strict_min_score = strict.strict_min_score;
-    body.strict_require_reference = strict.strict_require_reference;
-    body.strict_require_grounded = strict.strict_require_grounded;
-    if (deep) {
-      // 深度检索额外配置
-      body.max_subqueries = strict.max_subqueries;
-      body.allow_common_sense = strict.allow_common_sense;
+    if (strict.strict_mode) {
+      body.strict_max_attempts = strict.strict_max_attempts;
+      body.strict_min_score = strict.strict_min_score;
+      body.strict_require_reference = strict.strict_require_reference;
+      body.strict_require_grounded = strict.strict_require_grounded;
+      if (deep) {
+        // 深度检索额外配置
+        body.max_subqueries = strict.max_subqueries;
+        body.allow_common_sense = strict.allow_common_sense;
+      }
     }
   }
-  if (normalized.domainId && normalized.domainId !== 'all') {
-    body.domain_id = normalized.domainId;
-  }
+  // [jonex] 检索维度改为领域空间后，不再下发 domain_id（后端检索只认 knowledge_base_ids）
   if (normalized.kbIds.length > 0) {
     body.knowledge_base_ids = normalized.kbIds;
   }
@@ -303,6 +353,8 @@ export async function streamKnowledgeSearch(
       references: result.data.references ?? [],
       reasoning: result.data.reasoning ?? null,
       rag_used: result.data.rag_used,
+      // [jonex] answer-feedback 锚点：后端检索响应下发检索历史记录 id
+      history_id: result.data.history_id,
     };
     for (let i = 0; i < answer.length; i += 2) {
       if (signal?.aborted) return;
@@ -361,6 +413,113 @@ export async function cancelSearchFeedback(params: CancelSearchFeedbackParams): 
   }
   const result = await response.json();
   return result.data ?? { success: true, feedbackType: params.feedbackType, likeCount: 0, dislikeCount: 0 };
+}
+
+// ── answer-feedback（回答反馈，锚点 history_id）API ────────────
+
+/** 提交/更新回答反馈（operation_id 幂等，version 单调递增，切换类型直接覆盖） */
+export async function submitAnswerFeedback(params: SubmitAnswerFeedbackParams): Promise<SubmitAnswerFeedbackResponse> {
+  const token = readAccessToken();
+  const response = await fetch('/api/v1/knowledge-base/search/answer-feedback', {
+    method: 'POST',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      history_id: params.historyId,
+      operation_id: params.operationId,
+      version: params.version,
+      feedback_type: params.feedbackType,
+      feedback_reason: params.feedbackReason ?? undefined,
+      feedback_comment: params.feedbackComment?.trim() ? params.feedbackComment.trim() : undefined,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to submit feedback');
+  }
+  const result = await response.json();
+  return (
+    result.data ?? {
+      feedback: {
+        id: '',
+        history_id: params.historyId,
+        version: params.version,
+        feedback_type: params.feedbackType,
+        feedback_reason: params.feedbackReason ?? null,
+        feedback_comment: params.feedbackComment ?? null,
+      },
+      superseded: false,
+      idempotent: false,
+    }
+  );
+}
+
+/** 回显某条检索历史（history_id）的回答反馈，无反馈时 feedback 为 null */
+export async function getAnswerFeedback(historyId: string): Promise<AnswerFeedbackEchoResponse> {
+  const token = readAccessToken();
+  const searchParams = new URLSearchParams({ history_id: historyId });
+  const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback?${searchParams}`, {
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!response.ok) throw new Error('Failed to fetch feedback');
+  const result = await response.json();
+  return result.data ?? { feedback: null };
+}
+
+/** 按知识库聚合查询回答反馈列表（情况追踪页使用） */
+export async function getAnswerFeedbackList(
+  knowledgeBaseId: string,
+  params?: { feedbackType?: SearchFeedbackType; page?: number; pageSize?: number },
+): Promise<AnswerFeedbackListResponse> {
+  const token = readAccessToken();
+  const searchParams = new URLSearchParams({ knowledge_base_id: knowledgeBaseId });
+  if (params?.feedbackType) searchParams.set('feedback_type', params.feedbackType);
+  if (params?.page) searchParams.set('page', String(params.page));
+  if (params?.pageSize) searchParams.set('page_size', String(params.pageSize));
+
+  const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback/list?${searchParams}`, {
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!response.ok) throw new Error('Failed to fetch answer feedback list');
+  const result = await response.json();
+  return result.data ?? { items: [], total: 0, like_count: 0, dislike_count: 0, page: 1, page_size: 50 };
+}
+
+/** 切换回答反馈采纳状态 */
+export async function toggleAnswerFeedbackAdopted(feedbackId: string): Promise<void> {
+  const token = readAccessToken();
+  const response = await fetch('/api/v1/knowledge-base/search/answer-feedback/toggle-adopt', {
+    method: 'POST',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ feedback_id: feedbackId }),
+  });
+  if (!response.ok) throw new Error('Failed to toggle answer feedback adopted');
+}
+
+/** 获取知识库的回答反馈统计 */
+export async function getAnswerFeedbackStats(knowledgeBaseId: string): Promise<AnswerFeedbackStats> {
+  const token = readAccessToken();
+  const response = await fetch(
+    `/api/v1/knowledge-base/search/answer-feedback/stats?knowledge_base_id=${knowledgeBaseId}`,
+    { headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) } },
+  );
+  if (!response.ok) throw new Error('Failed to fetch answer feedback statistics');
+  const result = await response.json();
+  return result.data ?? { total: 0, like_count: 0, dislike_count: 0 };
+}
+
+/** 删除回答反馈记录（软删除） */
+export async function deleteAnswerFeedback(feedbackId: string): Promise<void> {
+  const token = readAccessToken();
+  const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback/${feedbackId}`, {
+    method: 'DELETE',
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!response.ok) throw new Error('Failed to delete answer feedback');
 }
 
 // ── 情况追踪（搜索反馈管理）API ──────────────────────────────

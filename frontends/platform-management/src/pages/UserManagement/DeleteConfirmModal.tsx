@@ -38,8 +38,8 @@ const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, Props>(({ getUse
       message.success(t('common.deleteSuccess'));
       setTarget(null);
       await onSaved();
-    } catch {
-      message.error(t('userManagement.deleteFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('userManagement.deleteFailed'));
     }
   };
 

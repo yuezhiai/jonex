@@ -33,8 +33,8 @@ export default function TagModal({ open, kbId, docId, docName, onClose }: TagMod
           setSelectedTags(docTags);
           setCommonTags(kbTags);
         })
-        .catch(() => {
-          message.error(t('common.loadFailed'));
+        .catch((err: any) => {
+          message.error(err?.message || t('common.loadFailed'));
         })
         .finally(() => setLoading(false));
     }
@@ -61,8 +61,8 @@ export default function TagModal({ open, kbId, docId, docName, onClose }: TagMod
       setCommonTags((prev) => [...prev, newTag]);
       setInputValue('');
       message.success(t('common.tagAdded'));
-    } catch {
-      message.error(t('common.tagCreateFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.tagCreateFailed'));
     }
   };
 
@@ -94,8 +94,8 @@ export default function TagModal({ open, kbId, docId, docName, onClose }: TagMod
       });
       message.success(t('common.saveSuccess'));
       onClose();
-    } catch {
-      message.error(t('common.saveFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.saveFailed'));
     } finally {
       setSaving(false);
     }

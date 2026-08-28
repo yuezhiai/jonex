@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface ModelProviderListResponse {
   items: ModelProviderItem[];
@@ -42,33 +35,20 @@ export interface SaveProviderPayload {
   config_json?: Record<string, unknown>;
 }
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
-
 export async function listProviders(offset = 0, limit = 100): Promise<ModelProviderListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<ModelProviderListResponse>>('/api/v1/ecosystem/model-providers', {
+  return apiClient.get<ModelProviderListResponse>('/ecosystem/model-providers', {
     params: { offset, limit },
   });
-  return unwrapEnvelope(resp.data);
 }
 
 export async function createProvider(data: SaveProviderPayload): Promise<ModelProviderItem> {
-  const resp = await apiClient.post<ApiEnvelope<ModelProviderItem>>('/api/v1/ecosystem/model-providers', data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<ModelProviderItem>('/ecosystem/model-providers', data);
 }
 
 export async function updateProvider(id: string, data: Partial<SaveProviderPayload>): Promise<ModelProviderItem> {
-  const resp = await apiClient.patch<ApiEnvelope<ModelProviderItem>>(`/api/v1/ecosystem/model-providers/${id}`, data);
-  return unwrapEnvelope(resp.data);
+  return apiClient.patch<ModelProviderItem>(`/ecosystem/model-providers/${id}`, data);
 }
 
 export async function testProvider(id: string): Promise<{ success: boolean; message: string }> {
-  const resp = await apiClient.post<ApiEnvelope<{ success: boolean; message: string }>>(
-    `/api/v1/ecosystem/model-providers/${id}/test`,
-  );
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<{ success: boolean; message: string }>(`/ecosystem/model-providers/${id}/test`);
 }

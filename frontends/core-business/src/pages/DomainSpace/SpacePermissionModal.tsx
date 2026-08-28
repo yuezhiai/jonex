@@ -62,8 +62,8 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
               };
             });
             setPermMembers(members);
-          } catch {
-            message.error(t('common.loadFailed'));
+          } catch (err: any) {
+            message.error(err?.message || t('common.loadFailed'));
             setPermMembers([]);
           } finally {
             setPermLoading(false);
@@ -105,7 +105,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
         message.success(t('common.saveSuccess'));
         setOpen(false);
         onSaved();
-      } catch (err: unknown) {
+      } catch (err: any) {
         message.error(err instanceof Error ? err.message : t('common.saveFailed'));
       } finally {
         setPermSaving(false);

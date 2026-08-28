@@ -14,6 +14,7 @@ import {
   DeleteOutlined,
   CaretDownOutlined,
   CaretRightOutlined,
+  DownloadOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { createColumns } from './config';
@@ -27,7 +28,10 @@ import {
   retryDocumentOntology,
   deleteManualDocument,
   batchMoveDocuments,
+  getDocumentViewTicket,
 } from '@/api/domainKnowledge';
+import { getShellContext, isPlatformAdmin } from '@jonex/shell-sdk';
+import { batchDownloadDocuments } from '@/utils/batchDocumentDownload';
 import { listAccessMethods } from '@/api/dataSource';
 import type { ManualDocItem, FolderItem } from '@/types/domainKnowledge';
 import type { AccessMethodItem } from '@/types/dataSource';
@@ -46,9 +50,21 @@ interface DocumentLibraryProps {
   kbId: string;
   /** [jonex] 知识库类型：openkb 时文档状态列按 llm_wiki_compile_status 显示。 */
   kbType?: string;
+  /** 文档配额已达上限（提升自父级，控制上传按钮禁用） */
+  docReached: boolean;
+  /** 配额加载失败（提升自父级，控制上传按钮 title 提示） */
+  quotaError: boolean;
+  /** 刷新配额数据：父级 useQuota.reload，列表刷新时同步调用（统计栏与上传按钮共用一份） */
+  onRefreshQuota: () => void;
 }
 
-export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) {
+export default function DocumentLibrary({
+  kbId,
+  kbType,
+  docReached,
+  quotaError,
+  onRefreshQuota,
+}: DocumentLibraryProps) {
   const { canWrite } = useKbPermission(kbId);
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -57,6 +73,7 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
   const [data, setData] = useState<ManualDocItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [folderModalOpen, setFolderModalOpen] = useState(false);
@@ -79,6 +96,8 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
     doc?: ManualDocItem;
   }>({ open: false, mode: 'single' });
   const [moveLoading, setMoveLoading] = useState(false);
+  // 批量下载进度（0 = 空闲；>0 时按钮显示「下载中 i/N」）
+  const [downloadProgress, setDownloadProgress] = useState(0);
   // 拖拽迁移状态（表格行 → 侧栏目录）：当前拖拽的文档 id + 悬停的 drop 目标（'all' = 根目录 / folder id）
   const [draggingDocId, setDraggingDocId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
@@ -89,7 +108,7 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
     if (!kbId) return;
     getFolderList(kbId)
       .then((res) => setFolders(res.items))
-      .catch(() => message.error(t('common.folderListLoadFailed')));
+      .catch((err: any) => message.error(err?.message || t('common.folderListLoadFailed')));
   }, [kbId]);
 
   useEffect(() => {
@@ -160,7 +179,7 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
       const result = await getManualDocList({
         knowledgeBaseId: kbId,
         page,
-        pageSize: PAGE_SIZE,
+        pageSize,
         keyword: keyword || undefined,
         phase: statusFilter.length ? statusFilter : undefined,
         folder_id: currentKey !== 'all' ? String(currentKey) : undefined,
@@ -172,11 +191,16 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
     } finally {
       setLoading(false);
     }
-  }, [kbId, page, keyword, selectedKeys, statusFilter]);
+  }, [kbId, page, pageSize, keyword, selectedKeys, statusFilter]);
 
   useEffect(() => {
     fetchList();
   }, [fetchList, reloadFlag]);
+
+  // 数据变更（上传/删除/重解析/移动等）触发列表刷新，同步刷新配额数据（used 随之变化）
+  useEffect(() => {
+    if (reloadFlag > 0) onRefreshQuota();
+  }, [reloadFlag, onRefreshQuota]);
 
   // 关键词、文件夹或状态变化时，重置页码并清空行选中（避免批量移动作用于当前数据集之外的旧选中）
   useEffect(() => {
@@ -298,6 +322,28 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
       setMoveLoading(false);
     }
   };
+
+  // ===== 批量下载（仅平台管理员可见；多选选中的才下载）=====
+  const isAdmin = isPlatformAdmin(getShellContext()?.user ?? null);
+
+  const handleBatchDownload = useCallback(async () => {
+    const ids = selectedRowKeys.map(String);
+    if (!ids.length) return;
+    setDownloadProgress(0);
+    try {
+      const { ok, failed } = await batchDownloadDocuments(ids, {
+        fetchTicket: getDocumentViewTicket,
+        onProgress: (done) => setDownloadProgress(done),
+      });
+      if (failed > 0) {
+        message.warning(t('common.batchDownloadPartial', { ok, failed }));
+      } else {
+        message.success(t('common.batchDownloadSuccess', { ok }));
+      }
+    } finally {
+      setDownloadProgress(0);
+    }
+  }, [selectedRowKeys, t]);
 
   // ===== 拖拽迁移（表格行 → 侧栏目录，HTML5 DnD）=====
   const handleRowDragStart = useCallback(
@@ -531,14 +577,28 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
             <DocumentStatusFilter value={statusFilter} onChange={(p) => setStatusFilter(p)} />
           </Space>
           <Space size={12}>
-            <Button icon={<ReloadOutlined />} onClick={() => fetchList()}>
+            <Button
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                fetchList();
+                onRefreshQuota();
+              }}
+            >
               {t('common.refresh')}
             </Button>
             <Button
               type="primary"
               icon={<PlusOutlined />}
-              disabled={!canWrite}
-              title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+              disabled={!canWrite || docReached}
+              title={
+                !canWrite
+                  ? t('domainSpace.noManagePermission')
+                  : quotaError
+                    ? t('common.quotaLoadFailed')
+                    : docReached
+                      ? t('common.quotaDocReached')
+                      : undefined
+              }
               onClick={() => setModalOpen(true)}
             >
               {t('common.addDocument')}
@@ -553,6 +613,13 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
             >
               {t('common.batchMove')}
             </Button>
+            {isAdmin && (
+              <Button icon={<DownloadOutlined />} disabled={selectedRowKeys.length === 0} onClick={handleBatchDownload}>
+                {downloadProgress > 0
+                  ? t('common.downloading', { i: downloadProgress, n: selectedRowKeys.length })
+                  : t('common.batchDownload')}
+              </Button>
+            )}
           </Space>
         </div>
 
@@ -563,12 +630,13 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
           loading={loading}
           pagination={{
             current: page,
-            pageSize: PAGE_SIZE,
+            pageSize,
             total,
-            showSizeChanger: false,
+            showSizeChanger: true,
             showTotal: (total) => t('common.totalItems', { total }),
-            onChange: (p) => {
+            onChange: (p, ps) => {
               setPage(p);
+              setPageSize(ps);
               setSelectedRowKeys([]);
             },
           }}
@@ -584,7 +652,13 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
           scroll={{ x: 1100 }}
         />
       </div>
-      <UploadModal kbId={kbId} open={modalOpen} onClose={() => setModalOpen(false)} onSuccess={handleUploadSuccess} />
+      <UploadModal
+        kbId={kbId}
+        open={modalOpen}
+        defaultFolderId={selectedKeys[0] !== 'all' ? selectedKeys[0] : ''}
+        onClose={() => setModalOpen(false)}
+        onSuccess={handleUploadSuccess}
+      />
       <FolderNameModal
         title={folderModalMode === 'create' ? t('common.newFolder') : t('common.renameFolder')}
         placeholder={folderModalMode === 'create' ? t('common.folderNamePlaceholder') : t('common.renamePlaceholder')}
@@ -608,7 +682,7 @@ export default function DocumentLibrary({ kbId, kbType }: DocumentLibraryProps) 
         open={moveModal.open}
         title={moveModal.mode === 'single' ? t('common.moveDocTitle') : t('common.moveBatchTitle')}
         folders={folders}
-        disabledFolderId={moveModal.mode === 'single' ? moveModal.doc?.folder_id ?? null : undefined}
+        disabledFolderId={moveModal.mode === 'single' ? (moveModal.doc?.folder_id ?? null) : undefined}
         confirmLoading={moveLoading}
         onOk={handleMoveOk}
         onCancel={() => setMoveModal({ open: false, mode: 'single' })}

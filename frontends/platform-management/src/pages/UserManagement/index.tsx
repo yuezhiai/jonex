@@ -68,7 +68,7 @@ export default function UserManagement() {
   const displayName = (user: UserItem) => {
     const builtIns: Record<string, { raw: string; key: string }> = {
       'tenant_jonex_demo|admin': {
-        raw: '系统管理员',
+        raw: '平台管理员',
         key: 'userManagement.builtInUsers.systemAdmin',
       },
       'tenant_jonex_demo|multi_same_pass': {

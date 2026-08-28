@@ -36,8 +36,8 @@ const RoleUserAssignModal = forwardRef<RoleUserAssignModalRef, Props>(({ onSaved
         ]);
         setUsers(all.items);
         setSelected(assigned);
-      } catch {
-        message.error(t('rolePermission.loadUsersFailed'));
+      } catch (err: any) {
+        message.error(err?.message || t('rolePermission.loadUsersFailed'));
       } finally {
         setLoading(false);
       }
@@ -52,8 +52,8 @@ const RoleUserAssignModal = forwardRef<RoleUserAssignModalRef, Props>(({ onSaved
       message.success(t('rolePermission.usersUpdated'));
       setOpen(false);
       onSaved();
-    } catch {
-      message.error(t('rolePermission.saveFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('rolePermission.saveFailed'));
     } finally {
       setSaving(false);
     }

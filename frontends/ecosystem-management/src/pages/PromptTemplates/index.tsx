@@ -164,8 +164,8 @@ export default function PromptTemplates() {
       await createPromptTemplate(data as CreatePromptTemplatePayload, domainSpaceId ?? undefined);
       message.success(t('promptTemplate.createSuccess'));
     } else if (editingTemplate) {
-      await updatePromptTemplate(editingTemplate.id, data as UpdatePromptTemplatePayload, domainSpaceId ?? undefined);
-      message.success(t('promptTemplate.updateSuccess'));
+      const updated = await updatePromptTemplate(editingTemplate.id, data as UpdatePromptTemplatePayload, domainSpaceId ?? undefined);
+      message.success(t('promptTemplate.updateSuccessWithVersion', { version: updated.current_version }));
     }
     await loadData();
   };

@@ -58,7 +58,6 @@ import type {
   CreateOntologyInstanceRequest,
   CreateOntologyInstanceResponse,
   CreateOntologyRelationResponse,
-  UpdateOntologyInstanceRequest,
   UpdateOntologyInstanceResponse,
   DeleteOntologyInstanceResponse,
   UpdateOntologyRelationResponse,
@@ -83,6 +82,30 @@ export function getDomainKnowledgeSpaces(): Promise<DomainKnowledgeSpace[]> {
   return getData<{ items: DomainKnowledgeSpace[] }>(
     request.get('/knowledge-base/spaces', { params: { limit: 100 } }),
   ).then((res) => res.items);
+}
+
+// ══ 系统配额（GET /knowledge-base/quota，契约见配额需求文档）══
+
+/** 单条配额项：bytes 类（*SizeLimitMiB / *StorageLimitMiB）used/limit 为 Byte，unit 仅作展示标签 */
+export interface QuotaItem {
+  quotaKey: string;
+  used: number;
+  reserved: number;
+  limit: number;
+  unit: string;
+}
+
+export interface QuotaViewResponse {
+  quotas: QuotaItem[];
+}
+
+/** 查询租户配额视图；传入 knowledge_base_id 时 knowledgeBaseDocumentLimit.used 返回该 KB 真实值 */
+export function getQuotaView(knowledgeBaseId?: string): Promise<QuotaViewResponse> {
+  return getData<QuotaViewResponse>(
+    request.get('/knowledge-base/quota', {
+      params: { knowledge_base_id: knowledgeBaseId || undefined },
+    }),
+  );
 }
 
 export function getDomainKnowledgeList(
@@ -202,7 +225,7 @@ function mapKBItem(item: BackendKBItem): DomainKnowledgeItem {
 /** KB 授权成员（后端 kb_permissions 表；display_name 后端 join，前端不再拉 /users 拼名字） */
 interface BackendKbPermission {
   user_id: string;
-  role: 'viewer' | 'editor';
+  role: 'viewer' | 'editor' | 'kb_manager';
   display_name: string | null;
   created_at: string | null;
 }
@@ -220,7 +243,7 @@ export async function getDomainKnowledgePermissions(
     dept: '',
     avatarText: (p.display_name || p.user_id).charAt(0).toUpperCase(),
     avatarColor: '#94a3b8',
-    role: p.role === 'editor' ? 'editor' : 'viewer',
+    role: p.role === 'kb_manager' ? 'kb_manager' : p.role === 'editor' ? 'editor' : 'viewer',
   }));
   if (keyword) members = members.filter((m) => m.name.includes(keyword));
   return { knowledgeBaseId, members };
@@ -513,15 +536,7 @@ function formatLocalDateTime(isoStr: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function getDocStatusText(docStatus: string, t: (key: string) => string): string {
-  if (docStatus === 'ready')
-    return `${t('common.statusImported')}·${t('common.statusParsing')}·${t('common.statusCompiling')}`;
-  if (docStatus === 'parsing') return `${t('common.statusImported')}·${t('common.statusParsing')}`;
-  if (docStatus === 'pending') return t('common.statusImported');
-  return docStatus;
-}
-
-function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, t: (key: string) => string): ManualDocItem {
+function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: (key: string) => string): ManualDocItem {
   // [jonex] 修正历史 bug：后端 to_dict 输出键是 metadata（非 extra_metadata），
   // 此前 meta 恒为空对象（uploader 等字段全空）。顺带提取 OpenKB 编译状态。
   const meta = doc.metadata || {};
@@ -1382,19 +1397,19 @@ export async function deleteOntologyConstraint(kbId: string, id: string): Promis
   return true;
 }
 
-export async function getCompileSteps(kbId: string): Promise<CompileStep[]> {
+export async function getCompileSteps(_kbId: string): Promise<CompileStep[]> {
   // TODO: 替换为真实后端接口
   return [];
 }
-export async function createCompileStep(kbId: string, p: SaveCompileStepPayload): Promise<CompileStep> {
+export async function createCompileStep(_kbId: string, _p: SaveCompileStepPayload): Promise<CompileStep> {
   // TODO: 替换为真实后端接口
   throw new Error('Not implemented');
 }
-export async function updateCompileStep(kbId: string, id: string, p: SaveCompileStepPayload): Promise<CompileStep> {
+export async function updateCompileStep(_kbId: string, _id: string, _p: SaveCompileStepPayload): Promise<CompileStep> {
   // TODO: 替换为真实后端接口
   throw new Error('Not implemented');
 }
-export async function deleteCompileStep(kbId: string, id: string): Promise<boolean> {
+export async function deleteCompileStep(_kbId: string, _id: string): Promise<boolean> {
   // TODO: 替换为真实后端接口
   throw new Error('Not implemented');
 }
@@ -1683,6 +1698,14 @@ export function getOntologyInstances(params: OntologyInstanceListParams): Promis
     page: number;
     page_size: number;
   }>(request.get('/knowledge-base/ontology/instances', { params: cleanQuery }));
+}
+
+/** 按 chunk_id 精确查单片 chunk 完整内容（GET /knowledge-base/documents/{doc_id}/chunks/{chunk_id}） */
+export function getChunkDetail(
+  documentId: string,
+  chunkId: string,
+): Promise<{ doc_id: string; chunk_id: string; content: string; chunk_index: number }> {
+  return getData(request.get(`/knowledge-base/documents/${documentId}/chunks/${chunkId}`));
 }
 
 /** 搜索本体实例（GET /knowledge-base/ontology/entities/search） */

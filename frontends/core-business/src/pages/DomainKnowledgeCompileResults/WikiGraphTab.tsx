@@ -29,9 +29,9 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
         setData(res);
         setLoading(false);
       })
-      .catch(() => {
+      .catch((err: any) => {
         if (cancelled) return;
-        message.error(t('common.loadFailed'));
+        message.error(err?.message || t('common.loadFailed'));
         setLoading(false);
       });
     return () => {
@@ -133,8 +133,8 @@ export default function WikiGraphTab({ kbId, docId }: WikiGraphTabProps) {
 
         graphRef.current = g6Graph;
       })
-      .catch(() => {
-        if (!cancelled) message.error(t('common.loadFailed'));
+      .catch((err: any) => {
+        if (!cancelled) message.error(err?.message || t('common.loadFailed'));
       });
 
     return () => {

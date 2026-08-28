@@ -100,7 +100,8 @@ export interface ServiceApiKeyItem {
   key_prefix: string;
   key_encrypted: string;
   expires_at: string | null;
-  is_active: boolean;
+  /** 是否启用：后端 SmallInteger 透出 0/1（1=启用） */
+  is_active: number;
   created_at: string | null;
 }
 

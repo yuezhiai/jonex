@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface ParserListResponse {
   items: ParserItem[];
@@ -25,16 +18,8 @@ export interface ParserItem {
   updated_at: string | null;
 }
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
-
 export async function listParsers(offset = 0, limit = 100): Promise<ParserListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<ParserListResponse>>('/api/v1/ecosystem/parser-configs', {
+  return apiClient.get<ParserListResponse>('/ecosystem/parser-configs', {
     params: { offset, limit },
   });
-  return unwrapEnvelope(resp.data);
 }

@@ -20,8 +20,8 @@ export default function DeleteConfirmModal({ deletingId, domainSpaceId, onClose,
       message.success(t('promptTemplate.deleteSuccess'));
       onClose();
       onDeleted();
-    } catch {
-      message.error(t('common.operationFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.operationFailed'));
     }
   };
 

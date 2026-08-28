@@ -16,9 +16,16 @@
 
 # ── 前端构建阶段（WebUI）──
 FROM --platform=$BUILDPLATFORM oven/bun:1.3.14-alpine AS frontend-builder
+# 构建源镜像开关：false=国内源（npmmirror），true=国外官方源（registry.npmjs.org）
+ARG USE_OVERSEAS_MIRROR=false
 WORKDIR /app
-# [jonex] bun 默认走 registry.npmjs.org 国内不稳（mermaid tarball 提取失败），切 npmmirror 源
-RUN printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > /root/.bunfig.toml
+# [jonex] bun 默认走 registry.npmjs.org 国内不稳（mermaid tarball 提取失败），切 npmmirror 源；
+# 国外源构建时保持官方 registry
+RUN if [ "$USE_OVERSEAS_MIRROR" = "true" ]; then \
+        printf '[install]\nregistry = "https://registry.npmjs.org"\n' > /root/.bunfig.toml; \
+    else \
+        printf '[install]\nregistry = "https://registry.npmmirror.com"\n' > /root/.bunfig.toml; \
+    fi
 COPY Reference/LightRAG/lightrag_webui/ ./lightrag_webui/
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     cd lightrag_webui \
@@ -28,12 +35,20 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # ── Python 构建阶段（uv 锁定依赖）──
 # 注意：所有依赖均以预编译 wheel 形式下载，无需 build-essential / Rust！
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+# 构建源镜像开关：false=国内源（清华 pypi），true=国外官方源（pypi.org）
+ARG USE_OVERSEAS_MIRROR=false
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
-    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     UV_HTTP_TIMEOUT=120
 WORKDIR /app
+
+# uv 源：国内=清华镜像；国外=官方 PyPI（uv.toml 对后续全部 uv sync 生效）
+RUN if [ "$USE_OVERSEAS_MIRROR" = "true" ]; then \
+        mkdir -p /root/.config/uv && printf 'index-url = "https://pypi.org/simple"\n' > /root/.config/uv/uv.toml; \
+    else \
+        mkdir -p /root/.config/uv && printf 'index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"\n' > /root/.config/uv/uv.toml; \
+    fi
 
 # 依赖元数据先行（利用层缓存）
 COPY Reference/LightRAG/pyproject.toml .

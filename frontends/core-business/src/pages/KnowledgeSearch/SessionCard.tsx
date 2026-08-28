@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, Button, Spin, message } from 'antd';
+import { Card, Button, Popconfirm, Radio, Input, Spin, message } from 'antd';
 import {
   SearchOutlined,
   StopOutlined,
@@ -25,10 +25,11 @@ import type {
   KnowledgeReferenceLocation,
   ReasoningStep,
   SearchFeedbackType,
+  FeedbackReason,
 } from '@/types/knowledgeSearch';
 import type { OntologyInstanceRow } from '@/types/domainKnowledge';
 import type { SearchSession } from './index';
-import { getOntologyInstances } from '@/api/domainKnowledge';
+import { getChunkDetail } from '@/api/domainKnowledge';
 import OntologyEntityDrawer from './OntologyEntityDrawer';
 import RagRecallDrawer, { type RagRecallItem } from './RagRecallDrawer';
 // ── Helper: 时间戳格式化 ──
@@ -160,7 +161,9 @@ function ImageAssetThumb({
               lineHeight: 1.6,
             }}
           >
-            {t('knowledgeSearch.imagePage', { page: asset.pageNo })}
+            {/* [jonex] 图片引用准确性修复：page_no 全链路 0-based（MinerU page_idx
+                原样透传），展示层 +1 对齐用户认知的 PDF 真实页码 */}
+            {t('knowledgeSearch.imagePage', { page: asset.pageNo + 1 })}
           </span>
         )}
       </div>
@@ -232,7 +235,7 @@ function StepDetail({
 }: {
   step: any;
   t: (key: string, opts?: any) => string;
-  onEntityClick?: (hit: { name: string; score?: number; kb_id?: string }) => void;
+  onEntityClick?: (hit: OntologyInstanceRow & { score?: number; kb_id?: string }) => void;
   onRecallClick?: (item: RagRecallItem, rank: number, score?: number | null) => void;
   references?: any[];
   onOpenReference?: (ref: any) => void;
@@ -504,14 +507,37 @@ function StepDetail({
 }
 
 // ── 反馈按钮 ──
+const FEEDBACK_REASONS: FeedbackReason[] = [
+  'inaccurate',
+  'not_answered',
+  'incomplete',
+  'wrong_reference',
+  'missing_knowledge',
+  'other',
+];
+
 function FeedbackButtons({
   activeVote,
   loading,
   onVote,
+  dislikeOpen,
+  voteReason,
+  voteComment,
+  onDislikeOpenChange,
+  onVoteReasonChange,
+  onVoteCommentChange,
+  onDislikeConfirm,
 }: {
   activeVote: SearchFeedbackType | null;
   loading: SearchFeedbackType | null;
   onVote: (type: SearchFeedbackType) => void;
+  dislikeOpen: boolean;
+  voteReason: FeedbackReason | null;
+  voteComment: string;
+  onDislikeOpenChange: (open: boolean) => void;
+  onVoteReasonChange: (reason: FeedbackReason) => void;
+  onVoteCommentChange: (comment: string) => void;
+  onDislikeConfirm: () => void;
 }) {
   const { t } = useTranslation();
   const isLikeLoading = loading === 'like';
@@ -533,6 +559,8 @@ function FeedbackButtons({
       }}
     >
       <span style={{ color: '#94a3b8' }}>{t('knowledgeSearch.helpfulQuestion')}</span>
+
+      {/* 有帮助 */}
       <button
         type="button"
         disabled={!!loading}
@@ -576,49 +604,90 @@ function FeedbackButtons({
         )}
         {isLikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.helpful')}
       </button>
-      <button
-        type="button"
-        disabled={!!loading}
-        onClick={() => onVote('dislike')}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 5,
-          border: 'none',
-          fontSize: 13,
-          borderRadius: 16,
-          padding: '3px 14px',
-          cursor: loading ? 'default' : 'pointer',
-          lineHeight: '22px',
-          fontWeight: isDislikeSelected ? 600 : 400,
-          color: isDislikeSelected ? '#fff' : '#94a3b8',
-          background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : '#f1f5f9',
-          boxShadow: isDislikeSelected ? '0 1px 4px rgba(239,68,68,0.35)' : 'none',
-          transition: 'all 0.25s ease',
-          opacity: loading && !isDislikeLoading ? 0.5 : 1,
-        }}
-        onMouseEnter={(e) => {
-          if (!loading && !isDislikeSelected) {
-            e.currentTarget.style.background = '#ffe4e6';
-            e.currentTarget.style.color = '#e11d48';
-          }
-        }}
-        onMouseLeave={(e) => {
-          if (!loading && !isDislikeSelected) {
-            e.currentTarget.style.background = '#f1f5f9';
-            e.currentTarget.style.color = '#94a3b8';
-          }
-        }}
+
+      {/* 无帮助：点踩原因 + 备注走 Popconfirm（按钮下方弹出） */}
+      <Popconfirm
+        open={dislikeOpen}
+        onOpenChange={onDislikeOpenChange}
+        placement="bottom"
+        icon={null}
+        title={t('knowledgeSearch.feedbackReasonTitle')}
+        description={
+          <div style={{ width: 300 }}>
+            <div style={{ marginBottom: 8, fontSize: 13, fontWeight: 600, color: '#334155' }}>
+              {t('knowledgeSearch.feedbackReasonLabel')}
+            </div>
+            <Radio.Group
+              value={voteReason}
+              onChange={(e) => onVoteReasonChange(e.target.value)}
+              style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}
+            >
+              {FEEDBACK_REASONS.map((reason) => (
+                <Radio key={reason} value={reason} style={{ fontSize: 13, color: '#475569' }}>
+                  {t(`knowledgeSearch.feedbackReason_${reason}`)}
+                </Radio>
+              ))}
+            </Radio.Group>
+            <div style={{ marginTop: 14, marginBottom: 6, fontSize: 13, fontWeight: 600, color: '#334155' }}>
+              {t('knowledgeSearch.feedbackCommentLabel')}
+            </div>
+            <Input.TextArea
+              value={voteComment}
+              onChange={(e) => onVoteCommentChange(e.target.value)}
+              maxLength={300}
+              rows={3}
+              placeholder={t('knowledgeSearch.feedbackCommentPlaceholder')}
+            />
+          </div>
+        }
+        okText={t('knowledgeSearch.feedbackSubmit')}
+        cancelText={t('common.cancel')}
+        okButtonProps={{ loading: isDislikeLoading }}
+        onConfirm={onDislikeConfirm}
       >
-        {isDislikeLoading ? (
-          <LoadingOutlined style={{ fontSize: 14, color: '#e11d48' }} />
-        ) : isDislikeSelected ? (
-          <DislikeFilled style={{ fontSize: 14 }} />
-        ) : (
-          <DislikeOutlined style={{ fontSize: 14 }} />
-        )}
-        {isDislikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.unhelpful')}
-      </button>
+        <button
+          type="button"
+          disabled={!!loading}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            border: 'none',
+            fontSize: 13,
+            borderRadius: 16,
+            padding: '3px 14px',
+            cursor: loading ? 'default' : 'pointer',
+            lineHeight: '22px',
+            fontWeight: isDislikeSelected ? 600 : 400,
+            color: isDislikeSelected ? '#fff' : '#94a3b8',
+            background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : '#f1f5f9',
+            boxShadow: isDislikeSelected ? '0 1px 4px rgba(239,68,68,0.35)' : 'none',
+            transition: 'all 0.25s ease',
+            opacity: loading && !isDislikeLoading ? 0.5 : 1,
+          }}
+          onMouseEnter={(e) => {
+            if (!loading && !isDislikeSelected) {
+              e.currentTarget.style.background = '#ffe4e6';
+              e.currentTarget.style.color = '#e11d48';
+            }
+          }}
+          onMouseLeave={(e) => {
+            if (!loading && !isDislikeSelected) {
+              e.currentTarget.style.background = '#f1f5f9';
+              e.currentTarget.style.color = '#94a3b8';
+            }
+          }}
+        >
+          {isDislikeLoading ? (
+            <LoadingOutlined style={{ fontSize: 14, color: '#e11d48' }} />
+          ) : isDislikeSelected ? (
+            <DislikeFilled style={{ fontSize: 14 }} />
+          ) : (
+            <DislikeOutlined style={{ fontSize: 14 }} />
+          )}
+          {isDislikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.unhelpful')}
+        </button>
+      </Popconfirm>
     </div>
   );
 }
@@ -736,6 +805,14 @@ interface SessionCardProps {
   onClear: () => void;
   onVote: (type: SearchFeedbackType) => void;
   onOpenReference: (ref: KnowledgeReference, loc?: KnowledgeReferenceLocation) => void;
+  /** 点踩 Popconfirm 受控状态与表单（由父级 KnowledgeSearch 持有） */
+  dislikeOpen: boolean;
+  voteReason: FeedbackReason | null;
+  voteComment: string;
+  onDislikeOpenChange: (open: boolean) => void;
+  onVoteReasonChange: (reason: FeedbackReason) => void;
+  onVoteCommentChange: (comment: string) => void;
+  onDislikeConfirm: () => void;
 }
 
 export default function SessionCard({
@@ -755,6 +832,13 @@ export default function SessionCard({
   onClear,
   onVote,
   onOpenReference,
+  dislikeOpen,
+  voteReason,
+  voteComment,
+  onDislikeOpenChange,
+  onVoteReasonChange,
+  onVoteCommentChange,
+  onDislikeConfirm,
 }: SessionCardProps) {
   const { t } = useTranslation();
 
@@ -776,40 +860,18 @@ export default function SessionCard({
   }, []);
 
   const [entityDrawerOpen, setEntityDrawerOpen] = React.useState(false);
-  const [entityDrawerLoading, setEntityDrawerLoading] = React.useState(false);
   const [drawerEntity, setDrawerEntity] = React.useState<OntologyInstanceRow | null>(null);
 
   const [ragRecallOpen, setRagRecallOpen] = React.useState(false);
   const [ragRecallItem, setRagRecallItem] = React.useState<RagRecallItem | null>(null);
   const [ragRecallRank, setRagRecallRank] = React.useState(1);
   const [ragRecallScore, setRagRecallScore] = React.useState<number | null>(null);
+  const [chunkLoading, setChunkLoading] = React.useState(false);
 
-  const openEntityDrawer = async (hit: { name: string; score?: number; kb_id?: string }) => {
-    if (!hit.kb_id) {
-      message.warning(t('knowledgeSearch.entityKbMissing'));
-      return;
-    }
-    setDrawerEntity(null);
-    setEntityDrawerLoading(true);
+  const openEntityDrawer = (hit: OntologyInstanceRow & { score?: number; kb_id?: string }) => {
+    // 本体实体信息直接取自问答接口返回的 ontology_match hits（含 description/attributes），不再二次查询
+    setDrawerEntity(hit);
     setEntityDrawerOpen(true);
-    try {
-      const res = await getOntologyInstances({
-        kbId: hit.kb_id,
-        keyword: hit.name,
-        page: 1,
-        pageSize: 1,
-      });
-      const item = res.items[0];
-      if (item) {
-        setDrawerEntity(item);
-      } else {
-        message.warning(t('knowledgeSearch.entityNotFound'));
-      }
-    } catch (e) {
-      message.error(t('knowledgeSearch.entityLoadError'));
-    } finally {
-      setEntityDrawerLoading(false);
-    }
   };
 
   const entityAttributeEntries = React.useMemo(() => {
@@ -817,11 +879,22 @@ export default function SessionCard({
     return Object.entries(drawerEntity.attributes).map(([key, value]) => ({ key, value }));
   }, [drawerEntity]);
 
-  const openRagRecallDrawer = (item: RagRecallItem, rank: number, score?: number | null) => {
+  const openRagRecallDrawer = async (item: RagRecallItem, rank: number, score?: number | null) => {
     setRagRecallItem(item);
     setRagRecallRank(rank);
     setRagRecallScore(score ?? null);
     setRagRecallOpen(true);
+    setChunkLoading(true);
+    try {
+      const detail = await getChunkDetail(item.doc_id, item.chunk_id);
+      setRagRecallItem((prev) =>
+        prev && prev.chunk_id === item.chunk_id ? { ...prev, text: detail.content || prev.text } : prev,
+      );
+    } catch (err: any) {
+      message.warning(err?.message || t('knowledgeSearch.chunkLoadError'));
+    } finally {
+      setChunkLoading(false);
+    }
   };
 
   return (
@@ -1164,7 +1237,18 @@ export default function SessionCard({
           )}
 
           {session.status === 'done' && (
-            <FeedbackButtons activeVote={sessionVote} loading={feedbackLoading} onVote={onVote} />
+            <FeedbackButtons
+              activeVote={sessionVote}
+              loading={feedbackLoading}
+              onVote={onVote}
+              dislikeOpen={dislikeOpen}
+              voteReason={voteReason}
+              voteComment={voteComment}
+              onDislikeOpenChange={onDislikeOpenChange}
+              onVoteReasonChange={onVoteReasonChange}
+              onVoteCommentChange={onVoteCommentChange}
+              onDislikeConfirm={onDislikeConfirm}
+            />
           )}
         </div>
       )}
@@ -1394,7 +1478,7 @@ export default function SessionCard({
 
       <OntologyEntityDrawer
         open={entityDrawerOpen}
-        loading={entityDrawerLoading}
+        loading={false}
         entity={drawerEntity}
         attributeEntries={entityAttributeEntries}
         onClose={() => setEntityDrawerOpen(false)}
@@ -1402,6 +1486,7 @@ export default function SessionCard({
 
       <RagRecallDrawer
         open={ragRecallOpen}
+        loading={chunkLoading}
         item={ragRecallItem}
         rank={ragRecallRank}
         score={ragRecallScore}

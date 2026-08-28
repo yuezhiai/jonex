@@ -92,23 +92,23 @@ SELECT 'spp_demo_viewer', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR),
  WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'viewer_demo' AND u.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
--- ⑥ 空间权限收紧（2026-08-19）：领域服务管理员角色描述同步——空间由平台/系统管理员
+-- ⑥ 空间权限收紧（2026-08-19）：领域服务管理员角色描述同步——空间由平台/租户管理员
 --    统一创建后授权管理；service:write 与空间权限完全解耦（不再含「创建和管理领域空间」）。
 UPDATE platform.roles
-   SET description = '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/系统管理员创建后授权管理（空间权限收紧，2026-08-19）'
+   SET description = '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/租户管理员创建后授权管理（空间权限收紧，2026-08-19）'
  WHERE tenant_id = 'tenant_jonex_demo' AND name = '领域服务管理员'
    AND description LIKE '%可创建和管理领域空间%';
 
 -- ⑦ 角色管理菜单权限码收敛为 role:read（2026-08-19 终版）：
 --   收紧点不在菜单码而在角色矩阵——领域服务管理员不再持有 role:read（见 ⑧ 段），
---   菜单按 role:read 控制即可（仅有 role:read 的平台/系统管理员可见）。
+--   菜单按 role:read 控制即可（仅有 role:read 的平台/租户管理员可见）。
 --   无条件 SET 保证幂等（覆盖曾误收紧为 role:write 的存量库）。
 UPDATE platform.menus
    SET permission_code = 'role:read'
  WHERE path = '/apps/platform-management/role-permission';
 
 -- ⑧ 领域服务管理员移除 role:read（2026-08-19）：角色管理功能已收紧为 role:write
---    （仅平台/系统管理员），role:read 对领域服务管理员无任何可用入口（角色页读接口
+--    （仅平台/租户管理员），role:read 对领域服务管理员无任何可用入口（角色页读接口
 --    已全部挂 role:write；用户编辑角色绑定挂 role:write）。与 006 全新库矩阵同步。
 DELETE FROM platform.role_permissions rp
  WHERE rp.tenant_id = 'tenant_jonex_demo'

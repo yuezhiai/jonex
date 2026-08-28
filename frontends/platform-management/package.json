@@ -18,6 +18,7 @@
     "@ant-design/icons": "^6.2.3",
     "@jonex/i18n-resources": "workspace:*",
     "@jonex/platform-theme": "workspace:*",
+    "@jonex/shared-lib": "workspace:*",
     "@jonex/shell-sdk": "workspace:*",
     "@loadable/component": "^5.15.3",
     "antd": "^6.4.3",

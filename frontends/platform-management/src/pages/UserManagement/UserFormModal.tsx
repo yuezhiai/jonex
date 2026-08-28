@@ -8,6 +8,7 @@ import {
   setUserRoles,
   type UserItem,
   type UserCreatePayload,
+  type UserUpdatePayload,
 } from '../../api/users';
 import { listRoles, type RoleItem } from '../../api/roles';
 import type { TenantItem } from '../../api/tenants';
@@ -126,21 +127,28 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      // 用户名与姓名去除首尾空格后提交
+      const username = (values.username ?? '').trim();
+      const displayName = (values.display_name ?? '').trim();
       setSubmitting(true);
       if (editing) {
-        await updateUser(
-          editing.id,
-          { display_name: values.display_name, email: values.email },
-          editing.tenant_id,
-        );
+        const payload: UserUpdatePayload = {
+          display_name: displayName,
+          email: values.email,
+        };
+        // [jonex] 新密码非空才带上（留空保持原密码）
+        if (values.new_password) {
+          payload.new_password = values.new_password;
+        }
+        await updateUser(editing.id, payload, editing.tenant_id);
         // 角色绑定走 RBAC user_roles（delete-then-insert），按用户所属租户
         await setUserRoles(editing.id, values.role_id != null ? [values.role_id] : [], editing.tenant_id);
         message.success(t('userManagement.updated'));
       } else {
         const payload: UserCreatePayload = {
-          username: values.username,
+          username,
           password: values.password,
-          display_name: values.display_name,
+          display_name: displayName,
           email: values.email,
           target_tenant_id: values.target_tenant_id,
           role_id: values.role_id,
@@ -175,14 +183,16 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           <Form.Item
             name="username"
             label={t('userManagement.username')}
-            rules={editing ? [] : [{ required: true, message: t('userManagement.requiredUsername') }]}
+            rules={editing ? [] : [{ required: true, whitespace: true, message: t('userManagement.requiredUsername') }]}
+            getValueFromEvent={(e) => e.target.value.replace(/\s+/g, '')}
           >
             <Input placeholder={t('userManagement.placeholderUsername')} disabled={!!editing} autoComplete="off" />
           </Form.Item>
           <Form.Item
             name="display_name"
             label={t('userManagement.displayName')}
-            rules={[{ required: true, message: t('userManagement.requiredDisplayName') }]}
+            rules={[{ required: true, whitespace: true, message: t('userManagement.requiredDisplayName') }]}
+            getValueFromEvent={(e) => e.target.value.replace(/\s+/g, '')}
           >
             <Input placeholder={t('userManagement.placeholderDisplayName')} />
           </Form.Item>
@@ -240,7 +250,20 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           </Form.Item>
         )}
         {editing && (
-          <Form.Item name="new_password" label={t('userManagement.newPassword')}>
+          <Form.Item
+            name="new_password"
+            label={t('userManagement.newPassword')}
+            rules={[
+              {
+                validator: (_: unknown, value: string) => {
+                  if (value && value.length < 6) {
+                    return Promise.reject(new Error(t('userManagement.passwordTooShort')));
+                  }
+                  return Promise.resolve();
+                },
+              },
+            ]}
+          >
             <Input.Password placeholder={t('userManagement.placeholderNewPassword')} autoComplete="new-password" />
           </Form.Item>
         )}

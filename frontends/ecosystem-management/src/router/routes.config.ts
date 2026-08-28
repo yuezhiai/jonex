@@ -14,6 +14,7 @@ const TemplateScenarios = loadableComponent(() => import('@/pages/TemplateScenar
 const TemplateObjects = loadableComponent(() => import('@/pages/TemplateObjects'));
 const TemplateRelations = loadableComponent(() => import('@/pages/TemplateRelations'));
 const PromptTemplates = loadableComponent(() => import('@/pages/PromptTemplates'));
+const ErrorPage = loadableComponent(() => import('@/pages/Error'));
 const NotFound = loadableComponent(() => import('@/pages/NotFound'));
 
 export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
@@ -37,7 +38,7 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           element: McpServiceDirectory,
           title: 'navigation.mcpServiceDirectory',
           // MCP 相关端点后端已收严为仅管理员可调（2026-08-17 决策），菜单按 permissionCode 过滤避免无权用户看到入口后 403
-          menu: { icon: 'ClusterOutlined', order: 2, permissionCode: 'mcp:read' },
+          menu: { icon: 'ClusterOutlined', order: 2, permissionCode: 'mcp:service:view' },
         },
         {
           path: 'business-marketplace',
@@ -68,6 +69,8 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
         },
       ],
     },
+    // 权限守卫 redirect 目标：?page=403 显示 403（顶层无布局壳，与 404 视觉统一）
+    { path: 'error', element: ErrorPage, title: 'error.403' },
     { path: '*', element: NotFound, title: '404' },
   ];
 }

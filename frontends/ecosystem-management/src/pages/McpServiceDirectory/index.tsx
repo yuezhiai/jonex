@@ -2,28 +2,28 @@ import { useTranslation } from 'react-i18next';
 import { Card, Tabs } from 'antd';
 import { useSearchParams } from 'react-router-dom';
 import { colors, radius } from '@jonex/platform-theme/tokens';
-import McpDomainServicesTab from './McpDomainServicesTab';
-import McpWriteKeysTab from './McpWriteKeysTab';
+import McpServicesTab from './McpServicesTab';
+import McpKeysTab from './McpKeysTab';
 
 /**
  * MCP 服务管理 — 页面外壳
  *
- * 两个 Tab（URL ?area 参数驱动，hosted MemoryRouter 下亦生效）：
- * - area=domain（默认）：MCP领域服务（卡片头：服务目录 / 服务访问Key 视图切换）
- * - area=write：MCP知识写入（知识写入 Key 管理，Phase 17 WRITE-01/02/03）
+ * 两个一级 Tab（URL ?tab 参数驱动，hosted MemoryRouter 下亦生效）：
+ * - tab=catalog（默认）：服务目录（只读）
+ * - tab=keys：Key 管理（统一 Key：服务授权 + 知识写入）
  */
 export default function McpServiceDirectory() {
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = searchParams.get('area') === 'write' ? 'write' : 'domain';
+  const activeTab = searchParams.get('tab') === 'keys' ? 'keys' : 'catalog';
 
-  /** Tab 切换同步 URL ?area 参数（replace，保留其他 query 如 view） */
+  /** Tab 切换同步 URL ?tab 参数（replace，保留其他 query） */
   const handleTabChange = (key: string) => {
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (key === 'write') next.set('area', 'write');
-        else next.delete('area');
+        if (key === 'keys') next.set('tab', 'keys');
+        else next.delete('tab');
         return next;
       },
       { replace: true },
@@ -47,14 +47,14 @@ export default function McpServiceDirectory() {
           onChange={handleTabChange}
           items={[
             {
-              key: 'domain',
-              label: t('mcpServiceDirectory.tabDomainServices'),
-              children: <McpDomainServicesTab />,
+              key: 'catalog',
+              label: t('mcpServiceDirectory.tabCatalog'),
+              children: <McpServicesTab onGoToKeys={() => handleTabChange('keys')} />,
             },
             {
-              key: 'write',
-              label: t('mcpServiceDirectory.tabWrite'),
-              children: <McpWriteKeysTab />,
+              key: 'keys',
+              label: t('mcpServiceDirectory.tabKeys'),
+              children: <McpKeysTab />,
             },
           ]}
         />

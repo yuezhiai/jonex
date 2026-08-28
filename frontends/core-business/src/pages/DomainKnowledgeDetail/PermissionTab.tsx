@@ -10,7 +10,7 @@ interface PermissionTabProps {
   loading: boolean;
   saving: boolean;
   memberName: (member: DomainKnowledgePermissionMember) => string;
-  onRoleChange: (userId: string, role: 'viewer' | 'editor') => void;
+  onRoleChange: (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => void;
   onRemove: (userId: string) => void;
   onSave: () => void;
   /** 添加成员（用户搜索选中后回调；新成员默认 viewer） */
@@ -175,10 +175,11 @@ export default function PermissionTab({
               <Select
                 value={role}
                 disabled={!canManage}
-                onChange={(value) => onRoleChange(record.userId, value as 'viewer' | 'editor')}
+                onChange={(value) => onRoleChange(record.userId, value as 'viewer' | 'editor' | 'kb_manager')}
                 style={{ width: 120 }}
                 options={[
                   { value: 'editor', label: t('kbPermission.editor') },
+                  { value: 'kb_manager', label: t('kbPermission.kbManager') },
                   { value: 'viewer', label: t('kbPermission.viewer') },
                 ]}
               />

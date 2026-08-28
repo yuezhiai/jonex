@@ -16,12 +16,22 @@
 
 FROM python:3.12-slim
 
+# 构建源镜像开关：false=国内源（腾讯云 pip），true=国外官方源（pypi.org）
+ARG USE_OVERSEAS_MIRROR=false
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
     PIP_DEFAULT_TIMEOUT=120
 WORKDIR /app
+
+# pip 源：国内=腾讯云镜像；国外=官方 PyPI（pip.conf 对后续全部 pip install 生效）
+RUN if [ "$USE_OVERSEAS_MIRROR" = "true" ]; then \
+        pip config set global.index-url https://pypi.org/simple; \
+    else \
+        pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple \
+        && pip config set global.trusted-host mirrors.cloud.tencent.com; \
+    fi
 
 # 只安装 OpenKB 依赖，不安装项目本身（回避 hatch-vcs 版本 + README.md 缺失；
 # 过滤 uv export 生成的 "-e ." 行）

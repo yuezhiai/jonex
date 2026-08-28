@@ -60,17 +60,3 @@ export async function rotateApiKey(serviceId: string): Promise<{ api_key: string
   return getData(request.post(`/knowledge-base/services/${serviceId}/rotate-api-key`));
 }
 
-/** 获取领域服务权限 */
-export async function getServicePermissions(
-  serviceId: string,
-): Promise<{ permissions: Array<{ id?: string; user_id: string; role: string }> }> {
-  return getData(request.get(`/knowledge-base/services/${serviceId}/permissions`));
-}
-
-/** 设置领域服务权限 */
-export async function setServicePermissions(
-  serviceId: string,
-  permissions: Array<{ user_id: string; role: string }>,
-): Promise<boolean> {
-  return getData(request.put(`/knowledge-base/services/${serviceId}/permissions`, { permissions }));
-}

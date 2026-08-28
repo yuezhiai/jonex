@@ -19,6 +19,7 @@ const KnowledgeCompileSearch = loadableComponent(() => import('@/pages/Knowledge
 const KnowledgeCompileGraph = loadableComponent(() => import('@/pages/KnowledgeCompileGraph'));
 const KnowledgeCompileVector = loadableComponent(() => import('@/pages/KnowledgeCompileVector'));
 const KnowledgeCompileCompile = loadableComponent(() => import('@/pages/KnowledgeCompileCompile'));
+const ErrorPage = loadableComponent(() => import('@/pages/Error'));
 const NotFound = loadableComponent(() => import('@/pages/NotFound'));
 
 export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key: string) => string) {
@@ -98,6 +99,8 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
         { path: 'knowledge-compile/compile', element: KnowledgeCompileCompile, title: T('navigation.compileCompile') },
       ],
     },
+    // 权限守卫 redirect 目标：?page=403 显示 403（顶层无布局壳，与 404 视觉统一）
+    { path: 'error', element: ErrorPage, title: T('error.403') },
     { path: '*', element: NotFound, title: '404' },
   ];
 }

@@ -2,6 +2,7 @@ import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, message, Tooltip } from 'antd';
 import { CopyOutlined, DeleteOutlined, EditOutlined, EyeOutlined, BranchesOutlined } from '@ant-design/icons';
+import copy from 'copy-to-clipboard';
 import type { PromptTemplateItem } from '../../api/promptTemplates';
 import { CATEGORY_ICON_MAP, PROMPT_CATEGORY_LABEL_KEYS } from '../../api/promptTemplates';
 import { systemPromptTemplateDisplay } from '../../utils/systemPromptTemplateDisplay';
@@ -34,12 +35,11 @@ const PromptCard: React.FC<PromptCardProps> = ({ template, onEdit, onView, onDel
   const previewHtml = escapeHtml(content).replace(/\n/g, '<br>');
 
   const handleCopyContent = useCallback(
-    (e: React.MouseEvent) => {
+    async (e: React.MouseEvent) => {
       e.stopPropagation();
-      navigator.clipboard.writeText(content).then(
-        () => message.success(t('promptTemplate.copySuccess')),
-        () => message.error(t('promptTemplate.copyFailed')),
-      );
+      const ok = await copy(content);
+      if (ok) message.success(t('promptTemplate.copySuccess'));
+      else message.error(t('promptTemplate.copyFailed'));
     },
     [content],
   );
@@ -89,7 +89,7 @@ const PromptCard: React.FC<PromptCardProps> = ({ template, onEdit, onView, onDel
         <span className="pt-tag-cat">
           {t(PROMPT_CATEGORY_LABEL_KEYS[displayTemplate.category] || displayTemplate.category)}
         </span>
-        <span className="pt-ver-badge">🔀 v{displayTemplate.current_version || '1.0'}</span>
+        <span className="pt-ver-badge">🔀 v{displayTemplate.current_version || '1'}</span>
       </div>
 
       {/* Actions */}

@@ -7,7 +7,8 @@
       "@jonex/i18n-resources": ["../shared/i18n-resources/src/index.ts"],
       "@jonex/i18n-resources/*": ["../shared/i18n-resources/src/*"],
       "@jonex/shell-sdk": ["../shared/shell-sdk/src/index.ts"],
-      "@jonex/shell-sdk/*": ["../shared/shell-sdk/src/*"]
+      "@jonex/shell-sdk/*": ["../shared/shell-sdk/src/*"],
+      "@jonex/shared-lib": ["../shared/shared-lib/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],

@@ -1,4 +1,4 @@
-import apiClient from './client';
+import apiClient from './request';
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -58,7 +58,6 @@ export interface UpdatePromptTemplatePayload {
   content?: string;
   status?: string;
   version_remark?: string;
-  target_version?: string;
 }
 
 // ── Constants ──────────────────────────────────────────────
@@ -84,23 +83,7 @@ export const CATEGORY_ICON_MAP: Record<string, { icon: string; bg: string }> = {
   其他: { icon: '📋', bg: 'linear-gradient(135deg, #64748b, #475569)' },
 };
 
-// ── API Helpers ────────────────────────────────────────────
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
-
-function unwrap<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'request_failed');
-  }
-  return payload.data as T;
-}
-
-// ── API Functions ──────────────────────────────────────────
+// ── API Functions（apiClient.get<T> 已解包，返回 data）──
 
 export async function listPromptTemplates(params: {
   scope?: string;
@@ -110,19 +93,13 @@ export async function listPromptTemplates(params: {
   offset?: number;
   limit?: number;
 }): Promise<PromptTemplateListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<PromptTemplateListResponse>>('/api/v1/ecosystem/prompt-templates', {
-    params,
-  });
-  return unwrap(resp.data);
+  return apiClient.get<PromptTemplateListResponse>('/ecosystem/prompt-templates', { params });
 }
 
 export async function getPromptTemplate(id: string, domain_space_id?: string): Promise<PromptTemplateDetail> {
   const params: Record<string, string> = {};
   if (domain_space_id) params.domain_space_id = domain_space_id;
-  const resp = await apiClient.get<ApiEnvelope<PromptTemplateDetail>>(`/api/v1/ecosystem/prompt-templates/${id}`, {
-    params,
-  });
-  return unwrap(resp.data);
+  return apiClient.get<PromptTemplateDetail>(`/ecosystem/prompt-templates/${id}`, { params });
 }
 
 export async function createPromptTemplate(
@@ -130,8 +107,7 @@ export async function createPromptTemplate(
   domain_space_id?: string,
 ): Promise<PromptTemplateItem> {
   const payload = domain_space_id ? { ...data, domain_space_id } : data;
-  const resp = await apiClient.post<ApiEnvelope<PromptTemplateItem>>('/api/v1/ecosystem/prompt-templates', payload);
-  return unwrap(resp.data);
+  return apiClient.post<PromptTemplateItem>('/ecosystem/prompt-templates', payload);
 }
 
 export async function updatePromptTemplate(
@@ -141,37 +117,24 @@ export async function updatePromptTemplate(
 ): Promise<PromptTemplateItem> {
   const payload: Record<string, unknown> = { ...data };
   if (domain_space_id) payload.domain_space_id = domain_space_id;
-  const resp = await apiClient.patch<ApiEnvelope<PromptTemplateItem>>(
-    `/api/v1/ecosystem/prompt-templates/${id}`,
-    payload,
-  );
-  return unwrap(resp.data);
+  return apiClient.patch<PromptTemplateItem>(`/ecosystem/prompt-templates/${id}`, payload);
 }
 
 export async function deletePromptTemplate(id: string, domain_space_id?: string): Promise<void> {
   const params: Record<string, string> = {};
   if (domain_space_id) params.domain_space_id = domain_space_id;
-  const resp = await apiClient.delete<ApiEnvelope<null>>(`/api/v1/ecosystem/prompt-templates/${id}`, { params });
-  unwrap(resp.data);
+  await apiClient.delete<null>(`/ecosystem/prompt-templates/${id}`, { params });
 }
 
 export async function copyPromptTemplate(id: string, domain_space_id?: string): Promise<PromptTemplateItem> {
   const payload = domain_space_id ? { domain_space_id } : undefined;
-  const resp = await apiClient.post<ApiEnvelope<PromptTemplateItem>>(
-    `/api/v1/ecosystem/prompt-templates/${id}/copy`,
-    payload,
-  );
-  return unwrap(resp.data);
+  return apiClient.post<PromptTemplateItem>(`/ecosystem/prompt-templates/${id}/copy`, payload);
 }
 
 export async function listVersions(id: string, domain_space_id?: string): Promise<VersionListResponse> {
   const params: Record<string, string> = {};
   if (domain_space_id) params.domain_space_id = domain_space_id;
-  const resp = await apiClient.get<ApiEnvelope<VersionListResponse>>(
-    `/api/v1/ecosystem/prompt-templates/${id}/versions`,
-    { params },
-  );
-  return unwrap(resp.data);
+  return apiClient.get<VersionListResponse>(`/ecosystem/prompt-templates/${id}/versions`, { params });
 }
 
 export async function rollbackVersion(
@@ -181,9 +144,5 @@ export async function rollbackVersion(
 ): Promise<PromptTemplateItem> {
   const payload: Record<string, unknown> = { target_version: targetVersion };
   if (domain_space_id) payload.domain_space_id = domain_space_id;
-  const resp = await apiClient.post<ApiEnvelope<PromptTemplateItem>>(
-    `/api/v1/ecosystem/prompt-templates/${id}/versions/rollback`,
-    payload,
-  );
-  return unwrap(resp.data);
+  return apiClient.post<PromptTemplateItem>(`/ecosystem/prompt-templates/${id}/versions/rollback`, payload);
 }

@@ -18,11 +18,13 @@
     "@ant-design/icons": "^6.2.3",
     "@jonex/i18n-resources": "workspace:*",
     "@jonex/platform-theme": "workspace:*",
+    "@jonex/shared-lib": "workspace:*",
     "@jonex/shell-sdk": "workspace:*",
     "@loadable/component": "^5.15.3",
     "antd": "^6.4.3",
     "axios": "^1.10.0",
     "classnames": "^2.5.1",
+    "copy-to-clipboard": "^4.0.2",
     "dayjs": "^1.11.13",
     "dompurify": "^3.3.1",
     "i18next": "^25.3.1",
@@ -32,8 +34,7 @@
     "react-i18next": "^15.6.0",
     "react-router-dom": "^6.22.3",
     "sass": "^1.89.2",
-    "zustand": "^5.0.14",
-    "@jonex/shared-lib": "workspace:*"
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@originjs/vite-plugin-federation": "^1.4.1",

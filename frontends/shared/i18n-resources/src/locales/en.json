@@ -25,7 +25,8 @@
     "export": "Export",
     "import": "Import",
     "expandSidebar": "Expand Sidebar",
-    "collapseSidebar": "Collapse Sidebar"
+    "collapseSidebar": "Collapse Sidebar",
+    "noPermission": "No permission"
   },
   "auth": {
     "login": "Sign In",
@@ -39,6 +40,11 @@
     "loginFailed": "Login failed",
     "sessionExpired": "Your session has expired. Please sign in again.",
     "noPermission": "You do not have permission to access this resource."
+  },
+  "impersonation": {
+    "switch": "Switch tenant",
+    "banner": "Impersonating tenant {{tenant}}",
+    "exit": "Exit impersonation"
   },
   "error": {
     "networkError": "Network error, please try again later",
@@ -55,31 +61,35 @@
     "settings": "Settings",
     "profile": "Profile",
     "help": "Help",
-    "coreBusiness": "Core Features",
+    "coreBusiness": "Domain Ontology",
     "knowledgeSearch": "Knowledge Search",
     "domainKnowledge": "Domain Knowledge Base",
     "domainManagement": "Domain Services",
     "domainSpaceManagement": "Domain Space Management",
-    "platformManagement": "Platform",
+    "platformManagement": "Platform Management",
+    "accountPermission": "Accounts & Permissions",
+    "systemOperations": "System Operations",
     "administration": "Administration",
     "engineManagement": "Engine Management",
-    "dataAccess": "Data Sources",
-    "parserManagement": "Parsers",
+    "dataAccessGroup": "Data Engine",
+    "dataAccess": "Data Source Management",
+    "parserManagement": "Parser Management",
     "modelAdapter": "Model Adapters",
-    "promptTemplates": "Prompt Templates",
+    "promptTemplates": "Prompts & Templates",
     "tenantManagement": "Tenants",
     "userManagement": "Users",
     "rolePermission": "Roles & Permissions",
     "systemConfig": "System Settings",
     "operationLog": "Audit Logs",
+    "integrationExtension": "Integration & Extensions",
     "ecosystemManagement": "Integrations",
     "ecoAdapter": "Integration Adapters",
     "adapterList": "Adapter Catalog",
     "skills": "Skill Library",
     "skillManagement": "Skill Management",
-    "templateDomains": "Domain Templates",
+    "templateDomains": "Ontology Templates",
     "mcpKeyManagement": "MCP Key Management",
-    "mcpServiceDirectory": "MCP Service Directory"
+    "mcpServiceDirectory": "MCP Ecosystem"
   },
   "rules": {
     "required": "Please enter {{field}}",

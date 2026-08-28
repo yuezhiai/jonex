@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Card, Empty, Input, Modal, Spin, message } from 'antd';
+import { Button, Card, Empty, Modal, Spin, message } from 'antd';
 import { useStore } from '@/store';
 import ReactMarkdown from 'react-markdown';
 import {
@@ -31,8 +31,8 @@ import {
   deleteKnowledgeSearchHistory,
   clearKnowledgeSearchHistory,
   streamKnowledgeSearch,
-  submitSearchFeedback,
-  cancelSearchFeedback,
+  submitAnswerFeedback as submitAnswerFeedbackApi,
+  getAnswerFeedback,
   DEFAULT_FAST_STRICT_CONFIG,
 } from '@/api/knowledgeSearch';
 import { useDocumentViewer } from '@/components/DocumentViewer';
@@ -47,7 +47,7 @@ import type {
   ReasoningTrace,
   ReasoningStep,
   SearchFeedbackType,
-  SubmitSearchFeedbackParams,
+  FeedbackReason,
 } from '@/types/knowledgeSearch';
 import SearchPanel from './SearchPanel';
 import SearchHistorySidebar from './SearchHistorySidebar';
@@ -101,6 +101,20 @@ export interface SearchSession {
   reasoning?: ReasoningTrace | null;
   /** [jonex] 本次搜索实际使用的检索条件（再次搜索时复用） */
   strictConfig?: KnowledgeSearchStrictConfig | null;
+  /** [jonex] answer-feedback 锚点：检索历史记录 id（检索响应下发 / 历史项 id），无则无法记录反馈 */
+  historyId?: string;
+}
+
+/** 生成 operation_id（优先 crypto.randomUUID，兼容非安全上下文） */
+function genUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 function parseThink(raw: string): { think: string; answer: string; thinking: boolean } {
@@ -341,7 +355,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
   const { t } = useTranslation();
   const { global } = useStore();
   const [query, setQuery] = useState('');
-  const [selectedDomain, setSelectedDomain] = useState('all');
+  const [selectedDomain, setSelectedDomain] = useState('');
   const [deepSearch, setDeepSearch] = useState(false);
   const [strictConfig, setStrictConfig] = useState<KnowledgeSearchStrictConfig>(DEFAULT_FAST_STRICT_CONFIG);
 
@@ -354,32 +368,49 @@ const KnowledgeSearch = function KnowledgeSearch() {
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
 
   const [activeSearch, setActiveSearch] = useState<SearchSession | null>(null);
+  /** 同步 activeSearch 的 ref（异步回显 / 提交后判断会话是否仍为当前） */
+  const activeSearchRef = useRef<SearchSession | null>(null);
+  useEffect(() => {
+    activeSearchRef.current = activeSearch;
+  }, [activeSearch]);
   const [pageLoading, setPageLoading] = useState(true);
   const [pageError, setPageError] = useState('');
   const [activeHistoryIndex, setActiveHistoryIndex] = useState<number | null>(null);
   const [thinkExpandedMap, setThinkExpandedMap] = useState<Record<string, boolean>>({});
-  /** 按查询文本持久化反馈状态（相同问题再次搜索时恢复） */
+  /** 按 history_id 持久化反馈状态（打开同一检索历史时恢复） */
   const voteCacheRef = useRef<Record<string, SearchFeedbackType>>({});
+  /** 按 history_id 记录已成功提交的版本号（下次提交 version+1，与后端单调递增对齐） */
+  const versionCacheRef = useRef<Record<string, number>>({});
+  /** 进行中的提交 operation_id（失败重试复用，实现幂等） */
+  const operationIdRef = useRef<{ historyId: string; operationId: string } | null>(null);
+  /** 按 history_id 回显的点踩原因/备注（点踩弹框预填，供查看/修改） */
+  const echoedFeedbackRef = useRef<Record<string, { reason: FeedbackReason | null; comment: string }>>({});
   /** 当前会话的反馈选中态 */
   const [sessionVote, setSessionVote] = useState<SearchFeedbackType | null>(null);
   /** 当前正在提交的反馈类型（加载态） */
   const [feedbackLoading, setFeedbackLoading] = useState<SearchFeedbackType | null>(null);
+  /** 点踩原因弹框 */
+  const [dislikeOpen, setDislikeOpen] = useState(false);
+  const [dislikeHistoryId, setDislikeHistoryId] = useState('');
+  const [voteReason, setVoteReason] = useState<FeedbackReason | null>(null);
+  const [voteComment, setVoteComment] = useState('');
 
   const abortRef = useRef<AbortController | null>(null);
   const reasoningRef = useRef<Record<string, unknown> | null>(null);
   const isSearching = isSearchRunning(activeSearch?.status);
 
-  // 按当前领域空间过滤服务候选（'all' 全领域项始终保留）
-  // 当 currentSpaceId 为空时不过滤，展示所有可用服务
-  const visibleDomains = useMemo(
-    () => domains.filter((d) => d.id === 'all' || !global.currentSpaceId || d.space_id === global.currentSpaceId),
-    [domains, global.currentSpaceId],
-  );
+  // [jonex] 检索维度 = 领域空间 + 领域服务（双维度并存）：下拉即完整候选，不再按空间过滤。
+  const visibleDomains = useMemo(() => domains, [domains]);
 
-  // 空间切换：若当前选中的服务不属于新空间，则回落到「全领域」
+  // 默认检索范围：当前领域空间（唯一空间项）→ 保留现有选中 → 第一个候选 → 空
   useEffect(() => {
-    setSelectedDomain((prev) => (prev === 'all' || visibleDomains.some((d) => d.id === prev) ? prev : 'all'));
-  }, [visibleDomains]);
+    setSelectedDomain((prev) => {
+      const currentSpace = visibleDomains.find((d) => d.kind === 'space');
+      if (currentSpace) return currentSpace.id;
+      if (prev && visibleDomains.some((d) => d.id === prev)) return prev;
+      return visibleDomains[0]?.id ?? '';
+    });
+  }, [visibleDomains, global.currentSpaceId]);
 
   // 原文段/视频预览：统一文档查看器
   const { openDocument, viewer } = useDocumentViewer();
@@ -475,16 +506,92 @@ const KnowledgeSearch = function KnowledgeSearch() {
   // ── search ─────────────────────────────────────────────
   const getSelectedKbIds = useCallback(
     (domainId?: string): string[] => {
-      if (!domainId || domainId === 'all') {
-        const allIds = new Set<string>();
-        visibleDomains.forEach((d) => d.kb_ids?.forEach((kid) => allIds.add(kid)));
-        return Array.from(allIds);
-      }
+      if (!domainId) return [];
       const domain = visibleDomains.find((d) => d.id === domainId);
       return domain?.kb_ids ?? [];
     },
     [visibleDomains],
   );
+
+  /** 拉取某条检索历史（history_id）的权威反馈状态，覆盖本地缓存与选中态 */
+  const fetchAnswerFeedback = useCallback(async (historyId: string, sessionId: string) => {
+    try {
+      const res = await getAnswerFeedback(historyId);
+      if (!res.feedback) {
+        delete voteCacheRef.current[historyId];
+        delete echoedFeedbackRef.current[historyId];
+        if (activeSearchRef.current?.id === sessionId) setSessionVote(null);
+        return;
+      }
+      const f = res.feedback;
+      voteCacheRef.current[historyId] = f.feedback_type;
+      versionCacheRef.current[historyId] = f.version;
+      if (f.feedback_reason || f.feedback_comment) {
+        echoedFeedbackRef.current[historyId] = {
+          reason: (f.feedback_reason as FeedbackReason) ?? null,
+          comment: f.feedback_comment ?? '',
+        };
+      }
+      if (activeSearchRef.current?.id === sessionId) setSessionVote(f.feedback_type);
+    } catch {
+      // 回显失败静默（保留本地缓存状态）
+    }
+  }, []);
+
+  /** 统一提交回答反馈：operation_id 失败复用（幂等）+ version 单调递增（每次成功 +1），返回是否成功 */
+  const submitFeedback = useCallback(
+    async (
+      historyId: string,
+      feedbackType: SearchFeedbackType,
+      reason: FeedbackReason | null,
+      comment: string,
+    ): Promise<boolean> => {
+      if (feedbackLoading) return false;
+      const sessionId = activeSearchRef.current?.id;
+      const operationId =
+        operationIdRef.current?.historyId === historyId ? operationIdRef.current.operationId : genUuid();
+      const version = (versionCacheRef.current[historyId] ?? 0) + 1;
+      setFeedbackLoading(feedbackType);
+      try {
+        await submitAnswerFeedbackApi({
+          historyId,
+          operationId,
+          version,
+          feedbackType,
+          feedbackReason: reason,
+          feedbackComment: comment,
+        });
+        operationIdRef.current = null;
+        versionCacheRef.current[historyId] = version;
+        voteCacheRef.current[historyId] = feedbackType;
+        echoedFeedbackRef.current[historyId] = { reason, comment };
+        if (sessionId && activeSearchRef.current?.id === sessionId) {
+          setSessionVote(feedbackType);
+        }
+        if (feedbackType === 'dislike') {
+          message.success(t('knowledgeSearch.feedbackThankYou'));
+        }
+        return true;
+      } catch (err: any) {
+        // 失败保留 operation_id 供同一次弹框内重试复用（幂等），不污染本地版本号
+        message.error(err?.message || t('knowledgeSearch.operationFailed'));
+        return false;
+      } finally {
+        setFeedbackLoading(null);
+      }
+    },
+    [feedbackLoading, t],
+  );
+
+  /** 点踩弹框提交：必须先选原因；提交成功才关闭（失败保留弹框供幂等重试） */
+  const confirmDislike = useCallback(async () => {
+    if (!voteReason) {
+      message.warning(t('knowledgeSearch.feedbackReasonRequired'));
+      return;
+    }
+    const ok = await submitFeedback(dislikeHistoryId, 'dislike', voteReason, voteComment.trim());
+    if (ok) setDislikeOpen(false);
+  }, [voteReason, voteComment, dislikeHistoryId, submitFeedback, t]);
 
   const handleSearch = useCallback(
     async (
@@ -568,6 +675,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
             },
             onDone: (meta) => {
               reasoningRef.current = (meta?.reasoning as any) ?? null;
+              // [jonex] answer-feedback 锚点：检索响应下发检索历史 id
+              const historyId = meta?.history_id;
 
               // 无答案检测：如果回答内容表示"无法回答"，清空引用
               const noAnswerPatterns = [
@@ -592,13 +701,15 @@ const KnowledgeSearch = function KnowledgeSearch() {
                       references: filteredRefs,
                       reasoning: meta?.reasoning ?? null,
                       source: meta?.source || prev.source,
+                      historyId,
                     }
                   : prev,
               );
-              // 恢复相同查询的投票状态
-              const cached = voteCacheRef.current[trimmedQuery];
-              if (cached) {
-                setSessionVote(cached);
+              // 恢复该 history_id 的本地投票缓存，再拉后端权威状态覆盖
+              if (historyId) {
+                const cached = voteCacheRef.current[historyId];
+                setSessionVote(cached ?? null);
+                void fetchAnswerFeedback(historyId, sessionId);
               } else {
                 setSessionVote(null);
               }
@@ -618,7 +729,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         setThinkExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
 
         saveKnowledgeSearchHistory('', {
-          domainSpaceId: global.currentSpaceId ?? undefined,
+          // 历史按空间过滤：空间项取自身，服务项取其所属空间
+          domainSpaceId: visibleDomains.find((d) => d.id === domainId)?.space_id,
           query: trimmedQuery,
           domainId,
           domain: domainName,
@@ -654,14 +766,14 @@ const KnowledgeSearch = function KnowledgeSearch() {
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [query, selectedDomain, getSelectedKbIds, deepSearch, strictConfig],
+    [query, selectedDomain, getSelectedKbIds, deepSearch, strictConfig, fetchAnswerFeedback],
   );
 
   const handleHistoryClick = useCallback(
     (item: KnowledgeSearchHistoryItem, index: number) => {
       setQuery(item.query);
       setActiveHistoryIndex(index);
-      if (item.domainId) setSelectedDomain(item.domainId);
+      if (item.domainId && visibleDomains.some((d) => d.id === item.domainId)) setSelectedDomain(item.domainId);
       // [jonex] 历史快照：有 answer/references 时直接展示历史结果，不重新检索；
       // 旧数据无快照则回退为重新检索
       const hasSnapshot = Boolean(item.answer) || (item.references?.length ?? 0) > 0;
@@ -681,7 +793,11 @@ const KnowledgeSearch = function KnowledgeSearch() {
           reasoning: item.reasoning ?? null,
           // [jonex] 检索条件快照：点击历史再次搜索时复用当时的 strictConfig
           strictConfig: item.strictConfig ?? null,
+          // [jonex] answer-feedback 锚点：历史项 id 即 history_id
+          historyId: item.id,
         });
+        // 回显该历史的反馈状态（异步覆盖本地缓存与选中态）
+        void fetchAnswerFeedback(item.id, sessionId);
         // 快照里的 raw_url 已剥离且会过期，按 doc_id/locations 重新富化
         if (item.references?.length) {
           resolveKnowledgeReferences(item.references)
@@ -702,7 +818,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
         strictConfig: item.strictConfig ?? undefined,
       });
     },
-    [handleSearch, selectedDomain],
+    [handleSearch, selectedDomain, fetchAnswerFeedback, visibleDomains],
   );
 
   const handleStopSearch = useCallback(() => {
@@ -723,67 +839,43 @@ const KnowledgeSearch = function KnowledgeSearch() {
     setActiveHistoryIndex(null);
   }, []);
 
-  /** 对当前回答点击「有帮助/无帮助」—— 加载态 + 匹配后端真实响应格式 */
+  /** 对当前回答点击「有帮助」—— 点赞直接提交；点踩由 Popconfirm 受控打开（见 handleDislikeOpenChange） */
   const handleVoteAnswer = useCallback(
     async (feedbackType: SearchFeedbackType) => {
       if (!activeSearch || feedbackLoading) return;
-      const sessionId = activeSearch.id;
-
-      // 从引用中提取所有不重复的知识库 ID
-      const kbIds: string[] = [];
-      if (activeSearch.references) {
-        const seen = new Set<string>();
-        activeSearch.references.forEach((ref) => {
-          if (ref.kb_id && !seen.has(ref.kb_id)) {
-            seen.add(ref.kb_id);
-            kbIds.push(ref.kb_id);
-          }
-        });
-      }
-      if (kbIds.length === 0) {
-        message.warning(t('knowledgeSearch.noRefFeedback'));
+      const historyId = activeSearch.historyId;
+      if (!historyId) {
+        message.warning(t('knowledgeSearch.noHistoryFeedback'));
         return;
       }
-
-      setFeedbackLoading(feedbackType);
-
-      try {
-        // 情况1：点击同一个按钮 → 取消反馈
-        if (sessionVote === feedbackType) {
-          await cancelSearchFeedback({ sessionId, feedbackType, kbIds });
-          setSessionVote(null);
-          if (activeSearch) delete voteCacheRef.current[activeSearch.query];
-        }
-        // 情况2：点击不同按钮或第一次 → 提交新反馈
-        else {
-          const answerText = parseThink(activeSearch.rawAnswer).answer;
-          const { body: cleanBody } = parseReferences(answerText);
-          const preview = cleanBody.replace(/\s+/g, ' ').trim().slice(0, 100);
-
-          // 如果之前选了其他类型，先取消旧的
-          if (sessionVote) {
-            await cancelSearchFeedback({ sessionId, feedbackType: sessionVote, kbIds }).catch(() => {});
-          }
-
-          await submitSearchFeedback({
-            sessionId,
-            query: activeSearch.query,
-            answerPreview: preview,
-            feedbackType,
-            kbIds,
-            searchedAt: new Date().toISOString(),
-          });
-
-          setSessionVote(feedbackType);
-          if (activeSearch) voteCacheRef.current[activeSearch.query] = feedbackType;
-        }
-      } catch {
-        message.error(t('knowledgeSearch.operationFailed'));
-      } finally {
-        setFeedbackLoading(null);
-      }
+      if (feedbackType !== 'like') return;
+      // 点赞：已是 like 则无操作（去取消），否则直接提交
+      if (sessionVote === 'like') return;
+      await submitFeedback(historyId, 'like', null, '');
     },
-    [activeSearch, sessionVote, feedbackLoading],
+    [activeSearch, sessionVote, feedbackLoading, submitFeedback, t],
+  );
+
+  /** Popconfirm 打开/关闭：打开时校验 history_id 并预填回显原因/备注；打开视为新的提交意图起点 */
+  const handleDislikeOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) {
+        setDislikeOpen(false);
+        return;
+      }
+      const historyId = activeSearchRef.current?.historyId;
+      if (!historyId) {
+        message.warning(t('knowledgeSearch.noHistoryFeedback'));
+        return;
+      }
+      operationIdRef.current = null;
+      const echoed = echoedFeedbackRef.current[historyId];
+      setDislikeHistoryId(historyId);
+      setVoteReason(echoed?.reason ?? null);
+      setVoteComment(echoed?.comment ?? '');
+      setDislikeOpen(true);
+    },
+    [t],
   );
 
   const handleDomainChange = useCallback((value: string) => {
@@ -797,7 +889,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
           setHistory((prev) => prev.filter((h) => h.id !== id));
           if (activeHistoryIndex === index) setActiveHistoryIndex(null);
         })
-        .catch(() => message.error(t('knowledgeSearch.operationFailed')));
+        .catch((err: any) => message.error(err?.message || t('knowledgeSearch.operationFailed')));
     },
     [activeHistoryIndex, t],
   );
@@ -817,7 +909,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
             setHistoryPage(1);
             setActiveHistoryIndex(null);
           })
-          .catch(() => message.error(t('knowledgeSearch.operationFailed')));
+          .catch((err: any) => message.error(err?.message || t('knowledgeSearch.operationFailed')));
       },
     });
   }, [t]);
@@ -836,15 +928,15 @@ const KnowledgeSearch = function KnowledgeSearch() {
       });
       setHistoryTotal(result.total);
       setHistoryPage(nextPage);
-    } catch {
-      message.warning(t('knowledgeSearch.operationFailed'));
+    } catch (err: any) {
+      message.warning(err?.message || t('knowledgeSearch.operationFailed'));
     } finally {
       setHistoryLoadingMore(false);
     }
   }, [historyLoadingMore, historyPage, global.currentSpaceId, t]);
 
   const getDomainName = useCallback(
-    (domainId?: string) => domains.find((d) => d.id === domainId)?.name ?? t('knowledgeSearch.allDomain'),
+    (domainId?: string) => domains.find((d) => d.id === domainId)?.name ?? '',
     [domains],
   );
 
@@ -937,6 +1029,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
         }
         onClear={handleClearSearch}
         onVote={handleVoteAnswer}
+        dislikeOpen={dislikeOpen}
+        voteReason={voteReason}
+        voteComment={voteComment}
+        onDislikeOpenChange={handleDislikeOpenChange}
+        onVoteReasonChange={setVoteReason}
+        onVoteCommentChange={setVoteComment}
+        onDislikeConfirm={() => void confirmDislike()}
         onOpenReference={openReference}
       />
     );

@@ -39,8 +39,8 @@ const ToggleStatusModal = forwardRef<ToggleStatusModalHandle, Props>(({ getUserD
       message.success(newStatus === 1 ? t('userManagement.enabled') : t('userManagement.disabled'));
       setTarget(null);
       await onSaved();
-    } catch {
-      message.error(t('userManagement.operationFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('userManagement.operationFailed'));
     }
   };
 

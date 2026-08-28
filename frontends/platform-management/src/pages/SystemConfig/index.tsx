@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Form, Input, Select, Switch, Button, message, Card, Spin, Result } from 'antd';
+import { Form, Input, Select, Button, message, Card, Spin, Result } from 'antd';
 import {
   SaveOutlined,
   UndoOutlined,
   InfoCircleOutlined,
   SafetyOutlined,
-  HddOutlined,
-  MailOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { listSystemConfigs, updateSystemConfig } from '../../api/systemConfig';
@@ -24,21 +22,7 @@ const DEFAULTS: ConfigMap = {
   password_min_length: '8',
   login_lock_threshold: '5',
   lock_duration: '15',
-  two_factor: 'false',
-  storage_path: '/data/jonex/storage',
-  backup_path: '/data/jonex/backup',
-  storage_limit: '500',
-  storage_used: '127',
-  auto_backup: 'true',
-  smtp_server: 'smtp.example.com',
-  smtp_port: '587',
-  sender_email: 'noreply@jonex.ai',
-  admin_email: 'admin@jonex.ai',
-  webhook_url: 'https://hooks.example.com/jonex/notify',
 };
-
-/** 布尔配置项（Switch 使用） */
-const BOOL_KEYS = new Set(['two_factor', 'auto_backup']);
 
 export default function SystemConfig() {
   const { t } = useTranslation();
@@ -58,12 +42,7 @@ export default function SystemConfig() {
         map[c.config_key] = c.config_value || '';
       });
       const merged: ConfigMap = { ...DEFAULTS, ...map };
-      // Switch 字段转换为 boolean 供 Form 使用
-      const values: Record<string, string | boolean> = {};
-      Object.entries(merged).forEach(([k, v]) => {
-        values[k] = BOOL_KEYS.has(k) ? v === 'true' : v;
-      });
-      form.setFieldsValue(values);
+      form.setFieldsValue(merged);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : t('common.loadFailed'));
     } finally {
@@ -85,8 +64,7 @@ export default function SystemConfig() {
     let done = 0;
     let fail = 0;
     for (const key of changed) {
-      const raw = values[key];
-      const str = BOOL_KEYS.has(key) ? String(raw === true || raw === 'true') : String(raw ?? '');
+      const str = String(values[key] ?? '');
       try {
         await updateSystemConfig(key, str);
         done++;
@@ -104,11 +82,7 @@ export default function SystemConfig() {
   };
 
   const handleReset = () => {
-    const values: Record<string, string | boolean> = {};
-    Object.entries(DEFAULTS).forEach(([k, v]) => {
-      values[k] = BOOL_KEYS.has(k) ? v === 'true' : v;
-    });
-    form.setFieldsValue(values);
+    form.setFieldsValue(DEFAULTS);
     setChanged(new Set(Object.keys(DEFAULTS)));
     message.info(t('systemConfig.resetToDefaultMsg'));
   };
@@ -233,85 +207,6 @@ export default function SystemConfig() {
               <Input style={fieldStyle('lock_duration')} />
             </Form.Item>
           </div>
-          <Form.Item name="two_factor" label={t('systemConfig.twoFactorAuth')} valuePropName="checked">
-            <Switch />
-          </Form.Item>
-        </Card>
-
-        <Card
-          style={{ borderRadius: 12, border: '1px solid #e2e8f0', marginBottom: 20 }}
-          styles={{ body: { padding: 24 } }}
-        >
-          <h3
-            style={{
-              margin: '0 0 16px',
-              fontSize: 16,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              paddingBottom: 12,
-              borderBottom: '1px solid #e2e8f0',
-            }}
-          >
-            <HddOutlined style={{ color: '#3b82f6' }} /> {t('systemConfig.storageSettings')}
-          </h3>
-          <div style={grid}>
-            <Form.Item name="storage_path" label={t('systemConfig.storagePath')}>
-              <Input style={fieldStyle('storage_path')} />
-            </Form.Item>
-            <Form.Item name="backup_path" label={t('systemConfig.backupPath')}>
-              <Input style={fieldStyle('backup_path')} />
-            </Form.Item>
-          </div>
-          <div style={gridTop}>
-            <Form.Item name="storage_limit" label={t('systemConfig.storageLimit')}>
-              <Input style={fieldStyle('storage_limit')} />
-            </Form.Item>
-            <Form.Item name="storage_used" label={t('systemConfig.storageUsed')}>
-              <Input disabled addonAfter="GB (25.4%)" />
-            </Form.Item>
-          </div>
-          <Form.Item name="auto_backup" label={t('systemConfig.autoBackup')} valuePropName="checked">
-            <Switch />
-          </Form.Item>
-        </Card>
-
-        <Card
-          style={{ borderRadius: 12, border: '1px solid #e2e8f0', marginBottom: 20 }}
-          styles={{ body: { padding: 24 } }}
-        >
-          <h3
-            style={{
-              margin: '0 0 16px',
-              fontSize: 16,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              paddingBottom: 12,
-              borderBottom: '1px solid #e2e8f0',
-            }}
-          >
-            <MailOutlined style={{ color: '#3b82f6' }} /> {t('systemConfig.notificationSettings')}
-          </h3>
-          <div style={grid}>
-            <Form.Item name="smtp_server" label={t('systemConfig.smtpServer')}>
-              <Input style={fieldStyle('smtp_server')} />
-            </Form.Item>
-            <Form.Item name="smtp_port" label={t('systemConfig.smtpPort')}>
-              <Input style={fieldStyle('smtp_port')} />
-            </Form.Item>
-          </div>
-          <div style={gridTop}>
-            <Form.Item name="sender_email" label={t('systemConfig.senderEmail')}>
-              <Input style={fieldStyle('sender_email')} />
-            </Form.Item>
-            <Form.Item name="admin_email" label={t('systemConfig.adminEmail')}>
-              <Input style={fieldStyle('admin_email')} />
-            </Form.Item>
-          </div>
-          <Form.Item name="webhook_url" label={t('systemConfig.webhookUrl')}>
-            <Input style={fieldStyle('webhook_url')} />
-          </Form.Item>
         </Card>
 
         <div style={{ display: 'flex', gap: 12 }}>

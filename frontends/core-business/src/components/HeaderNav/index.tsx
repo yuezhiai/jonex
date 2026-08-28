@@ -4,6 +4,7 @@ import { MenuOutlined, ArrowLeftOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation, useMatches } from 'react-router-dom';
 import { useStore } from '@/store';
+import { usePermission } from '@jonex/shared-lib';
 import { findMenuPathKeys, getMenuItemsByPermission } from '@/utils/menu';
 import { getAvatarText } from '@/utils/utils';
 import { buildLoginRedirectUrl, clearAuthStorage } from '@jonex/shell-sdk';
@@ -40,7 +41,7 @@ export default function HeaderNav({ type = null, previous = '', title = '', prev
       setDrawerOpen(false);
     }
   });
-  const userPermissions: string[] = Array.isArray(userInfo?.permissions) ? userInfo?.permissions : [];
+  const { permissions: userPermissions } = usePermission();
   const menuItems = useMemo(
     () => getMenuItemsByPermission(getMenuFromRoutes(getRoutes(), t), userPermissions),
     [t, userPermissions],

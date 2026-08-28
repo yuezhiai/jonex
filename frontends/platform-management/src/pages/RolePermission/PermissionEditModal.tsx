@@ -33,8 +33,8 @@ const PermissionEditModal = forwardRef<PermissionEditModalRef, Props>(({ perms, 
       try {
         const ids = await getRolePermissions(r.id);
         setChecked(ids);
-      } catch {
-        message.error(t('rolePermission.loadPermsFailed'));
+      } catch (err: any) {
+        message.error(err?.message || t('rolePermission.loadPermsFailed'));
       } finally {
         setLoading(false);
       }
@@ -48,8 +48,8 @@ const PermissionEditModal = forwardRef<PermissionEditModalRef, Props>(({ perms, 
       message.success(t('rolePermission.permsUpdated'));
       setOpen(false);
       onSaved();
-    } catch {
-      message.error(t('rolePermission.saveFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('rolePermission.saveFailed'));
     }
   };
 

@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal, Button } from 'antd';
-import type { SearchFeedbackItem } from '@/types/knowledgeSearch';
+import type { AnswerFeedbackListItem } from '@/types/knowledgeSearch';
 
 function formatTime(iso: string | null) {
   if (!iso) return '-';
@@ -16,7 +16,7 @@ function formatTime(iso: string | null) {
 
 interface FeedbackViewModalProps {
   open: boolean;
-  item: SearchFeedbackItem | null;
+  item: AnswerFeedbackListItem | null;
   onClose: () => void;
 }
 
@@ -68,13 +68,43 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
                 overflow: 'auto',
               }}
             >
-              {item.answer_preview || t('tracking.noAnswerPreview')}
+              {item.answer || t('tracking.noAnswerPreview')}
             </div>
           </div>
+          {item.feedback_type === 'dislike' && item.feedback_reason ? (
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+                {t('knowledgeSearch.feedbackReasonLabel')}
+              </label>
+              <div style={{ fontSize: 14, color: '#475569', lineHeight: 1.6 }}>
+                {t(`knowledgeSearch.feedbackReason_${item.feedback_reason}`)}
+              </div>
+            </div>
+          ) : null}
+          {item.feedback_comment ? (
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+                {t('knowledgeSearch.feedbackCommentLabel')}
+              </label>
+              <div
+                style={{
+                  padding: '12px 14px',
+                  background: '#f8fafc',
+                  border: '1px solid #eef2f6',
+                  borderRadius: 8,
+                  fontSize: 14,
+                  color: '#475569',
+                  lineHeight: 1.6,
+                }}
+              >
+                {item.feedback_comment}
+              </div>
+            </div>
+          ) : null}
           <div style={{ display: 'flex', gap: 20, fontSize: 13, color: '#94a3b8' }}>
             <span>
               {t('tracking.searchTime')}
-              {formatTime(item.searched_at)}
+              {formatTime(item.created_at)}
             </span>
             <span>
               {t('tracking.feedbackType')}

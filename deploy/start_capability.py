@@ -65,24 +65,17 @@ async def lifespan(app: FastAPI):
     registry = get_capability_registry()
     capability = None
     try:
-        # atomic.rag.lightrag 按 ATOMIC_RAG_VERSION 选 adapter。
-        # 默认 v1：W3(COS worker 本地化) 未完成前，默认切 v2 会让 COS 文档回退（见迁移计划 §6）。
-        # W3 完成 + M0 冒烟通过后，再把默认改为 v2（P4）。显式 =v2 可提前启用（测试环境）。
-        _rag_v2 = os.getenv("ATOMIC_RAG_VERSION", "v2").strip().lower() == "v2"
-        _rag_override = (
-            ("jonex_core.capability.atomic.rag.lightrag_adapter_v2", "LightRAGAdapterV2")
-            if _rag_v2
-            else ("jonex_core.capability.atomic.rag.lightrag_adapter", "LightRAGAdapter")
-        )
+        # [jonex] v1 退役：唯一 adapter 即 v2，ATOMIC_RAG_VERSION 开关已删除
         module_overrides = {
-            ("atomic", "rag.lightrag"): _rag_override,
+            ("atomic", "rag.lightrag"): (
+                "jonex_core.capability.atomic.rag.lightrag_adapter_v2",
+                "LightRAGAdapterV2",
+            ),
             ("domain", "rag.text"): (
                 "jonex_core.capability.domain.rag_text.rag_text",
                 "DomainRAGText",
             ),
         }
-        if (CAPABILITY_KIND, CAPABILITY_NAME) == ("atomic", "rag.lightrag"):
-            logger.info(f"atomic-rag adapter 版本: {'v2' if _rag_v2 else 'v1'} (ATOMIC_RAG_VERSION)")
         override = module_overrides.get((CAPABILITY_KIND, CAPABILITY_NAME))
         if override:
             module_path, class_name = override
@@ -219,8 +212,26 @@ async def invoke_capability(
     if incoming_request_id:
         req.request_id = incoming_request_id
 
+    # 模拟态上下文：Sidecar 透传的 impersonated/perms/original_tenant_id 注入 contextvar，
+    # 供 has_permission 兜底短路（模拟态按内嵌 perms 判权，不按原始 user_id 查 DB）。
+    from jonex_core.security.permission import reset_impersonation_context, set_impersonation_context
+
+    _imp_token = None
+    if request.get("impersonated"):
+        _imp_token = set_impersonation_context(
+            {
+                "impersonated": True,
+                "perms": request.get("perms") or [],
+                "original_tenant_id": request.get("original_tenant_id"),
+            }
+        )
+
     registry = get_capability_registry()
-    result = await registry.invoke(capability_id, req)
+    try:
+        result = await registry.invoke(capability_id, req)
+    finally:
+        if _imp_token is not None:
+            reset_impersonation_context(_imp_token)
 
     return {
         "request_id": result.request_id,

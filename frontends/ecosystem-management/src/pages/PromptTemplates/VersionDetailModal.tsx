@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal, Button, Tag, message, Typography } from 'antd';
 import { CopyOutlined } from '@ant-design/icons';
+import copy from 'copy-to-clipboard';
 import type { VersionItem } from '../../api/promptTemplates';
 
 const { Paragraph } = Typography;
@@ -15,12 +16,11 @@ interface VersionDetailModalProps {
 export default function VersionDetailModal({ open, version, onClose }: VersionDetailModalProps) {
   const { t } = useTranslation();
 
-  const handleCopyContent = () => {
+  const handleCopyContent = async () => {
     if (!version) return;
-    navigator.clipboard.writeText(version.content).then(
-      () => message.success(t('promptTemplate.copySuccess')),
-      () => message.error(t('promptTemplate.copyFailed')),
-    );
+    const ok = await copy(version.content);
+    if (ok) message.success(t('promptTemplate.copySuccess'));
+    else message.error(t('promptTemplate.copyFailed'));
   };
 
   return (

@@ -8,9 +8,10 @@ import {
   DeleteOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
+import copy from 'copy-to-clipboard';
 import type { ColumnsType } from 'antd/es/table';
 import type { DomainServiceItem, ServiceApiKeyItem } from '../../types/domainService';
-import { useStore } from '@/store';
+import { usePermission } from '@jonex/shared-lib';
 import McpKeyTab from './McpKeyTab';
 
 interface ServiceConfigModalProps {
@@ -35,13 +36,9 @@ export default function ServiceConfigModal({
   onCancel,
 }: ServiceConfigModalProps) {
   const { t } = useTranslation();
-  const { global } = useStore();
   // 权限码判断：MCP 接入 Tab 仅服务管理员（service:write）可见
-  const userInfo = global.userInfo as Record<string, unknown> | null | undefined;
-  const userPermissions: string[] = Array.isArray(userInfo?.permissions)
-    ? (userInfo.permissions as string[])
-    : [];
-  const isAdmin = userPermissions.includes('service:write');
+  const { hasPerm } = usePermission();
+  const isAdmin = hasPerm('service:write');
   const [activeTab, setActiveTab] = useState<string>('api');
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
@@ -59,22 +56,9 @@ export default function ServiceConfigModal({
   const apiAuth = 'API Key';
 
   const handleCopyKey = async (keyId: string, key: string) => {
-    try {
-      await navigator.clipboard.writeText(key);
-      setCopiedKeyId(keyId);
-      setTimeout(() => setCopiedKeyId(null), 2000);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = key;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      setCopiedKeyId(keyId);
-      setTimeout(() => setCopiedKeyId(null), 2000);
-    }
+    await copy(key);
+    setCopiedKeyId(keyId);
+    setTimeout(() => setCopiedKeyId(null), 2000);
   };
 
   const formatDate = (dateStr: string | null): string => {
@@ -109,11 +93,32 @@ export default function ServiceConfigModal({
       ),
     },
     {
+      title: t('domainManagement.keyPrefix'),
+      dataIndex: 'key_prefix',
+      key: 'key_prefix',
+      width: 130,
+      render: (val: string) => (val ? <Typography.Text code>{val}</Typography.Text> : '—'),
+    },
+    {
       title: t('domainManagement.expiresAt'),
       dataIndex: 'expires_at',
       key: 'expires_at',
       width: 120,
       render: (val: string | null) => formatDate(val),
+    },
+    {
+      title: t('domainManagement.createdAt'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 120,
+      render: (val: string | null) => formatDate(val),
+    },
+    {
+      title: t('domainManagement.status'),
+      dataIndex: 'is_active',
+      key: 'is_active',
+      width: 90,
+      render: (v: number) => (v === 1 ? <Tag color="success">{t('status.active')}</Tag> : <Tag>{t('status.inactive')}</Tag>),
     },
     {
       title: t('domainManagement.srvConfigActions'),

@@ -16,6 +16,7 @@ import type { DomainKnowledgeDetail, DocumentStatsResult } from '@/types/domainK
 import { getDomainKnowledgeDetail, getDocumentStats } from '@/api/domainKnowledge';
 import { listDataSources } from '@/api/dataSource';
 import { dataSourceInstanceDisplayName } from '@/utils/dataSourceDisplay';
+import { useQuota } from '@/hooks/useQuota';
 import DocumentLibrary from './DocumentLibrary';
 
 export default function DomainKnowledgeBlank() {
@@ -25,6 +26,12 @@ export default function DomainKnowledgeBlank() {
   const [detail, setDetail] = useState<DomainKnowledgeDetail | null>(null);
   const [dataSources, setDataSources] = useState<string>('—');
   const [docStats, setDocStats] = useState<DocumentStatsResult | null>(null);
+
+  // 文档配额（knowledgeBaseDocumentLimit，传 kb_id 取该 KB 真实 used；加载失败展示 '—'）
+  // 提升在父级：DocumentLibrary 刷新列表时经 onRefreshQuota 同步刷新，统计栏与上传按钮共用同一份数据
+  const { getQuota, isReached, error: quotaError, reload: reloadQuota } = useQuota(id);
+  const docQuota = getQuota('knowledgeBaseDocumentLimit');
+  const docReached = isReached('knowledgeBaseDocumentLimit');
 
   useEffect(() => {
     if (!id) return;
@@ -78,6 +85,11 @@ export default function DomainKnowledgeBlank() {
       labelKey: 'docPhase.parseFailedStat',
       value: docStats ? docStats.parseFailed.toLocaleString() : '—',
       icon: <CloseCircleOutlined style={{ color: '#ef4444' }} />,
+    },
+    {
+      labelKey: 'common.quotaDocLabel',
+      value: docQuota ? `${docQuota.used} / ${docQuota.limit}` : '—',
+      icon: <DatabaseOutlined style={{ color: '#8b5cf6' }} />,
     },
   ];
 
@@ -145,7 +157,13 @@ export default function DomainKnowledgeBlank() {
       </div>
 
       <div style={{ flex: 1, minHeight: 0 }}>
-        <DocumentLibrary kbId={id} kbType={detail?.kbType} />
+        <DocumentLibrary
+          kbId={id}
+          kbType={detail?.kbType}
+          quotaError={quotaError}
+          docReached={docReached}
+          onRefreshQuota={reloadQuota}
+        />
       </div>
     </div>
   );

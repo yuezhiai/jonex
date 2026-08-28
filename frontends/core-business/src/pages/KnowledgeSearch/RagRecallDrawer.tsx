@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { Drawer, Typography, Descriptions, Card, Empty, Space } from 'antd';
+import { Drawer, Typography, Descriptions, Card, Empty, Space, Spin } from 'antd';
 
 const { Title, Text } = Typography;
 
@@ -15,6 +15,7 @@ export interface RagRecallItem {
 
 interface RagRecallDrawerProps {
   open: boolean;
+  loading: boolean;
   item: RagRecallItem | null;
   rank: number;
   score?: number | null;
@@ -46,7 +47,7 @@ function SectionHeader({ title }: { title: string }) {
   );
 }
 
-export default function RagRecallDrawer({ open, item, rank, score, onClose }: RagRecallDrawerProps) {
+export default function RagRecallDrawer({ open, loading, item, rank, score, onClose }: RagRecallDrawerProps) {
   const { t } = useTranslation();
 
   return (
@@ -57,6 +58,7 @@ export default function RagRecallDrawer({ open, item, rank, score, onClose }: Ra
       onClose={onClose}
       destroyOnHidden
     >
+      <Spin spinning={loading}>
       {item ? (
         <Space vertical size="large" style={{ width: '100%' }}>
           <section>
@@ -115,6 +117,7 @@ export default function RagRecallDrawer({ open, item, rank, score, onClose }: Ra
       ) : (
         <Empty description={t('knowledgeSearch.ragRecallEmpty')} />
       )}
+      </Spin>
     </Drawer>
   );
 }

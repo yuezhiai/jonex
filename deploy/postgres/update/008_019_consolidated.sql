@@ -385,16 +385,18 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('template:write', '管理模板', 'template', 'write', '模板系统编辑', 'tenant'),
     ('prompt:read', '查看提示词模板', 'prompt', 'read', '提示词模板查看', 'tenant'),
     ('prompt:write', '管理提示词模板', 'prompt', 'write', '提示词模板编辑', 'tenant'),
-    ('mcp:read', '查看 MCP 服务', 'mcp', 'read', 'MCP 服务目录与 Key 查看', 'tenant'),
-    ('mcp:write', '管理 MCP 服务', 'mcp', 'write', 'MCP 服务发布与 Key 管理', 'tenant')
+    ('mcp:service:view', '查看 MCP 服务', 'service', 'view', 'MCP 服务目录与详情查看', 'tenant'),
+    ('mcp:service:manage', '管理 MCP 服务', 'service', 'manage', 'MCP 服务发布/取消发布/停用/启用', 'tenant'),
+    ('mcp:key:view', '查看 MCP Key', 'key', 'view', '本租户 MCP Key 脱敏信息与授权查看', 'tenant'),
+    ('mcp:key:manage', '管理 MCP Key', 'key', 'manage', '本租户 MCP Key 创建/停用/启用/撤销/重新创建/删除', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
 -- 4) 角色种子：demo 5 角色（平台管理员 is_system=1；其余 0）
 --    语义（用户决策）：平台管理员 = 平台级最高权限（全部码含平台面），仅 admin 账号绑定；
---    系统管理员 = 租户内管理员（全部租户业务码、无平台码）
+--    租户管理员 = 租户内管理员（全部租户业务码、无平台码）
 INSERT INTO platform.roles (id, tenant_id, name, description, is_system) VALUES
     (1, 'tenant_jonex_demo', '平台管理员', '平台级最高权限：全部权限码（含平台面跨租户码），仅 demo 租户 admin 账号绑定', 1),
-    (2, 'tenant_jonex_demo', '系统管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
+    (2, 'tenant_jonex_demo', '租户管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
     (3, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置，可创建和管理领域空间', 0),
     (4, 'tenant_jonex_demo', '知识编辑者', '负责知识的编辑、上传和维护，可管理知识库中的文档和数据', 0),
     (5, 'tenant_jonex_demo', '观察者', '仅可检索和查看知识，不具备编辑和管理权限，适用于只读访问场景', 0)
@@ -409,7 +411,7 @@ SELECT t.id, r.name, r.description, 0
 FROM platform.tenants t
 CROSS JOIN (SELECT name, description FROM platform.roles
             WHERE tenant_id = 'tenant_jonex_demo' AND is_deleted = 0
-              AND name IN ('系统管理员','领域服务管理员','知识编辑者','观察者')) r
+              AND name IN ('租户管理员','领域服务管理员','知识编辑者','观察者')) r
 WHERE t.id <> 'tenant_jonex_demo' AND t.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
@@ -431,16 +433,16 @@ INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id) VALUES
     ('tenant_jonex_demo', 5, 7), ('tenant_jonex_demo', 5, 9)
 ON CONFLICT DO NOTHING;
 
--- 5b) demo 预设角色 × 新业务码矩阵（平台管理员/系统管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
+-- 5b) demo 预设角色 × 新业务码矩阵（平台管理员/租户管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT 'tenant_jonex_demo', r.id, p.id
 FROM platform.roles r
 JOIN platform.permissions p ON p.code IN (
     'engine:read','engine:write','adapter:read','adapter:write','skill:read','skill:write',
-    'template:read','template:write','prompt:read','prompt:write','mcp:read','mcp:write'
+    'template:read','template:write','prompt:read','prompt:write','mcp:service:view','mcp:service:manage','mcp:key:view','mcp:key:manage'
 )
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.is_deleted = 0
-  AND r.name IN ('平台管理员', '系统管理员', '领域服务管理员')
+  AND r.name IN ('平台管理员', '租户管理员', '领域服务管理员')
 ON CONFLICT DO NOTHING;
 
 -- 5c) demo 平台管理员补全部平台面码（平台码只给平台管理员角色）
@@ -451,12 +453,12 @@ JOIN platform.permissions p ON p.scope = 'platform'
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '平台管理员' AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
--- 5d) 平台管理员 + 系统管理员补全部租户业务码（兜底幂等）
+-- 5d) 平台管理员 + 租户管理员补全部租户业务码（兜底幂等）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT r.tenant_id, r.id, p.id
 FROM platform.roles r
 JOIN platform.permissions p ON p.scope = 'tenant'
-WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '系统管理员') AND r.is_deleted = 0
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '租户管理员') AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
 -- 5e) 每租户角色-权限映射播种（按角色 name 对齐 demo 模板；仅 scope='tenant' 码）
@@ -480,12 +482,12 @@ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin' AND u.is_delete
   AND r.name = '平台管理员'
 ON CONFLICT DO NOTHING;
 
--- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「系统管理员」（无平台码）
+-- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「租户管理员」（无平台码）
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
 SELECT u.tenant_id, u.id, r.id
 FROM platform.users u
 JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
-WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '系统管理员'
+WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '租户管理员'
   AND NOT (u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin')
 ON CONFLICT DO NOTHING;
 
@@ -497,34 +499,34 @@ JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
 WHERE u.role = 'user' AND u.is_deleted = 0 AND r.name = '观察者'
 ON CONFLICT DO NOTHING;
 
--- 7) 菜单种子（三大应用分组；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
+-- 7) 菜单种子（四大板块：领域本体/数据接入/集成扩展/平台管理；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
 INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, permission_code) VALUES
-    -- 核心功能分组（直接项，无中间组）
+    -- 领域本体分组（直接项，无中间组）
     (1, 0, 'navigation.coreBusiness', NULL, 'HomeOutlined', NULL, 1, NULL),
     (2, 1, 'navigation.knowledgeSearch', '/apps/core-business/knowledge-search', 'SearchOutlined', NULL, 1, 'knowledge:read'),
     (3, 1, 'navigation.domainKnowledge', '/apps/core-business/domain-knowledge', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
     (4, 1, 'navigation.domainManagement', '/apps/core-business/domain-management', 'ClusterOutlined', NULL, 3, 'service:read'),
-    -- 平台分组 → 引擎管理组（可折叠）
-    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 2, NULL),
-    (6, 5, 'navigation.engineManagement', NULL, 'ApiOutlined', NULL, 1, NULL),
-    (7, 6, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
-    (8, 6, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
-    -- 平台分组 → 提示词模板（直接项）
+    (20, 1, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 4, 'template:read'),
+    -- 数据接入分组 → 数据源管理、解析器管理（直接项）
+    (21, 0, 'navigation.dataAccessGroup', NULL, 'CloudServerOutlined', NULL, 2, NULL),
+    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
+    (8, 21, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
+    -- 集成扩展分组 → Mcp生态（直接项；适配器目录已注释隐藏）
+    (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, NULL),
+    -- (18, 22, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'), -- 适配器目录：已注释隐藏，恢复时放开本行
+    (19, 22, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:service:view'),
+    -- 平台管理分组 → 账号与权限组（可折叠）
+    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, NULL),
+    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 1, NULL),
+    (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
+    (12, 25, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
+    (13, 25, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
+    -- 平台管理分组 → 提示词与模板（直接项）
     (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 2, 'prompt:read'),
-    -- 平台分组 → 管理后台组（可折叠）
-    (10, 5, 'navigation.administration', NULL, 'SettingOutlined', NULL, 3, NULL),
-    (11, 10, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
-    (12, 10, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
-    (13, 10, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
-    (14, 10, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 4, 'platform:config:read'),
-    (15, 10, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 5, 'platform:audit:read'),
-    -- 集成分组 → 集成适配器组（可折叠）
-    (16, 0, 'navigation.ecosystemManagement', NULL, 'GlobalOutlined', NULL, 3, NULL),
-    (17, 16, 'navigation.ecoAdapter', NULL, 'BlockOutlined', NULL, 1, NULL),
-    (18, 17, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'),
-    (19, 17, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:read'),
-    -- 集成分组 → 领域模板（直接项）
-    (20, 16, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 2, 'template:read')
+    -- 平台管理分组 → 系统运维组（可折叠）
+    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 3, NULL),
+    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read'),
+    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'platform:audit:read')
 ON CONFLICT DO NOTHING;
 
 -- 8) 序列兜底
@@ -543,8 +545,7 @@ SELECT setval('platform.menus_id_seq', (SELECT MAX(id) FROM platform.menus), tru
 -- 内容（全部 IF [NOT] EXISTS 幂等，重复执行安全）：
 --   ① mcp_keys 生命周期列：is_deleted / expires_at / note / disabled_at / space_id
 --   ② mcp_key_service_mappings 中间映射表（含 permission_level）
---   ③ mcp_write_keys 知识写入 Key 表（含 created_by / revoked_by 审计归属列）
---   ④ 下线组织维度：DROP org_id 列 + mcp_organizations 表
+--   ③ 下线组织维度：DROP org_id 列 + mcp_organizations 表
 
 -- ── ① mcp_keys 生命周期列 ──
 ALTER TABLE platform.mcp_keys
@@ -563,6 +564,10 @@ ALTER TABLE platform.mcp_keys
 CREATE INDEX IF NOT EXISTS idx_mcp_keys_space
     ON platform.mcp_keys (space_id);
 
+-- MCP Key 撤销审计归属：revoked_by（统一 Key 审计归属列）
+ALTER TABLE platform.mcp_keys
+    ADD COLUMN IF NOT EXISTS revoked_by VARCHAR(128);
+
 -- ── ② mcp_key_service_mappings（极早期数据库可能整表缺失）──
 CREATE TABLE IF NOT EXISTS platform.mcp_key_service_mappings (
     mcp_key_id       VARCHAR(64) NOT NULL,
@@ -579,35 +584,7 @@ CREATE INDEX IF NOT EXISTS idx_mk_sv_mapping_service
 ALTER TABLE platform.mcp_key_service_mappings
     ADD COLUMN IF NOT EXISTS permission_level VARCHAR(16) NOT NULL DEFAULT 'call';
 
--- ── ③ mcp_write_keys 知识写入 Key 表 ──
-CREATE TABLE IF NOT EXISTS platform.mcp_write_keys (
-    id              VARCHAR(64) PRIMARY KEY,
-    tenant_id       VARCHAR(64) NOT NULL,
-    name            VARCHAR(255) NOT NULL DEFAULT '',
-    key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
-    key_hash        VARCHAR(64) NOT NULL,
-    grants          JSONB NOT NULL DEFAULT '[]'::jsonb,
-    space_id        VARCHAR(64),
-    kb_id           VARCHAR(64),
-    disabled_at     TIMESTAMPTZ,
-    revoked_at      TIMESTAMPTZ,
-    expires_at      TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ,
-    is_deleted      INT NOT NULL DEFAULT 0,
-    UNIQUE(key_hash)
-);
-CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_tenant
-    ON platform.mcp_write_keys (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_kb
-    ON platform.mcp_write_keys (tenant_id, kb_id);
-
--- 写 Key 审计归属列
-ALTER TABLE platform.mcp_write_keys
-    ADD COLUMN IF NOT EXISTS created_by VARCHAR(128),
-    ADD COLUMN IF NOT EXISTS revoked_by VARCHAR(128);
-
--- ── ④ 下线组织维度 ──
+-- ── ③ 下线组织维度 ──
 ALTER TABLE platform.mcp_keys DROP COLUMN IF EXISTS org_id;
 DROP TABLE IF EXISTS platform.mcp_organizations;
 
@@ -681,29 +658,10 @@ CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_service
 -- 分节：原 018_permission_convergence.sql
 -- ══════════════════════════════════════════════════════════════
 
--- 018_permission_convergence.sql：MCP 权限值收敛（存量数据迁移，幂等）
+-- 018_permission_convergence.sql：MCP 服务级权限值收敛（存量数据迁移，幂等）
 -- 位置：deploy/postgres/update/（非 migrations/ 初始化目录——只对存量库执行）
--- 全新库无需执行：migrations/002 建表默认值已是终态（permissions DEFAULT 'view'、
---   permission_level DEFAULT 'call'），且无旧数据。
--- 内容（数据迁移，全部幂等，重复执行安全）：
---   ① mcp_keys.permissions 列默认值 read → view
---   ② v1.4 存量迁移：read → view（语义对齐）
---   ③ 权限收敛：write/* → call（物理删除 write/* 权限值，收敛为 call/view）
-
--- ── ① permissions 默认值对齐终态 ──
-ALTER TABLE platform.mcp_keys ALTER COLUMN permissions SET DEFAULT 'view';
-
--- ── ② v1.4 read → view（旧 "read" 语义 = 新 "view" 仅查看，不是 call 可调用）──
-UPDATE platform.mcp_keys SET permissions = 'view'             WHERE permissions = 'read';
-UPDATE platform.mcp_keys SET permissions = '*'                WHERE permissions = 'read,*';
-UPDATE platform.mcp_keys SET permissions = 'call,view,write'  WHERE permissions = 'read, call, view, write';
-UPDATE platform.mcp_keys SET permissions = '*,write'          WHERE permissions = '*,write,read';
-
--- ── ③ write/* → call（含 write 或 * 的单值/组合值整体迁为 call；
---        write 语义含 call，降级不丢失可调用能力，绝不扩大权限）──
-UPDATE platform.mcp_keys
-   SET permissions = 'call'
- WHERE permissions LIKE '%write%' OR permissions LIKE '%*%';
+-- 统一 Key 后 mcp_keys.permissions 列已废弃（021b DROP），本段仅保留
+-- service 级 mcp_key_service_mappings.permission_level 收敛（write/* → call）。
 
 -- service 级 permission_level：write/* 迁为 call
 UPDATE platform.mcp_key_service_mappings

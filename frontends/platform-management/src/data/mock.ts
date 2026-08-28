@@ -112,9 +112,9 @@ export const MOCK_USERS: User[] = [
   {
     id: '1',
     username: 'admin',
-    displayName: '系统管理员',
+    displayName: '平台管理员',
     email: 'admin@jonex.ai',
-    roles: ['系统管理员'],
+    roles: ['租户管理员'],
     tenantName: '默认租户',
     status: 'active',
     lastLogin: '2026-05-23 08:30',
@@ -174,8 +174,8 @@ export const MOCK_USERS: User[] = [
 export const MOCK_ROLES: Role[] = [
   {
     id: '1',
-    name: '系统管理员',
-    description: '平台全权限管理员',
+    name: '租户管理员',
+    description: '租户内管理员：拥有本租户全部业务权限（不含平台级权限）',
     userCount: 2,
     permissions: ['平台管理', '用户管理', '租户管理', '系统配置', '日志查看', '任务调度', '全部应用'],
     status: 'active',

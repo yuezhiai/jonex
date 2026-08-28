@@ -1,11 +1,4 @@
-import apiClient from './client';
-
-interface ApiEnvelope<T> {
-  success: boolean;
-  code?: number;
-  message?: string;
-  data?: T;
-}
+import apiClient from './request';
 
 export interface SkillListResponse {
   items: SkillItem[];
@@ -45,15 +38,8 @@ export interface SkillToggleResponse {
   enabled: boolean;
 }
 
-function unwrapEnvelope<T>(payload: ApiEnvelope<T>): T {
-  if (!payload?.success) {
-    throw new Error(payload?.message || 'Request failed');
-  }
-  return payload.data as T;
-}
-
 export async function fetchSkills(params: FetchSkillsParams = {}): Promise<SkillListResponse> {
-  const resp = await apiClient.get<ApiEnvelope<SkillListResponse>>('/api/v1/ecosystem/skills', {
+  return apiClient.get<SkillListResponse>('/ecosystem/skills', {
     params: {
       offset: params.offset ?? 0,
       limit: params.limit ?? 20,
@@ -61,20 +47,16 @@ export async function fetchSkills(params: FetchSkillsParams = {}): Promise<Skill
       keyword: params.keyword,
     },
   });
-  return unwrapEnvelope(resp.data);
 }
 
 export async function fetchSkill(skillId: string): Promise<SkillItem> {
-  const resp = await apiClient.get<ApiEnvelope<SkillItem>>(`/api/v1/ecosystem/skills/${skillId}`);
-  return unwrapEnvelope(resp.data);
+  return apiClient.get<SkillItem>(`/ecosystem/skills/${skillId}`);
 }
 
 export async function enableSkill(skillId: string): Promise<SkillToggleResponse> {
-  const resp = await apiClient.post<ApiEnvelope<SkillToggleResponse>>(`/api/v1/ecosystem/skills/${skillId}/enable`);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<SkillToggleResponse>(`/ecosystem/skills/${skillId}/enable`);
 }
 
 export async function disableSkill(skillId: string): Promise<SkillToggleResponse> {
-  const resp = await apiClient.post<ApiEnvelope<SkillToggleResponse>>(`/api/v1/ecosystem/skills/${skillId}/disable`);
-  return unwrapEnvelope(resp.data);
+  return apiClient.post<SkillToggleResponse>(`/ecosystem/skills/${skillId}/disable`);
 }

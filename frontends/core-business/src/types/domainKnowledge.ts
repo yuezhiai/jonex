@@ -50,7 +50,7 @@ export interface PaginationResult<T> {
   };
 }
 
-export type DomainKnowledgePermissionRole = 'viewer' | 'editor';
+export type DomainKnowledgePermissionRole = 'viewer' | 'editor' | 'kb_manager';
 
 export interface DomainKnowledgePermissionMember {
   userId: string;

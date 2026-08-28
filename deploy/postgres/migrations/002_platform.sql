@@ -313,6 +313,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_daily_tenant
 -- MCP Key 鉴权表（v1.2 MCP Server）
 -- v1.3 Phase 07: 新增 expires_at（有效期）
 -- v1.4 Phase 16: 新增 note（用途描述）、disabled_at（停用态）；下线组织维度（D8）
+-- v1.5 统一 Key：新增 write_grants / client_request_id（纯加列）；本表无 permissions 列、无 mcp_write_keys 表
 CREATE TABLE IF NOT EXISTS platform.mcp_keys (
     id              VARCHAR(64) PRIMARY KEY,
     tenant_id       VARCHAR(64) NOT NULL,
@@ -320,14 +321,16 @@ CREATE TABLE IF NOT EXISTS platform.mcp_keys (
     note            VARCHAR(512),
     key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
     key_hash        VARCHAR(64) NOT NULL,
-    permissions     VARCHAR(512) NOT NULL DEFAULT 'view',
     allowed_kb_ids  JSONB NOT NULL DEFAULT '[]'::jsonb,
     space_id        VARCHAR(64),
+    write_grants    JSONB,
+    client_request_id  VARCHAR(64),
     created_by      VARCHAR(128),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at      TIMESTAMPTZ,
     disabled_at     TIMESTAMPTZ,
     revoked_at      TIMESTAMPTZ,
+    revoked_by      VARCHAR(128),
     last_used_at    TIMESTAMPTZ,
     last_used_ip    VARCHAR(64),
     is_deleted      INT NOT NULL DEFAULT 0,
@@ -340,6 +343,14 @@ CREATE INDEX idx_mcp_keys_tenant_active
 
 CREATE INDEX idx_mcp_keys_space
     ON platform.mcp_keys(space_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_keys_tenant_reqid
+    ON platform.mcp_keys (tenant_id, client_request_id)
+    WHERE client_request_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_mcp_keys_write_grants
+    ON platform.mcp_keys (tenant_id)
+    WHERE write_grants IS NOT NULL;
 
 -- MCP Key ↔ 领域服务映射中间表（v1.3 Phase 2 B2 前置）
 -- v1.3 Phase 07: 新增 permission_level（权限级别）
@@ -365,6 +376,8 @@ CREATE TABLE IF NOT EXISTS platform.mcp_service_publish (
     is_published    INT NOT NULL DEFAULT 0,
     published_at    TIMESTAMPTZ,
     published_by    VARCHAR(64),
+    stopped_at      TIMESTAMPTZ,
+    stopped_by      VARCHAR(64),
     tool            VARCHAR(128),
     tool_description TEXT,
     service_type    VARCHAR(32) NOT NULL DEFAULT 'domain',
@@ -409,33 +422,3 @@ CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_tenant
 
 CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_service
     ON platform.mcp_service_api_keys(tenant_id, service_id);
-
--- 知识写入 Key 表（v1.4 Phase 17 WRITE-01）
--- 明文 Key 仅在创建响应一次性返回，绝不落库（无明文列，仅存 key_hash）
--- grants JSONB 存写入范围 [{kb, mode(all|specified), directories[]}]；
--- space_id 由 grants[0].kb 反推、kb_id = grants[0].kb 冗余索引（17-02 计算）
-CREATE TABLE IF NOT EXISTS platform.mcp_write_keys (
-    id              VARCHAR(64) PRIMARY KEY,
-    tenant_id       VARCHAR(64) NOT NULL,
-    name            VARCHAR(255) NOT NULL DEFAULT '',
-    key_prefix      VARCHAR(32) NOT NULL DEFAULT '',
-    key_hash        VARCHAR(64) NOT NULL,
-    grants          JSONB NOT NULL DEFAULT '[]'::jsonb,
-    space_id        VARCHAR(64),
-    kb_id           VARCHAR(64),
-    disabled_at     TIMESTAMPTZ,
-    revoked_at      TIMESTAMPTZ,
-    revoked_by      VARCHAR(128),
-    expires_at      TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      VARCHAR(128),
-    updated_at      TIMESTAMPTZ,
-    is_deleted      INT NOT NULL DEFAULT 0,
-    UNIQUE(key_hash)
-);
-
-CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_tenant
-    ON platform.mcp_write_keys(tenant_id);
-
-CREATE INDEX IF NOT EXISTS idx_mcp_write_keys_kb
-    ON platform.mcp_write_keys(tenant_id, kb_id);

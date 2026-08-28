@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { Form, Modal, Input, Radio, Tag, Space, Alert } from 'antd';
-import { PlusOutlined, EditOutlined, LockOutlined } from '@ant-design/icons';
+import { PlusOutlined, EditOutlined, LockOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { DomainKnowledgeItem, KnowledgeBaseType } from '@/types/domainKnowledge';
 
@@ -99,7 +99,24 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
         <Form.Item
           name="kb_type"
           label={t('domainKnowledge.kbType')}
-          extra={isEdit ? undefined : t('domainKnowledge.kbTypeCreateOnlyHint')}
+          extra={
+            isEdit
+              ? undefined
+              : (
+                  <span
+                    style={{
+                      color: '#ff4d4f',
+                      fontSize: 12,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                    }}
+                  >
+                    <ExclamationCircleOutlined />
+                    {t('domainKnowledge.kbTypeCreateOnlyHint')}
+                  </span>
+                )
+          }
         >
           {isEdit ? (
             <Space size={8} style={{ paddingTop: 2 }}>

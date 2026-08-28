@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Modal, Upload, Select, Space, Button, Progress, Tag, message } from 'antd';
+import { Modal, Upload, Select, Space, Button, Progress, Tag, Tooltip, message } from 'antd';
 import type { UploadProps } from 'antd/es/upload';
 import type { UploadFile } from 'antd';
-import { PlusOutlined, CloudUploadOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
+import { PlusOutlined, CloudUploadOutlined, QuestionCircleOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { uploadManualDocument, getFolderList } from '@/api/domainKnowledge';
-import { ACCEPT_EXTENSIONS, BATCH_UPLOAD_MAX_FILES } from '@/constants/upload';
+import { ACCEPT_EXTENSIONS } from '@/constants/upload';
 import type { FolderItem } from '@/types/domainKnowledge';
+import { useQuota, fileSizeLimitBytes, formatMiB } from '@/hooks/useQuota';
 import {
   runWithByteBudget,
   fingerprint,
@@ -23,10 +24,21 @@ export interface UploadModalProps {
   open: boolean;
   onClose: () => void;
   onSuccess?: () => void;
+  /** 打开弹窗时默认选中的目标目录（'' = 全部文档/根目录） */
+  defaultFolderId?: string;
 }
 
-const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSuccess }) => {
+const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSuccess, defaultFolderId }) => {
   const { t } = useTranslation();
+
+  // 配额视图：挂载即拉一次，每次打开弹窗重拉（打开时取最新上限）
+  const { quotas, error: quotaError, getQuota, reload: reloadQuota } = useQuota(kbId);
+  useEffect(() => {
+    if (open) reloadQuota();
+  }, [open, reloadQuota]);
+
+  // 单次上传数量上限；quota 未就绪时为 null（不做前端拦截，最终以后端阻断为准）
+  const uploadFileCountLimit = getQuota('uploadFileCountLimit')?.limit ?? null;
 
   const [selectedFolderId, setSelectedFolderId] = useState<string>('');
   const [folders, setFolders] = useState<FolderItem[]>([]);
@@ -39,6 +51,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
   const abortMapRef = useRef<Map<string, AbortController>>(new Map());
   const closedRef = useRef(false);
   const notifiedSuccessRef = useRef(0);
+  const overflowNotifiedRef = useRef(false); // 同批溢出提示只报一次（onChange 可能逐次触发）
 
   // 打开弹窗时重置所有批量状态 + 加载文件夹
   useEffect(() => {
@@ -48,13 +61,14 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
       abortMapRef.current = new Map();
       closedRef.current = false;
       notifiedSuccessRef.current = 0;
+      overflowNotifiedRef.current = false;
       setRunning(false);
-      setSelectedFolderId('');
+      setSelectedFolderId(defaultFolderId ?? '');
       getFolderList(kbId)
         .then((res) => setFolders(res.items ?? []))
         .catch(() => setFolders([]));
     }
-  }, [open, kbId]);
+  }, [open, kbId, defaultFolderId]);
 
   // 卸载时清定时器，避免 setState on unmounted
   useEffect(() => () => {
@@ -89,14 +103,16 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     [flushNow, scheduleFlush],
   );
 
-  /** 前置校验跳过原因 → 展示文案 */
+  /** 前置校验跳过原因 → 展示文案（fileTooLarge 用该文件类型的动态大小上限） */
   const renderSkipReason = useCallback(
-    (reason: SkipReason): string => {
+    (reason: SkipReason, maxBytes: number | null): string => {
       switch (reason) {
         case 'fileEmpty':
           return t('common.fileEmpty');
         case 'fileTooLarge':
-          return t('common.batchUploadFileTooLarge', { max: '500MB' });
+          return t('common.batchUploadFileTooLarge', {
+            max: maxBytes != null ? formatMiB(maxBytes) : t('common.quotaSizeUnknown'),
+          });
         case 'extNotAllowed':
           return t('common.batchUploadExtNotAllowed');
         case 'dupInBatch':
@@ -123,28 +139,45 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
         if (existingUids.has(uf.uid)) continue;
         const file = uf.originFileObj as File | undefined;
         if (!file) continue;
-        if (itemsRef.current.length >= BATCH_UPLOAD_MAX_FILES) {
+        if (uploadFileCountLimit != null && itemsRef.current.length >= uploadFileCountLimit) {
           overflow += 1;
           continue;
         }
 
         const item: UploadItem = { uid: uf.uid, file, status: 'pending', progress: 0 };
-        const reason = validate(file, seen);
+        const maxBytes = fileSizeLimitBytes(quotas, file.name);
+        const reason = validate(file, seen, maxBytes);
         if (reason) {
           item.status = 'skipped';
-          item.error = renderSkipReason(reason);
+          item.error = renderSkipReason(reason, maxBytes);
         } else {
           seen.add(fingerprint(file));
         }
         itemsRef.current.push(item);
       }
 
-      if (overflow > 0) {
-        message.warning(t('common.batchUploadTooManyFiles', { max: BATCH_UPLOAD_MAX_FILES }));
+      if (overflow > 0 && !overflowNotifiedRef.current) {
+        // antd 多选时 onChange 可能逐次触发（累积快照），同批溢出只提示一次
+        overflowNotifiedRef.current = true;
+        message.warning(
+          t('common.batchUploadTooManyFiles', { max: uploadFileCountLimit ?? 0 }),
+        );
       }
       flushNow();
     },
-    [renderSkipReason, t],
+    [renderSkipReason, t, uploadFileCountLimit, quotas],
+  );
+
+  /** 删除选中文件：上传中先中止请求，再从列表移除 */
+  const removeItem = useCallback(
+    (uid: string) => {
+      const ctrl = abortMapRef.current.get(uid);
+      if (ctrl) ctrl.abort();
+      abortMapRef.current.delete(uid);
+      itemsRef.current = itemsRef.current.filter((it) => it.uid !== uid);
+      flushNow();
+    },
+    [flushNow],
   );
 
   /** 单文件执行器：吞掉所有异常，只写状态，不向上抛 */
@@ -302,7 +335,60 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     return `${bytes} B`;
   };
 
+  // 单文件大小摘要：只列后端下发配额的类别（「类别 ≤xxMB」用 · 连接）
+  const sizeSummary = useMemo(() => {
+    if (!quotas) return '';
+    const typeDefs: { key: string; labelKey: string }[] = [
+      { key: 'documentFileSizeLimitMiB', labelKey: 'common.quotaTypeDocument' },
+      { key: 'spreadsheetFileSizeLimitMiB', labelKey: 'common.quotaTypeSpreadsheet' },
+      { key: 'imageFileSizeLimitMiB', labelKey: 'common.quotaTypeImage' },
+      { key: 'audioFileSizeLimitMiB', labelKey: 'common.quotaTypeAudio' },
+      { key: 'videoFileSizeLimitMiB', labelKey: 'common.quotaTypeVideo' },
+    ];
+    return typeDefs
+      .map((d) => {
+        const item = quotas.find((q) => q.quotaKey === d.key);
+        return item ? `${t(d.labelKey)} ≤${formatMiB(item.limit)}` : null;
+      })
+      .filter(Boolean)
+      .join(' · ');
+  }, [quotas, t]);
+
+  // 音视频时长摘要（一期仅展示，后端不校验）
+  const durationSummary = useMemo(() => {
+    if (!quotas) return '';
+    const audio = quotas.find((q) => q.quotaKey === 'audioDurationLimitMinutes');
+    const video = quotas.find((q) => q.quotaKey === 'videoDurationLimitMinutes');
+    const parts: string[] = [];
+    if (audio) parts.push(`${t('common.quotaTypeAudio')} ≤${audio.limit}${audio.unit}`);
+    if (video) parts.push(`${t('common.quotaTypeVideo')} ≤${video.limit}${video.unit}`);
+    return parts.length ? `${t('common.quotaDurationPrefix')}：${parts.join(' · ')}` : '';
+  }, [quotas, t]);
+
+  // 格式要求 Tooltip 内容：quota 加载失败显示刷新提示；就绪显示数量/大小/时长三条；未就绪为空（不弹）
+  const quotaTooltipContent = useMemo(() => {
+    if (quotaError) return t('common.quotaLoadFailed');
+    if (!quotas || quotas.length === 0) return null;
+    const rows: string[] = [];
+    if (uploadFileCountLimit != null) {
+      rows.push(t('common.quotaUploadCount', { count: uploadFileCountLimit }));
+    }
+    if (sizeSummary) rows.push(`${t('common.quotaSizePrefix')}：${sizeSummary}`);
+    if (durationSummary) rows.push(durationSummary);
+    if (!rows.length) return null;
+    return (
+      <div style={{ lineHeight: 1.7 }}>
+        {rows.map((row, i) => (
+          <div key={i}>{row}</div>
+        ))}
+      </div>
+    );
+  }, [quotaError, quotas, uploadFileCountLimit, sizeSummary, durationSummary, t]);
+
   const onChange: UploadProps['onChange'] = ({ fileList }) => enqueue(fileList);
+
+  // 已达单次数量上限：禁止继续点击拖拽区（删除文件腾出名额后自动恢复）
+  const countReached = uploadFileCountLimit != null && items.length >= uploadFileCountLimit;
 
   return (
     <Modal
@@ -359,7 +445,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
         fileList={[]}
         beforeUpload={() => false}
         onChange={onChange}
-        disabled={running}
+        disabled={running || countReached}
       >
         <div style={{ padding: '20px 0' }}>
           <p className="ant-upload-drag-icon">
@@ -372,11 +458,28 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
             {t('common.uploadDescription')}
           </p>
           <p style={{ fontSize: 13, color: '#f97316', margin: 0 }}>
-            <ExclamationCircleOutlined style={{ marginRight: 4 }} />
-            {t('common.uploadMaxSize')}
+            <Tooltip title={quotaTooltipContent ?? undefined}>
+              <span style={{ cursor: 'pointer' }}>
+                {t('common.quotaFormatHint')}
+                <QuestionCircleOutlined style={{ marginLeft: 4 }} />
+              </span>
+            </Tooltip>
           </p>
         </div>
       </Upload.Dragger>
+
+      {uploadFileCountLimit != null && (
+        <div
+          style={{
+            marginTop: 12,
+            fontSize: 13,
+            color: countReached ? '#ef4444' : '#64748b',
+            textAlign: 'right',
+          }}
+        >
+          {t('common.batchUploadCount', { count: items.length, max: uploadFileCountLimit })}
+        </div>
+      )}
 
       {items.length > 0 && (
         <div style={{ marginTop: 16 }}>
@@ -418,6 +521,14 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
                     <Progress percent={it.progress} size="small" style={{ marginTop: 4 }} />
                   )}
                 </div>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<DeleteOutlined />}
+                  aria-label={t('common.delete')}
+                  onClick={() => removeItem(it.uid)}
+                  style={{ color: '#ef4444', flexShrink: 0 }}
+                />
               </div>
             ))}
           </div>

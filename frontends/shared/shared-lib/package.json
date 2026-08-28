@@ -21,7 +21,8 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-i18next": "^15.6.0",
-    "@ant-design/icons": "^6.2.3"
+    "@ant-design/icons": "^6.2.3",
+    "@jonex/shell-sdk": "workspace:*"
   },
   "devDependencies": {
     "@types/react": "^18.3.0",

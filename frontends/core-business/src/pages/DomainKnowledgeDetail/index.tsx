@@ -229,7 +229,7 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
     });
   };
 
-  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor') => {
+  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => {
     setPermissionMembers((prev) => prev.map((m) => (m.userId === userId ? { ...m, role } : m)));
   };
 

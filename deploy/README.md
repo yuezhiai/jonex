@@ -100,7 +100,8 @@ bash deploy/scripts/build_all.sh gateway    # 仅构建某个 compose 服务
 deploy\scripts\build_all.cmd
 
 # make（自动先构建 base，再 COMPOSE_BAKE 并行构建）
-make build            # 本地联调
+make build            # 本地联调（国内源：腾讯云 pip/apt、npmmirror、清华 uv）
+make build-overseas   # 本地联调（国外官方源：pypi.org / deb.debian.org / registry.npmjs.org）
 make build-gpu        # GPU
 make build-prod       # 生产
 make build-backend    # 仅后端
@@ -202,19 +203,25 @@ docker exec -i jonex-postgres psql -U jonex -d jonex < postgres/migrations/004_k
 
 生产/已初始化的数据库在后续版本迭代时，表结构或字段变更不会自动应用（`/docker-entrypoint-initdb.d` 只在数据卷首次初始化执行）。所有增量变更沉淀为 `postgres/update/NNN_*.sql`，按编号顺序幂等执行，同时同步进 `postgres/migrations/`（全新库直接建齐，无需执行 update/）。
 
+迁移须**人工显式触发**（`make up` 不会自动执行迁移）。执行状态记录在 `public.schema_migrations` 版本表：已应用文件跳过、不重复执行；执行成功才登记，失败中断不登记（修复后重跑将重试）。
+
 ```bash
-# 一键应用全部增量 DDL（幂等，可重复执行）
+# 预览待应用迁移（不执行）
+make db-migrate-dry
+# 交互确认后执行
 make db-migrate
+# 跳过确认直接执行（CI/自动化）
+make db-migrate-yes
 # 或直接：
-bash deploy/postgres/update/apply.sh
-# 单个脚本：
-docker exec -i jonex-postgres psql -U jonex -d jonex < postgres/update/016_mcp_key_lifecycle.sql
+bash deploy/postgres/update/apply.sh [--dry-run | --yes]
 ```
 
 约定：
 
 - `update/` 脚本面向存量库，全部用 `IF [NOT] EXISTS` / `ON CONFLICT DO NOTHING` / 幂等数据迁移，重复执行安全。
 - 新增表结构时同时改 `migrations/` 对应全量 DDL，保证全新库与存量库最终态一致。
+- 不要绕过 `apply.sh` 直连 `psql` 执行单个脚本——会绕过版本表登记，导致版本表与实际 schema 不一致。
+- 破坏性变更（DROP 表/列、大范围 DELETE）发布前先 `make db-migrate-dry` 预览，由发布负责人评估后执行。
 
 ## GPU 加速（可选）
 
@@ -274,6 +281,39 @@ curl "http://localhost:8000/api/v1/knowledge-base/documents/search/enhanced?quer
 返回 `{answer, source:"ontology"|"rag", ontology_instances:[...], rag_used:boolean}`：`source="ontology"` 表示基于 Neo4j 图谱事实 + LLM 回答；`source="rag"` 表示本体未命中、回退完整 RAG。
 
 `ontology_status` 为 `pending`/`failed` 的文档由对账循环自动重试。
+
+### 查询期思考分档变量（[jonex] ontology-query-thinking-latency-fix 方案）
+
+严格模式升级策略为两档（快档 25s / 精档 120s），**思考作为档位维度**——
+设计见 `docs/ontology-query-thinking-latency-fix-plan.md`（§3 两档定义、§7.2 回滚阶梯）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `STRICT_MAX_ATTEMPTS_CAP` | `2` | 严格模式尝试上限（原 3 → 2，与两档结构一致；请求 `strict_max_attempts=3` 会被夹到 2，DTO 对外契约不变） |
+| `ONTOLOGY_CROSS_RAG_TIMEOUT` | `20` | `_cross_verify` 对侧 RAG 校验整体超时（秒）；超时按「对侧无结果」保留本体原答案。**仅精档生效**（快档 `cross_verify=False` 跳过对侧）。取值由精档超时台账反推：15+60+20+8+5=108 < 120 |
+| `LLMGW_DISABLE_THINKING_SCENES` | `lightrag_extract,ontology_extract,raganything_ingest,ontology_arbitration,ontology_qa_fast,rag_chunk_qa_fast,rag_fusion_fast` | 关思考白名单：抽取/裁决场景恒禁；`_fast` 变体=严格模式快档；原始查询 scene 不在列表=精档与非严格保留思考 |
+
+⚠️ **思考模式下 `max_tokens` 是思考+正文共享预算**（上游 tokenhub 行为）：
+思考链过长会吃光预算导致正文为空。本项目已在 `ontology_llm` 三个作答函数
+把 `max_tokens` 提到 8192 并加 `reasoning_content` 兜底（`finish_reason=="length"`
+时禁止兜底，防思考链泄漏）；`Reference/Rag-anything` 侧 `_metered_llm()` 已同源修复过一次。
+**新 LLM 调用点若开思考必须显式考虑此预算关系，勿沿用 2048 级别的旧常量。**
+
+**预算台账不变式**（守护测试 `tests/unit/test_ontology_thinking_scene.py::test_budget_ledger_invariant`）：
+快档 8(邻域)+12(作答)+3 = 23 < 25；精档 15+60+20(对侧)+8(裁决)+5 = 108 < 120；
+合计 145 < `STRICT_TOTAL_BUDGET`(150)。**改任一超时必须重算本台账**，并确认
+前端/网关/Sidecar HTTP 超时 > 各档之和（代码默认 180s 覆盖精档 145s + 深度查询 180s；
+`.env.local.example` 设 `GATEWAY_SIDECAR_TIMEOUT`/`SIDECAR_PROXY_TIMEOUT`=300 与 Docker 部署对齐）。
+
+**回滚阶梯（细 → 粗）**：
+
+1. 快档答案质量下降 → 白名单移除 3 个 `_fast`（纯配置）→ 全档恢复思考
+2. 仅数值/单位计算类变差 → 加 `allow_common_sense` 强制精档判据（代码一行）
+3. 档位表快档 `thinking` 改回 `True`（代码）→ 保留两档但都开思考
+4. `STRICT_MAX_ATTEMPTS_CAP=3` + revert 档位表（回三档）
+5. `LLMGW_DISABLE_THINKING_ENABLED=false`（总闸，连抽取场景一起恢复思考——慎用）
+
+⚠️ 改白名单后须 `docker compose up -d llm-gateway`（`restart` 不重读 `env_file`）。
 
 ### 本体相关环境变量
 
@@ -340,6 +380,24 @@ curl "http://localhost:8000/api/v1/knowledge-base/documents/search/enhanced?quer
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RAG_REF_PAGE_SCORING_ENABLED` | `true` | 跨页打包 chunk 的引用页精算开关：true 时按 pspans 把 chunk 全文切页段、对 query 做关键词打分，取最高分页作 page_no（语义「与 query 最相关」）；false 或精算失败（无命中/完整性防御）回落 chunk 起点页，与改造前一致 |
+
+### MCP Server 公网地址（mcp_config.url 来源）
+
+统一 MCP Key 创建响应的 `mcpServers.jonex.url` 直接取自 `MCP_SERVER_PUBLIC_URL`，
+无 localhost 兜底（代码锁定「无兜底」决策，本地需在 `.env.local` 显式填）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MCP_SERVER_PUBLIC_URL` | `""`（空串） | MCP 创建响应 `mcpServers.jonex.url` 的取值；**不配置则 url 为空串**，客户端无法连接 MCP Server |
+
+⚠️ **配置位置**：由 **platform-service 进程**读取（compose `env_file: .env`），
+生产配在 `deploy/.env`，本地调试配 `.env.local`。
+
+示例值（客户端可达的公网 HTTPS URL）：
+
+```bash
+MCP_SERVER_PUBLIC_URL=https://mcp.example.com
+```
 
 ## 数据备份
 

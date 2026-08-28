@@ -12,16 +12,18 @@ import {
   Spin,
   Result,
   Modal,
+  Tooltip,
   message,
 } from 'antd';
 import { PlusOutlined, SearchOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { listMcpKeys, deleteMcpKey, type McpKeyItem } from '@/api/mcpKeys';
-import { toggleKeyStatus } from '@/api/domainServices';
+import { listMcpKeys, revokeMcpKey, toggleMcpKey, deleteMcpKey, type McpKeyItem } from '@/api/mcpKeys';
+import type { WriteGrant } from '@/api/mcpKeys';
+import { listKnowledgeBases, type KnowledgeBaseBrief } from '@/api/spaces';
+import { PermButton, usePermission } from '@jonex/shared-lib';
 import { McpKeyDrawer, type McpKeyDrawerHandle } from './McpKeyDrawer';
 import { RecreateKeyModal, type RecreateKeyModalHandle } from './RecreateKeyModal';
-import { listMcpServices } from '@/api/mcpServices';
-import { listSpaces } from '@/api/spaces';
+import McpKeyDetailDrawer, { type McpKeyDetailDrawerHandle } from './McpKeyDetailDrawer';
 import './index.css';
 
 const defaultFormatDate = (d: string | null): string => {
@@ -33,38 +35,39 @@ const defaultFormatDate = (d: string | null): string => {
   }
 };
 
-/** 4 态派生：expired > disabled > revoked > active（后端 status 优先） */
+/** 4 态派生：revoked（不可逆终态）> expired > disabled > active（v2.1 对齐写 Key 语义） */
 const deriveStatus = (r: McpKeyItem): 'active' | 'disabled' | 'expired' | 'revoked' => {
   if (r.status === 'disabled' || r.status === 'expired' || r.status === 'revoked') return r.status;
+  if (r.revoked_at) return 'revoked';
   if (r.expires_at && new Date(r.expires_at).getTime() < Date.now()) return 'expired';
   if (r.disabled_at) return 'disabled';
-  if (r.revoked_at) return 'revoked';
   return 'active';
 };
 
-/** 存量 write/* 遗留权限（需降级角标） */
-const hasLegacyPermission = (r: McpKeyItem): boolean => {
-  if ((r.permissions || []).some((p) => p === 'write' || (p as string) === '*')) return true;
-  if ((r.service_permissions || []).some((s) => s.permission_level === 'write' || s.permission_level === '*')) return true;
-  return false;
-};
-
-/** 服务访问 Key 列表 Tab（Phase 16：4 态列/筛选/note/遗留角标/重新创建） */
+/** 服务访问 Key 列表 Tab（v2.1 统一 Key：授权能力/写入范围/按状态操作/revoked 终态优先） */
 export default function McpKeysTab() {
   const { t } = useTranslation();
+  // 权限（shell 下发）：由共享 hook usePermission 提供，按钮级判断交给 PermButton
+  const { permissions: userPermissions } = usePermission();
   const [keys, setKeys] = useState<McpKeyItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
-  // 领域空间下拉选项（供 Key 创建弹窗使用）
-  const [spaceOptions, setSpaceOptions] = useState<{ label: string; value: string }[]>([]);
-  // 领域服务 ID → 名称映射（列表展示用，来源全量服务确保都能映射名称）
-  const [serviceNameMap, setServiceNameMap] = useState<Map<string, string>>(new Map());
+  // 知识库列表（写入范围列名称映射）
+  const [kbList, setKbList] = useState<KnowledgeBaseBrief[]>([]);
 
   const keyDrawerRef = useRef<McpKeyDrawerHandle>(null);
   const recreateRef = useRef<RecreateKeyModalHandle>(null);
+  const detailRef = useRef<McpKeyDetailDrawerHandle>(null);
+
+  /** KB id → 名称（写入范围展示） */
+  const kbNameMap = useMemo(() => {
+    const m = new Map<string, string>();
+    kbList.forEach((k) => m.set(k.id, k.name));
+    return m;
+  }, [kbList]);
 
   /** 加载 Key 列表 */
   const loadKeys = useCallback(async () => {
@@ -73,11 +76,12 @@ export default function McpKeysTab() {
     try {
       const result = await listMcpKeys();
       setKeys(result.items || []);
-      setLoaded(true);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t('mcpKeyManagement.loadFailed'));
     } finally {
       setLoading(false);
+      // 成功/失败都必须结束首屏 Spin：失败时让 error Result（含重试按钮）可达
+      setLoaded(true);
     }
   }, [t]);
 
@@ -85,28 +89,11 @@ export default function McpKeysTab() {
     if (!loaded) loadKeys();
   }, [loaded, loadKeys]);
 
-  // 领域服务名称映射（含未发布服务，确保 service_ids 都能显示名称）
+  // 知识库列表（KB id → 名称映射，一次性加载）
   useEffect(() => {
-    listMcpServices()
-      .then((result) => {
-        const map = new Map<string, string>();
-        result.items.forEach((s) => map.set(s.id, s.name));
-        setServiceNameMap(map);
-      })
-      .catch(() => {
-        // 失败静默，映射为空
-      });
-  }, []);
-
-  // 领域空间下拉选项（供 Key 创建弹窗）
-  useEffect(() => {
-    listSpaces()
-      .then((items) => {
-        setSpaceOptions(items.map((s) => ({ label: s.name ?? s.id, value: s.id })));
-      })
-      .catch(() => {
-        // 失败静默，下拉为空
-      });
+    listKnowledgeBases()
+      .then(setKbList)
+      .catch(() => setKbList([]));
   }, []);
 
   // 搜索 + 状态筛选（客户端过滤）
@@ -119,31 +106,52 @@ export default function McpKeysTab() {
     });
   }, [keys, search, statusFilter]);
 
-  // ── 删除确认 ──
-  const confirmDelete = (record: McpKeyItem) => {
-    Modal.confirm({
-      title: t('mcpKeyManagement.deleteTitle'),
-      content: t('mcpKeyManagement.deleteConfirm', { name: record.name || record.key_prefix }),
-      okText: t('mcpKeyManagement.deleteBtn'),
-      cancelText: t('common.cancel'),
-      okButtonProps: { danger: true },
-      onOk: async () => {
-        try {
-          await deleteMcpKey(record.id);
-          message.success(t('mcpKeyManagement.deleteSuccess'));
-          await loadKeys();
-        } catch (err: unknown) {
-          message.error(err instanceof Error ? err.message : t('mcpKeyManagement.operationFailed'));
-        }
-      },
-    });
+  /** 授权能力聚合：可调用 N · 仅查看 N，含写入授权追加「知识写入」（legacy write/* 兜底） */
+  const renderCapabilities = (record: McpKeyItem) => {
+    const sp = record.service_permissions || [];
+    const callN = sp.filter((s) => s.permission_level === 'call').length;
+    const viewN = sp.filter((s) => s.permission_level === 'view').length;
+    // 旧写 Key 并入统一 mcp-keys 时 service_permissions 可能带 write/* 级权限 → 视同「知识写入」
+    const legacyWriteN = sp.filter((s) => s.permission_level !== 'call' && s.permission_level !== 'view').length;
+    const hasWrite = !!record.write_grants?.length || legacyWriteN > 0;
+    const parts: React.ReactNode[] = [];
+    if (callN > 0) parts.push(<Tag color="blue" key="call">{t('mcpKeyManagement.callCount', { n: callN })}</Tag>);
+    if (viewN > 0) parts.push(<Tag color="gold" key="view">{t('mcpKeyManagement.viewCount', { n: viewN })}</Tag>);
+    if (hasWrite) parts.push(<Tag color="green" key="write">{t('mcpKeyManagement.writeCapability')}</Tag>);
+    if (parts.length === 0) return <span style={{ color: '#94a3b8' }}>-</span>;
+    return <Space size={4} wrap>{parts}</Space>;
   };
 
-  /** 停用/启用（toggle 可逆，恢复原 Key） */
+  /** 写入范围聚合：KB名(全部) / KB名(N 目录)，多 KB 折叠（复用写 Key 渲染逻辑） */
+  const renderWriteScope = (record: McpKeyItem) => {
+    const grants = record.write_grants || [];
+    if (grants.length === 0) return <span style={{ color: '#94a3b8' }}>-</span>;
+    const renderOne = (g: WriteGrant) => {
+      const kbName = kbNameMap.get(g.kb) ?? g.kb;
+      return g.mode === 'all'
+        ? `${kbName}(${t('mcpKeyManagement.writeAll')})`
+        : `${kbName}(${g.directories?.length ?? 0} ${t('mcpKeyManagement.directoryUnit')})`;
+    };
+    const shown = grants.slice(0, 2);
+    const rest = grants.slice(2);
+    return (
+      <Space size={4} wrap>
+        {shown.map((g, i) => (
+          <Tag key={i}>{renderOne(g)}</Tag>
+        ))}
+        {rest.length > 0 && (
+          <Tooltip title={rest.map(renderOne).join('；')}>
+            <Tag>+{rest.length}</Tag>
+          </Tooltip>
+        )}
+      </Space>
+    );
+  };
+
+  /** 停用/启用（toggle 可逆，key 不变；已撤销 Key 调 toggle → 409） */
   const handleToggle = async (record: McpKeyItem) => {
-    const serviceId = record.service_ids?.[0] || '';
     try {
-      await toggleKeyStatus(serviceId, record.id);
+      await toggleMcpKey(record.id);
       message.success(t('mcpKeyManagement.toggleSuccess'));
       loadKeys();
     } catch (err: unknown) {
@@ -162,6 +170,46 @@ export default function McpKeysTab() {
     });
   };
 
+  /** 撤销（不可逆终态） */
+  const confirmRevoke = (record: McpKeyItem) => {
+    Modal.confirm({
+      title: t('mcpKeyManagement.revokeTitle'),
+      content: t('mcpKeyManagement.revokeConfirm', { name: record.name || record.key_prefix }),
+      okText: t('mcpKeyManagement.revokeBtn'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await revokeMcpKey(record.id);
+          message.success(t('mcpKeyManagement.revokeSuccess'));
+          loadKeys();
+        } catch (err: unknown) {
+          message.error(err instanceof Error ? err.message : t('mcpKeyManagement.operationFailed'));
+        }
+      },
+    });
+  };
+
+  /** 删除（软删除，不可逆；删除后 Key 立即失效且列表不再展示） */
+  const confirmDelete = (record: McpKeyItem) => {
+    Modal.confirm({
+      title: t('mcpKeyManagement.deleteTitle'),
+      content: t('mcpKeyManagement.deleteConfirm', { name: record.name || record.key_prefix }),
+      okText: t('mcpKeyManagement.deleteBtn'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await deleteMcpKey(record.id);
+          message.success(t('mcpKeyManagement.deleteSuccess'));
+          loadKeys();
+        } catch (err: unknown) {
+          message.error(err instanceof Error ? err.message : t('mcpKeyManagement.operationFailed'));
+        }
+      },
+    });
+  };
+
   /** 4 态状态渲染 */
   const renderStatus = (record: McpKeyItem) => {
     switch (deriveStatus(record)) {
@@ -176,37 +224,87 @@ export default function McpKeysTab() {
     }
   };
 
-  /** 权限渲染：精确映射 view=金/call=蓝/write=绿/*=紫，存量 write/* 保留遗留角标 */
-  const renderPermissions = (record: McpKeyItem) => {
-    const legacy = hasLegacyPermission(record);
-    const perms = record.permissions || [];
-    if (perms.length === 0 && !legacy) return <span style={{ color: '#94a3b8' }}>-</span>;
-    const tags = perms.map((p) => {
-      // 存量 Key 的 permissions 可能含 '*'（全部），McpKeyPermission 类型不含，显式转 string
-      const perm = p as string;
-      switch (perm) {
-        case 'view':
-          return <Tag color="gold">{t('mcpKeyManagement.permissionView')}</Tag>;
-        case 'call':
-          return <Tag color="blue">{t('mcpKeyManagement.permissionCall')}</Tag>;
-        case 'write':
-          return <Tag color="green">{t('mcpKeyManagement.permissionWrite')}</Tag>;
-        case '*':
-          return <Tag color="purple">{t('mcpKeyManagement.permissionAll')}</Tag>;
-        default:
-          return <Tag>{p}</Tag>;
-      }
-    });
-    if (legacy) {
-      tags.push(
-        <Tag color="orange" key="legacy">
-          {t('mcpKeyManagement.legacyPermissionTag')}
-        </Tag>,
-      );
-    }
+  /** 操作列：每个按钮独立按「权限 + 状态」判断；权限判断由 PermButton 承载（无权限禁用并提示） */
+  const renderActions = (record: McpKeyItem) => {
+    const status = deriveStatus(record);
     return (
-      <Space size={4} wrap>
-        {tags}
+      <Space size={0}>
+        <PermButton
+          type="link"
+          size="small"
+          permissions={userPermissions}
+          requiredPerm={['mcp:key:view', 'mcp:key:manage']}
+          onClick={() => detailRef.current?.open(record)}
+        >
+          {t('mcpKeyManagement.viewBtn')}
+        </PermButton>
+        {status === 'expired' && (
+          <PermButton
+            type="link"
+            size="small"
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => recreateRef.current?.open(record)}
+          >
+            {t('mcpKeyManagement.recreateBtn')}
+          </PermButton>
+        )}
+        {(status === 'active' || status === 'disabled') && (
+          <PermButton
+            type="link"
+            size="small"
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => keyDrawerRef.current?.openEdit(record)}
+          >
+            {t('mcpKeyManagement.editBtn')}
+          </PermButton>
+        )}
+        {status === 'disabled' && (
+          <PermButton
+            type="link"
+            size="small"
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => handleToggle(record)}
+          >
+            {t('mcpKeyManagement.enableBtn')}
+          </PermButton>
+        )}
+        {status === 'active' && (
+          <PermButton
+            type="link"
+            size="small"
+            danger
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => confirmDisable(record)}
+          >
+            {t('mcpKeyManagement.disableBtn')}
+          </PermButton>
+        )}
+        {(status === 'active' || status === 'disabled') && (
+          <PermButton
+            type="link"
+            size="small"
+            danger
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => confirmRevoke(record)}
+          >
+            {t('mcpKeyManagement.revokeBtn')}
+          </PermButton>
+        )}
+        <PermButton
+          type="link"
+          size="small"
+          danger
+          permissions={userPermissions}
+          requiredPerm="mcp:key:manage"
+          onClick={() => confirmDelete(record)}
+        >
+          {t('mcpKeyManagement.deleteBtn')}
+        </PermButton>
       </Space>
     );
   };
@@ -216,7 +314,7 @@ export default function McpKeysTab() {
       title: t('mcpKeyManagement.nameLabel'),
       dataIndex: 'name',
       key: 'name',
-      width: 140,
+      width: 150,
       render: (v: string) => v || <span style={{ color: '#94a3b8' }}>-</span>,
     },
     {
@@ -227,42 +325,16 @@ export default function McpKeysTab() {
       render: (v: string) => (v ? <Typography.Text code>{v}</Typography.Text> : '-'),
     },
     {
-      title: t('mcpKeyManagement.serviceScopeLabel'),
-      dataIndex: 'service_ids',
-      key: 'service_ids',
-      width: 160,
-      render: (_: unknown, record: McpKeyItem) => {
-        const ids = record.service_ids || [];
-        if (ids.length === 0) return <Tag>{t('mcpKeyManagement.allServices')}</Tag>;
-        return (
-          <Space size={4} wrap>
-            {ids.slice(0, 2).map((id) => (
-              <Tag key={id}>{serviceNameMap.get(id) || id}</Tag>
-            ))}
-            {ids.length > 2 && <Tag>+{ids.length - 2}</Tag>}
-          </Space>
-        );
-      },
+      title: t('mcpKeyManagement.colCapability'),
+      key: 'capability',
+      width: 180,
+      render: (_: unknown, record: McpKeyItem) => renderCapabilities(record),
     },
     {
-      title: t('mcpKeyManagement.expiryLabel'),
-      dataIndex: 'expires_at',
-      key: 'expires_at',
-      width: 110,
-      render: (v: string | null) => (v ? defaultFormatDate(v) : t('mcpKeyManagement.expiryForever')),
-    },
-    {
-      title: t('mcpKeyManagement.noteLabel'),
-      dataIndex: 'note',
-      key: 'note',
-      width: 160,
-      render: (v: string | null | undefined) => v || <span style={{ color: '#94a3b8' }}>-</span>,
-    },
-    {
-      title: t('mcpKeyManagement.permissions'),
-      key: 'permissions',
-      width: 130,
-      render: (_: unknown, record: McpKeyItem) => renderPermissions(record),
+      title: t('mcpKeyManagement.colWriteScope'),
+      key: 'write_scope',
+      width: 200,
+      render: (_: unknown, record: McpKeyItem) => renderWriteScope(record),
     },
     {
       title: t('mcpKeyManagement.status'),
@@ -271,37 +343,25 @@ export default function McpKeysTab() {
       render: (_: unknown, record: McpKeyItem) => renderStatus(record),
     },
     {
+      title: t('mcpKeyManagement.colCreatedAt'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 120,
+      render: (v: string | null) => (v ? defaultFormatDate(v) : '-'),
+    },
+    {
+      title: t('mcpKeyManagement.noteLabel'),
+      dataIndex: 'note',
+      key: 'note',
+      width: 180,
+      ellipsis: true,
+      render: (v: string | null) => (v ? v : <span style={{ color: '#94a3b8' }}>-</span>),
+    },
+    {
       title: t('mcpKeyManagement.actions'),
       key: 'actions',
-      width: 220,
-      render: (_: unknown, record: McpKeyItem) => {
-        const status = deriveStatus(record);
-        return (
-          <Space size={0}>
-            <Button type="link" size="small" onClick={() => keyDrawerRef.current?.openEdit(record)}>
-              {t('mcpKeyManagement.editBtn')}
-            </Button>
-            <Button type="link" size="small" danger onClick={() => confirmDelete(record)}>
-              {t('mcpKeyManagement.deleteBtn')}
-            </Button>
-            {status === 'active' && (
-              <Button type="link" size="small" danger onClick={() => confirmDisable(record)}>
-                {t('mcpKeyManagement.disableBtn')}
-              </Button>
-            )}
-            {status === 'disabled' && (
-              <Button type="link" size="small" onClick={() => handleToggle(record)}>
-                {t('mcpKeyManagement.enableBtn')}
-              </Button>
-            )}
-            {status === 'expired' && (
-              <Button type="link" size="small" onClick={() => recreateRef.current?.open(record)}>
-                {t('mcpKeyManagement.recreateBtn')}
-              </Button>
-            )}
-          </Space>
-        );
-      },
+      width: 300,
+      render: (_: unknown, record: McpKeyItem) => renderActions(record),
     },
   ];
 
@@ -360,17 +420,29 @@ export default function McpKeysTab() {
           <Button icon={<ReloadOutlined />} onClick={loadKeys}>
             {t('common.refresh')}
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => keyDrawerRef.current?.open()}>
+          <PermButton
+            type="primary"
+            icon={<PlusOutlined />}
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => keyDrawerRef.current?.open()}
+          >
             {t('mcpKeyManagement.createBtn')}
-          </Button>
+          </PermButton>
         </Space>
       </div>
 
       {keys.length === 0 ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('mcpKeyManagement.emptyText')}>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => keyDrawerRef.current?.open()}>
+          <PermButton
+            type="primary"
+            icon={<PlusOutlined />}
+            permissions={userPermissions}
+            requiredPerm="mcp:key:manage"
+            onClick={() => keyDrawerRef.current?.open()}
+          >
             {t('mcpKeyManagement.createFirst')}
-          </Button>
+          </PermButton>
         </Empty>
       ) : filtered.length === 0 ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('mcpKeyManagement.emptyFilteredText')} />
@@ -382,13 +454,13 @@ export default function McpKeysTab() {
           pagination={false}
           size="middle"
           loading={loading}
-          bordered
         />
       )}
 
-      {/* 创建 / 编辑 / 重新创建 抽屉 */}
-      <McpKeyDrawer ref={keyDrawerRef} onSuccess={loadKeys} spaceOptions={spaceOptions} />
+      {/* 创建 / 编辑 / 重新创建 / 详情 */}
+      <McpKeyDrawer ref={keyDrawerRef} onSuccess={loadKeys} />
       <RecreateKeyModal ref={recreateRef} onSuccess={loadKeys} />
+      <McpKeyDetailDrawer ref={detailRef} kbNameMap={kbNameMap} />
     </div>
   );
 }

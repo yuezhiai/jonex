@@ -38,8 +38,8 @@ const DomainDeleteModal = forwardRef<DomainDeleteModalHandle, DomainDeleteModalP
       setModalOpen(false);
       setDeletingDomain(null);
       onSuccess?.();
-    } catch {
-      message.error(t('common.deleteFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.deleteFailed'));
     }
   };
 

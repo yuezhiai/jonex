@@ -75,8 +75,8 @@ export default function LlmWikiSchemaTab({ kbId, canWrite = false }: Props) {
       setConceptTypes(s.concept_types || []);
       setAgentsMdExtra(s.agents_md_extra || '');
       setDirty(false);
-    } catch {
-      message.error(t('common.loadFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.loadFailed'));
     } finally {
       setLoading(false);
     }
@@ -172,8 +172,8 @@ export default function LlmWikiSchemaTab({ kbId, canWrite = false }: Props) {
       a.download = `llm-wiki-schema-${kbId}.yaml`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      message.error(t('common.loadFailed'));
+    } catch (err: any) {
+      message.error(err?.message || t('common.loadFailed'));
     }
   };
 

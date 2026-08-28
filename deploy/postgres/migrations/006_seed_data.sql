@@ -25,7 +25,7 @@ ON CONFLICT (api_key) DO NOTHING;
 INSERT INTO platform.users (tenant_id, username, password_hash, display_name, role)
 VALUES ('tenant_jonex_demo', 'admin',
         '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
-        '系统管理员', 'admin');
+        '平台管理员', 'admin');
 
 
 -- 多租户登录测试用户
@@ -98,11 +98,11 @@ ON CONFLICT (id) DO NOTHING;
 -- 显式 id 插入不推进序列：立即对齐，防后续无 id 的 INSERT 撞主键
 SELECT setval('platform.permissions_id_seq', (SELECT MAX(id) FROM platform.permissions), true);
 
--- 预设角色（语义：平台管理员 = 平台级最高权限仅 admin 绑定；系统管理员 = 租户内管理员）
+-- 预设角色（语义：平台管理员 = 平台级最高权限仅 admin 绑定；租户管理员 = 租户内管理员）
 INSERT INTO platform.roles (id, tenant_id, name, description, is_system) VALUES
     (1, 'tenant_jonex_demo', '平台管理员', '平台级最高权限：全部权限码（含平台面跨租户码），仅 demo 租户 admin 账号绑定', 1),
-    (2, 'tenant_jonex_demo', '系统管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
-    (3, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/系统管理员创建后授权管理（空间权限收紧，2026-08-19）', 0),
+    (2, 'tenant_jonex_demo', '租户管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
+    (3, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/租户管理员创建后授权管理（空间权限收紧，2026-08-19）', 0),
     (4, 'tenant_jonex_demo', '知识编辑者', '负责知识的编辑、上传和维护，可管理知识库中的文档和数据', 0),
     (5, 'tenant_jonex_demo', '观察者', '仅可检索和查看知识，不具备编辑和管理权限，适用于只读访问场景', 0)
 ON CONFLICT (id) DO NOTHING;
@@ -145,11 +145,13 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('template:write', '管理模板', 'template', 'write', '模板系统编辑', 'tenant'),
     ('prompt:read', '查看提示词模板', 'prompt', 'read', '提示词模板查看', 'tenant'),
     ('prompt:write', '管理提示词模板', 'prompt', 'write', '提示词模板编辑', 'tenant'),
-    ('mcp:read', '查看 MCP 服务', 'mcp', 'read', 'MCP 服务目录与 Key 查看', 'tenant'),
-    ('mcp:write', '管理 MCP 服务', 'mcp', 'write', 'MCP 服务发布与 Key 管理', 'tenant')
+    ('mcp:service:view', '查看 MCP 服务', 'service', 'view', 'MCP 服务目录与详情查看', 'tenant'),
+    ('mcp:service:manage', '管理 MCP 服务', 'service', 'manage', 'MCP 服务发布/取消发布/停用/启用', 'tenant'),
+    ('mcp:key:view', '查看 MCP Key', 'key', 'view', '本租户 MCP Key 脱敏信息与授权查看', 'tenant'),
+    ('mcp:key:manage', '管理 MCP Key', 'key', 'manage', '本租户 MCP Key 创建/停用/启用/撤销/重新创建/删除', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
--- 角色-权限关联（基础矩阵：平台管理员/系统管理员全 14 码；领域服务管理员/知识编辑者/观察者按矩阵）
+-- 角色-权限关联（基础矩阵：平台管理员/租户管理员全 14 码；领域服务管理员/知识编辑者/观察者按矩阵）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id) VALUES
     ('tenant_jonex_demo', 1, 1), ('tenant_jonex_demo', 1, 2), ('tenant_jonex_demo', 1, 3),
     ('tenant_jonex_demo', 1, 4), ('tenant_jonex_demo', 1, 5), ('tenant_jonex_demo', 1, 6),
@@ -167,16 +169,16 @@ INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id) VALUES
     ('tenant_jonex_demo', 5, 7), ('tenant_jonex_demo', 5, 9)
 ON CONFLICT DO NOTHING;
 
--- demo 预设角色 × 新增业务码矩阵（平台管理员/系统管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
+-- demo 预设角色 × 新增业务码矩阵（平台管理员/租户管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT 'tenant_jonex_demo', r.id, p.id
 FROM platform.roles r
 JOIN platform.permissions p ON p.code IN (
     'engine:read','engine:write','adapter:read','adapter:write','skill:read','skill:write',
-    'template:read','template:write','prompt:read','prompt:write','mcp:read','mcp:write'
+    'template:read','template:write','prompt:read','prompt:write','mcp:service:view','mcp:service:manage','mcp:key:view','mcp:key:manage'
 )
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.is_deleted = 0
-  AND r.name IN ('平台管理员', '系统管理员', '领域服务管理员')
+  AND r.name IN ('平台管理员', '租户管理员', '领域服务管理员')
 ON CONFLICT DO NOTHING;
 
 -- demo 平台管理员补全部平台面码（平台码只给平台管理员角色）
@@ -187,12 +189,12 @@ JOIN platform.permissions p ON p.scope = 'platform'
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '平台管理员' AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
--- 平台管理员 + 系统管理员补全部租户业务码（兜底幂等）
+-- 平台管理员 + 租户管理员补全部租户业务码（兜底幂等）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT r.tenant_id, r.id, p.id
 FROM platform.roles r
 JOIN platform.permissions p ON p.scope = 'tenant'
-WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '系统管理员') AND r.is_deleted = 0
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '租户管理员') AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
 -- 每租户预设角色播种（demo 已显式插入 id 1-4；其他租户按 demo 模板复制，is_system=0）
@@ -201,7 +203,7 @@ SELECT t.id, r.name, r.description, 0
 FROM platform.tenants t
 CROSS JOIN (SELECT name, description FROM platform.roles
             WHERE tenant_id = 'tenant_jonex_demo' AND is_deleted = 0
-              AND name IN ('系统管理员','领域服务管理员','知识编辑者','观察者')) r
+              AND name IN ('租户管理员','领域服务管理员','知识编辑者','观察者')) r
 WHERE t.id <> 'tenant_jonex_demo' AND t.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
@@ -226,12 +228,12 @@ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin' AND u.is_delete
   AND r.name = '平台管理员'
 ON CONFLICT DO NOTHING;
 
--- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「系统管理员」（无平台码）
+-- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「租户管理员」（无平台码）
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
 SELECT u.tenant_id, u.id, r.id
 FROM platform.users u
 JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
-WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '系统管理员'
+WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '租户管理员'
   AND NOT (u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin')
 ON CONFLICT DO NOTHING;
 
@@ -252,34 +254,34 @@ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_
   AND r.name = '知识编辑者'
 ON CONFLICT DO NOTHING;
 
--- 默认菜单（三大应用分组；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
+-- 默认菜单（四大板块：领域本体/数据接入/集成扩展/平台管理；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
 INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, permission_code) VALUES
-    -- 核心功能分组（直接项，无中间组）
+    -- 领域本体分组（直接项，无中间组）
     (1, 0, 'navigation.coreBusiness', NULL, 'HomeOutlined', NULL, 1, NULL),
     (2, 1, 'navigation.knowledgeSearch', '/apps/core-business/knowledge-search', 'SearchOutlined', NULL, 1, 'knowledge:read'),
     (3, 1, 'navigation.domainKnowledge', '/apps/core-business/domain-knowledge', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
     (4, 1, 'navigation.domainManagement', '/apps/core-business/domain-management', 'ClusterOutlined', NULL, 3, 'service:read'),
-    -- 平台分组 → 引擎管理组（可折叠）
-    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 2, NULL),
-    (6, 5, 'navigation.engineManagement', NULL, 'ApiOutlined', NULL, 1, NULL),
-    (7, 6, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
-    (8, 6, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
-    -- 平台分组 → 提示词模板（直接项）
+    (20, 1, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 4, 'template:read'),
+    -- 数据接入分组 → 数据源管理、解析器管理（直接项）
+    (21, 0, 'navigation.dataAccessGroup', NULL, 'CloudServerOutlined', NULL, 2, NULL),
+    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
+    (8, 21, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
+    -- 集成扩展分组 → Mcp生态（直接项；适配器目录已注释隐藏）
+    (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, NULL),
+    -- (18, 22, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'), -- 适配器目录：已注释隐藏，恢复时放开本行
+    (19, 22, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:service:view'),
+    -- 平台管理分组 → 账号与权限组（可折叠）
+    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, NULL),
+    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 1, NULL),
+    (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
+    (12, 25, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
+    (13, 25, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
+    -- 平台管理分组 → 提示词与模板（直接项）
     (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 2, 'prompt:read'),
-    -- 平台分组 → 管理后台组（可折叠）
-    (10, 5, 'navigation.administration', NULL, 'SettingOutlined', NULL, 3, NULL),
-    (11, 10, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
-    (12, 10, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
-    (13, 10, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
-    (14, 10, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 4, 'platform:config:read'),
-    (15, 10, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 5, 'platform:audit:read'),
-    -- 集成分组 → 集成适配器组（可折叠）
-    (16, 0, 'navigation.ecosystemManagement', NULL, 'GlobalOutlined', NULL, 3, NULL),
-    (17, 16, 'navigation.ecoAdapter', NULL, 'BlockOutlined', NULL, 1, NULL),
-    (18, 17, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'),
-    (19, 17, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:read'),
-    -- 集成分组 → 领域模板（直接项）
-    (20, 16, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 2, 'template:read')
+    -- 平台管理分组 → 系统运维组（可折叠）
+    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 3, NULL),
+    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read'),
+    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'platform:audit:read')
 ON CONFLICT DO NOTHING;
 
 -- 默认应用注册
@@ -531,8 +533,8 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_internet', 'tenant_jonex_demo', '互联网', '互联网科技公司/产品/技术情报模板领域', 'active', 1,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_internet', 'tenant_jonex_demo', '互联网', 'Internet Technology', '互联网科技公司/产品/技术情报模板领域', 'active', 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         'b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0abc1de')
 ON CONFLICT (id) DO NOTHING;
@@ -622,8 +624,8 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_finance', 'tenant_jonex_demo', '金融行业', '金融机构风控、投顾与客户经营模板领域', 'active', 1,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_finance', 'tenant_jonex_demo', '金融行业', 'Financial Services', '金融机构风控、投顾与客户经营模板领域', 'active', 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         '0476f5786a7e292d7a2aaaed06a06b6787b96a746da8818e3869cf2cd71f9777')
 ON CONFLICT (id) DO NOTHING;
@@ -679,8 +681,8 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_medical', 'tenant_jonex_demo', '医疗健康', '医疗数据解析与健康管理模板领域', 'active', 1,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_medical', 'tenant_jonex_demo', '医疗健康', 'Healthcare', '医疗数据解析与健康管理模板领域', 'active', 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         '6b518c74048be883c991406f509f03b1921f062a5ed0a7c1167e85e1886f38ba')
 ON CONFLICT (id) DO NOTHING;
@@ -734,8 +736,8 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_manufacturing', 'tenant_jonex_demo', '制造业', '生产制造、质检与设备运维模板领域', 'active', 1,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_manufacturing', 'tenant_jonex_demo', '制造业', 'Manufacturing', '生产制造、质检与设备运维模板领域', 'active', 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         'cb568b75836751b97660df5f6ff1f07c50ea57dcc428f12ef438ffcba8e02456')
 ON CONFLICT (id) DO NOTHING;
@@ -1186,8 +1188,8 @@ VALUES (
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_hardware_internet', 'tenant_jonex_demo', '硬件互联网', '硬件互联网上市公司财报分析与业务情报模板领域', 'active', 3,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_hardware_internet', 'tenant_jonex_demo', '硬件互联网', 'Hardware & Internet', '硬件互联网上市公司财报分析与业务情报模板领域', 'active', 3,
         '2026-06-24T00:00:00+00'::timestamptz,
         'd5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6')
 ON CONFLICT (id) DO NOTHING;
@@ -1929,8 +1931,8 @@ VALUES (
 -- ============================================================
 
 -- 1. 模板领域
-INSERT INTO business_domain.template_domains (id, tenant_id, name, description, status, version, published_at, structure_hash)
-VALUES ('tpl_domain_ai_tech_report', 'tenant_jonex_demo', 'AI大模型技术报告', 'AI大模型技术报告结构化抽取与分析模板领域', 'active', 2,
+INSERT INTO business_domain.template_domains (id, tenant_id, name, name_en, description, status, version, published_at, structure_hash)
+VALUES ('tpl_domain_ai_tech_report', 'tenant_jonex_demo', 'AI大模型技术报告', 'LLM Technical Reports', 'AI大模型技术报告结构化抽取与分析模板领域', 'active', 2,
         '2026-06-24T00:00:00+00'::timestamptz,
         'c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5')
 ON CONFLICT (id) DO NOTHING;
@@ -2514,23 +2516,23 @@ VALUES (
 -- ============================================================
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, space_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
-VALUES ('seed_pt_dom_contract', 'tenant_jonex_demo', 'space_demo_test', '合同条款合规审查', '合同审查', 'domain', '识别合同中的风险条款与合规问题，给出修改建议。', '启用', '1.0', '[{"remark": "初始版本", "content": "请作为法律合规专家审查以下合同条款，输出：\\n- 风险条款清单（标注位置）\\n- 合规问题说明\\n- 修改建议\\n\\n合同文本：{{合同内容}}", "version": "1.0", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
+VALUES ('seed_pt_dom_contract', 'tenant_jonex_demo', 'space_demo_test', '合同条款合规审查', '合同审查', 'domain', '识别合同中的风险条款与合规问题，给出修改建议。', '启用', '1', '[{"remark": "初始版本", "content": "请作为法律合规专家审查以下合同条款，输出：\\n- 风险条款清单（标注位置）\\n- 合规问题说明\\n- 修改建议\\n\\n合同文本：{{合同内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, space_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
-VALUES ('seed_pt_dom_report', 'tenant_jonex_demo', 'space_demo_test', '数据报表解读', '文档处理', 'domain', '基于数据报表自动生成业务洞察与趋势解读。', '启用', '1.0', '[{"remark": "初始版本", "content": "请基于以下报表数据，生成业务解读报告：\\n1. 关键指标同比/环比变化；\\n2. 异常波动归因；\\n3. 趋势预测与建议。\\n\\n报表数据：{{报表数据}}", "version": "1.0", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
+VALUES ('seed_pt_dom_report', 'tenant_jonex_demo', 'space_demo_test', '数据报表解读', '文档处理', 'domain', '基于数据报表自动生成业务洞察与趋势解读。', '启用', '1', '[{"remark": "初始版本", "content": "请基于以下报表数据，生成业务解读报告：\\n1. 关键指标同比/环比变化；\\n2. 异常波动归因；\\n3. 趋势预测与建议。\\n\\n报表数据：{{报表数据}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
-VALUES ('seed_pt_sys_docsum', NULL, '文档摘要生成', '文档处理', 'system', '对长文档进行自动摘要，输出核心观点与关键信息。', '启用', '1.1', '[{"remark": "初始版本", "content": "请阅读以下文档，生成一段不超过 200 字的摘要，包含：\\n- 核心主题\\n- 关键论点（3 条）\\n- 结论建议\\n\\n文档内容：{{文档内容}}", "version": "1.1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
+VALUES ('seed_pt_sys_docsum', NULL, '文档摘要生成', '文档处理', 'system', '对长文档进行自动摘要，输出核心观点与关键信息。', '启用', '1', '[{"remark": "初始版本", "content": "请阅读以下文档，生成一段不超过 200 字的摘要，包含：\\n- 核心主题\\n- 关键论点（3 条）\\n- 结论建议\\n\\n文档内容：{{文档内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
-VALUES ('seed_pt_sys_email', NULL, '邮件智能回复', '通用问答', 'system', '根据邮件内容生成专业、得体的回复草稿。', '启用', '1.0', '[{"remark": "初始版本", "content": "请根据收到的邮件内容，撰写一封得体的回复邮件，要求：\\n- 语气专业、礼貌；\\n- 覆盖对方所有问题；\\n- 200 字以内。\\n\\n收件邮件：{{邮件内容}}", "version": "1.0", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
+VALUES ('seed_pt_sys_email', NULL, '邮件智能回复', '通用问答', 'system', '根据邮件内容生成专业、得体的回复草稿。', '启用', '1', '[{"remark": "初始版本", "content": "请根据收到的邮件内容，撰写一封得体的回复邮件，要求：\\n- 语气专业、礼貌；\\n- 覆盖对方所有问题；\\n- 200 字以内。\\n\\n收件邮件：{{邮件内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
-VALUES ('seed_pt_sys_qa', NULL, '智能问答助手', '通用问答', 'system', '面向通用知识问答场景，结合上下文给出准确、结构化的回答。', '启用', '1.2', '[{"remark": "初始版本", "content": "你是一个专业、严谨的知识问答助手。请根据以下上下文回答用户问题，要求：\\n1. 仅依据给定上下文作答，不编造信息；\\n2. 答案结构化、条理清晰；\\n3. 如上下文不足，请如实说明。\\n\\n上下文：{{检索内容}}\\n用户问题：{{用户问题}}", "version": "1.2", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
+VALUES ('seed_pt_sys_qa', NULL, '智能问答助手', '通用问答', 'system', '面向通用知识问答场景，结合上下文给出准确、结构化的回答。', '启用', '1', '[{"remark": "初始版本", "content": "你是一个专业、严谨的知识问答助手。请根据以下上下文回答用户问题，要求：\\n1. 仅依据给定上下文作答，不编造信息；\\n2. 答案结构化、条理清晰；\\n3. 如上下文不足，请如实说明。\\n\\n上下文：{{检索内容}}\\n用户问题：{{用户问题}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================

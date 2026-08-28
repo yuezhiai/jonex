@@ -5,6 +5,7 @@ import { Outlet, useNavigate, useLocation, Link, useMatches, matchRoutes } from 
 import { useTranslation } from 'react-i18next';
 import { LANGUAGE_OPTIONS, LANGUAGE_STORAGE_KEY } from '@jonex/i18n-resources';
 import { useStore } from '@/store';
+import { usePermission } from '@jonex/shared-lib';
 import { getMenuFromRoutes, IconMap } from '@/router/menu';
 import type { MenuItem } from '@/router/menu';
 import { getRoutes } from '@/router/routes.config';
@@ -25,10 +26,8 @@ const BasicLayout = () => {
   const VITE_LOGIN = (import.meta as any).env?.VITE_LOGIN || '/login';
   const VITE_APP_ID = (import.meta as any).env?.VITE_APP_ID || 'ecosystem-management';
 
-  const userPermissions = useMemo(
-    () => (Array.isArray(userInfo?.permissions) ? (userInfo?.permissions as string[]) : []),
-    [userInfo?.permissions],
-  );
+  // 权限（shell 下发）：由共享 hook usePermission 统一提供
+  const { permissions: userPermissions } = usePermission();
 
   // 方案二：菜单从路由配置生成（routes.config.ts 的 menu 元数据）
   const allMenuItems = useMemo(() => getMenuFromRoutes(getRoutes(), t), [t]);

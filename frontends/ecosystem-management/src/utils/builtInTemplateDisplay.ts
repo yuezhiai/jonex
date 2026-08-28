@@ -64,14 +64,14 @@ export function isEnglishLanguage(language?: string): boolean {
   return Boolean(language?.toLowerCase().startsWith('en'));
 }
 
-export function getTemplateDomainDisplay(domain: TemplateDomain, t: Translate) {
-  const key = BUILT_IN_DOMAIN_KEYS[domain.id];
-  return key
-    ? {
-        name: t(`templateDomains.builtIn.${key}.name`),
-        description: t(`templateDomains.builtIn.${key}.description`),
-      }
-    : { name: domain.name, description: domain.description || '' };
+export function getTemplateDomainDisplay(domain: TemplateDomain, t: Translate, english = false) {
+  const builtInKey = BUILT_IN_DOMAIN_KEYS[domain.id];
+  return {
+    name: english ? (domain.name_en || domain.name) : domain.name,
+    description: builtInKey
+      ? t(`templateDomains.builtIn.${builtInKey}.description`)
+      : (domain.description || ''),
+  };
 }
 
 export function getTemplateScenarioDisplay(scenario: TemplateScenario, english: boolean, t: Translate) {

@@ -15,11 +15,28 @@ interface AuthKeyItem {
   key_prefix: string;
   permission_level: string;
   key_status: string;
+  /** 有效期（null = 永久有效） */
+  expires_at?: string | null;
+  /** 创建时间 */
+  created_at?: string | null;
 }
 
-/** MCP 服务发布状态（来自 GET /platform/mcp-services/{id}） */
-interface McpPublishState {
+/** 格式化日期：YYYY-MM-DD */
+const formatDate = (value?: string | null): string => {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '-';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+/** MCP 服务详情（来自 GET /platform/mcp-services/{id}） */
+interface McpServiceDetail {
   is_published?: boolean;
+  /** 已保存的 Tool 名称（未配置过为 null，回填表单用） */
+  tool?: string | null;
+  /** 已保存的 Tool 描述 */
+  tool_description?: string | null;
 }
 
 interface McpKeyTabProps {
@@ -45,28 +62,108 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
   const [toolDesc, setToolDesc] = useState('');
   const [published, setPublished] = useState<boolean>(false);
   const [authKeys, setAuthKeys] = useState<AuthKeyItem[]>([]);
+  const [saving, setSaving] = useState(false);
+  /** 最后一次落库/回读的 Tool 名称：已发布改名二次确认的比对基准 */
+  const [savedToolName, setSavedToolName] = useState('');
 
   useEffect(() => {
     if (!visible || !service) return;
-    setToolName(service.name || '');
-    setToolDesc(service.description || '');
+    // 切服务/重新打开先清空 Tool 配置，避免详情回读前残留上一个服务的值
+    // （Tool 名是 MCP 工具标识符，与领域服务名无关，不预填服务名）
+    setToolName('');
+    setToolDesc('');
+    setPublished(false);
+    setAuthKeys([]);
+    setSavedToolName('');
     // 访问授权列表
     getData<{ items: AuthKeyItem[] }>(
       request.get(`/platform/mcp-services/${service.id}/authorized-keys`),
     )
       .then((data) => setAuthKeys(data?.items ?? []))
       .catch(() => setAuthKeys([]));
-    // MCP 发布状态
-    getData<McpPublishState>(request.get(`/platform/mcp-services/${service.id}`))
-      .then((data) => setPublished(data?.is_published === true))
+    // MCP 服务详情：发布状态 + 已保存的 Tool 配置（有值则回填表单，并记录比对基准）
+    getData<McpServiceDetail>(request.get(`/platform/mcp-services/${service.id}`))
+      .then((data) => {
+        setPublished(data?.is_published === true);
+        setToolName(data?.tool ?? '');
+        setToolDesc(data?.tool_description ?? '');
+        setSavedToolName(data?.tool || '');
+      })
       .catch(() => {});
   }, [visible, service]);
 
-  /** 保存 Tool 配置：暂不加点击事件（仅展示按钮） */
+  /** 提交保存请求（已通过校验与二次确认） */
+  const doSaveTool = async (name: string) => {
+    if (!service) return;
+    setSaving(true);
+    try {
+      await getData(
+        request.put(`/platform/mcp-services/${service.id}/tool`, {
+          tool: name,
+          tool_description: toolDesc.trim() || undefined,
+        }),
+      );
+      setSavedToolName(name);
+      message.success(t('domainManagement.mcpToolSaved'));
+    } catch (err: unknown) {
+      // apiClient 已透传后端 message（如「Tool 名称已存在」），直接展示
+      message.error(err instanceof Error ? err.message : t('common.saveFailed'));
+    } finally {
+      setSaving(false);
+    }
+  };
 
-  /** 发布 MCP 能力 */
+  /** 校验 Tool 名称：合法返回 null，否则返回错误提示的 i18n key */
+  const validateToolName = (name: string): string | null => {
+    if (!name) return 'domainManagement.mcpToolNameRequired';
+    if (!/^[A-Za-z0-9_]+$/.test(name)) return 'domainManagement.mcpToolNameFormat';
+    if (name.length > 128) return 'domainManagement.mcpToolNameMaxLength';
+    return null;
+  };
+
+  /** 保存 Tool 配置：已发布且修改 Tool 名称时二次确认（未发布或未改名直接保存） */
+  const handleSaveTool = async () => {
+    if (!service) return;
+    const name = toolName.trim();
+    const invalidKey = validateToolName(name);
+    if (invalidKey) {
+      message.warning(t(invalidKey));
+      return;
+    }
+    if (toolDesc.trim().length > 255) {
+      message.warning(t('domainManagement.mcpToolDescMaxLength'));
+      return;
+    }
+
+    if (published && savedToolName && savedToolName !== name) {
+      Modal.confirm({
+        title: t('domainManagement.mcpToolNameChangeTitle'),
+        content: t('domainManagement.mcpToolNameChangeConfirm', {
+          oldName: savedToolName,
+          newName: name,
+        }),
+        okText: t('common.confirm'),
+        cancelText: t('common.cancel'),
+        onOk: () => doSaveTool(name),
+      });
+      return;
+    }
+    await doSaveTool(name);
+  };
+
+  /** 发布 MCP 能力：Tool 名称须合法且已保存，未保存不允许发布 */
   const handlePublish = async () => {
     if (!service) return;
+    const name = toolName.trim();
+    const invalidKey = validateToolName(name);
+    if (invalidKey) {
+      message.warning(t(invalidKey));
+      return;
+    }
+    if (name !== savedToolName) {
+      message.warning(t('domainManagement.mcpToolNameNotSaved'));
+      return;
+    }
     try {
       await getData(request.post(`/platform/mcp-services/${service.id}/publish`));
       setPublished(true);
@@ -145,7 +242,25 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
       title: t('domainManagement.mcpAuthExpiry'),
       key: 'expiry',
       width: 120,
-      render: () => '-',
+      render: (_: unknown, item: AuthKeyItem) =>
+        item.expires_at ? formatDate(item.expires_at) : t('domainManagement.mcpKeyPermanent'),
+    },
+    {
+      title: t('domainManagement.createdAt'),
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 120,
+      render: (v: string | null) => formatDate(v),
+    },
+    {
+      title: t('domainManagement.mcpAuthAction'),
+      key: 'actions',
+      width: 100,
+      render: () => (
+        <Typography.Link onClick={handleGoToKeyManagement}>
+          {t('domainManagement.mcpAuthManage')}
+        </Typography.Link>
+      ),
     },
   ];
 
@@ -160,7 +275,12 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
         <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
           {t('domainManagement.mcpToolName')}
         </Text>
-        <Input value={toolName} onChange={(e) => setToolName(e.target.value)} />
+        <Input
+          value={toolName}
+          onChange={(e) => setToolName(e.target.value)}
+          maxLength={128}
+          placeholder={t('domainManagement.mcpToolNameFormat')}
+        />
       </div>
       <div style={{ marginBottom: 14 }}>
         <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
@@ -189,9 +309,9 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
         </div>
       </Flex>
 
-      {/* 保存按钮（暂不加点击事件） */}
+      {/* 保存 Tool 配置按钮 */}
       <Flex justify="flex-start">
-        <Button type="primary" icon={<SaveOutlined />}>
+        <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSaveTool}>
           {t('domainManagement.saveToolConfig')}
         </Button>
       </Flex>

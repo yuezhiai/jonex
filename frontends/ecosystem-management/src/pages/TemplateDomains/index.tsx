@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import type { TemplateDomain } from '../../api/templateDomains';
 import { fetchDomains } from '../../api/templateDomains';
-import { getTemplateDomainDisplay } from '../../utils/builtInTemplateDisplay';
+import { getTemplateDomainDisplay, isEnglishLanguage } from '../../utils/builtInTemplateDisplay';
 import DomainFormModal, { type DomainFormModalHandle } from './DomainFormModal';
 import DomainDeleteModal, { type DomainDeleteModalHandle } from './DomainDeleteModal';
 import './index.css';
@@ -31,7 +31,8 @@ function getDomainIcon(index: number) {
 
 export default function TemplateDomains() {
   const navigate = useNavigate();
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const english = isEnglishLanguage(i18n.resolvedLanguage || i18n.language);
   const [domains, setDomains] = useState<TemplateDomain[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -63,7 +64,7 @@ export default function TemplateDomains() {
 
   const filtered = useMemo(() => {
     return domains.filter((d) => {
-      const display = getTemplateDomainDisplay(d, t);
+      const display = getTemplateDomainDisplay(d, t, english);
       const query = search.trim().toLocaleLowerCase();
       if (query && !`${display.name} ${display.description} ${d.name}`.toLocaleLowerCase().includes(query))
         return false;
@@ -169,7 +170,7 @@ export default function TemplateDomains() {
           <div className="domain-grid">
             {filtered.map((domain, index) => {
               const iconDef = getDomainIcon(index);
-              const display = getTemplateDomainDisplay(domain, t);
+              const display = getTemplateDomainDisplay(domain, t, english);
               const statusLabelMap: Record<string, string> = {
                 active: t('status.active'),
                 inactive: t('status.inactive'),

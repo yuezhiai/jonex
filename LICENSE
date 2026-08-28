@@ -1,3 +1,26 @@
+
+Jonex is distributed under an amended version of the Apache License 2.0, subject to the supplementary terms set forth below:
+
+1. Commercial use of Jonex is permitted. This includes deploying Jonex as a backend service for third-party applications or using it as an enterprise application development platform. However, you are required to obtain a commercial license from the project owner if any of the following circumstances apply:
+
+a. Multi-tenant deployment: You may not deploy or operate a multi-tenant environment based on the Jonex source code without prior explicit written authorization from Jonex.
+
+* Tenant Definition: For the purposes of Jonex, each tenant corresponds to an independent workspace. Each workspace provides isolated storage for tenant-specific data and configuration.
+
+b. Brand logos and copyright notices: When using the Jonex frontend, you may not remove or modify any brand logos or copyright notices displayed in the Jonex management console or built-in applications. This restriction does not apply where the Jonex frontend is not used.
+
+* Frontend Definition: Under this license, the Jonex “frontend” refers to all source-code components located in the `web/` directory for source-code deployments. For Docker-based deployments, it refers to the corresponding web container image.
+
+2. By submitting code contributions to this project, you acknowledge and agree to the following terms:
+
+a. The project owner reserves the right to revise this open-source license and to tighten or relax its terms at its sole discretion.
+
+b. Code contributed to this project may be used for commercial purposes, including, without limitation, in the operation of the project’s cloud-hosted services.
+
+All rights and obligations not expressly modified by the supplementary terms above shall be governed by the Apache License 2.0. The full license text is available at:
+
+
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/

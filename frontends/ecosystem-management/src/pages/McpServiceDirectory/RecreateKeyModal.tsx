@@ -3,8 +3,8 @@ import { Modal, Form, Button, Space, Radio, DatePicker, Alert, Input, Typography
 import { CopyOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import dayjs, { type Dayjs } from 'dayjs';
-import { recreateKey } from '@/api/domainServices';
-import type { McpKeyCreateResult, McpKeyItem } from '@/api/mcpKeys';
+import copy from 'copy-to-clipboard';
+import { recreateMcpKey, type McpKeyCreateResult, type McpKeyItem } from '@/api/mcpKeys';
 
 /** 重新创建抽屉对外暴露的句柄 */
 export type RecreateKeyModalHandle = {
@@ -64,27 +64,23 @@ export const RecreateKeyModal = forwardRef<RecreateKeyModalHandle, RecreateKeyMo
       const values = form.getFieldsValue();
       setSaving(true);
       try {
-        // service_id 仅为契约兼容，key_id 唯一定位
-        const serviceId = target.service_ids?.[0] || '';
-        const res = await recreateKey(serviceId, target.id, {
+        // 统一 Key 语义：重新创建 mcp-keys（继承原授权），key_id 唯一定位（不再依赖 service_id）
+        const res = await recreateMcpKey(target.id, {
           expires_at: calcExpiry(values.expiry_type || '12m', values.expiry_custom),
         });
         setResult(res);
-      } catch (e) {
+      } catch (e: any) {
         if (e && typeof e === 'object' && 'errorFields' in e) return;
-        message.error(t('mcpKeyManagement.operationFailed'));
+        message.error(e?.message || t('mcpKeyManagement.operationFailed'));
       } finally {
         setSaving(false);
       }
     };
 
     const copyText = async (text: string) => {
-      try {
-        await navigator.clipboard.writeText(text);
-        message.success(t('common.copySuccess'));
-      } catch {
-        message.error(t('mcpKeyManagement.operationFailed'));
-      }
+      const ok = await copy(text);
+      if (ok) message.success(t('common.copySuccess'));
+      else message.error(t('mcpKeyManagement.operationFailed'));
     };
 
     const close = (refresh = false) => {
@@ -128,8 +124,8 @@ export const RecreateKeyModal = forwardRef<RecreateKeyModalHandle, RecreateKeyMo
             <div style={{ marginBottom: 12 }}>{result.name || '-'}</div>
             <Typography.Text type="secondary">{t('mcpKeyManagement.keyPrefix')}</Typography.Text>
             <Space.Compact style={{ width: '100%', marginBottom: 12 }}>
-              <Input.Password readOnly value={result.plaintext} />
-              <Button icon={<CopyOutlined />} onClick={() => copyText(result.plaintext)}>
+              <Input.Password readOnly value={result.plaintext ?? ''} />
+              <Button icon={<CopyOutlined />} onClick={() => copyText(result.plaintext ?? '')}>
                 {t('mcpKeyManagement.copyKey')}
               </Button>
             </Space.Compact>

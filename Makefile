@@ -37,6 +37,9 @@ PYTHON ?= python3
 SERVICE ?=
 N ?= 1
 PYTHON_BASE_TAG ?= jonex/python-base:local
+# 构建源镜像开关：false=国内源（腾讯云 pip/apt、npmmirror、清华 uv），true=国外官方源
+# （pypi.org / deb.debian.org / registry.npmjs.org）。仅影响构建期下载，不影响运行。
+USE_OVERSEAS_MIRROR ?= false
 PERF_TAIL ?= 1000
 METERING_RETENTION_DAYS ?= 90
 
@@ -74,7 +77,7 @@ DOCKER_DEV := cd deploy && $(COMPOSE) $(COMPOSE_DEV_FILES)
 
 MIDDLEWARE_SERVICES := postgres redis etcd minio milvus
 RAG_SERVICES := lightrag atomic-rag
-BACKEND_SERVICES := gateway sidecar knowledge-base-service business-domain-service platform-service
+BACKEND_SERVICES := gateway sidecar knowledge-base-service business-domain-service platform-service mcp-server
 FRONTEND_SERVICES := frontend-gateway shell-frontend core-business-frontend platform-management-frontend ecosystem-management-frontend
 
 FRONTENDS_DIR := frontends
@@ -87,7 +90,7 @@ MAIN_FRONTEND_FILTERS := --filter $(SHELL_APP) --filter $(CORE_APP) --filter $(P
 LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(DB_USERNAME) DB_PASSWORD=$(DB_PASSWORD) DB_NAME=$(DB_NAME) REDIS_URL=redis://127.0.0.1:6379/0 MILVUS_HOST=127.0.0.1 MILVUS_PORT=19530 SIDECAR_URL=http://127.0.0.1:8001 KNOWLEDGE_BASE_URL=http://127.0.0.1:8003 BUSINESS_DOMAIN_URL=http://127.0.0.1:8005 ATOMIC_RAG_URL=http://127.0.0.1:8004 PLATFORM_URL=http://127.0.0.1:8006
 
 .PHONY: help init version \
-	build-python-base build build-local build-gpu build-prod build-server build-infra build-rag build-backend build-frontend build-service build-sidecar build-knowledge-base build-business-domain build-platform \
+	build-python-base build build-local build-overseas build-gpu build-prod build-server build-infra build-rag build-backend build-frontend build-service build-sidecar build-knowledge-base build-business-domain build-platform \
 	up up-local up-detached up-gpu up-server up-prod up-infra up-rag up-backend up-frontend up-service up-sidecar up-knowledge-base up-business-domain up-platform \
 	down down-local down-gpu down-server down-prod down-v stop stop-service down-service down-gateway down-sidecar down-frontend down-knowledge-base down-business-domain down-platform \
 	restart restart-gpu restart-server restart-prod restart-service recreate-service rebuild-service \
@@ -102,7 +105,7 @@ LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(
 	rebuild-gateway rebuild-sidecar rebuild-knowledge-base rebuild-business-domain rebuild-platform \
 	rebuild-frontend-gateway rebuild-shell-frontend rebuild-core-business-frontend rebuild-platform-management-frontend rebuild-ecosystem-management-frontend \
 	restart-gateway restart-sidecar restart-knowledge-base restart-business-domain restart-platform restart-frontend restart-frontend-gateway restart-shell-frontend restart-core-business-frontend restart-platform-management-frontend restart-ecosystem-management-frontend \
-	scale-knowledge-base up-postgres up-redis up-milvus up-lightrag pull-lightrag init-db test clean \
+	scale-knowledge-base up-postgres up-redis up-milvus up-lightrag pull-lightrag init-db db-migrate db-migrate-after-up test clean \
 	exec-postgres exec-gateway exec-sidecar exec-knowledge-base exec-business-domain exec-platform exec-lightrag exec-shell-frontend \
 	shell-postgres shell-gateway shell-sidecar shell-knowledge-base shell-business-domain shell-platform shell-lightrag shell-frontend \
 	_require-service
@@ -114,7 +117,7 @@ help: ## 显示帮助信息
 	@echo "=== 悦溪平台 Makefile ==="
 	@echo ""
 	@echo "初始化:"
-	@echo "  make init                         初始化 deploy/.env、deploy/.env.rag、前端 .env"
+	@echo "  make init                         初始化 deploy/.env、deploy/.env.rag、deploy/.env.mcp、前端 .env"
 	@echo "  make frontends-env                仅初始化各前端子应用的 .env（从 .env.example 复制）"
 	@echo "  make version                      查看 Docker / Compose 版本"
 	@echo ""
@@ -134,6 +137,7 @@ help: ## 显示帮助信息
 	@echo ""
 	@echo "模式二: 本地 Docker 部署（override）"
 	@echo "  make build                        构建本地 Docker 镜像（Mac 自动叠加 docker-compose.mac.yml）"
+	@echo "  make build-overseas               构建本地 Docker 镜像（国外官方源）"
 	@echo "  make up                           启动本地 Docker 部署（加载 docker-compose.override.yml）"
 	@echo "  make ps                           查看本地 Docker 状态"
 	@echo "  make logs                         查看本地 Docker 日志"
@@ -195,7 +199,7 @@ help: ## 显示帮助信息
 	@echo "  docker-compose.debug.yml          单服务宿主机调试覆盖（sidecar 指向宿主机后端/atomic-rag）"
 	@echo ""
 	@echo "常用服务名:"
-	@echo "  后端: gateway sidecar knowledge-base-service business-domain-service platform-service"
+	@echo "  后端: gateway sidecar knowledge-base-service business-domain-service platform-service mcp-server"
 	@echo "  前端: shell-frontend core-business-frontend platform-management-frontend ecosystem-management-frontend"
 	@echo "  RAG/原子能力: lightrag atomic-rag"
 	@echo "  中间件: postgres redis etcd minio milvus"
@@ -217,7 +221,19 @@ init: ## 初始化环境配置
 	else \
 		echo "RAG 配置已存在: deploy/.env.rag"; \
 	fi
-	@echo "下一步: 按需修改 deploy/.env 和 deploy/.env.rag"
+	@if [ ! -f deploy/.env.mcp ]; then \
+		cp deploy/.env.mcp.example deploy/.env.mcp; \
+		echo "已创建 MCP 配置: deploy/.env.mcp"; \
+	else \
+		echo "MCP 配置已存在: deploy/.env.mcp"; \
+	fi
+	@if [ ! -f deploy/.env.openkb ]; then \
+		cp deploy/.env.openkb.example deploy/.env.openkb; \
+		echo "已创建 OpenKB 配置: deploy/.env.openkb"; \
+	else \
+		echo "OpenKB 配置已存在: deploy/.env.openkb"; \
+	fi
+	@echo "下一步: 按需修改 deploy/.env、deploy/.env.rag、deploy/.env.mcp 和 deploy/.env.openkb"
 	@$(MAKE) frontends-env
 
 frontends-env: ## 初始化各前端子应用 .env
@@ -245,12 +261,16 @@ version: ## 显示 Docker/Compose 版本
 # ------------------------------------------------------------
 build-python-base: ## 构建共享基础镜像 jonex/python-base:local（被 7 个后端服务复用）
 	@echo "=== 构建共享基础镜像 $(PYTHON_BASE_TAG) ==="
-	cd deploy && docker buildx build --load -t $(PYTHON_BASE_TAG) -f docker/python-base.Dockerfile ..
+	cd deploy && docker buildx build --load -t $(PYTHON_BASE_TAG) -f docker/python-base.Dockerfile \
+		--build-arg USE_OVERSEAS_MIRROR=$(USE_OVERSEAS_MIRROR) ..
 
 build: build-python-base ## 构建本地 Docker 联调镜像（共享 base + 并行 bake）
 	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build
 
 build-local: build ## 别名: 构建本地 Docker 镜像
+
+build-overseas: ## 构建本地 Docker 镜像（国外源：官方 pypi / npm / debian 源）
+	$(MAKE) build USE_OVERSEAS_MIRROR=true
 
 build-gpu: build-python-base ## 构建 GPU Docker 镜像（Windows/Linux/服务器，需 NVIDIA GPU）
 	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_GPU_FILES) build
@@ -447,8 +467,24 @@ logs-business-domain: ## 查看业务领域服务日志
 logs-platform: ## 查看平台管理服务日志
 	@$(MAKE) logs-service SERVICE=platform-service
 
+logs-mcp-server: ## 查看 MCP Server 日志
+	@$(MAKE) logs-service SERVICE=mcp-server
+
 logs-lightrag: ## 查看 LightRAG 日志
 	@$(MAKE) logs-service SERVICE=lightrag
+
+# ── openkb ──
+up-openkb: ## 启动 openkb 服务
+	$(DOCKER_OVERRIDE) up -d openkb
+
+logs-openkb: ## 查看 openkb 日志
+	@$(MAKE) logs-service SERVICE=openkb
+
+exec-openkb: ## 进入 openkb 容器
+	$(DOCKER_OVERRIDE) exec openkb bash
+
+rebuild-openkb: ## 重建 openkb 镜像
+	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build --no-cache openkb
 
 logs-postgres: ## 查看 Postgres 日志
 	@$(MAKE) logs-service SERVICE=postgres
@@ -762,6 +798,18 @@ pull-lightrag:
 
 init-db: ## 初始化数据库
 	$(DOCKER_OVERRIDE) exec postgres psql -U $(DB_USERNAME) -d $(DB_NAME) -f /docker-entrypoint-initdb.d/init.sql
+
+db-migrate: ## 应用增量 DDL（update/*.sql 到运行中的 postgres，人工触发，交互确认）
+	bash deploy/postgres/update/apply.sh
+
+# 迁移已改为人工显式执行（不再由 make up 自动触发），迁移状态记录在
+# public.schema_migrations 版本表：已应用文件跳过、失败不登记。发布前先
+# `make db-migrate-dry` 预览待应用列表，再 `make db-migrate`（或 --yes）执行。
+db-migrate-dry: ## 预览待应用迁移（不执行）
+	bash deploy/postgres/update/apply.sh --dry-run
+
+db-migrate-yes: ## 跳过确认直接执行待应用迁移（CI/自动化）
+	bash deploy/postgres/update/apply.sh --yes
 
 test: ## 运行基础健康检查
 	$(DOCKER_OVERRIDE) ps

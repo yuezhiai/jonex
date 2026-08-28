@@ -2,7 +2,6 @@ import {
   ACCEPT_EXTENSIONS,
   BATCH_UPLOAD_MAX_INFLIGHT_BYTES,
   BATCH_UPLOAD_MAX_PARALLEL,
-  MAX_FILE_SIZE_BYTES,
 } from '@/constants/upload';
 
 /**
@@ -115,10 +114,14 @@ export function isExtAllowed(name: string): boolean {
   return ext != null && ALLOWED_EXTS.has(ext);
 }
 
-/** 前置校验：返回跳过原因 key 或 null（通过）。seen 为已入队指纹集合 */
-export function validate(file: File, seen: Set<string>): SkipReason | null {
+/** 前置校验：返回跳过原因 key 或 null（通过）。seen 为已入队指纹集合，maxSizeBytes 为该文件类型大小上限（Byte，null 不预检） */
+export function validate(
+  file: File,
+  seen: Set<string>,
+  maxSizeBytes: number | null,
+): SkipReason | null {
   if (file.size === 0) return 'fileEmpty';
-  if (file.size > MAX_FILE_SIZE_BYTES) return 'fileTooLarge';
+  if (maxSizeBytes != null && file.size > maxSizeBytes) return 'fileTooLarge';
   if (!isExtAllowed(file.name)) return 'extNotAllowed';
   if (seen.has(fingerprint(file))) return 'dupInBatch';
   return null;

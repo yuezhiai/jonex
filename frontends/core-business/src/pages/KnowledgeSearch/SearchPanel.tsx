@@ -157,10 +157,16 @@ export default function SearchPanel({
           onChange={onDomainChange}
           style={{ minWidth: 160, height: 48 }}
           size="large"
-          options={visibleDomains.map((d) => ({
-            value: d.id,
-            label: d.id === 'all' ? t('knowledgeSearch.allDomain') : d.name,
-          }))}
+          options={[
+            {
+              label: t('knowledgeSearch.domainSpaceGroup'),
+              options: visibleDomains.filter((d) => d.kind === 'space').map((d) => ({ value: d.id, label: d.name })),
+            },
+            {
+              label: t('knowledgeSearch.domainServiceGroup'),
+              options: visibleDomains.filter((d) => d.kind === 'service').map((d) => ({ value: d.id, label: d.name })),
+            },
+          ].filter((group) => group.options.length > 0)}
         />
         <Input
           prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 16 }} />}
@@ -214,71 +220,81 @@ export default function SearchPanel({
         <div className={styles.configIntro}>{t('knowledgeSearch.strictConfigDescription')}</div>
         <div className={styles.configForm}>
           <ConfigField
-            label={t('knowledgeSearch.strictMaxAttempts')}
-            description={t('knowledgeSearch.strictMaxAttemptsDesc')}
+            label={t('knowledgeSearch.strictMode')}
+            description={t('knowledgeSearch.strictModeDesc')}
           >
-            <InputNumber
-              min={0}
-              max={10}
-              value={draftConfig.strict_max_attempts}
-              onChange={(v) => updateDraft({ strict_max_attempts: v ?? 0 })}
-              className={styles.configNumber}
-            />
+            <Switch checked={draftConfig.strict_mode} onChange={(v) => updateDraft({ strict_mode: v })} />
           </ConfigField>
-          <ConfigField
-            label={t('knowledgeSearch.strictMinScore')}
-            description={t('knowledgeSearch.strictMinScoreDesc')}
-          >
-            <InputNumber
-              min={0}
-              max={1}
-              step={0.05}
-              value={draftConfig.strict_min_score}
-              onChange={(v) => updateDraft({ strict_min_score: v ?? 0 })}
-              className={styles.configNumber}
-            />
-          </ConfigField>
-          <ConfigField
-            label={t('knowledgeSearch.strictRequireReference')}
-            description={t('knowledgeSearch.strictRequireReferenceDesc')}
-          >
-            <Switch
-              checked={draftConfig.strict_require_reference}
-              onChange={(v) => updateDraft({ strict_require_reference: v })}
-            />
-          </ConfigField>
-          <ConfigField
-            label={t('knowledgeSearch.strictRequireGrounded')}
-            description={t('knowledgeSearch.strictRequireGroundedDesc')}
-          >
-            <Switch
-              checked={draftConfig.strict_require_grounded}
-              onChange={(v) => updateDraft({ strict_require_grounded: v })}
-            />
-          </ConfigField>
-          {editingMode === 'deep' && (
+          {draftConfig.strict_mode && (
             <>
               <ConfigField
-                label={t('knowledgeSearch.maxSubqueries')}
-                description={t('knowledgeSearch.maxSubqueriesDesc')}
+                label={t('knowledgeSearch.strictMaxAttempts')}
+                description={t('knowledgeSearch.strictMaxAttemptsDesc')}
               >
                 <InputNumber
-                  min={1}
-                  max={20}
-                  value={draftConfig.max_subqueries}
-                  onChange={(v) => updateDraft({ max_subqueries: v ?? 1 })}
+                  min={0}
+                  max={10}
+                  value={draftConfig.strict_max_attempts}
+                  onChange={(v) => updateDraft({ strict_max_attempts: v ?? 0 })}
                   className={styles.configNumber}
                 />
               </ConfigField>
               <ConfigField
-                label={t('knowledgeSearch.allowCommonSense')}
-                description={t('knowledgeSearch.allowCommonSenseDesc')}
+                label={t('knowledgeSearch.strictMinScore')}
+                description={t('knowledgeSearch.strictMinScoreDesc')}
               >
-                <Switch
-                  checked={draftConfig.allow_common_sense}
-                  onChange={(v) => updateDraft({ allow_common_sense: v })}
+                <InputNumber
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={draftConfig.strict_min_score}
+                  onChange={(v) => updateDraft({ strict_min_score: v ?? 0 })}
+                  className={styles.configNumber}
                 />
               </ConfigField>
+              <ConfigField
+                label={t('knowledgeSearch.strictRequireReference')}
+                description={t('knowledgeSearch.strictRequireReferenceDesc')}
+              >
+                <Switch
+                  checked={draftConfig.strict_require_reference}
+                  onChange={(v) => updateDraft({ strict_require_reference: v })}
+                />
+              </ConfigField>
+              <ConfigField
+                label={t('knowledgeSearch.strictRequireGrounded')}
+                description={t('knowledgeSearch.strictRequireGroundedDesc')}
+              >
+                <Switch
+                  checked={draftConfig.strict_require_grounded}
+                  onChange={(v) => updateDraft({ strict_require_grounded: v })}
+                />
+              </ConfigField>
+              {editingMode === 'deep' && (
+                <>
+                  <ConfigField
+                    label={t('knowledgeSearch.maxSubqueries')}
+                    description={t('knowledgeSearch.maxSubqueriesDesc')}
+                  >
+                    <InputNumber
+                      min={1}
+                      max={20}
+                      value={draftConfig.max_subqueries}
+                      onChange={(v) => updateDraft({ max_subqueries: v ?? 1 })}
+                      className={styles.configNumber}
+                    />
+                  </ConfigField>
+                  <ConfigField
+                    label={t('knowledgeSearch.allowCommonSense')}
+                    description={t('knowledgeSearch.allowCommonSenseDesc')}
+                  >
+                    <Switch
+                      checked={draftConfig.allow_common_sense}
+                      onChange={(v) => updateDraft({ allow_common_sense: v })}
+                    />
+                  </ConfigField>
+                </>
+              )}
             </>
           )}
         </div>
