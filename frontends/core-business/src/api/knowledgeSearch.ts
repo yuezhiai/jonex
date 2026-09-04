@@ -148,7 +148,8 @@ export async function getKnowledgeSearchDomains(spaceId?: string): Promise<Knowl
   // [jonex] 检索维度 = 当前领域空间 + 领域服务（双维度并存）：
   // - 空间：只保留「当前领域空间」一项（跟随全局空间切换器），兜底覆盖该空间全部 KB
   //   （含未挂服务的新建 KB）；
-  // - 服务：scope="search" 只返回「有可访问 KB 的服务」，保留按服务精确圈定。
+  // - 服务：scope="search" 只返回「有可访问 KB 的服务」，且仅保留当前领域空间下的服务，
+  //   不显示其他空间下的服务。
   const [spaces, kbResult, servicesResult] = await Promise.all([
     getDomainKnowledgeSpaces(),
     getDomainKnowledgeList({ page: 1, pageSize: 100 }),
@@ -182,15 +183,18 @@ export async function getKnowledgeSearchDomains(spaceId?: string): Promise<Knowl
     ];
   })();
 
-  const serviceItems: KnowledgeSearchDomain[] = (servicesResult.items ?? []).map((svc) => ({
-    id: svc.id,
-    name: svc.name,
-    kind: 'service',
-    space_id: svc.space_id,
-    space_name: svc.space_name,
-    kb_ids: svc.kb_ids ?? [],
-    kb_names: svc.kb_names ?? [],
-  }));
+  const serviceItems: KnowledgeSearchDomain[] = (servicesResult.items ?? [])
+    // [jonex] 只保留当前领域空间下的服务，不显示其他空间下的服务
+    .filter((svc) => !!spaceId && svc.space_id === spaceId)
+    .map((svc) => ({
+      id: svc.id,
+      name: svc.name,
+      kind: 'service',
+      space_id: svc.space_id,
+      space_name: svc.space_name,
+      kb_ids: svc.kb_ids ?? [],
+      kb_names: svc.kb_names ?? [],
+    }));
 
   return [...spaceItems, ...serviceItems];
 }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Input, Button, Table, Tag, Select, Result } from 'antd';
+import { Input, Button, Table, Tag, Select, Result, Alert } from 'antd';
 import { SearchOutlined, PlusOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sdk';
@@ -11,13 +11,28 @@ import ToggleStatusModal, { type ToggleStatusModalHandle } from './ToggleStatusM
 import DeleteConfirmModal, { type DeleteConfirmModalHandle } from './DeleteConfirmModal';
 import './index.css';
 
+// [jonex] 本页的搜索、角色筛选、分页全部是纯前端的，只作用于「已加载」的数据。
+// 所以一次要尽量把数据拉全，并在拉不全时显式告知，避免用户误以为搜不到就是不存在。
+/** 本租户视图单次拉取上限。后端 GET /platform/users 的 page_size 上限是 500。 */
+const USER_PAGE_SIZE = 500;
+/** 跨租户视图上限：后端 UserService.list_all_users 写死 list_all_shared(0, 10000)。
+ *  该端点返回的 total 是 len(items)，永远等于已加载数，检测不到截断，只能比对上限。 */
+const ALL_USERS_BACKEND_CAP = 10000;
+
 export default function UserManagement() {
   const { t } = useTranslation();
   const user = readCachedUser<ShellUser>();
   const isAdmin = isPlatformAdmin(user);
-  // 本租户管理能力：平台管理员（跨租户全量）或租户管理员（user:write 码）
+  // 本租户管理能力：平台管理员（跨租户全量）或租户管理员。
+  // [jonex] 权限重构 B1：isTenantAdmin 的后端判据已由 `user:write` 改为 `tenant:admin`
+  // （platform:admin 为上位）。这里读的是后端下发的布尔值，**不要**改成前端自己按
+  // 权限码推断 —— 现状 §10.1 的缺陷正是前端按 user:write 自行判断、与后端口径不一致，
+  // 导致只配了 user:write 的自定义角色「看得到管理入口但点不动」。
   const canManage = isAdmin || user?.isTenantAdmin === true;
   const [users, setUsers] = useState<UserItem[]>([]);
+  // [jonex] 服务端总数 > 已加载条数时为真。搜索/筛选/分页都是纯前端的（只作用于已加载
+  // 数据），静默截断会让人以为「搜不到就是没有」，故显式提示。
+  const [truncated, setTruncated] = useState(false);
   const [tenants, setTenants] = useState<(TenantItem & { userCount: number })[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -35,11 +50,17 @@ export default function UserManagement() {
     try {
       // 权限分支：平台管理员（platform:user:all）跨租户全量；其余用户本租户（/users 走 user:read）
       const [ur, tr, counts] = await Promise.all([
-        isAdmin ? listAllUsers() : listUsers(1, 100),
+        // page_size 取后端上限 500（le=500）。此前写死 100，超出即静默丢弃。
+        isAdmin ? listAllUsers() : listUsers(1, USER_PAGE_SIZE),
         listTenants(1, 100),
         getTenantUserCounts(),
       ]);
       setUsers(ur.items);
+      setTruncated(
+        isAdmin
+          ? ur.items.length >= ALL_USERS_BACKEND_CAP
+          : typeof ur.total === 'number' && ur.total > ur.items.length,
+      );
       setTenants(tr.items.map((t) => ({ ...t, userCount: counts[t.id] || 0 })));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : t('common.loadFailed'));
@@ -56,8 +77,11 @@ export default function UserManagement() {
     if (activeTenant !== 'all' && u.tenant_id !== activeTenant) return false;
     if (roleFilter && !(u.role_names ?? []).includes(roleFilter)) return false;
     if (search) {
+      // [jonex] 两侧都转小写。此前只对关键词做了 toLowerCase，被比较的字段没转，
+      // 导致含大写字母的用户名/邮箱搜不到。
       const q = search.toLowerCase();
-      if (!u.username.includes(q) && !(u.display_name || '').includes(q) && !(u.email || '').includes(q)) return false;
+      const hay = [u.username, u.display_name || '', u.email || ''].map((s) => s.toLowerCase());
+      if (!hay.some((s) => s.includes(q))) return false;
     }
     return true;
   });
@@ -195,6 +219,19 @@ export default function UserManagement() {
       <div className="yx-page-title">
         <h1>{t('userManagement.title')}</h1>
       </div>
+
+      {truncated && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={t('userManagement.listTruncated', {
+            loaded: users.length,
+            defaultValue:
+              '用户数超出单次加载上限，当前仅展示前 {{loaded}} 条。搜索与筛选只在已加载数据内生效。',
+          })}
+        />
+      )}
 
       <div className="user-layout">
         <div className="tenant-panel">

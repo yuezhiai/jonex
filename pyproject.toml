@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jonex-platform"
 version = "0.1.0"
-description = "悦溪平台 - 插件化AI能力平台框架"
+description = "Jonex 平台 - 插件化AI能力平台框架"
 requires-python = ">=3.12.13"
 dependencies = [
     "fastapi>=0.109.0,<0.110.0",
@@ -31,6 +31,9 @@ dependencies = [
     "boto3>=1.34.0,<2.0.0",
     "jsonpath-ng>=1.6.0,<2.0.0",
     "cryptography>=42.0.0",
+    # [jonex] §table-grid-v2 L3: xlsx 前置规范化主轨
+    "openpyxl>=3.1.0,<4.0.0",
+    "tencentcloud-sdk-python-sts>=3.0.1459",
 ]
 
 [project.optional-dependencies]

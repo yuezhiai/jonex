@@ -20,8 +20,8 @@ class CreatePromptTemplateRequest(BaseModel):
     """创建提示词模板（scope 固定 domain，不暴露给请求方）"""
     name: str = Field(..., min_length=1, max_length=255)
     category: str = Field(..., min_length=1, max_length=64)
-    description: Optional[str] = None
-    content: str = Field(..., min_length=1)  # 提示词内容
+    description: Optional[str] = Field(None, max_length=512)
+    content: str = Field(..., min_length=1, max_length=5000)  # 提示词内容
     status: str = Field(default="启用", max_length=16)
     domain_space_id: Optional[str] = Field(None, description="所属领域空间 ID（不传则归默认空间）")
 
@@ -30,8 +30,8 @@ class UpdatePromptTemplateRequest(BaseModel):
     """更新提示词模板。content 变化时自动生成新版本。"""
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     category: Optional[str] = Field(None, min_length=1, max_length=64)
-    description: Optional[str] = None
-    content: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = Field(None, max_length=512)
+    content: Optional[str] = Field(None, min_length=1, max_length=5000)
     status: Optional[str] = Field(None, max_length=16)
     version_remark: Optional[str] = Field(None, max_length=512)
     target_version: Optional[str] = Field(None, max_length=32)

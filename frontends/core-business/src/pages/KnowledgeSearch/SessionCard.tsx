@@ -1386,6 +1386,11 @@ export default function SessionCard({
                       >
                         {ref.file_name}
                       </span>
+                      {(ref.kb_name || ref.kb_id) && (
+                        <span style={{ fontSize: 12, color: '#64748b', flexShrink: 0 }}>
+                          {t('knowledgeSearch.sourceKb', { name: ref.kb_name || ref.kb_id })}
+                        </span>
+                      )}
                       {tsLoc && (
                         <span style={{ fontSize: 12, color: '#8b5cf6', flexShrink: 0 }}>
                           {formatTimestamp(tsLoc.time_start)}

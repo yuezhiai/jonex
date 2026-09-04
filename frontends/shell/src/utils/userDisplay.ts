@@ -19,9 +19,9 @@ export function userRoleLabel(user: ShellUser, t: Translate): string {
 
 export function tenantDisplayName(tenant: { tenant_id: string; tenant_name: string }, t: Translate): string {
   const builtIns: Record<string, { raw: string; key: string }> = {
-    tenant_jonex_demo: { raw: '悦溪演示租户', key: 'demo' },
-    tenant_jonex_alpha: { raw: '悦溪 Alpha 测试租户', key: 'alpha' },
-    tenant_jonex_beta: { raw: '悦溪 Beta 测试租户', key: 'beta' },
+    tenant_jonex_demo: { raw: 'Jonex演示租户', key: 'demo' },
+    tenant_jonex_alpha: { raw: 'Jonex Alpha 测试租户', key: 'alpha' },
+    tenant_jonex_beta: { raw: 'Jonex Beta 测试租户', key: 'beta' },
   };
   const builtIn = builtIns[tenant.tenant_id];
   return builtIn && tenant.tenant_name === builtIn.raw

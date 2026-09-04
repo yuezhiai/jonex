@@ -14,8 +14,6 @@ from capabilities.platform.models.audit_enums import LogType, Outcome, LogLevel,
 from capabilities.platform.models.task_schedule import TaskSchedule
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
 from capabilities.platform.models.mcp_service import McpServicePublish
-from capabilities.platform.models.mcp_service_api_key import McpServiceApiKey
-from capabilities.platform.models.mcp_write_key import McpWriteKey
 
 __all__ = [
     "User",
@@ -39,6 +37,4 @@ __all__ = [
     "McpKey",
     "McpKeyServiceMapping",
     "McpServicePublish",
-    "McpServiceApiKey",
-    "McpWriteKey",
 ]

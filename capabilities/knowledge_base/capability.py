@@ -23,12 +23,19 @@ from jonex_core.common.exceptions import (
     InvalidParameterError,
     JonexException,
     PermissionDeniedError,
+    ResourceNotFoundError,
     TenantIsolationError,
 )
 from jonex_core.common.i18n import translate
-from jonex_core.common.neo4j_client import close_neo4j_driver, ensure_ontology_schema
+from jonex_core.common.neo4j_client import (
+    close_neo4j_driver,
+    ensure_ontology_schema,
+    get_neo4j_driver,
+)
+from jonex_core.common.quota import get_system_quota
 from jonex_core.common.tenant import require_tenant
 
+from .repository.ontology_graph_repository import OntologyGraphRepository
 from .dtos.ontology_crud import (
     CreateOntologyInstanceRequest,
     CreateOntologyRelationRequest,
@@ -45,6 +52,7 @@ from .services import (
     SpaceService,
     TagService,
 )
+from .services.quota_service import QuotaService
 
 logger = logging.getLogger(__name__)
 
@@ -119,12 +127,14 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "import_synonyms": ("knowledge_base_id",),
     # ── 知识库信息管理 ──
     "list_knowledge_info": (),
+    "get_quota_view": (),  # [jonex] 系统配额查询（无空间语义）
     "create_knowledge_info": (),
     "get_knowledge_info": ("kb_id",),
     "update_knowledge_info": ("kb_id",),
     "delete_knowledge_info": ("kb_id",),
     "get_kb_permissions": ("kb_id",),
     "set_kb_permissions": ("kb_id",),
+    "get_kb_permission_candidates": ("kb_id",),
     # ── 领域空间 ──
     "list_spaces": (),
     "create_space": ("name",),
@@ -133,6 +143,7 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "delete_space": ("space_id",),
     "get_space_permissions": ("space_id",),
     "set_space_permissions": ("space_id",),
+    "get_space_permission_candidates": ("space_id",),
     # ── 领域服务 ──
     "list_services": (),
     "create_service": ("space_id", "name"),
@@ -147,8 +158,6 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "delete_service_api_key": ("service_id", "key_id"),
     "get_service_configs": ("service_id",),
     "update_service_configs": ("service_id",),
-    "get_service_permissions": ("service_id",),
-    "set_service_permissions": ("service_id",),
     "search_service": ("service_id", "query"),
     "set_document_folder": ("document_id", "knowledge_base_id"),
     "batch_set_document_folder": ("knowledge_base_id", "document_ids"),
@@ -181,6 +190,13 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "list_search_feedback": ("knowledge_base_id",),
     "toggle_search_feedback_adopted": ("feedback_id",),
     "get_search_feedback_stats": ("knowledge_base_id",),
+    # ── 回答级反馈（history_id 锚点）──
+    "submit_answer_feedback": ("history_id", "operation_id", "version", "feedback_type"),
+    "get_answer_feedback": ("history_id",),
+    "list_answer_feedback": ("knowledge_base_id",),
+    "get_answer_feedback_stats": ("knowledge_base_id",),
+    "toggle_answer_feedback_adopted": ("feedback_id",),
+    "delete_answer_feedback": ("feedback_id",),
     # ── 数据源接入 ──
     "list_data_sources": ("knowledge_base_id",),
     "get_data_source": ("ds_id",),
@@ -228,22 +244,32 @@ _SPACE_EXEMPT_ACTIONS = frozenset({
     "submit_search_feedback", "cancel_search_feedback",
     "list_search_feedback", "toggle_search_feedback_adopted",
     "get_search_feedback_stats",
+    "submit_answer_feedback", "get_answer_feedback",
+    "list_answer_feedback", "get_answer_feedback_stats",
+    "toggle_answer_feedback_adopted", "delete_answer_feedback",
     "ingest_push",
     "resolve_references",
+    "get_quota_view",
 })
 
 # 空间级管理：仅 owner 或租户管理员（tenant:write）。
 # 显式声明，不得落入前缀推导的 write 语义（manager 删空间必须 403）。
 _SPACE_LEVEL_ACTIONS = frozenset({
     "update_space", "delete_space", "set_space_permissions",
+    "get_space_permission_candidates",
 })
 
 # KB 权限管理（2026-08-20 设计）：仅空间 owner/manager 或租户管理员。
 # 不能进 _SPACE_WRITE_ACTIONS（editor 授权兜底会放行）、不能进 _SPACE_LEVEL_ACTIONS
 # （require_space_manage 口径是 owner/tenant_admin、不含 manager——比本组窄）。
 _KB_MANAGE_ACTIONS = frozenset({
-    "set_kb_permissions",
+    "set_kb_permissions", "get_kb_permission_candidates",
 })
+
+# 服务内检索：空间成员 OR 该服务存在 accessible kb（判定与 KB 过滤合成一次查询）。
+# 不能留在 _SERVICE_ID_ACTIONS —— 其解析 SQL 返回 kb_id=None，KB 授权兜底恒跳过，
+# 纯 KB 授权用户会在 execute 层 403，与 scope="search" 列表可见口径矛盾。
+_SERVICE_SEARCH_ACTIONS = frozenset({"search_service"})
 
 # KB 授权兜底排除（设计 §2.3）：delete_knowledge_info 不适用 KB 授权——
 # editor 授权不能删 KB（write 兜底对其不生效，空间判定照旧 owner/manager）
@@ -255,14 +281,13 @@ _KB_GRANT_EXCLUDED_ACTIONS = frozenset({
 _SPACE_WRITE_ACTIONS = frozenset({
     "create_knowledge_info", "update_knowledge_info", "delete_knowledge_info",
     "upload_document", "delete_document", "reparse_document",
-    "set_document_folder", "set_document_tags", "add_document_tag", "remove_document_tag",
+    "set_document_folder", "batch_set_document_folder", "set_document_tags", "add_document_tag", "remove_document_tag",
     "scan_stale_chunks", "purge_stale_chunks", "generate_upload_url",
     "create_folder", "rename_folder", "delete_folder",
     # 领域服务写（2026-08-19 终版）：owner/manager 可增删改服务（与 KB/文档同口径）
     "create_service", "update_service", "delete_service",
     "update_service_configs", "enable_service", "disable_service",
     "create_service_api_key", "rotate_service_api_key", "delete_service_api_key",
-    "set_service_permissions",
     "create_data_source", "update_data_source", "delete_data_source",
     "sync_data_source", "test_data_source", "reset_ingest_key",
     "create_ontology_instance", "update_ontology_instance", "delete_ontology_instance",
@@ -276,18 +301,38 @@ _SPACE_WRITE_ACTIONS = frozenset({
     "apply_llm_wiki_schema", "recompile_llm_wiki_schema_outdated_documents",
 })
 
+# [jonex] 权限重构 B4（方案 §5 Gap 8 / 执行文档 §5.4）：
+# **KB「浏览」类读 action** —— 收紧到 KB 成员口径（空间管理者 / 租户管理员 / KB 授权成员），
+# 空间 `member` 不再自动可见。这与 KB 列表/详情的收紧口径一致：
+# 「能否浏览这个知识库」受 KB 成员身份约束。
+#
+# ⚠️ **不含检索→原文链路**（方案 D8：「能打开，只是看不到知识库」）：
+#   get_raw_content / get_raw_url / get_chunk / get_document_chunks / get_raw_location
+#   等仍留在 _SPACE_READ_ACTIONS，维持空间成员可见 —— 空间 member 检索到内容后
+#   仍能点开原文。
+# ⚠️ 也**不含**本体/schema/wiki/synonym 等既是管理页 tab、又被检索增强复用的读 action，
+#   收紧它们会牵连检索体验，本批不动，留待业务确认（执行文档 §5.4 边界批）。
+#
+# 只收这 5 个「纯浏览知识库」的入口，判据是**每个都能从 knowledge_base_id/kb_id
+# 解析出 kb_id**（见 _resolve_space_context），否则 KB 授权兜底无从查起。
+_KB_MEMBER_READ_ACTIONS = frozenset({
+    "list_documents", "documents_stats", "list_folders",
+    "get_document_tags", "get_kb_permissions",
+})
+
 # 空间内读（成员：owner / manager / viewer）
 _SPACE_READ_ACTIONS = frozenset({
+    # [jonex] B4：get_knowledge_info（详情）与 list_knowledge_info（列表）的 KB 成员
+    # 收紧发生在 **service 层**（knowledge_info_service.get 404 / .list 过滤），
+    # capability 层仍按空间成员放行 —— 空间隔离在这层，KB 收紧在下层，分两处是有意的：
+    # capability 只认「你能不能进这个空间」，service 才认「这个空间里哪些 KB 归你」。
     "get_knowledge_info", "list_knowledge_info",
-    "get_document", "list_documents", "documents_stats",
+    "get_document",
     "get_document_status", "get_document_chunks", "get_document_parse_result",
     "get_chunk", "get_raw_content", "get_raw_location", "get_raw_url",
     "get_asset_raw_location",  # [jonex] §image-refs P2-3
-    "get_document_tags",
-    "list_folders",
     # 领域服务读：成员可见（viewer 可查看，不可操作——写归 _SPACE_LEVEL_ACTIONS）
     "get_service", "list_services", "get_service_configs", "list_service_api_keys",
-    "get_service_permissions", "search_service",
     "get_data_source", "list_data_sources",
     "list_ontology_instances", "list_ontology_relations",
     "list_ontology_entity_types", "list_ontology_relation_types",
@@ -299,7 +344,7 @@ _SPACE_READ_ACTIONS = frozenset({
     "get_parse_result_documents", "get_parse_result_entities",
     "get_parse_result_graph", "get_parse_result_graph_summary",
     "get_parse_result_relationships", "get_parse_result_summary",
-    "get_space_permissions", "get_kb_permissions",
+    "get_space_permissions",
 })
 
 # 检索类（过滤无权限 KB，不整体拒绝）
@@ -310,13 +355,13 @@ _SEARCH_ACTIONS = frozenset({
 
 # 空间解析路径（action 组 → space_id 数据来源）
 _SPACE_ID_DIRECT_ACTIONS = frozenset({
-    "update_space", "delete_space", "set_space_permissions",
-    "get_space_permissions", "create_knowledge_info",
+    "update_space", "delete_space", "set_space_permissions", "get_space_permission_candidates",
+    "get_space_permissions", "create_knowledge_info", "create_service",
     "list_knowledge_info", "list_services",
 })
 _KB_ID_FIELD_ACTIONS = frozenset({
     "get_knowledge_info", "update_knowledge_info", "delete_knowledge_info",
-    "get_kb_permissions", "set_kb_permissions",
+    "get_kb_permissions", "set_kb_permissions", "get_kb_permission_candidates",
 })  # 用 kb_id 字段
 _DOC_ID_ACTIONS = frozenset({
     "reparse_document", "scan_stale_chunks", "purge_stale_chunks",
@@ -333,7 +378,6 @@ _SERVICE_ID_ACTIONS = frozenset({
     "get_service", "update_service", "delete_service", "enable_service", "disable_service",
     "rotate_service_api_key", "list_service_api_keys", "create_service_api_key",
     "delete_service_api_key", "get_service_configs", "update_service_configs",
-    "get_service_permissions", "set_service_permissions", "search_service",
 })
 
 
@@ -366,6 +410,7 @@ class KnowledgeBaseCapability(BaseCapability):
         self._document_tags = DocumentTagService()
         self._dispatch = self._build_dispatch()
         self._reconcile_task: asyncio.Task | None = None
+        self._backfill_task: asyncio.Task | None = None
         super().__init__()
 
     def register_routes(self, app):
@@ -376,6 +421,8 @@ class KnowledgeBaseCapability(BaseCapability):
         app.include_router(router, prefix="/api/v1")
 
     async def initialize(self) -> None:
+        # [jonex] 配额：启动时解析校验，配置非法抛 QuotaConfigError 拒绝启动。
+        get_system_quota()
         try:
             await ensure_ontology_schema()
         except Neo4jAuthError:
@@ -384,10 +431,20 @@ class KnowledgeBaseCapability(BaseCapability):
         except Exception as exc:
             logger.warning("Neo4j schema init failed (will retry), ontology queries may degrade: %s", exc)
 
+        # 存量手动实体回填：补 extraction_method='manual' 标记与 embedding（幂等）。
+        # 后台执行不阻塞启动；失败仅告警，与 schema init 降级语义一致。
+        self._backfill_task = asyncio.create_task(self._backfill_manual_entities())
+
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         logger.info("Knowledge Base capability initialized (reconciliation loop started)")
 
     async def shutdown(self) -> None:
+        if self._backfill_task:
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except asyncio.CancelledError:
+                pass
         if self._reconcile_task:
             self._reconcile_task.cancel()
             try:
@@ -396,6 +453,23 @@ class KnowledgeBaseCapability(BaseCapability):
                 pass
         await close_neo4j_driver()
         logger.info("Knowledge Base capability shutdown complete")
+
+    async def _backfill_manual_entities(self) -> None:
+        """后台回填存量手动实体：补 extraction_method='manual' 标记与 embedding。
+
+        幂等、失败仅告警不阻塞启动。shutdown 时取消。
+        """
+        try:
+            backfilled = await OntologyGraphRepository(
+                get_neo4j_driver()
+            ).backfill_manual_entities_all()
+            if backfilled:
+                logger.info("存量手动实体回填完成：%d 个", backfilled)
+        except asyncio.CancelledError:
+            logger.info("Manual entity backfill cancelled")
+            raise
+        except Exception as exc:
+            logger.warning("存量手动实体回填失败（不阻塞启动）: %s", exc)
 
     async def _reconcile_loop(self) -> None:
         """每 30 秒扫描 PARSING 文档和本体对账（启动时立即执行一次）。"""
@@ -449,6 +523,7 @@ class KnowledgeBaseCapability(BaseCapability):
         ps = self.service.parser_settings
         s = self._space
         sv = self._domain_service
+        quota = QuotaService()
 
         return {
             # ── 文档管理 ──
@@ -463,7 +538,10 @@ class KnowledgeBaseCapability(BaseCapability):
             ),
             "get_raw_url": lambda r, d: _url_result(docs.get_raw_url(r.tenant_id, d.get("knowledge_base_id", ""), d["document_id"], user_id=r.user_id, username=r.username, ip=r.ip, mcp_key_id=(r.context or {}).get("mcp_key_id"))),
             "get_raw_content": lambda r, d: docs.get_raw_content(r.tenant_id, d.get("knowledge_base_id", ""), d["document_id"], user_id=r.user_id, username=r.username, ip=r.ip, mcp_key_id=(r.context or {}).get("mcp_key_id")),
-            "get_raw_location": lambda r, d: docs.get_raw_location(r.tenant_id, d.get("knowledge_base_id", ""), d["document_id"]),
+            "get_raw_location": lambda r, d: docs.get_raw_location(
+                r.tenant_id, d.get("knowledge_base_id", ""), d["document_id"],
+                download=d.get("download", False),
+            ),
             # [jonex] §image-refs P2-3: 图片资产原文位置（cos=预签名 / local=storage_key）
             "get_asset_raw_location": lambda r, d: docs.get_asset_raw_location(
                 r.tenant_id, d["document_id"], d["image_idx"],
@@ -476,10 +554,10 @@ class KnowledgeBaseCapability(BaseCapability):
             "scan_stale_chunks": lambda r, d: docs.scan_stale_chunks(r.tenant_id, d["document_id"]),
             "purge_stale_chunks": lambda r, d: docs.purge_stale_chunks(r.tenant_id, d["document_id"]),
             "set_document_folder": lambda r, d: docs.set_document_folder(
-                r.tenant_id, d["document_id"], d
+                r.tenant_id, d["document_id"], d, user_id=r.user_id, username=r.username, ip=r.ip
             ),
             "batch_set_document_folder": lambda r, d: docs.batch_set_document_folder(
-                r.tenant_id, d
+                r.tenant_id, d, user_id=r.user_id, username=r.username, ip=r.ip
             ),
             # ── 检索 ──
             "search": lambda r, d: search.search(r.tenant_id, _user_id(r), d, trace_id=r.request_id or str(uuid4())),
@@ -502,6 +580,13 @@ class KnowledgeBaseCapability(BaseCapability):
             "list_search_feedback": lambda r, d: feedback.list_feedback(r.tenant_id, d),
             "toggle_search_feedback_adopted": lambda r, d: feedback.toggle_adopted(r.tenant_id, d),
             "get_search_feedback_stats": lambda r, d: feedback.get_stats(r.tenant_id, d),
+            # ── 回答级反馈（history_id 锚点）──
+            "submit_answer_feedback": lambda r, d: self.service.answer_feedback.submit(r.tenant_id, _user_id(r), d),
+            "get_answer_feedback": lambda r, d: self.service.answer_feedback.get_status(r.tenant_id, _user_id(r), d),
+            "list_answer_feedback": lambda r, d: self.service.answer_feedback.list_feedback(r.tenant_id, d),
+            "get_answer_feedback_stats": lambda r, d: self.service.answer_feedback.get_stats(r.tenant_id, d),
+            "toggle_answer_feedback_adopted": lambda r, d: self.service.answer_feedback.toggle_adopted(r.tenant_id, d),
+            "delete_answer_feedback": lambda r, d: self.service.answer_feedback.delete(r.tenant_id, d),
             # ── 解析结果 ──
             "get_parse_result_summary": lambda r, d: parse.get_summary(r.tenant_id, d),
             "get_parse_result_documents": lambda r, d: parse.list_documents(r.tenant_id, d),
@@ -628,6 +713,7 @@ class KnowledgeBaseCapability(BaseCapability):
                 user_id=r.user_id,
             ),
             "create_knowledge_info": lambda r, d: kbinfo.create(r.tenant_id, d),
+            "get_quota_view": lambda r, d: quota.get_quota_view(r.tenant_id, d.get("knowledge_base_id")),
             "get_knowledge_info": lambda r, d: kbinfo.get(d["kb_id"], r.tenant_id, user_id=r.user_id),
             "update_knowledge_info": lambda r, d: kbinfo.update(d["kb_id"], r.tenant_id, d),
             "delete_knowledge_info": lambda r, d: kbinfo.delete(d["kb_id"], r.tenant_id),
@@ -639,6 +725,9 @@ class KnowledgeBaseCapability(BaseCapability):
                     d["kb_id"], r.tenant_id, d.get("permissions", []), user_id=r.user_id
                 )
             ),
+            "get_kb_permission_candidates": lambda r, d: _candidates_result(
+                kbinfo.get_permission_candidates(d["kb_id"], r.tenant_id, user_id=r.user_id)
+            ),
             # ── 领域空间 ──
             "list_spaces": lambda r, d: s.list(r.tenant_id, d.get("offset", 0), d.get("limit", 20), user_id=r.user_id),
             "create_space": lambda r, d: s.create(r.tenant_id, d, owner_id=r.user_id),
@@ -649,10 +738,13 @@ class KnowledgeBaseCapability(BaseCapability):
             "set_space_permissions": lambda r, d: _updated(
                 s.set_permissions(d["space_id"], r.tenant_id, d.get("permissions", []), user_id=r.user_id)
             ),
+            "get_space_permission_candidates": lambda r, d: _candidates_result(
+                s.get_permission_candidates(d["space_id"], r.tenant_id, user_id=r.user_id)
+            ),
             # ── 领域服务 ──
             "list_services": lambda r, d: sv.list(
                 r.tenant_id, d.get("space_id"), d.get("offset", 0), d.get("limit", 20),
-                user_id=r.user_id,
+                user_id=r.user_id, scope=d.get("scope") or "manage",
             ),
             "create_service": lambda r, d: sv.create(r.tenant_id, d),
             "get_service": lambda r, d: sv.get(d["service_id"], r.tenant_id),
@@ -670,11 +762,9 @@ class KnowledgeBaseCapability(BaseCapability):
             "update_service_configs": lambda r, d: _updated(
                 sv.update_configs(d["service_id"], r.tenant_id, d.get("configs", {}))
             ),
-            "get_service_permissions": lambda r, d: _list_result(sv.get_permissions(d["service_id"], r.tenant_id)),
-            "set_service_permissions": lambda r, d: _updated(
-                sv.set_permissions(d["service_id"], r.tenant_id, d.get("permissions", []))
+            "search_service": lambda r, d: sv.search(
+                d["service_id"], r.tenant_id, d["query"], actor_user_id=r.user_id,
             ),
-            "search_service": lambda r, d: sv.search(d["service_id"], r.tenant_id, d["query"]),
             # ── 引用富化 ──
             "resolve_references": lambda r, d: search.resolve_references(
                 r.tenant_id,
@@ -827,7 +917,9 @@ class KnowledgeBaseCapability(BaseCapability):
                 return None, None, None
             return row[0], row[1] if len(row) > 1 else None, row[2] if len(row) > 2 else None
 
-        if action in _SERVICE_ID_ACTIONS:
+        if action in _SERVICE_ID_ACTIONS or action in _SERVICE_SEARCH_ACTIONS:
+            # search_service 独立分组但同样需要 space_id 做「空间成员」判定；
+            # 其 kb_id 恒为 None（KB 授权改由 execute 分支查 accessible kb，不依赖 kb_id 兜底）
             sid = data.get("service_id")
             if not sid:
                 return None, None, None
@@ -966,27 +1058,55 @@ class KnowledgeBaseCapability(BaseCapability):
     async def _check_kb_manage(
         self, tenant_id: str, space_id: str, kb_id: str, actor: str | None
     ) -> None:
-        """set_kb_permissions 判定：空间 owner/manager 或租户管理员；无 KB 授权兜底。
+        """set_kb_permissions 判定：空间管理者、租户管理员，或 kb_manager 授权。
 
-        （设计 §2.7：editor 授权不能设权限——本方法刻意不查 get_kb_grant_role。）
-        模块级依赖注入点：has_space_role / is_tenant_admin（经判定服务模块属性）。
+        （设计 §2.7：kb_manager 授权可放行；其余 KB 授权不可。）
+        模块级依赖注入点：has_space_role / is_tenant_admin / get_kb_grant_role
+        （经判定服务模块属性）。
+
+        [jonex] B2（D2）：空间侧判据由 `("owner", "manager")` 改为 `SPACE_MANAGER`。
         """
         from jonex_core.common.exceptions import PermissionDeniedError
         from jonex_core.common.i18n import translate
-        from .services.space_permission_service import has_space_role, is_tenant_admin
+        from .services.space_permission_service import (
+            SPACE_MANAGER,
+            has_space_role,
+            is_tenant_admin,
+        )
+        from .services.kb_permission_service import (
+            KB_MANAGER,
+            get_kb_grant_role,
+        )
 
         if (
-            await has_space_role(tenant_id, space_id, actor, "owner", "manager")
+            await has_space_role(tenant_id, space_id, actor, SPACE_MANAGER)
             or await is_tenant_admin(tenant_id, actor)
+            or (kb_id and await get_kb_grant_role(tenant_id, kb_id, actor) == KB_MANAGER)
         ):
             return
         raise PermissionDeniedError(
             message=translate(
                 "err.kb_permission.manage_required",
                 params={"kb_id": kb_id or ""},
-                fallback=f"仅空间 owner/manager 或租户管理员可管理知识库权限: {kb_id or ''}",
+                fallback=f"仅空间管理者或租户管理员可管理知识库权限: {kb_id or ''}",
             )
         )
+
+    async def _service_kb_ids(self, tenant_id: str, service_id: str) -> list[str]:
+        """服务关联的 KB id 列表（search_service 判定用）；服务不存在/无关联 → []。"""
+        from sqlalchemy import text
+
+        if not service_id:
+            return []
+        async with get_db_session() as session:
+            rows = (await session.execute(
+                text(
+                    "SELECT kb_id FROM knowledge_base.service_knowledge_bases "
+                    "WHERE service_id=:sid AND tenant_id=:t AND is_deleted=0"
+                ),
+                {"sid": service_id, "t": tenant_id},
+            )).all()
+        return [r[0] for r in rows]
 
     def _build_metadata(self) -> CapabilityMetadata:
         return CapabilityMetadata(
@@ -1054,11 +1174,18 @@ class KnowledgeBaseCapability(BaseCapability):
             data.pop("_kb_granted", None)
             if not skip_space_check:
                 from .services.space_permission_service import (
+                    SPACE_MANAGER,
+                    SPACE_MEMBER,
                     has_space_role,
+                    is_tenant_admin,
                     require_space_manage,
                     require_space_role,
                 )
-                from .services.kb_permission_service import get_kb_grant_role
+                from .services.kb_permission_service import (
+                    KB_MANAGER,
+                    KB_MEMBER,
+                    get_kb_grant_role,
+                )
 
                 if action in _SEARCH_ACTIONS:
                     data = await self._filter_search_kbs(request, data)
@@ -1073,39 +1200,90 @@ class KnowledgeBaseCapability(BaseCapability):
                             await self._check_kb_manage(
                                 request.tenant_id, space_id, kb_id or "", actor
                             )
-                        elif action in _SPACE_WRITE_ACTIONS:
+                        elif action in _SERVICE_SEARCH_ACTIONS:
                             if not await has_space_role(
-                                request.tenant_id, space_id, actor, "owner", "manager"
-                            ):
-                                # KB 授权兜底：editor 覆盖「写」
+                                request.tenant_id, space_id, actor,
+                                SPACE_MANAGER, SPACE_MEMBER,
+                            ) and not await is_tenant_admin(request.tenant_id, actor):
+                                # 纯 KB 授权用户：该服务至少一个 KB 可访问即放行，
+                                # 具体裁剪由 service 层 actor_user_id 过滤承担
+                                from .services.space_permission_service import get_visible_space_ids
+                                from .services.kb_permission_service import get_accessible_kb_ids
+                                visible = await get_visible_space_ids(request.tenant_id, actor)
+                                accessible = await get_accessible_kb_ids(
+                                    request.tenant_id, actor, visible
+                                )
+                                svc_kbs = await self._service_kb_ids(
+                                    request.tenant_id, data.get("service_id") or ""
+                                )
+                                if accessible is not None and not (set(svc_kbs) & accessible):
+                                    await require_space_role(
+                                        request.tenant_id, space_id, actor,
+                                        SPACE_MANAGER, SPACE_MEMBER,
+                                    )
+                        elif action in _SPACE_WRITE_ACTIONS:
+                            # 租户管理员（tenant:write）豁免：非成员也能写（成员路径短路，零额外查询）
+                            if not await has_space_role(
+                                request.tenant_id, space_id, actor, SPACE_MANAGER
+                            ) and not await is_tenant_admin(request.tenant_id, actor):
+                                # KB 授权兜底：只有 kb_manager 覆盖「写」
+                                # [jonex] B3（D1）：原判据是 in ("kb_manager","editor")。
+                                # 两级模型下 member 只读，写权限只属于 kb_manager。
                                 if (
                                     kb_id
                                     and action not in _KB_GRANT_EXCLUDED_ACTIONS
                                     and await get_kb_grant_role(
                                         request.tenant_id, kb_id, actor
-                                    ) == "editor"
+                                    ) == KB_MANAGER
                                 ):
                                     data["_kb_granted"] = True
                                 else:
                                     await require_space_role(
-                                        request.tenant_id, space_id, actor, "owner", "manager"
+                                        request.tenant_id, space_id, actor, SPACE_MANAGER
+                                    )
+                        elif action in _KB_MEMBER_READ_ACTIONS:
+                            # [jonex] 权限重构 B4（方案 §5 Gap 8 / 执行文档 §5.4）：
+                            # KB 浏览类收紧到 **KB 成员口径** —— 与 _SPACE_READ_ACTIONS
+                            # 的唯一差别：空间 `member` 不再自动放行。
+                            # 放行者：空间管理者 / 租户管理员 / KB 授权成员（kb_manager|member）。
+                            if not await has_space_role(
+                                request.tenant_id, space_id, actor, SPACE_MANAGER
+                            ) and not await is_tenant_admin(request.tenant_id, actor):
+                                granted = (
+                                    await get_kb_grant_role(request.tenant_id, kb_id, actor)
+                                    if kb_id else None
+                                )
+                                if granted in (KB_MANAGER, KB_MEMBER):
+                                    data["_kb_granted"] = True
+                                else:
+                                    # 非 KB 成员（含"只是空间 member"）→ 404 防探测，
+                                    # 与 knowledge_info_service.get 的详情口径一致（不用 403）。
+                                    raise ResourceNotFoundError(
+                                        message=translate(
+                                            "err.kb.not_found",
+                                            params={"kb_id": kb_id or ""},
+                                            fallback=f"知识库不存在: {kb_id or ''}",
+                                        )
                                     )
                         elif action in _SPACE_READ_ACTIONS:
+                            # 租户管理员（tenant:write）豁免：非成员也能读（成员路径短路，零额外查询）
                             if not await has_space_role(
                                 request.tenant_id, space_id, actor,
-                                "owner", "manager", "viewer",
-                            ):
+                                SPACE_MANAGER, SPACE_MEMBER,
+                            ) and not await is_tenant_admin(request.tenant_id, actor):
                                 # KB 授权兜底：editor/viewer 覆盖「读」
                                 granted = (
                                     await get_kb_grant_role(request.tenant_id, kb_id, actor)
                                     if kb_id else None
                                 )
-                                if granted in ("editor", "viewer"):
+                                # KB 授权兜底：任一有效授权都覆盖「读」
+                                # [jonex] B3（D1）：取值由三级收为 kb_manager/member
+                                if granted in (KB_MANAGER, KB_MEMBER):
                                     data["_kb_granted"] = True
                                 else:
                                     await require_space_role(
                                         request.tenant_id, space_id, actor,
-                                        "owner", "manager", "viewer",
+                                        SPACE_MANAGER, SPACE_MEMBER,
                                     )
 
 
@@ -1163,6 +1341,12 @@ async def _list_result(coro) -> dict:
     """包装 list 返回值，使 CapabilityResponse.data 保持 dict 类型"""
     result = await coro
     return {"permissions": result} if isinstance(result, list) else result
+
+
+async def _candidates_result(coro) -> dict:
+    """包装成员候选列表，使 CapabilityResponse.data 保持 dict 类型"""
+    result = await coro
+    return {"candidates": result}
 
 
 async def _url_result(coro) -> dict:

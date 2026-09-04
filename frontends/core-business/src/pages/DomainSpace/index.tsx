@@ -34,7 +34,8 @@ export default function DomainSpace() {
   const [editing, setEditing] = useState<DomainSpace | null>(null);
   const permRef = useRef<SpacePermissionModalHandle>(null);
   const [deleting, setDeleting] = useState<DomainSpace | null>(null);
-  // 租户级创建权限（后端按 service:write 计算）
+  // 租户级创建权限：后端 space_service.list 按 is_tenant_admin 返回 can_create_space
+  // （B1 后判据是 tenant:admin 码，不再是 service:write）。优先用后端字段，前端不硬编码码名。
   const [canCreateSpace, setCanCreateSpace] = useState(false);
 
   const loadSpaces = useCallback(async () => {

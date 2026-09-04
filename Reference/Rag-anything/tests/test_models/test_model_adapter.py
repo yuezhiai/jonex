@@ -6,6 +6,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from raganything.models import adapters
+from raganything.models.adapters import (
+    base64_caption_adapter,
+    legacy_vlm_adapter,
+)
 from raganything.models.types import (
     BoundModel,
     ModelCapability,
@@ -69,7 +74,7 @@ def qwen_spec():
     return ModelSpec(
         model_id="qwen3-72b",
         binding="vllm",
-        host="http://172.16.13.125:8000/v1",
+        host="http://127.0.0.1:8000/v1",
         api_key="not-needed",
     )
 
@@ -79,7 +84,7 @@ def vl_spec():
     return ModelSpec(
         model_id="qwen2.5-vl-7b",
         binding="vllm",
-        host="http://172.16.13.125:8000/v1",
+        host="http://127.0.0.1:8000/v1",
         capability=ModelCapability(supports_vision=True),
     )
 
@@ -384,10 +389,10 @@ class TestModelRegistry:
 
     def test_parse_binding_url(self):
         binding, host = ModelRegistry._parse_binding_url(
-            "vllm://http://172.16.13.125:8000/v1"
+            "vllm://http://127.0.0.1:8000/v1"
         )
         assert binding == "vllm"
-        assert host == "http://172.16.13.125:8000/v1"
+        assert host == "http://127.0.0.1:8000/v1"
 
     def test_parse_binding_url_with_params_stripped(self):
         """Query params (e.g. ?dim=768) are stripped — belong in models.yaml."""
@@ -406,6 +411,69 @@ class TestModelRegistry:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-fallback")
         key = ModelRegistry._resolve_api_key("unknown-model", "vllm")
         assert key == "sk-fallback"
+
+
+# ── Test VLM adapters reasoning_effort ─────────────────────────────────
+# [jonex] RAG_VLM_REASONING_EFFORT 思考深度门控回归测试。
+
+
+class _SpyDriver(BaseModelDriver):
+    """Spy driver：捕获 complete 收到的 kwargs，不做任何网络请求。"""
+
+    bindings = ("spy",)
+
+    def __init__(self):
+        self.captured_kwargs = []
+
+    def normalize_images(self, messages, cap):
+        # 不读文件（file:// 指向不存在的路径），原样透传
+        return messages
+
+    async def complete(self, messages, spec, **kwargs):
+        self.captured_kwargs.append(kwargs)
+        return ModelResponse(text="ok")
+
+
+@pytest.fixture
+def spy_bound():
+    spec = ModelSpec(
+        model_id="spy-vlm",
+        binding="spy",
+        host="http://localhost",
+        capability=ModelCapability(supports_vision=True),
+    )
+    return BoundModel(spec=spec, driver=_SpyDriver())
+
+
+class TestVlmReasoningEffort:
+    @pytest.mark.asyncio
+    async def test_legacy_vlm_defaults_to_none(self, spy_bound, monkeypatch):
+        monkeypatch.delenv("RAG_VLM_REASONING_EFFORT", raising=False)
+        vlm = legacy_vlm_adapter(spy_bound)
+        await vlm("/tmp/fake.jpg", "describe")
+        assert spy_bound.driver.captured_kwargs[0]["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_base64_caption_defaults_to_none(self, spy_bound, monkeypatch):
+        monkeypatch.delenv("RAG_VLM_REASONING_EFFORT", raising=False)
+        vlm = base64_caption_adapter(spy_bound)
+        await vlm("describe", image_data="/9j/AAAA", system_prompt="sys")
+        assert spy_bound.driver.captured_kwargs[0]["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_env_override(self, spy_bound, monkeypatch):
+        monkeypatch.setenv("RAG_VLM_REASONING_EFFORT", "low")
+        vlm = base64_caption_adapter(spy_bound)
+        await vlm("describe", image_data="/9j/AAAA")
+        assert spy_bound.driver.captured_kwargs[0]["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_caller_kwarg_wins_over_env(self, spy_bound, monkeypatch):
+        """调用方显式传 reasoning_effort 时不被 setdefault 覆盖。"""
+        monkeypatch.setenv("RAG_VLM_REASONING_EFFORT", "low")
+        vlm = base64_caption_adapter(spy_bound)
+        await vlm("describe", image_data="/9j/AAAA", reasoning_effort="high")
+        assert spy_bound.driver.captured_kwargs[0]["reasoning_effort"] == "high"
 
 
 # ── Test extract_openai_usage ──────────────────────────────────────────

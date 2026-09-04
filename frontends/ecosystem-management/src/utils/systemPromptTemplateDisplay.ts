@@ -31,8 +31,6 @@ export function promptTemplateVersionsDisplay(
   return versions.map((version) => ({
     ...version,
     content: t(`${baseKey}.content`),
-    remark: t('promptTemplate.builtInVersionNote'),
-    updated_by: t('promptTemplate.systemUser'),
   }));
 }
 

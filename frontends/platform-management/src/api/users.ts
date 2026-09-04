@@ -27,8 +27,8 @@ export interface UserCreatePayload {
   email?: string;
   role?: string;
   target_tenant_id?: string;
-  /** RBAC 角色绑定（目标租户内的角色 id；创建后绑定） */
-  role_id?: number;
+  /** RBAC 角色绑定（目标租户内的角色 id 列表；创建后在同一事务内绑定） */
+  role_ids?: number[];
 }
 export interface UserUpdatePayload {
   display_name?: string;
@@ -60,8 +60,16 @@ export async function updateUser(id: number, data: UserUpdatePayload, targetTena
   });
 }
 
-export async function deleteUser(id: number): Promise<void> {
-  await apiClient.delete<null>(`/platform/users/${id}`);
+export async function deleteUser(id: number, targetTenantId?: string): Promise<void> {
+  // 注意 ApiClient 的签名差异：delete<T>(url, data?, config?) —— 第二个参数是「请求体」，
+  // 第三个才是 axios config；而 get<T>(url, config?) 的第二个参数就是 config。
+  // 想传 query 必须占位到第三个参数，否则 { params } 会被当成 body 发出去，
+  // 后端的 Query(target_tenant_id) 收不到，跨租户删除照旧失败。
+  await apiClient.delete<null>(
+    `/platform/users/${id}`,
+    undefined,
+    targetTenantId ? { params: { target_tenant_id: targetTenantId } } : undefined,
+  );
 }
 
 /** 用户当前绑定的角色 id 列表（RBAC 多角色） */

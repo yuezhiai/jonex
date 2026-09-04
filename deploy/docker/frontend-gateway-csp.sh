@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================
-# 生成 CSP 响应头片段 —— 被 frontend-gateway.conf 的 include 引入
+# 生成 CSP 响应头片段 —— 被 deploy/nginx/app-locations.conf 的 include 引入
 #
 # 为什么用「生成单文件 + include」而不是 nginx 官方镜像的 templates/envsubst：
 #   envsubst 会替换配置里所有 $VAR，包括 nginx 自身的运行时变量

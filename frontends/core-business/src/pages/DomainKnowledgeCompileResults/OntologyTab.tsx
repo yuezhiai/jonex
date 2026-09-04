@@ -58,11 +58,11 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
     [],
   );
 
-  // 挂载 / keyword 变化 / kbId 变化时重置到第 1 页
+  // 挂载 / keyword / kbId / docId 变化时重置到第 1 页（docId 过滤依赖，必须纳入）
   useEffect(() => {
     setPage(1);
     fetchData(1, keyword.trim(), kbId, docId);
-  }, [keyword, kbId, fetchData]);
+  }, [keyword, kbId, docId, fetchData]);
 
   // ── 实体类型显示映射及弹窗下拉框选项 ──
   const entityTypeDisplayMap = useMemo(() => {
@@ -133,7 +133,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
       message.success(t('compile.instanceCreated'));
       closeEditModal();
       setPage(1);
-      fetchData(1, keyword, kbId);
+      fetchData(1, keyword, kbId, docId);
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : '';
       message.error(`${t('common.createFailed')}${errMsg ? `: ${errMsg}` : ''}`);
@@ -349,7 +349,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           total,
           onChange: (p) => {
             setPage(p);
-            fetchData(p, keyword, kbId);
+            fetchData(p, keyword, kbId, docId);
           },
           showSizeChanger: false,
           showTotal: (tTotal) => t('compile.totalInstances', { count: tTotal }),

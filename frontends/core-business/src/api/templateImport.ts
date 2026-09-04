@@ -55,6 +55,18 @@ export interface TemplateRelation {
   relation_type: string;
 }
 
+export interface TemplateConstraint {
+  id: string;
+  scenario_id: string;
+  name: string;
+  target_type: 'object' | 'attribute' | 'relation';
+  target_id: string;
+  target_label: string;
+  constraint_type: 'unique' | 'exists' | 'conditional' | 'range';
+  expression?: string | null;
+  suggestion?: string | null;
+}
+
 interface ListResp<T> {
   items: T[];
   total: number;
@@ -96,7 +108,7 @@ function unwrap<T>(body: any): T {
 }
 
 export async function fetchTemplateDomains(): Promise<ListResp<TemplateDomain>> {
-  const resp = await templateApi.get('/ecosystem/templates/domains', { params: { limit: 100 } });
+  const resp = await templateApi.get('/ecosystem/templates/domains', { params: { limit: 100, status: 'active' } });
   return unwrap<ListResp<TemplateDomain>>(resp.data);
 }
 
@@ -119,6 +131,13 @@ export async function fetchTemplateRelations(scenarioId: string): Promise<ListRe
     params: { limit: 100 },
   });
   return unwrap<ListResp<TemplateRelation>>(resp.data);
+}
+
+export async function fetchTemplateConstraints(scenarioId: string): Promise<ListResp<TemplateConstraint>> {
+  const resp = await templateApi.get(`/ecosystem/templates/scenarios/${scenarioId}/constraints`, {
+    params: { limit: 100 },
+  });
+  return unwrap<ListResp<TemplateConstraint>>(resp.data);
 }
 
 export async function fetchTemplateCompilePreview(scenarioId: string): Promise<CompiledTemplatePreview> {

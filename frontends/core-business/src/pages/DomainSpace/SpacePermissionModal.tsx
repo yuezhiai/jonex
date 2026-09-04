@@ -2,10 +2,10 @@ import React, { useState, useCallback, forwardRef, useImperativeHandle, useRef, 
 import { useTranslation } from 'react-i18next';
 import { Modal, Input, Button, Spin, message } from 'antd';
 import { TeamOutlined, SearchOutlined, UserAddOutlined, CloseOutlined } from '@ant-design/icons';
-import { getSpacePermissions, updateSpacePermissions, type SpaceOwnerInfo } from '../../api/domainSpace';
-import { userToPermMember, type PermMember } from '../../types/domainService';
-import { listUsers, type PlatformUser } from '../../api/user';
+import { getSpacePermissions, updateSpacePermissions, getSpacePermissionCandidates, type SpaceOwnerInfo } from '../../api/domainSpace';
+import { candidateToPermMember, type MemberCandidate, type PermMember, type SpaceRole } from '../../types/domainService';
 import type { DomainSpace } from '../../types/domainSpace';
+import { getShellContext } from '@jonex/shell-sdk';
 
 export interface SpacePermissionModalHandle {
   open: (space: DomainSpace) => void;
@@ -22,7 +22,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
     const [open, setOpen] = useState(false);
     const [permSpace, setPermSpace] = useState<DomainSpace | null>(null);
     const [permMembers, setPermMembers] = useState<PermMember[]>([]);
-    // 空间创建者（owner 不落 space_permissions，后端响应层合成只读信息）
+    // 空间创建者（纯展示：owner_id 不参与判定；创建人本身以 space_manager 出现在成员列表里）
     const [permOwner, setPermOwner] = useState<SpaceOwnerInfo | null>(null);
     const [permSearch, setPermSearch] = useState('');
     const [permLoading, setPermLoading] = useState(false);
@@ -30,7 +30,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
 
     const [userSelectOpen, setUserSelectOpen] = useState(false);
     const [userSearchText, setUserSearchText] = useState('');
-    const [availableUsers, setAvailableUsers] = useState<PlatformUser[]>([]);
+    const [availableUsers, setAvailableUsers] = useState<MemberCandidate[]>([]);
     const [usersLoading, setUsersLoading] = useState(false);
     const userSelectRef = useRef<HTMLDivElement>(null);
 
@@ -58,7 +58,8 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                 department: '',
                 avatar: name.charAt(0).toUpperCase(),
                 avatarColor: '#94a3b8',
-                role: (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager',
+                // [jonex] B2（D2）：取值 space_manager / member；显式映射，勿用三元兜底
+                role: (p.role === 'space_manager' ? 'space_manager' : 'member') as SpaceRole,
               };
             });
             setPermMembers(members);
@@ -113,21 +114,22 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
     };
 
     const loadAvailableUsers = useCallback(async () => {
+      if (!permSpace) return;
       setUsersLoading(true);
       try {
-        const result = await listUsers(1, 100);
-        setAvailableUsers(result.items);
+        const result = await getSpacePermissionCandidates(permSpace.id);
+        setAvailableUsers(result);
       } catch {
         setAvailableUsers([]);
       } finally {
         setUsersLoading(false);
       }
-    }, []);
+    }, [permSpace]);
 
-    const addPermMember = (user: PlatformUser) => {
+    const addPermMember = (user: MemberCandidate) => {
       setPermMembers((prev) => {
-        if (prev.some((m) => m.id === String(user.id))) return prev;
-        return [...prev, userToPermMember(user, 'viewer')];
+        if (prev.some((m) => m.id === user.user_id)) return prev;
+        return [...prev, candidateToPermMember(user, 'member')];
       });
     };
 
@@ -140,15 +142,23 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
       return m.name.includes(permSearch) || m.department.includes(permSearch);
     });
 
+    const currentUserId = getShellContext()?.getCurrentUser()?.id ?? '';
     const addedUserIds = new Set(permMembers.map((m) => m.id));
+    // [jonex] B2（E3）：**撤掉了 owner 的候选排除**。
+    // D2 之后创建人就是普通的 space_manager，可被调整甚至移除（由后端
+    // 「空间至少保留一名管理者」兜底）。继续排除他会让「转交空间」做不了，
+    // 而且后端已不再拦截，前后端口径会不一致。
+    // 仍排除当前登录用户自己 —— 那是防「自己添加自己」的既有行为，与 owner 无关。
+    const excludedIds = new Set([currentUserId].filter(Boolean).map(String));
     const filteredAvailableUsers = availableUsers.filter((u) => {
-      if (!userSearchText) return !addedUserIds.has(String(u.id));
+      const uid = u.user_id;
+      if (addedUserIds.has(uid) || excludedIds.has(uid)) return false;
+      if (!userSearchText) return true;
       const q = userSearchText.toLowerCase();
       return (
-        !addedUserIds.has(String(u.id)) &&
-        ((u.display_name || '').toLowerCase().includes(q) ||
-          u.username.toLowerCase().includes(q) ||
-          (u.email || '').toLowerCase().includes(q))
+        (u.display_name || '').toLowerCase().includes(q) ||
+        (u.username || '').toLowerCase().includes(q) ||
+        (u.email || '').toLowerCase().includes(q)
       );
     });
 
@@ -226,7 +236,7 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                 ) : (
                   filteredAvailableUsers.slice(0, 30).map((user) => (
                     <div
-                      key={user.id}
+                      key={user.user_id}
                       className="yx-perm-user-row"
                       style={{ cursor: 'pointer', padding: '8px 12px' }}
                       onClick={() => {
@@ -234,12 +244,12 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                         setUserSearchText('');
                       }}
                     >
-                      <div className="yx-perm-avatar" style={{ background: userToPermMember(user).avatarColor }}>
-                        {userToPermMember(user).avatar}
+                      <div className="yx-perm-avatar" style={{ background: candidateToPermMember(user).avatarColor }}>
+                        {candidateToPermMember(user).avatar}
                       </div>
                       <div className="yx-perm-user-info" style={{ flex: 1 }}>
-                        <div className="yx-perm-user-name">{user.display_name || user.username}</div>
-                        <div className="yx-perm-user-dept">{user.email || user.role || ''}</div>
+                        <div className="yx-perm-user-name">{user.display_name || user.username || user.user_id}</div>
+                        <div className="yx-perm-user-dept">{user.email || user.username || ''}</div>
                       </div>
                       <span style={{ fontSize: 20, color: '#3b82f6', lineHeight: 1 }}>+</span>
                     </div>
@@ -307,35 +317,35 @@ const SpacePermissionModal = forwardRef<SpacePermissionModalHandle, SpacePermiss
                   <div className="yx-perm-user-dept">{member.department || `ID: ${member.id.slice(0, 8)}`}</div>
                 </div>
                 <div className="yx-perm-radio">
-                  <label className={`yx-perm-radio-label${member.role === 'viewer' ? ' is-checked' : ''}`}>
+                  <label className={`yx-perm-radio-label${member.role === 'member' ? ' is-checked' : ''}`}>
                     <input
                       type="radio"
                       name={`perm-${member.id}`}
-                      value="viewer"
-                      checked={member.role === 'viewer'}
+                      value="member"
+                      checked={member.role === 'member'}
                       disabled={!canManage}
                       onChange={() => {
                         setPermMembers((prev) =>
-                          prev.map((m) => (m.id === member.id ? { ...m, role: 'viewer' as const } : m)),
+                          prev.map((m) => (m.id === member.id ? { ...m, role: 'member' as const } : m)),
                         );
                       }}
                     />
-                    {t('permission.view')}
+                    {t('permission.spaceMember')}
                   </label>
-                  <label className={`yx-perm-radio-label${member.role === 'manager' ? ' is-checked' : ''}`}>
+                  <label className={`yx-perm-radio-label${member.role === 'space_manager' ? ' is-checked' : ''}`}>
                     <input
                       type="radio"
                       name={`perm-${member.id}`}
-                      value="manager"
-                      checked={member.role === 'manager'}
+                      value="space_manager"
+                      checked={member.role === 'space_manager'}
                       disabled={!canManage}
                       onChange={() => {
                         setPermMembers((prev) =>
-                          prev.map((m) => (m.id === member.id ? { ...m, role: 'manager' as const } : m)),
+                          prev.map((m) => (m.id === member.id ? { ...m, role: 'space_manager' as const } : m)),
                         );
                       }}
                     />
-                    {t('permission.manage')}
+                    {t('permission.spaceManager')}
                   </label>
                 </div>
                 {canManage && (

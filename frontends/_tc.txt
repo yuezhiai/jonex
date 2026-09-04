@@ -1,6 +1,0 @@
-$ tsc --noEmit
-src/api/domainKnowledge.test.ts(16,54): error TS2307: Cannot find module 'vitest' or its corresponding type declarations.
-/Users/javen/Documents/codingCode/ai-data/yuexi-platform/frontends/core-business:
-[ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL] @jonex/core-business@1.0.0 typecheck: `tsc --noEmit`
-Exit status 2
-exit=2

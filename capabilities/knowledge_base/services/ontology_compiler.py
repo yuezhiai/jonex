@@ -915,12 +915,19 @@ class OntologyCompiler:
     def _normalize_entity_types(self, entity_types: list[dict]) -> list[dict]:
         normalized: list[dict] = []
         names_seen: set[str] = set()
+        display_names_seen: set[str] = set()
 
         for index, item in enumerate(entity_types, start=1):
             name = self._require_name(item.get("name"), f"entity_types[{index}].name")
             if name in names_seen:
                 raise InvalidParameterError(message=translate("err.ontology.entity_code_duplicate", params={"name": name}, fallback=f"实体编码重复: {name}")  )  # 原消息)
             names_seen.add(name)
+
+            # 显示名（对象名称）在同 KB 内唯一，与 name 编码唯一性分开校验
+            display_name = (item.get("display_name") or name).strip()
+            if display_name in display_names_seen:
+                raise InvalidParameterError(message=translate("err.ontology.entity_name_duplicate", params={"name": display_name}, fallback=f"对象名称重复: {display_name}"))
+            display_names_seen.add(display_name)
 
             attr_names_seen: set[str] = set()
             attributes = []
@@ -944,7 +951,7 @@ class OntologyCompiler:
 
             normalized.append({
                 "name": name,
-                "display_name": (item.get("display_name") or name).strip(),
+                "display_name": display_name,
                 "description": (item.get("description") or "").strip(),
                 "requirement": (item.get("requirement") or "").strip(),
                 "status": _normalize_editor_status(item.get("status")),

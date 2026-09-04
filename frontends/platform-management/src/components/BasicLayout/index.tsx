@@ -9,7 +9,7 @@ import { usePermission } from '@jonex/shared-lib';
 import { getMenuFromRoutes, IconMap } from '@/router/menu';
 import type { MenuItem } from '@/router/menu';
 import { getRoutes } from '@/router/routes.config';
-import { buildLoginRedirectUrl, clearAuthStorage } from '@jonex/shell-sdk';
+import { clearAuthStorage, redirectToLogin } from '@jonex/shell-sdk';
 import styles from './index.module.scss';
 
 const { Content } = Layout;
@@ -58,8 +58,7 @@ const BasicLayout = () => {
   const handleLogout = () => {
     clearAuthStorage({ keepLocale: true });
     global.setUserInfo(null);
-    const loginUrl = VITE_LOGIN || '/login';
-    window.location.href = buildLoginRedirectUrl(loginUrl, window.location.href, VITE_APP_ID);
+    redirectToLogin({ loginUrl: VITE_LOGIN || '/login', appId: VITE_APP_ID });
   };
 
   const renderNavIcon = (iconName?: string) => {

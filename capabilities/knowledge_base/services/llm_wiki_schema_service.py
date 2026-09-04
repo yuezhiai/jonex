@@ -79,13 +79,21 @@ Operations: ingest, query, lint
 - `description:` — a single-sentence one-liner (the field formerly named `brief`).
 - Do not include YAML frontmatter (---) in generated content; it is managed by code.
 
-## Key Points of the Answer
-- Do not list the basis and explanations in parentheses, just answer the question itself. For example, "according to", "see details", etc. I don't want to see reference source information. For a correct response like "1+1=?", just answer "2."
-- Answer the question directly and accurately; do not restate or paraphrase the question.
-- Only include information that directly answers the question - irrelevant background information, cautions, and generic filler content are prohibited.
-- It is prohibited to describe the search process, tool usage, or reasoning steps in the answer.
-- Use short and direct answers.
-- Do not add closing remarks, proposals, or follow-up suggestions.
+## 输出要求（最高优先级，必须严格遵守）
+
+  1. 只输出查询结果的实际值，不输出字段名称、字段定义或任何附加说明。
+  2. 禁止输出任何字段元数据，包括但不限于：标签、字段编号、来源、依据。
+  3. 禁止在答案前后添加括号注释。
+  4. 不重述问题，不说明查询过程，不提供参考来源、解释、注意事项或后续建议。
+  5. 输出完成前必须检查：禁止附加括号说明
+  6. 输出答案必须简洁明了，禁止添加原因
+
+  示例：
+  问题：  七月份的最佳投资公司是什么？
+  正确输出：张三投资有限公司
+
+  问题：1+1等于多少？
+  正确输出：2
 """
 
 _CODE_RE = re.compile(r"^[a-z0-9 _-]+$")
@@ -147,6 +155,33 @@ def render_agents_md(entity_types: list[dict],
 class LlmWikiSchemaService:
     def __init__(self) -> None:
         self._repo = LlmWikiSchemaRepository()
+
+    @staticmethod
+    def _validate_code_uniqueness(entity_types: list, concept_types: list) -> None:
+        """词表 code 唯一性校验：entity_types 内部唯一、concept_types 内部唯一，两者互不排斥。"""
+        def _check(items: list, kind: str) -> None:
+            seen: set[str] = set()
+            for item in items:
+                code = str((item or {}).get("code") or "").strip()
+                if not code:
+                    continue
+                if code in seen:
+                    if kind == "entity":
+                        error_key = "err.llm_wiki_schema.entity_type_code_duplicate"
+                        error_code = "LLM_WIKI_SCHEMA_ENTITY_TYPE_CODE_DUPLICATE"
+                        fallback = f"实体类型编码重复: {code}"
+                    else:
+                        error_key = "err.llm_wiki_schema.concept_type_code_duplicate"
+                        error_code = "LLM_WIKI_SCHEMA_CONCEPT_TYPE_CODE_DUPLICATE"
+                        fallback = f"概念类型编码重复: {code}"
+                    raise InvalidParameterError(
+                        message=translate(error_key, params={"code": code}, fallback=fallback),
+                        details={"error_code": error_code, "code": code},
+                    )
+                seen.add(code)
+
+        _check(entity_types, "entity")
+        _check(concept_types, "concept")
 
     async def _require_openkb_kb(self, tenant_id: str, kb_id: str) -> None:
         """校验 KB 存在且 kb_type=openkb（方案 §7 第 1 步）。"""
@@ -237,6 +272,12 @@ class LlmWikiSchemaService:
                 ),
                 details={"error_code": "LLM_WIKI_SCHEMA_INVALID_ENTITY_TYPE"},
             )
+
+        # ②b code 唯一性校验（entity 内部 / concept 内部各自唯一，两者互不排斥）
+        self._validate_code_uniqueness(
+            [t.dict() for t in req.entity_types],
+            [c.dict() for c in req.concept_types],
+        )
 
         # ③ 渲染 + 构建投影
         entity_types = [t.dict() for t in req.entity_types]
@@ -396,6 +437,9 @@ class LlmWikiSchemaService:
                     fallback="实体类型词表必须包含 other（兜底类型）"),
                 details={"error_code": "LLM_WIKI_SCHEMA_INVALID_ENTITY_TYPE"},
             )
+
+        # code 唯一性校验（dry-run 与非 dry-run 都覆盖：非 dry-run 走 save_schema 再次校验）
+        self._validate_code_uniqueness(entity_types, concept_types)
 
         if dry_run:
             return {"valid": True, "entity_types": entity_types,

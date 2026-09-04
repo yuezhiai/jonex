@@ -58,6 +58,9 @@ class CapabilityInvokeRequest(BaseModel):
     username: Optional[str] = None
     ip: Optional[str] = None
     context: Optional[dict] = None
+    impersonated: bool = False
+    perms: list[str] = []
+    original_tenant_id: Optional[str] = None
 
 
 class InvokeResult(BaseModel):
@@ -82,6 +85,7 @@ class UserInfo(BaseModel):
 
 
 TENANT_REQUIRED_AUTH_PATHS = {
+    "auth/login",
     "auth/refresh",
     "auth/login-ticket",
 }
@@ -275,6 +279,8 @@ async def _record_platform_metrics(
     audit_user_id: str,
     audit_username: str,
     client_ip: str,
+    impersonated: bool = False,
+    original_tenant_id: Optional[str] = None,
 ):
     """记录 platform 代理的计量与审计"""
     latency = (time.time() - start) * 1000
@@ -299,6 +305,8 @@ async def _record_platform_metrics(
         username=audit_username,
         ip=client_ip,
         service_name="sidecar",
+        impersonated=impersonated,
+        original_tenant_id=original_tenant_id,
     )
 
 
@@ -351,6 +359,8 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
     ).split(",")[0].strip()
     audit_user_id = str(auth.get("user_id")) if auth and auth.get("user_id") else ""
     audit_username = auth.get("username", "") if auth else ""
+    impersonated = bool(auth.get("impersonated")) if auth else False
+    original_tenant_id = auth.get("original_tenant_id") if auth else None
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             kwargs = {"headers": headers, "params": request.query_params}
@@ -363,6 +373,7 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
             await _record_platform_metrics(
                 metering_tenant_id, path, request, status_code, start,
                 audit_user_id, audit_username, client_ip,
+                impersonated, original_tenant_id,
             )
             return result
         except httpx.HTTPStatusError as e:
@@ -370,6 +381,7 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
             await _record_platform_metrics(
                 metering_tenant_id, path, request, status_code, start,
                 audit_user_id, audit_username, client_ip,
+                impersonated, original_tenant_id,
             )
             try:
                 detail = e.response.json()
@@ -384,6 +396,7 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
             await _record_platform_metrics(
                 metering_tenant_id, path, request, 502, start,
                 audit_user_id, audit_username, client_ip,
+                impersonated, original_tenant_id,
             )
             raise CapabilityInvokeError(
                 message=translate("err.capability.unreachable", fallback=f"平台服务不可达: {str(e)}"),
@@ -396,7 +409,7 @@ class SidecarApp:
     def __init__(self):
         self.app = FastAPI(
             title="Jonex Platform Sidecar",
-            description="悦溪平台能力代理 - 统一入口（内部服务）",
+            description="Jonex 平台能力代理 - 统一入口（内部服务）",
             version="1.0.0"
         )
         self.proxy = get_capability_proxy()
@@ -467,6 +480,9 @@ class SidecarApp:
                     "tenant_id": require_tenant(payload.get("tenant_id")),
                     "user_id": int(payload["sub"]),
                     "username": payload.get("username", ""),
+                    "impersonated": bool(payload.get("impersonated")),
+                    "original_tenant_id": payload.get("original_tenant_id"),
+                    "perms": payload.get("perms") or [],
                 }
             if api_key and api_key.startswith("jonex_"):
                 tenant_id = require_tenant(x_tenant_id) if x_tenant_id else None
@@ -524,6 +540,14 @@ class SidecarApp:
         async def auth_logout(request: Request):
             return await _proxy_to_platform(request, "auth/logout")
 
+        @self.app.post("/auth/impersonate")
+        async def auth_impersonate(request: Request, auth: dict = Depends(verify_any_auth)):
+            return await _proxy_to_platform(request, "auth/impersonate", auth)
+
+        @self.app.post("/auth/impersonate/end")
+        async def auth_impersonate_end(request: Request, auth: dict = Depends(verify_any_auth)):
+            return await _proxy_to_platform(request, "auth/impersonate/end", auth)
+
         # ==================== 平台管理代理 ====================
 
         @self.app.api_route("/platform/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -562,6 +586,9 @@ class SidecarApp:
                 tenant_id = _resolve_invoke_tenant(invoke_request, auth, x_tenant_id)
             user_id = invoke_request.user_id or str(auth.get("user_id", ""))
             username = invoke_request.username or auth.get("username", "")
+            impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
+            original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
+            perms = invoke_request.perms or auth.get("perms") or []
             # 提取客户端 IP（优先 X-Forwarded-For）
             client_ip = request.headers.get(
                 "X-Forwarded-For",
@@ -605,6 +632,9 @@ class SidecarApp:
                     username=username,
                     ip=ip,
                     request_id=trace_id,
+                    impersonated=impersonated,
+                    perms=perms,
+                    original_tenant_id=original_tenant_id,
                 )
 
                 latency = (time.time() - start_time) * 1000
@@ -625,6 +655,8 @@ class SidecarApp:
                     invoke_action=_action,
                     is_invoke=True,
                     resource_id=_resource_id,
+                    impersonated=impersonated,
+                    original_tenant_id=original_tenant_id,
                 )
 
                 logger.info(
@@ -661,6 +693,8 @@ class SidecarApp:
                     invoke_action=_action,
                     is_invoke=True,
                     resource_id=_resource_id,
+                    impersonated=impersonated,
+                    original_tenant_id=original_tenant_id,
                 )
                 msg = str(e)
                 cid = invoke_request.capability_id
@@ -687,6 +721,9 @@ class SidecarApp:
 
             tenant_id = _resolve_invoke_tenant(invoke_request, auth, x_tenant_id)
             user_id = invoke_request.user_id or str(auth.get("user_id", ""))
+            impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
+            original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
+            perms = invoke_request.perms or auth.get("perms") or []
             import uuid as _uuid
             trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
 
@@ -697,6 +734,9 @@ class SidecarApp:
                     tenant_id=tenant_id,
                     user_id=user_id,
                     request_id=trace_id,
+                    impersonated=impersonated,
+                    perms=perms,
+                    original_tenant_id=original_tenant_id,
                 ):
                     yield line + "\n"
 

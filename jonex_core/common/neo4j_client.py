@@ -23,7 +23,7 @@ def get_neo4j_driver() -> AsyncDriver:
     if _driver is None:
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         username = os.getenv("NEO4J_USERNAME", "neo4j")
-        password = os.getenv("NEO4J_PASSWORD", "jonex_neo4j_123")
+        password = os.getenv("NEO4J_PASSWORD", "change-me")
         _driver = AsyncGraphDatabase.driver(uri, auth=(username, password))
         logger.info("Neo4j 驱动已创建: %s", uri)
     return _driver

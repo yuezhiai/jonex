@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - MCP Server 配置管理
+Jonex 平台 - MCP Server 配置管理
 
 从环境变量读取所有配置，不依赖 jonex_core。
 使用纯 os.getenv 替代 pydantic Settings（避免 pydantic v1/v2 冲突）。
@@ -16,7 +16,7 @@ class Settings:
     DB_HOST: str = os.getenv("DB_HOST", "localhost")
     DB_PORT: int = int(os.getenv("DB_PORT", "5432"))
     DB_USERNAME: str = os.getenv("DB_USERNAME", "jonex")
-    DB_PASSWORD: str = os.getenv("DB_PASSWORD", "jonex123")
+    DB_PASSWORD: str = os.getenv("DB_PASSWORD", "change-me")
     DB_NAME: str = os.getenv("DB_NAME", "jonex")
 
     # 服务配置

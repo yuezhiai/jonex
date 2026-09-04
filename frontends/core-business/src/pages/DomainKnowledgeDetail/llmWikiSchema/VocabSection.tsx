@@ -40,6 +40,16 @@ export default function VocabSection({ kind, value, onChange }: Props) {
 
   const codeInvalid = (code: string) => !CODE_RE.test(code.trim());
   const hasOther = value.some((v) => v.code.trim() === 'other');
+  // 重复 code 集合（trim 后出现次数 >1），用于标红（与 codeInvalid 一致）
+  const duplicatedCodes = (() => {
+    const counts = new Map<string, number>();
+    value.forEach((v) => {
+      const c = v.code.trim();
+      if (!c) return;
+      counts.set(c, (counts.get(c) ?? 0) + 1);
+    });
+    return new Set([...counts.entries()].filter(([, n]) => n > 1).map(([c]) => c));
+  })();
 
   const columns: ColumnsType<Item> = [
     {
@@ -50,7 +60,7 @@ export default function VocabSection({ kind, value, onChange }: Props) {
       render: (v: string, _row, idx) => (
         <Input
           value={v}
-          status={codeInvalid(v) ? 'error' : undefined}
+          status={codeInvalid(v) || duplicatedCodes.has(v.trim()) ? 'error' : undefined}
           onChange={(e) => update(idx, { code: e.target.value.trim() })}
         />
       ),

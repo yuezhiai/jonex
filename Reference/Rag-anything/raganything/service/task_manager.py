@@ -829,12 +829,14 @@ class TaskManager:
         *,
         kb_id: str = "",
         trace_id: str = "",
+        user_id: str = "",  # [jonex] v1 退役：查询计量维度对齐 v1 _jonex_query_headers
+        only_need_context: bool = False,  # [jonex] 方案 A：多 KB 只召回、平台侧作答
     ) -> dict:
         """Query LightRAG via HTTP client, returning {answer, references}.
 
-        Mirrors v1 LightRAGAdapter.query_detailed(): references are parsed
-        from :9621 response via parse_file_source(), ready for KB-side
-        enrichment with COS presigned URLs and DB lookups.
+        Mirrors the retired v1 LightRAGAdapter.query_detailed() contract:
+        references are parsed from :9621 response via parse_file_source(),
+        ready for KB-side enrichment with COS presigned URLs and DB lookups.
         """
         if self._http_client is not None:
             from jonex_core.common.file_source_util import (
@@ -844,6 +846,7 @@ class TaskManager:
             result = await self._http_client.query(
                 query, mode=mode, top_k=top_k,
                 tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id,
+                user_id=user_id, only_need_context=only_need_context,  # [jonex] 透传
             )
             if isinstance(result, dict):
                 answer = result.get("response", result.get("data", ""))
@@ -1162,10 +1165,11 @@ class TaskManager:
             # Validate file path
             # [jonex] P0-A.2: ontology_only 不本地化 COS、不需要原文件 → 跳过文件存在性校验，
             # 直接进入"按 document_id 读 LightRAG 实体/关系 → 抽本体"。
-            # [jonex] P0-1: COS 后端文件不检查本地路径（file_path 是 storage_key 标识符，
-            # 实际文件由 pipeline 阶段从 COS 下载），避免误判 FILE_NOT_FOUND。
+            # [jonex] P0-1: 对象存储后端（cos/s3）文件不检查本地路径（file_path 是 storage_key
+            # 标识符，实际文件由 pipeline 阶段从对象存储下载），避免误判 FILE_NOT_FOUND。
             needs_local = task.execution_mode != "ontology_only" and not (
-                task.storage_backend == "cos" and task.storage_key
+                (task.storage_backend or "").strip().lower() in ("cos", "s3")
+                and task.storage_key
             )
             if needs_local and not os.path.exists(task.file_path):
                 self._fail_task(task, ErrorCode.FILE_NOT_FOUND, f"File not found: {task.file_path}")
@@ -1694,13 +1698,17 @@ class TaskManager:
         return PromptOverride(by_code=by_code) if by_code else None
 
     async def _fetch_cos_object(self, task: TaskInfo) -> str | None:
-        """[jonex] R7-2b: 任务 pipeline 前从 COS 异步下载文件到本地临时路径。
+        """[jonex] R7-2b: 任务 pipeline 前从对象存储（cos/s3）异步下载文件到本地临时路径。
 
         full / parse_only 执行模式共用（parse_only 即 OpenKB 管线）。返回
-        本地临时文件路径，调用方负责 finally 清理；非 COS 后端返回 None；
+        本地临时文件路径，调用方负责 finally 清理；非对象存储后端返回 None；
         下载失败抛 OBJECT_FETCH_FAILED（可被 _classify_error 识别）。
+
+        [jonex] S3 兼容：按 task.storage_backend 选客户端（get_object_storage_for），
+        而非全局单例——混合数据（部分文档 cos、部分 s3）时全局单例会用错后端。
         """
-        if not (task.storage_backend == "cos" and task.storage_key):
+        _backend = (task.storage_backend or "").strip().lower()
+        if not (_backend in ("cos", "s3") and task.storage_key):
             return None
 
         import uuid as _uuid
@@ -1710,19 +1718,19 @@ class TaskManager:
         _base_name = os.path.basename(task.file_path or task.storage_key) or "cos_object"
         local_path = os.path.join(_cos_cache, f"{_uuid.uuid4().hex}_{_base_name}")
         try:
-            from jonex_core.common.object_storage import get_object_storage
-            await get_object_storage().get_to_path(task.storage_key, local_path)
+            from jonex_core.common.object_storage import get_object_storage_for
+            await get_object_storage_for(_backend).get_to_path(task.storage_key, local_path)
             logger.info(
-                "FetchObject: COS 下载完成 key=%s → %s task=%s",
-                task.storage_key, local_path, task.task_id,
+                "FetchObject: %s 下载完成 key=%s → %s task=%s",
+                _backend, task.storage_key, local_path, task.task_id,
             )
             task.file_path = local_path
             # 下游 pipeline 统一按本地文件处理
             # 不修改 task.storage_backend（保留 cos 语义给终态 finally 判断是否清理）
         except Exception as _e:
             logger.exception(
-                "FetchObject: COS 下载失败 key=%s task=%s",
-                task.storage_key, task.task_id,
+                "FetchObject: %s 下载失败 key=%s task=%s",
+                _backend, task.storage_key, task.task_id,
             )
             # [jonex] P0-1: 下载失败不留残留空文件
             try:
@@ -1731,7 +1739,9 @@ class TaskManager:
             except OSError:
                 pass
             # 抛一个能被 _classify_error 识别为 OBJECT_FETCH_FAILED 的异常
-            raise RuntimeError(f"OBJECT_FETCH_FAILED: COS 对象下载失败 key={task.storage_key}: {_e}") from _e
+            raise RuntimeError(
+                f"OBJECT_FETCH_FAILED: {_backend} 对象下载失败 key={task.storage_key}: {_e}"
+            ) from _e
 
         # [jonex] MPS 视频路径：视频文件需保留 COS URL 供 MPS backend 使用
         # [jonex] P2: 改用 storage_key 判扩展名（本地名是 {uuid}_{basename}，可能丢扩展名）
@@ -1766,7 +1776,8 @@ class TaskManager:
         # parse_document 直接 FileNotFoundError。
         if task.execution_mode == "parse_only":
             _cos_temp_path: str | None = None  # [jonex] P0-1: 供 finally 清理
-            if task.storage_backend == "cos" and task.storage_key:
+            # [jonex] S3 兼容：cos/s3 均需 pipeline 前下载到本地
+            if (task.storage_backend or "").strip().lower() in ("cos", "s3") and task.storage_key:
                 _cos_temp_path = await self._fetch_cos_object(task)
             try:
                 await self._run_parse_only(task, handle)
@@ -1785,11 +1796,12 @@ class TaskManager:
         progress_cb = ProgressTrackingCallback(task, handle)
         self._pipeline_executor.callback_manager.register(progress_cb)
 
-        # ── [jonex] R7-2b: FetchObject —— pipeline 前异步下载 COS 对象 ──
-        # 把 COS 下载从同步 HTTP 请求路径（insert/retry invoke）移到异步任务 pipeline，
+        # ── [jonex] R7-2b: FetchObject —— pipeline 前异步下载对象存储对象（cos/s3）──
+        # 把下载从同步 HTTP 请求路径（insert/retry invoke）移到异步任务 pipeline，
         # invoke 立刻返回 task_id，空窗期压到毫秒级。
         _cos_temp_path: str | None = None  # [jonex] P0-1: 供 finally 清理
-        if task.storage_backend == "cos" and task.storage_key:
+        # [jonex] S3 兼容：cos/s3 均需 pipeline 前下载到本地
+        if (task.storage_backend or "").strip().lower() in ("cos", "s3") and task.storage_key:
             _cos_temp_path = await self._fetch_cos_object(task)
 
         # ── PipelineContext (base) — per-task context ──

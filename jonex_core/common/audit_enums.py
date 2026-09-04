@@ -85,6 +85,7 @@ class ResourceType(str, Enum):
 
     # ---- 通用 ----
     HTTP = "http"
+    MCP_KEY = "mcp_key"
 
     @property
     def label_zh(self) -> str:
@@ -175,6 +176,7 @@ _RESOURCE_LABEL_ZH: dict[str, str] = {
     "editor_state": "编辑器状态",
     # ---- 通用 ----
     "http": "HTTP 请求",
+    "mcp_key": "MCP Key",
 }
 
 _RESOURCE_LABEL_EN: dict[str, str] = {
@@ -230,6 +232,7 @@ _RESOURCE_LABEL_EN: dict[str, str] = {
     "editor_state": "Editor State",
     # ---- 通用 ----
     "http": "HTTP Request",
+    "mcp_key": "MCP Key",
 }
 
 # ============ Action → ResourceType 映射 ============
@@ -239,6 +242,8 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "auth.login": "auth",
     "auth.exchange_ticket": "auth",
     "auth.logout": "auth",
+    "impersonate_start": "auth",
+    "impersonate_end": "auth",
     # ---- 文档 → document ----
     "document.upload": "document",
     "document.parse": "document",
@@ -409,6 +414,7 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "search_enhanced": "search",
     "search_ontology_entities": "search",
     "search_service": "service",
+    "batch_set_document_folder": "document",
     "set_document_folder": "document",
     "set_document_tags": "document",
     "set_service_permissions": "service",
@@ -434,6 +440,57 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "delete_prompt": "prompt",
     "get_prompt": "prompt",
     "retry": "prompt",
+    # ---- MCP Key → MCP_KEY ----
+    "mcp_key.create": "mcp_key",
+    "mcp_key.revoke": "mcp_key",
+    "mcp_key.enable": "mcp_key",
+    "mcp_key.disable": "mcp_key",
+    "mcp_key.recreate": "mcp_key",
+    "mcp_key.delete": "mcp_key",
+    "mcp_key.update": "mcp_key",
+    # ---- 服务启停 → service ----
+    "enable_service": "service",
+    "disable_service": "service",
+    # ---- LLM Wiki / 编译模式 → compiled_schema ----
+    "apply_llm_wiki_schema": "compiled_schema",
+    "get_llm_wiki_schema": "compiled_schema",
+    "save_llm_wiki_schema": "compiled_schema",
+    "export_llm_wiki_schema_yaml": "compiled_schema",
+    "import_llm_wiki_schema_yaml": "compiled_schema",
+    "recompile_llm_wiki_schema_outdated_documents": "compiled_schema",
+    "list_wiki_contents": "compiled_schema",
+    "get_wiki_page": "compiled_schema",
+    "export_compiled_schema_yaml": "compiled_schema",
+    "import_compiled_schema_yaml": "compiled_schema",
+    "preview_compiled_schema": "compiled_schema",
+    # ---- 本体模板 → ontology_instance ----
+    "export_template_ontology_yaml": "ontology_instance",
+    "import_template_ontology_yaml": "ontology_instance",
+    # ---- 检索 → search ----
+    "deep_query": "search",
+    "search_mix": "search",
+    "search_llmwiki": "search",
+    # ---- 答案反馈 → search_feedback ----
+    "get_answer_feedback": "search_feedback",
+    "get_answer_feedback_stats": "search_feedback",
+    "list_answer_feedback": "search_feedback",
+    "delete_answer_feedback": "search_feedback",
+    "submit_answer_feedback": "search_feedback",
+    "toggle_answer_feedback_adopted": "search_feedback",
+    # ---- 知识库权限 → knowledge_info ----
+    "get_kb_permissions": "knowledge_info",
+    "set_kb_permissions": "knowledge_info",
+    # ---- 文档状态 / 资产 / 配额 ----
+    "get_document_status": "document",
+    "get_asset_raw_location": "document",
+    "get_quota_view": "knowledge_info",
+    # ---- 分块维护 → chunk ----
+    "scan_stale_chunks": "chunk",
+    "purge_stale_chunks": "chunk",
+    # ---- 提示词模板 / 场景 ----
+    "check_prompt_template_name": "prompt_template",
+    "publish_template_scenario": "template_scenario",
+    "list_impacted_knowledge_bases": "knowledge_info",
 }
 
 # ============ ResourceType → ID 字段名映射 ============

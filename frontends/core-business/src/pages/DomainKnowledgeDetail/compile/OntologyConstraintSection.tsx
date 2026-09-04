@@ -2,7 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { ControlOutlined, PlusOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
+import { ControlOutlined, PlusOutlined, ImportOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { OntologyConstraint } from '@/types/domainKnowledge';
 import { constraintTargetTypeLabelKey } from '@/types/domainKnowledge';
 
@@ -35,11 +35,12 @@ interface Props {
   data: OntologyConstraint[];
   loading: boolean;
   onCreate: () => void;
+  onImport: () => void;
   onEdit: (item: OntologyConstraint) => void;
   onDelete: (item: OntologyConstraint) => void;  canWrite?: boolean;
 }
 
-export default function OntologyConstraintSection({ data, loading, canWrite = false, onCreate, onEdit, onDelete }: Props) {
+export default function OntologyConstraintSection({ data, loading, canWrite = false, onCreate, onImport, onEdit, onDelete }: Props) {
   const { t } = useTranslation();
   const columns: ColumnsType<OntologyConstraint> = [
     {
@@ -114,12 +115,20 @@ export default function OntologyConstraintSection({ data, loading, canWrite = fa
         <h3 style={h3Style}>
           <ControlOutlined style={{ color: '#3b82f6' }} /> {t('compile.constraint.sectionTitle')}
         </h3>
-        <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button type="primary" icon={<PlusOutlined />} style={{ fontSize: 13 }} onClick={onCreate}
             disabled={!canWrite}
             title={canWrite ? undefined : t('domainSpace.noManagePermission')}
           >
-          {t('compile.constraint.createBtn')}
-        </Button>
+            {t('compile.constraint.createBtn')}
+          </Button>
+          <Button icon={<ImportOutlined />} style={{ fontSize: 13 }} onClick={onImport}
+            disabled={!canWrite}
+            title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+          >
+            {t('compile.constraint.importBtn')}
+          </Button>
+        </div>
       </div>
       <p style={{ fontSize: 13, color: '#94a3b8', marginBottom: 16 }}>{t('compile.constraint.sectionDesc')}</p>
       <Table

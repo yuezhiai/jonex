@@ -255,7 +255,9 @@
     "editor": "Editor",
     "viewer": "Viewer",
     "edit": "Editor",
-    "kbManage": "KB Manager"
+    "kbManage": "KB Manager",
+    "spaceMember": "Member",
+    "spaceManager": "Manager"
   },
   "domainSpace": {
     "management": "Domain Space Management",
@@ -355,8 +357,7 @@
     "clear": "Clear",
     "searchPlaceholder": "Enter keywords, e.g., \"device fault diagnosis\" or \"risk assessment model\"",
     "allDomain": "All Domains",
-    "domainSpaceGroup": "Domain Space",
-    "domainServiceGroup": "Domain Service",
+    "currentSpace": "All Knowledge",
     "searchHistory": "Search History",
     "noSearchHistory": "No search history",
     "clearSearchHistory": "Clear Search History",
@@ -382,6 +383,7 @@
     "knowledgeAnalysis": "Knowledge base analysis · {{domain}}",
     "analyzing": "Analyzing...",
     "relatedDocs": "Related Documents ({{count}})",
+    "sourceKb": "Source KB: {{name}}",
     "locatePlay": "Locate & Play",
     "viewVideo": "View Video",
     "playAudio": "Play Audio",
@@ -722,6 +724,7 @@
       "suggestionPlaceholder": "Prompt or fix suggestion when the constraint is violated",
       "sectionTitle": "Constraint Definitions",
       "createBtn": "New Constraint",
+      "importBtn": "Import from Template",
       "sectionDesc": "Define validation constraints for ontology objects, attributes, and relationships, such as exclusivity, range, and uniqueness."
     },
     "statusLabel": "Status: ",
@@ -895,18 +898,22 @@
       "relationType": "Cardinality",
       "emptyObjects": "Select a domain and scenario to view importable objects",
       "emptyRelations": "Select a domain and scenario to view relationships available for import",
+      "emptyConstraints": "Select a domain and scenario to view constraints available for import",
       "loadDomainFailed": "Failed to load template domains",
       "loadScenarioFailed": "Failed to load template scenarios",
       "loadObjectsFailed": "Failed to load objects",
       "loadRelationsFailed": "Failed to load relationships",
+      "loadConstraintsFailed": "Failed to load constraints",
       "importObjectSuccess": "Imported {{created}} objects",
       "importRelationSuccess": "Imported {{created}} relationships",
+      "importConstraintSuccess": "Imported {{created}} constraints",
       "importSkippedSuffix": "; {{skipped}} existing items were skipped",
       "unknownSourceObject": "(Unknown source object)",
       "unknownTargetObject": "(Unknown target object)",
       "importFailed": "Import failed",
       "importTitleObjects": "Import Objects from Template Domain Scenarios",
       "importTitleRelations": "Import Relationships from a Domain Template",
+      "importTitleConstraints": "Import Constraints from a Domain Template",
       "importOkText": "Import Selected",
       "selectDomain": "Select template domain",
       "selectScenario": "Select one or more domain scenarios"
@@ -1033,6 +1040,7 @@
     "apiPullDesc2": "The API must return a JSON array whose items include a file download URL and file name.",
     "apiPullDesc3": "Example response: ",
     "endpointRequired": "Please enter the endpoint URL",
+    "endpointInvalid": "Please enter a valid URL starting with http:// or https://",
     "endpointTooltip": "URL of the external document-list API. The endpoint must support HTTP GET or POST.",
     "endpointPlaceholder": "https://api.example.com/documents",
     "methodTooltip": "Use GET for standard retrieval, or POST if the endpoint requires a request body.",
@@ -1641,6 +1649,7 @@
     "recompileSubmitted": "Submitted {{submitted}}/{{matched}} documents for recompilation; they will run in queue order (expected to take a while)",
     "affectedDocuments": "This change affects {{count}} compiled documents (applied < target, marked outdated)",
     "codeInvalid": "Entity type code must be lowercase ASCII ([a-z0-9 _-])",
+    "codeDuplicate": "Duplicate code: {{code}}",
     "entityTypeSection": "Entity Types (hard)",
     "customBlockSection": "Custom Block (appended to AGENTS.md as-is)",
     "customBlockPlaceholder": "Enter a custom markdown block; it will be appended to AGENTS.md verbatim, e.g.:\n\n## Compile Rules (soft)\nThe following rules are followed by the model on a best-effort basis:\n- Concept threshold: central_or_recurring\n- Max 8 concept pages / 15 entity pages per document\n- Use [[wikilink]] to link concepts and entities",
@@ -1653,8 +1662,7 @@
   },
   "kbPermission": {
     "grantShared": "Shared",
-    "editor": "Editor",
-    "viewer": "Viewer",
-    "kbManager": "KB Manager"
+    "kbManager": "KB Manager",
+    "member": "Member"
   }
 }

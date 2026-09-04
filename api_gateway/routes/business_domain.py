@@ -58,6 +58,24 @@ def _extract_username(request: Request) -> str | None:
         return None
 
 
+def _extract_impersonation(request: Request) -> tuple[bool, list[str], str | None]:
+    """从请求 Authorization 头的 JWT 中提取模拟态上下文（invoke 链路透传用）。"""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False, [], None
+    token = auth[7:]
+    config = get_config()
+    try:
+        payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        return False, [], None
+    return (
+        bool(payload.get("impersonated")),
+        payload.get("perms") or [],
+        payload.get("original_tenant_id"),
+    )
+
+
 async def _call_bd_capability(request: Request, action: str, payload: dict):
     import asyncio
     import random
@@ -70,6 +88,7 @@ async def _call_bd_capability(request: Request, action: str, payload: dict):
     tenant_id = extract_tenant_id(request)
     user_id = _extract_user_id(request)
     username = _extract_username(request)
+    _impersonated, _perms, _original_tenant_id = _extract_impersonation(request)
 
     sidecar_payload = {
         "capability_id": "business.business_domain.v1",
@@ -80,9 +99,14 @@ async def _call_bd_capability(request: Request, action: str, payload: dict):
         sidecar_payload["user_id"] = user_id
     if username:
         sidecar_payload["username"] = username
+    if _impersonated:
+        sidecar_payload["impersonated"] = True
+        sidecar_payload["perms"] = _perms
+        if _original_tenant_id:
+            sidecar_payload["original_tenant_id"] = _original_tenant_id
 
     headers = {
-        "X-API-Key": "jonex_test_gateway",
+        "X-API-Key": config.GATEWAY_API_KEY,
         "X-Request-ID": request_id,
         "X-Tenant-ID": tenant_id,
         "X-Forwarded-For": request.client.host if request.client else "",
@@ -95,7 +119,7 @@ async def _call_bd_capability(request: Request, action: str, payload: dict):
     max_retries = int(os.getenv("GATEWAY_SIDECAR_RETRIES", "2"))
     base_delay = float(os.getenv("GATEWAY_SIDECAR_BASE_DELAY", "1.0"))
     max_delay = float(os.getenv("GATEWAY_SIDECAR_MAX_DELAY", "8.0"))
-    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "120"))
+    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
@@ -232,9 +256,10 @@ async def list_template_domains(
     request: Request,
     offset: int = Query(0, ge=0, description="偏移量"),
     limit: int = Query(20, ge=1, le=100, description="每页条数"),
+    status: str | None = Query(None, description="按状态过滤(active/inactive)"),
 ):
     """获取业务模板领域分页列表"""
-    result = await _call_bd_capability(request, "list_template_domains", {"offset": offset, "limit": limit})
+    result = await _call_bd_capability(request, "list_template_domains", {"offset": offset, "limit": limit, "status": status})
     return success_response(data=result)
 
 
@@ -309,6 +334,27 @@ async def update_template_scenario(request: Request, scenario_id: str, payload: 
 async def delete_template_scenario(request: Request, scenario_id: str):
     """删除指定模板场景"""
     result = await _call_bd_capability(request, "delete_template_scenario", {"scenario_id": scenario_id})
+    return success_response(data=result)
+
+
+@ecosystem_router.post("/templates/scenarios/{scenario_id}/publish", summary="发布模板场景")
+async def publish_template_scenario(request: Request, scenario_id: str):
+    """发布指定模板场景，更新版本号/发布时间/结构哈希"""
+    result = await _call_bd_capability(request, "publish_template_scenario", {"scenario_id": scenario_id})
+    return success_response(data=result)
+
+
+@ecosystem_router.get("/templates/scenarios/{scenario_id}/compile-preview", summary="预览 compiled schema")
+async def preview_compiled_schema(request: Request, scenario_id: str):
+    """预览模板场景编译后的 ontology schema"""
+    result = await _call_bd_capability(request, "preview_compiled_schema", {"scenario_id": scenario_id})
+    return success_response(data=result)
+
+
+@ecosystem_router.get("/templates/scenarios/{scenario_id}/impacted-kbs", summary="查询模板变更影响 KB")
+async def list_impacted_knowledge_bases(request: Request, scenario_id: str):
+    """查询模板变更影响的 KB 列表"""
+    result = await _call_bd_capability(request, "list_impacted_knowledge_bases", {"scenario_id": scenario_id})
     return success_response(data=result)
 
 
@@ -609,6 +655,20 @@ async def list_prompt_templates(
 async def create_prompt_template(request: Request, payload: dict = Body(...)):
     """创建领域空间提示词模板（scope 固定 domain）"""
     result = await _call_bd_capability(request, "create_prompt_template", payload)
+    return success_response(data=result)
+
+
+@ecosystem_router.get("/prompt-templates/check-name", summary="校验提示词模板名称是否重复")
+async def check_prompt_template_name(
+    request: Request,
+    name: str = Query(..., description="待校验名称"),
+    domain_space_id: Optional[str] = Query(None, description="领域空间 ID"),
+    template_id: Optional[str] = Query(None, description="编辑时传入以排除自身"),
+):
+    """同领域空间内名称查重（防抖实时校验用），口径与创建/更新一致。"""
+    result = await _call_bd_capability(request, "check_prompt_template_name", {
+        "name": name, "domain_space_id": domain_space_id, "template_id": template_id,
+    })
     return success_response(data=result)
 
 

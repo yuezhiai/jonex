@@ -7,7 +7,6 @@ except ImportError:
     from pydantic import BaseModel, Field, validator
 
 
-VALID_PERMISSIONS = {"call", "view"}
 VALID_SERVICE_PERMISSION_LEVELS = {"call", "view"}
 
 
@@ -32,16 +31,33 @@ class ServicePermissionItem(BaseModel):
         return v.strip()
 
 
+class WriteGrant(BaseModel):
+    """单个知识库写入授权范围。
+
+    mode ∈ {all, specified}；specified 时 directories 为平铺 folder_id 列表。
+    """
+
+    kb: str
+    mode: str
+    directories: list[str] = []
+
+    @validator("mode")
+    def validate_mode(cls, v):
+        if v not in {"all", "specified"}:
+            raise ValueError("mode 必须是 all 或 specified")
+        return v
+
+
 class McpKeyCreateRequest(BaseModel):
-    """创建 MCP Key 请求——permissions 白名单仅允许 call / view"""
+    """创建统一 MCP Key 请求——多服务授权（service_permissions）+ 写入 grants（write_grants）"""
 
     name: str = Field(default="", max_length=255)
+    note: Optional[str] = Field(default=None, max_length=512)
     space_id: str = Field(..., max_length=64)
-    permissions: list[str] = Field(default=["view"])
-    allowed_kb_ids: list[str] = Field(default=[])
-    service_ids: list[str] = Field(default=[])
     service_permissions: list[ServicePermissionItem] = Field(default=[])
     expires_at: datetime | None = Field(default=None)
+    client_request_id: str = Field(..., max_length=64)
+    write_grants: Optional[list[WriteGrant]] = Field(default=None)
 
     @validator("space_id")
     def validate_space_id(cls, v):
@@ -57,60 +73,23 @@ class McpKeyCreateRequest(BaseModel):
             return stripped
         return v
 
-    @validator("permissions")
-    def validate_permissions(cls, v):
-        """白名单校验：仅接受 call / view"""
-        for perm in v:
-            if perm not in VALID_PERMISSIONS:
-                raise ValueError(
-                    f"无效权限: {perm}，仅支持 {', '.join(sorted(VALID_PERMISSIONS))}"
-                )
-        return v
-
-    @validator("allowed_kb_ids")
-    def validate_allowed_kb_ids(cls, v):
-        """元素级校验：拒绝空字符串、超长元素、超过 100 个元素"""
-        if len(v) > 100:
-            raise ValueError("allowed_kb_ids 最多 100 个")
-        for element in v:
-            if element == "":
-                raise ValueError("allowed_kb_ids 元素不能为空字符串")
-            if len(element) > 64:
-                raise ValueError(
-                    f"allowed_kb_ids 元素过长: {element[:20]}..., 最大 64 字符"
-                )
-        return v
-
-    @validator("service_ids")
-    def validate_service_ids(cls, v):
-        """元素级校验：拒绝空字符串、超长元素、超过 100 个元素"""
-        if len(v) > 100:
-            raise ValueError("service_ids 最多 100 个")
-        for element in v:
-            if element == "":
-                raise ValueError("service_ids 元素不能为空字符串")
-            if len(element) > 64:
-                raise ValueError(
-                    f"service_ids 元素过长: {element[:20]}..., 最大 64 字符"
-                )
-        return v
-
 
 class McpKeyResponse(BaseModel):
-    """单条 Key 响应——不含 key_hash 和 tenant_id，permissions 从逗号字符串 split 为 list"""
+    """单条 Key 响应——不含 key_hash 和 tenant_id"""
 
     id: str
     name: str
     note: str | None = None
     key_prefix: str
     space_id: str | None = None
-    permissions: list[str]
-    allowed_kb_ids: list[str]
-    service_ids: list[str] = []
     service_permissions: list[dict] = []
+    write_grants: Optional[list[WriteGrant]] = None
+    auth_summary: str = ""
+    write_scope_summary: str = ""
     created_by: str | None = None
     created_at: datetime | None = None
     revoked_at: datetime | None = None
+    revoked_by: str | None = None
     expires_at: datetime | None = None
     disabled_at: datetime | None = None
     status: str = "active"
@@ -119,30 +98,23 @@ class McpKeyResponse(BaseModel):
     class Config:
         orm_mode = True
 
-    @validator("permissions", pre=True)
-    def split_permissions(cls, v):
-        """DB 逗号分隔字符串 → list[str]，空字符串/None → []"""
-        if v is None:
-            return []
-        if isinstance(v, str):
-            if v.strip() == "":
-                return []
-            return v.split(",")
-        return v
-
 
 class McpKeyCreateResponse(BaseModel):
-    """创建/重置响应——明文 Key 仅在此 DTO 一次性返回"""
+    """创建/重置响应——明文 Key 仅在此 DTO 一次性返回（幂等命中时 plaintext 为 None）"""
 
     id: str
-    plaintext: str
+    plaintext: Optional[str] = None
     name: str
     key_prefix: str
     space_id: str | None = None
-    permissions: list[str]
-    allowed_kb_ids: list[str]
-    service_ids: list[str] = []
     service_permissions: list[dict] = []
+    write_grants: Optional[list[WriteGrant]] = None
+    status: str = "active"
+    auth_summary: str = ""
+    write_scope_summary: str = ""
+    mcp_config: Optional[dict] = None
+    delivery_failed: bool = False
+    dropped_service_ids: list[str] = Field(default=[])
     created_at: datetime
     expires_at: datetime | None = None
 
@@ -151,9 +123,9 @@ class McpKeyCreateResponse(BaseModel):
 
 
 class _McpKeyUpsertFields(BaseModel):
-    """MCP Key 重置/编辑请求共享字段与校验器。
+    """MCP Key 编辑请求共享字段与校验器。
 
-    为 McpKeyResetRequest 和 McpKeyUpdateRequest 提供统一的 Optional 字段
+    为 McpKeyUpdateRequest 提供统一的 Optional 字段
     定义与校验逻辑，消除重复代码。所有字段默认为 None，由 service 层按
     "传入则更新，未传入则保留原值"的语义处理。
 
@@ -164,12 +136,11 @@ class _McpKeyUpsertFields(BaseModel):
     """
 
     name: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=512)
     space_id: Optional[str] = None
-    permissions: Optional[list[str]] = None
-    allowed_kb_ids: Optional[list[str]] = None
-    service_ids: Optional[list[str]] = None
     service_permissions: Optional[list[ServicePermissionItem]] = Field(default=None)
     expires_at: Optional[datetime] = None
+    write_grants: Optional[list[WriteGrant]] = Field(default=None)
 
     @validator("space_id")
     def validate_space_id_upsert(cls, v):
@@ -180,63 +151,16 @@ class _McpKeyUpsertFields(BaseModel):
             raise ValueError("space_id 不能为空")
         return v.strip()
 
-    @validator("permissions")
-    def validate_permissions(cls, v):
-        """白名单校验——v 为 None（未传入）时跳过校验"""
-        if v is None:
-            return v
-        for perm in v:
-            if perm not in VALID_PERMISSIONS:
-                raise ValueError(
-                    f"无效权限: {perm}，仅支持 {', '.join(sorted(VALID_PERMISSIONS))}"
-                )
-        return v
-
-    @validator("allowed_kb_ids")
-    def validate_allowed_kb_ids(cls, v):
-        """元素级校验——v 为 None（未传入）时跳过校验"""
-        if v is None:
-            return v
-        if len(v) > 100:
-            raise ValueError("allowed_kb_ids 最多 100 个")
-        for element in v:
-            if element == "":
-                raise ValueError("allowed_kb_ids 元素不能为空字符串")
-            if len(element) > 64:
-                raise ValueError(
-                    f"allowed_kb_ids 元素过长: {element[:20]}..., 最大 64 字符"
-                )
-        return v
-
-    @validator("service_ids")
-    def validate_service_ids(cls, v):
-        """元素级校验——v 为 None（未传入）时跳过校验"""
-        if v is None:
-            return v
-        if len(v) > 100:
-            raise ValueError("service_ids 最多 100 个")
-        for element in v:
-            if element == "":
-                raise ValueError("service_ids 元素不能为空字符串")
-            if len(element) > 64:
-                raise ValueError(
-                    f"service_ids 元素过长: {element[:20]}..., 最大 64 字符"
-                )
-        return v
-
-
-class McpKeyResetRequest(_McpKeyUpsertFields):
-    """重置 MCP Key 请求体——所有字段可选，不传则继承旧 Key 对应值"""
-
 
 class McpKeyRecreateRequest(BaseModel):
-    """重新创建 MCP Key 请求——可选覆盖新 Key 的 expires_at（不传默认 12 个月）。
+    """重新创建 MCP Key 请求——可选覆盖新 Key 的 expires_at（不传默认 12 个月）与 name。
 
-    继承原 Key 的 service_permissions / service_ids 授权，生成全新明文 Key，
+    继承原 Key 的 service_permissions + write_grants 授权，生成全新明文 Key，
     旧 Key 保留历史（不撤销）。区别于「启用」（toggle 恢复原 Key）。
     """
 
     expires_at: Optional[datetime] = None
+    name: Optional[str] = Field(default=None, max_length=255)
 
 
 class McpKeyUpdateRequest(_McpKeyUpsertFields):

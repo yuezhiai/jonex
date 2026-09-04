@@ -13,6 +13,7 @@ import random
 import re
 import uuid
 from typing import Any, Optional
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -27,6 +28,7 @@ from pydantic.v1 import BaseModel
 from jonex_core.common.object_storage import build_object_key, get_object_storage, get_object_storage_for
 from capabilities.knowledge_base.dtos import (
     AddDocumentTagRequest,
+    AnswerFeedbackToggleAdoptRequest,
     BatchMoveDocumentsRequest,
     CreateOntologyInstanceRequest,
     DocumentParseResultRequest,
@@ -55,6 +57,7 @@ from capabilities.knowledge_base.dtos import (
     SearchRequest,
     SetDocumentFolderRequest,
     SetDocumentTagsRequest,
+    SubmitAnswerFeedbackRequest,
     TagCreateRequest,
     TagUpdateRequest,
 )
@@ -134,6 +137,28 @@ def _extract_username(request: Request) -> str | None:
         return None
 
 
+def _extract_impersonation(request: Request) -> tuple[bool, list[str], str | None]:
+    """从请求 Authorization 头的 JWT 中提取模拟态上下文（impersonated/perms/original_tenant_id）。
+
+    invoke 链路用 X-API-Key 走 Sidecar apikey 认证，用户 JWT 不会到达 Sidecar，
+    故由 Gateway 解出模拟态上下文放进 invoke payload 透传。
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False, [], None
+    token = auth[7:]
+    config = get_config()
+    try:
+        payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        return False, [], None
+    return (
+        bool(payload.get("impersonated")),
+        payload.get("perms") or [],
+        payload.get("original_tenant_id"),
+    )
+
+
 async def _call_kb_capability(
     request: Request,
     action: str,
@@ -147,6 +172,7 @@ async def _call_kb_capability(
     request_id = getattr(request.state, "request_id", "")
     resolved_user_id = user_id or _extract_user_id(request)
     resolved_username = _extract_username(request)
+    _impersonated, _perms, _original_tenant_id = _extract_impersonation(request)
 
     sidecar_payload: dict[str, Any] = {
         "capability_id": "business.knowledge_base.v1",
@@ -157,9 +183,14 @@ async def _call_kb_capability(
         sidecar_payload["user_id"] = resolved_user_id
     if resolved_username:
         sidecar_payload["username"] = resolved_username
+    if _impersonated:
+        sidecar_payload["impersonated"] = True
+        sidecar_payload["perms"] = _perms
+        if _original_tenant_id:
+            sidecar_payload["original_tenant_id"] = _original_tenant_id
 
     headers = {
-        "X-API-Key": "jonex_test_gateway",
+        "X-API-Key": config.GATEWAY_API_KEY,
         "X-Request-ID": request_id,
         "X-Tenant-ID": tenant_id,
         "X-Forwarded-For": request.client.host if request.client else "",
@@ -170,7 +201,7 @@ async def _call_kb_capability(
     max_retries = int(os.getenv("GATEWAY_SIDECAR_RETRIES", "2"))
     base_delay = float(os.getenv("GATEWAY_SIDECAR_BASE_DELAY", "1.0"))
     max_delay = float(os.getenv("GATEWAY_SIDECAR_MAX_DELAY", "8.0"))
-    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "120"))
+    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
@@ -250,13 +281,18 @@ async def upload_document(
         payload["folder_id"] = folder_id
 
     if storage_key:
-        # COS 直传模式：文件已在 COS 上，只需确认
+        # 对象存储直传模式（cos/s3）：文件已在对象存储上，只需确认
         if doc_id:
             payload["doc_id"] = doc_id
         payload["file_name"] = file_name or storage_key.rsplit("/", 1)[-1]
         payload["file_path"] = storage_key
         payload["storage_key"] = storage_key
-        payload["storage_backend"] = storage_backend or "cos"
+        # [jonex] S3 兼容：前端未显式指定时跟随平台全局配置，不硬编码 cos——
+        # 否则 S3 部署下直传确认会把文档标成 cos，后续取原文用错客户端。
+        _env_backend = (os.getenv("OBJECT_STORAGE_BACKEND", "local") or "local").strip().lower()
+        payload["storage_backend"] = storage_backend or (
+            _env_backend if _env_backend in ("cos", "s3") else "cos"
+        )
         if mime_type:
             payload["mime_type"] = mime_type
     else:
@@ -297,16 +333,23 @@ async def generate_upload_url(
     knowledge_base_id: str = Body(..., min_length=1, max_length=128),
     file_name: str = Body(..., min_length=1, max_length=512),
     content_type: Optional[str] = Body(None, max_length=128),
+    file_size: Optional[int] = Body(None, ge=1),
 ):
     """生成 COS 预签名 PUT URL，前端直传字节到 COS（不经 Sidecar）。
 
     D9：大文件不经 Sidecar 透传字节，用预签名 URL 直传 COS。
     上传完成后调 upload_document 只传 storage_key + 元数据确认。
+    file_size（可选）为待上传字节数：传时服务端校验上限并签入 Content-Length。
     """
     result = await _call_kb_capability(
         request,
         "generate_upload_url",
-        {"knowledge_base_id": knowledge_base_id, "file_name": file_name, "content_type": content_type},
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "file_name": file_name,
+            "content_type": content_type,
+            "file_size": file_size,
+        },
     )
     return success_response(data=result)
 
@@ -815,7 +858,7 @@ async def search_documents_stream(
             "created": created, "model": "lightrag", "choices": [None],
         }
         _stream_headers = {
-            "X-API-Key": "jonex_test_gateway",
+            "X-API-Key": config.GATEWAY_API_KEY,
             "X-Request-ID": request_id,
             "X-Tenant-ID": tenant_id,
         }
@@ -1071,6 +1114,100 @@ async def get_search_feedback_stats(
         request,
         "get_search_feedback_stats",
         {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 回答级反馈 /api/v1/knowledge-base/search/answer-feedback
+# 锚点 history_id = 检索历史 id；主记录保存最新反馈，事件表 operation_id 幂等
+# ════════════════════════════════════════════════════════════
+
+
+@router.post("/search/answer-feedback", summary="提交/更新回答反馈（点赞/点踩）")
+async def submit_answer_feedback(request: Request, payload: SubmitAnswerFeedbackRequest):
+    """提交回答级反馈：like/dislike + 原因 + 补充说明，按 history_id 锚定问答记录。"""
+    result = await _call_kb_capability(
+        request,
+        "submit_answer_feedback",
+        _schema_payload(payload),
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/search/answer-feedback", summary="回显回答反馈状态")
+async def get_answer_feedback(
+    request: Request,
+    history_id: str = Query(..., min_length=1, max_length=64, description="问答记录 ID"),
+):
+    """按 history_id 查询当前反馈状态（无反馈或非本人返回 null）。"""
+    result = await _call_kb_capability(
+        request,
+        "get_answer_feedback",
+        {"history_id": history_id},
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/search/answer-feedback/list", summary="按知识库聚合查询回答反馈列表")
+async def list_answer_feedback(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+    feedback_type: Optional[str] = Query(None, regex="^(like|dislike)?$", description="按反馈类型过滤"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(50, ge=1, le=100, description="每页条数"),
+):
+    """按知识库聚合查询回答反馈列表（含统计）。"""
+    result = await _call_kb_capability(
+        request,
+        "list_answer_feedback",
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "feedback_type": feedback_type,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+    return success_response(data=result)
+
+
+@router.get("/search/answer-feedback/stats", summary="按知识库聚合统计回答反馈")
+async def get_answer_feedback_stats(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """获取知识库回答反馈统计（总数、点赞数、点踩数）。"""
+    result = await _call_kb_capability(
+        request,
+        "get_answer_feedback_stats",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/search/answer-feedback/toggle-adopt", summary="切换回答反馈采纳状态")
+async def toggle_answer_feedback_adopted(request: Request, payload: AnswerFeedbackToggleAdoptRequest):
+    """切换指定回答反馈记录的采纳状态。"""
+    result = await _call_kb_capability(
+        request,
+        "toggle_answer_feedback_adopted",
+        _schema_payload(payload),
+    )
+    return success_response(data=result)
+
+
+@router.delete("/search/answer-feedback/{feedback_id}", summary="删除回答反馈记录")
+async def delete_answer_feedback(
+    request: Request,
+    feedback_id: str,
+):
+    """软删除指定回答反馈记录。"""
+    result = await _call_kb_capability(
+        request,
+        "delete_answer_feedback",
+        {"feedback_id": feedback_id},
     )
     return success_response(data=result)
 
@@ -1358,6 +1495,26 @@ async def recompile_llm_wiki_schema_outdated(
 
 
 # ════════════════════════════════════════════════════════════
+# 系统配额查询 /api/v1/knowledge-base/quota
+# ════════════════════════════════════════════════════════════
+
+@router.get("/quota", summary="系统配额用量查询")
+async def get_quota_view(
+    request: Request,
+    knowledge_base_id: Optional[str] = Query(None, description="知识库 ID（可选，传则 knowledgeBaseDocumentLimit 按该 KB 文档数统计）"),
+):
+    """查询当前租户的 12 项系统配额 used/reserved/limit/unit。
+
+    存储类（*MiB）limit/used 返回 Byte，前端除以 1048576 展示；单位 unit 仅作标签。
+    """
+    payload: dict[str, Any] = {}
+    if knowledge_base_id:
+        payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(request, "get_quota_view", payload)
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
 # 知识库信息管理（KnowledgeInfo CRUD）
 # ════════════════════════════════════════════════════════════
 
@@ -1413,6 +1570,13 @@ async def set_kb_permissions(request: Request, kb_id: str, payload: dict = Body(
     """设置指定知识库的授权成员（editor/viewer 叠加授权）"""
     payload["kb_id"] = kb_id
     result = await _call_kb_capability(request, "set_kb_permissions", payload)
+    return success_response(data=result)
+
+
+@router.get("/knowledge-info/{kb_id}/permission-candidates", summary="知识库添加成员候选用户")
+async def get_kb_permission_candidates(request: Request, kb_id: str):
+    """父空间成员池中可被加入该知识库的用户（排除已有 KB 成员与操作者本人）"""
+    result = await _call_kb_capability(request, "get_kb_permission_candidates", {"kb_id": kb_id})
     return success_response(data=result)
 
 
@@ -1475,6 +1639,13 @@ async def set_space_permissions(request: Request, space_id: str, payload: dict =
     return success_response(data=result)
 
 
+@router.get("/spaces/{space_id}/permission-candidates", summary="领域空间添加成员候选用户")
+async def get_space_permission_candidates(request: Request, space_id: str):
+    """本租户活跃用户中可被加入该空间的用户（排除已有空间成员与操作者本人）"""
+    result = await _call_kb_capability(request, "get_space_permission_candidates", {"space_id": space_id})
+    return success_response(data=result)
+
+
 # ════════════════════════════════════════════════════════════
 # 领域服务 /api/v1/knowledge-base/services  ->  business.knowledge_base.v1
 # ════════════════════════════════════════════════════════════
@@ -1485,9 +1656,10 @@ async def list_services(
     space_id: Optional[str] = Query(None, description="所属空间 ID"),
     offset: int = Query(0, ge=0, description="偏移量"),
     limit: int = Query(20, ge=1, le=100, description="每页条数"),
+    scope: Optional[str] = Query("manage", description="manage=管理视角 | search=检索视角"),
 ):
     """获取领域服务分页列表"""
-    result = await _call_kb_capability(request, "list_services", {"space_id": space_id, "offset": offset, "limit": limit})
+    result = await _call_kb_capability(request, "list_services", {"space_id": space_id, "offset": offset, "limit": limit, "scope": scope})
     return success_response(data=result)
 
 
@@ -1533,20 +1705,6 @@ async def disable_service(request: Request, service_id: str):
     result = await _call_kb_capability(request, "disable_service", {"service_id": service_id})
     return success_response(data=result, message="领域服务已停用")
 
-
-@router.get("/services/{service_id}/permissions", summary="获取领域服务权限")
-async def get_service_permissions(request: Request, service_id: str):
-    """获取指定领域服务的权限设置"""
-    result = await _call_kb_capability(request, "get_service_permissions", {"service_id": service_id})
-    return success_response(data=result)
-
-
-@router.put("/services/{service_id}/permissions", summary="设置领域服务权限")
-async def set_service_permissions(request: Request, service_id: str, payload: dict = Body(...)):
-    """设置指定领域服务的权限"""
-    payload["service_id"] = service_id
-    result = await _call_kb_capability(request, "set_service_permissions", payload)
-    return success_response(data=result)
 
 
 @router.get("/services/{service_id}/api-keys", summary="获取 API Key 列表")
@@ -1859,6 +2017,7 @@ async def get_ontology_graph(
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
     limit: int = Query(500, ge=1, le=2000, description="节点数量上限（按连接度取 top-N）"),
     entity_types: Optional[list[str]] = Query(None, description="按实体类型过滤，可重复传参"),
+    document_id: Optional[str] = Query(None, min_length=1, max_length=128, description="按来源文档过滤"),
 ):
     """获取知识库图谱数据（按连接度取 top-N 节点），返回 nodes、edges 及全量统计，
     用于前端力导向图渲染与类型筛选/数量提示"""
@@ -1866,6 +2025,7 @@ async def get_ontology_graph(
         knowledge_base_id=knowledge_base_id,
         limit=limit,
         entity_types=entity_types,
+        document_id=document_id,
     )
     result = await _call_kb_capability(request, "get_ontology_graph", _schema_payload(payload))
     return success_response(data=result)
@@ -2175,9 +2335,9 @@ async def _call_kb_capability_ingest(
             },
         },
     }
-    headers = {"X-API-Key": "jonex_test_gateway"}
+    headers = {"X-API-Key": config.GATEWAY_API_KEY}
     transmit_locale_header(headers)
-    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "120"))
+    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{config.SIDECAR_URL}/invoke", json=sidecar_payload, headers=headers)
     result = resp.json()
@@ -2201,8 +2361,16 @@ async def ingest_push(
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file_name)
     doc_id = str(uuid4())
     prefix = os.getenv("COS_KEY_PREFIX", "jonex")
-    # 外部调用无 tenant_id：用 ds_id 作为对象路径隔离；tenant 落库由能力侧 ds 记录决定
-    storage_key = f"{prefix}/ingest/{ds_id}/{doc_id}/{doc_id}_{safe}"
+    # 提前解析 ingest key 获取自包含租户，把对象纳入 kb/{tenant_id}/ingest/ 租户前缀，
+    # 使 STS 临时密钥 policy（kb/{tenant_id}/*）天然覆盖该对象的预签名下载
+    from jonex_core.common.crypto import decode_ingest_key
+    key_info = decode_ingest_key(x_ingest_key) or {}
+    if key_info.get("ds_id") and key_info["ds_id"] != ds_id:
+        raise InvalidApiKeyError(message=translate("err.ingest.key_mismatch", fallback="ingest key 与数据源不匹配"))
+    tenant_id = key_info.get("tenant_id")
+    if not tenant_id:
+        raise InvalidApiKeyError(message=translate("err.ingest.key_invalid", fallback="ingest key 无效"))
+    storage_key = f"{prefix}/kb/{tenant_id}/ingest/{ds_id}/{doc_id}/{doc_id}_{safe}"
     await get_object_storage().put_bytes(storage_key, content, content_type=file.content_type)
 
     result = await _call_kb_capability_ingest(
@@ -2223,16 +2391,21 @@ async def get_raw_document(
     document_id: str,
     token: Optional[str] = Query(None, description="短时查看 token（音视频/PDF/图片直连用）"),
     proxy: bool = Query(False, description="同源代理模式：COS 后端由网关流式透传字节，规避跨域 CSP/X-Frame-Options（PDF/文本 iframe 用）"),
+    download: bool = Query(False, description="下载模式：Content-Disposition attachment + 原文件名（仅前端对平台管理员暴露）"),
 ):
     """获取文档原文。鉴权二选一：
 
     - ``?token=``：短时查看票据，从 token 解析租户（音视频 ``<video>`` 直连、PDF/图片新标签预览）；
     - 否则回退 Authorization 头（文本 blob 取数路径，保持兼容）。
 
-    后端分流：
-    - cos + ``proxy=0``：302 预签名 URL（浏览器直连，Range/流式最优，适合音视频/图片）；
-    - cos + ``proxy=1``：网关流式透传 COS 字节（同源，规避 frame-src CSP 与 COS X-Frame-Options，适合 PDF/文本 iframe）；
+    后端分流（对象存储 = cos / s3，后者含 MinIO 等 S3 兼容端点）：
+    - 对象存储 + ``proxy=0``：302 预签名 URL（浏览器直连，Range/流式最优，适合音视频/图片）。
+      注意浏览器会按 CSP 的 img-src / media-src 校验该来源，部署需配 CSP_STORAGE_ORIGIN；
+    - 对象存储 + ``proxy=1``：网关流式透传上游字节（同源，规避 frame-src CSP 与上游
+      X-Frame-Options，适合 PDF/文本 iframe）；
     - local：FileResponse 从共享卷流式返回（支持 Range/seek）。
+
+    - ``download=1``：响应头改为 attachment + 原文件名（浏览器触发下载）；对象存储直连场景由预签名 URL 的 response-content-disposition 参数承载。
     """
     if token:
         info = verify_view_token(token)
@@ -2244,22 +2417,54 @@ async def get_raw_document(
         tenant_id = extract_tenant_id(request)
 
     loc = await _call_kb_capability(
-        request, "get_raw_location", {"document_id": document_id}, tenant_id=tenant_id
+        request, "get_raw_location", {"document_id": document_id, "download": download}, tenant_id=tenant_id
     )
     presigned = loc.get("presigned_url")
     if presigned:
+        # [jonex] 记录上游来源，用于核对 CSP 的 img-src / media-src 该填什么域
+        # （virtual-hosted 风格下 host 含 bucket 前缀，与 path-style 不同）。
+        # 只记 scheme+host+path，绝不记 query：预签名的 signature 是临时凭证，
+        # 落进日志等于泄漏该对象的读权限。
+        _up = urlsplit(presigned)
+        logger.info(
+            "原文预览: doc=%s backend=%s mode=%s upstream=%s://%s path=%s",
+            document_id,
+            loc.get("storage_backend") or "?",
+            "proxy" if proxy else "redirect-302",
+            _up.scheme,
+            _up.netloc,
+            _up.path,
+        )
         if proxy:
-            # 同源代理：网关向 COS 预签名 URL 发起流式 GET，转发 Range，原样回传字节。
-            # iframe 始终同源 → 不受 frame-src CSP / COS X-Frame-Options / COS CORS 限制。
+            # 同源代理：网关向对象存储预签名 URL 发起流式 GET，转发 Range，原样回传字节。
+            # iframe 始终同源 → 不受 frame-src CSP / 上游 X-Frame-Options / 上游 CORS 限制。
             range_header = request.headers.get("range")
             upstream_headers = {"Range": range_header} if range_header else {}
-            client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None), follow_redirects=True)
-            upstream = await client.send(
-                client.build_request("GET", presigned, headers=upstream_headers),
-                stream=True,
+            # [jonex] local_address 绑定 IPv4 通配地址，强制 httpx 走 IPv4。
+            # 背景：容器内 DNS 会为 S3 端点同时返回 IPv6（Docker Desktop 的 ULA 私有段）
+            # 和 IPv4，httpx（httpcore+anyio）优先拨 IPv6 且不 fallback，会在 start_tls
+            # 阶段抛空消息的 ConnectError；boto3（urllib3）走 IPv4 正常，故仅代理路径受影响。
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, read=None),
+                follow_redirects=True,
+                transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
             )
+            try:
+                upstream = await client.send(
+                    client.build_request("GET", presigned, headers=upstream_headers),
+                    stream=True,
+                )
+            except Exception:
+                # _stream_upstream 的 finally 只覆盖成功路径，这里兜底避免连接池泄漏
+                await client.aclose()
+                raise
+            disposition = "inline"
+            if download:
+                disposition = "attachment"
+                if loc.get("file_name"):
+                    disposition += f"; filename*=UTF-8''{quote(loc.get('file_name'))}"
             resp_headers = {
-                "Content-Disposition": "inline",
+                "Content-Disposition": disposition,
                 "X-Content-Type-Options": "nosniff",
                 "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
             }
@@ -2295,7 +2500,7 @@ async def get_raw_document(
         path=fs_path,
         media_type=_safe_inline_media_type(loc.get("mime_type")),
         filename=loc.get("file_name") or None,
-        content_disposition_type="inline",  # 内联预览而非强制下载
+        content_disposition_type="attachment" if download else "inline",  # download 触发浏览器下载，否则内联预览
         headers={"X-Content-Type-Options": "nosniff"},  # 同源场景禁 MIME 嗅探，配合 html/svg 降级防 XSS
     )
 

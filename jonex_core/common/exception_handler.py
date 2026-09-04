@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 全局异常处理器
+Jonex 平台 - 全局异常处理器
 
 提供 FastAPI 全局异常处理函数，统一异常到 HTTP 响应的映射
 """
@@ -35,7 +35,7 @@ def _resolve_error(exc: JonexException):
 
 async def jonex_exception_handler(request: Request, exc: JonexException) -> JSONResponse:
     """
-    处理悦溪平台自定义异常
+    处理Jonex 平台自定义异常
 
     Args:
         request: FastAPI 请求对象

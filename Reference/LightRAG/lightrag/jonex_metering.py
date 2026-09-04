@@ -1,4 +1,4 @@
-# [jonex] 悦溪新增文件：LLM/Embedding 计量上下文透传
+# [jonex] Jonex新增文件：LLM/Embedding 计量上下文透传
 #
 # 作用：让 LightRAG 内部发起的 LLM/Embedding 调用带上 X-Jonex-* 头，
 #       使 llm-gateway 能记录 tenant/kb/doc/scene/trace 维度。

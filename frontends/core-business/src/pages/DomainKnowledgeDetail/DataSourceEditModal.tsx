@@ -17,6 +17,7 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
   const [editingExtStr, setEditingExtStr] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [editingConfig, setEditingConfig] = useState<Record<string, any>>(editingDs?.configJson || {});
+  const [endpointError, setEndpointError] = useState('');
 
   // 同步 props 到内部状态
   React.useEffect(() => {
@@ -30,6 +31,7 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
             ? editingDs.configJson?.include_ext || []
             : [];
       setEditingExtStr(Array.isArray(extArr) ? extArr.join(',') : String(extArr || ''));
+      setEndpointError('');
     }
   }, [editingDs]);
 
@@ -72,6 +74,19 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
       message.warning(t('domainKnowledge.nameCannotBeEmpty'));
       return;
     }
+    // Endpoint URL 格式校验（api 必填，storage 可选，填了须合法）
+    if (editingDs.accessType === 'api' || editingDs.accessType === 'storage') {
+      const endpoint = (editingConfig.endpoint || '').trim();
+      if (editingDs.accessType === 'api' && !endpoint) {
+        setEndpointError(t('dataSource.endpointRequired'));
+        return;
+      }
+      if (endpoint && !/^https?:\/\/\S+/i.test(endpoint)) {
+        setEndpointError(t('dataSource.endpointInvalid'));
+        return;
+      }
+    }
+    setEndpointError('');
     setSubmitting(true);
     try {
       const cfg = buildEditConfig();
@@ -119,10 +134,17 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
 
         {editingDs?.accessType === 'api' && (
           <>
-            <Form.Item label={t('domainKnowledge.apiEndpoint')}>
+            <Form.Item
+              label={t('domainKnowledge.apiEndpoint')}
+              validateStatus={endpointError ? 'error' : undefined}
+              help={endpointError}
+            >
               <Input
                 value={getEditField('endpoint')}
-                onChange={(v) => setEditField('endpoint', v.target.value)}
+                onChange={(v) => {
+                  setEditField('endpoint', v.target.value);
+                  setEndpointError('');
+                }}
                 placeholder="https://api.example.com/documents"
               />
             </Form.Item>
@@ -199,10 +221,17 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
                 ]}
               />
             </Form.Item>
-            <Form.Item label={t('domainKnowledge.dataSourceDesc.endpoint')}>
+            <Form.Item
+              label={t('domainKnowledge.dataSourceDesc.endpoint')}
+              validateStatus={endpointError ? 'error' : undefined}
+              help={endpointError}
+            >
               <Input
                 value={getEditField('endpoint')}
-                onChange={(v) => setEditField('endpoint', v.target.value)}
+                onChange={(v) => {
+                  setEditField('endpoint', v.target.value);
+                  setEndpointError('');
+                }}
                 placeholder="http://minio:9000"
               />
             </Form.Item>

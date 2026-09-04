@@ -1,5 +1,5 @@
 -- ============================================================
--- 悦溪平台数据库初始化 - 业务领域 (business_domain schema)
+-- Jonex 平台数据库初始化 - 业务领域 (business_domain schema)
 -- 版本: 005
 -- 包含：引擎管理（数据接入/解析器/模型）、领域空间、领域服务
 --       领域服务 API Key 管理、生态适配器、技能管理、
@@ -249,7 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_tc_scenario ON business_domain.template_constrain
 CREATE INDEX IF NOT EXISTS idx_tc_target ON business_domain.template_constraints(target_id);
 
 -- ============================================================
--- 悦溪平台数据库迁移 - 提示词模板
+-- Jonex 平台数据库迁移 - 提示词模板
 -- 版本: 008
 -- 包含: business_domain.prompt_templates 表
 -- 说明: tenant_id 为 NULL 时表示系统全局模板（跨租户可见，只读）

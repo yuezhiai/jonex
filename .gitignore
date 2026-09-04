@@ -275,3 +275,44 @@ poc
 .agents
 .pnpm-store
 deploy/.env-aws
+
+# ===== TLS 证书与私钥 =====
+# 一律不进版本库。证书由运行期 volume 挂载（TLS_CERT_DIR 指向仓库外路径），
+# 见 docs/https-domain-access-plan.md 5.6 / 5.10
+*.key
+*.crt
+*.pem
+*.csr
+*.pfx
+*.p12
+certs/
+**/certs/
+
+# ===== 内部文档与内部资料（本地保留，禁止入库/推送公开仓库） =====
+# —— 仓库根的内部资料 ——
+/ARCHITECTURE_REFACTOR_SUMMARY.md
+/PROJECT_ISSUES_AND_TODO.md
+/README.zh.md
+/README_GITHUB.md
+/backend-development-standard.md
+/frontend-development-standard.md
+/dev-guide.macos.md
+/dev-guide.windows.md
+/server-local-frontend-dev-guide.md
+/frontends/core-business/CLAUDE.md
+# —— docs/ 下为内部设计文档与执行计划（仅公开素材与既有文档入库）——
+/docs/*
+!/docs/assets/
+!/docs/assets/**
+!/docs/dev/
+!/docs/examples/
+# —— 其余内部文档 ——
+/Reference/Rag-anything/docs/
+# 客户定制领域本体（含真实业务语料引用），不入库
+/deploy/config/ontology/nanfang_publishing.yaml
+# frontends/ 下的误提交杂项
+/frontends/_tc.txt
+# frontends/ 内部文档（设计/i18n 计划等，不入库）
+/frontends/docs/
+/frontends/translateDocs/
+/frontends/i18n-status.md

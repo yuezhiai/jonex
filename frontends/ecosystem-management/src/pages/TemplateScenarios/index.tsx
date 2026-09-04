@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Alert, Button, Menu, message, Modal, Select, Table, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
@@ -71,6 +71,9 @@ export default function TemplateScenarios() {
   const [relations, setRelations] = useState<TemplateRelation[]>([]);
   const [constraints, setConstraints] = useState<TemplateConstraint[]>([]);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // [jonex] 进入页面时按 URL domain_id 参数自动默认选中对应领域（首次渲染固定，后续变更不影响）
+  const initialDomainIdRef = useRef(searchParams.get('domain_id') || '');
   const { t, i18n } = useTranslation();
   const english = isEnglishLanguage(i18n.resolvedLanguage || i18n.language);
 
@@ -104,7 +107,7 @@ export default function TemplateScenarios() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectedFileRef = useRef<File | null>(null);
 
-  const [domainFilter, setDomainFilter] = useState('');
+  const [domainFilter, setDomainFilter] = useState(initialDomainIdRef.current);
   const [selectedSceneId, setSelectedSceneId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'objects' | 'relations' | 'constraints'>('objects');
 
@@ -213,7 +216,8 @@ export default function TemplateScenarios() {
       .catch((error) => message.error(getErrorMessage(error, t('templateScenarios.loadDomainsFailed'))))
       .finally(() => setLoadingDomains(false));
 
-    void refreshScenarios('');
+    // [jonex] 进入页面时按 URL domain_id 参数自动默认选中对应领域
+    void refreshScenarios(initialDomainIdRef.current);
   }, [refreshScenarios]);
 
   useEffect(() => {

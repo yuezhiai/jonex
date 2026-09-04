@@ -3,11 +3,11 @@
 完整视频处理链路测试 — vLLM Qwen2.5-VL-7B + LM Studio Embedding + Whisper ASR
 
 服务端点:
-  - LLM+VLM:    http://172.16.13.125:8000/v1  (vLLM OpenAI-compatible)
+  - LLM+VLM:    http://127.0.0.1:8000/v1  (vLLM OpenAI-compatible)
                  Qwen2.5-VL-7B — 文本 + 视觉，无 thinking 模式
   - Embedding:  http://localhost:1234/v1 (LM Studio)
                  text-embedding-embeddinggemma-300m (dim=768)
-  - ASR/Whisper: http://172.16.13.125:9090/v1
+  - ASR/Whisper: http://127.0.0.1:9090/v1
                  large-v3 (openai_compatible)
 
 Usage:
@@ -34,8 +34,8 @@ VIDEO_PATH = r"C:\work\项目文件\DataAI\dataset\DM_20260526140158_001.mp4"
 WORKING_DIR = "./rag_storage_video_test"
 
 # vLLM (LLM + VLM, OpenAI-compatible)
-VLLM_BASE = "http://172.16.13.125:8000/v1"
-VLLM_MODEL = "/home/yuexi/Qwen2.5-VL-7B"
+VLLM_BASE = "http://127.0.0.1:8000/v1"
+VLLM_MODEL = "/home/jonex/Qwen2.5-VL-7B"
 VLLM_KEY = "not-needed"
 
 # LM Studio 本地 Embedding
@@ -44,7 +44,7 @@ EMBEDDING_MODEL = "text-embedding-embeddinggemma-300m"
 EMBEDDING_DIM = 768
 
 # Whisper ASR
-WHISPER_BASE = "http://172.16.13.125:9090/v1"
+WHISPER_BASE = "http://127.0.0.1:9090/v1"
 WHISPER_MODEL = "large-v3"
 WHISPER_KEY = "not-needed"
 

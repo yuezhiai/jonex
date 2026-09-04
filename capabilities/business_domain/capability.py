@@ -19,6 +19,7 @@ from capabilities.business_domain.services import (
     AdapterService, SkillService, TemplateService,
 )
 from capabilities.business_domain.services.prompt_template_service import PromptTemplateService
+from capabilities.business_domain.services.template_publish_service import TemplatePublishService
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,14 @@ _ACTION_PERMISSIONS = {
     "update_prompt_template": "prompt:write",
     "delete_prompt_template": "prompt:write",
     "copy_prompt_template": "prompt:write",
+    "check_prompt_template_name": "prompt:read",
     "rollback_prompt_template": "prompt:write",
     "create_template_constraint": "template:write",
     "update_template_constraint": "template:write",
     "delete_template_constraint": "template:write",
     "import_template_ontology_yaml": "template:write",
     "export_template_ontology_yaml": "template:write",
+    "publish_template_scenario": "template:write",
 }
 
 
@@ -77,11 +80,9 @@ async def _check_action_permission(request) -> None:
         return
     if not request.user_id:
         return
-    from jonex_core.security.permission import get_user_permissions
+    from jonex_core.security.permission import has_permission
 
-    tenant_id = request.tenant_id
-    perms = await get_user_permissions(tenant_id, int(request.user_id))
-    if code not in perms:
+    if not await has_permission(request.tenant_id, int(request.user_id), code):
         raise PermissionDeniedError(
             message=translate("err.auth.insufficient_permission", params={"required": code}, fallback=f"权限不足：需要权限 {code}")
         )
@@ -96,6 +97,7 @@ class BusinessDomainCapability(BaseCapability):
         self._skill = SkillService()
         self._template = TemplateService()
         self._prompt_template = PromptTemplateService()
+        self._publish = TemplatePublishService()
         self._dispatch = self._build_dispatch()
         super().__init__()
 
@@ -112,6 +114,7 @@ class BusinessDomainCapability(BaseCapability):
         sk = self._skill
         t = self._template
         pt = self._prompt_template
+        p = self._publish
         return {
             # ── 引擎管理 ──
             "list_access_methods":    lambda r, d: e.list_access_methods(d.get("offset", 0), d.get("limit", 20)),
@@ -137,7 +140,7 @@ class BusinessDomainCapability(BaseCapability):
             "disable_skill":          lambda r, d: sk.disable(r.tenant_id, d["skill_id"]),
             "list_enabled_mcp_tools": lambda r, d: sk.list_enabled_mcp_tools(r.tenant_id),
             # ── 业务模板 ──
-            "list_template_domains":    lambda r, d: t.list_domains(r.tenant_id, d.get("offset", 0), d.get("limit", 20)),
+            "list_template_domains":    lambda r, d: t.list_domains(r.tenant_id, d.get("offset", 0), d.get("limit", 20), d.get("status")),
             "get_template_domain":      lambda r, d: t.get_domain(d["domain_id"], r.tenant_id),
             "create_template_domain":   lambda r, d: t.create_domain(r.tenant_id, d),
             "update_template_domain":   lambda r, d: t.update_domain(d["domain_id"], r.tenant_id, d),
@@ -181,6 +184,11 @@ class BusinessDomainCapability(BaseCapability):
                 d["template_id"], r.tenant_id, d.get("user_id"),
                 domain_space_id=d.get("domain_space_id"),
             ),
+            "check_prompt_template_name":  lambda r, d: pt.check_name_exists(
+                r.tenant_id, d.get("name"),
+                domain_space_id=d.get("domain_space_id"),
+                template_id=d.get("template_id"),
+            ),
             "list_prompt_template_versions": lambda r, d: pt.list_versions(
                 d["template_id"], r.tenant_id,
                 domain_space_id=d.get("domain_space_id"),
@@ -199,6 +207,10 @@ class BusinessDomainCapability(BaseCapability):
                 r.tenant_id, d["scenario_id"], d["yaml_text"],
                 dry_run=d.get("dry_run", True), mode=d.get("mode", "merge"),
             ),
+            # ── 模板发布 / 编译预览 / 影响范围 ──
+            "publish_template_scenario":     lambda r, d: p.publish_scenario(r.tenant_id, d["scenario_id"]),
+            "preview_compiled_schema":       lambda r, d: p.compile_preview(r.tenant_id, d["scenario_id"]),
+            "list_impacted_knowledge_bases": lambda r, d: p.list_impacted_kbs(r.tenant_id, d["scenario_id"]),
         }
 
     def _build_metadata(self) -> CapabilityMetadata:

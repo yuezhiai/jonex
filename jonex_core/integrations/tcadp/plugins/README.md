@@ -4,7 +4,7 @@
 
 ## TCADP API 插件模式
 
-1. **导出 YAML** - 将悦溪平台的业务 API 导出为 OpenAPI 3.0 YAML
+1. **导出 YAML** - 将Jonex 平台的业务 API 导出为 OpenAPI 3.0 YAML
 2. **导入 TCADP** - 在 TCADP 后台手动创建 API 插件并导入 YAML
 3. **直接调用** - TCADP 直接调用平台业务路由
 

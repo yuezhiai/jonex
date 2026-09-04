@@ -9,6 +9,7 @@ Includes:
 - GenericModalProcessor: Processor for other modal content
 """
 
+import os  # [jonex] §image-refs E2: RAG_IMAGE_ANCHOR_ENABLED 开关
 import re
 import json
 import time
@@ -61,6 +62,150 @@ def _pick_prompt(prompt_overrides, base_code: str, has_context: bool,
             pass
     return default_ctx if has_context else default_base
 
+
+
+# ── [jonex] §image-refs P0-6 图片版面主题锚点 ─────────────────────────
+# 背景（docs/image-reference-accuracy-fix-plan.md E 方案 §26/§27）：VLM
+# 图片描述的主题关联不稳定（低量化 VLM 在多候选上下文中选错主题，描述
+# 缺文档核心关键词 → 检索不召回，如"花瓜鱼蟹四屏"缺一屏）。锚点改为从
+# MinerU 结构化产物（content_list）确定性提取，两处使用，不依赖 VLM：
+#   1) VLM 调用前（ImageModalProcessor）：断言式注入提示词 + 收窄 context；
+#   2) push 阶段（stages._collect_multimodal_chunks）：chunk 前缀
+#      「图片描述：【版面主题：{anchor}】」确定性落入 embedding 前段。
+# 两处用同一函数重算（纯函数幂等），不跨阶段传值。
+
+_ANCHOR_MAX_LEN = 80        # 锚点字符预算（50~100 区间取中）
+_ANCHOR_Y_TOL = 25          # y 下方判定容忍（bbox 归一化 0-1000；允许图注与图框轻微重叠）
+_ANCHOR_X_OVERLAP_MIN = 15  # x 重叠最小宽度（0-1000 归一化），过滤擦边列文本
+_ANCHOR_CAP_MAX_LEN = 160   # 规则②候选文本长度上限，过滤正文段落只留图注级短文本
+
+
+def _bbox_x_overlap(a: tuple, b: tuple) -> float:
+    """两 bbox [x0, y0, x1, y1] 的 x 方向重叠宽度（归一化坐标）。"""
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+
+
+def _bbox_bottom(b: tuple) -> float:
+    return b[3] if len(b) == 4 else 0.0
+
+
+def _bbox_top(b: tuple) -> float:
+    return b[1] if len(b) == 4 else 0.0
+
+
+def _clean_anchor_text(text) -> str:
+    """折叠空白、去掉首尾标点，截断到锚点预算。"""
+    text = re.sub(r"\s+", " ", str(text or "")).strip(" ：:，,。.；;")
+    if len(text) > _ANCHOR_MAX_LEN:
+        text = text[:_ANCHOR_MAX_LEN].rstrip() + "…"
+    return text
+
+
+def _extract_image_anchor(
+    content_list: list[dict] | None,
+    item: dict | None,
+) -> tuple[str, str]:
+    """为图片 chunk 提取确定性版面主题锚点，返回 (anchor_text, anchor_src)。
+
+    bbox 约定：MinerU content_list.json 的 bbox 为 0-1000 归一化坐标
+    [x0, y0, x1, y1]，跨页可比，无需换算页面尺寸。
+
+    规则（按优先级，命中即返回）：
+    1. cap/foot — 图片 item 自带 MinerU 图注字段 img_caption / img_footnote；
+    2. col — 同页与图片 x 重叠（列过滤）且 y 在图片下方的短文本，取 y 距离
+       最小（画册横向排版走此路；A4 纵向排版全页 x 重叠时靠 y 约束区分）；
+    3. heading — 仅本页标题（text_level>0）：图上方最近标题优先，本页
+       无图上方标题时取页面最靠上标题。不做跨页回溯（实测画册类文档
+       页页主题独立，回溯页标题全错配；确定性错锚点比无锚点更糟）。
+    全部失败返回 ("", "")，调用方保持原描述不变（无锚点 = 现状行为）。
+    """
+    if not content_list or not isinstance(item, dict):
+        return "", ""
+    info = item.get("item_info") or {}
+    orig = item.get("original") or {}
+    if not isinstance(info, dict):
+        info = {}
+    if not isinstance(orig, dict):
+        orig = {}
+    if info or orig:
+        merged = {**info, **orig}  # original 是顶层 MinerU item，键冲突时优先
+    else:
+        # 顶层 MinerU item 直传（ImageModalProcessor 的 item_info 即顶层
+        # item，无 item_info/original 包装），直接使用
+        merged = item
+
+    page_idx = merged.get("page_idx")
+    bbox = merged.get("bbox")
+    if page_idx is None or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return "", ""
+
+    # ── 规则① cap/foot：MinerU 自带图注 ──
+    # 过滤图内编号噪声（如 "2"、"1-1"、"3-1"——嵌入图片的小字编号，
+    # 非主题文本；实测会劫持四屏第一屏的锚点）
+    for field in ("img_caption", "img_footnote"):
+        raw = merged.get(field)
+        if isinstance(raw, list):
+            raw = next((s for s in raw if s and str(s).strip()), None)
+        cap = _clean_anchor_text(raw) if raw else ""
+        if cap and len(cap) >= 4 and not re.fullmatch(r"[\d\-—–.]+", cap):
+            return cap, "cap" if field == "img_caption" else "foot"
+
+    try:
+        x0, y0, x1, y1 = (float(v) for v in bbox)
+    except (TypeError, ValueError):
+        return "", ""
+
+    # ── 规则② col：x 重叠列过滤 + 图片下方最近邻短文本 ──
+    best_gap, best_text = None, None
+    for t in content_list:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") != "text" or t.get("page_idx") != page_idx:
+            continue
+        ttext = t.get("text")
+        if not ttext or len(str(ttext)) > _ANCHOR_CAP_MAX_LEN:
+            continue  # 长正文段落不是图注，交给 heading 回退
+        tb = t.get("bbox")
+        if not isinstance(tb, (list, tuple)) or len(tb) != 4:
+            continue
+        try:
+            tx0, ty0, tx1, ty1 = (float(v) for v in tb)
+        except (TypeError, ValueError):
+            continue
+        if _bbox_x_overlap((x0, y0, x1, y1), (tx0, ty0, tx1, ty1)) < _ANCHOR_X_OVERLAP_MIN:
+            continue
+        gap = ty0 - y1  # 图下方：text 顶部在图片底部之下（负值容忍 _ANCHOR_Y_TOL）
+        if gap < -_ANCHOR_Y_TOL:
+            continue
+        if best_gap is None or gap < best_gap:
+            best_gap, best_text = gap, ttext
+    if best_text is not None:
+        return _clean_anchor_text(best_text), "col"
+
+    # ── 规则③ heading：仅本页标题 ──
+    # 图上方最近的标题（标题起点不晚于图顶——标题与图顶同水平也算，
+    # 画册排版常见）；本页无图上方标题时取页面最靠上的标题作为本页
+    # 主题代理。不做跨页回溯：实测画册类文档页页主题独立，回溯页
+    # 标题 14 例全错配（如时报剪报页回溯到前页「蔬果图册」）；确定性
+    # 错锚点比无锚点（VLM 描述兜底）更糟，宁缺毋滥。
+    heads = []
+    for t in content_list:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") != "text" or t.get("page_idx") != page_idx:
+            continue
+        if not t.get("text_level"):
+            continue
+        ttext = t.get("text")
+        tb = t.get("bbox")
+        if ttext and isinstance(ttext, str) and ttext.strip() and isinstance(tb, (list, tuple)) and len(tb) == 4:
+            heads.append((tb, ttext))
+    if heads:
+        above = [h for h in heads if h[0][1] <= y0 + _ANCHOR_Y_TOL]
+        pick = max(above, key=lambda h: h[0][3]) if above else min(heads, key=lambda h: h[0][1])
+        return _clean_anchor_text(pick[1]), "heading"
+    return "", ""
+
 from raganything.asr.backends.legacy import LegacyFunctionBackend
 from raganything.utils import (
     format_table_body,
@@ -104,6 +249,7 @@ class ContextExtractor:
         content_source: Any,
         current_item_info: Dict[str, Any],
         content_format: str = "auto",
+        window: Optional[int] = None,
     ) -> str:
         """Extract context for current item from content source
 
@@ -111,6 +257,8 @@ class ContextExtractor:
             content_source: Source content (list, dict, or other format)
             current_item_info: Information about current item (page_idx, index, etc.)
             content_format: Format hint for content source ("minerU", "text_chunks", "auto", etc.)
+            window: [jonex] §image-refs E2 — 显式页窗口覆盖 config.context_window
+                （有锚点收窄到本页 window=0；None 用配置值）
 
         Returns:
             Extracted context text
@@ -122,7 +270,7 @@ class ContextExtractor:
             # Use format hint if provided, otherwise auto-detect
             if content_format == "minerU" and isinstance(content_source, list):
                 return self._extract_from_content_list(
-                    content_source, current_item_info
+                    content_source, current_item_info, window=window
                 )
             elif content_format == "text_chunks" and isinstance(content_source, list):
                 return self._extract_from_text_chunks(content_source, current_item_info)
@@ -132,7 +280,7 @@ class ContextExtractor:
                 # Auto-detect content source format
                 if isinstance(content_source, list):
                     return self._extract_from_content_list(
-                        content_source, current_item_info
+                        content_source, current_item_info, window=window
                     )
                 elif isinstance(content_source, dict):
                     return self._extract_from_dict_source(
@@ -152,46 +300,58 @@ class ContextExtractor:
             return ""
 
     def _extract_from_content_list(
-        self, content_list: List[Dict], current_item_info: Dict
+        self, content_list: List[Dict], current_item_info: Dict,
+        window: Optional[int] = None,
     ) -> str:
         """Extract context from MinerU-style content list
 
         Args:
             content_list: List of content items with page_idx and type info
             current_item_info: Current item information
+            window: [jonex] §image-refs E2 — 显式页窗口覆盖配置（None 用配置值）
 
         Returns:
             Context text from surrounding pages/chunks
         """
         if self.config.context_mode == "page":
-            return self._extract_page_context(content_list, current_item_info)
+            return self._extract_page_context(content_list, current_item_info, window=window)
         elif self.config.context_mode == "chunk":
             return self._extract_chunk_context(content_list, current_item_info)
         else:
-            return self._extract_page_context(content_list, current_item_info)
+            return self._extract_page_context(content_list, current_item_info, window=window)
 
     def _extract_page_context(
-        self, content_list: List[Dict], current_item_info: Dict
+        self, content_list: List[Dict], current_item_info: Dict,
+        window: Optional[int] = None,
     ) -> str:
         """Extract context based on page boundaries
 
         Args:
             content_list: List of content items
             current_item_info: Current item with page_idx
+            window: [jonex] §image-refs E2 — 显式页窗口覆盖 config.context_window
+                （有锚点收窄到本页 window=0；None 用配置值）
 
         Returns:
             Context text from surrounding pages
         """
         # [jonex] §12 MinerU 顶层 item 有 page_idx 但 item_info 为空字典，加 original 兜底
+        # F0-3：原代码引用 current_item（未定义变量，NameError），应为 current_item_info。
         current_page = current_item_info.get("page_idx")
         if current_page is None:
-            current_page = (current_item.get("original") or {}).get("page_idx", 0)
-        window_size = self.config.context_window
+            current_page = (current_item_info.get("original") or {}).get("page_idx", 0)
+        # [jonex] §image-refs E2: window 显式覆盖（None 用配置值）
+        window_size = self.config.context_window if window is None else window
 
         start_page = max(0, current_page - window_size)
         end_page = current_page + window_size + 1
 
-        context_texts = []
+        # [jonex] §image-refs E2: 本页文本排最前，跨页（带 [Page N] 前缀）排后。
+        # 上下文按保头截断（_truncate_context），原实现按文档顺序拼接 → 前一页
+        # 优先保留、本页可能被截掉。实测低量化 VLM 在多候选跨页上下文中系统性
+        # 选错主题；本页文本是与图片主题最相关的候选，应最先进入 token 预算。
+        current_page_texts = []
+        other_page_texts = []
 
         for item in content_list:
             item_page = item.get("page_idx", 0)
@@ -206,11 +366,11 @@ class ContextExtractor:
                 if text_content and text_content.strip():
                     # Add page marker for better context understanding
                     if item_page != current_page:
-                        context_texts.append(f"[Page {item_page}] {text_content}")
+                        other_page_texts.append(f"[Page {item_page}] {text_content}")
                     else:
-                        context_texts.append(text_content)
+                        current_page_texts.append(text_content)
 
-        context = "\n".join(context_texts)
+        context = "\n".join(current_page_texts + other_page_texts)
         return self._truncate_context(context)
 
     def _extract_chunk_context(
@@ -457,11 +617,14 @@ class BaseModalProcessor:
         self.content_format = content_format
         logger.info(f"Content source set with format: {content_format}")
 
-    def _get_context_for_item(self, item_info: Dict[str, Any]) -> str:
+    def _get_context_for_item(
+        self, item_info: Dict[str, Any], window: Optional[int] = None
+    ) -> str:
         """Get context for current processing item
 
         Args:
             item_info: Information about current item (page_idx, index, etc.)
+            window: [jonex] §image-refs E2 — 显式页窗口覆盖配置（None 用配置值）
 
         Returns:
             Context text for the item
@@ -471,7 +634,7 @@ class BaseModalProcessor:
 
         try:
             context = self.context_extractor.extract_context(
-                self.content_source, item_info, self.content_format
+                self.content_source, item_info, self.content_format, window=window
             )
             if context:
                 logger.debug(
@@ -941,19 +1104,57 @@ class ImageModalProcessor(BaseModalProcessor):
             if not image_path_obj.exists():
                 raise FileNotFoundError(f"Image file not found: {image_path}")
 
+            # [jonex] §image-refs E2: 锚点提前提取（VLM 调用之前）。
+            # 与 push 阶段（stages._collect_multimodal_chunks）用同一纯函数
+            # 重算，结果必然一致，不跨阶段传值。
+            anchor, anchor_src = "", ""
+            anchor_enabled = (
+                os.getenv("RAG_IMAGE_ANCHOR_ENABLED", "true").lower()
+                not in ("0", "false", "no", "off")
+            )
+            if anchor_enabled and self.content_source and item_info:
+                anchor, anchor_src = _extract_image_anchor(self.content_source, item_info)
+
             # Extract context for current item
             context = ""
             if item_info:
-                context = self._get_context_for_item(item_info)
+                # 有锚点收窄到本页（window=0）：确定性主题已由提示词断言给出，
+                # 跨页文本只会增加错配候选（56 号荷花屏错配的根因正是候选过多）。
+                # 无锚点保持常规窗口（window=None → config，默认 1 页），
+                # _extract_page_context 已做本页优先重排。
+                # 边界（有意行为）：本页连 text 级标题都没有（纯图片页）时
+                # context 为空串，断言模板渲染出空的「本页内容上下文」区块——
+                # 空区块本身是信号（本页无额外文本），让 VLM 专注锚点+图像，
+                # 不填占位词、不按语言拆分模板。
+                context = self._get_context_for_item(
+                    item_info, window=0 if anchor else None
+                )
 
             # Build detailed visual analysis prompt (KB 主解析提示词覆盖 vision_prompt)
-            _tmpl = _pick_prompt(
-                prompt_overrides, "vision_prompt", bool(context),
-                PROMPTS["vision_prompt"],
-                PROMPTS.get("vision_prompt_with_context", PROMPTS["vision_prompt"]),
-            )
+            _has_override = False
+            if prompt_overrides is not None:
+                try:
+                    _has_override = bool(prompt_overrides.has_override("vision_prompt"))
+                except Exception:
+                    _has_override = False
+            if (
+                anchor
+                and not _has_override
+                and PROMPTS.get("vision_prompt_with_anchor")
+            ):
+                # [jonex] §image-refs E2: 断言式锚点模板（"此图是 {anchor} 的
+                # 配图"），对低量化 VLM 的指令遵从度高于参考式；override 优先
+                # （KB 主解析自定义提示词时锚点仍通过 context 收窄生效）。
+                _tmpl = PROMPTS["vision_prompt_with_anchor"]
+            else:
+                _tmpl = _pick_prompt(
+                    prompt_overrides, "vision_prompt", bool(context),
+                    PROMPTS["vision_prompt"],
+                    PROMPTS.get("vision_prompt_with_context", PROMPTS["vision_prompt"]),
+                )
             vision_prompt = _safe_format(
                 _tmpl,
+                anchor=anchor,
                 context=context,
                 entity_name=entity_name
                 if entity_name

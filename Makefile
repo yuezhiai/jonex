@@ -1,5 +1,5 @@
 # ============================================================
-# 悦溪平台 Makefile
+# Jonex 平台 Makefile
 #
 # 模式约定:
 #   1) macOS/Linux 本机开发（中间件/RAG 走 Docker，前端本机运行，后端断点调试走 VSCode Debug）
@@ -49,7 +49,7 @@ export
 DB_HOST ?= 127.0.0.1
 DB_PORT ?= 5432
 DB_USERNAME ?= jonex
-DB_PASSWORD ?= jonex123
+DB_PASSWORD ?= change-me
 DB_NAME ?= jonex
 
 UNAME_S := $(shell uname -s)
@@ -114,7 +114,7 @@ LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(
 # 帮助信息
 # ------------------------------------------------------------
 help: ## 显示帮助信息
-	@echo "=== 悦溪平台 Makefile ==="
+	@echo "=== Jonex 平台 Makefile ==="
 	@echo ""
 	@echo "初始化:"
 	@echo "  make init                         初始化 deploy/.env、deploy/.env.rag、deploy/.env.mcp、前端 .env"

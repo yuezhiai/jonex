@@ -14,6 +14,7 @@ except ImportError:
 
 class TemplateDomainCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
+    name_en: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     status: Optional[str] = Field(default="inactive", max_length=32)
     ontology_code: Optional[str] = Field(None, max_length=128)
@@ -22,6 +23,7 @@ class TemplateDomainCreateRequest(BaseModel):
 
 class TemplateDomainUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
+    name_en: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     status: Optional[str] = Field(None, max_length=32)
     ontology_code: Optional[str] = Field(None, max_length=128)
@@ -121,6 +123,7 @@ class TemplateDomainResponse(BaseModel):
     id: str
     tenant_id: str
     name: str
+    name_en: Optional[str] = None
     description: Optional[str] = None
     status: str
     version: int = 1

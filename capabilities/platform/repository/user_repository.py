@@ -22,16 +22,6 @@ class UserRepository(BaseRepository[User]):
         )
         return result.scalar_one_or_none()
 
-    async def list_active_by_username(self, username: str) -> Sequence[User]:
-        result = await self.session.execute(
-            select(User).where(
-                User.username == username,
-                User.status == 1,
-                User.is_deleted == 0,
-            )
-        )
-        return result.scalars().all()
-
     async def list_by_tenant(
         self, tenant_id: str, offset: int = 0, limit: int = 20
     ) -> Sequence[User]:

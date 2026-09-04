@@ -135,7 +135,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   }>({ open: false, title: '', desc: '', content: '' });
   const [importModal, setImportModal] = useState<{
     open: boolean;
-    mode: 'object' | 'relation';
+    mode: 'object' | 'relation' | 'constraint';
   }>({ open: false, mode: 'object' });
   const [submitting, setSubmitting] = useState(false);
 
@@ -530,6 +530,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
           data={constraints}
           loading={loadingConstraints}
           onCreate={() => setConstraintModal({ open: true, editing: null })}
+          onImport={() => setImportModal({ open: true, mode: 'constraint' })}
           onEdit={(c) => setConstraintModal({ open: true, editing: c })}
           onDelete={removeConstraint}
         />
@@ -628,7 +629,8 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         onClose={() => setImportModal((s) => ({ ...s, open: false }))}
         onImported={() => {
           if (importModal.mode === 'object') loadObjects();
-          else loadRelations();
+          else if (importModal.mode === 'relation') loadRelations();
+          else loadConstraints();
           loadTargetOptions();
         }}
       />

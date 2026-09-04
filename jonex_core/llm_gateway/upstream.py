@@ -476,38 +476,57 @@ async def proxy_rerank(
     key = cfg.LLMGW_UPSTREAM_RERANK_API_KEY
     model = body.get("model") or cfg.LLMGW_RERANK_MODEL
     query = body.get("query") or ""
-    docs = (body.get("documents") or [])[: cfg.LLMGW_RERANK_MAX_DOCS]
+    # [jonex] §image-refs E3-补: MAX_DOCS 语义是单批规模保护，不是截断上限。
+    # 旧实现 docs[:MAX_DOCS] 静默丢弃超限候选（62 张图片的 doc 只重排前
+    # 12 个，其余保持原分，E3 语义失效一半且调用方无感知）——改为分批
+    # 评分后合并，index 全局连续，对调用方透明。
+    docs = body.get("documents") or []
+    max_docs = max(1, cfg.LLMGW_RERANK_MAX_DOCS)
+    batches = [docs[i:i + max_docs] for i in range(0, len(docs), max_docs)]
     top_n = body.get("top_n")
 
     t0 = time.monotonic()
 
     if binding == "cohere":
-        url = f"{host}/rerank"
-        payload = {"model": model, "query": query, "documents": docs}
-        if top_n is not None:
-            payload["top_n"] = top_n
-        try:
-            async with httpx.AsyncClient(timeout=cfg.LLMGW_RERANK_TIMEOUT) as cli:
-                resp = await cli.post(
-                    url, json=payload,
-                    headers={"Authorization": f"Bearer {key}"},
-                )
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            return resp.json(), resp.status_code, latency_ms
-        except Exception as e:
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            logger.exception("rerank 上游异常(cohere) | req_id=%s err=%s", ctx.request_id, e)
-            return ({"error": {"message": f"rerank upstream failed: {e}"}}, 502, latency_ms)
+        results: list[dict] = []
+        for bi, batch in enumerate(batches):
+            url = f"{host}/rerank"
+            payload = {"model": model, "query": query, "documents": batch}
+            if top_n is not None:
+                payload["top_n"] = top_n
+            try:
+                async with httpx.AsyncClient(timeout=cfg.LLMGW_RERANK_TIMEOUT) as cli:
+                    resp = await cli.post(
+                        url, json=payload,
+                        headers={"Authorization": f"Bearer {key}"},
+                    )
+                batch_results = resp.json().get("results", [])
+                for r in batch_results:
+                    r["index"] = bi * max_docs + r.get("index", 0)
+                results.extend(batch_results)
+            except Exception as e:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                logger.exception("rerank 上游异常(cohere) | req_id=%s err=%s", ctx.request_id, e)
+                return ({"error": {"message": f"rerank upstream failed: {e}"}}, 502, latency_ms)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if top_n:
+            results = sorted(results, key=lambda r: r["relevance_score"], reverse=True)[:top_n]
+        return {"results": results}, 200, latency_ms
 
     # binding == "ollama-generate"
     try:
-        results = await _ollama_rerank_scores(host, key, model, query, docs, cfg)
+        results = []
+        for bi, batch in enumerate(batches):
+            batch_results = await _ollama_rerank_scores(host, key, model, query, batch, cfg)
+            for r in batch_results:
+                r["index"] = bi * max_docs + r.get("index", 0)
+            results.extend(batch_results)
     except Exception as e:
         latency_ms = int((time.monotonic() - t0) * 1000)
         logger.warning("rerank 整体降级(ollama-generate) | req_id=%s err=%s", ctx.request_id, e)
         return ({"error": {"message": f"rerank degraded: {e}"}}, 502, latency_ms)
 
+    latency_ms = int((time.monotonic() - t0) * 1000)
     if top_n:
         results = sorted(results, key=lambda r: r["relevance_score"], reverse=True)[:top_n]
-    latency_ms = int((time.monotonic() - t0) * 1000)
     return {"results": results}, 200, latency_ms

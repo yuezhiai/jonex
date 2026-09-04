@@ -14,7 +14,7 @@
   三层重构落地后只需改这一处 import 路径。
 - **生产契约以本类为准**；vendored `atomic-rag-server-v2.py` 仅本地调试入口。
 
-能力 ID：`atomic.rag.lightrag.v1`（与 v1 `LightRAGAdapter` 完全一致，capability_id 不变）。
+能力 ID：`atomic.rag.lightrag.v1`（与原 v1 `LightRAGAdapter`（已退役删除）完全一致，capability_id 不变）。
 """
 import importlib.util
 import os
@@ -299,20 +299,25 @@ class LightRAGAdapterV2(BaseRAGCapability):
             pass
 
     async def _localize_input(self, payload: dict, tenant_id: str) -> dict:
-        """storage_backend==cos 时把对象下载到本地，改写 file_path 为本地路径、backend 置 local。"""
-        if (payload.get("storage_backend") or "local").strip().lower() != "cos":
+        """对象存储后端（cos/s3）时把对象下载到本地，改写 file_path 为本地路径、backend 置 local。
+
+        [jonex] S3 兼容：按 payload 自身的 storage_backend 选客户端（get_object_storage_for），
+        混合数据（部分文档 cos、部分 s3）时全局单例会用错后端。
+        """
+        backend = (payload.get("storage_backend") or "local").strip().lower()
+        if backend not in ("cos", "s3"):
             return payload
         storage_key = payload.get("storage_key")
         if not storage_key:
             return payload  # 无 key，交给下游按原样报错（不隐藏问题）
 
-        from jonex_core.common.object_storage import get_object_storage
+        from jonex_core.common.object_storage import get_object_storage_for
 
         self._sweep_cos_cache()  # 机会式清理过期缓存
         base_name = os.path.basename(payload.get("file_path") or storage_key) or "cos_object"
         local_path = os.path.join(self._cos_cache_dir(), f"{uuid.uuid4().hex}_{base_name}")
-        await get_object_storage().get_to_path(storage_key, local_path)
-        logger.info("W3 COS 本地化: %s → %s", storage_key, local_path)
+        await get_object_storage_for(backend).get_to_path(storage_key, local_path)
+        logger.info("W3 %s 本地化: %s → %s", backend, storage_key, local_path)
 
         p = dict(payload)
         p["file_path"] = local_path
@@ -347,15 +352,15 @@ class LightRAGAdapterV2(BaseRAGCapability):
         }
         if preset:
             payload["preset"] = preset
-        # 兼容 LOCAL 直连传入的 document_id / storage_backend / storage_key / execution_mode
-        for k in ("document_id", "storage_backend", "storage_key", "execution_mode"):
+        # 兼容 LOCAL 直连传入的 document_id / storage_backend / storage_key /
+        # execution_mode / prompt_ids。
+        # [jonex] 键集与 LocalRAGClient.insert 的 _extra（client.py）逐一对应，
+        # 新加透传参数时两处需同步。
+        for k in ("document_id", "storage_backend", "storage_key", "execution_mode", "prompt_ids"):
             if kwargs.get(k) is not None:
                 payload[k] = kwargs[k]
         return self._unwrap(await self._dispatch("insert", payload, tenant_id), "insert")
 
-    # [jonex] 注：方案 A 的 only_need_context 透传**未**在本 v2 兼容路径实现
-    # （生产链路走 lightrag_adapter.py 的 v1 路径，本类仅兼容保留，
-    # 见 docs/rag-subject-filter-and-answer-source-remediation-plan.md §6.4）。
     async def query(
         self,
         query: str,
@@ -364,10 +369,47 @@ class LightRAGAdapterV2(BaseRAGCapability):
         top_k: int = 5,
         *,
         knowledge_base_id: str,
+        trace_id: str = "",
+        user_id: str = "",
+        only_need_context: bool = False,
     ) -> str:
-        payload = {"query": query, "mode": mode, "top_k": top_k, "knowledge_base_id": knowledge_base_id}
+        # [jonex] 方案 A + 计量维度：与 REMOTE 链（atomic-rag-server-v2 handle_query）同构，
+        # 对齐 v1 _jonex_query_headers / only_need_context 透传。
+        payload = {
+            "query": query, "mode": mode, "top_k": top_k,
+            "knowledge_base_id": knowledge_base_id,
+            "trace_id": trace_id, "user_id": user_id,
+            "only_need_context": only_need_context,
+        }
         data = self._unwrap(await self._dispatch("query", payload, tenant_id), "query")
         return (data or {}).get("answer", "")
+
+    async def query_detailed(
+        self,
+        query: str,
+        tenant_id: str,
+        mode: str = "hybrid",
+        top_k: int = 5,
+        *,
+        knowledge_base_id: str,
+        trace_id: str = "",
+        user_id: str = "",
+        only_need_context: bool = False,
+    ) -> dict:
+        # [jonex] v1 退役：补 LOCAL 直连面的 query_detailed（v1 独有的方法）。
+        # payload 与 query 同构（vendored handle_query 的 data 本就是 {answer, references}），
+        # 返回结构须与 RemoteRAGClient.query_detailed 对齐，不得只取 answer 字符串。
+        payload = {
+            "query": query, "mode": mode, "top_k": top_k,
+            "knowledge_base_id": knowledge_base_id,
+            "trace_id": trace_id, "user_id": user_id,
+            "only_need_context": only_need_context,
+        }
+        data = self._unwrap(await self._dispatch("query", payload, tenant_id), "query")
+        return {
+            "answer": (data or {}).get("answer", ""),
+            "references": (data or {}).get("references", []),
+        }
 
     async def delete(
         self,
@@ -646,6 +688,53 @@ class LightRAGAdapterV2(BaseRAGCapability):
         res = await self._dispatch("get_document_parse_result", {
             "knowledge_base_id": knowledge_base_id, "document_id": document_id,
         }, tenant_id)
+        return res.get("data")
+
+    # ── 提示词配置 CRUD（[jonex] v1 退役：补 LOCAL 直连面薄转发） ──
+
+    async def create_prompt(
+        self,
+        tenant_id: str,
+        *,
+        prompt_code: str,
+        content: str,
+        preset_name: str = "",
+        display_name: str = "",
+        description: str = "",
+        category: str = "analysis",
+        language: str = "zh",
+    ) -> dict:
+        """创建租户级 prompt 配置。对应 action create_prompt。"""
+        payload = {
+            "prompt_code": prompt_code, "content": content,
+            "preset_name": preset_name, "display_name": display_name,
+            "description": description, "category": category, "language": language,
+        }
+        return self._unwrap(
+            await self._dispatch("create_prompt", payload, tenant_id), "create_prompt",
+        ) or {}
+
+    async def update_prompt(
+        self, tenant_id: str, prompt_id: str, *, content: Optional[str] = None, **fields
+    ) -> dict:
+        """更新 prompt 配置（一般只传 content）。对应 action update_prompt。"""
+        payload: dict = {"prompt_id": prompt_id, **fields}
+        if content is not None:
+            payload["content"] = content
+        return self._unwrap(
+            await self._dispatch("update_prompt", payload, tenant_id), "update_prompt",
+        ) or {}
+
+    async def delete_prompt(self, tenant_id: str, prompt_id: str) -> dict:
+        """删除 prompt 配置（handler 幂等：不存在也 success，deleted=false）。"""
+        return self._unwrap(
+            await self._dispatch("delete_prompt", {"prompt_id": prompt_id}, tenant_id),
+            "delete_prompt",
+        ) or {}
+
+    async def get_prompt(self, tenant_id: str, prompt_id: str) -> Optional[dict]:
+        """按 id 查 prompt 配置；不存在返回 None（handler success=False 时回传 data）。"""
+        res = await self._dispatch("get_prompt", {"prompt_id": prompt_id}, tenant_id)
         return res.get("data")
 
     @staticmethod

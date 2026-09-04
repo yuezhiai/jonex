@@ -16,6 +16,17 @@ export interface AuditLogItem {
   detail: string | null;
   trace_id: string | null;
   created_at: string | null;
+  /** 执行结果：SUCCESS / FAILED（详情接口返回） */
+  outcome?: string | null;
+  /** 失败原因（详情接口返回） */
+  error_message?: string | null;
+  /** 错误堆栈（详情接口返回） */
+  error_stack?: string | null;
+  request_params?: unknown;
+  response_body?: unknown;
+  log_level?: string | null;
+  method?: string | null;
+  path?: string | null;
 }
 
 export interface AuditLogListResponse {

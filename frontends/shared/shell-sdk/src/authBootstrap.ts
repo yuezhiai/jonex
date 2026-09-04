@@ -1,12 +1,7 @@
 import type { ShellUser } from './types';
-import { readAccessToken, writeAccessToken, writeRefreshToken, writeCachedUser, clearAuthStorage } from './authStorage';
-import {
-  buildLoginRedirectUrl,
-  hasTicketCallback,
-  getTicketCallback,
-  stripBlockedAuthQuery,
-  stripCallbackQuery,
-} from './authRedirect';
+import { readAccessToken, writeAccessToken, writeRefreshToken, writeCachedUser } from './authStorage';
+import { hasTicketCallback, getTicketCallback, stripBlockedAuthQuery, stripCallbackQuery } from './authRedirect';
+import { emitSessionExpired, redirectToLogin } from './sessionExpired';
 
 export interface AuthBootstrapOptions {
   appId: string;
@@ -86,12 +81,6 @@ export async function bootstrapStandaloneAuth(options: AuthBootstrapOptions): Pr
   const fetchFn = options.fetchImpl || window.fetch.bind(window);
   const currentUrl = options.currentUrl || window.location.href;
   const url = new URL(currentUrl);
-  const getCleanCurrentUrl = () => {
-    const cleanUrl = new URL(url.toString());
-    stripBlockedAuthQuery(cleanUrl);
-    stripCallbackQuery(cleanUrl);
-    return cleanUrl.toString();
-  };
 
   // 1. 清理历史 URL token 参数
   const originalUrl = url.toString();
@@ -164,10 +153,9 @@ export async function bootstrapStandaloneAuth(options: AuthBootstrapOptions): Pr
             return { authenticated: true, token, user, source: 'local-token' };
           }
         }
-        // 401 或其他错误 → 清理并跳转登录
+        // 401 或其他错误 → 发会话失效信号（清 token + 事件），跳转由监听者统一执行
         if (resp.status === 401 || resp.status === 403) {
-          clearAuthStorage({ keepLocale: true });
-          window.location.href = buildLoginRedirectUrl(options.loginUrl, getCleanCurrentUrl(), options.appId);
+          emitSessionExpired();
           return { authenticated: false, token: null, user: null, source: 'none' };
         }
       } catch {
@@ -179,7 +167,7 @@ export async function bootstrapStandaloneAuth(options: AuthBootstrapOptions): Pr
     return { authenticated: true, token, user: null, source: 'local-token' };
   }
 
-  // 4. 无任何登录态 → 跳转登录页
-  window.location.href = buildLoginRedirectUrl(options.loginUrl, getCleanCurrentUrl(), options.appId);
+  // 4. 无任何登录态 → 跳转登录页（首次未登录引导，走统一跳转）
+  redirectToLogin({ loginUrl: options.loginUrl, appId: options.appId });
   return { authenticated: false, token: null, user: null, source: 'none' };
 }

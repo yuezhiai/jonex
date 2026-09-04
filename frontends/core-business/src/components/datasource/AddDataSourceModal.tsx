@@ -198,7 +198,13 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
               <Form.Item
                 label={t('domainKnowledge.apiEndpoint')}
                 name="endpoint"
-                rules={[{ required: true, message: t('dataSource.endpointRequired') }]}
+                rules={[
+                  { required: true, message: t('dataSource.endpointRequired') },
+                  {
+                    pattern: /^https?:\/\/\S+/i,
+                    message: t('dataSource.endpointInvalid'),
+                  },
+                ]}
                 tooltip={t('dataSource.endpointTooltip')}
               >
                 <Input placeholder={t('dataSource.endpointPlaceholder')} />
@@ -287,6 +293,12 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
               <Form.Item
                 label={t('dataSource.endpoint')}
                 name="endpoint"
+                rules={[
+                  {
+                    pattern: /^https?:\/\/\S+/i,
+                    message: t('dataSource.endpointInvalid'),
+                  },
+                ]}
                 tooltip={t('dataSource.storageEndpointTooltip')}
               >
                 <Input placeholder="http://minio:9000" />

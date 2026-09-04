@@ -1,5 +1,6 @@
 """Knowledge Base service facade."""
 
+from .answer_feedback_service import AnswerFeedbackService
 from .document_service import DocumentService
 from .data_source_service import DataSourceService
 from .folder_service import FolderService
@@ -28,6 +29,7 @@ class KnowledgeBaseService:
         self.search = SearchService()
         self.history = SearchHistoryService()
         self.feedback = SearchFeedbackService()
+        self.answer_feedback = AnswerFeedbackService()
         self.parse_results = ParseResultService()
         self.parser_settings = ParserSettingService()
         self.ontology_query = OntologyQueryService()

@@ -23,12 +23,12 @@ from .domain_service import (
     ServiceApiKey,
     ServiceConfig,
     ServiceKnowledgeBase,
-    ServicePermission,
 )
 from .knowledge_info import KnowledgeInfo
 from .kb_permission import KbPermission
 from .ontology_synonym import OntologySynonym
 from .parser_setting import KnowledgeParserSetting
+from .answer_feedback import KnowledgeAnswerFeedback, KnowledgeAnswerFeedbackEvent
 from .search_feedback import KnowledgeSearchFeedback
 from .search_history import KnowledgeSearchHistory, build_query_hash, normalize_query
 from .space import Space, SpacePermission
@@ -39,6 +39,8 @@ __all__ = [
     "DomainService",
     "Folder",
     "Tag",
+    "KnowledgeAnswerFeedback",
+    "KnowledgeAnswerFeedbackEvent",
     "KnowledgeDataSource",
     "KnowledgeDocument",
     "KnowledgeInfo",
@@ -51,7 +53,6 @@ __all__ = [
     "ServiceApiKey",
     "ServiceConfig",
     "ServiceKnowledgeBase",
-    "ServicePermission",
     "Space",
     "SpacePermission",
     "build_query_hash",

@@ -61,11 +61,12 @@ class OpenAIDriver(BaseModelDriver):
             "model": spec.model_id,
             "messages": messages,
         }
+        # [jonex] timeout 是 httpx 控制参数，不是上游请求字段——pop 后再合并，
+        # 否则会把 {"timeout": 300} 发进请求体（llama.cpp 可能拒绝未知字段）。
+        timeout = httpx.Timeout(float(kwargs.pop("timeout", 120.0)))
         for k, v in kwargs.items():
             if v is not None:
                 payload[k] = v
-
-        timeout = httpx.Timeout(float(kwargs.get("timeout", 120.0)))
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{spec.host}/chat/completions",

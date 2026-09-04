@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, message, Tooltip } from 'antd';
+import { Button, message, Tooltip, Typography } from 'antd';
 import { CopyOutlined, DeleteOutlined, EditOutlined, EyeOutlined, BranchesOutlined } from '@ant-design/icons';
 import copy from 'copy-to-clipboard';
 import type { PromptTemplateItem } from '../../api/promptTemplates';
@@ -54,31 +54,51 @@ const PromptCard: React.FC<PromptCardProps> = ({ template, onEdit, onView, onDel
 
   return (
     <div className="pt-card">
-      {/* Status badge — only for domain */}
-      {!isSystem && (
-        <span className={`pt-status ${displayTemplate.status === '启用' ? 'on' : 'off'}`}>
-          {displayTemplate.status === '启用'
-            ? t('promptTemplate.enabled')
-            : displayTemplate.status === '停用'
-              ? t('promptTemplate.disabled')
-              : displayTemplate.status}
-        </span>
-      )}
-
       {/* Header: icon + meta */}
       <div className="pt-card-top">
         <div className="pt-icon" style={{ background: categoryInfo.bg }}>
           {categoryInfo.icon}
         </div>
         <div className="pt-meta">
-          <h3 className="pt-name">{displayTemplate.name}</h3>
+          {/* 名称与状态徽章同一行、左右分布；描述在下一行，不影响徽章位置 */}
+          <div className="pt-title-row">
+            {/* 名称单行显示，超出省略；溢出时 hover 显示全文（Typography ellipsis tooltip 仅在溢出时启用） */}
+            <Typography.Paragraph
+              className="pt-name"
+              ellipsis={{ rows: 1, tooltip: displayTemplate.name }}
+              style={{ marginBottom: 0 }}
+            >
+              {displayTemplate.name}
+            </Typography.Paragraph>
+            {!isSystem && (
+              <span className={`pt-status ${displayTemplate.status === '启用' ? 'on' : 'off'}`}>
+                {displayTemplate.status === '启用'
+                  ? t('promptTemplate.enabled')
+                  : displayTemplate.status === '停用'
+                    ? t('promptTemplate.disabled')
+                    : displayTemplate.status}
+              </span>
+            )}
+          </div>
           <div className="pt-desc">{displayTemplate.description || t('promptTemplate.noDescription')}</div>
         </div>
       </div>
 
       {/* Content preview */}
       <div className="pt-preview">
-        <div dangerouslySetInnerHTML={{ __html: previewHtml }} />
+        <Tooltip
+          rootClassName="pt-preview-tooltip-wrap"
+          mouseEnterDelay={0.2}
+          mouseLeaveDelay={0.2}
+          title={
+            content ? (
+              // hover 显示完整提示词原文（保留换行，超长可滚动）
+              <div className="pt-preview-tooltip">{content}</div>
+            ) : undefined
+          }
+        >
+          <div dangerouslySetInnerHTML={{ __html: previewHtml }} />
+        </Tooltip>
       </div>
 
       {/* Tags */}

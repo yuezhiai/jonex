@@ -151,7 +151,7 @@ async def lifespan(app: FastAPI):
 # 创建 FastAPI 应用
 app = FastAPI(
     title=f"Jonex Capability: {CAPABILITY_NAME}",
-    description=f"悦溪平台能力服务: {CAPABILITY_NAME}",
+    description=f"Jonex 平台能力服务: {CAPABILITY_NAME}",
     version="1.0.0",
     lifespan=lifespan,
 )

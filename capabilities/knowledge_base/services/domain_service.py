@@ -11,7 +11,7 @@ import uuid
 from sqlalchemy import select
 
 from jonex_core.common import get_db_session
-from jonex_core.common.exceptions import JonexException
+from jonex_core.common.exceptions import JonexException, ResourceConflictError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
@@ -24,8 +24,8 @@ from ..models.domain_service import (
     DomainService,
     ServiceKnowledgeBase,
     ServiceApiKey,
-    ServicePermission,
 )
+from .kb_type_service import DEFAULT_KB_TYPE, get_kb_types
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +33,48 @@ logger = logging.getLogger(__name__)
 class DomainServiceService:
     """领域服务 CRUD + 知识库关联 + API Key + 配置 + 权限"""
 
+    async def _ensure_name_unique(
+        self,
+        session,
+        tenant_id: str,
+        space_id: str,
+        name: str,
+        exclude_id: str | None = None,
+    ) -> None:
+        """校验领域服务名称在同一领域空间内唯一（仅约束未删除记录）。"""
+        name = (name or "").strip()
+        conditions = [
+            DomainService.tenant_id == tenant_id,
+            DomainService.space_id == space_id,
+            DomainService.name == name,
+            DomainService.is_deleted == 0,
+        ]
+        if exclude_id:
+            conditions.append(DomainService.id != exclude_id)
+        result = await session.execute(
+            select(DomainService.id).where(*conditions).limit(1)
+        )
+        if result.scalar_one_or_none() is not None:
+            raise ResourceConflictError(
+                message=translate(
+                    "err.service.name_exists",
+                    params={"name": name},
+                    fallback=f"领域服务名称已存在: {name}",
+                )
+            )
+
     async def create(self, tenant_id: str, data: dict) -> dict:
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = DomainServiceRepository(session)
+            name = (data.get("name") or "").strip()
+            await self._ensure_name_unique(session, tenant_id, data["space_id"], name)
             service_id = uuid.uuid4().hex
             obj = await repo.create(
                 id=service_id,
                 tenant_id=tenant_id,
                 space_id=data["space_id"],
-                name=data["name"],
+                name=name,
                 description=data.get("description"),
                 domain_type=data.get("domain_type"),
                 enabled=data.get("enabled", 1),
@@ -96,7 +128,15 @@ class DomainServiceService:
                 )
                 kb_name_map = {row[0]: row[1] for row in kb_rows.all()}
 
-            return obj.to_dict(include_kb_ids=kb_ids, space_name=space_name, kb_names=kb_name_map)
+            # Fetch KB pipeline types (lightrag/openkb) aligned with kb_ids
+            type_map: dict[str, str] = await get_kb_types(tenant_id, kb_ids)
+
+            return obj.to_dict(
+                include_kb_ids=kb_ids,
+                space_name=space_name,
+                kb_names=kb_name_map,
+                kb_types=[type_map.get(k, DEFAULT_KB_TYPE) for k in kb_ids],
+            )
 
     @staticmethod
     async def _get_kb_ids(session, service_id: str, tenant_id: str) -> list[str]:
@@ -119,7 +159,7 @@ class DomainServiceService:
         return [row[0] for row in result.all()]
 
     async def list(self, tenant_id: str, space_id: str = None, offset: int = 0, limit: int = 20,
-                   user_id: str | None = None) -> dict:
+                   user_id: str | None = None, scope: str = "manage") -> dict:
         tenant_id = require_tenant(tenant_id)
         from .space_permission_service import get_visible_space_ids
 
@@ -132,7 +172,26 @@ class DomainServiceService:
             # [jonex] 空间隔离：不传 space_id 的租户级列表也只返回可见空间的服务
             visible = await get_visible_space_ids(tenant_id, user_id)
             if visible is not None:
-                conditions.append(DomainService.space_id.in_(visible))
+                if scope == "search":
+                    # 候选集 = accessible_kb 关联的服务（空间可见 ∪ KB 授权）
+                    from sqlalchemy import exists, or_
+                    from .kb_permission_service import get_granted_kb_ids
+                    granted = await get_granted_kb_ids(tenant_id, user_id)
+                    conditions.append(
+                        exists().where(
+                            ServiceKnowledgeBase.service_id == DomainService.id,
+                            ServiceKnowledgeBase.tenant_id == tenant_id,
+                            ServiceKnowledgeBase.is_deleted == 0,
+                            ServiceKnowledgeBase.kb_id == KnowledgeInfo.id,
+                            KnowledgeInfo.is_deleted == 0,
+                            or_(
+                                KnowledgeInfo.space_id.in_(visible),
+                                KnowledgeInfo.id.in_(granted),
+                            ),
+                        )
+                    )
+                else:
+                    conditions.append(DomainService.space_id.in_(visible))
             items = await repo.list_all(tenant_id, offset, limit, extra_conditions=conditions)
             total = await repo.count(tenant_id, extra_conditions=conditions)
 
@@ -156,6 +215,15 @@ class DomainServiceService:
                 )
                 for service_id, kb_id in result.all():
                     kb_map.setdefault(service_id, []).append(kb_id)
+
+            # [jonex] Gap 3：返回的 kb_ids 明细按 accessible_kb 裁剪（SQL 只决定服务可见性）
+            from .kb_permission_service import get_accessible_kb_ids
+            accessible = await get_accessible_kb_ids(tenant_id, user_id, visible)
+            if accessible is not None:
+                kb_map = {
+                    sid: [k for k in kbs if k in accessible]
+                    for sid, kbs in kb_map.items()
+                }
 
             # Batch fetch space names
             space_ids = list({o.space_id for o in items})
@@ -185,12 +253,16 @@ class DomainServiceService:
                 )
                 kb_name_map = {row[0]: row[1] for row in kb_rows.all()}
 
+            # Batch fetch KB pipeline types (lightrag/openkb) aligned with kb_ids
+            type_map: dict[str, str] = await get_kb_types(tenant_id, all_kb_ids)
+
             return {
                 "items": [
                     o.to_dict(
                         include_kb_ids=kb_map.get(o.id, []),
                         space_name=space_name_map.get(o.space_id, ""),
                         kb_names=kb_name_map,
+                        kb_types=[type_map.get(k, DEFAULT_KB_TYPE) for k in kb_map.get(o.id, [])],
                     )
                     for o in items
                 ],
@@ -204,6 +276,10 @@ class DomainServiceService:
             obj = await repo.get_required(service_id, tenant_id)
             updatable = {"name", "description", "domain_type", "status", "enabled"}
             values = {k: v for k, v in data.items() if k in updatable and v is not None}
+            if "name" in values:
+                await self._ensure_name_unique(
+                    session, tenant_id, obj.space_id, values["name"], exclude_id=service_id
+                )
             if values:
                 obj = await repo.update(service_id, tenant_id, **values)
 
@@ -252,17 +328,6 @@ class DomainServiceService:
             )
             for skb in existing_kb.scalars().all():
                 await session.delete(skb)
-
-            # Cascade delete permissions
-            existing_perm = await session.execute(
-                select(ServicePermission).where(
-                    ServicePermission.service_id == service_id,
-                    ServicePermission.tenant_id == tenant_id,
-                    ServicePermission.is_deleted == 0,
-                )
-            )
-            for sp in existing_perm.scalars().all():
-                await session.delete(sp)
 
             await session.commit()
             return True
@@ -347,60 +412,22 @@ class DomainServiceService:
         require_tenant(tenant_id)
         return True
 
-    async def get_permissions(self, service_id: str, tenant_id: str) -> list:
-        tenant_id = require_tenant(tenant_id)
-        async with get_db_session() as session:
-            result = await session.execute(
-                select(ServicePermission).where(
-                    ServicePermission.service_id == service_id,
-                    ServicePermission.tenant_id == tenant_id,
-                    ServicePermission.is_deleted == 0,
-                )
-            )
-            return [
-                {
-                    "id": row.id,
-                    "user_id": row.user_id,
-                    "role": row.role,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                }
-                for row in result.scalars().all()
-            ]
-
-    async def set_permissions(self, service_id: str, tenant_id: str, permissions: list) -> bool:
-        tenant_id = require_tenant(tenant_id)
-        async with get_db_session() as session:
-            # Remove existing permissions
-            existing = await session.execute(
-                select(ServicePermission).where(
-                    ServicePermission.service_id == service_id,
-                    ServicePermission.tenant_id == tenant_id,
-                    ServicePermission.is_deleted == 0,
-                )
-            )
-            for sp in existing.scalars().all():
-                await session.delete(sp)
-
-            # Add new permissions
-            for perm in permissions:
-                perm_obj = ServicePermission(
-                    id=uuid.uuid4().hex,
-                    tenant_id=tenant_id,
-                    service_id=service_id,
-                    user_id=perm["user_id"],
-                    role=perm.get("role", "viewer"),
-                )
-                session.add(perm_obj)
-
-            await session.commit()
-            return True
-
-    async def search(self, service_id: str, tenant_id: str, query: str) -> dict:
+    async def search(self, service_id: str, tenant_id: str, query: str,
+                     actor_user_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = DomainServiceRepository(session)
             await repo.get_required(service_id, tenant_id)
             kb_ids = await self._get_kb_ids(session, service_id, tenant_id)
+
+        # actor_user_id is None = MCP / 内部链路：遵循 MCP Key 自身授权，不套用户 KB 过滤
+        if actor_user_id:
+            from .space_permission_service import get_visible_space_ids
+            from .kb_permission_service import get_accessible_kb_ids
+            visible = await get_visible_space_ids(tenant_id, actor_user_id)
+            accessible = await get_accessible_kb_ids(tenant_id, actor_user_id, visible)
+            if accessible is not None:
+                kb_ids = [k for k in kb_ids if k in accessible]
 
         if not kb_ids:
             return {
@@ -418,7 +445,7 @@ class DomainServiceService:
             try:
                 return await SearchService().search(
                     tenant_id=tenant_id,
-                    user_id="mcp",
+                    user_id="mcp",  # 检索侧归属标记（检索历史），非权限判定——权限过滤在上方 actor_user_id 分支
                     request={
                         "knowledge_base_id": kb_id,
                         "query": query,

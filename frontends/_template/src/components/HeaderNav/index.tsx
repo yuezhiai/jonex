@@ -7,7 +7,7 @@ import { useNavigate, useLocation, useMatches } from 'react-router-dom';
 import { useStore } from '@/store';
 import { findMenuPathKeys, getMenuItemsByPermission } from '@/utils/menu';
 import { getAvatarText, clearLocalStorageExcept } from '@/utils/utils';
-import { buildLoginRedirectUrl, clearAuthStorage } from '@jonex/shell-sdk';
+import { clearAuthStorage, redirectToLogin } from '@jonex/shell-sdk';
 import { safeMessage } from '@/utils/safeMessage';
 import useIsMobile from '@/hooks/useIsMobile';
 import { getMenuFromRoutes } from '@/router/menu';
@@ -85,8 +85,7 @@ export default function HeaderNav({ type = null, previous = '', title = '', prev
     }
     clearAuthStorage({ keepLocale: true });
     global.setUserInfo(null);
-    const loginUrl = VITE_LOGIN || '/login';
-    window.location.href = buildLoginRedirectUrl(loginUrl, window.location.href, VITE_APP_ID);
+    redirectToLogin({ loginUrl: VITE_LOGIN || '/login', appId: VITE_APP_ID });
   };
 
   const renderMenuContent = () => (

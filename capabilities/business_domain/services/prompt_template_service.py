@@ -13,11 +13,14 @@ import re
 from typing import Any
 
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
+
 
 from jonex_core.common import get_db_session
 from jonex_core.common.exceptions import (
     InvalidParameterError,
     PermissionDeniedError,
+    ResourceConflictError,
     ResourceNotFoundError,
 )
 from jonex_core.common.i18n import translate
@@ -168,17 +171,21 @@ class PromptTemplateService:
     # ── 创建（仅 domain） ──
 
     async def create_template(self, tenant_id: str, data: dict, user_id: str | None = None, domain_space_id: str | None = None) -> dict:
-        """创建领域模板（scope 固定 domain，初始化 v1.0，可指定 space_id）"""
+        """创建领域模板（scope 固定 domain，初始化 v1，可指定 space_id）"""
         tenant_id = require_tenant(tenant_id)
         name = data.get("name", "").strip()
         content = data.get("content", "").strip()
         category = data.get("category", "其他")
         space_id = domain_space_id or data.get("domain_space_id")
+        description = data.get("description")
 
         if not name:
             raise InvalidParameterError(message=translate("err.template.name_required", fallback="模板名称不能为空"))  # 原消息
+        self._check_max_length(name, self.MAX_NAME_LENGTH, "err.prompt.name_too_long")
         if not content:
             raise InvalidParameterError(message=translate("err.prompt.content_required", fallback="提示词内容不能为空"))  # 原消息
+        self._check_max_length(content, self.MAX_CONTENT_LENGTH, "err.prompt.content_too_long")
+        self._check_max_length(description, self.MAX_DESCRIPTION_LENGTH, "err.prompt.description_too_long")
         if category not in VALID_CATEGORIES:
             raise InvalidParameterError(
                 message=translate("err.prompt.invalid_category", params={"category": category}, fallback=f"无效分类: {category}"),  # 原消息
@@ -188,7 +195,7 @@ class PromptTemplateService:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         operator = user_id or data.get("created_by", "系统用户")
         version_entry = {
-            "version": "1.0",
+            "version": "1",
             "content": content,
             "updated_by": operator,
             "updated_at": now,
@@ -197,21 +204,30 @@ class PromptTemplateService:
 
         async with get_db_session() as session:
             repo = PromptTemplateRepository(session)
-            obj = await repo.create(
-                id=uuid.uuid4().hex,
-                tenant_id=tenant_id,
-                space_id=space_id,
-                name=name,
-                category=category,
-                scope="domain",
-                description=data.get("description"),
-                status=data.get("status", "启用"),
-                current_version="1.0",
-                versions_json=[version_entry],
-                created_by=operator,
-            )
-            await session.commit()
+            await self._ensure_name_available(repo, tenant_id, space_id, name)
+            try:
+                obj = await repo.create(
+                    id=uuid.uuid4().hex,
+                    tenant_id=tenant_id,
+                    space_id=space_id,
+                    name=name,
+                    category=category,
+                    scope="domain",
+                    description=description,
+                    status=data.get("status", "启用"),
+                    current_version="1",
+                    versions_json=[version_entry],
+                    created_by=operator,
+                )
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise ResourceConflictError(
+                    message=translate("err.prompt.name_exists", params={"name": name},
+                                      fallback=f"该领域空间内已存在同名模板: {name}")
+                )
             return obj.to_dict()
+
 
     # ── 更新（仅 domain） ──
 
@@ -240,13 +256,20 @@ class PromptTemplateService:
                 )
 
             new_content = data.get("content")
+            self._check_max_length(new_content, self.MAX_CONTENT_LENGTH, "err.prompt.content_too_long")
             old_versions = list(obj.versions_json or [])
             old_current = old_versions[0] if old_versions else None
 
             # 更新基本字段
             if data.get("name") is not None:
-                obj.name = data["name"].strip()
+                new_name = data["name"].strip()
+                if not new_name:
+                    raise InvalidParameterError(message=translate("err.template.name_required", fallback="模板名称不能为空"))
+                self._check_max_length(new_name, self.MAX_NAME_LENGTH, "err.prompt.name_too_long")
+                await self._ensure_name_available(repo, tenant_id, domain_space_id, new_name, exclude_id=obj.id)
+                obj.name = new_name
             if data.get("description") is not None:
+                self._check_max_length(data["description"], self.MAX_DESCRIPTION_LENGTH, "err.prompt.description_too_long")
                 obj.description = data["description"]
             if data.get("status") is not None:
                 obj.status = data["status"]
@@ -280,7 +303,14 @@ class PromptTemplateService:
                 obj.current_version = new_ver
                 obj.versions_json = [new_entry] + old_versions
 
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise ResourceConflictError(
+                    message=translate("err.prompt.name_exists", params={"name": obj.name},
+                                      fallback=f"该领域空间内已存在同名模板: {obj.name}")
+                )
             return obj.to_dict()
 
     # ── 删除（仅 domain） ──
@@ -355,7 +385,7 @@ class PromptTemplateService:
 
             new_versions = [
                 {
-                    "version": "1.0",
+                    "version": "1",
                     "content": (
                         src.versions_json[0]["content"]
                         if src.versions_json
@@ -367,21 +397,50 @@ class PromptTemplateService:
                 }
             ]
 
-            obj = await repo.create(
-                id=uuid.uuid4().hex,
-                tenant_id=tenant_id,
-                space_id=space_id,
-                name=f"{src.name} (副本)",
-                category=src.category,
-                scope="domain",
-                description=src.description,
-                status="启用",
-                current_version="1.0",
-                versions_json=new_versions,
-                created_by=operator,
-            )
-            await session.commit()
+            # 目标空间内已占用名称（排除软删），用于副本递增
+            existing = await repo.list_domain_templates(tenant_id, limit=1000, space_id=space_id)
+            occupied = {t.name for t in existing}
+            new_name = self._resolve_copy_name(src.name, occupied)
+
+            try:
+                obj = await repo.create(
+                    id=uuid.uuid4().hex,
+                    tenant_id=tenant_id,
+                    space_id=space_id,
+                    name=new_name,
+                    category=src.category,
+                    scope="domain",
+                    description=src.description,
+                    status="启用",
+                    current_version="1",
+                    versions_json=new_versions,
+                    created_by=operator,
+                )
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                raise ResourceConflictError(
+                    message=translate("err.prompt.name_exists", params={"name": new_name},
+                                      fallback=f"该领域空间内已存在同名模板: {new_name}")
+                )
             return obj.to_dict()
+
+    async def check_name_exists(
+        self,
+        tenant_id: str,
+        name: str,
+        domain_space_id: str | None = None,
+        template_id: str | None = None,
+    ) -> dict:
+        """实时查重（体验层）。口径与 create/update 完全一致。"""
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            repo = PromptTemplateRepository(session)
+            exists = await repo.name_exists(
+                tenant_id, name, domain_space_id, exclude_id=template_id,
+            )
+            return {"exists": exists}
+        
 
     # ── 版本管理（仅 domain） ──
 
@@ -447,13 +506,55 @@ class PromptTemplateService:
 
     # ── 工具方法 ──
 
+    # 长度上限（与 DTO / 前端保持一致）
+    MAX_NAME_LENGTH = 255
+    MAX_CONTENT_LENGTH = 5000
+    MAX_DESCRIPTION_LENGTH = 512
+
+    @staticmethod
+    def _check_max_length(value: str | None, max_len: int, err_key: str) -> None:
+        """长度上限校验。统一 strip 后判长，避免首尾空白影响边界判断。"""
+        if value is not None and len(value.strip()) > max_len:
+            raise InvalidParameterError(
+                message=translate(err_key, params={"max": max_len},
+                                  fallback=f"长度不能超过 {max_len} 个字符")
+            )
+
+    async def _ensure_name_available(
+        self, repo, tenant_id, space_id, name, exclude_id=None,
+    ) -> None:
+        """同空间名称查重，命中抛 ResourceConflictError(409)。"""
+        if await repo.name_exists(tenant_id, name, space_id, exclude_id=exclude_id):
+            raise ResourceConflictError(
+                message=translate("err.prompt.name_exists", params={"name": name},
+                                  fallback=f"该领域空间内已存在同名模板: {name}")
+            )
+
+    @staticmethod
+    def _resolve_copy_name(base_name: str, occupied: set[str]) -> str:
+        """返回第一个未被占用的「{base}（副本N）」，N 从 1 递增。
+
+        注：系统种子模板名不含「（副本）」后缀；若未来允许复制 domain 副本再复制，
+        可在此先剥离 base_name 的「（副本N）」后缀再递增。
+        """
+        n = 1
+        while True:
+            candidate = f"{base_name}（副本{n}）"
+            if candidate not in occupied:
+                return candidate
+            n += 1
+
+
     @staticmethod
     def _bump_version(current: str) -> str:
-        """版本号自增末位：1.0 → 1.1, 2.3 → 2.4"""
-        parts = str(current or "1.0").split(".")
-        last = int(parts[-1] or 0)
-        parts[-1] = str(last + 1)
-        return ".".join(parts)
+        """版本号整数自增：1 → 2, 2 → 3；兼容旧 X.Y 格式（1.0 → 2）"""
+        try:
+            return str(int(current or "1") + 1)
+        except (TypeError, ValueError):
+            try:
+                return str(int(str(current).split(".")[0]) + 1)
+            except (TypeError, ValueError):
+                return "1"
 
     @classmethod
     def _resolve_next_version(
@@ -462,15 +563,15 @@ class PromptTemplateService:
         target_version: str | None,
         existing_versions: list[dict],
     ) -> str:
-        """返回下一版本号；用户未指定时沿用小版本自增，指定时校验格式与递增关系。"""
+        """返回下一版本号；用户未指定时自动整数自增，指定时校验格式与递增关系。"""
         requested = (target_version or "").strip()
         if not requested:
             return cls._bump_version(current)
 
-        if not re.fullmatch(r"\d+\.\d+", requested):
-            raise InvalidParameterError(message=translate("err.prompt.invalid_version_format", fallback="版本号格式无效，请使用如 1.1 或 2.0 的格式"))  # 原消息
+        if not re.fullmatch(r"\d+", requested):
+            raise InvalidParameterError(message=translate("err.prompt.invalid_version_format", fallback="版本号格式无效，请使用正整数"))  # 原消息
 
-        if cls._version_key(requested) <= cls._version_key(current or "1.0"):
+        if cls._version_key(requested) <= cls._version_key(current or "1"):
             raise InvalidParameterError(message=translate("err.prompt.new_version_must_be_higher", fallback="新版本号必须大于当前版本"))  # 原消息
 
         if any(str(v.get("version")) == requested for v in existing_versions):
@@ -479,9 +580,11 @@ class PromptTemplateService:
         return requested
 
     @staticmethod
-    def _version_key(version: str) -> tuple[int, int]:
-        major, minor = str(version or "0.0").split(".", 1)
-        return int(major), int(minor)
+    def _version_key(version: str) -> int:
+        try:
+            return int(str(version or "0"))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _match_content(template: PromptTemplate, keyword: str) -> bool:

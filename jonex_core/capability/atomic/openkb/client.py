@@ -1,4 +1,4 @@
-# [jonex] 悦溪新增文件 — OpenKB 客户端
+# [jonex] Jonex新增文件 — OpenKB 客户端
 import logging
 from abc import ABC, abstractmethod
 
@@ -68,7 +68,7 @@ class RemoteOpenKBClient(OpenKBClient):
         cfg = get_config()
         self._client = httpx.AsyncClient(
             base_url=(endpoint or cfg.SIDECAR_URL or "http://sidecar:8000").rstrip("/"),
-            headers={"X-API-Key": "jonex_test_gateway"},
+            headers={"X-API-Key": cfg.GATEWAY_API_KEY},
             timeout=300,
         )
         self._capability_id = capability_id

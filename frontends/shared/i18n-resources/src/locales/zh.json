@@ -81,6 +81,7 @@
     "rolePermission": "角色权限",
     "systemConfig": "系统设置",
     "operationLog": "审计日志",
+    "systemMonitor": "系统监控",
     "integrationExtension": "集成扩展",
     "ecosystemManagement": "集成",
     "ecoAdapter": "集成适配器",
@@ -116,7 +117,7 @@
     "en": "English"
   },
   "site": {
-    "title": "悦溪平台",
+    "title": "Jonex 平台",
     "subtitle": "AI 能力平台"
   },
   "space": {
@@ -126,6 +127,8 @@
   "shell": {
     "enterUsername": "请输入用户名",
     "enterPassword": "请输入密码",
+    "passwordTooShort": "密码长度不能少于 8 位",
+    "passwordTooLong": "密码长度不能超过 128 位",
     "selectTenant": "请选择租户",
     "selectTenantPlaceholder": "选择租户",
     "enterTenantId": "请输入租户ID",
@@ -137,7 +140,7 @@
     "loginSyncFailed": "登录成功，但登录态同步失败，请稍后重试",
     "loginSubtitle": "多模态领域知识引擎 · 登录",
     "testAccount": "测试账号：admin / admin123",
-    "welcomeToPlatform": "{{name}}，欢迎使用悦溪",
+    "welcomeToPlatform": "{{name}}，欢迎使用Jonex",
     "platformSubtitle": "智能知识管理与 AI 能力平台",
     "manifestLoadFailed": "加载应用清单失败",
     "appNotFound": "应用未找到",
@@ -157,9 +160,9 @@
     "selectSpace": "选择领域空间",
     "addSpace": "添加领域空间",
     "builtInTenants": {
-      "demo": "悦溪演示租户",
-      "alpha": "悦溪 Alpha 测试租户",
-      "beta": "悦溪 Beta 测试租户"
+      "demo": "Jonex演示租户",
+      "alpha": "Jonex Alpha 测试租户",
+      "beta": "Jonex Beta 测试租户"
     }
   },
   "mcpKeyManagement": {

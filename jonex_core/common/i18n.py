@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 国际化（i18n）核心模块
+Jonex 平台 - 国际化（i18n）核心模块
 
 提供：
 - LocaleContext：基于 contextvars 的异步安全 locale 上下文

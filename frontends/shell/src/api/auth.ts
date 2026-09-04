@@ -10,12 +10,30 @@ import {
   clearAuthStorage,
   backupAuthForImpersonation,
   restoreAuthFromImpersonation,
+  redirectToLogin,
 } from '@jonex/shell-sdk';
 
 const LOCALE_KEY = 'locale';
 
 export const getAccessToken = readAccessToken;
 export const getUser = readCachedUser<ShellUser>;
+
+/** 本地解析 access token 的 exp 判断是否已过期（JWT payload 为 base64url）。
+ * 仅用于刷新/启动时的零延迟预判；解析失败或无 exp 时返回 false，交由 `/auth/me` 权威校验。 */
+export function isAccessTokenExpired(): boolean {
+  const token = getAccessToken();
+  if (!token) return false;
+  try {
+    const part = token.split('.')[1];
+    if (!part) return false;
+    const base64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+    const payload = JSON.parse(atob(padded)) as { exp?: unknown };
+    return typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now();
+  } catch {
+    return false;
+  }
+}
 
 function normalizeUser(raw: Record<string, unknown>): ShellUser {
   const id = String(raw.user_id || raw.id || '');
@@ -182,7 +200,7 @@ export async function createLoginTicket(appId: string, redirectUri: string, stat
 
 export function logout(): void {
   clearTokens();
-  window.location.href = '/login';
+  redirectToLogin({ loginUrl: '/login' });
 }
 
 export default apiClient;

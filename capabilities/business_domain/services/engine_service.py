@@ -6,6 +6,7 @@ import uuid
 from jonex_core.common import get_db_session
 from jonex_core.common.i18n import translate
 
+from capabilities.business_domain.models import DataAccessMethod, ParserConfig
 from capabilities.business_domain.repository import (
     DataAccessMethodRepository,
     ParserConfigRepository,
@@ -20,8 +21,9 @@ class EngineService:
     async def list_access_methods(self, offset: int = 0, limit: int = 20) -> dict:
         async with get_db_session() as session:
             repo = DataAccessMethodRepository(session)
-            items = await repo.list_all_shared(offset, limit)
-            total = await repo.count_shared()
+            active_cond = [DataAccessMethod.status == "active"]
+            items = await repo.list_all_shared(offset, limit, extra_conditions=active_cond)
+            total = await repo.count_shared(extra_conditions=active_cond)
             return {"items": [o.to_dict() for o in items], "total": total, "offset": offset, "limit": limit}
 
     async def create_access_method(self, data: dict) -> dict:
@@ -51,8 +53,9 @@ class EngineService:
     async def list_parsers(self, offset: int = 0, limit: int = 20) -> dict:
         async with get_db_session() as session:
             repo = ParserConfigRepository(session)
-            items = await repo.list_all_shared(offset, limit)
-            total = await repo.count_shared()
+            active_cond = [ParserConfig.status == "active"]
+            items = await repo.list_all_shared(offset, limit, extra_conditions=active_cond)
+            total = await repo.count_shared(extra_conditions=active_cond)
             return {"items": [o.to_dict() for o in items], "total": total, "offset": offset, "limit": limit}
 
     async def create_parser(self, data: dict) -> dict:

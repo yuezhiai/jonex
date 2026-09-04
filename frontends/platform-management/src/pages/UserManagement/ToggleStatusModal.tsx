@@ -35,7 +35,10 @@ const ToggleStatusModal = forwardRef<ToggleStatusModalHandle, Props>(({ getUserD
     if (!target) return;
     const newStatus = target.status === 1 ? 0 : 1;
     try {
-      await updateUser(target.id, { status: newStatus });
+      // [jonex] 必须带目标用户所属租户：平台管理员在「全部租户」视图操作别的租户用户时，
+      // 后端 _resolve_target_tenant 无 target_tenant_id 会回落到操作者租户，导致查不到
+      // 该 user_id 而报「用户不存在」。与编辑弹窗的 updateUser(..., editing.tenant_id) 同口径。
+      await updateUser(target.id, { status: newStatus }, target.tenant_id);
       message.success(newStatus === 1 ? t('userManagement.enabled') : t('userManagement.disabled'));
       setTarget(null);
       await onSaved();

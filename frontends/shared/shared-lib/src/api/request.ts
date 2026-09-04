@@ -1,6 +1,6 @@
 import axios from 'axios';
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { clearAuthStorage, readAccessToken } from '@jonex/shell-sdk';
+import { emitSessionExpired, readAccessToken } from '@jonex/shell-sdk';
 import type { ApiError, ApiResponse } from './types';
 
 export interface CreateRequestOptions {
@@ -117,14 +117,9 @@ export function createRequest(options: CreateRequestOptions = {}): ApiClient {
         const config = error.config;
         if (apiError.status === 401 && handle401 && !isLoginRequest(config) && !tokenExpiredHandled) {
           tokenExpiredHandled = true;
-          clearAuthStorage({ keepLocale: true });
-          try {
-            (window.top || window.parent || window).dispatchEvent(new CustomEvent('jonex:token-expired'));
-          } catch {}
-          if (window.parent === window && (window as { __SHELL_CONTEXT__?: { mode?: string } }).__SHELL_CONTEXT__?.mode !== 'hosted') {
-            // expired=1 让登录页展示「会话已过期」提示，避免被页面跳转吞掉
-            window.location.href = `/login?redirect=${encodeURIComponent(window.location.href)}&expired=1`;
-          }
+          // 发会话失效信号（清 token + jonex:token-expired 事件），跳转由监听者统一执行；
+          // 调试开关 jonex_disable_401_redirect 的判定已收敛在 shell-sdk emitSessionExpired 内。
+          emitSessionExpired();
         }
         return Promise.reject(apiError);
       }

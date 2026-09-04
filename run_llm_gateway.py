@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - LLM 网关启动脚本
+Jonex 平台 - LLM 网关启动脚本
 
 使用方法:
     python run_llm_gateway.py               # 默认 8787 端口
@@ -21,7 +21,7 @@ logger = get_logger("llm_gateway_launcher")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="悦溪平台 LLM 网关")
+    parser = argparse.ArgumentParser(description="Jonex 平台 LLM 网关")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=config.LLMGW_PORT, help=f"监听端口 (默认: {config.LLMGW_PORT})")
     parser.add_argument("--workers", type=int, default=1, help="工作进程数 (默认: 1)")
@@ -35,7 +35,7 @@ def main():
         os.environ["ENV"] = args.env
 
     logger.info("=" * 60)
-    logger.info("悦溪平台 LLM 网关启动中...")
+    logger.info("Jonex 平台 LLM 网关启动中...")
     logger.info(f"监听地址: http://{args.host}:{args.port}")
     logger.info(f"工作进程数: {args.workers}")
     logger.info(f"开发模式: {'开启' if args.reload else '关闭'}")

@@ -30,14 +30,12 @@ PROMPTS_ZH["GENERIC_ANALYSIS_SYSTEM"] = "你是一位专注于{content_type}内�
 PROMPTS_ZH["vision_prompt"] = """请详细分析这张图片，并以以下JSON结构提供回答：
 
 {{
-    "detailed_description": "对图片的全面详细描述，遵循以下指导：
-    - 描述整体构图和布局
-    - 识别所有对象、人物、文字和视觉元素
-    - 解释元素之间的关系
-    - 注意颜色、光照和视觉风格
-    - 描述展示的任何动作或活动
-    - 如涉及图表、图解等，包含技术细节
-    - 始终使用具体名称而非代词",
+    "detailed_description": "用 1-3 句话客观描述图片内容要点，遵循以下指导：
+    - 只描述图片中可见的内容，不推测、不解读创作意图
+    - 识别主要对象、人物、文字和视觉元素（有把握才写）
+    - 如涉及图表、图解等，包含关键数据或结构信息
+    - 始终使用具体名称而非代词
+    - 禁止使用'可能/看似/或许/似乎/大概'等推测措辞",
     "entity_info": {{
         "entity_name": "{entity_name}",
         "entity_type": "image",
@@ -53,24 +51,26 @@ PROMPTS_ZH["vision_prompt"] = """请详细分析这张图片，并以以下JSON�
 请专注于提供准确、详细的视觉分析，以便于知识检索。"""
 
 # Image analysis prompt with context support
+# [jonex] §image-refs F1（终稿，docs/image-reference-accuracy-fix-plan.md §18）：
+# 从「纯视觉描述」改为「视觉描述 + 文档角色关联」，让图片描述携带文档主题
+# 关键词，改善主题 query 下的 rerank 相关性。含 Review 修正 F-2（保留图表
+# 指令）/F-3（名称关联限定「上下文明确指明对应关系」，结尾「自然保留」）。
 PROMPTS_ZH[
     "vision_prompt_with_context"
 ] = """请结合上下文详细分析这张图片，并以以下JSON结构提供回答：
 
 {{
-    "detailed_description": "对图片的全面详细描述，遵循以下指导：
-    - 描述整体构图和布局
-    - 识别所有对象、人物、文字和视觉元素
-    - 解释元素之间的关系及其与上下文的联系
-    - 注意颜色、光照和视觉风格
-    - 描述展示的任何动作或活动
-    - 如涉及图表、图解等，包含技术细节
-    - 在相关时引用与周围内容的联系
-    - 始终使用具体名称而非代词",
+    "detailed_description": "结合上下文用 1-3 句话描述图片内容及其在文档中的角色，遵循以下指导：
+    - 第一句：客观描述图片中可见的主要内容（对象、人物、文字、数据；如涉及图表或图解，包含关键数据或结构信息）
+    - 第二句：基于周围文本上下文，说明此图在文档中的角色（如：某人物/作品的配图、某主题的示例、某数据的可视化、某流程的图解）
+    - 仅当上下文明确指明此图与某名称的对应关系（如'图为 XX 的作品''如图所示'等指代）时，在描述中使用该名称
+    - 始终使用具体名称而非代词
+    - 只描述有把握的内容，禁止推测
+    - 禁止使用'可能/看似/或许/似乎/大概'等措辞",
     "entity_info": {{
         "entity_name": "{entity_name}",
         "entity_type": "image",
-        "summary": "图片内容、重要性及与周围内容关系的简明摘要（不超过100字）"
+        "summary": "图片内容、所属主题及与文档上下文关系的简明摘要（不超过100字）"
     }}
 }}
 
@@ -82,7 +82,42 @@ PROMPTS_ZH[
 - 标注：{captions}
 - 脚注：{footnotes}
 
-请专注于提供融合上下文的准确、详细的视觉分析，以便于知识检索。"""
+若上下文已提供与图片相关的主题关键词，在描述中自然保留这些关键词。"""
+
+# Image analysis prompt with deterministic anchor (assertive)
+# [jonex] §image-refs E2（docs/image-reference-accuracy-fix-plan.md §27）：
+# 锚点在 VLM 调用前确定后以「断言式」注入——"此图是 {anchor} 的配图"，
+# 不给选择余地。低量化 VLM 对参考式指令（"此图可能属于…"）遵从度低，
+# 断言式指令下描述围绕锚点主题展开；锚点来自 MinerU 结构化产物
+# （cap/foot/col/heading），可信度足够。与 chunk 前缀注入双保险：
+# 前缀确定性进 embedding，此处保证 VLM 描述与锚点语义一致。
+PROMPTS_ZH[
+    "vision_prompt_with_anchor"
+] = """此图是 {anchor} 的配图。请描述图中可见内容，并以以下JSON结构提供回答：
+
+{{
+    "detailed_description": "用 1-3 句话客观描述图中可见内容要点，遵循以下指导：
+    - 只描述图片中可见的内容，不推测、不解读创作意图
+    - 识别主要对象、人物、文字和视觉元素（有把握才写）
+    - 如涉及图表、图解等，包含关键数据或结构信息
+    - 始终使用具体名称而非代词
+    - 禁止使用'可能/看似/或许/似乎/大概'等推测措辞",
+    "entity_info": {{
+        "entity_name": "{entity_name}",
+        "entity_type": "image",
+        "summary": "图片内容及其与 {anchor} 关系的简明摘要（不超过100字）"
+    }}
+}}
+
+本页内容上下文（仅作背景参考）：
+{context}
+
+图片详细信息：
+- 图片路径：{image_path}
+- 标注：{captions}
+- 脚注：{footnotes}
+
+请专注于提供准确、详细的视觉分析，以便于知识检索。"""
 
 # Image analysis prompt with text fallback
 PROMPTS_ZH["text_prompt"] = """根据以下图片信息提供分析：

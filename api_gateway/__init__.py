@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - API 网关
+Jonex 平台 - API 网关
 """
 
 from .main import create_app, app

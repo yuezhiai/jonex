@@ -145,6 +145,11 @@ def parse_file_source(raw: str) -> dict[str, Any]:
         # 实体提示（= 表标题 heading，写入侧 ehint= 键），检索期主体
         # 一致性过滤的信号源；旧 chunk 无此键 → None
         "entity_hint": kv.get("ehint") or None,
+        # [jonex] §image-refs E 方案：图片 chunk 版面主题锚点来源
+        # （anchor_src=cap|foot|col|heading，写入侧见 raganything
+        # stages.py _build_file_source），供锚点命中率统计使用；
+        # 旧 chunk 无此键 → None
+        "anchor_src": kv.get("anchor_src") or None,
     }
 
 

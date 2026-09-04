@@ -12,6 +12,10 @@ export interface PlatformUser {
   last_login_at: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /** RBAC 绑定角色名（users.role 是历史列仅兜底；role_names 为真实绑定角色） */
+  role_names?: string[];
+  /** RBAC 绑定角色 id（与 role_names 同源；前端按管理员角色 id 过滤可选成员） */
+  role_ids?: number[];
 }
 
 export interface PlatformUserListResult {

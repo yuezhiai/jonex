@@ -6,6 +6,7 @@ import type {
   PaginationResult,
   DomainKnowledgeItem,
   DomainKnowledgePermissionMember,
+  DomainKnowledgePermissionRole,
   DomainKnowledgePermissionPayload,
   DomainKnowledgeDetail,
   DataSourceConfig,
@@ -42,6 +43,7 @@ import type {
   SaveCompileStepPayload,
   OntologyConstraint,
   SaveOntologyConstraintPayload,
+  ConstraintTargetType,
   CompiledSchemaConstraint,
   OntologyInstanceSummary,
   RelationInstanceSummary,
@@ -71,6 +73,7 @@ import type {
   WikiPageItem,
   WikiContents,
 } from '@/types/domainKnowledge';
+import type { MemberCandidate } from '@/types/domainService';
 import { request, getData, postData, putData, deleteData } from './request';
 import axios from 'axios';
 import { readAccessToken } from '@jonex/shell-sdk';
@@ -225,7 +228,8 @@ function mapKBItem(item: BackendKBItem): DomainKnowledgeItem {
 /** KB 授权成员（后端 kb_permissions 表；display_name 后端 join，前端不再拉 /users 拼名字） */
 interface BackendKbPermission {
   user_id: string;
-  role: 'viewer' | 'editor' | 'kb_manager';
+  // [jonex] B3：后端取值已收为 kb_manager / member
+  role: DomainKnowledgePermissionRole;
   display_name: string | null;
   created_at: string | null;
 }
@@ -243,7 +247,9 @@ export async function getDomainKnowledgePermissions(
     dept: '',
     avatarText: (p.display_name || p.user_id).charAt(0).toUpperCase(),
     avatarColor: '#94a3b8',
-    role: p.role === 'kb_manager' ? 'kb_manager' : p.role === 'editor' ? 'editor' : 'viewer',
+    // [jonex] B3：显式映射而非三元兜底。未知取值落到 member（只读，越权方向安全），
+    // 但后端白名单会在保存时拒绝旧值，所以「迁移没跑」不会被静默掩盖。
+    role: p.role === 'kb_manager' ? 'kb_manager' : 'member',
   }));
   if (keyword) members = members.filter((m) => m.name.includes(keyword));
   return { knowledgeBaseId, members };
@@ -259,6 +265,16 @@ export async function saveDomainKnowledgePermissions(
     }),
   );
   return true;
+}
+
+/** 获取知识库添加成员候选用户（父空间成员池；需 KB 管理权限，无需 user:read） */
+export async function getKbPermissionCandidates(
+  knowledgeBaseId: string,
+): Promise<MemberCandidate[]> {
+  const result = await getData<{ candidates: MemberCandidate[] }>(
+    request.get(`/knowledge-base/knowledge-info/${knowledgeBaseId}/permission-candidates`),
+  );
+  return result.candidates ?? [];
 }
 
 // ─── Detail APIs ────────────────────────────────────────
@@ -1116,6 +1132,20 @@ function decodeRelationMeta(id: string): {
   };
 }
 
+function assertEntityNameUnique(
+  entityTypes: CompiledSchemaEntityType[],
+  displayName: string,
+  excludeCode?: string,
+): void {
+  const target = (displayName || '').trim();
+  const conflict = entityTypes.some(
+    (entity) => entity.name !== excludeCode && (entity.display_name || entity.name).trim() === target,
+  );
+  if (conflict) {
+    throw new Error(`对象名称已存在: ${target}`);
+  }
+}
+
 function buildCompiledEntityFromPayload(
   payload: SaveOntologyObjectPayload,
   existingNames: Set<string>,
@@ -1187,6 +1217,7 @@ export async function getOntologyObjects(kbId: string): Promise<OntologyObjectDe
 export async function createOntologyObject(kbId: string, p: SaveOntologyObjectPayload): Promise<OntologyObjectDef> {
   const schema = await fetchCompiledSchemaForEditing(kbId);
   const entityTypes = schema.entity_types || [];
+  assertEntityNameUnique(entityTypes, p.name);
   const nextEntity = buildCompiledEntityFromPayload(p, new Set(entityTypes.map((entity) => entity.name)));
   // 新增对象不会使既有约束悬挂，constraints 传 undefined=后端保留
   await persistCompiledOntology(kbId, [...entityTypes, nextEntity], schema.relation_types || [], schema.schema_version);
@@ -1205,6 +1236,7 @@ export async function updateOntologyObject(
   const current = entityTypes.find((entity) => entity.name === meta.compiledName);
   if (!current) throw new Error('Object does not exist');
 
+  assertEntityNameUnique(entityTypes, p.name, current.name);
   const nextEntity = buildCompiledEntityFromPayload(p, new Set(entityTypes.map((entity) => entity.name)), current);
   const nextEntities = entityTypes.map((entity) => (entity.name === current.name ? nextEntity : entity));
   // 属性可能被删除，剔除悬挂约束（针对该实体属性目标）后显式回写
@@ -1637,6 +1669,87 @@ export async function importOntologyRelationsFromTemplate(
   };
 }
 
+/** 待导入约束项：target 用「名」表达（entityName 仅 attribute 约束回填所属对象），反查在导入函数内完成。 */
+export interface ConstraintImportItem {
+  name: string;
+  targetType: ConstraintTargetType;
+  entityName?: string;
+  targetName: string;
+  constraintType: string;
+  expression?: string;
+  suggestion?: string;
+}
+
+export async function importOntologyConstraintsFromTemplate(
+  kbId: string,
+  items: ConstraintImportItem[],
+): Promise<{ created: OntologyConstraint[]; skipped: number }> {
+  const schema = await fetchCompiledSchemaForEditing(kbId);
+  const entityTypes = schema.entity_types || [];
+  const relationTypes = schema.relation_types || [];
+  const constraints = readSchemaConstraints(schema);
+
+  // 反向索引：display_name → code（与关系导入反查一致，不假设 code 生成规则）
+  const entityCodeByDisplay = new Map<string, string>();
+  const attrCodeByKey = new Map<string, string>(); // `${display}.${attrDisplay}` -> `${code}.${attrCode}`
+  for (const e of entityTypes) {
+    const display = e.display_name || e.name;
+    entityCodeByDisplay.set(display, e.name);
+    for (const a of e.attributes || []) {
+      attrCodeByKey.set(`${display}.${a.display_name || a.name}`, `${e.name}.${a.name}`);
+    }
+  }
+  const relationCodeByDisplay = new Map<string, string>();
+  for (const r of relationTypes) {
+    relationCodeByDisplay.set(r.display_name || r.name, r.name);
+  }
+
+  const existingNames = new Set(constraints.map((c) => c.name));
+  const nextConstraints = [...constraints];
+  const created: OntologyConstraint[] = [];
+  let skipped = 0;
+
+  for (const item of items) {
+    if (existingNames.has(item.name)) {
+      skipped += 1;
+      continue;
+    }
+    let targetCode = '';
+    if (item.targetType === 'entity') {
+      targetCode = entityCodeByDisplay.get(item.targetName) || '';
+    } else if (item.targetType === 'relation') {
+      targetCode = relationCodeByDisplay.get(item.targetName) || '';
+    } else {
+      const key = item.entityName ? `${item.entityName}.${item.targetName}` : item.targetName;
+      targetCode = attrCodeByKey.get(key) || '';
+    }
+    if (!targetCode) {
+      skipped += 1;
+      continue;
+    }
+
+    const compiled = buildCompiledConstraintFromPayload({
+      name: item.name,
+      targetType: item.targetType,
+      targetCode,
+      targetLabel: item.targetName,
+      constraintType: item.constraintType || 'custom',
+      expression: item.expression || '',
+      suggestion: item.suggestion || '',
+    });
+    existingNames.add(item.name);
+    nextConstraints.push(compiled);
+    const ui = mapCompiledConstraintToUi(compiled);
+    if (ui) created.push(ui);
+  }
+
+  if (created.length > 0) {
+    await persistCompiledOntology(kbId, entityTypes, relationTypes, schema.schema_version, nextConstraints);
+  }
+
+  return { created, skipped };
+}
+
 // ═══════════════════════════════════════════════════════════
 // ─── 领域知识结果 — 真实后端 API（ontology_query_service）─
 // ═══════════════════════════════════════════════════════════
@@ -1761,7 +1874,7 @@ export function getOntologyRelationInstances(params: RelationInstanceListParams)
   }>(request.get('/knowledge-base/ontology/relations', { params: cleanQuery }));
 }
 
-/** 获取 KB 图谱数据（nodes + edges + 统计），支持类型筛选与节点上限 */
+/** 获取 KB 图谱数据（nodes + edges + 统计），支持类型筛选、文档筛选与节点上限 */
 export function getOntologyGraph(kbId: string, params?: OntologyGraphParams): Promise<OntologyGraphData> {
   return getData<OntologyGraphData>(
     request.get('/knowledge-base/ontology/graph', {
@@ -1769,6 +1882,7 @@ export function getOntologyGraph(kbId: string, params?: OntologyGraphParams): Pr
         knowledge_base_id: kbId,
         limit: params?.limit,
         entity_types: params?.entityTypes,
+        document_id: params?.documentId || undefined,
       },
       // 数组参数序列化为 entity_types=A&entity_types=B（FastAPI list[str] 期望格式）
       paramsSerializer: { indexes: null },

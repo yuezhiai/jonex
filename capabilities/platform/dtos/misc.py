@@ -10,7 +10,7 @@ except ImportError:
 # ============ 租户管理 ============
 
 class TenantCreateRequest(BaseModel):
-    id: str = Field(..., min_length=1, max_length=64)
+    id: str = Field(..., min_length=1, max_length=64, regex=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
     plan_type: str = Field(default="free")

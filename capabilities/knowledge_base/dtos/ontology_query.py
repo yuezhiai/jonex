@@ -18,6 +18,7 @@ class OntologyGraphRequest(BaseModel):
     knowledge_base_id: str
     limit: int = 500
     entity_types: Optional[list[str]] = None
+    document_id: Optional[str] = None  # 按来源文档过滤节点，只保留 doc_ids 含该文档的实体
 
 
 class OntologyNeighborRequest(BaseModel):

@@ -2,7 +2,7 @@
 Pydantic v1 DTOs — 请求/响应模型。
 """
 from datetime import datetime
-from typing import List, Literal, Optional, Union
+from typing import Literal, Optional
 
 try:
     from pydantic.v1 import BaseModel, Field
@@ -28,6 +28,8 @@ class UserInfo(BaseModel):
     is_platform_admin: bool = False
     is_tenant_admin: bool = False
     permissions: list[str] = []
+    impersonated: bool = False
+    original_tenant_id: Optional[str] = None
 
 
 class LoginResponse(BaseModel):
@@ -37,19 +39,6 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     user: UserInfo
-
-
-class TenantOption(BaseModel):
-    tenant_id: str
-    tenant_name: str
-
-
-class TenantSelectionRequiredResponse(BaseModel):
-    status: Literal["tenant_selection_required"] = "tenant_selection_required"
-    tenant_options: List[TenantOption]
-
-
-LoginFlowResponse = Union[LoginResponse, TenantSelectionRequiredResponse]
 
 
 class LoginTicketRequest(BaseModel):
@@ -68,3 +57,13 @@ class ExchangeTicketRequest(BaseModel):
     ticket: str
     redirectUri: str
     state: Optional[str] = None
+
+
+class ImpersonateRequest(BaseModel):
+    target_tenant_id: str
+
+
+class ImpersonateResponse(BaseModel):
+    token: str
+    target_tenant_id: str
+    target_tenant_name: Optional[str] = None

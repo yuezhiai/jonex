@@ -11,13 +11,16 @@ except ImportError:
 
 class UserCreateRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=8, max_length=128)
     display_name: Optional[str] = None
     email: Optional[str] = None
     role: str = "user"
     # 跨租户创建用户时指定目标租户（端点有 user:write 权限码守卫）
     target_tenant_id: Optional[str] = None
-    # RBAC 角色绑定：创建后绑定的角色 id（目标租户内的角色；为空则不绑定，users.role 保持默认 'user'）
+    # RBAC 角色绑定：创建后绑定的角色 id 列表（目标租户内的角色；为空则不绑定，
+    # users.role 保持默认 'user'）。一人多角色由 user_roles 的 uq(tenant,user,role) 支撑。
+    role_ids: Optional[list[int]] = None
+    # [jonex] 兼容旧调用方的单角色字段。role_ids 非空时以 role_ids 为准。
     role_id: Optional[int] = None
 
 
@@ -28,6 +31,8 @@ class UserUpdateRequest(BaseModel):
     status: Optional[int] = None
     # [jonex] 跨租户编辑目标租户（路由层解析，service 不落实体）
     target_tenant_id: Optional[str] = None
+    # [jonex] 可选改密：为空/NULL 表示不改密码（service 层重哈希写入 password_hash）
+    new_password: Optional[str] = Field(default=None, min_length=8, max_length=128)
 
 
 class UserResponse(BaseModel):
@@ -44,6 +49,8 @@ class UserResponse(BaseModel):
     # RBAC 绑定角色名（user_roles join roles；与编辑弹窗 get_roles 同源）。
     # users.role 是历史列（admin/user），仅作兜底展示。
     role_names: list[str] = []
+    # RBAC 绑定角色 id（与 role_names 同源；前端按管理员角色 id 过滤可添加成员）
+    role_ids: list[int] = []
 
     class Config:
         orm_mode = True

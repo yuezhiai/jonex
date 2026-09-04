@@ -29,6 +29,11 @@ const COLOR_PALETTE = [
   '#84cc16',
   '#d946ef',
 ];
+
+// 搜索命中节点的高亮色（不在 entity_type 调色板内，大红色高亮，保证视觉上唯一可区分）
+const SEARCH_HIGHLIGHT_FILL = '#FF0000'; // 大红色填充
+const SEARCH_HIGHLIGHT_STROKE = '#b91c1c'; // 深红描边
+
 let _colorIdx = 0;
 function getTypeColor(type: string): string {
   if (!TYPE_COLORS[type]) {
@@ -130,13 +135,17 @@ function buildGraphData(raw: { nodes: OntologyGraphNode[]; edges: OntologyGraphE
 
 interface KnowledgeGraphPanelProps {
   kbId: string;
+  /** 按来源文档过滤图谱节点，不传则返回 KB 级全库图谱 */
+  docId?: string;
 }
 
-export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) {
+export default function KnowledgeGraphPanel({ kbId, docId }: KnowledgeGraphPanelProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<any>(null);
   const currentDataRef = useRef<OntologyGraphData | null>(null);
+  /** 当前被放大显示的搜索节点 id（搜索新实体时先恢复旧节点图标） */
+  const enlargedNodeIdRef = useRef<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -203,8 +212,8 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
         data: gData,
         ...(renderer ? { renderer } : {}),
         layout,
+        // 不设图级 node.type：否则会覆盖数据里的 type，搜索命中的五角星节点无法生效
         node: {
-          type: 'circle',
           style: { cursor: 'pointer' },
         },
         edge: {
@@ -309,6 +318,7 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
         getOntologyGraph(kbId, {
           limit: NODE_LIMIT,
           entityTypes: selectedTypes.length ? selectedTypes : undefined,
+          documentId: docId || undefined,
         }),
         getOntologyStatistics(kbId),
       ]);
@@ -334,7 +344,7 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
     } finally {
       setLoading(false);
     }
-  }, [kbId, selectedTypes, renderGraph]);
+  }, [kbId, docId, selectedTypes, renderGraph]);
 
   // 初始化和清理
   useEffect(() => {
@@ -352,18 +362,54 @@ export default function KnowledgeGraphPanel({ kbId }: KnowledgeGraphPanelProps) 
   const handleZoomOut = () => graphRef.current?.zoomTo(graphRef.current.getZoom() * 0.7);
   const handleFitView = () => graphRef.current?.fitView();
 
-  // 搜索节点
-  const handleSearch = () => {
+  // 搜索节点：命中后图标放大 + 居中放大显示
+  const handleSearch = async () => {
     if (!searchKeyword.trim() || !currentDataRef.current) return;
     const kw = searchKeyword.toLowerCase();
     const found = currentDataRef.current.nodes.find(
       (n) => n.name.toLowerCase().includes(kw) || n.id.toLowerCase().includes(kw),
     );
-    if (found && graphRef.current) {
-      graphRef.current.focusElement(found.id, { duration: 500 });
-    } else {
+    const graph = graphRef.current;
+    if (!found || !graph) {
       message.info(t('knowledgeGraph.nodeNotFound'));
+      return;
     }
+    // 先恢复上一个被放大显示的节点图标（回到 mapNode 默认尺寸与类型色）
+    if (enlargedNodeIdRef.current && enlargedNodeIdRef.current !== found.id) {
+      const prevNode = currentDataRef.current.nodes.find((n) => n.id === enlargedNodeIdRef.current);
+      if (prevNode) {
+        graph.updateNodeData([
+          {
+            id: prevNode.id,
+            type: 'circle',
+            style: {
+              size: 30 + Math.min((prevNode.doc_ids?.length || 0) * 3, 30),
+              lineWidth: 2,
+              fill: getTypeColor(prevNode.type),
+              stroke: getTypeColor(prevNode.type),
+            },
+          },
+        ]);
+      }
+    }
+    // 搜索到的实体图标放大为五角星形状，并赋予唯一高亮色
+    graph.updateNodeData([
+      {
+        id: found.id,
+        type: 'star',
+        style: {
+          size: 90,
+          lineWidth: 3,
+          fill: SEARCH_HIGHLIGHT_FILL,
+          stroke: SEARCH_HIGHLIGHT_STROKE,
+        },
+      },
+    ]);
+    await graph.draw();
+    // 居中放大显示：先聚焦到节点（居中），再以视口中心放大
+    await graph.focusElement(found.id, { duration: 500 });
+    await graph.zoomTo(graph.getZoom() * 2.5, { duration: 500 });
+    enlargedNodeIdRef.current = found.id;
   };
 
   return (

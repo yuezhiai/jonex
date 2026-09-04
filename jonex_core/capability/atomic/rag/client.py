@@ -61,8 +61,8 @@ class RAGClient(ABC):
 
         Args:
             ontology_schema: per-KB compiled schema（可选，push 模式）
-            storage_backend: 存储后端（"local" | "cos"），P3
-            storage_key: COS 对象键（storage_backend="cos" 时使用）
+            storage_backend: 存储后端（"local" | "cos" | "s3"），P3
+            storage_key: 对象存储键（storage_backend 为 "cos"/"s3" 时使用）
 
         Returns:
             {"task_id": str, "status": "pending", "file_path": str}
@@ -324,16 +324,16 @@ class LocalRAGClient(RAGClient):
 
     def __init__(self, options: Optional[Dict[str, Any]] = None) -> None:
         # 延迟导入避免在 REMOTE/MOCK 模式下加载重依赖
-        from jonex_core.capability.atomic.rag.lightrag_adapter import LightRAGAdapter
+        # [jonex] v1 退役：唯一 adapter 即 v2（ATOMIC_RAG_VERSION 开关已删除）
+        from jonex_core.capability.atomic.rag.lightrag_adapter_v2 import LightRAGAdapterV2
 
-        self._adapter = LightRAGAdapter()
+        self._adapter = LightRAGAdapterV2()
         self._options = options or {}
-        logger.info("RAG Client 初始化：LOCAL 模式")
+        logger.info("RAG Client 初始化：LOCAL 模式（v2 adapter）")
 
     async def _ensure_initialized(self):
-        """延迟初始化适配器（_task_queue / 解析器 / HTTP 客户端 / workers）"""
-        if not self._adapter._initialized:
-            await self._adapter.initialize()
+        """延迟初始化适配器；v2 的 initialize() 自带幂等（_started 标志）"""
+        await self._adapter.initialize()
 
     async def insert(
         self,
@@ -457,12 +457,18 @@ class LocalRAGClient(RAGClient):
         document_id: str = "",
         trace_id: str = "",
     ) -> dict:
-        """[jonex] 批量删除——LOCAL 模式下逐条调用 LightRAGAdapter（v1 无批量接口）。
-
-        注意：远程模式应使用 RemoteRAGClient.delete_batch 以合并 rebuild。
-        """
+        """[jonex] 批量删除——v1 退役后 LOCAL 面优先走 v2 adapter 的 delete_batch
+        （单次 rebuild）；adapter 不可用/调用失败时逐条 delete 回退。"""
         tenant_id = require_tenant(tenant_id)
         await self._ensure_initialized()
+        try:
+            return await self._adapter.delete_batch(
+                doc_ids, tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                document_id=document_id, trace_id=trace_id,
+            )
+        except Exception:
+            logger.warning("LocalRAGClient delete_batch 批量调用失败，回退逐条删除", exc_info=True)
         accepted = []
         failed = []
         for doc_id in doc_ids:
@@ -498,15 +504,18 @@ class LocalRAGClient(RAGClient):
             "scope_mode": "knowledge_base",
         }
 
+    # [jonex] v1 退役：storage 委托从 _reader() 改为直调 v2 adapter 同名方法。
+    # v2 侧无 _reader 子对象（读操作经 dispatch 到 vendored storage handler）。
+
     async def get_storage_summary(
         self,
         knowledge_base_id: str,
         tenant_id: str,
     ) -> dict:
         await self._ensure_initialized()
-        return await self._adapter._reader().get_summary(
-            self._build_scope(knowledge_base_id, tenant_id)
-        )
+        return await self._adapter.get_storage_summary(
+            tenant_id, knowledge_base_id=knowledge_base_id
+        ) or {}
 
     async def get_storage_documents(
         self,
@@ -518,10 +527,10 @@ class LocalRAGClient(RAGClient):
         status: Optional[str] = None,
     ) -> dict:
         await self._ensure_initialized()
-        return await self._adapter._reader().get_documents(
-            self._build_scope(knowledge_base_id, tenant_id),
-            page=page, page_size=page_size, keyword=keyword, status=status,
-        )
+        return await self._adapter.get_storage_documents(
+            tenant_id, knowledge_base_id=knowledge_base_id,
+            page=page, page_size=page_size, keyword=keyword or "", status=status or "",
+        ) or {}
 
     async def get_storage_entities(
         self,
@@ -535,11 +544,12 @@ class LocalRAGClient(RAGClient):
         document_id: Optional[str] = None,
     ) -> dict:
         await self._ensure_initialized()
-        return await self._adapter._reader().get_entities(
-            self._build_scope(knowledge_base_id, tenant_id),
-            page=page, page_size=page_size, keyword=keyword,
-            entity_type=entity_type, file_path=file_path, document_id=document_id,
-        )
+        return await self._adapter.get_storage_entities(
+            tenant_id, knowledge_base_id=knowledge_base_id,
+            page=page, page_size=page_size, keyword=keyword or "",
+            entity_type=entity_type or "", doc_id=document_id or "",
+            file_path=file_path or "",
+        ) or {}
 
     async def get_storage_relationships(
         self,
@@ -553,13 +563,14 @@ class LocalRAGClient(RAGClient):
         source_entity: Optional[str] = None,
         target_entity: Optional[str] = None,
     ) -> dict:
+        # [jonex] v1 退役：vendored storage handler 暂不支持 source/target 实体筛选，
+        # LOCAL 面忽略这两个参数（开发环境专用，生产走 REMOTE）。
         await self._ensure_initialized()
-        return await self._adapter._reader().get_relationships(
-            self._build_scope(knowledge_base_id, tenant_id),
-            page=page, page_size=page_size, keyword=keyword,
-            file_path=file_path, document_id=document_id,
-            source_entity=source_entity, target_entity=target_entity,
-        )
+        return await self._adapter.get_storage_relationships(
+            tenant_id, knowledge_base_id=knowledge_base_id,
+            page=page, page_size=page_size, keyword=keyword or "",
+            file_path=file_path or "", doc_id=document_id or "",
+        ) or {}
 
     async def get_storage_graph_summary(
         self,
@@ -567,9 +578,9 @@ class LocalRAGClient(RAGClient):
         tenant_id: str,
     ) -> dict:
         await self._ensure_initialized()
-        return await self._adapter._reader().get_graph_summary(
-            self._build_scope(knowledge_base_id, tenant_id)
-        )
+        return await self._adapter.get_storage_graph_summary(
+            tenant_id, knowledge_base_id=knowledge_base_id
+        ) or {}
 
     async def get_storage_graph(
         self,
@@ -581,10 +592,11 @@ class LocalRAGClient(RAGClient):
         document_id: Optional[str] = None,
     ) -> dict:
         await self._ensure_initialized()
-        return await self._adapter._reader().get_graph(
-            self._build_scope(knowledge_base_id, tenant_id),
-            limit=limit, keyword=keyword, file_path=file_path, document_id=document_id,
-        )
+        return await self._adapter.get_storage_graph(
+            tenant_id, knowledge_base_id=knowledge_base_id,
+            limit=limit, keyword=keyword or "",
+            doc_id=document_id or "", file_path=file_path or "",
+        ) or {}
 
     async def get_document_parse_result(
         self,
@@ -593,12 +605,10 @@ class LocalRAGClient(RAGClient):
         document_id: Optional[str] = None,
     ) -> dict:
         await self._ensure_initialized()
-        scope = self._build_scope(knowledge_base_id, tenant_id)
-        if document_id:
-            scope["document_ids"] = [document_id]
-        return await self._adapter._reader().get_document_parse_result(
-            scope
-        )
+        return await self._adapter.get_document_parse_result(
+            tenant_id, knowledge_base_id=knowledge_base_id,
+            document_id=document_id or "",
+        ) or {}
 
     async def retry_ontology_extract(
         self,
@@ -614,26 +624,41 @@ class LocalRAGClient(RAGClient):
         content_generation: int = 0,
     ) -> dict:
         await self._ensure_initialized()
+        # [jonex] v1 退役：v2 adapter 形参序为 (document_id, tenant_id, *, knowledge_base_id)，
+        # 位置传参会把 knowledge_base_id 错位到 tenant_id —— 必须关键字传参。
+        # schema_version / schema_hash / force_retry / content_generation 为 v1 独有控制项，
+        # v2 无对应透传，LOCAL 面忽略（开发环境专用，生产走 REMOTE）。
         return await self._adapter.retry_ontology_extract(
-            document_id, knowledge_base_id, tenant_id, file_path=file_path,
-        )
+            document_id, tenant_id,
+            knowledge_base_id=knowledge_base_id, file_path=file_path,
+        ) or {}
 
-    # ── 提示词配置 CRUD：LOCAL 模式不支持，生产走 REMOTE ──
+    # ── 提示词配置 CRUD：[jonex] v1 退役后 LOCAL 面委托 v2 adapter 薄转发 ──
     async def create_prompt(self, tenant_id: str, *, prompt_code: str, content: str,
                             preset_name: str = "", display_name: str = "",
                             description: str = "", category: str = "analysis",
                             language: str = "zh") -> dict:
-        raise NotImplementedError("prompt CRUD 仅在 REMOTE 模式支持（生产链路）")
+        await self._ensure_initialized()
+        return await self._adapter.create_prompt(
+            tenant_id, prompt_code=prompt_code, content=content,
+            preset_name=preset_name, display_name=display_name,
+            description=description, category=category, language=language,
+        )
 
     async def update_prompt(self, tenant_id: str, prompt_id: str, *,
                             content: Optional[str] = None, **fields) -> dict:
-        raise NotImplementedError("prompt CRUD 仅在 REMOTE 模式支持（生产链路）")
+        await self._ensure_initialized()
+        return await self._adapter.update_prompt(
+            tenant_id, prompt_id, content=content, **fields,
+        )
 
     async def delete_prompt(self, tenant_id: str, prompt_id: str) -> dict:
-        raise NotImplementedError("prompt CRUD 仅在 REMOTE 模式支持（生产链路）")
+        await self._ensure_initialized()
+        return await self._adapter.delete_prompt(tenant_id, prompt_id)
 
     async def get_prompt(self, tenant_id: str, prompt_id: str) -> Optional[dict]:
-        raise NotImplementedError("prompt CRUD 仅在 REMOTE 模式支持（生产链路）")
+        await self._ensure_initialized()
+        return await self._adapter.get_prompt(tenant_id, prompt_id)
 
 
 # ============================================================
@@ -650,10 +675,12 @@ class RemoteRAGClient(RAGClient):
     ) -> None:
         import httpx
 
+        from jonex_core.common.config import get_config
+
         timeout = float(os.getenv("RAG_CLIENT_TIMEOUT", "120"))
         self._client = httpx.AsyncClient(
             base_url=endpoint.rstrip("/"),
-            headers={"X-API-Key": "jonex_test_gateway"},
+            headers={"X-API-Key": get_config().GATEWAY_API_KEY},
             timeout=(options or {}).get("timeout", timeout),
         )
         self._capability_id = capability_id

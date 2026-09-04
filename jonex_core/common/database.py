@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 数据库连接模块
+Jonex 平台 - 数据库连接模块
 
 基于 SQLAlchemy 2.0 + asyncpg，支持：
 - 异步数据库操作

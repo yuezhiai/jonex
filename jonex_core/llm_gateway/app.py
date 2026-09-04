@@ -16,7 +16,7 @@ def build_app() -> FastAPI:
     cfg = get_config()
 
     app = FastAPI(
-        title="悦溪平台 - LLM 网关",
+        title="Jonex 平台 - LLM 网关",
         description="OpenAI 兼容代理服务，统一 LLM/Embedding 出口计量",
         version=cfg.APP_VERSION,
     )

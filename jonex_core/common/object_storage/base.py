@@ -31,6 +31,12 @@ class ObjectStorage(Protocol):
         """生成预签名 GET URL（调用前需校验租户归属）。"""
         ...
 
+    async def presigned_put_url(
+        self, key: str, *, tenant_id: str, expires: int = 300, content_length: int | None = None
+    ) -> str:
+        """生成预签名 PUT URL（local 后端返回空字符串降级）。"""
+        ...
+
     async def delete(self, key: str) -> bool:
         """删除指定对象。"""
         ...

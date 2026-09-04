@@ -56,6 +56,9 @@ class CapabilityProxy:
         username: Optional[str] = None,
         ip: Optional[str] = None,
         request_id: Optional[str] = None,
+        impersonated: bool = False,
+        perms: Optional[list] = None,
+        original_tenant_id: Optional[str] = None,
     ):
         """
         转发调用到对应的能力服务
@@ -84,7 +87,7 @@ class CapabilityProxy:
             f"request_id={request_id}, tenant={tenant_id}"
         )
 
-        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "120"))
+        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "180"))
         async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 # 生成内部服务认证 Token
@@ -106,6 +109,9 @@ class CapabilityProxy:
                         "username": username,
                         "ip": ip,
                         "request_id": request_id,
+                        "impersonated": impersonated,
+                        "perms": perms or [],
+                        "original_tenant_id": original_tenant_id,
                     },
                     headers=_headers,
                 )
@@ -166,6 +172,9 @@ class CapabilityProxy:
         username: Optional[str] = None,
         ip: Optional[str] = None,
         request_id: Optional[str] = None,
+        impersonated: bool = False,
+        perms: Optional[list] = None,
+        original_tenant_id: Optional[str] = None,
     ):
         """流式转发能力调用，逐行 yield NDJSON"""
         tenant_id = require_tenant(tenant_id)
@@ -177,7 +186,7 @@ class CapabilityProxy:
             f"request_id={request_id}, tenant={tenant_id}"
         )
 
-        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "120"))
+        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "180"))
         # 急切捕获 locale：流式生成器在中间件 reset 后迭代，惰性读会拿到 None
         _locale = LocaleContext.get()
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -200,6 +209,9 @@ class CapabilityProxy:
                     "username": username,
                     "ip": ip,
                     "request_id": request_id,
+                    "impersonated": impersonated,
+                    "perms": perms or [],
+                    "original_tenant_id": original_tenant_id,
                 },
                 headers=_stream_headers,
             ) as resp:
@@ -227,7 +239,7 @@ class CapabilityProxy:
             f"query={query[:80]}, tenant={tenant_id}, kb={knowledge_base_id}"
         )
 
-        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "120"))
+        timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "180"))
         params = {"query": query, "mode": mode, "top_k": str(top_k), "tenant_id": tenant_id}
         # 知识库作用域：透传给 atomic /query/stream，由其按 (tenant, kb) 注入
         # LIGHTRAG-WORKSPACE 实现按知识库隔离检索，避免跨库串库。

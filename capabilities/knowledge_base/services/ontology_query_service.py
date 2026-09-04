@@ -199,6 +199,7 @@ class OntologyQueryService:
                 req.knowledge_base_id,
                 limit=req.limit,
                 entity_types=req.entity_types,
+                document_id=req.document_id,
             )
             result["degraded"] = False
             return result

@@ -22,11 +22,11 @@ from jonex_core.common.tenant import require_tenant
 from ..models.data_source import KnowledgeDataSource
 from ..models.knowledge_info import KnowledgeInfo
 from ..repository.data_source_repository import KnowledgeDataSourceRepository
-from ..repository.domain_service_repository import (
-    DomainServiceRepository,
-    ServiceKnowledgeBaseRepository,
-)
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
+# [jonex] 权限重构 B3：KB 资源身份取值的**唯一定义点**在 kb_permission_service。
+# 这里 import 常量而非另写字面量 —— 原先本文件里散落着 ("kb_manager","editor","viewer")
+# 三处独立的元组/字典，加减层级时必然漏改。
+from .kb_permission_service import KB_MANAGER, KB_MEMBER, _KB_ROLE_RANK
 
 
 class KnowledgeInfoService:
@@ -66,6 +66,9 @@ class KnowledgeInfoService:
 
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
+            # [jonex] 配额：新建知识库前校验单租户 KB 数量（advisory lock 原子化）。
+            from .quota_service import QuotaService
+            await QuotaService().check_kb_creation(session, tenant_id)
             obj = await repo.create(
                 id=uuid.uuid4().hex,
                 tenant_id=tenant_id,
@@ -76,36 +79,6 @@ class KnowledgeInfoService:
                 status=data.get("status", "synced"),
                 owner_id=data.get("owner_id"),
                 kb_type=raw_kb_type,  # [jonex]
-            )
-
-            # ── 自动绑定：确保该 space 下的知识库对知识检索可见 ──
-            # 检查 space 下是否已有 DomainService，有则绑定，无则创建默认服务再绑定。
-            from ..models.domain_service import DomainService
-
-            ds_repo = DomainServiceRepository(session)
-            svc_kb_repo = ServiceKnowledgeBaseRepository(session)
-
-            existing = await ds_repo.list_all(
-                tenant_id, 0, 1,
-                extra_conditions=[DomainService.space_id == space_id],
-            )
-
-            if existing:
-                service = existing[0]
-            else:
-                service = await ds_repo.create(
-                    id=uuid.uuid4().hex,
-                    tenant_id=tenant_id,
-                    space_id=space_id,
-                    name=kb_name,
-                    description=f"Auto-created for knowledge base: {kb_name}",
-                )
-
-            await svc_kb_repo.create(
-                id=uuid.uuid4().hex,
-                tenant_id=tenant_id,
-                service_id=service.id,
-                kb_id=obj.id,
             )
 
             # ── 默认数据源：新建 KB 自动创建「文件上传」(file) 数据源 ──
@@ -232,17 +205,39 @@ class KnowledgeInfoService:
             )
             data = obj.to_dict(space_name=space_name)
             data["document_count"] = doc_count_map.get(obj.id, 0)
-            # 管理权限（空间 owner/manager 或租户管理员）——详情页权限 tab 只读态依据
+            # 管理权限（空间管理者、租户管理员，或 kb_manager 授权）——详情页权限 tab 只读态依据
             from .space_permission_service import get_write_space_ids
-
-            write_ids = await get_write_space_ids(tenant_id, user_id)
-            data["can_manage_permissions"] = write_ids is None or obj.space_id in write_ids
-            # KB 写权限（空间 owner/manager/租户管理员 或 授权 editor）——详情页各 tab 写按钮依据
             from .kb_permission_service import get_kb_grant_role
 
+            write_ids = await get_write_space_ids(tenant_id, user_id)
             grant_role = await get_kb_grant_role(tenant_id, kb_id, user_id)
+
+            # [jonex] 权限重构 B4（方案 §5 Gap 8 / 执行文档 §5.4）：
+            # KB 详情与列表同口径 —— 非空间管理者且无 KB 授权 → **404 而非 403**。
+            # 用 404 是为了防探测：403 会告诉调用方「这个 id 存在」，与空间侧
+            # `require_space_visible` 的口径一致。
+            #
+            # 复用上面已经查好的 write_ids / grant_role，不额外查库。
+            # 判据不含「空间 member」：他能检索到这个 KB 的内容、能点开原文（D8），
+            # 但**不能浏览这个知识库**。这是本次收紧的核心语义差。
+            if write_ids is not None and obj.space_id not in write_ids and grant_role is None:
+                raise ResourceNotFoundError(
+                    message=translate(
+                        "err.kb.not_found",
+                        params={"kb_id": kb_id},
+                        fallback=f"知识库不存在: {kb_id}",
+                    )
+                )
+
+            data["can_manage_permissions"] = (
+                write_ids is None or obj.space_id in write_ids or grant_role == KB_MANAGER
+            )
+            # KB 写权限（空间管理者/租户管理员，或 kb_manager 授权）——详情页各 tab 写按钮依据
+            # [jonex] B3：原判据是 `in ("kb_manager", "editor")`。D1 删掉 editor 之后
+            # 「可写」的授权侧判据与 can_manage_permissions 同源 —— member 只读。
             data["can_write"] = (
-                (write_ids is None or obj.space_id in write_ids) or grant_role == "editor"
+                (write_ids is None or obj.space_id in write_ids)
+                or grant_role == KB_MANAGER
             )
 
         # [jonex] openkb 管线：本体统计走 OpenKB Wiki（Neo4j 里恒空，读了会误报 0）
@@ -283,7 +278,20 @@ class KnowledgeInfoService:
                    keyword: str = None, offset: int = 0, limit: int = 20,
                    user_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
-        from .space_permission_service import get_visible_space_ids
+        # [jonex] 权限重构 B4（方案 §5 Gap 8 / 执行文档 §5.2）：
+        # KB 列表可见范围 = **我管的空间下全部 KB ∪ 我被授权的 KB**。
+        #
+        # ⚠️ 这里**故意不用** `get_visible_space_ids` —— 那是「检索 / 领域服务可见」口径。
+        #    两个口径的差别只在**空间 member**：
+        #      · 检索口径含他所在的整个空间 → 他能检索到空间下全部 KB 的内容，
+        #        并且能点开引用看原文（方案 D8 明确「能打开，只是看不到知识库」）；
+        #      · 列表口径不含 → 他在领域知识库页看不到这些 KB。
+        #    **不要把这两个口径合并成一个函数、也不要"顺手统一"** —— 合并即回归。
+        #    检索侧在 `capability.py::_filter_search_kbs`，那段一行都没动。
+        #
+        # 副作用（已在方案 §6 决策不补发授权，需上线公告）：存量空间 member 的
+        # KB 列表上线后会变空，直到有人把他加成 KB 成员。
+        from .space_permission_service import get_write_space_ids
 
         async with get_db_session() as session:
             from ..models.space import Space
@@ -292,27 +300,31 @@ class KnowledgeInfoService:
             conditions = []
             if space_id:
                 conditions.append(KnowledgeInfo.space_id == space_id)
-            # [jonex] 空间隔离：不传 space_id 的租户级列表也只返回可见空间的 KB。
-            # get_visible_space_ids 返回 None = 不过滤（service:write / 内部链路）
-            visible = await get_visible_space_ids(tenant_id, user_id)
-            from .space_permission_service import get_write_space_ids
+            # None = 不过滤（租户管理员 / 平台管理员 / 无 user_id / anonymous 内部链路）。
+            # 原实现这里查两次（get_visible_space_ids + get_write_space_ids），
+            # 收紧后只需可管空间一次 → **少一次 SQL**。
+            manage_ids = await get_write_space_ids(tenant_id, user_id)
 
             granted: list[str] = []
-            if visible is not None:
-                # 授权 KB 叠加（visible None = 租户管理员/内部链路：不加条件、也不查授权
+            manager_ids: list[str] = []
+            if manage_ids is not None:
+                # 授权 KB 叠加（manage_ids None = 租户管理员/内部链路：不加条件、也不查授权
                 # ——否则租户管理员白付一次查询，与 Task 6「仅被过滤时补查」的对称性冲突）
                 from .kb_permission_service import get_granted_kb_ids
 
                 granted = await get_granted_kb_ids(tenant_id, user_id)
+                # in_() 要 list；manage_ids 是 set。两边都空时整个 or_ 恒 false → 空列表，
+                # 这正是空间 member 无 KB 授权时期望的结果（total == 0）。
                 conditions.append(or_(
-                    KnowledgeInfo.space_id.in_(visible),
+                    KnowledgeInfo.space_id.in_(list(manage_ids)),
                     KnowledgeInfo.id.in_(granted),
                 ))
-            write_ids = await get_write_space_ids(tenant_id, user_id)
-            # editor 授权集合（KB 写权限的额外来源，批量一次查询）
-            from .kb_permission_service import get_granted_editor_kb_ids
-
-            editor_ids = await get_granted_editor_kb_ids(tenant_id, user_id)
+                # kb_manager 授权集合（KB 写权限与人员管理权限的共同来源，批量一次查询）
+                # [jonex] B3（N4）：原先分别查 editor 集合与 manager 集合，
+                # D1 收为两级后两者等价 —— 合并成一次查询，少一次 DB 往返。
+                # manage_ids is None 时两个布尔恒 True，这次查询纯属浪费，一并跳过。
+                from .kb_permission_service import get_granted_manager_kb_ids
+                manager_ids = await get_granted_manager_kb_ids(tenant_id, user_id)
             if status:
                 conditions.append(KnowledgeInfo.status == status)
 
@@ -338,25 +350,34 @@ class KnowledgeInfoService:
                 )
                 space_name_map = {row[0]: row[1] for row in space_rows.all()}
 
-            # set 在循环外 hoist（visible_set/granted_set/editor_set 每请求建一次，勿逐行重建）
-            visible_set = set(visible) if visible is not None else None
+            # set 在循环外 hoist（granted_set/manager_set 每请求建一次，勿逐行重建）
             granted_set = set(granted)
-            editor_set = set(editor_ids)
+            manager_set = set(manager_ids)
             result_items = []
             for o in items:
                 d = o.to_dict(space_name=space_name_map.get(o.space_id, ""))
                 d["document_count"] = doc_count_map.get(o.id, 0)
-                # KB 授权共享标识（仅真正靠授权才看到的 KB；visible None 恒 False）
+                # KB 授权共享标识：这条 KB 只因为「我被单独授权」才出现在列表里
+                # （即不在我可管的空间内）。manage_ids None（租户管理员）恒 False。
+                # [jonex] B4：判据从 visible（空间可见）换成 manage_ids（空间可管），
+                # 与上面的过滤条件保持同一口径 —— 否则空间 member 靠授权看到的 KB
+                # 会因为「空间可见」而不被标记成共享，标记语义与列表语义脱节。
                 d["grant_shared"] = (
-                    visible is not None
-                    and o.space_id not in visible_set
+                    manage_ids is not None
+                    and o.space_id not in manage_ids
                     and o.id in granted_set
                 )
-                # 管理权限（空间 owner/manager 或租户管理员）
-                d["can_manage_permissions"] = write_ids is None or o.space_id in write_ids
-                # KB 写权限（额外含授权 editor）——列表页编辑/操作按钮依据
+                # 管理权限（空间管理者、租户管理员，或 kb_manager 授权）
+                d["can_manage_permissions"] = (
+                    manage_ids is None or o.space_id in manage_ids or o.id in manager_set
+                )
+                # KB 写权限 —— 列表页编辑/操作按钮依据。
+                # [jonex] B3：两级模型下「可写」与「可管人员」同源（都是 kb_manager），
+                # 所以这两个字段的授权侧判据变成同一个 manager_set。
+                # 保留两个字段是因为**空间侧**仍有区别：write_ids 给 can_write，
+                # 而 can_manage_permissions 语义上是「能改这个 KB 的人员名单」。
                 d["can_write"] = (
-                    (write_ids is None or o.space_id in write_ids) or o.id in editor_set
+                    (manage_ids is None or o.space_id in manage_ids) or o.id in manager_set
                 )
                 result_items.append(d)
             if keyword:
@@ -472,6 +493,74 @@ class KnowledgeInfoService:
                 for row in result.all()
             ]
 
+    async def get_permission_candidates(self, kb_id: str, tenant_id: str,
+                                        user_id: str | None = None) -> list:
+        """KB「添加成员」候选用户 = 父空间成员池 - 已有 KB 成员 - 操作者本人。
+
+        候选池取父空间成员而非全租户用户 —— require_parent_membership 要求
+        被授权人必须已在父空间成员池内。鉴权与 set_permissions 写入口径一致：
+        空间管理者 / 租户管理员 / kb_manager；invoke 链路在 capability 层已由
+        _KB_MANAGE_ACTIONS 判定，此处是 REST 直连兜底。
+        """
+        tenant_id = require_tenant(tenant_id)
+        space_id = await self.get_kb_space_id(kb_id, tenant_id)
+        if space_id is None:
+            raise ResourceNotFoundError(
+                message=translate(
+                    "err.kb_permission.not_found",
+                    params={"kb_id": kb_id},
+                    fallback=f"知识库 {kb_id} 不存在或无权访问",
+                )
+            )
+        from .space_permission_service import SPACE_MANAGER, has_space_role, is_tenant_admin
+        from .kb_permission_service import get_kb_grant_role
+        if not (
+            await has_space_role(tenant_id, space_id, user_id, SPACE_MANAGER)
+            or await is_tenant_admin(tenant_id, user_id)
+            or await get_kb_grant_role(tenant_id, kb_id, user_id) == KB_MANAGER
+        ):
+            raise PermissionDeniedError(
+                message=translate(
+                    "err.kb_permission.manage_required",
+                    params={"kb_id": kb_id},
+                    fallback=f"仅空间管理者或租户管理员可管理知识库权限: {kb_id}",
+                )
+            )
+        async with get_db_session() as session:
+            result = await session.execute(
+                text("""
+                    SELECT sp.user_id, u.username, u.display_name, u.email
+                      FROM knowledge_base.space_permissions sp
+                      LEFT JOIN platform.users u
+                        ON u.id::text = sp.user_id
+                       AND u.is_deleted = 0
+                     WHERE sp.space_id = :space_id
+                       AND sp.tenant_id = :tenant_id
+                       AND sp.is_deleted = 0
+                       AND sp.user_id <> :user_id
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM knowledge_base.kb_permissions kp
+                            WHERE kp.kb_id = :kb_id
+                              AND kp.tenant_id = :tenant_id
+                              AND kp.user_id = sp.user_id
+                              AND kp.is_deleted = 0
+                       )
+                     ORDER BY sp.user_id
+                """),
+                {"space_id": space_id, "tenant_id": tenant_id, "kb_id": kb_id,
+                 "user_id": user_id or ""},
+            )
+            return [
+                {
+                    "user_id": row[0],
+                    "username": row[1],
+                    "display_name": row[2],
+                    "email": row[3],
+                }
+                for row in result.all()
+            ]
+
     async def set_permissions(self, kb_id: str, tenant_id: str, permissions: list,
                               user_id: str | None = None) -> bool:
         """设置 KB 授权列表。管理员 = 空间 owner/manager 或租户管理员（get_write_space_ids）。"""
@@ -487,23 +576,42 @@ class KnowledgeInfoService:
                     fallback=f"知识库 {kb_id} 不存在或无权访问",
                 )
             )
+        # [jonex] 权限重构 B2（E3）：**撤掉了「空间创建者已拥有全部权限，禁止单独授权」拦截**。
+        #
+        # 原实现按 `spaces.owner_id` 判定。D2 取消 owner 概念后这个判据同时**过宽又过窄**：
+        #   · 过窄：真正「已拥有全部权限」的是空间**管理者**（向下穿透管所有 KB），
+        #           而管理者不一定是创建人 —— 别的 space_manager 不被拦；
+        #   · 过宽：创建人若已被移除管理者身份（空间转交），他并没有权限，却仍被拦住。
+        #
+        # 且本方法与 space_service.set_permissions 一样是**全量替换**语义：
+        # 某人先是 KB 成员、后被提升为空间管理者，KB 权限页原样提交就会保存失败。
+        #
+        # 「谁可以被授权」这件事由 B5 的成员池约束（require_parent_membership）统一承担，
+        # 那是按**当前身份**判定的，不依赖「谁是创建人」这个会过期的事实。
         write_ids = await get_write_space_ids(tenant_id, user_id)
         if write_ids is not None and space_id not in write_ids:
-            raise PermissionDeniedError(
-                message=translate(
-                    "err.kb_permission.manage_required",
-                    params={"kb_id": kb_id},
-                    fallback=f"仅空间 owner/manager 或租户管理员可管理知识库权限: {kb_id}",
+            from .kb_permission_service import get_kb_grant_role
+            if await get_kb_grant_role(tenant_id, kb_id, user_id) != KB_MANAGER:
+                raise PermissionDeniedError(
+                    message=translate(
+                        "err.kb_permission.manage_required",
+                        params={"kb_id": kb_id},
+                        fallback=f"仅空间管理者或租户管理员可管理知识库权限: {kb_id}",
+                    )
                 )
-            )
-        # role 白名单 {editor, viewer} + user_id 数字校验
+        # role 白名单（两级：kb_manager / member）+ user_id 数字校验
+        # [jonex] B3：拒绝旧取值 editor/viewer。前端若未同批更新会在这里 400 ——
+        # 这是刻意的，比静默接受旧值然后行为不一致要好。
         for perm in permissions:
-            if perm.get("role") not in ("editor", "viewer"):
+            if perm.get("role") not in _KB_ROLE_RANK:
                 raise InvalidParameterError(
                     message=translate(
                         "err.kb_permission.invalid_role",
                         params={"role": str(perm.get("role"))},
-                        fallback=f"非法角色: {perm.get('role')}（仅支持 editor / viewer）",
+                        fallback=(
+                            f"非法角色: {perm.get('role')}"
+                            f"（仅支持 {KB_MANAGER} / {KB_MEMBER}）"
+                        ),
                     )
                 )
             if not str(perm.get("user_id", "")).isdigit():
@@ -514,6 +622,17 @@ class KnowledgeInfoService:
                         fallback=f"非法用户 ID: {perm.get('user_id', '')}（必须为数字）",
                     )
                 )
+
+        # [jonex] 权限重构 B5（方案 §3.5 / 执行文档 §6.3 步骤 1）：成员池约束。
+        # 顺序重要 —— **在 role 白名单校验之后、写库之前**：先确认取值合法，再确认对象合法，
+        # 两类错误信息才不会互相掩盖（先报「非法角色」还是先报「不在成员池」是确定的）。
+        # 被授权人必须已在**本 KB 所属空间**的成员池内，否则 400。
+        from .membership_service import require_parent_membership
+        await require_parent_membership(
+            tenant_id, "space", space_id,
+            [str(p["user_id"]) for p in permissions],
+        )
+
         from ..models.kb_permission import KbPermission
 
         async with get_db_session() as session:
@@ -529,11 +648,15 @@ class KnowledgeInfoService:
             # 关键：先 flush 让 DELETE 落库再插入（UoW 默认 INSERT 先于 DELETE，撞唯一索引）
             await session.flush()
 
+            # [jonex] B3：取值与优先级统一由 kb_permission_service._KB_ROLE_RANK 定义，
+            # 不再在这里另写一份 —— 原先本地这份 {viewer:0, editor:1, kb_manager:2}
+            # 与判定服务里的取值集合是两处独立定义，加减层级时必然漏改一处。
+            _ROLE_RANK = _KB_ROLE_RANK
             deduped: dict[str, str] = {}
             for perm in permissions:
                 uid = str(perm["user_id"])
                 role = perm["role"]
-                if uid not in deduped or (role == "editor" and deduped[uid] == "viewer"):
+                if uid not in deduped or _ROLE_RANK[role] > _ROLE_RANK[deduped[uid]]:
                     deduped[uid] = role
             for uid, role in deduped.items():
                 session.add(KbPermission(

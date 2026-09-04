@@ -174,7 +174,6 @@ _LABEL_ZH: dict[str, str] = {
     "get_search_overview": "查看搜索概览",
     "get_service": "查看服务",
     "get_service_configs": "查看服务配置",
-    "get_service_permissions": "查看服务权限",
     "get_space": "查看空间",
     "get_space_permissions": "查看空间权限",
     "import_synonyms": "导入同义词",
@@ -214,9 +213,9 @@ _LABEL_ZH: dict[str, str] = {
     "search_enhanced": "增强搜索",
     "search_ontology_entities": "搜索本体实体",
     "search_service": "搜索服务",
+    "batch_set_document_folder": "批量移动文档",
     "set_document_folder": "设置文档文件夹",
     "set_document_tags": "设置文档标签",
-    "set_service_permissions": "设置服务权限",
     "set_space_permissions": "设置空间权限",
     "submit_search_feedback": "提交搜索反馈",
     "sync_data_source": "同步数据源",
@@ -239,6 +238,61 @@ _LABEL_ZH: dict[str, str] = {
     "delete_prompt": "删除提示词",
     "get_prompt": "查看提示词",
     "retry": "重试",
+    # ---- MCP Key ----
+    "mcp_key.create": "创建 MCP Key",
+    "mcp_key.revoke": "撤销 MCP Key",
+    "mcp_key.enable": "启用 MCP Key",
+    "mcp_key.disable": "停用 MCP Key",
+    "mcp_key.recreate": "重新生成 MCP Key",
+    "mcp_key.delete": "删除 MCP Key",
+    "mcp_key.update": "更新 MCP Key",
+    # ---- 租户模拟 ----
+    "impersonate_start": "开始租户模拟",
+    "impersonate_end": "结束租户模拟",
+    # ---- 服务启停 ----
+    "enable_service": "启用服务",
+    "disable_service": "停用服务",
+    # ---- LLM Wiki ----
+    "apply_llm_wiki_schema": "应用 LLM Wiki 模式",
+    "get_llm_wiki_schema": "查看 LLM Wiki 模式",
+    "save_llm_wiki_schema": "保存 LLM Wiki 模式",
+    "export_llm_wiki_schema_yaml": "导出 LLM Wiki 模式",
+    "import_llm_wiki_schema_yaml": "导入 LLM Wiki 模式",
+    "recompile_llm_wiki_schema_outdated_documents": "重编译 LLM Wiki 过期文档",
+    "list_wiki_contents": "查看 Wiki 内容",
+    "get_wiki_page": "查看 Wiki 页面",
+    # ---- 检索 ----
+    "deep_query": "深度查询",
+    "search_mix": "混合搜索",
+    "search_llmwiki": "LLM Wiki 搜索",
+    # ---- 编译模式 ----
+    "export_compiled_schema_yaml": "导出编译模式",
+    "import_compiled_schema_yaml": "导入编译模式",
+    "preview_compiled_schema": "预览编译模式",
+    # ---- 本体模板 ----
+    "export_template_ontology_yaml": "导出模板本体",
+    "import_template_ontology_yaml": "导入模板本体",
+    # ---- 答案反馈 ----
+    "get_answer_feedback": "查看答案反馈",
+    "get_answer_feedback_stats": "查看答案反馈统计",
+    "list_answer_feedback": "答案反馈列表",
+    "delete_answer_feedback": "删除答案反馈",
+    "submit_answer_feedback": "提交答案反馈",
+    "toggle_answer_feedback_adopted": "切换反馈采纳",
+    # ---- 知识库权限 ----
+    "get_kb_permissions": "查看知识库权限",
+    "set_kb_permissions": "设置知识库权限",
+    # ---- 文档状态 / 资产 / 配额 ----
+    "get_document_status": "查看文档状态",
+    "get_asset_raw_location": "查看资产原始位置",
+    "get_quota_view": "查看配额",
+    # ---- 分块维护 ----
+    "scan_stale_chunks": "扫描过期分块",
+    "purge_stale_chunks": "清除过期分块",
+    # ---- 提示词模板 / 场景 ----
+    "check_prompt_template_name": "校验提示词模板名称",
+    "publish_template_scenario": "发布模板场景",
+    "list_impacted_knowledge_bases": "受影响知识库列表",
 }
 
 _LABEL_EN: dict[str, str] = {
@@ -372,7 +426,6 @@ _LABEL_EN: dict[str, str] = {
     "get_search_overview": "View Search Overview",
     "get_service": "View Service",
     "get_service_configs": "View Service Configs",
-    "get_service_permissions": "View Service Permissions",
     "get_space": "View Space",
     "get_space_permissions": "View Space Permissions",
     "import_synonyms": "Import Synonyms",
@@ -412,9 +465,9 @@ _LABEL_EN: dict[str, str] = {
     "search_enhanced": "Search Enhanced",
     "search_ontology_entities": "Search Ontology Entities",
     "search_service": "Search Service",
+    "batch_set_document_folder": "Move Documents",
     "set_document_folder": "Set Document Folder",
     "set_document_tags": "Set Document Tags",
-    "set_service_permissions": "Set Service Permissions",
     "set_space_permissions": "Set Space Permissions",
     "submit_search_feedback": "Submit Search Feedback",
     "sync_data_source": "Sync Data Source",
@@ -437,6 +490,61 @@ _LABEL_EN: dict[str, str] = {
     "delete_prompt": "Delete Prompt",
     "get_prompt": "View Prompt",
     "retry": "Retry",
+    # ---- MCP Key ----
+    "mcp_key.create": "Create MCP Key",
+    "mcp_key.revoke": "Revoke MCP Key",
+    "mcp_key.enable": "Enable MCP Key",
+    "mcp_key.disable": "Disable MCP Key",
+    "mcp_key.recreate": "Recreate MCP Key",
+    "mcp_key.delete": "Delete MCP Key",
+    "mcp_key.update": "Update MCP Key",
+    # ---- 租户模拟 ----
+    "impersonate_start": "Start Tenant Impersonation",
+    "impersonate_end": "End Tenant Impersonation",
+    # ---- 服务启停 ----
+    "enable_service": "Enable Service",
+    "disable_service": "Disable Service",
+    # ---- LLM Wiki ----
+    "apply_llm_wiki_schema": "Apply LLM Wiki Schema",
+    "get_llm_wiki_schema": "View LLM Wiki Schema",
+    "save_llm_wiki_schema": "Save LLM Wiki Schema",
+    "export_llm_wiki_schema_yaml": "Export LLM Wiki Schema",
+    "import_llm_wiki_schema_yaml": "Import LLM Wiki Schema",
+    "recompile_llm_wiki_schema_outdated_documents": "Recompile LLM Wiki Outdated Documents",
+    "list_wiki_contents": "List Wiki Contents",
+    "get_wiki_page": "View Wiki Page",
+    # ---- 检索 ----
+    "deep_query": "Deep Query",
+    "search_mix": "Mixed Search",
+    "search_llmwiki": "LLM Wiki Search",
+    # ---- 编译模式 ----
+    "export_compiled_schema_yaml": "Export Compiled Schema",
+    "import_compiled_schema_yaml": "Import Compiled Schema",
+    "preview_compiled_schema": "Preview Compiled Schema",
+    # ---- 本体模板 ----
+    "export_template_ontology_yaml": "Export Template Ontology",
+    "import_template_ontology_yaml": "Import Template Ontology",
+    # ---- 答案反馈 ----
+    "get_answer_feedback": "View Answer Feedback",
+    "get_answer_feedback_stats": "View Answer Feedback Stats",
+    "list_answer_feedback": "List Answer Feedback",
+    "delete_answer_feedback": "Delete Answer Feedback",
+    "submit_answer_feedback": "Submit Answer Feedback",
+    "toggle_answer_feedback_adopted": "Toggle Answer Feedback Adopted",
+    # ---- 知识库权限 ----
+    "get_kb_permissions": "View KB Permissions",
+    "set_kb_permissions": "Set KB Permissions",
+    # ---- 文档状态 / 资产 / 配额 ----
+    "get_document_status": "View Document Status",
+    "get_asset_raw_location": "View Asset Raw Location",
+    "get_quota_view": "View Quota",
+    # ---- 分块维护 ----
+    "scan_stale_chunks": "Scan Stale Chunks",
+    "purge_stale_chunks": "Purge Stale Chunks",
+    # ---- 提示词模板 / 场景 ----
+    "check_prompt_template_name": "Check Prompt Template Name",
+    "publish_template_scenario": "Publish Template Scenario",
+    "list_impacted_knowledge_bases": "List Impacted Knowledge Bases",
 }
 
 

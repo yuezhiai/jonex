@@ -14,6 +14,17 @@ logger = logging.getLogger(__name__)
 _client: AsyncOpenAI | None = None
 
 
+def _scene(base: str, fast_mode: bool) -> str:
+    """[jonex] 查询期思考分档：fast_mode 时派生 `<base>_fast` 变体 scene。
+
+    网关据 LLMGW_DISABLE_THINKING_SCENES 白名单对 `_fast` 变体注入
+    thinking={"type":"disabled"}（见 llm_gateway/upstream.py::_maybe_disable_thinking）。
+    语义是「这次调用走快档」——精档与非严格模式使用原始 scene 名，天然保留思考。
+    计量维度随之可分：`_fast` 占比 = 被快档解决的查询比例。
+    """
+    return f"{base}_fast" if fast_mode else base
+
+
 def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
@@ -121,6 +132,7 @@ async def answer_from_facts(
     user_id: Optional[str] = None,
     trace_id: Optional[str] = None,
     allow_common_sense: bool = False,
+    fast_mode: bool = False,
 ) -> str:
     """根据本体实体 + 邻居事实回答，不足返回 "INSUFFICIENT"。
 
@@ -128,6 +140,9 @@ async def answer_from_facts(
         allow_common_sense: [jonex] P2-7 放宽常识边界。
             为 True 时允许模型在已取到确定领域事实的基础上，叠加通用常识/数学
             （物理常量、semver 语义、单位换算），但必须标注假设。
+        fast_mode: [jonex] 查询期思考分档（docs/ontology-query-thinking-latency-fix-plan.md §3）。
+            为 True 时 scene 派生 `ontology_qa_fast`，由网关白名单注入禁思考
+            （严格模式快档）；False 保留原 scene 与思考（精档/非严格模式）。
     """
     client = _get_client()
     model = os.getenv("ONTOLOGY_LLM_MODEL", "deepseek-v4-flash-202605")
@@ -166,7 +181,7 @@ async def answer_from_facts(
     # 注入计量上下文头
     extra_headers = {
         "X-Jonex-Tenant-Id": tenant_id or "unknown",
-        "X-Jonex-Scene": "ontology_qa",
+        "X-Jonex-Scene": _scene("ontology_qa", fast_mode),
     }
     if kb_id:
         extra_headers["X-Jonex-Kb-Id"] = kb_id
@@ -190,17 +205,32 @@ async def answer_from_facts(
                 },
             ],
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=8192,
             extra_headers=extra_headers,
         )
-        content = resp.choices[0].message.content
-        if not content or not content.strip():
-            logger.warning(
-                "本体 LLM 返回空内容 finish_reason=%s",
-                resp.choices[0].finish_reason,
-            )
+        msg = resp.choices[0].message
+        finish = resp.choices[0].finish_reason
+        content = (msg.content or "").strip()
+
+        if not content:
+            # [jonex] 思考模式下正文可能落在 reasoning_content、content 为空
+            # （上游 tokenhub 行为，Reference/Rag-anything 侧 _metered_llm() 已同源修复过一次）。
+            # ⚠️ 仅在**正常结束**时兜底：finish_reason=="length" 说明思考链自身被截断，
+            #    此时 reasoning_content 是不完整的思考文本而非答案，且直接返回会泄露思考链。
+            if finish == "length":
+                logger.warning(
+                    "本体 LLM 输出预算耗尽（finish_reason=length）且正文为空——"
+                    "非事实不足，而是 max_tokens 被思考 token 吃光；返回 INSUFFICIENT 交由升档重跑"
+                )
+                return "INSUFFICIENT"
+            content = (getattr(msg, "reasoning_content", None) or "").strip()
+            if content:
+                logger.info("本体 LLM content 为空，已用 reasoning_content 兜底（finish_reason=%s）", finish)
+
+        if not content:
+            logger.warning("本体 LLM 返回空内容 finish_reason=%s（兜底后仍为空）", finish)
             return "INSUFFICIENT"
-        return content.strip()
+        return content
     except Exception as e:
         logger.warning("本体 LLM 调用失败: %s", e)
         return "INSUFFICIENT"
@@ -213,6 +243,7 @@ async def answer_from_chunks(
     kb_id: Optional[str] = None,
     user_id: Optional[str] = None,
     trace_id: Optional[str] = None,
+    fast_mode: bool = False,
 ) -> str:
     """[jonex] 方案 A：基于召回 chunk 原文做一次平台侧作答（场景 rag_chunk_qa）。
 
@@ -224,8 +255,10 @@ async def answer_from_chunks(
     Args:
         chunks: 排序/截断后的 chunk 列表，每项含
             doc_id / file_name / kb_id / chunk_id / text / relevance，
-            以及 [jonex] 表格方案改动 64 的 ctype / row_start / row_end
-            （全量 reparse 前存量 chunk 三字段为 None，prompt 无类型标签属预期）。
+            以及 [jonex] 表格方案改动 64 的 ctype / row_start / row_end。
+            ⚠️ 检索侧 refs 由 parse_file_source 产出，类型键名是 chunk_type
+            （非 ctype）——读取时两键兼容；全量 reparse 前存量 chunk 无类型
+            字段，prompt 无类型标签属预期。
         kb_id: 多 KB 场景取主 KB（kb_ids[0]），与 _rerank_references 口径一致。
     """
     client = _get_client()
@@ -252,26 +285,34 @@ async def answer_from_chunks(
         "not in the chunks. If the chunks are insufficient, say so explicitly and "
         "list what is missing. Chunks may include table rows (labeled 表格明细) and "
         "table overviews (labeled 表格概览) — for precise value lookups prefer 表格明细; "
-        "for structural summaries prefer 表格概览."
+        "for structural summaries prefer 表格概览. "
+        "Chunks labeled 图片描述 are visual descriptions of images in the document — "
+        "they describe what appears in a picture, not the document's textual content. "
+        "Do not treat image descriptions as factual statements from the document; "
+        "only use them when the user is explicitly asking about visual content."
     )
 
     lines: list[str] = []
     for i, c in enumerate(budgeted, 1):
         fname = c.get("file_name") or c.get("doc_id") or ""
-        ctype = c.get("ctype")
+        # 检索侧 chunk 的类型键是 chunk_type（parse_file_source 产物）；
+        # ctype 仅为历史/其他调用方兜底（见 answer_from_chunks docstring）。
+        ctype = c.get("ctype") or c.get("chunk_type")
         label = ""
         if ctype == "table_row":
             rs, re_ = c.get("row_start"), c.get("row_end")
             label = f"表格明细（行 {rs}-{re_}）" if rs is not None and re_ is not None else "表格明细"
         elif ctype == "table_summary":
             label = "表格概览"
+        elif ctype == "image":
+            label = "图片描述"
         header = f"[ref_{i}] {fname}" + (f"（{label}）" if label else "")
         lines.append(f"{header}\n{c.get('text', '')}")
 
     # 注入计量上下文头（新场景 rag_chunk_qa，与 ontology_qa / rag_fusion 分离统计）
     extra_headers = {
         "X-Jonex-Tenant-Id": tenant_id or "unknown",
-        "X-Jonex-Scene": "rag_chunk_qa",
+        "X-Jonex-Scene": _scene("rag_chunk_qa", fast_mode),
     }
     if kb_id:
         extra_headers["X-Jonex-Kb-Id"] = kb_id
@@ -293,16 +334,26 @@ async def answer_from_chunks(
             },
         ],
         temperature=0.1,
-        max_tokens=2048,
+        max_tokens=8192,
         extra_headers=extra_headers,
     )
-    content = resp.choices[0].message.content
-    if not content or not content.strip():
+    msg = resp.choices[0].message
+    finish = resp.choices[0].finish_reason
+    content = (msg.content or "").strip()
+    if not content:
+        # [jonex] 与 answer_from_facts 同源的 reasoning_content 兜底：
+        # finish_reason=="length" 时思考链自身被截断（不完整思考文本而非答案，
+        # 直接返回会泄露思考链）→ 保持「抛异常回退旧链路」的既有语义。
+        if finish != "length":
+            content = (getattr(msg, "reasoning_content", None) or "").strip()
+            if content:
+                logger.info("answer_from_chunks content 为空，已用 reasoning_content 兜底（finish_reason=%s）", finish)
+    if not content:
         # 空答案视为失败 → 抛出，由调用方回退旧链路（不返回空答案）
         raise RuntimeError(
-            f"answer_from_chunks 返回空内容 finish_reason={resp.choices[0].finish_reason}"
+            f"answer_from_chunks 返回空内容 finish_reason={finish}"
         )
-    return content.strip()
+    return content
 
 
 async def fuse_rag_answers(
@@ -311,6 +362,7 @@ async def fuse_rag_answers(
     tenant_id: Optional[str] = None,
     user_id: Optional[str] = None,
     trace_id: Optional[str] = None,
+    fast_mode: bool = False,
 ) -> str:
     """将多个 KB 的 RAG 答案融合为一个准确、无重复、标注来源的统一回答。
 
@@ -330,8 +382,14 @@ async def fuse_rag_answers(
     system_prompt = (
         "You are a RAG answer fusion assistant. Given multiple answers from different "
         "knowledge bases for the same question, produce a single, accurate, non-redundant "
-        "answer. Resolve factual conflicts. When possible, note which knowledge base each "
-        "piece of information comes from, using the provided knowledge base names. "
+        "answer. Resolve factual conflicts. When noting which knowledge base a piece of "
+        "information comes from, you MUST ONLY use the exact knowledge base names provided "
+        "in the input — a name may list multiple knowledge bases separated by a Chinese "
+        "enumeration comma '、', in which case attribute the information to that group "
+        "rather than picking one of them. If you cannot attribute a piece of information "
+        "confidently, do not label it. The placeholder \"unspecified\" means the source "
+        "knowledge bases could not be located — never print \"unspecified\" in your "
+        "answer and do not label such information. Never invent knowledge base names. "
         "Do not make up information."
     )
 
@@ -340,8 +398,9 @@ async def fuse_rag_answers(
     # [jonex] 只把「知识库显示名 + 答案」喂给 LLM——此前 json.dumps(per_kb) 会把
     # kb_id（UUID 不可读）和内部 source 字段（如 "llm-wiki"）直接暴露给 LLM，
     # 产出「知识库 `llm-wiki`」「知识库 `470a9519...`」这类错误标注。
+    # 标签为空（该侧引用未定位到 KB）时落 unspecified，prompt 已指示不输出该词。
     def _kb_label(a: dict) -> str:
-        return str(a.get("kb_name") or a.get("kb_id") or "unknown")
+        return str(a.get("kb_name") or "unspecified")
 
     kb_texts = "\n\n".join(
         f"[Knowledge base: {_kb_label(a)}]\n{a.get('answer', '')}"
@@ -350,7 +409,7 @@ async def fuse_rag_answers(
 
     extra_headers = {
         "X-Jonex-Tenant-Id": tenant_id or "unknown",
-        "X-Jonex-Scene": "rag_fusion",
+        "X-Jonex-Scene": _scene("rag_fusion", fast_mode),
     }
     if user_id:
         extra_headers["X-Jonex-User-Id"] = user_id
@@ -371,7 +430,7 @@ async def fuse_rag_answers(
                 },
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=4096,
             extra_headers=extra_headers,
         )
         content = resp.choices[0].message.content

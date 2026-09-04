@@ -23,7 +23,7 @@ class DomainService(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     api_key_encrypted = Column(String(512))
     enabled = Column(SmallInteger, default=1)
 
-    def to_dict(self, include_kb_ids: list[str] | None = None, space_name: str = "", kb_names: dict[str, str] | None = None):
+    def to_dict(self, include_kb_ids: list[str] | None = None, space_name: str = "", kb_names: dict[str, str] | None = None, kb_types: list[str] | None = None):
         kb_ids = include_kb_ids or []
         result = {
             "id": self.id, "tenant_id": self.tenant_id,
@@ -34,6 +34,7 @@ class DomainService(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "api_key_encrypted": self.api_key_encrypted,
             "enabled": self.enabled,
             "kb_ids": kb_ids,
+            "kb_types": kb_types if kb_types is not None else [],
             "space_name": space_name,
             "kb_names": [kb_names.get(kid, kid) for kid in kb_ids] if kb_names else kb_ids,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -85,12 +86,3 @@ class ServiceConfig(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     config_value = Column(Text)
     description = Column(String(512))
 
-
-class ServicePermission(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
-    __tablename__ = "service_permissions"
-    __table_args__ = {"schema": "knowledge_base"}
-
-    id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
-    service_id = Column(String(64), nullable=False, index=True)
-    user_id = Column(String(64), nullable=False, index=True)
-    role = Column(String(32), nullable=False, default="viewer")

@@ -27,6 +27,7 @@ from jonex_core.common.ontology_yaml import (  # [jonex]
 from capabilities.business_domain.models.template import (
     TemplateAttribute,
     TemplateConstraint,
+    TemplateDomain,
     TemplateObject,
     TemplateRelation,
     TemplateScenario,
@@ -46,12 +47,13 @@ class TemplateService:
     """业务领域模板：模板领域 -> 场景 -> 对象/属性/关系。"""
 
     # Template Domains
-    async def list_domains(self, tenant_id: str, offset: int = 0, limit: int = 20) -> dict:
+    async def list_domains(self, tenant_id: str, offset: int = 0, limit: int = 20, status: str | None = None) -> dict:
         tenant_id = _check_tenant(tenant_id)
+        extra_conditions = [TemplateDomain.status == status] if status else []
         async with get_db_session() as session:
             repo = TemplateDomainRepository(session)
-            items = await repo.list_all(tenant_id, offset, limit)
-            total = await repo.count(tenant_id)
+            items = await repo.list_all(tenant_id, offset, limit, extra_conditions=extra_conditions)
+            total = await repo.count(tenant_id, extra_conditions=extra_conditions)
             domain_ids = [o.id for o in items]
             scenario_counts: dict[str, int] = {}
             if domain_ids:
@@ -87,6 +89,7 @@ class TemplateService:
                 id=uuid.uuid4().hex,
                 tenant_id=tenant_id,
                 name=data["name"],
+                name_en=data.get("name_en"),
                 description=data.get("description"),
                 status=data.get("status", "inactive"),
             )
@@ -99,7 +102,7 @@ class TemplateService:
             repo = TemplateDomainRepository(session)
             obj = await repo.update(domain_id, tenant_id, **{
                 k: v for k, v in data.items()
-                if k in ("name", "description", "status") and v is not None
+                if k in ("name", "name_en", "description", "status") and v is not None
             })
             if obj is None:
                 raise ResourceNotFoundError(message=translate("err.template.domain_not_found", params={"domain_id": domain_id}, fallback=f"模板领域不存在: {domain_id}"))  # 原消息
@@ -109,10 +112,57 @@ class TemplateService:
     async def delete_domain(self, domain_id: str, tenant_id: str) -> bool:
         tenant_id = _check_tenant(tenant_id)
         async with get_db_session() as session:
-            repo = TemplateDomainRepository(session)
-            deleted = await repo.delete_soft(domain_id, tenant_id)
-            if not deleted:
+            domain_repo = TemplateDomainRepository(session)
+            scenario_repo = TemplateScenarioRepository(session)
+            object_repo = TemplateObjectRepository(session)
+            attribute_repo = TemplateAttributeRepository(session)
+            relation_repo = TemplateRelationRepository(session)
+            constraint_repo = TemplateConstraintRepository(session)
+
+            # 校验领域存在（保留原错误码与文案）
+            domain = await domain_repo.get_by_id(domain_id, tenant_id)
+            if domain is None:
                 raise ResourceNotFoundError(message=translate("err.template.domain_not_found", params={"domain_id": domain_id}, fallback=f"模板领域不存在: {domain_id}"))  # 原消息
+
+            # 级联软删：领域 -> 场景 -> 对象 -> 属性 / 关系 / 约束
+            scenarios = await scenario_repo.list_all(
+                tenant_id, 0, 10000,
+                extra_conditions=[TemplateScenario.domain_id == domain_id],
+            )
+            scenario_ids = [s.id for s in scenarios]
+            if scenario_ids:
+                objects = await object_repo.list_all(
+                    tenant_id, 0, 10000,
+                    extra_conditions=[TemplateObject.scenario_id.in_(scenario_ids)],
+                )
+                object_ids = [o.id for o in objects]
+                relations = await relation_repo.list_all(
+                    tenant_id, 0, 10000,
+                    extra_conditions=[TemplateRelation.scenario_id.in_(scenario_ids)],
+                )
+                constraints = await constraint_repo.list_all(
+                    tenant_id, 0, 10000,
+                    extra_conditions=[TemplateConstraint.scenario_id.in_(scenario_ids)],
+                )
+                attributes: list = []
+                if object_ids:
+                    attributes = await attribute_repo.list_all(
+                        tenant_id, 0, 10000,
+                        extra_conditions=[TemplateAttribute.template_object_id.in_(object_ids)],
+                    )
+
+                for attr in attributes:
+                    await attribute_repo.delete_soft(attr, tenant_id)
+                for relation in relations:
+                    await relation_repo.delete_soft(relation, tenant_id)
+                for constraint in constraints:
+                    await constraint_repo.delete_soft(constraint, tenant_id)
+                for obj in objects:
+                    await object_repo.delete_soft(obj, tenant_id)
+                for scenario in scenarios:
+                    await scenario_repo.delete_soft(scenario, tenant_id)
+
+            await domain_repo.delete_soft(domain, tenant_id)
             await session.commit()
             return True
 

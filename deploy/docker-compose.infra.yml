@@ -1,5 +1,5 @@
 # ============================================================
-# 悦溪平台 — 基础设施服务编排（服务器端专用）
+# Jonex 平台 — 基础设施服务编排（服务器端专用）
 # ============================================================
 # 用途：在服务器上只启动 PostgreSQL、Redis、etcd、MinIO、
 #       Milvus、Neo4j，供本地开发机器连接。
@@ -54,7 +54,7 @@ services:
       - "0.0.0.0:5432:5432"
     environment:
       POSTGRES_USER: ${DB_USERNAME:-jonex}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-jonex123}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
       POSTGRES_DB: ${DB_NAME:-jonex}
       TZ: Asia/Shanghai
     volumes:
@@ -138,8 +138,8 @@ services:
       - "0.0.0.0:9000:9000"
       - "0.0.0.0:9001:9001"
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: change-me
+      MINIO_SECRET_KEY: change-me
       TZ: Asia/Shanghai
     volumes:
       - jonex-minio-data:/minio_data
@@ -167,8 +167,8 @@ services:
       TZ: Asia/Shanghai
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: change-me
+      MINIO_SECRET_KEY: change-me
     volumes:
       - jonex-milvus-data:/var/lib/milvus
     command: ["milvus", "run", "standalone"]
@@ -198,7 +198,7 @@ services:
       - "0.0.0.0:7474:7474"     # Browser 调试
       - "0.0.0.0:7687:7687"     # Bolt 连接
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-jonex_neo4j_123}
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}

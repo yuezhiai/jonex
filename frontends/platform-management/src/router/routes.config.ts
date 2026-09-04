@@ -12,6 +12,7 @@ const RolePermission = loadableComponent(() => import('@/pages/RolePermission'))
 const TaskSchedule = loadableComponent(() => import('@/pages/TaskSchedule'));
 const SystemConfig = loadableComponent(() => import('@/pages/SystemConfig'));
 const OperationLog = loadableComponent(() => import('@/pages/OperationLog'));
+const SystemMonitor = loadableComponent(() => import('@/pages/SystemMonitor'));
 const DataAccess = loadableComponent(() => import('@/pages/DataAccess'));
 const ParserManagement = loadableComponent(() => import('@/pages/ParserManagement'));
 const KnowledgeCompile = loadableComponent(() => import('@/pages/KnowledgeCompile'));
@@ -78,19 +79,37 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'operation-log',
           element: OperationLog,
           title: T('navigation.operationLog'),
-          menu: { icon: 'FileTextOutlined', order: 8, permissionCode: 'platform:audit:read' },
+          // [jonex] 权限重构 B1：platform:audit:read → audit:read（tenant scope）。
+          // 审计日志已放开给租户管理员（方案 §8 第 3 条）：接口改为双码放行、
+          // DB 菜单树 id 15 的码也改成 audit:read。这里若不同步改，租户管理员会
+          // 在 shell 导航看到「操作日志」入口，点进来被 router/index.tsx 的守卫
+          // 直接 redirect('/error?page=403') —— 三处（接口/菜单/路由）必须同批改。
+          // 平台管理员天然持全部 tenant 码，改后仍可见可进。
+          menu: { icon: 'FileTextOutlined', order: 8, permissionCode: 'audit:read' },
         },
         {
           path: 'data-access',
           element: DataAccess,
           title: T('navigation.dataAccessMethods'),
-          menu: { icon: 'CloudServerOutlined', order: 9, permissionCode: 'engine:read' },
+          // [jonex] 权限重构 B1：engine:read → datasource:read，与 DB 菜单树 id 7 对齐。
+          // 原先数据源管理与解析器管理共用 engine:read，两个不同页面一个码 → 无法分别授权。
+          // 两者都是 platform scope（仅平台管理员），所以当下没有可见的行为变化，
+          // 但码不一致会在「只授 datasource:read」时让页面 403，属埋雷。
+          menu: { icon: 'CloudServerOutlined', order: 9, permissionCode: 'datasource:read' },
         },
         {
           path: 'parser-management',
           element: ParserManagement,
           title: T('navigation.parserManagement'),
           menu: { icon: 'CodeOutlined', order: 10, permissionCode: 'engine:read' },
+        },
+        {
+          // [jonex] 全局系统监控 —— 占位页（研发中）。给 platform:monitor:read 一个真实落点，
+          // 避免角色权限页出现「勾了也没有入口」的权限项。见 docs/permissions/PERMISSIONS_REDESIGN.md §11.2
+          path: 'system-monitor',
+          element: SystemMonitor,
+          title: T('navigation.systemMonitor'),
+          menu: { icon: 'DashboardOutlined', order: 11, permissionCode: 'platform:monitor:read' },
         },
         { path: 'knowledge-compile', element: KnowledgeCompile, title: T('navigation.knowledgeCompile') },
         { path: 'knowledge-compile/search', element: KnowledgeCompileSearch, title: T('navigation.compileSearch') },

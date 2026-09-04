@@ -9,6 +9,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from jonex_core.common.config import get_config
 from jonex_core.common.crypto import generate_mcp_key, hash_mcp_key
 from jonex_core.common.exceptions import (
     InvalidParameterError,
@@ -22,9 +23,11 @@ from capabilities.platform.models.mcp_key import McpKey
 from capabilities.platform.repository.mcp_key_repository import McpKeyRepository, McpKeyServiceMappingRepository
 from capabilities.platform.dtos.mcp_key_dto import (
     McpKeyCreateRequest,
+    McpKeyCreateResponse,
     McpKeyResponse,
     McpKeyUpdateRequest,
     ServicePermissionItem,
+    WriteGrant,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,65 +43,6 @@ class McpKeyService:
 
     # ---- helpers ----
 
-    @staticmethod
-    def _default_service_permission_level(key_permissions: list[str]) -> str:
-        """根据 Key 级权限推断 service 级默认权限级别。
-
-        合法值已收敛为 call / view（write / * 已物理删除）。
-        先归一化遗留值（write/*→call、read→view，复用 _normalize_key_permissions），
-        再取最高权限；归一化后仍未知的值兜底回 view（最小权限，绝不升级）。
-        - 含 "call"（含归一化后的 write/*）→ service 级 "call"
-        - 含 "view"（含归一化后的 read）→ service 级 "view"
-        - 其他未知值 / 空 → service 级 "view"（最小权限兜底）
-        """
-        if not key_permissions:
-            return "view"
-        normalized = McpKeyService._normalize_key_permissions(",".join(key_permissions))
-        if "call" in normalized.split(","):
-            return "call"
-        return "view"
-
-    @staticmethod
-    def _normalize_key_permissions(permissions_str: str) -> str:
-        """防御性归一化：将遗留权限值迁移到 call / view，避免旧值传播到新 Key。
-
-        迁移规则（write/* → call/view）：
-        - "read" → "view"（旧 read 语义等同于 view：仅查看）
-        - "write" → "call"（write 语义含 call，降级不丢失可调用能力）
-        - "*" → "call"（通配含 call，降级到 call 不扩大权限）
-
-        reset()/recreate() 继承旧 Key permissions 时需归一化，否则新 Key 携带
-        已废弃的权限值。
-        """
-        if not permissions_str:
-            return permissions_str
-        parts = [p.strip() for p in permissions_str.split(",") if p.strip()]
-        normalized = []
-        for p in parts:
-            if p == "read":
-                normalized.append("view")
-            elif p in ("write", "*"):
-                normalized.append("call")
-            else:
-                normalized.append(p)
-        return ",".join(normalized)
-
-    @staticmethod
-    def _derive_status(key) -> str:
-        """派生 Key 4 态状态（逻辑字段，不落库）。
-
-        优先级：expired（expires_at 到期）> disabled（disabled_at 非空）
-        > revoked（revoked_at 非空）> active。
-        时间用 datetime.now(timezone.utc)——async ORM 禁 func.now()（MissingGreenlet 陷阱）。
-        """
-        if key.expires_at and key.expires_at <= datetime.now(timezone.utc):
-            return "expired"
-        if key.disabled_at:
-            return "disabled"
-        if key.revoked_at:
-            return "revoked"
-        return "active"
-
     def _extract_username(self, authorization_header: str | None) -> str:
         """从 Authorization Header 提取用户名，处理所有边界情况。
 
@@ -107,7 +51,7 @@ class McpKeyService:
         2. authorization_header 是空字符串 → "test_token"
         3. authorization_header 不以 "Bearer " 开头 → "test_token"
         4. 提取 token = authorization_header[7:]（去掉 "Bearer " 前缀）
-        5. token 以 "jonex_test_" 开头 → "test_token"（测试 token 无法 JWT 解码）
+        5. token 以 "jonex_test_" 开头（且 ENABLE_TEST_TOKENS=true）→ "test_token"
         6. decode_token(token) → payload.get("username")
         7. username 为 None 或空字符串 → "test_token"
         8. decode_token 抛出任何异常 → "test_token"
@@ -125,7 +69,7 @@ class McpKeyService:
         if not token:
             return "test_token"
 
-        if token.startswith("jonex_test_"):
+        if get_config().ENABLE_TEST_TOKENS and token.startswith("jonex_test_"):
             return "test_token"
 
         try:
@@ -174,7 +118,224 @@ class McpKeyService:
                 details={"space_id": space_id, "missing_service_ids": sorted(missing)},
             )
 
+    async def _resolve_space_id(self, tenant_id: str, kb_id: str) -> str:
+        """反推 space_id：grants[0].kb 对应知识库的 space_id。
+
+        跨 schema 只读查询 knowledge_base.knowledge_info；kb 不存在/跨租户
+        → ResourceNotFoundError（不泄露目标知识库是否存在）。
+        """
+        result = await self.session.execute(
+            sa_text(
+                "SELECT space_id FROM knowledge_base.knowledge_info "
+                "WHERE id = :kb_id AND tenant_id = :tid AND is_deleted = 0"
+            ),
+            {"kb_id": kb_id, "tid": tenant_id},
+        )
+        row = result.first()
+        if row is None:
+            raise ResourceNotFoundError(
+                message=translate(
+                    "err.mcp_write_key.kb_not_found",
+                    fallback=f"知识库不存在或不属于当前租户: {kb_id}",
+                ),
+                details={"kb_id": kb_id},
+            )
+        return row[0]
+
+    async def _validate_kb_ids_in_space(
+        self, tenant_id: str, space_id: str, kb_ids: list[str]
+    ) -> None:
+        """校验 kb_ids 中所有知识库都属于指定 space（跨 schema 查 knowledge_info）。
+
+        空 kb_ids → InvalidParameterError；任何 kb 缺失（跨 space/跨租户）
+        → InvalidParameterError。
+        """
+        if not kb_ids:
+            raise InvalidParameterError(
+                message="grants 不能为空", details={"space_id": space_id}
+            )
+        result = await self.session.execute(
+            sa_text(
+                "SELECT id FROM knowledge_base.knowledge_info "
+                "WHERE id = ANY(:kb_ids) AND tenant_id = :tid "
+                "AND space_id = :sid AND is_deleted = 0"
+            ),
+            {"kb_ids": kb_ids, "tid": tenant_id, "sid": space_id},
+        )
+        found = {row[0] for row in result.fetchall()}
+        missing = set(kb_ids) - found
+        if missing:
+            raise InvalidParameterError(
+                message=f"以下 kb_id 不在指定空间内: {', '.join(sorted(missing))}",
+                details={"space_id": space_id, "missing_kb_ids": sorted(missing)},
+            )
+
+    async def _validate_directory_ownership(
+        self, tenant_id: str, kb_ids: list[str], grants: list
+    ) -> None:
+        """校验 grants 中 specified 模式的 directory 归属。
+
+        每个 folder_id 映射回其 knowledge_base_id，且该 kb 必须 ∈ grants[].kb
+        （防「目录与 KB 跨 space 混配」）。folder 不存在/跨租户 → InvalidParameterError。
+        """
+        folder_ids = [
+            fid
+            for g in grants
+            if getattr(g, "mode", None) == "specified"
+            for fid in (getattr(g, "directories", None) or [])
+        ]
+        if not folder_ids:
+            return
+
+        result = await self.session.execute(
+            sa_text(
+                "SELECT id, knowledge_base_id FROM knowledge_base.folders "
+                "WHERE id = ANY(:folder_ids) AND tenant_id = :tid AND is_deleted = 0"
+            ),
+            {"folder_ids": folder_ids, "tid": tenant_id},
+        )
+        folder_to_kb = {row[0]: row[1] for row in result.fetchall()}
+
+        missing = set(folder_ids) - set(folder_to_kb.keys())
+        if missing:
+            raise InvalidParameterError(
+                message=f"以下目录不存在或不属于当前租户: {', '.join(sorted(missing))}",
+                details={"missing_folder_ids": sorted(missing)},
+            )
+
+        kb_set = set(kb_ids)
+        invalid = [fid for fid in folder_ids if folder_to_kb[fid] not in kb_set]
+        if invalid:
+            raise InvalidParameterError(
+                message=f"以下目录与知识库跨 space 混配: {', '.join(sorted(invalid))}",
+                details={"invalid_folder_ids": sorted(invalid)},
+            )
+
+    def _validate_grant_modes(self, grants: list) -> None:
+        """校验 grants 的 mode 与 directories 语义一致。
+
+        - specified 必须携带非空 directories；
+        - all 不应携带 directories（带了也静默忽略，语义混淆有越权写入风险）。
+        """
+        for g in grants:
+            if g.mode == "specified" and not g.directories:
+                raise InvalidParameterError(
+                    message="specified 模式必须指定至少一个目录",
+                    details={"kb": g.kb},
+                )
+            if g.mode == "all" and g.directories:
+                raise InvalidParameterError(
+                    message="all 模式不应携带 directories",
+                    details={"kb": g.kb},
+                )
+
     # ---- business methods ----
+
+    @staticmethod
+    def _is_client_request_id_conflict(exc: IntegrityError) -> bool:
+        """区分 IntegrityError 约束：uq_mcp_keys_tenant_reqid（幂等键冲突）vs key_hash 碰撞。"""
+        orig = getattr(exc, "orig", None)
+        text = str(orig).lower() if orig is not None else ""
+        return "uq_mcp_keys_tenant_reqid" in text
+
+    def _build_mcp_config(self, plaintext: str) -> dict:
+        """组装 WorkBuddy 兼容 mcp_config JSON。
+
+        url 直接取 MCP_SERVER_PUBLIC_URL（锁定决策选项 1：无 localhost 兜底，
+        生产由 deploy 注入 HTTPS，本地由 .env.local 显式填）。
+        """
+        return {
+            "mcpServers": {
+                "jonex-knowledge": {
+                    "url": get_config().MCP_SERVER_PUBLIC_URL,
+                    "transport": "streamable-http",
+                    "headers": {"Authorization": f"Bearer {plaintext}"},
+                }
+            }
+        }
+
+    @staticmethod
+    def _build_auth_summary(service_permissions: list, write_grants) -> str:
+        """组装 auth_summary：可调用 N · 仅查看 N · 写入开关。"""
+        perms = service_permissions or []
+        call = sum(
+            1
+            for sp in perms
+            if (sp.get("permission_level") if isinstance(sp, dict) else sp.permission_level) == "call"
+        )
+        view = sum(
+            1
+            for sp in perms
+            if (sp.get("permission_level") if isinstance(sp, dict) else sp.permission_level) == "view"
+        )
+        write_state = "写入开启" if write_grants else "写入关闭"
+        return f"可调用 {call} · 仅查看 {view} · {write_state}"
+
+    @staticmethod
+    def _grant_mode(g) -> str | None:
+        """兼容 dict（JSONB 反序列化）与 WriteGrant 对象，取 mode 字段。"""
+        return g.get("mode") if isinstance(g, dict) else getattr(g, "mode", None)
+
+    @staticmethod
+    def _grant_directories(g) -> list:
+        """兼容 dict（JSONB 反序列化）与 WriteGrant 对象，取 directories 字段。"""
+        if isinstance(g, dict):
+            return g.get("directories") or []
+        return getattr(g, "directories", None) or []
+
+    @staticmethod
+    def _build_write_scope_summary(write_grants) -> str:
+        """组装 write_scope_summary：可写知识库 N · 指定目录 N。"""
+        grants = write_grants or []
+        if not grants:
+            return "未开启写入"
+        kb_count = len(grants)
+        dir_count = sum(
+            len(McpKeyService._grant_directories(g))
+            for g in grants
+            if McpKeyService._grant_mode(g) == "specified"
+        )
+        return f"可写知识库 {kb_count} · 指定目录 {dir_count}"
+
+    async def _validate_service_publish(
+        self, tenant_id: str, service_ids: list[str]
+    ) -> None:
+        """校验 service_ids 均已发布且未停用（platform.mcp_service_publish）。"""
+        if not service_ids:
+            return
+        result = await self.session.execute(
+            sa_text(
+                "SELECT service_id FROM platform.mcp_service_publish "
+                "WHERE service_id = ANY(:sids) AND tenant_id = :tid "
+                "AND is_published = 1 AND stopped_at IS NULL"
+            ),
+            {"sids": service_ids, "tid": tenant_id},
+        )
+        published = {row[0] for row in result.fetchall()}
+        unpublished = set(service_ids) - published
+        if unpublished:
+            raise InvalidParameterError(
+                message=f"以下服务未发布或已停用: {', '.join(sorted(unpublished))}",
+                details={"unpublished_service_ids": sorted(unpublished)},
+            )
+
+    async def _build_idempotent_response(self, existing: McpKey) -> dict:
+        """幂等命中：返回脱敏信息 + delivery_failed=True，无明文/mcp_config。"""
+        dto = McpKeyResponse.from_orm(existing)
+        mapping_repo = McpKeyServiceMappingRepository(self.session)
+        mappings = await mapping_repo.get_mappings(existing.id)
+        dto.service_permissions = [
+            {"service_id": sid, "permission_level": pl} for sid, pl in mappings
+        ]
+        dto.status = McpKey._derive_status(existing)
+        dto.auth_summary = self._build_auth_summary(dto.service_permissions, dto.write_grants)
+        dto.write_scope_summary = self._build_write_scope_summary(dto.write_grants)
+        return McpKeyCreateResponse(
+            **dto.dict(),
+            plaintext=None,
+            mcp_config=None,
+            delivery_failed=True,
+        ).dict()
 
     async def create(
         self,
@@ -182,51 +343,86 @@ class McpKeyService:
         req: McpKeyCreateRequest,
         authorization_header: str | None = None,
     ) -> dict:
-        """创建 MCP Key，一次性返回明文 yxm_... Key。
+        """创建统一 MCP Key：幂等（client_request_id）+ 强校验 + 三态 write_grants + 一次性明文 + mcp_config。
 
-        permissions 存前用 ",".join() 转为逗号分隔字符串。
-        created_by 通过 _extract_username() helper 统一提取。
-        service_ids 写入 mcp_key_service_mappings 中间表。
-        IntegrityError（hash 碰撞）时重试一次。
+        校验顺序即优先级：require_tenant/space → 至少一授权 → write_grants 三态 →
+        发布校验 → 幂等预查 → 生成 Key → 映射 → 审计 → 组装响应。
         """
         tenant_id = require_tenant(tenant_id)
         created_by = self._extract_username(authorization_header)
 
-        # 校验 space_id 归属——跨 schema 查询 knowledge_base.spaces
+        # 1. 校验 space_id 归属
         await self._validate_space_id(tenant_id, req.space_id)
-        # 校验 service_ids 归属——确保所有 service 属于该 space
-        await self._validate_service_ids_in_space(tenant_id, req.space_id, req.service_ids or [])
 
+        # 2. 至少一授权（仅当写入关闭 write_grants=None 且无 service_permissions 时触发；
+        #    write_grants=[] 属「写入开启但无知识库」，交由下方三态校验产出特定文案）
+        if not req.service_permissions and req.write_grants is None:
+            raise InvalidParameterError(
+                message="至少需要授权一个已发布服务（service_permissions）或开启写入（write_grants）",
+                details={"space_id": req.space_id},
+            )
+
+        # 3. write_grants 三态
+        write_grants_value = None
+        if req.write_grants is not None:
+            if req.write_grants == []:
+                raise InvalidParameterError(
+                    message="写入开启但无知识库（write_grants 不能为空列表）",
+                    details={"space_id": req.space_id},
+                )
+            self._validate_grant_modes(req.write_grants)
+            kb_ids = list({g.kb for g in req.write_grants})
+            await self._validate_kb_ids_in_space(tenant_id, req.space_id, kb_ids)
+            await self._validate_directory_ownership(tenant_id, kb_ids, req.write_grants)
+            write_grants_value = [g.dict() for g in req.write_grants]
+
+        # 4. service_permissions 发布校验
+        service_permissions = req.service_permissions or []
+        if service_permissions:
+            service_ids = [sp.service_id for sp in service_permissions]
+            await self._validate_service_ids_in_space(tenant_id, req.space_id, service_ids)
+            await self._validate_service_publish(tenant_id, service_ids)
+
+        # 5. 幂等预查
+        existing = await self.repo.get_by_client_request_id(tenant_id, req.client_request_id)
+        if existing is not None:
+            return await self._build_idempotent_response(existing)
+
+        # 6. 生成 Key
         plaintext = generate_mcp_key()
         key_prefix = plaintext[4:12]  # yxm_ 后 8 位
         key_hash_value = hash_mcp_key(plaintext)
         key_id = uuid.uuid4().hex
-        service_ids = req.service_ids or []
-        service_permissions = req.service_permissions or []
 
         mcp_key = McpKey(
             id=key_id,
             tenant_id=tenant_id,
             name=req.name,
+            note=req.note,
             space_id=req.space_id,
             key_prefix=key_prefix,
             key_hash=key_hash_value,
-            permissions=",".join(req.permissions),
-            allowed_kb_ids=req.allowed_kb_ids or [],
+            write_grants=write_grants_value,
+            client_request_id=req.client_request_id,
             created_by=created_by,
             created_at=datetime.now(timezone.utc),
             expires_at=req.expires_at,
         )
 
+        # 7. 事务 + IntegrityError 兜底（约束名区分：幂等键冲突 vs hash 碰撞）
         sp = await self.session.begin_nested()
         try:
             self.session.add(mcp_key)
             await self.session.flush()
             await sp.commit()
-        except IntegrityError:
+        except IntegrityError as exc:
             await sp.rollback()
+            if self._is_client_request_id_conflict(exc):
+                existing = await self.repo.get_by_client_request_id(tenant_id, req.client_request_id)
+                if existing is not None:
+                    return await self._build_idempotent_response(existing)
+                raise
             logger.warning("MCP Key hash 碰撞，重试生成")
-            # Expunge the invalidated object so the session can accept a fresh one
             self.session.expunge(mcp_key)
             plaintext = generate_mcp_key()
             key_prefix = plaintext[4:12]
@@ -235,39 +431,36 @@ class McpKeyService:
                 id=key_id,
                 tenant_id=tenant_id,
                 name=req.name,
+                note=req.note,
                 space_id=req.space_id,
                 key_prefix=key_prefix,
                 key_hash=key_hash_value,
-                permissions=",".join(req.permissions),
-                allowed_kb_ids=req.allowed_kb_ids or [],
+                write_grants=write_grants_value,
+                client_request_id=req.client_request_id,
                 created_by=created_by,
                 created_at=datetime.now(timezone.utc),
                 expires_at=req.expires_at,
             )
-            # Retry in a fresh savepoint
             sp2 = await self.session.begin_nested()
             try:
                 self.session.add(mcp_key)
                 await self.session.flush()
                 await sp2.commit()
-            except IntegrityError:
+            except IntegrityError as exc2:
                 await sp2.rollback()
+                if self._is_client_request_id_conflict(exc2):
+                    existing = await self.repo.get_by_client_request_id(tenant_id, req.client_request_id)
+                    if existing is not None:
+                        return await self._build_idempotent_response(existing)
                 raise
 
-        # 写入 service 映射（service_permissions 优先于 service_ids）
-        sp_items = service_permissions or []
-        if sp_items:
-            mappings: list[str] | list[tuple[str, str]] = [
-                (item.service_id, item.permission_level) for item in sp_items
-            ]
-        elif service_ids:
-            default_pl = self._default_service_permission_level(req.permissions)
-            mappings = [(sid, default_pl) for sid in service_ids]
-        else:
-            mappings = []
-        if mappings:
+        # 8. 写入 service 映射（仅来自 service_permissions）
+        if service_permissions:
             mapping_repo = McpKeyServiceMappingRepository(self.session)
-            await mapping_repo.set_mappings(key_id, mappings)
+            await mapping_repo.set_mappings(
+                key_id,
+                [(sp.service_id, sp.permission_level) for sp in service_permissions],
+            )
 
         logger.info(f"MCP Key 已创建: id={key_id}, name={req.name}")
 
@@ -279,7 +472,7 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action="mcp_key.create",
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=key_id,
                 username=created_by,
                 sync=True,
@@ -287,9 +480,10 @@ class McpKeyService:
         except Exception:
             logger.warning("MCP Key 创建审计日志写入失败（不阻塞业务）")
 
-        # 查询当前映射用于响应
-        mapping_repo = McpKeyServiceMappingRepository(self.session)
-        current_mappings = await mapping_repo.get_mappings(key_id)
+        service_permissions_dicts = [
+            {"service_id": sp.service_id, "permission_level": sp.permission_level}
+            for sp in service_permissions
+        ]
 
         return {
             "id": key_id,
@@ -297,13 +491,13 @@ class McpKeyService:
             "name": req.name,
             "key_prefix": key_prefix,
             "space_id": req.space_id,
-            "permissions": req.permissions,
-            "allowed_kb_ids": req.allowed_kb_ids or [],
-            "service_ids": [sid for sid, _pl in current_mappings],
-            "service_permissions": [
-                {"service_id": sid, "permission_level": pl}
-                for sid, pl in current_mappings
-            ],
+            "service_permissions": service_permissions_dicts,
+            "write_grants": write_grants_value,
+            "status": McpKey._derive_status(mcp_key),
+            "auth_summary": self._build_auth_summary(service_permissions_dicts, write_grants_value),
+            "write_scope_summary": self._build_write_scope_summary(req.write_grants or []),
+            "mcp_config": self._build_mcp_config(plaintext),
+            "delivery_failed": False,
             "created_at": mcp_key.created_at,
             "expires_at": req.expires_at,
         }
@@ -326,12 +520,13 @@ class McpKeyService:
         for k in keys:
             dto = McpKeyResponse.from_orm(k)
             k_mappings = mappings_map.get(k.id, [])
-            dto.service_ids = [sid for sid, _pl in k_mappings]
             dto.service_permissions = [
                 {"service_id": sid, "permission_level": pl}
                 for sid, pl in k_mappings
             ]
-            dto.status = self._derive_status(k)
+            dto.status = McpKey._derive_status(k)
+            dto.auth_summary = self._build_auth_summary(dto.service_permissions, dto.write_grants)
+            dto.write_scope_summary = self._build_write_scope_summary(dto.write_grants)
             result.append(dto)
         return result
 
@@ -351,22 +546,24 @@ class McpKeyService:
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
         mappings = await mapping_repo.get_mappings(key_id)
-        dto.service_ids = [sid for sid, _pl in mappings]
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings
         ]
-        dto.status = self._derive_status(key)
+        dto.status = McpKey._derive_status(key)
+        dto.auth_summary = self._build_auth_summary(dto.service_permissions, dto.write_grants)
+        dto.write_scope_summary = self._build_write_scope_summary(dto.write_grants)
         return dto
 
-    async def revoke(self, tenant_id: str, key_id: str, authorization_header: str | None = None) -> None:
-        """撤销 MCP Key（设置 revoked_at）。Key 不存在时 raise ResourceNotFoundError。
+    async def revoke(self, tenant_id: str, key_id: str, authorization_header: str | None = None) -> dict:
+        """撤销 MCP Key（设置 revoked_at + revoked_by 审计归属）。Key 不存在时 raise ResourceNotFoundError。
 
         幂等操作——对已撤销 Key 再次调用不报错。
+        返回 {"status": "revoked"}，与 toggle 响应 data.status 形状一致。
         """
         tenant_id = require_tenant(tenant_id)
-        created_by = self._extract_username(authorization_header)
-        success = await self.repo.revoke(key_id, tenant_id)
+        operator = self._extract_username(authorization_header)
+        success = await self.repo.revoke(key_id, tenant_id, revoked_by=operator)
         if not success:
             raise ResourceNotFoundError(
                 message=translate(
@@ -386,214 +583,15 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action="mcp_key.revoke",
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=key_id,
-                username=created_by,
+                username=operator,
                 sync=True,
             )
         except Exception:
             logger.warning("MCP Key 撤销审计日志写入失败（不阻塞业务）")
 
-    async def reset(
-        self,
-        tenant_id: str,
-        key_id: str,
-        authorization_header: str | None = None,
-        name: str | None = None,
-        space_id: str | None = None,
-        permissions: list[str] | None = None,
-        allowed_kb_ids: list[str] | None = None,
-        service_ids: list[str] | None = None,
-        service_permissions: list | None = None,
-        expires_at: datetime | None = None,
-    ) -> dict:
-        """原子事务重置 MCP Key：撤销旧 Key + 替换映射 + 生成新 Key，返回新明文。
-
-        使用 async with self.session.begin() 包裹整个事务：
-        1. 在事务内使用 get_by_id_for_update()（内部 SELECT ... FOR UPDATE 行锁，
-           使用 with_for_update() 防止并发 reset 读到同一旧 Key）
-        2. 检查 old_key 是否为 None（Key 不存在 → ResourceNotFoundError）
-        3. 从旧 Key 读取 name/permissions/allowed_kb_ids（撤销前读取）
-        4. 撤销旧 Key（幂等）
-        5. 删除旧 service 映射
-        6. 生成新 Key（plaintext → hash → INSERT）
-        7. 写入新 service 映射
-        8. 参数传入值覆盖旧 Key 字段（None 时继承旧值）
-        9. 审计日志
-
-        事务退出后自动 commit（成功）或 rollback（异常）。
-        幂等——对已撤销 Key 调用 reset 正常生成新 Key。
-        IntegrityError（hash 碰撞）时重试一次。
-        """
-        tenant_id = require_tenant(tenant_id)
-
-        async with self.session.begin():
-            # 1. 行锁查询旧 Key（必须在活跃事务内）
-            old_key = await self.repo.get_by_id_for_update(key_id, tenant_id)
-
-            # 2. 检查 None — 防止后续 old_key.name 抛 AttributeError
-            if old_key is None:
-                raise ResourceNotFoundError(
-                    message=translate(
-                        "err.mcp_key.not_found",
-                        fallback=f"MCP Key 不存在: {key_id}",
-                    ),
-                    details={"key_id": key_id, "tenant_id": tenant_id},
-                )
-
-            # 3. 从旧 Key 读取属性（撤销前读取，revoke 是 UPDATE 不删除行）
-            #    参数传入值 > 旧 Key 继承
-            new_name = name if name is not None else old_key.name
-            new_permissions_str = (
-                ",".join(permissions) if permissions is not None
-                else self._normalize_key_permissions(old_key.permissions)
-            )
-            new_allowed_kb_ids = (
-                allowed_kb_ids if allowed_kb_ids is not None
-                else old_key.allowed_kb_ids
-            )
-            new_expires_at = (
-                expires_at if expires_at is not None
-                else old_key.expires_at
-            )
-            new_space_id = space_id if space_id is not None else old_key.space_id
-            if new_space_id:
-                await self._validate_space_id(tenant_id, new_space_id)
-            # Determine service mappings: service_permissions > service_ids > inherit from old key
-            if service_permissions is not None:
-                new_mappings: list[str] | list[tuple[str, str]] = [
-                    (item.service_id, item.permission_level)
-                    for item in service_permissions
-                ]
-            elif service_ids is not None:
-                # Key 级权限推断默认 service 级权限
-                new_perms_list = (
-                    permissions if permissions is not None
-                    else self._normalize_key_permissions(old_key.permissions).split(",")
-                )
-                default_pl = self._default_service_permission_level(new_perms_list)
-                new_mappings = [(sid, default_pl) for sid in service_ids]
-            else:
-                new_mappings = await McpKeyServiceMappingRepository(self.session).get_mappings(key_id)
-
-            # 空间校验：新 service 映射必须都属于 new_space_id（跨空间注入即拒绝）
-            new_sids = [sid for sid, _pl in new_mappings]
-            if new_space_id and new_sids:
-                await self._validate_service_ids_in_space(
-                    tenant_id, new_space_id, new_sids
-                )
-
-            # 4. 撤销旧 Key（幂等——已撤销也不报错）
-            await self.repo.revoke(key_id, tenant_id)
-
-            # 5. 生成新 Key
-            plaintext = generate_mcp_key()
-            key_prefix = plaintext[4:12]
-            key_hash_value = hash_mcp_key(plaintext)
-            new_id = uuid.uuid4().hex
-
-            # 6. created_by
-            created_by = self._extract_username(authorization_header)
-
-            # 7. 构建新 McpKey 对象
-            new_key = McpKey(
-                id=new_id,
-                tenant_id=tenant_id,
-                name=new_name,
-                space_id=new_space_id,
-                key_prefix=key_prefix,
-                key_hash=key_hash_value,
-                permissions=new_permissions_str,
-                allowed_kb_ids=new_allowed_kb_ids,
-                created_by=created_by,
-                created_at=datetime.now(timezone.utc),
-                expires_at=new_expires_at,
-            )
-
-            # 8. 写入新 Key + hash 碰撞重试（使用 savepoint 避免 aborted transaction）
-            sp = await self.session.begin_nested()
-            try:
-                self.session.add(new_key)
-                await self.session.flush()
-                await sp.commit()
-            except IntegrityError:
-                await sp.rollback()
-                logger.warning("MCP Key reset hash 碰撞，重试生成")
-                # Expunge the invalidated object so the session can accept a fresh one
-                self.session.expunge(new_key)
-                plaintext = generate_mcp_key()
-                key_prefix = plaintext[4:12]
-                key_hash_value = hash_mcp_key(plaintext)
-                new_key = McpKey(
-                    id=new_id,
-                    tenant_id=tenant_id,
-                    name=new_name,
-                    space_id=new_space_id,
-                    key_prefix=key_prefix,
-                    key_hash=key_hash_value,
-                    permissions=new_permissions_str,
-                    allowed_kb_ids=new_allowed_kb_ids,
-                    created_by=created_by,
-                    created_at=datetime.now(timezone.utc),
-                    expires_at=new_expires_at,
-                )
-                # Retry in a fresh savepoint
-                sp2 = await self.session.begin_nested()
-                try:
-                    self.session.add(new_key)
-                    await self.session.flush()
-                    await sp2.commit()
-                except IntegrityError:
-                    await sp2.rollback()
-                    raise
-
-            # 9. 替换 service 映射（全量：删旧 → 写新）
-            mapping_repo = McpKeyServiceMappingRepository(self.session)
-            await mapping_repo.set_mappings(new_id, new_mappings)
-
-        # 事务已提交
-
-        logger.info(
-            f"MCP Key 已重置: old_id={key_id}, new_id={new_id}"
-        )
-
-        # 审计日志（惰性导入避免启动循环依赖；失败不阻塞业务）
-        try:
-            from capabilities.platform.services.audit_log_service import AuditLogService
-            audit_svc = AuditLogService(self.session)
-            await audit_svc.record(
-                tenant_id=tenant_id,
-                log_type="MCP_KEY",
-                action="mcp_key.reset",
-                resource="MCP_KEY",
-                resource_id=new_id,
-                username=created_by,
-                sync=True,
-            )
-        except Exception:
-            logger.warning("MCP Key 重置审计日志写入失败（不阻塞业务）")
-
-        # 查询最终映射用于响应
-        mapping_repo = McpKeyServiceMappingRepository(self.session)
-        final_mappings = await mapping_repo.get_mappings(new_id)
-
-        # 注意：permissions 在 DB 中是逗号分隔字符串，返回前 split 为 list
-        return {
-            "id": new_id,
-            "plaintext": plaintext,
-            "name": new_name,
-            "key_prefix": key_prefix,
-            "space_id": new_space_id,
-            "permissions": new_permissions_str.split(",") if new_permissions_str else [],
-            "allowed_kb_ids": new_allowed_kb_ids,
-            "service_ids": [sid for sid, _pl in final_mappings],
-            "service_permissions": [
-                {"service_id": sid, "permission_level": pl}
-                for sid, pl in final_mappings
-            ],
-            "created_at": new_key.created_at,
-            "expires_at": new_expires_at,
-        }
+        return {"status": "revoked"}
 
     async def toggle(
         self,
@@ -646,7 +644,7 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action=action,
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=key_id,
                 username=created_by,
                 sync=True,
@@ -658,12 +656,13 @@ class McpKeyService:
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
         mappings = await mapping_repo.get_mappings(key_id)
-        dto.service_ids = [sid for sid, _pl in mappings]
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings
         ]
-        dto.status = self._derive_status(key)
+        dto.status = McpKey._derive_status(key)
+        dto.auth_summary = self._build_auth_summary(dto.service_permissions, dto.write_grants)
+        dto.write_scope_summary = self._build_write_scope_summary(dto.write_grants)
         return dto
 
     async def recreate(
@@ -672,12 +671,13 @@ class McpKeyService:
         key_id: str,
         authorization_header: str | None = None,
         expires_at: datetime | None = None,
+        name: str | None = None,
     ) -> dict:
-        """重新创建 MCP Key（继承授权 + 生成新明文 Key，区别于「启用」）。
+        """重新创建 MCP Key（仅 expired 态可用，继承授权 + 生成新明文 Key）。
 
-        继承原 Key 的 service_permissions / service_ids 授权，生成全新
-        id/key_hash/key_prefix，旧 Key 保留历史（不撤销）。
-        适用于「已过期 → 重新创建」。默认新 Key 有效期 12 个月。
+        继承原 Key 的 service_permissions（过滤已删除/无权服务）+ write_grants；
+        生成全新 id/key_hash/key_prefix，旧 Key 保留历史（不撤销）。
+        名称可改（name 非 None 时用新名），默认新 Key 有效期 12 个月。不幂等。
         """
         tenant_id = require_tenant(tenant_id)
 
@@ -691,31 +691,55 @@ class McpKeyService:
                 details={"key_id": key_id},
             )
 
+        # expired 门禁：仅 expired 态可 recreate，其余（active/disabled/revoked）→ 409
+        if McpKey._derive_status(old_key) != "expired":
+            raise ResourceConflictError(
+                message="仅过期（expired）状态的 Key 可重新创建",
+                details={"key_id": key_id, "status": McpKey._derive_status(old_key)},
+            )
+
         mapping_repo = McpKeyServiceMappingRepository(self.session)
-        # 继承授权：原 Key 的 service_permissions / service_ids
         old_mappings = await mapping_repo.get_mappings(key_id)
 
-        new_permissions_str = self._normalize_key_permissions(old_key.permissions)
-        plaintext = generate_mcp_key()
-        key_prefix = plaintext[4:12]
-        key_hash_value = hash_mcp_key(plaintext)
-        new_id = uuid.uuid4().hex
+        # 过滤已删除/无权服务（仅存在性过滤，不过滤发布状态），被丢弃的记入差异列表
+        old_sids = [sid for sid, _pl in old_mappings]
+        valid_sids: set = set()
+        if old_sids and old_key.space_id:
+            result = await self.session.execute(
+                sa_text(
+                    "SELECT id FROM knowledge_base.services "
+                    "WHERE id = ANY(:sids) AND tenant_id = :tid "
+                    "AND space_id = :sid AND is_deleted = 0"
+                ),
+                {"sids": old_sids, "tid": tenant_id, "sid": old_key.space_id},
+            )
+            valid_sids = {row[0] for row in result.fetchall()}
+        dropped_service_ids = sorted(set(old_sids) - valid_sids)
+        filtered_mappings = [(sid, pl) for sid, pl in old_mappings if sid in valid_sids]
+
+        old_write_grants = old_key.write_grants
+
+        new_name = name if name is not None else old_key.name
         new_expires_at = (
             expires_at if expires_at is not None
             else datetime.now(timezone.utc) + timedelta(days=365)
         )
         created_by = self._extract_username(authorization_header)
 
+        plaintext = generate_mcp_key()
+        key_prefix = plaintext[4:12]
+        key_hash_value = hash_mcp_key(plaintext)
+        new_id = uuid.uuid4().hex
+
         new_key = McpKey(
             id=new_id,
             tenant_id=tenant_id,
-            name=old_key.name,
+            name=new_name,
             note=old_key.note,
             space_id=old_key.space_id,
             key_prefix=key_prefix,
             key_hash=key_hash_value,
-            permissions=new_permissions_str,
-            allowed_kb_ids=old_key.allowed_kb_ids,
+            write_grants=old_write_grants,
             created_by=created_by,
             created_at=datetime.now(timezone.utc),
             expires_at=new_expires_at,
@@ -737,13 +761,12 @@ class McpKeyService:
             new_key = McpKey(
                 id=new_id,
                 tenant_id=tenant_id,
-                name=old_key.name,
+                name=new_name,
                 note=old_key.note,
                 space_id=old_key.space_id,
                 key_prefix=key_prefix,
                 key_hash=key_hash_value,
-                permissions=new_permissions_str,
-                allowed_kb_ids=old_key.allowed_kb_ids,
+                write_grants=old_write_grants,
                 created_by=created_by,
                 created_at=datetime.now(timezone.utc),
                 expires_at=new_expires_at,
@@ -758,8 +781,8 @@ class McpKeyService:
                 await sp2.rollback()
                 raise
 
-        # 继承授权：写入新 Key 的 service 映射
-        await mapping_repo.set_mappings(new_id, old_mappings)
+        # 继承授权：写入新 Key 的 service 映射（过滤后）
+        await mapping_repo.set_mappings(new_id, filtered_mappings)
 
         logger.info(f"MCP Key 已重新创建: old_id={key_id}, new_id={new_id}")
 
@@ -771,7 +794,7 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action="mcp_key.recreate",
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=new_id,
                 username=created_by,
                 sync=True,
@@ -781,20 +804,25 @@ class McpKeyService:
 
         # 查询最终映射用于响应
         final_mappings = await mapping_repo.get_mappings(new_id)
+        service_permissions_dicts = [
+            {"service_id": sid, "permission_level": pl}
+            for sid, pl in final_mappings
+        ]
 
         return {
             "id": new_id,
             "plaintext": plaintext,
-            "name": old_key.name,
+            "name": new_name,
             "key_prefix": key_prefix,
             "space_id": old_key.space_id,
-            "permissions": new_permissions_str.split(",") if new_permissions_str else [],
-            "allowed_kb_ids": old_key.allowed_kb_ids,
-            "service_ids": [sid for sid, _pl in final_mappings],
-            "service_permissions": [
-                {"service_id": sid, "permission_level": pl}
-                for sid, pl in final_mappings
-            ],
+            "service_permissions": service_permissions_dicts,
+            "write_grants": old_write_grants,
+            "status": McpKey._derive_status(new_key),
+            "auth_summary": self._build_auth_summary(service_permissions_dicts, old_write_grants),
+            "write_scope_summary": self._build_write_scope_summary(old_write_grants),
+            "mcp_config": self._build_mcp_config(plaintext),
+            "delivery_failed": False,
+            "dropped_service_ids": dropped_service_ids,
             "created_at": new_key.created_at,
             "expires_at": new_expires_at,
         }
@@ -844,7 +872,7 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action="mcp_key.delete",
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=key_id,
                 username=created_by,
                 sync=True,
@@ -862,8 +890,9 @@ class McpKeyService:
         """原位编辑 MCP Key 元数据（不重置 Key，不生成新 plaintext）。
 
         所有字段可选——不传则保持原值。
-        支持更新 name、permissions、allowed_kb_ids、service_ids。
-        返回更新后的 McpKeyResponse DTO（含 service_ids）。
+        支持更新 name、space_id、service_permissions、expires_at、write_grants。
+        write_grants 用 __fields_set__ 区分「未传」（保留原值）与「显式 null」（关闭写入）。
+        返回更新后的 McpKeyResponse DTO（含 service_permissions）。
         """
         tenant_id = require_tenant(tenant_id)
 
@@ -879,6 +908,8 @@ class McpKeyService:
 
         if req.name is not None:
             key.name = req.name.strip()
+        if req.note is not None:
+            key.note = req.note
         if req.space_id is not None:
             await self._validate_space_id(tenant_id, req.space_id)
             if req.space_id != key.space_id:
@@ -891,17 +922,37 @@ class McpKeyService:
                     await self._validate_service_ids_in_space(
                         tenant_id, req.space_id, existing_sids
                     )
+                # 变更 space：若本次未同步更新 write_grants，现有 write_grants 的
+                # 知识库必须仍属于新 space，否则拒绝跨空间写授权泄露（对称于 service 映射校验）
+                if key.write_grants and "write_grants" not in req.__fields_set__:
+                    existing_kb_ids = list(
+                        {g.get("kb") for g in key.write_grants if g and g.get("kb")}
+                    )
+                    await self._validate_kb_ids_in_space(
+                        tenant_id, req.space_id, existing_kb_ids
+                    )
             key.space_id = req.space_id
-        if req.permissions is not None:
-            key.permissions = ",".join(req.permissions)
-        if req.allowed_kb_ids is not None:
-            key.allowed_kb_ids = req.allowed_kb_ids
-        if req.expires_at is not None:
+        if "expires_at" in req.__fields_set__:
             key.expires_at = req.expires_at
+        if "write_grants" in req.__fields_set__:
+            # 显式传了（含 null）：null 关闭写入；非空才重跑三态/跨 schema 校验
+            if req.write_grants is None:
+                key.write_grants = None
+            else:
+                kb_ids = list({g.kb for g in req.write_grants})
+                if not kb_ids:
+                    raise InvalidParameterError(
+                        message="写入开启但无知识库（write_grants 不能为空列表）",
+                        details={"key_id": key_id},
+                    )
+                self._validate_grant_modes(req.write_grants)
+                await self._validate_kb_ids_in_space(tenant_id, key.space_id, kb_ids)
+                await self._validate_directory_ownership(tenant_id, kb_ids, req.write_grants)
+                key.write_grants = [g.dict() for g in req.write_grants]
 
         await self.session.flush()
 
-        # service_permissions 优先于 service_ids
+        # service_permissions 全量替换（set_mappings）
         if req.service_permissions is not None:
             mapping_repo = McpKeyServiceMappingRepository(self.session)
             mappings = [
@@ -913,25 +964,21 @@ class McpKeyService:
                 await self._validate_service_ids_in_space(
                     tenant_id, key.space_id, new_sids
                 )
+            await self._validate_service_publish(tenant_id, new_sids)
             await mapping_repo.set_mappings(key_id, mappings)
-        elif req.service_ids is not None:
-            curr_perms = key.permissions.split(",")
-            # 防御性过滤空值（DB 中 permissions 可能为 "" 或含空元素）
-            curr_perms = [p for p in curr_perms if p.strip()]
-            if not curr_perms:
-                logger.warning(
-                    "Key %s permissions 为空，回退到 view（最低权限）",
-                    key_id,
-                )
-                curr_perms = ["view"]
-            default_pl = self._default_service_permission_level(curr_perms)
-            mapping_repo = McpKeyServiceMappingRepository(self.session)
-            if req.service_ids and key.space_id:
-                await self._validate_service_ids_in_space(
-                    tenant_id, key.space_id, req.service_ids
-                )
-            await mapping_repo.set_mappings(
-                key_id, [(sid, default_pl) for sid in req.service_ids]
+
+        # 最终态复查：更新后 Key 至少需保留一个已发布服务授权或写入授权
+        final_write_grants = key.write_grants
+        if req.service_permissions is not None:
+            final_service_permissions = req.service_permissions
+        else:
+            final_service_permissions = await McpKeyServiceMappingRepository(
+                self.session
+            ).get_mappings(key_id)
+        if not final_write_grants and not final_service_permissions:
+            raise InvalidParameterError(
+                message="更新后 Key 至少需保留一个已发布服务授权（service_permissions）或写入授权（write_grants）",
+                details={"key_id": key_id},
             )
 
         logger.info(f"MCP Key 已更新: id={key_id}")
@@ -945,7 +992,7 @@ class McpKeyService:
                 tenant_id=tenant_id,
                 log_type="MCP_KEY",
                 action="mcp_key.update",
-                resource="MCP_KEY",
+                resource="mcp_key",
                 resource_id=key_id,
                 username=created_by,
                 sync=True,
@@ -953,14 +1000,15 @@ class McpKeyService:
         except Exception:
             logger.warning("MCP Key 更新审计日志写入失败（不阻塞业务）")
 
-        # 构建响应 DTO（含 service_ids 和 service_permissions 查询）
+        # 构建响应 DTO（含 service_permissions 查询）
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
         mappings = await mapping_repo.get_mappings(key_id)
-        dto.service_ids = [sid for sid, _pl in mappings]
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings
         ]
-        dto.status = self._derive_status(key)
+        dto.status = McpKey._derive_status(key)
+        dto.auth_summary = self._build_auth_summary(dto.service_permissions, dto.write_grants)
+        dto.write_scope_summary = self._build_write_scope_summary(dto.write_grants)
         return dto

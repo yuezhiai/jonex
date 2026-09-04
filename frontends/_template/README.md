@@ -76,7 +76,7 @@ src/
 1. `frontends/pnpm-workspace.yaml`。
 2. 平台后端应用注册表。
 3. `frontends/shell/public/app-manifest.json` 本地 fallback。
-4. `deploy/nginx/frontend-gateway.conf`。
+4. `deploy/nginx/app-locations.conf`。
 5. 子应用 `Dockerfile` 和 `nginx/default.conf`。
 6. `frontends/MANIFEST.md`。
 

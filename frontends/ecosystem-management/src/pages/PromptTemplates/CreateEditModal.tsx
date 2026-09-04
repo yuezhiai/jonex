@@ -4,6 +4,7 @@ import { Modal, Form, Input, Select, message } from 'antd';
 import {
   PROMPT_CATEGORIES,
   PROMPT_CATEGORY_LABEL_KEYS,
+  checkPromptTemplateName,  
   type PromptTemplateItem,
   type CreatePromptTemplatePayload,
   type UpdatePromptTemplatePayload,
@@ -15,6 +16,7 @@ interface CreateEditModalProps {
   open: boolean;
   mode: 'create' | 'edit' | 'view';
   template: PromptTemplateItem | null;
+  domainSpaceId: string | null;
   onClose: () => void;
   onSubmit: (data: CreatePromptTemplatePayload | UpdatePromptTemplatePayload) => Promise<void>;
 }
@@ -25,11 +27,48 @@ function getCurrentContent(item: PromptTemplateItem | null): string {
   return versions.length > 0 ? versions[0].content : '';
 }
 
-const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template, onClose, onSubmit }) => {
+const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template, domainSpaceId, onClose, onSubmit }) => {
   const { t } = useTranslation();
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const isView = mode === 'view';
+
+  // 名称实时查重（防抖，取消令牌版——settle 旧 Promise 避免悬挂）
+  const pendingNameCheck = React.useRef<{ timer: number; resolve: () => void } | null>(null);
+
+  useEffect(() => () => {
+    if (pendingNameCheck.current) {
+      window.clearTimeout(pendingNameCheck.current.timer);
+      pendingNameCheck.current.resolve();
+    }
+  }, []);
+
+  const validateNameUnique = (_rule: unknown, value: string): Promise<void> => {
+    const name = (value ?? '').trim();
+    if (!name) return Promise.resolve();
+    // 作废上一次：settle 旧 Promise，避免悬挂 + 覆盖旧的校验结果
+    if (pendingNameCheck.current) {
+      window.clearTimeout(pendingNameCheck.current.timer);
+      pendingNameCheck.current.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(async () => {
+        pendingNameCheck.current = null;
+        try {
+          const res = await checkPromptTemplateName({
+            name,
+            domain_space_id: domainSpaceId ?? undefined,
+            template_id: mode === 'edit' ? template?.id : undefined,
+          });
+          if (res.exists) reject(t('promptTemplate.nameExists'));
+          else resolve();
+        } catch {
+          resolve(); // 查重接口异常不阻断提交，最终由后端兜底
+        }
+      }, 350);
+      pendingNameCheck.current = { timer, resolve };
+    });
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -89,9 +128,13 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
         <Form.Item
           name="name"
           label={t('promptTemplate.name')}
-          rules={[{ required: true, message: t('promptTemplate.nameRequired') }]}
+          rules={[
+            { required: true, message: t('promptTemplate.nameRequired') },
+            { max: 255, message: t('promptTemplate.nameTooLong') },
+            { validator: validateNameUnique },
+          ]}
         >
-          <Input placeholder={t('promptTemplate.namePlaceholder')} maxLength={255} />
+          <Input placeholder={t('promptTemplate.namePlaceholder')} />
         </Form.Item>
 
         <Form.Item
@@ -151,7 +194,10 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
               t('promptTemplate.content')
             )
           }
-          rules={[{ required: true, message: t('promptTemplate.contentRequired') }]}
+          rules={[
+            { required: true, message: t('promptTemplate.contentRequired') },
+            { max: 5000, message: t('promptTemplate.contentTooLong') },
+          ]}
           extra={t('promptTemplate.variableHint', {
             variable: '{{variable}}',
             userQuestion: '{{user_question}}',
@@ -159,6 +205,7 @@ const CreateEditModal: React.FC<CreateEditModalProps> = ({ open, mode, template,
         >
           <TextArea
             rows={8}
+            showCount={{ formatter: ({ count }: { count: number }) => `${count} / 5000` }}
             placeholder={
               t('promptTemplate.contentTextareaPlaceholder', {
                 variable: '{{variable}}',

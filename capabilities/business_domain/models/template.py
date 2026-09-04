@@ -16,6 +16,7 @@ class TemplateDomain(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     name = Column(String(255), nullable=False)
+    name_en = Column(String(255), nullable=True)
     description = Column(Text)
     status = Column(String(32), default="inactive")
     version = Column(Integer, default=1)
@@ -25,6 +26,7 @@ class TemplateDomain(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     def to_dict(self):
         return {
             "id": self.id, "tenant_id": self.tenant_id, "name": self.name,
+            "name_en": self.name_en,
             "description": self.description,
             "status": self.status,
             "version": self.version,

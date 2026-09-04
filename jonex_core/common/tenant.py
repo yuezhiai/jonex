@@ -6,6 +6,7 @@
 业务资源必须使用显式租户，禁止落入 default/default_tenant/system。
 """
 
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Optional
@@ -15,6 +16,9 @@ from jonex_core.common.i18n import translate
 
 DEFAULT_TENANT_IDS = frozenset({"default", "default_tenant", "system"})
 _tenant_id_ctx: ContextVar[Optional[str]] = ContextVar("jonex_tenant_id", default=None)
+
+# 租户 ID 字符集白名单：阻止通配符/路径分隔/空白/引号等危险字符进入 COS policy 与对象 key。
+_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _normalize_tenant_id(tenant_id: str | None) -> str:
@@ -32,18 +36,21 @@ def require_tenant(tenant_id: str | None) -> str:
     normalized = _normalize_tenant_id(tenant_id)
     if is_default_tenant(normalized):
         raise TenantIsolationError(message=translate("err.tenant.default_forbidden", fallback="禁止使用默认租户"))
+    if _TENANT_ID_RE.fullmatch(normalized) is None:
+        raise TenantIsolationError(message=translate("err.tenant.illegal_chars", fallback="tenant_id 含非法字符"))
     return normalized
 
 
 def _tenant_from_bearer_token(token: str) -> str:
-    if token.startswith("jonex_test_"):
+    from jonex_core.common.config import get_config
+
+    config = get_config()
+    # 测试 token（jonex_test_{tenant_id}）仅当显式开启 ENABLE_TEST_TOKENS 时接受
+    if config.ENABLE_TEST_TOKENS and token.startswith("jonex_test_"):
         return _normalize_tenant_id(token.removeprefix("jonex_test_"))
 
     import jwt
 
-    from jonex_core.common.config import get_config
-
-    config = get_config()
     try:
         payload = jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALGORITHM])
     except jwt.ExpiredSignatureError as exc:
@@ -63,7 +70,7 @@ def extract_tenant_id(request) -> str:
 
     优先级：
     1. Authorization: Bearer {JWT} 中的 tenant_id
-    2. Authorization: Bearer jonex_test_{tenant_id}
+    2. Authorization: Bearer jonex_test_{tenant_id}（仅 ENABLE_TEST_TOKENS=true 时）
     3. X-Tenant-ID
 
     当 JWT/测试 Token 与 X-Tenant-ID 同时存在时，二者必须一致。

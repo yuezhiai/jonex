@@ -129,7 +129,7 @@ export default function CompileResultPanel({
               />
             )}
           {activeSubNav === 'graph' &&
-            (isOpenKB ? <WikiGraphTab kbId={kbId} docId={docId} /> : <GraphTab kbId={kbId} />)}
+            (isOpenKB ? <WikiGraphTab kbId={kbId} docId={docId} /> : <GraphTab kbId={kbId} docId={docId} />)}
         </div>
       </div>
     </Card>

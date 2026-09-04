@@ -183,13 +183,15 @@ class HttpLightRagClient:
         return h
 
     def _query_headers(
-        self, tenant_id: str, kb_id: str, trace_id: str = "", scene: str = "lightrag_query",
+        self, tenant_id: str, kb_id: str, trace_id: str = "",
+        user_id: str = "", scene: str = "lightrag_query",  # [jonex] user_id 对齐 v1 计量头
     ) -> dict[str, str]:
         """[jonex] Query metering headers + workspace isolation.
 
-        Mirrors v1 _jonex_query_headers(): injects X-Jonex-* dimensions so
-        LightRAG Server middleware can propagate tenant/kb/scene/trace to
-        the llm-gateway for per-tenant token metering.
+        Mirrors the retired v1 _jonex_query_headers(): injects X-Jonex-*
+        dimensions so LightRAG Server middleware can propagate
+        tenant/kb/scene/trace/user to the llm-gateway for per-tenant
+        token metering.
         """
         h = self._headers(tenant_id, kb_id)
         h["X-Jonex-Scene"] = scene
@@ -199,6 +201,8 @@ class HttpLightRagClient:
             h["X-Jonex-Kb-Id"] = kb_id
         if trace_id:
             h["X-Jonex-Trace-Id"] = trace_id
+        if user_id:
+            h["X-Jonex-User-Id"] = user_id  # [jonex] 补全 v1 六头计量维度
         return h
 
     async def _post(
@@ -789,6 +793,7 @@ class HttpLightRagClient:
     async def query(
         self, q: str, *, mode: str = "hybrid", top_k: int = 5,
         tenant_id: str, kb_id: str, trace_id: str = "",
+        user_id: str = "", only_need_context: bool = False,  # [jonex] 方案 A 透传
     ) -> dict:
         """POST /query → {response, references}."""
         body: dict[str, Any] = {
@@ -797,6 +802,7 @@ class HttpLightRagClient:
             "top_k": top_k,
             "include_references": True,
             "include_chunk_content": True,
+            "only_need_context": only_need_context,  # [jonex] 方案 A 透传（对齐 v1）
         }
         if trace_id:
             body["trace_id"] = trace_id
@@ -805,7 +811,7 @@ class HttpLightRagClient:
             raise LightRAGUnavailableError("LightRAG temporarily unavailable (circuit breaker open)")
 
         headers = self._query_headers(
-            tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id,
+            tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id, user_id=user_id,
         )
         url = f"{self.base_url}/query"
 

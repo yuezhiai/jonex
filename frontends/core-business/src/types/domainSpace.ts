@@ -1,3 +1,5 @@
+import type { SpaceRole } from './domainService';
+
 export interface DomainSpace {
   id: string;
   name: string;
@@ -18,9 +20,14 @@ export interface DomainSpace {
 export interface SpacePermission {
   id: string;
   user_id: string;
-  role: 'viewer' | 'manager';
+  /**
+   * [jonex] 权限重构 B2（D2）：`'viewer' | 'manager'` → `SpaceRole`
+   * （`'space_manager' | 'member'`）。取值定义在 types/domainService.ts，
+   * 必须与后端 space_permission_service 的常量一致。
+   */
+  role: SpaceRole;
   created_at: string | null;
-  /** 后端 join platform.users 返回；viewer/知识编辑者无 user:read，前端不再拉 /users 拼名字 */
+  /** 后端 join platform.users 返回；普通成员无 user:read，前端不再拉 /users 拼名字 */
   display_name: string | null;
 }
 
@@ -31,7 +38,7 @@ export interface SpaceMember {
   avatar: string;
   department: string;
   avatarColor: string;
-  role: 'viewer' | 'manager';
+  role: SpaceRole;
 }
 
 export interface DomainSpaceListParams {

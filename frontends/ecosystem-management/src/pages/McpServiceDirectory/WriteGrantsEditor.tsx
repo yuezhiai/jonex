@@ -15,15 +15,18 @@ interface WriteGrantsEditorProps {
   spaceNameMap?: Record<string, string>;
   /** 禁用整个编辑器 */
   disabled?: boolean;
+  /** Key 自身领域空间（创建态=全局空间，编辑态=原 Key 空间），约束 KB 下拉同空间过滤 */
+  spaceId?: string | null;
 }
 
 /** 写入范围编辑器（WRITE-02）：多个知识库，每个一项 { kb, mode(all|specified), directories[] }。
  *
- * - 同 space 约束：以第一个已选 KB 的空间为参照，过滤后续 KB 选择器选项；
+ * - 同 space 约束：以 Key 自身领域空间（spaceId）为参照，过滤 KB 选择器选项；
+ *   空间缺失（历史无空间 Key）时回退到第一个已选 KB 的空间；
  * - all 模式不展示目录多选（切换时清空 directories）；
  * - specified 模式按需加载该 KB 的目录做多选。
  */
-export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMap, disabled }: WriteGrantsEditorProps) {
+export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMap, disabled, spaceId }: WriteGrantsEditorProps) {
   const { t } = useTranslation();
   const grants: WriteGrant[] = value ?? [];
   const [folderMap, setFolderMap] = useState<Record<string, KbFolderItem[]>>({});
@@ -67,11 +70,12 @@ export default function WriteGrantsEditor({ value, onChange, kbList, spaceNameMa
     onChange?.(grants.filter((_, i) => i !== index));
   };
 
-  /** 参照空间：第一个已选 KB 的 space_id（未选时为空 → 不约束） */
+  /** 参照空间：优先 Key 自身领域空间（spaceId）；为空（历史无空间 Key）回退第一个已选 KB 的空间 */
   const refSpace = useMemo(() => {
+    if (spaceId) return spaceId;
     const firstKb = grants.find((g) => g.kb)?.kb;
     return kbList.find((k) => k.id === firstKb)?.space_id ?? null;
-  }, [grants, kbList]);
+  }, [spaceId, grants, kbList]);
 
   /** KB 选择器选项：参照空间过滤 + 排除其他行已占用 KB + 保留当前行已选值 */
   const kbOptionsFor = (index: number, currentKb: string) => {

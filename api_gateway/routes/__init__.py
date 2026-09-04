@@ -1,5 +1,5 @@
 """
-悦溪平台 - API 路由模块
+Jonex 平台 - API 路由模块
 """
 
 from .internal import router as internal_router

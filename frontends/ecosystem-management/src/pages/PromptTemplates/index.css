@@ -76,7 +76,8 @@
 /* ── Grid ─────────────────────────────────────────────────── */
 .pt-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* minmax(0, 1fr)：轨道最小宽度为 0，长内容不会撑破 1fr 列 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 20px;
 }
 
@@ -105,6 +106,8 @@
   position: relative;
   display: flex;
   flex-direction: column;
+  /* grid item 可收缩到 1fr 轨道宽度内，避免长名称/提示词内容撑破列宽 */
+  min-width: 0;
   transition: box-shadow 0.2s, transform 0.2s;
 }
 
@@ -137,14 +140,22 @@
   min-width: 0;
 }
 
+/* 名称与状态徽章所在行：左右分布，垂直居中；描述在下一行，不影响徽章位置 */
+.pt-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
 .pt-name {
-  margin: 0 0 4px;
+  margin: 0;
   font-size: 16px;
   color: #0b2b5c;
   font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* 名称占满 title-row 剩余宽度、可收缩省略，状态徽章靠右 */
+  flex: 1;
+  min-width: 0;
 }
 
 .pt-desc {
@@ -159,12 +170,11 @@
 
 /* ── Status badge ─────────────────────────────────────────── */
 .pt-status {
-  position: absolute;
-  top: 16px;
-  right: 16px;
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 6px;
+  /* 名称行内靠右：不收缩，垂直居中由 .pt-title-row 控制，不受描述高度影响 */
+  flex-shrink: 0;
 }
 
 .pt-status.on {
@@ -201,6 +211,22 @@
   right: 0;
   height: 30px;
   background: linear-gradient(transparent, #f8fafc);
+}
+
+/* ── Tooltip 提示词全文预览 ─────────────────────────────── */
+/* 放宽 antd Tooltip 默认最大宽度，保证长提示词可读 */
+.pt-preview-tooltip-wrap {
+  --ant-tooltip-max-width: 560px;
+}
+
+/* Tooltip 内全文：保留换行，超长可滚动，等宽字体与预览区一致 */
+.pt-preview-tooltip {
+  white-space: pre-line;
+  max-height: 320px;
+  overflow: auto;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 /* ── Tags ─────────────────────────────────────────────────── */

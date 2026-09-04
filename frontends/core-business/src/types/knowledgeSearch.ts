@@ -118,12 +118,13 @@ export interface KnowledgeReferenceLocation {
 export interface KnowledgeReference {
   doc_id: string;
   kb_id?: string | null;
+  kb_name?: string | null; // [jonex] 知识库名称（冗余，方便前端展示，无需二次查询）
   file_name: string;
   mime_type?: string | null;
   file_size?: number | null;
   media_type: 'text' | 'pdf' | 'audio' | 'video' | 'image' | 'other';
   raw_url?: string | null;
-  wiki_path?: string | null;  // [jonex] OpenKB wiki 页路径
+  wiki_path?: string | null; // [jonex] OpenKB wiki 页路径
   locations: KnowledgeReferenceLocation[];
 }
 
@@ -233,12 +234,7 @@ export interface CancelSearchFeedbackParams {
 
 /** 点踩原因枚举（dislike 必填其一） */
 export type FeedbackReason =
-  | 'inaccurate'
-  | 'not_answered'
-  | 'incomplete'
-  | 'wrong_reference'
-  | 'missing_knowledge'
-  | 'other';
+  'inaccurate' | 'not_answered' | 'incomplete' | 'wrong_reference' | 'missing_knowledge' | 'other';
 
 /** 回答反馈主记录（回显 / 提交响应共用） */
 export interface AnswerFeedbackRecord {

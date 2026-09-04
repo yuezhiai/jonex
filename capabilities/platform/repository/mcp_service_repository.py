@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import func, select, text as sa_text
-from sqlalchemy import and_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
@@ -41,7 +41,6 @@ _SERVICE_BASE_SQL = """
         s.description,
         s.domain_type,
         s.space_id,
-        s.status,
         s.enabled,
         s.created_at,
         s.updated_at,
@@ -51,6 +50,8 @@ _SERVICE_BASE_SQL = """
         COALESCE(p.is_published, 0) AS is_published,
         p.published_at,
         p.published_by,
+        p.stopped_at,
+        p.stopped_by,
         p.tool,
         p.tool_description,
         p.service_type,
@@ -94,6 +95,7 @@ class McpServiceRepository:
         tenant_id: str,
         search: Optional[str] = None,
         space_id: Optional[str] = None,
+        source: Optional[str] = None,
         status_filter: Optional[str] = None,
     ) -> list[dict]:
         """跨 schema 聚合查询 domain services。
@@ -104,9 +106,11 @@ class McpServiceRepository:
         - knowledge_base.spaces 获取空间名称
 
         筛选参数：
-        - search：s.name ILIKE '%search%'
+        - search：服务名或 MCP Tool 名模糊匹配（s.name / p.tool ILIKE '%search%'）
         - space_id：s.space_id = space_id
-        - status_filter：'published' 仅返回已发布，'unpublished' 仅返回未发布
+        - source：领域空间名（sp.name = source）
+        - status_filter：'published' 仅返回已发布且未停用，'stopped' 仅返回已停用，
+          'unpublished' 仅返回未发布
         """
         tenant_id = require_tenant(tenant_id)
 
@@ -114,13 +118,18 @@ class McpServiceRepository:
         where_clauses: list[str] = []
 
         if search:
-            where_clauses.append("s.name ILIKE :search")
+            where_clauses.append("(s.name ILIKE :search OR p.tool ILIKE :search)")
             params["search"] = f"%{search}%"
         if space_id:
             where_clauses.append("s.space_id = :space_id")
             params["space_id"] = space_id
+        if source:
+            where_clauses.append("sp.name = :source")
+            params["source"] = source
         if status_filter == "published":
-            where_clauses.append("p.is_published = 1")
+            where_clauses.append("p.is_published = 1 AND p.stopped_at IS NULL")
+        elif status_filter == "stopped":
+            where_clauses.append("p.is_published = 1 AND p.stopped_at IS NOT NULL")
         elif status_filter == "unpublished":
             where_clauses.append("(p.is_published IS NULL OR p.is_published = 0)")
 
@@ -269,6 +278,47 @@ class McpServiceRepository:
         await self.session.flush()
         return record
 
+    async def stop_service(
+        self,
+        tenant_id: str,
+        service_id: str,
+        stopped_by: str,
+    ) -> Optional[McpServicePublish]:
+        """停用已发布服务：仅 is_published=1 且 stopped_at IS NULL 时可停用。
+
+        非法状态（不存在/未发布/已停用）返回 None，由 service 层抛 409。
+        """
+        tenant_id = require_tenant(tenant_id)
+        existing = await self.get_publish_status(tenant_id, service_id)
+        if existing is None:
+            return None
+        if existing.is_published != 1 or existing.stopped_at is not None:
+            return None
+        existing.stopped_at = datetime.now(timezone.utc)
+        existing.stopped_by = stopped_by
+        await self.session.flush()
+        return existing
+
+    async def start_service(
+        self,
+        tenant_id: str,
+        service_id: str,
+    ) -> Optional[McpServicePublish]:
+        """启用已停用服务：仅 is_published=1 且 stopped_at IS NOT NULL 时可启用。
+
+        非法状态（不存在/未发布/未停用）返回 None，由 service 层抛 409。
+        """
+        tenant_id = require_tenant(tenant_id)
+        existing = await self.get_publish_status(tenant_id, service_id)
+        if existing is None:
+            return None
+        if existing.is_published != 1 or existing.stopped_at is None:
+            return None
+        existing.stopped_at = None
+        existing.stopped_by = None
+        await self.session.flush()
+        return existing
+
     async def ensure_publish_stubs(
         self, tenant_id: str, service_ids: list[str]
     ) -> int:
@@ -294,23 +344,32 @@ class McpServiceRepository:
         existing_ids = set(result.scalars().all())
 
         missing = [sid for sid in service_ids if sid not in existing_ids]
-        for sid in missing:
-            self.session.add(
-                McpServicePublish(
-                    id=_uuid.uuid4().hex,
-                    tenant_id=tenant_id,
-                    service_id=sid,
-                    is_published=0,
-                    published_at=None,
-                    published_by=None,
-                    created_at=datetime.now(timezone.utc),
-                )
-            )
+        if not missing:
+            return 0
 
-        if missing:
-            await self.session.flush()
-
-        return len(missing)
+        # 并发安全：INSERT ... ON CONFLICT (tenant_id, service_id) DO NOTHING。
+        # 两个 list_services 并发看到同一缺桩服务、或与 sync/publish 竞争时，
+        # 唯一约束冲突被 DO NOTHING 吸收，不抛 unique_violation；returning 只回
+        # 实际插入的行，保证返回计数精确。
+        insert_stmt = (
+            pg_insert(McpServicePublish)
+            .values([
+                {
+                    "id": _uuid.uuid4().hex,
+                    "tenant_id": tenant_id,
+                    "service_id": sid,
+                    "is_published": 0,
+                    "published_at": None,
+                    "published_by": None,
+                    "created_at": datetime.now(timezone.utc),
+                }
+                for sid in missing
+            ])
+            .on_conflict_do_nothing(index_elements=["tenant_id", "service_id"])
+            .returning(McpServicePublish.id)
+        )
+        insert_result = await self.session.execute(insert_stmt)
+        return len(insert_result.scalars().all())
 
     async def ensure_system_service(self, tenant_id: str) -> McpServicePublish:
         """幂等 upsert 系统服务条目。service_type='system'、tool 固定、is_published=1。
@@ -376,43 +435,6 @@ class McpServiceRepository:
             }
         return out
 
-    async def get_authorized_keys(
-        self, tenant_id: str, service_id: str
-    ) -> list[tuple]:
-        """查询已授权给指定 service 的 MCP Key 列表。
-
-        JOIN platform.mcp_key_service_mappings + platform.mcp_keys。
-        返回 list of tuples (key_id, key_name, key_prefix, permission_level,
-        revoked_at, expires_at)。
-        """
-        tenant_id = require_tenant(tenant_id)
-
-        stmt = (
-            select(
-                McpKey.id.label("key_id"),
-                McpKey.name.label("key_name"),
-                McpKey.key_prefix,
-                McpKeyServiceMapping.permission_level,
-                McpKey.revoked_at,
-                McpKey.expires_at,
-            )
-            .select_from(McpKeyServiceMapping)
-            .join(
-                McpKey,
-                and_(
-                    McpKeyServiceMapping.mcp_key_id == McpKey.id,
-                    McpKey.tenant_id == tenant_id,
-                    McpKey.is_deleted == 0,
-                ),
-            )
-            .where(
-                McpKeyServiceMapping.service_id == service_id,
-            )
-        )
-
-        result = await self.session.execute(stmt)
-        return list(result.all())
-
     async def get_domain_services(self, tenant_id: str) -> dict[str, str]:
         """读取 knowledge_base.services 获取当前租户所有 domain service。
 
@@ -430,3 +452,30 @@ class McpServiceRepository:
             {"tenant_id": tenant_id},
         )
         return {row[0]: row[1] for row in result.all()}
+
+    async def get_authorized_keys(
+        self, tenant_id: str, service_id: str
+    ) -> list[tuple[McpKey, str]]:
+        """查询指定领域服务已授权的 Key 列表（platform schema 内 ORM join）。
+
+        join platform.mcp_keys 与 platform.mcp_key_service_mappings：
+        - 仅返回未软删（is_deleted=0）且属于当前租户的 Key
+        - 返回 (McpKey, permission_level) 元组，status 由 service 层派生
+
+        不涉及跨 schema，直接用 ORM 即可（两表同属 platform schema）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        result = await self.session.execute(
+            select(McpKey, McpKeyServiceMapping.permission_level)
+            .join(
+                McpKeyServiceMapping,
+                McpKeyServiceMapping.mcp_key_id == McpKey.id,
+            )
+            .where(
+                McpKeyServiceMapping.service_id == service_id,
+                McpKey.tenant_id == tenant_id,
+                McpKey.is_deleted == 0,
+            )
+            .order_by(McpKey.created_at.desc())
+        )
+        return [(row[0], row[1]) for row in result.all()]

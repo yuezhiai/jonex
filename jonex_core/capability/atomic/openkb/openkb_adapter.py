@@ -1,4 +1,4 @@
-# [jonex] 悦溪新增文件 — OpenKB Atomic Capability 实现
+# [jonex] Jonex新增文件 — OpenKB Atomic Capability 实现
 import asyncio
 import json
 import os
@@ -680,6 +680,14 @@ class OpenkbCapability(BaseCapability):
         树条目输出 **stem/title**（页面路径用 stem、显示用 title）——页面树
         消费的是 stem/title 语义，不是图节点的 id/name 语义；下游
         `_handle_list_graph` 的 id/name 两分只在图谱契约里出现。
+
+        [jonex] 条目附带 `sources`（frontmatter 原值，形如
+        ["summaries/{document_id}.md", ...]），用于消费方把概念/实体页反解到
+        源文档——检索引用溯源（llm-wiki references 方案 B）需要这个映射。
+        摘要页的 sources 通常为空（它自身就是文档，stem == document_id）。
+        `_iter_wiki_pages(need_body=False)` 本就解析了该字段（`_page_belongs_to`
+        在用），这里只是不再丢弃，无额外 IO 成本。`_handle_list_graph` 的页面
+        字典早已输出 sources，此处与之对齐。
         """
         grouped: dict[str, list[dict]] = {"summaries": [], "concepts": [], "entities": []}
         for p in pages:
@@ -688,6 +696,7 @@ class OpenkbCapability(BaseCapability):
                 "title": p["title"],
                 "type": p["type"],
                 "description": p["description"],
+                "sources": p.get("sources") or [],
             })
         return {
             "summaries": grouped["summaries"],

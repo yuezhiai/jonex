@@ -1,5 +1,5 @@
 import React from 'react';
-import { Modal, Tag } from 'antd';
+import { Descriptions, Modal, Tag } from 'antd';
 import { useTranslation } from 'react-i18next';
 import dayjs from 'dayjs';
 import type { AuditLogItem, AuditActionOption, AuditResourceType } from '../../api/auditLogs';
@@ -24,16 +24,38 @@ export default function LogDetailModal({
 }: LogDetailModalProps) {
   const { t } = useTranslation();
 
-  return (
-    <Modal title={t('operationLog.logDetail')} open={open} onCancel={onClose} footer={null} width={600}>
-      {detailItem && (
-        <div>
-          <p>
-            <strong>{t('operationLog.actionLabel')}</strong>
-            <Tag color={actionTagColor(detailItem.action)}>
-              {getActionLabel(locale, actionOptions, detailItem.action)}
+  // 是否失败：outcome 明确为 FAILED，或未提供 outcome 时按 HTTP 状态码 >= 400 兜底判断
+  const isFailed =
+    !!detailItem &&
+    (detailItem.outcome === 'FAILED' || (!detailItem.outcome && (detailItem.status_code ?? 0) >= 400));
+
+  const items = detailItem
+    ? [
+        {
+          key: 'status',
+          label: t('operationLog.statusLabel'),
+          children: (
+            <Tag color={isFailed ? 'red' : 'success'}>
+              {isFailed ? t('operationLog.failed') : t('operationLog.success')}
             </Tag>
-            · <strong>{t('operationLog.resourceLabel')}</strong>
+          ),
+        },
+        ...(detailItem.status_code != null
+          ? [{ key: 'statusCode', label: t('operationLog.statusCodeLabel'), children: <span>{detailItem.status_code}</span> }]
+          : []),
+        {
+          key: 'action',
+          label: t('operationLog.actionLabel'),
+          children: (
+            <Tag color={actionTagColor(detailItem.action)}>
+              {getActionLabel(locale, actionOptions, detailItem.action, t('operationLog.unknownAction'))}
+            </Tag>
+          ),
+        },
+        {
+          key: 'resource',
+          label: t('operationLog.resourceLabel'),
+          children: (
             <span>
               {getResourceLabel(
                 detailItem.resource,
@@ -49,36 +71,68 @@ export default function LogDetailModal({
                 <span style={{ fontSize: 11, color: '#94a3b8', marginLeft: 8 }}>{detailItem.resource_id}</span>
               )}
             </span>
-          </p>
-          <p>
-            <strong>{t('operationLog.userLabel')}</strong>
-            {detailItem.username || '--'} · <strong>{t('operationLog.ipLabel')}</strong>
-            {detailItem.ip || '--'} · <strong>{t('operationLog.durationLabel')}</strong>
-            {formatDuration(detailItem.duration_ms)}
-          </p>
-          <p>
-            <strong>{t('operationLog.traceIdLabel')}</strong>
-            {detailItem.trace_id || '--'}
-          </p>
-          <p>
-            <strong>{t('operationLog.timeLabel')}</strong>
-            {detailItem.created_at ? dayjs(detailItem.created_at).format('YYYY-MM-DD HH:mm:ss') : '--'}
-          </p>
-          {detailItem.detail && (
-            <pre
-              style={{
-                background: '#f8fafc',
-                padding: 12,
-                borderRadius: 8,
-                fontSize: 12,
-                maxHeight: 300,
-                overflow: 'auto',
-              }}
-            >
-              {typeof detailItem.detail === 'string' ? detailItem.detail : JSON.stringify(detailItem.detail, null, 2)}
-            </pre>
-          )}
-        </div>
+          ),
+        },
+        {
+          key: 'user',
+          label: t('operationLog.userLabel'),
+          children: <span>{detailItem.username || '--'}</span>,
+        },
+        { key: 'ip', label: t('operationLog.ipLabel'), children: <span>{detailItem.ip || '--'}</span> },
+        {
+          key: 'duration',
+          label: t('operationLog.durationLabel'),
+          children: <span>{formatDuration(detailItem.duration_ms)}</span>,
+        },
+        {
+          key: 'time',
+          label: t('operationLog.timeLabel'),
+          children: <span>{detailItem.created_at ? dayjs(detailItem.created_at).format('YYYY-MM-DD HH:mm:ss') : '--'}</span>,
+        },
+        { key: 'traceId', label: t('operationLog.traceIdLabel'), children: <span>{detailItem.trace_id || '--'}</span> },
+        ...(isFailed && detailItem.error_message
+          ? [
+              {
+                key: 'errorMessage',
+                label: t('operationLog.errorMessageLabel'),
+                span: 2,
+                children: <span style={{ whiteSpace: 'pre-line' }}>{detailItem.error_message}</span>,
+              },
+            ]
+          : []),
+        ...(isFailed && detailItem.error_stack
+          ? [
+              {
+                key: 'errorStack',
+                label: t('operationLog.errorStackLabel'),
+                span: 2,
+                children: (
+                  <pre
+                    style={{
+                      margin: 0,
+                      background: '#f8fafc',
+                      padding: 12,
+                      borderRadius: 8,
+                      fontSize: 12,
+                      maxHeight: 300,
+                      overflow: 'auto',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {detailItem.error_stack}
+                  </pre>
+                ),
+              },
+            ]
+          : []),
+      ]
+    : [];
+
+  return (
+    <Modal title={t('operationLog.logDetail')} open={open} onCancel={onClose} footer={null} width={600}>
+      {detailItem && (
+        <Descriptions size="small" column={2} items={items} />
       )}
     </Modal>
   );

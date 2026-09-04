@@ -430,12 +430,26 @@ class OntologyExtractor:
 
         # Phase 5：溯源回填（按 name + aliases 匹配候选实体的 source_id/file_path）
         # [jonex] 方案⑧ D：索引覆盖 canonical_name 与 aliases，降低归一化/翻译改名 miss
+        # [jonex] 路线 B：预建图片 chunk 正文映射（content_list 中 image_idx 非空的 chunk
+        # 其 content 即 VLM 描述），供回填段写入 source_chunks[].content，查询侧零 IO 读取。
+        _img_content_by_fp: dict[str, str] = {}
+        for c in (content_list or []):
+            fp = c.get("file_path") or c.get("file_source") or ""
+            txt = (c.get("content") or "").strip()
+            if fp and txt and ("image_idx=" in fp or c.get("type") == "image"):
+                _img_content_by_fp[fp] = txt
         prov: dict[str, dict] = {}
         for e in filtered:
             p = {
                 "source_id": e.get("source_id", ""), "file_path": e.get("file_path", "")
             }
             if p["source_id"] or p["file_path"]:
+                # [jonex] 路线 B：图片 chunk 的 VLM 描述写入 source_chunks[].content，
+                # 供查询侧 _ontology_refs 直接读，零额外查询。
+                fp_val = p.get("file_path") or ""
+                img_content = _img_content_by_fp.get(fp_val, "")
+                if img_content:
+                    p["content"] = img_content
                 prov[e.get("name", e.get("entity_name", ""))] = p
                 for alias in (e.get("aliases") or []):
                     if alias and alias not in prov:

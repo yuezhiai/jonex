@@ -108,3 +108,15 @@ async def exchange_ticket(request: Request):
 async def logout(request: Request):
     """代理到 Sidecar POST /auth/logout"""
     return await _proxy_auth(request, "logout")
+
+
+@router.post("/impersonate")
+async def impersonate(request: Request):
+    """代理到 Sidecar POST /auth/impersonate"""
+    return await _proxy_auth(request, "impersonate")
+
+
+@router.post("/impersonate/end")
+async def impersonate_end(request: Request):
+    """代理到 Sidecar POST /auth/impersonate/end"""
+    return await _proxy_auth(request, "impersonate/end")

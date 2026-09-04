@@ -3,9 +3,9 @@
 
 TCADP API 插件模式：
 1. TCADP 通过 OpenAPI YAML 导入插件定义
-2. TCADP 直接调用悦溪平台的业务路由
-3. 悦溪平台验证 TCADP 请求签名，处理后返回结果
-4. 异步场景：悦溪通过 Webhook 回调通知 TCADP
+2. TCADP 直接调用Jonex 平台的业务路由
+3. Jonex 平台验证 TCADP 请求签名，处理后返回结果
+4. 异步场景：Jonex通过 Webhook 回调通知 TCADP
 """
 
 import httpx

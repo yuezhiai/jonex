@@ -11,6 +11,9 @@ const apiTarget = process.env.VITE_API_TARGET || parentEnv.VITE_API_TARGET || 'h
 
 export default defineConfig({
   base: '/',
+  // 依赖预构建缓存按应用隔离：多 dev server 共享 node_modules/.vite 会并发覆盖磁盘产物，
+  // 导致同一物理 chunk 被以不同 URL serve → 双 React 实例 → 子应用白屏
+  cacheDir: path.resolve(__dirname, '../node_modules/.vite/shell'),
   resolve: {
     alias: {
       '@jonex/shell-sdk': path.resolve(__dirname, '../shared/shell-sdk/src/index.ts'),

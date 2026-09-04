@@ -1,7 +1,7 @@
 [project]
 name = "mcp-server-jonex"
 version = "0.1.0"
-description = "悦溪平台 - MCP Server（知识库 Tool 注册与鉴权）"
+description = "Jonex 平台 - MCP Server（知识库 Tool 注册与鉴权）"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.28.1,<2",

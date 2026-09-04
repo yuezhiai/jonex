@@ -13,11 +13,10 @@ import os
 import random
 import re
 from typing import Any
-from uuid import uuid4
 
 import httpx
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Body, File, Form, Header, Request, UploadFile
+from fastapi import APIRouter, Body, Header, Request
 from fastapi.responses import RedirectResponse
 
 from jonex_core.common import (
@@ -32,7 +31,6 @@ from jonex_core.common import (
 )
 from jonex_core.common.audit import schedule_emit
 from jonex_core.common.exceptions import ResourceNotFoundError
-from jonex_core.common.object_storage import build_object_key, get_object_storage
 from jonex_core.common.tenant import require_tenant
 
 logger = get_logger("api_internal")
@@ -40,7 +38,7 @@ logger = get_logger("api_internal")
 router = APIRouter()
 
 # ── Action whitelist ──────────────────────────────────────────────
-_ALLOWED_ACTIONS = frozenset({"deep_query", "get_document_status", "get_raw_url", "get_service", "list_documents", "list_services", "query_with_ontology", "search_llmwiki", "search_mix"})
+_ALLOWED_ACTIONS = frozenset({"deep_query", "generate_upload_url", "get_document_status", "get_raw_url", "get_service", "list_documents", "list_services", "query_with_ontology", "search_llmwiki", "search_mix", "upload_document"})
 
 
 # ── Error sanitization ────────────────────────────────────────────
@@ -97,7 +95,7 @@ async def _get_redis() -> aioredis.Redis:
 _SIDECAR_MAX_RETRIES = int(os.getenv("GATEWAY_SIDECAR_RETRIES", "2"))
 _SIDECAR_BASE_DELAY = float(os.getenv("GATEWAY_SIDECAR_BASE_DELAY", "1.0"))
 _SIDECAR_MAX_DELAY = float(os.getenv("GATEWAY_SIDECAR_MAX_DELAY", "8.0"))
-_SIDECAR_TIMEOUT = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "120"))
+_SIDECAR_TIMEOUT = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
 
 def _sanitize_error_message(raw_message: str) -> str:
@@ -280,84 +278,6 @@ async def mcp_kb_invoke(
             mcp_key_id=mcp_key_id,
             action=action,
             data=data or {},
-        )
-    except CapabilityInvokeError as exc:
-        raise CapabilityInvokeError(
-            message=_sanitize_error_message(exc.message),
-            details=exc.details,
-        )
-
-    return success_response(data=result)
-
-
-# ── MCP upload endpoint ──────────────────────────────────────────────
-
-
-@router.post("/kb/documents/upload", summary="MCP Server 文档上传（内部端点）")
-async def mcp_upload_document(
-    request: Request,
-    file: UploadFile = File(...),
-    file_name: str = Form(..., min_length=1, max_length=512),
-    knowledge_base_id: str = Form(..., min_length=1, max_length=128),
-    mime_type: str = Form("", max_length=128),
-    mcp_key_id: str = Form(..., min_length=1, max_length=128),
-    x_internal_api_key: str = Header("", alias="X-Internal-API-Key"),
-    x_tenant_id: str = Header("", alias="X-Tenant-ID"),
-):
-    """MCP Server 专用文档上传端点：接收 multipart 文件字节 → 写对象存储 → 调 capability。
-
-    流程: 认证 → 租户校验 → 文件空检查 → 大小校验 → 写对象存储 → Sidecar invoke
-    """
-    config = get_config()
-    max_size_mb = int(os.getenv("MCP_UPLOAD_MAX_SIZE_MB", "50"))
-
-    # ── 1. 认证：X-Internal-API-Key ──
-    if not x_internal_api_key:
-        raise MissingApiKeyError(message="缺少 X-Internal-API-Key 请求头")
-    if x_internal_api_key != config.INTERNAL_API_KEY:
-        raise InvalidApiKeyError(message="X-Internal-API-Key 无效")
-
-    # ── 2. 租户校验 ──
-    require_tenant(x_tenant_id)
-
-    # ── 3. 文件读取与空检查 ──
-    content = await file.read()
-    if not content:
-        raise InvalidParameterError(message="上传文件不能为空")
-
-    # ── 4. 文件大小校验 ──
-    max_size_bytes = max_size_mb * 1024 * 1024
-    if len(content) > max_size_bytes:
-        raise InvalidParameterError(
-            message=f"文件大小超过限制 ({max_size_mb}MB)",
-            details={"file_size": len(content), "max_size": max_size_bytes},
-        )
-
-    # ── 5. 写对象存储 ──
-    doc_id = str(uuid4())
-    backend = os.getenv("OBJECT_STORAGE_BACKEND", "local").strip().lower()
-    content_type = mime_type or "application/octet-stream"
-    storage_key = build_object_key(x_tenant_id, knowledge_base_id, doc_id, file_name)
-    await get_object_storage().put_bytes(
-        storage_key, content, content_type=content_type
-    )
-
-    # ── 6. 调 capability ──
-    data = {
-        "doc_id": doc_id,
-        "file_name": file_name,
-        "file_size": len(content),
-        "mime_type": content_type,
-        "storage_key": storage_key,
-        "storage_backend": backend,
-        "knowledge_base_id": knowledge_base_id,
-    }
-    try:
-        result = await _call_kb_capability_mcp(
-            tenant_id=x_tenant_id,
-            mcp_key_id=mcp_key_id,
-            action="upload_document",
-            data=data,
         )
     except CapabilityInvokeError as exc:
         raise CapabilityInvokeError(

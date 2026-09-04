@@ -76,7 +76,7 @@ ENTITY_TYPES = (
 
 # 一段代表性中文 chunk（~1200 字符，模拟入库文本）
 CHUNK = (
-    "悦溪平台是一个插件化 AI 能力平台框架，通过可组合的 capability 对外提供业务服务。"
+    "Jonex 平台是一个插件化 AI 能力平台框架，通过可组合的 capability 对外提供业务服务。"
     "平台采用多租户架构，所有业务数据按 tenant_id 强隔离。知识库能力封装 RAG 检索，"
     "向量检索经 Milvus，本体图谱存储于 Neo4j，文档与对象走 MinIO 或腾讯云 COS。"
     "所有 LLM 与 Embedding 调用统一经 llm-gateway 出口，由网关完成 token 计量与限流，"

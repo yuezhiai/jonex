@@ -58,7 +58,7 @@ export default function DomainSpaceCreate() {
             value={form.name}
             onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
             placeholder={t('domainSpace.namePlaceholder')}
-            maxLength={128}
+            maxLength={255}
             onPressEnter={handleCreate}
           />
         </div>
@@ -69,6 +69,8 @@ export default function DomainSpaceCreate() {
             onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
             placeholder={t('domainSpace.descriptionPlaceholder')}
             rows={4}
+            maxLength={1024}
+            showCount
           />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>

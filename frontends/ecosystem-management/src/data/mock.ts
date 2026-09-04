@@ -288,7 +288,7 @@ export interface SkillCardItem {
 export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   {
     id: 'mock-1',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '图像识别与分析',
     description: '对图片内容进行智能识别，提取物体、文字、场景等多模态信息，支持OCR文字识别',
     skill_type: 'image',
@@ -301,7 +301,7 @@ export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   },
   {
     id: 'mock-2',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '语音转文本',
     description: '将音频文件中的语音内容自动转录为结构化文本，支持多语种和说话人分离',
     skill_type: 'voice',
@@ -314,7 +314,7 @@ export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   },
   {
     id: 'mock-3',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '文档版面分析',
     description: '分析PDF、图片等文档的版面结构，识别段落、表格、图表、页眉页脚等元素',
     skill_type: 'document',
@@ -327,7 +327,7 @@ export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   },
   {
     id: 'mock-4',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '视频内容理解',
     description: '对视频内容进行抽帧分析，识别场景、动作、人物及事件时间线',
     skill_type: 'video',
@@ -340,7 +340,7 @@ export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   },
   {
     id: 'mock-5',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '多模态融合检索',
     description: '跨文本、图像、语音等多模态数据的统一语义检索与相似度匹配',
     skill_type: 'fusion',
@@ -353,7 +353,7 @@ export const MOCK_SKILL_CARDS: SkillCardItem[] = [
   },
   {
     id: 'mock-6',
-    tenant_id: 'tenant_yuexi_demo',
+    tenant_id: 'tenant_jonex_demo',
     name: '智能数据提取',
     description: '从非结构化文档中自动提取关键字段和结构化数据，支持表格、表单、发票等场景',
     skill_type: 'custom',

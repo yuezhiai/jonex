@@ -2,7 +2,11 @@ import React from 'react';
 import { Modal, Button, Input } from 'antd';
 import { SettingOutlined, CloseOutlined, SearchOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import type { DomainKnowledgeItem, DomainKnowledgePermissionMember } from '@/types/domainKnowledge';
+import type {
+  DomainKnowledgeItem,
+  DomainKnowledgePermissionMember,
+  DomainKnowledgePermissionRole,
+} from '@/types/domainKnowledge';
 
 interface PermissionModalProps {
   open: boolean;
@@ -12,7 +16,7 @@ interface PermissionModalProps {
   loading: boolean;
   saving: boolean;
   onKeywordChange: (val: string) => void;
-  onRoleChange: (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => void;
+  onRoleChange: (userId: string, role: DomainKnowledgePermissionRole) => void;
   onSave: () => void;
   onCancel: () => void;
 }
@@ -67,12 +71,12 @@ export default function PermissionModal({
                   <div className="yx-perm-user-dept">{u.dept}</div>
                 </div>
                 <div className="yx-perm-radio">
-                  {(['viewer', 'editor', 'kb_manager'] as const).map((role) => {
+                  {/* [jonex] B3：两级，member 在前（权限从低到高） */}
+                  {(['member', 'kb_manager'] as const).map((role) => {
                     const isActive = checked === role;
                     const label = t({
-                      viewer: 'permission.view',
-                      editor: 'permission.edit',
-                      kb_manager: 'permission.kbManage',
+                      member: 'kbPermission.member',
+                      kb_manager: 'kbPermission.kbManager',
                     }[role]);
                     return (
                       <label key={role} className={isActive ? 'is-checked' : ''}>

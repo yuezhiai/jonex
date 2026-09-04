@@ -7,11 +7,12 @@ import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
 import { LANGUAGE_STORAGE_KEY } from '@jonex/i18n-resources';
 import { antdTheme, sharedCache } from '@jonex/platform-theme';
+import { redirectToLogin, writeCachedUser } from '@jonex/shell-sdk';
 import Login from './pages/Login';
 import AppShellLayout from './components/AppShellLayout';
 import Dashboard from './pages/Dashboard';
 import AppHost from './pages/AppHost';
-import { getAccessToken } from './api/auth';
+import { getAccessToken, fetchCurrentUser, isAccessTokenExpired } from './api/auth';
 import type { ReactNode } from 'react';
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -24,15 +25,43 @@ function RequireAuth({ children }: { children: ReactNode }) {
   const goLogin = useCallback(() => {
     if (redirectingRef.current) return;
     redirectingRef.current = true;
-    window.location.href = `/login?redirect=${encodeURIComponent(window.location.href)}&expired=1`;
+    redirectToLogin({ loginUrl: '/login', expired: true });
   }, []);
 
   useEffect(() => {
-    if (getAccessToken()) {
-      setAuthChecked(true);
-    } else {
+    if (!getAccessToken()) {
       goLogin();
+      return;
     }
+
+    // 本地同步预判 token 是否已过期：已过期直接跳转（零网络延迟，不等 /auth/me）；
+    // 未过期再走 /auth/me 权威校验，兜底「被撤销/禁用/租户停用」等本地判断不了的场景。
+    if (isAccessTokenExpired()) {
+      goLogin();
+      return;
+    }
+
+    // /auth/me 权威校验：
+    // - 成功 → 先刷新缓存用户再放行（保证 AppShellLayout 挂载时读到最新用户）；
+    // - 401/403 → 拦截器已 emitSessionExpired（清 token + 发 jonex:token-expired），
+    //   由下方事件监听 goLogin 收尾，这里不 setAuthChecked；
+    // - 网络/服务异常（非 401）→ token 仍在，放行，避免离线被误踢。
+    let cancelled = false;
+    fetchCurrentUser()
+      .then((user) => {
+        if (cancelled) return;
+        writeCachedUser(user);
+        setAuthChecked(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        if (getAccessToken()) {
+          setAuthChecked(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [goLogin]);
 
   // 监听子应用发来的 token 过期事件

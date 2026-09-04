@@ -129,7 +129,6 @@ export default function AppShellLayout({ children }: { children: React.ReactNode
         label: t('auth.logout'),
         onClick: () => {
           logout();
-          navigate('/login');
         },
       },
     ],

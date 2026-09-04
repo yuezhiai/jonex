@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Modal, Table, Button, Tag, message, Popconfirm } from 'antd';
+import { Modal, Table, Button, Tag, Typography, message, Popconfirm } from 'antd';
 import { EyeOutlined, RollbackOutlined, BranchesOutlined } from '@ant-design/icons';
 import { listVersions, rollbackVersion, type VersionItem, type PromptTemplateItem } from '../../api/promptTemplates';
 import { promptTemplateVersionsDisplay } from '../../utils/systemPromptTemplateDisplay';
@@ -76,29 +76,25 @@ const VersionModal: React.FC<VersionModalProps> = ({
     {
       title: t('promptTemplate.contentPreview'),
       dataIndex: 'content',
-      ellipsis: true,
-      render: (content: string, record: VersionItem) => (
-        <div>
-          <div
-            style={{
-              fontFamily: "'Courier New', monospace",
-              fontSize: 11,
-              color: '#64748b',
-              maxWidth: 260,
-              maxHeight: 36,
-              overflow: 'hidden',
-              lineHeight: 1.5,
-              whiteSpace: 'pre-wrap',
-            }}
-          >
-            {content?.replace(/\n/g, ' ').slice(0, 80)}
-            {(content || '').length > 80 ? '…' : ''}
-          </div>
-          <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>{record.remark || '—'}</div>
-        </div>
+      width: 320,
+      render: (content: string) => (
+        <Typography.Paragraph
+          type="secondary"
+          ellipsis={{ rows: 2, tooltip: content || undefined }}
+          style={{ margin: 0 }}
+        >
+          {content || ''}
+        </Typography.Paragraph>
       ),
     },
-    { title: t('promptTemplate.updatedBy'), dataIndex: 'updated_by', width: 90 },
+    {
+      title: t('promptTemplate.updateDescription'),
+      dataIndex: 'remark',
+      width: 90,
+      ellipsis: true,
+      render: (remark: string) => <span>{remark || '—'}</span>,
+    },
+    { title: t('promptTemplate.updatedBy'), dataIndex: 'updated_by', width: 120 },
     { title: t('promptTemplate.updatedAt'), dataIndex: 'updated_at', width: 150 },
     {
       title: t('common.actions'),
@@ -139,7 +135,7 @@ const VersionModal: React.FC<VersionModalProps> = ({
         open={open}
         onCancel={onClose}
         footer={<Button onClick={onClose}>{t('common.close')}</Button>}
-        width={780}
+        width={1080}
       >
         <div style={{ marginBottom: 16, fontSize: 13, color: '#475569' }}>
           <span>

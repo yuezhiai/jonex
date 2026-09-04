@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 缓存连接模块
+Jonex 平台 - 缓存连接模块
 
 基于 Redis 异步客户端，支持：
 - 异步 Redis 操作

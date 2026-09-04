@@ -80,7 +80,7 @@ export default function SpaceFormModal({ open, editing, onClose, onSaved }: Spac
             value={form.name}
             onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
             placeholder={t('domainSpace.namePlaceholder')}
-            maxLength={128}
+            maxLength={255}
           />
         </Form.Item>
         <Form.Item label={t('domainSpace.description')}>
@@ -89,6 +89,8 @@ export default function SpaceFormModal({ open, editing, onClose, onSaved }: Spac
             onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
             placeholder={t('domainSpace.descriptionPlaceholder')}
             rows={3}
+            maxLength={1024}
+            showCount
           />
         </Form.Item>
       </Form>

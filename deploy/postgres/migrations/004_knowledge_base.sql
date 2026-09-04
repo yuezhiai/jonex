@@ -1,5 +1,5 @@
 -- ============================================================
--- 悦溪平台数据库初始化 - 知识库 (knowledge_base schema)
+-- Jonex 平台数据库初始化 - 知识库 (knowledge_base schema)
 -- 版本: 004
 -- 建表顺序按业务层级自顶向下：
 --   领域空间 -> 知识库 -> 领域服务及其关联 ->
@@ -33,10 +33,11 @@ CREATE TABLE IF NOT EXISTS knowledge_base.space_permissions (
     tenant_id VARCHAR(64) NOT NULL,
     space_id VARCHAR(64) NOT NULL,
     user_id VARCHAR(64) NOT NULL,
-    role VARCHAR(32) NOT NULL DEFAULT 'viewer',
+    role VARCHAR(32) NOT NULL DEFAULT 'member',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted SMALLINT DEFAULT 0
+    is_deleted SMALLINT DEFAULT 0,
+    CONSTRAINT ck_kb_spp_role CHECK (role IN ('space_manager', 'member'))
 );
 CREATE INDEX IF NOT EXISTS idx_kb_spp_tenant ON knowledge_base.space_permissions(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_kb_spp_is_deleted ON knowledge_base.space_permissions(is_deleted);
@@ -44,16 +45,17 @@ CREATE INDEX IF NOT EXISTS idx_kb_spp_space ON knowledge_base.space_permissions(
 CREATE INDEX IF NOT EXISTS idx_kb_spp_user ON knowledge_base.space_permissions(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_spp_unique_member ON knowledge_base.space_permissions(tenant_id, space_id, user_id) WHERE is_deleted = 0;
 
--- 知识库授权成员（KB 级叠加授权：viewer/editor，设计 2026-08-20-kb-permission-design）
+-- 知识库授权成员（KB 级叠加授权：kb_manager/member，设计 2026-08-20-kb-permission-design）
 CREATE TABLE IF NOT EXISTS knowledge_base.kb_permissions (
     id VARCHAR(64) PRIMARY KEY,
     tenant_id VARCHAR(64) NOT NULL,
     kb_id VARCHAR(64) NOT NULL,
     user_id VARCHAR(64) NOT NULL,
-    role VARCHAR(32) NOT NULL DEFAULT 'viewer',
+    role VARCHAR(32) NOT NULL DEFAULT 'member',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted SMALLINT DEFAULT 0
+    is_deleted SMALLINT DEFAULT 0,
+    CONSTRAINT ck_kb_kbp_role CHECK (role IN ('kb_manager', 'member'))
 );
 CREATE INDEX IF NOT EXISTS idx_kb_perms_tenant ON knowledge_base.kb_permissions(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_kb_perms_is_deleted ON knowledge_base.kb_permissions(is_deleted);
@@ -103,6 +105,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base.services (
 CREATE INDEX IF NOT EXISTS idx_kb_svc_tenant ON knowledge_base.services(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_kb_svc_is_deleted ON knowledge_base.services(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_kb_svc_space ON knowledge_base.services(space_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_svc_unique_name
+    ON knowledge_base.services (tenant_id, space_id, name)
+    WHERE is_deleted = 0;
 
 -- 领域服务-知识库关联
 CREATE TABLE IF NOT EXISTS knowledge_base.service_knowledge_bases (
@@ -389,7 +394,7 @@ CREATE INDEX IF NOT EXISTS idx_kb_synonyms_tenant_kb
     ON knowledge_base.ontology_synonyms (tenant_id, knowledge_base_id, is_deleted);
 
 -- ============================================================
--- 悦溪平台数据库迁移 - 知识库解析引擎设置
+-- Jonex 平台数据库迁移 - 知识库解析引擎设置
 -- 版本: 008
 -- 包含: knowledge_base.knowledge_parser_settings 表
 -- 说明: KB 级文件类解析配置，引用 business_domain.parser_configs

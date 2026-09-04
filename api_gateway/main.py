@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - API 网关
+Jonex 平台 - API 网关
 
 统一入口，负责：
 - 请求路由
@@ -54,8 +54,8 @@ async def verify_api_key(request: Request) -> str:
         raise MissingApiKeyError()
 
     # TODO: 从数据库验证 API Key
-    # 临时实现：测试用 API Key
-    if api_key.startswith("jonex_test_"):
+    # 临时实现：仅当显式开启 ENABLE_TEST_TOKENS 时接受测试用 API Key
+    if config.ENABLE_TEST_TOKENS and api_key.startswith("jonex_test_"):
         return require_tenant(api_key.removeprefix("jonex_test_"))
     else:
         raise InvalidApiKeyError()
@@ -70,8 +70,8 @@ def create_app() -> FastAPI:
         FastAPI 应用实例
     """
     app = FastAPI(
-        title="悦溪平台 API 网关",
-        description="悦溪平台统一 API 入口，提供能力调用、认证鉴权、限流熔断等功能",
+        title="Jonex 平台 API 网关",
+        description="Jonex 平台统一 API 入口，提供能力调用、认证鉴权、限流熔断等功能",
         version="0.1.0",
         docs_url="/docs",
         redoc_url="/redoc",
@@ -146,13 +146,20 @@ def create_app() -> FastAPI:
         setup_logging(enable_file=True)
         logger.info("API Gateway 本地文件日志已启用")
 
-        # 安全守卫: INTERNAL_API_KEY 必须已从默认哨兵修改
+        # 安全守卫: INTERNAL_API_KEY / GATEWAY_API_KEY 必须已从默认哨兵修改
         _internal_key = config.INTERNAL_API_KEY
         if not _internal_key or _internal_key == "change-me-in-production":
             raise RuntimeError(
                 "INTERNAL_API_KEY 未配置或仍为默认哨兵值。"
                 "请在 .env 或环境变量中设置 INTERNAL_API_KEY 为真实随机 key。"
                 "未配置将导致 /internal/* 端点无认证保护。"
+            )
+        _gateway_key = config.GATEWAY_API_KEY
+        if not _gateway_key or _gateway_key == "change-me-in-production":
+            raise RuntimeError(
+                "GATEWAY_API_KEY 未配置或仍为默认哨兵值。"
+                "请在 .env 或环境变量中设置 GATEWAY_API_KEY 为真实随机 key。"
+                "未配置将导致 Gateway 到 Sidecar 的内部调用无认证保护。"
             )
 
     # ==================== 路由注册 ====================

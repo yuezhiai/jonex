@@ -4,17 +4,17 @@ type Translate = (key: string) => string;
 
 const BUILT_IN_TENANTS: Record<string, { name: string; description: string; key: string }> = {
   tenant_jonex_demo: {
-    name: '悦溪演示租户',
+    name: 'Jonex演示租户',
     description: '本地开发与演示租户',
     key: 'demo',
   },
   tenant_jonex_alpha: {
-    name: '悦溪 Alpha 测试租户',
+    name: 'Jonex Alpha 测试租户',
     description: '用于多租户登录选择流程测试',
     key: 'alpha',
   },
   tenant_jonex_beta: {
-    name: '悦溪 Beta 测试租户',
+    name: 'Jonex Beta 测试租户',
     description: '用于多租户登录选择流程测试',
     key: 'beta',
   },

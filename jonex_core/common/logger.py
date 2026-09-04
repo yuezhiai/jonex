@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 日志配置模块
+Jonex 平台 - 日志配置模块
 
 支持：
 - 多级别日志（DEBUG/INFO/WARNING/ERROR/CRITICAL）

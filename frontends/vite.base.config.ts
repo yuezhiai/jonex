@@ -31,8 +31,9 @@ export function defineAppConfig({ appId, scope, port }: DefineAppConfigOptions) 
   return defineConfig(() => {
     return {
       base: `/${appId}/`,
-      // 统一依赖预构建 / 构建缓存目录（pnpm workspace 共享 node_modules）
-      cacheDir: path.resolve(__dirname, 'node_modules/.vite'),
+      // 依赖预构建 / 构建缓存按 appId 隔离：多 dev server 共享同一 node_modules/.vite 会并发覆盖磁盘产物，
+      // 各 server 内存批次与磁盘脱节、同一物理 chunk 被以不同 URL serve → 双 React 实例 → 子应用白屏。
+      cacheDir: path.resolve(__dirname, `node_modules/.vite/${appId}`),
       plugins: [
         react(),
         federation({

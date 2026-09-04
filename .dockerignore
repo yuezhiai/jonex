@@ -121,3 +121,14 @@ frontends/**/coverage
 frontends/**/package-lock.json
 frontends/**/yarn.lock
 frontends/**/_legacy
+
+# TLS 证书与私钥 —— 不进构建上下文
+# 证书是运行期 volume 挂载，构建阶段完全不需要，进镜像层等于泄漏私钥
+*.key
+*.crt
+*.pem
+*.csr
+*.pfx
+*.p12
+certs/
+**/certs/

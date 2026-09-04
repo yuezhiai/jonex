@@ -14,8 +14,13 @@ import re
 from functools import lru_cache
 
 from jonex_core.common import get_logger
+from jonex_core.common.object_storage.sts_credentials_cache import StsCredentialsCache
 
 logger = get_logger("object_storage")
+
+# 模块级共享 STS 缓存单例：所有 Cos 存储实例共用同一份临时密钥缓存，
+# 避免 get_object_storage 与 get_object_storage_for 各自 new 一份导致同租户重复换证。
+_shared_sts_cache = StsCredentialsCache()
 
 
 def build_object_key(
@@ -106,9 +111,15 @@ def get_object_storage():
     if backend == "cos":
         from jonex_core.common.object_storage.cos_storage import CosObjectStorage
 
-        instance = CosObjectStorage()
+        instance = CosObjectStorage(sts_cache=_shared_sts_cache)
         instance.check_connectivity()  # 启动自检，凭证错误尽早暴露
         logger.info("对象存储后端: COS (腾讯云)")
+    elif backend == "s3":
+        from jonex_core.common.object_storage.s3_storage import S3ObjectStorage
+
+        instance = S3ObjectStorage()
+        instance.check_connectivity()  # 启动自检，凭证错误尽早暴露
+        logger.info("对象存储后端: S3 (兼容)")
     else:
         from jonex_core.common.object_storage.local_storage import LocalObjectStorage
 
@@ -129,7 +140,11 @@ def get_object_storage_for(backend: str | None):
     if name == "cos":
         from jonex_core.common.object_storage.cos_storage import CosObjectStorage
 
-        return CosObjectStorage()
+        return CosObjectStorage(sts_cache=_shared_sts_cache)
+    if name == "s3":
+        from jonex_core.common.object_storage.s3_storage import S3ObjectStorage
+
+        return S3ObjectStorage()
     from jonex_core.common.object_storage.local_storage import LocalObjectStorage
 
     return LocalObjectStorage()

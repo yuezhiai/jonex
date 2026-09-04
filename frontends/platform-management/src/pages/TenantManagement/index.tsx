@@ -45,13 +45,6 @@ export default function TenantManagement() {
   const openCreate = () => modalRef.current?.openCreate();
   const openEdit = (item: TenantItem) => modalRef.current?.openEdit(item);
 
-  const planLabel = (v: string) => {
-    if (v === 'free') return t('tenantManagement.planFree');
-    if (v === 'pro') return t('tenantManagement.planPro');
-    if (v === 'enterprise') return t('tenantManagement.planEnterprise');
-    return v;
-  };
-
   const columns = [
     { title: t('tenantManagement.tenantId'), dataIndex: 'id', key: 'id', width: 180 },
     {
@@ -66,13 +59,6 @@ export default function TenantManagement() {
       key: 'description',
       ellipsis: true,
       render: (_: string | null, tenant: TenantItem) => tenantDisplay(tenant, t).description,
-    },
-    {
-      title: t('tenantManagement.plan'),
-      dataIndex: 'plan_type',
-      key: 'plan_type',
-      width: 80,
-      render: (v: string) => planLabel(v),
     },
     {
       title: t('common.status'),

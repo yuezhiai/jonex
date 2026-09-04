@@ -151,6 +151,9 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         if (editRecord) return;
         setCurrentSpaceId(spaceId);
         setSelected({});
+        // 对称重置知识写入授权：避免切换空间后残留旧空间 KB，提交被后端按空间校验 400
+        setWriteEnabled(false);
+        setWriteGrants([]);
       });
     }, [editRecord]);
 
@@ -541,6 +544,7 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
                 onChange={setWriteGrants}
                 kbList={kbList}
                 spaceNameMap={spaceNameMap}
+                spaceId={currentSpaceId}
               />
             )}
           </div>

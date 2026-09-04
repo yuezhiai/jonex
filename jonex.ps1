@@ -64,7 +64,7 @@ $FrontendsDir = Join-Path $RepoRoot "frontends"
 
 $MiddlewareServices = @("postgres", "redis", "etcd", "minio", "milvus")
 $RagServices = @("lightrag", "atomic-rag")
-$BackendServices = @("gateway", "sidecar", "knowledge-base-service", "business-domain-service", "platform-service")
+$BackendServices = @("gateway", "sidecar", "knowledge-base-service", "business-domain-service", "platform-service", "mcp-server")
 $FrontendServices = @("frontend-gateway", "shell-frontend", "core-business-frontend", "platform-management-frontend", "ecosystem-management-frontend")
 
 $ShellApp = "@jonex/shell"
@@ -234,7 +234,7 @@ function Set-LocalBackendEnv {
 
     if (-not $env:DB_PORT) { $env:DB_PORT = "5432" }
     if (-not $env:DB_USERNAME) { $env:DB_USERNAME = "jonex" }
-    if (-not $env:DB_PASSWORD) { $env:DB_PASSWORD = "jonex123" }
+    if (-not $env:DB_PASSWORD) { $env:DB_PASSWORD = "change-me" }
     if (-not $env:DB_NAME) { $env:DB_NAME = "jonex" }
 
     $env:DB_HOST = "127.0.0.1"
@@ -281,6 +281,7 @@ $LogsServiceCommands = @{
     "logs-milvus" = "milvus"
     "logs-etcd" = "etcd"
     "logs-minio" = "minio"
+    "logs-mcp-server" = "mcp-server"
 }
 
 $RebuildServiceCommands = @{
@@ -388,7 +389,7 @@ switch ($Command) {
         Write-Host "  .\jonex.ps1 dev-frontend-platform       Platform Management: http://localhost:5177"
         Write-Host ""
         Write-Host "本地 Docker 联调:"
-        Write-Host "  .\jonex.ps1 init                        初始化 deploy/.env 与 deploy/.env.rag"
+        Write-Host "  .\jonex.ps1 init                        初始化 deploy/.env、deploy/.env.rag、deploy/.env.mcp 与前端 .env"
         Write-Host "  .\jonex.ps1 build-base                  强制重建 jonex/python-base 基础镜像"
         Write-Host "  .\jonex.ps1 build                       构建镜像"
         Write-Host "  .\jonex.ps1 up                          启动整套服务"
@@ -441,7 +442,16 @@ switch ($Command) {
         } else {
             Write-Host "RAG 配置已存在: deploy\.env.rag" -ForegroundColor Yellow
         }
-        Write-Host "下一步: 按需修改 deploy\.env 和 deploy\.env.rag" -ForegroundColor Yellow
+
+        $envMcpFile = Join-Path $DeployDir ".env.mcp"
+        $envMcpExample = Join-Path $DeployDir ".env.mcp.example"
+        if (-not (Test-Path $envMcpFile)) {
+            Copy-Item $envMcpExample $envMcpFile
+            Write-Host "已创建 MCP 配置: deploy\.env.mcp" -ForegroundColor Green
+        } else {
+            Write-Host "MCP 配置已存在: deploy\.env.mcp" -ForegroundColor Yellow
+        }
+        Write-Host "下一步: 按需修改 deploy\.env、deploy\.env.rag 和 deploy\.env.mcp" -ForegroundColor Yellow
 
         # 同时初始化前端 .env
         & $PSCommandPath "frontends-env"

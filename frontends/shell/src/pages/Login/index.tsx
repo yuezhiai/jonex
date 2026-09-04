@@ -193,7 +193,15 @@ function LoginPage() {
             />
           </Form.Item>
 
-          <Form.Item name="password" rules={[{ required: true, message: t('shell.enterPassword') }]}>
+          <Form.Item
+            name="password"
+            rules={[
+              { required: true, message: t('shell.enterPassword') },
+              // 对齐后端校验：密码长度 8~128（auth_service.password_min_length 默认 8 / max_length 128）
+              { min: 8, message: t('shell.passwordTooShort') },
+              { max: 128, message: t('shell.passwordTooLong') },
+            ]}
+          >
             <Input.Password
               prefix={<LockOutlined style={{ color: colors.textMuted }} />}
               placeholder={t('auth.password')}

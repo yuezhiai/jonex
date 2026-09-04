@@ -1,6 +1,6 @@
-# LightRAG 悦溪（jonex）改动点清单
+# LightRAG Jonex（jonex）改动点清单
 
-> 本文件记录悦溪平台对 vendored LightRAG 源码的所有改动点，便于后续升级 LightRAG 时
+> 本文件记录Jonex 平台对 vendored LightRAG 源码的所有改动点，便于后续升级 LightRAG 时
 > 快速定位、重新 apply。**所有改动均以 `# [jonex]` 注释标记**，可全局搜索 `[jonex]` 定位。
 
 ## 一、注释规范
@@ -8,7 +8,7 @@
 - 单行改动：行尾加 `# [jonex]`。
 - 代码块改动：块首加 `# ── [jonex] <说明> ───`，块尾可加 `# ── [jonex] end ───`。
 - 新增参数/字段：行尾 `# [jonex]`，参数名统一加前缀 `_jonex_` 或 `X-Jonex-`（HTTP 头）。
-- 新增整文件：文件头注释标明 `# [jonex] 悦溪新增文件`。
+- 新增整文件：文件头注释标明 `# [jonex] Jonex新增文件`。
 
 ## 二、改动分类
 

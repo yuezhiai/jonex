@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
-import { Button, Input, Select, Table } from 'antd';
+import { Button, Input, Select, Table, Typography } from 'antd';
 import { useStore } from '@/store';
 import {
   AudioFilled,
@@ -513,12 +513,14 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
         mode === 'edit' && editingId
           ? await updateParserSetting(editingId, payload)
           : await createParserSetting(payload);
-      const nextRow = mapSettingToRow(saved, t);
-
-      setRows((prev) =>
-        mode === 'edit' ? prev.map((row) => (row.id === nextRow.id ? nextRow : row)) : [...prev, nextRow],
-      );
       const label = parserTypeLabel(form.parserType, t);
+      if (mode === 'edit') {
+        const nextRow = mapSettingToRow(saved, t);
+        setRows((prev) => prev.map((row) => (row.id === nextRow.id ? nextRow : row)));
+      } else {
+        // 添加成功后不本地插入数据，改为重新请求列表接口，保证与后端一致
+        await loadData();
+      }
       setNotice(mode === 'edit' ? t('parserConfig.savedLabel', { label }) : t('parserConfig.addedLabel', { label }));
       closeFormModal();
     } catch (error) {
@@ -956,8 +958,14 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
                         <FileTextOutlined />
                       </span>
                       <span className="parser-template-info">
-                        <strong>{template.name}</strong>
-                        <span>{templateDesc(template, t)}</span>
+                        {/* 名称单行省略 + 溢出 hover 全文，交由 Typography 组件处理（不使用 CSS 省略） */}
+                        <Typography.Text
+                          ellipsis={{ tooltip: template.name }}
+                          style={{ display: 'block', color: '#0b2b5c', fontSize: 14, fontWeight: 500 }}
+                        >
+                          {template.name}
+                        </Typography.Text>
+                        <span className="parser-template-desc">{templateDesc(template, t)}</span>
                       </span>
                       <em>{t('parserConfig.useTemplate')}</em>
                     </Button>

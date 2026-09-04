@@ -100,6 +100,22 @@ export default function LlmWikiSchemaTab({ kbId, canWrite = false }: Props) {
       message.error(t('llmWikiSchema.otherRequired'));
       return;
     }
+    // 前端拦截：code 重复（entity 内部 / concept 内部各自唯一，空 code 跳过交由后端 DTO 拦截）
+    const findDup = (items: { code: string }[]) => {
+      const seen = new Set<string>();
+      for (const it of items) {
+        const c = it.code.trim();
+        if (!c) continue;
+        if (seen.has(c)) return c;
+        seen.add(c);
+      }
+      return null;
+    };
+    const dupCode = findDup(entityTypes) ?? findDup(conceptTypes);
+    if (dupCode) {
+      message.error(t('llmWikiSchema.codeDuplicate', { code: dupCode }));
+      return;
+    }
     setSaving(true);
     try {
       const saved = await saveLlmWikiSchema({

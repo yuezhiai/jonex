@@ -19,6 +19,7 @@ export * from './authStorage';
 export { isPlatformAdmin } from './platformAdmin';
 export * from './authRedirect';
 export { bootstrapStandaloneAuth } from './authBootstrap';
+export * from './sessionExpired';
 export type { AuthBootstrapOptions, AuthBootstrapResult } from './authBootstrap';
 
 const SHELL_CONTEXT_KEY = '__SHELL_CONTEXT__';

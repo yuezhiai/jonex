@@ -272,6 +272,8 @@ class AuditForwarder:
         invoke_action: Optional[str] = None,
         is_invoke: bool = False,
         resource_id: Optional[str] = None,
+        impersonated: bool = False,
+        original_tenant_id: Optional[str] = None,
     ):
         """采集一条审计条目
 
@@ -292,6 +294,14 @@ class AuditForwarder:
 
         # invoke 调用以业务 action 作为审计动作，REST 以 http.{method}
         audit_action = invoke_action if is_invoke and invoke_action else f"http.{method.lower()}"
+
+        # 模拟态元数据并入 request_params（JSONB），免改表结构
+        if impersonated:
+            _params = dict(request_params or {})
+            _params["impersonated"] = True
+            if original_tenant_id:
+                _params["original_tenant_id"] = original_tenant_id
+            request_params = _params
 
         entry = {
             "tenant_id": tenant_id,

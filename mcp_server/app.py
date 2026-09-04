@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - MCP Server
+Jonex 平台 - MCP Server
 
 知识库 MCP Tool 服务，提供：
 - MCP Streamable HTTP 传输

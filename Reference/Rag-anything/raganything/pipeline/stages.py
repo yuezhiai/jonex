@@ -16,6 +16,9 @@ from lightrag.operate import extract_entities, merge_nodes_and_edges
 from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
 
 from raganything.chunk_utils import apply_chunk_template, sample_frames
+# [jonex] §image-refs P0-6: 锚点提取函数定义在 modalprocessors.py（VLM 调用
+# 前提前提取需同模块复用；本模块 push 阶段重算同一纯函数保证一致性）
+from raganything.modalprocessors import _extract_image_anchor
 from raganything.event_bus import PipelineEvent
 from raganything.parsers.base import Parser
 from raganything.parsers.mineru import MineruParser
@@ -424,6 +427,18 @@ class MultimodalStage(Stage):
 
         # STANDALONE mode
         processors = getattr(services, "modal_processors", {})
+        # [jonex] F0-2：设置 content_source 供 VLM context 提取。
+        # ctx.content_list 是 MinerU 解析的完整内容列表（text + multimodal），
+        # 格式为 "minerU"（每项含 page_idx、type、text 等字段）。
+        # 各 processor 的 ContextExtractor 据此按 page 窗口提取周围文本。
+        # set_content_source 是实例方法，只设属性不做 IO，可安全同步调用。
+        if ctx.content_list:
+            for proc in processors.values():
+                if hasattr(proc, "set_content_source"):
+                    try:
+                        proc.set_content_source(ctx.content_list, "minerU")
+                    except Exception:
+                        pass  # best-effort，不阻断主流程
         # [jonex] 多模态描述并发（scene=raganything_ingest）。HTTP 模式下 services.lightrag=None，
         # 原兜底恒为 2，把并发锁死。优先读 config.max_parallel_multimodal（env MAX_PARALLEL_MULTIMODAL），
         # 回退嵌入模式的 lightrag.max_parallel_insert，最后回退 2。
@@ -433,6 +448,24 @@ class MultimodalStage(Stage):
             or 2
         )
         semaphore = asyncio.Semaphore(max(1, int(_mm_concurrency)))
+        # [jonex] §image-refs 排查衍生：VLM 独立限流（config.max_parallel_vlm /
+        # env MAX_PARALLEL_VLM）。图片描述直连远端 VLM（不经 llm-gateway），
+        # 单次 4~105s（thinking 模型），与表格/公式 2~3s 的 LLM 快任务共用通用
+        # 信号量会 head-of-line blocking，且远端槽位有限、排队超驱动超时（120s）
+        # 会 ReadTimeout 重试风暴。image 项只吃 VLM 信号量（不占通用信号量——
+        # 它不消耗 llm-gateway RPM），video 项两者都吃（关键帧 VLM + MapReduce
+        # LLM），其余项沿用通用信号量。
+        _vlm_concurrency = (
+            getattr(services.config, "max_parallel_vlm", 0)
+            or getattr(services.config, "max_parallel_multimodal", 0)
+            or 2
+        )
+        vlm_semaphore = asyncio.Semaphore(max(1, int(_vlm_concurrency)))
+        if services.logger:
+            services.logger.info(
+                "[jonex] multimodal 并发: 通用=%d VLM=%d",
+                semaphore._value, vlm_semaphore._value,
+            )
         cb = services.callback_manager
         multimodal_items = ctx.multimodal_items
         total_items = len(multimodal_items)
@@ -443,38 +476,55 @@ class MultimodalStage(Stage):
                         item_count=total_items)
         multimodal_start_time = time.time()
 
+        async def _process_one(item: Dict, idx: int,
+                               content_type: str) -> Optional[Dict]:
+            # [jonex] 方案 C：将 COS URL 注入 video modal_content，供 MPS backend 使用
+            if content_type == "video":
+                mps_url = getattr(ctx, "mps_video_url", "") or ""
+                if mps_url:
+                    item = {**item, "mps_video_url": mps_url}
+            processor = get_processor_for_type(processors, content_type)
+            if not processor:
+                if services.logger:
+                    services.logger.warning(
+                        f"No processor for type: {content_type}"
+                    )
+                return None
+            # [jonex] F0-1：传递 item 自身作为 item_info（含 page_idx 供 context 提取）。
+            # 多模态 item 来自 separate_content，MinerU 顶层 item 已带 page_idx。
+            desc, entity_info = await processor.generate_description_only(
+                modal_content=item, content_type=content_type,
+                item_info=item,
+                prompt_overrides=getattr(ctx, "prompt_overrides", None),
+            )
+            # ── Callback: multimodal item complete ──
+            if cb:
+                cb.dispatch("on_multimodal_item_complete",
+                            file_path=ctx.file_name,
+                            item_index=idx + 1, total_items=total_items,
+                            item_type=content_type)
+            return {
+                "index": idx, "chunk_order_index": idx,
+                "type": content_type, "content_type": content_type,
+                "description": desc, "entity_info": entity_info,
+                "original": item, "original_item": item,
+                "item_info": item.get("item_info", {}),
+            }
+
         async def _process(item: Dict, idx: int) -> Optional[Dict]:
+            content_type = item.get("type", "unknown")
+            if content_type == "image":
+                # 图片：仅 VLM 信号量（直连 VLM，不消耗 llm-gateway RPM）
+                async with vlm_semaphore:
+                    return await _process_one(item, idx, content_type)
+            if content_type == "video":
+                # 视频：关键帧打 VLM + MapReduce 打 LLM，两层信号量都要
+                async with vlm_semaphore:
+                    async with semaphore:
+                        return await _process_one(item, idx, content_type)
+            # 表格/公式/音频等 LLM 项：沿用通用信号量
             async with semaphore:
-                content_type = item.get("type", "unknown")
-                # [jonex] 方案 C：将 COS URL 注入 video modal_content，供 MPS backend 使用
-                if content_type == "video":
-                    mps_url = getattr(ctx, "mps_video_url", "") or ""
-                    if mps_url:
-                        item = {**item, "mps_video_url": mps_url}
-                processor = get_processor_for_type(processors, content_type)
-                if not processor:
-                    if services.logger:
-                        services.logger.warning(
-                            f"No processor for type: {content_type}"
-                        )
-                    return None
-                desc, entity_info = await processor.generate_description_only(
-                    modal_content=item, content_type=content_type,
-                    prompt_overrides=getattr(ctx, "prompt_overrides", None),
-                )
-                # ── Callback: multimodal item complete ──
-                if cb:
-                    cb.dispatch("on_multimodal_item_complete",
-                                file_path=ctx.file_name,
-                                item_index=idx + 1, total_items=total_items,
-                                item_type=content_type)
-                return {
-                    "index": idx, "chunk_order_index": idx,
-                    "type": content_type, "content_type": content_type,
-                    "description": desc, "entity_info": entity_info,
-                    "original": item, "original_item": item,
-                    "item_info": item.get("item_info", {}),
-                }
+                return await _process_one(item, idx, content_type)
 
         tasks = [_process(item, i) for i, item in enumerate(ctx.multimodal_items)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1249,6 +1299,7 @@ def _build_file_source(
     table_cols: str | None = None,
     notes: str | None = None,
     entity_hint: str | None = None,
+    anchor_src: str | None = None,
     page_end: int | None = None,
     pspans: str | None = None,
     stats: dict | None = None,
@@ -1339,6 +1390,11 @@ def _build_file_source(
         # [jonex] 改动 20：ehint= 主体实体提示（表格标题 heading）
         entity_hint = _truncate_source_field(str(entity_hint), 40)
         parts.append(f"ehint={entity_hint.replace('|', ' ')}")
+    if anchor_src is not None:
+        # [jonex] §image-refs P0-6: 图片 chunk 版面主题锚点来源标记
+        # （cap=img_caption / foot=img_footnote / col=下方图注 / heading=标题），
+        # 检索侧可观测用；值域固定 7 字符内，无需截断。
+        parts.append(f"anchor_src={anchor_src}")
     parts.append(f"trace={trace_id}")
     # [jonex] §table-grid-v2 修复：file_source 被 LightRAG 当作「文件路径」
     # 使用（删除文档时按 file_path 去 inputs 目录删文件），Linux 文件名上限
@@ -1659,7 +1715,8 @@ class PushChunksStage(Stage):
                                   document_id, file_name, stats=table_stats)
         self._collect_multimodal_chunks(chunks, ctx.multimodal_results or [],
                                         tenant_id, kb_id, document_id, file_name,
-                                        asset_exts=ctx.asset_exts)
+                                        asset_exts=ctx.asset_exts,
+                                        content_list=ctx.content_list)
 
         total_chunks = len(chunks)
         if total_chunks == 0:
@@ -2722,13 +2779,24 @@ class PushChunksStage(Stage):
         self, chunks: list[dict], multimodal_results: list[dict],
         tenant_id: str, kb_id: str, document_id: str, file_name: str,
         asset_exts: dict[int, str] | None = None,
+        content_list: list[dict] | None = None,
     ) -> None:
         """Extract image/audio/video description chunks from VLM results.
 
         For video: pushes the MapReduce summary + per-frame VLM descriptions
         (with timestamps) + per-segment ASR transcripts as individual chunks.
         For audio: pushes the summary + per-segment ASR transcripts.
+
+        content_list: [jonex] §image-refs P0-6 MinerU 结构化解析产物，供
+        图片 chunk 提取确定性版面主题锚点（bbox 只存在于 content_list，
+        multimodal_results 不携带）。None（如 parse_only 旧链路）时跳过
+        锚点，行为与改造前一致。
         """
+        # [jonex] §image-refs P0-6: 锚点总开关（默认开；false 完全回退旧行为）
+        anchor_enabled = (
+            os.getenv("RAG_IMAGE_ANCHOR_ENABLED", "true").lower()
+            not in ("0", "false", "no", "off")
+        )
         for item in multimodal_results:
             content_type = item.get("content_type", item.get("type", "image"))
             item_info = item.get("item_info", {})
@@ -2747,6 +2815,12 @@ class PushChunksStage(Stage):
             if isinstance(description, dict):
                 description = json.dumps(description, ensure_ascii=False)
             if description and isinstance(description, str) and description.strip():
+                # [jonex] §image-refs P0-6: 图片版面主题锚点（规则见
+                # _extract_image_anchor；仅 image 模态提取，无锚点时
+                # anchor_src 为空、描述保持原样）
+                anchor, anchor_src = "", ""
+                if content_type == "image" and anchor_enabled and content_list:
+                    anchor, anchor_src = _extract_image_anchor(content_list, item)
                 start_time = _first_present(item, item_info, "start_time")
                 end_time = _first_present(item, item_info, "end_time")
                 # 若 item 层无时间数据，从 _audio_segments 推导整个视频的时间范围
@@ -2772,6 +2846,9 @@ class PushChunksStage(Stage):
                     # 表格摘要的 ctype 用 table_summary（与明细行 table_row 区分，
                     # 供检索侧双路召回使用）；其余模态沿用 content_type
                     ctype=("table_summary" if content_type == "table" else content_type),
+                    # [jonex] §image-refs P0-6: 锚点来源旁路（cap|foot|col|heading，
+                    # 无锚点 None 不写），检索侧可观测（如 anchor_src 命中率统计）
+                    anchor_src=anchor_src or None,
                 )
                 # [jonex] §table-grid-v2 L4.2: 摘要正文前缀「表格概览：」，
                 # 与明细行的「表格明细：【表】」在 embedding 空间区分开
@@ -2784,7 +2861,13 @@ class PushChunksStage(Stage):
                     # 「表格概览：」同构——让图片 chunk 在 embedding 空间与
                     # 普通文本 chunk 可区分（与 ctype 双保险：前缀负责向量
                     # 层面、ctype 负责过滤层面）。
-                    summary_text = f"图片描述：{description}"
+                    # [jonex] §image-refs P0-6: 版面主题锚点拼在 VLM 描述
+                    # **之前** —— 确定性锚点落在 embedding 前段 token（即使
+                    # LightRAG 二次切块截断，锚点仍保留在前段）。
+                    if anchor:
+                        summary_text = f"图片描述：【版面主题：{anchor}】{description}"
+                    else:
+                        summary_text = f"图片描述：{description}"
                 chunks.append({
                     "text": _inject_ns_token(summary_text, tenant_id, kb_id, document_id),
                     "file_source": file_source,

@@ -61,6 +61,24 @@ class OntologyService:
 
         # ── 以下为 lightrag 原有逻辑 ──
 
+        # [jonex] 手动重抽也应尊重重试上限，避免 retry_count 被无限顶高。
+        # 已达上限的文档应走 force reparse（reparse 会重置计数），
+        # 而非继续点「重试本体抽取」。
+        from .reconciliation_service import MAX_ONTOLOGY_RETRIES
+
+        if (doc.ontology_retry_count or 0) >= MAX_ONTOLOGY_RETRIES:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.ontology.retry_limit_reached",
+                    fallback=f"本体重试次数已达上限 ({doc.ontology_retry_count}/{MAX_ONTOLOGY_RETRIES})，请对该文档执行 force reparse 以重置计数后重试",
+                ),
+                details={
+                    "document_id": document_id,
+                    "retry_count": doc.ontology_retry_count,
+                    "max_retries": MAX_ONTOLOGY_RETRIES,
+                },
+            )
+
         # ontology-only 必须携带 compiled schema，否则 atomic-rag 无法归类
         schema = None
         schema_version = 0

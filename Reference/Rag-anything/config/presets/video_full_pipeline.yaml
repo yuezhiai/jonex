@@ -8,7 +8,7 @@ config:
   # VLM: vLLM 实例 (Qwen2.5-VL-7B, OpenAI-compatible)
   # Embedding: LM Studio 本地
   llm: deepseek-v4-flash-202605
-  vlm: /home/yuexi/Qwen2.5-VL-7B
+  vlm: /home/jonex/Qwen2.5-VL-7B
   embedding: qwen3-embedding:8b
   asr: openai_compatible:large-v3
 

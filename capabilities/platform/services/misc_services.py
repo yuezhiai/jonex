@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from jonex_core.common.exceptions import ResourceNotFoundError, ResourceConflictError
+from jonex_core.common.exceptions import (
+    InternalError,
+    ResourceConflictError,
+    ResourceNotFoundError,
+)
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 from capabilities.platform.models.application import Application
@@ -224,13 +228,20 @@ class SystemConfigService:
     async def update_config(self, config_key: str, req: SystemConfigUpdateRequest) -> SystemConfigResponse:
         cfg = await self.repo.get_by_key(config_key)
         if not cfg:
-            raise ResourceNotFoundError(
-            message=translate("err.config.not_found", params={"config_key": config_key}, fallback=f"配置不存在: {config_key}")
-        )  # 原消息: 配置不存在: {config_key}
-        if req.config_value is not None:
-            cfg.config_value = req.config_value
-        if req.description is not None:
-            cfg.description = req.description
+            # 配置项尚未种子时按 upsert 创建（配置页保存新键不再 404）
+            cfg = SystemConfig(
+                config_group="platform",
+                config_key=config_key,
+                config_value=req.config_value,
+                value_type="string",
+                description=req.description,
+            )
+            self.session.add(cfg)
+        else:
+            if req.config_value is not None:
+                cfg.config_value = req.config_value
+            if req.description is not None:
+                cfg.description = req.description
         await self.session.flush()
         return SystemConfigResponse.from_orm(cfg)
 
@@ -302,12 +313,29 @@ class TaskScheduleService:
 
 # ============ 租户管理 ============
 
+# [jonex] 权限重构 B1（D6）：新租户的预设角色模板由 4 个收为 2 个。
+#
+# 「平台管理员」不在模板里：D3 已确认平台管理员绑定在运营租户（demo），不复制给业务租户。
+# 「领域服务管理员/知识编辑者/观察者」已取消 —— 其能力改由资源身份承担
+# （空间 space_manager/member、知识库 kb_manager/member）。
+#
+# ⚠️ 这个常量必须与 migrations/006_seed_data.sql 的「每租户预设角色播种」块、
+#    以及 update/027 的 4.1 保持一致。三处描述的是同一件事：一个租户开箱应有哪些账号角色。
+_TENANT_ROLE_TEMPLATE = ("租户管理员", "普通用户")
+
+
 async def seed_tenant_roles(session, tenant_id: str) -> None:
-    """新租户预设角色播种：4 角色 + scope='tenant' 权限映射（与 demo 模板同构，不含平台码）。
+    """新租户预设角色播种：2 角色 + scope='tenant' 权限映射（与 demo 模板同构，不含平台码）。
 
     与 015 第 4/5 步逻辑同构；由 TenantService.create 复用。
-    **is_system 一律置 0**（已决策）：仅 demo 租户的系统管理员受系统角色保护；
-    租户自己的「系统管理员」是普通角色，可改权限/可删。
+    **is_system 一律置 0**（已决策）：仅 demo 租户的租户管理员受系统角色保护；
+    租户自己的「租户管理员」是普通角色，可改权限/可删。
+
+    [jonex] B1：模板从 demo 按**角色名**复制，且查询带 `is_deleted == 0` ——
+    这意味着 demo 里某个模板角色被软删后，新租户会**静默地少一个角色**。
+    027 软删三个降级角色时就会踩到（旧模板里有它们）。所以本函数末尾加了完整性校验：
+    模板角色没建齐就抛异常，而不是造出一个「没有普通用户角色」的残缺租户 ——
+    那种租户里所有普通用户都绑不到账号角色，登录后菜单全空，且现象与权限缓存问题难以区分。
     """
     from sqlalchemy import select
 
@@ -320,10 +348,20 @@ async def seed_tenant_roles(session, tenant_id: str) -> None:
             select(Role.name, Role.description, Role.is_system).where(
                 Role.tenant_id == "tenant_jonex_demo",
                 Role.is_deleted == 0,
-                Role.name.in_(["系统管理员", "领域服务管理员", "知识编辑者", "观察者"]),
+                Role.name.in_(_TENANT_ROLE_TEMPLATE),
             )
         )
     ).all()
+
+    missing_in_demo = set(_TENANT_ROLE_TEMPLATE) - {name for name, _, _ in template}
+    if missing_in_demo:
+        raise InternalError(
+            message=(
+                f"运营租户 tenant_jonex_demo 缺少预设角色模板 {sorted(missing_in_demo)}，"
+                f"无法为租户 {tenant_id} 播种角色。请先修复 demo 租户的角色数据"
+                f"（参见 deploy/postgres/update/027_permission_codes_tenant_admin.sql 第 4 节）"
+            )
+        )
 
     for name, description, _is_system in template:
         role = Role(tenant_id=tenant_id, name=name, description=description, is_system=0)

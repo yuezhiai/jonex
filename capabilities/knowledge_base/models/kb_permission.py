@@ -14,4 +14,7 @@ class KbPermission(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     kb_id = Column(String(64), nullable=False, index=True)
     user_id = Column(String(64), nullable=False, index=True)
-    role = Column(String(32), nullable=False, default="viewer")
+    # [jonex] 权限重构 B3（D1）：默认值 viewer → member（取值收为 kb_manager / member）。
+    # 注意 models/space.py 的同名字段属**空间层**，由 B2 处理 ——
+    # 两张表默认值同源但不同层，容易只改一个。
+    role = Column(String(32), nullable=False, default="member")

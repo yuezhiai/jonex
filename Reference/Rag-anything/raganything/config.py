@@ -360,9 +360,27 @@ class RAGAnythingConfig:
     注意：该信号量是「每文档」创建的，实际并发 ≈ WORKER_COUNT × max_parallel_multimodal，
     调高时需与上游限流（如 200 次/分钟）及 lightrag_extract/ontology 抽取的并发额度一并权衡。"""
 
+    # [jonex] VLM 独立并发度（§image-refs 排查衍生：图片描述直连远端 VLM，
+    # 不经 llm-gateway，单次可 100s+，与表格/公式的 2~3s LLM 快任务共用
+    # max_parallel_multimodal 会 head-of-line blocking，且远端 VLM 槽位有限）
+    # ---
+    max_parallel_vlm: int = field(
+        default=get_env_value("MAX_PARALLEL_VLM", 2, int)
+    )
+    """[jonex] 单文档内图片/视频关键帧 VLM 调用的并发上限（独立于 max_parallel_multimodal）。
+
+    MultimodalStage 中 image 项只吃此信号量（不占通用信号量），video 项两者都吃
+    （关键帧 VLM + MapReduce LLM）。远端 VLM 为 35B MoE thinking 模型，单图实测
+    4~105s，槽位有限——并发过高会让排队请求超过驱动超时（默认 120s），触发
+    ReadTimeout 重试风暴（详见 JONEX_CHANGES §39）。"""
+
     # Context Extraction Configuration
     # ---
-    context_window: int = field(default=get_env_value("CONTEXT_WINDOW", 1, int))
+    # [jonex] §image-refs F3：默认 1→2——覆盖「正文末尾提图、图在下一页」的
+    # 常见跨 1~2 页排版；附录集中配图（>2 页）自然拿不到远处正文 context，
+    # 描述保持纯视觉、rerank 分低被 TopN 淘汰（自然衰减，§14.5）。
+    # env CONTEXT_WINDOW 未显式配置时才生效。
+    context_window: int = field(default=get_env_value("CONTEXT_WINDOW", 2, int))
     """Number of pages/chunks to include before and after current item for context."""
 
     context_mode: str = field(default=get_env_value("CONTEXT_MODE", "page", str))

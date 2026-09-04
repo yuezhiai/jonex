@@ -47,6 +47,21 @@ from capabilities.platform.dtos.misc import (
 router = APIRouter()
 
 
+async def _operator_permissions(_p: dict) -> set[str]:
+    """当前操作者的权限码集合（用于服务层的 scope / D4 授予约束）。
+
+    [jonex] B1（D4）：模拟态必须走 perms 直通 —— 模拟态下操作者在目标租户里
+    没有角色行，查库会返回空集，平台管理员反而被自己的约束拦住。
+    `get_user_permissions` 的 impersonated/perms 参数正是这个短路。
+    """
+    from jonex_core.security.permission import get_user_permissions
+
+    return await get_user_permissions(
+        _p["tenant_id"], _p["user_id"],
+        impersonated=_p.get("impersonated"), perms=_p.get("perms"),
+    )
+
+
 async def _resolve_target_tenant(
     request: Request, db, target_tenant_id: str | None, current: dict
 ) -> str:
@@ -60,8 +75,20 @@ async def _resolve_target_tenant(
         return extract_tenant_id(request)
     tenant_id = require_tenant(target_tenant_id)
     if tenant_id != current.get("tenant_id"):
+        # 模拟态越权收口：仅允许操作当前模拟租户本身，禁止跨租户（即使持 platform:tenant:read）
+        if current.get("impersonated"):
+            raise PermissionDeniedError(
+                message=translate(
+                    "err.tenant.cross_tenant_forbidden",
+                    fallback="无权操作其他租户",
+                )
+            )
         if not await has_permission(
-            current["tenant_id"], current["user_id"], "platform:tenant:read"
+            current["tenant_id"],
+            current["user_id"],
+            "platform:tenant:read",
+            impersonated=current.get("impersonated", False),
+            perms=current.get("perms") or [],
         ):
             raise PermissionDeniedError(
                 message=translate(
@@ -92,6 +119,7 @@ def _filter_visible_menus(menus: list, perms: set[str]) -> list:
     visible = {m for m in menus if not m.permission_code or m.permission_code in perms}
     visible_ids = {m.id for m in visible}
 
+    # 规则 ②：父不可见 → 子连带隐藏（自顶向下传播，迭代到不动点）
     changed = True
     while changed:
         changed = False
@@ -101,12 +129,27 @@ def _filter_visible_menus(menus: list, perms: set[str]) -> list:
                 visible_ids.discard(m.id)
                 changed = True
 
-    result = [
-        m for m in visible
-        if m.id not in parent_of
-        or any(c in visible_ids for c in parent_of[m.id])
-    ]
-    return sorted(result, key=lambda m: (m.sort_order or 0, m.id))
+    # 规则 ③：裁掉「所有子节点都不可见」的组头。
+    #
+    # [jonex] 权限重构 B1 修复：原实现是**单遍**列表推导，对**嵌套组头**失效。
+    # 现象：普通用户（只持 knowledge:read/service:read/space:read）会看到一个空的
+    # 「平台管理」组头 —— 它的子节点是「账号与权限」和「系统运维」两个组头，
+    # 这两个组头因子项全不可见而被裁，但单遍实现里它们仍留在 visible_ids 中，
+    # 于是父组头判定为「有可见子节点」而存活。
+    #
+    # 修法：自底向上迭代到不动点 —— 组头被裁后要从 visible_ids 移除，
+    # 让它的父组头在下一轮重新判定。这才真正落实规则 ③ 的意图「避免出现空分组」。
+    changed = True
+    while changed:
+        changed = False
+        for m in list(visible):
+            children = parent_of.get(m.id)
+            if children and not any(c in visible_ids for c in children):
+                visible.discard(m)
+                visible_ids.discard(m.id)
+                changed = True
+
+    return sorted(visible, key=lambda m: (m.sort_order or 0, m.id))
 
 
 # ==================== 租户管理 ====================
@@ -119,7 +162,13 @@ async def list_tenants(
     current: dict = Depends(get_current_user),
 ):
     svc = TenantService(db)
-    if await has_permission(current["tenant_id"], current["user_id"], "platform:tenant:read"):
+    if await has_permission(
+        current["tenant_id"],
+        current["user_id"],
+        "platform:tenant:read",
+        impersonated=current.get("impersonated", False),
+        perms=current.get("perms") or [],
+    ):
         offset = (page - 1) * page_size
         result = await svc.list(offset, page_size)
         return success_response(data=result)
@@ -135,7 +184,13 @@ async def list_tenants(
 async def get_tenant_user_counts(db=Depends(get_db), current: dict = Depends(get_current_user)):
     """各租户用户数统计（跨租户）；无平台级权限仅返回本租户计数"""
     svc = UserService(db)
-    if await has_permission(current["tenant_id"], current["user_id"], "platform:tenant:read"):
+    if await has_permission(
+        current["tenant_id"],
+        current["user_id"],
+        "platform:tenant:read",
+        impersonated=current.get("impersonated", False),
+        perms=current.get("perms") or [],
+    ):
         counts = await svc.get_user_counts()
         return success_response(data=counts)
     result = await svc.list_users(current["tenant_id"], 0, 10000)
@@ -213,9 +268,16 @@ async def create_user(
     tenant_id = await _resolve_target_tenant(request, db, req.target_tenant_id, current)
     svc = UserService(db)
     result = await svc.create(tenant_id, req)
-    # RBAC 角色绑定：创建时选择了角色则绑定（set_roles 内校验角色存在并失效权限缓存）
-    if req.role_id is not None:
-        await svc.set_roles(tenant_id, result.id, [req.role_id])
+    # RBAC 角色绑定：创建时选择了角色则绑定（set_roles 内校验角色存在并失效权限缓存）。
+    # [jonex] 支持多角色；role_ids 优先，回落到旧的单值 role_id。
+    # 与 create 同一 session/事务，绑定失败会整体回滚，不会留下无角色的用户。
+    role_ids = req.role_ids or ([req.role_id] if req.role_id is not None else [])
+    if role_ids:
+        # [jonex] B1（D4）：建用户时直接选「租户管理员」角色同样要拦，否则绕过 PUT roles
+        await svc.set_roles(
+            tenant_id, result.id, role_ids,
+            operator_permissions=await _operator_permissions(_p),
+        )
     return success_response(data=result.dict())
 
 
@@ -245,9 +307,16 @@ async def update_user(
 
 @router.delete("/users/{user_id}")
 async def delete_user(
-    request: Request, user_id: int, db=Depends(get_db), _p: dict = Depends(require_permission("user:write"))
+    request: Request, user_id: int,
+    target_tenant_id: str | None = Query(None),
+    db=Depends(get_db),
+    _p: dict = Depends(require_permission("user:write")),
+    current: dict = Depends(get_current_user),
 ):
-    tenant_id = extract_tenant_id(request)
+    # [jonex] 补齐跨租户删除：此前只有 extract_tenant_id，与同组其他端点
+    # （POST / PATCH / roles）不一致，平台管理员跨租户删除必然报「用户不存在」。
+    # _resolve_target_tenant 内含跨租户闸门（模拟态禁止 + 需 platform:tenant:read + 目标租户存在）。
+    tenant_id = await _resolve_target_tenant(request, db, target_tenant_id, current)
     svc = UserService(db)
     await svc.delete(tenant_id, user_id)
 
@@ -279,7 +348,11 @@ async def set_user_roles(
 ):
     tenant_id = await _resolve_target_tenant(request, db, req.target_tenant_id, current)
     svc = UserService(db)
-    await svc.set_roles(tenant_id, user_id, req.role_ids)
+    # [jonex] B1（D4）：D4 的主入口 —— 「租户管理员只能由平台管理员指定」
+    await svc.set_roles(
+        tenant_id, user_id, req.role_ids,
+        operator_permissions=await _operator_permissions(_p),
+    )
     return success_response(message="用户角色已更新")
 
 
@@ -372,7 +445,11 @@ async def set_role_users(
 ):
     tenant_id = extract_tenant_id(request)
     svc = RoleService(db)
-    await svc.set_users(tenant_id, role_id, req.user_ids)
+    # [jonex] B1（D4）：往「租户管理员」角色里塞人也是「指定租户管理员」，需透传操作者码
+    await svc.set_users(
+        tenant_id, role_id, req.user_ids,
+        operator_permissions=await _operator_permissions(_p),
+    )
     return success_response(message="角色用户已更新")
 
 
@@ -385,9 +462,7 @@ async def set_role_permissions(
     _p: dict = Depends(require_permission("role:write")),
 ):
     tenant_id = extract_tenant_id(request)
-    from jonex_core.security.permission import get_user_permissions
-
-    operator_permissions = await get_user_permissions(_p["tenant_id"], _p["user_id"])
+    operator_permissions = await _operator_permissions(_p)
     svc = RoleService(db)
     await svc.set_permissions(tenant_id, role_id, req.permission_ids, operator_permissions=operator_permissions)
     return success_response(message="角色权限已更新")
@@ -407,9 +482,25 @@ async def list_permissions(
     # 权限码驱动：仅当前用户持有 platform:admin 时返回平台码（防枚举/防看到不可授予的码）
     from jonex_core.security.permission import get_user_permissions
 
-    perms = await get_user_permissions(current["tenant_id"], current["user_id"])
-    scope = None if "platform:admin" in perms else "tenant"
+    perms = await get_user_permissions(
+        current["tenant_id"], current["user_id"],
+        impersonated=current.get("impersonated"), perms=current.get("perms"),
+    )
+    is_platform_admin = "platform:admin" in perms
+    scope = None if is_platform_admin else "tenant"
     result = await svc.list_permissions(offset, page_size, scope=scope)
+    # [jonex] 权限重构 B1（D4）：tenant:admin 是 scope='tenant' 的码，上面的 scope
+    # 过滤拦不住它，租户管理员会在角色权限页看到这个复选框 —— 但勾了保存必然 403
+    # （RoleService.set_permissions 的 D4 约束）。这里一并隐掉，避免出现
+    # 「配了也没用」的勾选项误导配置者（同 §11.5 删废弃码的理由）。
+    # 平台管理员照常可见可授。
+    if not is_platform_admin:
+        data = result.dict()
+        before = len(data.get("items", []))
+        data["items"] = [it for it in data.get("items", []) if it.get("code") != "tenant:admin"]
+        # total 同步扣减，否则前端分页显示的条数与实际列表不一致
+        data["total"] = max(0, data.get("total", 0) - (before - len(data["items"])))
+        return success_response(data=data)
     return success_response(data=result.dict())
 
 
@@ -427,7 +518,10 @@ async def get_my_menus(db=Depends(get_db), current: dict = Depends(get_current_u
     """当前用户可见菜单树（登录可见，按权限过滤）。"""
     from jonex_core.security.permission import get_user_permissions
 
-    perms = await get_user_permissions(current["tenant_id"], current["user_id"])
+    perms = await get_user_permissions(
+        current["tenant_id"], current["user_id"],
+        impersonated=current.get("impersonated"), perms=current.get("perms"),
+    )
     menus = await MenuRepository(db).list_tree()
     filtered = _filter_visible_menus(menus, perms)
     tree = MenuService._build_tree(filtered)

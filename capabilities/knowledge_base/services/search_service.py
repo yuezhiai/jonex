@@ -28,6 +28,7 @@ from jonex_core.common.object_storage import (
 )
 from jonex_core.common.ontology_embedding import embed
 from jonex_core.common.ontology_llm import (
+    _scene,               # [jonex] 查询期思考分档（快档派生 `_fast` scene）
     answer_from_chunks,   # [jonex] 方案 A：平台侧基于 chunk 作答
     answer_from_facts,
     arbitrate_answers,    # [jonex] S1+S7 双向校验裁决
@@ -134,6 +135,11 @@ ONTOLOGY_NEIGHBOR_DEPTH = max(1, min(
 ONTOLOGY_NEIGHBOR_LIMIT = max(1, int(os.getenv("ONTOLOGY_NEIGHBOR_LIMIT", "20")))
 ONTOLOGY_NEIGHBOR_PER_HOP_LIMIT = max(1, int(os.getenv("ONTOLOGY_NEIGHBOR_PER_HOP_LIMIT", "50")))
 ONTOLOGY_NEIGHBOR_TIMEOUT = max(1, int(os.getenv("ONTOLOGY_NEIGHBOR_TIMEOUT", "15")))
+# ── [jonex] 多意图邻域取证：单次查询最多并发展开多少个「过线命中」实体 ──
+# 查询含多个实体（如「甲实体与乙实体什么关系」）时，对 top-5 中所有过线命中逐一
+# neighbors() 展开邻域、合并 facts 去重再作答，避免只取 top1 漏掉其他实体的关系。
+# 上限 3 平衡召回完整度与 Neo4j 查询次数（并发 gather，复用 ONTOLOGY_NEIGHBOR_TIMEOUT 整体超时）。
+ONTOLOGY_NEIGHBOR_ENTITY_MAX = max(1, int(os.getenv("ONTOLOGY_NEIGHBOR_ENTITY_MAX", "3")))
 
 # ── 方案④：本体作答超时（INSUFFICIENT 快速短路）──
 ONTOLOGY_ANSWER_TIMEOUT = max(5, int(os.getenv("ONTOLOGY_ANSWER_TIMEOUT", "30")))
@@ -182,11 +188,30 @@ _REFUSAL_PATTERNS = [
     re.compile(r"没有.*提及|未.*提及|未.*提供|not\s+mentioned|not\s+provided", re.IGNORECASE),
 ]
 
-# 升级档位（可配，默认 3 档）
+# 升级档位（[jonex] 两档结构，docs/ontology-query-thinking-latency-fix-plan.md §3.3/§3.4）：
+#   快档 = 窄召回 + 1 跳 + 禁思考 + 跳过交叉校验 → 查表式查询 1~3s 秒回。
+#     禁思考避免思考 token 吃光 max_tokens 导致正文为空（根因 1/2）；
+#     跳过交叉校验是因为 desc-only 实体判 mid 会触发 20~96s 的对侧 RAG，
+#     必然撞破档超时 → continue → 该档答案被整体丢弃（query_with_ontology_strict
+#     的 TimeoutError 分支），白花时间。交叉校验不是被省掉，而是挪到精档。
+#   精档 = 全量召回 + 3 跳 + 开思考 + 完整交叉校验 → 快档打分不达标时补齐推理。
+# 要不要推理由 _verify_answer 的实测打分决定，不预判查询复杂度。
+#
+# ⚠️ 超时分层规则：每档「各内层阶段上限之和」必须 < 该档 timeout，
+#    否则档超时会丢弃已生成答案（见上）。台账（§3.4）：
+#      快档 8(邻域) + 12(作答) + 3(refs/verify) = 23 < 25 ✅
+#      精档 15(邻域) + 60(作答) + 20(对侧) + 8(裁决) + 5(refs/verify) = 108 < 120 ✅
+#      合计 25 + 120 = 145 < STRICT_TOTAL_BUDGET(150) ✅
+#    改任一超时都必须重算本台账，并确认前端/网关 HTTP 超时 > 各档之和。
 _STRICT_ESCALATION: list[dict] = [
-    {"top_k": 5, "neighbor_depth": 3, "route_score_min": 1.0, "label": "基线"},
-    {"top_k": 15, "neighbor_depth": 3, "route_score_min": 0.7, "label": "加召回"},
-    {"top_k": 25, "neighbor_depth": 3, "route_score_min": 0.5, "label": "全量"},
+    {"top_k": 5,  "neighbor_depth": 1, "route_score_min": 1.0,
+     "thinking": False, "cross_verify": False,
+     "neighbor_timeout": 8, "answer_timeout": 12,
+     "timeout": 25,  "label": "快档"},
+    {"top_k": 25, "neighbor_depth": 3, "route_score_min": 0.5,
+     "thinking": True,  "cross_verify": True,
+     "neighbor_timeout": 15, "answer_timeout": 60,
+     "timeout": 120, "label": "精档"},
 ]
 
 # ── P1-5 RAG 召回后处理配置 ──
@@ -220,12 +245,33 @@ ONTOLOGY_ARBITRATION_ENABLED = os.getenv(
     "ONTOLOGY_ARBITRATION_ENABLED", "true"
 ).lower() in ("1", "true", "yes", "on")
 ONTOLOGY_ARBITRATION_TIMEOUT = float(os.getenv("ONTOLOGY_ARBITRATION_TIMEOUT", "8"))
+# [jonex] 对侧 RAG 校验的整体超时：超时按「对侧无结果」处理（保留本体原答案），
+# 绝不因校验故障丢答案。默认 20s——取值由精档超时台账反推
+# （docs/ontology-query-thinking-latency-fix-plan.md §3.4）：
+#   15(邻域) + 60(作答) + 20(本项) + 8(裁决) + 5(refs/verify) = 108 < 精档 timeout 120。
+# 快档已由 gear.cross_verify=False 跳过对侧，本超时只对精档生效。
+# 调大本项须同步重算该台账并上调精档 timeout，否则精档会因超时丢弃已生成答案。
+ONTOLOGY_CROSS_RAG_TIMEOUT = float(os.getenv("ONTOLOGY_CROSS_RAG_TIMEOUT", "20"))
 # [jonex] L4.2 检索侧：双路召回配额（row : summary ≈ 3 : 1）。
 # 表格明细行与摘要各自按配额召回，防止连贯摘要抢占全部候选（T4）。
 # 依赖 ctype 存量数据（reparse 后生效；存量 chunk 无 ctype → 不参与配额）。
 RAG_DUAL_PATH_QUOTA_ENABLED = os.getenv(
     "RAG_DUAL_PATH_QUOTA_ENABLED", "true"
 ).lower() in ("1", "true", "yes", "on")
+
+# ── [jonex] §image-refs P4：图片引用配额（先按分数阈值过滤，再取 TopN）──
+# 解决图片描述 chunk 语义聚集导致批量误召回、前端展示大量不相关图片的问题。
+# 分数阈值：低于此值的图片 location 直接丢弃（基于 final_score/relevance/
+# group_final_score/_order_score，语义见 _build_references 图片候选登记段）。
+# 分数语义：rerank 开启时为 0~1 相关性分；关闭时为位置衰减分（1.0→0.0，
+# 0.5 表示排在后半段——注意 rerank 关闭时阈值会误伤后半段候选，此时应设 0）。
+# 默认 0.3：2026-08 以真实文档（岭南画派-10p，62 图）× 6 条真实查询实测，
+# rerank 分呈二值化分布——真相关 ≥0.74（四屏 query 下四屏图 0.745~0.991、
+# 苗松 query 下目标图 0.990），弱相关/无关 ≤0.03（绝大多数 0.000~0.025）。
+# 0.3 位于两带之间（10 倍安全余量），砍噪声带不伤相关带；设 0 关闭过滤。
+RAG_IMAGE_REF_SCORE_MIN = float(os.getenv("RAG_IMAGE_REF_SCORE_MIN", "0.3"))
+# 通过阈值后每个文档保留的图片 location 上限（按分数降序取 TopN）
+RAG_IMAGE_REF_MAX = max(1, int(os.getenv("RAG_IMAGE_REF_MAX", "6")))
 
 # ── P1-6 图查询模板：时间线/枚举/计数意图检测 ──
 _TIMELINE_PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -252,6 +298,24 @@ _ENUM_PATTERNS: list[re.Pattern] = [
     re.compile(r"分别(?:是|的|为)|各自"),
     re.compile(r"所有(?:的)?|全部"),
 ]
+
+
+def _read_gear_overrides(raw: dict) -> tuple[bool, bool, int, int]:
+    """[jonex] 查询期思考分档 override 读取（docs/ontology-query-thinking-latency-fix-plan.md §3.6）。
+
+    缺省值 = 现状（非严格模式与所有非 strict 调用方零行为变化）：
+      _fast_llm=False（保留思考）、_cross_enabled=True（跑对侧）、
+      两个内层超时取原环境变量兜底（ONTOLOGY_NEIGHBOR_TIMEOUT / ONTOLOGY_ANSWER_TIMEOUT）。
+
+    Returns:
+        (fast_llm, cross_enabled, neighbor_timeout, answer_timeout)
+    """
+    return (
+        bool(raw.get("_fast_llm_override", False)),
+        bool(raw.get("_cross_verify_override", True)),
+        int(raw.get("_neighbor_timeout_override", ONTOLOGY_NEIGHBOR_TIMEOUT)),
+        int(raw.get("_answer_timeout_override", ONTOLOGY_ANSWER_TIMEOUT)),
+    )
 
 
 def _evict_stale_entries() -> None:
@@ -479,7 +543,7 @@ class SearchService:
             },
         }
         if req.save_history:
-            await self._history.save_history(
+            history = await self._history.save_history(
                 tenant_id,
                 user_id,
                 SearchHistoryCreateRequest(
@@ -489,9 +553,12 @@ class SearchService:
                     top_k=req.top_k,
                     domain_space_id=req.domain_space_id,
                     answer_preview=answer[:300],
+                    answer=answer,
+                    references=references,
                     duration_ms=duration_ms,
                 ),
             )
+            result["history_id"] = history.get("id")
         return result
 
     async def enhanced_search(
@@ -639,20 +706,141 @@ class SearchService:
                 ref["_row_locs"].setdefault(key, []).append(loc)
             # [jonex] §image-refs P2-1: 图片 location 收集资产候选。aext 只在
             # 同一条 flat dict r 上（to_location 不透出 asset_ext），此处
-            # 登记 (loc, aext)，聚合后统一预签名（见下方资产富化段）。
+            # 登记 (loc, aext, score)，聚合后统一预签名（见下方资产富化段）。
+            # [jonex] §image-refs P4：额外记录检索分数，供图片配额截取使用。
+            # [jonex] J4-c：图片阈值优先用原始相关性（relevance / group_relevance），
+            # 避免 λ 混合导致的尺度漂移——final_score 已混入 subject_score，
+            # 同一阈值在不同组上等效 rel 要求漂移 0.60~0.933（实测见 §13.2）。
+            # 此链仅用于图片配额（_asset_cands），不影响 prompt_refs 排序与截断。
+            # group_final_score：主体加权路径下同组成员不继承代表分，仅带组代表
+            # 的融合分——用它近似成员语义相关性，避免成员只剩召回位置衰减分。
+            # _evidence_score：本体路径归一化证据权重兜底（方案 G2，P1）。
             if loc.get("type") == "image":
-                ref.setdefault("_asset_cands", []).append(
-                    (loc, r.get("asset_ext") or "")
+                _img_score = (
+                    r.get("relevance")
+                    if r.get("relevance") is not None
+                    else r.get("group_relevance")
+                    if r.get("group_relevance") is not None
+                    else r.get("final_score")
+                    if r.get("final_score") is not None
+                    else r.get("group_final_score")
+                    if r.get("group_final_score") is not None
+                    else r.get("_evidence_score")
+                    if r.get("_evidence_score") is not None
+                    else r.get("_order_score", 0.0)
                 )
+                # [jonex] §G2：本体路径 raw_refs 只有 _evidence_score（结构分），
+                # 无语义相关性分。结构分用于组内排序，但不应被语义阈值误杀。
+                _score_source = "structural" if (
+                    r.get("_evidence_score") is not None
+                    and r.get("relevance") is None
+                    and r.get("group_relevance") is None
+                    and r.get("final_score") is None
+                    and r.get("group_final_score") is None
+                ) else "semantic"
+                ref.setdefault("_asset_cands", []).append(
+                    (loc, r.get("asset_ext") or "", _img_score, _score_source)
+                )
+                # [jonex] §image-refs E3：登记图片描述原文（配额段超额 rerank
+                # 用），键为 loc 对象 id——与 _asset_cands 一一对应，聚合后
+                # 用完即弃，不进入输出序列化。
+                ref.setdefault("_asset_texts", {})[id(loc)] = r.get("text") or ""
 
         storage = get_object_storage()
+        # [jonex] §image-refs P4：图片引用配额——先按分数阈值过滤，再按分数
+        # 降序取 TopN。解决图片描述 chunk 语义聚集导致批量误召回的问题。
+        # 此段操作 _asset_cands 和 locations（同步裁剪），确保富化段只处理
+        # 存活的图片 location。
+        for ref in agg.values():
+            cands = ref.get("_asset_cands")
+            if not cands:
+                continue
+            orig_count = len(cands)
+            # [jonex] §image-refs E3 + 方案 G3：超额或同分并列时单独 rerank
+            # 图片描述，让 TopN 挑选有语义依据——主体加权路径下组成员共享
+            # 组代表分（group_final_score / group_relevance），同分并列导致
+            # 稳定排序退化为召回顺序，方案 A 的 batch 误召回保护原样复现。
+            # 本段每 doc 至多一次；失败返回 None 自动回退原码分链。
+            # 尺度注意（§E-6）：E3 分是原始 rerank 相关性（0~1），与代表
+            # final_score（λ>0 时 0.75×rel）尺度不同，阈值灰度时需留意。
+            _scores = [sc for _loc, _ext, sc, *_ in cands]
+            # [jonex] 方案 G3：同分并列（继承组代表分）或全零（无分数来源）
+            # → 无判别力，需 E3 逐张打分。单候选不触发（无排序意义）。
+            _no_discrimination = len(set(_scores)) <= 1
+            # [jonex] §G2：结构分来源（纯 _evidence_score）跳过语义阈值——
+            # 证据权重是图谱距离信号，不是 0~1 语义相关性，不应被
+            # RAG_IMAGE_REF_SCORE_MIN 误杀。只保留 TopN 截断。
+            _structural = any(
+                len(c) >= 4 and c[3] == "structural" for c in cands
+            )
+            if query and RAG_PRELLM_RERANK_ENABLED and (
+                orig_count > RAG_IMAGE_REF_MAX
+                or (orig_count > 1 and _no_discrimination)
+                or (orig_count > 1 and _structural)  # [jonex] I4-a：结构分来源必须 E3 语义打分
+            ):
+                texts = [
+                    ref.get("_asset_texts", {}).get(id(loc), "")
+                    for loc, _ext, _sc, *_ in cands
+                ]
+                d = doc_map[ref["doc_id"]]
+                from jonex_core.common.rerank import rerank
+
+                results = await rerank(
+                    query, texts, tenant_id=tenant_id,
+                    kb_id=d.knowledge_base_id or None,
+                )
+                if results:
+                    score_by_idx = {
+                        x.get("index"): x.get("relevance_score", 0.0)
+                        for x in results
+                    }
+                    cands = [
+                        (loc, ext, score_by_idx.get(i, sc))
+                        for i, (loc, ext, sc, *_rest) in enumerate(cands)
+                    ]
+                    _structural = False  # E3 rerank 后是真实语义分
+                    # [jonex] 临时：E3 段无日志，加一行确认 rerank 分数分布
+                    _e3_scores = sorted(
+                        [score_by_idx.get(i, 0.0) for i in range(len(cands))],
+                        reverse=True,
+                    )
+                    logger.info(
+                        "[image-ref-quota] E3 rerank 完成 doc=%s query=%r "
+                        "cands=%d scores=%s",
+                        ref["doc_id"], query[:60], len(cands),
+                        [round(s, 4) for s in _e3_scores[:6]],
+                    )
+            # 1) 按分数阈值过滤（结构分豁免）
+            if RAG_IMAGE_REF_SCORE_MIN > 0:
+                cands = [
+                    (loc, ext, sc) for loc, ext, sc, *_rest in cands
+                    if sc >= RAG_IMAGE_REF_SCORE_MIN or _structural
+                ]
+            # 2) 按分数降序取 TopN
+            if len(cands) > RAG_IMAGE_REF_MAX:
+                cands = sorted(cands, key=lambda x: x[2], reverse=True)[:RAG_IMAGE_REF_MAX]
+            # 3) 同步从 locations 中移除被裁剪的图片 location
+            survived_locs = {id(loc) for loc, *_ in cands}
+            ref["locations"] = [
+                loc for loc in ref["locations"]
+                if loc.get("type") != "image" or id(loc) in survived_locs
+            ]
+            ref["_asset_cands"] = cands
+            ref.pop("_asset_texts", None)
+            if len(cands) < orig_count:
+                logger.debug(
+                    "[image-ref-quota] doc=%s 图片配额裁剪: %d→%d (阈值=%.2f, topN=%d)",
+                    ref["doc_id"], orig_count, len(cands),
+                    RAG_IMAGE_REF_SCORE_MIN, RAG_IMAGE_REF_MAX,
+                )
+
         # [jonex] §image-refs P2-1: 图片资产 asset_url 富化。key 派生走
         # build_asset_key（ext 白名单归一，路径穿越免疫）；aext 缺失 =
         # 上传失败/开关关闭，跳过不富化（前端按无 asset_url 降级）。
         # 整段 best-effort：任何异常只影响图片预览，不阻断引用产出。
         asset_jobs: list[tuple[str, dict, str]] = []  # (doc_id, loc, ext)
         for ref in agg.values():
-            for loc, ext in ref.pop("_asset_cands", []):
+            for loc, ext, _score, *_rest in ref.pop("_asset_cands", []):
                 if ext:
                     asset_jobs.append((ref["doc_id"], loc, ext))
         if asset_jobs:
@@ -668,7 +856,22 @@ class SearchService:
                 return_exceptions=True,
             )
             for (_did, loc, _ext), res in zip(asset_jobs, results):
-                loc["asset_url"] = res if isinstance(res, str) else None
+                if isinstance(res, str):
+                    loc["asset_url"] = res
+                else:
+                    loc["asset_url"] = None
+                    # [jonex] I1-b：presign 失败不阻断（best-effort），但不再静默——
+                    # SDK 缺失/STS 故障/密钥过期等都会走到这里，需可观测。
+                    logger.warning(
+                        "[asset-url] presign 失败 doc=%s img=%s: %r",
+                        _did, loc.get("image_idx"), res,
+                    )
+
+        # [jonex] 批量查询 KB 名称（一次 DB 查询，避免每条引用单独查）
+        kb_ids_in_refs = list(dict.fromkeys(
+            d.knowledge_base_id for d in doc_map.values() if d.knowledge_base_id
+        ))
+        kb_names = await self._get_kb_names(tenant_id, kb_ids_in_refs) if kb_ids_in_refs else {}
 
         out = []
         for did, ref in agg.items():
@@ -677,11 +880,15 @@ class SearchService:
             if d.storage_key:
                 try:
                     raw_url = await storage.presigned_url(d.storage_key, tenant_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # [jonex] I1-b：与 asset_url 同源——STS SDK 缺失/密钥故障时
+                    # raw_url 也恒为 None，不再静默（best-effort 不阻断，但要可观测）。
+                    logger.warning("[raw-url] presign 失败 doc=%s: %r",
+                                   d.id, exc)
             out.append({
                 "doc_id": did,
                 "kb_id": d.knowledge_base_id,
+                "kb_name": kb_names.get(d.knowledge_base_id) if d.knowledge_base_id else None,
                 "file_name": d.file_name,
                 "mime_type": d.mime_type,
                 "file_size": d.file_size,
@@ -713,17 +920,27 @@ class SearchService:
             docs = [d for d in docs if d.knowledge_base_id in allowed]
 
         storage = get_object_storage()
+        # [jonex] 批量查询 KB 名称
+        kb_ids_in_refs = list(dict.fromkeys(
+            d.knowledge_base_id for d in docs if d.knowledge_base_id
+        ))
+        kb_names = await self._get_kb_names(tenant_id, kb_ids_in_refs) if kb_ids_in_refs else {}
+
         out = []
         for d in docs:
             raw_url = None
             if d.storage_key:
                 try:
                     raw_url = await storage.presigned_url(d.storage_key, tenant_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # [jonex] I1-b：与 asset_url 同源——STS SDK 缺失/密钥故障时
+                    # raw_url 也恒为 None，不再静默（best-effort 不阻断，但要可观测）。
+                    logger.warning("[raw-url] presign 失败 doc=%s: %r",
+                                   d.id, exc)
             out.append({
                 "doc_id": d.id,
                 "kb_id": d.knowledge_base_id,
+                "kb_name": kb_names.get(d.knowledge_base_id) if d.knowledge_base_id else None,
                 "file_name": d.file_name,
                 "mime_type": d.mime_type,
                 "file_size": d.file_size,
@@ -1061,9 +1278,14 @@ class SearchService:
         description，信息全在 attributes 里（全库最可靠的事实来源）；
         只有 desc 空 **且** attrs 空 才是真 stub（如 `Ver1.31`）。
         attributes 兼容 dict 与 JSON 字符串（`"{}"`）两种形态。
+
+        例外：`extraction_method == "manual"` 的用户手动创建实体，即便 desc/attrs
+        皆空也不视为 stub（用户有意创建，非编译管线产出的空壳）。
         """
         if not entity:
             return True
+        if entity.get("extraction_method") == "manual":
+            return False
         has_desc = bool((entity.get("description") or "").strip())
         attrs = entity.get("attributes")
         if isinstance(attrs, str):
@@ -1073,6 +1295,27 @@ class SearchService:
                 attrs = None
         has_attrs = bool(attrs)
         return not has_desc and not has_attrs
+
+    @staticmethod
+    def _entity_has_content(entity: dict | None) -> bool:
+        """实体是否有可作答内容（描述或结构化属性）。
+
+        与 `_is_stub` 的差别：不豁免 `extraction_method == "manual"`——手动实体
+        即便有 manual 标记，只要 desc/attrs 皆空，同样「无内容」。用于命中实体
+        但无内容时的友好提示兜底（避免误导性「未找到」）。
+        attributes 兼容 dict 与 JSON 字符串（`"{}"`）两种形态。
+        """
+        if not entity:
+            return False
+        if (entity.get("description") or "").strip():
+            return True
+        attrs = entity.get("attributes")
+        if isinstance(attrs, str):
+            try:
+                attrs = json.loads(attrs)
+            except Exception:
+                attrs = None
+        return bool(attrs)
 
     @staticmethod
     def _apply_dual_path_quota(
@@ -1415,7 +1658,10 @@ class SearchService:
         # truncate=False：截断必须发生在主体融合之后，否则主体分只对
         # rerank 存活的 top-K 生效（P0-1，§5.4 原文语义）。
         rerank_applied = False
-        if RAG_PRELLM_RERANK_ENABLED and len(reps) > RAG_PRELLM_RERANK_TOPK:
+        # [jonex] §image-refs E1：组代表 ≥2 即 rerank（truncate=False 只打分
+        # 不截断）。旧门槛 >TOPK 是「截断」语义——小结果集（单文档 2~6 组）
+        # 被挡在门外，图片组代表无 relevance 分，final 退化为纯主体分/0 分。
+        if RAG_PRELLM_RERANK_ENABLED and len(reps) > 1:
             rerank_applied = True
             reps = await self._prellm_rerank_chunks(
                 query, reps, tenant_id=tenant_id,
@@ -1463,6 +1709,13 @@ class SearchService:
                 # chunk 级主体分（组内成员逐个算，替代继承代表分）
                 item["subject_score"] = self._subject_score(item, subjects, doc_map)
                 item["group_final_score"] = rep.get("final_score", 0.0)
+                # [jonex] 方案 J4-c：同时下发组代表的**原始 rerank 相关性**
+                # （未经 λ 混合）。图片阈值必须比较原始 rel ——
+                # group_final_score 已混入 subject_score，同一阈值在不同组上
+                # 等效 rel 要求漂移 0.60~0.933（实测见方案文档 §13.2）。
+                # rep 无 relevance（rerank 关闭/失败）时不写入，让分数链自然回落。
+                if rep.get("relevance") is not None:
+                    item["group_relevance"] = rep["relevance"]
                 # 不覆盖成员自身 relevance（rerank 只对代表打过分，
                 # 成员可能带旧路径或后续链路写入的自身分值）
             items_sorted = sorted(
@@ -1512,7 +1765,11 @@ class SearchService:
         """
         from jonex_core.common.rerank import rerank
 
-        if not raw_refs or len(raw_refs) <= RAG_PRELLM_RERANK_TOPK:
+        # [jonex] §image-refs E2：truncate=False（主体融合路径）的目的是
+        # 「打分」而非截断，组代表 ≥2 就值得 rerank；truncate=True（旧
+        # 截断路径，1886/2107 调用点）保持 >TOPK 才处理，行为不变。
+        _threshold = 1 if not truncate else RAG_PRELLM_RERANK_TOPK
+        if not raw_refs or len(raw_refs) <= _threshold:
             return raw_refs
 
         # 提取每个 ref 的代表文本（chunk 原文）
@@ -1524,7 +1781,7 @@ class SearchService:
                 texts.append(txt[:1024])
                 indices.append(i)
 
-        if len(texts) <= RAG_PRELLM_RERANK_TOPK:
+        if len(texts) <= _threshold:
             return raw_refs
 
         try:
@@ -1587,12 +1844,15 @@ class SearchService:
         ontology_instances: list[dict],
         facts: list[dict] | None,
         collector: ReasoningCollector | None = None,
+        query: str = "",
     ) -> list[dict]:
         """方案⑦：从本体 source_chunks 直接构建 chunk 级引用，不回 LightRAG。
 
         收集命中实体 + facts 各 target_entity 的 source_chunks[].file_path，
         经 parse_file_source → _build_references 产出完整 references（含 COS 预签名/文件名）。
         source_chunks 为空的实体退化为文档级引用（_build_references_by_doc_ids）。
+
+        query：[jonex] 方案 G1 透传原始查询词，打通 E3 图片描述 rerank 兜底。
         """
         t = time.perf_counter()
 
@@ -1600,6 +1860,7 @@ class SearchService:
         weighted_sc: list[tuple[float, str]] = []   # (weight, file_path)
         chunk_doc_ids: list[str] = []
         fallback_doc_ids: list[str] = []
+        content_by_key: dict[tuple, str] = {}  # [jonex] I4-a 路线 B：source_chunks[].content → chunk key
 
         for ent in (ontology_instances or []):
             # 实体权重：命中实体的 confidence 加成（0.1~1.0 → 权重 1.1~2.0）
@@ -1608,8 +1869,19 @@ class SearchService:
             if isinstance(sc, list) and sc:
                 for s in sc:
                     fp = s.get("file_path") if isinstance(s, dict) else None
+                    c = (s.get("content") or "").strip() if isinstance(s, dict) else ""
                     if fp:
                         weighted_sc.append((w, fp))
+                        # [jonex] I4-a 路线 B：命中实体同口径登记 content
+                        if c:
+                            for seg in fp.split("<SEP>"):
+                                seg = seg.strip()
+                                if not seg:
+                                    continue
+                                parsed = parse_file_source(seg)
+                                if parsed and parsed.get("doc_id"):
+                                    k = (parsed["doc_id"], parsed.get("chunk_index"))
+                                    content_by_key.setdefault(k, c)
             else:
                 for did in (ent.get("doc_ids") or []):
                     if did:
@@ -1625,8 +1897,20 @@ class SearchService:
                 if isinstance(sc, list) and sc:
                     for s in sc:
                         fp = s.get("file_path") if isinstance(s, dict) else None
+                        c = (s.get("content") or "").strip() if isinstance(s, dict) else ""
                         if fp:
                             weighted_sc.append((w_fact, fp))
+                            # [jonex] I4-a 路线 B：本体编译时已把图片 VLM 描述
+                            # 存进 source_chunks[].content，查询侧直接读，零额外查询。
+                            if c:
+                                for seg in fp.split("<SEP>"):
+                                    seg = seg.strip()
+                                    if not seg:
+                                        continue
+                                    parsed = parse_file_source(seg)
+                                    if parsed and parsed.get("doc_id"):
+                                        k = (parsed["doc_id"], parsed.get("chunk_index"))
+                                        content_by_key.setdefault(k, c)
                 else:
                     for did in (te.get("doc_ids") or []):
                         if did:
@@ -1674,12 +1958,57 @@ class SearchService:
         # S3 重排：证据权重降序，同权重按贡献事实数降序（多事实共证的 chunk 优先），
         # 其余保持收集顺序（sort 稳定）
         key_order.sort(key=lambda k: (-score[k], -contrib[k]))
-        raw_refs = [parsed_by_key[k] for k in key_order]
+        # [jonex] 方案 G2：归一化证据权重写入 _evidence_score。
+        # _ontology_refs 产出的 raw_refs 只有 parse_file_source 的结构字段
+        # （无 text/final_score/relevance），在 _build_references 分数链中
+        # 全部落空 → _img_score=0.0 → 被阈值裁掉。证据权重是本体路径图片唯一
+        # 可用的分数信号——归一化到 (0,1] 后写入，让图片拿到非零分通过阈值。
+        _max_score = max(score.values()) if score else 0.0
+        raw_refs = []
+        for k in key_order:
+            ref = parsed_by_key[k]
+            if _max_score > 0:
+                ref["_evidence_score"] = score[k] / _max_score
+            # [jonex] I4-a 主路径（路线 B）：图片 chunk 优先读编译时存入
+            # source_chunks[].content 的 VLM 描述，零额外查询。
+            if ref.get("image_idx") is not None and not ref.get("text"):
+                ref["text"] = content_by_key.get(
+                    (ref["doc_id"], ref.get("chunk_index")), "")
+            raw_refs.append(ref)
         chunk_doc_ids = [parsed_by_key[k]["doc_id"] for k in key_order]
+
+        # ── [jonex] I4-a 兜底（路线 C）：路线 B 未覆盖的图片（存量/content
+        # 为空），从 LightRAG 回捞 chunk 正文（VLM 描述）。B 覆盖时零 IO。
+        _img_no_text = [r for r in raw_refs
+                        if r.get("image_idx") is not None and not r.get("text")]
+        if _img_no_text:
+            _miss_docs = list(dict.fromkeys(
+                r["doc_id"] for r in _img_no_text if r.get("doc_id")))
+            _chunk_text_map: dict[tuple, str] = {}
+            for did in _miss_docs:
+                try:
+                    result = await get_rag_client().get_doc_chunks(
+                        document_id=did,
+                        knowledge_base_id=kb_ids[0] if kb_ids else "",
+                        tenant_id=tenant_id,
+                    )
+                    for c in (result.get("chunks") or []):
+                        fp = c.get("file_path") or ""
+                        ci = parse_file_source(fp).get("chunk_index") if fp else None
+                        content = c.get("content") or ""
+                        if ci is not None and content:
+                            _chunk_text_map[(did, ci)] = content
+                except Exception as exc:
+                    logger.warning("[I4-a/C] 回捞图片 chunk 正文失败 doc=%s: %r", did, exc)
+            for r in _img_no_text:
+                if not r.get("text"):
+                    r["text"] = _chunk_text_map.get(
+                        (r["doc_id"], r.get("chunk_index")), "")
 
         # ── chunk 级引用（source_chunks 命中）──
         refs = await self._build_references(
             tenant_id, raw_refs, allowed_kb_ids=kb_ids,
+            query=query,       # [jonex] 方案 G1：打通 E3 图片描述 rerank 兜底
         ) if raw_refs else []
 
         # ── 文档级兜底（source_chunks 为空或 stub 实体）──
@@ -1724,6 +2053,7 @@ class SearchService:
         trace_id: str | None,
         collector: ReasoningCollector | None = None,
         ontology_instances: list[dict] | None = None,
+        fast_mode: bool = False,
     ) -> dict:
         """[jonex] 方案 A 新路径（§6.1）：多 KB 只召回（only_need_context）→ 平台侧一次作答。
 
@@ -1835,9 +2165,19 @@ class SearchService:
             )
 
         # ── 4) 预算硬截（按分数从高到低，总长 ≤ RAG_ANSWER_MAX_CONTEXT_CHARS）──
+        # [jonex] 软删防御（prompt 层）：doc_map 按 tenant + is_deleted==0 预查，
+        # 已删除文档的残留 chunk（LightRAG 清理失败的幽灵）直接跳过，不进预算、
+        # 不参与作答——答案与引用同源，prompt_chunk_count 与 recall_count 收敛一致。
+        allowed = set(kb_ids)
         prompt_refs: list[dict] = []
         total = 0
+        ghost_filtered = 0
         for r in all_raw_refs:
+            did = r.get("doc_id")
+            d = doc_map.get(did)
+            if d is None or d.knowledge_base_id not in allowed:
+                ghost_filtered += 1
+                continue
             text = (r.get("text") or "").strip()
             if not text:
                 continue
@@ -1847,6 +2187,34 @@ class SearchService:
             total += len(text)
         if not prompt_refs:
             raise RuntimeError("预算截断后无可用 chunk")
+        if ghost_filtered:
+            logger.warning(
+                "prompt 层软删防御: 剔除 %d 个已删除文档的残留 chunk，"
+                "作答上下文剩 %d 个（答案与引用同源）",
+                ghost_filtered, len(prompt_refs),
+            )
+
+        # ── 4.5) 召回明细（口径同旧路径 rag_fallback 的 recalls：实际进入
+        # prompt 的 chunk，与 references 同源——答案/引用/明细三者一致）──
+        recalls: list[dict] = []
+        if ONTOLOGY_RAG_RECALL_DETAIL_ENABLED and collector and prompt_refs:
+            for r in prompt_refs[:ONTOLOGY_RAG_RECALL_MAX_ITEMS]:
+                did = r.get("doc_id")
+                d = doc_map.get(did)
+                # 租户+跨库防御：doc_map 已按 tenant_id 查询；查不到或库外一律剔除
+                if d is None or d.knowledge_base_id not in allowed:
+                    continue
+                text = r.get("text") or ""
+                if len(text) > ONTOLOGY_RAG_RECALL_TEXT_MAX:
+                    text = text[:ONTOLOGY_RAG_RECALL_TEXT_MAX] + "…"
+                recalls.append({
+                    "doc_id": did,
+                    "file_name": d.file_name,
+                    "kb_id": d.knowledge_base_id,
+                    "chunk_index": r.get("chunk_index"),
+                    "chunk_id": r.get("chunk_id"),
+                    "text": text,
+                })
 
         if collector:
             collector.step(
@@ -1860,6 +2228,9 @@ class SearchService:
                     "kb_failed": kb_failed,
                     "raw_recall_count": raw_recall_count,
                     "prompt_chunk_count": len(prompt_refs),
+                    "soft_deleted_filtered": ghost_filtered,
+                    "recall_count": len(recalls),
+                    "recalls": recalls,
                     "subject_weighting": subject_stats,
                     "only_need_context": True,
                 },
@@ -1874,6 +2245,7 @@ class SearchService:
             kb_id=kb_ids[0] if kb_ids else None,
             user_id=user_id,
             trace_id=trace_id,
+            fast_mode=fast_mode,
         )
         answer_ms = int((time.perf_counter() - t_answer) * 1000)
         if collector:
@@ -1883,7 +2255,7 @@ class SearchService:
                 detail={
                     "chunk_count": len(prompt_refs),
                     "answer_ms": answer_ms,
-                    "scene": "rag_chunk_qa",
+                    "scene": _scene("rag_chunk_qa", fast_mode),
                 },
                 t_start=t_answer,
             )
@@ -1910,6 +2282,7 @@ class SearchService:
         kb_ids: list[str], trace_id: str | None,
         collector: ReasoningCollector | None = None,
         ontology_instances: list[dict] | None = None,
+        fast_mode: bool = False,
     ) -> dict:
         """策略 A：并行查询全部 KB 的 RAG → LLM 融合。
 
@@ -1939,6 +2312,7 @@ class SearchService:
                     tenant_id, user_id, req, kb_ids, trace_id,
                     collector=collector,
                     ontology_instances=ontology_instances,
+                    fast_mode=fast_mode,
                 )
             except Exception as e:
                 logger.warning(
@@ -2181,6 +2555,7 @@ class SearchService:
             answer = await fuse_rag_answers(
                 req.query, per_kb_fused,
                 tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
+                fast_mode=fast_mode,
             )
             fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
             if collector:
@@ -2866,7 +3241,7 @@ class SearchService:
             verify_result = {"checks": checks, "score": score, "passed": score >= req.strict_min_score, "unmet": [k for k, v in checks.items() if v < 0.6]}
             reliability = self._build_reliability(verify_result, 1, min_score=req.strict_min_score)  # deep 单次编排视为 1 次尝试
 
-        return {
+        result = {
             "answer": answer,
             "source": "deep",
             "references": all_refs or [],
@@ -2886,6 +3261,28 @@ class SearchService:
                 for f in facts
             ],
         }
+        if req.save_history:
+            history = await self._history.save_history(
+                tenant_id, user_id,
+                SearchHistoryCreateRequest(
+                    query=req.query,
+                    knowledge_base_id="" if len(kb_ids) > 1 else (kb_ids[0] if kb_ids else ""),
+                    mode=req.mode,
+                    top_k=req.top_k,
+                    domain_space_id=req.domain_space_id,
+                    answer_preview=(answer or "")[:300],
+                    answer=answer,
+                    references=all_refs or [],
+                    reasoning=result["reasoning"],
+                    metadata={
+                        "knowledge_base_ids": kb_ids,
+                        "source": "deep",
+                        "pipeline": "deep",
+                    },
+                ),
+            )
+            result["history_id"] = history.get("id")
+        return result
 
     async def query_with_ontology_strict(
         self,
@@ -2912,26 +3309,35 @@ class SearchService:
             label = gear.get("label", f"第{i + 1}次")
 
             # 构造升级参数（必须复位 strict_mode=False 防止无限递归）
+            # [jonex] 查询期思考分档 override（§3.6）：thinking/cross_verify/内层超时
+            # 随档位注入，与既有 _route_score_min_override/_neighbor_depth_override 同构。
             sub_req = req.copy(update={
                 "top_k": gear["top_k"],
                 "with_reasoning": req.with_reasoning,
                 "strict_mode": False,
+                "save_history": False,  # 内层循环不落库，strict 最外层统一落一条
                 "_route_score_min_override": gear.get("route_score_min", ONTOLOGY_ROUTE_SCORE_MIN),
                 "_neighbor_depth_override": gear.get("neighbor_depth", ONTOLOGY_NEIGHBOR_DEPTH),
+                "_fast_llm_override": not gear.get("thinking", True),
+                "_cross_verify_override": gear.get("cross_verify", True),
+                "_neighbor_timeout_override": gear.get("neighbor_timeout", ONTOLOGY_NEIGHBOR_TIMEOUT),
+                "_answer_timeout_override": gear.get("answer_timeout", ONTOLOGY_ANSWER_TIMEOUT),
             })
 
+            # [jonex] 每档独立超时（§3.4）：原全局 60s 对快档过松、对精档过紧。
+            gear_timeout = gear.get("timeout", _STRICT_ATTEMPT_TIMEOUT)
             try:
                 result = await asyncio.wait_for(
                     self.query_with_ontology(
                         tenant_id, user_id, sub_req, trace_id,
                     ),
-                    timeout=_STRICT_ATTEMPT_TIMEOUT,
+                    timeout=gear_timeout,
                 )
             except asyncio.TimeoutError:
                 collector.step(
                     STAGE_STRICT_ATTEMPT, f"严格模式·第{i + 1}次尝试（{label}）",
                     status="failed",
-                    summary=f"尝试超时（{_STRICT_ATTEMPT_TIMEOUT}s），进入下一档",
+                    summary=f"尝试超时（{gear_timeout}s），进入下一档",
                     t_start=t_i,
                 )
                 continue
@@ -3024,6 +3430,28 @@ class SearchService:
             "steps": strict_steps + inner_steps,
         }
         result["reasoning"] = merged
+        if req.save_history:
+            kb_ids_for_hist = result.get("knowledge_base_ids") or []
+            history = await self._history.save_history(
+                tenant_id, user_id,
+                SearchHistoryCreateRequest(
+                    query=req.query,
+                    knowledge_base_id="" if len(kb_ids_for_hist) > 1 else (kb_ids_for_hist[0] if kb_ids_for_hist else ""),
+                    mode=req.mode,
+                    top_k=req.top_k,
+                    domain_space_id=req.domain_space_id,
+                    answer_preview=(result.get("answer") or "")[:300],
+                    answer=result.get("answer"),
+                    references=result.get("references") or [],
+                    reasoning=result.get("reasoning"),
+                    metadata={
+                        "knowledge_base_ids": kb_ids_for_hist,
+                        "source": result.get("source"),
+                        "pipeline": "ontology-strict",
+                    },
+                ),
+            )
+            result["history_id"] = history.get("id")
         return result
 
     async def query_with_ontology(
@@ -3058,6 +3486,9 @@ class SearchService:
         _neighbor_depth_override = int(raw.get("_neighbor_depth_override", ONTOLOGY_NEIGHBOR_DEPTH))
         _route_min = max(0.0, min(_route_override, ONTOLOGY_ROUTE_SCORE_MIN))
         _nb_depth = max(1, min(_neighbor_depth_override, ONTOLOGY_NEIGHBOR_DEPTH_MAX))
+        # ── [jonex] 查询期思考分档 override（docs/ontology-query-thinking-latency-fix-plan.md §3.6）
+        # 读取逻辑见 _read_gear_overrides；缺省值 = 现状（零行为变化）。
+        _fast_llm, _cross_enabled, _nb_timeout, _answer_timeout = _read_gear_overrides(raw)
 
         kb_ids = await self._resolve_kb_ids(tenant_id, req)
         gdao = OntologyGraphRepository(get_neo4j_driver())
@@ -3077,7 +3508,16 @@ class SearchService:
                          if ontology_instances else "三级匹配均未命中"),
                 detail={
                     "hits": [
-                        {"name": i.get("name"), "score": i.get("score"), "kb_id": i.get("kb_id")}
+                        {
+                            "name": i.get("name"),
+                            "score": i.get("score"),
+                            "kb_id": i.get("kb_id"),
+                            "type": i.get("type"),
+                            "description": i.get("description"),
+                            "attributes": i.get("attributes"),
+                            "confidence": i.get("confidence"),
+                            "doc_ids": i.get("doc_ids"),
+                        }
                         for i in ontology_instances[:5]
                     ],
                     "total_hits": len(ontology_instances),
@@ -3099,16 +3539,20 @@ class SearchService:
 
         if ontology_instances:
             # 路由判定：top-5 内任一命中即走本体（避免高 vscore 候选因全文 rank 落后被埋没）
+            # [jonex] 多意图：收集所有过线命中（上限 ONTOLOGY_NEIGHBOR_ENTITY_MAX），
+            # 供阶段 3 逐一展开邻域；matched 仍取首个（向后兼容路由展示/时间线模板）。
             top_n = ontology_instances[:5]
             go_ontology = False
+            matched_list: list[dict] = []
             for hit in top_n:
                 src = hit.get("source", "")
                 vs = hit.get("vscore", 0)
                 fs = hit.get("ft_score", hit.get("score", 0))
                 if src in ("exact", "prefix") or vs >= ONTOLOGY_VECTOR_SCORE_MIN or fs >= _route_min:
                     go_ontology = True
-                    matched = hit
-                    break
+                    if len(matched_list) < ONTOLOGY_NEIGHBOR_ENTITY_MAX:
+                        matched_list.append(hit)
+            matched = matched_list[0] if matched_list else None
 
             top_source = matched.get("source", "") if matched else ""
             top_vscore = matched.get("vscore", 0) if matched else 0.0
@@ -3171,17 +3615,53 @@ class SearchService:
                 facts = graph_facts  # P1-6 图查询模板已取到 fact 则跳过 neighbors()
                 if facts is None and not enum_intent:  # S5：枚举意图不取邻域，facts=None → 自然降级 RAG
                     try:
-                        neighbor_data = await asyncio.wait_for(
-                            gdao.neighbors(
-                                tenant_id, top_kb_id, top_name,
+                        # [jonex] 多意图：对 matched_list 里所有过线实体并发展开邻域，
+                        # 合并 facts 按 (target, relation_type, path) 去重，避免只取
+                        # top1 漏掉其他实体的关系。单实体时退化为原单次
+                        # neighbors()；单个实体失败不阻断其余，仅记 warning。
+                        async def _fetch_neighbors(m: dict):
+                            _kb = m.get("kb_id") or kb_ids[0]
+                            _name = m.get("name", "")
+                            return _kb, _name, await gdao.neighbors(
+                                tenant_id, _kb, _name,
                                 limit=ONTOLOGY_NEIGHBOR_LIMIT,
                                 depth=_nb_depth,
                                 per_hop_limit=ONTOLOGY_NEIGHBOR_PER_HOP_LIMIT,
+                            )
+
+                        neighbor_results = await asyncio.wait_for(
+                            asyncio.gather(
+                                *[_fetch_neighbors(m) for m in matched_list],
+                                return_exceptions=True,
                             ),
-                            timeout=ONTOLOGY_NEIGHBOR_TIMEOUT,
+                            timeout=_nb_timeout,
                         )
-                        facts = neighbor_data.get("facts", [])
-                        neighbor_depth = neighbor_data.get("depth", 1)
+                        facts = []
+                        neighbor_depth = 1
+                        hop_distribution: dict[int, int] = {}
+                        truncated = False
+                        seen_facts: set[tuple] = set()
+                        for _kb, _name, res in neighbor_results:
+                            if isinstance(res, Exception):
+                                logger.warning(
+                                    "[ontology] 邻域取证失败 entity=%s kb=%s: %s",
+                                    _name, _kb, res,
+                                )
+                                continue
+                            neighbor_depth = max(neighbor_depth, int(res.get("depth", 1)))
+                            truncated = truncated or bool(res.get("truncated", False))
+                            for h, c in (res.get("hop_distribution") or {}).items():
+                                hop_distribution[h] = hop_distribution.get(h, 0) + c
+                            for f in res.get("facts", []):
+                                key = (
+                                    f.get("target", ""),
+                                    f.get("relation_type", ""),
+                                    tuple(f.get("path") or []),
+                                )
+                                if key in seen_facts:
+                                    continue
+                                seen_facts.add(key)
+                                facts.append(f)
                         collector.step(
                             STAGE_FACT_LOOKUP, "邻域事实检索",
                             summary=(
@@ -3190,12 +3670,12 @@ class SearchService:
                                    if neighbor_depth > 1 else "（1 跳）")
                             ),
                             detail={
-                                "entity": top_name,
+                                "entities": [m.get("name", "") for m in matched_list],
                                 "kb_id": top_kb_id,
                                 "fact_count": len(facts),
                                 "depth": neighbor_depth,
-                                "hop_distribution": neighbor_data.get("hop_distribution", {}),
-                                "truncated": neighbor_data.get("truncated", False),
+                                "hop_distribution": hop_distribution,
+                                "truncated": truncated,
                                 "facts": facts,
                             },
                             t_start=t,
@@ -3203,7 +3683,7 @@ class SearchService:
                     except asyncio.TimeoutError:
                         collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
                                        summary="邻域查询超时，降级 OntoRAG", t_start=t)
-                        logger.warning("[ontology] 邻域查询超时（%ds），降级 RAG", ONTOLOGY_NEIGHBOR_TIMEOUT)
+                        logger.warning("[ontology] 邻域查询超时（%ds），降级 RAG", _nb_timeout)
                     except Exception as e:
                         collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
                                        summary="邻域检索失败，降级 OntoRAG", t_start=t)
@@ -3242,26 +3722,67 @@ class SearchService:
                                 user_id=user_id,
                                 trace_id=trace_id,
                                 allow_common_sense=_from_graph_template,
+                                fast_mode=_fast_llm,
                             ),
-                            timeout=ONTOLOGY_ANSWER_TIMEOUT,   # [jonex] 方案④ 可调超时
+                            timeout=_answer_timeout,   # [jonex] 方案④ 可调超时（两档覆写）
                         )
                         if llm_answer and llm_answer != "INSUFFICIENT":
                             answer = llm_answer
                             source = "ontology"
                             rag_used = False
                             collector.step(STAGE_LLM_ANSWER, "本体事实作答",
-                                           summary="基于本体事实生成答案", t_start=t)
+                                           summary="基于本体事实生成答案", t_start=t,
+                                           detail={"thinking": not _fast_llm,
+                                                   "answer_timeout": _answer_timeout})
                         else:
                             collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="skipped",
                                            summary="事实不足（INSUFFICIENT），降级 OntoRAG", t_start=t)
                     except asyncio.TimeoutError:
                         collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="failed",
-                                       summary=f"本体 LLM 超时（{ONTOLOGY_ANSWER_TIMEOUT}s），降级 OntoRAG", t_start=t)
-                        logger.warning("[ontology] 本体 LLM 回答超时（%ds），降级 RAG", ONTOLOGY_ANSWER_TIMEOUT)
+                                       summary=f"本体 LLM 超时（{_answer_timeout}s），降级 OntoRAG", t_start=t)
+                        logger.warning("[ontology] 本体 LLM 回答超时（%ds），降级 RAG", _answer_timeout)
                     except Exception as e:
                         collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="failed",
                                        summary="本体作答失败，降级 OntoRAG", t_start=t)
                         logger.warning("[ontology] 本体问答失败，降级 RAG: %s", e)
+
+                # ── [jonex] 命中实体但无内容兜底（避免误导性「未找到」）──
+                # 手动实体只有名字、无 desc/attrs/关系时，answer_from_facts 正确返回
+                # INSUFFICIENT。此时不降级 RAG（RAG 无关联文档，必然空手而归），直接
+                # 返回「已找到实体但未录入内容」的友好提示。
+                # 触发条件须严格：facts 为空列表（neighbors 成功但无关系，而非超时/失败
+                # 留下的 None），且命中实体确实无 desc/attrs 才兜底，不误伤有内容实体。
+                if (
+                    answer is None
+                    and matched_list
+                    and facts is not None
+                    and not facts
+                ):
+                    empty_names = [
+                        h.get("name", "")
+                        for h in matched_list
+                        if not self._entity_has_content(h)
+                    ]
+                    if empty_names:
+                        names_text = "、".join(
+                            f"「{n}」" for n in empty_names[:ONTOLOGY_NEIGHBOR_ENTITY_MAX]
+                        )
+                        answer = (
+                            f"已找到实体 {names_text}，但未录入描述或属性，"
+                            "暂时无法回答具体内容。请先为该实体补充描述/属性，"
+                            "或尝试换个方式提问。"
+                        )
+                        source = "ontology"
+                        rag_used = False
+                        collector.step(
+                            STAGE_LLM_ANSWER, "空内容实体兜底",
+                            summary="命中实体但无描述/属性/关系，返回友好提示",
+                            detail={"entities": empty_names},
+                        )
+                        logger.info(
+                            "[ontology] 命中空内容实体，返回友好提示 entities=%s query=%r",
+                            empty_names, req.query,
+                        )
             else:
                 logger.info(
                     "[ontology] 路由=RAG降级（命中但分数不足）source=%s vscore=%.4f ft_score=%s query=%r",
@@ -3273,7 +3794,8 @@ class SearchService:
         if answer is None:
             fallback = await self._rag_fallback_multi(
                 tenant_id, user_id, req, kb_ids, trace_id, collector=collector,
-                ontology_instances=ontology_instances)
+                ontology_instances=ontology_instances,
+                fast_mode=_fast_llm)
             answer = fallback["answer"]
             references = fallback["references"]
             source = "rag"
@@ -3283,18 +3805,24 @@ class SearchService:
                 tenant_id=tenant_id, kb_ids=kb_ids,
                 ontology_instances=ontology_instances, facts=facts,
                 collector=collector,
+                query=req.query,   # [jonex] 方案 G1：打通 E3 图片描述 rerank 兜底
             )
 
         # ── [jonex] S1+S7：双向校验与裁决（§14.2/§15.4，两路答案就绪后）──
         # 高置信 → 不跑对侧（保持单路延迟）；中/低置信或 RAG 侧命中本体
         # 结构化槽位 → 裁决；异常一律回退现有答案（绝不因裁决故障丢答案）。
-        if ONTOLOGY_ARBITRATION_ENABLED and answer:
+        if ONTOLOGY_ARBITRATION_ENABLED and answer and not _cross_enabled:
+            # [jonex] 两档升档（§3.3）：快档跳过对侧校验，精档才跑 S1+S7
+            collector.step(STAGE_ARBITRATION, "双向校验裁决", status="skipped",
+                           summary="快档跳过对侧校验（cross_verify=false）")
+        elif ONTOLOGY_ARBITRATION_ENABLED and answer:
             try:
                 final = await self._cross_verify(
                     tenant_id, user_id, req, kb_ids, trace_id,
                     answer=answer, source=source, references=references,
                     facts=facts, ontology_instances=ontology_instances,
                     collector=collector,
+                    fast_mode=_fast_llm, answer_timeout=_answer_timeout,
                 )
                 if final is not None:
                     answer = final["answer"]
@@ -3308,7 +3836,7 @@ class SearchService:
                         summary=f"裁决失败回退原答案（{source}）",
                     )
 
-        return {
+        result = {
             "answer": answer,
             "source": source,
             "references": references,
@@ -3317,6 +3845,28 @@ class SearchService:
             "knowledge_base_ids": kb_ids,
             "reasoning": collector.build(source),
         }
+        if req.save_history:
+            history = await self._history.save_history(
+                tenant_id, user_id,
+                SearchHistoryCreateRequest(
+                    query=req.query,
+                    knowledge_base_id="" if len(kb_ids) > 1 else (kb_ids[0] if kb_ids else ""),
+                    mode=req.mode,
+                    top_k=req.top_k,
+                    domain_space_id=req.domain_space_id,
+                    answer_preview=(answer or "")[:300],
+                    answer=answer,
+                    references=references,
+                    reasoning=result["reasoning"],
+                    metadata={
+                        "knowledge_base_ids": kb_ids,
+                        "source": source,
+                        "pipeline": "ontology",
+                    },
+                ),
+            )
+            result["history_id"] = history.get("id")
+        return result
 
     # ── [jonex] S1+S7 双向校验与裁决 ───────────────────────────────────
 
@@ -3503,6 +4053,8 @@ class SearchService:
         facts: list[dict] | None,
         ontology_instances: list[dict] | None,
         collector: ReasoningCollector | None,
+        fast_mode: bool = False,
+        answer_timeout: int = ONTOLOGY_ANSWER_TIMEOUT,
     ) -> dict | None:
         """S1+S7 统一裁决入口（§14.2/§15.4）。
 
@@ -3526,15 +4078,29 @@ class SearchService:
             )
             if confidence == "high":
                 return None  # 高置信不跑对侧（保持单路延迟）
-            # 中/低置信 → 跑 RAG 对侧
+            # 中/低置信 → 跑 RAG 对侧（§4.4：整体超时兜底，超时按对侧无结果处理）
             t = time.perf_counter()
-            fallback = await self._rag_fallback_multi(
-                tenant_id, user_id, req, kb_ids, trace_id,
-                collector=collector, ontology_instances=ontology_instances,
-            )
-            rag_answer = fallback["answer"]
-            rag_refs = fallback["references"]
-            if collector:
+            try:
+                fallback = await asyncio.wait_for(
+                    self._rag_fallback_multi(
+                        tenant_id, user_id, req, kb_ids, trace_id,
+                        collector=collector, ontology_instances=ontology_instances,
+                        fast_mode=fast_mode,
+                    ),
+                    timeout=ONTOLOGY_CROSS_RAG_TIMEOUT,
+                )
+                rag_answer = fallback["answer"]
+                rag_refs = fallback["references"]
+            except asyncio.TimeoutError:
+                # 落到下方 "not rag_answer" 分支返回原答案（unverified）
+                logger.warning("[ontology] 对侧 RAG 校验超时（%.0fs），保留本体原答案", ONTOLOGY_CROSS_RAG_TIMEOUT)
+                rag_answer, rag_refs = "", []
+                if collector:
+                    collector.step(
+                        STAGE_ARBITRATION, "对侧 RAG 校验超时", status="failed",
+                        summary=f"超时 {ONTOLOGY_CROSS_RAG_TIMEOUT:.0f}s，保留本体答案（unverified）",
+                    )
+            if collector and rag_answer:
                 collector.step(
                     STAGE_ARBITRATION, "裁决触发（本体中/低置信）",
                     summary=(
@@ -3565,8 +4131,9 @@ class SearchService:
                         tenant_id=tenant_id,
                         kb_id=kb_ids[0] if kb_ids else None,
                         user_id=user_id, trace_id=trace_id,
+                        fast_mode=fast_mode,
                     ),
-                    timeout=ONTOLOGY_ANSWER_TIMEOUT,
+                    timeout=answer_timeout,
                 )
             except Exception:
                 return None
@@ -3576,6 +4143,7 @@ class SearchService:
                 tenant_id=tenant_id, kb_ids=kb_ids,
                 ontology_instances=ontology_instances, facts=facts,
                 collector=collector,
+                query=req.query,   # [jonex] 方案 G1：打通 E3 图片描述 rerank 兜底
             )
             if collector:
                 collector.step(
@@ -3663,39 +4231,147 @@ class SearchService:
 
     # ── [jonex] OpenKB 分流 — 批量管线查询、search_llmwiki、search_mix ──
 
+    @staticmethod
+    def _merge_references(*groups: list[dict]) -> list[dict]:
+        """[jonex] 合并多侧引用，按 doc_id 去重保序。
+
+        混合检索里 OntoRAG 与 llm-wiki 可能引用同一份文档（前者 chunk 级命中，
+        后者经 wiki 页溯源）。传入顺序即优先级——先到的保留，因此把证据更强的
+        一侧放前面（OntoRAG 的 chunk 级引用带 locations，信息比派生引用多）。
+        无 doc_id 的条目按原样保留，不参与去重。
+        """
+        out: list[dict] = []
+        seen: set[str] = set()
+        for group in groups:
+            for ref in group or []:
+                doc_id = str((ref or {}).get("doc_id") or "")
+                if not doc_id:
+                    out.append(ref)
+                    continue
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                out.append(ref)
+        return out
+
     async def _build_openkb_references(
         self, tenant_id: str, per_kb_traces: list[tuple[str, list[dict]]],
     ) -> list[dict]:
-        """[jonex] 从 agent 的 wiki 浏览轨迹反解出引用。
+        """[jonex] 从 agent 的 wiki 浏览轨迹反解出引用（方案 B，答案定稿后执行）。
 
         per_kb_traces: [(kb_id, turns), ...] 其中 turns 是 _extract_run_trace 产出。
-        只有 summaries/ 与 sources/ 下的页面能对应到 Jonex 文档。
-        entities/concepts 页不做为引用（无对应 PG 文档）。
+
+        溯源口径（决策见 docs/openkb/llmwiki-reasoning/03-references-and-images.md
+        §1.4，原选 A「概念/实体页不进引用」，现改选 B）：
+          · summaries/<uuid>.md、sources/<uuid>.md → stem 即 document_id，直接命中；
+          · concepts/<slug>.md、entities/<slug>.md → 该页 frontmatter 的
+            sources: ["summaries/<doc_id>.md"] 就是它的源文档，按此反解；
+          · index.md 及其它 → 无 sources，自然落空，不需要黑名单。
+
+        为什么改 B：A 把「页面本身不是用户上传的文档」误当成「页面无法定位到文档」。
+        B 产出的引用指向的仍是原始文档，符合「references 只放能点开看原文的文档」
+        这条口径。且概念性提问（「XX 是什么」）下 agent 往往只读 concepts/，A 会
+        导致引用为零条——实测如此。
+
+        成本：每个涉及概念/实体页的 KB 多一次 list_wiki_contents（页面树元数据，
+        need_body=False，不含正文），而非 A 方案评估时假设的「每页一次 read_page
+        全文读取」。去重发生在溯源之后、富化之前——多个概念页同源于一个文档时，
+        只做一次 PG 查询与一次预签名。
         """
         import uuid as _uuid
         from ..dtos.reference import SourceReference
 
-        # ① 收集所有可能的 document_id（去重保序）
-        seen: set[str] = set()
-        ref_sources: list[tuple[str, str, str]] = []  # (doc_id, wiki_path, kb_id)
+        def _as_doc_id(stem: str) -> str | None:
+            try:
+                return str(_uuid.UUID(stem))
+            except (ValueError, AttributeError, TypeError):
+                return None
+
+        # ① 收集轨迹里的 (kb_id, wiki_path)，保序去重
+        #    注意循环层级：路径判定必须在 `for call` 内层。此前误缩进到 `for turn`
+        #    层级，导致每轮只看最后一个调用（一轮内先读 summaries 再读 entities 会
+        #    丢掉前者），且首轮 calls 为空时 path 未绑定直接 NameError。
+        seen_paths: set[tuple[str, str]] = set()
+        browsed: list[tuple[str, str]] = []  # [(kb_id, wiki_path), ...] 按浏览顺序
         for kb_id, turns in per_kb_traces:
             for turn in (turns or []):
                 for call in (turn.get("calls") or []):
-                    path = (call.get("args") or {}).get("path", "")
-                if not path:
+                    path = str((call.get("args") or {}).get("path") or "")
+                    if not path:
+                        continue
+                    key = (kb_id, path)
+                    if key in seen_paths:
+                        continue
+                    seen_paths.add(key)
+                    browsed.append(key)
+
+        if not browsed:
+            return []
+
+        # ② 直接命中：summaries/ 与 sources/ 的 stem 就是 document_id
+        seen: set[str] = set()
+        ref_sources: list[tuple[str, str, str]] = []  # (doc_id, wiki_path, kb_id)
+        derived_paths: list[tuple[str, str]] = []     # 待反解的概念/实体页
+        for kb_id, path in browsed:
+            matched = False
+            for prefix in ("summaries/", "sources/"):
+                if path.startswith(prefix):
+                    matched = True
+                    doc_id = _as_doc_id(path[len(prefix):].removesuffix(".md"))
+                    if doc_id and doc_id not in seen:
+                        seen.add(doc_id)
+                        ref_sources.append((doc_id, path, kb_id))
+                    break
+            if not matched and path.startswith(("concepts/", "entities/")):
+                derived_paths.append((kb_id, path))
+
+        # ③ 间接溯源：概念/实体页 → frontmatter sources → summaries/<doc_id>.md
+        #    每个 KB 只拉一次页面树；失败降级为「只保留直接命中」，绝不让富化故障
+        #    冒泡成 500（同 §1.3 第 6 条口径）。
+        if derived_paths:
+            kbs_needing_map = list(dict.fromkeys(kid for kid, _ in derived_paths))
+            page_maps: dict[str, dict[str, list]] = {}
+            compiler = KnowledgeCompilerService()
+
+            async def _load_map(kid: str) -> tuple[str, dict[str, list]]:
+                contents = await compiler.list_wiki_contents(
+                    kb_name=kid, tenant_id=tenant_id, kb_id=kid, document_id="",
+                )
+                # stem → sources；概念与实体分处两个 section，但 stem 在各自 section
+                # 内唯一，故按 section 前缀建键，避免同名 slug 互相覆盖。
+                out: dict[str, list] = {}
+                for section in ("concepts", "entities"):
+                    for entry in (contents or {}).get(section) or []:
+                        stem = str(entry.get("stem") or "")
+                        if stem:
+                            out[f"{section}/{stem}"] = entry.get("sources") or []
+                return (kid, out)
+
+            map_results = await asyncio.gather(
+                *[_load_map(kid) for kid in kbs_needing_map], return_exceptions=True,
+            )
+            for item in map_results:
+                if isinstance(item, Exception):
+                    logger.warning("[openkb] 页面树拉取失败，概念页溯源降级: %s", item)
                     continue
-                # summaries/xxx.md 或 sources/xxx.md → stem 可能是 uuid
-                for prefix in ("summaries/", "sources/"):
-                    if path.startswith(prefix):
-                        stem = path[len(prefix):].removesuffix(".md")
-                        try:
-                            doc_id = str(_uuid.UUID(stem))
-                        except (ValueError, AttributeError):
-                            continue
-                        if doc_id not in seen:
-                            seen.add(doc_id)
-                            ref_sources.append((doc_id, path, kb_id))
-                        break
+                kid, mapping = item
+                page_maps[kid] = mapping
+
+            for kb_id, path in derived_paths:
+                mapping = page_maps.get(kb_id)
+                if not mapping:
+                    continue
+                for src in mapping.get(path.removesuffix(".md")) or []:
+                    src = str(src)
+                    if not src.startswith("summaries/"):
+                        continue
+                    doc_id = _as_doc_id(src[len("summaries/"):].removesuffix(".md"))
+                    if not doc_id or doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+                    # wiki_path 记「实际浏览的那一页」而非反解出的 summaries 页——
+                    # 这样前端能区分「直接读了摘要」与「经概念页溯源」，无需新增字段。
+                    ref_sources.append((doc_id, path, kb_id))
 
         if not ref_sources:
             return []
@@ -3709,6 +4385,10 @@ class SearchService:
         doc_map = {d.id: d for d in docs}
 
         # ③ 富化（照 _build_references 的口径，但不走它的 chunk 入参）
+        # [jonex] 批量查询 KB 名称
+        kb_ids_in_refs = list(dict.fromkeys(kid for _, _, kid in ref_sources if kid))
+        kb_names = await self._get_kb_names(tenant_id, kb_ids_in_refs) if kb_ids_in_refs else {}
+
         storage = get_object_storage()
         out: list[dict] = []
         for doc_id, wiki_path, kb_id in ref_sources:
@@ -3717,14 +4397,16 @@ class SearchService:
                 continue
             raw_url: str | None = None
             try:
-                raw_url = await storage.get_presigned_url(
+                raw_url = await storage.presigned_url(
                     d.storage_key or build_object_key(kb_id, d.id, d.file_name or ""),
+                    tenant_id,
                 )
             except Exception:
                 raw_url = None
             ref = SourceReference(
                 doc_id=doc_id,
                 kb_id=kb_id,
+                kb_name=kb_names.get(kb_id) if kb_id else None,
                 file_name=d.file_name or "",
                 mime_type=d.mime_type,
                 file_size=d.file_size,
@@ -3963,7 +4645,7 @@ class SearchService:
 
         # 8. 保存检索历史（D8: 多 KB knowledge_base_id=""）
         if req.save_history:
-            await self._history.save_history(
+            history = await self._history.save_history(
                 tenant_id, user_id,
                 SearchHistoryCreateRequest(
                     query=req.query,
@@ -3972,6 +4654,9 @@ class SearchService:
                     top_k=req.top_k,
                     domain_space_id=req.domain_space_id,
                     answer_preview=answer[:300],
+                    answer=answer,
+                    references=_references,
+                    reasoning=collector.build(source),
                     duration_ms=total_ms,
                     metadata={
                         "knowledge_base_ids": kb_ids,
@@ -3980,6 +4665,7 @@ class SearchService:
                     },
                 ),
             )
+            result["history_id"] = history.get("id")
 
         return result
 
@@ -4124,24 +4810,32 @@ class SearchService:
         if lr_effective and okb_effective:
             # 两侧都有效 → 融合
             # [jonex] 融合 prompt 用 KB 显示名标识来源（LLM 会照抄标识进答案；
-            # 用 kb_id UUID / source 值会产出「知识库 `llm-wiki`」这类错误标注）
-            _fuse_kb_ids = list(dict.fromkeys(lightrag_ids[:1] + openkb_ids[:1]))
-            _kb_names = await self._get_kb_names(tenant_id, _fuse_kb_ids)
+            # 用 kb_id UUID / source 值会产出「知识库 `llm-wiki`」这类错误标注）。
+            # 标签只列「该侧 references 实际命中的 KB」——请求中的无内容/无检索
+            # 命中的知识库不应被关联为来源（无关联 KB 标注问题）。某侧引用为空
+            # 时标签置空，由 fuse_rag_answers 落为 unspecified（答案中不标注）。
+            def _ref_kb_ids(refs) -> list[str]:
+                return list(dict.fromkeys(r.get("kb_id") for r in (refs or []) if r.get("kb_id")))
+
+            _lr_ref_kb_ids = _ref_kb_ids(lr_result.get("references") or [])
+            _okb_ref_kb_ids = _ref_kb_ids(okb_result.get("references") or [])
+            _kb_names = await self._get_kb_names(tenant_id, _lr_ref_kb_ids + _okb_ref_kb_ids)
+            _lr_label = "、".join(_kb_names.get(k, k) for k in _lr_ref_kb_ids)
+            _okb_label = "、".join(_kb_names.get(k, k) for k in _okb_ref_kb_ids)
             per_kb = [
                 {
-                    "kb_id": kid,
-                    "kb_name": _kb_names.get(kid, kid),
+                    "kb_id": lightrag_ids[0],
+                    "kb_name": _lr_label,
                     "answer": lr_answer,
                     "source": lr_result.get("source", "rag"),
-                }
-                for kid in lightrag_ids[:1]  # 融合只取各侧一个代表答案
+                },
+                {
+                    "kb_id": openkb_ids[0],
+                    "kb_name": _okb_label,
+                    "answer": okb_answer,
+                    "source": "llm-wiki",
+                },
             ]
-            per_kb.append({
-                "kb_id": openkb_ids[0],
-                "kb_name": _kb_names.get(openkb_ids[0], openkb_ids[0]),
-                "answer": okb_answer,
-                "source": "llm-wiki",
-            })
             t_fuse = time.perf_counter()
             answer = await fuse_rag_answers(
                 req.query, per_kb,
@@ -4151,7 +4845,13 @@ class SearchService:
             collector.step(STAGE_FUSION, "多答案融合",
                            summary=f"融合 OntoRAG + llm-wiki 两侧答案", t_start=t_fuse)
             source = "mixed"
-            references = lr_result.get("references") or []
+            # [jonex] 两侧引用都要带上。此前只取 lr_result，llm-wiki 侧经
+            # _build_openkb_references 溯源出的文档被静默丢弃。按 doc_id 去重，
+            # OntoRAG 侧在前（chunk 级证据比 wiki 页派生证据强）。
+            references = self._merge_references(
+                lr_result.get("references") or [],
+                okb_result.get("references") or [],
+            )
             ontology_instances = lr_result.get("ontology_instances") or []
             rag_used = lr_result.get("rag_used", False)
             references_available = bool(references)
@@ -4175,10 +4875,14 @@ class SearchService:
             # 仅 openkb 成功
             answer = okb_answer
             source = okb_result.get("source", "llm-wiki")
-            references = []
+            # [jonex] 带上 llm-wiki 侧的引用。此前硬编码为空 + available=False，
+            # 与隔壁 lr_effective 分支（取 lr_result["references"]）不对称，
+            # 导致「OntoRAG 无答案 + wiki 有答案」时引用必然为 0 条——
+            # 而这正是概念性提问的常见组合。
+            references = okb_result.get("references") or []
             ontology_instances = []
-            rag_used = False
-            references_available = False
+            rag_used = okb_result.get("rag_used", False)
+            references_available = bool(references)
             ontology_instances_available = False
             collector.step(
                 STAGE_FUSION, "多答案融合", status="skipped",
@@ -4214,7 +4918,7 @@ class SearchService:
 
         # 8. 统一保存检索历史（D8.1：混合模式只写 1 条）
         if req.save_history:
-            await self._history.save_history(
+            history = await self._history.save_history(
                 tenant_id, user_id,
                 SearchHistoryCreateRequest(
                     query=req.query,
@@ -4223,6 +4927,9 @@ class SearchService:
                     top_k=req.top_k,
                     domain_space_id=req.domain_space_id,
                     answer_preview=answer[:300],
+                    answer=answer,
+                    references=references,
+                    reasoning=collector.build(source),
                     duration_ms=total_ms,
                     metadata={
                         "knowledge_base_ids": raw_ids,
@@ -4231,6 +4938,7 @@ class SearchService:
                     },
                 ),
             )
+            result["history_id"] = history.get("id")
 
         return result
 

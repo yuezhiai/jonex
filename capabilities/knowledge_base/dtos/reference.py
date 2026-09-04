@@ -49,6 +49,7 @@ class SourceReference(BaseModel):
 
     doc_id: str
     kb_id: Optional[str] = None
+    kb_name: Optional[str] = None  # [jonex] 知识库名称（冗余，方便前端展示，无需二次查询）
     file_name: str
     mime_type: Optional[str] = None
     file_size: Optional[int] = None

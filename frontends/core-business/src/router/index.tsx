@@ -16,7 +16,7 @@ import i18next from 'i18next';
 import { getRoutes } from './routes.config';
 import { getMenuFromRoutes } from '@/router/menu';
 import AppLayout from '@/components/AppLayout';
-import { readAccessToken, readCachedUser, clearAuthStorage, buildLoginRedirectUrl } from '@jonex/shell-sdk';
+import { readAccessToken, readCachedUser, clearAuthStorage, redirectToLogin } from '@jonex/shell-sdk';
 
 interface RouteConfigItem {
   path?: string;
@@ -114,8 +114,7 @@ const createAuthLoader =
       if (whiteList.includes(path)) return null;
       if (typeof window !== 'undefined') {
         clearAuthStorage({ keepLocale: true });
-        const loginUrl = VITE_LOGIN || '/login';
-        window.location.href = buildLoginRedirectUrl(loginUrl, window.location.href, VITE_APP_ID);
+        redirectToLogin({ loginUrl: VITE_LOGIN || '/login', appId: VITE_APP_ID });
       }
       return null;
     }

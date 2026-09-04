@@ -1,5 +1,16 @@
 """Knowledge Base DTO exports."""
 
+from .answer_feedback import (
+    AnswerFeedbackItemResponse,
+    AnswerFeedbackListItemResponse,
+    AnswerFeedbackListResponse,
+    AnswerFeedbackQueryRequest,
+    AnswerFeedbackStatsResponse,
+    AnswerFeedbackStatusResponse,
+    AnswerFeedbackToggleAdoptRequest,
+    SubmitAnswerFeedbackRequest,
+    SubmitAnswerFeedbackResponse,
+)
 from .data_source import (
     DataSourceCreateRequest,
     DataSourceListResponse,
@@ -95,6 +106,15 @@ from .search_history import (
 )
 
 __all__ = [
+    "AnswerFeedbackItemResponse",
+    "AnswerFeedbackListItemResponse",
+    "AnswerFeedbackListResponse",
+    "AnswerFeedbackQueryRequest",
+    "AnswerFeedbackStatsResponse",
+    "AnswerFeedbackStatusResponse",
+    "AnswerFeedbackToggleAdoptRequest",
+    "SubmitAnswerFeedbackRequest",
+    "SubmitAnswerFeedbackResponse",
     "CreateOntologyInstanceRequest",
     "CreateOntologyRelationRequest",
     "DataSourceCreateRequest",

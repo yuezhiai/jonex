@@ -1,4 +1,4 @@
-# [jonex] 悦溪新增文件：raganything 入库计量上下文透传
+# [jonex] Jonex新增文件：raganything 入库计量上下文透传
 #
 # 作用：让 raganything 直连 llm-gateway 的多模态/summary LLM 与 embedding 调用
 #       带上 X-Jonex-* 维度头（tenant/kb/doc/trace），使 gateway 能按文档/任务

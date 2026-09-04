@@ -87,14 +87,12 @@ PROMPTS[
 ] = """Please analyze this image in detail and provide a JSON response with the following structure:
 
 {{
-    "detailed_description": "A comprehensive and detailed visual description of the image following these guidelines:
-    - Describe the overall composition and layout
-    - Identify all objects, people, text, and visual elements
-    - Explain relationships between elements
-    - Note colors, lighting, and visual style
-    - Describe any actions or activities shown
-    - Include technical details if relevant (charts, diagrams, etc.)
-    - Always use specific names instead of pronouns",
+    "detailed_description": "A concise (1-3 sentences) objective description of the image following these guidelines:
+    - Describe only what is visible in the image; do not speculate or interpret intent
+    - Identify main objects, people, text, and visual elements (only when confident)
+    - Include key data or structure if relevant (charts, diagrams, etc.)
+    - Always use specific names instead of pronouns
+    - Do not use speculative wording such as \"possibly/likely/seemingly/perhaps/maybe\"",
     "entity_info": {{
         "entity_name": "{entity_name}",
         "entity_type": "image",
@@ -110,24 +108,28 @@ Additional context:
 Focus on providing accurate, detailed visual analysis that would be useful for knowledge retrieval."""
 
 # Image analysis prompt with context support
+# [jonex] §image-refs F2 (final, mirrors §18 of
+# docs/image-reference-accuracy-fix-plan.md): from "pure visual description"
+# to "visual description + role in document", so descriptions carry document
+# topic keywords and rerank better against topic queries. Includes review
+# fixes F-2 (keep chart/data instruction) / F-3 (only use names when the
+# context clearly identifies the correspondence; "naturally retain" ending).
 PROMPTS[
     "vision_prompt_with_context"
 ] = """Please analyze this image in detail, considering the surrounding context. Provide a JSON response with the following structure:
 
 {{
-    "detailed_description": "A comprehensive and detailed visual description of the image following these guidelines:
-    - Describe the overall composition and layout
-    - Identify all objects, people, text, and visual elements
-    - Explain relationships between elements and how they relate to the surrounding context
-    - Note colors, lighting, and visual style
-    - Describe any actions or activities shown
-    - Include technical details if relevant (charts, diagrams, etc.)
-    - Reference connections to the surrounding content when relevant
-    - Always use specific names instead of pronouns",
+    "detailed_description": "A concise (1-3 sentences) description of the image and its role in the document, considering the surrounding context, following these guidelines:
+    - First sentence: objectively describe what is visible in the image (objects, people, text, data); include key data or structure for charts or diagrams
+    - Second sentence: based on the surrounding text context, state the role of this image in the document (e.g., illustration of a person/work, example of a topic, visualization of data, diagram of a process)
+    - Only use a name from the context when the context clearly identifies this image as corresponding to that name (e.g., \"the image shows XX's work\", \"as shown in the figure\")
+    - Always use specific names instead of pronouns
+    - Only describe what you are confident about; do not speculate
+    - Do not use speculative wording such as \"possibly/likely/seemingly/perhaps/maybe\"",
     "entity_info": {{
         "entity_name": "{entity_name}",
         "entity_type": "image",
-        "summary": "concise summary of the image content, its significance, and relationship to surrounding content (max 100 words)"
+        "summary": "concise summary of the image content, its topic, and relationship to surrounding context (max 100 words)"
     }}
 }}
 
@@ -139,7 +141,45 @@ Image details:
 - Captions: {captions}
 - Footnotes: {footnotes}
 
-Focus on providing accurate, detailed visual analysis that incorporates the context and would be useful for knowledge retrieval."""
+If the context provides topic keywords related to the image, naturally retain these keywords in the description."""
+
+# Image analysis prompt with deterministic anchor (assertive)
+# [jonex] §image-refs E2 (mirrors §27 of
+# docs/image-reference-accuracy-fix-plan.md): anchor is injected assertively
+# ("This image is an illustration of {anchor}") — no room for the VLM to
+# pick another topic. Low-quantization VLMs comply poorly with
+# reference-style instructions ("this image may belong to..."). Anchor comes
+# from MinerU structured output (cap/foot/col/heading), trustworthy enough.
+# Works with chunk-prefix injection as a double guarantee: prefix lands in
+# embedding deterministically; here the description stays semantically
+# consistent with the anchor.
+PROMPTS[
+    "vision_prompt_with_anchor"
+] = """This image is an illustration of {anchor}. Describe what is visible in the image and provide a JSON response with the following structure:
+
+{{
+    "detailed_description": "A concise (1-3 sentences) objective description of the image following these guidelines:
+    - Describe only what is visible in the image; do not speculate or interpret intent
+    - Identify main objects, people, text, and visual elements (only when confident)
+    - Include key data or structure if relevant (charts, diagrams, etc.)
+    - Always use specific names instead of pronouns
+    - Do not use speculative wording such as \"possibly/likely/seemingly/perhaps/maybe\"",
+    "entity_info": {{
+        "entity_name": "{entity_name}",
+        "entity_type": "image",
+        "summary": "concise summary of the image content and its relation to {anchor} (max 100 words)"
+    }}
+}}
+
+Context from the current page (background reference only):
+{context}
+
+Image details:
+- Image Path: {image_path}
+- Captions: {captions}
+- Footnotes: {footnotes}
+
+Focus on providing accurate, detailed visual analysis that would be useful for knowledge retrieval."""
 
 # Image analysis prompt with text fallback
 PROMPTS["text_prompt"] = """Based on the following image information, provide analysis:

@@ -333,7 +333,7 @@ class TestConfigResolver:
         )
         snapshot = resolver.resolve(req)
         assert snapshot["llm_model"] == "deepseek-v4-flash-202605"
-        assert snapshot["vlm_model_name"] == "/home/yuexi/Qwen2.5-VL-7B"
+        assert snapshot["vlm_model_name"] == "/home/jonex/Qwen2.5-VL-7B"
         assert snapshot["enable_video_processing"] is True
         assert snapshot["video_max_frames"] == 30
 

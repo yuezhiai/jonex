@@ -408,7 +408,13 @@ class OntologyGraphRepository:
             MATCH (e)-[r:ONT_REL]-(n:OntologyEntity {tenant_id:$t, kb_id:$k})
             WHERE coalesce(n.stub,false)=false
             WITH e, r, n, CASE WHEN startNode(r) = e THEN 'outgoing' ELSE 'incoming' END AS rel_dir
-            ORDER BY coalesce(n.confidence,0) DESC, n.canonical_name ASC
+            ORDER BY
+              (CASE
+                WHEN n.source_chunks CONTAINS 'image_idx=' THEN 0
+                WHEN n.source_chunks IS NOT NULL AND n.source_chunks <> '[]' THEN 1
+                ELSE 2
+              END),
+              coalesce(n.confidence,0) DESC, n.canonical_name ASC
             RETURN e.canonical_name AS source,
                    collect({
                        source: e.canonical_name,
@@ -421,7 +427,8 @@ class OntologyGraphRepository:
                            aliases: n.aliases, description: n.description,
                            attributes: n.attributes, confidence: n.confidence,
                            kb_id: n.kb_id, doc_ids: n.doc_ids,
-                           source_chunks: n.source_chunks
+                           source_chunks: n.source_chunks,
+                           extraction_method: n.extraction_method
                        },
                        relation_source_chunks: r.source_chunks,
                        hop: 1,
@@ -444,7 +451,13 @@ class OntologyGraphRepository:
                  [pn IN path_nodes | pn.canonical_name] AS path_names,
                  last_rel.source_chunks AS relation_source_chunks,
                  min(hop) AS hop
-            ORDER BY hop ASC, coalesce(n.confidence,0) DESC, n.canonical_name ASC
+            ORDER BY hop ASC,
+              (CASE
+                WHEN n.source_chunks CONTAINS 'image_idx=' THEN 0
+                WHEN n.source_chunks IS NOT NULL AND n.source_chunks <> '[]' THEN 1
+                ELSE 2
+              END),
+              coalesce(n.confidence,0) DESC, n.canonical_name ASC
             WITH e, collect({
                     source: e.canonical_name,
                     target: n.canonical_name,
@@ -454,7 +467,8 @@ class OntologyGraphRepository:
                         aliases: n.aliases, description: n.description,
                         attributes: n.attributes, confidence: n.confidence,
                         kb_id: n.kb_id, doc_ids: n.doc_ids,
-                        source_chunks: n.source_chunks
+                        source_chunks: n.source_chunks,
+                        extraction_method: n.extraction_method
                     },
                     relation_type: rel_types[-1],
                     relation_chain: rel_types,
@@ -650,6 +664,22 @@ class OntologyGraphRepository:
         """
         async with self._driver.session() as session:
             result = await session.run(cypher, {"t": tenant_id, "k": kb_id})
+            return {rec["type"]: rec["c"] async for rec in result}
+
+    async def _count_entities_by_type_doc(
+        self, tenant_id: str, kb_id: str, document_id: str
+    ) -> dict[str, int]:
+        """按 entity_type 聚合非 stub 实例数，仅统计 doc_ids 含指定文档的实体。"""
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(e.stub,false)=false AND $doc_id IN e.doc_ids
+        RETURN e.entity_type AS type, count(e) AS c
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "doc_id": document_id}
+            )
             return {rec["type"]: rec["c"] async for rec in result}
 
     async def count_relations_by_type(self, tenant_id: str, kb_id: str) -> dict[str, int]:
@@ -1130,6 +1160,7 @@ class OntologyGraphRepository:
         kb_id: str,
         limit: int = 500,
         entity_types: Optional[list[str]] = None,
+        document_id: Optional[str] = None,
     ) -> dict:
         """获取 KB 维度的图谱数据（nodes + edges），用于前端力导向图渲染。
 
@@ -1143,6 +1174,7 @@ class OntologyGraphRepository:
             kb_id: 知识库 ID
             limit: 节点数量上限（按连接度取 top-N）
             entity_types: 仅返回这些实体类型的节点（None 表示不过滤）
+            document_id: 仅返回 doc_ids 包含该文档的节点（None 表示不过滤）
 
         Returns:
             {
@@ -1155,13 +1187,22 @@ class OntologyGraphRepository:
         tenant_id = require_tenant(tenant_id)
 
         type_filter = ""
+        doc_filter = ""
         params: dict = {"t": tenant_id, "k": kb_id, "limit": limit}
         if entity_types:
             type_filter = "AND e.entity_type IN $types"
             params["types"] = entity_types
+        if document_id:
+            doc_filter = "AND $doc_id IN e.doc_ids"
+            params["doc_id"] = document_id
 
         # 1) 全量分类型计数（无视 limit，用于侧栏筛选与总数提示）
-        type_counts = await self.count_entities_by_type(tenant_id, kb_id)
+        if document_id:
+            type_counts = await self._count_entities_by_type_doc(
+                tenant_id, kb_id, document_id
+            )
+        else:
+            type_counts = await self.count_entities_by_type(tenant_id, kb_id)
         if entity_types:
             total_nodes = sum(type_counts.get(t, 0) for t in entity_types)
         else:
@@ -1170,7 +1211,7 @@ class OntologyGraphRepository:
         # 2) 按连接度排序取 top-N 节点（连接度高的是图谱枢纽，优先展示）
         node_cypher = f"""
         MATCH (e:OntologyEntity {{tenant_id:$t, kb_id:$k}})
-        WHERE coalesce(e.stub,false)=false {type_filter}
+        WHERE coalesce(e.stub,false)=false {type_filter} {doc_filter}
         OPTIONAL MATCH (e)-[r:ONT_REL]-(:OntologyEntity {{tenant_id:$t, kb_id:$k}})
         WITH e, count(r) AS degree
         RETURN e.entity_type + ':' + e.canonical_name AS id,
@@ -1191,12 +1232,15 @@ class OntologyGraphRepository:
 
         node_ids = [n["id"] for n in nodes]
 
-        # 3) 全量关系总数（受类型筛选约束：两端均在筛选类型内）
+        # 3) 全量关系总数（受类型筛选 + 文档筛选约束：两端均在筛选范围内）
         rel_where = "coalesce(s.stub,false)=false AND coalesce(o.stub,false)=false"
         rel_params: dict = {"t": tenant_id, "k": kb_id}
         if entity_types:
             rel_where += " AND s.entity_type IN $types AND o.entity_type IN $types"
             rel_params["types"] = entity_types
+        if document_id:
+            rel_where += " AND $doc_id IN s.doc_ids AND $doc_id IN o.doc_ids"
+            rel_params["doc_id"] = document_id
         count_rel_cypher = f"""
         MATCH (s:OntologyEntity {{tenant_id:$t, kb_id:$k}})-[r:ONT_REL]->(o:OntologyEntity {{tenant_id:$t, kb_id:$k}})
         WHERE {rel_where}
@@ -1326,6 +1370,33 @@ class OntologyGraphRepository:
             record = await result.single()
             return record["h"] if record and record["h"] else None
 
+    async def _get_entity_embedding_state(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str
+    ) -> Optional[dict]:
+        """读取实体当前 aliases/description/embedding_hash，供编辑时重算 embedding。
+
+        实体不存在时返回 None（由调用方决定是否跳过向量重算，主编辑流程仍会按
+        无行命中抛 ResourceNotFoundError）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$cn})
+        RETURN e.aliases AS aliases, e.description AS description,
+               e.embedding_hash AS embedding_hash
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "et": entity_type, "cn": canonical_name}
+            )
+            record = await result.single()
+        if not record:
+            return None
+        return {
+            "aliases": record["aliases"] or [],
+            "description": record["description"] or "",
+            "embedding_hash": record["embedding_hash"],
+        }
+
     async def get_embedding_hashes(self, tenant_id: str, kb_id: str) -> dict[tuple, str]:
         """批量预取 KB 内全部正式实体的 (entity_type, canonical_name) → embedding_hash 映射。
 
@@ -1384,7 +1455,8 @@ class OntologyGraphRepository:
         """创建本体实体实例节点。
 
         使用 MERGE 确保幂等：已存在的节点直接返回，不做更新。
-        与 merge_entity 不同：不处理 embedding/source_chunks/lightrag_doc_ids 等文档写入字段。
+        与 merge_entity 不同：不处理 source_chunks/lightrag_doc_ids 等文档写入字段，
+        但会写 embedding 并标记 extraction_method='manual'（不写 doc_ids）。
 
         Args:
             tenant_id: 租户 ID
@@ -1411,6 +1483,23 @@ class OntologyGraphRepository:
         attributes_json = json.dumps(attributes or {}, ensure_ascii=False)
         aliases_text = " ".join(aliases)
 
+        # 手动实体写侧补齐：生成 embedding 并标记 extraction_method='manual'，
+        # 使向量召回（ont_entity_embedding 索引）能命中、检索侧 _is_stub 能区分手动实体。
+        # 幂等由 MERGE 保证（仅 ON CREATE 写入）；embed 失败返回 None 时仍正常创建，仅不带向量。
+        embedding = None
+        embedding_hash_val = None
+        if os.getenv("ONTOLOGY_VECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+            text = build_embed_text(canonical_name, aliases, description or "")
+            if text:
+                h = embed_hash(text)
+                vec = await embed(
+                    text, tenant_id=tenant_id, kb_id=kb_id,
+                    trace_id=f"ontology_manual:{kb_id}",
+                )
+                if vec is not None:
+                    embedding = vec
+                    embedding_hash_val = h
+
         cypher = """
         MERGE (e:OntologyEntity {tenant_id:$tenant_id, kb_id:$kb_id, entity_type:$entity_type, canonical_name:$canonical_name})
         ON CREATE SET
@@ -1418,6 +1507,8 @@ class OntologyGraphRepository:
             e.description=$description, e.attributes=$attributes,
             e.stub=false, e.confidence=1.0,
             e.doc_ids=[], e.source_chunks=[], e.lightrag_doc_ids=[],
+            e.extraction_method='manual',
+            e.embedding=$embedding, e.embedding_hash=$embedding_hash,
             e.created_at=timestamp(), e.updated_at=timestamp()
         RETURN e
         """
@@ -1426,6 +1517,7 @@ class OntologyGraphRepository:
             "entity_type": entity_type, "canonical_name": canonical_name,
             "aliases": aliases, "aliases_text": aliases_text,
             "description": description, "attributes": attributes_json,
+            "embedding": embedding, "embedding_hash": embedding_hash_val,
         }
         async with self._driver.session() as session:
             result = await session.run(cypher, params)
@@ -1572,6 +1664,34 @@ class OntologyGraphRepository:
         """
         tenant_id = require_tenant(tenant_id)
 
+        # 编辑触发向量重算：仅 name/aliases/description 影响 embedding 文本
+        # （attributes 不进 build_embed_text，与 merge_entity 口径一致）。
+        # 文本变化才调 embed；embed 失败返回 None 时不更新向量（保留旧值），不阻断编辑。
+        embedding = None
+        embedding_hash_val = None
+        recompute_embedding = bool(
+            {"name", "aliases", "description"} & set(updates.keys())
+        )
+        if recompute_embedding and os.getenv("ONTOLOGY_VECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+            cur = await self._get_entity_embedding_state(
+                tenant_id, kb_id, entity_type, canonical_name
+            )
+            if cur is not None:
+                new_name = updates.get("name", canonical_name)
+                new_aliases = updates.get("aliases", cur["aliases"])
+                new_description = updates.get("description", cur["description"])
+                text = build_embed_text(new_name, new_aliases, new_description)
+                if text:
+                    new_hash = embed_hash(text)
+                    if new_hash != cur.get("embedding_hash"):
+                        vec = await embed(
+                            text, tenant_id=tenant_id, kb_id=kb_id,
+                            trace_id=f"ontology_manual:{kb_id}",
+                        )
+                        if vec is not None:
+                            embedding = vec
+                            embedding_hash_val = new_hash
+
         # 构建 SET 子句
         set_clauses = []
         params = {
@@ -1596,6 +1716,12 @@ class OntologyGraphRepository:
 
         if not set_clauses:
             raise ValueError("update_entity: no valid fields to update")
+
+        if recompute_embedding and embedding is not None:
+            set_clauses.append("e.embedding=$embedding")
+            set_clauses.append("e.embedding_hash=$embedding_hash")
+            params["embedding"] = embedding
+            params["embedding_hash"] = embedding_hash_val
 
         set_clauses.append("e.updated_at=timestamp()")
         set_str = ", ".join(set_clauses)
@@ -1642,6 +1768,101 @@ class OntologyGraphRepository:
                 raise ResourceNotFoundError(
                     message=translate("err.ontology.entity_not_found", params={"entity_type": entity_type, "name": canonical_name}, fallback=f"实体不存在: type={entity_type}, name={canonical_name}"),
                 )
+
+    async def backfill_manual_entities(self, tenant_id: str, kb_id: str) -> int:
+        """回填存量手动实体：补 extraction_method='manual' 标记与 embedding。
+
+        识别「非 stub、无 doc_ids、无 embedding」且 extraction_method 为空（早期手动
+        创建、未走编译管线）或已为 'manual'（新路径 embed 瞬时失败）的实体，逐个补
+        标记 + 向量。单 session 内完成 find + 全部 set，避免逐实体开 session。
+        embed 失败时仅补标记不补向量。返回回填的实体数量。
+        """
+        tenant_id = require_tenant(tenant_id)
+
+        find_cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(e.stub,false)=false
+          AND (e.extraction_method IS NULL OR e.extraction_method='manual')
+          AND size(coalesce(e.doc_ids,[]))=0
+          AND e.embedding IS NULL
+        RETURN e.entity_type AS entity_type, e.canonical_name AS canonical_name,
+               e.aliases AS aliases, e.description AS description
+        """
+        async with self._driver.session() as session:
+            result = await session.run(find_cypher, {"t": tenant_id, "k": kb_id})
+            candidates = [dict(rec) async for rec in result]
+
+            count = 0
+            for c in candidates:
+                entity_type = c["entity_type"]
+                canonical_name = c["canonical_name"]
+                aliases = c["aliases"] or []
+                description = c["description"] or ""
+
+                embedding = None
+                embedding_hash_val = None
+                if os.getenv("ONTOLOGY_VECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+                    text = build_embed_text(canonical_name, aliases, description)
+                    if text:
+                        h = embed_hash(text)
+                        vec = await embed(
+                            text, tenant_id=tenant_id, kb_id=kb_id,
+                            trace_id=f"ontology_manual:{kb_id}",
+                        )
+                        if vec is not None:
+                            embedding = vec
+                            embedding_hash_val = h
+
+                set_cypher = """
+                MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$entity_type, canonical_name:$canonical_name})
+                SET e.extraction_method='manual'"""
+                set_params = {
+                    "t": tenant_id, "k": kb_id,
+                    "entity_type": entity_type, "canonical_name": canonical_name,
+                }
+                if embedding is not None:
+                    set_cypher += ", e.embedding=$embedding, e.embedding_hash=$embedding_hash"
+                    set_params["embedding"] = embedding
+                    set_params["embedding_hash"] = embedding_hash_val
+                await session.run(set_cypher, set_params)
+                count += 1
+
+        return count
+
+    async def backfill_manual_entities_all(self) -> int:
+        """全局回填存量手动实体（启动时后台调用，跨所有租户/KB）。
+
+        扫描全图中「非 stub、无 doc_ids、无 embedding」且 extraction_method 为空或
+        已为 'manual' 的手动实体，按 (tenant_id, kb_id) 分组复用单 KB 回填。幂等：
+        回填后不再命中识别条件。单个租户/KB 回填失败仅告警并跳过，不阻塞其余。
+        返回回填总数。
+        """
+        find_pairs = """
+        MATCH (e:OntologyEntity)
+        WHERE coalesce(e.stub,false)=false
+          AND (e.extraction_method IS NULL OR e.extraction_method='manual')
+          AND size(coalesce(e.doc_ids,[]))=0
+          AND e.embedding IS NULL
+        RETURN DISTINCT e.tenant_id AS tenant_id, e.kb_id AS kb_id
+        """
+        async with self._driver.session() as session:
+            result = await session.run(find_pairs)
+            pairs = [dict(rec) async for rec in result]
+
+        total = 0
+        for p in pairs:
+            tenant_id = p.get("tenant_id")
+            kb_id = p.get("kb_id")
+            if not tenant_id or not kb_id:
+                continue
+            try:
+                total += await self.backfill_manual_entities(tenant_id, kb_id)
+            except Exception as exc:
+                logger.warning(
+                    "回填手动实体失败（跳过） tenant=%s kb=%s: %s",
+                    tenant_id, kb_id, exc,
+                )
+        return total
 
     async def update_relation(
         self,

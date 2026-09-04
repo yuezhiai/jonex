@@ -66,6 +66,13 @@ class LocalObjectStorage:
         logger.debug("local_storage: presigned_url not supported (local backend)")
         return ""
 
+    async def presigned_put_url(
+        self, key: str, *, tenant_id: str, expires: int = 300, content_length: int | None = None
+    ) -> str:
+        """本地后端不支持预签名直传，返回空字符串（前端降级走 multipart 上传）。"""
+        logger.debug("local_storage: presigned_put_url not supported (local backend)")
+        return ""
+
     async def delete(self, key: str) -> bool:
         path = self._resolve(key)
         if path.exists():

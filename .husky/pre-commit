@@ -1,0 +1,2 @@
+# pre-commit hook — lint-staged 对暂存文件执行格式化 + ESLint
+cd "$(dirname "$0")/../frontends" && npx lint-staged

@@ -323,6 +323,7 @@ export default function PromptTemplates() {
         open={modalOpen}
         mode={modalMode}
         template={editingTemplate}
+        domainSpaceId={domainSpaceId}
         onClose={() => setModalOpen(false)}
         onSubmit={handleSubmit}
       />

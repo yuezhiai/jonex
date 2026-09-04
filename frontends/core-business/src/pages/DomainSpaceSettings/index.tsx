@@ -18,11 +18,11 @@ import {
   updateSpace,
   getSpacePermissions,
   updateSpacePermissions,
+  getSpacePermissionCandidates,
   type SpaceOwnerInfo,
 } from '../../api/domainSpace';
 import type { DomainSpace } from '../../types/domainSpace';
-import { userToPermMember, type PermMember } from '../../types/domainService';
-import { listUsers, type PlatformUser } from '../../api/user';
+import { candidateToPermMember, type MemberCandidate, type PermMember, type SpaceRole } from '../../types/domainService';
 import { useStore } from '../../store';
 import DeleteSpaceModal from './DeleteSpaceModal';
 import type { DeleteSpaceModalHandle } from './DeleteSpaceModal';
@@ -47,7 +47,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
 
   // 权限成员
   const [permMembers, setPermMembers] = useState<PermMember[]>([]);
-  // 空间创建者（owner 不落 space_permissions，后端响应层合成只读信息）
+  // 空间创建者（纯展示：owner_id 不参与判定；创建人本身以 space_manager 出现在成员列表里）
   const [permOwner, setPermOwner] = useState<SpaceOwnerInfo | null>(null);
   const [permLoading, setPermLoading] = useState(false);
   const [permSaving, setPermSaving] = useState(false);
@@ -56,7 +56,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
   // 用户选择器
   const [userSelectOpen, setUserSelectOpen] = useState(false);
   const [userSearchText, setUserSearchText] = useState('');
-  const [availableUsers, setAvailableUsers] = useState<PlatformUser[]>([]);
+  const [availableUsers, setAvailableUsers] = useState<MemberCandidate[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const userSelectRef = useRef<HTMLDivElement>(null);
 
@@ -91,7 +91,11 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
         perms.map((p) => {
           const uid = String(p.user_id);
           const name = p.display_name || t('domainSpace.userPrefix', { id: uid.slice(0, 8) });
-          const role = (p.role === 'manager' ? 'manager' : 'viewer') as 'viewer' | 'manager';
+          // [jonex] B2（D2）：后端取值已改为 space_manager / member。
+          // 原实现是「非 manager 一律当 viewer」的三元兜底 —— 改名后若只换字面量、
+          // 不换兜底逻辑，未知取值会被静默当成 member（越权方向安全，但会掩盖迁移未跑）。
+          // 这里改为显式映射，未知值保持 member 但可由后端白名单兜底拒绝。
+          const role: SpaceRole = p.role === 'space_manager' ? 'space_manager' : 'member';
           return {
             id: uid,
             name,
@@ -135,16 +139,17 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
   }, [userSelectOpen]);
 
   const loadAvailableUsers = useCallback(async () => {
+    if (!id) return;
     setUsersLoading(true);
     try {
-      const result = await listUsers(1, 100);
-      setAvailableUsers(result.items);
+      const result = await getSpacePermissionCandidates(id);
+      setAvailableUsers(result);
     } catch {
       setAvailableUsers([]);
     } finally {
       setUsersLoading(false);
     }
-  }, []);
+  }, [id]);
 
   // ── 基本信息保存 ──
   const handleSaveInfo = async () => {
@@ -167,10 +172,10 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
   };
 
   // ── 权限成员 ──
-  const addPermMember = (user: PlatformUser) => {
+  const addPermMember = (user: MemberCandidate) => {
     setPermMembers((prev) => {
-      if (prev.some((m) => m.id === String(user.id))) return prev;
-      return [...prev, userToPermMember(user, 'viewer')];
+      if (prev.some((m) => m.id === user.user_id)) return prev;
+      return [...prev, candidateToPermMember(user, 'member')];
     });
   };
 
@@ -178,7 +183,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
     setPermMembers((prev) => prev.filter((m) => m.id !== userId));
   };
 
-  const setMemberRole = (userId: string, role: 'viewer' | 'manager') => {
+  const setMemberRole = (userId: string, role: SpaceRole) => {
     setPermMembers((prev) => prev.map((m) => (m.id === userId ? { ...m, role } : m)));
   };
 
@@ -199,13 +204,19 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
   };
 
   const addedUserIds = new Set(permMembers.map((m) => m.id));
+  // 当前登录用户（jonex_user 缓存为 ShellUser，id 兜底 user_id），添加成员时过滤掉自己
+  const selfUserId = global.userInfo ? String(global.userInfo.id ?? global.userInfo.user_id ?? '') : '';
+  // [jonex] B2（E3）：**撤掉了 owner 的候选排除**（原先这里算 ownerId 用于过滤）。
+  // D2 之后创建人就是普通的 space_manager，可被调整甚至移除。
   const filteredAvailableUsers = availableUsers.filter((u) => {
-    if (addedUserIds.has(String(u.id))) return false;
+    const uid = u.user_id;
+    if (selfUserId && uid === selfUserId) return false; // 过滤自己的账号
+    if (addedUserIds.has(uid)) return false;
     if (!userSearchText) return true;
     const q = userSearchText.toLowerCase();
     return (
       (u.display_name || '').toLowerCase().includes(q) ||
-      u.username.toLowerCase().includes(q) ||
+      (u.username || '').toLowerCase().includes(q) ||
       (u.email || '').toLowerCase().includes(q)
     );
   });
@@ -370,7 +381,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                   ) : (
                     filteredAvailableUsers.slice(0, 30).map((user) => (
                       <div
-                        key={user.id}
+                        key={user.user_id}
                         className="yx-perm-user-row"
                         style={{ cursor: 'pointer', padding: '8px 12px' }}
                         onClick={() => {
@@ -378,12 +389,12 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                           setUserSearchText('');
                         }}
                       >
-                        <div className="yx-perm-avatar" style={{ background: userToPermMember(user).avatarColor }}>
-                          {userToPermMember(user).avatar}
+                        <div className="yx-perm-avatar" style={{ background: candidateToPermMember(user).avatarColor }}>
+                          {candidateToPermMember(user).avatar}
                         </div>
                         <div className="yx-perm-user-info" style={{ flex: 1 }}>
-                          <div className="yx-perm-user-name">{user.display_name || user.username}</div>
-                          <div className="yx-perm-user-dept">{user.email || user.role || ''}</div>
+                          <div className="yx-perm-user-name">{user.display_name || user.username || user.user_id}</div>
+                          <div className="yx-perm-user-dept">{user.email || user.username || ''}</div>
                         </div>
                         <span style={{ fontSize: 20, color: '#3b82f6', lineHeight: 1 }}>+</span>
                       </div>
@@ -450,27 +461,27 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                     <div className="yx-perm-user-dept">{member.department || `ID: ${member.id.slice(0, 8)}`}</div>
                   </div>
                   <div className="yx-perm-radio">
-                    <label className={`yx-perm-radio-label${member.role === 'viewer' ? ' is-checked' : ''}`}>
+                    <label className={`yx-perm-radio-label${member.role === 'member' ? ' is-checked' : ''}`}>
                       <input
                         type="radio"
                         name={`perm-${member.id}`}
-                        value="viewer"
-                        checked={member.role === 'viewer'}
+                        value="member"
+                        checked={member.role === 'member'}
                         disabled={!canManage}
-                        onChange={() => setMemberRole(member.id, 'viewer')}
+                        onChange={() => setMemberRole(member.id, 'member')}
                       />
-                      {t('permission.view')}
+                      {t('permission.spaceMember')}
                     </label>
-                    <label className={`yx-perm-radio-label${member.role === 'manager' ? ' is-checked' : ''}`}>
+                    <label className={`yx-perm-radio-label${member.role === 'space_manager' ? ' is-checked' : ''}`}>
                       <input
                         type="radio"
                         name={`perm-${member.id}`}
-                        value="manager"
-                        checked={member.role === 'manager'}
+                        value="space_manager"
+                        checked={member.role === 'space_manager'}
                         disabled={!canManage}
-                        onChange={() => setMemberRole(member.id, 'manager')}
+                        onChange={() => setMemberRole(member.id, 'space_manager')}
                       />
-                      {t('permission.manage')}
+                      {t('permission.spaceManager')}
                     </label>
                   </div>
                   {canManage && (

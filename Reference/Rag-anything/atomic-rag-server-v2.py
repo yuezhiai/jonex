@@ -2,7 +2,7 @@
 """
 atomic-rag-server v2 — 新 TaskManager + /invoke 统一入口
 
-对接悦溪 Sidecar 协议:
+对接Jonex Sidecar 协议:
   POST /invoke  {capability_id, payload: {action, ...}, tenant_id}
     → ActionRegistry → 新 TaskManager (raganything.service)
 
@@ -226,11 +226,16 @@ async def handle_query(params: dict, tenant_id: str, task_manager, **kwargs):
     if not query_text.strip():
         raise HTTPException(400, "query 不能为空")
 
+    # [jonex] 方案 A：透传 only_need_context（多 KB 只召回、平台侧作答）；
+    # trace_id / user_id 对齐 v1 _jonex_query_headers 计量维度。
     result = await task_manager.query(
         query=query_text, tenant_id=tenant_id,
         mode=params.get("mode", "hybrid"),
         top_k=int(params.get("top_k", 5)),
         kb_id=params.get("knowledge_base_id", ""),
+        trace_id=str(params.get("trace_id", "")),
+        user_id=str(params.get("user_id", "")),
+        only_need_context=bool(params.get("only_need_context", False)),
     )
     return {"success": True, "code": 0, "message": "success",
             "data": {"answer": result["answer"], "references": result["references"]}}

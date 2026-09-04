@@ -64,6 +64,14 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           path: 'domain-space',
           element: DomainSpace,
           title: T('domainSpace.management'),
+          // [jonex] 权限重构 B6（方案 §12.4 / §12.3 / 执行文档 §7.4-§7.5）：
+          // 路由守卫用 space:read（「能否打开页面」的读通道）——普通用户持有 space:read，
+          // 所以进得来。⚠️ 绝不能用 space:write：那是租户级写（建空间），
+          // 空间管理者不一定有 space:write，用它守卫会把管理者挡在自己空间外。
+          // 单个空间内的编辑/删除/管成员按钮走 can_manage_permissions（资源身份字段），不在这里。
+          // order:2 补齐 standalone 侧边栏序列（search=1 / knowledge=3 / management=4）；
+          // hosted（shell）模式导航走 DB 菜单树、DB 菜单树按设计不含此项，故此改只影响 standalone。
+          menu: { icon: 'BlockOutlined', order: 2, permissionCode: 'space:read' },
         },
         { path: 'domain-space/new', element: DomainSpaceCreate, title: T('domainSpace.create') },
         { path: 'domain-space/:id/settings', element: DomainSpaceSettings, title: T('route.domainSpaceSettings') },

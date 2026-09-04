@@ -50,7 +50,18 @@ export interface PaginationResult<T> {
   };
 }
 
-export type DomainKnowledgePermissionRole = 'viewer' | 'editor' | 'kb_manager';
+/**
+ * 知识库资源身份取值（两级）。
+ *
+ * [jonex] 权限重构 B3（D1）：原为 `'viewer' | 'editor' | 'kb_manager'` 三级。
+ * 两级模型下 **写权限与人员管理权限都只属于 kb_manager，member 只读** ——
+ * 没有「能写但不能管人」这一档（原 editor 的位置）。
+ *
+ * 必须与后端 kb_permission_service.KB_MANAGER / KB_MEMBER 一致：
+ * 后端白名单会拒绝旧取值（400），前后端不同步会让 KB 权限页保存失败。
+ * 方案 docs/permissions/PERMISSIONS_REDESIGN.md §3.3
+ */
+export type DomainKnowledgePermissionRole = 'kb_manager' | 'member';
 
 export interface DomainKnowledgePermissionMember {
   userId: string;
@@ -488,6 +499,8 @@ export interface OntologyGraphParams {
   limit?: number;
   /** 仅返回这些实体类型的节点 */
   entityTypes?: string[];
+  /** 按来源文档过滤节点，只保留 doc_ids 含该文档的实体 */
+  documentId?: string;
 }
 
 /** 邻域展开返回数据（仅 nodes + edges 增量） */

@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - API 网关启动脚本
+Jonex 平台 - API 网关启动脚本
 
 使用方法:
     python run_gateway.py          # 启动网关
@@ -22,7 +22,7 @@ logger = get_logger("gateway_launcher")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="悦溪平台 API 网关")
+    parser = argparse.ArgumentParser(description="Jonex 平台 API 网关")
     parser.add_argument(
         "--host",
         type=str,
@@ -62,7 +62,7 @@ def main():
         logger.info(f"设置运行环境: {args.env}")
 
     logger.info("=" * 60)
-    logger.info("悦溪平台 API 网关启动中...")
+    logger.info("Jonex 平台 API 网关启动中...")
     logger.info(f"监听地址: http://{args.host}:{args.port}")
     logger.info(f"工作进程数: {args.workers}")
     logger.info(f"开发模式: {'开启' if args.reload else '关闭'}")

@@ -157,16 +157,11 @@ export default function SearchPanel({
           onChange={onDomainChange}
           style={{ minWidth: 160, height: 48 }}
           size="large"
-          options={[
-            {
-              label: t('knowledgeSearch.domainSpaceGroup'),
-              options: visibleDomains.filter((d) => d.kind === 'space').map((d) => ({ value: d.id, label: d.name })),
-            },
-            {
-              label: t('knowledgeSearch.domainServiceGroup'),
-              options: visibleDomains.filter((d) => d.kind === 'service').map((d) => ({ value: d.id, label: d.name })),
-            },
-          ].filter((group) => group.options.length > 0)}
+          options={visibleDomains.map((d) => ({
+            value: d.id,
+            // 当前领域空间（kind=space）为返回首项，label 固定显示「当前领域空间」
+            label: d.kind === 'space' ? t('knowledgeSearch.currentSpace') : d.name,
+          }))}
         />
         <Input
           prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 16 }} />}

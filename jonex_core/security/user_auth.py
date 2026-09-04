@@ -31,6 +31,7 @@ class UserAuth:
         self.algorithm = config.JWT_ALGORITHM
         self.access_expire_hours = config.USER_JWT_EXPIRE_HOURS
         self.refresh_expire_days = config.USER_JWT_REFRESH_DAYS
+        self.impersonate_expire_minutes = config.IMPERSONATE_EXPIRE_MINUTES
         self.bcrypt_rounds = config.BCRYPT_ROUNDS
 
     def hash_password(self, password: str) -> str:
@@ -39,7 +40,14 @@ class UserAuth:
     def verify_password(self, password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(password.encode(), password_hash.encode())
 
-    def _create_token(self, user, roles: list[str] | None, expires_delta: timedelta, token_type: str) -> str:
+    def _create_token(
+        self,
+        user,
+        roles: list[str] | None,
+        expires_delta: timedelta,
+        token_type: str,
+        extra_claims: dict | None = None,
+    ) -> str:
         now = datetime.now(timezone.utc)
         payload = {
             "sub": str(user.id),
@@ -51,13 +59,36 @@ class UserAuth:
             "exp": now + expires_delta,
             "iat": now,
         }
+        if extra_claims:
+            payload.update(extra_claims)
         return jwt.encode(payload, self.secret, algorithm=self.algorithm)
 
-    def create_access_token(self, user, roles: list[str] | None = None) -> str:
-        return self._create_token(user, roles, timedelta(hours=self.access_expire_hours), "user")
+    def create_access_token(self, user, roles: list[str] | None = None, expires_minutes: int | None = None) -> str:
+        minutes = expires_minutes if expires_minutes is not None else self.access_expire_hours * 60
+        return self._create_token(user, roles, timedelta(minutes=minutes), "user")
 
     def create_refresh_token(self, user, roles: list[str] | None = None) -> str:
         return self._create_token(user, roles, timedelta(days=self.refresh_expire_days), "refresh")
+
+    def create_impersonation_token(
+        self,
+        user,
+        roles: list[str] | None,
+        perms: list[str] | None,
+        target_tenant_id: str,
+    ) -> str:
+        """签发模拟态 access token（type=user，含 impersonated/original_tenant_id/perms）。
+
+        仅签发 access token，不签发 refresh；refresh 端点天然拒绝 type=user。
+        """
+        expires_delta = timedelta(minutes=self.impersonate_expire_minutes)
+        extra_claims = {
+            "tenant_id": target_tenant_id,
+            "perms": perms or [],
+            "impersonated": True,
+            "original_tenant_id": user.tenant_id,
+        }
+        return self._create_token(user, roles, expires_delta, "user", extra_claims=extra_claims)
 
     def decode_token(self, token: str) -> dict:
         try:
@@ -113,6 +144,8 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
             "username": "test_token",
             "role": "admin",
             "roles": ["admin"],
+            "perms": [],
+            "impersonated": False,
         }
     auth = get_user_auth()
     payload = auth.decode_token(token)
@@ -122,6 +155,9 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
         "username": payload["username"],
         "role": payload["role"],
         "roles": payload.get("roles") or ([payload.get("role")] if payload.get("role") else []),
+        "perms": payload.get("perms") or [],
+        "impersonated": bool(payload.get("impersonated")),
+        "original_tenant_id": payload.get("original_tenant_id"),
     }
 
 
@@ -144,7 +180,7 @@ def require_role(*roles: str):
 
 
 async def require_admin(current_user: dict = Depends(get_current_user)):
-    """依赖本身（非工厂）：roles 数组含 'admin' 或「系统管理员」角色名放行。
+    """依赖本身（非工厂）：roles 数组含 'admin' 或「租户管理员」角色名放行。
 
     用法::
 
@@ -155,12 +191,12 @@ async def require_admin(current_user: dict = Depends(get_current_user)):
     非 admin 用户调用返回 403 PermissionDeniedError。
     """
     user_roles = set(current_user.get("roles") or [])
-    if not (user_roles & {"admin", "系统管理员"}):
+    if not (user_roles & {"admin", "租户管理员"}):
         raise PermissionDeniedError(
             message=translate(
                 "err.auth.insufficient_role",
-                params={"required": "admin/系统管理员", "current": ", ".join(user_roles)},
-                fallback="需要角色: admin/系统管理员",
+                params={"required": "admin/租户管理员", "current": ", ".join(user_roles)},
+                fallback="需要角色: admin/租户管理员",
             )
         )
     return current_user

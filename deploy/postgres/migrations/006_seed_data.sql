@@ -1,24 +1,24 @@
 -- ============================================================
--- 悦溪平台数据库初始化 - 种子数据
+-- Jonex 平台数据库初始化 - 种子数据
 -- 版本: 006
 -- 包含：开发租户、管理员用户、基础角色/权限、基础菜单、基础应用
 -- ============================================================
 
 -- 开发租户
 INSERT INTO platform.tenants (id, name, description, plan_type)
-VALUES ('tenant_jonex_demo', '悦溪默认租户', '默认租户', 'free')
+VALUES ('tenant_jonex_demo', 'Jonex默认租户', '默认租户', 'free')
 ON CONFLICT (id) DO NOTHING;
 
 -- 多租户登录测试租户
 INSERT INTO platform.tenants (id, name, description, plan_type)
 VALUES
-    ('tenant_jonex_alpha', '悦溪 Alpha 租户', '用于多租户登录选择流程', 'free'),
-    ('tenant_jonex_beta', '悦溪 Beta 租户', '用于多租户登录选择流程', 'free')
+    ('tenant_jonex_alpha', 'Jonex Alpha 租户', '用于多租户登录选择流程', 'free'),
+    ('tenant_jonex_beta', 'Jonex Beta 租户', '用于多租户登录选择流程', 'free')
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试 API Key
 INSERT INTO platform.api_keys (tenant_id, api_key, name, rate_limit)
-VALUES ('tenant_jonex_demo', 'jonex_test_key', '示例 API Key', 1000)
+VALUES ('tenant_jonex_demo', 'jonex_demo_key', '示例 API Key', 1000)
 ON CONFLICT (api_key) DO NOTHING;
 
 -- 管理员用户 (password: admin123)
@@ -77,34 +77,53 @@ ON CONFLICT DO NOTHING;
 -- 导致 RBAC 显式 id 1-14 基础码块被 ON CONFLICT 跳过；无端点消费、无映射引用）。
 -- 权限码统一由下方 RBAC 三批种子提供。
 
--- RBAC 权限（带显式 id，供角色-权限映射引用）
+-- RBAC 基础权限码（带显式 id；id 保留原值，便于与存量库比对）
+--
+-- [jonex] 权限重构 B1：原 14 码里 5 个不再播种（方案 §11.5「建议删除的码」）——
+--   id 1  tenant:read     后端零引用；租户读走 platform:tenant:read
+--   id 8  knowledge:write 后端零引用；KB 写权限由资源身份（kb_manager / 空间管理者穿透）决定
+--   id 10 service:write   后端零引用；领域服务管理由空间管理者身份决定
+--   id 13 system:read     后端零引用；平台配置走 platform:config:*
+--   id 14 system:write    同上
+-- 留着不构成漏洞，但会让角色权限页出现一堆「配了也没用」的勾选项，误导配置者。
+-- 存量库的删除见 update/027（先删 role_permissions 绑定再删码）。
+--
+-- id 2 tenant:write **保留**：它的删除有硬依赖（方案 §11.5），必须在
+-- space_permission_service 已改看 tenant:admin 并稳定运行后单独执行，不在本批。
+-- 它现在回归字面语义（租户 CRUD），**不再**兼任租户管理员标识。
+--
+-- id 11/12 model:read|write 保留但**改 scope 为 platform**（见下方 UPDATE）：
+-- 它们服务「模型适配」页，该页是平台级菜单。
 INSERT INTO platform.permissions (id, code, name, resource, action, description) VALUES
-    (1, 'tenant:read', '查看租户', 'tenant', 'read', '查看租户列表和详情'),
-    (2, 'tenant:write', '管理租户', 'tenant', 'write', '创建、编辑、删除租户'),
+    (2, 'tenant:write', '管理租户', 'tenant', 'write', '创建、编辑、删除租户（不再兼任租户管理员标识）'),
     (3, 'user:read', '查看用户', 'user', 'read', '查看用户列表和详情'),
     (4, 'user:write', '管理用户', 'user', 'write', '创建、编辑、删除用户'),
     (5, 'role:read', '查看角色', 'role', 'read', '查看角色和权限配置'),
     (6, 'role:write', '管理角色', 'role', 'write', '创建、编辑、删除角色，分配权限'),
-    (7, 'knowledge:read', '查看知识', 'knowledge', 'read', '检索和查看知识库内容'),
-    (8, 'knowledge:write', '编辑知识', 'knowledge', 'write', '编辑、上传、维护知识文档'),
-    (9, 'service:read', '查看服务', 'service', 'read', '查看领域服务和配置'),
-    (10, 'service:write', '管理服务', 'service', 'write', '创建和管理领域服务、知识库、数据源'),
-    (11, 'model:read', '查看模型', 'model', 'read', '查看模型配置和状态'),
-    (12, 'model:write', '管理模型', 'model', 'write', '配置和管理模型适配'),
-    (13, 'system:read', '查看系统配置', 'system', 'read', '查看系统配置项'),
-    (14, 'system:write', '管理系统配置', 'system', 'write', '修改系统配置')
+    (7, 'knowledge:read', '查看知识', 'knowledge', 'read', '知识库/检索菜单可见（仅控菜单，后端不做数据准入）'),
+    (9, 'service:read', '查看服务', 'service', 'read', '领域服务菜单可见（仅控菜单，后端不做数据准入）'),
+    (11, 'model:read', '查看模型', 'model', 'read', '模型适配页查看（平台级）'),
+    (12, 'model:write', '管理模型', 'model', 'write', '模型适配页编辑（平台级）')
 ON CONFLICT (id) DO NOTHING;
 
 -- 显式 id 插入不推进序列：立即对齐，防后续无 id 的 INSERT 撞主键
 SELECT setval('platform.permissions_id_seq', (SELECT MAX(id) FROM platform.permissions), true);
 
--- 预设角色（语义：平台管理员 = 平台级最高权限仅 admin 绑定；租户管理员 = 租户内管理员）
+-- 预设角色 —— [jonex] 权限重构 B1（D6）：账号角色由 5 个收为 3 个。
+--
+-- 「领域服务管理员」(id 3) / 「知识编辑者」(id 4) / 「观察者」(id 5) 不再播种：
+-- 它们的业务能力改由**资源身份**承担（空间 space_manager/member、知识库 kb_manager/member），
+-- 三者统一降级为「普通用户」。存量库的迁移见 update/027_permission_codes_tenant_admin.sql。
+--
+-- 「普通用户」刻意占 id 6 而非复用 3 —— 存量库里 id 3 是「领域服务管理员」（027 只软删不删行），
+-- 若新库用 id 3 表示普通用户，两种库的同一 id 会指向不同角色，排障时极易误判。
+--
+-- is_system：平台管理员=1（不可改不可删）；租户管理员与普通用户=0（租户可按需调整菜单码）。
+-- 方案 docs/permissions/PERMISSIONS_REDESIGN.md §3.1
 INSERT INTO platform.roles (id, tenant_id, name, description, is_system) VALUES
     (1, 'tenant_jonex_demo', '平台管理员', '平台级最高权限：全部权限码（含平台面跨租户码），仅 demo 租户 admin 账号绑定', 1),
-    (2, 'tenant_jonex_demo', '租户管理员', '租户内管理员：全部租户业务码（不含平台面码）', 0),
-    (3, 'tenant_jonex_demo', '领域服务管理员', '管理领域服务、知识库、数据源等服务相关配置；领域空间由平台/租户管理员创建后授权管理（空间权限收紧，2026-08-19）', 0),
-    (4, 'tenant_jonex_demo', '知识编辑者', '负责知识的编辑、上传和维护，可管理知识库中的文档和数据', 0),
-    (5, 'tenant_jonex_demo', '观察者', '仅可检索和查看知识，不具备编辑和管理权限，适用于只读访问场景', 0)
+    (2, 'tenant_jonex_demo', '租户管理员', '租户内管理员：全部租户业务码（不含平台面码）；标识码 tenant:admin', 0),
+    (6, 'tenant_jonex_demo', '普通用户', '账号角色兜底态：只持业务菜单码；实际业务能力完全由领域/知识库资源身份决定', 0)
 ON CONFLICT (id) DO NOTHING;
 
 -- 显式 id 插入不推进序列：立即对齐，防后续无 id 的角色播种撞主键
@@ -125,7 +144,10 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('platform:config:write', '管理配置', 'system_config', 'write', '平台级：配置写', 'platform'),
     ('platform:audit:read', '查看审计日志', 'audit_log', 'read', '平台级：审计日志', 'platform'),
     ('platform:task:read', '查看任务', 'task_schedule', 'read', '平台级：任务调度', 'platform'),
-    ('platform:task:write', '管理任务', 'task_schedule', 'write', '平台级：任务写', 'platform')
+    ('platform:task:write', '管理任务', 'task_schedule', 'write', '平台级：任务写', 'platform'),
+    -- [jonex] 全局系统监控（方案 docs/permissions/PERMISSIONS_REDESIGN.md §11.2）。
+    -- 页面当前为占位（研发中），先建码是为了让菜单与角色权限页有真实落点。
+    ('platform:monitor:read', '查看系统监控', 'monitor', 'read', '平台级：全平台服务/任务/组件运行状态', 'platform')
 ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
 
 -- 兜底：旧种子 6 条废弃 platform:* 码（platform:user/role/app:*）无同名新码覆盖，
@@ -133,12 +155,38 @@ ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
 UPDATE platform.permissions SET scope = 'platform'
 WHERE code LIKE 'platform:%' AND scope <> 'platform';
 
--- RBAC 权限系统：租户业务权限码（scope='tenant'，新增 10 个；user/role/knowledge/service/model 已在 id 1-14）
+-- [jonex] 权限重构 B1：新增的系统级码（scope='platform'）
 INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
-    ('engine:read', '查看引擎目录', 'engine', 'read', '接入方式/解析器/模型目录查看', 'tenant'),
-    ('engine:write', '管理引擎目录', 'engine', 'write', '接入方式/解析器/模型目录管理', 'tenant'),
-    ('adapter:read', '查看适配器', 'adapter', 'read', '生态适配器查看', 'tenant'),
-    ('adapter:write', '管理适配器', 'adapter', 'write', '生态适配器管理', 'tenant'),
+    -- 数据源管理页（/apps/platform-management/data-access）只有平台管理员可见 →
+    -- 系统级而非租户级。租户不维护自己的数据源，给知识库加数据时读平台统一那份。
+    -- 方案 §11.4b（「租户级数据源管理」一行已从目标矩阵删除）
+    ('datasource:read', '查看数据源', 'datasource', 'read', '平台级：统一数据源目录', 'platform'),
+    ('datasource:write', '管理数据源', 'datasource', 'write', '平台级：数据源与连接配置', 'platform')
+ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
+
+-- [jonex] 权限重构 B1：新增的租户级码（scope='tenant'）
+INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
+    -- 本次重构的关键单点：租户管理员**标识码**（纯标识，不参与任何业务准入）。
+    -- 一次解决两个现状问题：① 前端看 user:write、后端看 tenant:write 的口径不一致；
+    -- ② tenant:write 语义过载（既是租户 CRUD 又是全租户知识库超级开关）。
+    -- 授予受 D4 约束：只有持 platform:admin 者可把它配给角色（RoleService.set_permissions）。
+    ('tenant:admin', '租户管理员', 'tenant', 'admin', '租户管理员标识码（纯标识，不做业务准入）；仅平台管理员可授予', 'tenant'),
+    -- 领域空间读写分离（方案 §12.3）：read = 能打开空间列表/设置页；write = 能建空间、改设置、指定领域管理者。
+    -- read 发给全部三种角色（普通用户靠它进入自己的空间，内容按资源身份过滤）；write 只给管理员。
+    ('space:read', '查看领域空间', 'space', 'read', '领域空间菜单与设置页可见（内容按资源身份过滤）', 'tenant'),
+    ('space:write', '管理领域空间', 'space', 'write', '创建/管理领域空间、指定领域管理者（租户级能力）', 'tenant'),
+    -- 租户审计查看：数据边界早已由 extract_tenant_id 保证为本租户，本码只是补上「租户级」这一层。
+    ('audit:read', '查看审计日志', 'audit_log', 'read', '租户级：仅本租户操作与调用记录', 'tenant')
+ON CONFLICT (code) DO NOTHING;
+
+-- RBAC 权限系统：租户业务权限码（scope='tenant'）
+-- [jonex] B1（D7）：engine:* / adapter:* 由 tenant 迁到 platform —— 解析器与适配器是
+-- **系统级**能力，两个功能页只有平台管理员在用。scope 见下方统一 UPDATE。
+INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
+    ('engine:read', '查看引擎目录', 'engine', 'read', '平台级：解析器/接入方式目录查看', 'platform'),
+    ('engine:write', '管理引擎目录', 'engine', 'write', '平台级：解析器/接入方式目录管理', 'platform'),
+    ('adapter:read', '查看适配器', 'adapter', 'read', '平台级：生态适配器查看', 'platform'),
+    ('adapter:write', '管理适配器', 'adapter', 'write', '平台级：生态适配器管理', 'platform'),
     ('skill:read', '查看技能', 'skill', 'read', '技能查看', 'tenant'),
     ('skill:write', '管理技能', 'skill', 'write', '技能启用/停用', 'tenant'),
     ('template:read', '查看模板', 'template', 'read', '模板系统查看', 'tenant'),
@@ -151,35 +199,25 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('mcp:key:manage', '管理 MCP Key', 'key', 'manage', '本租户 MCP Key 创建/停用/启用/撤销/重新创建/删除', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
--- 角色-权限关联（基础矩阵：平台管理员/租户管理员全 14 码；领域服务管理员/知识编辑者/观察者按矩阵）
-INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id) VALUES
-    ('tenant_jonex_demo', 1, 1), ('tenant_jonex_demo', 1, 2), ('tenant_jonex_demo', 1, 3),
-    ('tenant_jonex_demo', 1, 4), ('tenant_jonex_demo', 1, 5), ('tenant_jonex_demo', 1, 6),
-    ('tenant_jonex_demo', 1, 7), ('tenant_jonex_demo', 1, 8), ('tenant_jonex_demo', 1, 9),
-    ('tenant_jonex_demo', 1, 10), ('tenant_jonex_demo', 1, 11), ('tenant_jonex_demo', 1, 12),
-    ('tenant_jonex_demo', 1, 13), ('tenant_jonex_demo', 1, 14),
-    ('tenant_jonex_demo', 2, 1), ('tenant_jonex_demo', 2, 2), ('tenant_jonex_demo', 2, 3),
-    ('tenant_jonex_demo', 2, 4), ('tenant_jonex_demo', 2, 5), ('tenant_jonex_demo', 2, 6),
-    ('tenant_jonex_demo', 2, 7), ('tenant_jonex_demo', 2, 8), ('tenant_jonex_demo', 2, 9),
-    ('tenant_jonex_demo', 2, 10), ('tenant_jonex_demo', 2, 11), ('tenant_jonex_demo', 2, 12),
-    ('tenant_jonex_demo', 2, 13), ('tenant_jonex_demo', 2, 14),
-    ('tenant_jonex_demo', 3, 3), ('tenant_jonex_demo', 3, 7),
-    ('tenant_jonex_demo', 3, 9), ('tenant_jonex_demo', 3, 10),
-    ('tenant_jonex_demo', 4, 7), ('tenant_jonex_demo', 4, 8), ('tenant_jonex_demo', 4, 9),
-    ('tenant_jonex_demo', 5, 7), ('tenant_jonex_demo', 5, 9)
-ON CONFLICT DO NOTHING;
+-- [jonex] 权限重构 B1：scope 迁移收敛（幂等）。
+-- 上面几个 INSERT 用的是 ON CONFLICT DO NOTHING，对**已存在**的码不会改 scope，
+-- 所以这里显式 UPDATE 一次 —— 存量库里这 6 个码是 tenant scope，必须落到 platform。
+-- 显式列码名而非用 LIKE：将来新增 engine:*/model:* 之外的码时，否定式条件会过期。
+--   engine:*  / adapter:*  → D7（解析器/适配器是系统级）
+--   model:*              → 模型适配页是平台级菜单（2026-08-29 决策，码保留不删）
+UPDATE platform.permissions SET scope = 'platform'
+WHERE code IN ('engine:read','engine:write','adapter:read','adapter:write','model:read','model:write')
+  AND scope <> 'platform';
 
--- demo 预设角色 × 新增业务码矩阵（平台管理员/租户管理员/领域服务管理员全 rw；知识编辑者/观察者 read）
-INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
-SELECT 'tenant_jonex_demo', r.id, p.id
-FROM platform.roles r
-JOIN platform.permissions p ON p.code IN (
-    'engine:read','engine:write','adapter:read','adapter:write','skill:read','skill:write',
-    'template:read','template:write','prompt:read','prompt:write','mcp:service:view','mcp:service:manage','mcp:key:view','mcp:key:manage'
-)
-WHERE r.tenant_id = 'tenant_jonex_demo' AND r.is_deleted = 0
-  AND r.name IN ('平台管理员', '租户管理员', '领域服务管理员')
-ON CONFLICT DO NOTHING;
+-- 角色-权限关联
+--
+-- [jonex] 权限重构 B1：原先这里有一段按 permission_id 硬编码的矩阵
+-- （('tenant_jonex_demo', 1, 1) ... 共 38 行）。已删除，原因有两个：
+--   1. 它对角色 1/2 授予的内容**完全被下方两个按 scope 的兜底块覆盖**（重复且脆弱）；
+--   2. 它按 id 引用权限码 —— 删码/加码时 id 会错位，改起来必须人工对表。
+-- 现在全部走「按 scope / 按 code」的声明式块，加减码不需要动这里。
+--
+-- 三个降级角色（id 3/4/5）的矩阵行一并删除 —— D6 已把它们收敛为「普通用户」。
 
 -- demo 平台管理员补全部平台面码（平台码只给平台管理员角色）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
@@ -197,13 +235,34 @@ JOIN platform.permissions p ON p.scope = 'tenant'
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '租户管理员') AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
--- 每租户预设角色播种（demo 已显式插入 id 1-4；其他租户按 demo 模板复制，is_system=0）
+-- [jonex] 权限重构 B1：「普通用户」只持 3 个业务菜单码（方案 §3.2-D / §11.4）。
+--
+-- 这 3 个码**仅控前端菜单与路由可见性，后端一律不用它们做数据准入**
+-- （已核实为既有事实：全仓 capabilities/ api_gateway/ jonex_core/ mcp_server/ 对
+--  knowledge:read / service:read 零命中）。业务数据范围完全由资源身份决定。
+--
+-- 为什么普通用户必须有菜单码：目标说普通用户能力「由资源身份确定」，但菜单可见性
+-- 不能也由资源身份定 —— 否则用户连入口都看不到，无法发现自己被授权了。
+--
+-- space:read 在这里出现不是笔误：普通用户需要它才能打开空间列表页，
+-- 页面内容按 get_visible_space_ids 过滤，只显示他是 space_manager/member 的空间。
+-- 「能不能建空间/改设置」由 space:write 控制，普通用户没有。
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT r.tenant_id, r.id, p.id
+FROM platform.roles r
+JOIN platform.permissions p ON p.code IN ('knowledge:read', 'service:read', 'space:read')
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '普通用户' AND r.is_deleted = 0
+ON CONFLICT DO NOTHING;
+
+-- 每租户预设角色播种（demo 已显式插入 id 1/2/6；其他租户按 demo 模板复制，is_system=0）
+-- [jonex] B1（D6）：模板由 4 个角色收为 2 个 —— 「租户管理员」+「普通用户」。
+-- 「平台管理员」刻意不复制：D3 已确认平台管理员绑定在运营租户（demo），非缺陷。
 INSERT INTO platform.roles (tenant_id, name, description, is_system)
 SELECT t.id, r.name, r.description, 0
 FROM platform.tenants t
 CROSS JOIN (SELECT name, description FROM platform.roles
             WHERE tenant_id = 'tenant_jonex_demo' AND is_deleted = 0
-              AND name IN ('租户管理员','领域服务管理员','知识编辑者','观察者')) r
+              AND name IN ('租户管理员','普通用户')) r
 WHERE t.id <> 'tenant_jonex_demo' AND t.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
@@ -237,21 +296,41 @@ WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '租户管理员'
   AND NOT (u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin')
 ON CONFLICT DO NOTHING;
 
--- 6c. role='user' → 「观察者」
+-- 6c. role='user' → 「普通用户」
+-- [jonex] B1（D6）：原先绑到「观察者」。该角色已取消，其"查看"能力现由资源身份
+-- （空间 member / 知识库 member）承担，账号角色只负责菜单可见性。
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
 SELECT u.tenant_id, u.id, r.id
 FROM platform.users u
 JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
-WHERE u.role = 'user' AND u.is_deleted = 0 AND r.name = '观察者'
+WHERE u.role = 'user' AND u.is_deleted = 0 AND r.name = '普通用户'
 ON CONFLICT DO NOTHING;
 
--- 6d. 空间权限演示：editor_demo → 「知识编辑者」（叠加 6c 的「观察者」，权限码取并集）
+-- 6d. 空间权限演示：editor_demo → 「普通用户」
+-- [jonex] B1（D6）：原先绑到「知识编辑者」。该角色已取消 —— 「编辑知识」不再是账号角色，
+-- 而是知识库的 kb_manager 资源身份。演示账号的编辑能力需另行在 kb_permissions 里授予。
+-- 注意 6c 已把它绑到「普通用户」（role='user'），这里的 ON CONFLICT 会跳过，属预期。
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
 SELECT u.tenant_id, u.id, r.id
 FROM platform.users u
 JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
 WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_deleted = 0
-  AND r.name = '知识编辑者'
+  AND r.name = '普通用户'
+ON CONFLICT DO NOTHING;
+
+-- 6e. 兜底：任何没有角色绑定的用户 → 「普通用户」
+-- [jonex] B1（D6）：三个降级角色取消后，若某用户的 role 字段既不是 'admin' 也不是 'user'
+-- （历史脏数据），6a-6d 都不会命中，他会落到**零角色**——连菜单都看不见。
+-- 这条兜底保证「每个有效用户至少有一个账号角色」，也是 §2.4-4.1 断言的前提。
+INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
+SELECT u.tenant_id, u.id, r.id
+FROM platform.users u
+JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0 AND r.name = '普通用户'
+WHERE u.is_deleted = 0
+  AND NOT EXISTS (
+    SELECT 1 FROM platform.user_roles ur
+    WHERE ur.tenant_id = u.tenant_id AND ur.user_id = u.id
+  )
 ON CONFLICT DO NOTHING;
 
 -- 默认菜单（四大板块：领域本体/数据接入/集成扩展/平台管理；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
@@ -264,8 +343,13 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     (20, 1, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 4, 'template:read'),
     -- 数据接入分组 → 数据源管理、解析器管理（直接项）
     (21, 0, 'navigation.dataAccessGroup', NULL, 'CloudServerOutlined', NULL, 2, NULL),
-    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'engine:read'),
+    -- [jonex] B1：数据源管理改用 datasource:read（原先与解析器管理共用 engine:read，
+    -- 两个不同的页面共享一个码 → 无法分别授权）。两者都是 platform scope，仅平台管理员可见。
+    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'datasource:read'),
     (8, 21, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
+    -- [jonex] 模型适配：此前只在 platform-management 子应用侧边栏（standalone 模式）可达，
+    -- 未进菜单树 → 经 shell 的 hosted 模式无入口（HostedLayout 不渲染子应用侧边栏）。
+    (27, 21, 'navigation.modelAdapter', '/apps/platform-management/model-adapter', 'ApiOutlined', NULL, 3, 'model:read'),
     -- 集成扩展分组 → Mcp生态（直接项；适配器目录已注释隐藏）
     (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, NULL),
     -- (18, 22, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'), -- 适配器目录：已注释隐藏，恢复时放开本行
@@ -281,12 +365,25 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     -- 平台管理分组 → 系统运维组（可折叠）
     (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 3, NULL),
     (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read'),
-    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'platform:audit:read')
+    -- [jonex] B1：操作日志菜单码由 platform:audit:read 改为 audit:read（tenant scope）。
+    -- 接口已改成双码放行（platform:audit:read 或 audit:read），但菜单码若还是平台码，
+    -- 租户管理员会被 _filter_visible_menus 裁掉这一项 → 组头「系统运维」也被连带裁掉
+    -- → 「接口通了但没有入口」。菜单与接口必须一起改。
+    -- 平台管理员天然持全部 tenant 码，所以他仍然看得到。
+    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'audit:read'),
+    -- [jonex] 系统监控：占位页（研发中），与系统配置/操作日志同属系统运维组
+    (28, 26, 'navigation.systemMonitor', '/apps/platform-management/system-monitor', 'DashboardOutlined', NULL, 3, 'platform:monitor:read')
 ON CONFLICT DO NOTHING;
+
+-- 隐藏「模型适配」与「系统监控」两个菜单（软删除；恢复时改回 0）
+UPDATE platform.menus
+SET is_deleted = 1
+WHERE name IN ('navigation.modelAdapter', 'navigation.systemMonitor');
+
 
 -- 默认应用注册
 INSERT INTO platform.applications (app_code, name, entry_path, description, sort_order) VALUES
-    ('shell', '悦溪 Shell', '/', '统一登录入口与导航壳', 1),
+    ('shell', 'Jonex Shell', '/', '统一登录入口与导航壳', 1),
     ('core-business', '核心业务', '/apps/core-business', '核心业务管理', 2),
     ('platform-management', '平台管理', '/apps/platform-management', '平台管理', 3),
     ('ecosystem-management', '生态管理', '/apps/ecosystem-management', '生态管理', 4)
@@ -802,11 +899,11 @@ ON CONFLICT (id) DO NOTHING;
 
 -- 默认空间成员种子（演示空间权限：owner 不落 space_permissions，见设计 §2）
 INSERT INTO knowledge_base.space_permissions (id, tenant_id, space_id, user_id, role, created_at, updated_at)
-SELECT 'spp_demo_editor', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'manager', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+SELECT 'spp_demo_editor', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'space_manager', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
   FROM platform.users u
  WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_deleted = 0
 UNION ALL
-SELECT 'spp_demo_viewer', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'viewer', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+SELECT 'spp_demo_viewer', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR), 'member', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
   FROM platform.users u
  WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'viewer_demo' AND u.is_deleted = 0
 ON CONFLICT DO NOTHING;
@@ -2510,7 +2607,7 @@ VALUES (
 ) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
 
 -- ============================================================
--- 悦溪平台 - business_domain.prompt_templates 数据导出
+-- Jonex 平台 - business_domain.prompt_templates 数据导出
 -- 导出时间: 2026-07-07 14:42:02
 -- 记录数: 6
 -- ============================================================

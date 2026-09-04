@@ -35,12 +35,13 @@ _publish_service = TemplatePublishService()
 @router.get("/templates/domains")
 async def list_template_domains(
     request: Request,
+    status: str | None = Query(None),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
     tenant_id = extract_tenant_id(request)
     try:
-        result = await _service.list_domains(tenant_id, offset, limit)
+        result = await _service.list_domains(tenant_id, offset, limit, status=status)
         return success_response(data=result)
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)

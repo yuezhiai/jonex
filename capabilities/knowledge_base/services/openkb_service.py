@@ -1,4 +1,4 @@
-# [jonex] 悦溪新增文件 — OpenKB 编译服务
+# [jonex] Jonex新增文件 — OpenKB 编译服务
 """knowledge_base 侧 OpenKB 编译/查询/删除编排服务。
 
 通过 RemoteOpenKBClient → Sidecar /invoke 调用 OpenKB 容器。

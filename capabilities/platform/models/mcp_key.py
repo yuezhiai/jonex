@@ -1,16 +1,30 @@
+from datetime import datetime, timezone
+
 from sqlalchemy import Column, Integer, String, TIMESTAMP
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
 
-# permission_level 白名单 — call=可调用（搜索+阅读），view=仅查看（阅读）
-# write / * 已物理删除（jonex-29l）：写入能力移交独立知识写入 Key
-VALID_PERMISSION_LEVELS = {"call", "view"}
-
 
 class McpKey(Base):
     __tablename__ = "mcp_keys"
     __table_args__ = {"schema": "platform"}
+
+    @staticmethod
+    def _derive_status(key) -> str:
+        """派生 4 态状态（逻辑字段，不落库）。
+
+        优先级：revoked（revoked_at 非空，撤销不可逆终态最优先）
+        > expired（expires_at 到期）> disabled（disabled_at 非空）> active。
+        时间用 datetime.now(timezone.utc)——async ORM 禁 func.now()（MissingGreenlet 陷阱）。
+        """
+        if key.revoked_at:
+            return "revoked"
+        if key.expires_at and key.expires_at <= datetime.now(timezone.utc):
+            return "expired"
+        if key.disabled_at:
+            return "disabled"
+        return "active"
 
     id = Column(String(64), primary_key=True)
     tenant_id = Column(String(64), nullable=False)
@@ -18,12 +32,14 @@ class McpKey(Base):
     note = Column(String(512))
     key_prefix = Column(String(32), nullable=False, default="")
     key_hash = Column(String(64), nullable=False)
-    permissions = Column(String(512), nullable=False, default="view")
     allowed_kb_ids = Column(JSONB, nullable=False, default=[])
     space_id = Column(String(64), nullable=True)
+    write_grants = Column(JSONB, nullable=True)
+    client_request_id = Column(String(64), nullable=True)
     created_by = Column(String(128))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False)
     revoked_at = Column(TIMESTAMP(timezone=True))
+    revoked_by = Column(String(128))
     expires_at = Column(TIMESTAMP(timezone=True))
     disabled_at = Column(TIMESTAMP(timezone=True))
     last_used_at = Column(TIMESTAMP(timezone=True))

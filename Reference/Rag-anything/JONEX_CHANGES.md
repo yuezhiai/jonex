@@ -1,6 +1,6 @@
-# RAG-Anything 悦溪（jonex）改动点清单
+# RAG-Anything Jonex（jonex）改动点清单
 
-> 本文件记录悦溪平台对 vendored RAG-Anything（`Reference/Rag-anything/`）源码的改动点，
+> 本文件记录Jonex 平台对 vendored RAG-Anything（`Reference/Rag-anything/`）源码的改动点，
 > 便于后续升级 RAG-Anything 时快速定位、重新 apply。**代码改动均以 `# [jonex]` 注释标记**，
 > 可全局搜索 `[jonex]` 定位。约定与 `Reference/LightRAG/JONEX_CHANGES.md` 一致。
 
@@ -8,7 +8,7 @@
 
 - 单行改动：行尾加 `# [jonex]`。
 - 代码块改动：块首 `# ── [jonex] <说明> ───`，块尾 `# ── [jonex] end ───`。
-- 新增整类/整文件：类/文件头注释标明 `# [jonex] 悦溪新增`。
+- 新增整类/整文件：类/文件头注释标明 `# [jonex] Jonex新增`。
 
 ## 二、改动总览
 
@@ -19,7 +19,7 @@
 | 依赖分层 | 把 `mineru[core]` 从核心依赖降为 optional extra `local`，支撑 atomic-rag 镜像瘦身 |
 
 > 说明：仓库中 `mineru_online`（mineru.net 云 API 解析器）、`raganything/asr/*`、
-> `raganything/video_analysis/*`（含腾讯 MPS 后端）、`resilience`/`callbacks` 等模块亦为悦溪相关定制/新增，
+> `raganything/video_analysis/*`（含腾讯 MPS 后端）、`resilience`/`callbacks` 等模块亦为Jonex相关定制/新增，
 > 本清单自「MinerU 内网自建接入」起开始系统记录；对应设计见
 > `docs/mineru-selfhost-parser-execution-plan.md`。
 
@@ -31,7 +31,7 @@
 
 | 文件 | 位置 | 说明 |
 |------|------|------|
-| `raganything/parser.py` | `class MineruSelfHostParser(MineruParser)` | `# ── [jonex] 悦溪新增：内网自建 MinerU (mineru-api) 解析器 ───` |
+| `raganything/parser.py` | `class MineruSelfHostParser(MineruParser)` | `# ── [jonex] Jonex新增：内网自建 MinerU (mineru-api) 解析器 ───` |
 
 要点：
 - 对接内网自建的 **MinerU 官方 `mineru-api`（FastAPI）** 服务（默认 `http://127.0.0.1:8000`；实际内网地址在 gitignored 的 `deploy/.env` 配），

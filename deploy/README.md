@@ -1,6 +1,6 @@
 # deploy
 
-`deploy/` 保存悦溪平台部署相关文件，包括 Docker 构建上下文、Nginx 配置和 PostgreSQL migration。
+`deploy/` 保存Jonex 平台部署相关文件，包括 Docker 构建上下文、Nginx 配置和 PostgreSQL migration。
 
 ## 目录
 
@@ -29,14 +29,17 @@ frontend-gateway:80
 
 | 文件 | 职责 |
 |---|---|
-| `nginx/frontend-gateway.conf` | 唯一前端入口，聚合 shell、子应用、remote assets 和 `/api/**` 反代。 |
+| `nginx/app-locations.conf` | 唯一前端入口的**业务路由**：聚合 shell、子应用、remote assets 和 `/api/**` 反代。新增子应用的路由加在这里。两种接入模式共用。 |
+| `nginx/modes/server-http.conf` | 监听层：IP + HTTP，无 TLS。`ACCESS_MODE=http`（默认）时启用。 |
+| `nginx/modes/server-https.conf` | 监听层：80 跳转 + 443 终止 TLS。`ACCESS_MODE=https` 时启用，需挂载证书。 |
+| `nginx/50x.html` | 上游全挂时返回的静态 5xx 错误页。 |
 | `nginx/expert-call.conf` | expert-call 子前端 standalone fallback 和 remote assets。 |
 
 新增前端子应用时，需要同步：
 
 - 子应用 Dockerfile。
 - 子应用 `nginx/default.conf`。
-- `deploy/nginx/frontend-gateway.conf` 中的 standalone 路由和 remote assets 反代。
+- `deploy/nginx/app-locations.conf` 中的 standalone 路由和 remote assets 反代。
 - 平台后端应用注册表。
 - `frontends/shell/public/app-manifest.json` 本地 fallback。
 
@@ -264,10 +267,10 @@ make restart-service SERVICE=atomic-rag
 
 ```bash
 # 约束检查
-docker exec jonex-neo4j cypher-shell -u neo4j -p jonex_neo4j_123 "SHOW CONSTRAINTS;"
+docker exec jonex-neo4j cypher-shell -u neo4j -p <your-neo4j-password> "SHOW CONSTRAINTS;"
 
 # 查看本体实体
-docker exec jonex-neo4j cypher-shell -u neo4j -p jonex_neo4j_123 \
+docker exec jonex-neo4j cypher-shell -u neo4j -p <your-neo4j-password> \
   "MATCH (n:OntologyEntity) RETURN n.tenant_id, n.entity_type, n.canonical_name LIMIT 10;"
 ```
 
@@ -275,7 +278,7 @@ docker exec jonex-neo4j cypher-shell -u neo4j -p jonex_neo4j_123 \
 
 ```bash
 curl "http://localhost:8000/api/v1/knowledge-base/documents/search/enhanced?query=腾讯&knowledge_base_id=KB1&mode=hybrid&top_k=3" \
-     -H "Authorization: Bearer jonex_test_tenant123"
+     -H "X-API-Key: <your-api-key>"
 ```
 
 返回 `{answer, source:"ontology"|"rag", ontology_instances:[...], rag_used:boolean}`：`source="ontology"` 表示基于 Neo4j 图谱事实 + LLM 回答；`source="rag"` 表示本体未命中、回退完整 RAG。
@@ -323,7 +326,7 @@ curl "http://localhost:8000/api/v1/knowledge-base/documents/search/enhanced?quer
 | `ONTOLOGY_SCHEMA_PATH` | `deploy/config/ontology/default.yaml` | TBox schema 路径 |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j 连接地址 |
 | `NEO4J_USERNAME` | `neo4j` | Neo4j 用户名 |
-| `NEO4J_PASSWORD` | `jonex_neo4j_123` | Neo4j 密码 |
+| `NEO4J_PASSWORD` | `<your-neo4j-password>` | Neo4j 密码 |
 
 ### RAG 召回后处理变量（[jonex] rag-subject-filter 方案）
 

@@ -7,6 +7,7 @@ import os
 import re
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import quote
 
 from sqlalchemy import and_, delete, or_, select
 
@@ -46,8 +47,15 @@ from ..dtos import (
     DocumentUploadRequest,
     SetDocumentFolderRequest,
 )
+from .quota_service import QuotaService
+from jonex_core.common.quota import classify_quota_category
 
 logger = logging.getLogger(__name__)
+
+
+# [jonex] COS 预签名直传单文件大小上限（字节）。默认 500MB 对齐 Nginx 对外硬上限
+# client_max_body_size 500m，可通过环境变量 OBJECT_STORAGE_MAX_UPLOAD_SIZE 调整。
+_MAX_UPLOAD_SIZE = int(os.getenv("OBJECT_STORAGE_MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
 
 
 # [jonex] 线性状态（phase）→ SQLAlchemy 谓词。单一事实来源，供 list_documents 与
@@ -406,6 +414,42 @@ class DocumentService:
         req = DocumentUploadRequest(**data)
         metadata = dict(req.metadata or {})
 
+        # ── 安全加固：storage_key 租户段 fail-closed 校验 ──
+        # 客户端 COS 直传确认会直接信任传入的 storage_key。此处校验 key 的租户/知识库段
+        # 与当前上下文一致，防止构造他租户的 storage_key 触发 RAG 解析造成跨租户数据泄露。
+        # 兼容三种布局：
+        # 1) 旧存量入站推送（api_push，{prefix}/ingest/{ds_id}/{doc_id}/...）：不含租户段，
+        #    租户由 ds 记录服务端推导，仅做段数结构校验后放行；
+        # 2) 新入站推送（{prefix}/kb/{tenant}/ingest/{ds_id}/{doc_id}/...）：已纳入租户前缀，
+        #    校验租户段与上下文一致；
+        # 3) 普通 kb 直传/上传（{prefix}/kb/{tenant}/{kb_id}/{doc_id}/...）：校验租户/知识库/文档段。
+        if req.storage_key:
+            parts = req.storage_key.split("/")
+            if len(parts) >= 2 and parts[1] == "ingest":
+                # 旧存量入站推送布局：不含租户段，仅做段数结构校验
+                valid = len(parts) >= 5
+            elif len(parts) >= 4 and parts[1] == "kb" and parts[3] == "ingest":
+                # 新入站推送布局：kb/{tenant}/ingest/{ds_id}/{doc_id}/...，校验租户段
+                valid = len(parts) >= 6 and parts[2] == tenant_id
+            else:
+                valid = (
+                    len(parts) >= 5
+                    and parts[1] == "kb"
+                    and parts[2] == tenant_id
+                    and parts[3] == req.knowledge_base_id
+                )
+                if valid and req.doc_id:
+                    valid = parts[4] == req.doc_id
+            if not valid:
+                raise PermissionDeniedError(
+                    message="storage_key 与租户/知识库不匹配",
+                    details={
+                        "storage_key": req.storage_key,
+                        "tenant_id": tenant_id,
+                        "knowledge_base_id": req.knowledge_base_id,
+                    },
+                )
+
         # 统一来源标记：未显式归属（即手动上传，同步/推送路径已自带 data_source_id）时，
         # 归属到该 KB 已存在的 file 数据源；不存在则报错，不隐式创建。
         if not metadata.get("data_source_id"):
@@ -425,16 +469,27 @@ class DocumentService:
         storage_key = req.storage_key or req.file_path
         storage_backend = req.storage_backend
         # 未显式指定存储后端时，从环境变量自动推断
-        if storage_backend == "local" and os.getenv("OBJECT_STORAGE_BACKEND", "local") == "cos":
-            storage_backend = "cos"
+        if storage_backend == "local":
+            global_backend = os.getenv("OBJECT_STORAGE_BACKEND", "local").strip().lower()
+            if global_backend in ("cos", "s3"):
+                storage_backend = global_backend
 
         # file_path 由存储后端统一推导（下游 atomic-rag 解析用）：
         #  - 对象存储后端（cos 等）：通过 storage_key 下载，file_path 仅作标识 → 用 storage_key；
         #  - local 后端：解析需可直接读取的绝对路径，由对象存储后端把 key 解析为共享卷绝对路径。
-        if storage_backend == "cos":
+        if storage_backend in ("cos", "s3"):
             file_path = req.file_path or storage_key
         else:
             file_path = get_object_storage().fs_path(storage_key) or req.file_path or storage_key
+
+        # [jonex] 配额：解析真实文件大小 + 静态校验（文件类型 / 单文件大小，事务外）。
+        # COS 直传不经 Gateway，前端不填 file_size → 从对象存储元数据（Content-Length）读取。
+        file_size = req.file_size
+        if storage_backend in ("cos", "s3") and not file_size:
+            file_size = await get_object_storage().head_object_size(storage_key) or 0
+        quota = QuotaService()
+        category = classify_quota_category(req.mime_type, req.file_name)
+        quota.check_upload_static(category, file_size)
 
         # [jonex] 上传去重：同 KB 内内容 md5 相同的活跃文档已存在则拒绝，避免重复入库。
         # （fail-open：hash 取不到 → 放行，不因临时存储错误阻塞上传）
@@ -457,13 +512,16 @@ class DocumentService:
         doc_id = req.doc_id or None  # 预生成 doc_id（COS 直传模式），None 则自动 UUID
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
+            # [jonex] 配额：计数校验（单 KB 文档数 → 租户文档数 → 租户容量），
+            # 与 INSERT 同事务 + advisory lock，校验通过即占额（D2-B）。
+            await quota.check_upload_counts(session, tenant_id, req.knowledge_base_id, file_size)
             doc = await repo.create(
                 KnowledgeDocument(
                     id=doc_id,
                     tenant_id=tenant_id,
                     file_name=req.file_name,
                     file_path=file_path,
-                    file_size=req.file_size,
+                    file_size=file_size,
                     mime_type=req.mime_type,
                     knowledge_base_id=req.knowledge_base_id,
                     storage_backend=storage_backend,
@@ -486,7 +544,7 @@ class DocumentService:
             "username": username,
             "ip": ip,
             "log_type": "OPERATION",
-            "action": "document.upload",
+            "action": "upload_document",
             "outcome": "SUCCESS",
             "service_name": "knowledge_base",
             "resource": ResourceType.DOCUMENT.value,
@@ -506,8 +564,8 @@ class DocumentService:
             "resource_id": str(doc_id),
         })
 
-        # COS 后端：确认对象已存在后再入队解析，避免竞态（D9）
-        if storage_backend == "cos":
+        # 对象存储后端（cos/s3）：确认对象已存在后再入队解析，避免竞态（D9）
+        if storage_backend in ("cos", "s3"):
             exists = await get_object_storage().head_object(storage_key)
             if not exists:
                 raise ResourceNotFoundError(
@@ -630,24 +688,37 @@ class DocumentService:
 
     async def generate_upload_url(
         self, tenant_id: str, kb_id: str, file_name: str, content_type: str | None = None,
+        file_size: int | None = None,
     ) -> dict:
         """生成 COS 预签名 PUT URL 和 storage_key（D9）。
 
         前端/网关直传字节到 COS（不经 Sidecar 透传），
         然后再调 upload_document 传 storage_key 确认。
+
+        file_size：客户端声明的待上传字节数。非空时先做上限校验，再把 Content-Length
+        头纳入签名，锁死客户端必须上传该精确字节数（防随意扩大）；local 后端返回空
+        upload_url 降级走 multipart 上传。
         """
         from uuid import uuid4
 
         tenant_id = require_tenant(tenant_id)
+        if file_size is not None and (file_size <= 0 or file_size > _MAX_UPLOAD_SIZE):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.upload.size_exceeded",
+                    params={"size": file_size, "max": _MAX_UPLOAD_SIZE},
+                    fallback=f"文件大小超限：{file_size} 字节，最大允许 {_MAX_UPLOAD_SIZE} 字节",
+                ),
+                details={"file_size": file_size, "max_size": _MAX_UPLOAD_SIZE},
+            )
         doc_id = str(uuid4())
         storage_key = build_object_key(tenant_id, kb_id, doc_id, file_name)
 
         storage = get_object_storage()
-        try:
-            upload_url = await storage.presigned_put_url(storage_key, expires=300)
-        except Exception:
-            # local 后端不支持预签名 PUT 时降级
-            upload_url = None
+        # local 后端显式实现 presigned_put_url 返回空串降级，cos 后端按 content_length 签名
+        upload_url = await storage.presigned_put_url(
+            storage_key, tenant_id=tenant_id, expires=300, content_length=file_size,
+        )
 
         return {
             "doc_id": doc_id,
@@ -656,13 +727,18 @@ class DocumentService:
             "storage_backend": os.getenv("OBJECT_STORAGE_BACKEND", "local"),
         }
 
-    async def get_raw_location(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "") -> dict:
+    async def get_raw_location(self, tenant_id: str, knowledge_base_id: str = "", document_id: str = "",
+                               download: bool = False) -> dict:
         """获取文档原文位置信息（校验租户归属后返回）。
 
         统一 raw 入口：
-        - 对象存储后端（cos）：返回 presigned_url，gateway 302 直跳（天然支持 Range/流式）；
+        - 对象存储后端（cos/s3）：返回 presigned_url，gateway 302 直跳（天然支持 Range/流式）；
         - local 后端：presigned_url 为空，返回 storage_key，gateway 用 FileResponse
           从共享卷流式返回（支持 Range，音视频可拖动/边下边播，不经 Sidecar 传字节）。
+
+        download=True 时对象存储预签名 URL 附带
+        response-content-disposition: attachment; filename*=UTF-8''<原名>，
+        浏览器下载并使用原始文件名（local 后端的 attachment 由 gateway 处理）。
 
         knowledge_base_id 可为空——仅用于可选 KB 级归属校验；租户级鉴权已由 get_required 保证。
         """
@@ -679,8 +755,15 @@ class DocumentService:
         # 按文档自身的 storage_backend 选后端（混合数据时不能用全局 env 单例）
         backend = (doc.storage_backend or "local").strip().lower()
         presigned = ""
-        if backend == "cos":
-            presigned = await get_object_storage_for("cos").presigned_url(doc.storage_key, tenant_id, expires=300)
+        if backend in ("cos", "s3"):
+            disposition = None
+            if download:
+                disposition = "attachment"
+                if doc.file_name:
+                    disposition += f"; filename*=UTF-8''{quote(doc.file_name)}"
+            presigned = await get_object_storage_for(backend).presigned_url(
+                doc.storage_key, tenant_id, expires=300, disposition=disposition,
+            )
         return {
             "storage_backend": backend,
             "storage_key": doc.storage_key,
@@ -1260,8 +1343,10 @@ class DocumentService:
                 OntologyStatus.READY.value if is_openkb else OntologyStatus.PENDING.value
             )
             doc.error_message = None
-            if is_openkb:
-                doc.ontology_error = None
+            # [jonex] reparse 是全量重来，本体重试计数与错误一并清零，
+            # 否则历史 retry_count 会让对账在重解析后立刻撞上限失败。
+            doc.ontology_retry_count = 0
+            doc.ontology_error = None
             # [jonex] R1-c：持久化源文件 hash + 配置指纹到 extra_metadata，供后续 reparse 比对
             # [jonex] R2-a0: 清除旧 rag_task_id（防对账用旧 id 查到 not_found→判死）
             # + 写入提交锚点（宽限期从这一刻开始）
@@ -1309,15 +1394,15 @@ class DocumentService:
             "username": username,
             "ip": ip,
             "log_type": "TASK",
-            "action": "document.reparse",
+            "action": "reparse_document",
             "outcome": "SUCCESS",
             "service_name": "knowledge_base",
             "resource": ResourceType.DOCUMENT.value,
             "resource_id": str(document_id),
         })
 
-        # COS 后端：确认对象仍存在
-        if storage_backend == "cos":
+        # 对象存储后端（cos/s3）：确认对象仍存在
+        if storage_backend in ("cos", "s3"):
             exists = await get_object_storage().head_object(storage_key)
             if not exists:
                 # [jonex] 文档此前已置 PARSING，这里直接 raise 会永久卡住（PARSING 又被
@@ -1769,7 +1854,7 @@ class DocumentService:
             "username": username,
             "ip": ip,
             "log_type": "OPERATION",
-            "action": "document.delete",
+            "action": "delete_document",
             "outcome": "SUCCESS",
             "service_name": "knowledge_base",
             "resource": ResourceType.DOCUMENT.value,
@@ -1779,7 +1864,14 @@ class DocumentService:
         return {"id": document_id, "deleted": True}
 
     async def set_document_folder(
-        self, tenant_id: str, document_id: str, req: SetDocumentFolderRequest | dict
+        self,
+        tenant_id: str,
+        document_id: str,
+        req: SetDocumentFolderRequest | dict,
+        *,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        ip: Optional[str] = None,
     ) -> dict:
         """设置或清除文档的文件夹归属。
 
@@ -1809,10 +1901,34 @@ class DocumentService:
 
             doc.folder_id = folder_id
             await session.commit()
+
+            schedule_emit({
+                "tenant_id": tenant_id,
+                "user_id": _audit_user_id(user_id),
+                "username": username,
+                "ip": ip,
+                "log_type": "OPERATION",
+                "action": "set_document_folder",
+                "outcome": "SUCCESS",
+                "service_name": "knowledge_base",
+                "resource": ResourceType.DOCUMENT.value,
+                "resource_id": str(document_id),
+                "request_params": {
+                    "knowledge_base_id": knowledge_base_id,
+                    "folder_id": folder_id,
+                },
+            })
+
             return doc.to_dict()
 
     async def batch_set_document_folder(
-        self, tenant_id: str, req: BatchMoveDocumentsRequest | dict
+        self,
+        tenant_id: str,
+        req: BatchMoveDocumentsRequest | dict,
+        *,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        ip: Optional[str] = None,
     ) -> dict:
         """批量设置文档文件夹归属（整体事务回滚 + 幂等跳过）。
 
@@ -1855,6 +1971,27 @@ class DocumentService:
                 moved += 1
 
             await session.commit()
+
+            schedule_emit({
+                "tenant_id": tenant_id,
+                "user_id": _audit_user_id(user_id),
+                "username": username,
+                "ip": ip,
+                "log_type": "OPERATION",
+                "action": "batch_set_document_folder",
+                "outcome": "SUCCESS",
+                "service_name": "knowledge_base",
+                "resource": ResourceType.DOCUMENT.value,
+                "resource_id": str(document_ids[0]),
+                "request_params": {
+                    "knowledge_base_id": knowledge_base_id,
+                    "folder_id": folder_id,
+                    "document_ids": document_ids,
+                    "moved_count": moved,
+                    "skipped_count": skipped,
+                },
+            })
+
             return {"moved_count": moved, "skipped_count": skipped, "folder_id": folder_id}
 
     async def _lookup_rag_doc_ids(

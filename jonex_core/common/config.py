@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 配置管理模块
+Jonex 平台 - 配置管理模块
 
 支持：
 - 多环境配置（dev/test/uat/prod）
@@ -30,7 +30,7 @@ class DatabaseSettings(BaseSettings):
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
     DB_USERNAME: str = "jonex"
-    DB_PASSWORD: str = "jonex123"
+    DB_PASSWORD: str = "change-me"
     DB_NAME: str = "jonex"
 
     # 连接池配置
@@ -104,6 +104,9 @@ class SecuritySettings(BaseSettings):
     # 登录票据配置
     LOGIN_TICKET_EXPIRE_SECONDS: int = 60
     AUTH_ALLOWED_REDIRECT_URIS: str = ""  # JSON 字符串: {"appId": ["uri1", "uri2"]}
+
+    # 租户模拟配置
+    IMPERSONATE_EXPIRE_MINUTES: int = 30
 
     class Config:
         env_file = ".env"
@@ -230,8 +233,19 @@ class AppSettings(BaseSettings):
     # Sidecar 服务地址
     SIDECAR_URL: str = "http://localhost:8001"
 
+    # MCP Server 公网地址（mcp_config.url 来源）
+    # 默认空串；生产由 deploy 环境变量注入 HTTPS，本地由 .env.local 显式填，无 localhost 兜底。
+    MCP_SERVER_PUBLIC_URL: str = ""
+
     # Gateway 到 Sidecar 的内部认证 key
-    GATEWAY_API_KEY: str = "jonex_test_gateway"
+    # 默认值为哨兵字符串；生产部署必须用真实随机 key 覆盖
+    # （Gateway 启动时会校验非默认值，拒绝以默认哨兵启动）。
+    GATEWAY_API_KEY: str = "change-me-in-production"
+
+    # 测试用 API Key 开关（jonex_test_{tenant_id} 前缀 token 免 JWT 验签）。
+    # 默认关闭；仅本地/联调环境显式开启（.env.local: ENABLE_TEST_TOKENS=true）。
+    # 生产环境必须保持关闭，否则任何 jonex_test_ 前缀 token 均可绕过认证。
+    ENABLE_TEST_TOKENS: bool = False
 
     # MCP Server 的内部 API Key（用于 /internal/* 端点认证）
     # 默认值为哨兵字符串；生产部署必须用真实随机 key 覆盖。
@@ -305,7 +319,13 @@ class LLMGatewaySettings(BaseSettings):
     #    需改 upstream._maybe_disable_thinking 适配，否则应把 ENABLED 设为 False
     LLMGW_DISABLE_THINKING_ENABLED: bool = True
     LLMGW_DISABLE_THINKING_MODELS: str = "deepseek-v4-flash-202605"             # 逗号分隔；空=不限模型
-    LLMGW_DISABLE_THINKING_SCENES: str = "lightrag_extract,ontology_extract"  # 逗号分隔；空=不限场景
+    # 逗号分隔；空=不限场景。分档策略见 docs/ontology-query-thinking-latency-fix-plan.md §3：
+    # 抽取场景恒禁；ontology_arbitration 恒禁（二选一分类）；`_fast` 变体=严格模式快档；
+    # 原始查询 scene（ontology_qa/rag_chunk_qa/rag_fusion）不在列表=精档与非严格保留思考。
+    LLMGW_DISABLE_THINKING_SCENES: str = (
+        "lightrag_extract,ontology_extract,raganything_ingest,"
+        "ontology_arbitration,ontology_qa_fast,rag_chunk_qa_fast,rag_fusion_fast"
+    )
     # PG 批量缓冲
     LLMGW_PG_FLUSH_MAX_ROWS: int = 20
     LLMGW_PG_FLUSH_MAX_SECONDS: float = 5.0

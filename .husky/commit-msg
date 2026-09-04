@@ -1,0 +1,2 @@
+# commit-msg hook — 校验提交信息格式
+cd "$(dirname "$0")/../frontends" && npx --no -- commitlint --edit "$1"

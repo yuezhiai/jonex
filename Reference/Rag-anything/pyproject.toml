@@ -32,7 +32,7 @@ text = ["reportlab>=4.0.0"]
 audio = ["openai-whisper>=20231117"]  # ASR transcription support
 office = []  # Requires LibreOffice (external program)
 # [jonex] 本地 MinerU CLI 解析（RAG_PARSER=mineru）。原为核心依赖 `mineru[core]`，
-#   悦溪将其移到此 optional extra：online/selfhost 为纯 HTTP 客户端不需要，
+#   Jonex将其移到此 optional extra：online/selfhost 为纯 HTTP 客户端不需要，
 #   slim 镜像不装此 extra 即可去掉 mineru 及其重传递依赖（torch 除外，torch 来自 whisper/st）。
 local = ["mineru[core]"]  # [jonex]
 video = [

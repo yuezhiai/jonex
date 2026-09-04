@@ -1,4 +1,4 @@
-# 悦溪平台系统架构设计文档
+# Jonex 平台系统架构设计文档
 
 > 更新时间：2026-07-15
 > 版本：0.5.0
@@ -8,7 +8,7 @@
 
 ## 一、项目定位
 
-悦溪平台是一个插件化、多租户的 AI 能力平台。平台由前端工作台、统一 API 入口、Sidecar 能力治理层、多个 capability service、RAG 原子能力和基础设施组件组成。
+Jonex 平台是一个插件化、多租户的 AI 能力平台。平台由前端工作台、统一 API 入口、Sidecar 能力治理层、多个 capability service、RAG 原子能力和基础设施组件组成。
 
 平台目标不是单个业务应用，而是支撑新子应用、新业务域和新 AI 能力持续接入的统一工程底座。
 
@@ -674,7 +674,9 @@ jonex-platform/
 │   │   ├── download_models.py                     # 构建期预下载 whisper、mineru、paddlex 等模型
 │   │   └── frontend-entrypoint.sh                 # 前端容器入口脚本
 │   ├── nginx/                                     # Nginx 子应用和网关配置
-│   │   ├── frontend-gateway.conf                  # 聚合前端静态资源并反代 /api
+│   │   ├── app-locations.conf                     # 聚合前端静态资源并反代 /api（两种接入模式共用）
+│   │   ├── modes/                                 # 监听层：server-http.conf / server-https.conf 二选一
+│   │   ├── 50x.html                               # 上游不可用时的静态错误页
 │   │   └── shell.conf                             # shell 子应用 Nginx 配置
 │   ├── postgres/                                  # PostgreSQL 初始化与迁移
 │   │   ├── init.sql                               # 初始 schema 创建
@@ -859,7 +861,7 @@ jonex-platform/
 
 ## 十二、架构结论
 
-悦溪平台的正系统架构应理解为：
+Jonex 平台的正系统架构应理解为：
 
 ```text
 frontend-gateway + shell/子应用

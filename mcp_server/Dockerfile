@@ -3,9 +3,17 @@ FROM python:3.12-slim
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_DEFAULT_TIMEOUT=120
 
 # 系统依赖：curl（healthcheck）+ gcc + libpq-dev（asyncpg 编译，安装后会清理）
+# 替换腾讯源；trixie-updates 组件腾讯云镜像未同步（无 Release 文件），apt update 会失败，故从 Suites 中移除。
+RUN sed -i \
+    -e 's|^URIs: http://deb.debian.org/debian$|URIs: http://mirrors.cloud.tencent.com/debian|' \
+    -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: http://mirrors.cloud.tencent.com/debian-security|' \
+    -e 's| trixie-updates||g' \
+    /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*

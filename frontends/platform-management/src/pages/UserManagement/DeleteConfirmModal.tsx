@@ -34,7 +34,8 @@ const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, Props>(({ getUse
   const handleDelete = async () => {
     if (!target) return;
     try {
-      await deleteUser(target.id);
+      // [jonex] 带目标用户所属租户，支持平台管理员跨租户删除（理由同 ToggleStatusModal）
+      await deleteUser(target.id, target.tenant_id);
       message.success(t('common.deleteSuccess'));
       setTarget(null);
       await onSaved();

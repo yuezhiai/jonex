@@ -11,6 +11,7 @@ from capabilities.platform.models.user import User
 from capabilities.platform.repository.role_repository import RoleRepository
 from capabilities.platform.repository.user_repository import UserRepository
 from capabilities.platform.repository.user_role_repository import UserRoleRepository
+from capabilities.platform.services.admin_role_guard import assert_can_assign_roles
 from jonex_core.security.user_auth import get_user_auth
 from capabilities.platform.dtos.platform import (
     UserCreateRequest,
@@ -68,7 +69,8 @@ class UserService:
         tenant_id = require_tenant(tenant_id)
         items = await self.repo.list_by_tenant(tenant_id, offset, limit)
         total = await self.repo.count_by_tenant(tenant_id)
-        # 批量查 RBAC 绑定角色名（单 SQL，避免 N+1）——列表角色列与编辑弹窗（get_roles）同源
+        # 批量查 RBAC 绑定角色 id+名称（单 SQL，避免 N+1）——列表角色列与编辑弹窗（get_roles）同源
+        role_id_map: dict[int, list[int]] = {u.id: [] for u in items}
         role_name_map: dict[int, list[str]] = {u.id: [] for u in items}
         if items:
             from sqlalchemy import select
@@ -77,7 +79,7 @@ class UserService:
             from capabilities.platform.models.user_role import UserRole
 
             rows = await self.session.execute(
-                select(UserRole.user_id, Role.name)
+                select(UserRole.user_id, Role.id, Role.name)
                 .join(Role, Role.id == UserRole.role_id)
                 .where(
                     UserRole.tenant_id == tenant_id,
@@ -86,10 +88,12 @@ class UserService:
                 )
                 .order_by(Role.id)
             )
-            for user_id, role_name in rows.all():
+            for user_id, role_id, role_name in rows.all():
+                role_id_map.setdefault(user_id, []).append(role_id)
                 role_name_map.setdefault(user_id, []).append(role_name)
         responses = [UserResponse.from_orm(u) for u in items]
         for r in responses:
+            r.role_ids = role_id_map.get(r.id, [])
             r.role_names = role_name_map.get(r.id, [])
         return UserListResponse(total=total, items=responses)
 
@@ -102,6 +106,9 @@ class UserService:
         )  # 原消息: 用户不存在: {user_id}
 
         update_data = req.dict(exclude_unset=True)
+        new_password = update_data.pop("new_password", None)
+        if new_password:
+            user.password_hash = self.user_auth.hash_password(new_password)
         for key, val in update_data.items():
             setattr(user, key, val)
         await self.session.flush()
@@ -146,7 +153,13 @@ class UserService:
         )
         return list(result.scalars().all())
 
-    async def set_roles(self, tenant_id: str, user_id: int, role_ids: list[int]) -> None:
+    async def set_roles(
+        self,
+        tenant_id: str,
+        user_id: int,
+        role_ids: list[int],
+        operator_permissions: set[str] | None = None,
+    ) -> None:
         tenant_id = require_tenant(tenant_id)
         user = await self.repo.get_by_id(user_id, tenant_id)
         if not user or user.is_deleted:
@@ -161,6 +174,17 @@ class UserService:
                 raise ResourceNotFoundError(
                     message=translate("err.role.not_found", params={"role_id": str(role_id)}, fallback=f"角色不存在: {role_id}")
                 )  # 原消息: 角色不存在: {role_id}
+
+        # [jonex] 权限重构 B1（D4）：「租户管理员只能由平台管理员指定」。
+        # 只在 RoleService.set_permissions 拦「配码」是不够的 —— 029 迁移后
+        # 「租户管理员」角色天然持有 tenant:admin，租户管理员把别人绑到这个**既有**
+        # 角色上即可绕过。这里补上「用户 → 角色」方向的闸门。
+        # operator_permissions=None 表示内部调用（无 HTTP 操作者上下文），此时不拦，
+        # 避免种子/迁移脚本类调用被误伤；所有 API 入口都必须显式透传。
+        if operator_permissions is not None:
+            await assert_can_assign_roles(
+                self.session, tenant_id, normalized_role_ids, operator_permissions
+            )
 
         await self.user_role_repo.set_roles(tenant_id, user_id, normalized_role_ids)
         logger.info(f"设置用户角色: user_id={user_id}, roles={normalized_role_ids}")

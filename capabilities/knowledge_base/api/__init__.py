@@ -15,6 +15,7 @@ from jonex_core.common.tenant import extract_tenant_id
 from jonex_core.security.user_auth import get_current_user
 
 from ..dtos import (
+    AnswerFeedbackToggleAdoptRequest,
     BatchMoveDocumentsRequest,
     DocumentParseResultRequest,
     DocumentScopeRequest,
@@ -29,6 +30,7 @@ from ..dtos import (
     SearchHistoryCreateRequest,
     SearchHistoryDeleteRequest,
     SearchRequest,
+    SubmitAnswerFeedbackRequest,
 )
 from ..dtos.ontology_schema import (
     BindTemplateRequest,
@@ -358,6 +360,97 @@ async def get_search_feedback_stats(
         result = await _service.feedback.get_stats(tenant_id, {
             "knowledge_base_id": knowledge_base_id,
         })
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+# ── 回答级反馈（history_id 锚点）──────────────────────────
+
+
+@router.post("/search/answer-feedback", summary="提交/更新回答反馈（点赞/点踩）")
+async def submit_answer_feedback(request: Request, payload: SubmitAnswerFeedbackRequest):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.submit(
+            tenant_id, _extract_user_id_from_request(request), _schema_payload(payload),
+        )
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/search/answer-feedback", summary="回显回答反馈状态")
+async def get_answer_feedback(
+    request: Request,
+    history_id: str = Query(..., min_length=1, max_length=64),
+):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.get_status(
+            tenant_id, _extract_user_id_from_request(request), {"history_id": history_id},
+        )
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/search/answer-feedback/list", summary="按知识库聚合查询回答反馈列表")
+async def list_answer_feedback(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128),
+    feedback_type: Optional[str] = Query(None, regex="^(like|dislike)?$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.list_feedback(tenant_id, {
+            "knowledge_base_id": knowledge_base_id,
+            "feedback_type": feedback_type,
+            "page": page,
+            "page_size": page_size,
+        })
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/search/answer-feedback/stats", summary="按知识库聚合统计回答反馈")
+async def get_answer_feedback_stats(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128),
+):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.get_stats(tenant_id, {
+            "knowledge_base_id": knowledge_base_id,
+        })
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.post("/search/answer-feedback/toggle-adopt", summary="切换回答反馈采纳状态")
+async def toggle_answer_feedback_adopted(request: Request, payload: AnswerFeedbackToggleAdoptRequest):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.toggle_adopted(
+            tenant_id, _schema_payload(payload),
+        )
+        return success_response(data=result)
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.delete("/search/answer-feedback/{feedback_id}", summary="删除回答反馈记录")
+async def delete_answer_feedback(
+    request: Request,
+    feedback_id: str,
+):
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.answer_feedback.delete(tenant_id, {"feedback_id": feedback_id})
         return success_response(data=result)
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
@@ -779,6 +872,22 @@ async def set_kb_permissions(
             kb_id, tenant_id, body.get("permissions", []), user_id=user_id
         )
         return success_response(message="知识库权限已更新")
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/knowledge-info/{kb_id}/permission-candidates", summary="知识库添加成员候选用户")
+async def get_kb_permission_candidates(
+    kb_id: str, request: Request, current: dict = Depends(get_current_user)
+):
+    """双入口兜底：REST 解析用户后传入 service；invoke 走 dispatch 判定。"""
+    tenant_id = extract_tenant_id(request)
+    user_id = str(current.get("user_id", "")) or None
+    try:
+        result = await _service.knowledge_infos.get_permission_candidates(
+            kb_id, tenant_id, user_id=user_id
+        )
+        return success_response(data={"candidates": result})
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
 

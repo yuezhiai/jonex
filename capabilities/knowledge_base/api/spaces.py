@@ -105,3 +105,18 @@ async def set_space_permissions(
         return success_response(message="权限已更新")
     except JonexException as e:
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
+
+
+@router.get("/spaces/{space_id}/permission-candidates", summary="领域空间添加成员候选用户")
+async def get_space_permission_candidates(
+    space_id: str, request: Request, current: dict = Depends(get_current_user)
+):
+    """双入口兜底：REST 解析用户后传入 service；invoke 走 dispatch 判定。"""
+    tenant_id = extract_tenant_id(request)
+    try:
+        result = await _service.get_permission_candidates(
+            space_id, tenant_id, user_id=_actor_user_id(current)
+        )
+        return success_response(data={"candidates": result})
+    except JonexException as e:
+        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)

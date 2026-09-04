@@ -454,6 +454,8 @@ export default function McpKeysTab() {
           pagination={false}
           size="middle"
           loading={loading}
+          // 列宽合计 1370，容器不足时允许左右滑动查看完整内容
+          scroll={{ x: 1400 }}
         />
       )}
 

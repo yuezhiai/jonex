@@ -1,6 +1,6 @@
 import type { ShellContext, ShellUser } from './types';
 import { readAccessToken, readCachedUser, clearAuthStorage } from './authStorage';
-import { buildLoginRedirectUrl } from './authRedirect';
+import { redirectToLogin } from './sessionExpired';
 
 interface StandaloneOptions {
   appId: string;
@@ -37,8 +37,7 @@ export function createStandaloneShellContext(options: StandaloneOptions): ShellC
 
     logout: () => {
       clearAuthStorage({ keepLocale: true });
-      const loginUrl = options.loginUrl || '/login';
-      window.location.href = buildLoginRedirectUrl(loginUrl, window.location.href, appId);
+      redirectToLogin({ loginUrl: options.loginUrl || '/login', appId });
     },
 
     getToken: () => options.token ?? readAccessToken(),

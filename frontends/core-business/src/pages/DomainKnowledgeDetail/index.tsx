@@ -38,6 +38,7 @@ import type {
   RelationInstanceSummary,
   OntologyStatistics,
   DomainKnowledgePermissionMember,
+  DomainKnowledgePermissionRole,
 } from '@/types/domainKnowledge';
 import { getStatusTextMap } from '@/types/domainKnowledge';
 import {
@@ -212,24 +213,25 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
     }, 300);
   };
 
-  const handlePermAddMember = (user: import('@/api/user').PlatformUser) => {
+  const handlePermAddMember = (user: import('@/types/domainService').MemberCandidate) => {
     setPermissionMembers((prev) => {
-      if (prev.some((m) => m.userId === String(user.id))) return prev;
+      if (prev.some((m) => m.userId === user.user_id)) return prev;
+      const name = user.display_name || user.username || user.user_id;
       return [
         ...prev,
         {
-          userId: String(user.id),
-          name: user.display_name || user.username,
+          userId: user.user_id,
+          name,
           dept: '',
-          avatarText: (user.display_name || user.username).charAt(0).toUpperCase(),
+          avatarText: name.charAt(0).toUpperCase(),
           avatarColor: '#94a3b8',
-          role: 'viewer',
+          role: 'member',
         },
       ];
     });
   };
 
-  const handlePermRoleChange = (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => {
+  const handlePermRoleChange = (userId: string, role: DomainKnowledgePermissionRole) => {
     setPermissionMembers((prev) => prev.map((m) => (m.userId === userId ? { ...m, role } : m)));
   };
 
@@ -381,6 +383,7 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
       case 'permission':
         return (
           <PermissionTab
+            kbId={id}
             members={permissionMembers}
             loading={permissionLoading}
             saving={permissionSaving}

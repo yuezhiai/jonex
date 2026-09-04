@@ -123,13 +123,26 @@ export async function updatePromptTemplate(
 export async function deletePromptTemplate(id: string, domain_space_id?: string): Promise<void> {
   const params: Record<string, string> = {};
   if (domain_space_id) params.domain_space_id = domain_space_id;
-  await apiClient.delete<null>(`/ecosystem/prompt-templates/${id}`, { params });
+  await apiClient.delete<null>(`/ecosystem/prompt-templates/${id}`, undefined, { params });
 }
 
 export async function copyPromptTemplate(id: string, domain_space_id?: string): Promise<PromptTemplateItem> {
   const payload = domain_space_id ? { domain_space_id } : undefined;
   return apiClient.post<PromptTemplateItem>(`/ecosystem/prompt-templates/${id}/copy`, payload);
 }
+
+export interface CheckPromptTemplateNameParams {
+  name: string;
+  domain_space_id?: string;
+  template_id?: string;
+}
+
+export async function checkPromptTemplateName(
+  params: CheckPromptTemplateNameParams,
+): Promise<{ exists: boolean }> {
+  return apiClient.get<{ exists: boolean }>('/ecosystem/prompt-templates/check-name', { params });
+}
+
 
 export async function listVersions(id: string, domain_space_id?: string): Promise<VersionListResponse> {
   const params: Record<string, string> = {};

@@ -8,7 +8,7 @@
 
 ## 动机
 
-生产环境通过 `deploy/docker/frontend-gateway.Dockerfile` + `deploy/nginx/frontend-gateway.conf`
+生产环境通过 `deploy/docker/frontend-gateway.Dockerfile` + `deploy/nginx/app-locations.conf`
 使用 Nginx 作为唯一对外前端入口。开发时需要同样的路由能力，
 但不想依赖 Docker / Nginx，因此用 Node.js http-proxy 实现轻量替代。
 
@@ -92,7 +92,7 @@ pnpm start   # 单次运行
 
 ## 与 Nginx 配置的对应关系
 
-Nginx `frontend-gateway.conf` 中的路由规则被原样映射到
+Nginx `app-locations.conf` 中的路由规则被原样映射到
 本网关，唯一区别是：
 
 - 开发时连接 localhost Vite dev server 而非 Docker 容器

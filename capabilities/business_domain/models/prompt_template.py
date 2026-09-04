@@ -28,7 +28,7 @@ class PromptTemplate(TimestampMixin, SoftDeleteMixin, Base):
     scope = Column(String(16), nullable=False, default="domain")
     description = Column(Text)
     status = Column(String(16), nullable=False, default="启用")
-    current_version = Column(String(32), nullable=False, default="1.0")
+    current_version = Column(String(32), nullable=False, default="1")
     # versions_json[0] 为当前版本，后续为历史版本
     versions_json = Column(JSONB, nullable=False, default=list)
     created_by = Column(String(128))

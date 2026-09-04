@@ -1,4 +1,4 @@
-# 悦溪平台部署架构
+# Jonex 平台部署架构
 
 本文描述当前部署拓扑。系统按全新架构维护：生产环境浏览器只访问 `frontend-gateway`，前端业务请求统一通过 `/api/**` 进入 API Gateway。
 
@@ -147,7 +147,9 @@ Gateway -> Sidecar -> Capability Service -> Repository -> PostgreSQL / Redis
 
 ## 6. Nginx 规则
 
-`deploy/nginx/frontend-gateway.conf` 维护外部入口规则：
+`deploy/nginx/app-locations.conf` 维护外部入口的业务路由规则（监听与 TLS 由
+`deploy/nginx/modes/server-{http,https}.conf` 按 `ACCESS_MODE` 二选一，
+见 `docs/https-domain-access-plan.md`）：
 
 - `/api/**` 反代到 `gateway:8000`。
 - `/remotes/{app-id}/**` 反代到对应子应用容器。

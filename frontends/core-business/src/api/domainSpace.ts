@@ -1,5 +1,6 @@
 import { request, getData } from './request';
 import type { DomainSpace, DomainSpaceFormData, DomainSpaceListResult, SpacePermission } from '../types/domainSpace';
+import type { MemberCandidate } from '../types/domainService';
 
 /** 获取领域空间列表 */
 export async function listSpaces(offset = 0, limit = 50): Promise<DomainSpaceListResult> {
@@ -47,4 +48,12 @@ export async function updateSpacePermissions(
   permissions: { user_id: string; role: string }[],
 ): Promise<void> {
   await getData(request.put(`/knowledge-base/spaces/${spaceId}/permissions`, { permissions }));
+}
+
+/** 获取空间添加成员候选用户（需空间管理权限；无需 user:read） */
+export async function getSpacePermissionCandidates(spaceId: string): Promise<MemberCandidate[]> {
+  const result = await getData<{ candidates: MemberCandidate[] }>(
+    request.get(`/knowledge-base/spaces/${spaceId}/permission-candidates`),
+  );
+  return result.candidates ?? [];
 }

@@ -1,5 +1,6 @@
 """Knowledge Base service exports."""
 
+from .answer_feedback_service import AnswerFeedbackService
 from .data_source_service import DataSourceService
 from .document_service import DocumentService
 from .document_tag_service import DocumentTagService
@@ -20,6 +21,7 @@ from .search_history_service import SearchHistoryService
 from .space_service import SpaceService
 
 __all__ = [
+    "AnswerFeedbackService",
     "DataSourceService",
     "DocumentService",
     "DocumentTagService",

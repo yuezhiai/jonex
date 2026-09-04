@@ -1,5 +1,5 @@
 # ============================================================
-# 悦溪平台 Docker Compose 编排文件
+# Jonex 平台 Docker Compose 编排文件
 # ============================================================
 # 基础设施版本选型（锁定）：
 #   PostgreSQL  15-alpine   (LTS → 2027-11)
@@ -57,7 +57,7 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_USER: ${DB_USERNAME:-jonex}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-jonex123}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
       POSTGRES_DB: ${DB_NAME:-jonex}
       TZ: Asia/Shanghai
     volumes:
@@ -136,8 +136,8 @@ services:
     networks:
       - jonex-network
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: change-me
+      MINIO_SECRET_KEY: change-me
       TZ: Asia/Shanghai
     volumes:
       - jonex-minio-data:/minio_data
@@ -165,8 +165,8 @@ services:
       TZ: Asia/Shanghai
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: change-me
+      MINIO_SECRET_KEY: change-me
     volumes:
       - jonex-milvus-data:/var/lib/milvus
     command: ["milvus", "run", "standalone"]
@@ -209,7 +209,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       # RAG 调用通过 Sidecar 反代到 atomic-rag
@@ -220,7 +220,7 @@ services:
       # Neo4j 本体图数据库连接
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USERNAME: neo4j
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-jonex_neo4j_123}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me}
       NEO4J_ONTOLOGY_LABEL: OntologyEntity
       # Ontology LLM (分流问答)
       ONTOLOGY_LLM_BINDING_HOST: ${ONTOLOGY_LLM_BINDING_HOST:-http://llm-gateway:8787/v1}
@@ -309,7 +309,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       SIDECAR_URL: http://sidecar:8000
@@ -358,7 +358,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       SIDECAR_URL: http://sidecar:8000
@@ -403,7 +403,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_BASE_URL: http://knowledge-base-service:8000
@@ -463,7 +463,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       SIDECAR_URL: http://sidecar:8000
@@ -533,7 +533,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
-      DB_PASSWORD: ${DB_PASSWORD:-jonex123}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       LLMGW_UPSTREAM_LLM_HOST: ${LLMGW_UPSTREAM_LLM_HOST:-https://tokenhub.tencentmaas.com/v1}
       LLMGW_UPSTREAM_LLM_API_KEY: ${LLMGW_UPSTREAM_LLM_API_KEY:-}
@@ -576,6 +576,10 @@ services:
     container_name: jonex-frontend-gateway
     hostname: frontend-gateway
     environment:
+      # [jonex] 对外接入形态：http = IP + HTTP（内部部署）/ https = 域名 + TLS 终止。
+      # 启动时由 /docker-entrypoint.d/05-access-mode.sh 二选一生成 default.conf。
+      # 切换只改这个变量 + make up（不能 restart，environment 是容器创建时固化的）。
+      ACCESS_MODE: ${ACCESS_MODE:-http}
       # [jonex] CSP 中 img-src / media-src 允许的对象存储来源（302 直跳预览用）。
       # 不设则按 OBJECT_STORAGE_BACKEND 取默认：cos 自动用 *.myqcloud.com，
       # s3 无法推导会启动告警，local 留空。填法见 .env.example 第 14 节。
@@ -585,6 +589,17 @@ services:
       - jonex-network
     ports:
       - "${FRONTEND_PORT:-80}:80"
+      # 443 在 http 模式下也映射：容器内没有 443 server，端口空转无副作用。
+      # 这样切模式只改 ACCESS_MODE，不用同时动 ports，少一个出错点。
+      - "${FRONTEND_HTTPS_PORT:-443}:443"
+    volumes:
+      # TLS 证书只读挂载。默认指向项目内 deploy/certs（Mac/Windows 本地联调
+      # Docker Desktop 不共享 /opt）；服务器部署在 deploy/.env 设
+      # TLS_CERT_DIR=/opt/jonex/certs 覆盖即可。安全：证书文件已被
+      # deploy/.gitignore 排除（仅 .gitkeep 入库），勿将私钥纳入版本控制。
+      # http 模式下挂载空目录无副作用（无 443 server 去读）；
+      # https 模式下证书缺失由 05-access-mode.sh 报错退出，失败点明确。
+      - "${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro"
     depends_on:
       shell-frontend:
         condition: service_started
@@ -621,7 +636,6 @@ services:
       - "80"
     environment:
       TZ: Asia/Shanghai
-      API_BASE_URL: ${FRONTEND_API_BASE_URL:-/api}
       ENV: production
       VITE_ALLOWED_REDIRECT_ORIGINS: ${VITE_ALLOWED_REDIRECT_ORIGINS:-}
     healthcheck:
@@ -649,7 +663,6 @@ services:
       - "80"
     environment:
       TZ: Asia/Shanghai
-      API_BASE_URL: ${FRONTEND_API_BASE_URL:-/api}
       ENV: production
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1/health"]
@@ -676,7 +689,6 @@ services:
       - "80"
     environment:
       TZ: Asia/Shanghai
-      API_BASE_URL: ${FRONTEND_API_BASE_URL:-/api}
       ENV: production
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1/health"]
@@ -703,7 +715,6 @@ services:
       - "80"
     environment:
       TZ: Asia/Shanghai
-      API_BASE_URL: ${FRONTEND_API_BASE_URL:-/api}
       ENV: production
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1/health"]
@@ -978,37 +989,37 @@ services:
       llm-gateway:
         condition: service_started
 
-  # # ============================================================
-  # # MCP Server - 知识库 MCP Tool 注册与鉴权
-  # # ============================================================
-  # # 配置文件：deploy/.env.mcp（MCP Server 专用，与平台主配置分离）
-  # # MCP Server 仅容器间通信——AI 客户端经 Nginx 反向代理到达，
-  # # Nginx 通过 jonex-network 内部路由到 mcp-server:8002
-  # # Phase 2 MCP Key 鉴权中间件就绪前不对外暴露端口
-  # mcp-server:
-  #   build:
-  #     context: ..
-  #     dockerfile: mcp_server/Dockerfile
-  #   container_name: jonex-mcp-server
-  #   hostname: mcp-server
-  #   networks:
-  #     - jonex-network
-  #   ports:
-  #     - "8002:8002"
-  #   env_file:
-  #     - .env.mcp                    # 仅 mcp-server 加载此文件
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 30s
-  #   restart: unless-stopped
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
+  # ============================================================
+  # MCP Server - 知识库 MCP Tool 注册与鉴权
+  # ============================================================
+  # 配置文件：deploy/.env.mcp（MCP Server 专用，与平台主配置分离）
+  # MCP Server 仅容器间通信——AI 客户端经 Nginx 反向代理到达，
+  # Nginx 通过 jonex-network 内部路由到 mcp-server:8002
+  # Phase 2 MCP Key 鉴权中间件就绪前不对外暴露端口
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: mcp_server/Dockerfile
+    container_name: jonex-mcp-server
+    hostname: mcp-server
+    networks:
+      - jonex-network
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env.mcp                    # 仅 mcp-server 加载此文件
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # ============================================================
   # Neo4j - 本体图数据库（社区版，单 database）
@@ -1024,7 +1035,7 @@ services:
       - "7474:7474"     # dev 期 browser 调试
       - "7687:7687"     # dev 期 bolt 连接
     environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-jonex_neo4j_123}
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}

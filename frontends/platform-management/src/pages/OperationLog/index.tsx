@@ -30,18 +30,30 @@ export function actionToLabel(action: string): string {
   return action;
 }
 
+/** 后端两端均未提供翻译映射时视为未知 action。 */
+export function isUnknownAction(opt: AuditActionOption): boolean {
+  return opt.label_zh === opt.action && opt.label_en === opt.action;
+}
+
 /** 从 AuditActionOption 中获取当前语言下的显示名。 */
-export function getOptionLabel(opt: AuditActionOption, locale: string): string {
+export function getOptionLabel(opt: AuditActionOption, locale: string, fallback?: string): string {
   const label = locale.startsWith('zh') ? opt.label_zh : opt.label_en;
-  if (label === opt.action) return actionToLabel(opt.action);
+  if (label === opt.action) {
+    return isUnknownAction(opt) && fallback ? fallback : actionToLabel(opt.action);
+  }
   return label;
 }
 
 /** 获取操作类型的显示名。 */
-export function getActionLabel(locale: string, options: AuditActionOption[], action: string): string {
+export function getActionLabel(
+  locale: string,
+  options: AuditActionOption[],
+  action: string,
+  fallback?: string,
+): string {
   const found = options.find((o) => o.action === action);
-  if (found) return getOptionLabel(found, locale);
-  return actionToLabel(action);
+  if (found) return getOptionLabel(found, locale, fallback);
+  return fallback ?? actionToLabel(action);
 }
 
 /** 操作类型的标签颜色。 */
@@ -79,7 +91,7 @@ export default function OperationLog() {
   const [error, setError] = useState<string | null>(null);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(15);
+  const [pageSize, setPageSize] = useState(10);
   const [keyword, setKeyword] = useState('');
   const [action, setAction] = useState<string | undefined>();
   const [dateRange, setDateRange] = useState<[dayjs.Dayjs, dayjs.Dayjs] | null>(null);
@@ -97,7 +109,10 @@ export default function OperationLog() {
     setActionsError(false);
     listAuditActions()
       .then((opts) => {
-        if (!cancelled) setActionOptions(opts);
+        if (!cancelled) {
+          const deduped = Array.from(new Map(opts.map((o) => [o.action, o])).values());
+          setActionOptions(deduped);
+        }
       })
       .catch(() => {
         if (!cancelled) setActionsError(true);
@@ -190,7 +205,7 @@ export default function OperationLog() {
       key: 'action',
       width: 90,
       render: (v: string) => {
-        const label = getActionLabel(locale, actionOptions, v);
+        const label = getActionLabel(locale, actionOptions, v, t('operationLog.unknownAction'));
         return <Tag color={actionTagColor(v)}>{label}</Tag>;
       },
     },
@@ -270,7 +285,7 @@ export default function OperationLog() {
             allowClear
             loading={actionsLoading}
             options={actionOptions.map((o) => ({
-              label: getOptionLabel(o, locale),
+              label: getOptionLabel(o, locale, t('operationLog.unknownAction')),
               value: o.action,
             }))}
             notFoundContent={

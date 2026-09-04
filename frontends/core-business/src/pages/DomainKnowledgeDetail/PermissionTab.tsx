@@ -1,20 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Button, Table, Select, Input, message } from 'antd';
+import { Button, Table, Select, Input } from 'antd';
 import { TeamOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import type { DomainKnowledgePermissionMember } from '@/types/domainKnowledge';
-import { listUsers, type PlatformUser } from '@/api/user';
+import type {
+  DomainKnowledgePermissionMember,
+  DomainKnowledgePermissionRole,
+} from '@/types/domainKnowledge';
+import { getKbPermissionCandidates } from '@/api/domainKnowledge';
+import type { MemberCandidate } from '@/types/domainService';
+import { getShellContext } from '@jonex/shell-sdk';
 
 interface PermissionTabProps {
   members: DomainKnowledgePermissionMember[];
   loading: boolean;
   saving: boolean;
   memberName: (member: DomainKnowledgePermissionMember) => string;
-  onRoleChange: (userId: string, role: 'viewer' | 'editor' | 'kb_manager') => void;
+  onRoleChange: (userId: string, role: DomainKnowledgePermissionRole) => void;
   onRemove: (userId: string) => void;
   onSave: () => void;
-  /** 添加成员（用户搜索选中后回调；新成员默认 viewer） */
-  onAdd: (user: PlatformUser) => void;
+  /** 知识库 id（拉取添加成员候选用户） */
+  kbId?: string;
+  /** 添加成员（用户搜索选中后回调；新成员默认 member） */
+  onAdd: (user: MemberCandidate) => void;
   /** 只读态：该 KB 的权限管理权（空间 owner/manager 或租户管理员） */
   canManage?: boolean;
 }
@@ -27,13 +34,14 @@ export default function PermissionTab({
   onRoleChange,
   onRemove,
   onSave,
+  kbId,
   onAdd,
   canManage = false,
 }: PermissionTabProps) {
   const { t } = useTranslation();
   const [userSelectOpen, setUserSelectOpen] = useState(false);
   const [userSearchText, setUserSearchText] = useState('');
-  const [availableUsers, setAvailableUsers] = useState<PlatformUser[]>([]);
+  const [availableUsers, setAvailableUsers] = useState<MemberCandidate[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const userSelectRef = useRef<HTMLDivElement>(null);
 
@@ -51,26 +59,28 @@ export default function PermissionTab({
   }, [userSelectOpen]);
 
   const loadAvailableUsers = async () => {
+    if (!kbId) return;
     setUsersLoading(true);
     try {
-      const result = await listUsers(1, 500);
-      setAvailableUsers(result.items);
+      const result = await getKbPermissionCandidates(kbId);
+      setAvailableUsers(result);
     } catch {
-      // 无 user:read 时降级为空（与空间权限 modal 同口径）
       setAvailableUsers([]);
     } finally {
       setUsersLoading(false);
     }
   };
 
+  const currentUserId = getShellContext()?.getCurrentUser()?.id ?? '';
   const addedUserIds = new Set(members.map((m) => m.userId));
   const filteredAvailableUsers = availableUsers.filter((u) => {
-    if (addedUserIds.has(String(u.id))) return false;
+    const uid = u.user_id;
+    if (addedUserIds.has(uid) || (currentUserId && uid === String(currentUserId))) return false;
     if (!userSearchText) return true;
     const q = userSearchText.toLowerCase();
     return (
       (u.display_name || '').toLowerCase().includes(q) ||
-      u.username.toLowerCase().includes(q) ||
+      (u.username || '').toLowerCase().includes(q) ||
       (u.email || '').toLowerCase().includes(q)
     );
   });
@@ -134,7 +144,7 @@ export default function PermissionTab({
                 ) : (
                   filteredAvailableUsers.slice(0, 30).map((user) => (
                     <div
-                      key={user.id}
+                      key={user.user_id}
                       style={{ cursor: 'pointer', padding: '8px 12px', borderBottom: '1px solid #f1f5f9' }}
                       onClick={() => {
                         onAdd(user);
@@ -142,10 +152,8 @@ export default function PermissionTab({
                         setUserSelectOpen(false);
                       }}
                     >
-                      <div style={{ fontWeight: 500, color: '#0b2b5c' }}>
-                        {user.display_name || user.username}
-                      </div>
-                      <div style={{ fontSize: 12, color: '#94a3b8' }}>{user.email || user.username}</div>
+                      <div style={{ fontWeight: 500, color: '#0b2b5c' }}>{user.display_name || user.username || user.user_id}</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8' }}>{user.email || user.username || ''}</div>
                     </div>
                   ))
                 )}
@@ -175,12 +183,12 @@ export default function PermissionTab({
               <Select
                 value={role}
                 disabled={!canManage}
-                onChange={(value) => onRoleChange(record.userId, value as 'viewer' | 'editor' | 'kb_manager')}
+                onChange={(value) => onRoleChange(record.userId, value as DomainKnowledgePermissionRole)}
                 style={{ width: 120 }}
                 options={[
-                  { value: 'editor', label: t('kbPermission.editor') },
+                  // [jonex] B3：两级。member 在前（权限从低到高），避免误选管理者
+                  { value: 'member', label: t('kbPermission.member') },
                   { value: 'kb_manager', label: t('kbPermission.kbManager') },
-                  { value: 'viewer', label: t('kbPermission.viewer') },
                 ]}
               />
             ),

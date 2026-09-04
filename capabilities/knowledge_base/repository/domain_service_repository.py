@@ -8,7 +8,6 @@ from ..models.domain_service import (
     DomainService,
     ServiceApiKey,
     ServiceKnowledgeBase,
-    ServicePermission,
 )
 
 
@@ -22,7 +21,3 @@ class ServiceKnowledgeBaseRepository(BaseRepository[ServiceKnowledgeBase]):
 
 class ServiceApiKeyRepository(BaseRepository[ServiceApiKey]):
     model = ServiceApiKey
-
-
-class ServicePermissionRepository(BaseRepository[ServicePermission]):
-    model = ServicePermission

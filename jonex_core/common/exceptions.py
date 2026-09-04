@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - 统一异常体系
+Jonex 平台 - 统一异常体系
 
 定义平台所有业务异常的层级结构和错误码规范
 错误码规范：
@@ -17,7 +17,7 @@ from typing import Optional, Dict, Any
 
 class JonexException(Exception):
     """
-    悦溪平台基础异常类
+    Jonex 平台基础异常类
 
     所有自定义异常必须继承自该类，便于统一处理
     """
@@ -202,6 +202,45 @@ class RateLimitExceededError(AuthError):
     default_message = "请求过于频繁，请稍后重试"
 
 
+class AccountLockedError(AuthError):
+    """账户因多次登录失败被锁定"""
+    code = 3009
+    status_code = 403
+    default_message = "账户已锁定，请稍后重试"
+
+
+class AccountDisabledError(AuthError):
+    """账号被管理员停用（users.status != 1）。
+
+    与 InvalidCredentialsError 区分：本异常只在密码已校验通过后抛出，
+    调用方已证明知道正确凭据，据此返回明确原因不构成账号枚举泄漏。
+    """
+    code = 3013
+    status_code = 403
+    default_message = "账号已停用，请联系管理员"
+
+
+class ImpersonationForbiddenError(AuthError):
+    """租户模拟被拒绝（无 platform:admin 或嵌套切换）"""
+    code = 3010
+    status_code = 403
+    default_message = "无权进行租户模拟"
+
+
+class ImpersonationTargetError(AuthError):
+    """租户模拟目标非法（不存在 / default 占位 / == 当前租户）"""
+    code = 3011
+    status_code = 400
+    default_message = "租户模拟目标非法"
+
+
+class NotImpersonatedError(AuthError):
+    """非模拟态调用退出模拟端点"""
+    code = 3012
+    status_code = 400
+    default_message = "当前未处于租户模拟态"
+
+
 # ==================== 4xxx 数据相关错误 ====================
 class DataError(JonexException):
     """数据错误基类"""
@@ -229,6 +268,17 @@ class DataIntegrityError(DataError):
     code = 4003
     status_code = 400
     default_message = "数据完整性约束违反"
+
+
+class QuotaExceededError(DataError):
+    """配额已用尽（阻断创建/上传）。
+
+    details 固定携带需求字段：
+    quotaKey / used / reserved / limit / unit。
+    """
+    code = 4004
+    status_code = 409
+    default_message = "配额已用尽"
 
 
 # ==================== 5xxx 服务依赖错误 ====================
@@ -293,11 +343,15 @@ EXCEPTION_REGISTRY: Dict[int, type] = {
     3006: PermissionDeniedError,
     3007: RateLimitExceededError,
     3008: InvalidCredentialsError,
+    3010: ImpersonationForbiddenError,
+    3011: ImpersonationTargetError,
+    3012: NotImpersonatedError,
     # 数据相关
     4000: DataError,
     4001: DatabaseError,
     4002: CacheError,
     4003: DataIntegrityError,
+    4004: QuotaExceededError,
     # 服务依赖
     5000: ServiceError,
     5001: ServiceUnavailableError,

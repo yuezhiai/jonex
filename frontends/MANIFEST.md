@@ -34,6 +34,6 @@
 
 1. 在平台后端注册应用、菜单、权限和 remote 元数据。
 2. 同步更新 `frontends/shell/public/app-manifest.json` 作为本地 fallback。
-3. 在 `deploy/nginx/frontend-gateway.conf` 配置 standalone 路径和 remote assets 反代。
+3. 在 `deploy/nginx/app-locations.conf` 配置 standalone 路径和 remote assets 反代。
 4. 新增或调整子应用自身 `Dockerfile`、`nginx/default.conf`、`vite.config.ts`（业务子应用继承 `frontends/vite.base.config.ts` 的 `defineAppConfig`，`tsconfig.json` extends `frontends/tsconfig.base.json`）。
 5. 在 `frontends/` 根目录运行 `pnpm run typecheck` 和 `pnpm run build`，必要时再用 `pnpm --filter <package> typecheck` 定位单个子应用问题。

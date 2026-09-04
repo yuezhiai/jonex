@@ -1,6 +1,7 @@
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, update, func, delete
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
@@ -30,16 +31,17 @@ class McpKeyRepository(BaseRepository[McpKey]):
         )
         return list(result.scalars().all())
 
-    async def revoke(self, key_id: str, tenant_id: str) -> bool:
-        """设置 revoked_at = NOW()。返回 True 表示更新成功，False 表示 Key 不存在。
+    async def revoke(self, key_id: str, tenant_id: str, revoked_by: str | None = None) -> bool:
+        """设置 revoked_at + revoked_by（审计归属）。返回 True 表示更新成功，False 表示 Key 不存在。
 
         幂等——对已撤销 Key（revoked_at 已有值）再次调用，SET 同值无副作用，rowcount 仍 > 0。
+        时间用 Python datetime（async ORM 禁 func.now()，MissingGreenlet 陷阱）。
         """
         tenant_id = require_tenant(tenant_id)
         result = await self.session.execute(
             update(McpKey)
             .where(McpKey.id == key_id, McpKey.tenant_id == tenant_id)
-            .values(revoked_at=func.now())
+            .values(revoked_at=datetime.now(timezone.utc), revoked_by=revoked_by)
         )
         await self.session.flush()
         return result.rowcount > 0
@@ -75,6 +77,23 @@ class McpKeyRepository(BaseRepository[McpKey]):
             select(McpKey).where(
                 McpKey.id == key_id,
                 McpKey.tenant_id == tenant_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_client_request_id(
+        self, tenant_id: str, client_request_id: str
+    ) -> Optional[McpKey]:
+        """幂等命中预查：同 (tenant_id, client_request_id) 已存在则返回 McpKey，否则 None。
+
+        不过滤 is_deleted / revoked_at —— 编号终身占用（软删/撤销后不复用），
+        与部分唯一索引 uq_mcp_keys_tenant_reqid 语义一致。
+        """
+        tenant_id = require_tenant(tenant_id)
+        result = await self.session.execute(
+            select(McpKey).where(
+                McpKey.tenant_id == tenant_id,
+                McpKey.client_request_id == client_request_id,
             )
         )
         return result.scalar_one_or_none()

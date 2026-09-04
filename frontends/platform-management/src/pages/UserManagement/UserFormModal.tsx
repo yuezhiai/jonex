@@ -61,23 +61,27 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
         : roleList.items.filter((r) => r.is_system !== 1);
 
       if (editing) {
-        // 编辑：当前绑定角色若被过滤（系统角色），保留在选项中防误改丢失绑定
+        // 编辑：当前绑定角色若被过滤（系统角色），全部保留在选项中防误改丢失绑定
         let boundRoleIds: number[] = [];
         try {
           boundRoleIds = await getUserRoles(editing.id, tenantId);
         } catch {
           boundRoleIds = [];
         }
-        if (boundRoleIds[0] != null && !visibleRoles.some((r) => r.id === boundRoleIds[0])) {
-          const bound = roleList.items.find((r) => r.id === boundRoleIds[0]);
-          if (bound) visibleRoles.push(bound);
+        // [jonex] 逐个补回被过滤掉的已绑定角色。此前只处理 boundRoleIds[0]，
+        // 多角色用户的第 2 个及之后的系统角色会从选项里消失 → 保存时被静默解绑。
+        for (const boundId of boundRoleIds) {
+          if (!visibleRoles.some((r) => r.id === boundId)) {
+            const bound = roleList.items.find((r) => r.id === boundId);
+            if (bound) visibleRoles.push(bound);
+          }
         }
         setRoleOptions(visibleRoles);
-        form.setFieldValue('role_id', boundRoleIds[0]);
+        form.setFieldValue('role_ids', boundRoleIds);
       } else {
         setRoleOptions(visibleRoles);
-        // 切换租户清空已选角色，防止跨租户 role_id 残留
-        form.setFieldValue('role_id', undefined);
+        // 切换租户清空已选角色，防止跨租户角色 id 残留
+        form.setFieldValue('role_ids', []);
       }
     } catch {
       setRoleOptions([]);
@@ -98,7 +102,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             password: '',
             display_name: user.display_name || '',
             email: user.email || '',
-            role_id: undefined,
+            role_ids: [],
             new_password: '',
             // 编辑：目标租户固定为用户所属租户（隐藏字段驱动角色加载）
             target_tenant_id: user.tenant_id,
@@ -109,7 +113,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             password: '',
             display_name: '',
             email: '',
-            role_id: undefined,
+            role_ids: [],
             new_password: '',
             // 新建：默认操作者租户，可切换（切换触发角色重载）
             target_tenant_id: cachedUser?.tenantId ?? undefined,
@@ -141,8 +145,11 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           payload.new_password = values.new_password;
         }
         await updateUser(editing.id, payload, editing.tenant_id);
-        // 角色绑定走 RBAC user_roles（delete-then-insert），按用户所属租户
-        await setUserRoles(editing.id, values.role_id != null ? [values.role_id] : [], editing.tenant_id);
+        // 角色绑定走 RBAC user_roles（delete-then-insert），按用户所属租户。
+        // 注意这是与上面 PATCH 分开的第二个请求，两者不在同一事务，且权限码不同
+        // （PATCH 要 user:write，PUT roles 要 role:write）——只有 user:write 的角色
+        // 会走到「资料已改、角色 403」的部分成功状态。属既有设计，未在本次改动范围。
+        await setUserRoles(editing.id, values.role_ids ?? [], editing.tenant_id);
         message.success(t('userManagement.updated'));
       } else {
         const payload: UserCreatePayload = {
@@ -151,7 +158,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           display_name: displayName,
           email: values.email,
           target_tenant_id: values.target_tenant_id,
-          role_id: values.role_id,
+          role_ids: values.role_ids ?? [],
         };
         await createUser(payload);
         message.success(t('userManagement.created'));
@@ -225,12 +232,23 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             />
           </Form.Item>
         )}
+        {/* [jonex] 多选。DB 的 uq_user_roles、DTO 的 role_ids、Service 的 set_roles
+            本就支持一人多角色，此前表单是单选 Select，编辑一次会把多角色压成一个。 */}
         <Form.Item
-          name="role_id"
+          name="role_ids"
           label={t('userManagement.role')}
-          rules={[{ required: true, message: t('userManagement.requiredRole') }]}
+          rules={[
+            {
+              validator: (_: unknown, value: number[]) =>
+                value && value.length > 0
+                  ? Promise.resolve()
+                  : Promise.reject(new Error(t('userManagement.requiredRole'))),
+            },
+          ]}
         >
           <Select
+            mode="multiple"
+            allowClear
             placeholder={targetTenantId ? t('userManagement.requiredRole') : t('userManagement.requiredTenant')}
             loading={roleLoading}
             disabled={!targetTenantId}
@@ -244,7 +262,12 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           <Form.Item
             name="password"
             label={t('auth.password')}
-            rules={[{ required: true, message: t('userManagement.requiredPassword') }]}
+            rules={[
+              { required: true, message: t('userManagement.requiredPassword') },
+              // 对齐后端统一校验：密码长度 8~128（与登录 password_min_length / max_length 一致）
+              { min: 8, message: t('userManagement.passwordTooShort') },
+              { max: 128, message: t('userManagement.passwordTooLong') },
+            ]}
           >
             <Input.Password placeholder={t('userManagement.placeholderPassword')} autoComplete="new-password" />
           </Form.Item>
@@ -256,8 +279,11 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             rules={[
               {
                 validator: (_: unknown, value: string) => {
-                  if (value && value.length < 6) {
+                  if (value && value.length < 8) {
                     return Promise.reject(new Error(t('userManagement.passwordTooShort')));
+                  }
+                  if (value && value.length > 128) {
+                    return Promise.reject(new Error(t('userManagement.passwordTooLong')));
                   }
                   return Promise.resolve();
                 },

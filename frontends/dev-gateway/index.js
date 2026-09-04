@@ -44,7 +44,7 @@ proxy.on('error', (err, req, res) => {
 })
 
 proxy.on('proxyRes', (proxyRes, req) => {
-  // Security headers (mirroring Nginx frontend-gateway.conf)
+  // Security headers (mirroring Nginx deploy/nginx/app-locations.conf)
   proxyRes.headers['X-Frame-Options'] = 'SAMEORIGIN'
   proxyRes.headers['X-XSS-Protection'] = '1; mode=block'
   proxyRes.headers['X-Content-Type-Options'] = 'nosniff'

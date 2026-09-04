@@ -30,7 +30,7 @@ _TEXT_MUL = int(os.getenv("BENCH_TEXT_MUL", "3"))
 
 # 一段有代表性的中文文本（模拟入库 chunk）
 SAMPLE_TEXT = (
-    "悦溪平台是一个插件化 AI 能力平台框架，通过可组合的 capability 对外提供业务服务。"
+    "Jonex 平台是一个插件化 AI 能力平台框架，通过可组合的 capability 对外提供业务服务。"
     "知识库能力封装 RAG 检索，向量检索经 Milvus，本体图谱存储于 Neo4j，"
     "所有 LLM 与 embedding 调用统一经 llm-gateway 出口。"
 ) * _TEXT_MUL

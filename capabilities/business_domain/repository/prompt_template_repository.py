@@ -7,7 +7,7 @@
 """
 from typing import Sequence
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from jonex_core.common.repository import BaseRepository
 from jonex_core.common.tenant import require_tenant
@@ -158,6 +158,41 @@ class PromptTemplateRepository(BaseRepository[PromptTemplate]):
                 details={"id": template_id, "tenant_id": tenant_id},
             )
         return obj
+
+      # ── 名称查重 ──
+
+    async def name_exists(
+        self,
+        tenant_id: str,
+        name: str,
+        space_id: str | None = None,
+        exclude_id: str | None = None,
+    ) -> bool:
+        """判断同领域空间内是否已存在同名 domain 模板。
+
+        - 区分大小写（== 精确匹配，与 DB 部分唯一索引语义一致）
+        - 排除软删（is_deleted=0）
+        - space_id=None 表示精确匹配 space_id IS NULL 的模板（NULL 也是明确空间，
+        不按「不过滤」处理 —— 与 list_domain_templates 的 space_id=None 语义不同）
+        - exclude_id 用于编辑场景排除自身
+        """
+        tenant_id = require_tenant(tenant_id)
+        conditions = [
+            PromptTemplate.tenant_id == tenant_id,
+            PromptTemplate.scope == "domain",
+            PromptTemplate.is_deleted == 0,
+            PromptTemplate.name == name,
+        ]
+        if space_id is not None:
+            conditions.append(PromptTemplate.space_id == space_id)
+        else:
+            conditions.append(PromptTemplate.space_id.is_(None))
+        if exclude_id is not None:
+            conditions.append(PromptTemplate.id != exclude_id)
+        result = await self.session.execute(
+            select(func.count()).select_from(PromptTemplate).where(*conditions)
+        )
+        return result.scalar_one() > 0
 
     # ── 通用查询（任意模板，不校验租户归属） ──
 

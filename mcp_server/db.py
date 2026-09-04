@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """
-悦溪平台 - MCP Server 数据库连接模块
+Jonex 平台 - MCP Server 数据库连接模块
 
 基于 asyncpg 原始连接池，支持：
 - 异步数据库操作

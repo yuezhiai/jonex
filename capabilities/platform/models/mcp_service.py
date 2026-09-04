@@ -26,6 +26,8 @@ class McpServicePublish(Base):
     is_published = Column(Integer, nullable=False, default=0)
     published_at = Column(TIMESTAMP(timezone=True))
     published_by = Column(String(64))
+    stopped_at = Column(TIMESTAMP(timezone=True))
+    stopped_by = Column(String(64))
     tool = Column(String(128))
     tool_description = Column(Text)
     service_type = Column(String(32), nullable=False, default="domain")

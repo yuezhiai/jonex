@@ -46,15 +46,10 @@ from capabilities.platform.dtos.mcp_key_dto import (
     McpKeyResponse,
     McpKeyCreateResponse,
     McpKeyListResponse,
-    McpKeyResetRequest,
 )
 from capabilities.platform.dtos.mcp_service_dto import (
     McpServiceListRequest,
     McpServiceResponse,
     McpServiceListResponse,
     PublishRequest,
-    TestCallRequest,
-    TestCallResponse,
-    AuthorizedKeyResponse,
-    AuthorizedKeyListResponse,
 )

@@ -7,6 +7,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -43,6 +44,20 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name or "unnamed")
 
 
+def _is_valid_http_url(value: Any) -> bool:
+    """校验 endpoint 必须是 http/https URL（与前端 pattern 对齐）。"""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value:
+        return False
+    try:
+        parts = urlparse(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
 class DataSourceService:
     def __init__(self) -> None:
         self._docs = DocumentService()
@@ -59,6 +74,29 @@ class DataSourceService:
             if cfg.get("credential"):  # "ak:sk" 明文 → 密文
                 cfg["credential_ref"] = encrypt_secret(cfg.pop("credential"))
         return cfg
+
+    # ── 内部：endpoint 校验 ──
+    def _validate_endpoint(self, access_type: str, cfg: dict, *, require: bool = False) -> None:
+        """校验 config_json.endpoint 为合法 http/https URL（后端兜底前端拦截）。
+
+        - api 出站：endpoint 必填（create 时 require=True）。
+        - storage 出站：endpoint 可选（AWS S3 走默认端点），填了必须合法。
+        """
+        if access_type not in ("api", "storage"):
+            return
+        endpoint = cfg.get("endpoint")
+        if not endpoint:
+            if require and access_type == "api":
+                raise InvalidParameterError(message=translate(
+                    "err.datasource.endpoint_required",
+                    fallback="请输入 API 接口地址（Endpoint）",
+                ))
+            return
+        if not _is_valid_http_url(endpoint):
+            raise InvalidParameterError(message=translate(
+                "err.datasource.invalid_endpoint",
+                fallback="Endpoint 格式错误，需以 http:// 或 https:// 开头",
+            ))
 
     # ── CRUD ──
     async def list_sources(self, tenant_id: str, kb_id: str) -> dict:
@@ -93,7 +131,9 @@ class DataSourceService:
         access_type = data.get("access_type")
         if access_type not in _VALID_ACCESS_TYPES:
             raise InvalidParameterError(message=translate("err.datasource.invalid_access_type", params={"access_type": access_type}, fallback=f"非法 access_type: {access_type}"))
-        cfg = self._encrypt_config(access_type, data.get("config_json") or {})
+        cfg_raw = data.get("config_json") or {}
+        self._validate_endpoint(access_type, cfg_raw, require=True)
+        cfg = self._encrypt_config(access_type, cfg_raw)
 
         ds_id = str(uuid4())
         kb_id = data["knowledge_base_id"]
@@ -144,6 +184,7 @@ class DataSourceService:
             if data.get("status") is not None:
                 ds.status = data["status"]
             if data.get("config_json") is not None:
+                self._validate_endpoint(ds.access_type, data["config_json"])
                 merged = {**(ds.config_json or {}), **self._encrypt_config(ds.access_type, data["config_json"])}
                 ds.config_json = merged
             await session.flush()

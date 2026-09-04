@@ -152,27 +152,6 @@ async def delete_service_api_key(service_id: str, key_id: str, request: Request)
         return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
 
 
-@router.get("/domain-services/{service_id}/permissions")
-async def get_service_permissions(service_id: str, request: Request):
-    tenant_id = extract_tenant_id(request)
-    try:
-        result = await _service.get_permissions(service_id, tenant_id)
-        return success_response(data={"permissions": result})
-    except JonexException as e:
-        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
-
-
-@router.put("/domain-services/{service_id}/permissions")
-async def set_service_permissions(service_id: str, request: Request):
-    body = await request.json()
-    tenant_id = extract_tenant_id(request)
-    try:
-        await _service.set_permissions(service_id, tenant_id, body.get("permissions", []))
-        return success_response(message="权限已更新")
-    except JonexException as e:
-        return error_response(code=e.code, message=e.message, status_code=e.status_code, details=e.details)
-
-
 @router.get("/domain-services/{service_id}/search", summary="搜索领域服务")
 async def search_service(
     request: Request,

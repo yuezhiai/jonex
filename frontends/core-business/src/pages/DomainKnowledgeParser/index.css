@@ -826,13 +826,7 @@
   min-width: 0;
 }
 
-.parser-template-info strong {
-  color: #0b2b5c;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.parser-template-info span {
+.parser-template-desc {
   margin-top: 2px;
   overflow: hidden;
   color: #94a3b8;
