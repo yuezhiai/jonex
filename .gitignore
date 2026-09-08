@@ -292,7 +292,6 @@ certs/
 # —— 仓库根的内部资料 ——
 /ARCHITECTURE_REFACTOR_SUMMARY.md
 /PROJECT_ISSUES_AND_TODO.md
-/README.zh.md
 /README_GITHUB.md
 /backend-development-standard.md
 /frontend-development-standard.md

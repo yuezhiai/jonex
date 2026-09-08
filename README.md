@@ -3,17 +3,22 @@
 </p>
 
 <p align="center">
-  <strong>All-in-One Multimodal Parsing Engine + Ontology-Powered AI-Ready Knowledge Engine</strong><br />
-  Parse every modality. Compile knowledge with ontology. Reason before retrieval.
+  <strong>AI Multimodal Domain Knowledge Engine</strong><br />
+  Built for Enterprise Agents · Powered by the Dual Engines of Jonex Wiki and Graph Ontology
 </p>
 
+<hr />
+<br />
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12" />
   <img src="https://img.shields.io/badge/React-TypeScript-3178C6?logo=react&logoColor=white" alt="React and TypeScript" />
   <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
   <img src="https://img.shields.io/badge/Multi--Tenant-Ready-0051D8" alt="Multi-tenant ready" />
-  <img src="https://img.shields.io/badge/License-Apache--2.0-D22128" alt="Apache License 2.0" />
+</p>
+
+<p align="center">
+  English | <a href="README.zh.md">中文</a>
 </p>
 
 <p align="center">
@@ -28,6 +33,12 @@
   <a href="#license">License</a>
 </p>
 
+<p align="center">
+  <strong>
+  If you find value in Jonex, please ⭐ Star the project to support us.
+  </strong>
+</p>
+
 ---
 
 ## Overview
@@ -39,7 +50,6 @@ It is an end-to-end enterprise AI knowledge platform that turns raw content into
 <p align="center">
   <img src="./docs/assets/jonex-knowledge-pipeline.png" alt="Jonex knowledge pipeline: from multimodal raw data to actionable knowledge" width="100%" />
 </p>
-
 
 ## Quick Start
 
@@ -55,7 +65,7 @@ Docker Compose is the fastest way to run the complete platform.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/jonexaiorg/jonex.git
+git clone https://github.com/yuezhiai/jonex.git
 cd jonex
 ```
 
@@ -69,6 +79,7 @@ This creates:
 
 - `deploy/.env` for the platform, database, object storage, and LLM Gateway
 - `deploy/.env.rag` for LightRAG, embeddings, and parsing
+- `deploy/.env.mcp` for the MCP server
 - Frontend `.env` files for Shell, Core Business, Ecosystem Management, Platform Management, and Dev Gateway
 
 ### 3. Configure model connections
@@ -83,7 +94,7 @@ LLMGW_UPSTREAM_EMBED_HOST=https://your-embedding-host/v1
 LLMGW_UPSTREAM_EMBED_API_KEY=your_embedding_api_key
 ```
 
-If your model names differ from the defaults, also update `LLM_MODEL` and `EMBEDDING_MODEL` in `deploy/.env.rag`.
+If your model names differ from the defaults, update the matching `LLM_MODEL` / `EMBEDDING_MODEL` keys — they are defined in both `deploy/.env` and `deploy/.env.rag`, and `EMBEDDING_MODEL` must be kept identical in the two files (it is used to build the vector index).
 
 Keep `LIGHTRAG_API_KEY` identical in `deploy/.env` and `deploy/.env.rag`. For audio, video, or advanced image processing, also configure the VLM and ASR connections in `deploy/.env`.
 
@@ -112,6 +123,7 @@ Local demo credentials:
 ```text
 Username: admin
 Password: admin123
+Tenant: tenant_jonex_demo
 ```
 
 > **Security warning:** These credentials are for local evaluation only. Change or remove the default administrator account before binding Jonex to a non-loopback interface, sharing the deployment, or exposing it to any network. Complete the production checklist in [SECURITY.md](SECURITY.md) before deployment.
@@ -159,8 +171,8 @@ Local development uses root-level environment files and VSCode Debug. It is sepa
 ### Initialize the local environment
 
 ```bash
-cp docs/env/.env.local.example .env.local
-cp docs/env/.env.rag.local.example .env.rag.local
+cp .env.local.example .env.local
+cp .env.rag.local.example .env.rag.local
 mkdir -p .vscode
 cp docs/examples/launch.json.example .vscode/launch.json
 make frontends-install
@@ -187,7 +199,7 @@ Open `http://localhost:8080`.
 
 ## Your First Knowledge Search in Five Minutes
 
-1. Sign in with the local demo credentials `admin / admin123`.
+1. Sign in with the local demo credentials `admin / admin123` in the demo tenant `tenant_jonex_demo`.
 2. Open Core Business and create or select a domain space.
 3. Create a knowledge base and organize it with folders or tags.
 4. Select a parser profile or preset for the content you plan to ingest.
@@ -205,6 +217,7 @@ All external APIs are exposed through the unified Gateway.
 ```bash
 curl -X POST "http://localhost/api/v1/auth/login" \
   -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: tenant_jonex_demo" \
   -d '{"username":"admin","password":"admin123"}'
 ```
 
@@ -261,14 +274,31 @@ In production, the browser communicates only with Frontend Gateway. Business API
 
 ## License
 
-Jonex is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their respective licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+This repository is licensed under the [Jonex Open Source License](LICENSE), based on Apache License 2.0 with additional conditions. Third-party components remain under their respective licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 
 ---
 
-<p align="center">
-  <strong>Turn enterprise data into knowledge that is understandable, verifiable, and operational.</strong>
-</p>
+<div align="center">
 
----
+### **Jonex** — AI Multimodal Domain Knowledge Engine
+
+*Providing enterprise Agents with ontology-powered knowledge services that are reasoning-ready, traceable, and callable.*
+
+<br/>
+
+### Enjoying Jonex?
+
+<a href="https://github.com/yuezhiai/jonex/stargazers">
+  <img src="https://img.shields.io/github/stars/yuezhiai/jonex?style=social" alt="Stars"/>
+</a>
+<a href="https://github.com/yuezhiai/jonex/network/members">
+  <img src="https://img.shields.io/github/forks/yuezhiai/jonex?style=social" alt="Forks"/>
+</a>
+
+**Click ⭐ Star to support us, thank you!**
+
+</div>
 
 © 2026 JONEX
