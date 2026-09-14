@@ -32,7 +32,7 @@ def create_app():
     logger.info("=" * 60)
     logger.info("Jonex 平台 Sidecar 代理启动成功")
     logger.info("运行模式: 反向代理模式（调用独立能力服务）")
-    logger.info(f"监听端口: {sidecar_app.app.state}.{8001}")
+    logger.info("监听端口: 8001")
     logger.info("API 文档: http://localhost:8001/docs")
     logger.info("=" * 60)
 
