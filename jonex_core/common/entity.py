@@ -4,7 +4,7 @@
 统一实体 mixin。
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, SmallInteger, String
 from sqlalchemy.orm import declared_attr
@@ -21,11 +21,15 @@ class TenantMixin:
 class TimestampMixin:
     """创建/更新时间字段。"""
 
-    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
     updated_at = Column(
         DateTime,
-        default=datetime.now,
-        onupdate=datetime.now,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
