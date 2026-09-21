@@ -8,11 +8,13 @@ import PermissionEditModal, { type PermissionEditModalRef } from './PermissionEd
 import RoleUserAssignModal, { type RoleUserAssignModalRef } from './RoleUserAssignModal';
 import NewRoleModal, { type NewRoleModalRef } from './NewRoleModal';
 
+// 键为数据库里的角色名（见 deploy/postgres/migrations/006_seed_data.sql 的 platform.roles 播种）
 const BUILT_IN_ROLE_KEYS: Record<string, string> = {
   admin: 'systemAdmin',
   user: 'user',
   平台管理员: 'platformAdmin',
   租户管理员: 'systemAdmin',
+  普通用户: 'user',
   领域服务管理员: 'domainServiceAdmin',
   知识编辑者: 'knowledgeEditor',
   观察者: 'observer',
