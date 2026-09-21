@@ -136,8 +136,8 @@ services:
     networks:
       - jonex-network
     environment:
-      MINIO_ACCESS_KEY: change-me
-      MINIO_SECRET_KEY: change-me
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
       TZ: Asia/Shanghai
     volumes:
       - jonex-minio-data:/minio_data
@@ -165,8 +165,8 @@ services:
       TZ: Asia/Shanghai
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY: change-me
-      MINIO_SECRET_KEY: change-me
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
     volumes:
       - jonex-milvus-data:/var/lib/milvus
     command: ["milvus", "run", "standalone"]
@@ -490,6 +490,7 @@ services:
       S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       # 网关对外公开地址（用于构造文档下载等公开 URL），生产环境需覆盖为实际 IP/域名
       GATEWAY_PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_BASE_URL:-http://localhost:8000}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-change-me-in-production}
     volumes:
       - jonex-logs:/app/logs
       - jonex-rag-inputs:/app/inputs             # 与 atomic-rag 共享上传文件（named volume）

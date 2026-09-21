@@ -30,6 +30,13 @@ COMMENT ON TABLE platform.applications IS '应用注册表';
 COMMENT ON TABLE platform.application_routes IS '应用路由表';
 COMMENT ON TABLE platform.system_configs IS '系统配置表';
 COMMENT ON TABLE platform.audit_logs IS '审计日志表';
+COMMENT ON COLUMN platform.audit_logs.log_type IS 'Log type column on platform.audit_logs.';
+COMMENT ON COLUMN platform.audit_logs.service_name IS 'Service name column on platform.audit_logs.';
+COMMENT ON COLUMN platform.audit_logs.outcome IS 'SUCCESS / FAILED';
+COMMENT ON COLUMN platform.audit_logs.log_level IS 'INFO / WARN / ERROR';
+COMMENT ON COLUMN platform.audit_logs.error_message IS 'Error message column on platform.audit_logs.';
+COMMENT ON COLUMN platform.audit_logs.method IS 'Method column on platform.audit_logs.';
+COMMENT ON COLUMN platform.audit_logs.path IS 'Path column on platform.audit_logs.';
 COMMENT ON TABLE platform.task_schedules IS '任务调度表';
 
 -- knowledge_base
@@ -153,6 +160,7 @@ COMMENT ON COLUMN knowledge_base.knowledge_info.status IS '知识库状态：syn
 COMMENT ON COLUMN knowledge_base.knowledge_info.owner_id IS '负责人用户 ID';
 
 COMMENT ON COLUMN knowledge_base.knowledge_documents.data_source_type IS '文档来源类型：api/api_push/storage/file';
+COMMENT ON COLUMN knowledge_base.knowledge_documents.folder_id IS 'Folder id column on knowledge_base.knowledge_documents.';
 
 -- ============================================================
 -- 补齐：business_domain 模板表注释
