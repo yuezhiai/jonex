@@ -155,8 +155,10 @@
     "loadingApp": "正在加载应用...",
     "loadAppFailed": "应用加载失败",
     "cannotLoadSubApp": "无法加载子应用",
+    "cannotLoadApp": "无法加载「{{appName}}」",
     "openInNewWindow": "在新窗口打开",
     "appRunError": "应用运行出错",
+    "appRunErrorMessage": "应用「{{appName}}」运行出错：{{message}}",
     "selectSpace": "选择领域空间",
     "addSpace": "添加领域空间",
     "builtInTenants": {

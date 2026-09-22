@@ -334,51 +334,63 @@ WHERE u.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
 -- 默认菜单（四大板块：领域本体/数据接入/集成扩展/平台管理；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
-INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, permission_code) VALUES
+INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, visible, status, permission_code, is_deleted) VALUES
     -- 领域本体分组（直接项，无中间组）
-    (1, 0, 'navigation.coreBusiness', NULL, 'HomeOutlined', NULL, 1, NULL),
-    (2, 1, 'navigation.knowledgeSearch', '/apps/core-business/knowledge-search', 'SearchOutlined', NULL, 1, 'knowledge:read'),
-    (3, 1, 'navigation.domainKnowledge', '/apps/core-business/domain-knowledge', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
-    (4, 1, 'navigation.domainManagement', '/apps/core-business/domain-management', 'ClusterOutlined', NULL, 3, 'service:read'),
-    (20, 1, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 4, 'template:read'),
+    (1, 0, 'navigation.coreBusiness', NULL, 'HomeOutlined', NULL, 1, 1, 1, NULL, 0),
+    (2, 1, 'navigation.knowledgeSearch', '/apps/core-business/knowledge-search', 'SearchOutlined', NULL, 1, 1, 1, 'knowledge:read', 0),
+    (3, 1, 'navigation.domainKnowledge', '/apps/core-business/domain-knowledge', 'DatabaseOutlined', NULL, 2, 1, 1, 'knowledge:read', 0),
+    (4, 1, 'navigation.domainManagement', '/apps/core-business/domain-management', 'ClusterOutlined', NULL, 3, 1, 1, 'service:read', 0),
+    (20, 1, 'navigation.templateDomains', '/apps/ecosystem-management/template-domains', 'CopyOutlined', NULL, 4, 1, 1, 'template:read', 0),
     -- 数据接入分组 → 数据源管理、解析器管理（直接项）
-    (21, 0, 'navigation.dataAccessGroup', NULL, 'CloudServerOutlined', NULL, 2, NULL),
+    (21, 0, 'navigation.dataAccessGroup', NULL, 'CloudServerOutlined', NULL, 2, 1, 1, NULL, 0),
     -- [jonex] B1：数据源管理改用 datasource:read（原先与解析器管理共用 engine:read，
     -- 两个不同的页面共享一个码 → 无法分别授权）。两者都是 platform scope，仅平台管理员可见。
-    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 'datasource:read'),
-    (8, 21, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 'engine:read'),
+    (7, 21, 'navigation.dataAccess', '/apps/platform-management/data-access', 'CloudServerOutlined', NULL, 1, 1, 1, 'datasource:read', 0),
+    (8, 21, 'navigation.parserManagement', '/apps/platform-management/parser-management', 'CodeOutlined', NULL, 2, 1, 1, 'engine:read', 0),
     -- [jonex] 模型适配：此前只在 platform-management 子应用侧边栏（standalone 模式）可达，
     -- 未进菜单树 → 经 shell 的 hosted 模式无入口（HostedLayout 不渲染子应用侧边栏）。
-    (27, 21, 'navigation.modelAdapter', '/apps/platform-management/model-adapter', 'ApiOutlined', NULL, 3, 'model:read'),
+    (27, 21, 'navigation.modelAdapter', '/apps/platform-management/model-adapter', 'ApiOutlined', NULL, 3, 1, 1, 'model:read', 1),  -- 隐藏（软删除）
     -- 集成扩展分组 → Mcp生态（直接项；适配器目录已注释隐藏）
-    (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, NULL),
+    (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, 1, 1, NULL, 0),
     -- (18, 22, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'), -- 适配器目录：已注释隐藏，恢复时放开本行
-    (19, 22, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:service:view'),
+    (19, 22, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 1, 1, 'mcp:service:view', 0),
     -- 平台管理分组 → 账号与权限组（可折叠）
-    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, NULL),
-    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 1, NULL),
-    (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
-    (12, 25, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
-    (13, 25, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
+    (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, 1, 1, NULL, 0),
+    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 1, 1, 1, NULL, 0),
+    (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 1, 1, 'platform:tenant:read', 0),
+    (12, 25, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 1, 1, 'user:read', 0),
+    (13, 25, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 1, 1, 'role:read', 0),
     -- 平台管理分组 → 提示词与模板（直接项）
-    (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 2, 'prompt:read'),
+    (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 2, 1, 1, 'prompt:read', 0),
     -- 平台管理分组 → 系统运维组（可折叠）
-    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 3, NULL),
-    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read'),
+    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 3, 1, 1, NULL, 0),
+    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 1, 1, 'platform:config:read', 0),
     -- [jonex] B1：操作日志菜单码由 platform:audit:read 改为 audit:read（tenant scope）。
     -- 接口已改成双码放行（platform:audit:read 或 audit:read），但菜单码若还是平台码，
     -- 租户管理员会被 _filter_visible_menus 裁掉这一项 → 组头「系统运维」也被连带裁掉
     -- → 「接口通了但没有入口」。菜单与接口必须一起改。
     -- 平台管理员天然持全部 tenant 码，所以他仍然看得到。
-    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'audit:read'),
+    (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 1, 1, 'audit:read', 0),
     -- [jonex] 系统监控：占位页（研发中），与系统配置/操作日志同属系统运维组
-    (28, 26, 'navigation.systemMonitor', '/apps/platform-management/system-monitor', 'DashboardOutlined', NULL, 3, 'platform:monitor:read')
-ON CONFLICT DO NOTHING;
+    (28, 26, 'navigation.systemMonitor', '/apps/platform-management/system-monitor', 'DashboardOutlined', NULL, 3, 1, 1, 'platform:monitor:read', 1)  -- 隐藏（软删除）
+ON CONFLICT (id) DO UPDATE SET
+    parent_id      = EXCLUDED.parent_id,
+    name           = EXCLUDED.name,
+    path           = EXCLUDED.path,
+    icon           = EXCLUDED.icon,
+    app_id         = EXCLUDED.app_id,
+    sort_order     = EXCLUDED.sort_order,
+    visible        = EXCLUDED.visible,
+    status         = EXCLUDED.status,
+    permission_code = EXCLUDED.permission_code,
+    is_deleted     = EXCLUDED.is_deleted,
+    updated_at     = CURRENT_TIMESTAMP;
 
--- 隐藏「模型适配」与「系统监控」两个菜单（软删除；恢复时改回 0）
+-- 清理规范集合之外的旧 seed 菜单（name LIKE 'navigation.%' 即 seed 菜单；用户自定义菜单不在此列）
 UPDATE platform.menus
-SET is_deleted = 1
-WHERE name IN ('navigation.modelAdapter', 'navigation.systemMonitor');
+SET is_deleted = 1, updated_at = CURRENT_TIMESTAMP
+WHERE name LIKE 'navigation.%'
+  AND id NOT IN (1, 2, 3, 4, 5, 7, 8, 9, 11, 12, 13, 14, 15, 19, 20, 21, 22, 25, 26, 27, 28);
 
 
 -- 默认应用注册
@@ -2709,19 +2721,11 @@ SET name = initcap(action) || ' ' || initcap(replace(resource, '_', ' ')),
     END
 WHERE name ~ U&'[\4E00-\9FA5]' OR coalesce(description, '') ~ U&'[\4E00-\9FA5]';
 
-UPDATE platform.menus AS m
-SET name = v.name
-FROM (VALUES
-    (1, 'Platform Management'),
-    (2, 'User Management'),
-    (3, 'Role Management'),
-    (4, 'Menu Management'),
-    (5, 'Application Management'),
-    (6, 'System Configuration'),
-    (7, 'Audit Logs'),
-    (8, 'Task Scheduling')
-) AS v(id, name)
-WHERE m.id = v.id;
+-- [jonex] 菜单 name 现为 i18n key（navigation.*），由前端 t(node.name) 翻译（zh/en 文案在
+-- frontends/shared/i18n-resources）。原 010_english_display_data.sql 里「把菜单 name 覆写成英文
+-- 字面量」这段已废弃：它按旧菜单结构（id 1-8 对应旧「平台管理/用户管理/角色管理/菜单管理…」）
+-- 覆写现在的导航 key，会导致菜单文案错乱（中英都显示错误英文）。菜单英文由 navigation.* 键承担，
+-- 此处不再覆写 name。
 
 UPDATE platform.applications AS a
 SET name = v.name, description = v.description

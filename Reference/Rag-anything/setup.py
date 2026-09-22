@@ -65,7 +65,7 @@ extras_require = {
     "text": ["reportlab>=4.0.0"],  # For text file to PDF conversion (TXT, MD)
     "office": [],  # Office document processing requires LibreOffice (external program)
     # [jonex] 本地 MinerU CLI 解析（RAG_PARSER=mineru）。online/selfhost 不需要，slim 镜像可省。
-    "local": ["mineru[core]"],  # [jonex]
+    "local": ["mineru[vlm,pipeline,api]>=2.0.0,<3.0.0"],  # [jonex] 锁 2.x（3.0 CLI 改了）；vlm+pipeline+api 去 gradio 防 pip ResolutionTooDeep
     "paddleocr": [
         "paddleocr>=2.7.0",
         "pypdfium2>=4.25.0",

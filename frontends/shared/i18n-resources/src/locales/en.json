@@ -155,8 +155,10 @@
     "loadingApp": "Loading app...",
     "loadAppFailed": "Failed to load app",
     "cannotLoadSubApp": "Unable to load app",
+    "cannotLoadApp": "Unable to load \"{{appName}}\"",
     "openInNewWindow": "Open in new window",
     "appRunError": "App error",
+    "appRunErrorMessage": "App \"{{appName}}\" failed to run: {{message}}",
     "selectSpace": "Select space",
     "addSpace": "Add space",
     "builtInTenants": {

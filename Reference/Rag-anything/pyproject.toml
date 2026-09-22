@@ -34,7 +34,7 @@ office = []  # Requires LibreOffice (external program)
 # [jonex] 本地 MinerU CLI 解析（RAG_PARSER=mineru）。原为核心依赖 `mineru[core]`，
 #   Jonex将其移到此 optional extra：online/selfhost 为纯 HTTP 客户端不需要，
 #   slim 镜像不装此 extra 即可去掉 mineru 及其重传递依赖（torch 除外，torch 来自 whisper/st）。
-local = ["mineru[core]"]  # [jonex]
+local = ["mineru[vlm,pipeline,api]>=2.0.0,<3.0.0"]  # [jonex] 锁 2.x（3.0 起 CLI 改为 mineru parse 子命令）；用 vlm+pipeline+api 而非 core（core 含 gradio 大依赖树，易触发 pip ResolutionTooDeep）
 video = [
     "cos-python-sdk-v5>=1.9.0",
     "xxhash>=3.0.0",

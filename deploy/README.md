@@ -192,7 +192,7 @@ make shell-postgres
 make init-db
 ```
 
-迁移脚本位于 `postgres/migrations/`，按编号顺序执行（`001_schemas` → `002_platform` → `004_knowledge_base` → `005_business_domain` → `006_seed_data` → `007_comments`）。`postgres/init.sql` 为容器首次启动的聚合初始化入口。
+迁移脚本位于 `postgres/migrations/`，按编号顺序执行（`001_schemas` → `002_platform` → `004_knowledge_base` → `005_business_domain` → `006_seed_data` → `007_comments`）。容器首次启动时由 PostgreSQL 镜像自动按字母序执行 `migrations/` 下所有 `.sql`（`init.sql` 仅为本机手动 `psql -f deploy/postgres/init.sql` 场景的聚合入口，并不挂载进容器）。
 
 > 说明：`001` 创建全部 schema（platform/knowledge_base/business_domain/metering）；计量表 `metering.llm_usage_log` 并入 `002`；知识库文档存储列、数据源表、本体编译快照的可编辑字段均已并入 `004`；对应种子并入 `006`；历史补丁脚本 `008`/`009`/`010` 的净新增内容（审计日志列注释、文档 folder_id 注释、英文显示数据）已分别并入 `007` 与 `006`，原脚本已移除。
 

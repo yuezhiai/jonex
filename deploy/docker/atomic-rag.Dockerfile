@@ -13,7 +13,7 @@
 # - poppler-utils（PDF 渲染）
 # - tesseract-ocr + tesseract-ocr-chi-sim（OCR 文字识别）
 # - whisper base 模型（ASR 语音转写，构建时预下载）
-# - mineru V3 + VLM / layout / OCR 模型（构建时预下载约 2-4GB）
+# - mineru 2.x（pyproject 已 pin <3.0.0，3.0 起 CLI 改为 `mineru parse`）+ VLM / layout / OCR 模型（构建时预下载约 2-4GB）
 # - mineru / docling / paddleocr 解析器
 
 FROM python:3.12.13-slim AS base
@@ -85,7 +85,10 @@ ENV HF_ENDPOINT=https://hf-mirror.com \
     MINERU_MODEL_SOURCE=${MINERU_SOURCE}
 
 # ── 第 2 层：raganything 安装（按 RAG_PROFILE 决定依赖胖瘦；源码隔离到 /opt，避免污染 /app）──
-#   full : [all,local] —— 含本地 mineru CLI + 音视频/paddleocr 等全部可选依赖
+#   full : 显式装 [image,text,audio,office,markdown,video,local] —— 等价于 all 但去掉 paddleocr。
+#          paddleocr→paddlex→paddlepaddle+opencv-contrib-python，与 mineru 2.x 的
+#          opencv-python + numpy 约束互斥，会导致 pip 回溯超限（ResolutionTooDeep）。
+#          RAG_PARSER=mineru 场景用不到 paddleocr 解析器，故排除。
 #   slim : [image,text] —— online/selfhost 纯 HTTP 客户端，不装 mineru/whisper，
 #          连带去掉 torch + CUDA(nvidia) + modelscope 等（~3.9GB+）。
 #          ⚠️ slim 镜像下 RAG_PARSER=mineru（本地）会因缺依赖在运行时报错，属预期取舍。
@@ -97,7 +100,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       pip install -e "/opt/raganything[image,text]"; \
     else \
       echo "[RAG_PROFILE=full] 安装完整依赖（含本地 mineru CLI 与音视频 ASR）"; \
-      pip install -e "/opt/raganything[all,local]"; \
+      pip install -e "/opt/raganything[image,text,audio,office,markdown,video,local]"; \
     fi
 
 # ── 第 3 层：平台基础依赖（sqlalchemy / redis / pydantic 等）──

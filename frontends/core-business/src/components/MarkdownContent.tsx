@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -37,7 +38,9 @@ const headingSizes: Record<string, number> = { h1: 20, h2: 17, h3: 15, h4: 14, h
  * 统一 Markdown 渲染组件：remark-gfm（表格/任务列表/删除线）+ 样式定制。
  * 用于解析结果片段、文档正文等可能带格式的内容展示。
  */
-export default function MarkdownContent({ content, imagePlaceholder = '图片' }: MarkdownContentProps) {
+export default function MarkdownContent({ content, imagePlaceholder }: MarkdownContentProps) {
+  const { t } = useTranslation();
+  const placeholder = imagePlaceholder ?? t('common.image');
   return (
     <div style={{ fontSize: 14, lineHeight: 1.8, color: '#334155', wordBreak: 'break-word' }}>
       <ReactMarkdown
@@ -131,7 +134,7 @@ export default function MarkdownContent({ content, imagePlaceholder = '图片' }
           ),
           img: ({ alt }) => (
             <span style={{ color: '#94a3b8', fontSize: 12 }}>
-              <PictureOutlined /> {alt || imagePlaceholder}
+              <PictureOutlined /> {alt || placeholder}
             </span>
           ),
         }}
