@@ -343,9 +343,11 @@ EXCEPTION_REGISTRY: Dict[int, type] = {
     3006: PermissionDeniedError,
     3007: RateLimitExceededError,
     3008: InvalidCredentialsError,
+    3009: AccountLockedError,
     3010: ImpersonationForbiddenError,
     3011: ImpersonationTargetError,
     3012: NotImpersonatedError,
+    3013: AccountDisabledError,
     # 数据相关
     4000: DataError,
     4001: DatabaseError,
