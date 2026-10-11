@@ -387,6 +387,46 @@ class TenantCache:
     async def release_lock(self, lock_key: str, lock_id: str) -> bool:
         return await CacheUtil.release_lock(self._make_key(lock_key), lock_id)
 
+    # ==================== TTL / Expiry ====================
+    async def ttl(self, key: str) -> int:
+        return await CacheUtil.ttl(self._make_key(key))
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        return await CacheUtil.expire(self._make_key(key), seconds)
+
+    # ==================== Hash 操作 ====================
+    async def hgetall(self, key: str) -> dict:
+        return await CacheUtil.hgetall(self._make_key(key))
+
+    async def hget(self, key: str, field: str) -> Optional[Any]:
+        return await CacheUtil.hget(self._make_key(key), field)
+
+    async def hset(self, key: str, field: str, value: Any) -> int:
+        return await CacheUtil.hset(self._make_key(key), field, value)
+
+    async def hdel(self, key: str, *fields: str) -> int:
+        return await CacheUtil.hdel(self._make_key(key), *fields)
+
+    async def hincrby(self, key: str, field: str, amount: int = 1) -> int:
+        return await CacheUtil.hincrby(self._make_key(key), field, amount)
+
+    # ==================== Set 操作 ====================
+    async def sadd(self, key: str, *members: Any) -> int:
+        return await CacheUtil.sadd(self._make_key(key), *members)
+
+    async def smembers(self, key: str) -> set:
+        return await CacheUtil.smembers(self._make_key(key))
+
+    async def srem(self, key: str, *members: Any) -> int:
+        return await CacheUtil.srem(self._make_key(key), *members)
+
+    # ==================== Counters ====================
+    async def incr(self, key: str, amount: int = 1) -> int:
+        return await CacheUtil.incr(self._make_key(key), amount)
+
+    async def decr(self, key: str, amount: int = 1) -> int:
+        return await CacheUtil.decr(self._make_key(key), amount)
+
 
 # ==================== 快捷函数 ====================
 async def check_redis_health() -> bool:
