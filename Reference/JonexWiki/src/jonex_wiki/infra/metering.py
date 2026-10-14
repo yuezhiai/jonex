@@ -11,7 +11,7 @@ import time
 log = logging.getLogger(__name__)
 
 
-#: 调用结果三态。`degraded` 单独一档而不并入 `failed`——embed/rerank 返回 None 是
+#: 调用结果三态。`degraded` 单独一档而不并入 `failed`——rerank 返回 None 是
 #: §9 明文规定的降级(BM25-only / 保留原序),把它记成失败会让告警噪音盖掉真正的故障。
 OK, DEGRADED, FAILED = "ok", "degraded", "failed"
 
@@ -112,8 +112,8 @@ class MeteredGw:
         """统一计时 + 记录。**失败尝试同样记录**——尾延迟几乎全在重试与挂起里,
         只统计成功调用会系统性低估延迟(complete 内部重试 2 次,外层页面编辑再重试 1 次)。
 
-        ``fallback_model`` 是该通道（chat / embedding）在"请求没带模型名"时实际会用的
-        模型，供失败路径记名使用；必须是**本通道**的模型，否则 embed 失败会被错记成 chat 模型。
+        ``fallback_model`` 是该通道（chat）在"请求没带模型名"时实际会用的
+        模型，供失败路径记名使用；必须是**本通道**的模型，避免失败路径记录错误的模型。
         """
         start = time.monotonic()
         try:
@@ -149,13 +149,6 @@ class MeteredGw:
                                             trace_id=trace_id, **kwargs),
                                 fallback_model=getattr(self._inner, "llm_model", None))
 
-    async def embed(self, texts, *, scene, tenant_id, kb_id, trace_id, **kwargs):
-        return await self._call(self._inner.embed, scene=scene,
-                                trace_id=trace_id, kb_id=kb_id,
-                                args=(texts,),
-                                kwargs=dict(scene=scene, tenant_id=tenant_id, kb_id=kb_id,
-                                            trace_id=trace_id, **kwargs),
-                                fallback_model=getattr(self._inner, "embed_model", None))
 
     async def rerank(self, query, documents, *, scene, tenant_id, kb_id, trace_id, **kwargs):
         return await self._call(self._inner.rerank, scene=scene,

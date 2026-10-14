@@ -20,14 +20,16 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-import math
+from collections.abc import Mapping
 
 from jonex_wiki.kernel.contracts import (
-    EmbeddingIdentity,
     EffectiveRuntimeSnapshot,
     SourceArtifact,
     SourceInventorySnapshot,
 )
+from jonex_wiki.kernel.ports import RevisionFileReference,RevisionFileArtifact
+from jonex_wiki.domain.engine.json_artifacts import iter_json_artifact, load_json_artifact
+from jonex_wiki.domain.engine.source_index import compact_source_index, restore_source_index
 from jonex_wiki.domain.engine.compile.pipeline import (
     ENGINE_ID,
     ENGINE_VERSION,
@@ -62,7 +64,45 @@ from jonex_wiki.domain.engine.query.retrieval import (
 logger = logging.getLogger(__name__)
 
 
-def _corpus_sha256(corpus, *, legacy: bool = False, derived_placeholders: tuple = ()) -> str:
+def _canonical_fragments(value, depth=0):
+    """Bound Unicode intermediates by records, using the fast JSON encoder."""
+    if (isinstance(value, Mapping) and depth < 2
+            and all(isinstance(key, str) for key in value)):
+        yield "{"
+        for index, key in enumerate(sorted(value)):
+            if index:
+                yield ","
+            yield json.dumps(key, ensure_ascii=False) + ":"
+            yield from _canonical_fragments(value[key], depth + 1)
+        yield "}"
+    elif isinstance(value, (list, tuple)) and depth < 2:
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _canonical_fragments(item, depth + 1)
+        yield "]"
+    else:
+        yield json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), default=lambda item: dict(item)
+                         if isinstance(item, Mapping) else item.model_dump())
+
+
+def _corpus_sha256(corpus, **kwargs) -> str:
+    from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
+    with telemetry_stage(current_runtime_telemetry(), "corpus_snapshot_hash"):
+        return _corpus_sha256_impl(corpus, **kwargs)
+
+
+def canonical_checksum(material):
+    """The original canonical SHA256 without a second whole model dump."""
+    digest = hashlib.sha256()
+    for fragment in _canonical_fragments(material):
+        digest.update(fragment.encode('utf-8'))
+    return digest.hexdigest()
+
+
+def _corpus_sha256_impl(corpus, *, legacy: bool = False, derived_placeholders: tuple = (), retired_vector_placeholder: bool = False) -> str:
     """Stream the unchanged canonical snapshot without materializing its JSON."""
     material = {
         key: value for key, value in corpus
@@ -70,13 +110,38 @@ def _corpus_sha256(corpus, *, legacy: bool = False, derived_placeholders: tuple 
         and not (legacy and key == "revision_id")
     }
     material.update({key: {} for key in derived_placeholders})
-    encoder = json.JSONEncoder(
-        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        default=lambda value: value.model_dump(),
-    )
+    if retired_vector_placeholder:
+        material["page_vectors"] = None
     digest = hashlib.sha256()
-    for fragment in encoder.iterencode(material):
-        digest.update(fragment.encode("utf-8"))
+    # Repeated source intervals share a passage's metadata. Encode that object
+    # once while retaining the exact original canonical byte sequence/hash.
+    locations = material.get('source_locations', {})
+    from collections import Counter
+    counts = Counter(id(loc.get('metadata')) for loc in locations.values())
+    encoded_metadata = {}
+    digest.update(b'{')
+    for index, key in enumerate(sorted(material)):
+        if index:digest.update(b',')
+        digest.update((json.dumps(key, ensure_ascii=False)+':').encode())
+        if key != 'source_locations':
+            for fragment in _canonical_fragments(material[key], 1):digest.update(fragment.encode())
+            continue
+        digest.update(b'{')
+        for n, path in enumerate(sorted(locations)):
+            if n:digest.update(b',')
+            digest.update((json.dumps(path,ensure_ascii=False)+':{').encode())
+            location = locations[path]
+            for k, name in enumerate(sorted(location)):
+                if k:digest.update(b',')
+                digest.update((json.dumps(name,ensure_ascii=False)+':').encode())
+                value = location[name]
+                if name == 'metadata' and counts[id(value)] > 1:
+                    if id(value) not in encoded_metadata:encoded_metadata[id(value)] = _canonical_bytes(value)
+                    digest.update(encoded_metadata[id(value)])
+                else:digest.update(_canonical_bytes(value))
+            digest.update(b'}')
+        digest.update(b'}')
+    digest.update(b'}')
     return digest.hexdigest()
 
 
@@ -259,8 +324,7 @@ def _canonical_bytes(value: Any) -> bytes:
     """Canonical JSON with bounded Unicode intermediates (unchanged wire bytes)."""
     from io import BytesIO
     output = BytesIO()
-    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    for chunk in encoder.iterencode(value):
+    for chunk in _canonical_fragments(value):
         output.write(chunk.encode("utf-8"))
     return output.getvalue()
 
@@ -285,8 +349,6 @@ def iter_bundle_files(
     source_inventory: SourceInventorySnapshot | None = None,
     effective_runtime: EffectiveRuntimeSnapshot | None = None,
     lexical_index: bytes | None = None,
-    dense_vectors: Dict[str, List[float]] | None = None,
-    dense_unit_cache: Dict[str, List[float]] | None = None,
     rendered_wiki_files: Dict[str, bytes] | None = None,
     prepared_corpus=None,
     prepared_audit=None,
@@ -298,7 +360,12 @@ def iter_bundle_files(
     previous_contributions: Any = None,
     link_increment: Any = None,
     previous_link_increment: Any = None,
-) -> Iterator[Tuple[str, bytes]]:
+    previous_wiki_files: Dict[str, str] | None = None,
+    file_references: Mapping[str, RevisionFileReference] | None = None,
+    shard_artifacts: bool = False,
+    previous: Any = None,
+    prepared_contribution_payload: Any = None,
+) -> Iterator[Tuple[str, bytes | RevisionFileReference | RevisionFileArtifact]]:
     """Yield identical bundle artifacts one at a time, without retaining their bytes."""
     claim_audit = prepared_audit if prepared_audit is not None else enforce_claim_policy(
         state,
@@ -324,7 +391,8 @@ def iter_bundle_files(
     else:
         incoming = source_contribution.from_claims(claims, source_versions=digest_map, pages=state.pages)
         contributions = incoming
-    contribution_payload = source_contribution.payload(contributions)
+    contribution_payload = (prepared_contribution_payload if prepared_contribution_payload is not None
+                            else source_contribution.payload(contributions))
     snapshots = build_source_snapshots(artifacts)
     source_inventory = source_inventory or bundle.build_source_inventory(
         artifacts, digest_map
@@ -338,6 +406,12 @@ def iter_bundle_files(
     runtime_snapshot_checksum = bundle.snapshot_checksum(
         effective_runtime
     )
+
+    shard_specs = getattr(previous, "json_shards", None) or {}
+    def partitioned(path, data, fields, old_data=None, owners=None, bucket_count=256):
+        return iter_json_artifact(path, data, fields=fields, encode=_canonical_bytes,
+            previous=old_data, previous_specs=shard_specs.get(path),
+            file_references=file_references, owners=owners, bucket_count=bucket_count)
 
     revision = {
         "revision_id": revision_id,
@@ -355,8 +429,28 @@ def iter_bundle_files(
             source_id: snap["content_sha256"]
             for source_id, snap in snapshots.items()
         },
-        "compiler_state": state.model_dump(),
     }
+    if shard_artifacts:
+        large_state_fields = {key: value for key, value in state
+                              if isinstance(value, dict) and key in type(state).model_fields}
+        state_payload = {**state.model_dump(exclude=set(large_state_fields)), **large_state_fields}
+        old_state = ({key: getattr(previous.state, key) for key in large_state_fields}
+                     if previous is not None else None)
+        archive_owners = {key: value.document_id for key, value in state.source_archive.items()}
+        source_documents = {}
+        for passage in state.source_archive.values():
+            source_documents.setdefault(passage.source_id, set()).add(passage.document_id)
+        page_owners = {key: "|".join(sorted({document
+            for source in value.source_ids
+            for document in ({state.source_archive[source].document_id} if source in state.source_archive
+                             else source_documents.get(source, ())) }))
+            for key, value in state.pages.items()}
+        yield from partitioned("state/compiler.json", state_payload,
+            {key: None for key in large_state_fields}, old_state,
+            {"source_archive": archive_owners, "pages": page_owners, "index": page_owners})
+        revision["compiler_state_file"] = "state/compiler.json"
+    else:
+        revision["compiler_state"] = state.model_dump()
     yield ("revision.json", _canonical_bytes(revision))
     del revision
 
@@ -422,7 +516,12 @@ def iter_bundle_files(
     relation_payload = relation_increment.payload(
         relations, page_index=corpus.page_index, downgraded=relation_downgraded)
     for key, data in corpus.files.items():
-        yield ("wiki/" + key, data.encode("utf-8"))
+        path = "wiki/" + key
+        if (file_references is not None and path in file_references
+                and previous_wiki_files is not None and previous_wiki_files.get(key) == data):
+            yield (path, file_references[path])
+        else:
+            yield (path, data.encode("utf-8"))
     if render_signatures is not None:
         yield ("indexes/render_signatures.json", _canonical_bytes({
             "schema_version": 1, "signatures": render_signatures,
@@ -437,12 +536,14 @@ def iter_bundle_files(
     from jonex_wiki.domain.engine.compile.mention_index import (
         build_page_graph_and_links,
     )
-    reading_index = build_page_graph_and_links(
-        corpus.page_index, corpus.files,
-        previous=previous_reading_index,
-        previous_page_index=previous_page_index,
-        changed_paths=rendered_pages,
-    )
+    from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
+    with telemetry_stage(current_runtime_telemetry(), "reading_index"):
+        reading_index = build_page_graph_and_links(
+            corpus.page_index, corpus.files,
+            previous=previous_reading_index,
+            previous_page_index=previous_page_index,
+            changed_paths=rendered_pages,
+        )
     # [jonex] source_records/source_locations 单独落 source_index.json：这俩是 query
     # 检索溯源用的重数据（大库实测 source_locations 达 258MB），而 reading 页面清单
     # （list_pages/outline）只读 page_index/page_graph。拆开后 reading 侧
@@ -457,9 +558,10 @@ def iter_bundle_files(
     for record in relations.links:
         published_query_links.setdefault(record.page_path, []).append({
             "target_id": record.target_id, "why_visit": record.why_visit, "kind": record.kind})
-    yield ("query/navigation.json", _canonical_bytes({
+    navigation_payload = {
         "schema_version": 2,
         "query_projection_version": 1,
+        "source_scopes": corpus.source_scopes,
         "revision_id": revision_id,
         "page_source_ids": {path: page_source_ids_from_markdown(corpus.files[path])
                             for path in corpus.page_index},
@@ -477,17 +579,46 @@ def iter_bundle_files(
                       "link_count": len(relation_payload["links"]),
                       "pending_count": len(relation_payload["pending"]),
                       "digest": relation_payload["digest"]},
-    }))
-    yield ("query/source_index.json", _canonical_bytes({
+    }
+    from jonex_wiki.domain.engine.query.retrieval import build_evidence_fallback
+    navigation_payload['evidence_fallback'] = build_evidence_fallback(
+        navigation_payload['page_source_ids'], corpus.source_records, skip_paths=set(corpus.claims))
+    if shard_artifacts:
+        source_documents = {}
+        for passage in state.source_archive.values():
+            source_documents.setdefault(passage.source_id,set()).add(passage.document_id)
+        page_owners = {path:'|'.join(sorted({doc for sid in ids for doc in source_documents.get(sid,())}))
+                       for path,ids in navigation_payload['page_source_ids'].items()}
+        fields = {key:None for key,value in navigation_payload.items() if isinstance(value,dict) and key != 'relations'}
+        yield from partitioned('query/navigation.json',navigation_payload,fields,
+            getattr(previous,'navigation',None), {key:page_owners for key in fields if key != 'fact_mentions'},32)
+    else:
+        yield ('query/navigation.json',_canonical_bytes(navigation_payload))
+    source_payload = {
         "schema_version": 2,
         "source_records": corpus.source_records,
         "source_locations": corpus.source_locations,
-    }))
-    yield ("indexes/links.json", _canonical_bytes({
+    }
+    if shard_artifacts:
+        source_payload, source_owners = compact_source_index(corpus.source_records, corpus.source_locations)
+        old_sources = (compact_source_index(previous.corpus.source_records, previous.corpus.source_locations)[0]
+                       if previous is not None and previous.corpus is not None else None)
+        yield from partitioned("query/source_index.json", source_payload,
+            {"source_records": None, "source_locations": None, "passage_metadata": None}, old_sources,
+            source_owners)
+    else:
+        yield ("query/source_index.json", _canonical_bytes(source_payload))
+    links_payload = {
         "schema_version": 1,
         "in_links": reading_index["in_links"],
         "mentions": reading_index["mentions"],
-    }))
+        "mention_filters": reading_index["mention_filters"],
+    }
+    if shard_artifacts:
+        yield from partitioned("indexes/links.json", links_payload,
+            {"in_links": None, "mentions": None, "mention_filters": None}, previous_reading_index)
+    else:
+        yield ("indexes/links.json", _canonical_bytes(links_payload))
     del reading_index
     yield ("evidence_disposition.json", _canonical_bytes(disposition_ledger(state, claims, error_book, rule_version=KEEP_AND_SEARCH_RULE_VERSION)))
 
@@ -581,10 +712,26 @@ def iter_bundle_files(
     yield ("claim_audit.json", _canonical_bytes(claim_audit))
     # S5.1: writing the record set here puts it under the container's checksum
     # map automatically (see ``encode_bundle``).
-    yield (source_contribution.FILE_NAME, _canonical_bytes(contribution_payload))
+    if shard_artifacts:
+        contribution_owners = {record.record_id: "|".join(sorted({span.document_id
+            for span in record.source_spans})) for record in contributions.records}
+        old_contributions = ({key: value for key, value in previous.source_contributions}
+            if previous is not None and previous.source_contributions is not None else None)
+        fields = {key: None for key, value in contribution_payload.items() if isinstance(value, dict)}
+        fields["records"] = "record_id"
+        yield from partitioned(source_contribution.FILE_NAME, contribution_payload,
+            fields, old_contributions, {"records": contribution_owners})
+    else:
+        yield (source_contribution.FILE_NAME, _canonical_bytes(contribution_payload))
     # S6.3: same container checksum map, and the navigation snapshot points at
     # it so the default query tool reads the audited links, not the raw draft.
-    yield (relation_increment.FILE_NAME, _canonical_bytes(relation_payload))
+    if shard_artifacts:
+        yield from partitioned(relation_increment.FILE_NAME,relation_payload,
+            {'links':lambda row:hashlib.sha256(_canonical_bytes(row)).hexdigest(),
+             'pending':lambda row:hashlib.sha256(_canonical_bytes(row)).hexdigest()},
+            getattr(previous,'relation_payload',None), bucket_count=32)
+    else:
+        yield (relation_increment.FILE_NAME, _canonical_bytes(relation_payload))
 
     ledger = [
         {
@@ -619,43 +766,10 @@ def iter_bundle_files(
     yield ("provenance.json", _canonical_bytes(provenance))
 
     lexical_bytes = lexical_index or build_fts_index_bytes(corpus)
-    if not isinstance(lexical_bytes, bytes) or not lexical_bytes:
+    if not isinstance(lexical_bytes,(bytes,RevisionFileReference,RevisionFileArtifact)) or not lexical_bytes:
         raise ValueError("lexical index must be non-empty SQLite bytes")
     yield ("indexes/lexical.sqlite", lexical_bytes)
 
-    vectors = dense_vectors if dense_vectors is not None else {}
-    if vectors and set(vectors) != set(corpus.page_text):
-        raise ValueError("dense index paths must match the published Wiki pages")
-    dimensions = {len(vector) for vector in vectors.values()}
-    if len(dimensions) > 1 or (dimensions and 0 in dimensions):
-        raise ValueError("dense vectors must have one positive dimension")
-    actual_dimension = next(iter(dimensions), None)
-    if (
-        actual_dimension is not None
-        and effective_runtime.embedding.dimension is not None
-        and actual_dimension != effective_runtime.embedding.dimension
-    ):
-        raise ValueError("dense vector dimension does not match runtime snapshot")
-    if vectors:
-        if effective_runtime.embedding.status != "ready":
-            raise ValueError("dense vectors require a ready runtime embedding")
-        dense_status = "ready"
-    else:
-        dense_status = effective_runtime.embedding.status
-        if dense_status not in {"disabled", "unavailable"}:
-            raise ValueError("empty dense index must be disabled or unavailable")
-    dense_payload = {
-        "schema_version": 1,
-        "revision_id": revision_id,
-        "source_inventory_digest": source_inventory.digest,
-        "runtime_snapshot_checksum": runtime_snapshot_checksum,
-        "embedding": effective_runtime.embedding.model_dump(),
-        "status": dense_status,
-        "vectors": vectors,
-        "unit_cache": dense_unit_cache or {},
-    }
-    dense_bytes = canonical_json(dense_payload).encode("utf-8")
-    yield ("indexes/dense.json", dense_bytes)
     index_manifest = {
         "schema_version": 1,
         "revision_id": revision_id,
@@ -664,15 +778,8 @@ def iter_bundle_files(
         "lexical": {
             "preprocessing": lexical_preprocessing_identity(),
             "format": "sqlite-fts5",
-            "sha256": sha256_hex(lexical_bytes),
+            "sha256": lexical_bytes.sha256 if isinstance(lexical_bytes,(RevisionFileReference,RevisionFileArtifact)) else sha256_hex(lexical_bytes),
             "page_count": len(corpus.page_text),
-        },
-        "dense": {
-            "preprocessing": "bounded-512-weighted-mean-v1",
-            "format": "canonical-json",
-            "sha256": sha256_hex(dense_bytes),
-            "status": dense_payload["status"],
-            "dimension": actual_dimension,
         },
     }
     yield ("indexes/manifest.json", _canonical_bytes(index_manifest))
@@ -708,7 +815,6 @@ def build_empty_bundle_files(
         context_id=context_id,
         source_inventory=source_inventory,
         effective_runtime=effective_runtime,
-        dense_vectors={},
     )
     claim_audit = json.loads(files["claim_audit.json"].decode("utf-8"))
     files["ledger.json"] = canonical_json(
@@ -742,15 +848,17 @@ class PreviousBundle:
     source_inventory: SourceInventorySnapshot
     effective_runtime: EffectiveRuntimeSnapshot
     runtime_snapshot_checksum: str
-    lexical_index: bytes
-    dense_vectors: Dict[str, List[float]]
+    lexical_index: bytes | RevisionFileReference
     index_manifest: Dict[str, Any]
     corpus: Any = None
-    dense_unit_cache: Any = None
     render_signatures: Dict[str, str] | None = None
     reading_index: Dict[str, Any] | None = None
     source_contributions: Any = None
     link_increment: Any = None
+    json_shards: Dict[str, Any] | None = None
+    navigation: Dict[str, Any] | None = None
+    relation_payload: Dict[str, Any] | None = None
+    source_unit_rule_version: str | None = None
 
 
 def decode_previous_bundle(bundle_bytes: bytes) -> PreviousBundle:
@@ -775,12 +883,6 @@ def decode_previous_files(files: Dict[str, bytes], *, revision_id: str,
     files = dict(files)
     if "indexes/catalog.sqlite" in files and "indexes/lexical.sqlite" not in files:
         files["indexes/lexical.sqlite"] = files.pop("indexes/catalog.sqlite")
-    if "state/compiler.json" in files:
-        revision_payload = json.loads(files["revision.json"].decode("utf-8"))
-        if "compiler_state" not in revision_payload:
-            state_payload = json.loads(files["state/compiler.json"].decode("utf-8"))
-            revision_payload["compiler_state"] = state_payload["compiler_state"]
-            files["revision.json"] = canonical_json(revision_payload).encode("utf-8")
     try:
         provenance_payload = json.loads(files["provenance.json"].decode("utf-8"))
         provenance = BundleProvenance.model_validate({key: provenance_payload[key] for key in (
@@ -793,7 +895,58 @@ def decode_previous_files(files: Dict[str, bytes], *, revision_id: str,
     return _decode_previous_decoded(decoded)
 
 
+def decode_previous_view(view) -> PreviousBundle:
+    """Verify a directory, then read only artifacts needed to restore it.
+
+    Do not retain the complete byte tree alongside decoded compiler/query
+    objects. Every read still goes through the view's checksum validation.
+    """
+    from jonex_wiki.kernel.contracts import BundleProvenance
+    from jonex_wiki.kernel.telemetry import count_work
+    entries = view.list_entries()
+    # Legacy split compiler-state/catalog layouts retain their existing decoder.
+    if ("indexes/catalog.sqlite" in entries
+            or not getattr(view, "is_published_revision", True)):
+        return decode_previous_files({path: view.read_bytes(path) for path in entries},
+                                     revision_id=view.revision_id)
+
+    class Files(Mapping):
+        def __iter__(self):
+            return iter(entries)
+
+        def __len__(self):
+            return len(entries)
+
+        def __contains__(self, path):
+            return path in entry_set
+
+        def __getitem__(self, path):
+            if path not in entry_set:
+                raise KeyError(path)
+            return view.read_bytes(path)
+
+        def file_reference(self,path):return view.file_reference(path)
+
+    entry_set = set(entries)
+    files = Files()
+    provenance_payload = json.loads(files["provenance.json"])
+    provenance = BundleProvenance.model_validate({key: provenance_payload[key] for key in (
+        "tenant_id", "context_id", "source_inventory_digest", "runtime_snapshot_checksum")})
+    count_work("directory_bundle_open")
+    decoded = DecodedBundle(files=files, checksums={entry["path"]: entry["sha256"]
+        for entry in view.manifest["files"]}, revision_id=view.revision_id,
+        engine_id=ENGINE_ID, engine_version=ENGINE_VERSION, provenance=provenance)
+    previous = _decode_previous_decoded(decoded)
+    # Reads above have verified their bytes already. The view checks the
+    # remaining files, unchanged file identities and directory manifest here.
+    view.verify_integrity()
+    return previous
+
+
 def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
+    json_shards = {}
+    def read_json(path):
+        return load_json_artifact(decoded.files.__getitem__, path, manifests=json_shards)
     try:
         revision = json.loads(decoded.files["revision.json"].decode("utf-8"))
         if not isinstance(revision, dict):
@@ -817,7 +970,14 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
             raise ValueError("inner revision prompt checksum is invalid")
         if not isinstance(revision.get("tool_checksum"), str):
             raise ValueError("inner revision tool checksum is invalid")
-        state = CompilerState.model_validate(revision["compiler_state"])
+        if "compiler_state" in revision:
+            state_payload = revision["compiler_state"]
+        else:
+            if revision.get("compiler_state_file", "state/compiler.json") != "state/compiler.json":
+                raise ValueError("invalid compiler state reference")
+            state_payload = read_json("state/compiler.json")
+            state_payload = state_payload.get("compiler_state", state_payload)
+        state = CompilerState.model_validate(state_payload)
         digest_map = _string_map(revision["digest_map"], "digest_map")
         source_digests = _string_map(revision["source_digests"], "source_digests")
         if set(digest_map) != set(source_digests):
@@ -840,18 +1000,14 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         from jonex_wiki.domain.engine.compile import source_contribution
         raw_contributions = None
         if source_contribution.FILE_NAME in decoded.files:
-            raw_contributions = json.loads(
-                decoded.files[source_contribution.FILE_NAME].decode("utf-8")
-            )
+            raw_contributions = read_json(source_contribution.FILE_NAME)
         source_contributions = source_contribution.load(
             raw_contributions, claims=claims
         )
         from jonex_wiki.domain.engine.compile import relation_increment
         raw_relations = None
         if relation_increment.FILE_NAME in decoded.files:
-            raw_relations = json.loads(
-                decoded.files[relation_increment.FILE_NAME].decode("utf-8")
-            )
+            raw_relations = read_json(relation_increment.FILE_NAME)
         link_increment = relation_increment.load(raw_relations)
 
         manifest_payload = json.loads(
@@ -1009,9 +1165,10 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 raise ValueError(f"{label} runtime snapshot does not match provenance")
 
         seen_source_digests: Dict[str, str] = {}
-        for rel, raw in decoded.files.items():
+        for rel in decoded.files:
             if not rel.startswith("sources/digests/"):
                 continue
+            raw = decoded.files[rel]
             source_digest = json.loads(raw.decode("utf-8"))
             if not isinstance(source_digest, dict):
                 raise ValueError("source digest must be an object")
@@ -1047,62 +1204,24 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         index_manifest = json.loads(
             decoded.files["indexes/manifest.json"].decode("utf-8")
         )
-        dense_payload = json.loads(decoded.files["indexes/dense.json"].decode("utf-8"))
-        if not isinstance(index_manifest, dict) or not isinstance(dense_payload, dict):
-            raise ValueError("index metadata must be JSON objects")
+        if not isinstance(index_manifest, dict):
+            raise ValueError("index metadata must be a JSON object")
         if index_manifest.get("schema_version") != 1:
             raise ValueError("index manifest schema version is invalid")
-        if dense_payload.get("schema_version") != 1:
-            raise ValueError("dense index schema version is invalid")
-        for payload, label in (
-            (index_manifest, "index manifest"),
-            (dense_payload, "dense index"),
-        ):
-            if payload.get("revision_id") != decoded.revision_id:
-                raise ValueError(f"{label} revision does not match bundle")
-            if payload.get("source_inventory_digest") != source_inventory.digest:
-                raise ValueError(f"{label} source inventory does not match bundle")
-            if payload.get("runtime_snapshot_checksum") != runtime_snapshot_checksum:
-                raise ValueError(f"{label} runtime snapshot does not match bundle")
+        if index_manifest.get("revision_id") != decoded.revision_id:
+            raise ValueError("index manifest revision does not match bundle")
+        if index_manifest.get("source_inventory_digest") != source_inventory.digest:
+            raise ValueError("index manifest source inventory does not match bundle")
+        if index_manifest.get("runtime_snapshot_checksum") != runtime_snapshot_checksum:
+            raise ValueError("index manifest runtime snapshot does not match bundle")
         lexical_meta = index_manifest.get("lexical")
-        dense_meta = index_manifest.get("dense")
-        if not isinstance(lexical_meta, dict) or not isinstance(dense_meta, dict):
-            raise ValueError("index manifest entries must be objects")
-        lexical_index = decoded.files["indexes/lexical.sqlite"]
-        if lexical_meta.get("sha256") != sha256_hex(lexical_index):
+        if not isinstance(lexical_meta, dict):
+            raise ValueError("lexical index manifest must be an object")
+        lexical_index = (decoded.files.file_reference('indexes/lexical.sqlite')
+            if hasattr(decoded.files,'file_reference') else decoded.files['indexes/lexical.sqlite'])
+        lexical_sha = lexical_index.sha256 if isinstance(lexical_index,RevisionFileReference) else sha256_hex(lexical_index)
+        if lexical_meta.get("sha256") != lexical_sha:
             raise ValueError("lexical index checksum does not match index manifest")
-        dense_raw = decoded.files["indexes/dense.json"]
-        if dense_meta.get("sha256") != sha256_hex(dense_raw):
-            raise ValueError("dense index checksum does not match index manifest")
-        dense_embedding = EmbeddingIdentity.model_validate(dense_payload.get("embedding"))
-        if dense_embedding != effective_runtime.embedding:
-            raise ValueError("dense embedding identity does not match runtime snapshot")
-        dense_status = dense_payload.get("status")
-        if dense_status not in {"ready", "unavailable", "disabled"}:
-            raise ValueError("dense index status is invalid")
-        if dense_status != effective_runtime.embedding.status:
-            raise ValueError("dense index status does not match runtime snapshot")
-        raw_vectors = dense_payload.get("vectors")
-        if not isinstance(raw_vectors, dict):
-            raise ValueError("dense index vectors must be an object")
-        dense_vectors: Dict[str, List[float]] = {}
-        for path, vector in raw_vectors.items():
-            if not isinstance(path, str) or not isinstance(vector, list) or not vector:
-                raise ValueError("dense index vector entry is invalid")
-            if any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                for value in vector
-            ):
-                raise ValueError("dense index vector values must be numeric")
-            dense_vectors[path] = [float(value) for value in vector]
-        dimensions = {len(vector) for vector in dense_vectors.values()}
-        if len(dimensions) > 1:
-            raise ValueError("dense index contains mixed vector dimensions")
-        recorded_dimension = effective_runtime.embedding.dimension
-        if dimensions and next(iter(dimensions)) != recorded_dimension:
-            raise ValueError("dense index dimension does not match runtime snapshot")
         has_snapshot = "query/corpus.json" in decoded.files
         snapshot = json.loads(decoded.files["query/corpus.json"]) if has_snapshot else None
         from jonex_wiki.domain.engine.compile.publication import (
@@ -1112,9 +1231,9 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
             disposition_ledger,
         )
         snapshot_rule = snapshot.get("rule_version") if snapshot else None
-        navigation_raw = decoded.files.get("query/navigation.json")
-        if navigation_raw is not None:
-            navigation = json.loads(navigation_raw.decode("utf-8"))
+        navigation_raw = 'query/navigation.json' in decoded.files
+        if navigation_raw:
+            navigation = read_json('query/navigation.json')
             if navigation.get("schema_version") not in (1, 2, 3):
                 raise ValueError("unsupported query navigation version")
             from jonex_wiki.domain.engine.models.query_models import QueryCorpus, PageIndexEntry
@@ -1123,8 +1242,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 page_source_ids_from_markdown,
             )
             wiki_files = {
-                path[len("wiki/"):]: raw.decode("utf-8")
-                for path, raw in decoded.files.items() if path.startswith("wiki/")
+                path[len("wiki/"):]: decoded.files[path].decode("utf-8")
+                for path in decoded.files if path.startswith("wiki/")
             }
             page_index = {
                 path: PageIndexEntry.model_validate(value)
@@ -1143,14 +1262,13 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                     grouped_claims.setdefault(claim.page_path, []).append(claim)
             # [jonex] source_records/source_locations 新产物下沉 query/source_index.json；
             # 旧产物仍内嵌在 navigation.json，这里优先读独立文件、回退内嵌字段兼容。
-            source_index_raw = decoded.files.get("query/source_index.json")
-            evidence_raw = decoded.files.get("query/evidence.json")
-            if source_index_raw is not None:
-                source_index = json.loads(source_index_raw.decode("utf-8"))
+            if "query/source_index.json" in decoded.files:
+                source_index = restore_source_index(read_json("query/source_index.json"))
                 source_records = source_index["source_records"]
                 source_locations = source_index["source_locations"]
-            elif evidence_raw is not None:
+            elif "query/evidence.json" in decoded.files:
                 # Compatibility with previously published split-evidence bundles.
+                evidence_raw = decoded.files["query/evidence.json"]
                 evidence = json.loads(evidence_raw.decode("utf-8"))
                 metadata = evidence["passage_metadata"]
                 source_records = evidence["source_records"]
@@ -1172,7 +1290,7 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 page_text={path: wiki_files[path] for path in page_index},
                 claims=grouped_claims,
                 source_records=source_records,
-                source_locations=source_locations,
+                source_locations={} if not isinstance(source_locations, dict) else source_locations,
                 page_number_map=navigation.get("page_number_map", {}),
                 evidence_fallback=build_evidence_fallback(
                     {
@@ -1183,6 +1301,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                     skip_paths=set(grouped_claims),
                 ),
             )
+            if not isinstance(source_locations, dict):
+                corpus = corpus.model_copy(update={'source_locations':source_locations})
         else:
             # Compatibility adapter for historical single-JSON bundles only.
             corpus = build_query_corpus(state, claims, error_book=error_book if has_snapshot else None,
@@ -1208,6 +1328,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 }
                 valid_snapshot = snapshot.get("corpus") in (
                     corpus_material, legacy_corpus_material,
+                    {**corpus_material, "page_vectors": None},
+                    {**legacy_corpus_material, "page_vectors": None},
                 )
             else:
                 expected_digest = snapshot.get("corpus_sha256")
@@ -1217,9 +1339,11 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 # not. Accept only these enumerated historical empty shapes,
                 # without dropping evidence or changing navigation versions.
                 valid_snapshot = any(expected_digest == _corpus_sha256(
-                    corpus, legacy=legacy, derived_placeholders=fields)
+                    corpus, legacy=legacy, derived_placeholders=fields,
+                    retired_vector_placeholder=retired)
                     for legacy in (False, True)
-                    for fields in ((), ("page_links",), ("page_links", "fact_mentions")))
+                    for fields in ((), ("page_links",), ("page_links", "fact_mentions"))
+                    for retired in (False, True))
             if not valid_snapshot:
                 raise ValueError("query snapshot does not match admitted evidence")
             if json.loads(decoded.files["evidence_disposition.json"]) != disposition_ledger(
@@ -1227,40 +1351,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
             ):
                 raise ValueError("evidence disposition mismatch")
             for path, content in corpus.files.items():
-                if decoded.files.get("wiki/" + path) != content.encode("utf-8"):
+                if decoded.checksums.get("wiki/" + path) != sha256_hex(content.encode("utf-8")):
                     raise ValueError("published Wiki differs from query snapshot")
-        if dense_status == "ready" and not dense_vectors:
-            raise ValueError("ready dense index must contain vectors")
-        if dense_status != "ready" and dense_vectors:
-            raise ValueError("non-ready dense index cannot contain vectors")
-        if dense_vectors and set(dense_vectors) != set(corpus.page_text):
-            raise ValueError("dense index paths do not match published Wiki pages")
-        actual_dimension = next(iter(dimensions), None)
-        if dense_meta.get("status") != dense_status:
-            raise ValueError("dense manifest status does not match dense index")
-        if dense_meta.get("dimension") != actual_dimension:
-            raise ValueError("dense manifest dimension does not match dense index")
-        if has_snapshot:
-            from jonex_wiki.domain.engine.compile.dense_units import split_units, PREPROCESSING
-            if dense_meta.get("preprocessing") != PREPROCESSING:
-                raise ValueError("unsupported dense preprocessing")
-            unit_cache = dense_payload.get("unit_cache", {})
-            expected_units = {sha256_hex(t.encode()): t for text in corpus.page_text.values() for t in split_units(text)}
-            if dense_status == "ready":
-                if not isinstance(unit_cache, dict) or set(unit_cache) != set(expected_units):
-                    raise ValueError("dense unit cache differs from published text")
-                for vector in unit_cache.values():
-                    if (not isinstance(vector, list) or len(vector) != actual_dimension or any(
-                            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in vector)):
-                        raise ValueError("invalid cached dense vector")
-                for path, text in corpus.page_text.items():
-                    chunks = split_units(text)
-                    expected = [sum(unit_cache[sha256_hex(c.encode())][i] * len(c) for c in chunks) / sum(map(len, chunks))
-                                for i in range(actual_dimension)]
-                    if dense_vectors[path] != expected:
-                        raise ValueError("dense page vector differs from cached units")
-            elif unit_cache:
-                raise ValueError("disabled/unavailable dense index cannot retain unit vectors")
         if lexical_meta.get("page_count") != len(corpus.page_text):
             raise ValueError("lexical manifest page count does not match Wiki pages")
         # Opening the frozen SQLite bytes proves the index is readable now,
@@ -1337,6 +1429,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                 sort_keys=True, separators=(",", ":"))))
         corpus = corpus.model_copy(update={
             "page_links": {path: items for path, items in sorted(published_links.items())}})
+    reading_links = (read_json("indexes/links.json")
+                     if "indexes/links.json" in decoded.files and navigation_raw else None)
     return PreviousBundle(
         state=state,
         claims=claims,
@@ -1351,12 +1445,14 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         effective_runtime=effective_runtime,
         runtime_snapshot_checksum=runtime_snapshot_checksum,
         lexical_index=lexical_index,
-        dense_vectors=dense_vectors,
         index_manifest=index_manifest,
-        dense_unit_cache=dense_payload.get("unit_cache", {}),
         corpus=corpus,
         source_contributions=source_contributions,
         link_increment=link_increment,
+        json_shards=json_shards,
+        navigation=navigation if navigation_raw else None,
+        relation_payload=raw_relations,
+        source_unit_rule_version=snapshot_rule if lexical_index is not None else None,
         render_signatures=(
             _string_map(json.loads(decoded.files["indexes/render_signatures.json"])["signatures"],
                         "render signatures")
@@ -1364,9 +1460,10 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         ),
         reading_index=(
             {"page_graph": navigation.get("page_graph", {}),
-             "in_links": json.loads(decoded.files["indexes/links.json"]).get("in_links", {}),
-             "mentions": json.loads(decoded.files["indexes/links.json"]).get("mentions", {})}
-            if "indexes/links.json" in decoded.files and navigation_raw is not None else None
+             "in_links": reading_links.get("in_links", {}),
+             "mentions": reading_links.get("mentions", {}),
+             "mention_filters": reading_links.get("mention_filters", {})}
+            if reading_links is not None else None
         ),
     )
 

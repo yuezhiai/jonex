@@ -125,6 +125,12 @@ async def get_document(kb_id: str, document_id: str, request: Request,
                 "error": r.error}
 
 
+@router.get("/documents/{document_id}/chunks")
+async def get_document_chunks(kb_id: str, document_id: str, request: Request,
+                              tenant_id: str = Depends(require_tenant)):
+    return await request.app.state.app.get_document_chunks(tenant_id, kb_id, document_id)
+
+
 @router.post("/documents/{document_id}/recompile", status_code=202)
 async def recompile_document(kb_id: str, document_id: str, request: Request,
                              tenant_id: str = Depends(require_tenant)):

@@ -77,6 +77,21 @@ def _published_source_count(layout: Layout, tenant_id: str, kb_id: str) -> int:
         return 0
 
 
+def _query_page_count(revision_dir) -> int:
+    """Count the actual query projection, including readable source/table pages."""
+    try:
+        from jonex_wiki.domain.engine.json_artifacts import load_json_artifact
+        navigation = load_json_artifact(lambda path:(revision_dir/path).read_bytes(),
+            'query/navigation.json',lazy_fields={'page_index','page_graph','page_links','fact_mentions','page_source_ids'})
+        if not isinstance(navigation, dict):
+            return 0
+        pages = navigation.get("page_index")
+        from collections.abc import Mapping
+        return len(pages) if isinstance(pages, Mapping) else 0
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
 def create_compile_runner(session_factory, settings, layout: Layout, gw, executor=None):
     engine = LLMWikiV1Engine()
     manifest_builder = ManifestBuilder(settings)
@@ -144,11 +159,18 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
                 telemetry=recorder,
             )
 
-        # 4) 空产出守卫（外壳层硬闸，§6.3/§11）：有源却 0 页，或较上一版骤降超阈值，
-        #    拒绝发布并保留旧 bundle 继续服务。core 的 publishable 不判页面数。
-        if has_sources and artifacts.page_count == 0:
+        # Generated knowledge pages can be absent for native tables or source-only
+        # evidence. The engine already validated their query projection; only an
+        # actually empty projection is an empty output, not a zero claim/page count.
+        reused_unchanged = prev_ref is not None and staging_key == prev_ref
+        query_pages = artifacts.page_count
+        if has_sources and query_pages == 0:
+            candidate = (layout.versions_dir(tenant_id, kb_id, staging_key) if reused_unchanged
+                         else layout.staging_dir(tenant_id, kb_id, staging_key))
+            query_pages = await asyncio.to_thread(_query_page_count, candidate)
+        if has_sources and query_pages == 0:
             raise ValidationError(
-                f"编译产出 0 个页面，但仍有 {len(docs)} 个已解析文档；"
+                f"编译产出 0 个可检索页面（知识页和原文/原表均为空），但仍有 {len(docs)} 个已解析文档；"
                 "拒绝发布空 bundle（保留上一版）")
         prev_pages = _published_page_count(layout, tenant_id, kb_id)
         threshold = float(getattr(settings, "compile_page_drop_threshold", 0.5))
@@ -165,7 +187,6 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
                     f"超阈值 {threshold:.0%}；拒绝发布（保留上一版）")
 
         # 5) 发布（Layout 原子目录发布 + symlink 切换）
-        reused_unchanged = prev_ref is not None and staging_key == prev_ref
         async with layout.publication_lock(tenant_id, kb_id, wait_resume):
             async with session_factory() as s:
                 latest_docs = await DocumentRepo().list_parsed_for_compile(s, tenant_id, kb_id)
@@ -236,6 +257,7 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
                     # than adding them to reconstruct wall_ms.
                     "stage_wall_ms": {name: round(elapsed, 3)
                                       for name, elapsed in recorder.stage_wall_ms.items()},
+                    "stage_events": recorder.stage_events,
                     "stage_calls": dict(recorder.stage_calls),
                 }
             await s.commit()

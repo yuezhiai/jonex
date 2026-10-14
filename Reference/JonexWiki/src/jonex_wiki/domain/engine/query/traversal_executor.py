@@ -52,18 +52,7 @@ from jonex_wiki.domain.engine.models.query_models import (
     SubQuestionList,
     TraceEntry,
 )
-from jonex_wiki.domain.engine.query.retrieval import (
-    _chapter_tree_hits,
-    _cosine_scores,
-    _dense_strict,
-    _diversity_rerank,
-    _embed_query_timeout,
-    _env_int,
-    _hit_tokens,
-    _llm_rerank,
-    _make_snippet,
-    _search_terms,
-)
+from jonex_wiki.domain.engine.query.retrieval import (_SearchMaterialCache, _chapter_tree_hits, _diversity_rerank, _env_int, _hit_tokens, _llm_rerank, _make_snippet, _search_terms)
 
 # Read-through seam (lwp-arch-001 QA-3): the traversal resolves these five
 # knobs through the legacy ``query_algorithm`` namespace at call time so
@@ -151,7 +140,6 @@ from jonex_wiki.domain.engine.compile.content_validation import (
     ValidatedClaim,
     validate_claim_evidence,
 )
-from jonex_wiki.domain.engine.query.dense.index import PreparedDenseIndex
 from jonex_wiki.domain.engine.query.controller.control_state import (
     FailureClass,
     ControlEvent,
@@ -260,7 +248,7 @@ QUERY_ANSWER_STYLE_ENV = "QUERY_ANSWER_STYLE"
 # single segment through the injected ``corpus.raw_source_reader`` keyed by
 # SourceSpan identity (source_id/document_id/chunk_id + start/end).  The whole
 # source archive is never re-injected into the corpus.  In "matched" mode the
-# fallback fails closed, aligned with QUERY_DENSE_STRICT; in "production" mode
+# fallback fails closed, strict in matched mode; in "production" mode
 # it degrades with a CFG-001 DegradationEvent(component="fallback", False→True)
 # plus a ``raw_source_fallback`` trace event and a degraded count on run.config.
 RAW_SOURCE_FALLBACK_STRICT = "RAW_SOURCE_FALLBACK_STRICT"
@@ -348,7 +336,7 @@ def _raw_source_fallback_span(
     handle (claim_id/passage_id/source_id/document_id/chunk_id/excerpt).
 
     Matched mode fails closed (RAW_SOURCE_FALLBACK_STRICT, aligned with
-    QUERY_DENSE_STRICT).  Production mode emits the ``raw_source_fallback``
+    the matched fallback policy).  Production mode emits the ``raw_source_fallback``
     trace event plus a CFG-001 DegradationEvent(component="fallback",
     from_value=False, to_value=True).
     """
@@ -721,6 +709,9 @@ _SYSTEM_INSTRUCTION_COMMON = (
     "If the question restricts sources or sections, obtain inputs and citations from "
     "those sources or sections; identical values elsewhere are not substitutes. "
     "Identify the requested measure and classification first. When the question names "
+    "a member selected by a measure, compare the relevant peers on that measure. "
+    "A negative contribution to growth is not the same as a negative growth rate; "
+    "keep the stated category level and read the peer values before selecting. When the question names "
     "statement components, organizational segments are a different classification. "
     "Locate original statement row labels for the requested concepts (for example, "
     "'Sales of products', 'Cost of sales', 'Inventories') and read the matching table. "
@@ -4816,6 +4807,7 @@ def _try_deliver_workbook_for_table_tool(
     *, tool_result: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Atomically replace a first XLSX table probe with its whole workbook."""
+    progress_started = time.monotonic()
     from jonex_wiki.domain.engine.query.read_views import reading_view_payload
 
     if tool_result is not None and tool_result.get("status"):
@@ -4929,6 +4921,11 @@ def _try_deliver_workbook_for_table_tool(
                 "pages": len(views), "page_count": len(views),
                 "truncated": False, "whole_unit": True},
     ))
+    from jonex_wiki.kernel.query_progress import publish_query_progress
+    from jonex_wiki.domain.engine.util.query_progress import tool_progress_details
+    publish_query_progress({"type": "tool", "tool": name, "title": "source material read",
+                            "duration_ms": int((time.monotonic() - progress_started) * 1000),
+                            "details": tool_progress_details(args, views=view_payloads)})
     return True
 
 
@@ -4943,7 +4940,6 @@ async def _exec_tool(
     trace: List[TraceEntry],
     *,
     model: Any = None,
-    page_vectors: Optional[PreparedDenseIndex] = None,
     routing: Optional[Dict[str, Any]] = None,
     spans: Optional[_SpanBuilder] = None,
     usage_acc: Optional[Dict[str, int]] = None,
@@ -5190,6 +5186,7 @@ async def _exec_tool(
 
     category = "RETRIEVAL" if name in ("wiki_search", "wiki_read", "table_inspect", "table_locate", "table_read", "table_compute") else None
     if spans is not None:
+        from jonex_wiki.domain.engine.util.query_progress import tool_progress_details
         spans.add(
             type_=TraceSpanType.TOOL,
             title="{} started".format(name),
@@ -5197,6 +5194,7 @@ async def _exec_tool(
             category=category,
             started_at=_utc_now_iso(started_dt),
             decision="execute",
+            progress_details=tool_progress_details(args),
             event_type=QueryEventType.TOOL_STARTED.value,
             parent_id=parent_span_id,
         )
@@ -5305,58 +5303,16 @@ async def _exec_tool(
             with telemetry_stage(
                 current_runtime_telemetry(), "candidate_retrieval"
             ):
-                # LWP-RET-002 lexical route forbids dense entirely: no per-query
-                # embedding, no RRF fusion.  The published dense vectors are
-                # additionally dropped in ``run_query`` so nothing dense warms up.
-                route = getattr(corpus, "route", None)
-                use_dense = route != "lexical"
-                # Per-hop dense retrieval recomputes query-to-page scores from
-                # the current hop instead of reusing the original question.
-                dense_scores = None
-                if page_vectors is not None and model is not None and use_dense:
-                    with telemetry_stage(current_runtime_telemetry(), "dense"):
-                        try:
-                            with telemetry_stage(
-                                current_runtime_telemetry(), "embedding_rpc"
-                            ):
-                                query_vec = await asyncio.wait_for(
-                                    model.embed(
-                                        [query],
-                                        # Never route the LLM model name to the
-                                        # separate embedding endpoint.
-                                        model=None,
-                                        tenant_id=(routing or {}).get("tenant_id", ""),
-                                        context_id=(routing or {}).get("context_id", ""),
-                                        trace_id=(routing or {}).get("trace_id", ""),
-                                        scene="jonex_wiki_query_embed",
-                                    ),
-                                    timeout=_embed_query_timeout(),
-                                )
-                        except Exception:  # noqa: BLE001 — degrade to BM25-only
-                            if _dense_strict():
-                                raise ValueError(
-                                    "DENSE_UNAVAILABLE_STRICT: per-query embedding "
-                                    "failed with strict mode enabled"
-                                )
-                            query_vec = None
-                            trace.append(
-                                TraceEntry(
-                                    event="dense_embed_unavailable",
-                                    detail={"reason": "timeout_or_error"},
-                                )
-                            )
-                        if query_vec:
-                            dense_scores = _cosine_scores(
-                                corpus, page_vectors, query_vec[0]
-                            )
-                hits = _fts_search(
-                    fts, corpus, query, dense_scores, use_dense=use_dense
-                )
+                material_cache = state.get("search_material_cache")
+                if material_cache is None or material_cache.corpus is not corpus:
+                    material_cache = _SearchMaterialCache(corpus)
+                    state["search_material_cache"] = material_cache
+                hits = _fts_search(fts, corpus, query, material_cache=material_cache)
                 # LWP-RET-002 chapter_tree route: merge deterministic
                 # chapter-tree navigation hits (page-number ordered) ahead of
                 # the FTS hits so structural questions surface chapter pages
                 # even when the lexical index misses.
-                if route == "chapter_tree":
+                if getattr(corpus, "route", None) == "chapter_tree":
                     nav_hits = _chapter_tree_hits(corpus, query)
                     if nav_hits:
                         merged = list(nav_hits)
@@ -5430,7 +5386,7 @@ async def _exec_tool(
             # LWP-RET-002 raw-source fallback (P0 #1): an empty search degrades
             # to a code-forced, on-demand read of the raw source spans of the
             # top matching claims — never the whole archive.  Matched mode fails
-            # closed (aligned with QUERY_DENSE_STRICT); production mode emits
+            # closed (strict in matched mode); production mode emits
             # the raw_source_fallback trace + CFG-001 DegradationEvent and the
             # run can cite the raw handles (six-field chain).
             raw_handles: List[Dict[str, str]] = []
@@ -5470,7 +5426,7 @@ async def _exec_tool(
                     "cached": cached_hit,
                     # Public candidate frontier: enough to attribute a miss
                     # to recall/ranking without persisting prompts or source
-                    # text.  ``rank`` is the deterministic FTS/dense score
+                    # text.  ``rank`` is the deterministic FTS score
                     # ordering value already present on SearchHit.
                     "candidate_paths": [hit.path for hit in hits],
                     "candidate_ranks": [hit.rank for hit in hits],
@@ -5522,7 +5478,7 @@ async def _exec_tool(
         else:
             # Low-level retrieval probes may exercise this private tool helper
             # without the full traversal runtime. Keep those probes focused on
-            # dense/cache behavior while production runs always publish typed
+            # retrieval/cache behavior while production runs always publish typed
             # controller progress through the branch above.
             state["frontier_paths"] = [
                 hit.path for hit in hits if hit.path not in state["read_pages"]
@@ -5537,6 +5493,8 @@ async def _exec_tool(
                 duration_ms=int((time.monotonic() - started_mono) * 1000),
                 input_summary="query={}".format(query[:200]),
                 result_summary="{} hit(s)".format(len(hits)),
+                progress_details=tool_progress_details({"query": query}, pages=(
+                    {"path": hit.path, "title": hit.title, "excerpt": hit.snippet} for hit in hits)),
                 decision="execute",
                 event_type=QueryEventType.TOOL_COMPLETED.value,
                 parent_id=parent_span_id,
@@ -5573,7 +5531,7 @@ async def _exec_tool(
             await _exec_tool(
                 corpus, fts, "wiki_read", {"paths": [forced_path]}, None,
                 state, messages, trace,
-                model=model, page_vectors=page_vectors, routing=routing,
+                model=model, routing=routing,
                 spans=spans, usage_acc=usage_acc, parent_span_id=parent_span_id,
             )
             return
@@ -5585,7 +5543,7 @@ async def _exec_tool(
             await _exec_tool(
                 corpus, fts, "wiki_search", {"query": rewritten}, None,
                 state, messages, trace,
-                model=model, page_vectors=page_vectors, routing=routing,
+                model=model, routing=routing,
                 spans=spans, usage_acc=usage_acc, parent_span_id=parent_span_id,
                 # A rewrite of a controller-forced search is also controller
                 # recovery, so it inherits the outer stall sensitivity: a
@@ -6468,6 +6426,9 @@ async def _exec_tool(
             duration_ms=duration_ms,
             input_summary="paths={}".format(len(paths)),
             result_summary="success={}; files={}".format(outcome.success, len(outcome.files)),
+            progress_details=tool_progress_details(args, pages=(
+                {"path": path, "title": getattr(corpus.page_index.get(path), "title", path)}
+                for path in outcome.files), views=read_payload.get("views") or ()),
             decision="execute",
             event_type=QueryEventType.TOOL_COMPLETED.value,
             parent_id=parent_span_id,
@@ -6509,7 +6470,7 @@ async def _exec_tool(
             await _exec_tool(
                 corpus, fts, "wiki_read", {"paths": nav_paths}, None,
                 state, messages, trace,
-                model=model, page_vectors=page_vectors, routing=routing,
+                model=model, routing=routing,
                 spans=spans, usage_acc=usage_acc, parent_span_id=parent_span_id,
             )
             return

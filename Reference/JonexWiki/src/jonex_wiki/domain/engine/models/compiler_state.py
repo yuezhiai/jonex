@@ -505,6 +505,7 @@ class CompilerState(BaseModel):
     _rendered_wiki_files: Optional[Dict[str, bytes]] = PrivateAttr(default=None)
     _publication: Optional[Any] = PrivateAttr(default=None)
     _fact_mentions: Dict[str, List[str]] = PrivateAttr(default_factory=dict)
+    _compile_delta: Optional[Any] = PrivateAttr(default=None)
 
     model_config = ConfigDict(extra="forbid")
     @field_validator("batch_number")

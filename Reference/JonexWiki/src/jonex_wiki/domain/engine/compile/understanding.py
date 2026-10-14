@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import os
 import time
 from datetime import datetime, timezone
@@ -143,6 +144,14 @@ class UnderstandingFact(BaseModel):
 
     # Match the existing EvidenceRef limit while response errors can still retry.
     excerpt: str = Field(max_length=content_validation._MAX_EXCERPT)
+
+    @field_validator("excerpt", mode="wrap")
+    @classmethod
+    def _literal_table_excerpt(cls, value, handler):
+        if content_validation.source_text_limit(value) == content_validation._MAX_TABLE_EXCERPT:
+            return content_validation._validate_text(value, "excerpt", content_validation._MAX_TABLE_EXCERPT)
+        return handler(value)
+
     topic_hint: str = ""
     original_names: List[str] = Field(default_factory=list)
     aliases: List[str] = Field(default_factory=list)
@@ -183,8 +192,8 @@ class SourceUnderstandingResponse(BaseModel):
         facts = []
         for item in value if isinstance(value, list) else ():
             excerpt = item.get("excerpt") if isinstance(item, Mapping) else None
-            if isinstance(excerpt, str) and len(excerpt) > content_validation._MAX_EXCERPT:
-                raise ValueError(f"excerpt exceeds {content_validation._MAX_EXCERPT} characters")
+            if isinstance(excerpt, str) and len(excerpt) > content_validation.source_text_limit(excerpt):
+                raise ValueError(f"excerpt exceeds {content_validation.source_text_limit(excerpt)} characters")
             try:
                 fact = UnderstandingFact.model_validate(item)
             except (ValueError, TypeError):
@@ -456,7 +465,23 @@ def understanding_cache_key(
         "model": model_name,
         "config": config_fingerprint,
     }
+    if _has_long_html_table(artifact.text):
+        material["schema"]["literal_table_policy"] = "complete_html_table_16000_v1"
     return sha256_hex(canonical_json_bytes(material))
+
+
+def _has_long_html_table(text: str) -> bool:
+    return any(content_validation._MAX_EXCERPT < len(m.group())
+               <= content_validation._MAX_TABLE_EXCERPT
+               for m in re.finditer(r"<table\b[^>]*>[\s\S]*?</table>", text, re.IGNORECASE))
+
+
+_TABLE_LITERAL_CONSTRAINT = (
+    "Ordinary text excerpts remain limited to 4000 characters. A single complete HTML "
+    "table may contain at most 16000 characters: copy its full literal markup, header "
+    "and rows together as one fact. Keep separate tables and narrative in separate facts. "
+    "Never truncate, paraphrase or discard rows to fit the ordinary text limit."
+)
 
 
 def _instructions() -> str:
@@ -943,6 +968,10 @@ async def _understand_attempt(
 ) -> SourceUnderstandingResponse:
     """One model call.  Attempt policy lives in :func:`understand_one_passage`."""
     constraints = list(state.active_constraints) + list(extra_constraints)
+    schema = SourceUnderstandingResponse.model_json_schema()
+    if _has_long_html_table(passage.text):
+        schema["$defs"]["UnderstandingFact"]["properties"]["excerpt"]["maxLength"] = content_validation._MAX_TABLE_EXCERPT
+        constraints.append(_TABLE_LITERAL_CONSTRAINT)
     payload = passage_payload(passage, active_constraints=constraints)
     user = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     messages = [{"role": "system", "content": UNDERSTANDING_SYSTEM_INSTRUCTION}]
@@ -951,7 +980,7 @@ async def _understand_attempt(
     messages.append({"role": "user", "content": user})
     raw = await model.complete(
         messages,
-        SourceUnderstandingResponse.model_json_schema(),
+        schema,
         max_tokens=max_tokens,
         model=model_name,
         tenant_id=routing.get("tenant_id", ""),
@@ -1043,6 +1072,14 @@ async def understand_one_passage(
             if attempt == 0:
                 extra = ((TRUNCATION_CONSTRAINT,) if getattr(exc, "output_truncated", False)
                          else (pipeline._compile_retry_constraint(exc),))
+                if f"excerpt exceeds {content_validation._MAX_EXCERPT} characters" in str(exc):
+                    extra += (
+                        f"Each fact excerpt must contain at most {content_validation._MAX_EXCERPT} "
+                        "characters for ordinary text. Do not copy a whole long passage into one fact. "
+                        "Return multiple separate facts with contiguous verbatim excerpts; "
+                        "each must retain its subject, period, unit and applicable conditions. "
+                        "Do not truncate an excerpt or omit material facts to meet this limit.",
+                    )
             logger.warning(
                 "source understanding failure (attempt %d/%d) | pid=%s error=%s",
                 attempt + 1, MAX_UNDERSTANDING_ATTEMPTS, passage.passage_id,

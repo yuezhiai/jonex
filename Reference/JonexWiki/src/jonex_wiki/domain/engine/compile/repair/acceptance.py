@@ -20,14 +20,7 @@ import re
 from copy import deepcopy
 from typing import Any, Dict, List, Literal, Optional
 
-from jonex_wiki.domain.engine.compile.repair.blocking import (
-    MAX_CANDIDATE_PAGE_SNAPSHOTS,
-    _copy_state_for_mutation,
-    _high_risk_content,
-    _semantic_review_mode,
-    derive_page_candidates,
-    derive_page_candidates_hybrid,
-)
+from jonex_wiki.domain.engine.compile.repair.blocking import (MAX_CANDIDATE_PAGE_SNAPSHOTS, _copy_state_for_mutation, _high_risk_content, _semantic_review_mode, derive_page_candidates)
 from jonex_wiki.domain.engine.models.repair_models import (
     Algorithm1BatchResult,
     CombinedCompileResponse,
@@ -276,36 +269,9 @@ async def run_algorithm1_batch(
     # Hybrid candidate retrieval (opt-in): the retriever indexes only accepted
     # pages (``working``), so uncommitted candidate states never enter the
     # index; it is refreshed after every accepted mutation.
-    hybrid_retriever = None
-    if model is not None:
-        # The optional hybrid candidate module is not part of the minimal
-        # standalone distribution.  Keep the deterministic metadata blocker
-        # as the safe fallback rather than making every model-backed compile
-        # fail at import time; deployments that provide the module still get
-        # the opt-in hybrid path.
-        try:
-            from .candidate_retrieval import (
-                CandidateRetriever,
-                candidate_hybrid_enabled,
-            )
-        except ModuleNotFoundError as exc:
-            if not (exc.name or "").endswith("candidate_retrieval"):
-                raise
-            CandidateRetriever = None
-            candidate_hybrid_enabled = lambda: False
-
-        if candidate_hybrid_enabled():
-            hybrid_retriever = CandidateRetriever(working, model=model)
-            await hybrid_retriever.ensure_dense(working)
-
     for pid in passage_ids:
         passage = working.source_archive[pid]
-        if hybrid_retriever is not None:
-            candidates = await derive_page_candidates_hybrid(
-                working, passage, retriever=hybrid_retriever
-            )
-        else:
-            candidates = derive_page_candidates(working, passage)
+        candidates = derive_page_candidates(working, passage)
 
         # 1+2. SELECTPAGES + COMPILEWIKIPAGES collapsed into ONE model call.
         # Candidate page snapshots (with content) are included so the model can
@@ -725,12 +691,6 @@ async def run_algorithm1_batch(
             for name, paths in fresh_mentions.items():
                 working._fact_mentions[name] = sorted(set(working._fact_mentions.get(name, ())) | set(paths))
             working_render_index = candidate_render_index
-            # Phase 4: only accepted pages enter the retrieval index.  Refresh
-            # BM25 + incremental dense from the new working state so the next
-            # passage never sees uncommitted candidate pages.
-            if hybrid_retriever is not None:
-                hybrid_retriever.refresh(working)
-                await hybrid_retriever.ensure_dense(working)
         else:
             halted = pid
             logger.warning(
@@ -770,8 +730,6 @@ async def run_algorithm1_batch(
         if not accepted:
             break
 
-    if hybrid_retriever is not None:
-        hybrid_retriever.close()
 
     return Algorithm1BatchResult(
         state=working,

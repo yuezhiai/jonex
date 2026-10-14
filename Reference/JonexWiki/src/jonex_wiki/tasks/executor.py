@@ -49,10 +49,11 @@ class TaskExecutor:
         self._cancel_flags[row.task_id] = asyncio.Event()
         self._running_tasks[row.task_id] = asyncio.create_task(self._run(row))
 
-    def submit_query(self, row: QueryTaskRow) -> None:
+    def submit_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None) -> None:
         """提交后台查询任务（独立 query_tasks 表,不复用 tasks 生命周期）。"""
         self._cancel_flags[row.query_id] = asyncio.Event()
-        self._running_tasks[row.query_id] = asyncio.create_task(self._run_query(row))
+        self._running_tasks[row.query_id] = asyncio.create_task(
+            self._run_query(row, thinking_mode=thinking_mode))
 
     def _dispatch(self, row: TaskRow) -> tuple:
         """kind → (runner, semaphore, 运行中状态)。outline 用独立 sem（不占编译槽）。"""
@@ -168,7 +169,7 @@ class TaskExecutor:
         return {"kb_id": kb_id, "paused": paused,
                 "task_ids": [row.task_id for row in rows]}
 
-    async def _run_query(self, row: QueryTaskRow) -> None:
+    async def _run_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None) -> None:
         """后台查询生命周期(§6.3/§6.4):queued→running→done/failed/cancelled。
 
         query_tasks 只读高频、无 stage 恢复重放;不落 tasks 表。
@@ -186,7 +187,8 @@ class TaskExecutor:
                                                  TaskStatus.running.value)
                     await s.commit()
                 try:
-                    result = await self.query_runner(row)
+                    result = (await self.query_runner(row) if thinking_mode is None else
+                              await self.query_runner(row, thinking_mode=thinking_mode))
                 except asyncio.CancelledError:
                     async with self.session_factory() as s:
                         await self._transition_query(s, row.tenant_id, row.query_id,
@@ -292,6 +294,24 @@ class TaskExecutor:
     def is_cancelled(self, task_id: str) -> bool:
         flag = self._cancel_flags.get(task_id)
         return bool(flag and flag.is_set())
+
+    async def cancel_query(self, session: AsyncSession, tenant_id: str, query_id: str) -> QueryTaskRow:
+        row = await QueryTaskRepo().get(session, tenant_id, query_id)
+        if row is None:
+            raise NotFoundError(f"任务 {query_id} 不存在")
+        if row.status in (TaskStatus.done.value, TaskStatus.failed.value, TaskStatus.cancelled.value):
+            return row
+        row.status = TaskStatus.cancelled.value
+        row.error = "cancelled"
+        row.finished_at = _now()
+        await session.commit()
+        flag = self._cancel_flags.get(query_id)
+        if flag is not None:
+            flag.set()
+        task = self._running_tasks.get(query_id)
+        if task is not None:
+            task.cancel()
+        return row
 
     async def cancel_kb_queries(self, tenant_id: str, kb_id: str) -> None:
         async with self.session_factory() as s:

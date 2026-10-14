@@ -204,7 +204,7 @@ def observe_search_progress(
         hop_id=runtime.state.current_hop_id or "",
         query=query,
         candidate_paths=candidates,
-        # The current FTS/dense ranker already defines the accepted candidate
+        # The current FTS ranker already defines the accepted candidate
         # set.  CTRL.3 deliberately does not invent a second score threshold.
         high_quality_candidate_paths=candidates,
         unread_candidate_paths=unread,

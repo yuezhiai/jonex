@@ -14,6 +14,9 @@ calls a model or touches storage, a clock, randomness, or the network.
 from __future__ import annotations
 
 import re
+import sys
+from collections import OrderedDict
+from threading import RLock
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Callable, FrozenSet, List, Literal, Optional, Sequence, Tuple
@@ -591,7 +594,54 @@ def _derived_sum_decision(
     return "NOT_ENOUGH_INFO", "derived_fact_unproven"
 
 
+_SUPPORT_CACHE_BYTES = 64 * 1024 * 1024
+_support_cache = OrderedDict()
+_support_cache_size = 0
+_support_cache_lock = RLock()
+
+
 def assess_claim_support(
+    claim_text: str,
+    source_spans: Sequence[SourceSpan],
+    *,
+    has_unresolved_evidence: bool,
+) -> ClaimSupportDecision:
+    """Reuse only the exact inputs of the unchanged deterministic checker.
+
+    Spans are frozen, including their full text, identities, digests and ranges.
+    Binding them to the current archive and global publication checks still run
+    in their original callers. This cache is never a stored support certificate.
+    """
+    global _support_cache_size
+    if has_unresolved_evidence or not source_spans or not all(isinstance(span,SourceSpan) for span in source_spans):
+        return _assess_claim_support(claim_text,source_spans,has_unresolved_evidence=has_unresolved_evidence)
+    key=(SUPPORT_RULE_VERSION,claim_text,tuple(source_spans))
+    from jonex_wiki.kernel.telemetry import count_work
+    with _support_cache_lock:
+        decision=_support_cache.get(key)
+        if decision is not None:
+            _support_cache.move_to_end(key)
+            count_work('claim_support_cache_hits')
+            return decision[0]
+    count_work('claim_support_cache_misses')
+    result=_assess_claim_support(claim_text,source_spans,has_unresolved_evidence=False)
+    # Conservative reachable-object weight; shared strings/spans count again.
+    weight=512+sys.getsizeof(claim_text)+sys.getsizeof(key[2])
+    for span in source_spans:
+        weight+=sys.getsizeof(span)+sys.getsizeof(span.__dict__)
+        weight+=sum(sys.getsizeof(value) for value in span.__dict__.values())
+    if weight<=_SUPPORT_CACHE_BYTES:
+        with _support_cache_lock:
+            if key not in _support_cache:
+                while _support_cache and (_support_cache_size+weight>_SUPPORT_CACHE_BYTES or len(_support_cache)>=32768):
+                    _,old_weight=_support_cache.popitem(last=False)[1]
+                    _support_cache_size-=old_weight
+                _support_cache[key]=(result,weight)
+                _support_cache_size+=weight
+    return result
+
+
+def _assess_claim_support(
     claim_text: str,
     source_spans: Sequence[SourceSpan],
     *,

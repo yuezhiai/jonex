@@ -234,6 +234,9 @@ class ModelPortAdapter(ModelPort):
     ) -> Dict[str, Any]:
         if self._before_call is not None:
             await self._before_call()
+        from jonex_wiki.kernel.query_progress import publish_query_progress
+        publish_query_progress({"type": "synthesis" if "synth" in (scene or self._scene or "") else "model",
+                                "title": "正在生成回答" if "synth" in (scene or self._scene or "") else "正在分析资料"})
         gw_kwargs: Dict[str, Any] = {
             "scene": scene or self._scene,
             "tenant_id": tenant_id or self._tenant_id,
@@ -299,22 +302,3 @@ class ModelPortAdapter(ModelPort):
                 err.raw_content = content  # type: ignore[attr-defined]
                 raise err from exc
         raise AssertionError("unreachable: complete() retry loop must return or raise")
-
-    async def embed(
-        self,
-        texts: List[str],
-        *,
-        model: str | None = None,
-        tenant_id: str = "",
-        context_id: str = "",
-        trace_id: str = "",
-        scene: str | None = None,
-    ) -> List[List[float]] | None:
-        return await self._gw.embed(
-            texts,
-            scene=scene or self._scene,
-            tenant_id=tenant_id or self._tenant_id,
-            kb_id=context_id or self._kb_id,
-            trace_id=trace_id,
-            model=model,
-        )

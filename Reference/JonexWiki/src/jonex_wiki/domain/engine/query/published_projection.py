@@ -7,6 +7,8 @@ from jonex_wiki.domain.engine.models.compiler_state import CompilerState
 from jonex_wiki.domain.engine.models.query_models import QueryCorpus, PageIndexEntry
 from jonex_wiki.domain.engine.compile.content_validation import ValidatedClaim
 from jonex_wiki.domain.engine.query.retrieval import build_evidence_fallback
+from jonex_wiki.domain.engine.json_artifacts import load_json_artifact
+from jonex_wiki.domain.engine.source_index import restore_source_index
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,6 @@ class PublishedQueryRevision:
     state: CompilerState
     claims: list
     lexical_index: object = None
-    dense_vectors: dict = None
 
 
 def load_query_projection(view, navigation):
@@ -49,6 +50,10 @@ def load_query_projection(view, navigation):
     """
     def read_json(path):
         return json.loads(view.read_bytes(path))
+
+    if '_jonex_json_shards' in navigation:
+        navigation=load_json_artifact(view.read_bytes,'query/navigation.json',
+            lazy_fields={'page_graph','page_links','fact_mentions','page_source_ids'})
 
     provenance = read_json("provenance.json")
     if (provenance.get("tenant_id"), provenance.get("context_id"),
@@ -74,7 +79,8 @@ def load_query_projection(view, navigation):
             grouped.setdefault(claim.page_path, []).append(claim)
     if admitted != {claim.claim_id for claims in grouped.values() for claim in claims}:
         raise ValueError("query navigation claim missing from publication")
-    source_index = read_json("query/source_index.json")
+    source_index = restore_source_index(load_json_artifact(view.read_bytes, "query/source_index.json",
+        lazy_fields={'source_records','source_locations','passage_metadata'}))
     records = source_index["source_records"]
     # Typed metadata is validated above. model_construct preserves the lazy
     # text mappings rather than making Pydantic eagerly read every body.
@@ -84,16 +90,13 @@ def load_query_projection(view, navigation):
         source_records=records, source_locations=source_index["source_locations"],
         page_number_map=navigation.get("page_number_map", {}),
         page_links=navigation.get("page_links", {}),
+        source_scopes=navigation.get("source_scopes", {}),
         fact_mentions=navigation.get("fact_mentions", {}),
-        evidence_fallback=build_evidence_fallback(
-            navigation["page_source_ids"], records, skip_paths=set(grouped)),
+        evidence_fallback=(navigation['evidence_fallback'] if 'evidence_fallback' in navigation
+            else build_evidence_fallback(navigation["page_source_ids"], records, skip_paths=set(grouped))),
     )
     runtime = provenance["effective_runtime"]
-    dense = read_json("indexes/dense.json")
-    if dense.get("revision_id") != view.revision_id:
-        raise ValueError("query dense index revision mismatch")
     return PublishedQueryRevision(
         view.revision_id, view.tenant_id, view.context_id,
         {"models": runtime["models"]}, corpus, CompilerState(), [],
-        dense_vectors=dense.get("vectors", {}),
     )

@@ -246,11 +246,12 @@ class CodeIdentity(BaseModel):
 
     commit: str = Field(default="unknown")
     source_tree_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    compiler_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     dirty: Optional[bool] = Field(default=None)
 
     model_config = ConfigDict(extra="forbid")
 class EmbeddingIdentity(BaseModel):
-    """Effective embedding backend and the vector contract it produced."""
+    """Historical provenance shape; new Wiki revisions record it as disabled."""
 
     provider: str = Field(default="llm-gateway")
     host: str = Field(default="")
@@ -735,45 +736,3 @@ __all__ = [
     "TraceSpanType",
     "WikiRevision",
 ]
-
-
-# --- dev-javen2 shell contracts (kept for shell import compatibility; deleted stage 9) ---
-class Claim(BaseModel):
-    """带证据引用的陈述句(spec §5.4 claims.jsonl 行格式)。"""
-
-    model_config = {"extra": "ignore"}
-
-    claim_id: str
-    text: str
-    document_id: str
-    chunk_id: str
-    passage_id: str = ""   # 归属 passage(增量重放过滤键);旧 bundle 无此字段 → 走全量
-    page_number: int | None = None   # 源文档页码;与 document_id/chunk_id 共同构成证明链
-    page_path: str
-    excerpt: str
-
-
-class Page(BaseModel):
-    """wiki 页面(spec §5.2 页面产物)。"""
-
-    model_config = {"extra": "ignore"}
-
-    path: str            # 小写 ASCII 斜杠分隔,如 "products/atlas"
-    title: str
-    aliases: list[str] = []
-    tags: list[str] = []
-    description: str = ""
-    body: str = ""       # 页面正文(融合累积)
-    source_ids: list[str] = []   # 贡献文档,级联清理追踪基础
-    passage_ids: list[str] = []  # 名下 passages(按 passage_order)
-
-
-class BundleManifest(BaseModel):
-    """indexes/manifest.json(spec §5.4/§5.5)。"""
-
-    bundle_sha: str
-    files: dict[str, str]          # 相对路径 → sha256
-    dense: dict | None = None      # shape/维度/embedding 身份/status
-    pages: list[str] = []          # 页清单(dense.bin 行序)
-    segmenter: dict | None = None  # jieba 版本 + 自定义词典 hash
-

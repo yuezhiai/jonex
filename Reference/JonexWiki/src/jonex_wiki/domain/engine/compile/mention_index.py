@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+from zlib import crc32
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple
 
@@ -47,6 +48,34 @@ RAW_PAGE_PREFIXES: Tuple[str, ...] = (
 _MENTION_MIN_LEN = 3
 
 _FIELD_RE = re.compile(r"^(links|related|source_ids|version):\s*(.*?)\s*$", re.MULTILINE)
+_ASCII_WORD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def _mention_filter(text: str) -> int:
+    """Stable 2048-bit trigram filter: false positives only cause extra reads.
+
+    Every literal match contains every trigram of its name. Store their bits
+    so a new title/alias can find possible old pages without opening every
+    Markdown file. Exact matching below remains the authority.
+    """
+    value = 0
+    for gram in {text[i:i + 3] for i in range(len(text) - 2)}:
+        value |= 1 << (crc32(gram.encode("utf-8")) & 2047)
+    return value
+
+
+def _literal_mention_matches(text: str, name: str, ascii_name: bool) -> bool:
+    """Match the old escaped literal with its exact ASCII boundary rule."""
+    position = text.find(name)
+    if not ascii_name:
+        return position >= 0
+    while position >= 0:
+        end = position + len(name)
+        if ((position == 0 or text[position - 1] not in _ASCII_WORD)
+                and (end == len(text) or text[end] not in _ASCII_WORD)):
+            return True
+        position = text.find(name, position + 1)
+    return False
 
 
 def is_raw_page(path: str) -> bool:
@@ -111,23 +140,44 @@ def build_page_graph_and_links(
         path: entry for path, entry in (previous_page_index or {}).items()
         if not is_raw_page(path)
     }
-    candidates_unchanged = (
-        previous is not None and changed_paths is not None
-        and {path: (entry.title, tuple(entry.aliases)) for path, entry in reading.items()}
-        == {path: (entry.title, tuple(entry.aliases)) for path, entry in old_reading.items()}
-    )
+    old_filters = (previous or {}).get("mention_filters") or {}
+    incremental = (previous is not None and changed_paths is not None
+                   and all(path in old_filters for path in old_reading))
+    changed_targets = {path for path, entry in reading.items()
+                       if path not in old_reading or (entry.title, tuple(entry.aliases))
+                       != (old_reading[path].title, tuple(old_reading[path].aliases))}
     scan_paths = set(reading)
-    if candidates_unchanged:
-        scan_paths &= changed_paths
+    if incremental:
+        scan_paths &= changed_paths | (set(reading) - set(old_reading))
+        masks = {_mention_filter(name.strip())
+                 for path in changed_targets
+                 for name in [reading[path].title, *reading[path].aliases,
+                              path.removesuffix(".md")]
+                 if name and len(name.strip()) >= _MENTION_MIN_LEN}
+        has_short_target = any(len(target.removesuffix(".md")) < _MENTION_MIN_LEN
+                               for target in changed_targets)
+        filter_matches = {}
+        for path in set(reading) - scan_paths:
+            value = int(old_filters[path], 16)
+            if value not in filter_matches:
+                filter_matches[value] = has_short_target or any(value & mask == mask for mask in masks)
+            if filter_matches[value]:
+                scan_paths.add(path)
     from jonex_wiki.kernel.telemetry import count_work
     count_work("reading_pages_reused", len(reading) - len(scan_paths))
     count_work("reading_pages_scanned", len(scan_paths))
+    # An unchanged body already has all edges to unchanged names. Only new or
+    # renamed targets need matching there, even when a broad Bloom filter hits.
+    full_scan_paths = (scan_paths & (changed_paths | (set(reading) - set(old_reading)))
+                       if incremental else scan_paths)
+    count_work("reading_pages_full_scan", len(full_scan_paths))
+    count_work("reading_pages_target_scan", len(scan_paths - full_scan_paths))
 
     # 1. page_graph covers every page (raw pages remain readable), rebuilt from
     #    the engine's own rendered frontmatter.
     page_graph: Dict[str, Dict[str, Any]] = {}
     for path in page_index:
-        if (candidates_unchanged and path not in changed_paths
+        if (incremental and path not in changed_paths
                 and path in previous.get("page_graph", {})):
             page_graph[path] = previous["page_graph"][path]
             continue
@@ -140,17 +190,10 @@ def build_page_graph_and_links(
         }
 
     # 2. in_links: reverse compile-time navigation edges, reading tree only.
-    if candidates_unchanged:
-        in_links: Dict[str, List[Dict[str, str]]] = {
-            target: [entry for entry in entries if entry.get("path") not in scan_paths]
-            for target, entries in previous.get("in_links", {}).items()
-            if target in reading
-        }
-    else:
-        in_links = {}
+    # Edges to a newly added target may already exist in an old page. Reverse
+    # the small cached graph; body text is still read only for affected pages.
+    in_links: Dict[str, List[Dict[str, str]]] = {}
     for path in reading:
-        if path not in scan_paths:
-            continue
         for link in page_graph[path]["links"]:
             if not isinstance(link, dict):
                 continue
@@ -164,8 +207,9 @@ def build_page_graph_and_links(
             in_links.setdefault(target, []).append(entry)
 
     # 3. Raw-only changes do not rescan the reading tree. In that common case
-    # avoid compiling a regex for every title/alias in the entire KB.
+    # avoid building candidates for every title/alias in the entire KB.
     anchored = defaultdict(list)
+    changed_anchored = defaultdict(list)
     if scan_paths:
         names = defaultdict(set)
         for path, entry in reading.items():
@@ -179,10 +223,10 @@ def build_page_graph_and_links(
         counts = Counter(gram for keys in grams.values() for gram in keys)
         for name, targets in names.items():
             anchor = min(grams[name], key=lambda gram: (counts[gram], gram))
-            escaped = re.escape(name)
-            if all(ord(ch) < 128 for ch in name):
-                escaped = rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
-            anchored[anchor].append((re.compile(escaped), targets))
+            anchored[anchor].append((name, targets, name.isascii()))
+            changed = targets & changed_targets
+            if changed:
+                changed_anchored[anchor].append((name, changed, name.isascii()))
         del names, grams, counts
 
     protected_re = re.compile(r"\[[^\]]*\]\([^)]*\)|`[^`]*`")
@@ -191,17 +235,22 @@ def build_page_graph_and_links(
     wikilink_re = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
 
     mentions: Dict[str, List[str]] = {}
-    if candidates_unchanged:
+    if incremental:
         mentions = {
             target: [source for source in sources
-                     if source in reading and source not in scan_paths]
+                     if source in reading and source not in full_scan_paths]
             for target, sources in previous.get("mentions", {}).items()
-            if target in reading
+            if target in reading and target not in changed_targets
         }
+    mention_filters = {path: old_filters[path] for path in reading
+                       if path not in full_scan_paths and path in old_filters}
     for path in reading:
         if path not in scan_paths:
             continue
         body = _strip_frontmatter(rendered.get(path, ""))
+        if path in full_scan_paths:
+            mention_filters[path] = format(_mention_filter(body), "x")
+        candidates = anchored if path in full_scan_paths else changed_anchored
         used: set = set()
         in_fence = False
         for line in body.splitlines():
@@ -214,9 +263,9 @@ def build_page_graph_and_links(
                 if not segment:
                     continue
                 for gram in {segment[i:i + 3] for i in range(len(segment) - 2)}:
-                    for pattern, targets in anchored.get(gram, ()):
+                    for name, targets, ascii_name in candidates.get(gram, ()):
                         available = targets - used - {path}
-                        if available and pattern.search(segment):
+                        if available and _literal_mention_matches(segment, name, ascii_name):
                             used.update(available)
                             for target in available:
                                 mentions.setdefault(target, []).append(path)
@@ -231,10 +280,10 @@ def build_page_graph_and_links(
                 mentions.setdefault(target, []).append(path)
 
     # Replace one target at a time instead of duplicating the whole reverse graph.
-    for target, paths in mentions.items():
-        mentions[target] = sorted(set(paths))
+    mentions = {target: sorted(set(paths)) for target, paths in mentions.items() if paths}
     in_links = {
         target: sorted(entries, key=lambda e: e["path"])
         for target, entries in in_links.items() if entries
     }
-    return {"page_graph": page_graph, "in_links": in_links, "mentions": mentions}
+    return {"page_graph": page_graph, "in_links": in_links, "mentions": mentions,
+            "mention_filters": mention_filters}

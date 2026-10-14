@@ -18,7 +18,6 @@ from jonex_wiki.domain.engine.compile.bundle import decode_bundle, sha256_hex
 from jonex_wiki.kernel.ports import CancelPort, ModelPort
 from jonex_wiki.domain.engine.models.query_models import TraceEntry
 from jonex_wiki.domain.engine.query.router import Route, resolve_route
-from jonex_wiki.domain.engine.query.traversal_executor import apply_summary_route
 from jonex_wiki.domain.engine.query.retrieval import build_query_corpus
 from jonex_wiki.kernel.telemetry import (
     current_runtime_telemetry,
@@ -58,11 +57,10 @@ async def run_query(
         with telemetry_stage(current_runtime_telemetry(), "render"):
             corpus = build_query_corpus(state, claims)
     else:
-        # Per-query routing/vectors are assigned on a detached envelope. No
+        # Per-query routing are assigned on a detached envelope. No
         # query state is stored in the shared publication maps.
         corpus = prepared_corpus.model_copy(deep=False)
     lexical_index = routing.pop("_published_lexical_index", None)
-    dense_vectors = routing.pop("_published_dense_vectors", None)
     frozen_indexes = lexical_index is not None or routing.get("bundle_view") is not None
     # LWP-RET-002: engine-side query-intent classification (zero API/DB
     # changes, nothing persisted).  Explicit override flows through the routing
@@ -82,12 +80,6 @@ async def run_query(
     corpus.raw_fallback_mode = raw_fallback_mode
     corpus.raw_source_reader = raw_source_reader
     if frozen_indexes:
-        # lexical forbids dense entirely: never even warm the published dense
-        # index, so the lexical route leaves no dense trace and no dense call.
-        if resolved_route == Route.LEXICAL:
-            corpus.page_vectors = None
-        else:
-            corpus.page_vectors = dict(dense_vectors) if dense_vectors else None
         routing["lexical_index"] = lexical_index
         routing["frozen_indexes"] = True
     # Read-through seam: tests patch ``query.algorithm.run_query_algorithm``;
@@ -104,11 +96,9 @@ async def run_query(
     )
     if resolved_route != Route.PROPOSITION:
         detail: Dict[str, Any] = {"route": resolved_route.value}
-        if resolved_route == Route.LEXICAL:
-            detail["dense"] = "off"
         result.trace.append(TraceEntry(event="route_selected", detail=detail))
-    if resolved_route == Route.SUMMARY:
-        result = apply_summary_route(result, corpus, question)
+    # The query already answered the requested scope from verified evidence.
+    # Citation excerpts are previews, not a replacement for that answer.
     probes = [entry for entry in result.trace if entry.event == "coverage_delivery_probe"]
     matched = any(entry.detail.get("matched") for entry in probes)
     result.trace.append(TraceEntry(event="coverage_diagnosis", detail={

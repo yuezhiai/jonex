@@ -21,12 +21,18 @@ from jonex_wiki.kernel.contracts import (
 )
 from jonex_wiki.kernel.ports import ModelPort
 from jonex_wiki.kernel.runtime_env import current_env
-from jonex_wiki.kernel.telemetry import (
-    current_runtime_telemetry,
-    record_response_usage,
-    telemetry_stage,
-)
+from jonex_wiki.kernel.telemetry import (current_runtime_telemetry, telemetry_stage)
 
+
+
+def _query_thinking(default=None):
+    """Keep per-step choices when on; disable every query-agent call when off."""
+    mode = current_env().get("JONEX_WIKI_AGENT_THINKING", "on")
+    if mode == "on":
+        return default
+    if mode != "off":
+        raise ValueError("JONEX_WIKI_AGENT_THINKING must be on or off")
+    return {"type": "disabled"}
 
 
 async def _model_complete(
@@ -40,6 +46,10 @@ async def _model_complete(
     authentication and other deterministic failures are never hidden.
     """
 
+    if str(kwargs.get("scene", "")).startswith("jonex_wiki_query_"):
+        thinking = _query_thinking(kwargs.get("thinking"))
+        if thinking is not None:
+            kwargs["thinking"] = thinking
     with telemetry_stage(current_runtime_telemetry(), "model_turn"):
         try:
             timeout = max(0.001, float(current_env().get("QUERY_MODEL_CALL_TIMEOUT_SECONDS", "75")))
@@ -54,7 +64,6 @@ async def _model_complete(
                 response = await asyncio.wait_for(
                     model_port.complete(*args, **kwargs), timeout=timeout
                 )
-                record_response_usage(response)
                 return response
             except asyncio.TimeoutError:
                 if attempt >= retries:
@@ -136,6 +145,7 @@ class _SpanBuilder:
         output_tokens: Optional[int] = None,
         input_summary: Optional[str] = None,
         result_summary: Optional[str] = None,
+        progress_details: Optional[Dict[str, Any]] = None,
         evidence: Optional[List[Dict[str, Any]]] = None,
         decision: str = "n/a",
     ) -> str:
@@ -160,6 +170,11 @@ class _SpanBuilder:
             event_type=event_type,
         )
         self._spans.append(span)
+        from jonex_wiki.kernel.query_progress import publish_query_progress
+        progress_event = span.model_dump(mode="json", exclude={"event_type"})
+        if progress_details is not None:
+            progress_event["details"] = progress_details
+        publish_query_progress(progress_event)
         return span_id
 
 

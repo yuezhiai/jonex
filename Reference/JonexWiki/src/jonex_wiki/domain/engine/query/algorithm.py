@@ -54,11 +54,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
-try:
-    import numpy as _np  # optional: faster cosine; falls back to pure Python
-except ImportError:  # pragma: no cover
-    _np = None
-
 from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator, ConfigDict
 
 from jonex_wiki.kernel.contracts import (
@@ -70,6 +65,7 @@ from jonex_wiki.kernel.contracts import (
 from jonex_wiki.kernel.runtime_env import current_env
 
 from jonex_wiki.domain.engine.util.model_io import (
+    _query_thinking,
     _SpanBuilder,
     _finalize_token_usage,
     _merge_usage,
@@ -192,60 +188,7 @@ from jonex_wiki.domain.engine.query.traversal_evidence import (
     _record_query_state_event,
 )
 
-from jonex_wiki.domain.engine.query.retrieval import (
-    DENSE_BATCH,
-    DENSE_RRF_K,
-    DIVERSITY_RERANK_ALPHA,
-    FTS5_UNAVAILABLE,
-    LLM_RERANK_KEEP,
-    LLM_RERANK_POOL,
-    MAX_SEARCH_HITS,
-    MAX_SEARCH_HITS_ENV,
-    PASSAGE_MAX_CHARS,
-    QUERY_DECOMPOSE_MULTIHOP_ENV,
-    QUERY_DENSE_ENV,
-    QUERY_DENSE_STRICT_ENV,
-    QUERY_DIVERSITY_RERANK_ENV,
-    QUERY_LLM_RERANK_ENV,
-    QUERY_SNIPPET_ENV,
-    _COMPOSITE_COMPARATIVES,
-    _COMPOSITE_CONJUNCTIONS,
-    _COMPOSITE_QUESTION_WORDS,
-    _MULTIHOP_ENTITY_OF,
-    _QUERY_STOPWORDS,
-    _TOKEN_RE,
-    _build_fts_index,
-    _claim_hits,
-    _cosine_scores,
-    _cosine_scores_unmeasured,
-    _dense_enabled,
-    _dense_strict,
-    _diversity_rerank,
-    _diversity_rerank_enabled,
-    _embed_query_timeout,
-    _embedding_dimension_override,
-    _env_int,
-    _fts_query,
-    _fts_search,
-    _hit_tokens,
-    _is_composite_question,
-    _is_multihop_single_question,
-    _llm_rerank,
-    _llm_rerank_enabled,
-    _load_page_vectors,
-    _make_snippet,
-    _max_search_hits,
-    _multihop_decomposition_enabled,
-    _open_fts_index,
-    _passage_hits,
-    _rerank_messages,
-    _rewrite_query_for_search,
-    _search_terms,
-    _snippet_enabled,
-    _split_passages,
-    build_fts_index_bytes,
-    build_query_corpus,
-)
+from jonex_wiki.domain.engine.query.retrieval import (DIVERSITY_RERANK_ALPHA, FTS5_UNAVAILABLE, LLM_RERANK_KEEP, LLM_RERANK_POOL, MAX_SEARCH_HITS, MAX_SEARCH_HITS_ENV, PASSAGE_MAX_CHARS, QUERY_DECOMPOSE_MULTIHOP_ENV, QUERY_DIVERSITY_RERANK_ENV, QUERY_LLM_RERANK_ENV, QUERY_SNIPPET_ENV, _COMPOSITE_COMPARATIVES, _COMPOSITE_CONJUNCTIONS, _COMPOSITE_QUESTION_WORDS, _MULTIHOP_ENTITY_OF, _QUERY_STOPWORDS, _TOKEN_RE, _build_fts_index, _claim_hits, _diversity_rerank, _diversity_rerank_enabled, _env_int, _fts_query, _fts_search, _hit_tokens, _is_composite_question, _is_multihop_single_question, _llm_rerank, _llm_rerank_enabled, _make_snippet, _max_search_hits, _multihop_decomposition_enabled, _open_fts_index, _passage_hits, _rerank_messages, _rewrite_query_for_search, _search_terms, _snippet_enabled, _split_passages, build_fts_index_bytes, build_query_corpus)
 
 # ──────────────────────────────────────────────
 #  Legacy patchable surface (lwp-arch-001 QA-1)
@@ -254,7 +197,6 @@ from jonex_wiki.domain.engine.query.retrieval import (
 # through ``query_algorithm`` keep working; the moved retrieval module reads
 # them back through call-time accessors.
 # Legacy WAVE5_EMB_CACHE knob removed (§15); fixed default directory.
-DENSE_CACHE_DIR = Path("/tmp/wave5-emb")
 LLM_RERANK_MIN_CANDIDATES = 6
 
 # Stable checksum over the query tool surface; feeds EffectiveRuntimeSnapshot.
@@ -334,18 +276,6 @@ from jonex_wiki.domain.engine.query.controller.controller import (
     sync_evidence_window,
 )
 from jonex_wiki.domain.engine.query.controller.control_state import ControlEvent, ControlState, FailureClass
-from jonex_wiki.domain.engine.query.dense.cache import (
-    build_dense_cache_identity,
-    load_dense_cache,
-    store_dense_cache,
-)
-from jonex_wiki.domain.engine.query.dense.index import (
-    PreparedDenseIndex,
-    prepare_dense_index,
-    prepare_published_dense_index,
-    validate_page_vectors,
-    validate_query_vector,
-)
 from jonex_wiki.domain.engine.query.controller.failure import (
     FailureDecision,
     RuntimeFailureSignals,
@@ -373,8 +303,6 @@ from jonex_wiki.domain.engine.query.controller.synthesis import (
     resolve_handle_draft,
 )
 from jonex_wiki.domain.engine.compile.rendering import render_wiki_tree
-# ``query_plan`` is a pure data class with no runtime wiring (R1.1): the
-# controller runtime and the evidence ledger are the run's only authority.
 
 
 # --- Pre-request input estimate ------------------------------------------
@@ -619,7 +547,7 @@ class _BudgetedQueryModel:
 
     def fits_retrieval_and_answer(self, messages: Any, schema: Any, tools: Any,
                                   requested_output: int, answer_messages: Any,
-                                  answer_output: int = 8192) -> bool:
+                                  answer_output: int = 8192, answer_schema: Any = None) -> bool:
         """Admit another retrieval turn only while one answer turn still fits.
 
         Use the existing estimator and ceilings, without increasing the budget
@@ -630,13 +558,16 @@ class _BudgetedQueryModel:
             return False
         if not self.fits_request(messages, schema, tools, requested_output):
             return False
-        if not self.fits_request(answer_messages, schema, None, answer_output):
+        answer_schema = schema if answer_schema is None else answer_schema
+        if not self.fits_request(answer_messages, answer_schema, None, answer_output):
             return False
         retrieval = self.context_messages(messages, schema, tools, requested_output)
-        answer = self.context_messages(answer_messages, schema, None, answer_output)
+        answer = self.context_messages(answer_messages, answer_schema, None, answer_output)
+        # Short traversal replies must not shrink the final answer reservation.
         return (self.max_tokens is None or self.tokens
                 + self.estimate_units(retrieval, schema, tools, requested_output)
-                + self.estimate_units(answer, schema, None, answer_output)
+                + self._estimate_input_units(answer, answer_schema, None)
+                + max(0, int(answer_output))
                 <= self.max_tokens)
 
     def _account(self, messages: Any, schema: Any, tools: Any, requested_output: int,
@@ -790,8 +721,6 @@ class _BudgetedQueryModel:
         self._record_overrun()
         return response
 
-    async def embed(self, *args: Any, **kwargs: Any):
-        return await self.inner.embed(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
@@ -1322,7 +1251,7 @@ def _programmatic_incomplete_answer(question: str, reason: Optional[str]) -> str
     label = _TERMINATION_LIMIT_LABELS.get(reason or "", ("运行", "run"))
     if _question_prefers_english(question):
         return ("This question is not complete: the {} limit was reached and the "
-                "the run stopped before an answer was produced.").format(label[1])
+                "run stopped before an answer was produced.").format(label[1])
     return "当前问题未完成：已达到{}限制。".format(label[0])
 
 
@@ -1479,11 +1408,6 @@ class QueryRunResult(BaseModel):
     tool_calls: int
     judge_calls: int = 0
     model_calls: int = 0
-    # Evaluation integrity: how many per-search dense embeddings degraded to
-    # BM25-only during this run.  In benchmark mode a non-zero value means the
-    # run did NOT actually evaluate the configured hybrid retrieval and must be
-    # treated as failed, never as a valid dense result.
-    dense_degraded: int = 0
     stop_reason: str
     failure_class: Optional[FailureClass] = None
     trace: List[TraceEntry] = Field(default_factory=list)
@@ -1585,8 +1509,16 @@ async def run_query_algorithm(
     model = budgeted_model
     if _answer_style_natural() and traversal_thinking is None:
         traversal_thinking = {"type": "enabled"}
-    if _answer_style_natural() and synthesis_thinking is None:
-        synthesis_thinking = {"type": "enabled"}
+    if synthesis_thinking is None:
+        synthesis_mode = current_env().get("QUERY_SYNTHESIS_THINKING", "scene_default")
+        if synthesis_mode not in {"scene_default", "on", "off"}:
+            raise ValueError("QUERY_SYNTHESIS_THINKING must be on, off, or scene_default")
+        if synthesis_mode != "scene_default":
+            synthesis_thinking = {"type": "enabled" if synthesis_mode == "on" else "disabled"}
+        elif _answer_style_natural():
+            synthesis_thinking = {"type": "enabled"}
+    traversal_thinking = _query_thinking(traversal_thinking)
+    synthesis_thinking = _query_thinking(synthesis_thinking)
     document_scope = tuple(document_scope)
     if len(document_scope) != len(set(document_scope)) or any(
         not isinstance(value, str) or not value.strip() for value in document_scope
@@ -1642,61 +1574,13 @@ async def run_query_algorithm(
             if file_index else _build_fts_index(corpus)
         )
 
-    # Wave 5 dense fusion: load the page→embedding vectors once.  Each
-    # ``wiki_search`` then recomputes its own query→page dense scores from the
-    # current search string (see ``_exec_tool``), so a bridge hop ranks pages
-    # against the intermediate entity rather than the original whole question.
-    # On by default; when the port cannot embed, page_vectors stays None and
-    # retrieval degrades to BM25-only.
-    dense_enabled = _dense_enabled()
-    embedding_model: str | None = None
-    embedding_revision: str | None = None
-    embedding_dimension: int | None = None
-    page_vectors: PreparedDenseIndex | None = None
-    if dense_enabled:
-        embedding_model = current_env().get(
-            "EMBEDDING_MODEL", "Qwen3-Embedding-8B"
-        )
-        embedding_revision = current_env().get(
-            "EMBEDDING_MODEL_REVISION", embedding_model
-        )
-        embedding_dimension = _embedding_dimension_override()
-        with telemetry_stage(current_runtime_telemetry(), "dense_index_load"):
-            raw_page_vectors = corpus.page_vectors
-            if raw_page_vectors is None and not frozen_indexes:
-                raw_page_vectors = await _load_page_vectors(
-                    model,
-                    corpus,
-                    tenant_id=tenant_id,
-                    context_id=context_id,
-                    trace_id=trace_id,
-                    embedding_model=embedding_model,
-                    embedding_revision=embedding_revision,
-                    embedding_dimension=embedding_dimension,
-                )
-        if raw_page_vectors is not None:
-            with telemetry_stage(
-                current_runtime_telemetry(), "dense_index_prepare"
-            ):
-                page_vectors = (
-                    prepare_published_dense_index(raw_page_vectors)
-                    if frozen_indexes
-                    else prepare_dense_index(raw_page_vectors)
-                )
-        if page_vectors is None and current_env().get(
-            "QUERY_DENSE_STRICT", "off"
-        ).strip().casefold() not in ("0", "off", "false", "no"):
-            # Benchmark strict mode: a missing dense index is a hard failure,
-            # never a silent BM25-only run.
-            raise ValueError("DENSE_UNAVAILABLE_STRICT: dense enabled but page "
-                             "vectors could not be loaded")
-
     # Wave 3 P0.2: the 15-call cap and the evidence-sufficiency stall are
     # configurable via environment overrides, keeping the frozen defaults.
     max_tool_calls = _max_tool_calls_limit()
     stall_limit = _evidence_stall_limit()
     max_active_evidence = _max_active_evidence()
     runtime_config = {
+        "agent_thinking": current_env().get("JONEX_WIKI_AGENT_THINKING", "on"),
         "model": model_name,
         "answer_style": "natural" if _answer_style_natural() else "entity",
         "thinking_traversal": (traversal_thinking or {}).get("type", "scene_default"),
@@ -1725,10 +1609,6 @@ async def run_query_algorithm(
         "evidence_stall_limit": stall_limit,
         "search_read_force_limit": None,
         "max_active_evidence": max_active_evidence,
-        "dense_enabled": dense_enabled,
-        "embedding_model": embedding_model,
-        "embedding_revision": embedding_revision,
-        "embedding_dimension": embedding_dimension,
         "llm_rerank_enabled": _llm_rerank_enabled(),
         "diversity_rerank_enabled": _diversity_rerank_enabled(),
         "evidence_units_max": _evidence_units_max(),
@@ -1769,9 +1649,6 @@ async def run_query_algorithm(
         # The rewrite re-search is itself a tool call, so it must not push the
         # run past the 15-call cap (P0 invariant).
         "max_tool_calls": max_tool_calls,
-        # Wave 5 dense fusion: page→embedding vectors (None when disabled).
-        # Per-search dense scores are recomputed inside _exec_tool.
-        "page_vectors": page_vectors,
         # Candidate-frontier diagnostics remain separate from the typed
         # read/active/citable evidence state above.
         "frontier_paths": [],
@@ -1815,10 +1692,7 @@ async def run_query_algorithm(
     # The agent chooses searches from the original question and observed text.
     # No predetermined hop slots or separate relation judge are needed.
     controller_directions = []
-    # R1.1: the only runtime authority is ``ControllerRuntime`` plus the
-    # delivered-evidence ledger below.  ``query_plan.py`` stays a pure data
-    # class (its own tests exercise it) but nothing here builds one and nothing
-    # reads one back, so no run may claim a dependency loop from it.
+    # ControllerRuntime and the delivered-evidence ledger own the query loop.
     runtime_config["controller_version"] = "agent_v1"
     runtime_config["decomposition_requires_evidence_bridge"] = False
 
@@ -1842,7 +1716,6 @@ async def run_query_algorithm(
             messages,
             trace,
             model=model,
-            page_vectors=page_vectors,
             routing=routing,
             spans=spans,
             usage_acc=usage_acc,
@@ -1865,7 +1738,6 @@ async def run_query_algorithm(
             messages,
             trace,
             model=model,
-            page_vectors=page_vectors,
             routing=routing,
             spans=spans,
             usage_acc=usage_acc,
@@ -1985,12 +1857,14 @@ async def run_query_algorithm(
             trace.append(TraceEntry(event="history_recomposed", detail=recomposed))
 
         if _answer_style_natural():
-            from jonex_wiki.domain.engine.query.synthesis_orchestration import _answer_material_messages
+            from jonex_wiki.domain.engine.query.synthesis_orchestration import (
+                _answer_material_messages, _answer_material_schema)
             answer_messages, evidence_count = _answer_material_messages(state, question)
             if (evidence_count and not budgeted_model.fits_retrieval_and_answer(
                     messages, TraversalResponse.model_json_schema(),
                     None if tool_final_turn else QUERY_TOOLS[:-1],
-                    _traversal_max_tokens(), answer_messages)):
+                    _traversal_max_tokens(), answer_messages,
+                    answer_schema=_answer_material_schema())):
                 finalization_requested = True
                 trace.append(TraceEntry(event="budget_answer_only_turn", detail={
                     "reason": "reserve_answer_within_existing_budget",
@@ -2100,8 +1974,7 @@ async def run_query_algorithm(
                 await _exec_tool(
                     corpus, fts, call.name, call.arguments, call.id, state, messages, trace,
                     model=model,
-                    page_vectors=page_vectors,
-                    routing=routing,
+                            routing=routing,
                     spans=spans, usage_acc=usage_acc, parent_span_id=last_model_span_id,
                 )
                 control_state = state["controller"].state
@@ -2217,9 +2090,6 @@ async def run_query_algorithm(
             read_calls=state["read_calls"],
             tool_calls=state["total"],
             judge_calls=state["judge_calls"],
-            dense_degraded=sum(
-                1 for t in trace if t.event == "dense_embed_unavailable"
-            ),
             model_calls=budgeted_model.calls,
         )
 
@@ -2421,13 +2291,15 @@ async def run_query_algorithm(
                 or computed_count_conflict(answer, state.get("table_compute_results") or []))
             # Natural answers have no explicit scalar/result bindings. A
             # mismatch with the last result cannot refute another step or a
-            # value quoted from a separately cited source/table range.
+            # value quoted from a source/table range. A lookup amount is not
+            # a derived result, even when it cites the calculation's inputs.
             multiple_steps = any(len((item.get("payload") or {}).get("steps") or []) > 1
                                  for item in state.get("table_compute_results") or [])
             directly_cited = bool(conflict and set(conflict.get("citations_to_use") or [])
                                   & {citation.handle for citation in citations})
             if conflict and (conflict.get("reason") in ("comparison_direction_conflict", None)
                              or (conflict.get("reason") == "not_a_program_result"
+                                 and conflict.get("marker")
                                  and not multiple_steps and directly_cited)):
                 state.setdefault("final_local_issues", {})["computed_result_conflict"] = conflict
             elif conflict:

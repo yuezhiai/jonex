@@ -80,7 +80,6 @@ class ManifestBuilder:
             "models": {
                 "curation": _resolve_compile_model(self._settings),
                 "query": _resolve_compile_model(self._settings),
-                "embedding": self._settings.embedding_model,
             },
             "curation": {
                 "claim_policy": claim_policy,
@@ -88,12 +87,9 @@ class ManifestBuilder:
                 # 这类部署默认值——同一旋钮存在两份默认值正是漂移的温床(两边各写一个
                 # 数字、谁都不报错),这里保持唯一入口:Settings → manifest → engine。
                 "compile_concurrency": self._settings.compile_concurrency,
-                "compile_scheduler": self._settings.compile_scheduler,
                 "max_passage_failure_rate": self._settings.compile_max_passage_failure_rate,
-                "repair_interval": self._settings.compile_repair_interval,
-                # 编译模式（S7.0）：legacy/layered 是内容身份的一部分，故意**不**放进
-                # engine._RUNTIME_ONLY_CURATION_KEYS——切换模式必须让旧整轮产物作废。
-                "compile_mode": self._settings.compile_mode,
+                # 唯一编译链路的身份；历史版本仍携带此字段。
+                "compile_mode": "layered",
             },
             "query": {
                 "strategy": "browse-first",

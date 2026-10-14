@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
@@ -72,7 +73,7 @@ from jonex_wiki.domain.engine.models.compiler_state import (
 )
 from jonex_wiki.domain.engine.models.claim import SUPPORT_RULE_VERSION
 from jonex_wiki.kernel.ports import CancelPort
-from jonex_wiki.kernel.telemetry import count_work, telemetry_stage
+from jonex_wiki.kernel.telemetry import count_work, telemetry_stage, timed_async_stage
 
 logger = logging.getLogger(__name__)
 
@@ -398,9 +399,11 @@ def project_page(
 def page_body_lines(claims: Sequence[Any]) -> List[str]:
     """The page's body lines: claim text, order preserved, deduplicated."""
     body: List[str] = []
+    seen = set()
     for claim in claims:
         text = " ".join(str(claim.text).split())
-        if text and text not in body:
+        if text and text not in seen:
+            seen.add(text)
             body.append(text)
     return body
 
@@ -417,8 +420,12 @@ class Organizer:
     is why concurrency cannot change the published fact set.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, identity_store=None, identity_source_versions=None) -> None:
+        self.identity_store = identity_store
+        self.identity_source_versions = identity_source_versions or {}
+        self.identity_model_calls = 0
         self.records: Dict[str, List[Any]] = {}
+        self._record_ids: Dict[str, set[str]] = {}
         self.claims: Dict[str, List[Any]] = {}
         #: page -> [(record, claim_id)] for the records that passed the
         #: evidence gate, replaced (never appended) on each materialization.
@@ -589,8 +596,10 @@ class Organizer:
     def _assign(self, path: str, name: str, record: Any) -> bool:
         """Place one record on a page; ``False`` when it is already there."""
         bucket = self.records.setdefault(path, [])
-        if any(str(existing.record_id) == str(record.record_id) for existing in bucket):
+        ids = self._record_ids.setdefault(path, set())
+        if str(record.record_id) in ids:
             return False
+        ids.add(str(record.record_id))
         bucket.append(record)
         self.titles.setdefault(path, name)
         self._register(path, name)
@@ -706,19 +715,46 @@ class Organizer:
         from jonex_wiki.domain.engine.compile.error_book import _messages
 
         routing = dict(routing or {})
+        messages = _messages({"stage": "identity_assignment", "task": ORGANIZATION_JUDGMENT_SCENE,
+                              "cases": payload})
+        dependencies = []
+        for case in cases:
+            records = list(case.records)
+            for path in self._judgment_candidates(case):
+                records.extend(self.records.get(path, ()))
+            dependencies.append([(record.record_id, sorted(
+                (span.source_id, self.identity_source_versions.get(span.source_id, span.source_sha256))
+                for span in record.source_spans)) for record in records])
+        cache_key = hashlib.sha256(pipeline.canonical_json({
+            'rule':IDENTITY_JUDGMENT_RULE_VERSION, 'organization_rule':ORGANIZATION_RULE_VERSION,
+            'support_rule':SUPPORT_RULE_VERSION, 'messages':messages, 'schema':_ORGANIZATION_JUDGMENT_SCHEMA,
+            'model':routing.get('model_name',''), 'max_tokens':ORGANIZATION_JUDGMENT_MAX_TOKENS,
+            'dependencies':dependencies}).encode()).hexdigest()
+        response = None
+        if self.identity_store is not None:
+            try:
+                cached = json.loads(await self.identity_store.get_checkpoint('organization-identity', cache_key))
+                if (cached.get('cache_key') == cache_key and cached.get('response_sha256') ==
+                        hashlib.sha256(pipeline.canonical_json(cached['response']).encode()).hexdigest()):
+                    response = cached['response']
+                    count_work('compile_organization_identity_cache_hits')
+            except (OSError, ValueError, KeyError, TypeError, NotImplementedError):
+                pass
+        cache_hit = response is not None
         try:
-            response = await model.complete(
-                _messages({"stage": "identity_assignment", "task": ORGANIZATION_JUDGMENT_SCENE,
-                           "cases": payload}),
-                _ORGANIZATION_JUDGMENT_SCHEMA,
-                max_tokens=ORGANIZATION_JUDGMENT_MAX_TOKENS,
-                model=routing.get("model_name", ""),
-                tenant_id=routing.get("tenant_id", ""),
-                context_id=routing.get("context_id", ""),
-                trace_id=routing.get("trace_id", ""),
-                thinking={"type": "disabled"},
-                scene=ORGANIZATION_JUDGMENT_SCENE,
-            )
+            if response is None:
+                self.identity_model_calls += 1
+                response = await model.complete(
+                    messages,
+                    _ORGANIZATION_JUDGMENT_SCHEMA,
+                    max_tokens=ORGANIZATION_JUDGMENT_MAX_TOKENS,
+                    model=routing.get("model_name", ""),
+                    tenant_id=routing.get("tenant_id", ""),
+                    context_id=routing.get("context_id", ""),
+                    trace_id=routing.get("trace_id", ""),
+                    thinking={"type": "disabled"},
+                    scene=ORGANIZATION_JUDGMENT_SCENE,
+                )
         except (ValueError, RuntimeError) as exc:
             # A malformed structured answer is a missing judgment, not a
             # failed compile: the material stays independent and is counted.
@@ -756,6 +792,15 @@ class Organizer:
         if invalid:
             self.identity_judgment_invalid += invalid
             count_work("compile_organization_identity_judgment_invalid", invalid)
+        if self.identity_store is not None and not cache_hit and not invalid and len(answers) == len(cases):
+            cached_response = {'assignments':response.get('assignments')}
+            encoded = pipeline.canonical_json(cached_response).encode()
+            try:
+                await self.identity_store.put_checkpoint('organization-identity', cache_key,
+                    pipeline.canonical_json({'cache_key':cache_key, 'response':cached_response,
+                        'response_sha256':hashlib.sha256(encoded).hexdigest()}).encode())
+            except (OSError, ValueError, NotImplementedError):
+                count_work('compile_organization_identity_cache_write_failed')
         return answers
 
     def materialize(self, path: str, *, state: CompilerState) -> Tuple[WikiPageSnapshot, List[Any]]:
@@ -922,12 +967,14 @@ def _validation_key(path: str, record: Any, state: CompilerState) -> Tuple[Any, 
 
 def _gate_state(state: CompilerState, path: str) -> CompilerState:
     """The evidence gate's minimum: this page declared, the archive present."""
-    pages = dict(state.pages)
-    pages.setdefault(path, WikiPageSnapshot(
-        index=PageIndexEntry(path=path, title="draft")))
-    return CompilerState(
+    # The pure gate reads only page membership and the validated archive.
+    # Construct a local view without copying/revalidating the entire corpus
+    # for every claim. The caller's state and all evidence stay untouched.
+    page = state.pages.get(path) or WikiPageSnapshot(
+        index=PageIndexEntry(path=path, title="draft"))
+    return CompilerState.model_construct(
         batch_number=0,
-        pages=pages,
+        pages={path: page},
         index={},
         source_archive=state.source_archive,
         processed_passage_ids=[],
@@ -995,6 +1042,7 @@ def _page_is_reusable(path: str, organizer: Organizer, *, reusable: Any,
     return bool(current) and current == set(previous_records[path])
 
 
+@timed_async_stage('organization_driver')
 async def organize_sources(
     state: CompilerState,
     *,
@@ -1010,6 +1058,8 @@ async def organize_sources(
     previous_pages: Any = None,
     previous_records: Any = None,
     previous_claims: Any = None,
+    identity_store: Any = None,
+    identity_source_versions: Any = None,
 ) -> LayeredCompilation:
     """Understand and organize the corpus inside one bounded window.
 
@@ -1033,7 +1083,7 @@ async def organize_sources(
     previous_claims = dict(previous_claims or {})
     concurrency = max(1, int(concurrency))
     window = 2 * concurrency
-    organizer = Organizer()
+    organizer = Organizer(identity_store=identity_store, identity_source_versions=identity_source_versions)
     result = LayeredCompilation(state=state, understanding=stage.result)
     commit_lock = asyncio.Lock()
     tasks: Dict[int, "asyncio.Task[Any]"] = {}
@@ -1190,7 +1240,7 @@ async def organize_sources(
     # projected from, with the display bindings the projection produced.
     result.contributions = organizer.contributions()
     result.identity_unresolved = organizer.unresolved
-    result.organization_model_calls = organizer.identity_judgments
+    result.organization_model_calls = organizer.identity_model_calls
     result.identity_judgments = organizer.identity_judgments
     result.identity_judgment_cases = organizer.identity_judgment_cases
     result.identity_judgment_applied = organizer.identity_judgment_applied

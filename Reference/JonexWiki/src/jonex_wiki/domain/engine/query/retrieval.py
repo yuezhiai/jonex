@@ -1,10 +1,10 @@
 """Retrieval / tokenizer core for the wiki query engine (lwp-arch-001 QA-1).
 
 Extracted verbatim from ``engines/llm_wiki_plus/query_algorithm.py``: the
-FTS5 index over knowledge pages, BM25 + dense (RRF) hybrid search, snippet and
+FTS5 index over knowledge pages, BM25 lexical search, snippet and
 passage machinery, deterministic query decomposition markers, and the
 query-corpus builder.  Pure with respect to the environment: only ``ModelPort``
-(optional LLM rerank / dense embedding) is called; no provider, network,
+(optional LLM rerank) is called; no provider, network,
 filesystem, storage or database access happens here beyond the in-memory
 SQLite FTS index.  The old import path stays available through the re-export
 shim.
@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+from threading import RLock
 import logging
 import re
 import sqlite3
+import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -54,20 +56,8 @@ def _bounded_preview(text: str, limit: int = TABLE_PREVIEW_LIMIT) -> tuple[str, 
     return encoded[:limit].decode("utf-8", errors="ignore"), True
 
 
-def _numpy():
-    """Optional numpy binding, read through the legacy module namespace."""
-
-    from jonex_wiki.domain.engine.query.algorithm import _np as _impl
-
-    return _impl
 
 
-def _dense_cache_dir():
-    """Dense cache directory, read through the legacy module namespace."""
-
-    from jonex_wiki.domain.engine.query.algorithm import DENSE_CACHE_DIR as _impl
-
-    return _impl
 
 
 def _llm_rerank_min_candidates() -> int:
@@ -133,16 +123,6 @@ from jonex_wiki.domain.engine.compile.content_validation import (
     ValidatedClaim,
     validate_claim_evidence,
 )
-from jonex_wiki.domain.engine.query.dense.cache import (
-    build_dense_cache_identity,
-    load_dense_cache,
-    store_dense_cache,
-)
-from jonex_wiki.domain.engine.query.dense.index import (
-    PreparedDenseIndex,
-    validate_page_vectors,
-    validate_query_vector,
-)
 from jonex_wiki.domain.engine.compile.rendering import render_wiki_tree
 
 MAX_SEARCH_HITS = 10
@@ -157,27 +137,6 @@ MAX_SEARCH_HITS_ENV = "QUERY_MAX_SEARCH_HITS"
 # via ``QUERY_SNIPPET=off`` for a strict A/B against the no-snippet baseline.
 QUERY_SNIPPET_ENV = "QUERY_SNIPPET"
 
-# Wave 5: hybrid retrieval — BM25 fused with dense (qwen3-embedding) via RRF.
-# Default off; ``QUERY_DENSE=on`` explicitly enables it. Page vectors are loaded lazily
-# through ``ModelPort.embed`` and cached on disk keyed by corpus content, so a
-# corpus is embedded once and reused across queries.  When the port returns no
-# vectors (or embedding fails) retrieval silently falls back to BM25-only.
-QUERY_DENSE_ENV = "QUERY_DENSE"
-# Benchmark strict mode: when on, an unavailable embedding backend FAILS the
-# query run instead of silently degrading to BM25-only.  Production keeps the
-# default off (degrade + dense_degraded counter).  Set only in benchmark
-# harness runs so measured numbers never mix dense and degraded answers.
-QUERY_DENSE_STRICT_ENV = "QUERY_DENSE_STRICT"
-DENSE_RRF_K = 60
-DENSE_BATCH = 50
-# Per-search query embedding is an enhancement: a slow embedding server must
-# never stall the retrieval pipeline.  A short fast-fail timeout (seconds)
-# degrades that one search to BM25-only; the corpus warm-up keeps its own
-# longer client timeout.  The legacy WAVE5_EMBED_TIMEOUT knob was removed (§15).
-
-
-def _embed_query_timeout() -> float:
-    return 15.0
 
 # Wave 3 P2: passage-level candidates.  Each page body is split into bounded,
 # paragraph-aligned passages that are indexed separately, so a bridge page can
@@ -246,155 +205,16 @@ def _snippet_enabled() -> bool:
     return raw not in ("0", "off", "false", "no")
 
 
-def _dense_enabled() -> bool:
-    """Whether hybrid retrieval (BM25 + dense) is enabled (default on).
-
-    ``QUERY_DENSE=on`` enables it; page vectors are loaded lazily through
-    ``ModelPort.embed`` and cached on disk.
-    """
-    raw = current_env().get(QUERY_DENSE_ENV, "off").strip().casefold()
-    return raw in ("1", "on", "true", "yes")
 
 
-def _dense_strict() -> bool:
-    """Benchmark strictness: dense failure fails the run (default off)."""
-    raw = current_env().get(QUERY_DENSE_STRICT_ENV, "off").strip().casefold()
-    return raw not in ("0", "off", "false", "no")
 
 
-def _cosine_scores(
-    corpus: QueryCorpus,
-    page_vectors: Dict[str, List[float]] | PreparedDenseIndex,
-    query_vec: List[float],
-) -> Dict[str, float]:
-    """Measure the exact dense scan over all published page vectors."""
-
-    with telemetry_stage(current_runtime_telemetry(), "exact_scan"):
-        return _cosine_scores_unmeasured(corpus, page_vectors, query_vec)
 
 
-def _cosine_scores_unmeasured(
-    corpus: QueryCorpus,
-    page_vectors: Dict[str, List[float]] | PreparedDenseIndex,
-    query_vec: List[float],
-) -> Dict[str, float]:
-    """Cosine similarity of every page vector against the query vector.
-
-    numpy is used when available (fast path); falls back to a pure-Python dot
-    product so the module stays usable without numpy.
-    """
-    if isinstance(page_vectors, PreparedDenseIndex):
-        return page_vectors.score(query_vec)
-
-    paths, rows, dimension = validate_page_vectors(page_vectors)
-    validated_query = validate_query_vector(query_vec, dimension=dimension)
-    numpy_impl = _numpy()
-    if numpy_impl is not None:
-        qv = numpy_impl.asarray(validated_query, dtype=numpy_impl.float32)
-        qn = qv / (float(numpy_impl.linalg.norm(qv)) + 1e-9)
-        mat = numpy_impl.asarray(rows, dtype=numpy_impl.float32)
-        norms = numpy_impl.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
-        sims = (mat / norms) @ qn
-        return {path: float(sims[index]) for index, path in enumerate(paths)}
-    qnorm = sum(x * x for x in validated_query) ** 0.5 or 1.0
-    scores: Dict[str, float] = {}
-    for row_index, path in enumerate(paths):
-        vec = rows[row_index]
-        norm = sum(x * x for x in vec) ** 0.5 or 1.0
-        scores[path] = sum(
-            vec[column] * validated_query[column]
-            for column in range(dimension)
-        ) / (norm * qnorm)
-    return scores
 
 
-async def _load_page_vectors(
-    model: Any,
-    corpus: QueryCorpus,
-    *,
-    tenant_id: str = "",
-    context_id: str = "",
-    trace_id: str = "",
-    embedding_model: str | None = None,
-    embedding_revision: str | None = None,
-    embedding_dimension: int | None = None,
-    normalization: str = "raw-float-v1",
-) -> Optional[Dict[str, List[float]]]:
-    """Load or build tenant-bound page vectors with an immutable cache key.
-
-    Transport unavailability returns ``None`` so the caller can apply its
-    explicit strict/degraded policy.  A successful embedding response with an
-    invalid count, value, or dimension fails closed instead of becoming a
-    silent BM25 fallback.
-    """
-    if not corpus.page_text:
-        return None
-    effective_model = embedding_model or current_env().get(
-        "EMBEDDING_MODEL", "Qwen3-Embedding-8B"
-    )
-    effective_revision = embedding_revision or current_env().get(
-        "EMBEDDING_MODEL_REVISION", effective_model
-    )
-    from jonex_wiki.domain.engine.compile.dense_units import PREPROCESSING, embed_page_units
-    normalization = PREPROCESSING + ":" + normalization
-    identity = build_dense_cache_identity(
-        corpus.page_text,
-        tenant_id=tenant_id,
-        context_id=context_id,
-        model=effective_model,
-        model_revision=effective_revision,
-        normalization=normalization,
-    )
-    with telemetry_stage(
-        current_runtime_telemetry(), "dense_cache"
-    ) as cache_stage:
-        cached = load_dense_cache(
-            _dense_cache_dir(),
-            identity,
-            dimension=embedding_dimension,
-        )
-        if cached is not None:
-            if cache_stage is not None:
-                cache_stage.observe_cache(hit=True)
-            return cached
-        if cache_stage is not None:
-            cache_stage.observe_cache(hit=False)
-    with telemetry_stage(current_runtime_telemetry(), "embedding_rpc"):
-        mapping = await embed_page_units(corpus.page_text, model, effective_model,
-            tenant_id=tenant_id, context_id=context_id, trace_id=trace_id,
-            scene="jonex_wiki_query_embed")
-    if mapping is None:
-        return None
-    _validated_paths, _validated_rows, actual_dimension = validate_page_vectors(
-        mapping
-    )
-    if (
-        embedding_dimension is not None
-        and actual_dimension != embedding_dimension
-    ):
-        raise ValueError("DENSE_EMBEDDING_DIMENSION_MISMATCH")
-    try:
-        store_dense_cache(_dense_cache_dir(), identity, mapping)
-    except OSError:
-        pass
-    return mapping
 
 
-def _embedding_dimension_override() -> int | None:
-    """Return the configured positive embedding dimension, if any."""
-
-    raw = current_env().get("EMBEDDING_DIMENSION") or current_env().get(
-        "EMBEDDING_DIMENSIONS"
-    )
-    if raw in (None, ""):
-        return None
-    try:
-        dimension = int(str(raw))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("DENSE_EMBEDDING_DIMENSION_INVALID") from exc
-    if dimension < 1:
-        raise ValueError("DENSE_EMBEDDING_DIMENSION_INVALID")
-    return dimension
 
 FTS5_UNAVAILABLE = "FTS5_UNAVAILABLE"
 
@@ -553,16 +373,13 @@ def _fts_rows(corpus: QueryCorpus, paths: Iterable[str]):
     """Prepare identical FTS text while sharing repeated segmentation work.
 
     jieba already treats whitespace as independent block boundaries. Segment
-    each ASCII non-whitespace run once in this build, then join exactly as the
+    each non-whitespace run once in this build, then join exactly as the
     original segmenter does. Preserve dictionary-specific splits (e.g. 5B).
-    Mixed/non-ASCII text keeps the original whole-text segmentation.
+    Whitespace also separates jieba's CJK blocks. Keep large runs uncached so
+    a source with no whitespace cannot fill the bounded cache with long text.
     """
     from functools import lru_cache
     from jonex_wiki.kernel.telemetry import count_work, current_runtime_telemetry, telemetry_stage
-
-    @lru_cache(maxsize=4096)
-    def segment_short(text):
-        return _segment_for_search(text)
 
     @lru_cache(maxsize=8192)
     def segment_run(text):
@@ -572,10 +389,10 @@ def _fts_rows(corpus: QueryCorpus, paths: Iterable[str]):
         count_work("fts_input_chars", len(text))
         if text.isascii():
             count_work("fts_ascii_chars", len(text))
-            return " ".join(segment_run(run) for run in re.findall(r"\S+", text))
-        if len(text) <= 8192:
-            return segment_short(text)
-        return _segment_for_search(text)
+        return " ".join(
+            segment_run(run) if len(run) <= 8192 else _segment_for_search(run)
+            for run in re.findall(r"\S+", text)
+        )
 
     rows, passages, claims = [], [], []
     with telemetry_stage(current_runtime_telemetry(), "fts_tokenize"):
@@ -592,8 +409,8 @@ def _fts_rows(corpus: QueryCorpus, paths: Iterable[str]):
     count_work("fts_page_rows", len(rows))
     count_work("fts_passage_rows", len(passages))
     count_work("fts_claim_rows", len(claims))
-    count_work("fts_token_cache_hits", segment_short.cache_info().hits + segment_run.cache_info().hits)
-    count_work("fts_segment_calls", segment_short.cache_info().misses + segment_run.cache_info().misses)
+    count_work("fts_token_cache_hits", segment_run.cache_info().hits)
+    count_work("fts_segment_calls", segment_run.cache_info().misses)
     return rows, passages, claims
 
 
@@ -632,10 +449,38 @@ def _build_fts_index(corpus: QueryCorpus) -> "sqlite3.Connection":
             conn.executemany("INSERT INTO pages VALUES (?,?,?,?,?,?)", rows)
             conn.executemany("INSERT INTO passages VALUES (?,?,?)", passage_rows)
             conn.executemany("INSERT INTO claims VALUES (?,?,?)", claim_rows)
+            _ensure_fts_paths(conn)
             conn.commit()
     except Exception:
         raise ValueError(FTS5_UNAVAILABLE)
     return conn
+
+
+def _ensure_fts_paths(conn):
+    """One indexed path-to-row map; old published databases migrate privately."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='fts_paths'").fetchone():
+        return
+    from jonex_wiki.kernel.telemetry import count_work
+    count_work("fts_path_map_build")
+    conn.execute("CREATE TABLE fts_paths (path TEXT NOT NULL, kind TEXT NOT NULL, row_id INTEGER NOT NULL, PRIMARY KEY(kind,row_id))")
+    conn.execute("CREATE INDEX fts_paths_path ON fts_paths(path)")
+    for table, column in (("pages", "path"), ("passages", "page_path"), ("claims", "page_path")):
+        conn.execute(f"INSERT INTO fts_paths SELECT {column}, ?, rowid FROM {table}", (table,))
+
+
+def _insert_fts_delta(conn, rows, passages, claims):
+    for table, data, path_index in (("pages", rows, 5), ("passages", passages, 1), ("claims", claims, 1)):
+        if not data:
+            continue
+        last = conn.execute(f"SELECT rowid FROM {table} ORDER BY rowid DESC LIMIT 1").fetchone()
+        start = (last[0] if last else 0) + 1
+        placeholders = ",".join("?" for _ in range(len(data[0]) + 1))
+        columns = {"pages": "title,alias,tag,description,body,path",
+                   "passages": "text,page_path,idx", "claims": "text,page_path,claim_id"}[table]
+        conn.executemany(f"INSERT INTO {table}(rowid,{columns}) VALUES ({placeholders})",
+                         ((start + i, *row) for i, row in enumerate(data)))
+        conn.executemany("INSERT INTO fts_paths VALUES (?,?,?)",
+                         ((row[path_index], table, start + i) for i, row in enumerate(data)))
 
 
 def lexical_preprocessing_identity():
@@ -645,9 +490,17 @@ def lexical_preprocessing_identity():
     return "cjk-character:unicode61-v2"
 
 
-def build_fts_index_bytes(corpus: QueryCorpus, *, previous=None) -> bytes:
+def build_fts_index_bytes(corpus: QueryCorpus, *, previous=None, output_directory=None) -> bytes:
     """Update a private SQLite copy; the prior publication remains immutable."""
     from jonex_wiki.kernel.telemetry import count_work
+    from jonex_wiki.kernel.ports import RevisionFileReference,RevisionFileArtifact
+    from pathlib import Path
+    import os, tempfile, shutil
+    private_path=None
+    def private_name():
+        descriptor,path=tempfile.mkstemp(prefix='fts-',suffix='.sqlite',dir=output_directory)
+        os.close(descriptor)
+        return path
     if previous is None or previous.corpus is None:
         count_work("fts_full_build")
         conn = _build_fts_index(corpus)
@@ -665,29 +518,50 @@ def build_fts_index_bytes(corpus: QueryCorpus, *, previous=None) -> bytes:
         count_work("fts_records_updated", len(changed))
         if not changed:
             count_work("fts_index_reused")
-            return previous.lexical_index
-        conn = _open_fts_index(previous.lexical_index, writable=True)
+            index=previous.lexical_index
+            return index.read_bytes() if output_directory is None and isinstance(index,RevisionFileReference) else index
+        if output_directory is not None and isinstance(previous.lexical_index,RevisionFileReference) and previous.lexical_index.verify_file:
+            from jonex_wiki.kernel.telemetry import current_runtime_telemetry,telemetry_stage
+            private_path=private_name()
+            try:
+                with telemetry_stage(current_runtime_telemetry(),'fts_private_copy'):
+                    shutil.copyfile(previous.lexical_index.verify_file(),private_path)
+                conn=sqlite3.connect(private_path)
+            except BaseException:
+                Path(private_path).unlink(missing_ok=True);raise
+        else:
+            conn = _open_fts_index(previous.lexical_index, writable=True)
         try:
             with conn:
-                # FTS UNINDEXED path columns have no lookup index. Scan each
-                # table once, then delete by rowid before inserting new rows.
+                _ensure_fts_paths(conn)
                 with telemetry_stage(current_runtime_telemetry(), "fts_delete"):
-                    for table, column in (("pages", "path"), ("passages", "page_path"),
-                                          ("claims", "page_path")):
-                        rowids = [(rowid,) for rowid, path in conn.execute(
-                            f"SELECT rowid, {column} FROM {table}") if path in changed]
+                    deleted = defaultdict(list)
+                    for path in sorted(changed):
+                        for table, rowid in conn.execute("SELECT kind,row_id FROM fts_paths WHERE path=?", (path,)):
+                            deleted[table].append((rowid,))
+                    for table, rowids in deleted.items():
                         conn.executemany(f"DELETE FROM {table} WHERE rowid=?", rowids)
+                    conn.executemany("DELETE FROM fts_paths WHERE path=?", ((path,) for path in sorted(changed)))
                 rows, passages, claims = _fts_rows(corpus, sorted(changed))
                 with telemetry_stage(current_runtime_telemetry(), "fts_insert"):
-                    conn.executemany("INSERT INTO pages VALUES (?,?,?,?,?,?)", rows)
-                    conn.executemany("INSERT INTO passages VALUES (?,?,?)", passages)
-                    conn.executemany("INSERT INTO claims VALUES (?,?,?)", claims)
+                    _insert_fts_delta(conn, rows, passages, claims)
         except Exception:
             conn.close()
+            if private_path:Path(private_path).unlink(missing_ok=True)
             raise
     try:
         from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
         with telemetry_stage(current_runtime_telemetry(), "fts_serialize"):
+            if output_directory is not None:
+                if private_path is None:
+                    private_path=private_name();target=sqlite3.connect(private_path)
+                    try:conn.backup(target)
+                    finally:target.close()
+                conn.close()
+                artifact=RevisionFileArtifact.from_file('indexes/lexical.sqlite',private_path)
+                private_path=None
+                count_work('fts_private_file_published')
+                return artifact
             if hasattr(conn, "serialize"):
                 return bytes(conn.serialize())
             # Older SQLite builds use a private backup so published bytes stay
@@ -711,10 +585,26 @@ def build_fts_index_bytes(corpus: QueryCorpus, *, previous=None) -> bytes:
                     pass
     finally:
         conn.close()
+        if private_path:Path(private_path).unlink(missing_ok=True)
 
 
 def _open_fts_index(data: bytes, *, writable: bool = False) -> "sqlite3.Connection":
     """Open and minimally validate a lexical index from published bytes."""
+    from jonex_wiki.kernel.ports import RevisionFileReference,RevisionFileArtifact
+    if isinstance(data,RevisionFileReference):
+        if not writable and data.verify_file:
+            from pathlib import Path
+            conn=None
+            try:
+                conn=sqlite3.connect(Path(data.verify_file()).resolve().as_uri()+'?mode=ro&immutable=1',uri=True)
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'").fetchone():
+                    raise ValueError(FTS5_UNAVAILABLE)
+                return conn
+            except Exception as exc:
+                if conn is not None:conn.close()
+                raise ValueError(FTS5_UNAVAILABLE) from exc
+        data=data.read_bytes()
+    elif isinstance(data,RevisionFileArtifact):data=data.read_bytes()
     if not isinstance(data, bytes) or not data:
         raise ValueError(FTS5_UNAVAILABLE)
     try:
@@ -889,13 +779,106 @@ def _make_snippet(body: str, terms: List[str], limit: int = 250) -> str:
     return body[start:start + limit]
 
 
+_TOKEN_CACHE = OrderedDict()
+_TOKEN_CACHE_LOCK = RLock()
+_TOKEN_CACHE_BYTES = 0
+
+
+def _material_tokens(text: str) -> frozenset[str]:
+    """Share exact, content-addressed token sets; retain neither sources nor queries."""
+    global _TOKEN_CACHE_BYTES
+    from jonex_wiki.domain.engine.query.algorithm import _segment_for_search as segmenter
+    limit = max(0, int(current_env().get("JONEX_WIKI_QUERY_TOKEN_CACHE_BYTES", 16 * 1024 * 1024)))
+    key = (_segment_for_search, segmenter, hashlib.sha256(text.encode("utf-8")).digest())
+    with _TOKEN_CACHE_LOCK:
+        while _TOKEN_CACHE and _TOKEN_CACHE_BYTES > limit:
+            _, (_, weight) = _TOKEN_CACHE.popitem(last=False)
+            _TOKEN_CACHE_BYTES -= weight
+        found = _TOKEN_CACHE.get(key) if limit else None
+        if found is not None:
+            _TOKEN_CACHE.move_to_end(key)
+            return found[0]
+    tokens = frozenset(_segment_for_search(text).split())
+    weight = sys.getsizeof(tokens) + sum(sys.getsizeof(t) for t in tokens) + 256
+    if not limit or weight > limit:
+        return tokens
+    with _TOKEN_CACHE_LOCK:
+        # Another concurrent query may already have computed these same tokens.
+        if key not in _TOKEN_CACHE:
+            while _TOKEN_CACHE and _TOKEN_CACHE_BYTES + weight > limit:
+                _, (_, removed) = _TOKEN_CACHE.popitem(last=False)
+                _TOKEN_CACHE_BYTES -= removed
+            _TOKEN_CACHE[key] = (tokens, weight)
+            _TOKEN_CACHE_BYTES += weight
+    return tokens
+
+
+def _search_material(corpus: QueryCorpus, path: str) -> tuple[str, str, frozenset[str]]:
+    entry = corpus.page_index.get(path)
+    body = corpus.page_text.get(path, "")
+    haystack = " ".join((
+        entry.title if entry else "",
+        " ".join(entry.aliases) if entry else "",
+        body,
+    )).casefold()
+    return body, haystack, _material_tokens(haystack)
+
+
+class _SearchMaterialCache:
+    """LRU of complete page material, owned by one query and pinned corpus.
+
+    Charge Python strings, token sets and a conservative entry overhead. An
+    oversized page is still searched in full, but is never retained here.
+    """
+
+    def __init__(self, corpus: QueryCorpus, max_bytes: int | None = None):
+        self.corpus = corpus
+        self.max_bytes = max(0, int(
+            current_env().get("JONEX_WIKI_QUERY_MATERIAL_CACHE_BYTES", 16 * 1024 * 1024)
+            if max_bytes is None else max_bytes
+        ))
+        self.entries = OrderedDict()
+        self.bytes = 0
+        self.hits = self.misses = self.evictions = self.oversized = 0
+
+    def get(self, path: str) -> tuple[str, str, frozenset[str]]:
+        cached = self.entries.get(path)
+        if cached is not None:
+            self.hits += 1
+            self.entries.move_to_end(path)
+            return cached[0]
+        self.misses += 1
+        material = _search_material(self.corpus, path)
+        body, haystack, tokens = material
+        weight = (sys.getsizeof(path) + sys.getsizeof(material)
+                  + sys.getsizeof(body) + sys.getsizeof(haystack)
+                  + sys.getsizeof(tokens) + sum(sys.getsizeof(t) for t in tokens)
+                  + 256)
+        if weight > self.max_bytes:
+            self.oversized += 1
+            return material
+        while self.entries and self.bytes + weight > self.max_bytes:
+            _, (_, removed_weight) = self.entries.popitem(last=False)
+            self.bytes -= removed_weight
+            self.evictions += 1
+        self.entries[path] = (material, weight)
+        self.bytes += weight
+        return material
+
+    def body(self, path: str) -> str:
+        cached = self.entries.get(path)
+        if cached is not None:
+            self.entries.move_to_end(path)
+            return cached[0][0]
+        return self.corpus.page_text.get(path, "")
+
+
 def _fts_search(
     conn: "sqlite3.Connection",
     corpus: QueryCorpus,
     query: str,
-    dense_scores: Optional[Dict[str, float]] = None,
     *,
-    use_dense: bool = True,
+    material_cache: _SearchMaterialCache | None = None,
 ) -> List[SearchHit]:
     """Run a ranked FTS search, ordered by BM25 then canonical path.
 
@@ -903,17 +886,9 @@ def _fts_search(
     body; ``path`` is unindexed.  Returns at most ``MAX_SEARCH_HITS`` hits.
     Raises ``ValueError(FTS5_UNAVAILABLE)`` when querying is unavailable.
 
-    Wave 5 dense fusion: when ``dense_scores`` (path → cosine similarity) is
-    supplied, the BM25 ranking is fused with the dense ranking via reciprocal
-    rank fusion (RRF, k=60).  A page found by either retriever surfaces; the
-    dense rank especially recovers bridge pages that BM25 buries on multi-hop
-    corpora (musique).  When absent, behaviour is identical to BM25-only.
-
-    LWP-RET-002 lexical route: ``use_dense=False`` forbids dense entirely — the
-    supplied ``dense_scores`` are ignored, no RRF fusion runs and no hit carries
-    a ``dense_score``.  The default ``use_dense=True`` keeps the production
-    hybrid path byte-identical.
     """
+    if material_cache is not None and material_cache.max_bytes == 0:
+        material_cache = None
     bm25_ranked: List[tuple[str, float]] = []
     try:
         with telemetry_stage(current_runtime_telemetry(), "bm25"):
@@ -942,73 +917,51 @@ def _fts_search(
                     bm25_ranked.extend((p, float(rank)) for p, rank in extra if p not in seen)
 
     except Exception:
-        if not (dense_scores and use_dense):
-            raise ValueError(FTS5_UNAVAILABLE)
-        bm25_ranked = []
+        raise ValueError(FTS5_UNAVAILABLE)
 
-    if dense_scores and use_dense:
-        with telemetry_stage(current_runtime_telemetry(), "rerank"):
-            rrf: Dict[str, float] = {}
-            for i, (path, _rank) in enumerate(bm25_ranked):
-                rrf[path] = rrf.get(path, 0.0) + 1.0 / (60 + i + 1)
-            dense_ranked = sorted(
-                dense_scores.items(), key=lambda kv: kv[1], reverse=True
-            )[:_max_search_hits()]
-            for i, (path, _score) in enumerate(dense_ranked):
-                rrf[path] = rrf.get(path, 0.0) + 1.0 / (60 + i + 1)
-            merged = sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)
-            ordered = [
-                (path, rrf_score)
-                for path, rrf_score in merged[:_max_search_hits()]
-            ]
-    else:
-        # FTS uses OR so a short page matching only a common word (such as
-        # "menu") can outrank the page that matches the month, day and meal.
-        # Fetch a bounded wider pool and prefer distinct query-term coverage,
-        # retaining BM25 as the tie-breaker.  This is deterministic and applies
-        # to every lexical query, including numeric/date lookups.
-        terms = _search_terms(query)
-        def lexical_coverage(path: str) -> int:
-            entry = corpus.page_index.get(path)
-            haystack = " ".join((
-                entry.title if entry else "",
-                " ".join(entry.aliases) if entry else "",
-                corpus.page_text.get(path, ""),
-            )).casefold()
-            segmented = set(_segment_for_search(haystack).split())
-            score = sum(1 for term in set(terms) if term.casefold() in segmented)
-            # Spreadsheet headings commonly spell a Chinese date as ``4.14``
-            # or as an Excel serial, while the question says ``4月14日``.  The
-            # source title still carries the month.  Preserve that structured
-            # signal and meal-row labels without changing the FTS vocabulary.
-            for month in re.findall(r"(?<!\d)(\d{1,2})月", query):
-                if re.search(rf"(?<!\d){re.escape(month)}月|(?<!\d){re.escape(month)}[./-]", haystack):
-                    score += 6
-            for day in re.findall(r"(?<!\d)(\d{1,2})日", query):
-                if re.search(rf"[./-]0?{re.escape(day)}(?:\D|$)|(?<!\d){re.escape(day)}日", haystack):
-                    score += 3
-            # A combined month/day match is much more selective than either
-            # number alone.  This promotes the correct weekly table above
-            # unrelated reports that happen to mention both values far apart.
-            for month, day in re.findall(
-                r"(?<!\d)(\d{1,2})月\s*(\d{1,2})日", query
+    # FTS uses OR so a short page matching only a common word (such as
+    # "menu") can outrank the page that matches the month, day and meal.
+    # Fetch a bounded wider pool and prefer distinct query-term coverage,
+    # retaining BM25 as the tie-breaker.  This is deterministic and applies
+    # to every lexical query, including numeric/date lookups.
+    terms = _search_terms(query)
+    def lexical_coverage(path: str) -> int:
+        _body, haystack, segmented = (
+            material_cache.get(path) if material_cache is not None
+            else _search_material(corpus, path)
+        )
+        score = sum(1 for term in set(terms) if term.casefold() in segmented)
+        # Spreadsheet headings commonly spell a Chinese date as ``4.14``
+        # or as an Excel serial, while the question says ``4月14日``.  The
+        # source title still carries the month.  Preserve that structured
+        # signal and meal-row labels without changing the FTS vocabulary.
+        for month in re.findall(r"(?<!\d)(\d{1,2})月", query):
+            if re.search(rf"(?<!\d){re.escape(month)}月|(?<!\d){re.escape(month)}[./-]", haystack):
+                score += 6
+        for day in re.findall(r"(?<!\d)(\d{1,2})日", query):
+            if re.search(rf"[./-]0?{re.escape(day)}(?:\D|$)|(?<!\d){re.escape(day)}日", haystack):
+                score += 3
+        # A combined month/day match is much more selective than either
+        # number alone.  This promotes the correct weekly table above
+        # unrelated reports that happen to mention both values far apart.
+        for month, day in re.findall(
+            r"(?<!\d)(\d{1,2})月\s*(\d{1,2})日", query
+        ):
+            if re.search(
+                rf"(?<!\d)0?{re.escape(month)}(?:月|[./-])\s*0?{re.escape(day)}(?:日|\D|$)",
+                haystack,
             ):
-                if re.search(
-                    rf"(?<!\d)0?{re.escape(month)}(?:月|[./-])\s*0?{re.escape(day)}(?:日|\D|$)",
-                    haystack,
-                ):
-                    score += 20
-            for question_term, row_label in (("早餐", "早"), ("午餐", "午"), ("晚餐", "晚")):
-                if question_term in query and re.search(rf"\|\s*{row_label}\s*\|", haystack):
-                    score += 2
-            return score
-        ordered = sorted(
-            bm25_ranked,
-            key=lambda item: (-lexical_coverage(item[0]), item[1], item[0]),
-        )[:_max_search_hits()]
+                score += 20
+        for question_term, row_label in (("早餐", "早"), ("午餐", "午"), ("晚餐", "晚")):
+            if question_term in query and re.search(rf"\|\s*{row_label}\s*\|", haystack):
+                score += 2
+        return score
+    ordered = sorted(
+        bm25_ranked,
+        key=lambda item: (-lexical_coverage(item[0]), item[1], item[0]),
+    )[:_max_search_hits()]
 
     bm25_score_map = {path: score for path, score in bm25_ranked}
-    dense_score_map = (dense_scores or {}) if use_dense else {}
 
     # Wave 4 Q1: precompute content terms once for snippet anchoring.
     enabled = _snippet_enabled()
@@ -1037,7 +990,8 @@ def _fts_search(
         entry = corpus.page_index.get(path)
         if entry is None:
             continue
-        body = corpus.page_text.get(path, "")
+        body = (material_cache.body(path) if material_cache is not None
+                else corpus.page_text.get(path, ""))
         best_claim = claim_by_page.get(path)
         evidence_units = claim_units.get(path) or passage_units.get(path, [])[:3]
         if best_claim is not None:
@@ -1057,9 +1011,13 @@ def _fts_search(
                 tags=list(entry.tags),
                 description=entry.description,
                 bm25_score=bm25_score_map.get(path),
-                dense_score=dense_score_map.get(path),
                 snippet=snippet,
                 evidence_units=[_make_snippet(u, terms) for u in evidence_units],
+                scope={**entry.scope, 'source_context': [{
+                    key: corpus.source_scopes[sid].get(key) for key in (
+                        'source_name', 'source_sha256', 'source_version',
+                        'source_period_labels', 'period_basis', 'subject_mentions')}
+                    for sid in entry.scope.get('source_ids', []) if sid in corpus.source_scopes]},
             )
         )
     return hits
@@ -1139,7 +1097,6 @@ def _chapter_tree_hits(
                 tags=list(entry.tags),
                 description=entry.description,
                 bm25_score=None,
-                dense_score=None,
                 snippet="",
                 evidence_units=[],
             )
@@ -1164,6 +1121,8 @@ def validate_query_claims(
     claims: List[ValidatedClaim],
     *,
     tolerate_support_drift: bool = False,
+    previous_state: CompilerState | None = None,
+    previous_claims: List[ValidatedClaim] | None = None,
 ) -> None:
     """Validate accepted claims once, independently of rendering/indexing.
 
@@ -1177,6 +1136,19 @@ def validate_query_claims(
     if not isinstance(state, CompilerState):
         raise ValueError("QUERY_CORPUS_INVALID_STATE")
 
+    old_claims = {claim.claim_id: claim for claim in previous_claims or []}
+    unchanged_documents: set[str] = set()
+    delta = getattr(state, '_compile_delta', None)
+    if previous_state is not None and delta is not None:
+        unchanged_documents = set(delta.unchanged_documents)
+    elif previous_state is not None:
+        old_sources, current_sources = defaultdict(dict), defaultdict(dict)
+        for pid, passage in previous_state.source_archive.items():
+            old_sources[passage.document_id][pid] = passage
+        for pid, passage in state.source_archive.items():
+            current_sources[passage.document_id][pid] = passage
+        unchanged_documents = {sid for sid, passages in current_sources.items()
+                             if passages == old_sources.get(sid)}
     seen_ids = set()
     for claim in claims:
         if claim.claim_id in seen_ids:
@@ -1185,6 +1157,16 @@ def validate_query_claims(
 
         if claim.page_path not in state.pages:
             raise ValueError("CLAIM_PAGE_MISSING: " + claim.page_path)
+        # The previous Bundle has already passed the decoder's full trust
+        # boundary. Reuse its proof only for the identical claim and archived
+        # inputs; changed/missing evidence always takes the ordinary gate.
+        if previous_state is not None and old_claims.get(claim.claim_id) == claim:
+            refs = list(claim.evidence) + list(claim.unresolved_evidence)
+            # The gate also reads neighbouring passages for table/unit scope.
+            # Reuse therefore requires the complete document archive to match.
+            if refs and all(ref.document_id in unchanged_documents for ref in refs):
+                count_work("claim_validation_reused")
+                continue
         # Claim text is not required to be a substring of the (LLM-rewritten)
         # page content; claim correctness is enforced by validate_claim_evidence
         # against the archived source passage.
@@ -1778,6 +1760,7 @@ def build_query_corpus(
     raw_pages: Any = (),
     workbook_outlines: Optional[Dict[str, Any]] = None,
     previous_corpus: QueryCorpus | None = None,
+    previous_source_unit_rule_version: str | None = None,
     previous_render_signatures: Dict[str, str] | None = None,
     render_signatures_out: Dict[str, str] | None = None,
     rendered_pages_out: set[str] | None = None,
@@ -1836,21 +1819,47 @@ def build_query_corpus(
 
     pages: Dict[str, WikiPageSnapshot] = {}
     index: Dict[str, PageIndexEntry] = {}
+    from jonex_wiki.domain.engine.source_scope import build_source_scopes, attach_source_scopes, is_overview
+    source_scopes = build_source_scopes(state.source_archive,
+        (claim for items in grouped.values() for claim in items))
+    overview_paths = defaultdict(list)
     for path, snapshot in state.pages.items():
         entry = snapshot.index.model_copy(update={
             "scope": {**snapshot.index.scope, "content_kind": "generated"},
         })
         pages[path] = snapshot.model_copy(update={"index": entry})
         index[path] = entry
+        if is_overview(entry.title):
+            for sid in snapshot.source_ids:
+                overview_paths[sid].append((path, entry.title))
 
     source_records: Dict[str, List[Dict[str, str]]] = {}
     source_locations: Dict[str, Dict[str, Any]] = {}
     raw_paths_by_table: Dict[tuple[str, str], List[str]] = defaultdict(list)
 
     if include_sources:
-        for path, passage, record, location in source_units(
-            state, error_book, unit_rule_version=KEEP_AND_SEARCH_RULE_VERSION
-        ):
+        delta = getattr(state, '_compile_delta', None)
+        reusable_documents = (delta.unchanged_documents if delta is not None
+            and previous_corpus is not None
+            and previous_source_unit_rule_version == KEEP_AND_SEARCH_RULE_VERSION else frozenset())
+        units = []
+        if reusable_documents:
+            for path, records in previous_corpus.source_records.items():
+                if len(records) != 1:
+                    continue
+                record = records[0]
+                if record.get('document_id') in reusable_documents:
+                    passage = state.source_archive[record['passage_id']]
+                    units.append((path, passage, record, previous_corpus.source_locations[path]))
+            count_work('query_source_units_reused',len(units))
+        changed_state = state.model_copy(update={'source_archive':{
+            pid:passage for pid,passage in state.source_archive.items()
+            if passage.document_id not in reusable_documents}}) if reusable_documents else state
+        units.extend(source_units(changed_state,error_book,unit_rule_version=KEEP_AND_SEARCH_RULE_VERSION))
+        # Keep the same passage/interval order as a fresh publication, including
+        # origin-link order. Only a fully verified identical document is reused.
+        units.sort(key=lambda unit:(unit[1].passage_id,unit[3]['start_char']))
+        for path, passage, record, location in units:
             if path in pages:
                 raise ValueError("SOURCE_EVIDENCE_PATH_COLLISION")
             source_records[path] = [record]
@@ -1985,7 +1994,18 @@ def build_query_corpus(
                 content_generation=content_generation, source_path=source_path,
                 table_paths=table_paths, table_status=table_status,
                 table_titles=table_titles)
+            if overview_paths[source_id]:
+                links = '\n'.join('- [[{}|{}]]'.format(path, title)
+                                  for path, title in sorted(overview_paths[source_id]))
+                source_snapshot = source_snapshot.model_copy(update={
+                    'content': source_body + '\n\n## Overview entry points\n\n'
+                    + 'Read the linked supported facts for the requested scope; these links are not a complete summary.\n'
+                    + links + '\n'})
             index[source_path] = source_entry
+            scope_info = source_scopes.get(source_id, {})
+            source_snapshot = source_snapshot.model_copy(update={'content':
+                source_snapshot.content + '\n\n## Source scope and version\n\n'
+                + json.dumps(scope_info, ensure_ascii=False, sort_keys=True) + '\n'})
             pages[source_path] = source_snapshot
             # Each table page lists the source's other tables as scoped
             # candidates, so an article's table reference can be checked by
@@ -2190,6 +2210,17 @@ def build_query_corpus(
             pages[topic_path] = WikiPageSnapshot(index=topic_entry, content=topic_body)
 
     # Origin links are best-effort and only use associations already present.
+    attach_source_scopes(pages, source_scopes)
+    if include_sources and source_scopes:
+        path = 'topics/overview.md'
+        links = '\n'.join('- [[sources/source-{}.md|{}]]'.format(
+            hashlib.sha256(sid.encode()).hexdigest()[:16], scope['source_name'])
+            for sid, scope in sorted(source_scopes.items()))
+        entry = PageIndexEntry(path=path, title='Source overviews and versions',
+            tags=['overview', 'navigation-only'], scope={'content_kind': 'navigation'},
+            limitations=['navigation_only', 'source_period_is_not_fact_period'])
+        pages[path] = WikiPageSnapshot(index=entry, content=(
+            'Browse source-bound overview entry points and their versions. Read linked facts before answering.\n\n' + links))
     attach_origin_links(pages, state, claims, source_records, source_locations)
     index = {path: pages[path].index for path in pages}
 
@@ -2223,6 +2254,11 @@ def build_query_corpus(
             raise ValueError("QUERY_CORPUS_UNEXPECTED_ARTIFACT")
         files[key[len("wiki/"):]] = blob.decode("utf-8")
 
+    if include_sources and source_scopes and 'index.md' in files:
+        # Incremental rendering may reuse the previous index body. Replace our
+        # own suffix instead of appending another copy on every publication.
+        marker = '\n\n## Source overviews and scope\n'
+        files['index.md'] = files['index.md'].split(marker, 1)[0] + marker + '\n[[topics/overview.md|Source overviews and versions]]\n'
     page_text = {path: files[path] for path in index}
     page_number_map = derive_page_number_map(state, claims)
     evidence_fallback = build_evidence_fallback(
@@ -2239,6 +2275,7 @@ def build_query_corpus(
         page_number_map=page_number_map,
         source_records=source_records,
         source_locations=source_locations,
+        source_scopes=source_scopes,
         evidence_fallback=evidence_fallback,
     )
 
@@ -2699,7 +2736,7 @@ def _diversity_rerank(
 ) -> List[SearchHit]:
     """Greedy MMR-style diversity rerank over the hybrid candidate pool.
 
-    The hybrid (BM25+dense RRF) list is already rank-ordered; this keeps at
+    The lexical list is already rank-ordered; this keeps at
     most ``keep`` pages by balancing rank score against novelty:
 
       score(h) = alpha * rank_score(h) + (1 - alpha) * max_{s in S}(1 - sim(h, s))

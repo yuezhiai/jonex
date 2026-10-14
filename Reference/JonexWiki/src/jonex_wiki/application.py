@@ -476,6 +476,37 @@ class WikiApplication:
             self.executor.submit(task)
             return {"task_id": task.task_id, "document_id": document_id, "status": task.status}
 
+    async def get_document_chunks(self, tenant_id: str, kb_id: str, document_id: str) -> dict:
+        """Read the current saved compile inputs, without requiring publication."""
+        from jonex_wiki.kernel.contracts import SourceArtifact
+
+        async with self.session_factory() as s:
+            doc = await DocumentRepo().get(s, tenant_id, kb_id, document_id)
+            if doc is None or doc.deleted_at is not None:
+                raise NotFoundError(f"文档 {document_id} 不存在")
+        chunks = []
+        if doc.content_generation:
+            path = self.layout.artifacts_path(tenant_id, kb_id, document_id, doc.content_generation)
+
+            def read():
+                with path.open(encoding="utf-8") as handle:
+                    artifacts = [SourceArtifact.model_validate_json(line)
+                                 for line in handle if line.strip()]
+                artifacts.sort(key=lambda a: a.position if a.position is not None else 10**12)
+                return [{
+                    "chunk_id": a.chunk_id, "content": a.text,
+                    "content_length": len(a.text), "file_name": doc.source_name,
+                    "chunk_order_index": a.position, "chunk_index": a.position,
+                    "page_no": a.page_number, "file_path": f"doc={document_id}",
+                    "tokens": None, "full_doc_id": None,
+                    "time_start": None, "time_end": None,
+                    "char_start": None, "char_end": None,
+                } for a in artifacts]
+
+            chunks = await asyncio.to_thread(read)
+        return {"doc_id": document_id, "total": len(chunks), "chunks": chunks,
+                "kb_type": "jonex_wiki"}
+
     async def parse_status(self, tenant_id: str, kb_id: str) -> dict:
         """Read-only inventory of documents needing reparse before compilation."""
         from jonex_wiki.domain.parsing.identity import parse_input_signature
@@ -596,11 +627,15 @@ class WikiApplication:
                 "previous_source_name": old_name,
                 "compile_task_id": compile_task.task_id, "status": compile_task.status}
 
-    async def query(self, tenant_id: str, kb_id: str, question: str) -> dict:
+    async def query(self, tenant_id: str, kb_id: str, question: str,
+                    *, thinking_mode: str | None = None) -> dict:
         """提交查询任务(异步,返回 task_id)。"""
         question = (question or "").strip()
         if not question or len(question) > 4096:
             raise ValidationError("question 必须为 1-4096 字符")
+        if thinking_mode is not None:
+            from jonex_wiki.domain.query.thinking import thinking_overrides
+            thinking_overrides(thinking_mode)
         async with self.layout.version_lock(tenant_id, kb_id):
             published = self.layout.resolve_published(tenant_id, kb_id)
             if published is None or not published.is_dir():
@@ -612,7 +647,10 @@ class WikiApplication:
                                                    question=question, bundle_sha=published.name)
                 query_id = row.query_id
                 await s.commit()
-        self.executor.submit_query(row)
+        if thinking_mode is None:
+            self.executor.submit_query(row)
+        else:
+            self.executor.submit_query(row, thinking_mode=thinking_mode)
         return {"task_id": query_id, "kind": "query"}
 
     async def get_task(self, tenant_id: str, task_id: str) -> dict:
@@ -623,7 +661,8 @@ class WikiApplication:
                 if row is None:
                     raise NotFoundError(f"任务 {task_id} 不存在")
                 return {"task_id": row.query_id, "kind": TaskKind.query.value, "status": row.status,
-                        "stage": row.stage, "error": row.error, "result": row.result}
+                        "stage": row.stage, "error": row.error, "result": row.result,
+                        "progress": row.progress, "kb_id": row.kb_id}
         async with self.session_factory() as s:
             row = await TaskRepo().get(s, tenant_id, task_id)
             if row is None:
@@ -643,6 +682,9 @@ class WikiApplication:
 
     async def cancel_task(self, tenant_id: str, task_id: str) -> dict:
         async with self.session_factory() as s:
+            if task_id.startswith("qry-"):
+                row = await self.executor.cancel_query(s, tenant_id, task_id)
+                return {"task_id": task_id, "status": row.status}
             row = await self.executor.cancel(s, tenant_id, task_id)
             if row.kind == TaskKind.parse.value and row.status == "cancelled" and row.document_id:
                 doc = await DocumentRepo().get(s, tenant_id, row.kb_id, row.document_id)

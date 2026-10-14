@@ -41,6 +41,7 @@ from jonex_wiki.domain.reading.page_merge import (
     is_merge_candidate,
 )
 from jonex_wiki.kernel.errors import NotFoundError
+from jonex_wiki.domain.engine.json_artifacts import load_json_artifact
 
 _MAX_REFS_PER_PAGE = 12
 _MAX_EXCERPTS_PER_DOC = 2
@@ -180,7 +181,7 @@ def _navigation_cached(pub_str: str, stamp: Tuple[int, int]) -> Dict[str, Any]:
     故可安全共享同一份对象。``maxsize`` 取小值：单份约 24MB，多 bundle 只在
     重新编译期间短暂共存。
     """
-    return json.loads((Path(pub_str) / "query" / "navigation.json").read_text("utf-8"))
+    return load_json_artifact(lambda path:(Path(pub_str)/path).read_bytes(),'query/navigation.json')
 
 
 def load_navigation(pub: Path) -> Dict[str, Any]:
@@ -198,7 +199,7 @@ def load_links(pub: Path) -> Dict[str, Any]:
     path = pub / "indexes" / "links.json"
     if not path.is_file():
         return {"in_links": {}, "mentions": {}}
-    data = json.loads(path.read_text("utf-8"))
+    data = load_json_artifact(lambda relative: (pub / relative).read_bytes(), "indexes/links.json")
     return {
         "in_links": data.get("in_links", {}),
         "mentions": data.get("mentions", {}),

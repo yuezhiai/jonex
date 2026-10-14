@@ -34,7 +34,6 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Sequence
-from urllib.parse import urlsplit, urlunsplit
 
 from jonex_wiki.domain.engine.compile.build_identity import implementation_checksum
 from jonex_wiki.kernel.contracts import (
@@ -62,7 +61,6 @@ REQUIRED_FILES: List[str] = [
     "provenance.json",
     "indexes/manifest.json",
     "indexes/lexical.sqlite",
-    "indexes/dense.json",
 ]
 
 # Only compilation and published-index inputs belong to the Bundle identity.
@@ -76,12 +74,6 @@ SAFE_RUNTIME_ENV = (
     "JONEX_WIKI_COMPILE_OUTPUT_TOKENS",
     "JONEX_WIKI_SEMANTIC_REVIEW_OUTPUT_TOKENS",
     "LLM_WIKI_SEMANTIC_REVIEW",
-    "EMBEDDING_DIMENSION",
-    "EMBEDDING_DIMENSIONS",
-    "EMBEDDING_MODEL",
-    "EMBEDDING_MODEL_REVISION",
-    "QUERY_DENSE",
-    "QUERY_DENSE_STRICT",
 )
 
 
@@ -202,8 +194,6 @@ def capture_effective_runtime(
     environment: Mapping[str, str] | None = None,
     commit_sha: str | None = None,
     dirty: bool | None = None,
-    embedding_dimension: int | None = None,
-    embedding_status: str = "unavailable",
 ) -> EffectiveRuntimeSnapshot:
     """Capture safe effective runtime values without shelling out or secrets."""
     env = environment if environment is not None else current_env()
@@ -216,29 +206,6 @@ def capture_effective_runtime(
         "0", "off", "false", "no", ""
     }:
         overrides.pop("JONEX_WIKI_SEMANTIC_REVIEW_OUTPUT_TOKENS", None)
-    if overrides.get("QUERY_DENSE", "off").strip().casefold() in {
-        "0", "off", "false", "no", ""
-    }:
-        overrides.pop("QUERY_DENSE_STRICT", None)
-    dimension = embedding_dimension
-    if dimension is None:
-        raw_dimension = env.get("EMBEDDING_DIMENSION") or env.get(
-            "EMBEDDING_DIMENSIONS"
-        )
-        if raw_dimension not in (None, ""):
-            try:
-                dimension = int(str(raw_dimension))
-            except ValueError as exc:
-                raise ValueError("embedding dimension override must be an integer") from exc
-            if dimension < 1:
-                raise ValueError("embedding dimension override must be positive")
-
-    raw_host = str(
-        env.get("CONTEXT_LLM_BASE_URL", "http://llm-gateway:8787/v1")
-    )
-    host = _safe_endpoint_identity(raw_host)
-    model = str(env.get("EMBEDDING_MODEL", "Qwen3-Embedding-8B"))
-    revision = str(env.get("EMBEDDING_MODEL_REVISION", model))
     if commit_sha is None:
         commit_sha = str(
             env.get("APP_COMMIT_SHA")
@@ -259,30 +226,12 @@ def capture_effective_runtime(
         prompt_checksum=prompt_checksum,
         tool_checksum=tool_checksum,
         models=models,
-        embedding=EmbeddingIdentity(
-            provider="llm-gateway",
-            host=host,
-            model=model,
-            revision=revision,
-            dimension=dimension,
-            status=embedding_status,
-        ),
+        embedding=EmbeddingIdentity(status="disabled"),
         environment_overrides=overrides,
-        code=CodeIdentity(commit=commit_sha, dirty=dirty, source_tree_sha256=implementation_checksum()),
+        code=CodeIdentity(commit=commit_sha, dirty=dirty,
+                          source_tree_sha256=implementation_checksum(),
+                          compiler_sha256=implementation_checksum(compilation=True)),
     )
-
-
-def _safe_endpoint_identity(value: str) -> str:
-    """Drop credentials, query and fragment from an endpoint identity."""
-    if not value:
-        return ""
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.hostname:
-        return value
-    hostname = parsed.hostname
-    if parsed.port is not None:
-        hostname = f"{hostname}:{parsed.port}"
-    return urlunsplit((parsed.scheme, hostname, parsed.path.rstrip("/"), "", ""))
 
 
 def _parse_optional_bool(value: Any) -> bool | None:

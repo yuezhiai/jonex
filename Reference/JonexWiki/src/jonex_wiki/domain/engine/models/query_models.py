@@ -13,7 +13,7 @@ validation semantics are unchanged.
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator, field_validator, ConfigDict
+from pydantic import BaseModel, Field, model_validator, field_validator, field_serializer, ConfigDict
 
 from jonex_wiki.domain.engine.models.compiler_state import (
     PageIndexEntry,
@@ -32,11 +32,8 @@ class SearchHit(BaseModel):
     aliases: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
     description: str = ""
-    # Wave 5 diagnostics: the pre-fusion BM25 rank and dense cosine score are
-    # kept separately so a hybrid miss can be attributed to a component rather
-    # than being flattened into a single 0.0 rank.
+    # The numeric BM25 score is retained for lexical retrieval diagnostics.
     bm25_score: Optional[float] = None
-    dense_score: Optional[float] = None
     # Wave 4 Q1: a query-anchored body snippet so the model can judge whether a
     # hit actually contains the entity/evidence it needs before choosing to read
     # it — reduces wasted wiki_read calls on multi-hop corpora (musique).
@@ -45,6 +42,7 @@ class SearchHit(BaseModel):
     # that actually match the query, so wiki_search surfaces paragraph/claim
     # level evidence instead of only page metadata.
     evidence_units: List[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
     @field_validator("path")
@@ -196,6 +194,7 @@ class QueryCorpus(BaseModel):
     # Navigation only - a delivered link is never evidence.
     fact_mentions: Dict[str, List[str]] = Field(default_factory=dict, exclude=True)
     page_links: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict, exclude=True)
+    source_scopes: Dict[str, Dict[str, Any]] = Field(default_factory=dict, exclude=True)
     # Source records have source_span_* identities, never claim_* identities.
     # The legacy citation envelope carries record_id in its claim_id slot.
     source_records: Dict[str, List[Dict[str, str]]] = Field(default_factory=dict)
@@ -214,10 +213,6 @@ class QueryCorpus(BaseModel):
     # serialized key would invalidate every already-published bundle.
     evidence_fallback: Dict[str, List[str]] = Field(
         default_factory=dict, exclude=True)
-    # Wave 5 dense retrieval: optional page-path → embedding vector.  When
-    # present, ``_fts_search`` fuses BM25 with cosine dense scores (RRF).
-    # Absent → BM25-only (all existing behaviour unchanged).
-    page_vectors: Optional[Dict[str, List[float]]] = None
     # LWP-RET-002 long-document routing (per-query runtime axis, never part of
     # effective-config).  All four fields are optional with defaults so every
     # existing QueryCorpus construction is unchanged; the route layer sets them
@@ -239,6 +234,10 @@ class QueryCorpus(BaseModel):
     # explicit production/matched callers enable it; the default stack is
     # byte-identical to the pre-route hybrid.
     raw_fallback_mode: str = "off"
+
+    @field_serializer('source_records','source_locations','page_links','fact_mentions')
+    def _serialize_mappings(self,value):
+        return dict(value)
 
     model_config = ConfigDict(extra="forbid")
     @model_validator(mode="after")

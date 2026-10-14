@@ -111,7 +111,7 @@ def _dump_spans(spans) -> list:
 def create_query_runner(session_factory, settings, layout: Layout, gw, executor=None):
     engine = LLMWikiV1Engine()
 
-    async def runner(row: QueryTaskRow) -> dict:
+    async def runner(row: QueryTaskRow, *, thinking_mode: str | None = None) -> dict:
         start = time.monotonic()
         tenant_id, kb_id = row.tenant_id, row.kb_id
         cancel = CancelPortAdapter(executor, row.query_id) if executor else None
@@ -149,10 +149,19 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
         request = {"question": row.question, "strategy": "browse-first"}
 
         # 4) 核心查询算法；运行时旋钮经 Settings 注入
-        with runtime_environment(settings.runtime_env()):
-            result = await engine.query(
-                request, revision, {"store": store, "model": model}, cancel=cancel
-            )
+        environment = settings.runtime_env()
+        if thinking_mode is not None:
+            from jonex_wiki.domain.query.thinking import thinking_overrides
+            environment.update(thinking_overrides(thinking_mode))
+        from jonex_wiki.adapters.query_progress import QueryProgressAdapter
+        from jonex_wiki.kernel.query_progress import query_progress
+        async with QueryProgressAdapter(session_factory, tenant_id, row.query_id) as progress:
+            with runtime_environment(environment), query_progress(progress.record):
+                result = await engine.query(
+                    request, revision, {"store": store, "model": model}, cancel=cancel
+                )
+        if thinking_mode is not None:
+            result.config["thinking_mode"] = thinking_mode
 
         out = {
             "answer": result.answer,
@@ -162,7 +171,6 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
             "read_calls": result.read_calls,
             "tool_calls": result.tool_calls,
             "model_calls": result.model_calls,
-            "dense_degraded": result.dense_degraded,
             "stop_reason": result.stop_reason,
             "token_usage": dict(result.token_usage or {}),
             "config": dict(result.config or {}),

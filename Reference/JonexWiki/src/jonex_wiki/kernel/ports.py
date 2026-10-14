@@ -10,9 +10,47 @@ from __future__ import annotations
 import hashlib
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from dataclasses import dataclass,field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from jonex_wiki.kernel.contracts import CurationPhase, SourceArtifact
+
+
+@dataclass(frozen=True)
+class RevisionFileReference:
+    """Checksummed immutable file; resolve only if sharing its inode fails."""
+
+    path: str
+    sha256: str
+    read_bytes: Callable[[], bytes]
+    file_path: str | None = None
+    verify_file: Callable[[], str] | None = None
+
+
+@dataclass(frozen=True)
+class RevisionFileArtifact:
+    """A newly built private file, consumed by staging without a bytes copy."""
+    path: str
+    source_file: str
+    sha256: str
+    verified_identity: tuple | None = field(default=None,init=False,repr=False)
+
+    @classmethod
+    def from_file(cls, path, source_file):
+        file=Path(source_file);before=file.stat()
+        with file.open('rb') as stream:checksum=hashlib.file_digest(stream,'sha256').hexdigest()
+        after=file.stat()
+        def identity(s):return (s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+        if identity(before)!=identity(after):raise ValueError('private artifact changed while hashing')
+        result=cls(path,str(file),checksum)
+        object.__setattr__(result,'verified_identity',identity(after))
+        import weakref
+        weakref.finalize(result,file.unlink,missing_ok=True)
+        return result
+
+    def read_bytes(self):return Path(self.source_file).read_bytes()
+    def cleanup(self):Path(self.source_file).unlink(missing_ok=True)
 
 
 class SourceArtifactPort(ABC):
@@ -85,29 +123,6 @@ class ModelPort(ABC):
         """
         ...
 
-    async def embed(
-        self,
-        texts: List[str],
-        *,
-        model: str | None = None,
-        tenant_id: str = "",
-        context_id: str = "",
-        trace_id: str = "",
-        scene: str | None = None,
-    ) -> List[List[float]] | None:
-        """Return one embedding vector per input text, or ``None`` if unavailable.
-
-        This optional capability is used by hybrid retrieval.  The default
-        implementation returns ``None``.  Concrete ports return ``None`` for
-        unsupported or transport-unavailable backends, but MUST raise a stable
-        validation error when a successful response has a wrong count, index,
-        non-finite value, or mixed dimension.  Malformed provider data cannot
-        be silently relabeled as an ordinary BM25 fallback.
-
-        ``scene`` labels the logical call site for per-scene metering;
-        ``None`` means "use the implementation's default scene".
-        """
-        return None
 
 
 class ArtifactStore(ABC):
@@ -233,7 +248,7 @@ class ArtifactStore(ABC):
         tenant_id: str,
         context_id: str,
         revision_id: str,
-        files: Mapping[str, bytes] | Iterable[Tuple[str, bytes]],
+        files: Mapping[str, bytes] | Iterable[Tuple[str, bytes | RevisionFileReference]],
         *,
         attempt_id: str | None = None,
         parent_revision: str | None = None,
@@ -420,6 +435,8 @@ __all__ = [
     "Clock",
     "ModelPort",
     "ProgressSink",
+    "RevisionFileReference",
+    "RevisionFileArtifact",
     "SourceArtifactPort",
     "SystemClock",
 ]

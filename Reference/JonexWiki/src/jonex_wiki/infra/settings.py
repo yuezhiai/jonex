@@ -50,22 +50,8 @@ class Settings(BaseSettings):
     # 单次 chat 调用超时。OpenAI SDK 默认 600s,一次挂起就能堵死整个页面串行链
     # (页面内 passage 逐条串行),也会让延迟统计彻底失真;超时后交给 complete 的重试预算
     llm_timeout: float = Field(default=120.0, validation_alias="LLM_TIMEOUT")
-    embedding_binding_host: str = Field(default="", validation_alias="EMBEDDING_BINDING_HOST")
-    embedding_binding_api_key: str = Field(default="", validation_alias="EMBEDDING_BINDING_API_KEY")
-    embedding_model: str = Field(default="Qwen3-Embedding-8B", validation_alias="EMBEDDING_MODEL")
-    # 统一后的 embedding 维度语义(§15):dense 维度校验 + bundle 身份。
-    # core 的 EMBEDDING_DIMENSION / EMBEDDING_DIMENSIONS 与 dev 的 EMBEDDING_DIM
-    # 三个拼写都收敛进这一个字段;默认不设(未显式配置 = 不强制维度,与 core 语义一致)。
-    embedding_dim: int | None = Field(
-        default=None,
-        validation_alias=AliasChoices("EMBEDDING_DIM", "EMBEDDING_DIMENSION", "EMBEDDING_DIMENSIONS"),
-    )
-    # core 的 EMBEDDING_MODEL_REVISION(embedding 修订号,进 dense cache 身份与 bundle 身份)
-    embedding_model_revision: str = Field(default="", validation_alias="EMBEDDING_MODEL_REVISION")
     # core 的 QUERY_LLM_RERANK → query_rerank(现有字段,只做读点映射)
     query_rerank: bool = Field(default=False, validation_alias="QUERY_RERANK")
-    # core 的 QUERY_DENSE_STRICT → query_dense_strict(现有字段,只做读点映射)
-    query_dense_strict: bool = Field(default=False, validation_alias="QUERY_DENSE_STRICT")
     # query_tasks 终态行保留时长(秒)。done/failed/cancelled 且 finished_at 早于该窗口的
     # 行由启动 GC 清除,防 query_tasks 无界增长(方案 §6.4)。
     query_task_ttl_seconds: int = 7 * 24 * 3600
@@ -74,22 +60,10 @@ class Settings(BaseSettings):
     compile_page_drop_threshold: float = 0.5   # 空产出守卫骤降阈值:page_count 较上一版下跌超此比例拒绝发布
     # ── 编译链路调度旋钮(唯一权威在本文件;经 ManifestBuilder 进 manifest.curation)──
     # 页面 passage 并发度。没有「不限」语义:要串行就显式写 1(0/负数非法)。
-    # 这是**唯一**的部署默认值——引擎侧不再内置第二份(见 pipeline.DEFAULT_COMPILE_CONCURRENCY
-    # 的注释:两处默认值漂移过)。
-    compile_concurrency: int = Field(default=10, ge=1)
-    # 编译模式（S7.0 唯一新增设置）：legacy=现有逐 passage「选择页面并编译」单链；
-    # layered=来源理解与页面组织分离的分层链。取值只有这两个，写错即拒绝启动
-    # （不做拼写兜底、不静默回落）。它**参与编译身份**：切换模式不能让上一版整轮
-    # 产物被复用（见 engine._RUNTIME_ONLY_CURATION_KEYS 的反向约定）。
-    compile_mode: Literal["legacy", "layered"] = "layered"
-    # 调度器取值 stream(有界信号量+重排缓冲,默认)/ window(固定窗口屏障,回滚用)。
-    # 两者的差异与 A/B 判据见 pipeline.compile_passages 的文档串。
-    compile_scheduler: str = "stream"
+    # 这是部署默认值的唯一入口；由 manifest 传给分层编译器。
+    compile_concurrency: int = Field(default=20, ge=1)
     # passage 永久失败率上限(0..1):超过即 fail closed;production 策略下按降级审计发布。
     compile_max_passage_failure_rate: float = 0.05
-    # Error Book 有界修复轮的触发间隔(每 N 个 batch 一轮);范围与
-    # error_book.run_compiler_batch 的校验同口径 1..1000。
-    compile_repair_interval: int = 50
     # 并发
     api_parse_concurrency: int = 2
     api_compile_concurrency: int = 2
@@ -128,7 +102,6 @@ class Settings(BaseSettings):
     semantic_review_output_tokens: int = 4096
     semantic_review: str = Field(default="off", validation_alias="LLM_WIKI_SEMANTIC_REVIEW")
     # QUERY_* 开关 + 证据/检索预算(不带前缀,显式 alias)
-    query_dense: bool = Field(default=False, validation_alias="QUERY_DENSE")
     query_snippet: bool = Field(default=True, validation_alias="QUERY_SNIPPET")
     query_diversity_rerank: bool = Field(default=False, validation_alias="QUERY_DIVERSITY_RERANK")
     query_decompose: bool = Field(default=True, validation_alias="QUERY_QUERY_DECOMPOSE")
@@ -158,11 +131,9 @@ class Settings(BaseSettings):
     # model 超时重试
     query_model_call_timeout_seconds: float = Field(default=75.0, validation_alias="QUERY_MODEL_CALL_TIMEOUT_SECONDS")
     query_model_call_timeout_retries: int = Field(default=1, validation_alias="QUERY_MODEL_CALL_TIMEOUT_RETRIES")
-    # embed
-    embed_batch_size: int = 16
-    embed_batch_attempts: int = 3
     # prepared cache
     prepared_cache_bytes: int = 768 * 1024 * 1024
+    query_material_cache_bytes: int = Field(default=16 * 1024 * 1024, ge=0)
     # 解析杂项
     allow_private_urls: bool = False
     text_encoding: str = "utf-8"
@@ -185,15 +156,17 @@ class Settings(BaseSettings):
     inspect_enabled: bool = True
     # ── 思考(thinking)总开关 ──
     # 取值 off(默认)/on/scene_default。引擎侧**未显式声明** thinking 的模型调用
-    # (查询遍历 jonex_wiki_query_traversal + 最终合成 jonex_wiki_query_synthesize)
-    # 统一走它;调用点写死 {"type":"disabled"} 的辅助步骤(桥接/关系/检索/合成子步/
-    # 编译期 error_book 与 repair planner)恒关,不受本项影响。
+    # 才走它；显式逐步设置优先。查询统一覆盖由 agent_thinking 控制，默认保留原链路。
     # 默认 off 的原因:reasoning token **计入** max_tokens(遍历 4096~8192、合成 8192),
     # 实测 30 次查询里 9 次因思考把预算吃光 → stop_reason=model_output_truncated,
     # 并且是"预算花在不产出内容的 token 上"的直接浪费。
     # scene_default = 不发该字段,交回 llm-gateway 按 X-Jonex-Scene 白名单决定
     # (LLMGW_DISABLE_THINKING_SCENES)。
     thinking_default: str = "off"
+    # on preserves existing per-step choices; off disables all query-agent thinking.
+    agent_thinking: Literal["on", "off"] = "on"
+    query_synthesis_thinking: Literal["scene_default", "on", "off"] = "off"
+    query_token_cache_bytes: int = Field(default=16 * 1024 * 1024, ge=0)
 
     @property
     def database_url(self) -> str:
@@ -213,43 +186,24 @@ class Settings(BaseSettings):
                 f"JONEX_WIKI_THINKING_DEFAULT 取值非法: {value!r}(仅支持 off/on/scene_default)")
         return normalized
 
-    @field_validator("compile_scheduler", mode="before")
-    @classmethod
-    def _valid_compile_scheduler(cls, value):
-        """调度器白名单。非法值 fail-fast——静默回落会让「配了 window 却在跑 stream」不可见。"""
-        normalized = str(value or "stream").strip().casefold()
-        if normalized not in {"stream", "window"}:
-            raise ValueError(
-                f"JONEX_WIKI_COMPILE_SCHEDULER 取值非法: {value!r}(仅支持 stream/window)")
-        return normalized
 
     @field_validator("compile_max_passage_failure_rate", mode="before")
     @classmethod
     def _valid_compile_max_passage_failure_rate(cls, value):
-        """与 pipeline.compile_passages 的入参校验同口径:必须在 [0, 1]。"""
+        """永久失败率必须在 [0, 1]。"""
         rate = float(value)
         if not 0.0 <= rate <= 1.0:
             raise ValueError(
                 f"JONEX_WIKI_COMPILE_MAX_PASSAGE_FAILURE_RATE 取值非法: {value!r}(须在 0..1)")
         return rate
 
-    @field_validator("compile_repair_interval", mode="before")
-    @classmethod
-    def _valid_compile_repair_interval(cls, value):
-        """与 error_book.run_compiler_batch 的范围校验同口径(1..1000)。"""
-        interval = int(value)
-        if not 1 <= interval <= 1000:
-            raise ValueError(
-                f"JONEX_WIKI_COMPILE_REPAIR_INTERVAL 取值非法: {value!r}(须在 1..1000)")
-        return interval
 
     def runtime_env(self) -> dict[str, str]:
         """把运行时旋钮序列化为 env 名→值(供引擎注入)。
 
         引擎模块经 ``current_env()`` 读这些名字(默认回退 ``os.environ`` 保持
         monkeypatch.setenv 测试兼容)。布尔统一序列化为 ``on``/``off``,与各
-        ``_*_enabled()`` 的 casefold 解析一致。embedding_dim 仅当显式配置(进入
-        ``model_fields_set``)时才序列化,未配置则保持 core 的「不强制维度」语义。
+        ``_*_enabled()`` 的 casefold 解析一致。
         """
         def on_off(value: bool) -> str:
             return "on" if value else "off"
@@ -270,9 +224,6 @@ class Settings(BaseSettings):
             "JONEX_WIKI_PACK_PREVIOUS_TOKENS": str(self.pack_previous_tokens),
             # 编译输入体检
             "JONEX_WIKI_INSPECT_ENABLED": on_off(self.inspect_enabled),
-            # embed
-            "JONEX_WIKI_EMBED_BATCH_SIZE": str(self.embed_batch_size),
-            "JONEX_WIKI_EMBED_BATCH_ATTEMPTS": str(self.embed_batch_attempts),
             # model 超时重试
             "QUERY_MODEL_CALL_TIMEOUT_SECONDS": str(self.query_model_call_timeout_seconds),
             "QUERY_MODEL_CALL_TIMEOUT_RETRIES": str(self.query_model_call_timeout_retries),
@@ -280,8 +231,6 @@ class Settings(BaseSettings):
             "QUERY_LLM_RERANK": on_off(self.query_rerank),
             "QUERY_DIVERSITY_RERANK": on_off(self.query_diversity_rerank),
             "QUERY_SNIPPET": on_off(self.query_snippet),
-            "QUERY_DENSE": on_off(self.query_dense),
-            "QUERY_DENSE_STRICT": on_off(self.query_dense_strict),
             "QUERY_MAX_SEARCH_HITS": str(self.query_max_search_hits),
             "QUERY_EVIDENCE_EXCERPT_LIMIT": str(self.query_evidence_excerpt_limit),
             "QUERY_EVIDENCE_UNITS_MAX": str(self.query_evidence_units_max),
@@ -305,11 +254,12 @@ class Settings(BaseSettings):
             # current_env() 会**完全遮蔽** os.environ —— 不进这张映射的名字,
             # env 文件里写多少都不生效(test_query_budget_env.py 记录过同一个坑)。
             "LLM_MODEL": current_llm_model() or self.llm_model,
-            # embedding 身份(修订号缺省时回退到 model,与 core 一致)
-            "EMBEDDING_MODEL": self.embedding_model,
-            "EMBEDDING_MODEL_REVISION": self.embedding_model_revision or self.embedding_model,
             # prepared cache
             "JONEX_WIKI_PREPARED_CACHE_BYTES": str(self.prepared_cache_bytes),
+            "JONEX_WIKI_QUERY_MATERIAL_CACHE_BYTES": str(self.query_material_cache_bytes),
+            "JONEX_WIKI_AGENT_THINKING": self.agent_thinking,
+            "QUERY_SYNTHESIS_THINKING": self.query_synthesis_thinking,
+            "JONEX_WIKI_QUERY_TOKEN_CACHE_BYTES": str(self.query_token_cache_bytes),
             # 解析杂项
             "JONEX_WIKI_ALLOW_PRIVATE_URLS": on_off(self.allow_private_urls),
             "JONEX_WIKI_TEXT_ENCODING": self.text_encoding,
@@ -326,9 +276,6 @@ class Settings(BaseSettings):
             "MINERU_POLL_INTERVAL": str(self.mineru_poll_interval),
             "MINERU_POLL_TIMEOUT": str(self.mineru_poll_timeout),
         }
-        # embedding_dim 仅在显式配置时序列化(未配置 = core 的「不强制维度」语义)
-        if self.embedding_dim is not None and "embedding_dim" in self.model_fields_set:
-            env["EMBEDDING_DIMENSION"] = str(self.embedding_dim)
         return env
 
     @model_validator(mode="after")
@@ -338,6 +285,4 @@ class Settings(BaseSettings):
             raise ValueError("JONEX_WIKI_API_KEY 未配置,拒绝启动")
         if not self.llm_binding_host or not self.llm_binding_api_key:
             raise ValueError("LLM_BINDING_HOST / LLM_BINDING_API_KEY 未配置,拒绝启动")
-        if not self.embedding_binding_host or not self.embedding_binding_api_key:
-            raise ValueError("EMBEDDING_BINDING_HOST / EMBEDDING_BINDING_API_KEY 未配置,拒绝启动")
         return self

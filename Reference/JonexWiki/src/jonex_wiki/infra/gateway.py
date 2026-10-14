@@ -153,20 +153,18 @@ def thinking_payload(value: str | None) -> dict | None:
 
 
 class GwClient:
-    """spec §12:所有模型调用走 llm-gateway;计量头强制注入;rerank/embed 失败降级。"""
+    """spec §12:所有模型调用走 llm-gateway;计量头强制注入;rerank 失败降级。"""
 
     def __init__(self, settings, transport: httpx.AsyncBaseTransport | None = None,
                  backoff_schedule=(1.0, 2.0)):
         self.settings = settings
         self._backoff = backoff_schedule
-        # 客户端级超时给 embedding 留余量(整库分批 embed 比单次 chat 慢);
         # chat 用 per-request timeout 收紧到 settings.llm_timeout
         self.llm = AsyncOpenAI(base_url=settings.llm_binding_host,
                                api_key=settings.llm_binding_api_key,
                                max_retries=0,  # 重试预算由 GwClient 统一控制,禁用 SDK 自带重试
                                timeout=max(settings.llm_timeout, 300.0),
                                http_client=httpx.AsyncClient(transport=transport) if transport else None)
-        self.embed_model = settings.embedding_model
         self.llm_model = settings.llm_model
         self._httpx = httpx.AsyncClient(transport=transport, timeout=30.0)
 
@@ -286,31 +284,6 @@ class GwClient:
             "llm complete 重试耗尽(model={}, 尝试 3 次): {}".format(resolved_model, last)
         ) from last
 
-    async def embed(self, texts, *, scene, tenant_id, kb_id, trace_id,
-                    model=None, doc_id=None) -> list[list[float]] | None:
-        """失败返回 None(spec §12.2 降级:编译 → BM25-only bundle,查询 → BM25-only 检索)。
-
-        **重试预算与 complete 对齐**:降级的代价不对等——一次瞬时 502 会让整个 bundle
-        失去向量索引(实测连续两轮编译都因末尾一次 502 丢掉 dense),而一次 chat 调用
-        失败只影响一条 passage。所以先按同样的预算重试,耗尽了才降级。
-        """
-        if not texts:
-            return []
-        last: Exception | None = None
-        for attempt in range(3):  # 重试 2 次,共 3 尝试(与 complete 一致)
-            try:
-                resp = await self.llm.embeddings.create(
-                    model=model or self.embed_model, input=texts,
-                    extra_headers=self._headers(scene=scene, tenant_id=tenant_id,
-                                                kb_id=kb_id, trace_id=trace_id, doc_id=doc_id))
-                return [d.embedding for d in resp.data]
-            except Exception as e:  # noqa: BLE001 —— 网络/5xx 重试
-                last = e
-                log.warning("embed attempt %d 失败: %s", attempt + 1, e)
-                if attempt < 2:
-                    await asyncio.sleep(self._backoff[attempt])
-        log.warning("embed 重试耗尽,降级 BM25-only: %s", last)
-        return None
 
     async def rerank(self, query, documents, *, scene, tenant_id, kb_id, trace_id,
                      top_n=10) -> list[dict] | None:

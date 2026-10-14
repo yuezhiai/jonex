@@ -49,6 +49,7 @@ _CLAIM_ID_RE = re.compile(r"claim_[0-9a-f]{24}")
 _MAX_CLAIM_TEXT = 4000
 # Layered claims use the verbatim excerpt as their canonical text.
 _MAX_EXCERPT = _MAX_CLAIM_TEXT
+_MAX_TABLE_EXCERPT = 16000
 _MAX_REASON = 2000
 SUBSTANTIVE_PASSAGE_MIN_CHARS = 40
 
@@ -66,6 +67,17 @@ def _validate_claim_id(value: str) -> str:
     if not isinstance(value, str) or not _CLAIM_ID_RE.fullmatch(value):
         raise ValueError("invalid claim id")
     return value
+
+
+def source_text_limit(value: Any) -> int:
+    """Allow a complete long HTML table with its verbatim source context."""
+    if (isinstance(value, str)
+            and len(re.findall(r"<table\b", value, re.IGNORECASE))
+            == len(re.findall(r"</table\s*>", value, re.IGNORECASE))
+            and any(len(m.group()) > _MAX_EXCERPT for m in
+                    re.finditer(r"<table\b[^>]*>[\s\S]*?</table\s*>", value, re.IGNORECASE))):
+        return _MAX_TABLE_EXCERPT
+    return _MAX_EXCERPT
 
 
 def _validate_text(value: str, field: str, limit: int) -> str:
@@ -127,7 +139,7 @@ class EvidenceRef(BaseModel):
 
     @field_validator("excerpt", mode="before")
     def _validate_excerpt(cls, v: str) -> str:
-        return _validate_text(v, "excerpt", _MAX_EXCERPT)
+        return _validate_text(v, "excerpt", source_text_limit(v))
 
 
 class ClaimDraft(BaseModel):
@@ -144,7 +156,7 @@ class ClaimDraft(BaseModel):
 
     @field_validator("text", mode="before")
     def _validate_text(cls, v: str) -> str:
-        return _validate_text(v, "text", _MAX_CLAIM_TEXT)
+        return _validate_text(v, "text", source_text_limit(v))
 
     @field_validator("evidence")
     def _validate_evidence(cls, v: List[EvidenceRef]) -> List[EvidenceRef]:
@@ -181,7 +193,7 @@ class ValidatedClaim(BaseModel):
 
     @field_validator("text", mode="before")
     def _validate_text(cls, v: str) -> str:
-        return _validate_text(v, "text", _MAX_CLAIM_TEXT)
+        return _validate_text(v, "text", source_text_limit(v))
 
     @field_validator("evidence")
     def _validate_evidence(cls, v: List[EvidenceRef]) -> List[EvidenceRef]:

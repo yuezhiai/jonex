@@ -1,7 +1,7 @@
 """Per-operation work counters for compile diagnostics.
 
 Provider usage and billing remain with ``MeteredGw``. Work counts and stage
-wall times are task-local; response-usage hooks remain compatibility no-ops.
+wall times are task-local.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager, nullcontext, contextmanager
 from contextvars import ContextVar
 from collections import Counter
 import time
+from functools import wraps
 from typing import Any, Optional
 
 
@@ -20,6 +21,8 @@ class RuntimeTelemetryRecorder:
         self.work_counts: Counter[str] = Counter()
         self.stage_wall_ms: Counter[str] = Counter()
         self.stage_calls: Counter[str] = Counter()
+        self.started_ns = time.perf_counter_ns()
+        self.stage_events = []
 
 
 _active_recorder: ContextVar[Optional[RuntimeTelemetryRecorder]] = ContextVar(
@@ -44,15 +47,28 @@ def telemetry_stage(
         try:
             yield
         finally:
-            recorder.stage_wall_ms[name] += (time.perf_counter_ns() - started) / 1_000_000
+            ended = time.perf_counter_ns()
+            recorder.stage_wall_ms[name] += (ended - started) / 1_000_000
             recorder.stage_calls[name] += 1
+            if len(recorder.stage_events) < 4096 or name == 'compile_total':
+                recorder.stage_events.append({'stage':name,
+                    'start_ms':round((started-recorder.started_ns)/1_000_000,3),
+                    'end_ms':round((ended-recorder.started_ns)/1_000_000,3)})
 
     return measured()
 
 
-def bind_operation_telemetry(function):
-    """Identity decorator — nothing to bind."""
-    return function
+def timed_async_stage(name):
+    def decorate(function):
+        @wraps(function)
+        async def measured(*args, **kwargs):
+            recorder = kwargs.get('telemetry') or current_runtime_telemetry()
+            with telemetry_stage(recorder, name):
+                return await function(*args, **kwargs)
+        return measured
+    return decorate
+
+
 
 
 def bind_runtime_telemetry(recorder):
@@ -72,23 +88,14 @@ def count_work(name: str, amount: int = 1) -> None:
         recorder.work_counts[name] += amount
 
 
-def record_response_usage(response: Any) -> None:
-    """No-op response-usage recorder."""
-    del response
 
 
-def process_peak_rss_bytes() -> Optional[int]:
-    """No-op — return ``None``."""
-    return None
 
 
 __all__ = [
     "RuntimeTelemetryRecorder",
-    "bind_operation_telemetry",
     "bind_runtime_telemetry",
     "count_work",
     "current_runtime_telemetry",
-    "process_peak_rss_bytes",
-    "record_response_usage",
     "telemetry_stage",
 ]

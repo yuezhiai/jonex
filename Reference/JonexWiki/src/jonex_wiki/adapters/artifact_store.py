@@ -1,14 +1,14 @@
 """ArtifactStore 适配器：engine ArtifactStore → dev Layout 目录布局。
 
 引擎产物内容换成 core（revision.json/manifest.json/provenance.json/wiki/*/query/*/
-sources/*/indexes/{lexical.sqlite,dense.json}），发布/读取走 dev Layout（staging →
+sources/*/indexes/{lexical.sqlite}），发布/读取走 dev Layout（staging →
 versions/{bundle_sha} + published symlink）。这里完成三件 dev 独有的事：
 
 1. ``revision.json`` 增补 dev 字段（kb_id/page_count/claim_count/doc_fingerprints/
    fingerprints/prompt_shas），core 字段（compiler_state/digest_map/source_digests）
    原样保留供 ``decode_previous_files`` 增量还原；
 2. ``indexes/manifest.json`` 用 dev BundleManifest（bundle_sha/files/pages/segmenter）
-   覆盖，并把 core 的 index_manifest（lexical/dense 身份）合并进去，两套读者都能读；
+   覆盖，并把 core 的 index_manifest（lexical 身份）合并进去，两套读者都能读；
 3. bundle_sha = 除 indexes/manifest.json 外全部文件的聚合哈希（dev 口径）。
 """
 
@@ -17,13 +17,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
-from jonex_wiki.adapters.bundle_view import DirectoryBundleView
-from jonex_wiki.kernel.ports import ArtifactStore, BundleView
+from jonex_wiki.adapters.bundle_view import DirectoryBundleView, read_revision_header, remember_verified_file
+from jonex_wiki.kernel.ports import ArtifactStore, BundleView, RevisionFileReference,RevisionFileArtifact
 from jonex_wiki.storage.layout import Layout
 
 _MANIFEST_EXCLUDED = "indexes/manifest.json"
@@ -48,11 +49,24 @@ def _bundle_sha_of(staging: Path) -> str:
     return h.hexdigest()
 
 
+def _bundle_sha_from_files(files: Mapping[str, str]) -> str:
+    digest = hashlib.sha256()
+    for path, checksum in sorted(files.items()):
+        digest.update(path.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(checksum))
+    return digest.hexdigest()
+
+
 class ArtifactStoreAdapter(ArtifactStore):
+    supports_file_references = True
+    supports_json_shards = True
     def __init__(self, layout: Layout, *, tenant_id: str, kb_id: str) -> None:
         self._layout = layout
         self._tenant_id = tenant_id
         self._kb_id = kb_id
+        # One operation's pinned view, not a cache of decoded compiler objects.
+        self._last_view: DirectoryBundleView | None = None
 
     # ── legacy blob hooks（dev 目录布局不用，保留显式 NotImplementedError）──
 
@@ -64,12 +78,17 @@ class ArtifactStoreAdapter(ArtifactStore):
 
     # ── write path ─────────────────────────────────────────────────────
 
+    def private_index_directory(self):
+        directory=self._layout.kb_dir(self._tenant_id,self._kb_id)/'compile'/'.index-work'
+        directory.mkdir(parents=True,exist_ok=True)
+        return directory
+
     async def stage_revision(
         self,
         tenant_id: str,
         context_id: str,
         revision_id: str,
-        files: Mapping[str, bytes] | Iterable[Tuple[str, bytes]],
+        files: Mapping[str, bytes] | Iterable[Tuple[str, bytes | RevisionFileReference]],
         *,
         attempt_id: str | None = None,
         parent_revision: str | None = None,
@@ -90,22 +109,115 @@ class ArtifactStoreAdapter(ArtifactStore):
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
 
+        parent = self._layout.resolve_published(tenant_id, context_id)
+        old_files = {}
+        if parent is not None:
+            try:
+                old_files = json.loads((parent / _MANIFEST_EXCLUDED).read_text("utf-8")).get("files", {})
+            except (OSError, ValueError):
+                pass  # A damaged old manifest cannot prevent a fresh publication.
+        file_digests = {}
+        verified_parent = self._last_view
+        if verified_parent is not None and verified_parent._dir != parent:
+            verified_parent = None
+        directories = {staging}
+        def ensure_directory(directory):
+            if directory not in directories:
+                directory.mkdir(parents=True, exist_ok=True)
+                directories.add(directory)
+        def checked_parent_file(path, checksum, old_path):
+            stat = old_path.stat()
+            if verified_parent is not None and verified_parent.has_verified_file(path, checksum, stat):
+                count_work("bundle_file_checks_reused")
+                return True, stat.st_size
+            with old_path.open("rb") as stream:
+                valid = hashlib.file_digest(stream, "sha256").hexdigest() == checksum
+            count_work("bundle_file_checks_read")
+            return valid, stat.st_size
+        from jonex_wiki.kernel.telemetry import count_work
+
         core_index_manifest: bytes | None = None
         for path, data in (files.items() if isinstance(files, Mapping) else files):
             if path == _MANIFEST_EXCLUDED:
                 core_index_manifest = data
                 continue
             target = staging / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            ensure_directory(target.parent)
+            if isinstance(data,RevisionFileArtifact):
+                if data.path!=path:raise ValueError('private artifact path mismatch')
+                source=Path(data.source_file);stat=source.stat()
+                identity=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)
+                if identity!=data.verified_identity:
+                    with source.open('rb') as stream:actual=hashlib.file_digest(stream,'sha256').hexdigest()
+                    after=source.stat()
+                    if actual!=data.sha256 or (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=identity:
+                        raise ValueError('private artifact checksum mismatch')
+                try:os.replace(source,target)
+                except OSError:
+                    shutil.copyfile(source,target);data.cleanup()
+                file_digests[path]=data.sha256
+                remember_verified_file(DirectoryBundleView._file_identity(target.stat()),data.sha256)
+                count_work('bundle_files_moved_private');count_work('bundle_bytes_written',stat.st_size)
+                continue
+            if isinstance(data, RevisionFileReference):
+                # References are offered only for byte-identical rendered files.
+                # Pin the parent and verify disk bytes before sharing an inode.
+                if data.path != path or parent is None or old_files.get(path) != data.sha256:
+                    raise ValueError("immutable file reference does not match parent: " + path)
+                old_path = parent / path
+                valid, size = checked_parent_file(path, data.sha256, old_path)
+                if not valid:
+                    raise ValueError("bundle artifact checksum mismatch: " + path)
+                try:
+                    os.link(old_path, target)
+                    count_work("bundle_files_reused")
+                    count_work("bundle_files_reused_early")
+                    count_work("bundle_bytes_reused", size)
+                except OSError:
+                    content = data.read_bytes()
+                    if hashlib.sha256(content).hexdigest() != data.sha256:
+                        raise ValueError("bundle artifact checksum mismatch: " + path)
+                    target.write_bytes(content)
+                    count_work("bundle_files_written")
+                    count_work("bundle_bytes_written", len(content))
+                file_digests[path] = data.sha256
+                remember_verified_file(DirectoryBundleView._file_identity(target.stat()),data.sha256)
+                continue
+            checksum = hashlib.sha256(data).hexdigest()
+            file_digests[path] = checksum
+            reused = False
+            if path != "revision.json" and old_files.get(path) == checksum:
+                old_path = parent / path
+                # Validate the actual bytes before sharing an immutable inode;
+                # a damaged old publication must never taint a new version.
+                if old_path.is_file():
+                    valid, _ = checked_parent_file(path, checksum, old_path)
+                    if valid:
+                        try:
+                            os.link(old_path, target)
+                            reused = True
+                        except OSError:
+                            pass  # Cross-filesystem stores keep the ordinary write.
+            if reused:
+                count_work("bundle_files_reused")
+                count_work("bundle_bytes_reused", len(data))
+            else:
+                target.write_bytes(data)
+                count_work("bundle_files_written")
+                count_work("bundle_bytes_written", len(data))
+            remember_verified_file(DirectoryBundleView._file_identity(target.stat()),checksum)
             del data
 
-        self._enrich_revision(
-            staging, tenant_id, context_id, parent_revision, fingerprints
-        )
+        from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
+        with telemetry_stage(current_runtime_telemetry(), "bundle_revision_enrich"):
+            self._enrich_revision(
+                staging, tenant_id, context_id, parent_revision, fingerprints
+            )
         # bundle_sha 必须在 indexes/manifest.json 写入前计算（它排除自身）。
-        sha = _bundle_sha_of(staging)
-        self._write_index_manifest(staging, core_index_manifest, sha)
+        file_digests["revision.json"] = hashlib.sha256((staging / "revision.json").read_bytes()).hexdigest()
+        sha = _bundle_sha_from_files(file_digests)
+        with telemetry_stage(current_runtime_telemetry(), "bundle_manifest_write"):
+            self._write_index_manifest(staging, core_index_manifest, sha, file_digests=file_digests)
         return staging_key
 
     async def publish_revision(
@@ -137,9 +249,11 @@ class ArtifactStoreAdapter(ArtifactStore):
         d = self._layout.versions_dir(self._tenant_id, self._kb_id, revision_ref)
         if not d.is_dir():
             d = self._layout.staging_dir(self._tenant_id, self._kb_id, revision_ref)
-        return DirectoryBundleView(
+        view = DirectoryBundleView(
             tenant_id=self._tenant_id, context_id=self._kb_id, revision_dir=d
         )
+        self._last_view = view
+        return view
 
     async def published_revision_id(self, tenant_id: str, context_id: str) -> str:
         """The revision id the published pointer resolves to (S7-B).
@@ -152,7 +266,7 @@ class ArtifactStoreAdapter(ArtifactStore):
             self._layout.resolve_published, tenant_id, context_id)
         if published is None:
             return ""
-        revision = json.loads((published / "revision.json").read_text("utf-8"))
+        revision = await asyncio.to_thread(read_revision_header, published)
         return str(revision.get("revision_id") or "")
 
     async def get_revision_files(self, header: Mapping[str, Any]) -> Dict[str, bytes]:
@@ -246,10 +360,13 @@ class ArtifactStoreAdapter(ArtifactStore):
             revision["parent_revision"] = parent_revision
 
         with rev_path.open("w", encoding="utf-8") as stream:
-            json.dump(revision, stream, ensure_ascii=False, indent=2)
+            # A compact dump uses the C encoder and one write, rather than
+            # millions of pretty-print fragments for large compiler histories.
+            stream.write(json.dumps(revision, ensure_ascii=False, separators=(",", ":")))
 
     def _write_index_manifest(
-        self, staging: Path, core_index_manifest: bytes | None, sha: str
+        self, staging: Path, core_index_manifest: bytes | None, sha: str,
+        *, file_digests: Mapping[str, str] | None = None,
     ) -> None:
         idx_dir = staging / "indexes"
         idx_dir.mkdir(parents=True, exist_ok=True)
@@ -261,21 +378,21 @@ class ArtifactStoreAdapter(ArtifactStore):
             except (ValueError, UnicodeDecodeError):
                 merged = {}
 
-        files = {}
-        for p in sorted(staging.rglob("*")):
-            if p.is_file() and p.relative_to(staging).as_posix() != _MANIFEST_EXCLUDED:
-                with p.open("rb") as stream:
-                    files[p.relative_to(staging).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+        files = dict(file_digests) if file_digests is not None else {}
+        if file_digests is None:
+            for p in sorted(staging.rglob("*")):
+                if p.is_file() and p.relative_to(staging).as_posix() != _MANIFEST_EXCLUDED:
+                    with p.open("rb") as stream:
+                        files[p.relative_to(staging).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
         import jieba
 
         merged.update({
             "bundle_sha": sha,
             "files": files,
             "pages": sorted(
-                p.relative_to(staging / "wiki").as_posix()[:-3]
-                for p in (staging / "wiki").rglob("*.md")
-                if p.is_file()
-            ) if (staging / "wiki").is_dir() else [],
+                path[len("wiki/"):-3] for path in files
+                if path.startswith("wiki/") and path.endswith(".md")
+            ),
             "segmenter": {"lib": "jieba", "version": jieba.__version__},
         })
         (idx_dir / "manifest.json").write_text(

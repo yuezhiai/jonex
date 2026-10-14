@@ -24,6 +24,8 @@ class PreparedRevision:
 def _retained_size(root: object) -> int:
     """Count reachable Python objects once, including shared corpus references."""
     seen, pending, size = set(), [root], 0
+    from jonex_wiki.domain.engine.json_artifacts import PartitionedMapping
+    from jonex_wiki.domain.engine.source_index import SourceLocations
     while pending:
         value = pending.pop()
         if id(value) in seen:
@@ -38,6 +40,9 @@ def _retained_size(root: object) -> int:
         elif isinstance(value, BaseModel):
             pending.extend((value.__dict__, value.__pydantic_fields_set__,
                             value.__pydantic_extra__, value.__pydantic_private__))
+        elif isinstance(value, (PartitionedMapping,SourceLocations)):
+            pending.append(vars(value))
+            if isinstance(value,PartitionedMapping):size+=value.cache_budget*8
         elif hasattr(value, "_manifest_raw"):
             pending.append(vars(value))
         elif is_dataclass(value) and not isinstance(value, type):
@@ -112,7 +117,9 @@ class PreparedRevisionCache:
                 count_work("prepared_revision_hit")
                 return cached[0]
         from jonex_wiki.domain.engine.query.published_projection import load_query_projection
-        navigation = (json.loads(view.read_bytes("query/navigation.json"))
+        from jonex_wiki.domain.engine.json_artifacts import load_json_artifact
+        navigation = (load_json_artifact(view.read_bytes,'query/navigation.json',
+                        lazy_fields={'page_graph','page_links','fact_mentions','page_source_ids'})
                       if isinstance(view, DirectoryBundleView)
                       and "query/navigation.json" in view.list_entries() else {})
         files = {}

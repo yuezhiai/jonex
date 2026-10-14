@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any, List, Mapping
 
@@ -33,16 +32,12 @@ from jonex_wiki.kernel.ports import (
     SourceArtifactPort,
 )
 from jonex_wiki.kernel.runtime_env import current_env
-from jonex_wiki.kernel.telemetry import (
-    RuntimeTelemetryRecorder,
-    bind_operation_telemetry,
-    telemetry_stage,
-)
+from jonex_wiki.kernel.telemetry import (RuntimeTelemetryRecorder, telemetry_stage, timed_async_stage)
 
 from . import bundle
 
 logger = logging.getLogger(__name__)
-from jonex_wiki.domain.engine.compile.digest import classify_changes, source_fingerprint
+from jonex_wiki.domain.engine.compile.digest import (source_fingerprint)
 from . import bundle_codec
 from . import pipeline
 from jonex_wiki.domain.engine.query import orchestration
@@ -65,10 +60,6 @@ _RUNTIME_ONLY_CURATION_KEYS = frozenset({
     "repair_interval",
     "publication_only_migration",
 })
-# ``compile_mode`` is deliberately *not* runtime-only (S7.0): legacy and
-# layered compile different things, so switching modes must invalidate a
-# previous bundle instead of reusing one the other branch produced.
-COMPILE_MODES = ("legacy", "layered")
 
 
 def _record_contribution_rejections(book: ErrorBook, rejections, state) -> ErrorBook:
@@ -188,20 +179,15 @@ def _compilation_manifest(manifest: dict) -> dict:
 
 
 def _compilation_runtime_matches(old, current) -> bool:
-    """Compare runtime inputs, excluding result-only embedding status/dimension."""
-    old_embedding, new_embedding = old.embedding, current.embedding
+    """Compare the effective compiler runtime inputs."""
     return (
-        old.code.source_tree_sha256 == current.code.source_tree_sha256
+        ((old.code.compiler_sha256 == current.code.compiler_sha256)
+         if old.code.compiler_sha256 and current.code.compiler_sha256
+         else old.code.source_tree_sha256 == current.code.source_tree_sha256)
         and old.prompt_checksum == current.prompt_checksum
         and old.environment_overrides == current.environment_overrides
-        and {key: value for key, value in old.models.items() if key != "query"}
-        == {key: value for key, value in current.models.items() if key != "query"}
-        and (old_embedding.provider, old_embedding.host, old_embedding.model,
-             old_embedding.revision)
-        == (new_embedding.provider, new_embedding.host, new_embedding.model,
-            new_embedding.revision)
-        and (new_embedding.dimension is None
-             or old_embedding.dimension == new_embedding.dimension)
+        and {key: value for key, value in old.models.items() if key not in {"query", "embedding"}}
+        == {key: value for key, value in current.models.items() if key not in {"query", "embedding"}}
     )
 
 
@@ -360,7 +346,7 @@ class LLMWikiV1Engine:
         }
         return digests, bundle.build_source_inventory(artifacts, digests)
 
-    @bind_operation_telemetry
+    @timed_async_stage('compile_total')
     async def compile(
         self,
         context_id: str,
@@ -395,12 +381,9 @@ class LLMWikiV1Engine:
         # that omit it; historical manifests remain untouched when decoded.
         # Otherwise a missing field could replay an old legacy publication.
         curation = dict(manifest.get("curation") or {})
-        compile_mode = curation.get("compile_mode", "layered")
-        if compile_mode not in COMPILE_MODES:
-            raise ValueError(
-                "unknown compile_mode {!r}; expected one of {}".format(
-                    compile_mode, ", ".join(COMPILE_MODES)))
-        curation["compile_mode"] = compile_mode
+        if curation.get("compile_mode", "layered") != "layered":
+            raise ValueError("only layered compilation is supported")
+        curation["compile_mode"] = "layered"
         manifest = {**manifest, "curation": curation}
 
         if cancel:
@@ -425,17 +408,6 @@ class LLMWikiV1Engine:
                 prompt_checksum=pipeline.PROMPT_CHECKSUM,
                 tool_checksum=TOOL_CHECKSUM,
             )
-            dense_override = effective_runtime.environment_overrides.get(
-                "QUERY_DENSE", "off"
-            ).strip().casefold()
-            if dense_override in {"0", "off", "false", "no"}:
-                effective_runtime = effective_runtime.model_copy(
-                    update={
-                        "embedding": effective_runtime.embedding.model_copy(
-                            update={"status": "disabled"}
-                        )
-                    }
-                )
             runtime_snapshot_checksum = bundle.snapshot_checksum(
                 effective_runtime
             )
@@ -487,6 +459,7 @@ class LLMWikiV1Engine:
         # accepted for backward compatibility but cannot restore state without
         # a bundle, so it is intentionally ignored.
         previous = None
+        previous_view = None
         # A completed retry candidate can supply reusable compiler work while
         # its publication still belongs on the currently published revision.
         parent_revision = publication_parent_revision
@@ -495,11 +468,12 @@ class LLMWikiV1Engine:
             with telemetry_stage(telemetry, "previous_bundle_decode"):
                 try:
                     if isinstance(previous_bundle, str):
-                        view = store.open_revision(previous_bundle)
+                        view = await asyncio.to_thread(store.open_revision, previous_bundle)
                         if parent_revision is None:
                             parent_revision = view.revision_id
                         fingerprints = view.manifest.get("fingerprints") or {}
-                        published_manifest = json.loads(view.read_text("manifest.json"))
+                        published_manifest = await asyncio.to_thread(
+                            lambda: json.loads(view.read_text("manifest.json")))
                         if (
                             not omission_confirmations
                             and view.tenant_id == tenant_id
@@ -507,13 +481,15 @@ class LLMWikiV1Engine:
                             and fingerprints.get("source_inventory") == source_inventory.digest
                             and fingerprints.get("runtime") == runtime_snapshot_checksum
                             and published_manifest.get("manifest") == manifest
+                            and not ((published_manifest.get("claim_audit") or {})
+                                     .get("summary") or {}).get("failed_passage_count", 0)
                         ):
                             # This early return otherwise skips the ordinary
                             # previous-bundle decoder's checksum validation.
                             verify = getattr(view, "verify_integrity", None)
                             if verify is not None:
                                 with telemetry_stage(telemetry, "bundle_integrity"):
-                                    verify()
+                                    await asyncio.to_thread(verify)
                             from jonex_wiki.kernel.telemetry import count_work
                             # The directory fast path must enforce the same
                             # publication boundaries as decoded-bundle reuse.
@@ -538,11 +514,15 @@ class LLMWikiV1Engine:
                                 source_count=int(counts.get("sources", 0)), page_count=int(counts.get("pages", 0)),
                                 claim_count=int(counts.get("claims", 0)), error_count=int(counts.get("open_errors", 0)),
                             ), previous_bundle
-                        from jonex_wiki.domain.engine.compile.bundle_codec import decode_previous_files
-                        previous = decode_previous_files(
-                            {path: view.read_bytes(path) for path in view.list_entries()},
-                            revision_id=view.revision_id,
-                        )
+                        from jonex_wiki.domain.engine.compile.bundle_codec import decode_previous_files, decode_previous_view
+                        if hasattr(view, "verify_integrity"):
+                            previous = await asyncio.to_thread(decode_previous_view, view)
+                            previous_view = view
+                        else:
+                            previous = await asyncio.to_thread(lambda: decode_previous_files(
+                                {path: view.read_bytes(path) for path in view.list_entries()},
+                                revision_id=view.revision_id,
+                            ))
                     else:
                         try:
                             previous_header = json.loads(previous_bundle.decode("utf-8"))
@@ -551,11 +531,12 @@ class LLMWikiV1Engine:
                         if previous_header.get("format") == "jonex-wiki-directory":
                             from jonex_wiki.domain.engine.compile.bundle_codec import decode_previous_files
                             previous_files = await store.get_revision_files(previous_header)
-                            previous = decode_previous_files(
+                            previous = await asyncio.to_thread(decode_previous_files,
                                 previous_files, revision_id=previous_header["revision_id"]
                             )
                         else:
-                            previous = bundle_codec.decode_previous_bundle(previous_bundle)
+                            previous = await asyncio.to_thread(
+                                bundle_codec.decode_previous_bundle, previous_bundle)
                     publication_only_migration = bool(
                         (manifest.get("curation") or {}).get(
                             "publication_only_migration", False
@@ -613,6 +594,7 @@ class LLMWikiV1Engine:
             parent_revision = previous.revision_id
 
         if (not omission_confirmations and previous is not None and previous_key is not None
+                and not previous.state.passage_failures
                 and curr_digests == previous.digest_map
                 and previous.manifest == manifest):
             from jonex_wiki.kernel.telemetry import count_work
@@ -677,10 +659,6 @@ class LLMWikiV1Engine:
             pipeline.DEFAULT_COMPILE_CONCURRENCY if raw_concurrency is None
             else max(1, int(raw_concurrency))
         )
-        compile_scheduler = str(
-            curation_cfg.get("compile_scheduler")
-            or pipeline.DEFAULT_COMPILE_SCHEDULER
-        )
         # A passage permanently rejected twice is skipped unless this rate cap
         # is exceeded (then the compile fails closed).
         raw_rate = curation_cfg.get("max_passage_failure_rate")
@@ -690,91 +668,35 @@ class LLMWikiV1Engine:
             max_passage_failure_rate = max(
                 0.0, min(1.0, float(raw_rate))
             )
-        # Error Book 有界修复轮的触发间隔,同样是 manifest 下发的旋钮;越界即按
-        # error_book.run_compiler_batch 的口径夹紧(那里的硬闸是 1..1000)。
-        raw_repair_interval = curation_cfg.get("repair_interval")
-        repair_interval = (
-            pipeline.DEFAULT_REPAIR_INTERVAL if raw_repair_interval is None
-            else max(1, min(1000, int(raw_repair_interval)))
+        state, error_book, claims, contribution_set = await self._layered_compile(
+            all_artifacts,
+            model,
+            routing,
+            progress,
+            store=store,
+            tenant_id=tenant_id,
+            context_id=context_id,
+            manifest=manifest,
+            compile_concurrency=compile_concurrency,
+            max_passage_failure_rate=max_passage_failure_rate,
+            claim_policy=claim_policy,
+            has_previous=previous is not None or previous_key is not None,
+            telemetry=telemetry,
+            cancel=cancel,
+            compile_main_prompt=compile_main_prompt,
+            current_digests=curr_digests,
+            previous_contributions=(
+                previous.source_contributions
+                if previous is not None
+                and getattr(previous, "source_contributions", None) is not None
+                else None
+            ),
+            previous_revision_id=(
+                previous.revision_id if previous is not None else ""
+            ),
+            previous=previous,
+            sources=sources,
         )
-
-        # Layered and legacy produce the same ``(state, error_book, claims)``
-        # triple and then share one publication tail: relations, link
-        # resolution, query corpus, indexes, immutable Bundle staging and
-        # publication are the *same* code for both modes (S7.2).  Layered does
-        # not get its own copy of the engine.
-        #: The contribution ledger this publication carries.  The layered chain
-        #: computes it from its own verified records; the legacy chain derives
-        #: it from its claims below.  Either way the *claims are a view of it*,
-        #: and one ledger enters the revision identity and the Bundle.
-        contribution_set = None
-        if compile_mode == "layered":
-            state, error_book, claims, contribution_set = await self._layered_compile(
-                all_artifacts,
-                model,
-                routing,
-                progress,
-                store=store,
-                tenant_id=tenant_id,
-                context_id=context_id,
-                manifest=manifest,
-                compile_concurrency=compile_concurrency,
-                max_passage_failure_rate=max_passage_failure_rate,
-                claim_policy=claim_policy,
-                has_previous=previous is not None or previous_key is not None,
-                telemetry=telemetry,
-                cancel=cancel,
-                compile_main_prompt=compile_main_prompt,
-                current_digests=curr_digests,
-                previous_contributions=(
-                    previous.source_contributions
-                    if previous is not None
-                    and getattr(previous, "source_contributions", None) is not None
-                    else None
-                ),
-                previous_revision_id=(
-                    previous.revision_id if previous is not None else ""
-                ),
-                previous=previous,
-                sources=sources,
-            )
-        elif previous is not None:
-            from jonex_wiki.kernel.telemetry import count_work
-            count_work("incremental_compile_started")
-            with telemetry_stage(telemetry, "passage_compile"):
-                state, error_book, claims = await self._incremental_compile(
-                    all_artifacts,
-                    curr_digests,
-                    previous,
-                    model,
-                    routing,
-                    progress,
-                    compile_concurrency=compile_concurrency,
-                    max_passage_failure_rate=max_passage_failure_rate,
-                    compile_scheduler=compile_scheduler,
-                    repair_interval=repair_interval,
-                    claim_policy=claim_policy,
-                    telemetry=telemetry,
-                    cancel=cancel,
-                    compile_main_prompt=compile_main_prompt,
-                )
-        else:
-            with telemetry_stage(telemetry, "passage_compile"):
-                state, error_book, claims = await self._full_compile(
-                    all_artifacts,
-                    model,
-                    routing,
-                    progress,
-                    compile_concurrency=compile_concurrency,
-                    max_passage_failure_rate=max_passage_failure_rate,
-                    compile_scheduler=compile_scheduler,
-                    repair_interval=repair_interval,
-                    claim_policy=claim_policy,
-                    telemetry=telemetry,
-                    cancel=cancel,
-                    compile_main_prompt=compile_main_prompt,
-                    omission_confirmations=omission_confirmations,
-                )
 
         if omission_confirmations:
             from jonex_wiki.domain.engine.compile.omission_repair import apply_confirmed_omissions
@@ -827,10 +749,17 @@ class LLMWikiV1Engine:
                         collect_workbook_outlines,
                     )
                     from jonex_wiki.domain.engine.query.retrieval import validate_query_claims
-                    validate_query_claims(state, claims)
-                    validated_errors = reconcile_claim_issues(state, claims, error_book)
-                    raw_pages = collect_article_and_table_pages(all_artifacts)
-                    workbook_outlines = collect_workbook_outlines(all_artifacts)
+                    with telemetry_stage(telemetry,'claim_validation'):
+                        validate_query_claims(
+                            state, claims,
+                            previous_state=previous.state if previous is not None else None,
+                            previous_claims=previous.claims if previous is not None else None,
+                        )
+                    with telemetry_stage(telemetry,'claim_issue_reconcile'):
+                        validated_errors = reconcile_claim_issues(state, claims, error_book)
+                    with telemetry_stage(telemetry,'raw_source_pages'):
+                        raw_pages = collect_article_and_table_pages(all_artifacts)
+                        workbook_outlines = collect_workbook_outlines(all_artifacts)
                     render_signatures = {}
                     rendered_pages = set()
                     corpus = build_query_corpus(
@@ -840,6 +769,7 @@ class LLMWikiV1Engine:
                         raw_pages=raw_pages,
                         workbook_outlines=workbook_outlines,
                         previous_corpus=previous.corpus if previous is not None else None,
+                        previous_source_unit_rule_version=previous.source_unit_rule_version if previous is not None else None,
                         previous_render_signatures=previous.render_signatures if previous is not None else None,
                         render_signatures_out=render_signatures,
                         rendered_pages_out=rendered_pages,
@@ -849,61 +779,27 @@ class LLMWikiV1Engine:
 
         corpus, claim_audit, render_signatures, rendered_pages, error_book = await asyncio.to_thread(prepare_publication)
         with telemetry_stage(telemetry, "bm25_index"):
-            lexical_index = await asyncio.to_thread(build_fts_index_bytes, corpus, previous=previous)
-        with telemetry_stage(telemetry, "embedding_rpc"):
-            dense_vectors, dense_units, effective_runtime = await self._compile_dense_index(
-                corpus.page_text,
-                model,
-                effective_runtime,
-                tenant_id=tenant_id,
-                context_id=context_id,
-                trace_id=routing["trace_id"],
-                previous=previous,
-                source_inventory_digest=source_inventory.digest,
-                cancel=cancel,
-            )
+            directory=store.private_index_directory() if hasattr(store,'private_index_directory') else None
+            lexical_index = await asyncio.to_thread(build_fts_index_bytes, corpus, previous=previous,output_directory=directory)
         runtime_snapshot_checksum = bundle.snapshot_checksum(
             effective_runtime
         )
         from jonex_wiki.domain.engine.compile import source_contribution
-        if contribution_set is None:
-            # The legacy chain has no page-free records of its own: its ledger
-            # is the claim-derived set, reconciled against the previous Bundle
-            # so a deleted source is withdrawn and an unchanged record keeps the
-            # descriptive fields an earlier, richer ledger recorded.
-            derived = source_contribution.from_claims(
-                claims, source_versions=curr_digests, pages=state.pages)
-            contribution_set, rejections = source_contribution.reconcile_publication(
-                (previous.source_contributions
-                 if previous is not None
-                 and getattr(previous, "source_contributions", None) is not None
-                 else None),
-                incoming=derived.records,
-                read_versions=curr_digests,
-                current_versions=curr_digests,
-                read_at_revision=previous.revision_id if previous is not None else "",
-                # Incremental: only the sources this run re-read have their
-                # published contributions withdrawn and rebuilt; an untouched
-                # source keeps the record the previous Bundle carried.
-                affected_sources=(),
-            )
-            error_book = _record_contribution_rejections(error_book, rejections, state)
         contribution_set, dangling = _prune_dangling_displays(contribution_set, claims)
         if dangling:
             error_book = _record_contribution_rejections(error_book, dangling, state)
-        contribution_payload = source_contribution.payload(contribution_set)
+        with telemetry_stage(telemetry, 'contribution_payload'):
+            contribution_payload = source_contribution.payload(contribution_set)
 
         from jonex_wiki.domain.engine.compile.publication import RULE_VERSION as evidence_rule_version
+        with telemetry_stage(telemetry, 'publication_identity'):
+            publication_checksum = bundle_codec.canonical_checksum({
+                'state':{key:value for key,value in state}, 'claims':claims,
+                'error_book':error_book, 'source_contributions':contribution_payload,
+                'evidence_rule_version':evidence_rule_version})
         revision_id = pipeline.derive_revision_id(
             curr_digests,
-            publication_checksum=bundle.sha256_hex(pipeline.canonical_json({
-                "state": state.model_dump(), "claims": [c.model_dump() for c in claims],
-                "error_book": error_book.model_dump(), "dense_vectors": dense_vectors,
-                "dense_units": dense_units,
-                # A richer or different contribution ledger is a different
-                # publication even when the claims happen to be identical.
-                "source_contributions": contribution_payload,
-                "evidence_rule_version": evidence_rule_version}).encode("utf-8")),
+            publication_checksum=publication_checksum,
             manifest_checksum=manifest_checksum,
             manifest_payload_checksum=bundle.sha256_hex(
                 pipeline.canonical_json(manifest).encode("utf-8")
@@ -936,6 +832,15 @@ class LLMWikiV1Engine:
         if repaired_entries:
             import hashlib
             revision_id = hashlib.sha256((revision_id + json.dumps(repaired_entries)).encode()).hexdigest()
+        file_references = None
+        if (previous is not None and previous_view is not None
+                and getattr(store, "supports_file_references", False)):
+            from jonex_wiki.kernel.ports import RevisionFileReference
+            file_references = {entry["path"]: RevisionFileReference(
+                path=entry["path"], sha256=entry["sha256"],
+                read_bytes=lambda path=entry["path"]: previous_view.read_bytes(path))
+                for entry in previous_view.manifest["files"]
+                if entry["path"].startswith(("wiki/", "json-shards/"))}
         files = bundle_codec.iter_bundle_files(
             revision_id=revision_id,
             artifacts=all_artifacts,
@@ -950,8 +855,6 @@ class LLMWikiV1Engine:
             source_inventory=source_inventory,
             effective_runtime=effective_runtime,
             lexical_index=lexical_index,
-            dense_vectors=dense_vectors,
-            dense_unit_cache=dense_units,
             rendered_wiki_files=getattr(state, "_rendered_wiki_files", None),
             prepared_corpus=corpus,
             prepared_audit=claim_audit,
@@ -960,6 +863,11 @@ class LLMWikiV1Engine:
             previous_page_index=previous.corpus.page_index if previous is not None and previous.corpus is not None else None,
             rendered_pages=rendered_pages,
             source_contributions=contribution_set,
+            previous_wiki_files=(previous.corpus.files if previous is not None and previous.corpus is not None else None),
+            file_references=file_references,
+            shard_artifacts=getattr(store, "supports_json_shards", False),
+            previous=previous,
+            prepared_contribution_payload=contribution_payload,
         )
         # ── pre-publication parent recheck (S7-B) ────────────────────────
         # Publishing on top of a parent that is no longer the published head
@@ -1071,50 +979,8 @@ class LLMWikiV1Engine:
         )
         return artifacts, key
 
-    async def _compile_dense_index(
-        self,
-        page_text: dict[str, str],
-        model: ModelPort,
-        runtime: EffectiveRuntimeSnapshot,
-        *,
-        tenant_id: str,
-        context_id: str,
-        trace_id: str,
-        previous: Any | None,
-        source_inventory_digest: str,
-        cancel: CancelPort | None = None,
-    ) -> tuple[dict[str, list[float]], dict[str, list[float]], EffectiveRuntimeSnapshot]:
-        """Build or replay the immutable page-vector index before staging."""
-        if runtime.embedding.status == "disabled" or not page_text:
-            return {}, {}, runtime
 
-        from jonex_wiki.kernel.telemetry import count_work
-        from jonex_wiki.domain.engine.compile.dense_units import PREPROCESSING, embed_page_units
-        reusable = {}
-        if (previous is not None and previous.corpus is not None
-                and previous.index_manifest.get("dense", {}).get("preprocessing") == PREPROCESSING):
-            old = previous.effective_runtime.embedding
-            new = runtime.embedding
-            if (old.provider, old.host, old.model, old.revision) == (new.provider, new.host, new.model, new.revision) and (
-                    new.dimension is None or new.dimension == old.dimension):
-                reusable = previous.dense_unit_cache
-        dense_units = {}
-        added = await embed_page_units(page_text, model, runtime.embedding.model,
-            cache=reusable, output_cache=dense_units,
-            tenant_id=tenant_id, context_id=context_id, trace_id=(trace_id + ":dense")[:64],
-            scene="jonex_wiki_compile_embed", cancel=cancel)
-        if added is None:
-            return {}, dense_units, runtime.model_copy(update={"embedding": runtime.embedding.model_copy(update={"status": "unavailable"})})
-        normalized = added
-        dimensions = {len(v) for v in normalized.values()}
-        if len(dimensions) != 1:
-            raise ValueError("embedding backend returned mixed vector dimensions")
-        dimension = next(iter(dimensions))
-        if runtime.embedding.dimension is not None and runtime.embedding.dimension != dimension:
-            raise ValueError("embedding dimension differs from effective runtime")
-        return normalized, dense_units, runtime.model_copy(update={"embedding": runtime.embedding.model_copy(
-            update={"dimension": dimension, "status": "ready"})})
-
+    @timed_async_stage('understanding_and_organization')
     async def _layered_compile(
         self,
         all_artifacts: list,
@@ -1145,7 +1011,7 @@ class LLMWikiV1Engine:
         (``understanding.py``) answers what each source says and persists that
         answer; organization (``organization.py``) projects those validated
         contributions onto pages inside a bounded window.  Both return the same
-        ``(state, error_book, claims)`` triple the legacy chain returns, so
+        ``(state, error_book, claims)`` state for publication, so
         relations, link resolution, query corpus, indexes, Bundle staging and
         publication remain the *same* code -- not a second engine.
 
@@ -1176,10 +1042,17 @@ class LLMWikiV1Engine:
         previous_versions = dict(
             getattr(previous, "digest_map", None)
             or getattr(previous, "source_digests", {}) or {})
-        moved_sources = {sid for sid in live_sources
-                         if previous_versions.get(sid) != live_versions.get(sid)}
-        removed_sources = {sid for sid in previous_versions
-                           if sid not in live_sources}
+        from .delta import CompileDelta
+        with telemetry_stage(telemetry, "archive_delta"):
+            state._compile_delta = CompileDelta.between(state, previous_state, live_versions, previous_versions)
+            # Archived inputs are read-only during compilation. Sharing exact
+            # matches also preserves metadata sharing across source intervals.
+            if previous_state is not None:
+                for pid, passage in list(state.source_archive.items()):
+                    if passage.document_id in state._compile_delta.unchanged_documents:
+                        state.source_archive[pid] = previous_state.source_archive[pid]
+        moved_sources = set(state._compile_delta.changed_sources)
+        removed_sources = set(state._compile_delta.removed_sources)
         reusable_pages: set = set()
         previous_records: dict = {}
         previous_claims: dict = {}
@@ -1241,6 +1114,8 @@ class LLMWikiV1Engine:
                             if previous_state is not None else None),
             previous_records=previous_records,
             previous_claims=previous_claims,
+            identity_store=store,
+            identity_source_versions=live_versions,
         )
         understanding = result.understanding
         count_work("layered_understanding_passages", len(stage.order))
@@ -1352,7 +1227,7 @@ class LLMWikiV1Engine:
         # withdraw or refuse, so a vanished fact is visible rather than silent.
         book = _record_contribution_rejections(ErrorBook(entries=[]), rejections,
                                                result.state)
-        # ── S7-C: the legacy closeout, reused verbatim ────────────────────
+        # ── Final validation and bounded repair ────────────────────
         # Layered compilation is a different way to *produce* pages, not a
         # different publication standard: the same bounded repair rounds, the
         # same structural audit and the same publishability gate run before
@@ -1365,12 +1240,12 @@ class LLMWikiV1Engine:
     async def _finalize_layered(self, state: Any, book: ErrorBook, claims: list,
                                 model: ModelPort, routing: dict, *, telemetry=None
                                 ) -> tuple[Any, ErrorBook, list]:
-        """Run the legacy finalization over a layered compile's output.
+        """Validate and finalize a layered compilation.
 
         The repair rounds are bounded and make no model call when the book has
         nothing to repair, so a clean layered compile pays only for the one
         structural audit both modes must pass.  A book that stays blocking, or
-        a tree the audit rejects, refuses the publication with the legacy
+        a tree the audit rejects, refuses the publication with the existing
         chain's own error -- in either mode.
         """
         from jonex_wiki.domain.engine.compile.error_book import (
@@ -1446,141 +1321,7 @@ class LLMWikiV1Engine:
             count_work("publication_parent_recheck_unavailable")
             return ""
 
-    async def _full_compile(
-        self,
-        all_artifacts: list,
-        model: ModelPort,
-        routing: dict,
-        progress: ProgressSink | None,
-        *,
-        compile_concurrency: int = pipeline.DEFAULT_COMPILE_CONCURRENCY,
-        max_passage_failure_rate: float = pipeline.DEFAULT_MAX_PASSAGE_FAILURE_RATE,
-        compile_scheduler: str = pipeline.DEFAULT_COMPILE_SCHEDULER,
-        repair_interval: int = pipeline.DEFAULT_REPAIR_INTERVAL,
-        claim_policy: object = "production",
-        telemetry: RuntimeTelemetryRecorder | None = None,
-        cancel: CancelPort | None = None,
-        compile_main_prompt: str = "",
-        omission_confirmations: "Sequence[Mapping[str, Any]]" = (),
-    ) -> tuple[Any, ErrorBook, list]:
-        """Fresh compile: build the archive and compile every passage."""
-        state, passage_order = pipeline.build_state(all_artifacts)
-        if hasattr(model, "set_archive"):
-            model.set_archive(state.source_archive)
-        if progress:
-            await progress.update(
-                "", "aggregate", 30,
-                "Compiling {} passages".format(len(passage_order)),
-            )
-        from jonex_wiki.domain.engine.compile.raw_collection import (
-            collect_article_and_table_pages,
-            collect_workbook_outlines,
-        )
-        raw_pages = collect_article_and_table_pages(all_artifacts)
-        workbook_outlines = collect_workbook_outlines(all_artifacts)
-        state, error_book, claims = await pipeline.compile_passages(
-            state,
-            passage_order,
-            model,
-            routing,
-            concurrency=compile_concurrency,
-            max_passage_failure_rate=max_passage_failure_rate,
-            scheduler=compile_scheduler,
-            repair_interval=repair_interval,
-            claim_policy=claim_policy,
-            telemetry=telemetry,
-            cancel=cancel,
-            raw_pages=raw_pages,
-            workbook_outlines=workbook_outlines,
-            compile_main_prompt=compile_main_prompt,
-            omission_confirmations=omission_confirmations,
-        )
-        return state, error_book, claims
 
-    async def _incremental_compile(
-        self,
-        all_artifacts: list,
-        curr_digests: dict,
-        previous: "bundle_codec.PreviousBundle",
-        model: ModelPort,
-        routing: dict,
-        progress: ProgressSink | None,
-        *,
-        compile_concurrency: int = pipeline.DEFAULT_COMPILE_CONCURRENCY,
-        max_passage_failure_rate: float = pipeline.DEFAULT_MAX_PASSAGE_FAILURE_RATE,
-        compile_scheduler: str = pipeline.DEFAULT_COMPILE_SCHEDULER,
-        repair_interval: int = pipeline.DEFAULT_REPAIR_INTERVAL,
-        claim_policy: object = "production",
-        telemetry: RuntimeTelemetryRecorder | None = None,
-        cancel: CancelPort | None = None,
-        compile_main_prompt: str = "",
-        omission_confirmations: "Sequence[Mapping[str, Any]]" = (),
-    ) -> tuple[Any, ErrorBook, list]:
-        """Incremental compile against a restored previous bundle."""
-        state = previous.state.model_copy(deep=True)
-        error_book = previous.error_book.model_copy(deep=True)
-        claims = list(previous.claims)
-
-        with telemetry_stage(telemetry, "incremental_diff"):
-            changes = classify_changes(
-                previous.digest_map, curr_digests, all_artifacts
-            )
-
-            if changes["new"] or changes["changed"] or changes["removed_ids"]:
-                from jonex_wiki.domain.engine.compile.block_replay import replay_blocks
-                passage_order = replay_blocks(state, claims, all_artifacts)
-                passage_order = [passage_id for passage_id in passage_order
-                                 if state.source_archive[passage_id].source_metadata.get("compile_table_values", True) is not False]
-            else:
-                passage_order = []
-
-        if progress:
-            await progress.update(
-                "", "replay", 25,
-                "Replaying {} unchanged sources".format(len(changes["replay"])),
-            )
-
-        from jonex_wiki.domain.engine.compile.source_contribution import from_claims
-        from jonex_wiki.domain.engine.compile.identity import build_identity_index
-        state._fact_mentions = build_identity_index(from_claims(claims)).entity_to_pages
-
-        if passage_order:
-            if hasattr(model, "set_archive"):
-                model.set_archive(state.source_archive)
-            if progress:
-                await progress.update(
-                    "", "aggregate", 40,
-                    "Compiling {} changed passages".format(len(passage_order)),
-                )
-            from jonex_wiki.domain.engine.compile.raw_collection import (
-                collect_article_and_table_pages,
-                collect_workbook_outlines,
-            )
-            raw_pages = collect_article_and_table_pages(all_artifacts)
-            workbook_outlines = collect_workbook_outlines(all_artifacts)
-            state, error_book, claims = await pipeline.compile_passages(
-                state,
-                passage_order,
-                model,
-                routing,
-                book=error_book,
-                claims=claims,
-                concurrency=compile_concurrency,
-                max_passage_failure_rate=max_passage_failure_rate,
-                scheduler=compile_scheduler,
-                repair_interval=repair_interval,
-                claim_policy=claim_policy,
-                telemetry=telemetry,
-                cancel=cancel,
-                raw_pages=raw_pages,
-                workbook_outlines=workbook_outlines,
-                compile_main_prompt=compile_main_prompt,
-                previous_corpus=previous.corpus,
-                previous_render_signatures=previous.render_signatures,
-                omission_confirmations=omission_confirmations,
-            )
-
-        return state, error_book, claims
 
     # ── Phase C ───────────────────────────────────────────────────────
 
@@ -1720,7 +1461,6 @@ class LLMWikiV1Engine:
             "trace_id": ("query:" + bundle_key)[:64],
             "run_id": run_id,
             "_published_lexical_index": getattr(previous, "lexical_index", None),
-            "_published_dense_vectors": getattr(previous, "dense_vectors", {}),
             "_prepared_corpus": previous.corpus,
             "traversal_thinking": _thinking(thinking_traversal, "thinking_traversal"),
             "synthesis_thinking": _thinking(thinking_synthesis, "thinking_synthesis"),
