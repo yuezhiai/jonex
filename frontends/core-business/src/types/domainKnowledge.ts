@@ -397,6 +397,8 @@ export interface CreateOntologyInstanceRequest {
   aliases?: string[];
   description?: string;
   attributes?: Record<string, unknown>;
+  /** 来源文档 ID：文档结果页创建时传（实例归属该文档）；KB 级资产页不传 */
+  document_id?: string;
 }
 
 /** 创建本体实例响应（返回已创建的实例行） */
@@ -552,7 +554,7 @@ export interface DocumentChunk {
   chunk_id: string;
   /** chunk 完整文本内容（原 content_summary 已废弃，请用 content） */
   content: string;
-  /** chunk 内容长度（字符数），由 content.length 推导 */
+  /** chunk 内容长度（接口字符数；缺失时由正文推导） */
   content_length: number;
   /** chunk token 数 */
   tokens: number | null;
@@ -562,6 +564,8 @@ export interface DocumentChunk {
   full_doc_id: string | null;
   /** file_source 原始字符串（含 tstart=/tend= 时间锚点） */
   file_path: string;
+  /** 原始文档展示名（Wiki 编译输入片段）。 */
+  file_name?: string;
   /** 视频/音频时间轴起点（秒），来自 file_source tstart= 锚点 */
   time_start: number | null;
   /** 视频/音频时间轴终点（秒），来自 file_source tend= 锚点 */
@@ -586,10 +590,37 @@ export interface DocumentChunk {
   content_summary?: string;
 }
 
+// ─── Parse Quality Types（数据治理 · 解析质量门禁）────────
+
+export type QualityVerdict = 'ok' | 'bad';
+
+/** 列表页批量摘要（不签 md URL）。 */
+export interface DocumentQualitySummary {
+  document_id: string;
+  /** 是否支持解析质量观测；false ⇒ 该文档没有解析质量观测。 */
+  supported: boolean;
+  /** null = 已跑但未产出报告 / 未评估。 */
+  verdict: QualityVerdict | null;
+  /** 档位为 bad 时的判据名（如 page_yield_zero）。 */
+  reasons: string[];
+}
+
+/** 详情页单文档报告：`report` 是引擎 `QualityReport.to_dict()` 的整份。 */
+export interface DocumentQualityReport {
+  supported: boolean;
+  document_id: string;
+  task_id: string | null;
+  status: string | null;
+  report: Record<string, unknown> | null;
+  /** parse.md 证据的短时预签名 URL（键漂移 / 无 md 时为 null）。 */
+  md_url: string | null;
+}
+
 // ─── Manual Datasource Types ────────────────────────────
 
 export interface ManualDocItem {
   id: string;
+  updatedAt?: string;
   name: string;
   type: string;
   size: string;
@@ -609,6 +640,9 @@ export interface ManualDocItem {
   llmWikiCompileStatus?: string;
   /** [jonex] LLM-Wiki 编译失败原因（顶层字段 llm_wiki_compile_error）。 */
   llmWikiCompileError?: string;
+  /** [jonex] 文档粘性入库后端（后端 extra_metadata.ingest_backend；缺省=老文档按 rag）。
+      详情页用它决定是否显示独立的「质量报告」Tab（仅支持的链有质量观测）。 */
+  ingestBackend?: string;
   /** [jonex] 管线类型 lightrag/openkb/jonex_wiki（后端 extra_metadata.kb_type，upload/reparse 时写入）。
       详情页用它随 doc 详情同一次请求到达，消除独立 KB 详情请求慢/失败的竞态窗口
       （「编译结果 tab 首次显示空本体、刷新后才切 Wiki」问题的根因）。 */
@@ -622,6 +656,12 @@ export interface ManualDocItem {
   mimeType?: string;
   /** 派生的媒体类型：video | document。 */
   mediaType?: 'video' | 'document';
+  /** 解析质量：该文档是否支持质量观测（false/缺省 = 不显示质量档位）。 */
+  qualitySupported?: boolean;
+  /** 解析质量档位；null = 已跑但未产出报告 / 未评估。 */
+  qualityVerdict?: QualityVerdict | null;
+  /** 档位为 bad 时的判据名（用于 tooltip）。 */
+  qualityReasons?: string[];
 }
 
 export interface ManualDocListParams {
