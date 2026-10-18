@@ -205,6 +205,10 @@ async def invoke_capability(
         user_id=request.get("user_id"),
         username=request.get("username"),
         ip=request.get("ip"),
+        # 调用方上下文（MCP 的 source/mcp_key_id 等）必须进能力层：
+        # `KnowledgeBaseCapability.execute` 用 `context.mcp_key_id` 判断机器调用，
+        # 决定是否跳过空间判定但仍执行密级守卫。
+        context=request.get("context"),
     )
     # 透传链路追踪 ID（来自 Sidecar 的 X-Request-ID / body.request_id）；
     # 缺失时保留 CapabilityRequest 默认生成的 uuid。

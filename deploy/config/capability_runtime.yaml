@@ -14,6 +14,14 @@ atomic:
   jonex_wiki:
     mode: remote
     # endpoint 留空走 SIDECAR_URL 默认值
+  ontology_compile:
+    mode: remote
+    # endpoint 留空走 SIDECAR_URL 默认值
+    # [jonex] P2 独立容器（atomic.ontology_compile.v1）。**必须声明 remote**：
+    # 未声明时 get_spec 会兜底成 LOCAL，而 `get_ontology_compile_client()` 对 LOCAL
+    # **显式报错**（client.py 只支持 MOCK / REMOTE，不做静默回落）⇒ 调用即失败。
+    # 灰度开关是 ONTOLOGY_COMPILE_BACKEND（库级列 + KB 侧接线）；**P4a 2026-10-17 起
+    #   提交默认已是 `ontology_compile`**（回滚 = 设 `ONTOLOGY_COMPILE_BACKEND=rag` + 重启）。
 # ============================================================
 # 业务能力
 # ============================================================
