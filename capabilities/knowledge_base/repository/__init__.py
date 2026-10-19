@@ -7,6 +7,7 @@ from .answer_feedback_repository import (
     KnowledgeAnswerFeedbackRepository,
 )
 from .document_repository import KnowledgeDocumentRepository, UNCLASSIFIED_SENTINEL
+from .document_version_repository import KnowledgeDocumentVersionRepository
 from .data_source_repository import KnowledgeDataSourceRepository
 from .document_tag_repository import DocumentTagRepository
 from .domain_service_repository import (
@@ -20,6 +21,7 @@ from .ontology_graph_repository import OntologyGraphRepository
 from .ontology_schema_repository import OntologySchemaRepository
 from .ontology_synonym_repository import OntologySynonymRepository
 from .parser_setting_repository import KnowledgeParserSettingRepository
+from .query_image_repository import KnowledgeQueryImageRepository
 from .processing_task_repository import (
     COMPILE_STATUS_MAP,
     EXTRACT_STATUS_MAP,
@@ -34,7 +36,10 @@ from .processing_task_repository import (
     record_compile_task,
     record_processing_task,
 )
-from .search_event_repository import SearchEventRepository
+from .search_event_repository import (
+    SearchEventRepository,
+    safe_record_asset_status_event,
+)
 from .search_feedback_repository import KnowledgeSearchFeedbackRepository
 from .search_history_repository import KnowledgeSearchHistoryRepository
 from .space_repository import SpacePermissionRepository, SpaceRepository
@@ -59,6 +64,7 @@ __all__ = [
     "KnowledgeDataSourceRepository",
     "KnowledgeDocumentRepository",
     "KnowledgeParserSettingRepository",
+    "KnowledgeQueryImageRepository",
     "KnowledgeSearchFeedbackRepository",
     "OntologyGraphRepository",
     "OntologySchemaRepository",
@@ -71,4 +77,5 @@ __all__ = [
     "build_processing_task_id",
     "record_compile_task",
     "record_processing_task",
+    "safe_record_asset_status_event",
 ]

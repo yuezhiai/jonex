@@ -4,6 +4,10 @@
 
 连接的是客户外部桶（与平台 object_storage 无关）。用 boto3（S3 兼容，
 MinIO 通过 endpoint_url 指向 MinIO 服务）。
+
+安全（渗透报告 3.1 / RC-C，SSRF）：``endpoint_url`` 是**用户可控出站目标**，与 api
+适配器**同档** —— 出站前过 ``validate_kb_ingestion_url``（严格档：阻断私网 / 回环 /
+链路本地 / 云元数据；``KB_INGESTION_ALLOWED_HOSTS`` 白名单是逃生阀）。
 """
 from __future__ import annotations
 
@@ -12,8 +16,10 @@ import logging
 from datetime import datetime
 from typing import Any, Optional
 
+from jonex_core.common.config import get_config
 from jonex_core.common.crypto import decrypt_secret
 from jonex_core.common.i18n import translate
+from jonex_core.security.outbound_url_validator import validate_kb_ingestion_url
 
 from .base import RemoteFile
 
@@ -46,6 +52,12 @@ class StorageIngestionAdapter:
                 endpoint = urlunsplit(
                     (parts.scheme, parts.netloc[len(bucket) + 1:], "", "", "")
                 )
+
+        if endpoint:
+            # 用户可控出站目标（endpoint_url）→ 与 api 适配器同档的严格 SSRF 校验。
+            validate_kb_ingestion_url(
+                endpoint, allowed_hosts=get_config().kb_ingestion_allowed_hosts
+            )
 
         return boto3.client(
             "s3",

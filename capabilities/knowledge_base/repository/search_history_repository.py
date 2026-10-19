@@ -5,6 +5,7 @@
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from jonex_core.common.repository import BaseRepository
 
@@ -12,6 +13,32 @@ from ..models import KnowledgeSearchHistory, build_query_hash
 
 # [jonex] 检索历史单用户保留上限：超过后自动软清理最早记录
 MAX_HISTORY_PER_USER = 200
+
+# [jonex] 列表视图列：**不含快照三件套**（answer / references / reasoning）。
+# 这三列是 TOAST 存储的大对象——实测单用户 18 条历史的 references 原始 JSON 就
+# 102 KB（其中 97% 是 locations[].text，即整段 chunk 正文）。列表把它们排除在
+# SELECT 之外有两个好处：响应体积降下来；这些大字段不从 TOAST 读进 shared
+# buffers（一读就会把缓冲区占用抬上去，挤掉本该缓存的索引页）。
+# ⚠️ 与 `KnowledgeSearchHistory.to_dict(include_snapshot=False)` 成对使用。
+_LIGHT_COLUMNS = (
+    KnowledgeSearchHistory.id,
+    KnowledgeSearchHistory.tenant_id,
+    KnowledgeSearchHistory.user_id,
+    KnowledgeSearchHistory.domain_space_id,
+    KnowledgeSearchHistory.query,
+    KnowledgeSearchHistory.query_hash,
+    KnowledgeSearchHistory.knowledge_base_id,
+    KnowledgeSearchHistory.mode,
+    KnowledgeSearchHistory.top_k,
+    KnowledgeSearchHistory.status,
+    KnowledgeSearchHistory.reference_count,
+    KnowledgeSearchHistory.result_count,
+    KnowledgeSearchHistory.duration_ms,
+    KnowledgeSearchHistory.extra_metadata,
+    KnowledgeSearchHistory.searched_at,
+    KnowledgeSearchHistory.created_at,
+    KnowledgeSearchHistory.updated_at,
+)
 
 
 def _strip_raw_urls(refs: list) -> list:
@@ -49,19 +76,31 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         offset: int = 0,
         limit: int = 20,
         domain_space_id: str | None = None,
+        history_id: str | None = None,
+        with_snapshot: bool = True,
     ) -> list[KnowledgeSearchHistory]:
+        """按 tenant/user 列历史。
+
+        - `history_id` 非空 → 只取这一条（主键条件），忽略 offset/limit；
+        - `with_snapshot=False` → **不 SELECT 快照三件套**（见 `_LIGHT_COLUMNS`），
+          调用方必须用 `to_dict(include_snapshot=False)` 取值，否则会触发懒加载。
+        """
         conditions = [
             KnowledgeSearchHistory.tenant_id == self._tenant_id(tenant_id),
             KnowledgeSearchHistory.user_id == user_id,
             KnowledgeSearchHistory.is_deleted == 0,
         ]
+        if history_id:
+            conditions.append(KnowledgeSearchHistory.id == history_id)
         if knowledge_base_id:
             conditions.append(KnowledgeSearchHistory.knowledge_base_id == knowledge_base_id)
         if domain_space_id is not None:
             conditions.append(KnowledgeSearchHistory.domain_space_id == domain_space_id)
+        stmt = select(KnowledgeSearchHistory)
+        if not with_snapshot:
+            stmt = stmt.options(load_only(*_LIGHT_COLUMNS))
         stmt = (
-            select(KnowledgeSearchHistory)
-            .where(*conditions)
+            stmt.where(*conditions)
             .order_by(KnowledgeSearchHistory.searched_at.desc())
             .offset(offset)
             .limit(limit)
@@ -136,10 +175,14 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         tenant_id: str,
         user_id: str,
         keep: int = MAX_HISTORY_PER_USER,
-    ) -> int:
-        """该用户检索历史超过 keep 条时，软删除最早记录，返回删除条数。
+    ) -> list[str]:
+        """该用户检索历史超过 keep 条时，软删除最早记录，返回**被删的 id 列表**。
 
         在 save 后调用：保留最新 keep 条，其余（含同一问题的更早记录）标记 is_deleted=1。
+
+        [jonex] 以图问知识：返回值由「删除条数」改成「被删 id」——
+        调用方要用这些 id 去释放它们独占的查询图片（D9）。
+        `RETURNING` 而不是先查后删：多一次往返，且中间可能被别的写入插队。
         """
         conditions = [
             KnowledgeSearchHistory.tenant_id == self._tenant_id(tenant_id),
@@ -154,15 +197,16 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         )
         keep_ids = set((await self.session.execute(stmt_ids)).scalars())
         if not keep_ids:
-            return 0
+            return []
         stmt = (
             update(KnowledgeSearchHistory)
             .where(*conditions, KnowledgeSearchHistory.id.not_in(keep_ids))
             .values(is_deleted=1, updated_at=func.now())
+            .returning(KnowledgeSearchHistory.id)
         )
         result = await self.session.execute(stmt)
         await self.session.flush()
-        return result.rowcount or 0
+        return list(result.scalars())
 
     async def delete_for_user(
         self,
@@ -172,6 +216,9 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         history_id: str,
         domain_space_id: str | None = None,
     ) -> bool:
+        """软删单条。**签名不变** —— 被删的 id 就是入参 `history_id`，
+        调用方不需要额外返回值（F22：三处方法改造量不同，这里最小）。
+        """
         history = await self.get_by_id(history_id, tenant_id)
         if (
             not history
@@ -187,19 +234,35 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
     async def clear_for_user(
         self, tenant_id: str, user_id: str, knowledge_base_id: str,
         domain_space_id: str | None = None,
-    ) -> int:
-        histories = await self.list_by_user(
-            tenant_id,
-            user_id,
-            knowledge_base_id=knowledge_base_id,
-            offset=0,
-            limit=1000,
-            domain_space_id=domain_space_id,
+    ) -> list[str]:
+        """清空该用户的历史，返回**被删的 id 列表**。
+
+        [jonex] 2026-10-09 重写（F22 存量问题 + D17）：
+        - 原实现是 `list_by_user(limit=1000)` 再逐行 ORM 置删 —— **超过 1000 条时
+          一次清空清不干净**（每用户上限 200 条时不会触发，但那是巧合不是保证）。
+          改成一条批量 UPDATE，天然没有条数上限；
+        - 返回 id 列表（不再是条数），调用方据此释放独占的查询图片（D9）；
+        - 筛选条件与 `list_by_user` **逐条对齐**（tenant / user / is_deleted，
+          以及可选的 kb / space），否则会删到别的空间的历史。
+        """
+        conditions = [
+            KnowledgeSearchHistory.tenant_id == self._tenant_id(tenant_id),
+            KnowledgeSearchHistory.user_id == user_id,
+            KnowledgeSearchHistory.is_deleted == 0,
+        ]
+        if knowledge_base_id:
+            conditions.append(KnowledgeSearchHistory.knowledge_base_id == knowledge_base_id)
+        if domain_space_id is not None:
+            conditions.append(KnowledgeSearchHistory.domain_space_id == domain_space_id)
+        stmt = (
+            update(KnowledgeSearchHistory)
+            .where(*conditions)
+            .values(is_deleted=1, updated_at=func.now())
+            .returning(KnowledgeSearchHistory.id)
         )
-        for history in histories:
-            history.is_deleted = 1
+        result = await self.session.execute(stmt)
         await self.session.flush()
-        return len(histories)
+        return list(result.scalars())
 
 
 __all__ = ["KnowledgeSearchHistoryRepository"]

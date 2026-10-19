@@ -14,6 +14,7 @@ from jonex_core.common.audit_enums import ResourceType
 from jonex_core.common.exceptions import (
     InvalidParameterError,
     PermissionDeniedError,
+    ResourceConflictError,
     ResourceNotFoundError,
 )
 from jonex_core.common.i18n import translate
@@ -22,7 +23,10 @@ from jonex_core.common.tenant import require_tenant
 from ..models.data_source import KnowledgeDataSource
 from ..models.knowledge_info import KnowledgeInfo
 from ..repository.data_source_repository import KnowledgeDataSourceRepository
-from ..repository.knowledge_info_repository import KnowledgeInfoRepository
+from ..repository.knowledge_info_repository import (
+    KnowledgeInfoRepository,
+    cleanup_kb_residue,
+)
 # [jonex] 权限重构 B3：KB 资源身份取值的**唯一定义点**在 kb_permission_service。
 # 这里 import 常量而非另写字面量 —— 原先本文件里散落着 ("kb_manager","editor","viewer")
 # 三处独立的元组/字典，加减层级时必然漏改。
@@ -33,9 +37,86 @@ from .kb_permission_service import KB_MANAGER, KB_MEMBER, _KB_ROLE_RANK
 # （两级校验 + 两个错误码），本文件不再直接判集合，避免又出现第二个判定点。
 from .kb_type_service import LLM_WIKI_TYPES, resolve_creatable_kb_type
 
+# [jonex] 知识库名称 / 描述长度上限（2026-10-16）。**唯一判定点**，create / update 共用。
+#
+# 与 DB 列宽（`knowledge_info.name` VARCHAR(255) / `description` TEXT）不是一回事：
+#   · > 255 的名称撞 DB 列宽，asyncpg 抛 DataError，一路冒到调用方只剩「执行失败」；
+#   · 51~255 的名称**静默成功**落库 —— 越过了产品口径却没人拦。
+# 50 / 200 是产品口径，必须由服务层给可读文案；DB 列宽不动（存量数据可能更长，
+# 收窄列宽只会把"报错"从应用层挪回 DB 层）。
+KB_NAME_MAX_LENGTH = 50
+KB_DESCRIPTION_MAX_LENGTH = 200
+
+
+def _check_text_lengths(name: str | None = None, description: str | None = None) -> None:
+    """名称 / 描述超长即抛 `InvalidParameterError`（业务可读文案，不是「执行失败」）。
+
+    ⚠ 名称按 **strip 后**长度判定：create / update 都先 strip 再落库（见 create 内注释），
+    这里若按原始串判，`"<50 字> "`（尾随空格）会被拦，而它入库后正好 50 字 —— 写入口径
+    与校验口径分叉。描述原样判定（写入路径也不 strip）。
+
+    非字符串值直接跳过：那不是"长度"问题，交给下游既有的类型路径，不在这里改口径。
+    """
+    checks = (
+        (name.strip() if isinstance(name, str) else "",
+         KB_NAME_MAX_LENGTH, "err.kb.name_too_long", "知识库名称"),
+        (description if isinstance(description, str) else "",
+         KB_DESCRIPTION_MAX_LENGTH, "err.kb.description_too_long", "知识库描述"),
+    )
+    for value, max_length, msg_key, label in checks:
+        if len(value) > max_length:
+            raise InvalidParameterError(
+                message=translate(
+                    msg_key,
+                    params={"max": max_length, "actual": len(value)},
+                    fallback=f"{label}不能超过 {max_length} 个字符（当前 {len(value)} 个）",
+                )
+            )
+
 
 class KnowledgeInfoService:
     """知识库信息 CRUD"""
+
+    async def _ensure_name_unique(
+        self,
+        session,
+        tenant_id: str,
+        space_id: str,
+        name: str,
+        exclude_id: str | None = None,
+    ) -> None:
+        """校验知识库名称在同一领域空间内唯一（仅约束未删除记录）。
+
+        [jonex] 与 DB 的 partial unique index `uq_kb_info_name_per_space`
+        （`deploy/postgres/update/055_knowledge_info_name_unique.sql`）**同口径**：
+        `tenant_id + space_id + name + is_deleted = 0`。
+        两者职责不同，缺一不可 ——
+          * 这一层负责**说人话**：DB 只能给出约束名，给不出「该领域空间内已存在同名知识库」；
+          * 索引负责**兜住并发窗口**：两个请求同时 select 都查不到、再同时 INSERT。
+
+        ⚠ 改这里的条件时必须同步改索引的列，否则两层判定分叉：应用层放行、索引拒绝，
+        用户看到的是不可读的 IntegrityError；反过来则是两条重名真的并存。
+        """
+        name = (name or "").strip()
+        conditions = [
+            KnowledgeInfo.tenant_id == tenant_id,
+            KnowledgeInfo.space_id == space_id,
+            KnowledgeInfo.name == name,
+            KnowledgeInfo.is_deleted == 0,
+        ]
+        if exclude_id:
+            conditions.append(KnowledgeInfo.id != exclude_id)
+        result = await session.execute(
+            select(KnowledgeInfo.id).where(*conditions).limit(1)
+        )
+        if result.scalar_one_or_none() is not None:
+            raise ResourceConflictError(
+                message=translate(
+                    "err.kb.name_exists",
+                    params={"name": name},
+                    fallback=f"该领域空间内已存在同名知识库: {name}",
+                )
+            )
 
     async def create(self, tenant_id: str, data: dict) -> dict:
         tenant_id = require_tenant(tenant_id)
@@ -53,7 +134,15 @@ class KnowledgeInfoService:
                     fallback="请先选择知识库所属的领域空间",
                 ),
             )
-        kb_name = data["name"]
+        # [jonex] 名称统一 strip 后写入：查重按 strip 比对（见 _ensure_name_unique），
+        # 写入若保留首尾空格，`"测试"` 与 `"测试 "` 就会作为两个名字并存 ——
+        # 应用层看起来"查过重了"，实际还是漏。前端提交前已 trim，此处把口径钉在服务层。
+        kb_name = (data["name"] or "").strip()
+
+        # [jonex] 长度上限（2026-10-16）：放在 kb_type 解析之前 —— 长度是**请求自身**的
+        # 属性，不该受本部署的 `capability_runtime` / 开关配置影响，也没必要为一个
+        # 明显非法的名字去解析"允许建哪类库"。
+        _check_text_lengths(kb_name, data.get("description"))
 
         # [jonex] kb_type 校验：裸 dict 透传无类型校验，非法值会静默降级。
         # 两级、两个错误码，都在 `resolve_creatable_kb_type()` 里（单一判定点）：
@@ -64,6 +153,10 @@ class KnowledgeInfoService:
 
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
+            # [jonex] 同空间重名校验（2026-10-16）：必须在 INSERT 之前。
+            # 放在配额校验**之前**是刻意的 —— 查重是一次廉价的索引查询，
+            # 没必要先拿配额 advisory lock 再告诉用户"名字重复了"。
+            await self._ensure_name_unique(session, tenant_id, space_id, kb_name)
             # [jonex] 配额：新建知识库前校验单租户 KB 数量（advisory lock 原子化）。
             from .quota_service import QuotaService
             await QuotaService().check_kb_creation(session, tenant_id)
@@ -481,15 +574,42 @@ class KnowledgeInfoService:
                         ),
                     ),
                 )
+        # [jonex] 长度上限（2026-10-16）：与上面的 kb_type / ingest_backend 闸门同一纪律
+        # —— 非法值不去读库。判据用 `updatable` 而不是直接看 data：白名单是"这个字段到底
+        # 受理不受理"的唯一口径，调用方身份（kb_granted）变了这里自动跟随，不会出现
+        # "字段被静默丢弃、却先为它报了个长度错"的错位。
+        _check_text_lengths(
+            name=data.get("name") if "name" in updatable else None,
+            description=data.get("description") if "description" in updatable else None,
+        )
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
-            await repo.get_required(kb_id, tenant_id)
+            # [jonex] 接住返回值：搬迁校验要读 obj.space_id / obj.name 作为"目标值缺省来源"。
+            obj = await repo.get_required(kb_id, tenant_id)
             values = {k: v for k, v in data.items() if k in updatable and v is not None}
             # [jonex] `ingest_backend` 的显式 None 是**撤销**（回到跟随服务端开关）；
             # 其余字段的 None 仍是「不更新」—— 不特判的话这个设置只能设不能撤，
             # 撤销只能去改库，等于把它做成单向门。
             if "ingest_backend" in updatable and data.get("ingest_backend", "missing") is None:
                 values["ingest_backend"] = None
+            # [jonex] 同空间重名校验（2026-10-16）：只在真的动 name / space_id 时查。
+            #
+            # ⚠ **必须用"目标 space_id"**：`space_id` 在本文件的 updatable 白名单里
+            # （知识库可跨空间搬迁），而领域服务那边没有这一项 —— 照抄
+            # `DomainServiceService` 的 `obj.space_id` 写法会漏掉
+            # 「搬进一个已有同名知识库的空间」这条路径：查的是旧空间，查不到冲突，
+            # 放行，目标空间出现重名。前端编辑知识库时会真的带上 space_id
+            # （`DomainKnowledge/index.tsx` 的 data 对象 create/update 共用），
+            # 所以这是活路径。
+            if "name" in values or "space_id" in values:
+                target_space_id = values.get("space_id", obj.space_id)
+                target_name = (values.get("name", obj.name) or "").strip()
+                if "name" in values:
+                    # 与 create 同口径：查重按 strip 比对，写入也用 strip 后的值
+                    values["name"] = target_name
+                await self._ensure_name_unique(
+                    session, tenant_id, target_space_id, target_name, exclude_id=kb_id,
+                )
             if values:
                 obj = await repo.update(kb_id, tenant_id, **values)
                 await session.commit()
@@ -502,6 +622,11 @@ class KnowledgeInfoService:
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
             await repo.get_required(kb_id, tenant_id)
+
+            # 删库残留清理：文档行/配置/派生关联/对象存储。
+            # 检索索引不在这里清（归文档删除链路与任务看门狗）。
+            residue = await cleanup_kb_residue(session, tenant_id, kb_id)
+
             await repo.delete_soft(kb_id, tenant_id)
 
             # 级联：硬删该 KB 的授权记录
@@ -520,7 +645,38 @@ class KnowledgeInfoService:
                 await syn_repo.delete_soft(group)
 
             await session.commit()
-            return {"deleted": True}
+
+        # 对象存储放在事务提交后 best-effort 清理：失败时文档行仍保留
+        # `storage_key`（软删不清列），可据此重试；不能因为一个对象失败就回滚删库。
+        from jonex_core.common.object_storage import (
+            get_object_storage,
+            get_object_storage_for,
+        )
+
+        storage_failed = 0
+        for item in residue.get("storage", []):
+            key = item.get("key")
+            if not key:
+                continue
+            backend = item.get("backend")
+            try:
+                storage = get_object_storage_for(backend) if backend else get_object_storage()
+                await storage.delete(key)
+            except Exception:
+                storage_failed += 1
+                logger.warning(
+                    "Failed to delete storage object %s for deleted KB %s",
+                    key, kb_id, exc_info=True,
+                )
+
+        summary = {
+            "documents": residue.get("documents", 0),
+            "document_tags": residue.get("document_tags", 0),
+            "soft_deleted": residue.get("soft_deleted", {}),
+            "deleted": residue.get("deleted", {}),
+            "storage_failed": storage_failed,
+        }
+        return {"deleted": True, "cleanup": summary}
 
     async def get_kb_space_id(self, kb_id: str, tenant_id: str) -> str | None:
         """KB → space_id（权限管理判定用）；KB 不存在返回 None。"""

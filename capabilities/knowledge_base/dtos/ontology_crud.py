@@ -18,7 +18,13 @@ except ImportError:
 
 
 class CreateOntologyInstanceRequest(BaseModel):
-    """创建本体实例请求。"""
+    """创建本体实例请求。
+
+    `document_id` 区分两个入口的语义（**可选**）：
+    - 从**文档结果页**建（带 docId）→ 写进节点的 `doc_ids`，该文档的本体视图
+      （`GET /ontology/instances?document_id=` 按 `$doc_id IN e.doc_ids` 过滤）就能看到；
+    - 从 **KB 级「编译资产」tab** 建（不带）→ `doc_ids=[]`，属于全库实例，不归属任何文档。
+    """
 
     knowledge_base_id: str = Field(..., min_length=1, description="知识库 ID")
     entity_type: str = Field(..., min_length=1, description="实体类型")
@@ -26,6 +32,9 @@ class CreateOntologyInstanceRequest(BaseModel):
     aliases: Optional[list[str]] = Field(default=None, description="别名列表")
     description: Optional[str] = Field(default=None, description="实例描述")
     attributes: Optional[dict] = Field(default=None, description="扩展属性")
+    document_id: Optional[str] = Field(
+        default=None, description="来源文档 ID（从文档页创建时带；写入 doc_ids 关联）"
+    )
 
 
 class UpdateOntologyInstanceRequest(BaseModel):
@@ -46,7 +55,12 @@ class DeleteOntologyInstanceRequest(BaseModel):
 
 
 class CreateOntologyRelationRequest(BaseModel):
-    """创建本体关系请求。"""
+    """创建本体关系请求。
+
+    `document_id` 与实例同口径：文档页建的关系写进 `r.doc_ids`（该文档的关系视图按
+    `$doc_id IN r.doc_ids` 过滤），KB 级资产页建的写 `[]`。两端自动补的 stub 实体也
+    沿用同一个 doc（与抽取侧 merge_relation 一致）。
+    """
 
     knowledge_base_id: str = Field(..., min_length=1, description="知识库 ID")
     source_entity_type: str = Field(..., min_length=1, description="源实体类型")
@@ -55,6 +69,9 @@ class CreateOntologyRelationRequest(BaseModel):
     target_entity_type: str = Field(..., min_length=1, description="目标实体类型")
     target_canonical_name: str = Field(..., min_length=1, description="目标实体规范名称")
     attributes: Optional[dict] = Field(default=None, description="扩展属性")
+    document_id: Optional[str] = Field(
+        default=None, description="来源文档 ID（从文档页创建时带；写入 doc_ids 关联）"
+    )
 
 
 class UpdateOntologyRelationRequest(BaseModel):

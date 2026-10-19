@@ -18,6 +18,7 @@ except ImportError:
 class SourceLocation(BaseModel):
     """知识来源在原文档中的精确位置。"""
 
+    evidence_ref: Optional[dict[str, Any]] = None
     type: str = "chunk"  # chunk | char | page | timestamp | table_row | image
     chunk_index: Optional[int] = None
     char_start: Optional[int] = None
@@ -61,6 +62,9 @@ class SourceReference(BaseModel):
     locations[] 收纳多个位置信息。
     """
 
+    query_id: Optional[str] = None
+    evidence_handle: Optional[str] = None
+    bundle_sha: Optional[str] = None
     doc_id: str
     kb_id: Optional[str] = None
     kb_name: Optional[str] = None  # [jonex] 知识库名称（冗余，方便前端展示，无需二次查询）

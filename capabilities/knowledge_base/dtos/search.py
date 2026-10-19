@@ -1,6 +1,6 @@
 """Knowledge Base search DTOs."""
 
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 
 try:
     from pydantic.v1 import BaseModel, Field, validator
@@ -118,6 +118,7 @@ class LlmWikiSearchRequest(BaseModel):
 class JonexWikiSearchRequest(BaseModel):
     """jonex_wiki 管线检索请求（只查 jonex_wiki 管线）"""
     query: str = Field(..., min_length=1, max_length=2000)
+    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
     mode: str = Field(default="hybrid", min_length=1, max_length=32)
 
     @validator("mode")

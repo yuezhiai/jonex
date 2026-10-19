@@ -45,7 +45,8 @@ class OntologySchemaRepository:
             binding.template_domain_id = template_domain_id
             binding.template_scenario_id = template_scenario_id
             binding.source_type = source_type
-            binding.updated_at = datetime.now(timezone.utc)
+            # 同 `mark_schema_outdated`：naive 列不能赋 aware datetime。
+            binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         else:
             binding = OntologyTemplateBinding(
                 tenant_id=require_tenant(tenant_id),
@@ -211,7 +212,10 @@ class OntologySchemaRepository:
         if schema is None:
             return False
         schema.sync_status = "outdated"
-        schema.updated_at = datetime.now(timezone.utc)
+        # 列是 TIMESTAMP WITHOUT TIME ZONE（`TimestampMixin` 的 DateTime），
+        # 赋 aware datetime 会让 asyncpg 抛「can't subtract offset-naive and
+        # offset-aware datetimes」，表现为发布联动「执行失败」。
+        schema.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await self.session.flush()
         return True
 

@@ -50,6 +50,47 @@ def _match_by_file_name(items: list, file_name: str) -> list:
     ]
 
 
+async def find_rag_doc_ids_by_document(
+    get_client,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+) -> list | None:
+    """按 `doc=<id>` 锚点反查 LightRAG doc_ids（B11）。
+
+    LightRAG 的 `/documents/paginated` 有 jonex 扩展 `doc_id`：按 `file_source`
+    里的 `doc=<id>` 锚点过滤。部分 chunk 文档的 `file_name` 为 null，关键词筛选
+    永远筛不到它们，必须走这个过滤。
+
+    **三态**（与 `find_rag_doc_ids` 的「失败即空」不同，这里不能合并）：
+    - `list`（可空）：查询成功；`[]` = 确认没有该文档的旧内容；
+    - `None`：查询失败 —— 调用方**必须拒绝**清旧/重解析，不能把「查不了」
+      当成「没有」。
+    """
+    if not knowledge_base_id or not document_id:
+        return []
+    try:
+        result = await get_client().get_storage_documents(
+            knowledge_base_id=knowledge_base_id,
+            tenant_id=tenant_id,
+            page=1,
+            page_size=PAGE_SIZE,
+            document_id=document_id,
+        ) or {}
+        items = result.get(DOCS_KEY) or []
+        # 服务端已按 doc_id 过滤；这里再匹配一次，防旧版服务端忽略该参数时
+        # 把整页文档当成命中。
+        matched = _match_by_document_id(items, document_id)
+        return [item["id"] for item in matched if item.get("id")]
+    except Exception:
+        logger.error(
+            "Storage lookup by document failed: doc_id=%s", document_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def find_rag_doc_ids(
     get_client,
     *,

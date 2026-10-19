@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 """数据源应用服务（CRUD / 测试连接 / 立即同步 / 入站推送）。"""
-import json
 import logging
 import os
 import re
@@ -12,6 +11,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
+from jonex_core.common.config import get_config
 from jonex_core.common.crypto import (
     decode_ingest_key,
     encrypt_secret,
@@ -28,12 +28,14 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.i18n import translate
 from jonex_core.common.object_storage import get_object_storage
 from jonex_core.common.tenant import require_tenant
+from jonex_core.security.outbound_url_validator import validate_kb_ingestion_url
 
 from ..models.data_source import KnowledgeDataSource
 from ..repository.data_source_repository import KnowledgeDataSourceRepository
 from ..repository.document_repository import KnowledgeDocumentRepository
 from .document_service import DocumentService
 from .ingestion import get_ingestion_adapter
+from .ingestion.api_adapter import validate_api_config
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +79,16 @@ class DataSourceService:
 
     # ── 内部：endpoint 校验 ──
     def _validate_endpoint(self, access_type: str, cfg: dict, *, require: bool = False) -> None:
-        """校验 config_json.endpoint 为合法 http/https URL（后端兜底前端拦截）。
+        """校验 config_json.endpoint 为合法 http/https URL 并做 SSRF 网段判定。
 
-        - api 出站：endpoint 必填（create 时 require=True）。
+        - api 出站：endpoint 必填（create 时 require=True）；另校验 method 白名单与
+          auth.header_name（见 ``validate_api_config``）；
         - storage 出站：endpoint 可选（AWS S3 走默认端点），填了必须合法。
+
+        ``_is_valid_http_url`` 只做**格式预检**（职责分离），私网 / 回环 / 链路本地 /
+        云元数据的网段判定统一交给 ``validate_kb_ingestion_url``（严格档，违规抛
+        ``InvalidTargetUrlError``(1007)）；需要拉内网源时由部署方用
+        ``KB_INGESTION_ALLOWED_HOSTS`` 白名单显式放行（安全默认 + 逃生阀）。
         """
         if access_type not in ("api", "storage"):
             return
@@ -97,6 +105,11 @@ class DataSourceService:
                 "err.datasource.invalid_endpoint",
                 fallback="Endpoint 格式错误，需以 http:// 或 https:// 开头",
             ))
+        if access_type == "api":
+            validate_api_config(cfg)
+        validate_kb_ingestion_url(
+            endpoint, allowed_hosts=get_config().kb_ingestion_allowed_hosts
+        )
 
     # ── CRUD ──
     async def list_sources(self, tenant_id: str, kb_id: str) -> dict:

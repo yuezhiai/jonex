@@ -96,6 +96,17 @@ def kb_type_options() -> dict[str, Any]:
     return {"kb_types": ordered, "default": ordered[0]}
 
 
+def normalize_kb_type(raw: str | None) -> str:
+    """把 ``kb_type`` 收口成 canonical 形态：去首尾空白 + 小写。
+
+    **只做大小写/空白归一，不做别名猜测**（``jonex-wiki`` 不会被悄悄改成
+    ``jonex_wiki``）：``kb_type`` 创建后不可变，猜错代价高；未知值仍由
+    ``resolve_creatable_kb_type`` 明确拒绝。读取侧同样走这里，避免历史库里的
+    `` OpenKB `` 被当成未知类型、落进 lightrag 分支。
+    """
+    return (raw or "").strip().lower()
+
+
 def resolve_creatable_kb_type(raw: str | None) -> str:
     """把请求里的 ``kb_type`` 解析成本次**允许创建**的类型；不允许则抛业务异常。
 
@@ -105,8 +116,9 @@ def resolve_creatable_kb_type(raw: str | None) -> str:
     * 值认识但**本部署禁用**（运维配置）→ ``err.kb.kb_type_disabled``
 
     缺省值也走同一道闸门：``kb_type`` 创建后不可变，**不能替用户改选**成别的类型。
+    大小写与首尾空白先归一（`` OpenKB `` → ``openkb``），但不接受连字符等别名。
     """
-    value = (raw or "").strip() or DEFAULT_KB_TYPE
+    value = normalize_kb_type(raw) or DEFAULT_KB_TYPE
     if value not in VALID_KB_TYPES:
         raise InvalidParameterError(
             message=translate(
@@ -141,7 +153,7 @@ async def get_kb_type(tenant_id: str, kb_id: str) -> str:
             )
         )
         row = result.first()
-    return row[0] if row else DEFAULT_KB_TYPE
+    return normalize_kb_type(row[0]) if row else DEFAULT_KB_TYPE
 
 
 async def get_kb_type_or_none(tenant_id: str, kb_id: str) -> Optional[str]:
@@ -165,7 +177,7 @@ async def get_kb_type_or_none(tenant_id: str, kb_id: str) -> Optional[str]:
             )
         )
         row = result.first()
-    return (row[0] or None) if row else None
+    return (normalize_kb_type(row[0]) or None) if row else None
 
 
 async def get_kb_ingest_backend(tenant_id: str, kb_id: str) -> Optional[str]:
@@ -177,14 +189,41 @@ async def get_kb_ingest_backend(tenant_id: str, kb_id: str) -> Optional[str]:
     rag」—— 判据就少了一层，库级设置从此只是「碰巧与回落值相同」时才成立。
     所以**不要**好心给它加 `or "rag"` 之类的默认值。
 
-    消费方是 `ingest_backend.resolve_backend(kb_backend)`（**提交时**的库级判据：
-    非 NULL 库值优先，NULL 走 `current_backend()` 读服务端开关）。
+    消费方是 `ingest_backend.resolve_backend(kb_type, storage_backend, kb_backend)`
+    （库值层：仅剩的存储硬回落之下、env 之上；P4b 2026-10-17 起 openkb 边界已移除）。
     """
     if not kb_id:
         return None
     async with get_db_session() as session:
         result = await session.execute(
             select(KnowledgeInfo.ingest_backend).where(
+                KnowledgeInfo.tenant_id == tenant_id,
+                KnowledgeInfo.id == kb_id,
+                KnowledgeInfo.is_deleted == 0,
+            )
+        )
+        row = result.first()
+    return (row[0] or None) if row else None
+
+
+async def get_kb_ontology_compile_backend(tenant_id: str, kb_id: str) -> Optional[str]:
+    """查单个 KB 的 **compile 步**库级派单值（`knowledge_info.ontology_compile_backend`，
+    P2 / 2026-10-17 加）。**形状逐字照 `get_kb_ingest_backend`**（同一张表、同一套回落语义）。
+
+    **查不到 / 列是 NULL 都返回 `None`，绝不回落 `rag`** —— `None` 在这个字段上是一个
+    **合法值**，表示「这个库没表态、跟随服务端开关 `ONTOLOGY_COMPILE_BACKEND`」。
+    回落 `rag` 会把「没表态」读成「明确要 rag」：开关开着时这个库会被静默改走另一条链。
+
+    ⚠ 与 `get_kb_ingest_backend` 是**两把钥匙**（解析链 vs compile 步），不要互相复用：
+    `ingest_backend.resolve_backend` 与 `compile_backend.resolve_compile_backend` 各读各的列。
+
+    消费方是 `compile_backend.resolve_compile_backend(kb_backend=...)`。
+    """
+    if not kb_id:
+        return None
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(KnowledgeInfo.ontology_compile_backend).where(
                 KnowledgeInfo.tenant_id == tenant_id,
                 KnowledgeInfo.id == kb_id,
                 KnowledgeInfo.is_deleted == 0,
@@ -210,4 +249,7 @@ async def get_kb_types(tenant_id: str, kb_ids: list[str]) -> dict[str, str]:
             )
         )
         rows = {row[0]: row[1] for row in result.all()}
-    return {k: rows.get(k) or DEFAULT_KB_TYPE for k in kb_ids}
+    return {
+        k: normalize_kb_type(rows.get(k)) or DEFAULT_KB_TYPE
+        for k in kb_ids
+    }

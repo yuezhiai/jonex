@@ -31,6 +31,7 @@
 from enum import Enum
 
 from sqlalchemy import Column, DateTime, Index, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
 from jonex_core.common.entity import TenantMixin, TimestampMixin
@@ -55,22 +56,64 @@ class TaskCenterDocState(str, Enum):
     """任务中心链正在跑（或刚跑完某一步、在等下一步派活）。"""
 
     RELEASED = "released"
-    """**交接完成**：任务中心那侧不再管这份文档了，接管行交还给既有对账。
+    """**看门狗交还**：运行方不再盯着这一步了 —— 但**任务中心那条链可能还活着**。
 
     三种来源：① 三步都跑完（compile 步 READY）；② 链路判死（任一步失败/超时）；
-    ③ 任务被删（`remove_task`）。**release 之后文档行一个字段都不改** ——
-    文档留在当前状态，下一个 30 秒被既有机器接手（`PARSING` 由
-    `patrol_parsing_timeout` 兜住，`READY` 是稳定态）。
+    ③ 任务被删（`remove_task`）。
+
+    ⚠️ **`released` ≠ 「任务中心不管了」**（2026-10-14 更正）。它只说明**看门狗放弃
+    等待**（典型是 `_abandon` 等满 `TC_NO_DISPATCH_SEC` 之后交还）。交还那一刻任务中心
+    那条链完全可能是活的 —— 实测：`compile` 子任务一直 `pending` 在队列里等全局并发
+    名额，任务还是 `running`，**只是派不出去**。
+
+    所以「这份文档归不归任务中心管」看的是 `MANAGED_STATES`（含本态），**不是本态
+    本身**；旧对账据此决定「能不能替它发起工作」。原 docstring 写的「任务中心那侧不再
+    管这份文档了」是错的 —— 那正是 2026-10-14 那次事故的成因：交还之后旧对账自己把
+    本体抽取跑完了（`metering.llm_usage_log` 16:40 起 31 次 `ontology_extract`），
+    而任务中心那条 `compile` 永远停在「等待中」，两边各记各的账。
+
+    收尾不受影响：文档行一个字段都不改，`PARSING` 仍由 `reconcile_documents` /
+    `patrol_parsing_timeout` 兜住，`READY` 是稳定态。
+
+    ⚠️ 来源 ③（任务被删）**与上面这条口径不自洽**：任务都没了，文档却仍算「归任务中心
+    管」→ 旧对账不许驱动它，而也没有任务能驱动它 = **没人管**。当前任务删除功能未对外
+    开放，故**本期不处理**；**开放删除之前必须先改 `remove_task`**（删掉接管行，或另立
+    一个明确的「彻底交回」态），否则被删任务的文档会被永久搁置。详见 `remove_task` 的
+    docstring。
     """
 
 
-#: 「还在接管中」的两个状态 —— 对账/巡检跳过、用户接管拦截，判据都是它。
+#: 「还在接管中」的两个状态 —— **回答「还有人在为它干活吗」**。
 #:
-#: ⚠️ **不含 `released`**：release 就是交接，跳过的范围必须随之收窄，
-#: 否则交接出去的文档永远不会被既有对账接手。
+#: 消费点：对账/巡检的**收尾**判据（`_takeover_is_in_flight`）、用户接管拦截
+#: （`exists_active`）、看门狗扫描（`list_active`）、`begin_step` / `mark_released`
+#: 的 CAS、jonex_wiki 的 fencing。
+#:
+#: ⚠️ **不含 `released`**，而且**不许**把它换成 `MANAGED_STATES`：本集合要回答的是
+#: 「有没有人在跑」，交还之后确实没人跑了，对账**必须**能看见这些文档去收尾
+#: （否则交还的解析任务没人管，文档永久卡 `parsing`）。「归谁管」是另一个问题，
+#: 见 `MANAGED_STATES`。
 ACTIVE_STATES: tuple[str, str] = (
     TaskCenterDocState.SUBMITTING.value,
     TaskCenterDocState.MANAGED.value,
+)
+
+
+#: 「归任务中心管」的三个状态 —— **回答「这份文档归谁管」**（2026-10-14 加）。
+#:
+#: 与 `ACTIVE_STATES` 的差别只有一个 `released`，但这一格就是全部意义所在：
+#: 交还之后**任务中心仍然管着这份文档**（任务还在，只是它暂时派不出活），所以
+#: **旧对账不许替它发起任何下游工作**（解析 / 本体抽取 / wiki 编译 / 补提交）。
+#: 用户想重跑，走「重新解析 / 重新编译」两个按钮 —— 那两条路会 `rearm_for_step`
+#: 把卡打回 `managed` 并请任务中心重跑，授权链是完整的。
+#:
+#: ⚠️ **专用于旧对账的「发起」闸门**，别拿去当收尾判据 —— 两处用错都会出事：
+#:   · 收尾用本集合 → 交还的文档被判成「有人在管」而永远 skip，永久卡 `parsing`；
+#:   · 发起用 `ACTIVE_STATES` → 就是本次要修的 bug（旧对账替交还的文档发起工作）。
+MANAGED_STATES: tuple[str, str, str] = (
+    TaskCenterDocState.SUBMITTING.value,
+    TaskCenterDocState.MANAGED.value,
+    TaskCenterDocState.RELEASED.value,
 )
 
 
@@ -152,6 +195,25 @@ class TaskCenterDocument(Base, TenantMixin, TimestampMixin):
     #: 而不是 atomic-rag 的执行时长（两个完全不同的东西不能共用一个阈值）。
     rag_task_id = Column(String(128), nullable=True)
 
+    #: **最后一次收口的那份上报报文**（JSONB）。NULL = 还没收口、或收口是**中性**的一次。
+    #:
+    #: 2026-10-11 加，**只服务「管理方主动问」**（`RunnerPort.query_step_status`）。
+    #:
+    #: ⚠️ **为什么存整份报文、而不是只存一个 `success`/`failed` 字样**（用户 2026-10-11 定）：
+    #: 管理方问出「成功了」之后**不能只写个状态** —— 它还要拿这一步的**产出**（`outputs`）
+    #: 去填下一步的输入（`bind_inputs`：比如「解析」的产出里有 `document_id`，「编译」要用），
+    #: 而**产出只有运行方知道**。所以把当初要上报的那份报文**原样存下来、原样回** ——
+    #: 管理方拿到它就能**当一条上报直接消化，零转换、不可能分叉**（形状见协议层
+    #: `StepStatusQuery.report`，与上报口 `ReportStatusRequest` 逐字一致）。
+    #:
+    #: ⚠️ **别拿 `error_message` 代替它**：`error_message` 非空**不等于失败** ——
+    #: `remove_task`（任务被删除）也往那儿写一句说明，但那是**中性**的（既不算成、也不算败）。
+    #:
+    #: **谁写**：成功收口（`mark_step_handled`）写成功报文；判死（`_fail_step` /
+    #: `_fail_document` / `_abandon` → `mark_released(report=...)`）写失败报文；
+    #: 「任务被删除」那种中性收口**不写**（保持 NULL → 管理方问出「这活不归我」）。
+    last_report = Column(JSONB, nullable=True)
+
     #: 看门狗的计时基准。**不是 `created_at`** —— 那个是「接管开始」的时刻，
     #: 而每步的活是从「本步开始」算的，共用一个基准会把前一步的耗时算到后一步头上。
     #:
@@ -177,6 +239,7 @@ class TaskCenterDocument(Base, TenantMixin, TimestampMixin):
             "execution_id": self.execution_id,
             "handled_execution_id": self.handled_execution_id,
             "rag_task_id": self.rag_task_id,
+            "last_report": self.last_report,
             "step_started_at": self.step_started_at.isoformat() if self.step_started_at else None,
             "submit_attempts": self.submit_attempts or 0,
             "error_message": self.error_message,
@@ -233,6 +296,7 @@ class TaskExecutionRegistry(Base, TimestampMixin):
 
 __all__ = [
     "ACTIVE_STATES",
+    "MANAGED_STATES",
     "TaskCenterDocState",
     "TaskCenterDocument",
     "TaskExecutionRegistry",

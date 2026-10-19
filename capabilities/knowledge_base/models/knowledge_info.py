@@ -34,6 +34,16 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     # NULL，行为与从前逐字一致。
     # 建列脚本：`deploy/postgres/update/045_knowledge_info_ingest_backend.sql`。
     ingest_backend = Column(String(32), nullable=True)
+    # [jonex] P2 库级派单值：这个库的 **compile 步**（本体编译）走哪个后端，
+    # `rag`（atomic-rag 现状）/ `ontology_compile`（独立编译服务）。
+    # **NULL 是合法值** = 没表态、跟随服务端开关（`ONTOLOGY_COMPILE_BACKEND`）—— 存量库全是
+    # NULL ⇒ 未设库值即跟随开关（P4a 2026-10-17 起开关缺省已翻为 `ontology_compile`）。
+    # ⚠ 与上一列是**两把钥匙、两个语义**：`ingest_backend` 管解析链，本列管 compile 步；
+    # 前者写进 `extra_metadata["ingest_backend"]`，后者写进 `extra_metadata["ontology_compile_backend"]`。
+    # 建列脚本：`deploy/postgres/update/057_knowledge_info_ontology_compile_backend.sql`。
+    # ⚠ 刻意**不进 `to_dict`**：库级 API 暴露（前端/接口层）是设计 §5.5 的独立项，本期不做
+    # （本期只有列 + env）；读取走 `kb_type_service.get_kb_ontology_compile_backend` 直查列。
+    ontology_compile_backend = Column(String(32), nullable=True)
 
     def to_dict(self, space_name: str = None):
         result = {

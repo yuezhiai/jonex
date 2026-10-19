@@ -8,6 +8,8 @@ AnalyticsService 直接按事件表写 SQL 聚合，本仓储只管 append-only 
 (tenant_id, processing_task_id) 唯一键 upsert（同一任务状态覆盖）。
 """
 
+import logging
+
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,8 @@ from ..models import (
     SearchRequestEvent,
     SearchStepEvent,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SearchEventRepository:
@@ -165,7 +169,16 @@ class SearchEventRepository:
         previous_status: str | None = None,
         reason: str | None = None,
         kb_id: str | None = None,
-    ) -> AssetStatusEvent:
+    ) -> AssetStatusEvent | None:
+        # 门禁：缺租户 / 缺资产 / 缺状态一律不写（绝不落脏行）。
+        # 必须在 `require_tenant` **之前**判 —— 空租户在那里是抛异常，而埋点
+        # 的契约是「写不了就跳过」，不该由一条坏埋点把调用方带崩。
+        if not tenant_id or not asset_id or not status:
+            logger.warning(
+                "asset_status_event 缺关键字段，已跳过：tenant=%r asset=%r status=%r",
+                tenant_id, asset_id, status,
+            )
+            return None
         tenant_id = require_tenant(tenant_id)
         stmt = (
             insert(AssetStatusEvent)
@@ -238,4 +251,49 @@ class SearchEventRepository:
         return result.scalar_one()
 
 
-__all__ = ["SearchEventRepository"]
+async def safe_record_asset_status_event(
+    session: AsyncSession,
+    tenant_id: str,
+    *,
+    asset_id: str,
+    status: str,
+    previous_status: str | None = None,
+    reason: str | None = None,
+    kb_id: str | None = None,
+) -> AssetStatusEvent | None:
+    """写一条状态事件，**写入失败不得污染调用方的主事务**。
+
+    ── 为什么需要 SAVEPOINT（这不是过度设计）──
+
+    PostgreSQL 里一条语句失败后，**整个事务**立刻进入 aborted 状态：后面的任何
+    语句（包括调用方自己的 `flush` / `commit`）都会收到
+    `current transaction is aborted`。所以「`except` 吞掉异常」在 PG 上是假的：
+    异常吞了，事务已经废了，主流程照样崩 —— 只是崩在更远的地方、报一个与埋点
+    毫无关系的错。
+
+    `begin_nested()` = `SAVEPOINT`：事件写入失败只回滚到保存点，主事务继续可用。
+    这与 `record_processing_task` 的「埋点失败不影响主流程」是**同一条契约**，
+    那边只是因为唯一键 upsert 极少失败、且没有 savepoint 兜底，属于已知缺口；
+    状态事件是纯 INSERT，撞约束/类型错误的概率更高，必须按正确形状写。
+
+    返回事件行；被门禁挡下 / 写入失败返回 `None`（调用方不需要关心）。
+    """
+    try:
+        async with session.begin_nested():
+            return await SearchEventRepository(session).record_asset_status_event(
+                tenant_id,
+                asset_id=asset_id,
+                status=status,
+                previous_status=previous_status,
+                reason=reason,
+                kb_id=kb_id,
+            )
+    except Exception:  # noqa: BLE001 — 埋点失败不得影响主流程，但必须留日志
+        logger.warning(
+            "asset_status_event write failed (tenant=%s asset=%s %s -> %s)",
+            tenant_id, asset_id, previous_status, status, exc_info=True,
+        )
+        return None
+
+
+__all__ = ["SearchEventRepository", "safe_record_asset_status_event"]

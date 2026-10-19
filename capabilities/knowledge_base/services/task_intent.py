@@ -23,7 +23,10 @@ Ontology 库一进任务中心，同一个 `step_code == "parse"` 就背上了**
 
 - **写**：只在「提交/发起那一刻」写一次 —— 上传路径
   （`document_service._upload_via_task_center`）写 `upload`，重新解析入口
-  （`document_service.reparse_document`）写 `reparse`。两处都与接管行的写入同一次提交。
+  （`document_service.reparse_document`）写 `reparse`，任务中心的「任务重试」
+  （`task_runner_service._rearm_after_console_retry`）写 `reparse`
+  （它就是「再解析一遍」的语义，且必须与 `reparse_strict` 配套才会真的删掉旧切片）。
+  三处都与接管行的写入**同一次提交**。
 - **读**：只有 handler（`task_runner_service._prepare_step`）读它 —— 它要据此选引擎档位。
   **`不读 env、不猜步骤名`**。看门狗（`task_watch_service`）**已经不读它了**：
   两条链的 `parse` 都推切片，所以「哪一步置 `ready`」不必分来头（2026-09-29 起）。

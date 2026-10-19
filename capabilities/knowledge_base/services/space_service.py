@@ -24,6 +24,7 @@ from ..repository import SpaceRepository
 from .space_permission_service import (
     SPACE_MANAGER,
     SPACE_MEMBER,
+    can_create_space,
     get_write_space_ids,
     is_tenant_admin,
     require_space_manage,
@@ -114,9 +115,14 @@ class SpaceService:
 
     async def create(self, tenant_id: str, data: dict, owner_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
-        # owner 必须可确定（排除「无 user_id 放行」口径）且是租户管理员（tenant:write）——
-        # 收紧终版（2026-08-19）：空间统一由平台/租户管理员创建，再授权给领域服务管理员管理。
-        # 忽略 data["owner_id"]——客户端不能指定 owner（防把空间全权送人）。
+        # owner 必须可确定（排除「无 user_id 放行」口径）。
+        # [jonex] W2（2026-10-19）：准入判据由 `is_tenant_admin` 放宽为
+        # `can_create_space` —— 租户管理员（tenant:admin/platform:admin）**或**
+        # 持有租户级能力码 space:write。原先只认租户管理员，导致租户自建的
+        # 「空间创建」角色（只授 space:write）必然 403，而权限文档里 space:write
+        # 的语义正是「创建/管理领域空间」（PERMISSIONS_REDESIGN §11.3 / §12.3）。
+        # 判据与 list 返回的 can_create_space 同源，前端按字段显示才不会错。
+        # 仍忽略 data["owner_id"]——客户端不能指定 owner（防把空间全权送人）。
         if not owner_id or owner_id == "anonymous":
             raise PermissionDeniedError(
                 message=translate(
@@ -125,7 +131,7 @@ class SpaceService:
                     fallback="创建空间需要租户管理员权限",
                 )
             )
-        if not await is_tenant_admin(tenant_id, owner_id):
+        if not await can_create_space(tenant_id, owner_id):
             raise PermissionDeniedError(
                 message=translate(
                     "err.space.tenant_admin_required",
@@ -251,7 +257,10 @@ class SpaceService:
             return {
                 "items": rows,
                 "total": total, "offset": offset, "limit": limit,
-                "can_create_space": tenant_admin,
+                # [jonex] W2（2026-10-19）：与 create 的准入同源（tenant:admin /
+                # platform:admin 或 space:write）。前端「新建空间」入口按本字段显示，
+                # 二者判据必须一致，否则又会出现「按钮在但点了 403」的不一致。
+                "can_create_space": await can_create_space(tenant_id, user_id),
             }
 
     async def update(self, space_id: str, tenant_id: str, data: dict,

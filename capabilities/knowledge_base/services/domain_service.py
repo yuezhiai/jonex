@@ -438,6 +438,32 @@ class DomainServiceService:
             accessible = await get_accessible_kb_ids(tenant_id, actor_user_id, visible)
             if accessible is not None:
                 kb_ids = [k for k in kb_ids if k in accessible]
+            # [jonex] B6 §5.1：在 KB 可见性之上再叠一层密级过滤。
+            # actor 为 None（MCP/内部链路）时保持原口径，上面整块不进入。
+            if actor_user_id != "anonymous":
+                from jonex_core.security import classification_access as policy
+                from .space_permission_service import is_tenant_admin
+
+                if not await is_tenant_admin(tenant_id, actor_user_id):
+                    async with get_db_session() as session:
+                        max_ranks = await policy.kb_max_level_rank(
+                            session, tenant_id, kb_ids,
+                        )
+                        user_rank = await policy.get_user_max_rank(
+                            session, tenant_id, actor_user_id,
+                            is_tenant_admin=False,
+                        )
+                    if user_rank is not None:
+                        kept = [
+                            k for k in kb_ids
+                            if max_ranks.get(k, 0) <= user_rank
+                        ]
+                        if len(kept) < len(kb_ids):
+                            logger.info(
+                                "服务检索批量跳过：%d 个知识库超密级（service=%s）",
+                                len(kb_ids) - len(kept), service_id,
+                            )
+                        kb_ids = kept
 
         if not kb_ids:
             return {

@@ -253,16 +253,20 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         *,
         execution_id: str,
         release: bool,
+        report: dict | None = None,
     ) -> bool:
         """本步上报成功之后收口（**上报成功才调**，见 `services/task_watch_service.py`）。
 
-        一次 UPDATE 里做四件事，**必须一起做**：
+        一次 UPDATE 里做**五件事**，**必须一起做**：
 
         - `handled_execution_id = execution_id` —— 审计 + 防御性幂等判据
         - `execution_id = NULL` —— 下轮看门狗看到的就是「在等下一步派活」
         - `rag_task_id = NULL` / `step_started_at = NULL` —— 让 `TC_NO_DOWNSTREAM_SEC`
           只衡量任务中心的派活延迟，而不是 atomic-rag 的执行时长
         - `release=True` 时 `state = released` —— compile 步专用（链路终点就是交接）
+        - `last_report = report` —— **最后一次收口的那份上报报文**（2026-10-11 加）：
+          管理方事后主动来问时（`query_step_status`）拿它当一条上报消化。
+          ⚠️ 成功收口**必须带上产出**（`outputs`），否则管理方写了「成功」也派不出下一步
 
         `release=False` 时状态不动（仍是 `managed`）：parse / ingest 后面还有下一步，
         release 了就等于把还在链上的文档提前交还给既有对账，两边会同时动手。
@@ -271,9 +275,10 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         这一列在「等下一步派活」的那段窗口里是**上一步的残留**（看门狗那一档压根不看它）。
 
         ⚠️ **这里曾经有个 `next_step` 形参**，是给「重新解析」那条链补调第二步用的
-        （任务中心的「重跑一步」不连带下游，早先只能由看门狗推着走）。现在那两步由
-        `retry_subtasks`（§4.2 ④）在用户请求里**一次交出去**，先后由任务中心写进依赖
-        —— 补调这条路已经拆掉了，**别再加回来**：两边都推会让同一串步骤重跑两遍。
+        （那时候任务中心的「重跑一步」还不连带下游，只能由看门狗推着走；2026-10-11 起
+        `retry_subtask` 自己会连带下游了）。现在那两步由 `retry_subtasks`（§4.2 ④）
+        在用户请求里**一次交出去**，先后由任务中心写进依赖 —— 补调这条路已经拆掉了，
+        **别再加回来**：两边都推会让同一串步骤重跑两遍。
 
         条件带 `handled_execution_id IS DISTINCT FROM :execution_id`：上报成功后重复
         走到这里是 no-op（第二次 rowcount=0），这正是「上报与清空之间崩掉」那个
@@ -284,6 +289,10 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
             "execution_id": None,
             "rag_task_id": None,
             "step_started_at": None,
+            # 「最后一次收口的那份上报报文」—— 走到这儿就是**成功收口**（失败走
+            # `mark_released`）。管理方主动问时（`query_step_status`）读的就是它，
+            # 拿去当一条上报消化（所以**必须带上产出**，见模型那一列的说明）。
+            "last_report": report,
         }
         if release:
             values["state"] = TaskCenterDocState.RELEASED.value
@@ -307,15 +316,22 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         tenant_id: str,
         task_id: str,
         step_code: str,
+        clear_handled: bool = False,
     ) -> bool:
         """把一份**已经交还**的接管行重新武装起来，等某一步被重跑。
 
-        ## 只服务「重新解析 / 重新编译」这两个按钮
+        ## 三个调用点
 
-        这两个按钮**不是新任务** —— 它们是「把这条任务里的某一步原地重跑一次」
-        （任务中心的 `retry_subtask`，按 `node_id` 寻址）。重跑之前必须先让这一行回到
-        `managed`：handler 的 `_prepare_step` 第一道闸就是「`state IN 在途`」，行还停在
-        `released` 的话，派过来的活会被**显式拒**，子任务直接终态 `failed`。
+        · 「重新解析 / 重新编译」两个按钮（`rearm_for_rerun`）—— **不是新任务**，
+          是「把这条任务里的某一步原地重跑一次」（任务中心 `retry_subtask`，按 `node_id`
+          寻址）；
+        · 任务中心的「**任务重试**」（`task_runner_service._prepare_step` 撞上一张已交还的
+          接管行）—— 整条任务原地重跑，第一个派活又回来了。那种情况下传
+          `clear_handled=True`（理由见下）。
+
+        重跑之前必须先让这一行回到 `managed`：handler 的 `_prepare_step` 第一道闸就是
+        「`state IN 在途`」，行还停在 `released` 的话，派过来的活会被**显式拒**，
+        子任务直接终态 `failed`。
 
         ## 写进去的每一个值都有理由
 
@@ -330,8 +346,26 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         - `error_message=None`：清掉上一次判死的原因，否则一次早已恢复的失败会一直挂在
           这一列上，把排障的人引向错误的方向（`begin_step` 同一条理由）。
 
-        **不动 `handled_execution_id`**：它记的是「上一次被收口的执行编号」，是审计值，
+        **默认不动 `handled_execution_id`**：它记的是「上一次被收口的执行编号」，是审计值，
         下一次 `mark_step_handled` 会覆盖它。在这里顺手清掉只会白丢一段历史。
+
+        ── `clear_handled`（2026-10-10 加，只服务「任务重试」）──
+
+        `True` 时**连它一起清**。两个理由：
+
+        1. **它在新一轮里是「上一轮的事实」，且恰好与一条巡检的判据同形**。
+           `jonex_wiki_service.claim_compile(batch=True)` 有个 carve-out：
+           `current_step='parse' AND execution_id IS NULL AND handled_execution_id IS NOT NULL`
+           —— 含义是「parse 已经收口、可以派批量编译了」。而**刚重新武装、还没 `begin_step`**
+           的行长得一模一样（`current_step` 是上一次的 `parse`、`execution_id` 刚被清空、
+           `handled_execution_id` 还留着上轮的值）→ 巡检会拿上轮的审计值当本次事实，
+           **提前把编译派出去**。清掉它，这个形状就不成立了。
+        2. 语义上它就是该清：重新武装 = **上一轮已经结束、这一轮从头开始**，
+           留着上轮的收口痕迹只会让「这一行的历史」和「这一行的现在」互相矛盾。
+
+        ⚠️ 清掉**不破坏幂等**：`mark_step_handled` 的条件是
+        `handled_execution_id IS DISTINCT FROM :execution_id`，清成 `NULL` 之后
+        第一次上报必然写入（本来就该写）。
 
         ## 条件带 `state == released` 是**安全闸**，不是形式主义
 
@@ -344,6 +378,19 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         了参数（`task_id` 上有唯一索引，它才是「这份文档归哪条任务管」的定位键）。
         宁可 no-op 也不能改错行 —— 改错行的表现是「用户点了 A 文档的按钮、B 文档被重跑」。
         """
+        values = {
+            "state": TaskCenterDocState.MANAGED.value,
+            "current_step": step_code,
+            "execution_id": None,
+            "rag_task_id": None,
+            "step_started_at": None,
+            "error_message": None,
+            # 新一轮开始 —— 上一次的收口报文**作废**（否则管理方来问时会拿到上一轮的
+            # 那份报文，把这一次的「还没跑」读成「已经成了」，还会拿旧产出去派下游）。
+            "last_report": None,
+        }
+        if clear_handled:
+            values["handled_execution_id"] = None
         stmt = (
             update(TaskCenterDocument)
             .where(
@@ -352,14 +399,7 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
                 TaskCenterDocument.task_id == task_id,
                 TaskCenterDocument.state == TaskCenterDocState.RELEASED.value,
             )
-            .values(
-                state=TaskCenterDocState.MANAGED.value,
-                current_step=step_code,
-                execution_id=None,
-                rag_task_id=None,
-                step_started_at=None,
-                error_message=None,
-            )
+            .values(**values)
         )
         result = await self.session.execute(stmt)
         await self.session.flush()
@@ -371,6 +411,7 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         *,
         error_message: str | None = None,
         only_if_idle: bool = False,
+        report: dict | None = None,
     ) -> bool:
         """判死 / 放弃接力：把接管行交还给既有对账（`state = released`）。
 
@@ -411,6 +452,13 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
                 rag_task_id=None,
                 step_started_at=None,
                 error_message=(error_message[:2000] if error_message else None),
+                # 「最后一次收口的那份上报报文」由**调用方给**（`report=`）：
+                #   判死（`_fail_step` / `_fail_document` / `_abandon`）传**失败报文**；
+                #   「任务被删除」那种中性收口**不传** —— 保持 NULL，于是管理方来问时
+                #   会得到「这活不归我」（既不算成、也不算败，与它的语义一致）。
+                # ⚠️ 不传就是**写 NULL**（不是「别动」）—— 中性收口确实该把上一次的
+                # 报文抹掉，否则一份旧的失败报文会一直挂在那儿骗后来的查询。
+                last_report=report,
             )
         )
         result = await self.session.execute(stmt)

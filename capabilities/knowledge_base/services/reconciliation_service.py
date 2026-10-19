@@ -15,7 +15,11 @@ import os
 import re
 import time
 from datetime import datetime, timedelta
+from typing import Optional
 
+from jonex_core.capability.atomic.ontology_compile.client import (  # [jonex] P2 compile 步新后端
+    get_ontology_compile_client,
+)
 from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.common.audit import schedule_emit
 from jonex_core.common.audit_enums import ResourceType
@@ -26,7 +30,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.neo4j_client import get_neo4j_driver
 
 from ..models import DocStatus, OntologyStatus
-from ..models.task_center import ACTIVE_STATES
+from ..models.task_center import ACTIVE_STATES, MANAGED_STATES
 from ..ontology_write_state import clear_ontology_write_state
 from ..repository import (
     KnowledgeDocumentRepository,
@@ -37,7 +41,7 @@ from ..repository.ontology_graph_repository import (
     _is_transient_error,
     _write_retry_base_delay,
 )
-from . import ingest_backend  # [jonex] 粘性值判据 + 任务存活白名单
+from . import compile_backend, ingest_backend  # [jonex] P2：compile 步后端 + 粘性值判据
 from .document_service import DocumentService  # [jonex] O7 残留扫描复用
 from .kb_type_service import LLM_WIKI_TYPES  # [jonex] llm-wiki 子集 {openkb, jonex_wiki}
 from .rag_storage_lookup import find_rag_doc_ids
@@ -215,10 +219,10 @@ async def _fetch_task_status(tenant_id: str, kb_id: str, task_id: str,
       ③ HTTP 抛异常 → 回退磁盘。
     两条路都拿不到时返回 None，调用方保持原有降级语义。
 
-    `doc`（文档行）与 `force_backend` 一起声明这条 `task_id` 属于哪条链，判据函数
-    是 `ingest_backend.backend_for_document`。当前注册的后端只有 `rag` 一条
-    （`ingest_backend.VALID_BACKENDS`），函数体内没有分派可做 —— 两个参数是
-    **表态机制**：由调用点显式写明任务归属，而不是靠查询侧读环境变量猜。
+    `doc`（文档行）与 `force_backend` 一起声明这条 `task_id` 属于哪条链：解析链由
+    `ingest_backend.backend_for_document` 读粘性值（当前只有 `rag` 一条）；
+    compile 步由 `compile_backend.backend_for_document` 读 `ontology_compile_backend`
+    粘性值，决定问 atomic-rag 还是独立编译服务（P2）。
 
     ⚠ `doc` 是**必填关键字参数**（没有默认值）：它的默认值曾经是 `None`，于是
     「漏传」与「有意不传」在调用点长得一模一样 —— 新加的调用点漏传时不会报错，
@@ -228,14 +232,12 @@ async def _fetch_task_status(tenant_id: str, kb_id: str, task_id: str,
 
     `backend_for_document` 读的是**解析链**的粘性值（`insert` 发给了谁），可调用方手里
     的 `rag_task_id` 未必是解析任务：`_retry_ontology_one` 的 EXTRACTING 分支问的是
-    **本体任务**，而本体任务全平台只有两个写入者（那个分支自己的提交段、
-    `ontology_service.retry_extract`），两者都**无条件**发
-    `get_rag_client().retry_ontology_extract` —— 没有按后端分叉。解析链与本体链
-    一旦不是同一条，拿解析链的粘性值去派本体任务就会问错后端：`not_found`，一个
-    分支都不命中，真因读不回来，只能一路空转重试。当前两条链都是 `rag`，错配
-    发生不了；显式表态是为了它发生时不靠猜。
+    **本体任务**。本体任务在哪由 compile 步的粘性值（`ontology_compile_backend`）
+    决定 —— 该分支据此传 `force_backend`（见那里的注释），把**解析链**的粘性值让位。
 
-    取值与 `ingest_backend.VALID_BACKENDS` 同域；传 `None` = 沿用粘性值（现状）。
+    ⚠ **取值域**：本参数认 `ontology_compile`，以及「其余一切」（走 atomic-rag 那三条
+    路径）。`rag` 不在新域里，但语义上等价于「atomic-rag 那一支」。认不出的值仍走
+    「不是新链路」的那一支（与粘性值出脏值时的回落同口径），不会静默当成新链路。
 
     取不到状态时**区分两种**（对齐 `RAGClient.get_task_status` 的返回形态）：
       · 任务行不存在 ⇒ `{"status": "not_found"}`（下游 client 归一为状态、不抛异常），
@@ -244,6 +246,37 @@ async def _fetch_task_status(tenant_id: str, kb_id: str, task_id: str,
         塌成 `None` 的话它只会被对账跳过、最终由 patrol 判死。
       · 其它取状态失败 ⇒ `None`，保持调用方的降级语义不变。
     """
+    backend = force_backend or ingest_backend.backend_for_document(doc)
+    if backend == "ontology_compile":
+        # [jonex] P2：compile 步在独立服务里的那一支 —— 与解析链那一支同形。
+        # `include_data=True` 是**承重**的：本函数的调用方之一是对账的 EXTRACTING
+        # 轮询，它命中 `completed` 后要靠 `ontology_data` 收尾（`_handle_completed` 写
+        # Neo4j）。默认的 `include_data=False` 只是「不带数据」，**键都不在** —— 少了它
+        # 那份文档永远不落 READY（也不是报错，是静默不完成）。
+        # （看门狗那条路只读 `ontology_status` / `ontology_error`，多带的 `ontology_data`
+        # 对它是无用的负载；但 `compile` 步在 `task_watch_service` 里走 `_inspect_compile`，
+        # **不问**本函数，所以这份负载只落在对账这一条需要它的路上。）
+        try:
+            info = await get_ontology_compile_client().get_compile_status(
+                compile_id=task_id, tenant_id=tenant_id, include_data=True,
+            )
+        except ResourceNotFoundError:
+            # 与旧链路/new 链路同口径：不是异常，是一个状态
+            logger.warning(
+                "P2 compile 任务不存在（进入查证链）: doc_id=%s task=%s",
+                doc_id or "-", task_id,
+            )
+            return {"status": "not_found"}
+        except Exception as exc:  # noqa: BLE001 —— 取不到就是取不到，交给调用方降级
+            logger.warning(
+                "P2 compile 取任务状态失败: doc_id=%s task=%s err=%s",
+                doc_id or "-", task_id, exc,
+            )
+            return None
+        # 状态词汇 / 字段名归一到对账循环消费的口径（`queued` → `pending` 是承重的一档，
+        # `ontology_error` → `error` 让失败真因到得了文档行）。见 `compile_backend`。
+        return compile_backend.normalize_status_info(info)
+
     size = await asyncio.to_thread(_disk_task_json_size, tenant_id, kb_id, task_id)
     if size >= _RAG_TASK_JSON_DISK_FIRST_MB * 1024 * 1024:
         logger.warning(
@@ -856,9 +889,11 @@ _ONTOLOGY_TASK_FAILED_STATUSES = frozenset({"failed", "cancelled", "canceled", "
 def _ontology_task_failure_detail(status_info: dict, rag_status: str) -> str:
     """从下游失败的任务状态里取真因；三个键都没有就按状态词造一句。
 
-    `error` 排在最前：这条链问的永远是 atomic-rag（见 `_fetch_task_status` 的
-    `force_backend` 一节），而 `error` 是**它的**原生字段名；`error_message` /
-    `message` 是历史别名，留着只是兜底。取不到任何键时给出一句「状态是 X」——
+    `error` 排在最前：这一支问的下游后端由 **compile 步的粘性值**决定
+    （`rag` → atomic-rag，`ontology_compile` → P2 新服务，见 `_fetch_task_status` 的
+    `force_backend` 一节），而 `error` 是两边归一后**共同的**字段名
+    （新服务侧的 `ontology_error` 由 `compile_backend.normalize_status_info` 别名过来）；
+    `error_message` 是历史别名，留着只是兜底。取不到任何键时给出一句「状态是 X」——
     总比落一个空字符串强：空串会让「读不到真因」与「真因就是空」两件事长得一模一样。
     """
     for key in ("error", "error_message", "message"):
@@ -978,6 +1013,15 @@ class ReconciliationService:
                 # [jonex] Ontology 库接入任务中心：正被接管的文档不归这两趟管 ——
                 # 它的 PARSING 是任务中心链的第一步，按老形态去问会得到错误结论
                 # （patrol 判超时后会重新 insert，与任务中心链分叉、产出重复向量）。
+                #
+                # ⚠️ **这里刻意不传 `task_center_exclude_states`**（2026-10-14）：
+                # 本趟是**收尾**（`_reconcile_one` 只轮询引擎 → `_handle_completed`
+                # / `_handle_failed`），必须用默认的 `ACTIVE_STATES` —— **交还
+                # （`released`）的文档也得能进来**。交还时那条在途解析任务号是靠本趟
+                # 兜住的（`hand_over_in_flight_task_id` 把任务号抄给文档行，本趟接着
+                # 轮询收尾）；换成 `MANAGED_STATES` 会把它们一起挡在门外，文档永久卡
+                # `parsing`。要拦住的是"替它发起工作"，那是 `patrol_parsing_timeout`，
+                # 不是这里。
                 exclude_task_center_managed=True,
             )
 
@@ -1018,6 +1062,17 @@ class ReconciliationService:
                 # 就挂在这条路上，排除掉 compile 步永远收不了尾。详见仓储的同名参数。
                 exclude_task_center_managed=True,
                 task_center_kept_statuses=[OntologyStatus.EXTRACTING],
+                # ⚠️ **必须传 `MANAGED_STATES`（含 `released`）**（2026-10-14 加）：
+                # 默认的 `ACTIVE_STATES` 不含 `released`，于是运行方把卡一交还
+                # （看门狗等满 `TC_NO_DISPATCH_SEC` / 链路判死），这些文档就落回本趟的
+                # 扫描面、被**重新发起抽取**。
+                #
+                # 实测（2026-10-14，空间 9ce36c69…）：`compile` 步因全局并发名额占满
+                # 从未被派发，16:39:27 看门狗交还，**16:40 就冒出 31 次
+                # `ontology_extract`**、16:41 文档 `ontology_status=ready` —— 活被旧对账
+                # 干完了，而任务中心那条 `compile` 永远停在「等待中」。交还只说明**看门狗
+                # 放弃等待**，任务中心那条链还活着（任务仍是 `running`），授权链没断。
+                task_center_exclude_states=MANAGED_STATES,
             )
 
         budget = max(0, max_inflight - inflight)  # 本轮可新提交的 ontology-only 任务数
@@ -1061,7 +1116,14 @@ class ReconciliationService:
                 # [jonex] Ontology 库接入任务中心：正被接管的文档不归这两趟管 ——
                 # 它的 PARSING 是任务中心链的第一步，按老形态去问会得到错误结论
                 # （patrol 判超时后会重新 insert，与任务中心链分叉、产出重复向量）。
+                #
+                # ⚠️ **必须传 `MANAGED_STATES`（含 `released`）**（2026-10-14 加）：
+                # 本趟是**发起**（判超时后 `get_rag_client().insert(...)` 重投），
+                # 而 `released` 只是"看门狗不盯了"，文档仍归任务中心管。用默认的
+                # `ACTIVE_STATES` 会让交还的文档落进本趟扫描面 → 被重投一份解析，
+                # 正是仓储 docstring 点名的"与任务中心链彻底分叉、产出重复向量"。
                 exclude_task_center_managed=True,
+                task_center_exclude_states=MANAGED_STATES,
             )
 
         now = datetime.now()  # [jonex] P0-2: naive 本地时间，与 DB 写入口径一致
@@ -1545,14 +1607,38 @@ class ReconciliationService:
         """
         # [jonex] P0-I 代次 fencing：任务代次早于文档当前 content_generation → 整体作废，
         # 不改状态 / 不删数据 / 不覆盖 rag_doc_ids（交给最新代次任务收敛）。
+        #
+        # ⚠️ **「交给最新代次收敛」有个前提：最新代次的任务真的存在。**
+        # 停止 / 删除来得比「提交」快时，那个任务**压根没被创建** —— 这时候还照旧 skip，
+        # 就**没有任何人**来收尾了，文档永久卡在 `parsing`（三条出口全堵：看门狗只认
+        # 「接管行在途」的文档、用户点重新解析/删除被中间态挡住、对账自己跳过）。
+        # 2026-10-11 实测复现：`reparse_then_stop_immediately`（重新解析后立刻停止）——
+        # 日志里那句 `Reconcile→skip(stale generation): task_gen=0 doc_gen=1` 每 30 秒
+        # 重复一次，就是它的心跳。
+        #
+        # 所以先确认一次「有没有人在为最新代次干活」—— **看接管行**（运行方手里的凭据，
+        # 与本文档同在 knowledge_base 库，**不产生任何跨服务调用**）：
+        #   · 接管行仍在途（`submitting` / `managed`）→ 运行方攥着它 → 真有人管 → 跳过；
+        #   · 已交还（`released`）→ 运行方早撒手了 → **没人管** → **必须自己收尾**。
+        # 这个信号可靠的理由、以及「为什么不能改成让运行方上报」见
+        # `_takeover_is_in_flight` 的 docstring。
         task_generation = int(status_info.get("content_generation", 0) or 0)
         doc_generation = int(getattr(doc, "content_generation", 0) or 0)
         if task_generation < doc_generation:
-            logger.info(
-                "Reconcile→skip(stale generation): doc_id=%s task_gen=%s doc_gen=%s",
-                doc.id, task_generation, doc_generation,
+            if await self._takeover_is_in_flight(doc):
+                logger.info(
+                    "Reconcile→skip(stale generation, 最新代次在途): "
+                    "doc_id=%s task_gen=%s doc_gen=%s",
+                    doc.id, task_generation, doc_generation,
+                )
+                return "skipped"
+            # 没人管了 —— **不能一直 skip**，拿手上这份结果老老实实收尾
+            # （能置 READY 就置；真收不了自然走 FAILED，用户就能重新解析/删除了）。
+            logger.warning(
+                "Reconcile→按现有结果收尾（代次 %s<%s 但接管行已交还，最新代次没人做）: "
+                "doc_id=%s",
+                task_generation, doc_generation, doc.id,
             )
-            return "skipped"
 
         ont_status = status_info.get("ontology_status", "pending")
         ont_data = status_info.get("ontology_data")
@@ -1851,8 +1937,26 @@ class ReconciliationService:
             await session.commit()
 
         # ── [jonex] llm-wiki 管线：解析完成 → 推送 Wiki 编译 ──
+        #
+        # ⚠️ **归任务中心管的文档不许在这里发起编译**（2026-10-14 加）：
+        # 这一步是**发起**（提交编译任务 / 标 stale 让巡检去提交），而发起的权力归任务
+        # 中心链（handler → `queue_task_compile` → stale → 巡检）。上面那段写 Neo4j +
+        # 置 READY 是**收尾**，照做不受影响 —— 只有这一个 if 里的派发被挡。
+        #
+        # 挡它的理由与 A1/A2 同源：本方法是被 `_reconcile_one` / `_retry_ontology_one`
+        # 轮询叫起来的，而交还（`released`）之后那两趟仍会走到这里。`released` 只说明
+        # 看门狗不盯了，任务中心那条链还活着 —— 旧对账替它把 wiki 编译发起掉，就是
+        # 「两套驱动器同跑」。
+        #
+        # 任务被删（接管行不存在）时本闸门放行，那正是把驱动权交回既有对账的时刻
+        # （⚠️ 但该路径当前未对外开放，见 `TaskCenterDocState.RELEASED` 的注）。
         if kb_type in LLM_WIKI_TYPES:
-            if kb_type == "openkb":
+            if await self._takeover_is_task_center_managed(doc):
+                logger.info(
+                    "Reconcile→跳过 Wiki 编译派发（文档归任务中心管，发起权不在旧对账）: "
+                    "doc_id=%s kb_type=%s", doc.id, kb_type,
+                )
+            elif kb_type == "openkb":
                 await self._dispatch_openkb_compile(doc, status_info)
             elif kb_type == "jonex_wiki":
                 await self._dispatch_jonex_wiki_compile(doc, status_info)
@@ -1905,6 +2009,97 @@ class ReconciliationService:
             },
         })
         return "updated"
+
+    async def _takeover_is_in_flight(self, doc) -> bool:
+        """这份文档的接管行**还在运行方手上**吗（= 还有人在为它干活）。
+
+        ## 为什么要看它
+
+        代次判据（`task_generation < doc_generation → skip`，见 `_handle_completed`）的本意是
+        「旧结果别覆盖新结果，**交给最新代次收敛**」—— 而那句话**建立在「最新代次真的存在」
+        这个假设上**。停止 / 删除来得比提交快时，新任务压根没被创建，**假设不成立**；
+        这时候再跳过，文档就永久卡在 `parsing`（三条出口全堵：看门狗只认「接管行在途」的
+        文档、用户点重新解析/删除被中间态挡住、对账自己跳过）。
+
+        ## 为什么这个判据可靠
+
+        接管行是**运行方手里的凭据**：它**动手之前**必先 `begin_step` 把接管行标成在途
+        （那一步刻意排在调引擎**之前**）。所以「正在提交 / 正在跑」的**全程**它都是在途的
+        —— 这里判「没人管」绝不会误伤正在跑的活儿。反过来，一旦交还，运行方那侧**确实
+        不会再有人动它**了（看门狗只扫在途行），本文档也不该继续干等。
+
+        ⚠️ **但「交还」不等于「任务中心那条链已经彻底结束」**（2026-10-14 更正，原文这么
+        写是错的）：交还只说明**看门狗放弃等待**。实测：`compile` 子任务因全局并发名额
+        占满从未被派发，看门狗等满 1800 秒交还，那一刻任务**还是 `running`**、子任务
+        还在队列里 —— 只是派不出去。所以本判据回答的是「**还有人正在为它干活吗**」
+        （用于**收尾**），**不是**「它归谁管」。后者见 `_takeover_is_task_center_managed`，
+        两个问题别混。
+
+        ## 为什么不用「让运行方上报」
+
+        该上报的那个人**已经退场了**（任务中心那条链结束、运行方也没有理由再说话），
+        **指望一个已经离场的人补一句话本身就是不可靠的** —— 漏报一次，文档又卡住，
+        而卡住是没人兜底的。查接管行是**查事实**：事实就摆在自己库里，不会漏报、不用等谁开口。
+        这也是它唯一的代价 —— 一次本地小查询，不碰任何跨服务通道。
+        """
+        # ⚠️ `text` 在本文件里是**函数内局部 import** 的（模块顶部没有它）——
+        # 跟本文件其它几处同款，别删。
+        from sqlalchemy import text
+
+        async with get_db_session() as session:
+            hit = (await session.execute(
+                text(
+                    "SELECT 1 FROM knowledge_base.task_center_documents "
+                    "WHERE document_id = :doc_id AND state = ANY(:active_states) "
+                    "LIMIT 1"
+                ),
+                {"doc_id": doc.id, "active_states": list(ACTIVE_STATES)},
+            )).first()
+        return hit is not None
+
+    async def _takeover_is_task_center_managed(self, doc) -> bool:
+        """这份文档**归任务中心管吗**（= 旧对账不许替它发起任何下游工作）。
+
+        ## 和 `_takeover_is_in_flight` 是两个问题，别合并、别互相改坏
+
+        | | 问的是什么 | 用哪个集合 | 用在哪 |
+        |---|---|---|---|
+        | `_takeover_is_in_flight` | 还有人在为它干活吗 | `ACTIVE_STATES`（不含 released） | **收尾**：没人管 → 对账自己收尾 |
+        | 本方法 | 这份文档归谁管 | `MANAGED_STATES`（**含** released） | **发起**：归任务中心管 → 旧对账一步都不许发起 |
+
+        差别只在 `released` 一格，而那一格就是整件事：交还之后**看门狗不盯了、但任务中心
+        那条链还活着**（任务可能仍是 `running`，只是子任务排在队列里派不出去）。此时
+
+          · 收尾该照做（在途任务号是交还时抄给文档行的，得有人接着轮询）→ 所以
+            `_takeover_is_in_flight` 必须继续返回 False；
+          · 发起**一步都不许**——发起的权力归任务中心，用户想重跑走「重新解析 /
+            重新编译」两个按钮（那两条路会 `rearm_for_step` + `retry_subtask`，
+            授权链完整）→ 所以本方法返回 True。
+
+        ⚠️ **把本方法拿去当收尾判据**会让交还的文档被判成「有人在管」而永远 skip，
+        文档永久卡 `parsing` —— 那正是 `_takeover_is_in_flight` 当初要治的病。
+        ⚠️ **把 `_takeover_is_in_flight` 的判据改成 `MANAGED_STATES`** 是同一个错误，
+        别顺手"统一口径"。
+
+        ## 查库而不是查内存
+
+        与 `_takeover_is_in_flight` 同构：一次本地小查询，不碰任何跨服务通道。调用方多半
+        手上就有 `doc`，但接管行**不在文档表上**，只能现查。
+        """
+        # ⚠️ `text` 在本文件里是**函数内局部 import** 的（模块顶部没有它）——
+        # 跟本文件其它几处同款，别删。
+        from sqlalchemy import text
+
+        async with get_db_session() as session:
+            hit = (await session.execute(
+                text(
+                    "SELECT 1 FROM knowledge_base.task_center_documents "
+                    "WHERE document_id = :doc_id AND state = ANY(:managed_states) "
+                    "LIMIT 1"
+                ),
+                {"doc_id": doc.id, "managed_states": list(MANAGED_STATES)},
+            )).first()
+        return hit is not None
 
     @staticmethod
     def _cleanup_stuck_timeout(status_info: dict) -> float:
@@ -2279,29 +2474,37 @@ class ReconciliationService:
                 # 取不到才放弃本轮，保持原有「查不到状态就跳过」的保守语义；不兜底的话，
                 # 在途重抽即便已经跑完也永远收不了尾，只能等 patrol 误判超时。
                 #
-                # ⚠ `force_backend="rag"`：这一支问的 `rag_task_id` 是**本体任务**，
-                # 而本体任务在 atomic-rag —— 见 `_fetch_task_status` 的 `force_backend`
-                # 一节。**不能按行上的粘性值派**（那是解析链的后端）：解析链与本体链
-                # 一旦不是同一条，按粘性值派会问错后端、恒 `not_found`，一个分支都
-                # 不命中 → 真因读不回来、只剩空转重试。
-                # 当前两条链都是 `rag`，这一传参与现状**完全等价**；显式表态是让
-                # 假设不成立时不必靠猜。
+                # ⚠ `force_backend` 传的是 **compile 步自己的粘性值**
+                # （`ontology_compile_backend`），不是解析链的 `ingest_backend`。
+                # 这一支问的 `rag_task_id` 是**本体任务**，而本体任务在哪由 compile 步
+                # 当时派给了谁决定：`rag`（atomic-rag，现状）/ `ontology_compile`（P2 新
+                # 服务）。**不能按解析链的粘性值派** —— 按它派会去问错后端 ⇒ 恒 404
+                # ⇒ `not_found` 一个分支都不命中 ⇒ 真因读不回来、只剩空转重试
+                # （2026-10-09 事故）。
+                # 老文档没有这个键 ⇒ 回落 `rag` ⇒ 与改动前**逐字等价**（见
+                # `compile_backend.backend_for_document`）。
+                # ⚠ 这个值必须与 `_fetch_task_status` 的分支**成对**改：那函数认不出
+                # `ontology_compile` 就会静默落到 atomic-rag 那三条路径 —— 比原先硬编码
+                # `"rag"` 更隐蔽（看起来改对了、实际没生效）。
                 status_info = await _fetch_task_status(
                     doc.tenant_id,
                     (doc.knowledge_base_id
                      or (doc.extra_metadata or {}).get("knowledge_base_id", "")),
                     doc.rag_task_id, doc_id=doc.id, doc=doc,
-                    force_backend="rag",
+                    force_backend=compile_backend.backend_for_document(doc),
                 )
                 if status_info is None:
-                    # 取不到状态（atomic-rag 连不上 / 任务 JSON 读不出来）→ 本轮跳过。
-                    # ⚠ 这里**必须留声**：静默返回会让「问错了后端」与「对面暂时
-                    # 不可达」在日志上长得一模一样 —— 只有重试次数在涨，真因读不回来。
-                    # 文案里点明问的是哪个后端，假设一旦不成立（本体任务真的不在
-                    # atomic-rag）能一眼看见。
+                    # 取不到状态（下游后端连不上 / atomic-rag 的任务 JSON 读不出来）→
+                    # 本轮跳过。
+                    # ⚠ 这里**必须留声**：这一支原先静默返回，于是「按解析链的粘性值去问
+                    # 了错的服」这件事和真因一起被吞掉，日志上什么也看不出来，只有重试
+                    # 次数在涨（2026-10-09 事故的排查代价就花在这）。
+                    # 文案里点明问的是哪个后端（P2 起是**compile 步的粘性值**，可能是
+                    # atomic-rag，也可能是新服务），假设一旦不成立能一眼看见。
                     logger.warning(
-                        "本体任务状态取不到（问的是 atomic-rag，未回退解析链后端）: "
+                        "本体任务状态取不到（问的是 %s，未回退解析链后端）: "
                         "doc_id=%s task=%s",
+                        compile_backend.backend_for_document(doc),
                         doc.id, doc.rag_task_id,
                     )
                     return False
@@ -2338,32 +2541,53 @@ class ReconciliationService:
                         return False
                     # 落空（还有额度）→ 跳出整条 if/elif，继续往下触发新一轮重抽
                 elif rag_status in _ONTOLOGY_TASK_FAILED_STATUSES:
-                    # 下游任务**明确失败** → 把真因落到文档行上，**状态不动**（仍是
-                    # EXTRACTING：这一轮还没收口，重抽与否交给下面的闸门）。落库走
-                    # `set_ontology_status`：状态没变 ⇒ `record_processing_task` 那条
-                    # 埋点不会发（它按 `prev_status != new_status` 判）。
+                    # 下游任务**明确失败** → 把真因落到文档行上。
                     #
-                    # 原来这一支是**静默**往下走的：任务在 atomic-rag 里明明带着
-                    # 「为什么失败」，文档行却一个字都不写，最后只剩闸门那句计数文案
-                    # —— 与 2026-10-09 那次同一个病（真因只活在任务 JSON 里）。
+                    # 两类文档的终态不同：
+                    #
+                    # · **归任务中心管**：落 `FAILED`。compile 步的看门狗
+                    #   （`task_watch_service._inspect_compile`）只看
+                    #   `ontology_status` 的 READY / FAILED —— 保持 EXTRACTING
+                    #   会让界面「编译中」一直挂到 `TC_STEP_HARD_TIMEOUT_SEC`
+                    #   （默认 6 小时），而真正失败的任务 30 秒前就结束了
+                    #   （2026-10-19 事故）。旧对账本来也不能替它重抽（下面那道
+                    #   归属闸门），落 FAILED 不会引出任何自动重试；用户点
+                    #   「重新编译」时 `retry_extract` 会重新置回 EXTRACTING。
+                    # · **不归任务中心管**（旧链路）：**状态不动**（仍是
+                    #   EXTRACTING：这一轮还没收口，重抽与否交给下面的闸门）。
+                    #
+                    # 落库走 `set_ontology_status`：状态没变 ⇒ `record_processing_task`
+                    # 那条埋点不会发（它按 `prev_status != new_status` 判）。
+                    #
+                    # 原来这一支是**静默**往下走的：下游任务（atomic-rag 或 P2 新服务）
+                    # 里明明带着「为什么失败」，文档行却一个字都不写，最后只剩闸门那句
+                    # 计数文案 —— 与 2026-10-09 那次同一个病（真因只活在下游任务里）。
                     detail = _ontology_task_failure_detail(status_info, rag_status)
+                    managed = await self._takeover_is_task_center_managed(doc)
                     async with get_db_session() as session:
                         repo = KnowledgeDocumentRepository(session)
                         await repo.set_ontology_status(
-                            doc, OntologyStatus.EXTRACTING, error=detail,
+                            doc,
+                            OntologyStatus.FAILED if managed else OntologyStatus.EXTRACTING,
+                            error=detail,
                         )
                         await session.commit()
                     logger.warning(
-                        "本体任务失败，真因已落文档行: doc_id=%s task=%s status=%s detail=%s",
+                        "本体任务失败，真因已落文档行（%s）: doc_id=%s task=%s "
+                        "status=%s detail=%s",
+                        "任务中心托管 → FAILED" if managed else "旧链路 → 保持 EXTRACTING",
                         doc.id, doc.rag_task_id, rag_status, detail,
                     )
+                    if managed:
+                        return False
                 elif rag_status == "not_found":
-                    # atomic-rag 那侧找不到这条任务。**不判死**（既有查证链就是为
+                    # 下游那一侧找不到这条任务。**不判死**（既有查证链就是为
                     # 「任务行被清理了但产物还在」准备的），但必须留声：原先它与
                     # `failed` 一样静默，排查时看不出「问到了、但对方说没有」。
                     logger.warning(
-                        "本体任务在 atomic-rag 里不存在（保持 EXTRACTING 等下一轮）: "
+                        "本体任务在 %s 里不存在（保持 EXTRACTING 等下一轮）: "
                         "doc_id=%s task=%s",
+                        compile_backend.backend_for_document(doc),
                         doc.id, doc.rag_task_id,
                     )
                 else:
@@ -2394,6 +2618,29 @@ class ReconciliationService:
                 await session.commit()
             return False
 
+        # ── ⚠️ 最后一道闸：归任务中心管的文档，**新提交**一步都不许（2026-10-14 加）──
+        #
+        # 位置是刻意的：排在**上面所有轮询 / 写图 / 判死收尾段之后**，只拦「重新发起抽取」
+        # 这一个动作。上面那些是收尾（EXTRACTING 轮询下游任务（atomic-rag / P2 新服务，
+        # 按 compile 步粘性值）、写 Neo4j、把终态落到文档行），照做；到了这一行才开始
+        # "替文档发起一个新任务"，那就越权了。
+        #
+        # 为什么 `reconcile_ontology` 的领取查询拦不住、这里还要再拦一次：领取那层的
+        # `task_center_kept_statuses=[EXTRACTING]` 是**收尾例外**，被接管的 EXTRACTING
+        # 文档**故意**放进了扫描面。而本函数在「下游任务明确失败」那支（`rag_status in
+        # _ONTOLOGY_TASK_FAILED_STATUSES`）**只落真因、不 return**，会一路穿透到这里 ——
+        # 于是被接管的文档仍会被旧链重抽一次。两层判据缺一不可：领取层管"进不进扫描面"，
+        # 这一层管"要不要真发"。
+        #
+        # 拦下来之后这类文档停在 `EXTRACTING`（文档本身 `READY`、可检索，缺的只是图），
+        # 等用户点「重新编译」——那条路走任务中心、授权链完整。这是口径，不是退化。
+        if await self._takeover_is_task_center_managed(doc):
+            logger.info(
+                "本体抽取新提交被拦（文档归任务中心管，发起权不在旧对账）: doc_id=%s "
+                "ontology_status=%s", doc.id, doc.ontology_status,
+            )
+            return False
+
         # [jonex] P1-F 领取协议：CAS 领取（当前状态 → EXTRACTING 占位）→ 提交 atomic-rag →
         # 拿到 task_id 后写 rag_task_id + ++retry；提交失败回退 PENDING、不 ++retry。
         prev_status = doc.ontology_status
@@ -2407,6 +2654,7 @@ class ReconciliationService:
             return False
 
         # Trigger new ontology retry (ontology-only, 携带 schema + 版本 + 代次)
+
         try:
             result = await get_rag_client().retry_ontology_extract(
                 document_id=doc.id,
@@ -2416,6 +2664,9 @@ class ReconciliationService:
                 ontology_schema=schema,
                 schema_version=schema_version,
                 content_generation=int(getattr(doc, "content_generation", 0) or 0),
+                # [jonex] A18（N5）：无条件 force_retry —— 对账重抽 = 明确要求重跑；
+                # 不传会被同一幂等键下的 completed 任务早退复用（空转告终根因）。
+                force_retry=True,
             )
         except Exception as e:
             logger.warning("Retry ontology extract failed for doc %s: %s", doc.id, e)
@@ -2445,7 +2696,7 @@ class ReconciliationService:
             await repo.set_ontology_status(
                 doc, OntologyStatus.EXTRACTING, increment_retry=True, error="",
             )
-            await repo.set_status(doc, doc.status, rag_task_id=retry_task_id)
+            fresh = await repo.set_status(doc, doc.status, rag_task_id=retry_task_id)
             await session.commit()
 
         logger.info("Ontology retry queued: doc_id=%s, new_task_id=%s", doc.id, retry_task_id)
@@ -2927,7 +3178,7 @@ class ReconciliationService:
                 "timed_out": timed_out, "stale_submitted": stale_submitted}
 
     async def _patrol_stale_recompile(self, limit: int = 50, kb_type: str = "openkb") -> int:
-        """[jonex] stale 且 ready 的文档重新提交编译。
+        """[jonex] ready 的 stale 文档补投；Jonex Wiki 还包含从未编译的 NULL。
 
         reparse 常规路径会推回 parsing→ready 再触发钩子，但 stale 若由其他路径
         写入、或 reparse 中途失败停在 ready，文档会永久停在 stale——此处兜底。
@@ -2938,9 +3189,25 @@ class ReconciliationService:
         persist an execution-fenced request and share this KB-wide batch dispatcher;
         unfinished parses and compile handlers that have not queued yet still block it.
         Finished parse steps can join before compile concurrency allows their dispatch.
+        Task-center parsing bypasses the legacy stale hook, so its initial NULL
+        compile state must join both candidate selection and the full-KB drain.
         """
         from sqlalchemy import text
 
+        # ── ⚠️ 两条接管行判据用的是**两个不同的状态集合**，别顺手统一（2026-10-14）──
+        #
+        #   · `owner.state = ANY(:active_states)` —— 问「**这个 KB 现在忙不忙**」。
+        #     必须留在 `ACTIVE_STATES`：它是**整库**的闸门，把 `released` 也算进来的话，
+        #     一份卡住的交还文档就能把这**整个 KB** 的批量编译永久堵死 —— 那些与它
+        #     毫不相干的文档会一起饿死。
+        #   · `tcd.state = ANY(:managed_states)` —— 问「**这份文档归谁管**」（本文档自身）。
+        #     用 `MANAGED_STATES`（含 `released`）：交还之后文档仍归任务中心管，旧巡检
+        #     不许替它补投编译。
+        #
+        # 下面那个 `NOT (...)` 的豁免也**只对在途行生效**（`tcd.state = ANY(:active_states)`）：
+        # 它放行的是「parse 步已收口、正等 compile 派活」这一形状。`mark_released` **不清**
+        # `handled_execution_id`，所以同样的形状在 `released` 行上**也能拼出来** —— 不补这
+        # 道状态条件，刚交还的文档就会被这个豁免误放行。
         sql = text("""
             SELECT d.id, d.tenant_id, d.knowledge_base_id, d.file_name
               FROM knowledge_base.knowledge_documents d
@@ -2948,7 +3215,9 @@ class ReconciliationService:
                 ON ki.id = d.knowledge_base_id
                AND ki.tenant_id = d.tenant_id
                AND ki.is_deleted = 0
-             WHERE d.is_deleted = 0 AND d.llm_wiki_compile_status = 'stale'
+             WHERE d.is_deleted = 0
+               AND (d.llm_wiki_compile_status = 'stale'
+                    OR (:kb_type = 'jonex_wiki' AND d.llm_wiki_compile_status IS NULL))
                AND d.status = 'ready'
                AND ki.kb_type = :kb_type
                AND (:kb_type != 'jonex_wiki' OR NOT EXISTS (
@@ -2956,7 +3225,10 @@ class ReconciliationService:
                     WHERE pending.tenant_id = d.tenant_id
                       AND pending.knowledge_base_id = d.knowledge_base_id AND pending.is_deleted = 0
                       AND (pending.status IN ('pending', 'parsing', 'ingesting')
-                           OR (pending.llm_wiki_compile_status = 'stale' AND pending.updated_at > :quiet_before)
+                           OR (pending.status = 'ready'
+                               AND (pending.llm_wiki_compile_status = 'stale'
+                                    OR pending.llm_wiki_compile_status IS NULL)
+                               AND pending.updated_at > :quiet_before)
                            OR (pending.status != 'failed' AND EXISTS (
                                SELECT 1 FROM knowledge_base.task_center_documents owner
                                 WHERE owner.document_id = pending.id AND owner.tenant_id = pending.tenant_id
@@ -2972,13 +3244,14 @@ class ReconciliationService:
                AND NOT EXISTS (
                    SELECT 1 FROM knowledge_base.task_center_documents tcd
                     WHERE tcd.document_id = d.id
-                      AND tcd.state = ANY(:active_states)
+                      AND tcd.state = ANY(:managed_states)
                       AND (:kb_type != 'jonex_wiki'
                            OR tcd.current_step IS DISTINCT FROM 'compile'
                            OR tcd.execution_id IS NULL
                            OR (d.extra_metadata->>'jonex_wiki_compile_execution_id')
                               IS DISTINCT FROM tcd.execution_id)
                       AND NOT (:kb_type = 'jonex_wiki'
+                               AND tcd.state = ANY(:active_states)
                                AND tcd.current_step IS NOT DISTINCT FROM 'parse'
                                AND tcd.execution_id IS NULL
                                AND tcd.handled_execution_id IS NOT NULL)
@@ -2992,6 +3265,7 @@ class ReconciliationService:
                     "limit": limit,
                     "kb_type": kb_type,
                     "active_states": list(ACTIVE_STATES),
+                    "managed_states": list(MANAGED_STATES),
                     "quiet_before": datetime.now() - timedelta(seconds=5),
                 },
             )).all()
@@ -3073,7 +3347,9 @@ class ReconciliationService:
                     SELECT 1 FROM knowledge_base.knowledge_documents
                      WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
                        AND (status IN ('pending', 'parsing', 'ingesting')
-                            OR (llm_wiki_compile_status = 'stale' AND updated_at > :quiet_before)
+                            OR (status = 'ready'
+                                AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
+                                AND updated_at > :quiet_before)
                             OR (status != 'failed' AND EXISTS (
                                 SELECT 1 FROM knowledge_base.task_center_documents owner
                                  WHERE owner.document_id = knowledge_documents.id AND owner.tenant_id = :tenant
@@ -3091,23 +3367,30 @@ class ReconciliationService:
                         "active_states": list(ACTIVE_STATES)})).first()
                 if waiting:
                     continue
+                # 同 `_patrol_stale_recompile`：上面 `waiting`（整库忙不忙）留在
+                # `ACTIVE_STATES`，这里（本文档归谁管）用 `MANAGED_STATES`，豁免也只对
+                # 在途行生效 —— 理由见那一处的注释，别把两处置成同一个集合。
                 documents = (await session.execute(text("""
                     SELECT id, file_name, storage_key, storage_backend, file_path
                       FROM knowledge_base.knowledge_documents d
                      WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
-                       AND status = 'ready' AND llm_wiki_compile_status = 'stale'
+                       AND status = 'ready'
+                       AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
                        AND NOT EXISTS (SELECT 1 FROM knowledge_base.task_center_documents tcd
                             WHERE tcd.document_id = d.id AND tcd.tenant_id = :tenant
-                              AND tcd.state = ANY(:active_states)
+                              AND tcd.state = ANY(:managed_states)
                               AND (tcd.current_step IS DISTINCT FROM 'compile'
                                    OR tcd.execution_id IS NULL
                                    OR (d.extra_metadata->>'jonex_wiki_compile_execution_id')
                                       IS DISTINCT FROM tcd.execution_id)
-                              AND NOT (tcd.current_step IS NOT DISTINCT FROM 'parse'
+                              AND NOT (tcd.state = ANY(:active_states)
+                                       AND tcd.current_step IS NOT DISTINCT FROM 'parse'
                                        AND tcd.execution_id IS NULL
                                        AND tcd.handled_execution_id IS NOT NULL))
                      ORDER BY id
-                """), {"tenant": tenant_id, "kb": kb_id, "active_states": list(ACTIVE_STATES)})).all()
+                """), {"tenant": tenant_id, "kb": kb_id,
+                        "active_states": list(ACTIVE_STATES),
+                        "managed_states": list(MANAGED_STATES)})).all()
                 artifacts, claimed = [], []
                 target = await compiler.get_active_schema_version(tenant_id, kb_id)
                 try:

@@ -66,8 +66,17 @@ class KnowledgeSearchHistory(Base, TenantMixin, TimestampMixin, SoftDeleteMixin)
     reasoning = Column(JSONB, nullable=True)
     searched_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, include_snapshot: bool = True) -> dict:
+        """`include_snapshot=False` 产出「列表视图」——不含三个快照大字段。
+
+        [jonex] 快照三件套（`answer` / `references` / `reasoning`）实测占
+        列表响应体积的 **83%**，且只有「点开某条历史回放」时才用得上。
+        列表用 `include_snapshot=False`，点击时按 `history_id` 单取（见 repository
+        的 `with_snapshot`）—— ⚠️ 两者必须成对使用：列表视图**不能碰**这三个属性，
+        因为 SQL 侧用 `load_only` 把它们裁掉了，在这里读取会触发懒加载
+        （异步会话下表现为 `MissingGreenlet`）。
+        """
+        data = {
             "id": self.id,
             "tenant_id": self.tenant_id,
             "user_id": self.user_id,
@@ -78,18 +87,20 @@ class KnowledgeSearchHistory(Base, TenantMixin, TimestampMixin, SoftDeleteMixin)
             "mode": self.mode,
             "top_k": self.top_k,
             "status": self.status,
-            "answer_preview": self.answer_preview,
             "reference_count": self.reference_count,
             "result_count": self.result_count,
             "duration_ms": self.duration_ms,
             "metadata": self.extra_metadata or {},
-            "answer": self.answer,
-            "references": self.references or [],
-            "reasoning": self.reasoning,
             "searched_at": _iso(self.searched_at),
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
         }
+        if include_snapshot:
+            data["answer_preview"] = self.answer_preview
+            data["answer"] = self.answer
+            data["references"] = self.references or []
+            data["reasoning"] = self.reasoning
+        return data
 
 
 __all__ = ["KnowledgeSearchHistory", "build_query_hash", "normalize_query"]

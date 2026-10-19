@@ -104,9 +104,10 @@ Ontology 库一律进任务中心，**走哪条编排由提交时定下的 `inge
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from jonex_core.common.database import get_db_session
+from jonex_core.common.i18n import translate
 from jonex_core.task_protocol.results import TerminalSubmitDisposition
 from jonex_core.task_runtime import ExecutionContext, TerminalReport
 
@@ -118,13 +119,26 @@ from . import ingest_backend
 from .reconciliation_service import _fetch_task_status
 from .task_runner_service import (
     ONTOLOGY_DEFINITION_ID,
+    REF_KIND_PREFIX,
+    # 整条任务的终态（`completed` / `failed` / `stopped`）：与子任务终态同一类拷贝，
+    # 原因见 `task_runner_service.TASK_TERMINAL_STATUSES` 的注释。
+    TASK_TERMINAL_STATUSES,
+    # 某一步的终态（`success` / `failed` / `timeout` / `stopped`）。
+    SUBTASK_TERMINAL_STATUSES,
+    # 输入「从哪儿来」的引用（`input_refs`）：构造在运行方那侧 —— `remove_task` 那条
+    # 「用户停止、运行方弃单」的失败上报也要用**同一份**，两处各写一遍必然漂移。
+    build_input_refs,
     # 交还接管行之前先把在途任务号交给文档行（与 `task_stopped` 共用同一份实现）。
     hand_over_in_flight_task_id,
+    # 文档名（`input_refs` 里 `document_name` 的来源）。
+    load_document_name,
     # `step_code` → 节点名（`parse` → `parse_1`）：`task.subtask_get` 按 `node_id` 寻址，
     # 而接管行上存的是 `step_code` —— 两边的映射只有 `_NODE_BY_STEP` 一处出处。
     node_id_for_step,
     submission_accepted,
     submit_ontology_task,
+    # 文档来源方式（`data_source_type`）→ 任务来源码：补交时要用（上传路径用的是同一份）。
+    task_source_for_access_type,
 )
 # `_KB_TYPE_OPENKB` / `_KB_TYPE_JONEX_WIKI` 是运行方那侧的私有常量，这里按名取用
 # （与 `_fetch_task_status` 同一做法）：两个模块必须对「这两类 wiki 库的取值是什么」
@@ -166,15 +180,38 @@ TC_STEP_HARD_TIMEOUT_SEC = _env_int("TC_STEP_HARD_TIMEOUT_SEC", 21600)
 #: `output_refs` 里 `kind` 的**运行方前缀** = 本运行方在 `task_center.runner_definitions`
 #: 里的 `code`。任务中心是**多运行方**的，`kind` 不带前缀迟早和别人撞（谁都在切块）——
 #: 协议层那张枚举表（`OUTPUT_REF_PARAMS`）就是按 `{前缀}.{产物类型}` 编的。
-_REF_KIND_PREFIX = "knowledge_base"
+_REF_KIND_PREFIX = REF_KIND_PREFIX
 
 #: 拿不到真因时的兜底文案：把读者指回文档行的 `ontology_error`。
 #: 那个字段确实该有答案 —— 只有当对账那侧也一个字都没读回来时才会落到这里。
 _COMPILE_FAILED_POINTER = "知识编译失败（本体抽取未成功，详见文档的本体错误信息）"
 
 
-def _compile_failure_reason(ontology_error: str | None) -> str:
-    """`compile` 步失败的收口文案：**把文档行上的真因抄进来**。
+def _kb_reason(
+    code: str, params: Optional[Dict[str, Any]], fallback: str
+) -> Dict[str, Any]:
+    """运行方这边的失败原因：**快照 + 代号 + 参数**一组（形态与任务中心那份同构）。
+
+    ⚠️ **不能复用** `capabilities.task_center.services.error_reason` —— 那是**另一个
+    capability** 的内部模块，跨能力 import 违反本项目的分层（知识库只经 SDK 与任务中心
+    往来）。所以这里留一份最小的同构实现；两边真正共用的只有**形状判据**（协议层的
+    `check_error_reason`），不在这里。
+
+    键名与落库那三个一致，所以能直接展开进 `_fail_step` / `TerminalReport.failed`。
+    """
+    return {
+        "error_message": translate(code, params=params, fallback=fallback),
+        "error_code": code,
+        "error_params": dict(params or {}),
+    }
+
+
+#: 拿不到真因时的兜底文案：把读者指回文档行的 `ontology_error`。
+#: 那个字段确实该有答案 —— 只有当对账那侧也一个字都没读回来时才会落到这里。
+
+
+def _compile_failure_reason(ontology_error: str | None) -> Dict[str, Any]:
+    """`compile` 步失败的原因：**把文档行上的真因抄进 `detail`**。
 
     原来只写死一句「详见文档的本体错误信息」—— 那是个**悬空引用**：真因确实该写在
     `ontology_error` 上，可当它没写上时（2026-10-09 事故：那一刻字段里躺的是对账刚
@@ -183,11 +220,20 @@ def _compile_failure_reason(ontology_error: str | None) -> str:
 
     真因在手就抄进来：任务中心那侧看到的就是原因本身，不必再去另一个字段上找一圈、
     再发现里面是别的东西。真因拿不到才退回那句指路文案。
+
+    ⚠️ 真因（引擎/对账那侧的自由文本）放 **`detail` 参数**里 —— 外层包装可翻译、
+    内嵌原文原样带出。「翻不了的不假装能翻」是这套设计的一部分。
     """
     detail = (ontology_error or "").strip()
     if not detail:
-        return _COMPILE_FAILED_POINTER
-    return f"知识编译失败（本体抽取未成功）：{detail}"
+        return _kb_reason(
+            "err.kb.task_center.compile_failed", None, _COMPILE_FAILED_POINTER
+        )
+    return _kb_reason(
+        "err.kb.task_center.compile_failed",
+        {"detail": detail},
+        f"知识编译失败（本体抽取未成功）：{detail}",
+    )
 
 
 class TaskWatchService:
@@ -247,12 +293,14 @@ class TaskWatchService:
             ]
 
     async def _doc_facts(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """一次读出后面要用的**文档行事实**：在不在、走哪条编排、叫什么名字、哪类库。
+        """一次读出后面要用的**文档行事实**：在不在、走哪条编排、叫什么名字、哪类库、
+        哪个入口进来的。
 
         做成一个口子、而不是各读一遍：补交那条路同时要「粘性值」（决定建到哪条编排上）、
-        「文档名」（当任务名）与「库类型」（与粘性值一起选编排，见
-        `definition_for_kb_type`）。分几次读就是同一个 `get_by_id` 调几遍，而几遍之间
-        文档可能被删掉 —— 那会拿到互相矛盾的事实（A 的后端 + B 的名字）。
+        「文档名」（当任务名）、「库类型」（与粘性值一起选编排，见
+        `definition_for_kb_type`）与「来源方式」（换算成任务来源）。分几次读就是同一个
+        `get_by_id` 调几遍，而几遍之间文档可能被删掉 —— 那会拿到互相矛盾的事实
+        （A 的后端 + B 的名字）。
 
         `backend` 是文档行上的**粘性值**，**只读它、不读 env**（`ingest_backend` 模块
         docstring 的同一条纪律：读 env 的话开关一翻转就把在途文档判去问错的后端）。
@@ -268,17 +316,25 @@ class TaskWatchService:
             )
             if doc is None:
                 return {"exists": False, "backend": "rag", "file_name": None,
-                        "kb_type": None}
+                        "kb_type": None, "data_source_type": None}
             kb_type = (getattr(doc, "extra_metadata", None) or {}).get("kb_type")
             if not kb_type:
                 from .kb_type_service import get_kb_type
 
                 kb_type = await get_kb_type(row["tenant_id"], row["knowledge_base_id"])
+            else:
+                from .kb_type_service import normalize_kb_type
+
+                kb_type = normalize_kb_type(kb_type)
         return {
             "exists": True,
             "backend": ingest_backend.backend_for_document(doc),
             "file_name": getattr(doc, "file_name", None),
             "kb_type": kb_type,
+            # 文档来源方式（file / api / api_push / storage）—— 补交时换算成任务来源
+            # （`task_source_for_access_type`）。**同一次读里取**，不额外查库：
+            # 分两次读之间文档可能被改，会拿到互相矛盾的事实（本函数 docstring 那条）。
+            "data_source_type": getattr(doc, "data_source_type", None),
         }
 
     # ========================================================
@@ -294,9 +350,9 @@ class TaskWatchService:
         ⚠️ **必须问两样，只问步骤是不够的**（这是这条退路的关键）：
 
         - **先问那一步**（`task.subtask_get`）：它已是 `success` / `failed` / `timeout`
-          → 定局 ✓；
+          / `stopped` → 定局 ✓；
         - **不是终态时再问这条任务**（`task.get`）：任务已是 `completed` / `failed`
-          → 也定局 ✓。
+          / `stopped` → 也定局 ✓。
 
         只看步骤会漏掉**最常见的那一格**：用户把任务**停了** —— `task.stop` 只判死
         **还没开始**的步骤，**正在跑的那一步原地不动**（运行方没有停止能力，杀了也白杀），
@@ -343,7 +399,7 @@ class TaskWatchService:
                 self._warn_probe_failed(row, exc)
                 step = None
             if step is not None and step.success and isinstance(step.data, dict):
-                if str(step.data.get("status") or "") in ("success", "failed", "timeout"):
+                if str(step.data.get("status") or "") in SUBTASK_TERMINAL_STATUSES:
                     return True
 
         # ② 不是终态（或那一步压根问不到）→ **再问整条任务**。
@@ -353,7 +409,7 @@ class TaskWatchService:
             self._warn_probe_failed(row, exc)
             return False
         if task.success and isinstance(task.data, dict):
-            if str(task.data.get("status") or "") in ("completed", "failed"):
+            if str(task.data.get("status") or "") in TASK_TERMINAL_STATUSES:
                 return True
         return False
 
@@ -375,8 +431,54 @@ class TaskWatchService:
             exc,
         )
 
+    async def _kb_deleted(self, row: Dict[str, Any]) -> bool:
+        """这个知识库是不是已经软删了。
+
+        ⚠️ 每个在途接管行每轮查一次（`knowledge_info` 主键级查询）。这不是为了「顺手
+        清理」—— 它是**删库后的唯一收口出口**：删库只软删 `knowledge_info`，不会停任务；
+        接管行若继续按正常流程走，`compile` 会在任务中心一直占着目录共用名额，直到
+        25200 秒编排超时才被收掉。详见 `_inspect` 里那一支。
+        """
+        kb_id = row.get("knowledge_base_id") or ""
+        if not kb_id:
+            return False
+        from sqlalchemy import select
+
+        from ..models import KnowledgeInfo
+
+        async with get_db_session() as session:
+            return bool(await session.scalar(select(KnowledgeInfo.id).where(
+                KnowledgeInfo.id == kb_id,
+                KnowledgeInfo.tenant_id == row["tenant_id"],
+                KnowledgeInfo.is_deleted == 1,
+            )))
+
     async def _inspect(self, row: Dict[str, Any]) -> str:
         """一条接管行现在该干什么。返回一个档位名（只用于计数与日志）。"""
+        # 删库收口**必须放在所有分支之前**（2026-10-18）：
+        #   · `submitting` 不先拦的话，看门狗会继续给一个已删除的库补交任务 —— 那正是
+        #     「删库后冒出新孤儿任务」的来源；
+        #   · `managed` 不论哪一步都要收口。从前只处理 `compile`，`parse` / `ingest`
+        #     在删库后会一直跑到 `TC_STEP_HARD_TIMEOUT_SEC`（6 小时），期间任务中心
+        #     那一步仍是 `running`，继续占着该目录的并发名额。
+        if await self._kb_deleted(row):
+            if row["state"] == TaskCenterDocState.SUBMITTING.value:
+                await self._fail_document(
+                    row, "知识库已删除，任务提交中止", job="知识库删除",
+                )
+                return "kb_deleted"
+            if row.get("execution_id"):
+                # 有受理凭证 → 替这一步报失败，把任务中心那侧的 `running` 收成终态；
+                # 文档不再标 FAILED（库都没了，标它只会写一条没人看的记录）。
+                await self._fail_step(
+                    row, "知识库已删除，任务中止", fail_document=False,
+                )
+            else:
+                # 没有凭证 = 本步还没跑；交还接管行即可（`_abandon` 的 `only_if_idle`
+                # 会兜住「读快照到动手之间刚好派了活」的窗口）。
+                await self._abandon(row, "知识库已删除，接管中止")
+            return "kb_deleted"
+
         if row["state"] == TaskCenterDocState.SUBMITTING.value:
             return await self._supervise_submission(row)
 
@@ -390,7 +492,11 @@ class TaskWatchService:
             if elapsed > TC_NO_DISPATCH_SEC:
                 await self._abandon(
                     row,
-                    f"任务中心超过 {TC_NO_DISPATCH_SEC} 秒未派活（任务 {row['task_id']}）",
+                    **_kb_reason(
+                        "err.kb.task_center.no_dispatch",
+                        {"seconds": TC_NO_DISPATCH_SEC, "task_id": row["task_id"]},
+                        f"任务中心超过 {TC_NO_DISPATCH_SEC} 秒未派活（任务 {row['task_id']}）",
+                    ),
                 )
                 return "no_dispatch_timeout"
             return "waiting_dispatch"
@@ -408,7 +514,14 @@ class TaskWatchService:
             # 硬超时对**所有**在途形态一视同仁：只要这一步起了、超了上限，就收口。
             await self._fail_step(
                 row,
-                f"步骤 {row['current_step']} 超过 {TC_STEP_HARD_TIMEOUT_SEC} 秒未完成",
+                **_kb_reason(
+                    "err.kb.task_center.step_hard_timeout",
+                    {
+                        "step": row["current_step"],
+                        "seconds": TC_STEP_HARD_TIMEOUT_SEC,
+                    },
+                    f"步骤 {row['current_step']} 超过 {TC_STEP_HARD_TIMEOUT_SEC} 秒未完成",
+                ),
                 fail_document=fail_document,
             )
             return "step_hard_timeout"
@@ -434,7 +547,13 @@ class TaskWatchService:
             # **现役编排够不到这一格**：进得来要「步龄超 `TC_NO_DOWNSTREAM_SEC`（10 分钟）
             # 且管理方已终态」，而平台四份编排的 `timeout_seconds` 都是 25200；只有把它调到
             # 10 分钟以下的自定义编排才会撞上。真撞上了再决定「交还」还是「落 FAILED」。
-            await self._abandon(row, "管理方那边这次编排已经结束，不再等它")
+            await self._abandon(
+                row,
+                **_kb_reason(
+                    "err.kb.task_center.master_settled", None,
+                    "管理方那边这次编排已经结束，不再等它",
+                ),
+            )
             return "master_settled"
 
         if not (row["rag_task_id"] or ""):
@@ -446,8 +565,15 @@ class TaskWatchService:
             if elapsed > TC_NO_DOWNSTREAM_SEC:
                 await self._fail_step(
                     row,
-                    f"步骤 {row['current_step']} 已受理但未发出下游任务"
-                    f"（超过 {TC_NO_DOWNSTREAM_SEC} 秒）",
+                    **_kb_reason(
+                        "err.kb.task_center.no_downstream",
+                        {
+                            "step": row["current_step"],
+                            "seconds": TC_NO_DOWNSTREAM_SEC,
+                        },
+                        f"步骤 {row['current_step']} 已受理但未发出下游任务"
+                        f"（超过 {TC_NO_DOWNSTREAM_SEC} 秒）",
+                    ),
                     fail_document=fail_document,
                 )
                 return "no_downstream_timeout"
@@ -538,6 +664,11 @@ class TaskWatchService:
                 # `kb_type` 同理（它决定 lightrag 那两类库之外还有没有别的链）。
                 kb_type=facts["kb_type"],
                 backend=facts["backend"],
+                # 任务来源（**必传**）：从文档行的来源方式**现算**，与上传路径同一条映射
+                # （`task_source_for_access_type`）—— 它是文档行上**不会变**的真实列
+                # （不像 `backend` 那个开关值会被翻转），所以读回来永远与当初一致。
+                # ⚠️ 任务其实早已建成时这次调用会走 `REUSED`，这个值被忽略、不影响。
+                task_source=task_source_for_access_type(facts["data_source_type"]),
                 # 任务名 = 文档名（用户定的）。任务中心那边只在**任务诞生那一刻**读它，
                 # 而补交这条路正是「任务还没建上」的情形 —— 所以这里必须带上，否则
                 # 走补交建出来的任务在列表里显示的是编排定义名。
@@ -600,7 +731,14 @@ class TaskWatchService:
             return await self._finish_step(row, step_code, status_info)
         if rag_status in ("failed", "cancelled", "canceled", "error"):
             reason = status_info.get("error_message") or status_info.get("error") or rag_status
-            await self._fail_step(row, f"{step_code} 步骤下游任务失败：{reason}")
+            await self._fail_step(
+                row,
+                **_kb_reason(
+                    "err.kb.task_center.downstream_failed",
+                    {"step": step_code, "detail": reason},
+                    f"{step_code} 步骤下游任务失败：{reason}",
+                ),
+            )
             return "step_failed"
         # `not_found` / 空 / 没见过的状态词：**绝不判死**，交硬超时。
         return "waiting_unknown_status"
@@ -644,6 +782,9 @@ class TaskWatchService:
             wiki_status = (getattr(doc, "llm_wiki_compile_status", None) or "").lower()
             wiki_error = getattr(doc, "llm_wiki_compile_error", None)
 
+        from .kb_type_service import VALID_KB_TYPES, normalize_kb_type
+
+        kb_type = normalize_kb_type(kb_type) if kb_type else kb_type
         if not kb_type:
             # 老文档行上没有这份快照 —— 查权威源（与 `_doc_facts` 同一口径）。
             #
@@ -671,6 +812,20 @@ class TaskWatchService:
             )
             return "waiting_kb_type_unknown"
 
+        if kb_type not in VALID_KB_TYPES:
+            # 未知值**绝不落进 lightrag 分支**：wiki 类文档的 `ontology_status` 被上传路径
+            # 写成 READY，猜成 lightrag 会把「编译刚发起」判成「编译成功」。这里既不判成功
+            # 也不判失败，交给这一步的硬超时兜底，同时留痕让人去修数据。
+            logger.warning(
+                "[TaskCenter] 文档 %s 的 kb_type=%r 不在合法取值 %s 内，"
+                "本步既不判成功也不判失败、等下一轮（任务 %s）",
+                row["document_id"],
+                kb_type,
+                sorted(VALID_KB_TYPES),
+                row.get("task_id"),
+            )
+            return "waiting_kb_type_unknown"
+
         if kb_type in (_KB_TYPE_OPENKB, _KB_TYPE_JONEX_WIKI):
             # ⚠️ **两类 wiki 库都必须在这里分流**，漏了 jonex_wiki 会落到下面 lightrag 的
             # `ontology_status` 分支 —— 而 wiki 类文档的 `ontology_status` 被上传路径写成
@@ -688,7 +843,8 @@ class TaskWatchService:
             # （切片已入库、检索可用，缺的只是图）。这里要是顺手把文档置 FAILED，就等于
             # 让一次「本体没抽出来」把一份能检索的文档整个标成坏的。
             await self._fail_step(
-                row, _compile_failure_reason(ont_error),
+                row,
+                **_compile_failure_reason(ont_error),
                 fail_document=False,
             )
             return "step_failed"
@@ -713,7 +869,11 @@ class TaskWatchService:
             # 缺的只是 Wiki；把文档整个标成 FAILED 会把一份可用的文档打成坏的。
             await self._fail_step(
                 row,
-                f"Wiki 编译失败：{wiki_error or '详见文档的编译错误信息'}",
+                **_kb_reason(
+                    "err.kb.task_center.wiki_compile_failed",
+                    {"detail": wiki_error or "详见文档的编译错误信息"},
+                    f"Wiki 编译失败：{wiki_error or '详见文档的编译错误信息'}",
+                ),
                 fail_document=False,
             )
             return "step_failed"
@@ -748,14 +908,25 @@ class TaskWatchService:
         # 反过来（先上报）最坏只是**重复上报**：收件箱 `subtask_reports` 没有唯一约束，
         # 重复到达的那条由后台消化的「已是终态」闸吸收。所以这个方向是自愈的 ——
         # 这一轮没报上去，下一轮看门狗看到的还是同一个 `rag_task_id`，再走一遍这里。
-        if not await self._report_success(row, document_id):
-            # **没收口、文档状态一个字也没动**，下一轮拿同一行再来。
+        report, accepted = await self._report_success(row, document_id)
+        if not accepted:
+            # ── ⚠️ **上报没被持久受理，仍然照常收口**（2026-10-11 改）──
+            #
+            # 旧行为是「不收口、下一轮拿同一行重报」—— 那是**只靠「推」**的思路：
+            # 推不通就一直推，推不到就挂到编排硬超时（预置 7 小时）。
+            #
+            # 现在多了一条「拉」的路（管理方主动来问，`RunnerProtocol.query_step_status`），
+            # 而它答「成功」的**唯一来源就是这一行上的 `last_report`**。不收口 = 不写
+            # `last_report` = 管理方永远只能问出「还在跑」⇒ **「拉」在成功侧形同虚设**。
+            # 所以：**照常收口 + 把报文落盘**，让管理方自己把结论拉回去。
+            #
+            # **与失败侧同口径**：`_fail_step` / `_fail_document` / `_abandon` 从来就是
+            # 「上报送不出去也照常交还并写报文」—— 成功侧这样才对得上。
             logger.warning(
-                "看门狗上报未被受理，本步不收口、下一轮重试: doc=%s step=%s execution=%s",
+                "看门狗上报未被持久受理，**仍照常收口**（结论由管理方的对账拉回去）: "
+                "doc=%s step=%s execution=%s",
                 document_id, step_code, execution_id,
             )
-            return "report_not_accepted"
-
         async with get_db_session() as session:
             tc_repo = TaskCenterDocumentRepository(session)
             doc_repo = KnowledgeDocumentRepository(session)
@@ -803,6 +974,9 @@ class TaskWatchService:
 
             await tc_repo.mark_step_handled(
                 document_id, execution_id=execution_id, release=is_last,
+                # 把上报的那份报文一并存进接管行：管理方事后主动来问时
+                # （`query_step_status`）直接拿它当一条上报消化（零转换）。
+                report=report,
             )
 
         logger.info(
@@ -812,15 +986,26 @@ class TaskWatchService:
         return "step_ok"
 
     async def _fail_step(
-        self, row: Dict[str, Any], reason: str, *, fail_document: bool = True
+        self,
+        row: Dict[str, Any],
+        error_message: str,
+        *,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+        fail_document: bool = True,
     ) -> None:
         """这一步没成：上报失败 → 记账 → 交还接管。
 
         `fail_document=False` 给 `compile` 步用（本体失败不动文档状态，见 `_inspect_compile`）。
+
+        `error_code` / `error_params` **能给就给**：管理方按**读的人的语言**渲染它，
+        比冻住一句话强。给不出（引擎原文那种）就只给 `error_message`，行为与从前一字不变。
         """
         document_id = row["document_id"]
         try:
-            await self._report_failure(row, reason)
+            await self._report_failure(
+                row, error_message, error_code=error_code, error_params=error_params
+            )
         except Exception:  # noqa: BLE001
             # 上报不上去（任务中心那侧连不上、或已被判终态）**不能拦住交还** ——
             # 交还是用户的解封点，比「让任务中心知道」重要得多。上报本身在 SDK 里
@@ -837,14 +1022,26 @@ class TaskWatchService:
                 )
                 if doc is not None:
                     await KnowledgeDocumentRepository(session).set_status(
-                        doc, DocStatus.FAILED, error_message=reason[:2000],
+                        doc, DocStatus.FAILED, error_message=error_message[:2000],
                     )
             await TaskCenterDocumentRepository(session).mark_released(
-                document_id, error_message=reason[:2000],
+                document_id, error_message=error_message[:2000],
+                # 把**失败报文**存进接管行 —— 管理方主动问时（`query_step_status`）
+                # 拿它当一条上报消化。带上代号与参数（管理方按读的人的语言渲染）。
+                # 不写的话管理方只能答「这活不归我」，一次真实的失败就被读成「配置错误」。
+                report={
+                    "status": "failed",
+                    "error_message": error_message[:2000],
+                    "error_code": error_code,
+                    "error_params": error_params,
+                },
             )
         logger.warning(
             "看门狗判死: doc=%s step=%s execution=%s reason=%s",
-            document_id, row.get("current_step"), row.get("execution_id"), reason,
+            document_id,
+            row.get("current_step"),
+            row.get("execution_id"),
+            error_message,
         )
 
     async def _fail_document(self, row: Dict[str, Any], reason: str, *, job: str) -> None:
@@ -859,11 +1056,30 @@ class TaskWatchService:
                 )
             await TaskCenterDocumentRepository(session).mark_released(
                 row["document_id"], error_message=f"{job}：{reason}"[:2000],
+                # 同 `_fail_step`：这一步是真失败了，存一份失败报文给管理方来问。
+                report={"status": "failed", "error_message": f"{job}：{reason}"[:2000]},
             )
         logger.warning("看门狗放弃: doc=%s task=%s reason=%s", row["document_id"], row["task_id"], reason)
 
-    async def _abandon(self, row: Dict[str, Any], reason: str) -> None:
-        """「有 execution_id 但上一步早已收口、下一步迟迟不来」时的交还。
+    async def _abandon(
+        self,
+        row: Dict[str, Any],
+        error_message: str,
+        *,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """交还一张接管行（`state = released`）、把它还给既有对账。
+
+        ⚠️ **两个调用点、两种形态**（判据都是**快照** `row["execution_id"]` 空不空 ——
+        快照从 `_load_active` 取到、到这里之间**没有锁**，`only_if_idle` 正是为这段窗口设的闸）：
+
+          · **无 `execution_id`** —— `_inspect` 的「上一步已收口、正等下一步派活」档
+            （超 `TC_NO_DISPATCH_SEC`；「两个按钮」武装好等派活也落这一档）。
+            **这一步什么都没跑** → 报文留 `NULL`（保持中性）、`only_if_idle=True`；
+          · **有 `execution_id`** —— `_inspect` 的「我接了活、管理方那边却已终态」档
+            （超 `TC_NO_DOWNSTREAM_SEC`）。**这一步真挂了** → 补一句失败上报 + 写失败报文、
+            `only_if_idle=False`（卡上是自己这次的痕迹，本来就该释放）。
 
         ⚠️ **交还前先把在途任务号交给文档行**（同 `task_stopped` 那处，共用一份实现）：
         交还之后这一行就出看门狗视野、这份文档回到既有对账手里，而任务中心链的文档行上
@@ -873,8 +1089,8 @@ class TaskWatchService:
 
         ⚠️ **交还前还要替在途那一步报一句失败**（2026-09-30 补，与 `task_stopped` 逐字同一条
         理由）：交还之后这一行**也出了管理方的结算视野** —— 不报的话，任务中心那侧那一步
-        一直挂在 `running`，占着 `count_running_by_step_code` 的**全平台共用名额**
-        （`parse` 一共 10 个，跨库跨租户），最长到编排超时（预置 25200 秒 ≈ 7 小时）才被
+        一直挂在 `running`，占着 `count_running_by_catalog_step` 数出来的**本目录共用名额**
+        （该目录的 `parse` 一共 10 个），最长到编排超时（预置 25200 秒 ≈ 7 小时）才被
         超时巡检收掉；这期间用户想「重新解析 / 重新编译」还会被管理方拒（那一步没结束）。
         走到这一支的典型成因正是「`task_stopped` 那条通知**丢了**」（单发、不重发、失败只
         记 warning）—— 两条路必须给同一个结局，否则**通知丢没丢**决定了平台里留不留僵尸。
@@ -883,7 +1099,9 @@ class TaskWatchService:
         """
         if row.get("execution_id"):
             try:
-                await self._report_failure(row, reason)
+                await self._report_failure(
+                    row, error_message, error_code=error_code, error_params=error_params
+                )
             except Exception as exc:  # noqa: BLE001 —— 见上：上报失败不影响交还
                 logger.warning(
                     "看门狗交还前补上报失败（不影响交还）: doc=%s task=%s: %s",
@@ -898,9 +1116,46 @@ class TaskWatchService:
                 step_code=row.get("current_step"),
             )
             await TaskCenterDocumentRepository(session).mark_released(
-                row["document_id"], error_message=reason[:2000],
+                row["document_id"], error_message=error_message[:2000],
+                # ⚠️ **`only_if_idle` 的取值与上面那次上报同一个门**（快照里 `execution_id` 空不空）：
+                #   · **快照里为空**（=「上一步已收口、正等下一步派活」那一档，`_inspect` 的
+                #     `no_dispatch_timeout` / 「两个按钮」武装好等派活）→ **传 `True`**。
+                #     这一档本身**没接活**（纪律与 `_prepare_step` 那几个回绝点同款）；
+                #     而从 `_load_active` 取快照到这里**之间没锁** —— 万一这窗口里 handler
+                #     恰好进来 `begin_step` 写上了新 `execution_id`、正在发下游，无条件按
+                #     `document_id` 释放会**把别人在途的活拆掉**（那头随后 `set_rag_task_id`
+                #     CAS 落空、回 `downstream_unclaimed`，下游任务成孤儿）。
+                #     `True` 命中 0 行什么都不做正是想要的：真有人在途就让它自己收口，
+                #     真没人管则由看门狗下一轮 `TC_NO_DISPATCH_SEC` 兜（见 `mark_released` docstring）。
+                #   · **快照里非空**（=「我接了活、管理方那边却已终态」那一档，`master_settled`）→
+                #     传 `False`：卡上挂的是**自己这次**的执行痕迹，本来就该释放；
+                #     加了这道闸反而释放不掉、要白等。
+                only_if_idle=not row.get("execution_id"),
+                # ⚠️ **报文的取舍与上面那次上报同一个门**（`execution_id` 非空）——
+                # 这不是「顺手写的」，是两种情形本来就不同：
+                #   · **有 `execution_id`**（那一步在跑、管理方那边任务却已结束）→
+                #     这一步**真没成**，写失败报文（与另外两个判死点同口径）；
+                #   · **没有**（只是「**等下一步派活**」等到放弃）→ 这一步**什么都没跑**
+                #     （它可能上一步刚成功、报文还挂在行上），**留 NULL 保持中性**。
+                # 不区分会怎样：把一个「非末步刚成功、正等下一步派活」的行写成 `failed`，
+                # 既把管理方来问的答案变成「失败」，也把「上一步其实成了」这个事实抹掉。
+                report=(
+                    {
+                        "status": "failed",
+                        "error_message": error_message[:2000],
+                        "error_code": error_code,
+                        "error_params": error_params,
+                    }
+                    if row.get("execution_id")
+                    else None
+                ),
             )
-        logger.warning("看门狗交还: doc=%s task=%s reason=%s", row["document_id"], row["task_id"], reason)
+        logger.warning(
+            "看门狗交还: doc=%s task=%s reason=%s",
+            row["document_id"],
+            row["task_id"],
+            error_message,
+        )
 
     async def _bump_attempt(self, row: Dict[str, Any], error_message: str) -> None:
         async with get_db_session() as session:
@@ -923,31 +1178,52 @@ class TaskWatchService:
             execution_id=row["execution_id"] or "",
         )
 
-    async def _report_success(self, row: Dict[str, Any], document_id: str) -> bool:
-        """上报成功。返回值 = 任务中心**持久受理**了没有（`DURABLY_ACCEPTED`）。
+    async def _report_success(
+        self, row: Dict[str, Any], document_id: str
+    ) -> tuple[dict, bool]:
+        """上报成功。返回 `(报文, 管理方**持久受理**了没有)`。
 
-        ⚠️ 返回值必须被调用方用起来：`report_terminal` **不抛异常** —— 它重试 3 次之后
-        把 `TerminalSubmitResult` 交回来，其余两档（`RETRYABLE_UNKNOWN` /
-        `PERMANENT_REJECTED`）都只意味着「发过」。把「发过」当成「对方收到了」而放心
-        收口，就是 `_finish_step` 里那条永久丢失的来路。
+        ⚠️ **报文无论如何都返回**（2026-10-11 改）：调用方 `_finish_step` 现在**不管受理没受理
+        都要收口** —— 没收口的话接管行永远停在在途、`last_report` 永远不写，
+        于是「管理方主动来问」永远只能答「还在跑」，**本特性在成功侧形同虚设**
+        （只有等编排硬超时，预置 7 小时）。理由详见 `_finish_step` 里那段。
 
-        `outputs` **必须带 `document_id`**：下游两步的 `bind_inputs` 写的是
-        `@<上一步>.outputs.document_id`（`008_task_center.sql` 的编排定义段）。漏了它，
+        ## 那个「受理没受理」的返回值**必须被调用方用起来**
+
+        `report_terminal` **不抛异常** —— 它重试 3 次之后把 `TerminalSubmitResult` 交回来，
+        其余两档（`RETRYABLE_UNKNOWN` / `PERMANENT_REJECTED`）都只意味着「**发过**」，
+        不是「对方收到了」。所以这个布尔值要如实交出去，别在调用点丢掉。
+
+        ## `outputs` 必须带 `document_id`（`compile` 步除外）
+
+        下游两步的 `bind_inputs` 写的是 `@<上一步>.outputs.document_id`。漏了它，
         下一步拿到空值、最后一步查不到文档。
 
-        `compile` 步按定义它的 `output_schema` 是 `{}`（那两步才是
-        `{"document_id": ...}`）—— 报空对象是**对的**，不是漏传：它是链路终点，没有下游。
+        `compile` 步按定义它的 `output_schema` 是 `{}` —— 报空对象是**对的**，不是漏传：
+        它是链路终点，没有下游。
         """
         from jonex_core.task_runtime import get_task_runtime
 
         outputs = {} if row["current_step"] == "compile" else {"document_id": document_id}
+        refs = await self._artifact_refs(row, document_id)
+        # 输入那份引用（2026-10-16 加）：与产出那份**同一次上报一起带** —— 用户看某一步时，
+        # 「吃的是什么」和「出了什么」本来就该并排能看到。
+        in_refs = await self._input_refs(row, document_id)
+        # **上报的那份报文原样留一份**（下传 `mark_step_handled` 存进接管行）——
+        # 管理方事后主动来问时（`query_step_status`）拿它当上报消化：
+        # **必须有产出**，否则管理方写了个「成功」却派不出下一步（下一步的输入
+        # 是从 `outputs` 按 `bind_inputs` 填的）。
+        report = {
+            "status": "success",
+            "outputs": outputs,
+            "output_refs": refs,
+            "input_refs": in_refs,
+        }
         result = await get_task_runtime().report_terminal(
             self._carrier(row),
-            TerminalReport.success(
-                outputs, output_refs=await self._artifact_refs(row, document_id)
-            ),
+            TerminalReport.success(outputs, output_refs=refs, input_refs=in_refs),
         )
-        return result.disposition is TerminalSubmitDisposition.DURABLY_ACCEPTED
+        return report, result.disposition is TerminalSubmitDisposition.DURABLY_ACCEPTED
 
     async def _artifact_refs(self, row: Dict[str, Any], document_id: str) -> list:
         """产出「**去哪儿看**」的引用（§4.2 ① 的 `output_refs`）。
@@ -966,8 +1242,10 @@ class TaskWatchService:
         （`OUTPUT_REF_PARAMS`）。
 
         `params` 给的是**我们这边接口要的字段** —— 前端拿它去调**我们**的接口看详情，
-        **权限也归这边判**（谁能看这份文档谁才能看它的产物）—— 所以那条给前端**不判权**的
-        任务列表接口里只放引用、不放正文。
+        **权限也归这边判**（谁能看这份文档谁才能看它的产物）。所以引用里**只放入口、不放正文**：
+        这是**设计选择**（内容与它的权限都留在运行方这一侧）。
+        ⚠️ **别把它说成「因为任务中心那个读接口不判权」** —— 那句已经过时：控制台的两个子任务
+        读口子从 2026-10-13 起都过 `require_space_visible`（租户 + 空间可见性）。
 
         三种终态各一处：
           · `parse` / 遗留 `ingest` → 切片列表（解析的产物就是切片）；
@@ -996,17 +1274,60 @@ class TaskWatchService:
                 from .kb_type_service import get_kb_type
 
                 kb_type = await get_kb_type(row["tenant_id"], kb)
+            else:
+                from .kb_type_service import normalize_kb_type
+
+                kb_type = normalize_kb_type(kb_type)
             if kb_type in (_KB_TYPE_OPENKB, _KB_TYPE_JONEX_WIKI):
                 return [{"kind": f"{_REF_KIND_PREFIX}.wiki", "params": params}]
             return [{"kind": f"{_REF_KIND_PREFIX}.ontology", "params": params}]
         # 其它步骤（认不出的）不给入口 —— 宁可不显示，也不给一个点进去 404 的按钮。
         return []
 
-    async def _report_failure(self, row: Dict[str, Any], reason: str) -> None:
+    async def _input_refs(
+        self, row: Dict[str, Any], document_id: str
+    ) -> List[Dict[str, Any]]:
+        """输入「**从哪儿来**」的引用（§4.2 ① 的 `input_refs`，2026-10-16 加）。
+
+        形状与分派规则都在 `build_input_refs`（运行方那侧，与本类 `_artifact_refs` 对称）：
+        解析 1 条（那份文档）、编译 2 条（文档 + 它吃的那批切片）。这里只做一件事 ——
+        把这一步的两个上下文事实（库、步骤）+ 文档名凑齐递过去。
+
+        文档名单独读一次（`load_document_name`）：`_doc_facts` 那个口子会顺带算
+        backend / kb_type / 来源方式，这里用不着。查不到时由 `build_input_refs` 回落成
+        `document_id`（协议层要求 params 值非空，占位空名会把上报本身拒掉）。
+        """
+        return build_input_refs(
+            knowledge_base_id=row.get("knowledge_base_id") or "",
+            current_step=row.get("current_step") or "",
+            document_id=document_id,
+            document_name=await load_document_name(row["tenant_id"], document_id),
+        )
+
+    async def _report_failure(
+        self,
+        row: Dict[str, Any],
+        error_message: str,
+        *,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+    ) -> None:
         from jonex_core.task_runtime import get_task_runtime
 
+        # 失败也带输入引用（2026-10-16 用户点名）：这一步栽了跟头时，最想知道的就是
+        # 「它当时吃的是哪份东西」—— 少这条，用户只能从别处猜。
+        in_refs = await self._input_refs(row, row.get("document_id") or "")
         await get_task_runtime().report_terminal(
-            self._carrier(row), TerminalReport.failed(reason[:2000]),
+            self._carrier(row),
+            TerminalReport.failed(
+                error_message[:2000],
+                input_refs=in_refs,
+                # 代号 + 参数走协议里那两个**可选**字段（2026-10-10 加）：管理方存下来，
+                # 读接口按请求的 `X-Lang` 现场渲染 —— 否则「哪国语言」由这里上报的那一刻
+                # 决定，而看门狗多半跑在后台，那一刻只有默认语言。
+                error_code=error_code,
+                error_params=error_params,
+            ),
         )
 
     # ========================================================

@@ -18,6 +18,8 @@ from .reconciliation_service import ReconciliationService
 from .search_feedback_service import SearchFeedbackService
 from .search_history_service import SearchHistoryService
 from .search_service import SearchService
+from .image_query_service import ImageQueryService
+from .query_image_service import QueryImageService
 from .task_runner_service import TaskRunnerService
 from .task_watch_service import TaskWatchService
 from .execution_registry import PostgresExecutionRegistry
@@ -31,7 +33,14 @@ class KnowledgeBaseService:
         self.data_sources = DataSourceService()
         self.knowledge_infos = KnowledgeInfoService()
         self.search = SearchService()
-        self.history = SearchHistoryService()
+        # [jonex] 以图问知识（两步式的第一步 + 图片生命周期）：
+        #   `image_query` = 图片 → 查询文本（识别完只在 Redis 暂存，不落盘）
+        #   `query_image` = 落盘 / 查看定位 / 释放清理 / 每小时兜底扫描
+        # 两者共用同一份 `kb:imgq:*` 键规则（`image_query_service` 里那三个函数），
+        # 所以历史服务必须拿到**同一个** query_image 实例，不能各建一个。
+        self.query_image = QueryImageService()
+        self.image_query = ImageQueryService()
+        self.history = SearchHistoryService(query_image=self.query_image)
         self.feedback = SearchFeedbackService()
         self.answer_feedback = AnswerFeedbackService()
         self.parse_results = ParseResultService()

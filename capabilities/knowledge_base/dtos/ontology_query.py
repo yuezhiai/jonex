@@ -64,8 +64,15 @@ class OntologyEntitySearchRequest(BaseModel):
 
     用于在实例/关系表单中，让用户通过模糊搜索快速定位实体实例。
     复用 Neo4j 全文索引 ont_entity_ft（cjk analyzer）实现中文模糊匹配。
+
+    `document_id`（可选）限定候选范围：从**文档结果页**打开表单时带上，只返回
+    `doc_ids` 含该文档的实体（与文档本体视图同一判据 `$doc_id IN e.doc_ids`），
+    避免在单篇文档里把整个 KB 的实体都列出来选；KB 级表单不带 → 全库候选。
     """
 
     knowledge_base_id: str = Field(..., min_length=1, description="知识库 ID")
     keyword: str = Field(..., min_length=0, max_length=256, description="搜索关键词")
     limit: int = Field(20, ge=1, le=200, description="返回条数上限")
+    document_id: Optional[str] = Field(
+        default=None, description="限定候选实体所属文档 ID（文档页表单带；KB 级表单不带）"
+    )

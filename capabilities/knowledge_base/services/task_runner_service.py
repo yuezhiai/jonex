@@ -62,12 +62,24 @@ handler 里上报」。
 | 按钮 | 重跑哪几步 | 这次是哪种操作（`tc_intent`） |
 | --- | --- | --- |
 | 重新编译 | `compile_1`（**单步**，`retry_subtask_for_step`） | 不变（`compile` 步对三种来头语义相同） |
-| 重新解析 | `parse_1` → `compile_1`（**一次调用交两步**，`retry_subtasks_for_steps`） | `reparse` —— lightrag 触发 `_submit_reparse`（`reparse_strict`）；两类 wiki 库同一个 `parse` 步**照发 `parse_only`**（它们不推切片，没有严格重解析那个档），差异只在 `document_service` 那一侧（代次 +1、编译标 `stale`） |
+| 重新解析 | `parse_1`（外加 `compile_1`，**当它已终态时**；一次调用交出去，`retry_subtasks_for_steps`） | `reparse` —— lightrag 触发 `_submit_reparse`（`reparse_strict`）；两类 wiki 库都**没有严格重解析那个档**（它们不推切片）：都走 `parse_only`，差异只在 `document_service` 那一侧（代次 +1、编译标 `stale`） |
 
-⚠️ **「重新解析」必须一口气把两步都交出去**，不是「发完 `parse_1` 再等看门狗补
-`compile_1`」：用户按一下按钮期望的就是「解析和本体都重来」，而任务中心的「重跑」
-**不连带下游**。批量口把**先后写进依赖**（第 i 步等第 i-1 步成功），所以 `compile_1`
-不会跟那个正在重建切片的解析步抢跑 —— 逐条论证见 `retry_subtasks_for_steps`。
+⚠️ **「重新解析」一口气把名单交出去**（不是「只交 `parse_1`、靠连带带出 `compile_1`」），
+**但名单里只放已终态的节点**（2026-10-14 修，判据收在 `reparse_step_codes`）：
+
+- 用户按一下按钮期望的就是「解析和本体**一起**重来」，一次提交把这件事**显式**表达出来，
+  比「重跑一步、指望它连带」直白；
+- 批量口把**先后写进依赖**（第 i 步等第 i-1 步成功），同一个事务里两支都重置 ——
+  `compile_1` 不会跟那个正在重建切片的解析步抢跑，中间也没有「上游重置了、下游还没」的
+  半成品窗口。逐条论证见 `retry_subtasks_for_steps`；
+- ⚠️ 但名单里**不能带上还没跑完的节点**：任务中心对名单里**每一行**都要求「那一步已
+  终态」，带上一个 `pending` 的 `compile_1`（= 从未编译过的文档，真机那一档）就是
+  **整批被拒** ⇒ 主用例「解析失败后重试」100% 不可用。判据（`pending` 不带 / `running`
+  直接拒 / 读不到按保守侧）与逐条论证见 `reparse_step_codes`。
+
+（任务中心的单步重跑从 2026-10-11 起也会**连带下游**了 —— 所以「只交 `parse_1`」现在
+也能达到同样效果；这里仍然用批量口，是为了把「这两步是一件事」写死在调用点上，
+不依赖下游那一侧的连带规则。）
 
 ⚠️ 于是**同一个 `parse` 步背上了两种含义**（上传 → `full` / 重新解析 → `reparse_strict`，
 后者的差别是「先删旧切片」）。分流的唯一判据是文档行上的 `tc_intent`，**不是 `step_code`
@@ -95,7 +107,7 @@ atomic-rag**，真正干活的是它、跑几十分钟；handler 里等它跑完
 """
 
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.capability.response import ApiResponse
@@ -105,7 +117,17 @@ from jonex_core.common.i18n import translate
 from jonex_core.common.object_storage import get_object_storage_for
 from jonex_core.common.tenant import require_tenant
 from jonex_core.task_protocol.errors import TaskRuntimeNotBuiltError
-from jonex_core.task_protocol.models import ExecutionDispatch, TaskSubmission
+from jonex_core.task_protocol.models import (
+    STEP_STATUS_FAILED,
+    STEP_STATUS_PENDING_DISPATCH,
+    STEP_STATUS_RUNNING,
+    STEP_STATUS_SUCCEEDED,
+    STEP_STATUS_UNKNOWN,
+    ExecutionDispatch,
+    ExecutionEnvelope,
+    StepStatusQuery,
+    TaskSubmission,
+)
 from jonex_core.task_protocol.results import (
     SubmissionDisposition,
     SubmissionResult,
@@ -123,6 +145,12 @@ from . import ingest_backend, task_intent
 from ..models import DocStatus
 from ..models.task_center import ACTIVE_STATES, TaskCenterDocState
 from ..repository.document_repository import KnowledgeDocumentRepository
+from ..repository.processing_task_repository import (
+    TASK_STATUS_RUNNING,
+    TASK_TYPE_PARSE,
+    record_processing_task,
+)
+from ..repository.search_event_repository import safe_record_asset_status_event
 from ..repository.task_center_repository import TaskCenterDocumentRepository
 
 logger = logging.getLogger(__name__)
@@ -136,6 +164,96 @@ logger = logging.getLogger(__name__)
 STEP_PARSE = "parse"
 STEP_INGEST = "ingest"
 STEP_COMPILE = "compile"
+
+#: 引用（`output_refs` / `input_refs`）里 `kind` 的**运行方前缀** = 本运行方在
+#: `task_center.runner_definitions` 里的 `code`。任务中心是**多运行方**的，`kind` 不带
+#: 前缀迟早和别人撞（谁都在切块）—— 协议层那两张枚举表就是按 `{前缀}.{资源}` 编的。
+#: 定义在这个模块：看门狗（`task_watch_service`）已经依赖本模块，反过来 import 会成环。
+REF_KIND_PREFIX = "knowledge_base"
+
+
+async def load_document_name(tenant_id: str, document_id: str) -> Optional[str]:
+    """取这份文档的**文件名**（`input_refs` 的 `document_name` 的来源）。
+
+    为什么不复用看门狗那个 `_doc_facts`：那一处顺带要算 backend / kb_type / 来源方式
+    （建任务时确实都要），而这里**只要名字** —— 多算的那几项要么白算、要么再查一次库。
+    单行读、不跨事务，也就没有「两次读之间文档被删」的顾虑（这里只读一次）。
+
+    查不到（文档已删）回 `None`，由调用方兜（见 `build_input_refs`：回落成 `document_id`）。
+
+    ⚠️ **读失败一律吞成 `None` + 告警**（写这条注释是为了让它别被"顺手"改成往上抛）：
+    名字是**展示用**的，而调用它的两条路都在**上报**里 —— 为了一个展示字段把整条上报
+    炸掉，等于让一次本来能收口的终态永远收不了口（任务挂到超时）。同一条口径见
+    `_master_already_settled` 那句「探查失败不改行为」。
+    """
+    try:
+        async with get_db_session() as session:
+            doc = await KnowledgeDocumentRepository(session).get_by_id(
+                document_id, tenant_id
+            )
+            return getattr(doc, "file_name", None) if doc is not None else None
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：展示字段不阻塞上报
+        logger.warning(
+            "读文档名失败（input_refs 的名字回落成 document_id）: doc=%s err=%s",
+            document_id,
+            exc,
+        )
+        return None
+
+
+def build_input_refs(
+    *,
+    knowledge_base_id: str,
+    current_step: str,
+    document_id: str,
+    document_name: Optional[str],
+) -> List[Dict[str, Any]]:
+    """输入「**从哪儿来**」的引用（§4.2 ① 的 `input_refs`，2026-10-16 加）。
+
+    与 `output_refs` 是**对称的两份**：那份说「这一步的成果去哪儿看」，这份说「这一步吃的
+    是什么」。同样**由运行方填**（只有我们知道自己的输入对应哪个页面）、同样只有
+    `kind` + `params`、不带地址，`kind` 带运行方前缀。
+
+    按 `current_step` 分派（2026-10-16 用户拍板）：
+
+      · `parse` / 遗留 `ingest` —— **1 条**：那份文档（`{前缀}.document`）；
+      · `compile` —— **2 条**：文档 + 切片（`{前缀}.chunks`）。为什么要两条：编译这一步
+        既要知道「编的是哪份文档」，也要能直接跳到「它吃的那批切片」；而切片正是上一步
+        解析的产物（上一步的 `output_refs` 就是它）。
+      · 其它步骤（认不出的）—— 不给入口（与产出那份的收尾口径一致：宁可不显示，
+        也不给一个点进去 404 的按钮）。
+
+    ⚠️ **`document_name` 拿不到时回落成 `document_id`**：协议层要求 `params` 的值是
+    **非空标量**，占位名（空串 / `None`）会被**当场拒** —— 那等于我们自己把上报搞坏，
+    比少显示一个名字严重得多。回落之后前端至少还能显示点什么。
+
+    ⚠️ 放在本模块（而不是看门狗里）是因为**两处都要用**：看门狗的成功/失败上报，以及
+    `remove_task` 那条「用户停止、运行方弃单」的失败上报 —— 而看门狗已经依赖本模块，
+    公共函数只能待在依赖的**上游**这一侧。
+    """
+    if current_step not in (STEP_PARSE, STEP_INGEST, STEP_COMPILE):
+        return []
+    document = {
+        "kind": f"{REF_KIND_PREFIX}.document",
+        "params": {
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_name": document_name or document_id,
+        },
+    }
+    if current_step in (STEP_PARSE, STEP_INGEST):
+        return [document]
+    # `compile`：文档 + 它吃的那批切片（切片 = 上一步解析的产出）。
+    return [
+        document,
+        {
+            "kind": f"{REF_KIND_PREFIX}.chunks",
+            "params": {
+                "knowledge_base_id": knowledge_base_id,
+                "document_id": document_id,
+            },
+        },
+    ]
 
 #: 编排里的**节点 id**（`008_task_center.sql` 的预置定义段）—— 「重新解析 / 重新编译」
 #: 靠它指认要重跑哪一步。
@@ -197,9 +315,8 @@ def node_id_for_step(step_code: str) -> str:
 #:
 #: ⚠️ **这张表只覆盖「上传」那一次解析**。lightrag 的同一个 `parse` 步在「重新解析」时
 #: 发的是 `reparse_strict`（解析 + 删旧切片 + 推新切片，走 `_submit_reparse`）—— 判据是
-#: 文档行上的 `tc_intent`。**两类 wiki 库都没有这个分叉**：它们不推切片，「重新解析」
-#: 与「上传」发的是同一个 `parse_only`（差异全在 `document_service` 那一侧：代次 +1、
-#: 编译标 `stale`）。
+#: 文档行上的 `tc_intent`。**两类 wiki 库都没有这个分叉**（它们不推切片）：都发
+#: `parse_only` —— 差异全在 `document_service` 那一侧：代次 +1、编译标 `stale`。
 _INSERT_MODES: Dict[tuple, str] = {
     (STEP_PARSE, "lightrag"): "full",
     (STEP_PARSE, "openkb"): "parse_only",
@@ -228,9 +345,9 @@ def insert_mode_for(step_code: str, kb_type: str) -> str:
 #: 本运行方认的**库类型**（`kb_type`）。三类库全部接入：
 #:   · `lightrag`   —— 页面上的「Ontology」，走 atomic-rag 那条链；
 #:   · `openkb`     —— 页面上的「Ontology Wiki」，走 wiki 链（`parse_only` + Wiki 编译）；
-#:   · `jonex_wiki` —— 页面上的「Jonex Wiki」，与 openkb **同形**（`parse_only` + Wiki
-#:     编译），差别只有产物形状（`content_list.json` vs `content.md`）与编译入口 /
-#:     巡检各自一个（见下面那两个定义常量与 `_submit_jonex_wiki_compile`）。
+#:   · `jonex_wiki` —— 页面上的「Jonex Wiki」，两步形状与 openkb 相同（parse + Wiki
+#:     编译），差别是产物形状（`content_list.json` vs `content.md`）与编译入口 / 巡检
+#:     各自一个（见下面那两个定义常量与 `_submit_jonex_wiki_compile`）。
 #: 域外的值进来一律显式拒 —— 拒比「按 lightrag 的模式去解析一个本该走 parse_only 的库」
 #: 安全（那会把它的产物口径写坏）。
 _KB_TYPE_LIGHTRAG = "lightrag"
@@ -310,6 +427,46 @@ def definition_for_backend(backend: str) -> str:
             message=(
                 f"KB_INGEST_BACKEND 取值 {backend!r} 没有对应的编排定义"
                 f"（可选 {sorted(_DEFINITION_BY_BACKEND)}）"
+            ),
+        ) from None
+
+
+#: 文档**来源方式**（`knowledge_documents.data_source_type` 的现役四值）→ **任务来源码**。
+#:
+#: ⚠️ **右边是协议层写死的枚举**（`jonex_core/task_protocol/models.py` 的
+#: `TASK_SOURCES`），运行方不许自创；左边那四个字面量才是本模块自己的词汇
+#: （`dtos/data_source.py` 的 `ACCESS_TYPES` 是同一套值）。两边对得上由
+#: `tests/unit/kb_integration/test_kb_task_source_mapping.py` 那条「映射值 ∈
+#: `TASK_SOURCES`」的用例钉住 —— 改了这里忘了改协议层，任务会一律提交不出去（1001）。
+#:
+#: **为什么不另存一列来表达来源**：`data_source_type` 是文档行上早就有的真实列
+#: （统计已按它分组），四种接入方式与它**一一对应**；再存一份必然漂移。
+_TASK_SOURCE_BY_ACCESS_TYPE = {
+    "file": "knowledge_base.file.manual_upload",  # 手动上传（含 COS 预签名直传确认）
+    "api": "knowledge_base.file.api_pull",  # API 接入：**我方出站**拉第三方 REST
+    "api_push": "knowledge_base.file.api_push",  # API 开放：第三方**入站推送**
+    "storage": "knowledge_base.file.storage_upload",  # 文件存储直连：MinIO / S3 出站拉
+}
+
+
+def task_source_for_access_type(access_type: Optional[str]) -> str:
+    """把「文档来源方式」翻成协议层的「任务来源」码（提交任务时必须带上）。
+
+    **域外取值一律抛**（照 `definition_for_kb_type` / `resolve_backend` 的同一条纪律）：
+    静默挑一个默认来源，会把「这条任务到底从哪个入口来的」**记成假的** —— 而这一列
+    存在的全部意义就是回答那个问题，记错比记不出来更坏。
+
+    ⚠️ **空值（`None` / 空白）同样抛**：`upload_document` 给所有入库路径都写过
+    `data_source_type`（手动上传那条也回落成 `file`），拿不到值说明是**装配错了**，
+    不能当成「手动上传」蒙混过去。
+    """
+    try:
+        return _TASK_SOURCE_BY_ACCESS_TYPE[(access_type or "").strip()]
+    except KeyError:
+        raise InternalError(
+            message=(
+                f"文档来源方式 {access_type!r} 没有对应的任务来源"
+                f"（可选 {sorted(_TASK_SOURCE_BY_ACCESS_TYPE)}）"
             ),
         ) from None
 
@@ -438,6 +595,21 @@ class TaskRunnerService(RunnerBase):
                 await TaskCenterDocumentRepository(session).mark_released(
                     snapshot.document_id,
                     error_message=err_text[:2000],
+                    # ⚠️ **也得写失败报文**（2026-10-11 补）：上面那句注释说「口径与看门狗的
+                    # `_fail_step` 一致」，但在 `last_report` 这一维上原先并不一致 ——
+                    # 不写的话，管理方事后主动来问只会得到 `unknown`（「这活不归我」），
+                    # 把它当**配置错**处置，而其实这是一次**真实的业务失败**（下游压根没建出来）。
+                    # ⚠️ **代号与参数一并存**（2026-10-13 补）：另外两个判死点
+                    # （`_fail_step` / `task_stopped`）都存了 `error_code` + `error_params`，
+                    # 只有这一处漏了 —— 管理方 `query_step_status` 会把 `last_report`
+                    # **原样带回**，读的人按自己的语言渲染；缺了代号，这条链在这一处
+                    # **静默退化成一句冻死的中文文本**（「存代号+参数、读时渲染」断了一节）。
+                    report={
+                        "status": "failed",
+                        "error_message": err_text[:2000],
+                        "error_code": "err.kb.task_center.downstream_submit_failed",
+                        "error_params": {"step": step_code, "error": str(exc)[:500]},
+                    },
                 )
             return ApiResponse.fail(
                 translate(
@@ -494,6 +666,157 @@ class TaskRunnerService(RunnerBase):
         # **这一步的终态不在这里报**（见模块 docstring）：回 ok 的含义是「我收下了」。
         return ApiResponse.ok()
 
+    async def _rearm_after_console_retry(
+        self,
+        session: Any,
+        *,
+        row: Any,
+        execution: ExecutionDispatch,
+        step_code: str,
+        tenant_id: str,
+    ) -> Optional[ApiResponse]:
+        """任务中心的「**任务重试**」：把已交还的接管行就地重新武装，并按「重新解析」重置文档行。
+
+        ## 为什么要在这里做
+
+        接管行是运行方判断「这一步该不该受理」的**唯一凭据**，而它被**任何一条收口出口**
+        写成 `released`（跑完 / 判死 / 用户停止 / 任务被删）。任务中心的「任务重试」
+        （`task.console_task_retry`）是**整条任务原地重跑**：它重置自己的子任务、重新派活，
+        但**一个字都不碰这张表、也不出站通知运行方**（对比 `stop_task` 会 `_notify_stopped`）。
+        于是重跑后的第一枪必然撞上 `released` → 被老口径当场拒（
+        `err.kb.task_center.takeover_closed`），任务从 success 变成 failed。
+
+        ⚠️ **不只是「停过的」**：上传成功后接管行本来就是 `released` —— 三类库
+        （`lightrag` / `openkb` / `jonex_wiki`）的**任何**文档点它都会这样。两个按钮
+        （重新解析 / 重新编译）不受影响：它们走 `rearm_for_rerun` 先武装再请重跑。
+
+        ## 判据为什么够用
+
+        「`released` + 这条 `task_id` 又来派活」= 这条任务又被跑起来了。别的可能：
+        · **任务被删**（`remove_task` 也把行写成 `released`）—— 但它不再派活；
+        · **用户点停止**（`task_stopped` 同）—— 任务已收成 `failed`，也不再派活。
+        所以派活本身就是「这条任务在跑」的证据，不需要再向管理方查一次。
+
+        ## 顺序与事务
+
+        「武装接管行 + 重置文档行」**必须与后面的 `begin_step` 同一次提交**（`session`
+        是调用方那一笔事务）：
+        · 分开提交的话，中间崩一下会留下「接管行说重跑、文档行还是上一轮的终态」——
+          而**上一轮的 `ontology_status=READY` 会让 `compile` 步当场判成功**（假成功）；
+        · 更要紧的是 `begin_step` 自带 `state IN 在途` 的 CAS：武装与它之间只要被别人
+          插进来，这次派活就没有落点了。
+
+        ## 只做「武装」这一件事 —— **不在这里动文档行**
+
+        后面那几道闸门（派活报文与接管行交叉核对 / 文档还在不在 / 库类型对不对）
+        全是主流程**已经有的**，让它们照常跑：它们回绝时会「**先交还再拒**」，
+        而那时行已经是 `managed`、正好被交还回去，净效果与「行本来就是 `released`」
+        一模一样（文档行一个字没动）。文档行的重置排在**所有这些闸门之后**
+        —— 即 `begin_step` 成功之后（见 `_reset_document_after_console_retry`）。
+        排在前面的话，任何一条回绝路径都会留下「文档说在重解析、却没有任何人在跑」的
+        假状态（接管行在途、文档 `parsing`、任务中心那边那一步却是失败的）。
+
+        返回 `None` = 武装好了、**继续走主流程**（后面还有那几道闸门要过）；
+        返回 `ApiResponse` = 明确拒绝（CAS 没抢到）。
+        """
+        # 抢 CAS 把接管行拿回来。`rearm_for_step` 的条件是 `state='released'` ——
+        # 它就是这次处置的**并发安全闸**：抢不到说明这行在「读到写」之间被别处动过
+        # （另一次上传接管了它 / 任务被删了 / 又回到在途），按老口径明确拒绝。
+        # `clear_handled=True`：上一轮的收口痕迹必须清（见仓储那处的两条理由）。
+        armed = await TaskCenterDocumentRepository(session).rearm_for_step(
+            row.document_id,
+            tenant_id=tenant_id,
+            task_id=row.task_id,
+            step_code=step_code,
+            clear_handled=True,
+        )
+        if not armed:
+            return ApiResponse.fail(
+                translate(
+                    "err.kb.task_center.takeover_closed",
+                    params={"task_id": execution.task_id, "state": "<changed>"},
+                    fallback=f"任务 {execution.task_id} 的接管记录已变更，不再受理这一步",
+                )
+            )
+        return None
+
+    async def _reset_document_after_console_retry(
+        self,
+        session: Any,
+        *,
+        doc: Any,
+        step_code: str,
+        kb_type: str,
+        task_id: str,
+        document_id: str,
+    ) -> None:
+        """「任务重试」受理之后：把文档行按「重新解析」的口径重置。
+
+        **调用点排在 `begin_step` 成功之后**（理由见 `_rearm_after_console_retry`
+        与那里的调用点注释）—— 到这一步为止，闸门全过了、这次派活真的成立了。
+
+        与用户点「重新解析」**共用同一个函数**（`reset_document_for_rerun`），
+        所以两条路在文档侧留下的形状一定一样。
+        """
+        from .kb_type_service import LLM_WIKI_TYPES
+
+        if step_code != STEP_PARSE:
+            # 重跑的第一步**不是** `parse`：文档行一个字不动。
+            #
+            # 为什么不动：`reset_document_for_rerun` 会**把代次 +1** = 「重新解析」的语义，
+            # 而它必须与「第一步会重推切片」配套（引擎按代次 fencing 掉在途的旧结果）。
+            # 单独重跑 `compile` 时切片还是上一代推的，代次 +1 会让那份**正在被用的**
+            # 切片被判成过期产物 —— 那是静默的数据损坏，比「这步跑不出想要的结果」糟得多。
+            # 实际路径上走不到这里（「任务重试」的第一枪永远是 `parse_1`，它跑完会把行交回
+            # `managed`，后面的 `compile` 就进不了那道闸）—— 留着是因为**编排定义是数据、
+            # 可以被改**，猜不得。
+            logger.warning(
+                "任务重试：重跑的第一步是 %s（不是 parse）—— 只重新武装接管行、不动文档行: "
+                "doc=%s task=%s",
+                step_code, document_id, task_id,
+            )
+            return
+
+        from .document_service import reset_document_for_rerun
+
+        rerun_rollback = reset_document_for_rerun(doc, is_llm_wiki=kb_type in LLM_WIKI_TYPES)
+
+        # 第 3 期：这次 `-> parsing` 的流转留痕（与「重新解析」按钮同一口径，
+        # 只是 reason 区分来源）。`reset_document_for_rerun` 是直写属性。
+        await safe_record_asset_status_event(
+            session, doc.tenant_id,
+            asset_id=doc.id,
+            status=doc.status,
+            previous_status=rerun_rollback.get("status"),
+            reason="task_retry",
+            kb_id=doc.knowledge_base_id,
+        )
+
+        # `tc_intent=reparse` —— 让这一枪 `parse` 发引擎的**严格重解析**
+        # （`reparse_strict`：解析 + 删旧切片 + 推新切片），这正是用户要的
+        # 「清掉旧的解析数据、重来一次」。
+        #
+        doc.extra_metadata = task_intent.with_intent(
+            doc.extra_metadata, task_intent.INTENT_REPARSE,
+        )
+
+        # 埋点：这是**新代次**的一次解析开工。`reset_document_for_rerun` 是直写属性
+        # （不走 `set_status`），所以没有自动埋点 —— 不补的话，收口那次
+        # （`set_status(READY)`，仍走仓储的自动埋点）会写一条**没有对应 running 行**
+        # 的 success 事件，统计里就多一次「无中生有」的解析。
+        await record_processing_task(
+            session, doc.tenant_id,
+            asset_id=doc.id, task_type=TASK_TYPE_PARSE,
+            status=TASK_STATUS_RUNNING, doc_id=doc.id,
+            kb_id=doc.knowledge_base_id, content_generation=doc.content_generation,
+        )
+        await session.flush()
+        logger.warning(
+            "任务重试：接管行已重新武装 + 文档按「重新解析」重置 "
+            "（doc=%s task=%s step=%s 新代次=%s）",
+            document_id, task_id, step_code, doc.content_generation,
+        )
+
     async def _prepare_step(
         self, execution: ExecutionDispatch, step_code: str, tenant_id: str
     ):
@@ -518,18 +841,25 @@ class TaskRunnerService(RunnerBase):
                         fallback=f"没有找到任务 {execution.task_id} 的知识库接管记录",
                     )
                 )
-            if row.state not in ACTIVE_STATES:
-                # 已经被交还给既有对账（跑完了 / 判死了 / 任务被删了）—— 这次派活来晚了。
-                return ApiResponse.fail(
-                    translate(
-                        "err.kb.task_center.takeover_closed",
-                        params={"task_id": execution.task_id, "state": row.state},
-                        fallback=(
-                            f"任务 {execution.task_id} 的接管记录已交还（state={row.state}），"
-                            "不再受理这一步"
-                        ),
-                    )
+            retrying = row.state not in ACTIVE_STATES
+            if retrying:
+                # 已经被交还给既有对账（跑完了 / 判死了 / 用户停了 / 任务被删了）。
+                #
+                # ⚠️ **这里曾经是一句「这次派活来晚了、拒掉」** —— 那对任务中心的
+                # 「**任务重试**」是错的：那条路是**整条任务原地重跑**，而接管行早就
+                # 被收口出口写成 `released` 了，于是每次重试的第一枪都被当场拒，
+                # 任务从 success 变成 failed（三类库的任何文档都这样）。
+                # 现在改成「就地重新武装」，判据与事务边界见 `_rearm_after_console_retry`。
+                # **返回非 None 才是真拒绝**（CAS 没抢到）。
+                rejected = await self._rearm_after_console_retry(
+                    session,
+                    row=row,
+                    execution=execution,
+                    step_code=step_code,
+                    tenant_id=tenant_id,
                 )
+                if rejected is not None:
+                    return rejected
 
             # ② 交叉核对：派活报文里的 `document_id` 与接管行必须指同一份文档。
             # `inputs` 由任务中心按上一步的 `outputs` 填好（`bind_inputs`），正常路径
@@ -628,12 +958,32 @@ class TaskRunnerService(RunnerBase):
             if not started:
                 # 从上面读到写之间接管行变了（被删任务 / 被看门狗交还）—— 这次派活
                 # 已经没有落点，拒绝比「先干了再说」安全。
+                #
+                # ⚠️「任务重试」那条路（上面刚武装过）走到这里**理论上不可达**：
+                # 那次武装与这次 CAS 在同一笔事务里、条件也重合。真到了这里，
+                # 行留在 `managed`、而**文档行一个字都还没动** —— 由看门狗的
+                # `TC_NO_DISPATCH_SEC`（30 分钟）兜底交还，不会留下坏数据。
                 return ApiResponse.fail(
                     translate(
                         "err.kb.task_center.takeover_closed",
                         params={"task_id": execution.task_id, "state": "<changed>"},
                         fallback=f"任务 {execution.task_id} 的接管记录已变更，不再受理这一步",
                     )
+                )
+
+            # ③' 【任务重试】到这里**才**动文档行 —— 与上面那句的顺序是刻意的：
+            #     所有闸门都过了、这一步真的受理了，才把文档按「重新解析」重置。
+            #     排在任何一条回绝路径之前的话，那份文档会停在
+            #     「接管行在途 + 自己 `parsing` + 任务中心那边这一步失败」的假状态，
+            #     要等满看门狗的 30 分钟兜底才解开。
+            if retrying:
+                await self._reset_document_after_console_retry(
+                    session,
+                    doc=doc,
+                    step_code=step_code,
+                    kb_type=kb_type,
+                    task_id=row.task_id,
+                    document_id=row.document_id,
                 )
 
             # ④ 把这一步要用的东西全部拍成快照：事务一关，ORM 对象就 detached 了。
@@ -703,8 +1053,12 @@ class TaskRunnerService(RunnerBase):
             return await self._submit_ontology_only(snapshot)
         if snapshot.kb_type in (_KB_TYPE_OPENKB, _KB_TYPE_JONEX_WIKI):
             # 两类 wiki 库都只有两步链、且两步都不吃 `tc_intent`（它们没有严格重解析
-            # 那个档），所以这里直接落到 `_submit_insert`（档位由 `insert_mode_for`
-            # 定 = `parse_only`）。
+            # 那个档）。
+            # [P3b 复审 fix] 显式门 `step_code == STEP_PARSE`：`compile` 已在本块上游
+            # 提前返回，而 `ingest` 只存在于改版前遗留任务（`_INSERT_MODES` 里仅
+            # lightrag 有该档）。将来若有人给 wiki 编排加 ingest 节点，落回
+            # `_submit_insert` 会因取不到执行模式**显式抛错**；缺了这道门，那个步会
+            # 再投一次引擎 insert（重复解析 / 重复扣配额），且完全不报错。
             return await self._submit_insert(step_code, snapshot)
         if step_code == STEP_PARSE and snapshot.intent == task_intent.INTENT_REPARSE:
             return await self._submit_reparse(snapshot)
@@ -889,7 +1243,9 @@ class TaskRunnerService(RunnerBase):
             snapshot.execution_id,
         )
 
-    async def _submit_ontology_only(self, snapshot: "_StepSnapshot") -> str:
+    async def _submit_ontology_only(
+        self, snapshot: "_StepSnapshot",
+    ) -> str:
         """`compile` 步：发起本体抽取（`ontology_only`）。
 
         **复用他们既有的 `OntologyService.retry_extract`**，语义一个字不改 —— 它自己会
@@ -947,6 +1303,21 @@ class TaskRunnerService(RunnerBase):
 
         **本侧的残留是什么**：一张接管行。它记着「这份文档归任务中心管、走到哪一步」。
 
+        ⚠️⚠️ **已知缺口（2026-10-14）：本方法与新的「归属」口径不自洽，任务删除开放前必须先改这里。**
+
+        2026-10-14 起，「归任务中心管」= 接管行存在（`MANAGED_STATES`，**含 `released`**），
+        旧对账据此**不许替它发起任何下游工作**。而本方法把行写成 `released` —— 于是任务明明
+        没了，文档却仍算「归任务中心管」：旧对账不肯驱动它，**也没有任务能驱动它**，这份文档
+        就此搁置（`READY` 的还能检索，`PARSING` 的会由 `reconcile_documents` 收尾到 FAILED）。
+        当前任务删除**未对外开放**，所以这个组合暂时到不了；但它是个**真缺口**，不是"以后再说"。
+
+        开放删除之前的正确改法（二选一，届时再定）：
+          · **删掉这张接管行** —— 「有卡 = 归任务中心管、卡没了 = 交回旧对账」的不变式最干净；
+          · 或**新增一个「彻底交回」态**（不在 `MANAGED_STATES` 里）—— 保留审计痕迹，
+            但要新起一个 DDL 迁移改 `state` 列的 COMMENT，并把 `rearm_for_step` 的 CAS 与
+            用户按钮的文案逐处审一遍。
+        无论选哪个，**上面「三件必须做对的事」里第 2 条的落点都会跟着变**（见该条）。
+
         ── 三件必须做对的事 ──
 
         1. **幂等**：删两次、删不存在的、压根没接管过，**都要回成功**。任务中心对这条路
@@ -954,9 +1325,15 @@ class TaskRunnerService(RunnerBase):
            看见的可能是「上一次其实已经删干净了、只是回执没回来」。回失败会把这显示成
            「删除失败」，而任务中心那边因为这一下失败**一个字段都不改**、用户还得再点一次。
         2. **不动文档状态**。撤销的是任务中心那侧的编排，不是这份文档 —— 文档留在当前
-           状态，下一个 30 秒被既有对账接手（`PARSING` 由 `patrol_parsing_timeout` 兜住，
-           `READY` 是稳定态）。把它置 FAILED 等于让一次**管理侧**的操作把好数据打成失败，
-           而且原因与这份文档毫无关系。
+           状态，本来该由既有对账接手。把它置 FAILED 等于让一次**管理侧**的操作把好数据
+           打成失败，而且原因与这份文档毫无关系。
+
+           ⚠️ **但 2026-10-14 之后这一条只兑现了一半**：接手的是**收尾**那趟
+           （`reconcile_documents` 轮询在途任务、收敛 `PARSING`），**发起**那趟
+           （`patrol_parsing_timeout` 重投解析）**不会再碰它** —— 因为这些行是
+           `released`、属于 `MANAGED_STATES`，旧对账不许替它发起。`PARSING` 且**没有**
+           在途任务号的文档因此会收敛到 FAILED（而不是被重投）。这正是上面那条缺口的
+           表现形式，改法见上。
         3. **不取消 atomic-rag 的活**。`RAGClient` 根本没有取消任务的接口（只有
            `delete` / `delete_orphan_chunk` / `delete_batch`），所以在跑的那个任务会跑完 ——
            它的结果由**既有对账**接手：交还之前这里会把接管行上那个在途任务号抄到文档行上
@@ -1059,6 +1436,8 @@ class TaskRunnerService(RunnerBase):
                 # 已是终态，直接收工（第 1 条）。
                 return ApiResponse.ok()
             doc_id = row.document_id
+            # `input_refs` 要的两个上下文事实（步骤在下面 carrier 里已经有了）
+            kb_id = row.knowledge_base_id
             carrier = ExecutionContext(
                 tenant_id=row.tenant_id,
                 space_id=row.space_id,
@@ -1089,8 +1468,26 @@ class TaskRunnerService(RunnerBase):
         # 这个原因改写掉。
         if carrier.execution_id:
             reason = "用户停止了这条任务，本步不再等待结果（运行方主动弃单）"
+            # 失败也带输入引用（2026-10-16 用户点名「失败肯定还是要上报的」）：用户看这一步
+            # 为什么停的时候，同样想知道它当时吃的是哪份东西。与看门狗那两处**共用同一份
+            # 构造**（`build_input_refs`），不在这里另写一套分派规则。
+            in_refs = build_input_refs(
+                knowledge_base_id=kb_id,
+                current_step=carrier.step_code,
+                document_id=doc_id,
+                document_name=await load_document_name(
+                    require_tenant(tenant_id), doc_id
+                ),
+            )
             result = await get_task_runtime().report_terminal(
-                carrier, TerminalReport.failed(reason),
+                carrier,
+                TerminalReport.failed(
+                    reason,
+                    input_refs=in_refs,
+                    # 代号 + 参数：这句原来是**硬编码中文**（库里那批就这么进去的），
+                    # 带上代号之后管理方就能按读的人的语言渲染它。
+                    error_code="err.kb.task_center.runner_abandoned",
+                ),
             )
             # **没被持久受理也照样往下走**（与 `_finish_step` 的处置不同，理由不同）：
             # 那一步在任务中心已经是「任务已停止」的一部分，最坏退回原来的样子
@@ -1124,7 +1521,18 @@ class TaskRunnerService(RunnerBase):
                 step_code=fresh.current_step,
             )
             await repo.mark_released(
-                fresh.document_id, error_message="任务被用户停止，接管交还给既有对账"
+                fresh.document_id,
+                error_message="任务被用户停止，接管交还给既有对账",
+                # ⚠️ **也得写失败报文**（2026-10-11 补）：用户点停止时，运行方是**真弃单**
+                # （`runner_abandoned`），不是「这活不归我」。而这条通知是**单发、不重发、
+                # 失败只记 warning** 的 —— 如果那次上报丢了，本该由管理方的对账兜住；
+                # 不写报文的话对账只能问出 `unknown`，管理方按**配置错**处置、不塞收件箱，
+                # 那一步就要挂到硬超时（还占着本目录共用的并发名额）。
+                report={
+                    "status": "failed",
+                    "error_message": "任务被用户停止，接管交还给既有对账",
+                    "error_code": "err.kb.task_center.runner_abandoned",
+                },
             )
             doc_id = fresh.document_id
         logger.info(
@@ -1133,6 +1541,100 @@ class TaskRunnerService(RunnerBase):
             doc_id,
         )
         return ApiResponse.ok()
+
+    async def query_step_status(
+        self, envelope: ExecutionEnvelope
+    ) -> Optional[StepStatusQuery]:
+        """**管理方主动问**：这个子任务现在什么情况（§4.1 ④，2026-10-11 加）。
+
+        ## 只读
+
+        这是「看一眼」，不是「推一把」—— 整个方法**不写一个字**。想改状态的走它自己的
+        收口路径（`mark_step_handled` / `mark_released`）。
+
+        ## 靠接管行一行就能回答
+
+        接管行（`task_center_documents`）本来就记着管理方要的全部东西：
+
+        | 接管行 | 回答 |
+        | --- | --- |
+        | 在途 + `execution_id` **空** | `pending_dispatch`（收下了、还没等到派活） |
+        | 在途 + `execution_id` **非空** | `running` |
+        | 已交还 + `last_report` 里 `status='success'` | `succeeded` |
+        | 已交还 + `last_report` 里 `status='failed'` | `failed` |
+        | 没有接管行 / 已交还但**没有结论** | **`unknown`** |
+
+        ⚠️ **最后一档不是「失败」**：`unknown` 的语义是「**这活不归我 / 我说不清**」——
+        管理方对它有**独立处置**（记明确原因，不聚合进业务失败）。最典型的来源是
+        「任务被删过」（`remove_task` 交还时**不表态**，`last_report` 留 NULL）。
+        把它读成失败，等于把一次**管理侧的操作**算成**运行方的业务失败**。
+
+        ⚠️ **`envelope.step_code` / `node_id` 这里不参与判断**：运行方手里**一份文档
+        只有一条接管行**，它记的是「**最近**跑到哪一步」；管理方来问的必然是
+        **在途或刚收口**的那一步，与接管行对得上。真要按 `node_id` 分别记账，
+        得另开一张表 —— 那是另一种设计，本方法刻意不往那个方向走。
+        """
+        tenant_id = require_tenant(envelope.tenant_id)
+        async with get_db_session() as session:
+            row = await TaskCenterDocumentRepository(session).read_by_task_id(
+                envelope.task_id, tenant_id,
+            )
+            if row is None:
+                return StepStatusQuery(
+                    status=STEP_STATUS_UNKNOWN,
+                    detail=f"没有任务 {envelope.task_id} 的接管记录",
+                )
+            # 事务一关 ORM 对象就 detached 了 —— 用到的列**在这里全部取出来**。
+            state = row.state
+            execution_id = row.execution_id
+            current_step = row.current_step or ""
+            last_report = row.last_report
+            handled_execution_id = row.handled_execution_id
+
+        def _settled() -> Optional[StepStatusQuery]:
+            """按**最后一次收口的那份上报报文**答终态（没有报文就说「说不清」）。
+
+            ⚠️ **原样带回 `report`**：管理方拿它当一条上报消化，而「成功」那份里
+            **带着产出**（`outputs` / `output_refs`）—— 没有产出，管理方写了「成功」
+            也派不出下一步。
+            """
+            if isinstance(last_report, dict) and last_report.get("status") == "success":
+                return StepStatusQuery(status=STEP_STATUS_SUCCEEDED, report=last_report)
+            if isinstance(last_report, dict) and last_report.get("status") == "failed":
+                return StepStatusQuery(
+                    status=STEP_STATUS_FAILED, report=last_report,
+                    detail=str(last_report.get("error_message") or "")[:500],
+                )
+            return None
+
+        # ── ⚠️ **先看「管理方问的这一步是不是已经收口了」**（2026-10-11 加）──
+        #
+        # 非末步（`parse` / 遗留 `ingest`）收口时是 `release=False` —— 行**仍停在
+        # `managed`**、`execution_id` 被清空。只按「在途」判会把它答成
+        # `pending_dispatch`（「已受理，等派活」），而**这一步其实已经成功**了。
+        #
+        # 判据：`envelope.execution_id` 是**管理方派活时给的那个编号**，
+        # `handled_execution_id` 是**运行方收口时记下的同一个编号** ——
+        # 两者相等就说明「**你问的正是我已经收口的那一次**」，可以直接答终态。
+        if envelope.execution_id and envelope.execution_id == handled_execution_id:
+            settled = _settled()
+            if settled is not None:
+                return settled
+
+        if state in ACTIVE_STATES:
+            if execution_id:
+                return StepStatusQuery(
+                    status=STEP_STATUS_RUNNING, detail=f"正在跑 {current_step}".strip(),
+                )
+            return StepStatusQuery(
+                status=STEP_STATUS_PENDING_DISPATCH, detail="已受理，等任务中心派活",
+            )
+        # 已交还 —— 看那份收口报文
+        return _settled() or StepStatusQuery(
+            status=STEP_STATUS_UNKNOWN,
+            detail="接管记录已交还且没有收口报文（多半是任务被删过）",
+        )
+
 
 class _StepSnapshot:
     """`_prepare_step` 从 DB 里拍下来的、发下游要用的那几个值。
@@ -1231,6 +1733,7 @@ async def submit_ontology_task(
     knowledge_base_id: str,
     kb_type: str,
     backend: str,
+    task_source: str,
     task_name: Optional[str] = None,
     operator_id: Optional[str] = None,
 ) -> SubmissionResult:
@@ -1273,6 +1776,14 @@ async def submit_ontology_task(
 
     ⚠️ **它不参与任何判定**（不进 `inputs`、不决定跑哪条编排、不决定跑哪一版）——
     所以调用方读不到文档名时传空即可，不要为了拼一个名字去多查一次库。
+
+    ── `task_source`（**必传**，2026-10-13 加）──
+
+    这条任务是哪个入口来的（如 `knowledge_base.file.manual_upload`）。**必须由调用方显式传，
+    不要在这里从 env / 库里现推** —— 两个调用点（上传路径、看门狗补交）拿到的都是
+    **文档行上那个粘性值**（`data_source_type`），经 `task_source_for_access_type`
+    换算后传进来。在这条公共出口里现推的话，看门狗那一帧要额外查一次库，
+    多出来的那次查询没有任何收益。
     """
     from jonex_core.task_runtime import get_task_runtime
 
@@ -1285,6 +1796,10 @@ async def submit_ontology_task(
                 "document_id": document_id,
                 "knowledge_base_id": knowledge_base_id,
             },
+            # 任务来源（**任务中心那条路必传**）：协议层写死枚举，由调用方按
+            # `data_source_type` 经 `task_source_for_access_type` 换算好传进来。
+            # 看门狗补交时从文档行重算同一个值 —— 同一条映射，不会分叉。
+            task_source=task_source,
             # 空白名交给任务中心回落成定义名（它的既定语义），这里不做「是不是空的」
             # 判断 —— 判据只能有一份，多一份就多一处会分叉的地方。
             name=task_name or None,
@@ -1532,6 +2047,151 @@ async def retry_subtasks_for_steps(
     )
 
 
+#: 任务中心那侧「某一步**跑完了**」的四档（`SubtaskStatus` 的结束态）。
+#:
+#: ⚠️ **不是** KB 侧的 `DocStatus`、也**不是**协议层的 `STEP_STATUS_*`：这是
+#: `task.subtask_get` 回包里 `data.status` 的取值域（`SubtaskItemResponse`），
+#: 与任务中心 `SUBTASK_TERMINAL_STATUSES` 指的是同一件事 —— 那边住能力层
+#: （`capabilities/task_center/`），KB 侧不该反向依赖，所以在这里写一份。
+#: 漂移的症状是「名单里多带 / 少带一步」，两种都**不报错**（少带了由依赖兜住、
+#: 多带了整批被拒）—— 改任务中心那几档时这里要一起改。
+#: ⚠️ **`stopped` 是 2026-10-15 跟任务中心一起加的**：被用户停掉的那一步与失败 / 超时
+#: 同档 —— 它同样「跑完了、有明确结论」，重跑它就是「重新排队」。
+#: 少了它，KB 侧读到的 `stopped` 会被当成「还在跑」，保守侧会**只交解析**，
+#: 于是「用户停过的那一步」永远重跑不到编译那一段。
+SUBTASK_TERMINAL_STATUSES = frozenset({"success", "failed", "timeout", "stopped"})
+
+#: 任务中心那侧「整条任务**已经结束**」的三档（`TaskStatus` 的终态）。
+#:
+#: 与 `SUBTASK_TERMINAL_STATUSES` 同一类拷贝：定义在
+#: `capabilities/task_center/models/enums.py` 的 `TaskStatus`，KB 侧不该反向依赖能力层，
+#: 所以在这里写一份。`stopped` 必须在内 —— 用户停任务时，正在跑的子任务还会停在
+#: `running`，**只有任务这一问看得出已经结束**；少了它，看门狗会一直等到 6 小时硬超时。
+#: 机器闸见 `tests/unit/test_reparse_step_codes_constants.py`。
+TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
+
+#: 上面那个取值域里「**正在跑**」那一档 —— 唯一一档不能按保守侧处置的
+#: （保守侧 = 只交解析；对 `running` 那等同于把两轮叠在同一个节点上）。见
+#: `reparse_step_codes`。
+SUBTASK_RUNNING = "running"
+
+
+def _subtask_status_of(resp: Any) -> str:
+    """从 `task.subtask_get` 的回包里取那一步的状态；**读不到一律回空串**。
+
+    三种读不到长同一个样：壳说 `success=False`、`data` 不是 dict、`data` 里没有
+    `status`。生产代码对它们的处置是同一档（保守），所以在这里收口成同一个信号 ——
+    调用方只判一次「有没有拿到状态」。
+    """
+    if not getattr(resp, "success", False):
+        return ""
+    data = getattr(resp, "data", None)
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("status") or "")
+
+
+async def reparse_step_codes(
+    *, tenant_id: str, task_id: str, document_id: str,
+) -> Tuple[str, ...]:
+    """「重新解析」这次该把哪几步交给任务中心：**名单里只放已终态的节点**（§4.2 ④ 的调用侧）。
+
+    返回的元组直接喂 `retry_subtasks_for_steps`（顺序就是执行顺序，别排序、别去重）。
+
+    ── 为什么名单必须按「那一步现在跑到哪了」定 ──
+
+    任务中心的重跑口有**前提三条**（单步与批量逐条对齐）：① 任务已终态；② **那一步也已
+    终态**（`success` / `failed` / `timeout` —— `pending` / `running` 还没结束，没什么可
+    重试的）；③ 这一步的上游全都 `success`。批量口是**对名单里每一行**套同一套 ——
+    带上一个没跑完的节点，**整批被拒**。
+
+    而「从未成功编译过」的文档（=「解析失败后重试」要覆盖的那一档）其
+    `compile_1` **必然是 `pending`**（判据 ⟺ 无 `extract` 事件 ⟺ `ontology_status`
+    从未离开 `PENDING` ⟺ 编译从未跑过）⇒ 名单里带上它，主用例「解析失败后重试」
+    100% 不可用。真机原文（2026-10-14 复现）：
+    `Node compile_1 is currently pending; only finished subtasks … can be retried`。
+
+    ── 判据：`parse` 恒在名单里，`compile` 只在它**已终态**时进名单 ──
+
+    · **已终态**（`success` / `failed` / `timeout`）⇒ 交 `(parse, compile)`：这一步
+      **跑过**、手里是上一轮的产出，上游重跑出新产出之后它必须跟着刷新 —— 这就是
+      「连带下游」原本的理由，它**只对跑过的下游成立**；
+    · **`pending`** ⇒ 只交 `(parse,)`：那一步**从未开始**、没有旧产出可旧，解析成功之后
+      任务中心会**按依赖**把它自然派起来（真机实测：只交 `parse_1`，`compile_1` 随后
+      `attempt=1` 一次成功、文档转 `ready`）；
+    · **`running`** ⇒ **响亮报错、一步都不交**（`ResourceConflictError`）：与 `pending`
+      的区别是实打实的 —— 它**正拿着上一轮的输入在干活**（用户把任务停了也一样：
+      `task.stop` 不打断正在跑的那一步，那条任务已是终态、这一步仍是 `running`）。
+      这时只交解析会被任务中心**受理**（任务终态 + 解析终态两条都过），两轮解析 / 编译
+      就叠在同一个节点上；
+    · **读不到**（`get_subtask` 抛了 / 回了失败壳 / `data` 里没有 `status`）⇒ 保守地按
+      `pending` 那一档处置（**只交 `parse`**）+ warning。两侧的代价不对称：发多了
+      **必被拒**（主用例当场不可用，而这是一次失败里最该能自救的那个按钮）；发少了最坏
+      只是**少刷新一次下游** —— 本体可能还停在上一轮，但那是**可恢复**的（「重新编译」
+      那个单步口还能补），而且它会在 `ontology_status` 上显出来、不会伪装成成功。
+      所以保守侧就是「可用」侧。
+      ⚠️ 读的异常**不许放出去**：那只值一次「名单要不要带上编译」的判断，不该让整次
+      「重新解析」失败。
+
+    ⚠️ **`parse` 自己不按这条判据过滤**：它就是用户按下去的那一步，重跑它正是这次操作
+    本身。它要是也没终态，任务中心会按同一套前提**明确拒绝**（与从前逐字相同的行为）——
+    本地不去猜它，猜错的方向是「用户点了重新解析、我们却什么都不发」。
+
+    ⚠️ `tenant_id` 显式传，且**只在调用方自己的事务里调**（这个读发生在「武装接管行」
+    与「这次是重新解析」那些写入的同一次提交里，见 `document_service.reparse_document`）：
+    读回来是 `running` 时那个异常会把整笔写入一起回滚 —— 拒绝得干净，没有半成品窗口。
+
+    ⚠️ `document_id` **不参与判据，只为日志在场**（2026-10-14 上一轮审查 Minor 1 收口）：
+    `tenant_id` / `task_id` 都进不了「这是哪份文档」这一问（`task_id` 只能反查），
+    而下面三条日志正是排查「名单交了几步 / 为什么少交一步」的唯一入口 —— 换目录、
+    翻日志的人不该再去做一次关联查询。
+    """
+    from jonex_core.task_runtime import get_task_runtime
+
+    node_id = node_id_for_step(STEP_COMPILE)
+    try:
+        resp = await get_task_runtime().get_subtask(tenant_id, task_id, node_id)
+    except Exception as exc:  # noqa: BLE001 —— 读不到不改「能不能重跑」，见 docstring
+        # 能抛到这里的不是传送层失败（那种回 `success=false` 的壳），而是「我们自己
+        # 写错了」（运行时没装配……）。留 warning 而不是 debug：默认 `LOG_LEVEL=INFO`，
+        # debug 等于没记 —— 那会让这个判断**静默**退化成「永远只交解析」。
+        logger.warning(
+            "重新解析：读不到 %s 现在的状态，按保守侧只交解析步 doc=%s tenant=%s task=%s: %s",
+            node_id, document_id, tenant_id, task_id, exc,
+        )
+        return (STEP_PARSE,)
+
+    status = _subtask_status_of(resp)
+    if status == SUBTASK_RUNNING:
+        raise ResourceConflictError(
+            message=translate(
+                "err.kb.task_center.compile_step_running",
+                params={"node_id": node_id},
+                fallback=(
+                    f"节点 {node_id} 正在运行，现在重跑解析会与它叠在同一个节点上；"
+                    "请等这一步结束后再试"
+                ),
+            ),
+            details={"task_id": task_id, "node_id": node_id, "status": status},
+        )
+    if status not in SUBTASK_TERMINAL_STATUSES:
+        if status:
+            # `pending`（正常：这一步从未跑过）与**未来新增的**非终态取值都走这里。
+            logger.info(
+                "重新解析：%s 还没到终态（status=%s），名单只交解析步 —— "
+                "它跑成后任务中心会按依赖把下一步自然派起来 doc=%s tenant=%s task=%s",
+                node_id, status, document_id, tenant_id, task_id,
+            )
+        else:
+            logger.warning(
+                "重新解析：%s 的状态读不到（回包里没有 status），按保守侧只交解析步 "
+                "doc=%s tenant=%s task=%s",
+                node_id, document_id, tenant_id, task_id,
+            )
+        return (STEP_PARSE,)
+    return (STEP_PARSE, STEP_COMPILE)
+
+
 def retry_accepted(result: SubtaskRetryResult) -> bool:
     """这次「重跑一步 / 某几步」算不算受理了。
 
@@ -1562,6 +2222,8 @@ __all__ = [
     "STEP_COMPILE",
     "STEP_INGEST",
     "STEP_PARSE",
+    "SUBTASK_RUNNING",
+    "SUBTASK_TERMINAL_STATUSES",
     "TaskRunnerService",
     "SUPPORTED_KB_TYPES",
     "definition_for_backend",
@@ -1570,9 +2232,11 @@ __all__ = [
     "insert_mode_for",
     "node_id_for_step",
     "rearm_for_rerun",
+    "reparse_step_codes",
     "retry_accepted",
     "retry_subtask_for_step",
     "retry_subtasks_for_steps",
     "submission_accepted",
     "submit_ontology_task",
+    "task_source_for_access_type",
 ]

@@ -667,11 +667,25 @@ class OntologyGraphRepository:
                 {"t": tenant_id, "k": kb_id},
             )
 
-    async def search_entities(self, tenant_id: str, kb_ids: list[str], query: str, limit: int = 5) -> list[dict]:
+    async def search_entities(
+        self,
+        tenant_id: str,
+        kb_ids: list[str],
+        query: str,
+        limit: int = 5,
+        doc_id: Optional[str] = None,
+    ) -> list[dict]:
+        """全文索引模糊搜索本体实体（表单选择器用）。
+
+        `doc_id` 有值时只返回 `doc_ids` 含该文档的实体（文档页表单的候选范围），
+        判据与 `list_entities(document_id=...)` 一致（`$doc_id IN e.doc_ids`），
+        避免在单篇文档里列出整个 KB 的实体。
+        """
         tenant_id = require_tenant(tenant_id)
         cypher = """
         CALL db.index.fulltext.queryNodes('ont_entity_ft', $q) YIELD node, score
         WHERE node.tenant_id=$t AND node.kb_id IN $kbs AND coalesce(node.stub,false)=false
+          AND ($doc_id IS NULL OR $doc_id IN coalesce(node.doc_ids,[]))
         RETURN node.canonical_name AS name, node.entity_type AS type,
                node.aliases AS aliases, node.attributes AS attributes,
                node.description AS description,
@@ -685,7 +699,10 @@ class OntologyGraphRepository:
         ORDER BY score DESC LIMIT $limit
         """
         async with self._driver.session() as session:
-            result = await session.run(cypher, {"t": tenant_id, "kbs": kb_ids, "q": query, "limit": limit})
+            result = await session.run(
+                cypher,
+                {"t": tenant_id, "kbs": kb_ids, "q": query, "limit": limit, "doc_id": doc_id or None},
+            )
             rows = [dict(record) async for record in result]
         for row in rows:
             if isinstance(row.get("attributes"), str):
@@ -862,6 +879,107 @@ class OntologyGraphRepository:
             "hop_distribution": hop_distribution,
             "truncated": truncated,
         }
+
+    # ══════════════════════════════════════════════════════════════════
+    # 数据运营抽屉 B（Ontology 对象详情）：按三元组精确定位
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # 两个方法都收 `(kb_id, entity_type, canonical_name)` **完整三元组**，与
+    # `expand_neighbors` 同款判据 —— 这是本仓里唯一能把「同名不同 type」区分开的口径。
+    # `exact_match_entities` / `list_entities` 都不能用来做这件事：前者按 canonical_name
+    # 在多 KB 间模糊命中、后者是 `CONTAINS` 模糊 + 分页，都会撞进同名实例。
+
+    async def get_entity(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        entity_type: str,
+        canonical_name: str,
+    ) -> Optional[dict]:
+        """按三元组精确定位单个本体实例；不存在（或已改名）返回 None。
+
+        返回 `{canonical_name, entity_type, aliases, attributes, description, confidence,
+        created_at, updated_at, doc_ids}`；时间戳为 Neo4j `timestamp()`（epoch 毫秒），
+        由调用方转 ISO（`AnalyticsService._ts_to_iso`）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$name})
+        WHERE coalesce(e.stub,false)=false
+        RETURN e.canonical_name AS canonical_name, e.entity_type AS entity_type,
+               e.aliases AS aliases, e.attributes AS attributes,
+               e.description AS description, e.confidence AS confidence,
+               e.created_at AS created_at,
+               coalesce(e.updated_at, e.created_at) AS updated_at,
+               e.doc_ids AS doc_ids
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "et": entity_type, "name": canonical_name}
+            )
+            record = await result.single()
+        if not record:
+            return None
+        row = dict(record)
+        self._deserialize_attrs([row])
+        return row
+
+    async def neighbors_by_entity(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        entity_type: str,
+        canonical_name: str,
+        limit: int = 200,
+    ) -> tuple[list[dict], int, bool]:
+        """按三元组取一跳邻居事实，返回 `(facts, total, truncated)`。
+
+        与 `neighbors()` 的两处差别：
+
+        1. **MATCH 带上 `entity_type`** —— `neighbors()` 只按 `canonical_name` 匹配，
+           同名不同 type 的实例会被串在一起；
+        2. **`total` 是「不同 (关系类型, 目标) 的对数」，不是本次返回的条数** —— 抽屉要显示
+           「共 N 条」，`neighbors()` 在 Cypher 里就 `[..$limit]` 截断了、总数拿不回来。
+
+        `facts` 每条为 `{relation_type, direction, target, target_type}`，并已按
+        `(relation_type, target)` 去重（平行边只留一条，方向上「有来有往」也算一条）。
+        `truncated = total > len(facts)`：明细被 `limit` 截了，前端据此提示「仅显示前 N 条」。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$name})
+        WHERE coalesce(e.stub,false)=false
+        MATCH (e)-[r:ONT_REL]-(n:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(n.stub,false)=false
+        WITH e, r, n,
+             CASE WHEN startNode(r) = e THEN 'outgoing' ELSE 'incoming' END AS rel_dir
+        ORDER BY r.relation_type ASC, coalesce(n.confidence,0) DESC, n.canonical_name ASC
+        RETURN count(DISTINCT [r.relation_type, n.canonical_name]) AS total,
+               collect({
+                   relation_type: r.relation_type,
+                   direction: rel_dir,
+                   target: n.canonical_name,
+                   target_type: n.entity_type
+               })[..$limit] AS facts
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher,
+                {"t": tenant_id, "k": kb_id, "et": entity_type, "name": canonical_name, "limit": limit},
+            )
+            record = await result.single()
+        data = dict(record) if record else {"total": 0, "facts": []}
+        total = int(data.get("total") or 0)
+
+        seen: set[tuple] = set()
+        facts: list[dict] = []
+        for f in data.get("facts") or []:
+            key = (f.get("relation_type"), f.get("target"))
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append(f)
+        return facts, total, total > len(facts)
 
     async def exact_match_entities(self, tenant_id: str, kb_ids: list[str], name: str) -> list[dict]:
         """精确匹配 canonical_name 或 aliases（多 KB），返回列表（同名实体在不同 KB 各命中一条）。"""
@@ -2035,12 +2153,20 @@ class OntologyGraphRepository:
         aliases: Optional[list] = None,
         description: str = "",
         attributes: Optional[dict] = None,
+        doc_id: Optional[str] = None,
     ) -> dict:
         """创建本体实体实例节点。
 
-        使用 MERGE 确保幂等：已存在的节点直接返回，不做更新。
+        使用 MERGE 确保幂等：已存在的节点**不更新其它字段**（要改走 update_entity），
+        但 `doc_id` 有值时会把该文档补进已有节点的 `doc_ids`（见下）。
         与 merge_entity 不同：不处理 source_chunks/lightrag_doc_ids 等文档写入字段，
-        但会写 embedding 并标记 extraction_method='manual'（不写 doc_ids）。
+        但会写 embedding 并标记 extraction_method='manual'。
+
+        `doc_id` 决定节点归属哪个入口建的：
+        - **有值**（文档结果页建）→ `doc_ids=[doc_id]`；节点已存在时**追加**该 doc
+          （该实体本来是从别的文档抽出来的，现在这份文档也要能按文档过滤看到它）；
+        - **None**（KB 级「编译资产」tab 建）→ `doc_ids=[]`，全库实例，不属于任何文档；
+          此时不碰已有节点的 `doc_ids`（不能把别人已有的文档关联抹掉）。
 
         Args:
             tenant_id: 租户 ID
@@ -2050,6 +2176,7 @@ class OntologyGraphRepository:
             aliases: 别名列表
             description: 描述
             attributes: 属性 dict
+            doc_id: 来源文档 ID（可选；决定 doc_ids 与是否追加）
 
         Returns:
             dict: {name, type, aliases, attributes, description, confidence, doc_ids}
@@ -2090,10 +2217,15 @@ class OntologyGraphRepository:
             e.aliases=$aliases, e.aliases_text=$aliases_text,
             e.description=$description, e.attributes=$attributes,
             e.stub=false, e.confidence=1.0,
-            e.doc_ids=[], e.source_chunks=[], e.lightrag_doc_ids=[],
+            e.doc_ids=$doc_ids, e.source_chunks=[], e.lightrag_doc_ids=[],
             e.extraction_method='manual',
             e.embedding=$embedding, e.embedding_hash=$embedding_hash,
             e.created_at=timestamp(), e.updated_at=timestamp()
+        ON MATCH SET
+            e.doc_ids=CASE WHEN $doc_id IS NOT NULL
+                THEN apoc.coll.toSet(coalesce(e.doc_ids,[])+[$doc_id]) ELSE e.doc_ids END,
+            e.updated_at=CASE WHEN $doc_id IS NOT NULL
+                THEN timestamp() ELSE e.updated_at END
         RETURN e
         """
         params = {
@@ -2102,6 +2234,9 @@ class OntologyGraphRepository:
             "aliases": aliases, "aliases_text": aliases_text,
             "description": description, "attributes": attributes_json,
             "embedding": embedding, "embedding_hash": embedding_hash_val,
+            # doc_id 与 doc_ids 一起下发：前者判「本次是否来自某个文档」，后者是 ON CREATE 的初值
+            "doc_id": doc_id or None,
+            "doc_ids": [doc_id] if doc_id else [],
         }
         async with self._driver.session() as session:
             result = await session.run(cypher, params)
@@ -2138,10 +2273,18 @@ class OntologyGraphRepository:
         target_entity_type: str,
         target_canonical_name: str,
         attributes: Optional[dict] = None,
+        doc_id: Optional[str] = None,
     ) -> dict:
         """创建实体间关系。
 
         两端实体如不存在则创建 stub 节点。关系使用 MERGE 确保幂等。
+
+        `doc_id` 口径与 `create_entity` 一致（有值=来自文档结果页，None=KB 级资产页）：
+        - 关系边：ON CREATE 写 `doc_ids=[doc_id]`；已存在则**追加**该 doc
+          （该关系本来是从别的文档抽出来的，这份文档也要能按文档过滤看到它）；
+        - 两端**新建的 stub**：同样带上该 doc（与抽取侧 merge_relation 一致）；
+          已存在的非 stub 实体不动其 `doc_ids` —— 别人的文档归属不该因为这里画了条关系
+          而被改写（对齐 merge_relation 的 `coalesce(a.stub,false)=true` 判据）。
 
         Args:
             tenant_id: 租户 ID
@@ -2152,6 +2295,7 @@ class OntologyGraphRepository:
             target_entity_type: 目标实体类型
             target_canonical_name: 目标实体规范名
             attributes: 属性 dict
+            doc_id: 来源文档 ID（可选）
 
         Returns:
             dict: {source, source_type, relation_type, target, target_type, attributes, confidence}
@@ -2178,19 +2322,30 @@ class OntologyGraphRepository:
         ON CREATE SET
             s.stub=true, s.description='', s.attributes='{}',
             s.aliases=[], s.aliases_text='',
-            s.confidence=0.1, s.doc_ids=[], s.source_chunks=[], s.lightrag_doc_ids=[],
+            s.confidence=0.1, s.doc_ids=$doc_ids, s.source_chunks=[], s.lightrag_doc_ids=[],
             s.created_at=timestamp(), s.updated_at=timestamp()
+        ON MATCH SET
+            s.doc_ids=CASE WHEN $doc_id IS NOT NULL AND coalesce(s.stub,false)=true
+                THEN apoc.coll.toSet(coalesce(s.doc_ids,[])+[$doc_id]) ELSE s.doc_ids END
         MERGE (o:OntologyEntity {tenant_id:$tenant_id, kb_id:$kb_id, entity_type:$target_type, canonical_name:$target_name})
         ON CREATE SET
             o.stub=true, o.description='', o.attributes='{}',
             o.aliases=[], o.aliases_text='',
-            o.confidence=0.1, o.doc_ids=[], o.source_chunks=[], o.lightrag_doc_ids=[],
+            o.confidence=0.1, o.doc_ids=$doc_ids, o.source_chunks=[], o.lightrag_doc_ids=[],
             o.created_at=timestamp(), o.updated_at=timestamp()
+        ON MATCH SET
+            o.doc_ids=CASE WHEN $doc_id IS NOT NULL AND coalesce(o.stub,false)=true
+                THEN apoc.coll.toSet(coalesce(o.doc_ids,[])+[$doc_id]) ELSE o.doc_ids END
         MERGE (s)-[r:ONT_REL {relation_type:$relation_type}]->(o)
         ON CREATE SET
             r.confidence=1.0, r.attributes=$attributes,
-            r.doc_ids=[], r.lightrag_doc_ids=[],
+            r.doc_ids=$doc_ids, r.lightrag_doc_ids=[],
             r.created_at=timestamp(), r.updated_at=timestamp()
+        ON MATCH SET
+            r.doc_ids=CASE WHEN $doc_id IS NOT NULL
+                THEN apoc.coll.toSet(coalesce(r.doc_ids,[])+[$doc_id]) ELSE r.doc_ids END,
+            r.updated_at=CASE WHEN $doc_id IS NOT NULL
+                THEN timestamp() ELSE r.updated_at END
         RETURN r
         """
         params = {
@@ -2199,6 +2354,9 @@ class OntologyGraphRepository:
             "relation_type": relation_type,
             "target_type": target_entity_type, "target_name": target_canonical_name,
             "attributes": attributes_json,
+            # 见 create_entity 的同名参数：doc_id 判「本次是否来自某个文档」，doc_ids 是初值
+            "doc_id": doc_id or None,
+            "doc_ids": [doc_id] if doc_id else [],
         }
         async with self._driver.session() as session:
             result = await session.run(cypher, params)
@@ -2550,6 +2708,72 @@ class OntologyGraphRepository:
                 raise ResourceNotFoundError(
                     message=translate("err.ontology.relation_not_found", params={"source": source_canonical_name, "type": relation_type, "target": target_canonical_name}, fallback=f"关系不存在: {source_canonical_name} --[{relation_type}]--> {target_canonical_name}"),
                 )
+
+    async def list_document_provenance(
+        self, tenant_id: str, kb_id: str, doc_id: str, limit: int = 100,
+    ) -> tuple[list[dict], list[dict]]:
+        """只读：某文档参与产出的本体实体与关系（数据治理血缘消费）。
+
+        - 实体命中判据：``$doc_id IN coalesce(e.doc_ids, [])``；排除 stub
+          （``merge_relation`` 的端点兜底产物不是正式实体，与同仓
+          ``count_entities_by_document`` / ``count_relations_by_type_doc`` /
+          ``get_kb_graph`` 口径一致）。
+        - 关系命中判据：``$doc_id IN coalesce(r.doc_ids, [])``（边级精确过滤，与
+          同仓 ``list_relations(document_id=...)`` 口径一致）；两端节点都钉
+          ``tenant_id/kb_id`` 且都排除 stub（否则会返回悬挂边 / 跨租户边）。
+          **不做端点 ``a.doc_ids`` 过滤**：从文档页 ``create_relation`` 建边时只给
+          ``r.doc_ids`` 追加本 doc，不会补已存在的非 stub 端点；``merge_relation``
+          的 ``ON MATCH`` 对非 stub 端点同样不追加。因此「边含本 doc、端点多 doc
+          不含」是正常数据，端点条件会静默漏掉合法关系（端点完整性由抽取侧回填
+          负责，读侧按边 doc_ids 过滤）。
+        - 两条查询都 ``RETURN DISTINCT``，在 ``LIMIT`` 之前先压缩完全重复行，
+          避免重复行占满 ``limit + 1`` 窗口导致 service 误判「未截断」（实体返回
+          列含 ``source_chunks``，同名同型但出处不同的行仍由 service 层按业务键去重）。
+        - 两条查询都有确定性排序（实体按 ``canonical_name, entity_type``，关系按
+          ``source, target, relation_type``），保证 ``LIMIT`` 截断结果可复现。
+        - ``source_chunks`` 原样返回（写入侧是 JSON 字符串），归一在 service 层。
+
+        成本（治理侧按文档循环调用时需知）：``doc_ids`` 是列表属性、**没有索引**，
+        本查询是 **KB 级扫描**；关系查询只能按边属性过滤，同样不是索引下钻。
+        当前保持单 session 串行两条查询（简单优先）；大 KB / 高并发场景再评估
+        并行双 session。
+
+        只发 MATCH/RETURN/LIMIT，不写图。
+        """
+        tenant_id = require_tenant(tenant_id)
+        params = {"t": tenant_id, "k": kb_id, "doc_id": doc_id, "limit": limit}
+        async with self._driver.session() as session:
+            ent = await session.run(
+                """
+                MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+                WHERE $doc_id IN coalesce(e.doc_ids, [])
+                  AND coalesce(e.stub,false)=false
+                RETURN DISTINCT e.canonical_name AS canonical_name,
+                       e.entity_type AS entity_type,
+                       e.source_chunks AS source_chunks
+                ORDER BY e.canonical_name, e.entity_type
+                LIMIT $limit
+                """,
+                params,
+            )
+            entities = [dict(r) async for r in ent]
+            rel = await session.run(
+                """
+                MATCH (a:OntologyEntity {tenant_id:$t, kb_id:$k})-[r:ONT_REL]->
+                      (b:OntologyEntity {tenant_id:$t, kb_id:$k})
+                WHERE $doc_id IN coalesce(r.doc_ids, [])
+                  AND coalesce(a.stub,false)=false
+                  AND coalesce(b.stub,false)=false
+                RETURN DISTINCT a.canonical_name AS source,
+                       b.canonical_name AS target,
+                       r.relation_type AS relation_type
+                ORDER BY source, target, relation_type
+                LIMIT $limit
+                """,
+                params,
+            )
+            relations = [dict(r) async for r in rel]
+        return entities, relations
 
 
 __all__ = ["OntologyGraphRepository"]

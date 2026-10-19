@@ -19,6 +19,7 @@ from jonex_core.capability.models import (
     CapabilityType,
 )
 from jonex_core.common import get_db_session
+from jonex_core.common.config import get_config
 from jonex_core.common.exceptions import (
     InternalError,
     InvalidParameterError,
@@ -74,7 +75,16 @@ _PASS_FAILED = object()
 # ---------------------------------------------------------------------------
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "get_document": ("document_id", "knowledge_base_id"),
+    "list_document_versions": ("document_id",),
+    "upload_document_version": ("document_id", "knowledge_base_id", "storage_key"),
+    "get_document_version_url": ("document_id", "version_no"),
+    "get_document_quality_report": ("document_id", "knowledge_base_id"),
+    "get_document_quality_reports": ("document_ids", "knowledge_base_id"),
     "delete_document": ("document_id", "knowledge_base_id"),
+    # 第 3 期生命周期：归档 / 恢复 / 销毁（KB 执行）
+    "archive_document": ("document_id", "knowledge_base_id"),
+    "restore_document": ("document_id", "knowledge_base_id"),
+    "destroy_document": ("document_id", "knowledge_base_id"),
     "upload_document": ("knowledge_base_id",),
     "list_documents": ("knowledge_base_id",),
     "documents_stats": ("knowledge_base_id",),
@@ -82,14 +92,29 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "search_enhanced": ("query", "knowledge_base_id"),
     "query_with_ontology": ("query",),
     "search_llmwiki": ("query",),     # [jonex]
+    "start_jonex_wiki_search": ("query",),
+    "poll_jonex_wiki_search": ("session_id",),
+    "cancel_jonex_wiki_search": ("session_id",),
+    "resolve_wiki_evidence": ("knowledge_base_id", "query_id", "handle"),
     "search_jonex_wiki": ("query",),  # [jonex]
     "search_mix": ("query",),          # [jonex]
+    # 网关流式检索的写前预检（B2）：只判权限/密级，不读内容。
+    "assert_kb_searchable": ("knowledge_base_id",),
+    # 流式检索埋点（gateway 在发流前调用；权限已由 assert_kb_searchable 预检）
+    "record_stream_search": ("knowledge_base_id", "query"),
+    # 标准侧发布联动（business_domain 经 Sidecar 调用）
+    "mark_template_scenario_published": ("scenario_id",),
+    "list_impacted_knowledge_bases": ("scenario_id",),
     "deep_query": ("query",),
     "get_search_overview": (),
     "list_search_history": (),
     "save_search_history": ("query",),
     "delete_search_history": ("history_id",),
     "clear_search_history": (),
+    # ── 以图问知识（图片转查询 + 查看）──
+    "image_to_query": ("images",),
+    "get_query_image_ticket": ("image_id",),
+    "get_query_image_location": ("image_id",),
     "get_parse_result_summary": ("knowledge_base_id",),
     "get_parse_result_documents": ("knowledge_base_id",),
     "get_parse_result_entities": ("knowledge_base_id",),
@@ -119,6 +144,13 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "retry_ontology_extract": ("document_id", "knowledge_base_id"),
     "get_editor_state": ("knowledge_base_id",),
     "get_compiled_schema": ("knowledge_base_id",),
+    # [jonex] 原子抽取入口（atomic-rag Stage4）：等同 get_compiled_schema **+ 注入
+    # KB 级同义词**。原先这条语义只存在于容器 REST 层
+    # （api/__init__.py 的 GET /ontology/compiled-schema，见其注释「仅在对外下发
+    # （atomic-rag 拉取入口）注入 KB 级同义词」），而 invoke 侧的 get_compiled_schema
+    # **有意不注入**（避免污染查询链路）。为让 atomic-rag 摆脱对容器 REST 层的依赖，
+    # 把该语义显式提成一个 action，而不是复用 get_compiled_schema。
+    "get_compiled_schema_for_extraction": ("knowledge_base_id",),
     "save_compiled_schema": ("knowledge_base_id",),
     "reseed_compiled_schema": ("knowledge_base_id", "template_scenario_id"),
     "recompile_schema": ("knowledge_base_id",),
@@ -191,6 +223,10 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     # build_asset_key 白名单兜底 png）
     "get_asset_raw_location": ("document_id", "image_idx"),
     "get_document_chunks": ("document_id",),
+    # 引用原文坐标（bbox 定位；chunk_index/expect 可选，缺了服务层降级为只跳页）
+    "get_document_source_spans": ("document_id",),
+    # [jonex] 第2期 · 任务5/6：数据治理血缘读取（只读）
+    "get_document_provenance": ("document_id", "knowledge_base_id"),
     "get_chunk": ("document_id", "chunk_id"),
     "reparse_document": ("document_id",),
     # [jonex] §table-grid-v2 O7: 新旧格式残留扫描与定点清理
@@ -248,6 +284,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "ingest_push": ("ds_id", "ingest_key", "storage_key", "file_name"),
     # ── MCP 文档上传状态查询 ──
     "get_document_status": ("document_id",),
+    # [jonex] B6 §5.2：网关 view-ticket 的只读校验口（只收 document_id、不回正文）
+    "assert_document_readable": ("document_id",),
     # ── 数据运营（Data Operations）──
     "get_data_operations_overview": (),
     "get_data_assets_analytics": (),
@@ -255,6 +293,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "get_search_analytics": (),
     # 异常资产下钻（分页/筛选，全部可选，故必填字段为空）
     "get_abnormal_assets_analytics": (),
+    # 解析质量异常（域空间/知识库筛选，全部可选）
+    "get_quality_anomalies": (),
     # ── 任务中心接入（运行方**三个**入口：execute / remove_task / task_stopped，
     #    由 `dispatch.update(runner.bind())` 装配）──
     # ⚠️ **`execute` 是六个键，别漏 `node_id`**：`ExecutionEnvelope` 的字段是
@@ -265,6 +305,18 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "remove_task": ("tenant_id", "space_id", "task_id"),
     # §4.1 ③ 那条**通知**（2026-09-30 加）：字段与 `remove_task` 逐字相同（同一份定位键）。
     "task_stopped": ("tenant_id", "space_id", "task_id"),
+    # ── 数据运营 · 列表钻取详情（三期，原型「点名称进抽屉」）──
+    # 定位键是**真实键**，不是列表里展示用的 id：本体那个 `object_id` 是
+    # sha256(tenant|kb|type|name) 的单向哈希，反解不回三元组，所以接口 B 收三元组。
+    "get_data_asset_detail": ("asset_id",),
+    "get_data_ontology_entity_detail": ("kb_id", "entity_type", "canonical_name"),
+    "get_data_kb_detail": ("kb_id",),
+    "get_data_service_detail": ("service_id",),
+    # §4.1 ④：管理方主动问「这一步现在什么情况」。入参就是 `ExecutionEnvelope`
+    # （派活报文去掉 `inputs`），所以必填集与它一致。
+    "query_step_status": (
+        "tenant_id", "space_id", "task_id", "step_code", "node_id", "execution_id",
+    ),
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -280,6 +332,14 @@ _SPACE_EXEMPT_ACTIONS = frozenset({
     "list_spaces", "create_space", "get_space",
     "get_search_overview", "list_search_history", "save_search_history",
     "delete_search_history", "clear_search_history",
+    # [jonex] 以图问知识：三个都是**用户级**隔离（图片按 tenant+user 存与查，D10），
+    # 没有任何空间语义 —— 判据全在 service 层（归不归本人 / 还有没有引用）。
+    # ⚠️ **不能进 `_SEARCH_ACTIONS`**：那是「过滤无权限 KB」的分组，而这三个
+    # action 压根不读任何 KB 数据（D8 明确 `image_to_query` 不接收 KB 范围）。
+    # 塞进去会让 `_filter_search_kbs` 拿到空 kb 列表白跑一趟，还会触发检索埋点
+    # （`_record_search_request` 认 `_SEARCH_ACTIONS`）—— 识别不是检索行为，
+    # 计进去会把「检索次数」这个指标污染掉。
+    "image_to_query", "get_query_image_ticket", "get_query_image_location",
     "submit_search_feedback", "cancel_search_feedback",
     "list_search_feedback", "toggle_search_feedback_adopted",
     "get_search_feedback_stats",
@@ -287,7 +347,14 @@ _SPACE_EXEMPT_ACTIONS = frozenset({
     "list_answer_feedback", "get_answer_feedback_stats",
     "toggle_answer_feedback_adopted", "delete_answer_feedback",
     "ingest_push",
-    "resolve_references",
+    # [jonex] B6 §5.2：view-ticket 的文档可读校验口。它**自己**在 service 层做
+    # KB 空间/KB 授权读权限判定（has_space_role / get_kb_grant_role），没有空间语义
+    # 可供 capability 统一判定；密级过滤仍由 classification_access_guard 承担。
+    "assert_document_readable",
+    # 流式检索埋点：不读 KB 内容，权限已由 assert_kb_searchable 预检过；
+    # 再走空间判定会因 action 无空间语义而误拒。
+    "record_stream_search",
+    "resolve_references", "poll_jonex_wiki_search", "cancel_jonex_wiki_search",
     "get_quota_view",
     # [jonex] KB_ENABLED_TYPES 的下发口：报文体里没有任何 id（没有 space_id、没有 kb_id），
     # 走常规判定只会「解析不到空间、什么也不判」。豁免是把这份「不判」写成意图而不是巧合
@@ -305,7 +372,11 @@ _SPACE_EXEMPT_ACTIONS = frozenset({
     # ⚠️ **绝不能改放进 `_INTERNAL_ACTIONS`**（那条路跳过的是**租户闸**）：派活报文带的
     # 正是必须走 `require_tenant()` 收口的可信租户，跳过它等于放弃租户隔离 —— 两件事
     # 别混：这里豁免的是「是不是这个空间的成员」，不是「是不是这个租户的」。
-    "execute", "remove_task", "task_stopped",
+    "execute", "remove_task", "task_stopped", "query_step_status",
+    # [jonex] 模板场景联动（标准侧→知识库）：business_domain 发布/变更场景后经
+    # Sidecar invoke 调用，报文只有 `scenario_id`、没有用户身份，也解析不出空间。
+    # 与 execute/remove_task 同款：豁免的是「是不是这个空间的成员」，**不是租户闸**。
+    "mark_template_scenario_published", "list_impacted_knowledge_bases",
 })
 
 # 空间级管理：仅 owner 或租户管理员（tenant:write）。
@@ -337,6 +408,9 @@ _KB_GRANT_EXCLUDED_ACTIONS = frozenset({
 _SPACE_WRITE_ACTIONS = frozenset({
     "create_knowledge_info", "update_knowledge_info", "delete_knowledge_info",
     "upload_document", "delete_document", "reparse_document",
+    "upload_document_version",
+    # 第 3 期生命周期：归档/恢复按空间写口径；销毁的租户管理员硬校验在 service 内
+    "archive_document", "restore_document", "destroy_document",
     "set_document_folder", "batch_set_document_folder", "set_document_tags", "add_document_tag", "remove_document_tag",
     "scan_stale_chunks", "purge_stale_chunks", "generate_upload_url",
     "create_folder", "rename_folder", "delete_folder",
@@ -387,9 +461,15 @@ _SPACE_READ_ACTIONS = frozenset({
     # capability 只认「你能不能进这个空间」，service 才认「这个空间里哪些 KB 归你」。
     "get_knowledge_info", "list_knowledge_info",
     "get_document",
-    "get_document_status", "get_document_chunks", "get_document_parse_result",
+    "get_document_status", "get_document_quality_report",
+    "get_document_quality_reports",
+    "get_document_provenance",  # [jonex] 第2期 · 任务5/6：数据治理血缘读取
+    "get_document_chunks", "get_document_parse_result",
     "get_chunk", "get_raw_content", "get_raw_location", "get_raw_url",
     "get_asset_raw_location",  # [jonex] §image-refs P2-3
+    "get_document_source_spans",  # 引用 bbox 定位（只读，成员可见）
+    # 文档版本链（只读）：与 get_document / get_raw_url 同口径，成员可见
+    "list_document_versions", "get_document_version_url",
     # 领域服务读：成员可见（viewer 可查看，不可操作——写归 _SPACE_LEVEL_ACTIONS）
     "get_service", "list_services", "get_service_configs", "list_service_api_keys",
     "get_data_source", "list_data_sources",
@@ -398,8 +478,9 @@ _SPACE_READ_ACTIONS = frozenset({
     "get_ontology_graph", "get_ontology_statistics",
     "expand_ontology_neighbors", "search_ontology_entities",
     "get_compiled_schema", "export_compiled_schema_yaml", "export_llm_wiki_schema_yaml",
+    "get_compiled_schema_for_extraction",  # [jonex] atomic-rag 抽取入口（含同义词注入）
     "get_llm_wiki_schema", "list_synonyms", "list_tags", "list_parser_settings",
-    "get_wiki_page", "list_wiki_contents", "get_wiki_outline", "get_editor_state",
+    "resolve_wiki_evidence", "get_wiki_page", "list_wiki_contents", "get_wiki_outline", "get_editor_state",
     "get_wiki_compilation_state",
     "get_wiki_backlinks", "get_wiki_claims",
     "get_parse_result_documents", "get_parse_result_entities",
@@ -411,15 +492,29 @@ _SPACE_READ_ACTIONS = frozenset({
 # 检索类（过滤无权限 KB，不整体拒绝）
 _SEARCH_ACTIONS = frozenset({
     "search", "search_enhanced", "deep_query", "search_mix",
-    "query_with_ontology", "search_llmwiki", "search_jonex_wiki",
+    "query_with_ontology", "search_llmwiki", "search_jonex_wiki", "start_jonex_wiki_search",
+    # [jonex] B2：网关流式检索的写前预检。走 `_filter_search_kbs` 的
+    # 「空间 member / KB 授权」口径（与真实检索一致），不套 KB 浏览的成员口径。
+    "assert_kb_searchable",
 })
+
+# 检索埋点排除名单：这些 action 虽在 `_SEARCH_ACTIONS`（复用同一套 KB 权限过滤），
+# 但**不是检索行为**。`assert_kb_searchable` 是网关流式检索的写前预检（只判权限/
+# 密级、不读内容），计进检索次数会把「预检 + 真实检索」算成两次。
+_METERING_EXCLUDED_SEARCH_ACTIONS = frozenset({"assert_kb_searchable"})
 
 # 数据运营聚合（空间级聚合，非用户级）：domain_space_id 传则空间成员，
 # 不传则仅租户管理员（execute 内单独判定，不进 _SPACE_EXEMPT_ACTIONS）。
 _ANALYTICS_ACTIONS = frozenset({
     "get_data_operations_overview", "get_data_assets_analytics",
     "get_knowledge_assets_analytics", "get_search_analytics",
-    "get_abnormal_assets_analytics",
+    "get_abnormal_assets_analytics", "get_quality_anomalies",
+    # 三期：列表钻取详情（与列表同一个权限口子 —— 它们读的是同一批数据，
+    # 单独放宽就等于给「点开抽屉」开了一条绕过列表范围的旁路）
+    "get_data_asset_detail", "get_data_ontology_entity_detail", "get_data_kb_detail",
+    # 抽屉 D（领域服务详情）：同一个口子。它**不抛 404**（详见 `ServiceDetail` 的
+    # DTO 注释）—— 权限仍由本组的空间判定 + service 层的空间范围过滤承担。
+    "get_data_service_detail",
 })
 
 # 空间解析路径（action 组 → space_id 数据来源）
@@ -436,6 +531,9 @@ _DOC_ID_ACTIONS = frozenset({
     "reparse_document", "scan_stale_chunks", "purge_stale_chunks",
     "get_chunk", "get_raw_content", "get_asset_raw_location",  # [jonex] §image-refs P2-3
     "get_document_parse_result",
+    "get_document_source_spans",  # 引用 bbox 定位：靠 document_id 解析空间
+    # 文档版本链（第 2 项）
+    "list_document_versions", "upload_document_version", "get_document_version_url",
 })
 _DS_ID_ACTIONS = frozenset({
     "get_data_source", "update_data_source", "delete_data_source",
@@ -459,6 +557,8 @@ class KnowledgeBaseCapability(BaseCapability):
     # 清单与方案 §15 一致——这些 action 当前都在 dispatch 直接分发、无 kb_type 校验。
     _ONTOLOGY_GATED_ACTIONS = {
         "get_compiled_schema",
+        # [jonex] 抽取入口同为「本体 schema 消费方」，openkb KB 一律拒绝（同 get_compiled_schema）
+        "get_compiled_schema_for_extraction",
         "save_compiled_schema",
         "reseed_compiled_schema",
         "recompile_schema",
@@ -483,14 +583,35 @@ class KnowledgeBaseCapability(BaseCapability):
         super().__init__()
 
     def register_routes(self, app):
-        """注册知识库 REST API 路由"""
-        from capabilities.knowledge_base.api import create_router
+        """**不注册任何并行 REST 层** —— 该层已于 2026-10 物理删除。
 
-        router = create_router()
-        app.include_router(router, prefix="/api/v1")
+        历史背景（2026-10 渗透测试 RC-A）：knowledge-base 除 `/invoke`（生产链路，
+        强制内部服务 JWT）外，还额外挂了一层并行 REST（`/api/v1/knowledge-info`、
+        `/api/v1/documents` 等 84 条）。该层**不在生产链路上** —— Gateway 对
+        knowledge_base 一律经 Sidecar `/invoke`，前端只打网关前缀
+        `/api/v1/knowledge-base/**`；却**无任何鉴权**且按客户端 `X-Tenant-ID`
+        决定租户，容器端口一旦可达（RC-B 宿主端口发布）即为跨租户读写面
+        （报告 3.2/3.4）。
+
+        处置过程：
+        1. P1 先加 `CONTAINER_REST_ENABLED` 开关（默认 `false`）→ 生产不挂载，
+           攻击面 137 → 0；
+        2. 随后**物理删除**该层实现与开关本身（纯清理，生产行为不变：此前默认
+           也不挂载），使「误挂载」这一类风险从根上消失。
+
+        ⚠️ **不要再往这里加路由**。需要新的对外能力时：
+        - 在 `_build_dispatch` 里加 invoke action（`/invoke` 注册在
+          `deploy/start_capability.py`，与本方法无关）
+        - 同步 `api_gateway/routes/knowledge_base.py` 与 Sidecar 契约
+
+        原子抽取侧的 compiled schema 读取走 `/invoke` 的
+        `get_compiled_schema_for_extraction`（见 `_build_dispatch`）。
+        """
+        return super().register_routes(app)
 
     async def initialize(self) -> None:
-        # 安全守卫：JWT_SECRET 必须为真实随机值（无条件）。本服务用 _sign_payload
+        # 安全守卫：JWT_SECRET 必须为真实随机值（**生产档 ENV=prod 硬拦**，非生产只告警；
+        # 见 jonex_core/common/security_guards.py 约束 2）。本服务用 _sign_payload
         # 计算 ingest key 哈希，泄漏即可伪造 ingest key 向任意租户知识库注入数据。
         assert_secure_jwt_secret()
         # [jonex] 配额：启动时解析校验，配置非法抛 QuotaConfigError 拒绝启动。
@@ -532,9 +653,62 @@ class KnowledgeBaseCapability(BaseCapability):
         self._backfill_task = asyncio.create_task(self._backfill_manual_entities())
 
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+
+        # [jonex] 第 3 期 · 任务 5/8：保留策略扫描（归档到期 / 销毁宽限到期）。
+        # `RETENTION_SCHEDULER_INTERVAL_SECONDS<=0` 时 start() 自己 no-op。
+        # ⚠️ 调度器起不来**不能拖垮服务启动**（保留策略是后台治理能力，不是服务
+        # 可用性的前置条件）；失败只记 warning，下一轮重启再试。
+        try:
+            from .services.retention_scheduler import start_scheduler as _start_retention
+
+            await _start_retention()
+        except Exception as exc:  # noqa: BLE001 —— 保护服务启动
+            logger.warning("保留策略调度器启动失败（服务继续启动）: %s", exc)
+
+        # [jonex] 删库索引补偿：软删 KB 的文档行没有逐文档删除入口，
+        # 检索索引（LightRAG/OpenKB/jonex_wiki/Neo4j）由该后台循环补清。
+        try:
+            from .services.index_cleanup_scheduler import (
+                start_scheduler as _start_index_cleanup,
+            )
+
+            await _start_index_cleanup()
+        except Exception as exc:  # noqa: BLE001 —— 保护服务启动
+            logger.warning("删库索引补偿器启动失败（服务继续启动）: %s", exc)
+
+        # 调用明细采集写口（monitor.call_attempt，N2）。task_runtime 四个方向的重试埋点
+        # （`jonex_core/task_runtime/runtime.py` 的 `attempt_span`）走的是共享内核那个
+        # 采集器，而**采集器是每进程一份实例**：本服务不启动它，埋点会静默失效
+        # （`put_call_attempt` 见 `_running=False` 直接返回，业务无感、数据全丢）。
+        # 同 platform 的理由：采集是旁路，起不来绝不能拖垮知识库本体。
+        try:
+            from jonex_core.common.monitor_collector import get_monitor_collector
+            get_monitor_collector().start()
+            logger.info("MonitorCollector 已启动")
+        except Exception:
+            logger.exception("MonitorCollector 启动失败（不影响知识库功能）")
+
         logger.info("Knowledge Base capability initialized (reconciliation loop started)")
 
     async def shutdown(self) -> None:
+        # [jonex] 第 3 期 · 任务 5/8：先停保留扫描（它与对账循环无共享状态，
+        # 顺序只是为了在关 Neo4j 驱动前收掉所有后台任务）。
+        try:
+            from .services.retention_scheduler import stop_scheduler as _stop_retention
+
+            await _stop_retention()
+        except Exception as exc:  # noqa: BLE001 —— 关停失败不阻塞其余清理
+            logger.warning("保留策略调度器停止失败: %s", exc)
+
+        try:
+            from .services.index_cleanup_scheduler import (
+                stop_scheduler as _stop_index_cleanup,
+            )
+
+            await _stop_index_cleanup()
+        except Exception as exc:  # noqa: BLE001 —— 关停失败不阻塞其余清理
+            logger.warning("删库索引补偿器停止失败: %s", exc)
+
         if self._backfill_task:
             self._backfill_task.cancel()
             try:
@@ -547,6 +721,13 @@ class KnowledgeBaseCapability(BaseCapability):
                 await self._reconcile_task
             except asyncio.CancelledError:
                 pass
+        try:
+            from jonex_core.common.monitor_collector import get_monitor_collector
+            await get_monitor_collector().stop()
+            logger.info("MonitorCollector 已停止")
+        except Exception:
+            logger.exception("MonitorCollector 停止失败")
+
         await close_neo4j_driver()
         logger.info("Knowledge Base capability shutdown complete")
 
@@ -566,6 +747,28 @@ class KnowledgeBaseCapability(BaseCapability):
             raise
         except Exception as exc:
             logger.warning("存量手动实体回填失败（不阻塞启动）: %s", exc)
+
+    def _image_query_sweep_due(self) -> bool:
+        """查询图片兜底清理该不该跑（B12）。按 `IMAGE_QUERY_SWEEP_INTERVAL` 节流。
+
+        状态放在实例上（`_image_query_swept_at`），懒初始化 —— 第一次调用即到期，
+        这样重启后不用等满一个周期才扫第一遍。
+        """
+        import time
+
+        try:
+            interval = int(get_config().IMAGE_QUERY_SWEEP_INTERVAL)
+        except Exception:  # noqa: BLE001 —— 配置读不出来不该让对账循环整趟崩
+            interval = 3600
+        if interval <= 0:
+            # 配 0 / 负数 = 关掉这趟（不是"每轮都跑"），给运维一个显式的关闭开关
+            return False
+        now = time.monotonic()
+        last = getattr(self, "_image_query_swept_at", None)
+        if last is not None and (now - last) < interval:
+            return False
+        self._image_query_swept_at = now
+        return True
 
     async def _reconcile_pass(self, label: str, run: Callable[[], Awaitable[Any]]) -> Any:
         """跑一趟对账/巡检，**只兜自己这一趟的异常**；没跑成返回 `_PASS_FAILED`。
@@ -598,7 +801,11 @@ class KnowledgeBaseCapability(BaseCapability):
             return _PASS_FAILED
 
     async def _reconcile_loop(self) -> None:
-        """每 30 秒扫描 PARSING 文档和本体对账（启动时立即执行一次）。"""
+        """每 30 秒扫描 PARSING 文档和本体对账（启动时立即执行一次）。
+
+        另挂一趟**低频**的查询图片兜底清理（以图问知识，B12）：它不需要 30 秒的
+        节拍，由 `_image_query_sweep_due` 按 `IMAGE_QUERY_SWEEP_INTERVAL` 自己节流。
+        """
         logger.info("Reconciliation loop started (first run immediately)")
         first_run = True
         while True:
@@ -676,6 +883,26 @@ class KnowledgeBaseCapability(BaseCapability):
                 elif watch_result:
                     logger.info("对账→任务中心看门狗: %s", watch_result)
 
+                # [jonex] 以图问知识：查询图片兜底清理（B12）。
+                #
+                # 它补的是**同步清理漏掉的那部分**（删历史时删对象失败、进程在两步之间
+                # 退出）—— 那些图片不进这条路就永远留在桶里，而对象存储没有 TTL（F13）。
+                #
+                # ⚠️ **必须自己节流**：本循环 30 秒一轮，而这个活按小时算就够
+                # （`IMAGE_QUERY_SWEEP_INTERVAL` 默认 3600）。不节流等于每 30 秒
+                # 扫一次库 + 可能删一次对象，纯浪费。
+                # ⚠️ **多副本并发跑是安全的**：删对象与软删都幂等（删不存在的对象视为
+                # 成功），所以不选主 —— 与这个循环里的其它趟同一个口径。
+                if self._image_query_sweep_due():
+                    sweep_result = await self._reconcile_pass(
+                        "查询图片兜底清理",
+                        lambda: self.service.query_image.sweep_orphans(),
+                    )
+                    if sweep_result is _PASS_FAILED:
+                        failed.append("查询图片兜底清理")
+                    elif sweep_result and (sweep_result.get("orphans") or sweep_result.get("objects")):
+                        logger.info("对账→查询图片兜底清理: %s", sweep_result)
+
                 if failed:
                     await asyncio.sleep(10)
             except asyncio.CancelledError:
@@ -693,6 +920,9 @@ class KnowledgeBaseCapability(BaseCapability):
         search = self.service.search
         history = self.service.history
         feedback = self.service.feedback
+        # [jonex] 以图问知识：识别（图片→文本）与图片生命周期（落盘/查看/清理）
+        image_query = self.service.image_query
+        query_image = self.service.query_image
         parse = self.service.parse_results
         ontology = self.service.ontology
         reconcile = self.service.reconciliation
@@ -718,8 +948,42 @@ class KnowledgeBaseCapability(BaseCapability):
             "list_documents": lambda r, d: docs.list_documents(r.tenant_id, d),
             "documents_stats": lambda r, d: docs.documents_stats(r.tenant_id, d),
             "get_document": lambda r, d: docs.get_document(r.tenant_id, d["document_id"], d),
+            "list_document_versions": lambda r, d: docs.list_document_versions(
+                r.tenant_id, d["document_id"],
+            ),
+            "upload_document_version": lambda r, d: docs.upload_document_version(
+                r.tenant_id, d["document_id"], d,
+                user_id=r.user_id, username=r.username, ip=r.ip,
+            ),
+            "get_document_version_url": lambda r, d: docs.get_document_version_url(
+                r.tenant_id, d["document_id"], d["version_no"],
+            ),
             "get_document_status": lambda r, d: docs.get_document_status(r.tenant_id, d["document_id"], d.get("kb_ids", [])),
+            # [jonex] B6 §5.2：仅校验文档可读（租户 + KB 空间/授权），不返回正文
+            "assert_document_readable": lambda r, d: docs.assert_document_readable(
+                r.tenant_id, r.user_id, d["document_id"],
+            ),
+            "get_document_quality_report": lambda r, d: docs.get_document_quality_report(
+                r.tenant_id, d["document_id"], d.get("knowledge_base_id", ""),
+            ),
+            # B6 §5.1：批量质量报告全被密级过滤时，服务会因空 list 撞 1..100 入参闸，
+            # 由守卫打标记后在这里直接返回空 items。
+            "get_document_quality_reports": self._get_document_quality_reports,
             "delete_document": lambda r, d: docs.delete_document(r.tenant_id, d["document_id"], d, user_id=r.user_id, username=r.username, ip=r.ip),
+            # ── 第 3 期生命周期：归档 / 恢复 / 销毁（KB 执行）──
+            "archive_document": lambda r, d: docs.archive_document(
+                r.tenant_id, d["document_id"], d["knowledge_base_id"],
+                reason=d.get("reason", "manual"),
+                user_id=r.user_id, username=r.username, ip=r.ip,
+            ),
+            "restore_document": lambda r, d: docs.restore_document(
+                r.tenant_id, d["document_id"], d["knowledge_base_id"],
+                user_id=r.user_id, username=r.username, ip=r.ip,
+            ),
+            "destroy_document": lambda r, d: docs.destroy_document(
+                r.tenant_id, d["document_id"], d["knowledge_base_id"],
+                user_id=r.user_id, username=r.username, ip=r.ip,
+            ),
             "generate_upload_url": lambda r, d: docs.generate_upload_url(
                 r.tenant_id, d["knowledge_base_id"], d["file_name"], d.get("content_type"),
             ),
@@ -735,6 +999,16 @@ class KnowledgeBaseCapability(BaseCapability):
                 ext=d.get("ext", ""), knowledge_base_id=d.get("knowledge_base_id", ""),
             ),
             "get_document_chunks": lambda r, d: docs.get_document_chunks(r.tenant_id, d["document_id"]),
+            # 引用原文坐标（bbox 定位）：chunk_index / expect 缺省时服务层降级为只跳页
+            "get_document_source_spans": lambda r, d: docs.get_document_source_spans(
+                r.tenant_id, d["document_id"], d.get("chunk_index"),
+                expect=d.get("expect") or {},
+            ),
+            # [jonex] 第2期 · 任务5/6：limit 原样交给服务层校验（dispatch 不裸 int()）
+            "get_document_provenance": lambda r, d: docs.get_document_provenance(
+                r.tenant_id, d["document_id"], d["knowledge_base_id"],
+                limit=d.get("limit", 100),
+            ),
             "get_chunk": lambda r, d: docs.get_chunk(r.tenant_id, d["document_id"], d["chunk_id"]),
             "reparse_document": lambda r, d: docs.reparse_document(r.tenant_id, d["document_id"], user_id=r.user_id, username=r.username, ip=r.ip, force=d.get("force", False)),
             # [jonex] §table-grid-v2 O7: 新旧格式残留扫描与定点清理
@@ -755,13 +1029,30 @@ class KnowledgeBaseCapability(BaseCapability):
             # [jonex] openkb 分流
             "search_llmwiki": self._search_llmwiki,
             "search_jonex_wiki": self._search_jonex_wiki,
+            "start_jonex_wiki_search": self._start_wiki_search,
+            "poll_jonex_wiki_search": self._poll_wiki_search,
+            "cancel_jonex_wiki_search": self._cancel_wiki_search,
+            "resolve_wiki_evidence": self._resolve_wiki_evidence,
             "search_mix": self._search_mix,
+            # 网关流式检索预检：权限/密级在 execute 前置阶段已完成，这里只回执。
+            "assert_kb_searchable": self._assert_kb_searchable,
+            "record_stream_search": self._record_stream_search,
+            "mark_template_scenario_published": self._mark_template_scenario_published,
+            "list_impacted_knowledge_bases": self._list_impacted_knowledge_bases,
             # ── 数据运营（Data Operations）──
             "get_data_operations_overview": lambda r, d: analytics.overview(r.tenant_id, _user_id(r), d),
             "get_data_assets_analytics": lambda r, d: analytics.data_assets(r.tenant_id, _user_id(r), d),
             "get_knowledge_assets_analytics": lambda r, d: analytics.knowledge_assets(r.tenant_id, _user_id(r), d),
             "get_search_analytics": lambda r, d: analytics.search_analytics(r.tenant_id, _user_id(r), d),
             "get_abnormal_assets_analytics": lambda r, d: analytics.abnormal_assets(r.tenant_id, _user_id(r), d),
+            "get_quality_anomalies": lambda r, d: analytics.quality_anomalies(r.tenant_id, _user_id(r), d),
+            # 三期：列表钻取详情。窗口/范围参数与列表共用同一组字段
+            # （`days` 或 `start_date`+`end_date`，加 `domain_space_id`），
+            # 所以这三个 action 不需要自己的 `_REQUIRED_FIELDS` 之外的特殊解析。
+            "get_data_asset_detail": lambda r, d: analytics.asset_detail(r.tenant_id, _user_id(r), d),
+            "get_data_ontology_entity_detail": lambda r, d: analytics.ontology_entity_detail(r.tenant_id, _user_id(r), d),
+            "get_data_kb_detail": lambda r, d: analytics.kb_detail(r.tenant_id, _user_id(r), d),
+            "get_data_service_detail": lambda r, d: analytics.service_detail(r.tenant_id, _user_id(r), d),
             "get_search_overview": lambda r, d: history.get_overview(r.tenant_id, _user_id(r), d),
             "list_search_history": lambda r, d: history.list_history(r.tenant_id, _user_id(r), d),
             "save_search_history": lambda r, d: history.save_history(r.tenant_id, _user_id(r), d),
@@ -769,6 +1060,18 @@ class KnowledgeBaseCapability(BaseCapability):
                 r.tenant_id, _user_id(r), d["history_id"], d
             ),
             "clear_search_history": lambda r, d: history.clear_history(r.tenant_id, _user_id(r), d),
+            # ── 以图问知识 ──
+            # 识别：图片 → 查询文本。**它不检索** —— 前端拿到 query 后照常调
+            # `/search/mix` 等现有接口（方案 D1 两步式），所以这里没有 kb 参数。
+            "image_to_query": lambda r, d: image_query.resolve(
+                r.tenant_id, _user_id(r), d, trace_id=r.request_id
+            ),
+            # 查看票据：校验归属通过后把身份交回 Gateway 签票（签票是接口层的事，
+            # service 不知道外部访问地址长什么样）
+            "get_query_image_ticket": lambda r, d: self._query_image_ticket(r, d),
+            "get_query_image_location": lambda r, d: query_image.get_location(
+                r.tenant_id, _user_id(r), d["image_id"]
+            ),
             # ── 搜索结果反馈 ──
             "submit_search_feedback": lambda r, d: feedback.submit_feedback(r.tenant_id, _user_id(r), d),
             "cancel_search_feedback": lambda r, d: feedback.cancel_feedback(r.tenant_id, _user_id(r), d),
@@ -846,6 +1149,12 @@ class KnowledgeBaseCapability(BaseCapability):
                 r.tenant_id, d["knowledge_base_id"],
             ),
             "get_compiled_schema": lambda r, d: compiler.get_compiled_schema(
+                r.tenant_id, d["knowledge_base_id"],
+            ),
+            # [jonex] 抽取入口：get_compiled_schema + 注入 KB 级同义词（语义见
+            # _get_compiled_schema_for_extraction）。atomic-rag Stage4 本体抽取走这条，
+            # 使它不再依赖容器 REST 层（该层默认已不挂载）。
+            "get_compiled_schema_for_extraction": lambda r, d: self._get_compiled_schema_for_extraction(
                 r.tenant_id, d["knowledge_base_id"],
             ),
             "save_compiled_schema": lambda r, d: compiler.save_compiled_schema(
@@ -1110,6 +1419,58 @@ class KnowledgeBaseCapability(BaseCapability):
         logger.debug("Resolved service_id=%s to kb_ids=%s", service_id, kb_ids)
         return kb_ids
 
+    async def _get_document_quality_reports(self, request, data):
+        """批量质量摘要（B6 §5.1）。
+
+        全被密级过滤时直接返回空 items：传空 list 给服务会撞它 1..100 的
+        入参闸（400），而「全部不可见」对调用方应当等价于空列表。
+        """
+        if data.get("_classification_all_filtered"):
+            return {"items": []}
+        return await self.service.documents.get_document_quality_reports(
+            request.tenant_id, data["knowledge_base_id"], data["document_ids"],
+        )
+
+    async def _allowed_kb_ids(
+        self, tenant_id: str, user_id: str | None, kb_ids: list[str],
+    ) -> list[str]:
+        """按用户可读最高等级过滤 KB（B6 §5.1 多 KB 检索）。
+
+        租户管理员全放行；其余按 KB 内最高生效 rank 与用户 rank 比较。
+        保持输入顺序与重复项。
+
+        ⚠ 无 user / "anonymous" **不再原样放行**（B6 收口）：MCP 工具
+        （`/internal/kb/invoke`）就是无用户身份的机器调用，原来的早退让整条
+        MCP 检索链路绕过了密级过滤。机器身份按「最低启用等级」处理（fail closed），
+        与文档级守卫对空用户的既有口径一致。
+        """
+        kb_ids = list(kb_ids or [])
+        if not kb_ids:
+            return kb_ids
+
+        from jonex_core.security import classification_access as policy
+        from .services.space_permission_service import is_tenant_admin
+
+        if user_id and user_id != "anonymous":
+            if await is_tenant_admin(tenant_id, user_id):
+                return kb_ids
+        async with get_db_session() as session:
+            max_ranks = await policy.kb_max_level_rank(session, tenant_id, kb_ids)
+            user_rank = await policy.get_user_max_rank(
+                session, tenant_id, user_id, is_tenant_admin=False,
+            )
+        if user_rank is None:
+            return kb_ids
+        allowed = [
+            kb_id for kb_id in kb_ids if max_ranks.get(kb_id, 0) <= user_rank
+        ]
+        if len(allowed) < len(kb_ids):
+            logger.info(
+                "检索批量跳过：%d 个知识库超密级（user=%s）",
+                len(kb_ids) - len(allowed), user_id,
+            )
+        return allowed
+
     def _make_search_handler(self, search_method_name: str):
         """创建 search handler：解析 service_id → kb_ids → 调用对应的 search 方法。
 
@@ -1117,6 +1478,17 @@ class KnowledgeBaseCapability(BaseCapability):
         """
         async def _handler(request, data):
             kb_ids = await self._resolve_service_id_to_kb_ids(data, request.tenant_id)
+            kb_ids = await self._allowed_kb_ids(
+                request.tenant_id, _user_id(request), kb_ids,
+            )
+            if not kb_ids:
+                # B6 §5.1：全部 KB 被密级过滤 ⇒ 统一空结果（不把空结果当异常）
+                return {
+                    "answer": "",
+                    "references": [],
+                    "knowledge_base_ids": [],
+                    "reasoning": {},
+                }
             data = dict(data, knowledge_base_ids=kb_ids)
             method = getattr(self.service.search, search_method_name)
             return await method(
@@ -1138,8 +1510,112 @@ class KnowledgeBaseCapability(BaseCapability):
     async def _search_jonex_wiki(self, request: CapabilityRequest, data: dict[str, Any]) -> dict:
         return await self._make_search_handler("search_jonex_wiki")(request, data)
 
+    async def _start_wiki_search(self, request, data):
+        from .services.wiki_search_session_service import WikiSearchSessionService
+        kb_ids = await self._resolve_service_id_to_kb_ids(data, request.tenant_id)
+        kb_ids = await self._allowed_kb_ids(
+            request.tenant_id, _user_id(request), kb_ids,
+        )
+        if not kb_ids:
+            # B6 §5.1：单/多 KB 检索全部被密级过滤 ⇒ 404，不泄露存在性
+            raise ResourceNotFoundError(message="知识库不存在或无权访问")
+        return await WikiSearchSessionService().start(
+            request.tenant_id, _user_id(request), dict(data, knowledge_base_ids=kb_ids),
+            self.service.search, request.request_id)
+
+    async def _poll_wiki_search(self, request, data):
+        from .services.wiki_search_session_service import WikiSearchSessionService
+        return await WikiSearchSessionService().poll(request.tenant_id, _user_id(request), data["session_id"])
+
+    async def _cancel_wiki_search(self, request, data):
+        from .services.wiki_search_session_service import WikiSearchSessionService
+        return await WikiSearchSessionService().cancel(request.tenant_id, _user_id(request), data["session_id"])
+
+    async def _resolve_wiki_evidence(self, request, data):
+        from .services.wiki_search_session_service import resolve_wiki_evidence
+        return await resolve_wiki_evidence(request.tenant_id, data)
+
     async def _search_mix(self, request: CapabilityRequest, data: dict[str, Any]) -> dict:
         return await self._make_search_handler("search_mix")(request, data)
+
+    async def _assert_kb_searchable(
+        self, request: CapabilityRequest, data: dict[str, Any],
+    ) -> dict:
+        """流式检索网关的写前预检（B2）—— 只回执，不读 KB 内容。
+
+        空间/KB 授权在 execute 的 `_SEARCH_ACTIONS` 分支由 `_filter_search_kbs`
+        判定；KB 密级由 `classification_access_guard._KB_ACTIONS` 判定。本 handler
+        在两者之后执行，能走到这里即表示「可检索」，返回 kb id 供调用方确认。
+        """
+        kb_id = data.get("knowledge_base_id")
+        if not str(kb_id or "").strip():
+            # 纵深防御：execute 不做必填校验（validate_input 无调用方），缺字段会
+            # 在下面 KeyError → 500。预检缺 KB 应明确 400，而不是让调用方猜。
+            raise InvalidParameterError(message="knowledge_base_id 不能为空")
+        return {"knowledge_base_id": kb_id}
+
+    async def _record_stream_search(
+        self, request: CapabilityRequest, data: dict[str, Any],
+    ) -> dict:
+        """流式检索请求埋点（`/documents/search/stream` 直连 Sidecar，绕过 execute 埋点）。
+
+        只写请求事件（检索次数/入口），不含步骤/命中等明细 —— SSE 链路的命中
+        在 gateway 解析，能力层拿不到。权限拒绝（预检 404）不会走到这里。
+        """
+        from .services.search_event_writer import write_request_event
+
+        kb_ids = list(data.get("knowledge_base_ids") or [])
+        if not kb_ids and data.get("knowledge_base_id"):
+            kb_ids = [data["knowledge_base_id"]]
+        await write_request_event(
+            tenant_id=request.tenant_id,
+            request_id=request.request_id,
+            user_id=_user_id(request),
+            query=data.get("query"),
+            kb_ids=kb_ids,
+            domain_space_id=data.get("domain_space_id"),
+        )
+        return {"recorded": True}
+
+    async def _mark_template_scenario_published(
+        self, request: CapabilityRequest, data: dict[str, Any],
+    ) -> dict:
+        """模板场景发布后：把绑定该场景的 KB schema 标为过期（标准侧联动）。
+
+        business_domain 是独立容器，不能 import knowledge_base —— 该动作供它经
+        Sidecar invoke 调用；无用户身份，仅做租户内数据联动。
+        """
+        from .services.ontology_compiler import OntologyCompiler
+
+        return await OntologyCompiler().react_to_publish(
+            request.tenant_id, data["scenario_id"],
+        )
+
+    async def _list_impacted_knowledge_bases(
+        self, request: CapabilityRequest, data: dict[str, Any],
+    ) -> dict:
+        """模板场景变更影响哪些 KB（绑定表口径），供 business_domain 查询。"""
+        from .services.ontology_compiler import OntologyCompiler
+
+        items = await OntologyCompiler().list_impacted_knowledge_bases(
+            request.tenant_id, data["scenario_id"],
+        )
+        return {"items": items, "total": len(items)}
+
+    async def _query_image_ticket(self, request: CapabilityRequest, data: dict[str, Any]) -> dict:
+        """校验查询图片可看，把身份交回 Gateway 签票（以图问知识）。
+
+        能力侧只做**归属校验**（本人 + 仍被未删除历史引用，D10），签票交给 Gateway：
+        token 的载荷是 `tenant + user + image_id`，其中 `user_id` 只有这里知道
+        （Gateway 解的是它自己的用户 JWT，与服务端存的 user_id 未必同一形态）；
+        而「票怎么签、地址长什么样」是接口层的事，service 不该知道。
+
+        返回的 `user_id` 有意用 `_user_id(r)` 的**原值**（含 `anonymous` 那种形态）——
+        校验在 service 里已经拒掉匿名，能走到这里说明身份是实的；Gateway 直接拿它签票。
+        """
+        user_id = _user_id(request)
+        await self.service.query_image.check_viewable(request.tenant_id, user_id, data["image_id"])
+        return {"image_id": data["image_id"], "user_id": user_id}
 
     async def _resolve_space_context(
         self, action: str, data: dict[str, Any], tenant_id: str
@@ -1414,7 +1890,10 @@ class KnowledgeBaseCapability(BaseCapability):
         `service_knowledge_bases` 补齐。
 
         口径：权限拒绝（403）的请求**不计数** —— 埋点在这之后，那是 403 而非检索行为。
+        预检类 action（`_METERING_EXCLUDED_SEARCH_ACTIONS`）同样不计数。
         """
+        if action in _METERING_EXCLUDED_SEARCH_ACTIONS:
+            return
         if action not in _SEARCH_ACTIONS and action not in _SERVICE_SEARCH_ACTIONS:
             return
         from .services.search_event_writer import write_request_event
@@ -1431,6 +1910,28 @@ class KnowledgeBaseCapability(BaseCapability):
             kb_ids=list(kb_ids),
             entry_service_id=data.get("service_id"),
             domain_space_id=data.get("domain_space_id"),
+        )
+
+    async def _get_compiled_schema_for_extraction(
+        self, tenant_id: str, knowledge_base_id: str
+    ):
+        """[jonex] 对外下发（atomic-rag 抽取入口）的 compiled schema —— 注入 KB 级同义词。
+
+        与 `get_compiled_schema` 的**唯一差别**是多一步 `inject_synonyms`，因此两者
+        不可互换：invoke 侧的 `get_compiled_schema` 有意不注入（避免污染查询链路），
+        而抽取 prompt 需要同义词才能让 LLM 统一到 canonical 表述。
+
+        本方法承载的正是原先只存在于容器 REST 层的语义（`api/__init__.py` 的
+        `GET /ontology/compiled-schema`）—— 该层默认已不挂载（见 register_routes），
+        atomic-rag 改经 `/invoke` 走这里，以保证抽取质量零回归。
+        """
+        schema = await self.service.compiler.get_compiled_schema(
+            tenant_id, knowledge_base_id
+        )
+        if not schema:
+            return schema
+        return await self.service.compiler.inject_synonyms(
+            tenant_id, knowledge_base_id, schema
         )
 
     async def execute(self, request: CapabilityRequest) -> CapabilityResponse:
@@ -1450,6 +1951,11 @@ class KnowledgeBaseCapability(BaseCapability):
             return CapabilityResponse.error(request.request_id, 400, f"不支持的操作: {action}")
 
         try:
+            # [jonex] B6 内部标记无条件清理（守卫之前）：`_classification_all_filtered`
+            # 只能由 classification_access_guard 在「全被过滤」时设置。管理员/匿名/MCP
+            # 链路会跳过守卫，客户端若自带该标记就会让批量摘要恒空。守卫内部仍会自己
+            # pop（防御仍在），这里是更外层的兜底。
+            data.pop("_classification_all_filtered", None)
             if action not in self._INTERNAL_ACTIONS:
                 request.tenant_id = require_tenant(request.tenant_id)
             kb_type = None
@@ -1595,6 +2101,20 @@ class KnowledgeBaseCapability(BaseCapability):
                                         SPACE_MANAGER, SPACE_MEMBER,
                                     )
 
+
+            # [jonex] B6 访问侧分级保护（§5.1）：空间权限之后、dispatch 之前做
+            # 文档级/KB 级密级守卫。
+            # ⚠ MCP 链路本来就跳过空间判定（机器身份），但**不能**连带跳过密级守卫：
+            # 否则 MCP 可读 KB 浏览/文档/原文等出口。MCP 按最低启用等级处理
+            # （fail closed，与多 KB 检索过滤同口径）；其余无 user/"anonymous"
+            # 的非 MCP 链路保持原口径。
+            if not skip_space_check or is_mcp:
+                from .services.space_permission_service import is_tenant_admin
+                from .services.classification_access_guard import guard_capability_request
+                data = await guard_capability_request(
+                    request.tenant_id, actor, action, data,
+                    is_tenant_admin=await is_tenant_admin(request.tenant_id, actor),
+                )
 
             # [jonex] 双向门禁（方案 §15）：本体 schema/抽取类 action 拒绝 llm-wiki KB——
             # llm-wiki 不跑本体，调了会存没人读的 ontology_compiled_schemas 行。

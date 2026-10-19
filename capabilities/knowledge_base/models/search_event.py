@@ -89,7 +89,10 @@ class SearchHitEvent(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
 
     id = Column(String(64), primary_key=True, default=lambda: str(uuid4()))
     request_id = Column(String(64), nullable=False)
-    target_type = Column(String(16), nullable=False)
+    # 32 而非 16：本体命中事件写 'ontology_instance'（17 字符）。
+    # 声明 16 会让 INSERT 报 value too long，把同一事务里的步骤/命中/采用三类事件整批回滚
+    # （「被引用数据资产数」「高频引用资产 Top10」随之不更新）。见 tests/unit/test_search_event_schema_contract.py
+    target_type = Column(String(32), nullable=False)
     target_id = Column(String(128), nullable=False)
     entity_type = Column(String(64), nullable=True)
     canonical_name = Column(String(256), nullable=True)
@@ -115,7 +118,8 @@ class SearchAdoptionEvent(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     id = Column(String(64), primary_key=True, default=lambda: str(uuid4()))
     answer_id = Column(String(64), nullable=False)
     request_id = Column(String(64), nullable=True)
-    target_type = Column(String(16), nullable=False)
+    # 同 SearchHitEvent.target_type：32 而非 16，见该字段注释
+    target_type = Column(String(32), nullable=False)
     target_id = Column(String(128), nullable=False)
     entity_type = Column(String(64), nullable=True)
     canonical_name = Column(String(256), nullable=True)

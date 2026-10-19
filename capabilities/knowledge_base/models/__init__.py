@@ -7,7 +7,12 @@
 终止整个 models 包的加载并指示失败的模型，从而不会注册部分模型。
 """
 
-from .document import DocStatus, KnowledgeDocument, OntologyStatus
+from .document import (
+    DocStatus,
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
+    OntologyStatus,
+)
 from .llm_wiki_schema import (
     LlmWikiSchema,
     STATUS_ACTIVE,
@@ -31,6 +36,7 @@ from .parser_setting import KnowledgeParserSetting
 from .answer_feedback import KnowledgeAnswerFeedback, KnowledgeAnswerFeedbackEvent
 from .search_feedback import KnowledgeSearchFeedback
 from .search_history import KnowledgeSearchHistory, build_query_hash, normalize_query
+from .query_image import KnowledgeQueryImage, KnowledgeSearchHistoryImage
 from .search_event import (
     AssetStatusEvent,
     ProcessingTaskEvent,
@@ -44,6 +50,7 @@ from .space import Space, SpacePermission
 # 在这里被 import 才算注册进元数据 —— 别只靠「某个 repository 恰好 import 了它」。
 from .task_center import (
     ACTIVE_STATES,
+    MANAGED_STATES,
     TaskCenterDocState,
     TaskCenterDocument,
     TaskExecutionRegistry,
@@ -51,6 +58,7 @@ from .task_center import (
 
 __all__ = [
     "ACTIVE_STATES",
+    "MANAGED_STATES",
     "AssetStatusEvent",
     "DocStatus",
     "DocumentTag",
@@ -65,6 +73,9 @@ __all__ = [
     "KnowledgeParserSetting",
     "KnowledgeSearchFeedback",
     "KnowledgeSearchHistory",
+    "KnowledgeQueryImage",
+    "KnowledgeDocumentVersion",
+    "KnowledgeSearchHistoryImage",
     "KbPermission",
     "OntologyStatus",
     "OntologySynonym",

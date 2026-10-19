@@ -268,11 +268,17 @@ class JonexWikiService:
     async def search_compiled_knowledge(
         self, kb_name: str, tenant_id: str, kb_id: str, question: str,
         return_trace: bool = False,  # [jonex]
+        thinking_mode: str | None = None,
+        progress_session: str | None = None,
     ) -> dict:
         """搜索已编译的 Wiki 知识。"""
+        options = {"thinking_mode": thinking_mode} if thinking_mode is not None else {}
+        if progress_session:
+            options["progress_session"] = progress_session
         return await self._client.query(
             kb_name=kb_name, question=question, tenant_id=tenant_id, kb_id=kb_id,
             return_trace=return_trace,
+            **options,
         )
 
     async def remove_document(
@@ -622,7 +628,9 @@ class JonexWikiService:
                     document_id, tenant_id, for_update=True,
                 )
                 doc = await KnowledgeDocumentRepository(session).get_required(document_id, tenant_id)
-                if doc.status != "ready" or doc.llm_wiki_compile_status != "stale":
+                # Task-center parsing does not pass through the legacy hook
+                # that writes stale. NULL is also a ready, never-compiled source.
+                if doc.status != "ready" or doc.llm_wiki_compile_status not in (None, "stale"):
                     return False
                 metadata = dict(doc.extra_metadata or {})
                 parsed = False

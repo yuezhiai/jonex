@@ -38,6 +38,14 @@ _SPACE_ROLE_RANK: dict[str, int] = {SPACE_MEMBER: 0, SPACE_MANAGER: 1}
 _TENANT_ADMIN = "tenant:admin"
 _PLATFORM_ADMIN = "platform:admin"
 
+# [jonex] W2（2026-10-19）：建空间的租户级能力码。
+# 权限重构原设计里 space:write 就是「租户级空间管理：建新空间 / 管所有空间」
+# （docs/permissions/PERMISSIONS_REDESIGN.md §11.3 / §12.3），且执行文档明确要求
+# 「新建空间按钮用 space:write，或后端 can_create_space 字段，二者等价」。
+# 但先前实现只在 create 里判 is_tenant_admin ⇒ 只带 space:write 的自定义角色
+# （如租户自建的「空间创建」）永远 403，space:write 成了没有任何判定点的摆设码。
+_SPACE_WRITE = "space:write"
+
 
 def _coerce_user_id(user_id: str | None) -> int | None:
     """invoke 链路 user_id 是 str（''/'anonymous' 表示无用户）；权限码查询需要 int。"""
@@ -71,6 +79,33 @@ async def is_tenant_admin(tenant_id: str, user_id: str | None) -> bool:
     # 上位兜底：platform:admin 角色理应同时持有全部 tenant 码（含 tenant:admin），
     # 这里显式再判一次，避免角色矩阵播种漏配时平台管理员被挡在租户业务之外。
     return await has_permission(tenant_id, uid, _PLATFORM_ADMIN)
+
+
+async def can_create_space(tenant_id: str, user_id: str | None) -> bool:
+    """能否**创建**领域空间 —— 后端唯一判据，`create` 与 `list.can_create_space` 共用。
+
+    [jonex] W2（2026-10-19，用户决策）：租户管理员（tenant:admin / platform:admin）
+    **或**持有租户级能力码 space:write 即可创建。
+
+    变更前只判 `is_tenant_admin` ⇒ 租户自建的自定义角色（例如只授了 space:write 的
+    「空间创建」角色）永远 403「创建空间需要租户管理员权限」，而前端按 `can_create_space`
+    显示入口、按码授予又不生效 —— 实现与 docs/permissions/PERMISSIONS_REDESIGN.md
+    §11.3 / §12.3（space:write = 创建/管理领域空间、指定领域管理者）不一致。
+
+    ⚠️ 授权面提示：创建人会被自动写入该空间的 `space_permissions` 为 space_manager
+    （space_service.create 内同事务），因此「授予 space:write」= 「可自建空间并自动成为
+    该空间管理者」。租户内不跨租户，但等于把「空间结构规划」下放给持码角色 —— 这是
+    W2 决策的既定影响，改这条判据前先确认产品口径。
+
+    可见性 / 单空间内管理（can_write_space / can_manage_permissions）**不受本函数影响**，
+    仍走 space_permissions 资源身份（B2/D2 模型）。
+    """
+    if await is_tenant_admin(tenant_id, user_id):
+        return True
+    uid = _coerce_user_id(user_id)
+    if uid is None:
+        return False
+    return await has_permission(tenant_id, uid, _SPACE_WRITE)
 
 
 async def get_user_role(tenant_id: str, space_id: str, user_id: str | None) -> str | None:

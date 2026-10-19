@@ -303,7 +303,11 @@ class OntologyQueryService:
     # ══════════════════════════════════════════════════════════════════
 
     async def create_instance(self, tenant_id: str, req: CreateOntologyInstanceRequest) -> dict:
-        """创建本体实例（实体节点）。"""
+        """创建本体实例（实体节点）。
+
+        `req.document_id` 有值（从文档结果页创建）→ 写进 `doc_ids`，该文档的本体视图可见；
+        为空（KB 级编译资产页创建）→ `doc_ids=[]`，属于全库实例。
+        """
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
         return await gdao.create_entity(
@@ -314,10 +318,11 @@ class OntologyQueryService:
             aliases=req.aliases,
             description=req.description or "",
             attributes=req.attributes,
+            doc_id=req.document_id,
         )
 
     async def create_relation(self, tenant_id: str, req: CreateOntologyRelationRequest) -> dict:
-        """创建本体关系（实体间关系边）。"""
+        """创建本体关系（实体间关系边）。`req.document_id` 口径同 `create_instance`。"""
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
         return await gdao.create_relation(
@@ -329,6 +334,7 @@ class OntologyQueryService:
             target_entity_type=req.target_entity_type,
             target_canonical_name=req.target_canonical_name,
             attributes=req.attributes,
+            doc_id=req.document_id,
         )
 
     async def update_instance(self, tenant_id: str, req: UpdateOntologyInstanceRequest) -> dict:
@@ -364,6 +370,9 @@ class OntologyQueryService:
 
         无关键词时：回退到 list_entities 返回前 limit 条，确保搜索选择器初始有数据。
 
+        `req.document_id` 有值时两条分支都只在**该文档关联的实体**里选（判据
+        `$doc_id IN e.doc_ids`，与文档本体视图一致）；为空时保持全库候选。
+
         Returns:
             dict: {"items": list[dict]} — items 为匹配/默认的实体列表
         """
@@ -375,6 +384,7 @@ class OntologyQueryService:
                 kb_id=req.knowledge_base_id,
                 offset=0,
                 limit=req.limit,
+                document_id=req.document_id,
             )
             return {"items": items}
         items = await gdao.search_entities(
@@ -382,6 +392,7 @@ class OntologyQueryService:
             kb_ids=[req.knowledge_base_id],
             query=req.keyword,
             limit=req.limit,
+            doc_id=req.document_id,
         )
         return {"items": items}
 

@@ -2,7 +2,9 @@
 # -*- coding:utf-8 -*-
 """Repository for Knowledge Base documents."""
 
-from sqlalchemy import exists, func, or_ as sa_or, select
+from datetime import datetime
+
+from sqlalchemy import exists, func, or_ as sa_or, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jonex_core.common.repository import BaseRepository
@@ -16,6 +18,7 @@ from .processing_task_repository import (
     TASK_TYPE_PARSE,
     record_processing_task,
 )
+from .search_event_repository import safe_record_asset_status_event
 from ..models.task_center import ACTIVE_STATES, TaskCenterDocument
 
 
@@ -79,8 +82,8 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         return list(result.scalars())
 
     @staticmethod
-    def _not_task_center_managed():
-        """`NOT EXISTS` 子查询：把「正被任务中心接管」的文档排除出扫描面。
+    def _not_task_center_managed(states: tuple[str, ...] = ACTIVE_STATES):
+        """`NOT EXISTS` 子查询：把「归任务中心管」的文档排除出扫描面。
 
         ⚠️ **必须下沉成 SQL**（不能取一批再在 Python 里 `continue`）：一个全是接管
         文档的知识库会把 `limit` 的扫描额度吃光，真正需要救的文档排不进来 ——
@@ -89,10 +92,26 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         判据只认状态、不认识接管表的其他列（**纯 NOT EXISTS，不含任何业务判断**）：
         业务侧「哪些状态即使被接管也不能排除」由调用方用 `task_center_kept_statuses`
         显式列出（见 `list_by_ontology_status_for_reconciliation`）。
+
+        ── `states` 为什么是参数、而不是写死一个集合 ──
+
+        同一份扫描面被两类调用方共用，而它们要的判据**恰好相反**（2026-10-14 加）：
+
+          · **发起型**（`patrol_parsing_timeout` / `reconcile_ontology` 的新提交）→ 传
+            `MANAGED_STATES`。这类动作会**替文档发起下游任务**，是任务中心的专属权力，
+            交还（`released`）之后仍然不许旧对账染指。
+          · **收尾型**（`reconcile_documents`）→ 用默认值 `ACTIVE_STATES`。它只轮询
+            引擎状态、收尾既有任务，**必须**还能看见 `released` 的文档：交还时那条
+            在途解析任务号是靠它兜住的（`hand_over_in_flight_task_id`），排除掉文档就
+            永久卡 `parsing`。
+
+        默认值取 `ACTIVE_STATES` 是**故意的保守**：既有调用方一个字不改就保持原行为，
+        新加的地方必须显式写出自己要哪个集合 —— 「忘了想清楚」会退化成旧行为，而不是
+        悄悄把别人的收尾也拦掉。
         """
         return ~exists().where(
             TaskCenterDocument.document_id == KnowledgeDocument.id,
-            TaskCenterDocument.state.in_(list(ACTIVE_STATES)),
+            TaskCenterDocument.state.in_(list(states)),
         )
 
     async def list_by_status_for_reconciliation(
@@ -101,16 +120,25 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         limit: int = 100,
         *,
         exclude_task_center_managed: bool = False,
+        task_center_exclude_states: tuple[str, ...] = ACTIVE_STATES,
     ) -> list[KnowledgeDocument]:
         """Cross-tenant scan reserved for internal reconciliation workers.
 
         [jonex] 批次 2-B：支持单 status 或多 status 列表扫描，
         使 reconcile_documents / patrol_parsing_timeout 可同时覆盖 PARSING + INGESTING。
 
-        `exclude_task_center_managed=True` 时跳过**正被任务中心接管**的文档：这些文档的
+        `exclude_task_center_managed=True` 时跳过**归任务中心管**的文档：这些文档的
         `PARSING` 是任务中心链的第一步（不是老链路的「解析+入库一次做完」），既有对账按老
         形态去问会得到错误的结论 —— `patrol_parsing_timeout` 尤其危险，它判超时后会
         **重新 insert**，与任务中心链彻底分叉、产出重复向量。
+
+        ⚠️ **`task_center_exclude_states` 由调用方自己选，两个调用方要的不一样**
+        （2026-10-14 加，理由见 `_not_task_center_managed`）：
+
+          · `reconcile_documents`（**收尾**）→ 用默认 `ACTIVE_STATES`，一个字都别传。
+            排除 `released` 会让交还的在途解析任务没人收尾、文档永久卡 `parsing`。
+          · `patrol_parsing_timeout`（**发起**，会 `insert`）→ 必须传 `MANAGED_STATES`。
+            交还（`released`）之后这份文档仍然归任务中心管，旧对账不许替它重投。
         """
 
         if isinstance(status, list):
@@ -123,7 +151,9 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
             status_cond,
         ]
         if exclude_task_center_managed:
-            conditions.append(self._not_task_center_managed())
+            conditions.append(
+                self._not_task_center_managed(task_center_exclude_states)
+            )
 
         stmt = (
             select(KnowledgeDocument)
@@ -142,6 +172,7 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         skip_locked: bool = False,
         exclude_task_center_managed: bool = False,
         task_center_kept_statuses: list[str | OntologyStatus] | None = None,
+        task_center_exclude_states: tuple[str, ...] = ACTIVE_STATES,
     ) -> list[KnowledgeDocument]:
         """Cross-tenant ontology scan reserved for internal reconciliation workers.
 
@@ -150,7 +181,7 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
 
         ── 与任务中心接管的关系（`exclude_task_center_managed`）──
 
-        被任务中心接管的文档，其「本体抽取」由任务中心链的 compile 步发起，**不能再被对账
+        归任务中心管的文档，其「本体抽取」由任务中心链的 compile 步发起，**不能再被对账
         发起第二次**（两套驱动器同跑会写两次 Neo4j、token 翻倍）。所以这里排除它们。
 
         ⚠️ **但有一档必须留下**：`EXTRACTING`。它是**收尾**、不是新提交 —— 写 Neo4j 的
@@ -160,6 +191,12 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
 
         所以「哪些状态即使被接管也不排除」由**调用方**用 `task_center_kept_statuses`
         显式给出 —— 仓储不认识业务状态的含义，不替调用方猜。
+
+        ⚠️ **`task_center_exclude_states` 必须传 `MANAGED_STATES`**（2026-10-14 加）：
+        本体抽取的**新提交**是发起型动作，交还（`released`）之后这份文档仍归任务中心管，
+        旧对账不许替它发起 —— 这正是 2026-10-14 那次事故（交还后旧对账自己把抽取跑了）。
+        调用方传参见 `ReconciliationService.reconcile_ontology`；`kept=EXTRACTING` 那档
+        只放行**收尾**，新提交由 `_retry_ontology_one` 里的第二道闸兜住。
         """
 
         conditions = [
@@ -169,7 +206,7 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         ]
         if exclude_task_center_managed:
             kept = [_value(s) for s in (task_center_kept_statuses or [])]
-            not_managed = self._not_task_center_managed()
+            not_managed = self._not_task_center_managed(task_center_exclude_states)
             if kept:
                 # 被接管的文档里，只有落在 kept 里的状态仍归对账管。
                 conditions.append(
@@ -254,6 +291,82 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         )
         await self.session.flush()
 
+    async def transition_status(
+        self,
+        document_id: str,
+        tenant_id: str,
+        *,
+        from_status: str | DocStatus,
+        to_status: str | DocStatus,
+        reason: str | None = None,
+        archived_at: datetime | None = None,
+        clear_rag_doc_ids: bool = False,
+        kb_id: str | None = None,
+    ) -> bool:
+        """**条件状态迁移**：仅当行仍是 `from_status` 时才写入 `to_status`。
+
+        归档/销毁这类「先做一段耗时清理、再写终态」的流程必须用它收尾：
+        读写之间文档可能已被 reparse / delete 推进，无条件回写会覆盖别人的新状态。
+        返回 `False` 表示状态已变化、本次迁移未发生（调用方应报 409 而不是假装成功）。
+
+        `rowcount > 0` 时同步写一条 `asset_status_event`（`from -> to`）。
+        `kb_id` 由调用方传（本方法只拿到 id，不为此多读一行）；写事件失败
+        由 savepoint 兜住、不影响这次迁移。
+        """
+        values: dict = {
+            "status": _value(to_status),
+            "updated_at": datetime.now(),
+        }
+        if archived_at is not None:
+            values["archived_at"] = archived_at
+        if clear_rag_doc_ids:
+            values["rag_doc_ids"] = []
+
+        result = await self.session.execute(
+            update(KnowledgeDocument)
+            .where(
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.tenant_id == tenant_id,
+                KnowledgeDocument.status == _value(from_status),
+                KnowledgeDocument.is_deleted == 0,
+            )
+            .values(**values)
+        )
+        await self.session.flush()
+        moved = (result.rowcount or 0) > 0
+        if moved:
+            await safe_record_asset_status_event(
+                self.session,
+                tenant_id,
+                asset_id=document_id,
+                status=_value(to_status),
+                previous_status=_value(from_status),
+                reason=reason,
+                kb_id=kb_id,
+            )
+        return moved
+
+    async def get_status_including_deleted(
+        self,
+        document_id: str,
+        tenant_id: str,
+    ) -> tuple[str | None, str | None] | None:
+        """查 `(status, knowledge_base_id)`，**不过滤 is_deleted**。
+
+        销毁的幂等出口：`get_by_id` 看不到已软删的行，但「对一篇已销毁文档再点
+        销毁」应当是成功而不是 404。租户 + KB 归属校验仍由调用方做。
+        """
+        row = (
+            await self.session.execute(
+                select(KnowledgeDocument.status, KnowledgeDocument.knowledge_base_id)
+                .where(
+                    KnowledgeDocument.id == document_id,
+                    KnowledgeDocument.tenant_id == tenant_id,
+                )
+            )
+        ).first()
+        return (row[0], row[1]) if row else None
+
     async def set_status(
         self,
         doc: KnowledgeDocument,
@@ -262,7 +375,13 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         rag_task_id: str | None = None,
         rag_doc_ids: list[str] | None = None,
         error_message: str | None = None,
+        reason: str | None = None,
     ) -> KnowledgeDocument:
+        """更新文档状态。
+
+        第 3 期生命周期：`reason` 是状态变更原因（manual / retention /
+        manual_restore…），状态变化时随 `asset_status_event` 一并落库。
+        """
         fresh = await self.get_by_id(doc.id, doc.tenant_id)
         # [jonex] 数据运营二期：改动前的状态要**在赋值之前**取（merge 兜底路径
         # 拿不到旧值，故在 merge 之前算，否则那条路的终态事件会丢）。
@@ -291,6 +410,24 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
                 doc_id=fresh.id, kb_id=fresh.knowledge_base_id,
                 content_generation=fresh.content_generation,
                 error=fresh.error_message if _task_status == TASK_STATUS_FAILED else None,
+            )
+        # [jonex] 第 3 期生命周期：资产状态事件（asset_status_event）。
+        # 判据与上面的处理任务埋点**同源**（状态真的变了才写），但**不受
+        # PARSE_STATUS_MAP 限制** —— 事件表记录的是资产状态的完整流转，
+        # archive/restore 这类非解析状态也必须留痕。
+        # ⚠️ `prev_value is None` 时**不写**：那是 merge 兜底路径（本 session
+        # 里查不到行），它拿不到改动前的真实状态；写一条 `NULL -> ready`
+        # 是凭空捏造的流转事实。
+        prev_value = _value(prev_status)
+        if prev_value is not None and prev_value != fresh.status:
+            await safe_record_asset_status_event(
+                self.session,
+                fresh.tenant_id,
+                asset_id=fresh.id,
+                status=fresh.status,
+                previous_status=prev_value,
+                reason=reason,
+                kb_id=fresh.knowledge_base_id,
             )
         return fresh
 
@@ -382,6 +519,9 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
                 *self._tenant_conditions(tenant_id),
                 *self._soft_delete_conditions(),
                 KnowledgeDocument.knowledge_base_id.in_(deduped),
+                # 第 3 期生命周期：归档 = 可恢复的下线，不计入浏览口径
+                # （与 list_documents / documents_stats 保持一致）。
+                KnowledgeDocument.status != DocStatus.ARCHIVED.value,
             )
             .group_by(KnowledgeDocument.knowledge_base_id)
         )
@@ -402,6 +542,8 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
                 *self._soft_delete_conditions(),
                 KnowledgeDocument.knowledge_base_id == knowledge_base_id,
                 KnowledgeDocument.data_source_type.is_not(None),
+                # 第 3 期生命周期：归档不计入来源统计（与列表口径一致）。
+                KnowledgeDocument.status != DocStatus.ARCHIVED.value,
             )
             .group_by(KnowledgeDocument.data_source_type)
         )
@@ -420,6 +562,8 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
                 *self._tenant_conditions(tenant_id),
                 *self._soft_delete_conditions(),
                 KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+                # 第 3 期生命周期：归档不计入目录树计数（与列表口径一致）。
+                KnowledgeDocument.status != DocStatus.ARCHIVED.value,
             )
             .group_by(KnowledgeDocument.folder_id)
         )

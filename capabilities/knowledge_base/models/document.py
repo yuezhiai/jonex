@@ -23,6 +23,8 @@ class DocStatus(str, Enum):
     FAILED = "failed"
     DELETING = "deleting"
     DELETED = "deleted"
+    # 第 3 期生命周期：检索索引已清、对象存储与文档行保留（可恢复）
+    ARCHIVED = "archived"
 
 
 class OntologyStatus(str, Enum):
@@ -66,6 +68,8 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     storage_key = Column(String(1024), nullable=True)
 
     status = Column(String(32), nullable=False, default=DocStatus.PENDING.value, index=True)
+    # 归档时间（第 3 期生命周期宽限销毁判据；NULL = 未归档）
+    archived_at = Column(DateTime, nullable=True)
     rag_task_id = Column(String(128), nullable=True, index=True)
     rag_doc_ids = Column(JSONB, nullable=False, default=list)
     error_message = Column(Text, nullable=True)
@@ -117,6 +121,7 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
             "mime_type": self.mime_type,
             "knowledge_base_id": self.knowledge_base_id,
             "status": self.status,
+            "archived_at": _iso(self.archived_at),
             "storage_backend": self.storage_backend,
             "storage_key": self.storage_key,
             "rag_task_id": self.rag_task_id,
@@ -144,3 +149,45 @@ class KnowledgeDocument(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
 
 
 __all__ = ["DocStatus", "KnowledgeDocument", "OntologyStatus"]
+
+
+class KnowledgeDocumentVersion(TenantMixin, Base):
+    """文档源文件版本（同一 `document_id` 的版本链）。
+
+    - 新版生效：上传新版本后文档行指向新文件并重新解析/建索引；
+    - 旧版只存档（对象存储保留 + 本表可下载），不参与检索；
+    - 引用锚点仍是 document_id（当前版）。
+    """
+
+    __tablename__ = "knowledge_document_versions"
+    __table_args__ = {"schema": "knowledge_base"}
+
+    id = Column(String(64), primary_key=True, default=lambda: uuid4().hex)
+    document_id = Column(String(64), nullable=False, index=True)
+    version_no = Column(Integer, nullable=False)
+    file_name = Column(String(512), nullable=False)
+    file_size = Column(BigInteger, nullable=False, default=0)
+    mime_type = Column(String(128), nullable=True)
+    storage_backend = Column(String(16), nullable=False, default="local")
+    storage_key = Column(String(1024), nullable=False)
+    content_hash = Column(String(32), nullable=True)
+    source = Column(String(32), nullable=False, default="upload")
+    created_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "document_id": self.document_id,
+            "version_no": self.version_no,
+            "file_name": self.file_name,
+            "file_size": self.file_size,
+            "mime_type": self.mime_type,
+            "storage_backend": self.storage_backend,
+            "storage_key": self.storage_key,
+            "content_hash": self.content_hash,
+            "source": self.source,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

@@ -3,6 +3,9 @@
 import logging
 from typing import Optional
 
+from jonex_core.capability.atomic.ontology_compile.client import (  # [jonex] P2 compile 步新后端
+    get_ontology_compile_client,
+)
 from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import (
@@ -17,6 +20,7 @@ from ..models import OntologyStatus
 from ..ontology_write_state import clear_ontology_write_state
 from ..repository import KnowledgeDocumentRepository
 from ..repository.task_center_repository import TaskCenterDocumentRepository
+from . import compile_backend  # [jonex] P2：compile 步后端判据
 
 logger = logging.getLogger(__name__)
 
@@ -311,24 +315,54 @@ class OntologyService:
                 operator_id=operator_id,
             )
 
+        # ── [jonex] P2：compile 步后端判据（库级优先、env 兜底、缺省 ontology_compile；
+        #    P4a 2026-10-17 起翻默认，回滚 = 设 ONTOLOGY_COMPILE_BACKEND=rag）──
+        # **只有这一处读 env**；选中的值随下面那次 commit 写进文档行（粘性），查询侧
+        # （对账 EXTRACTING 轮询）只读粘性 —— 见 `compile_backend` 的模块 docstring。
+        # 在**提交时**当场求值：库设置 / env 改了只影响下一次提交，在途文档按旧值收尾。
+        backend = compile_backend.resolve_compile_backend(
+            kb_backend=await self._get_kb_compile_backend(tenant_id, real_kb_id),
+        )
+
         # 提交 ontology-only 任务（不在此处 ++retry / 置 EXTRACTING）
         try:
-            result = await get_rag_client().retry_ontology_extract(
-                document_id=document_id,
-                knowledge_base_id=knowledge_base_id,
-                tenant_id=tenant_id,
-                file_path=file_path,
-                ontology_schema=schema,
-                schema_version=schema_version,
-                content_generation=content_generation,
-                # [jonex] 手动重抽 = 明确要求重跑，必须传 force_retry。
-                # 否则 atomic-rag 按幂等键 `ontology:{tenant}:{kb}:{doc}:{schema_version}`
-                # 命中同版本的 completed 任务时直接 return（handler 里
-                # `completed and not force_retry` 分支），抽取根本不执行——
-                # 接口却返回成功、retry_count 照常 +1，报的还是上一次的错误，
-                # 表现为「重试按钮点了没反应」。
-                force_retry=True,
-            )
+            if backend == "ontology_compile":
+                # 新服务：`chunks` 不传 = 容器在 worker 执行时按 `document_id`
+                # 从 LightRAG 直读（设计 §4.5 ①-②「跳过灌库步」）。
+                # 拿回的 `compile_id` 就落在下面那个 `task_id` 槽位
+                # （与 rag 路径**同一列** `rag_task_id` —— 查询侧靠粘性值决定去问谁）。
+                #
+                # `content_generation` 与下面 rag 支**同源同值**（提交那一刻的文档代次）：
+                # 对账收尾的代次栅栏读 `status_info["content_generation"]`，而新服务的任务
+                # 状态里**不带**这个键 —— 不在这里传下去，容器就恒按 0 记，凡是被重新解析过
+                # 的文档（gen≥1）必然被判「旧代次」、停在 EXTRACTING 永不 READY（不报错）。
+                result = await get_ontology_compile_client().compile(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    tenant_id=tenant_id,
+                    mode="extract_only",
+                    schema=schema,
+                    content_generation=content_generation,
+                )
+                task_id = (result or {}).get("compile_id", "")
+            else:
+                result = await get_rag_client().retry_ontology_extract(
+                    document_id=document_id,
+                    knowledge_base_id=knowledge_base_id,
+                    tenant_id=tenant_id,
+                    file_path=file_path,
+                    ontology_schema=schema,
+                    schema_version=schema_version,
+                    content_generation=content_generation,
+                    # [jonex] 手动重抽 = 明确要求重跑，必须传 force_retry。
+                    # 否则 atomic-rag 按幂等键 `ontology:{tenant}:{kb}:{doc}:{schema_version}`
+                    # 命中同版本的 completed 任务时直接 return（handler 里
+                    # `completed and not force_retry` 分支），抽取根本不执行——
+                    # 接口却返回成功、retry_count 照常 +1，报的还是上一次的错误，
+                    # 表现为「重试按钮点了没反应」。
+                    force_retry=True,
+                )
+                task_id = (result or {}).get("task_id", "")
         except Exception as e:
             logger.warning("Ontology retry submit failed for doc %s: %s", document_id, e)
             if strict:
@@ -340,7 +374,6 @@ class OntologyService:
                 doc = await repo.get_required(document_id, tenant_id)
                 return doc.to_dict()
 
-        task_id = (result or {}).get("task_id", "")
         if not task_id:
             logger.warning("Ontology retry did not return task_id for doc %s", document_id)
             if strict:
@@ -369,6 +402,14 @@ class OntologyService:
             # force reparse），不清的话被打标的文档重抽后第一次写图失败即再达上限。
             _fm = clear_ontology_write_state(doc.extra_metadata)
             _fm["ontology_retry_task_id"] = task_id
+            # ── [jonex] P2 粘性：**本次实际派给谁，就写谁** ──
+            # ⚠ 必须与 `rag_task_id` 落在**同一次 commit** 里（**先后无关**，但**不许拆成两次提交**）。
+            # 分开提交会留下「有 task_id、却看不出它是哪个服务的」的中间态，而查询侧
+            # （对账 EXTRACTING 轮询）正要靠这个键决定去问谁 —— 那种行的 task_id 在两个
+            # 后端都不存在，只能等超时判死（先例 `document_service.py:893-896`）。
+            # 取值恒为 `rag` / `ontology_compile`（已由 `resolve_compile_backend` 校验）。
+            # 老文档没有这个键 ⇒ 查询侧按旧链路口径回落 `rag`，行为与从前逐字一致。
+            _fm["ontology_compile_backend"] = backend
             doc.extra_metadata = _fm
             await session.commit()
             return doc.to_dict()
@@ -427,6 +468,21 @@ class OntologyService:
         """[jonex] 查询 KB 的 kb_type（转调公共 helper）。"""
         from .kb_type_service import get_kb_type
         return await get_kb_type(tenant_id, kb_id)
+
+    async def _get_kb_compile_backend(self, tenant_id: str, kb_id: str) -> str | None:
+        """[jonex] P2：查询 KB 行的 **compile 步**库级派单值（转调 kb_type_service）。
+
+        形状照 `DocumentService._get_kb_ingest_backend`（`document_service.py:2973`）：
+        `None` 是**合法值**（= 跟随服务端开关 `ONTOLOGY_COMPILE_BACKEND`），不是「查不到」
+        —— 两者对 `compile_backend.resolve_compile_backend` 是同一件事。
+
+        ⚠ 与解析链的 `ingest_backend` 是**两把钥匙、两个语义**：那个读
+        `knowledge_info.ingest_backend`，本方法读 `knowledge_info.ontology_compile_backend`。
+        独立成方法（而不是内联）还有一个实务理由：单测按既有形状 patch 它即可，
+        不必让桩会话去支持 `execute`。
+        """
+        from .kb_type_service import get_kb_ontology_compile_backend
+        return await get_kb_ontology_compile_backend(tenant_id, kb_id)
 
 
 __all__ = ["OntologyService"]

@@ -27,7 +27,9 @@ class DocumentListRequest(BaseModel):
     status: Optional[str] = Field(default=None, max_length=32)
     ontology_status: Optional[str] = Field(default=None, max_length=32)
     # 线性状态多选筛选（优先于 status/ontology_status）：
-    # pending_parse / parsing / ingesting / parse_failed / pending_compile / compiling / compiled / compile_failed
+    # pending_parse / parsing / ingesting / parse_failed / pending_compile / compiling /
+    # compiled / compile_failed / archived
+    # ⚠️ 默认列表排除 archived；显式传 phase=["archived"] 时才保留（第 3 期生命周期）。
     phase: Optional[list[str]] = Field(default=None)
     keyword: Optional[str] = Field(default=None, max_length=255)
     folder_id: Optional[str] = Field(default=None, max_length=64)

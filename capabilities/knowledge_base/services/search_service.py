@@ -1140,6 +1140,43 @@ def _evict_stale_entries() -> None:
             del _query_embedding_cache[k]
 
 
+async def _filter_kbs_by_classification(
+    tenant_id: str, user_id: str | None, kb_ids: list[str],
+) -> list[str]:
+    """按用户可读最高等级过滤 KB（B6 §5.1 多 KB 检索）。
+
+    管理员原样返回；保持输入顺序与重复项。
+
+    ⚠ 无 user / "anonymous" **不再原样放行**（B6 收口）：MCP 等机器调用没有
+    用户身份，早退会让检索完全绕过密级。机器身份按最低启用等级处理
+    （fail closed），与文档级守卫对空用户的口径一致。
+    """
+    kb_ids = list(kb_ids or [])
+    if not kb_ids:
+        return kb_ids
+
+    from jonex_core.security import classification_access as policy
+    from .space_permission_service import is_tenant_admin
+
+    if user_id and user_id != "anonymous":
+        if await is_tenant_admin(tenant_id, user_id):
+            return kb_ids
+    async with get_db_session() as session:
+        max_ranks = await policy.kb_max_level_rank(session, tenant_id, kb_ids)
+        user_rank = await policy.get_user_max_rank(
+            session, tenant_id, user_id, is_tenant_admin=False,
+        )
+    if user_rank is None:
+        return kb_ids
+    allowed = [kb_id for kb_id in kb_ids if max_ranks.get(kb_id, 0) <= user_rank]
+    if len(allowed) < len(kb_ids):
+        logger.info(
+            "检索批量跳过：%d 个知识库超密级（user=%s）",
+            len(kb_ids) - len(allowed), user_id,
+        )
+    return allowed
+
+
 async def _embed_query_cached(query: str, tenant_id: str) -> list[float] | None:
     key = hashlib.sha256(query.encode("utf-8")).hexdigest()
     now = time.time()
@@ -7410,100 +7447,63 @@ class SearchService:
         per_kb_citations: list[tuple[str, list[dict]]],
         allowed_kb_ids: list[str] | None = None,
     ) -> list[dict]:
-        """[jonex] 由引擎已核验的 citations 组装来源引用。
-
-        与 _build_openkb_references 的关键差异：openkb 的引用要从浏览轨迹的
-        summaries/<uuid>.md 反解出平台文档 id；jonex_wiki 的 citation 里 document_id
-        就是平台文档 id、page_path 就是承载证据的 Wiki 页，因此这里只做三件事：
-          ① 按文档聚合（D6）+ 证据摘录进 locations[].text（前端引用卡片直接展示该片段）；
-          ② 纵深防御：剔除不属于本次请求知识库（allowed_kb_ids）的文档；
-          ③ 富化：KB 名 / 文件名 / MIME / 预签名 raw_url。
-        """
+        """Keep each verified evidence handle distinct; document enrichment is batched."""
         from ..dtos.reference import SourceLocation, SourceReference
-
-        agg: dict[str, dict] = {}
-        for kb_id, citations in per_kb_citations or []:
-            for c in citations or []:
-                if not isinstance(c, dict):
-                    continue
-                doc_id = str(c.get("document_id") or "")
-                if not doc_id:
-                    continue
-                entry = agg.get(doc_id)
-                if entry is None:
-                    entry = {"kb_id": kb_id, "wiki_path": "", "locations": [], "_seen": set()}
-                    agg[doc_id] = entry
-                page_path = str(c.get("page_path") or "")
-                if page_path and not entry["wiki_path"]:
-                    entry["wiki_path"] = page_path
-                excerpt = str(c.get("excerpt") or "").strip()
-                key = (str(c.get("chunk_id") or ""), excerpt)
-                if not excerpt or key in entry["_seen"]:
-                    continue
-                entry["_seen"].add(key)
-                # chunk_index 刻意留空：引擎 chunk_id 与平台 llm-wiki 合成 chunk_id
-                # （{doc}#jonex_wiki-{i}）不是同一套编号，硬填会指到错误的片段。
-                entry["locations"].append(
-                    SourceLocation(type="chunk", text=excerpt).dict(),
-                )
-
-        if not agg:
+        entries = [(kid, c) for kid, citations in per_kb_citations for c in citations
+                   if isinstance(c, dict) and c.get("document_id")]
+        if not entries:
             return []
-
         async with get_db_session() as session:
-            repo = KnowledgeDocumentRepository(session)
-            docs = await repo.get_by_ids(list(agg.keys()), tenant_id)
-        doc_map = {d.id: d for d in docs}
-
-        if allowed_kb_ids is not None:
-            allowed = set(allowed_kb_ids)
-            cross_kb = [
-                did for did, d in doc_map.items()
-                if d.knowledge_base_id not in allowed
-            ]
-            if cross_kb:
-                logger.warning(
-                    "jonex_wiki references: %d 个 doc_id 命中库外知识库被剔除: %s",
-                    len(cross_kb), cross_kb[:10],
-                )
-            doc_map = {
-                did: d for did, d in doc_map.items()
-                if d.knowledge_base_id in allowed
-            }
-
-        kb_ids_in_refs = list(dict.fromkeys(
-            v["kb_id"] for v in agg.values() if v["kb_id"]))
-        kb_names = await self._get_kb_names(tenant_id, kb_ids_in_refs) if kb_ids_in_refs else {}
-
+            docs = await KnowledgeDocumentRepository(session).get_by_ids(
+                list(dict.fromkeys(c["document_id"] for _, c in entries)), tenant_id)
+        allowed = set(allowed_kb_ids) if allowed_kb_ids is not None else None
+        doc_map = {d.id: d for d in docs if allowed is None or d.knowledge_base_id in allowed}
+        kb_names = await self._get_kb_names(tenant_id, list(dict.fromkeys(k for k, _ in entries)))
         storage = get_object_storage()
-        out: list[dict] = []
-        for doc_id, entry in agg.items():
-            d = doc_map.get(doc_id)
-            if d is None:
+        urls = {}
+        out = []
+        seen = set()
+        for kid, c in entries:
+            d = doc_map.get(c["document_id"])
+            if d is None or d.knowledge_base_id != kid:
                 continue
-            kb_id = entry["kb_id"] or d.knowledge_base_id
-            raw_url: str | None = None
-            try:
-                raw_url = await storage.presigned_url(
-                    d.storage_key or build_object_key(kb_id, d.id, d.file_name or ""),
-                    tenant_id,
-                )
-            except Exception:
-                raw_url = None
-            ref = SourceReference(
-                doc_id=doc_id,
-                kb_id=kb_id,
-                kb_name=kb_names.get(kb_id) if kb_id else None,
-                file_name=d.file_name or "",
-                mime_type=d.mime_type,
-                file_size=d.file_size,
-                media_type=classify_media(d.mime_type, d.file_name),
-                raw_url=raw_url,
-                locations=entry["locations"],
-                wiki_path=entry["wiki_path"],
+            key = (kid, c.get("query_id"), c.get("handle"), c.get("chunk_id"), c.get("excerpt"))
+            if key in seen:
+                continue
+            seen.add(key)
+            if d.id not in urls:
+                try:
+                    urls[d.id] = await storage.presigned_url(
+                        d.storage_key or build_object_key(kid, d.id, d.file_name or ""), tenant_id)
+                except Exception:
+                    urls[d.id] = None
+            evidence = c.get("evidence_ref") or {}
+            spans = evidence.get("spans") or []
+            location = SourceLocation(
+                type="char" if spans else "table_row" if evidence.get("table_id") else "chunk",
+                text=c.get("excerpt") or "", evidence_ref=evidence or None,
+                char_start=spans[0][0] if spans else None,
+                char_end=spans[0][1] if spans else None,
+                row_start=evidence.get("row_start", evidence.get("row")),
+                row_end=evidence.get("row_end"),
             )
-            out.append(ref.dict())
+            out.append(SourceReference(
+                doc_id=d.id, kb_id=kid, kb_name=kb_names.get(kid),
+                file_name=d.file_name or "", mime_type=d.mime_type, file_size=d.file_size,
+                media_type=classify_media(d.mime_type, d.file_name), raw_url=urls[d.id],
+                wiki_path=c.get("page_path"), query_id=c.get("query_id"),
+                evidence_handle=c.get("handle"), bundle_sha=c.get("bundle_sha"),
+                locations=[location],
+            ).dict())
         return out
+
+    @staticmethod
+    def _normalize_wiki_handles(answer: str, kb_id: str, references: list[dict]) -> str:
+        # Evidence indexes, not document indexes: two citations in one PDF may differ.
+        import re
+        indexes = {ref["evidence_handle"]: i + 1 for i, ref in enumerate(references)
+                   if ref.get("kb_id") == kb_id and ref.get("evidence_handle")}
+        return re.sub(r"\[E[0-9]+\]", lambda m: f"[{indexes[m[0]]}]" if m[0] in indexes else m[0], answer)
 
     @staticmethod
     def _is_openkb_effective_answer(answer: str | None) -> bool:
@@ -7880,6 +7880,7 @@ class SearchService:
         user_id: str,
         request: JonexWikiSearchRequest | dict,
         trace_id: str | None = None,
+        progress_session: str | None = None,
     ) -> dict:
         """[jonex] jonex_wiki 管线检索（只查 jonex_wiki 管线，D3 异管线拒绝）。"""
         tenant_id = require_tenant(tenant_id)
@@ -7939,6 +7940,8 @@ class SearchService:
                     _res = await compiler.search_compiled_knowledge(
                         kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
                         return_trace=_want_trace,
+                        thinking_mode=req.thinking_mode,
+                        **({"progress_session": progress_session} if progress_session else {}),
                     )
                     return (kid, _res, int((time.perf_counter() - _t0) * 1000))
                 except Exception as e:
@@ -8028,14 +8031,6 @@ class SearchService:
         _references = await self._build_jonex_wiki_references(
             tenant_id, _citations_by_kb, allowed_kb_ids=kb_ids,
         ) if _citations_by_kb else []
-        _handle_to_doc_by_kb: dict[str, dict[str, str]] = {
-            kid: {
-                c["handle"]: str(c.get("document_id") or "")
-                for c in cits
-                if isinstance(c, dict) and c.get("handle") and c.get("document_id")
-            }
-            for kid, cits in _citations_by_kb
-        }
 
         # 6. 无有效答案 → source="none"
         # [jonex] 必须先区分「全部调用失败」与「确实无答案」：两者都进 not per_kb，
@@ -8063,9 +8058,7 @@ class SearchService:
         elif len(per_kb) == 1:
             answer = per_kb[0]["answer"]
             # [jonex] 引擎答案里的 [E#] 证据句柄 → 平台引用卡片下标 [n]
-            answer = normalize_evidence_handles(
-                answer, _handle_to_doc_by_kb.get(per_kb[0]["kb_id"], {}), _references,
-            )
+            answer = self._normalize_wiki_handles(answer, per_kb[0]["kb_id"], _references)
             # [jonex] 与 kb_type 同拼写（前端直接展示 final_source，别混两种写法）
             source = "jonex_wiki"
             rag_used = False
@@ -8081,9 +8074,7 @@ class SearchService:
                 p["kb_name"] = _fkb_names.get(p["kb_id"], p["kb_id"])
                 # [jonex] 融合前先把 [E#] → [n]（handle 是 KB 内编号，须按 KB 映射），
                 # 融合 LLM 按 prompt 原样保留 [n]，融合后编号即最终卡片下标。
-                p["answer"] = normalize_evidence_handles(
-                    p["answer"], _handle_to_doc_by_kb.get(p["kb_id"], {}), _references,
-                )
+                p["answer"] = self._normalize_wiki_handles(p["answer"], p["kb_id"], _references)
             t_fuse = time.perf_counter()
             answer = await fuse_rag_answers(
                 req.query, per_kb_fused,
@@ -8170,6 +8161,22 @@ class SearchService:
                 message=translate("err.search.kb_required",
                                   fallback="请至少指定一个知识库（knowledge_base_ids 不能为空）"),
             )
+
+        # [jonex] B6 §5.1：多 KB 检索按用户可读最高等级过滤；全部被过滤 ⇒ 空结果
+        # （不报错，前端已有空答案容错）。管理员/无 user/anonymous 原样放行。
+        raw_ids = await _filter_kbs_by_classification(tenant_id, user_id, raw_ids)
+        if not raw_ids:
+            return {
+                "answer": "",
+                "source": "none",
+                "references": [],
+                "ontology_instances": [],
+                "rag_used": False,
+                "knowledge_base_ids": [],
+                "reasoning": {},
+                "references_available": False,
+                "ontology_instances_available": False,
+            }
 
         pipeline_map = await self._get_kb_types(tenant_id, raw_ids)
         # [jonex] 三引擎显式分桶：jonex_wiki 不兜进 lightrag 桶（Phase 5 /search/mix 三路接入）

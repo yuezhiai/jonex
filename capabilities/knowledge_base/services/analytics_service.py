@@ -28,6 +28,7 @@
    本文件只读不写，写侧口径见 `repository/processing_task_repository.py` 的模块注释。
 """
 
+import json
 import logging
 import os
 from datetime import date, datetime, timedelta
@@ -36,7 +37,8 @@ from functools import wraps
 from sqlalchemy import func, select, text
 
 from jonex_core.common import get_db_session
-from jonex_core.common.exceptions import JonexException
+from jonex_core.common.exceptions import JonexException, ResourceNotFoundError
+from jonex_core.common.i18n import translate
 from jonex_core.common.neo4j_client import get_neo4j_driver
 from jonex_core.common.quota import classify_quota_category
 from jonex_core.common.tenant import require_tenant
@@ -55,7 +57,12 @@ from ..dtos.reasoning import (
     STATUS_DONE,
     STATUS_FAILED,
 )
-from ..models import KnowledgeDataSource, KnowledgeDocument, KnowledgeInfo
+from ..models import (
+    DomainService,
+    KnowledgeDataSource,
+    KnowledgeDocument,
+    KnowledgeInfo,
+)
 from ..models.document import DocStatus, OntologyStatus
 from ..repository import (
     TASK_STATUS_FAILED,
@@ -64,8 +71,10 @@ from ..repository import (
     TASK_TYPE_COMPILE,
     TASK_TYPE_EXTRACT,
     TASK_TYPE_PARSE,
+    OntologyGraphRepository,
 )
 from .kb_type_service import LLM_WIKI_TYPES
+from .knowledge_info_service import KnowledgeInfoService
 from .search_event_writer import (
     TARGET_DOCUMENT,
     TARGET_ONTOLOGY_INSTANCE,
@@ -74,22 +83,51 @@ from .search_event_writer import (
 
 logger = logging.getLogger(__name__)
 
-# 结构化数据分类：在 classify_quota_category 的 document/spreadsheet/
-# image/audio/video/other 基础上补 structured；csv 仍归 spreadsheet（表格）。
+# ── 五个「解析器类目」的后缀表 ──────────────────────────────────
+# 这是「文档/文本/图像/音频/视频」五类在平台里的**唯一权威定义**，直接抄自 KB 详情页
+# 「解析配置 → 文件类解析配置」那张表（即 `business_domain.parser_configs.file_types`，
+# 种子数据见 `deploy/postgres/migrations/006_seed_data.sql`）。
+# 顺序即判定优先级（五类后缀互不重叠，实际无所谓，但保持与展示顺序一致）。
+#
+# ⚠️ 与 `quota.py` 的配额类别**刻意有两处不同**，改回去就是口径漂移：
+#   · `.xls/.xlsx` 在这里属**文档**（解析配置的文档解析器就管 Excel），
+#     而配额轴把它们算作 spreadsheet（表格）；
+#   · `.json/.jsonl` 在这里属**文本**（文本解析器的 file_types 里有 JSON/JSONL），
+#     而配额轴把 `.json` 算 document、`.jsonl` 算 document。
+# 两条轴各管各的：配额轴管「放不放行、算多少量」（上传准入第一道门，别动），
+# 这条管「构成图上算哪一类、标签显示什么」。
+_PARSER_CATEGORY_EXT: tuple[tuple[str, frozenset[str]], ...] = (
+    ("document", frozenset({".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls", ".xlsx"})),
+    ("text", frozenset({".json", ".jsonl", ".markdown", ".md", ".txt"})),
+    ("image", frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})),
+    ("audio", frozenset({".aac", ".amr", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"})),
+    ("video", frozenset({".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm", ".wmv"})),
+)
+
+# 结构化数据分类：五类之外的补充档（json 已随解析配置归「文本」，不在这里）。
+# csv/ods 仍归 spreadsheet（表格，页面上是隐藏类）。
 _STRUCTURED_MIME = frozenset({
-    "application/json", "application/xml", "text/xml",
+    "application/xml", "text/xml",
     "application/x-yaml", "text/yaml", "application/yaml",
     "application/x-sql", "application/sql",
     "application/x-parquet", "application/vnd.apache.parquet",
 })
 _STRUCTURED_EXT = frozenset({
-    ".json", ".xml", ".yaml", ".yml", ".parquet", ".sql", ".sqlite", ".db", ".ndjson",
+    ".xml", ".yaml", ".yml", ".parquet", ".sql", ".sqlite", ".db", ".ndjson",
 })
 
-# 固定 7 类顺序（structured 恒在 image 之后、video 之前）
-_COMPOSITION_CATEGORIES = ("document", "spreadsheet", "image", "structured", "video", "audio", "other")
+# 无扩展名时的纯文本补充判据（解析配置按后缀分档，没有后缀就只剩 mime 可看）。
+# ⚠️ 不要用 `text/` 前缀兜底 —— `text/csv` 属表格，一刀切会把 csv 变成「文本」。
+_TEXT_MIME = frozenset({
+    "text/plain", "text/x-markdown", "application/x-markdown",
+})
 
-# [jonex] 二期：对外直出 `asset_type`。前端 `DoAssetType` 只有 6 类，
+# 固定 8 类顺序（structured 恒在 image 之后、video 之前；text 紧随 document）
+_COMPOSITION_CATEGORIES = (
+    "document", "text", "spreadsheet", "image", "structured", "video", "audio", "other",
+)
+
+# [jonex] 二期：对外直出 `asset_type`。前端 `DoAssetType` 只有 7 类，
 # 与后端的唯一差异是表格：后端按 mime 归为 `spreadsheet`，前端叫 `table`
 # （`api/dataOperations.ts` 的 TO_API_CATEGORY 已固化这个映射）。
 # 这里直接输出前端口径 —— 否则前端要再写一遍分类逻辑，而且两处必然判得不一样。
@@ -99,12 +137,24 @@ _ASSET_TYPE_ALIAS = {"spreadsheet": "table"}
 # （`pagination={false}`），给全量会把页面撑爆 —— 长期未使用天然是长尾。
 _UNUSED_LIST_LIMIT = 20
 # 高频引用 / 高频使用榜单长度（原型 Top10）
+# 排序契约：次数 DESC → 最近一次引用/命中时间 DESC → 稳定兜底键（资产 id / 实体三元组）。
+# 第二键是需求方明确要求的「同次数按最新引用排前」，**不要**改回按 id / 名称定序。
 _TOP_LIST_LIMIT = 10
 # 带 Neo4j 存活回捞的榜单多取候选：回捞被丢弃的名额由后续候选补上
 _TOP_CANDIDATE_FACTOR = 6
 # Neo4j 实体全集有界拉取条数：长期未使用 = 全集 − 用过的，是补集，
 # 无法像 active_entities 那样反转取数方向，只能有界拉取后在 Python 侧求差。
+# ⚠️ 拉取顺序见 `_neo4j_entities_head`（按创建时间**升序**）：样本要尽量落在
+# 「创建满 N 天」那一侧，否则年龄闸会把样本滤空、榜内条数系统性偏少。
+# 仍然是有界的**近似**：库里实体多于这个数时，榜只反映其中最老的一批。
 _NEO4J_ENTITY_HEAD_LIMIT = 500
+# 抽屉 B「主要关系」最多展开多少条邻居事实。抽屉只展示一组组目标名，200 已远超
+# 一屏；真正的总数由 `neighbors_by_entity` 单独 count 返回（不靠这个上限凑），
+# 被截断时 `relation_truncated=true`，前端提示「仅显示前 N 条」。
+_NEO4J_RELATION_LIMIT = 200
+# 关系类型缺失时的兜底组名（Neo4j 的 `r.relation_type` 理论上必填，但历史数据
+# 有写空串的，分组时给出 `None` 会让前端渲染出 `undefined`）
+_RELATION_TYPE_FALLBACK = "未分类"
 
 # ⚠️ `degraded` 当前**没有生产者**（reasoning_trace 只产出 running/done/skipped/failed）。
 # 保留它是把「参与率分子」的口径做成超集：将来真出现「跑过但降级」的步骤无需再改这里，
@@ -128,6 +178,10 @@ _STAGES_RAG = (STAGE_CONTEXT_RETRIEVE, STAGE_CHUNK_ANSWER, STAGE_LLM_ANSWER)
 _DAYS_DEFAULT = 7
 _DAYS_MIN = 1
 _DAYS_MAX = 365
+# 自定义区间（start_date ~ end_date，含首尾）的跨度上限。与 `_DAYS_MAX` 同量级：
+# 再长的话日粒度趋势点太密，而且 `_neo4j_stats` 要把图内**全部**实体的 created_at
+# 拉回 Python 再按日期分桶，区间越大这步越贵。
+_RANGE_MAX_DAYS = 366
 _UNUSED_DAYS_DEFAULT = 30
 _PAGE_DEFAULT = 1
 _PAGE_SIZE_DEFAULT = 20
@@ -146,27 +200,115 @@ _REASON_FALLBACK = "未提供失败原因"
 
 
 def classify_asset_category(mime_type: str | None, file_name: str | None) -> str:
-    """资产构成分类：在配额分类基础上补 structured（json/xml/yaml/parquet/sql）。
+    """资产构成分类：五个「解析器类目」优先，其余落回配额分类（structured / 表格 / other）。
 
-    ⚠️ `file_name` **必须传**：`.json`/`.yaml`/`.parquet` 这类文件常常只靠扩展名
+    ⚠️ `file_name` **必须传**：`.docx`/`.json`/`.yaml` 这类文件常常只靠扩展名
     才能识别（mime 是 `application/octet-stream`），只传 mime 会让它们永远进不了
-    structured 类（一期就是把 `file_name` 传了 `None`）。
+    正确类别（一期就是把 `file_name` 传了 `None`）。另注意**必须是完整文件名**：
+    `os.path.splitext('.docx')` 返回 `('.docx', '')`（前导点被当成隐藏文件名），
+    只给「含点后缀」会解析出空扩展名 —— 见 `_composition` 的调用点。
+
+    判定顺序是**契约**（五类后缀表 → structured → text(mime) → 配额兜底），不要调换：
+    ① 先查 `_PARSER_CATEGORY_EXT`，因为 `.json` 既在解析配置的文本解析器里、
+       又长得像结构化数据，必须先被「文本」拿走；
+    ② 剩下 `_STRUCTURED_EXT` 里的 `.xml/.yaml/.sql/...` 才归 structured（隐藏类）；
+    ③ 无扩展名时用 mime 兜一层纯文本；
+    ④ 其余（`.csv/.ods/...`）交给配额分类，保持一期行为不变。
     """
     mt = (mime_type or "").strip().lower()
-    if mt in _STRUCTURED_MIME:
-        return "structured"
     ext = os.path.splitext(file_name or "")[1].lower()
-    if ext in _STRUCTURED_EXT:
+    for category, suffixes in _PARSER_CATEGORY_EXT:
+        if ext in suffixes:
+            return category
+    if mt in _STRUCTURED_MIME or ext in _STRUCTURED_EXT:
         return "structured"
+    if mt in _TEXT_MIME:
+        return "text"
     return classify_quota_category(mime_type, file_name)
 
 
 def to_asset_type(category: str) -> str:
-    """后端 7 类 `category` → 前端 6 类 `asset_type`（表格：spreadsheet → table）。
+    """后端 8 类 `category` → 前端 7 类 `asset_type`（表格：spreadsheet → table）。
 
     `other` 照直输出：前端 `DoAssetType` 没有这一类，由前端做兜底展示位。
     """
     return _ASSET_TYPE_ALIAS.get(category, category)
+
+
+def _file_format(mime_type: str | None, file_name: str | None) -> str | None:
+    """抽屉 A「文件格式」展示串：优先扩展名，取不到才回落 mime 子类型。
+
+    为什么在后端算：① 扩展名大小写规范（`pdf` → `PDF`）是全站展示细节，前端按
+    mime 猜会各处不一致；② `application/vnd.openxmlformats-...` 这类 mime 直接显示
+    没法看；③ 前端 `file_name` 可能已被截断（只用来展示），不能反推扩展名。
+
+    两者都取不到返回 `None`（前端渲染 `—`），**不要**回落 `"未知"` 这类字面量 ——
+    文案归前端。
+    """
+    ext = os.path.splitext(file_name or "")[1].lstrip(".").strip()
+    if ext:
+        # `.tar.gz` 这类复合扩展名只取最后一段（`GZ`），够用且不会长得没法看
+        return ext.upper()[:16]
+    main = (mime_type or "").split(";")[0].strip()
+    if "/" in main:
+        # `application/vnd.ms-excel` → `VND.MS-EXCEL`，难看但比空白有信息量
+        sub = main.split("/", 1)[1].strip()
+        return sub.upper()[:32] or None
+    return None
+
+
+def _attr_pairs(raw) -> list:
+    """Neo4j 实例 `attributes` → `[{"key", "value"}]`（抽屉 B「核心属性」）。
+
+    `value` 一律转字符串：图里存的类型不定（数字、bool、嵌套 dict 都有），前端那一列
+    只是文本；`None` 给**空串**（不给 `"None"`，那会被当成真值显示出来）。
+
+    ⚠️ **不补任何默认键**。原型对缺属性的实例显示「业务编码 = —、负责人 = —」，
+    那是**前端**的兜底模板 —— 后端补进去就再也分不清「图里确实没有」和「后端编的」。
+    """
+    if not isinstance(raw, dict):
+        return []
+    pairs = []
+    for key, value in raw.items():
+        if value is None:
+            text = ""
+        elif isinstance(value, str):
+            text = value
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            text = str(value)
+        else:
+            text = json.dumps(value, ensure_ascii=False)
+        pairs.append({"key": str(key), "value": text})
+    return pairs
+
+
+def _relation_groups(facts: list) -> list:
+    """一跳邻居事实 → 按 `relation_type` 归组（抽屉 B「主要关系」）。
+
+    正反向边**合并成同一组**：原型那几组（发行方 / 适用客户 / 关联风险）不分方向，
+    拆成两组会出现两个「发行方」。去重由仓储层负责（同一 (类型, 目标) 只留一条），
+    这里只做归组。
+
+    分组顺序 = 事实的到达顺序（仓储侧按 `relation_type` 排过），目标同理；
+    不再按名称重排 —— 重排会把「高频/高置信的目标」挤到后面。
+    """
+    groups: dict = {}
+    for fact in facts:
+        relation_type = str(fact.get("relation_type") or _RELATION_TYPE_FALLBACK)
+        target = fact.get("target")
+        if not target:
+            continue
+        group = groups.get(relation_type)
+        if group is None:
+            group = {"relation_type": relation_type, "targets": []}
+            groups[relation_type] = group
+        group["targets"].append({
+            "canonical_name": target,
+            "entity_type": fact.get("target_type"),
+        })
+    return list(groups.values())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -212,6 +354,47 @@ def _parse_bool(raw, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _parse_date(raw):
+    """解析 `start_date` / `end_date`：接受 `date` / `datetime` 对象或 ISO `YYYY-MM-DD` 串。
+
+    非法值返回 `None`（**不抛**）—— 「参数不合法要 400」是网关的职责（那儿面向客户端）；
+    能力层还会被内部调用方经 invoke 打进来，不该因为一个新参数给不出就 500。
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    try:
+        return date.fromisoformat(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_range(data: dict):
+    """解析自定义区间，返回 `(start, end)`；不成对就给 `(None, None)`。
+
+    **成对才有意义**：只给一边、或给了个反的区间（start > end），都当没传 ——
+    退回 `days` 的相对窗口。这里只判「能不能用」，不判「该不该拒」（那是网关的事）。
+
+    跨度超过 `_RANGE_MAX_DAYS` 时把右界夹到上限并留 WARNING：正常入口（网关）会在
+    更早的地方 400 掉，能走到这儿的只有内部调用方 —— 夹一下保证 `window_dates` 有界，
+    比返回一个几千点的时间轴安全。
+    """
+    start = _parse_date(data.get("start_date"))
+    end = _parse_date(data.get("end_date"))
+    if start is None or end is None or start > end:
+        return None, None
+    if (end - start).days + 1 > _RANGE_MAX_DAYS:
+        logger.warning(
+            "[jonex] 数据运营自定义区间超上限（%s ~ %s），右界夹到 %s 天",
+            start, end, _RANGE_MAX_DAYS,
+        )
+        end = start + timedelta(days=_RANGE_MAX_DAYS - 1)
+    return start, end
+
+
 def _parse_scope(data: dict) -> dict:
     """解析「范围 + 窗口 + 分页 + 筛选」全部入参，一次解析、全链路复用。
 
@@ -220,10 +403,23 @@ def _parse_scope(data: dict) -> dict:
     把 `unused_threshold_days` 接掉，前端那个 30/90 天切换器因此一直是死的。
     """
     data = data or {}
+    start_date, end_date = _parse_range(data)
     return {
         "domain_space_id": data.get("domain_space_id") or None,
         "kb_id": data.get("kb_id") or None,
+        # ── 三期钻取详情（抽屉 A/B）的定位键 ──
+        # 与 `kb_id` 同类：一路透传到降级空壳构造器（空壳也要把定位键原样回显，
+        # 前端拿到的响应结构在降级/正常两条路上逐字段一致）。
+        # 抽屉 C 不在这里 —— 它的定位键就是 `kb_id`；抽屉 D 的定位键是 `service_id`。
+        "asset_id": data.get("asset_id") or None,
+        "entity_type": data.get("entity_type") or None,
+        "canonical_name": data.get("canonical_name") or None,
+        "service_id": data.get("service_id") or None,
         "days": _clamp_int(data.get("days"), _DAYS_DEFAULT, _DAYS_MIN, _DAYS_MAX),
+        # 自定义区间：成对给出时**覆盖** `days`（窗口右界不再等于今天）。
+        # 只给一边 / 给反了 → 这里已经是 (None, None)，自然退回 `days`。
+        "start_date": start_date,
+        "end_date": end_date,
         "unused_threshold_days": _clamp_int(
             data.get("unused_threshold_days"), _UNUSED_DAYS_DEFAULT, _DAYS_MIN, _DAYS_MAX
         ),
@@ -235,14 +431,46 @@ def _parse_scope(data: dict) -> dict:
     }
 
 
-def _window_dates(days: int) -> list:
-    """升序日期串窗口 —— **降级路径专用**：正常路径的日期取自 DB `current_date()`。
+def _resolve_window(today: date, days: int, start, end):
+    """把「相对窗口 `days`」与「绝对区间 `start`~`end`」归一成同一个三元组。
 
-    降级空壳也要给出「日期点数正确」的趋势，前端就不必为降级单写分支；
-    容器与 DB 同为 `Asia/Shanghai`，本地 `date.today()` 与 DB `current_date()` 同一天。
+    返回 `(win_start, win_end, window_dates)`：`win_end` 是**最后一天 +1 天的开区间右界**
+    （SQL 一律写 `>= win_start AND < win_end`，写成 `<= 末日` 会把末日整段截掉）；
+    `window_dates` 是升序日期串，供趋势补零。
+
+    自定义区间优先：`start`/`end` 成对给出时完全按它算、`days` 被忽略 ——
+    「右界不等于今天」正是本次扩展要支持的能力，`days` 表达不了。
+
+    正常路径（`_scope_window`）与降级路径（`_scope_window_dates`）共用本函数，
+    日期轴口径只有一处 —— 否则降级壳的点数与真数据对不上，前端要为此单写分支。
     """
-    today = date.today()
-    return [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    if start is not None and end is not None:
+        return (
+            start,
+            end + timedelta(days=1),
+            [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)],
+        )
+    return (
+        today - timedelta(days=days - 1),
+        today + timedelta(days=1),
+        [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)],
+    )
+
+
+def _scope_window_dates(scope: dict) -> list:
+    """降级空壳用的日期轴 —— **降级路径专用**：正常路径的日期取自 DB `current_date()`。
+
+    降级空壳也要给出「日期点数正确」的趋势（自定义区间下点数同样得对），
+    前端就不必为降级单写分支；容器与 DB 同为 `Asia/Shanghai`，
+    本地 `date.today()` 与 DB `current_date()` 同一天。
+    """
+    _, _, window_dates = _resolve_window(
+        date.today(),
+        scope.get("days", _DAYS_DEFAULT),
+        scope.get("start_date"),
+        scope.get("end_date"),
+    )
+    return window_dates
 
 
 # ══════════════════════════════════════════════════════════════
@@ -294,6 +522,33 @@ _REQ_IN_SCOPE = """
             WHERE x.kb = ANY(:kb_ids)
        )
        AND (r.user_id IS NULL OR r.user_id <> 'anonymous')
+"""
+
+# ── 领域服务归因（请求级）：把「一次检索经哪个服务发起」展开成 (request_id, service_id) ──
+# **列表与抽屉 D 共用这一份**（原先内联在 `_search_agg` 里，抽屉要复用时抽到模块级）：
+# 两个方向都要算，缺一不可 ——
+#   ① kb → service 映射（一个库可能挂在多个服务下）；
+#   ② 请求自带的 `entry_service_id`（领域服务形态的入口只有它，无 kb 的请求
+#      也只剩这一条归因线索）。
+# UNION 自带去重；上层一律再套 `count(DISTINCT request_id)`
+# （`search_request_event` 无唯一约束，重复行会虚增）。
+# ⚠️ 少写一支就会让列表与抽屉同时少算（口径同源的好处），但**改这里等于同时改列表**。
+_PAIR_CTE = _REQ_CTE + f"""
+, pair AS (
+    SELECT r.request_id, r.tenant_id, skb.service_id
+      FROM req r
+      CROSS JOIN LATERAL jsonb_array_elements_text(r.kb_ids) AS x(kb)
+      JOIN knowledge_base.service_knowledge_bases skb
+        ON skb.kb_id = x.kb
+       AND skb.tenant_id = r.tenant_id
+       AND skb.is_deleted = 0
+     WHERE x.kb = ANY(:kb_ids)
+       AND (r.user_id IS NULL OR r.user_id <> 'anonymous')
+    UNION
+    SELECT r.request_id, r.tenant_id, r.entry_service_id
+      FROM req r
+     WHERE {_REQ_IN_SCOPE}
+)
 """
 
 # ── 文档级 CTE（处理线三块复用）──
@@ -442,15 +697,34 @@ _LAST_CITED_SUB = f"""
 
 # 长期未使用资产清单。
 #
+# 判据是**两半取交集**（缺任意一半都会出假阳性）：
+#   ① 年龄：`d.created_at`（上传时间）早于「今天 − threshold_days」；
+#   ② 未被使用：`last_cited_at` 为空（从未引用）或早于同一个阈值。
+# 只判 ② 的后果是「今天刚上传、一次没被引用过」的文档当场进榜；只判 ① 则把
+# 「天天被引用的老资产」也算成未使用。只判 ② 时 30/90 两档对「从未引用」那半
+# 还是同一个空判（`last_cited_at IS NULL` 与阈值无关），所以 ① 是它真生效的前提。
+#
+# ⚠️ 年龄那半边**用应用进程的时钟**（`:created_before`，Python 侧
+# `datetime.now() - timedelta(days=...)` 算的 naive 本地时间），**不要**写成
+# SQL 的 `created_at < now() - INTERVAL ...`：
+# `d.created_at` 是 `TimestampMixin` 写的**无时区** `TIMESTAMP`（本地墙钟），
+# `now()` 是 `timestamptz`，PG 会按**会话 `TimeZone`** 把左边隐式转成 timestamptz
+# 再比 —— 只在「PG 会话时区 == 写入方时区」时才正确（本机靠 compose 的 `TZ` 撑着，
+# 官方 postgres 镜像默认 UTC，换一套部署就**静默差 8 小时**）。
+# 这与 `_local_naive_to_iso` 立的是同一条规矩（见该函数注释）：naive 列的
+# 还原/比较都必须用**写入方（应用进程）的时区**。同理 **CAST 目标是 `timestamp`
+# 而不是 `timestamptz`**，写成后者等于把时区又塞回来。
+# 注：`last_cited_at` 那半边仍是 timestamptz，用 DB 的 `now()` 是对的 ——
+# 两条比较用两个「此刻」（应用进程 vs DB），差在毫秒级，阈值是 30/90 天，可忽略。
+#
 # ⚠️ 这里**不**做时区换算（列保持裸的），换算在 Python 侧由 `_local_naive_to_iso`
-# 负责 —— 理由见那个函数的注释：**必须用写入方（应用进程）的时区**去还原，
-# 而不是 DB 的 `current_setting('TimeZone')`。
+# 负责 —— 理由同上。
 #
 # `ORDER BY` 用裸列：它只在库内比较，与时区无关。
 _UNUSED_ASSETS_SQL = f"""
 SELECT d.id AS asset_id, d.file_name, d.mime_type, d.knowledge_base_id,
        d.data_source_type,
-       d.updated_at,
+       d.updated_at, d.created_at,
        m.last_cited_at
   FROM knowledge_base.knowledge_documents d
   LEFT JOIN {_LAST_CITED_SUB} m ON m.doc_id = d.id
@@ -458,6 +732,7 @@ SELECT d.id AS asset_id, d.file_name, d.mime_type, d.knowledge_base_id,
    AND d.is_deleted = 0
    AND d.status = '{DocStatus.READY.value}'
    AND d.knowledge_base_id = ANY(:kb_ids)
+   AND d.created_at < CAST(:created_before AS timestamp)
    AND (m.last_cited_at IS NULL
         OR m.last_cited_at < (now() - CAST(:threshold_days AS int) * INTERVAL '1 day'))
  ORDER BY m.last_cited_at ASC NULLS FIRST, d.updated_at DESC, d.id ASC
@@ -550,7 +825,7 @@ def _empty_search(data: dict) -> dict:
         "total_kbs": 0,
         "unused_kbs": 0,
         "used_services": 0,
-        "request_trend": [{"date": d, "count": 0} for d in _window_dates(data["days"])],
+        "request_trend": [{"date": d, "count": 0} for d in _scope_window_dates(data)],
         "pipeline_usage": _empty_pipeline_usage(),
         "top_questions": [],
         "question_topics": [],
@@ -592,7 +867,7 @@ def _empty_data_assets(data: dict) -> dict:
         "usage_rate": 0.0,
         "new_assets_in_window": 0,
         "new_data_sources_in_window": 0,
-        "access_trend": [{"date": d, "count": 0} for d in _window_dates(data["days"])],
+        "access_trend": [{"date": d, "count": 0} for d in _scope_window_dates(data)],
         "composition": [
             {"category": c, "asset_type": to_asset_type(c), "count": 0}
             for c in _COMPOSITION_CATEGORIES
@@ -618,7 +893,7 @@ def _empty_knowledge_assets(data: dict) -> dict:
         "wiki": {"entities": 0, "concepts": 0, "active_pages": 0, "activity_rate": 0.0},
         "entity_type_distribution": [],
         "kb_entity_distribution": [],
-        "entity_growth_trend": [{"date": d, "count": 0} for d in _window_dates(data["days"])],
+        "entity_growth_trend": [{"date": d, "count": 0} for d in _scope_window_dates(data)],
         "top_used_entities": [],
         "unused_entities": [],
     }
@@ -630,6 +905,87 @@ def _empty_abnormal_page(data: dict) -> dict:
         "total": 0,
         "page": data.get("page", _PAGE_DEFAULT),
         "page_size": data.get("page_size", _PAGE_SIZE_DEFAULT),
+    }
+
+
+def _empty_quality_anomalies(data: dict) -> dict:
+    """解析质量异常（观测档）的降级空壳。"""
+    return {"items": [], "total": 0}
+
+
+# 三期三个钻取空壳：**定位键原样回显**（`asset_id` / `kb_id` + 三元组），
+# 名称为空串而不是 `None` —— 前端拿到的是「结构完整但内容为空」，
+# 与其它空壳一样不必为降级单写分支。⚠️ 只有「非预期异常」会走到这里；
+# 「资产/实例/知识库不存在」走 404（`JonexException` 不被降级层吞掉）。
+
+
+def _empty_asset_detail(data: dict) -> dict:
+    return {
+        "asset_id": data.get("asset_id") or "",
+        "file_name": "",
+        "asset_type": None,
+        "file_format": None,
+        "file_size": None,
+        "source": None,
+        "kb_id": data.get("kb_id") or None,
+        "kb_name": None,
+        "uploaded_at": None,
+        "last_processed_at": None,
+        "status": None,
+        "ontology_status": None,
+        "llm_wiki_compile_status": None,
+        "cite_count": 0,
+        "last_cited_at": None,
+    }
+
+
+def _empty_ontology_entity_detail(data: dict) -> dict:
+    return {
+        "kb_id": data.get("kb_id") or "",
+        "kb_name": None,
+        "canonical_name": data.get("canonical_name") or "",
+        "entity_type": data.get("entity_type") or "",
+        "aliases": [],
+        "description": None,
+        "created_at": None,
+        "updated_at": None,
+        "attributes": [],
+        "relation_total": 0,
+        "relation_groups": [],
+        "relation_truncated": False,
+        "hit_count": 0,
+        "adopted_count": 0,
+        "last_used_at": None,
+        "degraded": True,
+    }
+
+
+def _empty_kb_detail(data: dict) -> dict:
+    return {
+        "kb_id": data.get("kb_id") or "",
+        "kb_name": "",
+        "kb_type": None,
+        "ontology": {"object_instances": 0, "relation_instances": 0, "degraded": True},
+        "asset_total": 0,
+        "assets_by_type": [],
+        "services": [],
+        "updated_at": None,
+        "request_count": 0,
+        "last_request_at": None,
+    }
+
+
+def _empty_service_detail(data: dict) -> dict:
+    # 定位键照常回显：降级壳也要能和列表那一行对得上位（同 `_empty_kb_detail`）
+    sid = data.get("service_id") or ""
+    return {
+        "service_id": sid,
+        "service_name": sid,
+        "status": None,
+        "enabled": None,
+        "knowledge_bases": [],
+        "request_count": 0,
+        "last_request_at": None,
     }
 
 
@@ -657,20 +1013,25 @@ class AnalyticsService:
         kbs = list(result.scalars())
         return [kb.id for kb in kbs], {kb.id: kb for kb in kbs}
 
-    async def _window(self, session, days: int):
-        """返回 (win_start, win_end, window_dates)；`win_end` 是最后一天 +1 天的开区间右界。
+    async def _scope_window(self, session, scope: dict):
+        """按 `scope` 解析出本次统计的窗口三元组 (win_start, win_end, window_dates)。
 
-        `window_dates` 为 DB 时区的升序日期串（趋势补零用）。日期一律取自 DB
-        `current_date()`，不与容器本地时钟各算一遍 —— 两处各算一次就会出现
-        「趋势最后一个点跟今天差一天」这类只有跨时区才暴露的问题。
+        `win_end` 是最后一天 +1 天的开区间右界；`window_dates` 为升序日期串（趋势补零用）。
+
+        相对窗口（`days`）的日期一律取自 DB `current_date()`，不与容器本地时钟各算一遍
+        —— 两处各算一次就会出现「趋势最后一个点跟今天差一天」这类只有跨时区才暴露的问题。
+        **自定义区间例外**：右界由调用方指定、本来就不是今天，此时不去（也不该去）DB
+        问一次 `current_date()` —— 既少一次查询，语义上也没有「今天」这个锚点。
+
+        ⚠️ 窗口**只在本方法里算一次**，再往下游聚合函数传：`_search_agg` / `_access_trend`
+        以前各自调一遍 `_window`，加自定义区间时漏传一个就会出现「趋势按自定义、同页其他
+        指标按 7 天」的错位 —— 而且不报错，只是数字对不上。
         """
+        start, end = scope.get("start_date"), scope.get("end_date")
+        if start is not None and end is not None:
+            return _resolve_window(date.today(), scope["days"], start, end)
         today = (await session.execute(select(func.current_date()))).scalar_one()
-        win_start = today - timedelta(days=days - 1)
-        win_end = today + timedelta(days=1)
-        window_dates = [
-            (today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)
-        ]
-        return win_start, win_end, window_dates
+        return _resolve_window(today, scope["days"], None, None)
 
     @staticmethod
     def _fill_trend(raw: dict, window_dates: list) -> list:
@@ -688,9 +1049,12 @@ class AnalyticsService:
 
     # ── 检索线聚合（事件表口径）────────────────────────
 
-    async def _search_agg(self, session, tenant_id: str, kb_ids: list, days: int) -> dict:
-        """从检索事件表聚合「检索分析」页签的全部指标。kb_ids 为空时短路。"""
-        win_start, win_end, window_dates = await self._window(session, days)
+    async def _search_agg(self, session, tenant_id: str, kb_ids: list,
+                          win_start: date, win_end: date, window_dates: list) -> dict:
+        """从检索事件表聚合「检索分析」页签的全部指标。kb_ids 为空时短路。
+
+        窗口由调用方算好传进来（`_scope_window`），本方法不再自己推 —— 见那里的说明。
+        """
         if not kb_ids:
             return {
                 "total_requests": 0,
@@ -822,28 +1186,9 @@ SELECT count(DISTINCT s.request_id) FILTER (
             "wiki": {"count": wiki_cnt, "rate": _rate(wiki_cnt)},
         }
 
-        # ⑥ 领域服务归因：请求经哪个服务发起。两个方向都要算，缺一不可 ——
-        #    ① kb → service 映射（一个库可能挂在多个服务下）；
-        #    ② 请求自带的 `entry_service_id`（领域服务形态的入口只有它，
-        #       无 kb 的请求也只剩这一条归因线索）。
-        #    计数一律 `count(DISTINCT request_id)`（事件表无唯一约束，重复行会虚增）。
-        pair_cte = _REQ_CTE + f"""
-, pair AS (
-    SELECT r.request_id, r.tenant_id, skb.service_id
-      FROM req r
-      CROSS JOIN LATERAL jsonb_array_elements_text(r.kb_ids) AS x(kb)
-      JOIN knowledge_base.service_knowledge_bases skb
-        ON skb.kb_id = x.kb
-       AND skb.tenant_id = r.tenant_id
-       AND skb.is_deleted = 0
-     WHERE x.kb = ANY(:kb_ids)
-       AND (r.user_id IS NULL OR r.user_id <> 'anonymous')
-    UNION
-    SELECT r.request_id, r.tenant_id, r.entry_service_id
-      FROM req r
-     WHERE {_REQ_IN_SCOPE}
-)
-"""
+        # ⑥ 领域服务归因：请求经哪个服务发起。CTE 见模块级 `_PAIR_CTE`
+        #    （抽屉 D 复用同一份，口径只有一处）。
+        pair_cte = _PAIR_CTE
         used_services = int(
             (
                 await session.execute(
@@ -932,6 +1277,14 @@ SELECT count(DISTINCT a.target_id) AS cnt
         )
 
         # 同一 answer_id 只计 1 次（同一次回答里同资产重复出现不该虚增引用数）
+        #
+        # 排序契约（需求方口径）：引用次数 DESC → 最近一次引用时间 DESC → `target_id` 兜底。
+        # 第二键**不能**省：并列行若退回按 `target_id`（随机 UUID）定序，同分资产在榜内
+        # 的先后与「谁最近被引用过」无关，等于伪随机。第三键只为把并列行定成全序 ——
+        # 同一批埋点写入的 `adopted_at` 可能逐位相同，只留两个键时 PG 对并列行次序不作
+        # 保证（同 `_search_agg` 里「高频提问」那处的顾虑）。
+        # `HAVING >= 1` 在 `answer_id NOT NULL` 下是 no-op，写出来是为了让「至少被引用
+        # 过一次」这条口径不隐式依赖 DDL 约束。
         top_rows = (
             await session.execute(
                 text(f"""
@@ -946,7 +1299,10 @@ SELECT a.target_id AS doc_id,
    AND a.adopted_at >= CAST(:win_start AS DATE)
    AND a.adopted_at <  CAST(:win_end AS DATE)
  GROUP BY a.target_id
- ORDER BY count(DISTINCT a.answer_id) DESC, a.target_id ASC
+HAVING count(DISTINCT a.answer_id) >= 1
+ ORDER BY count(DISTINCT a.answer_id) DESC,
+          max(a.adopted_at) DESC,
+          a.target_id ASC
  LIMIT {_TOP_LIST_LIMIT}
 """),
                 params,
@@ -960,15 +1316,23 @@ SELECT a.target_id AS doc_id,
 
     async def _unused_assets_agg(self, session, tenant_id: str, kb_ids: list,
                                  threshold_days: int, kb_map=None) -> list:
-        """长期未使用资产：READY 文档中「最近一次被采用」为空或早于阈值。
+        """长期未使用资产：READY 文档中**上传满 `threshold_days` 天**且「最近一次被采用」
+        为空或早于同一个阈值的。
 
         `unused_threshold_days` 一期解析完就被丢掉了（`_parse` 的 4 元组三个调用方
         都用 `_` 接掉），前端那个 30/90 天切换器一直是死的 —— 这里真的用上它。
+
+        判据是**两半取交集**，理由与取舍见 `_UNUSED_ASSETS_SQL` 上方注释：
+        「年龄」那半边必须用**应用进程的时钟**（这里算的 `created_before`），
+        不能交给 SQL 的 `now()`，否则会静默依赖 PG 会话时区。
 
         `kb_map` 不传时（兼容老调用点）`kb_name` 回落 `kb_id`，与 `_enrich_cited` 同口径。
         """
         if not kb_ids:
             return []
+        # 年龄下限：与 `d.created_at` 是同一个钟（都是应用进程的 naive 本地时间），
+        # 故不受 PG 会话时区影响 —— 见 `_UNUSED_ASSETS_SQL` 上方注释，别改成 SQL 表达式。
+        created_before = datetime.now() - timedelta(days=threshold_days)
         rows = (
             await session.execute(
                 text(_UNUSED_ASSETS_SQL),
@@ -976,6 +1340,7 @@ SELECT a.target_id AS doc_id,
                     "tenant_id": tenant_id,
                     "kb_ids": list(kb_ids),
                     "threshold_days": threshold_days,
+                    "created_before": created_before,
                 },
             )
         ).all()
@@ -996,6 +1361,10 @@ SELECT a.target_id AS doc_id,
                 ),
                 # ⚠️ 必须过 `_local_naive_to_iso`（裸 isoformat 会丢掉时区，见该函数注释）
                 "updated_at": _local_naive_to_iso(r.updated_at),
+                # 上传时间（= 判据里「年龄」那一半的可视化依据，语义同 `AssetDetail.uploaded_at`）。
+                # 没有它的话，表上只有「更新时间」—— 一份 100 天前上传、3 天前重新解析过的
+                # 文档会显示「更新 3 天前」，用户看不出它凭什么叫「长期未使用」。
+                "created_at": _local_naive_to_iso(r.created_at),
             }
             for r in rows
         ]
@@ -1186,8 +1555,13 @@ SELECT processing_task_id, asset_id, task_type, error, occurred_at,
 
     # ── Neo4j 本体聚合 ──────────────────────────────────────────
 
-    async def _neo4j_stats(self, tenant_id: str, kb_ids: list, days: int) -> dict:
-        """跨 KB 聚合本体指标；Neo4j 不可用降级全 0，不阻塞基础能力。"""
+    async def _neo4j_stats(self, tenant_id: str, kb_ids: list) -> dict:
+        """跨 KB 聚合本体指标；Neo4j 不可用降级全 0，不阻塞基础能力。
+
+        ⚠️ **不带窗口参数**：`growth` 把图内**全部**实体的 `created_at` 拉回 Python
+        （Cypher 侧无时间过滤，见下方 `growth_rec`），调用方再用 `_fill_trend(growth,
+        window_dates)` 按窗口补零 —— 所以自定义区间天然生效，代价是区间越大这步越贵。
+        """
         empty = {
             "entities": 0,
             "relations": 0,
@@ -1329,7 +1703,15 @@ SELECT DISTINCT s.kb_id, s.entity_type, s.canonical_name
 
     async def _top_hits(self, session, tenant_id: str, kb_ids: list,
                         win_start: date, win_end: date) -> list:
-        """高频使用本体候选榜单（按三元组 group by）。"""
+        """高频使用本体候选榜单（按三元组 group by）。
+
+        排序契约（需求方口径）：命中次数 DESC → 最近一次命中时间 DESC → 三元组兜底。
+        第二键**不能**退回 `canonical_name`（按名字节序定序，与「谁最近被命中过」无关）。
+
+        ⚠️ 候选池（`LIMIT _TOP_LIST_LIMIT * _TOP_CANDIDATE_FACTOR`）也是这条 `ORDER BY`
+        选出来的，而调用方随后只做 Neo4j 存活过滤、**只删不排**（见 `knowledge_assets`）
+        —— 所以排序必须在 SQL 里定死，不能挪到 Python 侧补排。
+        """
         if not kb_ids:
             return []
         rows = (
@@ -1346,7 +1728,10 @@ SELECT s.kb_id, s.entity_type, s.canonical_name,
    AND s.hit_at >= CAST(:win_start AS DATE)
    AND s.hit_at <  CAST(:win_end AS DATE)
  GROUP BY s.kb_id, s.entity_type, s.canonical_name
- ORDER BY count(DISTINCT s.request_id) DESC, s.canonical_name ASC
+HAVING count(DISTINCT s.request_id) >= 1
+ ORDER BY count(DISTINCT s.request_id) DESC,
+          max(s.hit_at) DESC,
+          s.kb_id ASC, s.entity_type ASC, s.canonical_name ASC
  LIMIT {_TOP_LIST_LIMIT * _TOP_CANDIDATE_FACTOR}
 """),
                 {
@@ -1369,7 +1754,14 @@ SELECT s.kb_id, s.entity_type, s.canonical_name,
         ]
 
     async def _neo4j_entities_head(self, tenant_id: str, kb_ids: list, limit: int):
-        """有界拉取 Neo4j 实体（按最近改动倒序）；不可用返回 None。"""
+        """有界拉取 Neo4j 实体全集样本（**按创建时间升序，最老的在前**）；不可用返回 None。
+
+        ⚠️ 排序方向是**为「长期未使用」这个唯一调用点选的**：它在 Python 侧要减掉
+        「近 N 天命中过的」再取前 20，而这批候选现在还要过「创建满 N 天」这道闸。
+        按「最近改动倒序」取头部样本的话，样本会被**刚创建/刚改过**的实体占满，
+        年龄闸一卡几乎全被滤掉，榜内条数系统性偏少；按创建时间升序取，样本恰好就是
+        「最可能长期未使用」的那一批。全仓只有 `knowledge_assets` 一处调用它。
+        """
         if not kb_ids:
             return []
         try:
@@ -1384,7 +1776,7 @@ SELECT s.kb_id, s.entity_type, s.canonical_name,
                     "       e.canonical_name AS canonical_name, "
                     "       e.created_at AS created_at, "
                     "       coalesce(e.updated_at, e.created_at) AS updated_at "
-                    "ORDER BY coalesce(e.updated_at, e.created_at) DESC "
+                    "ORDER BY coalesce(e.created_at, e.updated_at) ASC "
                     "LIMIT $limit",
                     {"t": tenant_id, "kbs": kb_ids, "limit": limit},
                 )
@@ -1470,14 +1862,16 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
                 session, tenant_id, scope["domain_space_id"], scope["kb_id"]
             )
             total_kbs = len(kb_ids)
-            win_start, win_end, _ = await self._window(session, scope["days"])
+            win_start, win_end, window_dates = await self._scope_window(session, scope)
             total_assets = await self._count_docs_ready(session, tenant_id, kb_ids)
             total_data_sources = await self._count_sources(session, tenant_id, kb_ids)
             cited_assets, _ = await self._cited_agg(session, tenant_id, kb_ids, win_start, win_end)
-            search = await self._search_agg(session, tenant_id, kb_ids, scope["days"])
+            search = await self._search_agg(
+                session, tenant_id, kb_ids, win_start, win_end, window_dates
+            )
 
         usage_rate = (cited_assets / total_assets) if total_assets else 0.0
-        neo = await self._neo4j_stats(tenant_id, kb_ids, scope["days"])
+        neo = await self._neo4j_stats(tenant_id, kb_ids)
         return {
             "data_assets": {
                 "total_assets": total_assets,
@@ -1510,14 +1904,16 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
             kb_ids, kb_map = await self._kb_scope(
                 session, tenant_id, scope["domain_space_id"], scope["kb_id"]
             )
-            win_start, win_end, _ = await self._window(session, scope["days"])
+            win_start, win_end, window_dates = await self._scope_window(session, scope)
 
             total_assets = await self._count_docs_ready(session, tenant_id, kb_ids)
             total_data_sources = await self._count_sources(session, tenant_id, kb_ids)
             cited_assets, top_cited = await self._cited_agg(
                 session, tenant_id, kb_ids, win_start, win_end
             )
-            access_trend = await self._access_trend(session, tenant_id, kb_ids, scope["days"])
+            access_trend = await self._access_trend(
+                session, tenant_id, kb_ids, win_start, window_dates
+            )
             composition = await self._composition(session, tenant_id, kb_ids)
             top_cited_assets = await self._enrich_cited(session, tenant_id, top_cited, kb_map)
             unused_assets = await self._unused_assets_agg(
@@ -1564,7 +1960,7 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
             kb_ids, kb_map = await self._kb_scope(
                 session, tenant_id, scope["domain_space_id"], scope["kb_id"]
             )
-            win_start, win_end, window_dates = await self._window(session, scope["days"])
+            win_start, win_end, window_dates = await self._scope_window(session, scope)
 
             # 活跃本体：PG 出候选 → Neo4j 回捞存活项。分母与 `_neo4j_stats`
             # 的 entities 对齐（两处都带 `coalesce(stub,false)=false`）。
@@ -1582,18 +1978,42 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
                 tenant_id, kb_ids, _NEO4J_ENTITY_HEAD_LIMIT
             )
 
-            # 长期未使用本体 = 全集 − 阈值窗口内命中过的。
+            # 长期未使用本体 = 全集 − 阈值窗口内命中过的，**再按年龄收窄**。
+            #
+            # 判据与资产侧同构、也是**两半取交集**：① 实体创建满 threshold 天；
+            # ② 阈值窗口内 0 次命中。只判 ② 的话，昨天刚编译出来的实体（一次没被
+            # 检索命中过）当天就进榜 —— 那不是「长期未使用」，是「还没来得及用」。
+            #
             # `win_end` 是「今天 +1 天」的开区间右界，故 `win_end - threshold`
             # 正是「最近 threshold 天」的左界。
-            th_start = win_end - timedelta(days=scope["unused_threshold_days"])
+            # ⚠️ 该等式在**相对窗口**（`days`）下成立；若将来这条链路支持自定义区间
+            # （`start_date`/`end_date`），阈值窗口会变成「以区间末日结尾」—— 那是
+            # 独立的口径问题，登记在方案文档 §6.3，不在本处兜底。
+            threshold_days = scope["unused_threshold_days"]
+            th_start = win_end - timedelta(days=threshold_days)
             used_in_threshold = set(
                 await self._hit_candidates(session, tenant_id, kb_ids, th_start, win_end)
+            )
+            # 年龄下限（纪元毫秒）。⚠️ 与资产侧那个 naive 列不是一回事：Neo4j 的
+            # `created_at` 是 `timestamp()` 毫秒，`datetime.now().timestamp()` 与
+            # `_ts_to_day` / `_ts_to_iso` 里的 `fromtimestamp(ms/1000)` 用的是同一套
+            # 本机时区，相减时自动抵消 —— 这里**不存在**会话时区那个坑，不要照搬
+            # 资产侧「必须用应用进程本地 naive 时间」的写法去改它。
+            age_cutoff_ms = int(
+                (datetime.now() - timedelta(days=threshold_days)).timestamp() * 1000
             )
             unused_candidates = []
             if entities_all is not None:
                 for row in entities_all:
                     triple = (row["kb_id"], row["entity_type"], row["canonical_name"])
                     if not all(triple) or triple in used_in_threshold:
+                        continue
+                    # 太年轻 / 没有创建时间 → 不构成「长期未使用」。
+                    # `created_at` 缺失时**排除而不是放进榜**：两半判据里「年龄」这半
+                    # 拿不到，放进榜等于用「未知」冒充「长期未使用」，与列表文案
+                    # 「创建 ≥N 天」直接矛盾。
+                    created_ms = row.get("created_at")
+                    if created_ms is None or int(created_ms) >= age_cutoff_ms:
                         continue
                     unused_candidates.append(row)
                     if len(unused_candidates) >= _UNUSED_LIST_LIMIT:
@@ -1604,7 +2024,7 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
                 [(r["kb_id"], r["entity_type"], r["canonical_name"]) for r in unused_candidates],
             )
 
-            neo = await self._neo4j_stats(tenant_id, kb_ids, scope["days"])
+            neo = await self._neo4j_stats(tenant_id, kb_ids)
             entities = int(neo["entities"])
             type_distribution = [
                 {"entity_type": t, "count": int(c)}
@@ -1686,7 +2106,10 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
                 session, tenant_id, scope["domain_space_id"], scope["kb_id"]
             )
             total_kbs = len(kb_ids)
-            search = await self._search_agg(session, tenant_id, kb_ids, scope["days"])
+            win_start, win_end, window_dates = await self._scope_window(session, scope)
+            search = await self._search_agg(
+                session, tenant_id, kb_ids, win_start, win_end, window_dates
+            )
 
         total_requests = search["total_requests"]
         active_users = search["active_users"]
@@ -1757,6 +2180,364 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
             "page_size": scope["page_size"],
         }
 
+    @_resilient(_empty_quality_anomalies)
+    async def quality_anomalies(self, tenant_id: str, user_id, data: dict) -> dict:
+        """解析质量异常（观测档）：最近 `quality_report.verdict='bad'` 的任务。
+
+        本版本不接入解析质量观测，恒返回空列表。
+        **观测档**：档位差不拦截检索、不改变任务结论。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_scope(data)
+        async with get_db_session() as session:
+            kb_ids, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], scope["kb_id"]
+            )
+        if not kb_ids:
+            return {"items": [], "total": 0}
+
+        result = {"items": []}
+        raw_items = [
+            raw for raw in ((result or {}).get("items") or [])
+            # 范围兜底：引擎已按 kb_ids 过滤，这里再挡一次跨范围泄露。
+            if (raw.get("kb_id") or "") in kb_ids
+        ]
+        name_map: dict[str, str] = {}
+        doc_ids = [raw.get("document_id") for raw in raw_items if raw.get("document_id")]
+        if doc_ids:
+            async with get_db_session() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            KnowledgeDocument.id,
+                            KnowledgeDocument.file_name,
+                        ).where(
+                            KnowledgeDocument.tenant_id == tenant_id,
+                            KnowledgeDocument.id.in_(doc_ids),
+                            KnowledgeDocument.is_deleted == 0,
+                        )
+                    )
+                ).all()
+                name_map = {r.id: r.file_name for r in rows}
+        items = []
+        for raw in raw_items:
+            kb_id = raw.get("kb_id") or ""
+            kb = kb_map.get(kb_id)
+            doc_id = raw.get("document_id")
+            items.append({
+                "document_id": doc_id,
+                "document_name": name_map.get(doc_id) or doc_id,
+                "kb_id": kb_id,
+                "kb_name": getattr(kb, "name", "") if kb is not None else "",
+                "task_id": raw.get("task_id"),
+                "verdict": raw.get("verdict"),
+                "reasons": raw.get("reasons") or [],
+                "occurred_at": raw.get("occurred_at"),
+            })
+        return {"items": items, "total": len(items)}
+
+    # ── 三期：列表钻取详情（原型「点名称进抽屉」）───────────────
+    #
+    # 三个方法共用的两条约定（改之前先读 `dtos/analytics.py` 三期段注释）：
+    # ① 窗口/范围参数与打开列表时**同一组**（`days` 或 `start_date`+`end_date`，
+    #    加 `domain_space_id`）—— 抽屉里的次数才等于列表里那个数字；
+    #    前端不传不会报错，只会按默认 7 天算而「数字对不上」。
+    # ② 定位键是**真实键**：A 用 `asset_id`、B 用 `kb_id`+`entity_type`+`canonical_name`
+    #    三元组、C 用 `kb_id`。列表里的本体 `object_id` 是单向 sha 值，**查不了详情**。
+    #
+    # 「不存在」一律走 404（`ResourceNotFoundError`，`_resilient` 不吞 `JonexException`），
+    # 而不是返回空壳 —— 空壳的语义是「降级」，两者混在一起前端就分不清要不要提示
+    # 「内容已变更」。
+
+    @_resilient(_empty_asset_detail)
+    async def asset_detail(self, tenant_id: str, user_id, data: dict) -> dict:
+        """抽屉 A · 数据资产详情。
+
+        范围判据：文档所属的库必须在「本次范围」内 —— 与列表同源（`domain_space_id`
+        传了就是空间范围，没传就是租户级全量）。这层校验挡住「拿空间 A 的凭证读
+        空间 B 的资产」，`execute` 里的空间成员判定只保证「能进这个空间」。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_scope(data)
+        asset_id = scope["asset_id"]
+        async with get_db_session() as session:
+            _, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], scope["kb_id"]
+            )
+            doc = (
+                await session.execute(
+                    select(KnowledgeDocument).where(
+                        KnowledgeDocument.id == asset_id,
+                        KnowledgeDocument.tenant_id == tenant_id,
+                        KnowledgeDocument.is_deleted == 0,
+                    )
+                )
+            ).scalars().first()
+            # 「不存在 / 已被删 / 不在本次范围」合并成同一个 404：把后两者区分出来
+            # 等于确认了「有这条资产，只是不给你看」（与 KB 详情的防探测同口径）。
+            if doc is None or doc.knowledge_base_id not in kb_map:
+                raise ResourceNotFoundError(
+                    message=translate(
+                        "err.kb.asset_not_found",
+                        params={"asset_id": asset_id},
+                        fallback=f"资产不存在: {asset_id}",
+                    )
+                )
+            win_start, win_end, _ = await self._scope_window(session, scope)
+            cite_count, last_cited_at = await self._cited_agg_asset(
+                session, tenant_id, asset_id, win_start, win_end
+            )
+            kb = kb_map.get(doc.knowledge_base_id)
+
+        return {
+            "asset_id": doc.id,
+            "file_name": doc.file_name,
+            "asset_type": to_asset_type(classify_asset_category(doc.mime_type, doc.file_name)),
+            "file_format": _file_format(doc.mime_type, doc.file_name),
+            "file_size": int(doc.file_size) if doc.file_size is not None else None,
+            # 数据来源：与异常抽屉同口径（`data_source_type` 为空的老数据回落 `file`）
+            "source": doc.data_source_type or "file",
+            "kb_id": doc.knowledge_base_id,
+            # 富化不到（库已删）时回落 kb_id：非空 id 也比空白列强（与 `_enrich_cited` 一致）
+            "kb_name": kb.name if kb is not None else doc.knowledge_base_id,
+            # ⚠️ 这两列是 `TimestampMixin` 的**本地 naive** 时间，必须过
+            # `_local_naive_to_iso`（裸 `isoformat()` 会丢时区，见该函数注释）
+            "uploaded_at": _local_naive_to_iso(doc.created_at),
+            "last_processed_at": _local_naive_to_iso(doc.updated_at),
+            # 三条处理链的状态**各自透出原始码**，不在后端合成「当前处理状态」：
+            # 同一个文档可能解析已 ready、本体抽取还在跑，合成一个词必然丢掉一半事实。
+            "status": doc.status,
+            "ontology_status": doc.ontology_status,
+            "llm_wiki_compile_status": doc.llm_wiki_compile_status,
+            "cite_count": cite_count,
+            "last_cited_at": last_cited_at.isoformat() if last_cited_at else None,
+        }
+
+    @_resilient(_empty_ontology_entity_detail)
+    async def ontology_entity_detail(self, tenant_id: str, user_id, data: dict) -> dict:
+        """抽屉 B · Ontology 对象详情。
+
+        ⚠️ 两块数据来自两个库，**降级口径不同**：属性/关系在 Neo4j（不可用 → 空 +
+        `degraded=true`），命中次数在 PG（**照常返回**，没理由跟着降）。
+
+        这直接决定 404 怎么判：只有「图在、但查不到这个三元组」才是 404。
+        `degraded=true` 时问不出「实例还在不在」，只能出空壳 —— 把它当 404 会让
+        Neo4j 一挂，整个知识资产页签点谁都报「对象不存在」。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_scope(data)
+        kb_id, entity_type, canonical_name = (
+            scope["kb_id"], scope["entity_type"], scope["canonical_name"]
+        )
+        async with get_db_session() as session:
+            _, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], kb_id
+            )
+            if kb_id not in kb_map:
+                raise ResourceNotFoundError(
+                    message=translate(
+                        "err.kb.not_found",
+                        params={"kb_id": kb_id},
+                        fallback=f"知识库不存在: {kb_id}",
+                    )
+                )
+            win_start, win_end, _ = await self._scope_window(session, scope)
+            hit_count, last_used_at = await self._hit_agg_entity(
+                session, tenant_id, kb_id, entity_type, canonical_name, win_start, win_end
+            )
+            kb_name = kb_map[kb_id].name
+
+        detail, facts, relation_total, relation_truncated, degraded = (
+            await self._entity_graph_detail(tenant_id, kb_id, entity_type, canonical_name)
+        )
+        # 图在、但没这个三元组 → 实例不存在，或**已被改名**（列表里的旧名字查不到了）。
+        # 前端按「对象已变更，请刷新列表」处理；不要重试，重试还是这个名字。
+        if detail is None and not degraded:
+            raise ResourceNotFoundError(
+                message=translate(
+                    "err.kb.ontology_entity_not_found",
+                    params={"canonical_name": canonical_name},
+                    fallback=f"Ontology 对象不存在: {canonical_name}",
+                )
+            )
+        detail = detail or {}
+
+        return {
+            "kb_id": kb_id,
+            "kb_name": kb_name,
+            "canonical_name": canonical_name,
+            "entity_type": entity_type,
+            "aliases": list(detail.get("aliases") or []),
+            "description": detail.get("description"),
+            "created_at": self._ts_to_iso(detail.get("created_at")),
+            "updated_at": self._ts_to_iso(detail.get("updated_at")),
+            "attributes": _attr_pairs(detail.get("attributes")),
+            # `relation_total` 是**全部**关系数，不是 `relation_groups` 里目标的数量 ——
+            # 后者受 `_NEO4J_RELATION_LIMIT` 和去重影响，拿它凑总数会把截断说成「就这么多」
+            "relation_total": relation_total,
+            "relation_groups": _relation_groups(facts),
+            # 明细被上限截断：前端提示「仅显示前 N 条」，不要静默少列
+            "relation_truncated": relation_truncated,
+            "hit_count": hit_count,
+            # 结构性恒 0：采用事件（`search_adoption_event`）只记 document，
+            # **没有实体采用这一类埋点**（同列表 `UsedEntityItem.adopted_count`）
+            "adopted_count": 0,
+            "last_used_at": last_used_at.isoformat() if last_used_at else None,
+            "degraded": degraded,
+        }
+
+    @_resilient(_empty_kb_detail)
+    async def kb_detail(self, tenant_id: str, user_id, data: dict) -> dict:
+        """抽屉 C · 知识库详情。
+
+        ⚠️ **权限前置是 `KnowledgeInfoService.get()` 的 404 判据**，不另写一套：
+        它会挡掉「非空间管理者且无 KB 授权」的访问（防探测 404）。数据运营页的空间
+        成员本来就能检索到这个库的内容，但**不该**从这里读到库结构 —— 对象实例数、
+        资产类型拆解、关联服务都是这个页面上新增的信息面。权限只有一份实现。
+
+        本方法只补三块 `get()` 没有的：资产类型拆解、窗口内检索次数、关联领域服务。
+
+        `object_instances` / `relation_instances` 直接取 `get(with_stats=True)` 算好的值：
+        它已经处理了 llm-wiki 库要走 Wiki 图的问题（自己查 Neo4j 会把它们误报 0）。
+        ⚠️ 代价：llm-wiki 库的 `with_stats=True` 会触发跨容器全图扫描（~2.6s）。
+        抽屉是「点开一次」的请求，接受；**若将来把它塞进列表批量调用，必须先改这里**。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_scope(data)
+        kb_id = scope["kb_id"]
+        async with get_db_session() as session:
+            # 与 A/B 同一层范围校验：`domain_space_id` 传了就得对得上，
+            # 否则会出现「按空间 A 过滤、却返回空间 B 的库」。
+            _, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], kb_id
+            )
+            if kb_id not in kb_map:
+                raise ResourceNotFoundError(
+                    message=translate(
+                        "err.kb.not_found",
+                        params={"kb_id": kb_id},
+                        fallback=f"知识库不存在: {kb_id}",
+                    )
+                )
+            win_start, win_end, _ = await self._scope_window(session, scope)
+            composition = await self._composition(session, tenant_id, [kb_id])
+            services = await self._kb_services(session, tenant_id, [kb_id])
+            request_count, last_request_at = await self._kb_request_usage(
+                session, tenant_id, kb_id, win_start, win_end
+            )
+            # `KnowledgeInfo.updated_at` 同为本机 naive 列，取原始值自己转 ——
+            # `to_dict()` 里是裸 `isoformat()`（不带时区偏移），直接用它会让这一个
+            # 字段跟同一响应里其余 `*_at` 的口径不一致（见 `_local_naive_to_iso`）。
+            kb_updated_at = (
+                await session.execute(
+                    select(KnowledgeInfo.updated_at).where(
+                        KnowledgeInfo.id == kb_id,
+                        KnowledgeInfo.tenant_id == tenant_id,
+                    )
+                )
+            ).scalar()
+
+        # ② 真正的权限门槛（404 防探测）。放在范围校验之后：先判「在不在范围内」
+        #    再判「有没有权限」，两种情况对外都是 404，但先跑便宜的那步。
+        info = await KnowledgeInfoService().get(
+            kb_id, tenant_id, user_id=user_id, with_stats=True
+        )
+
+        # 只返回非零项：抽屉要列的是「这个库有什么」，把 7 类里恒为 0 的那几类也铺出来
+        # 只是噪声（前端要拼的是标签组，不是固定列）。`asset_total` 仍是全量口径，
+        # 与「数据资产」页签的 READY 文档数同一个数。
+        by_type = [
+            {"asset_type": c["asset_type"], "count": c["count"]}
+            for c in composition
+            if c["count"] > 0
+        ]
+        # ⚠️ 降级时两个计数**必须是 None，不能透明成 0**：`get(with_stats=True)` 在
+        # Neo4j / 编译服务不可用时会把计数**填 0** 并置 `ontology_degraded=True`
+        # （`knowledge_info_service.py:274-276` / `290-293`）。那个 0 是「没取到」的
+        # 占位值，直接透出会让抽屉显示「编译资产：0 个对象、0 条关系」—— 库里明明有
+        # 上千个对象，这是**对用户陈述一件假事**。转成 None 后前端渲染「—」，
+        # 由 `degraded` 提供「暂不可用」文案（DTO 的 `Optional[int]` 就是这个语义）。
+        degraded = bool(info.get("ontology_degraded", False))
+        return {
+            "kb_id": kb_id,
+            "kb_name": info.get("name") or kb_id,
+            "kb_type": info.get("kb_type"),
+            "ontology": {
+                "object_instances": None if degraded else int(info.get("entity_count") or 0),
+                "relation_instances": None if degraded else int(info.get("relation_count") or 0),
+                "degraded": degraded,
+            },
+            "asset_total": sum(c["count"] for c in composition),
+            "assets_by_type": by_type,
+            "services": services,
+            "updated_at": _local_naive_to_iso(kb_updated_at),
+            "request_count": request_count,
+            "last_request_at": last_request_at.isoformat() if last_request_at else None,
+        }
+
+    @_resilient(_empty_service_detail)
+    async def service_detail(self, tenant_id: str, user_id, data: dict) -> dict:
+        """抽屉 D · 领域服务详情。
+
+        ⚠️ **本方法刻意不抛 404**（与 A/B/C 不同，理由见 `ServiceDetail` 的 DTO 注释）：
+        抽屉的主体是列表那一行**归因记录**，服务实体只是装饰。列表在 `services` 查不到
+        时本来就回落 `service_id` 显示，所以「行在、实体不在」是列表已承认的合法状态
+        （软删服务、历史回填把空间 id 写进 `entry_service_id` 的遗留数据）。
+        取不到就留空属性块、**使用情况照常返回** —— 使用情况来自事件表，与服务实体无关。
+
+        范围外服务的属性**同样不填**（回落 id），两种情形对外完全同形 ——
+        否则「404 / 200」或「真名 / 机器 id」的差别就成了「这个 id 在别的空间存不存在」
+        的探测口子。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_scope(data)
+        service_id = scope["service_id"]
+        async with get_db_session() as session:
+            kb_ids, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"]
+            )
+            win_start, win_end, _ = await self._scope_window(session, scope)
+            svc = (
+                await session.execute(
+                    select(DomainService).where(
+                        DomainService.id == service_id,
+                        DomainService.tenant_id == tenant_id,
+                        DomainService.is_deleted == 0,
+                    )
+                )
+            ).scalars().first()
+            # 属性块只认「本空间的服务」：跨空间的同 id 服务不得从这里透出名称与状态。
+            # 判空后与「本来就没有这条服务」走同一条路（回落 id），不留可观测差异。
+            if (
+                svc is not None
+                and scope["domain_space_id"]
+                and svc.space_id != scope["domain_space_id"]
+            ):
+                svc = None
+            bound_kb_ids = await self._service_kbs(session, tenant_id, service_id, kb_ids)
+            request_count, last_request_at = await self._service_request_usage(
+                session, tenant_id, kb_ids, service_id, win_start, win_end
+            )
+
+        return {
+            "service_id": service_id,
+            "service_name": (svc.name if svc is not None else None) or service_id,
+            "status": svc.status if svc is not None else None,
+            # `enabled` 列是 SmallInteger（1/0），DTO 是 bool|None：
+            # 实体取不到 → None（前端渲染「—」），不要把它当成「已停用」
+            "enabled": (
+                bool(svc.enabled)
+                if svc is not None and svc.enabled is not None
+                else None
+            ),
+            "knowledge_bases": [
+                {"kb_id": kid, "kb_name": kb_map[kid].name if kid in kb_map else kid}
+                for kid in bound_kb_ids
+            ],
+            "request_count": request_count,
+            "last_request_at": last_request_at.isoformat() if last_request_at else None,
+        }
+
     # ── 其余统计辅助 ────────────────────────────────────────────
 
     async def _count_docs_ready(self, session, tenant_id: str, kb_ids: list) -> int:
@@ -1807,13 +2588,14 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
         )
         return int(result.scalar_one())
 
-    async def _access_trend(self, session, tenant_id: str, kb_ids: list, days: int) -> list:
+    async def _access_trend(self, session, tenant_id: str, kb_ids: list,
+                            win_start: date, window_dates: list) -> list:
         """数据接入趋势：用 `documents.created_at` 近似（上传时刻，非可用时刻）。
 
         `asset_status_event` 本期默认不写，所以拿不到「真实 ready 时刻」；
         切到它是可选项，不是本期的默认口径。
+        窗口由调用方算好传进来（`_scope_window`），本方法不再自己推。
         """
-        win_start, _, window_dates = await self._window(session, days)
         if not kb_ids:
             return self._fill_trend({}, window_dates)
         # ⚠️ `to_char` 表达式必须在 select 与 group_by 里复用同一个**表达式对象**：
@@ -1850,8 +2632,7 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
                 {"category": c, "asset_type": to_asset_type(c), "count": 0}
                 for c in _COMPOSITION_CATEGORIES
             ]
-        # `substring(... from '(\.[^.]*)$')` 取出「含点的扩展名」，
-        # 正好能直接喂给 `classify_asset_category(mime, file_name)`
+        # `substring(... from '(\.[^.]*)$')` 取出「含点的扩展名」
         rows = (
             await session.execute(
                 text("""
@@ -1873,7 +2654,12 @@ SELECT d.mime_type,
             )
         ).all()
         for mime_type, ext, cnt in rows:
-            category = classify_asset_category(mime_type, ext)
+            # ⚠️ `ext` 是**含点的扩展名**（`.docx`），不能直接当文件名喂进去：
+            # `os.path.splitext('.docx')` 返回 `('.docx', '')` —— 前导点被当成隐藏文件名，
+            # 扩展名解析为空 → 整批落进 `other`。docx/pptx/xlsx/csv 只有扩展名这一条判据
+            # （mime 是 `application/vnd.openxmlformats-…` 或 `application/octet-stream`），
+            # 所以「其他」会凭空吃掉所有 Office 与表格文件。补一个基名规避。
+            category = classify_asset_category(mime_type, f"f{ext}" if ext else None)
             counts[category] = counts.get(category, 0) + int(cnt)
         return [
             {"category": c, "asset_type": to_asset_type(c), "count": counts[c]}
@@ -1926,6 +2712,234 @@ SELECT d.mime_type,
                 ),
             })
         return result
+
+    # ── 三期钻取详情的取数辅助 ──────────────────────────────────
+
+    async def _cited_agg_asset(self, session, tenant_id: str, asset_id: str,
+                               win_start: date, win_end: date):
+        """单个数据资产在窗口内的被采用次数，返回 `(cite_count, last_cited_at)`。
+
+        与「高频引用资产 Top10」**逐字同口径**：`count(DISTINCT answer_id)`
+        （同一次回答里同一资产重复出现只算 1 次）、窗口边界 `>= win_start AND < win_end`。
+
+        ⚠️ **不按 `kb_id` 过滤**：`target_id` 就是 `knowledge_documents.id`（全表主键、
+        全局唯一），再叠一层 `a.kb_id = 文档的 kb` 在数据正常时等价、在事件行 kb_id
+        异常时反而与列表算出的数**不一致**。租户边界仍由 `tenant_id` 守住。
+        """
+        row = (
+            await session.execute(
+                text(f"""
+SELECT count(DISTINCT a.answer_id) AS cite_count,
+       max(a.adopted_at) AS last_cited_at
+  FROM knowledge_base.search_adoption_event a
+ WHERE a.tenant_id = :tenant_id
+   AND a.is_deleted = 0
+   AND a.target_type = '{TARGET_DOCUMENT}'
+   AND a.target_id = :asset_id
+   AND a.adopted_at >= CAST(:win_start AS DATE)
+   AND a.adopted_at <  CAST(:win_end AS DATE)
+"""),
+                {
+                    "tenant_id": tenant_id,
+                    "asset_id": asset_id,
+                    **self._window_params(win_start, win_end),
+                },
+            )
+        ).first()
+        if row is None:
+            return 0, None
+        return int(row.cite_count or 0), row.last_cited_at
+
+    async def _hit_agg_entity(self, session, tenant_id: str, kb_id: str, entity_type: str,
+                              canonical_name: str, win_start: date, win_end: date):
+        """单个本体实例在窗口内的命中次数，返回 `(hit_count, last_hit_at)`。
+
+        判据与「高频使用本体实例 Top10」完全一致（`_top_hits`）：按三元组定位、
+        `count(DISTINCT request_id)`、同窗口边界。⚠️ 用 `canonical_name` 而**不是**
+        列表里的 `object_id` —— 后者是 sha 值，不在事件表里做 join 键。
+        """
+        row = (
+            await session.execute(
+                text(f"""
+SELECT count(DISTINCT s.request_id) AS hit_count,
+       max(s.hit_at) AS last_hit_at
+  FROM knowledge_base.search_hit_event s
+ WHERE s.tenant_id = :tenant_id
+   AND s.is_deleted = 0
+   AND s.target_type = '{TARGET_ONTOLOGY_INSTANCE}'
+   AND s.kb_id = :kb_id
+   AND s.entity_type = :entity_type
+   AND s.canonical_name = :canonical_name
+   AND s.hit_at >= CAST(:win_start AS DATE)
+   AND s.hit_at <  CAST(:win_end AS DATE)
+"""),
+                {
+                    "tenant_id": tenant_id,
+                    "kb_id": kb_id,
+                    "entity_type": entity_type,
+                    "canonical_name": canonical_name,
+                    **self._window_params(win_start, win_end),
+                },
+            )
+        ).first()
+        if row is None:
+            return 0, None
+        return int(row.hit_count or 0), row.last_hit_at
+
+    async def _kb_request_usage(self, session, tenant_id: str, kb_id: str,
+                                win_start: date, win_end: date):
+        """单个知识库在窗口内的检索请求数 / 最近一次检索时间。
+
+        ⚠️ `count(*)` 而**不是** `count(DISTINCT request_id)`：必须与「知识库使用情况」
+        表里那一行**逐字对上**（`_search_agg` 的 kb_usage CTE 用的就是 `count(*)`）。
+        这里换个更正确的判据，页面上立刻出现「列表 38,620 / 抽屉 38,611」这种
+        对不上的数字 —— 要改就列表与抽屉两处一起改（`search_request_event` 无唯一
+        约束，重复行确实会虚增，那是个独立的口径问题）。
+        """
+        row = (
+            await session.execute(
+                text(_REQ_CTE + """
+SELECT count(*) AS request_count,
+       max(r.received_at) AS last_request_at
+  FROM req r
+  CROSS JOIN LATERAL jsonb_array_elements_text(r.kb_ids) AS x(kb)
+ WHERE x.kb = :kb_id
+   AND (r.user_id IS NULL OR r.user_id <> 'anonymous')
+"""),
+                {
+                    "tenant_id": tenant_id,
+                    "kb_id": kb_id,
+                    **self._window_params(win_start, win_end),
+                },
+            )
+        ).first()
+        if row is None:
+            return 0, None
+        return int(row.request_count or 0), row.last_request_at
+
+    async def _kb_services(self, session, tenant_id: str, kb_ids: list) -> list:
+        """知识库绑定的领域服务（抽屉 C「关联领域服务」）。
+
+        **只看绑定关系、不看检索事件**：抽屉要回答的是「这个库挂在哪些服务下」，
+        与「近 7 天有谁经服务搜过它」是两件事（后者是 `service_usage`）。
+
+        服务可能已被删（`services` LEFT JOIN 未命中）→ 回落 `service_id` 当名字，
+        与 `_search_agg` 的服务归因同口径，不留空白列。
+        """
+        if not kb_ids:
+            return []
+        rows = (
+            await session.execute(
+                text("""
+SELECT DISTINCT skb.service_id AS service_id, ds.name AS service_name
+  FROM knowledge_base.service_knowledge_bases skb
+  LEFT JOIN knowledge_base.services ds
+         ON ds.id = skb.service_id
+        AND ds.tenant_id = skb.tenant_id
+        AND ds.is_deleted = 0
+ WHERE skb.tenant_id = :tenant_id
+   AND skb.is_deleted = 0
+   AND skb.kb_id = ANY(:kb_ids)
+ ORDER BY skb.service_id ASC
+"""),
+                {"tenant_id": tenant_id, "kb_ids": list(kb_ids)},
+            )
+        ).all()
+        return [
+            {"service_id": r.service_id, "service_name": r.service_name or r.service_id}
+            for r in rows
+        ]
+
+    async def _service_kbs(self, session, tenant_id: str, service_id: str,
+                           kb_ids: list) -> list:
+        """领域服务在**本次范围内**绑定的知识库 id（抽屉 D「关联知识库」）。
+
+        过滤条件与列表行 `kb_count`（`_search_agg` 的 `service_knowledge_bases` join）
+        **逐字相同** —— 少一个条件，`len(knowledge_bases)` 就和列表那一行的 `kb_count`
+        对不上，而这种错位不报错、只是数字不同。
+
+        名字由调用方用 `_kb_scope` 的 `kb_map` 富化（同一份范围，不再查一次）。
+        """
+        if not kb_ids:
+            return []
+        rows = (
+            await session.execute(
+                text("""
+SELECT DISTINCT skb.kb_id AS kb_id
+  FROM knowledge_base.service_knowledge_bases skb
+ WHERE skb.tenant_id = :tenant_id
+   AND skb.is_deleted = 0
+   AND skb.service_id = :service_id
+   AND skb.kb_id = ANY(:kb_ids)
+ ORDER BY skb.kb_id ASC
+"""),
+                {"tenant_id": tenant_id, "service_id": service_id, "kb_ids": list(kb_ids)},
+            )
+        ).all()
+        return [r.kb_id for r in rows]
+
+    async def _service_request_usage(self, session, tenant_id: str, kb_ids: list,
+                                     service_id: str, win_start: date, win_end: date):
+        """单个领域服务在窗口内的调用次数 / 最近调用时间（抽屉 D）。
+
+        ⚠️ 必须与「领域服务使用情况」表那一行**逐字对上**，所以复用 `_PAIR_CTE`
+        同款 `count(DISTINCT request_id)`（`UNION` 已去重，这里再 DISTINCT 一层是为了
+        与列表的写法保持一模一样）。把 `entry_service_id` 那一支省掉、或改成
+        `count(*)`，页面上立刻出现「列表 87 / 抽屉 79」这种对不上的数字。
+        """
+        row = (
+            await session.execute(
+                text(_PAIR_CTE + """
+SELECT count(DISTINCT p.request_id) AS request_count,
+       max(rq.received_at) AS last_used_at
+  FROM pair p
+  LEFT JOIN req rq ON rq.request_id = p.request_id
+ WHERE p.service_id = :service_id
+"""),
+                {
+                    "tenant_id": tenant_id,
+                    "kb_ids": list(kb_ids),
+                    "service_id": service_id,
+                    **self._window_params(win_start, win_end),
+                },
+            )
+        ).first()
+        if row is None:
+            return 0, None
+        return int(row.request_count or 0), row.last_used_at
+
+    async def _entity_graph_detail(self, tenant_id: str, kb_id: str, entity_type: str,
+                                   canonical_name: str):
+        """取实例本体（别名/属性/时间）+ 一跳邻居事实。
+
+        返回 `(detail | None, facts, relation_total, relation_truncated, degraded)`：
+
+        - `degraded=True` → driver 取不到或查询报错，detail 恒为 `None`，
+          **不代表实例不存在**（调用方据此不判 404）；
+        - `degraded=False, detail is None` → 图是通的，就是没有这个三元组
+          （不存在 / 已改名），调用方判 404。
+
+        与 `_neo4j_alive` / `_neo4j_stats` 同款降级：Neo4j 挂了不影响基础能力。
+        """
+        try:
+            driver = get_neo4j_driver()
+            if driver is None:
+                return None, [], 0, False, True
+            gdao = OntologyGraphRepository(driver)
+            detail = await gdao.get_entity(tenant_id, kb_id, entity_type, canonical_name)
+            if detail is None:
+                return None, [], 0, False, False
+            facts, total, truncated = await gdao.neighbors_by_entity(
+                tenant_id, kb_id, entity_type, canonical_name,
+                limit=_NEO4J_RELATION_LIMIT,
+            )
+            return detail, facts, total, truncated, False
+        except Exception:  # noqa: BLE001 — Neo4j 降级：属性/关系给空，命中次数照常（在 PG）
+            logger.warning(
+                "[jonex] 数据运营 Ontology 对象详情降级 tenant=%s kb=%s name=%s",
+                tenant_id, kb_id, canonical_name, exc_info=True,
+            )
+            return None, [], 0, False, True
 
     @staticmethod
     def _kb_distribution(kb_distribution: dict, kb_map: dict, total: int) -> list:

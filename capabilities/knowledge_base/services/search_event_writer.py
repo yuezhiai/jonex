@@ -46,7 +46,9 @@ from ..repository import SearchEventRepository
 
 logger = logging.getLogger(__name__)
 
-# ── 列宽（与 008_search_events.sql 逐列对齐，超长必须截断）──
+# ── 列宽（与 004_knowledge_base.sql 的事件表逐列对齐，超长必须截断）──
+# 契约由 tests/unit/test_search_event_schema_contract.py 守卫：任何「写入值 / 裁剪上限 >
+# 列宽」都会让 INSERT 失败并回滚整批埋点（2026-10-13 被引用资产数不更新的直接原因）。
 _TITLE_MAX = 128          # search_step_event.title VARCHAR(128)
 _SUMMARY_MAX = 2000       # summary TEXT，但单请求可含多步，仍设上限防爆
 _STAGE_MAX = 32           # stage VARCHAR(32)，现有常量最长 17
@@ -56,6 +58,12 @@ _KB_ID_MAX = 128          # kb_id VARCHAR(128)
 _TARGET_ID_MAX = 128      # target_id VARCHAR(128)
 _REQUEST_ID_MAX = 64      # request_id VARCHAR(64)
 _QUERY_HASH_MAX = 64
+# target_type 只能取 TARGET_DOCUMENT(8) / TARGET_ONTOLOGY_INSTANCE(17)，
+# 但**必须显式裁剪**：裸传时一旦出现更长的取值，整批埋点会被 PG 打回（见文件头 _TARGET_TYPE_MAX 事故说明）。
+_TARGET_TYPE_MAX = 32     # search_hit_event/search_adoption_event.target_type VARCHAR(32)
+# ⚠️ service_id / entry_service_id / domain_space_id 三列都是 VARCHAR(64)，
+# 不能复用 _KB_ID_MAX(128) —— 两者都是 128 时看不出问题，但列宽只有 64。
+_SERVICE_ID_MAX = 64      # search_step_event.service_id、search_request_event.entry_service_id / domain_space_id
 
 # detail 序列化后的单条上限（通用兜底）
 _DETAIL_MAX_BYTES = 8 * 1024
@@ -327,6 +335,106 @@ def _extract_adoptions(result: dict) -> list[dict]:
     return events
 
 
+# ── 分事务落库 ──────────────────────────────────────────────
+# 三个 `_write_*_events` 各自 `async with get_db_session()`，互不共事务：
+# 一类里的一条坏行只回滚那一类（2026-10-13 事故：命中事件超长把采用事件一起冲掉）。
+# 空列表直接返回 True（没内容可写 ≠ 写失败），避免无谓开连接。
+
+
+async def _write_step_events(
+    *,
+    tenant_id: str,
+    request_id: str,
+    kb_ids: list[str],
+    service_id: str | None,
+    events: list[dict],
+) -> bool:
+    if not events:
+        return True
+    try:
+        async with get_db_session() as session:
+            repo = SearchEventRepository(session)
+            for event in events:
+                await repo.record_step_event(
+                    tenant_id,
+                    request_id=request_id[:_REQUEST_ID_MAX],
+                    stage=event["stage"],
+                    title=event["title"],
+                    status=event["status"],
+                    summary=event["summary"],
+                    detail=event["detail"],
+                    duration_ms=event["duration_ms"],
+                    knowledge_base_ids=kb_ids,
+                    service_id=_clip(service_id, _SERVICE_ID_MAX),
+                )
+        return True
+    except Exception:  # noqa: BLE001 — 埋点失败不得影响检索
+        logger.warning(
+            "[jonex] 检索步骤埋点写入失败（不影响检索；命中/采用仍会写入）：tenant=%s request_id=%s",
+            tenant_id, request_id, exc_info=True,
+        )
+        return False
+
+
+async def _write_hit_events(*, tenant_id: str, request_id: str, events: list[dict]) -> bool:
+    if not events:
+        return True
+    try:
+        async with get_db_session() as session:
+            repo = SearchEventRepository(session)
+            for event in events:
+                await repo.record_hit_event(
+                    tenant_id,
+                    request_id=request_id[:_REQUEST_ID_MAX],
+                    # 必须裁：'ontology_instance' 已 17 字符，靠 _TARGET_TYPE_MAX 兜住未来更长的取值
+                    target_type=_clip(event["target_type"], _TARGET_TYPE_MAX),
+                    target_id=event["target_id"],
+                    entity_type=event["entity_type"],
+                    canonical_name=event["canonical_name"],
+                    kb_id=event["kb_id"],
+                )
+        return True
+    except Exception:  # noqa: BLE001 — 埋点失败不得影响检索
+        logger.warning(
+            "[jonex] 检索命中埋点写入失败（不影响检索；采用事件仍会写入）：tenant=%s request_id=%s",
+            tenant_id, request_id, exc_info=True,
+        )
+        return False
+
+
+async def _write_adoption_events(
+    *,
+    tenant_id: str,
+    request_id: str,
+    answer_id: str | None,
+    events: list[dict],
+) -> bool:
+    """采用事件：**独立事务，且优先级最高的那类**（被引用资产 KPI 唯一数据源）。"""
+    if not events:
+        return True
+    try:
+        async with get_db_session() as session:
+            repo = SearchEventRepository(session)
+            for event in events:
+                await repo.record_adoption_event(
+                    tenant_id,
+                    answer_id=(answer_id or request_id)[:_REQUEST_ID_MAX],
+                    request_id=request_id[:_REQUEST_ID_MAX],
+                    target_type=_clip(event["target_type"], _TARGET_TYPE_MAX),
+                    target_id=event["target_id"],
+                    entity_type=event["entity_type"],
+                    canonical_name=event["canonical_name"],
+                    kb_id=event["kb_id"],
+                )
+        return True
+    except Exception:  # noqa: BLE001 — 埋点失败不得影响检索
+        logger.warning(
+            "[jonex] 检索采用埋点写入失败（不影响检索；「被引用数据资产数」不会更新）：tenant=%s request_id=%s",
+            tenant_id, request_id, exc_info=True,
+        )
+        return False
+
+
 # ── 对外入口 ────────────────────────────────────────────────
 
 
@@ -363,8 +471,8 @@ async def write_request_event(
                 tenant_id,
                 user_id=user_id,
                 request_id=request_id[:_REQUEST_ID_MAX],
-                entry_service_id=_clip(entry_service_id, _KB_ID_MAX),
-                domain_space_id=_clip(domain_space_id, _KB_ID_MAX),
+                entry_service_id=_clip(entry_service_id, _SERVICE_ID_MAX),
+                domain_space_id=_clip(domain_space_id, _SERVICE_ID_MAX),
                 query=query,
                 query_hash=hash_query(query),
                 knowledge_base_ids=list(kb_ids or []),
@@ -394,6 +502,15 @@ async def write_trace_events(
     关联键（history 表没有 request_id / trace_id 列）。为 None 时跳过采用事件
     的 answer_id 关联（仍写步骤与命中）。
 
+    ⚠️ **三类事件各写各的事务，不合并**（顺序：步骤 → 命中 → 采用）。合并成一个
+    事务时，任一类里的一条坏行会连坐回滚另外两类 —— 2026-10-13 的事故正是如此：
+    本体命中事件的 `target_type='ontology_instance'` 超出当时的列宽，INSERT 报
+    `value too long`，把同一事务里的**采用事件**一起冲掉，而采用事件是「被引用数据
+    资产数」「高频引用资产 Top10」唯一的数据源 → 两个 KPI 长期不动，检索照常返回。
+    拆分后单类失败只丢那一类，并在各自日志里留 `stage=步骤/命中/采用` 便于定位。
+
+    返回：三类都写成功（或本就没内容可写）为 True；任一类失败为 False（调用方不关心，
+    只作观测）。
     调用点：7 处 `if req.save_history:` 块内、`save_history` 之后、`return` 之前。
     """
     if not request_id:
@@ -428,46 +545,27 @@ async def write_trace_events(
         )
         adoption_events = _dedup_events(_extract_adoptions(result), ("target_type", "target_id"))
 
-        async with get_db_session() as session:
-            repo = SearchEventRepository(session)
-            for event in step_events:
-                await repo.record_step_event(
-                    tenant_id,
-                    request_id=request_id[:_REQUEST_ID_MAX],
-                    stage=event["stage"],
-                    title=event["title"],
-                    status=event["status"],
-                    summary=event["summary"],
-                    detail=event["detail"],
-                    duration_ms=event["duration_ms"],
-                    knowledge_base_ids=kb_ids,
-                    service_id=_clip(service_id, _KB_ID_MAX),
-                )
-            for event in hit_events:
-                await repo.record_hit_event(
-                    tenant_id,
-                    request_id=request_id[:_REQUEST_ID_MAX],
-                    target_type=event["target_type"],
-                    target_id=event["target_id"],
-                    entity_type=event["entity_type"],
-                    canonical_name=event["canonical_name"],
-                    kb_id=event["kb_id"],
-                )
-            for event in adoption_events:
-                await repo.record_adoption_event(
-                    tenant_id,
-                    answer_id=(answer_id or request_id)[:_REQUEST_ID_MAX],
-                    request_id=request_id[:_REQUEST_ID_MAX],
-                    target_type=event["target_type"],
-                    target_id=event["target_id"],
-                    entity_type=event["entity_type"],
-                    canonical_name=event["canonical_name"],
-                    kb_id=event["kb_id"],
-                )
-        return True
+        # 三类事件各写各的事务：单类失败只丢那一类，不连坐（见本函数 docstring 的事故说明）。
+        steps_ok = await _write_step_events(
+            tenant_id=tenant_id,
+            request_id=request_id,
+            kb_ids=kb_ids,
+            service_id=service_id,
+            events=step_events,
+        )
+        hits_ok = await _write_hit_events(
+            tenant_id=tenant_id, request_id=request_id, events=hit_events
+        )
+        adoptions_ok = await _write_adoption_events(
+            tenant_id=tenant_id,
+            request_id=request_id,
+            answer_id=answer_id,
+            events=adoption_events,
+        )
+        return steps_ok and hits_ok and adoptions_ok
     except Exception:  # noqa: BLE001 — 埋点失败不得影响检索
         logger.warning(
-            "[jonex] 检索轨迹埋点写入失败（不影响检索）：tenant=%s request_id=%s",
+            "[jonex] 检索轨迹埋点抽取失败（不影响检索）：tenant=%s request_id=%s",
             tenant_id, request_id, exc_info=True,
         )
         return False

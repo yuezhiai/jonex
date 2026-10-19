@@ -132,6 +132,14 @@ from .search_history import (
     SearchHistoryResponse,
     SearchOverviewResponse,
 )
+from .image_query import (
+    ALLOWED_IMAGE_MIME,
+    ImageQueryImageIn,
+    ImageQueryImageOut,
+    ImageQueryRequest,
+    ImageQueryResponse,
+    QueryImageRef,
+)
 from .ontology_schema import NativeOntologyExtractRequest
 
 __all__ = [
@@ -247,4 +255,11 @@ __all__ = [
     "DocumentTagActionResponse",
     "UpdateOntologyInstanceRequest",
     "UpdateOntologyRelationRequest",
+    # ── 以图问知识（图片转查询）──
+    "ALLOWED_IMAGE_MIME",
+    "ImageQueryImageIn",
+    "ImageQueryImageOut",
+    "ImageQueryRequest",
+    "ImageQueryResponse",
+    "QueryImageRef",
 ]

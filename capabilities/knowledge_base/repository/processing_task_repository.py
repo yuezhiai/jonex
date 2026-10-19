@@ -18,10 +18,11 @@
 
 import logging
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.document import DocStatus, OntologyStatus
+from ..models.search_event import ProcessingTaskEvent
 from .search_event_repository import SearchEventRepository
 
 logger = logging.getLogger(__name__)
