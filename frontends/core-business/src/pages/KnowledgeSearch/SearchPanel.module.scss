@@ -1,32 +1,3 @@
-.modeSelector {
-  display: inline-flex;
-  align-items: center;
-  flex-shrink: 0;
-
-  .modeSearchButton {
-    height: 48px;
-    padding: 0 20px;
-    font-size: 15px;
-    border-radius: 10px 0 0 10px;
-    border-right: 1px solid rgba(255, 255, 255, 0.25);
-  }
-
-  .modeDropdownTrigger {
-    height: 48px;
-    width: 44px;
-    padding: 0;
-    font-size: 14px;
-    border-radius: 0 10px 10px 0;
-
-    &:global(.ant-btn-primary:disabled) {
-      color: #fff;
-      background: var(--ant-color-primary, #1677ff);
-      border-color: var(--ant-color-primary, #1677ff);
-      opacity: 0.65;
-    }
-  }
-}
-
 .modeDropdown {
   width: 280px;
   background: #fff;
@@ -40,11 +11,10 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 14px;
+  // 内边距挪进按钮本体，整行（含上下留白）都能点
+  padding: 0 6px 0 0;
   border-radius: 8px;
-  cursor: pointer;
   transition: background 0.2s ease;
-  outline: none;
 
   &:hover {
     background: #f3f6fb;
@@ -56,6 +26,21 @@
     &:hover {
       background: #e6f0ff;
     }
+  }
+}
+
+// 档位正文是 antd Button（type=text）：去掉组件自带的内边距/居中，让整行可点
+.modeOptionMain {
+  flex: 1;
+  min-width: 0;
+  height: auto !important;
+  padding: 12px 14px !important;
+  justify-content: flex-start !important;
+  text-align: left !important;
+  border-radius: 8px;
+
+  &:hover:not(:disabled) {
+    background: transparent !important;
   }
 }
 
@@ -83,9 +68,9 @@
   color: #6b7280;
   flex-shrink: 0;
 
-  &:hover {
-    color: #2563eb;
-    background: rgba(37, 99, 235, 0.08);
+  &:hover:not(:disabled) {
+    color: #2563eb !important;
+    background: rgba(37, 99, 235, 0.08) !important;
   }
 }
 
@@ -141,4 +126,65 @@
 
 .configNumber {
   width: 110px;
+}
+
+/* 底部悬浮输入区：外层只负责定位，内层负责视觉 */
+.dock {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.composer {
+  width: 100%;
+  // 上方建议卡最大 820，输入框略宽一点（860）才有主控件的分量，又不至于贴到卡片边
+  max-width: 860px;
+  background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
+  border: 1px solid #e3eaf5;
+  border-radius: 22px;
+  box-shadow:
+    0 14px 34px rgba(11, 43, 92, 0.09),
+    0 2px 6px rgba(11, 43, 92, 0.04);
+  padding: 12px 14px 8px;
+  pointer-events: auto;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+
+  &:focus-within {
+    border-color: #9dbcf5;
+    box-shadow:
+      0 16px 38px rgba(11, 43, 92, 0.12),
+      0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+}
+
+/* 输入区底部工具条：领域与档位退成文字级控件，不与输入文字抢注意力 */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  flex-wrap: wrap;
+  padding: 0 2px;
+}
+
+.toolbarSelect {
+  min-width: 128px;
+}
+
+.toolbarDivider {
+  width: 1px;
+  height: 12px;
+  margin: 0 2px;
+  background: #e2e8f0;
+}
+
+.toolbarHint {
+  margin-left: auto;
+  font-size: 12px;
+  line-height: 20px;
+  color: #aab6c8;
+  white-space: nowrap;
 }

@@ -1,0 +1,255 @@
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #eef2f7;
+  border-radius: 16px;
+  box-shadow: 0 6px 20px rgba(11, 43, 92, 0.04);
+  /* 高度由 flex 拉伸到与左侧卡片一致；内容区在卡片内部滚动 */
+  position: sticky;
+  top: 0;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.headerIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: #eef4ff;
+  color: #3b82f6;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0b2b5c;
+  white-space: nowrap;
+}
+
+.count {
+  font-size: 11px;
+  font-weight: 500;
+  color: #64748b;
+  background: #f1f5f9;
+  border-radius: 999px;
+  padding: 1px 7px;
+  line-height: 16px;
+}
+
+.clearBtn {
+  margin-left: auto;
+  color: #94a3b8 !important;
+  font-size: 12px;
+  padding: 0 4px;
+  height: 22px;
+
+  &:hover {
+    color: #3b82f6 !important;
+  }
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+
+  /* 细滚动条：默认几乎不可见，悬停才明显 */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+
+  &:hover {
+    scrollbar-color: #dbe3ef transparent;
+  }
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 999px;
+  }
+
+  &:hover::-webkit-scrollbar-thumb {
+    background: #dbe3ef;
+  }
+}
+
+.item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 10px 10px 12px;
+  border-radius: 10px;
+  transition:
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+
+  &:hover {
+    background: #f6f9fd;
+  }
+
+  &:hover .deleteBtn,
+  &.itemActive .deleteBtn {
+    opacity: 1;
+  }
+}
+
+.itemActive {
+  background: #eff6ff;
+  box-shadow: inset 0 0 0 1px #dbeafe;
+
+  &:hover {
+    background: #eaf3ff;
+  }
+}
+
+// 点击区是 antd Button（type=text）：只保留它作为整块点击面的语义，
+// 布局与外观回到原来的条目样式。
+.itemMain {
+  flex: 1;
+  min-width: 0;
+  display: flex !important;
+  align-items: flex-start !important;
+  justify-content: flex-start !important;
+  gap: 8px;
+  height: auto !important;
+  padding: 0 !important;
+  background: transparent !important;
+  text-align: left !important;
+  line-height: inherit;
+
+  &:hover:not(:disabled) {
+    background: transparent !important;
+  }
+}
+
+.thumb {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.thumbImg {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid #e6ecf4;
+  display: block;
+}
+
+.thumbPlaceholder {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  border: 1px dashed #e2e8f0;
+  background: #f8fafc;
+}
+
+.thumbBadge {
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #fff;
+}
+
+.body {
+  flex: 1;
+  min-width: 0;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.metaDot {
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: #cbd5e1;
+  flex-shrink: 0;
+}
+
+.deleteBtn {
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  color: #b6c2d4 !important;
+  font-size: 14px;
+  line-height: 1;
+  height: 20px !important;
+  padding: 0 4px !important;
+  border-radius: 6px;
+
+  &:hover {
+    color: #ef4444 !important;
+    background: #fee2e2 !important;
+  }
+}
+
+.spinner {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.emptyIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: #f4f7fb;
+  color: #b6c4d8;
+  font-size: 18px;
+}
+
+.emptyText {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #94a3b8;
+}
+
+.loadMore {
+  padding: 10px 0 4px;
+  text-align: center;
+}

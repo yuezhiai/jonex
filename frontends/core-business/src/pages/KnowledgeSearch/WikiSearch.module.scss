@@ -1,0 +1,140 @@
+.answer {
+  background: #fafcff;
+  border: 1px solid #e8edf5;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.answerHeading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #6366f1;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  :global(.anticon) { color: #6366f1; }
+  span { color: #94a3b8; font-size: 12px; font-weight: 400; margin-left: 2px; }
+}
+.answerSplit {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  align-items: start;
+  column-gap: 22px;
+  row-gap: 12px;
+  @media (max-width: 1100px) { grid-template-columns: minmax(0, 1fr); }
+}
+.answerText {
+  font-size: 15px;
+  line-height: 1.85;
+  color: #334155;
+  overflow-wrap: break-word;
+  line-break: strict;
+  > :first-child { margin-top: 0; }
+  :global(p) { margin: 0 0 16px; }
+  :global(h1), :global(h2), :global(h3) { color: #17233d; font-weight: 600; line-height: 1.5; margin: 24px 0 10px; }
+  :global(h1) { font-size: 22px; }
+  :global(h2) { font-size: 19px; }
+  :global(h3) { font-size: 17px; }
+  :global(ul), :global(ol) { padding-left: 22px; margin: 0 0 16px; }
+  :global(li) { margin: 4px 0; }
+  :global(strong) { color: #0b2b5c; }
+  :global(blockquote) { margin: 16px 0; padding: 6px 16px; border-left: 3px solid #3b82f6; color: #475569; background: #f8fafc; }
+  :global(pre) { overflow: auto; padding: 12px 16px; background: #f8fafc; border-radius: 6px; font-size: 13px; }
+}
+.answerTable {
+  overflow: auto;
+  margin: 16px 0;
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #e2e8f0; padding: 8px 12px; font-size: 13px; text-align: left; }
+  th { background: #f8fafc; font-weight: 600; }
+}
+.progress { margin-bottom: 16px; color: #475569; padding: 12px 16px;
+  background: #fbfaff; border: 1px solid #ece9fb; border-radius: 10px; }
+.progressSummary {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: #334155;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%; flex-wrap: wrap; font-size: 13px; text-align: left;
+  :global(.anticon) { font-size: 12px; }
+  strong { color: #6d28d9; font-size: 13px; font-weight: 600; }
+}
+.progressIcon { color: #8b5cf6; }
+.progressMeta { color: #a78bda; font-size: 12px; }
+.progressFeed { padding-top: 16px; }
+.progressItem { margin-bottom: 18px; .progressStep { margin-bottom: 6px; } }
+.progressContent {
+  padding-left: 25px; max-width: 86ch; font-size: 13px; line-height: 1.85;
+  color: #475569; overflow-wrap: anywhere;
+  p { margin: 3px 0; }
+  > p > span { color: #8492a6; margin-right: 8px; }
+}
+.progressPath { color: #64748b; font-size: 12px; }
+.progressPreview { margin: 8px 0; strong { color: #334155; font-size: 13px; font-weight: 500; } }
+.progressExcerpt { border-left: 2px solid #e2e8f0; padding-left: 12px; white-space: pre-wrap; }
+.previewLabel { color: #94a3b8; font-size: 11px; margin-left: 8px; }
+.progressStep {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 16px;
+  color: #8a8f98;
+  font-size: 13px;
+  line-height: 1.65;
+  > :global(.anticon) { font-size: 15px; flex-shrink: 0; }
+  small { font-size: 12px; color: #a0a6b0; }
+  .stepStatus { font-size: 11px; margin-left: 2px; }
+}
+.sources { background: #f8fafc; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 18px 0; }
+.sourcesSummary {
+  border: 0; background: transparent; padding: 0; cursor: pointer;
+  display: flex; align-items: center; gap: 7px;
+  color: #3b82f6; font-size: 13px; font-weight: 600;
+}
+.sourceList { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+.sourceCard { background: #fff; border: 1px solid #e2e8f0; border-radius: 9px; padding: 12px 14px; min-width: 0; }
+.sourceHeader {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  strong { font-size: 13px; color: #0b2b5c; max-width: 100%; overflow-wrap: anywhere; }
+}
+.fileFormat { color: #64748b; background: #f1f5f9; border-radius: 4px; padding: 2px 7px; font-size: 11px; }
+.sourceKb { color: #8492a6; font-size: 12px; }
+.openSource { margin-left: auto; flex-shrink: 0; color: #3b82f6; background: none; border: 0; padding: 2px 0; font-size: 12px; cursor: pointer; }
+.sourceCitations {
+  display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0;
+  button { border: 1px solid #e2e8f0; color: #64748b; border-radius: 5px; padding: 3px 8px; background: #fff; font-size: 11px; cursor: pointer; }
+  button.selectedCitation { border-color: #bfd8ff; color: #2563eb; background: #eff6ff; }
+}
+.sourceExcerpt { background: #fafcff; border-radius: 6px; padding: 12px 14px; max-height: 240px; overflow: auto; font-size: 13px; line-height: 1.8; }
+.plainExcerpt { white-space: pre-wrap; overflow-wrap: anywhere; color: #475569; }
+.evidenceHeader { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 20px; strong { overflow-wrap: anywhere; } span { color: #64748b; } }
+.sourceText { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; font-size: 14px; mark { background: #fff0b3; color: inherit; padding: 2px 0; } }
+.note { color: #64748b; font-size: 12px; }
+.tableViewport { overflow: auto; max-height: 55vh; margin: 16px 0; }
+.sourceTable { border-collapse: collapse; font-size: 13px; th, td { border: 1px solid #e2e8f0; padding: 7px 10px; min-width: 68px; white-space: pre-wrap; } th { background: #f8fafc; } }
+.hitCell { background: #fff0b3; outline: 2px solid #e5ac27; outline-offset: -2px; }
+.progressSummary:focus-visible, .sourcesSummary:focus-visible, .openSource:focus-visible, .sourceCitations button:focus-visible { outline: 2px solid #3b82f6; outline-offset: 3px; }
+@media (max-width: 600px) {
+  .answer { padding: 16px; }
+  .answerHeading { flex-wrap: wrap; span { width: 100%; margin-left: 22px; } }
+  .sources { padding: 12px; }
+  .sourceKb { width: 100%; order: 3; }
+}
+
+.cellSnippet {
+  display: flex; flex-direction: column; gap: 8px;
+  > span { color: #8492a6; font-size: 12px; }
+  > strong { color: #0b2b5c; font-size: 16px; }
+  details { color: #64748b; font-size: 12px; }
+  summary { cursor: pointer; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; margin-bottom: 0; }
+}
+
+.sourcePassage { margin-top: 18px; font-size: 14px; line-height: 1.9; overflow-wrap: anywhere; }
+.highlightedPassage { background: #fffbeb; border-left: 3px solid #e5ac27; border-radius: 0 6px 6px 0; padding: 16px 18px; margin: 12px 0; overflow: auto; }
+.passageContext { color: #64748b; padding: 12px 18px; }
+.sourceText { margin-top: 18px; }

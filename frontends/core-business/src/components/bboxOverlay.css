@@ -1,0 +1,14 @@
+/* bbox 覆盖层脉冲：主 span 红框呼吸 3 次 ≈ 3s */
+@keyframes jonex-bbox-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.jonex-bbox-pulse {
+  animation: jonex-bbox-pulse 1s ease-in-out 3;
+}

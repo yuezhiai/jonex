@@ -1,8 +1,17 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Empty, Typography } from 'antd';
-import { CaretRightFilled } from '@ant-design/icons';
+import { Button, Descriptions, Empty, Image, Typography, message } from 'antd';
+import {
+  AlignLeftOutlined,
+  CaretRightFilled,
+  DownloadOutlined,
+  EnvironmentOutlined,
+  FileTextOutlined,
+} from '@ant-design/icons';
+import { getShellContext, isPlatformAdmin } from '@jonex/shell-sdk';
+import { getDocumentViewTicket } from '@/api/domainKnowledge';
 import MarkdownContent from '@/components/MarkdownContent';
+import { clickDownloadLink } from '@/utils/batchDocumentDownload';
 import type { KnowledgeReference, KnowledgeReferenceLocation } from '@/types/knowledgeSearch';
 import {
   describeLocation,
@@ -12,6 +21,7 @@ import {
   snippetLocation,
 } from './citationIndex';
 import styles from './Citation.module.scss';
+import WikiReferenceSnippet from './WikiReferenceSnippet';
 
 /**
  * [jonex] 引用详情面板 —— 点击答案内联引用角标后，在答案区右栏展开。
@@ -31,33 +41,8 @@ interface CitationDetailPanelProps {
   onNext: () => void;
   onClose: () => void;
   onOpenReference: (ref: KnowledgeReference, loc?: KnowledgeReferenceLocation) => void;
-}
-
-/** 媒体类引用（视频 / 图片）的文本详情：与「来源 / 位置」同一套行式布局，默认一行、可展开收起 */
-function DetailRow({ text }: { text: string }) {
-  const { t } = useTranslation();
-  if (!text) return null;
-  return (
-    <div className={styles.metaRow}>
-      <dt>{t('knowledgeSearch.citationDetailLabel')}</dt>
-      <dd>
-        <Typography.Paragraph
-          className={styles.detailText}
-          ellipsis={{
-            rows: 1,
-            // 必须传 'collapsible' 而不是 true：传 true 时 antd 一展开就停掉测量
-            // （Base/index.js:132 → enableMeasure=false → canEllipsis=false），
-            // 整个操作区被摘掉，只剩「展开」没有「收起」
-            expandable: 'collapsible',
-            // antd 6 的 zh_CN 包里没有 Typography 段，默认展开符号取到的文案是空的，必须自带
-            symbol: (expanded: boolean) => (expanded ? t('common.collapse') : t('common.expand')),
-          }}
-        >
-          {text}
-        </Typography.Paragraph>
-      </dd>
-    </div>
-  );
+  /** 抽屉形态：去掉内联分栏用的左边框/内边距，改成占满抽屉的上下结构 */
+  inDrawer?: boolean;
 }
 
 /** 扩展名 chip：`manual.PDF` → `PDF`；无扩展名时回落到 media_type 大写 */
@@ -75,10 +60,15 @@ export default function CitationDetailPanel({
   onNext,
   onClose,
   onOpenReference,
+  inDrawer = false,
 }: CitationDetailPanelProps) {
   const { t } = useTranslation();
-  const [imageState, setImageState] = React.useState<'loading' | 'ok' | 'error'>('loading');
+  const [imageState, setImageState] = React.useState<'ready' | 'error'>('ready');
   const [posterFailed, setPosterFailed] = React.useState(false);
+  const [downloading, setDownloading] = React.useState(false);
+  // 灯箱受控：面板内容区的图点击可看，操作区的「图片预览」也要落到同一个灯箱，
+  // 而不是另开文档弹窗——两处看到的必须是同一份画面（含放大/旋转那套工具条）。
+  const [previewOpen, setPreviewOpen] = React.useState(false);
 
   const loc = preferredLocation(reference);
   const isVideo = reference.media_type === 'video';
@@ -112,9 +102,9 @@ export default function CitationDetailPanel({
   const locationText = describeLocation(loc, t);
   const kbLabel = reference.kb_name || reference.kb_id;
   const positionText = locationText;
-  // 图片预览地址变化时重置加载态（面板内切换到下一条引用时复用同一实例）
+  // 图片地址变化时清掉上一条的加载失败态（面板内切换到下一条引用时复用同一实例）
   React.useEffect(() => {
-    setImageState('loading');
+    setImageState('ready');
   }, [imageUrl]);
 
   // 视频画面：后端不产封面图，前端直接吃 raw_url 的预签名直连，自己解一帧出来。
@@ -137,8 +127,44 @@ export default function CitationDetailPanel({
           ? t('knowledgeSearch.previewImage')
           : t('knowledgeSearch.locateOriginal');
 
+  // 图片下载与「下载原始文件」同口径：仅平台管理员可见（/raw 的 download 网关侧不校验，
+  // 门禁只在前端，见 DocumentViewer 的同类注释）。
+  const canDownloadImage = isPlatformAdmin(getShellContext()?.user ?? null);
+  // 画面确实出得来（有地址且没加载失败）才给预览与下载两个入口：
+  // 图挂了还留着灯箱入口，点开只有一张坏图，等于什么都没开
+  const imageReady = isImage && !!imageUrl && imageState !== 'error';
+
+  /**
+   * 下载引用里这张图。画面的两个来源对应两种下法：
+   * - 文档内嵌图资产：直接用图片自己的地址——原图对象的 Content-Type 决定浏览器是
+   *   下载还是内联打开（内嵌图资产常被存成 octet-stream），这就是「下载图片」原本的
+   *   形态，不需要后端再出一个 download 参数；
+   * - 「文档本身就是图片」（画面取自 raw_url）：raw_url 是 inline 预签名，导航过去只会
+   *   把图摊在标签页里，改走现成的 `/raw?download=1`（后端签 attachment + 原始文件名）。
+   */
+  const handleDownloadImage = async () => {
+    if (!imageUrl) return;
+    if (activeImage?.asset_url) {
+      clickDownloadLink(activeImage.asset_url);
+      return;
+    }
+    if (!reference.doc_id || downloading) return;
+    setDownloading(true);
+    try {
+      const { url } = await getDocumentViewTicket(reference.doc_id);
+      clickDownloadLink(`${url}${url.includes('?') ? '&' : '?'}download=1`);
+    } catch (err: any) {
+      message.error(err?.message || t('knowledgeSearch.imageDownloadFailed'));
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   return (
-    <aside className={styles.panel} aria-label={t('knowledgeSearch.citationDetail')}>
+    <aside
+      className={inDrawer ? `${styles.panel} ${styles.panelInDrawer}` : styles.panel}
+      aria-label={t('knowledgeSearch.citationDetail')}
+    >
       <header className={styles.panelHeader}>
         <div className={styles.panelTitle}>
           <h3>{t('knowledgeSearch.citationDetail')}</h3>
@@ -147,24 +173,26 @@ export default function CitationDetailPanel({
           </span>
         </div>
         <nav className={styles.panelNav}>
-          <button type="button" title={t('knowledgeSearch.citationPrev')} onClick={onPrev} disabled={total <= 1}>
+          <Button type="text" size="small" title={t('knowledgeSearch.citationPrev')} onClick={onPrev} disabled={total <= 1}>
             ‹
-          </button>
-          <button type="button" title={t('knowledgeSearch.citationNext')} onClick={onNext} disabled={total <= 1}>
+          </Button>
+          <Button type="text" size="small" title={t('knowledgeSearch.citationNext')} onClick={onNext} disabled={total <= 1}>
             ›
-          </button>
-          <button type="button" title={t('knowledgeSearch.citationClose')} onClick={onClose}>
+          </Button>
+          <Button type="text" size="small" title={t('knowledgeSearch.citationClose')} onClick={onClose}>
             ×
-          </button>
+          </Button>
         </nav>
       </header>
 
       <div className={styles.panelBody}>
         {/* 命中内容区 */}
         {isVideo ? (
-          <button
-            type="button"
+          <Button
+            type="text"
             className={styles.videoPlaceholder}
+            // 画面与播放键都在按钮内部，antd 默认的内边距/高度会把 16:9 撑变形
+            style={{ padding: 0, height: 'auto', border: '1px solid #e8edf5', background: '#000' }}
             aria-label={t('knowledgeSearch.locatePlay')}
             onClick={() => onOpenReference(reference, loc)}
           >
@@ -184,35 +212,36 @@ export default function CitationDetailPanel({
             <span className={styles.playGlyph} aria-hidden="true">
               <CaretRightFilled />
             </span>
-          </button>
+          </Button>
         ) : imageUrl ? (
-          <>
-            <button
-              type="button"
-              className={styles.imagePreview}
-              onClick={() => window.open(imageUrl, '_blank', 'noopener')}
-            >
-              {imageState !== 'error' && (
-                <img
-                  src={imageUrl}
-                  alt={imageDescription || reference.file_name}
-                  onLoad={() => setImageState('ok')}
-                  onError={() => setImageState('error')}
-                />
-              )}
-            </button>
-            {imageState === 'error' && (
-              <div className={styles.imageFallback}>{t('knowledgeSearch.imageLoadFailed')}</div>
-            )}
-          </>
-        ) : snippet ? (
-          isMarkdownSnippet(reference.file_name, snippet) ? (
-            <div className={styles.snippetRich}>
-              <MarkdownContent content={snippet} />
-            </div>
+          imageState === 'error' ? (
+            <div className={styles.imageFallback}>{t('knowledgeSearch.imageLoadFailed')}</div>
           ) : (
-            <div className={styles.snippetText}>{snippet}</div>
+            /* [jonex] 预览走 antd 灯箱（内部就是 <img>），不走 window.open：
+               asset_url 是对象存储直链，浏览器可能按 Content-Type 判成下载 */
+            <Image
+              rootClassName={styles.imagePreview}
+              src={imageUrl}
+              alt={imageDescription || reference.file_name}
+              onError={() => setImageState('error')}
+              preview={{ open: previewOpen, onOpenChange: setPreviewOpen }}
+            />
           )
+        ) : snippet ? (
+          <div>
+            <div className={styles.sectionLabel}>{t('knowledgeSearch.citationFragment')}</div>
+            {reference.query_id ? (
+              <div className={styles.snippetRich}>
+                <WikiReferenceSnippet reference={reference} />
+              </div>
+            ) : isMarkdownSnippet(reference.file_name, snippet) ? (
+              <div className={styles.snippetRich}>
+                <MarkdownContent content={snippet} />
+              </div>
+            ) : (
+              <div className={styles.snippetText}>{snippet}</div>
+            )}
+          </div>
         ) : tsLoc ? (
           <div className={styles.timeCard}>
             <strong>
@@ -226,32 +255,114 @@ export default function CitationDetailPanel({
         )}
 
         {/* 元信息 */}
-        <dl className={styles.meta}>
-          <div className={styles.metaRow}>
-            <dt>{t('knowledgeSearch.citationSourceLabel')}</dt>
-            <dd>
-              <span className={styles.formatChip}>{formatChip(reference.file_name)}</span>
-              <span className={styles.fileName} title={reference.file_name}>
-                {reference.file_name || '—'}
-              </span>
-              {kbLabel && <span className={styles.kbChip}>{kbLabel}</span>}
-            </dd>
-          </div>
-          {positionText && (
-            <div className={styles.metaRow}>
-              <dt>{t('knowledgeSearch.citationPosition')}</dt>
-              <dd>{positionText}</dd>
-            </div>
-          )}
-          {mediaDetail ? <DetailRow text={mediaDetail} /> : null}
-        </dl>
+        <div className={styles.metaBlock}>
+          <div className={styles.sectionLabel}>{t('knowledgeSearch.citationInfo')}</div>
+          <Descriptions
+            className={styles.meta}
+            column={1}
+            layout="vertical"
+            colon={false}
+            size="small"
+            styles={{
+              label: { color: '#8a97a8', fontSize: 12 },
+              content: {
+                display: 'flex',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                gap: 8,
+                color: '#1e293b',
+                fontSize: 13,
+                lineHeight: '20px',
+              },
+            }}
+            items={[
+              {
+                key: 'source',
+                label: (
+                  <>
+                    <FileTextOutlined className={styles.metaIcon} />
+                    {t('knowledgeSearch.citationSourceLabel')}
+                  </>
+                ),
+                children: (
+                  <>
+                    <span className={styles.formatChip}>{formatChip(reference.file_name)}</span>
+                    <span className={styles.fileName} title={reference.file_name}>
+                      {reference.file_name || '—'}
+                    </span>
+                    {kbLabel && <span className={styles.kbChip}>{kbLabel}</span>}
+                  </>
+                ),
+              },
+              ...(positionText
+                ? [
+                    {
+                      key: 'position',
+                      label: (
+                        <>
+                          <EnvironmentOutlined className={styles.metaIcon} />
+                          {t('knowledgeSearch.citationPosition')}
+                        </>
+                      ),
+                      children: (
+                        <span data-testid="citation-position" className={styles.locationValue}>
+                          {positionText}
+                        </span>
+                      ),
+                    },
+                  ]
+                : []),
+              ...(mediaDetail
+                ? [
+                    {
+                      key: 'detail',
+                      label: (
+                        <>
+                          <AlignLeftOutlined className={styles.metaIcon} />
+                          {t('knowledgeSearch.citationDetailLabel')}
+                        </>
+                      ),
+                      children: (
+                        <Typography.Paragraph
+                          data-testid="citation-detail"
+                          className={styles.detailText}
+                          ellipsis={{
+                            rows: 1,
+                            // 必须传 'collapsible' 而不是 true：传 true 时 antd 一展开就停掉测量
+                            // （Base/index.js:132 → enableMeasure=false → canEllipsis=false），
+                            // 整个操作区被摘掉，只剩「展开」没有「收起」
+                            expandable: 'collapsible',
+                            // antd 6 的 zh_CN 包里没有 Typography 段，默认展开符号取到的文案是空的，必须自带
+                            symbol: (expanded: boolean) => (expanded ? t('common.collapse') : t('common.expand')),
+                          }}
+                        >
+                          {mediaDetail}
+                        </Typography.Paragraph>
+                      ),
+                    },
+                  ]
+                : []),
+            ]}
+          />
+        </div>
 
         {/* 操作区：视频的播放入口在内容区，这里不再重复给按钮 */}
         {!isVideo && (
           <div className={styles.actions}>
-            <Button type="primary" onClick={() => onOpenReference(reference, loc)}>
+            <Button
+              type="primary"
+              // 图片的主按钮就是内容区那张图的灯箱入口（不再另开文档弹窗）；
+              // 其余类型（含图挂了的）仍落到统一的「定位原文 / 播放」弹层
+              onClick={() => (imageReady ? setPreviewOpen(true) : onOpenReference(reference, loc))}
+            >
               {primaryLabel}
             </Button>
+            {/* 画面出得来才给下载入口：没图可下时不留一枚空按钮 */}
+            {imageReady && canDownloadImage && (
+              <Button icon={<DownloadOutlined />} loading={downloading} onClick={handleDownloadImage}>
+                {t('knowledgeSearch.downloadImage')}
+              </Button>
+            )}
           </div>
         )}
       </div>

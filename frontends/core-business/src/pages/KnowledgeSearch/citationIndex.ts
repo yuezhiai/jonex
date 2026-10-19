@@ -3,81 +3,42 @@ import type { KnowledgeReference, KnowledgeReferenceLocation } from '@/types/kno
 /** i18n 翻译函数的最小签名（只取本模块用到的形态） */
 type Translator = (key: string, opts?: Record<string, unknown>) => string;
 
-/**
- * hast 节点最小结构 —— 项目未安装 `@types/hast`，只声明本模块用到的字段，
- * 避免为插件测试引入新依赖。
- */
-export interface HastNode {
-  type: string;
-  value?: string;
-  tagName?: string;
-  properties?: Record<string, unknown>;
-  children?: HastNode[];
-}
-
-/** 引用角标 class，`components.sup` 据此区分「引用角标」与普通上标 */
+/** 引用角标 class，渲染层据此区分「引用角标」与普通上标 */
 export const CITE_BADGE_CLASS = 'jonex-cite-badge';
 
 /**
- * [jonex] rehype 插件：react-markdown v10 的 `components` 只映射 hast element（如 p/strong），
- * 纯文本节点不会经过 `components`，所以无法用 `components.text` 拦截引用编号。
- * 这里在 hast 树阶段把正文里的 `[n]`（单个引用）或 `[n-m]`（连续引用范围）拆成
- * `<sup class="jonex-cite-badge" data-cite-index="n">` 元素，交给 `components.sup`
- * 渲染成可点击角标；范围 `[n-m]` 拆成 n、横杠、m 三个节点，使起止编号各自独立成圆标。
+ * [jonex] 把正文里的 `[n]`（单个引用）或 `[n-m]`（连续引用范围）注入为引用角标标签，
+ * 交给 XMarkdown 的 `components.sup` 渲染成可点击圆标；范围 `[n-m]` 注入 n、横杠、m
+ * 三个节点，使起止编号各自独立成圆标。
  *
- * 放在本模块（而非 SessionCard）是为了让角标切分逻辑脱离 React 依赖、可被单测直接覆盖。
+ * 作用在 **markdown 源码字符串**上而非 hast 树：`@ant-design/x-markdown` 基于 marked，
+ * 不提供 rehype 插件入口（2026-10-16 接入 Ant Design X）。本函数取代了原先的
+ * `rehypeCitationBadge`，正则与产出结构保持同口径。
+ *
+ * 代码区段（``` 围栏 / ` 行内）内的编号**不注入**：markdown 渲染器不会把代码里的 HTML
+ * 当标签解析，注入进去只会变成可见的尖括号源码。围栏允许**未闭合到结尾** —— 流式输出
+ * 期间围栏是逐步到达的，闭合前若按普通文本处理，代码块里会先冒出角标再变回去。
+ *
+ * 放在本模块（而非组件）是为了让角标切分逻辑脱离 React 依赖、可被单测直接覆盖。
  */
-export function rehypeCitationBadge() {
-  return (tree: HastNode) => {
-    const walk = (node: HastNode) => {
-      if (!node || !Array.isArray(node.children)) return;
-      const next: HastNode[] = [];
-      for (const child of node.children) {
-        if (child && child.type === 'text') {
-          const value = String(child.value ?? '');
-          const parts = value.split(/(\[\d+(?:-\d+)?\])/g);
-          if (parts.length <= 1) {
-            next.push(child);
-            continue;
-          }
-          for (const part of parts) {
-            if (part === '') continue;
-            const m = /^\[(\d+)(?:-(\d+))?\]$/.exec(part);
-            if (m) {
-              // 编号随节点下传（`data-cite-index`），供 `components.sup` 渲染可点击角标；
-              // hast 的 data-* 属性按原样键名存放，不做驼峰转换
-              const badge = (num: string): HastNode => ({
-                type: 'element',
-                tagName: 'sup',
-                properties: { className: [CITE_BADGE_CLASS], 'data-cite-index': num },
-                children: [{ type: 'text', value: num }],
-              });
-              if (m[2]) {
-                // 范围 [n-m]：n、横杠、m 三个节点，起止编号各自独立成圆标
-                next.push(badge(m[1]));
-                next.push({
-                  type: 'element',
-                  tagName: 'sup',
-                  properties: {},
-                  children: [{ type: 'text', value: '-' }],
-                });
-                next.push(badge(m[2]));
-              } else {
-                next.push(badge(m[1]));
-              }
-            } else {
-              next.push({ type: 'text', value: part });
-            }
-          }
-        } else {
-          walk(child);
-          next.push(child);
-        }
-      }
-      node.children = next;
-    };
-    walk(tree);
-  };
+export function injectCitationBadges(md: string): string {
+  if (!md) return '';
+  // 在函数内建正则：带 `g` 的模块级正则若被 `test()`/`exec()` 复用它处会残留 lastIndex
+  // （同文件 `MARKDOWN_BLOCK_PATTERNS` 的注释），而 split/replace 虽会重置，仍不值得留这个坑。
+  const codeSegment = /((?:```|~~~)[\s\S]*?(?:```|~~~|$)|`[^`\n]*`)/g;
+  const citePattern = /\[(\d+)(?:-(\d+))?\]/g;
+  const badge = (num: string) => `<sup class="${CITE_BADGE_CLASS}" data-cite-index="${num}">${num}</sup>`;
+
+  // split 带捕获组时，捕获到的代码区段落在奇数下标，偶数下标是需要处理的正文
+  return md
+    .split(codeSegment)
+    .map((segment, index) => {
+      if (index % 2 === 1) return segment;
+      return segment.replace(citePattern, (_whole, start: string, end?: string) =>
+        end ? `${badge(start)}<sup>-</sup>${badge(end)}` : badge(start),
+      );
+    })
+    .join('');
 }
 
 /** 秒 → mm:ss（与 SessionCard 卡片内时间锚点展示同口径） */
@@ -107,9 +68,29 @@ export function parseCiteIndex(raw: unknown): number | null {
   return Number.isInteger(n) && n >= 1 ? n : null;
 }
 
+/** location 是否带「可定位锚点」——`document` 级等无锚点的位置定位不了原文。 */
+function hasLocator(loc: KnowledgeReferenceLocation): boolean {
+  return (
+    loc.page_no != null ||
+    loc.time_start != null ||
+    loc.time_end != null ||
+    loc.image_idx != null ||
+    loc.chunk_index != null
+  );
+}
+
 /**
- * 取引用的「首选定位」——与「关联原文」卡片「查看原文」按钮同口径：
- * 纯图片文档优先可直开的图片 location，其余按 时间锚点 → 页码 → 首个 location 依次回落。
+ * 取引用的「首选定位」——与「关联原文」卡片「查看原文」按钮同口径。
+ *
+ * 一条引用（尤其是本体路径按文档聚合的那类）可能带多个 location，**首个带正文的
+ * location 才是详情面板展示、答案实际引用的那一段**，定位必须跟着它走：
+ * 若改按「首个 page location」回落，图表/表格/后页引用会被拽到文档首页附近的
+ * 无关正文（实测 2026-10-19「美国时薪同比分析」：引的是第 3 页图表，却跳到第 2 页
+ * 的正文）。因此顺序是：
+ *
+ * 1. 纯图片文档：优先可直开的图片 location；
+ * 2. 首个带正文且可定位的 location（= 展示正文所在处）；
+ * 3. 时间锚点 → 页码 → 首个 location（无正文/无锚点的旧数据回落）。
  *
  * 抽成纯函数是为了让内联角标、引用详情面板、卡片按钮三处共用同一套规则，
  * 避免口径漂移（此前该三元表达式内联在卡片 onClick 里）。
@@ -121,6 +102,8 @@ export function preferredLocation(ref: KnowledgeReference): KnowledgeReferenceLo
     const imageLoc = locs.find((l) => l.type === 'image' && l.asset_url && l.image_idx != null);
     return imageLoc || locs[0];
   }
+  const snippet = snippetLocation(ref);
+  if (snippet && hasLocator(snippet)) return snippet;
   return (
     locs.find((l) => l.type === 'timestamp' && l.time_start != null) ||
     locs.find((l) => l.type === 'page' && l.page_no != null) ||

@@ -53,7 +53,7 @@ export default function RagRecallDrawer({ open, loading, item, rank, score, onCl
   return (
     <Drawer
       title={t('knowledgeSearch.ragRecallDetail')}
-      size="large"
+      width={720}
       open={open}
       onClose={onClose}
       destroyOnHidden

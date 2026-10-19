@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, Button, Popconfirm, Radio, Input, Spin, message } from 'antd';
+import { Card, Button, Popconfirm, Radio, Input, Spin, message, Image, Typography } from 'antd';
 import {
   SearchOutlined,
   StopOutlined,
@@ -8,7 +8,6 @@ import {
   CloseCircleOutlined,
   CaretDownOutlined,
   CaretRightOutlined,
-  NodeIndexOutlined,
   BulbOutlined,
   FileTextOutlined,
   PictureOutlined,
@@ -18,31 +17,32 @@ import {
   DislikeFilled,
   LoadingOutlined,
 } from '@ant-design/icons';
-import ReactMarkdown from 'react-markdown';
 import MarkdownContent from '@/components/MarkdownContent';
 import type {
   KnowledgeReference,
   KnowledgeReferenceLocation,
-  ReasoningStep,
   SearchFeedbackType,
   FeedbackReason,
 } from '@/types/knowledgeSearch';
 import type { OntologyInstanceRow } from '@/types/domainKnowledge';
 import type { SearchSession } from './index';
 import { getChunkDetail } from '@/api/domainKnowledge';
+import { getQueryImageViewTicket } from '@/api/knowledgeSearch';
 import OntologyEntityDrawer from './OntologyEntityDrawer';
 import RagRecallDrawer, { type RagRecallItem } from './RagRecallDrawer';
-import CitationDetailPanel from './CitationDetailPanel';
+import CitationDrawer from './CitationDrawer';
+import AnswerMarkdown from './AnswerMarkdown';
 import {
-  CITE_BADGE_CLASS,
   formatTimestamp,
   isMarkdownSnippet,
-  parseCiteIndex,
   preferredLocation,
-  rehypeCitationBadge,
   snippetLocation,
 } from './citationIndex';
 import styles from './Citation.module.scss';
+import wikiStyles from './WikiSearch.module.scss';
+import { WikiProgress, WikiSources } from './WikiSearchDetails';
+import WikiAnswerContent from './WikiAnswerContent';
+import ThoughtSteps from './ThoughtSteps';
 // ── Helper: 媒体类型标签 ──
 function getMediaLabel(type: string, t: (key: string) => string): string {
   const map: Record<string, string> = {
@@ -95,14 +95,12 @@ function ImageAssetThumb({
   asset,
   compact = false,
   t,
-  onOpen,
 }: {
   asset: ImageAsset;
   compact?: boolean;
   t: (key: string, opts?: any) => string;
-  onOpen?: (asset: ImageAsset) => void;
 }) {
-  const [state, setState] = React.useState<'loading' | 'ok' | 'error'>('loading');
+  const [failed, setFailed] = React.useState(false);
   const size = compact ? 72 : 96;
   return (
     <div
@@ -113,7 +111,6 @@ function ImageAssetThumb({
         borderRadius: 8,
         overflow: 'hidden',
         background: '#fff',
-        cursor: state === 'ok' ? 'pointer' : 'default',
       }}
       title={asset.description || undefined}
     >
@@ -126,31 +123,25 @@ function ImageAssetThumb({
           justifyContent: 'center',
           position: 'relative',
         }}
-        onClick={state === 'ok' ? () => onOpen?.(asset) : undefined}
       >
-        {state === 'loading' && <Spin size="small" />}
-        {state !== 'error' && (
-          <img
-            src={asset.assetUrl}
-            alt={asset.description || `img_${asset.imageIdx}`}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-              position: 'absolute',
-              inset: 0,
-              opacity: state === 'ok' ? 1 : 0,
-            }}
-            onLoad={() => setState('ok')}
-            onError={() => setState('error')}
-          />
-        )}
-        {state === 'error' && (
+        {/* [jonex] 预览走 antd 灯箱（内部就是 <img>），不走 window.open：
+            asset_url 是对象存储直链，浏览器可能按 Content-Type 判成下载 */}
+        {failed ? (
           <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', padding: '0 6px', lineHeight: 1.5 }}>
             {t('knowledgeSearch.imageLoadFailed')}
           </div>
+        ) : (
+          <Image
+            src={asset.assetUrl}
+            alt={asset.description || `img_${asset.imageIdx}`}
+            width={size}
+            height={size}
+            style={{ objectFit: 'cover' }}
+            placeholder={<Spin size="small" />}
+            onError={() => setFailed(true)}
+          />
         )}
-        {state === 'ok' && asset.pageNo != null && (
+        {!failed && asset.pageNo != null && (
           <span
             style={{
               position: 'absolute',
@@ -162,6 +153,8 @@ function ImageAssetThumb({
               borderRadius: 3,
               padding: '0 4px',
               lineHeight: 1.6,
+              // 角标压在图上，别把点击从灯箱触发器手里截走
+              pointerEvents: 'none',
             }}
           >
             {/* [jonex] 图片引用准确性修复：page_no 全链路 0-based（MinerU page_idx
@@ -172,22 +165,6 @@ function ImageAssetThumb({
       </div>
     </div>
   );
-}
-
-// ── Helper: 推理链状态元 ──
-function reasoningStatusMeta(status: string, t: (key: string) => string): { color: string; bg: string; label: string } {
-  switch (status) {
-    case 'done':
-      return { color: '#10b981', bg: '#ecfdf5', label: t('status.done') };
-    case 'skipped':
-      return { color: '#94a3b8', bg: '#f1f5f9', label: t('status.skipped') };
-    case 'failed':
-      return { color: '#ef4444', bg: '#fef2f2', label: t('status.failed') };
-    case 'running':
-      return { color: '#3b82f6', bg: '#eff6ff', label: t('status.running') };
-    default:
-      return { color: '#64748b', bg: '#f1f5f9', label: status };
-  }
 }
 
 // ── Helper: 数值安全格式化 ──
@@ -476,7 +453,7 @@ function StepDetail({
           <div key={idx} style={{ display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 12 }}>
             <ReasoningChip tone="primary">{c.tool}</ReasoningChip>
             {canOpen ? (
-              <a
+              <Typography.Link
                 onClick={(e) => {
                   e.preventDefault();
                   onOpenReference!(ref);
@@ -489,7 +466,7 @@ function StepDetail({
                 }}
               >
                 {wikiPath}
-              </a>
+              </Typography.Link>
             ) : (
               <span style={{ color: '#4c1d95', wordBreak: 'break-all' as const }}>
                 {c.args?.path || c.args?.doc_name || c.args?.image_path || '—'}
@@ -630,7 +607,7 @@ function StepDetail({
                           <span key={p + pi}>
                             {pi > 0 ? '、' : ''}
                             {ref && onOpenReference ? (
-                              <a
+                              <Typography.Link
                                 onClick={(e) => {
                                   e.preventDefault();
                                   onOpenReference(ref);
@@ -639,7 +616,7 @@ function StepDetail({
                                 title={p}
                               >
                                 {p}
-                              </a>
+                              </Typography.Link>
                             ) : (
                               <span title={p}>{p}</span>
                             )}
@@ -726,8 +703,7 @@ function FeedbackButtons({
       <span style={{ color: '#94a3b8' }}>{t('knowledgeSearch.helpfulQuestion')}</span>
 
       {/* 有帮助 */}
-      <button
-        type="button"
+      <Button
         disabled={!!loading}
         onClick={() => onVote('like')}
         style={{
@@ -735,6 +711,7 @@ function FeedbackButtons({
           alignItems: 'center',
           gap: 5,
           border: 'none',
+          height: 'auto',
           fontSize: 13,
           borderRadius: 16,
           padding: '3px 14px',
@@ -768,7 +745,7 @@ function FeedbackButtons({
           <LikeOutlined style={{ fontSize: 14 }} />
         )}
         {isLikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.helpful')}
-      </button>
+      </Button>
 
       {/* 无帮助：点踩原因 + 备注走 Popconfirm（按钮下方弹出） */}
       <Popconfirm
@@ -810,14 +787,14 @@ function FeedbackButtons({
         okButtonProps={{ loading: isDislikeLoading }}
         onConfirm={onDislikeConfirm}
       >
-        <button
-          type="button"
+        <Button
           disabled={!!loading}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
             gap: 5,
             border: 'none',
+            height: 'auto',
             fontSize: 13,
             borderRadius: 16,
             padding: '3px 14px',
@@ -851,7 +828,7 @@ function FeedbackButtons({
             <DislikeOutlined style={{ fontSize: 14 }} />
           )}
           {isDislikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.unhelpful')}
-        </button>
+        </Button>
       </Popconfirm>
     </div>
   );
@@ -966,8 +943,15 @@ interface SessionCardProps {
   onToggleReasoning: (sessionId: string) => void;
   onToggleRefs: (sessionId: string) => void;
   onStop: () => void;
-  onReSearch: (query: string, domainId: string) => void;
+  /** [jonex] 以图问知识：把**整个会话**交回去 —— 重新检索要沿用它的图片、原话等，
+   *  只传 query+domainId 会丢掉附图，且新历史不带图。 */
+  onReSearch: (session: SearchSession) => void;
   onClear: () => void;
+  // ── [jonex] 以图问知识：识别失败后的两个出口（**不自动降级**，用户自己选）──
+  /** 仅用文字检索（保留会话里保存的原话） */
+  onTextOnlyRetry?: () => void;
+  /** 用同一组图重试（已识别成功的张会命中缓存） */
+  onImageRetry?: () => void;
   onVote: (type: SearchFeedbackType) => void;
   onOpenReference: (ref: KnowledgeReference, loc?: KnowledgeReferenceLocation) => void;
   /** 点踩 Popconfirm 受控状态与表单（由父级 KnowledgeSearch 持有） */
@@ -995,6 +979,8 @@ export default function SessionCard({
   onStop,
   onReSearch,
   onClear,
+  onTextOnlyRetry,
+  onImageRetry,
   onVote,
   onOpenReference,
   dislikeOpen,
@@ -1010,6 +996,8 @@ export default function SessionCard({
   const parsedAnswer = parseThink(session.rawAnswer);
   const { body: responseBody } = parseReferences(parsedAnswer.answer);
   const running = isSearchRunning(session.status);
+  const isWiki = session.wiki || session.source === 'jonex_wiki' || session.references?.some((ref) => !!ref.query_id);
+  const wikiKbNames = [...new Set((session.references ?? []).map((ref) => ref.kb_name || ref.kb_id).filter(Boolean))].join('、');
   const hasThink = parsedAnswer.think.length > 0;
   const hasAnswerContent = responseBody.length > 0;
   const hasContent = hasThink || hasAnswerContent;
@@ -1017,9 +1005,31 @@ export default function SessionCard({
 
   // [jonex] §image-refs P3-2: 答案旁图片资产（与 prompt 同源的 references 中筛出）
   const imageAssets = React.useMemo(() => collectImageAssets(session.references), [session.references]);
-  const openImageAsset = React.useCallback((asset: ImageAsset) => {
-    window.open(asset.assetUrl, '_blank', 'noopener');
+  // [jonex] 以图问知识：历史长期停留时，后端补签的 view_url 会过期（默认 15 分钟），
+  // 图片加载失败就按 image_id 重签一次并缓存。
+  // ⚠️ 用 ref 记账「已经刷过哪些」而不是在 setState 的更新函数里发请求 ——
+  // 更新函数必须是纯的（StrictMode 下会被调两次，那就是两次请求）。
+  const [imageTicketMap, setImageTicketMap] = React.useState<Record<string, string>>({});
+  const refreshedImageIdsRef = React.useRef<Set<string>>(new Set());
+  // 重签过一次仍失败 → 判定为真的取不到，渲染占位块（而不是浏览器默认的破图图标）
+  const [failedImageIds, setFailedImageIds] = React.useState<Set<string>>(() => new Set());
+  const markImageFailed = React.useCallback((imageId: string) => {
+    setFailedImageIds((prev) => (prev.has(imageId) ? prev : new Set(prev).add(imageId)));
   }, []);
+  const refreshImageTicket = React.useCallback(
+    (imageId: string) => {
+      if (refreshedImageIdsRef.current.has(imageId)) {
+        // 每张只重试一次，避免死循环；第二次失败就认了
+        markImageFailed(imageId);
+        return;
+      }
+      refreshedImageIdsRef.current.add(imageId);
+      void getQueryImageViewTicket(imageId)
+        .then((ticket) => setImageTicketMap((prev) => ({ ...prev, [imageId]: ticket.url })))
+        .catch(() => markImageFailed(imageId));
+    },
+    [markImageFailed],
+  );
 
   const [entityDrawerOpen, setEntityDrawerOpen] = React.useState(false);
   const [drawerEntity, setDrawerEntity] = React.useState<OntologyInstanceRow | null>(null);
@@ -1097,7 +1107,33 @@ export default function SessionCard({
           }}
         >
           <SearchOutlined style={{ color: '#3b82f6', flexShrink: 0 }} />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{session.query}</span>
+          {/*
+            [jonex] 以图问知识：有图时标题优先显示**用户原话**（他认得出自己问的是什么），
+            没原话就标「以图检索（n 张）」；`session.query` 存的是识别产出，
+            显示它会让用户以为那是自己打的字。
+          */}
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {session.imageQuestion ||
+              (session.queryImages?.length
+                ? t('knowledgeSearch.imageSearchTitle', { count: session.queryImages.length })
+                : session.query)}
+          </span>
+          {session.mode && (
+            <span
+              style={{
+                fontSize: 12,
+                color: '#1d4ed8',
+                fontWeight: 400,
+                background: '#eef4ff',
+                border: '1px solid #dbeafe',
+                borderRadius: 999,
+                padding: '2px 8px',
+                flexShrink: 0,
+              }}
+            >
+              {t(`knowledgeSearch.${session.mode === 'fast' ? 'fastSearch' : session.mode === 'deep' ? 'deepSearch' : 'wikiSearch'}`)}
+            </span>
+          )}
           <span
             style={{
               fontSize: 12,
@@ -1114,7 +1150,10 @@ export default function SessionCard({
           {running && (
             <span style={{ fontSize: 12, color: '#94a3b8', fontWeight: 400, marginLeft: 8, flexShrink: 0 }}>
               <Spin size="small" style={{ marginRight: 4 }} />
-              {t('knowledgeSearch.searching')}
+              {/* 两段式：识别和检索是两次往返回合，用户得知道这会儿在等哪一段 */}
+              {session.status === 'recognizing'
+                ? t('knowledgeSearch.recognizingImage')
+                : t('knowledgeSearch.searching')}
             </span>
           )}
           {session.status === 'error' && (
@@ -1144,12 +1183,17 @@ export default function SessionCard({
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          {session.startedAt ? (
+            <span style={{ fontSize: 12, color: '#a8b6c8', whiteSpace: 'nowrap' }}>
+              {new Date(session.startedAt).toLocaleString()}
+            </span>
+          ) : null}
           {running ? (
             <Button size="small" icon={<StopOutlined />} onClick={onStop}>
               {t('knowledgeSearch.stopGenerate')}
             </Button>
           ) : (
-            <Button size="small" icon={<ReloadOutlined />} onClick={() => onReSearch(session.query, session.domainId)}>
+            <Button size="small" icon={<ReloadOutlined />} onClick={() => onReSearch(session)}>
               {t('knowledgeSearch.reSearch')}
             </Button>
           )}
@@ -1158,6 +1202,94 @@ export default function SessionCard({
           </Button>
         </div>
       </div>
+
+      {/* [jonex] 以图问知识：本轮附带的图片（缩略图 + 点开大图左右切换） */}
+      {Boolean(session.queryImages?.length) && (
+        <div style={{ marginBottom: 14 }}>
+          <Image.PreviewGroup>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              {session.queryImages!.map((image, index) => {
+                // 重签过的地址优先（票据过期过）；否则用回包里带的
+                const src =
+                  (image.imageId ? imageTicketMap[image.imageId] : undefined) ||
+                  image.localUrl ||
+                  image.viewUrl ||
+                  '';
+                const failed = image.status === 'failed';
+                // 取不到图（票据过期且重签也失败 / 已被清理）→ 走占位分支
+                const unavailable = Boolean(image.imageId) && failedImageIds.has(image.imageId!);
+                return (
+                  <div key={image.imageId ?? `${index}`} style={{ textAlign: 'center' }}>
+                    {src && !unavailable ? (
+                      <Image
+                        src={src}
+                        alt={t('knowledgeSearch.uploadImage')}
+                        width={72}
+                        height={72}
+                        style={{
+                          objectFit: 'cover',
+                          borderRadius: 8,
+                          border: '1px solid #e2e8f0',
+                          // 识别失败的张置灰：它**没有参与检索**，不能看着像生效了
+                          opacity: failed ? 0.45 : 1,
+                          filter: failed ? 'grayscale(1)' : undefined,
+                        }}
+                        onError={() => {
+                          // 服务端票据会过期（历史长期停留时），按 image_id 重签一次。
+                          // 本地 objectURL 不会过期，所以只在「服务端地址」这条路上重试。
+                          if (image.imageId && !image.localUrl) refreshImageTicket(image.imageId);
+                        }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          width: 72,
+                          height: 72,
+                          borderRadius: 8,
+                          border: '1px dashed #e2e8f0',
+                          background: '#f8fafc',
+                        }}
+                      />
+                    )}
+                    {failed && (
+                      <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
+                        {t('knowledgeSearch.imageNotUsed')}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </Image.PreviewGroup>
+        </div>
+      )}
+
+      {/* [jonex] 以图问知识：识别产出。可折叠 —— 用户要能看出「它把图认成了什么」 */}
+      {session.recognized && (
+        <div
+          style={{
+            padding: '10px 14px',
+            background: '#f8fafc',
+            border: '1px solid #e2e8f0',
+            borderRadius: 10,
+            marginBottom: 14,
+            fontSize: 13,
+            color: '#475569',
+            lineHeight: 1.7,
+          }}
+        >
+          <span style={{ color: '#94a3b8', marginRight: 6 }}>{t('knowledgeSearch.recognizedAs')}:</span>
+          <span>{session.recognized.query}</span>
+          {session.recognized.images.some((image) => image.ocrText) && (
+            <div style={{ marginTop: 6, fontSize: 12, color: '#94a3b8' }}>
+              {session.recognized.images
+                .filter((image) => image.ocrText)
+                .map((image) => image.ocrText.slice(0, 120))
+                .join(' / ')}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Error */}
       {session.status === 'error' && (
@@ -1173,7 +1305,26 @@ export default function SessionCard({
             lineHeight: 1.7,
           }}
         >
-          {session.errorMessage || t('knowledgeSearch.searchFailed')}
+          <div>{session.errorMessage || t('knowledgeSearch.searchFailed')}</div>
+          {/*
+            [jonex] 以图问知识：识别失败的出口。**有意不做自动降级**（D2）——
+            自动用纯文字重搜会让用户以为图片参与了检索，实际没有。
+            所以把选择交给用户：有文字才给「仅用文字检索」，有原图才给「重试」。
+          */}
+          {Boolean(session.retryFiles?.length || session.imageQuestion) && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+              {session.retryFiles?.length ? (
+                <Button size="small" onClick={onImageRetry}>
+                  {t('knowledgeSearch.retry')}
+                </Button>
+              ) : null}
+              {session.imageQuestion ? (
+                <Button size="small" onClick={onTextOnlyRetry}>
+                  {t('knowledgeSearch.textOnlySearch')}
+                </Button>
+              ) : null}
+            </div>
+          )}
         </div>
       )}
 
@@ -1188,13 +1339,16 @@ export default function SessionCard({
             marginBottom: 12,
           }}
         >
-          <button
+          <Button
+            type="text"
+            block
             onClick={() => onToggleThink(session.id)}
             style={{
               width: '100%',
               padding: 0,
               display: 'flex',
               alignItems: 'center',
+              justifyContent: 'flex-start',
               gap: 8,
               color: '#64748b',
               textAlign: 'left',
@@ -1220,7 +1374,7 @@ export default function SessionCard({
                 {thinkExpanded ? t('knowledgeSearch.clickCollapse') : t('knowledgeSearch.collapsed')}
               </span>
             )}
-          </button>
+          </Button>
           {thinkExpanded ? (
             <div
               style={{
@@ -1253,153 +1407,68 @@ export default function SessionCard({
         </div>
       )}
 
+      {isWiki && <WikiProgress events={session.wikiProgress?.length ? session.wikiProgress : (session.reasoning?.steps ?? []).flatMap((step) =>
+        Array.isArray(step.detail?.spans) ? step.detail!.spans as any[] : []).map((event, seq) => ({ ...event, seq }))} running={running} completed={session.status === 'done'}
+        startedAt={session.startedAt} durationMs={session.elapsedMs ?? session.reasoning?.total_ms}
+        source={session.reasoning?.final_source || session.source || (session.wiki ? 'jonex_wiki' : undefined)}
+        expanded={reasoningExpanded} onToggle={() => onToggleReasoning(session.id)} />}
       {/* Reasoning chain */}
-      {(() => {
-        const reasoning = session.reasoning;
-        return (
-          (reasoning?.steps?.length ?? 0) > 0 && (
-            <div
-              style={{
-                background: '#fbfaff',
-                border: '1px solid #ece9fb',
-                borderRadius: 10,
-                padding: '12px 16px',
-                marginBottom: 16,
-              }}
-            >
-              <button
-                onClick={() => onToggleReasoning(session.id)}
-                style={{
-                  width: '100%',
-                  padding: 0,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  justifyContent: 'flex-start',
-                  height: 'auto',
-                  lineHeight: 'inherit',
-                  border: 'none',
-                  background: 'transparent',
-                  cursor: 'pointer',
-                  fontSize: 13,
-                }}
-              >
-                {reasoningExpanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
-                <NodeIndexOutlined style={{ color: '#8b5cf6' }} />
-                <span style={{ fontSize: 13, fontWeight: 600, color: '#6d28d9' }}>
-                  {t('knowledgeSearch.reasoningProcess')}
-                </span>
-                <span style={{ fontSize: 12, color: '#a78bda' }}>
-                  {t('knowledgeSearch.steps', {
-                    count: reasoning!.steps.length,
-                    source: reasoning!.final_source,
-                  })}
-                  {reasoning!.total_ms != null ? ` · ${reasoning!.total_ms}ms` : ''}
-                </span>
-              </button>
-              {reasoningExpanded && (
-                <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {reasoning!.steps.map((step: ReasoningStep, i: number) => {
-                    const meta = reasoningStatusMeta(step.status, t);
-                    return (
-                      <div key={`${step.stage}-${i}`} style={{ display: 'flex', gap: 10 }}>
-                        <div
-                          style={{
-                            width: 22,
-                            height: 22,
-                            borderRadius: '50%',
-                            flexShrink: 0,
-                            background: meta.bg,
-                            color: meta.color,
-                            fontSize: 11,
-                            fontWeight: 700,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                          }}
-                        >
-                          {i + 1}
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                            <span style={{ fontSize: 13, fontWeight: 600, color: '#334155' }}>{step.title}</span>
-                            <span
-                              style={{
-                                fontSize: 11,
-                                color: meta.color,
-                                background: meta.bg,
-                                borderRadius: 4,
-                                padding: '0 6px',
-                              }}
-                            >
-                              {meta.label}
-                            </span>
-                            {step.duration_ms != null && (
-                              <span style={{ fontSize: 11, color: '#a3adbb' }}>{step.duration_ms}ms</span>
-                            )}
-                          </div>
-                          {step.summary && (
-                            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2, lineHeight: 1.6 }}>
-                              {step.summary}
-                            </div>
-                          )}
-                          <StepDetail
-                            step={step}
-                            t={t}
-                            onEntityClick={openEntityDrawer}
-                            onRecallClick={openRagRecallDrawer}
-                            references={session.references}
-                            onOpenReference={onOpenReference}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )
-        );
-      })()}
+      {!isWiki && (
+        <ThoughtSteps
+          steps={session.reasoning?.steps ?? []}
+          totalMs={session.reasoning?.total_ms}
+          finalSource={session.reasoning?.final_source}
+          expanded={reasoningExpanded}
+          onToggle={() => onToggleReasoning(session.id)}
+          renderDetail={(step) => (
+            <StepDetail
+              step={step}
+              t={t}
+              onEntityClick={openEntityDrawer}
+              onRecallClick={openRagRecallDrawer}
+              references={session.references}
+              onOpenReference={onOpenReference}
+            />
+          )}
+        />
+      )}
 
       {/* Answer */}
-      {(responseBody || running) && (
-        <div className={`${styles.answerBlock} ${activeCitationIndex !== null ? styles.answerBlockSplit : ''}`}>
+      {(responseBody || (!isWiki && running)) && (
+        <div className={`${styles.answerBlock} ${isWiki ? wikiStyles.answer : ''}`}>
           {/* 左栏：标题行 + 正文 + 流式 loading（角标激活时与右栏「引用详情」并排） */}
           <div className={styles.answerMain}>
-            <div
-              style={{
-                fontSize: 13,
-                fontWeight: 600,
-                color: '#6366f1',
-                marginBottom: 10,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-              }}
-            >
+            <div className={isWiki ? wikiStyles.answerHeading : undefined}
+              style={isWiki ? undefined : { fontSize: 13, fontWeight: 600, color: '#6366f1',
+                marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
               <BulbOutlined />
               {t('knowledgeSearch.searchResult')}
-              <span style={{ fontWeight: 400, fontSize: 12, color: '#94a3b8' }}>
-                {t('knowledgeSearch.knowledgeAnalysis', { domain: domainName })}
+              <span style={isWiki ? undefined : { fontWeight: 400, fontSize: 12, color: '#94a3b8' }}>
+                {isWiki ? wikiKbNames : t('knowledgeSearch.knowledgeAnalysis', { domain: domainName })}
               </span>
             </div>
-            <div style={{ fontSize: 14, color: '#334155', lineHeight: 1.8 }}>
-              <ReactMarkdown
-                rehypePlugins={[rehypeCitationBadge]}
+            {isWiki ? <WikiAnswerContent content={responseBody} referenceCount={referenceCount}
+              activeIndex={activeCitationIndex} onCitation={setActiveCitationIndex} />
+            : <div style={{ fontSize: 15, color: '#334155', lineHeight: 1.85 }}>
+              <AnswerMarkdown
+                content={responseBody || (running ? t('knowledgeSearch.analyzing') : '')}
+                referenceCount={referenceCount}
+                activeCitationIndex={activeCitationIndex}
+                onCitation={setActiveCitationIndex}
+                streaming={running}
                 components={{
                   h1: ({ children }) => (
-                    <h1 style={{ fontSize: 20, lineHeight: 1.45, margin: '12px 0 8px', color: '#0f172a' }}>
+                    <h1 style={{ fontSize: 22, lineHeight: 1.45, margin: '14px 0 8px', color: '#0f172a' }}>
                       {children}
                     </h1>
                   ),
                   h2: ({ children }) => (
-                    <h2 style={{ fontSize: 18, lineHeight: 1.5, margin: '12px 0 8px', color: '#0f172a' }}>
+                    <h2 style={{ fontSize: 19, lineHeight: 1.5, margin: '14px 0 8px', color: '#0f172a' }}>
                       {children}
                     </h2>
                   ),
                   h3: ({ children }) => (
-                    <h3 style={{ fontSize: 16, lineHeight: 1.5, margin: '10px 0 6px', color: '#0f172a' }}>
+                    <h3 style={{ fontSize: 17, lineHeight: 1.5, margin: '12px 0 6px', color: '#0f172a' }}>
                       {children}
                     </h3>
                   ),
@@ -1408,50 +1477,9 @@ export default function SessionCard({
                   ol: ({ children }) => <ol style={{ margin: '0 0 10px', paddingLeft: 20 }}>{children}</ol>,
                   li: ({ children }) => <li style={{ marginBottom: 4 }}>{children}</li>,
                   strong: ({ children }) => <strong style={{ color: '#0f172a' }}>{children}</strong>,
-                  // [jonex] 引用编号 [n] 渲染为可点击角标：点击 → 右栏展开「引用详情」
-                  // （对齐原型 openDomainSearchCitation）。编号越界 / 引用未回填时降级为
-                  // 不可点，保持改动前的纯展示形态（圆形灰底角标、去方括号、缩小偏上）。
-                  sup: ({ node, children }) => {
-                    const props = (node as { properties?: Record<string, unknown> })?.properties ?? {};
-                    const cls = props.className;
-                    const isCite = Array.isArray(cls) ? cls.includes(CITE_BADGE_CLASS) : cls === CITE_BADGE_CLASS;
-                    if (!isCite) return <sup>{children}</sup>;
-
-                    const citeIndex = parseCiteIndex(props['data-cite-index'] ?? children);
-                    // 契约：答案第 n 个角标 ⇒ references[n - 1]（后端 normalize_citations 重排）
-                    if (citeIndex == null || citeIndex > referenceCount) {
-                      return (
-                        <sup className={styles.badgeSup}>
-                          <span className={styles.badgeStatic}>{children}</span>
-                        </sup>
-                      );
-                    }
-
-                    const active = activeCitationIndex === citeIndex - 1;
-                    return (
-                      <sup className={styles.badgeSup}>
-                        <button
-                          type="button"
-                          className={`${styles.badge} ${active ? styles.badgeActive : ''}`}
-                          aria-label={t('knowledgeSearch.citationBadgeAria', { index: citeIndex })}
-                          aria-current={active ? 'true' : undefined}
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            // 再点一次同一角标收起面板
-                            setActiveCitationIndex(active ? null : citeIndex - 1);
-                          }}
-                        >
-                          {children}
-                        </button>
-                      </sup>
-                    );
-                  },
                 }}
-              >
-                {responseBody || (running ? t('knowledgeSearch.analyzing') : '')}
-              </ReactMarkdown>
-            </div>
+              />
+            </div>}
             {running && hasContent && (
               <div style={{ marginTop: 8 }}>
                 <Spin size="small" />
@@ -1459,20 +1487,21 @@ export default function SessionCard({
             )}
           </div>
 
-          {/* 右栏：引用详情（角标激活时出现；对齐原型 domainSearchCitationDetail） */}
-          {activeCitationIndex !== null && session.references?.[activeCitationIndex] && (
-            <CitationDetailPanel
-              index={activeCitationIndex}
-              total={referenceCount}
-              reference={session.references[activeCitationIndex]}
-              onPrev={() =>
-                setActiveCitationIndex((prev) => (prev === null ? null : (prev - 1 + referenceCount) % referenceCount))
-              }
-              onNext={() => setActiveCitationIndex((prev) => (prev === null ? null : (prev + 1) % referenceCount))}
-              onClose={() => setActiveCitationIndex(null)}
-              onOpenReference={onOpenReference}
-            />
-          )}
+          {/* 引用详情：抽屉从右侧滑出，不再挤占正文宽度 */}
+          <CitationDrawer
+            open={activeCitationIndex !== null && Boolean(session.references?.[activeCitationIndex])}
+            index={activeCitationIndex ?? 0}
+            total={referenceCount}
+            reference={
+              activeCitationIndex !== null ? session.references?.[activeCitationIndex] ?? null : null
+            }
+            onPrev={() =>
+              setActiveCitationIndex((prev) => (prev === null ? null : (prev - 1 + referenceCount) % referenceCount))
+            }
+            onNext={() => setActiveCitationIndex((prev) => (prev === null ? null : (prev + 1) % referenceCount))}
+            onClose={() => setActiveCitationIndex(null)}
+            onOpenReference={onOpenReference}
+          />
 
           {session.status === 'done' && (
             <div className={styles.answerFooter}>
@@ -1524,7 +1553,7 @@ export default function SessionCard({
                 key={`${a.docId}-${a.imageIdx}`}
                 style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center', maxWidth: 96 }}
               >
-                <ImageAssetThumb asset={a} t={t} onOpen={openImageAsset} />
+                <ImageAssetThumb asset={a} t={t} />
                 {a.description && (
                   <div
                     style={{
@@ -1545,18 +1574,23 @@ export default function SessionCard({
         </div>
       )}
 
+      {isWiki && (session.references?.length ?? 0) > 0 && <WikiSources references={session.references!}
+        expanded={refsExpanded} onToggle={() => onToggleRefs(session.id)} onOpen={onOpenReference}
+        activeIndex={activeCitationIndex} onSelect={setActiveCitationIndex} />}
       {/* References */}
-      {(session.references?.length ?? 0) > 0 && (
+      {!isWiki && (session.references?.length ?? 0) > 0 && (
         <div
           style={{
             background: '#f8fafc',
             borderLeft: '3px solid #3b82f6',
-            borderRadius: '0 8px 8px 0',
+            borderRadius: 8,
             padding: '14px 18px',
             marginBottom: 16,
           }}
         >
-          <button
+          <Button
+            type="text"
+            block
             onClick={() => onToggleRefs(session.id)}
             style={{
               width: '100%',
@@ -1578,7 +1612,7 @@ export default function SessionCard({
             {refsExpanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
             <FileTextOutlined />
             {t('knowledgeSearch.relatedDocs', { count: session.references!.length })}
-          </button>
+          </Button>
           {refsExpanded && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 }}>
               {session.references!.map((ref: KnowledgeReference, i: number) => {
@@ -1665,7 +1699,7 @@ export default function SessionCard({
                           {t('knowledgeSearch.docPage', { page: (pageLoc.page_no ?? 0) + 1 })}
                         </span>
                       )}
-                      <a
+                      <Typography.Link
                         className="yx-table-action"
                         style={{ marginLeft: 'auto', fontSize: 12, flexShrink: 0 }}
                         onClick={() => onOpenReference(ref, preferredLocation(ref))}
@@ -1679,7 +1713,7 @@ export default function SessionCard({
                             : ref.media_type === 'image'
                               ? t('knowledgeSearch.viewImage')
                               : t('knowledgeSearch.viewOriginal')}
-                      </a>
+                      </Typography.Link>
                     </div>
                     {/* [jonex] §image-refs P3-2: 卡片内图片缩略图（location 级打开原图） */}
                     {imageLocs.length > 0 && (
@@ -1696,7 +1730,6 @@ export default function SessionCard({
                               description: (l.text || '').replace(/^图片描述：/, '').trim(),
                             }}
                             t={t}
-                            onOpen={openImageAsset}
                           />
                         ))}
                       </div>
@@ -1742,7 +1775,7 @@ export default function SessionCard({
       )}
 
       {/* Searching spinner */}
-      {running && !hasContent && (
+      {running && !hasContent && !isWiki && (
         <div style={{ textAlign: 'center', padding: '30px 0' }}>
           <Spin size="default" />
           <div style={{ marginTop: 10, color: '#94a3b8', fontSize: 13 }}>{t('knowledgeSearch.searchingKnowledge')}</div>

@@ -1,0 +1,23 @@
+// 左侧检索区整体是一张卡片：蓝色以顶边中部为圆心向四周扩散，
+// 越往外越白，让回答像落在一层很浅的蓝色上，而不是又一层白卡。
+.shell {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #e2ecf8;
+  border-radius: 20px;
+  // 色值与中心取自参考图：顶边中心 #DEEBFF，向外/向下渐白
+  background: radial-gradient(ellipse 64% 84% at 50% 0%, #deebff 0%, #e7f2ff 40%, #f1f8ff 66%, #fbfdff 86%, #ffffff 100%);
+  box-shadow: 0 12px 32px rgba(11, 43, 92, 0.07);
+}
+
+// 结果卡与外壳合并成一张卡：正文直接落在渐变上，避免白卡盖住中间那层深色
+.shell :global(.ant-card) {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}

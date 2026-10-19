@@ -79,7 +79,7 @@ export default function OntologyEntityDrawer({
   return (
     <Drawer
       title={t('knowledgeSearch.ontologyEntityDetail')}
-      size="large"
+      width={720}
       open={open}
       onClose={onClose}
       destroyOnHidden
