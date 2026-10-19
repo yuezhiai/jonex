@@ -157,6 +157,7 @@ _LABEL_ZH: dict[str, str] = {
     "get_document": "查看文档",
     "get_document_chunks": "查看文档切片",
     "get_document_parse_result": "查看文档解析结果",
+    "get_document_source_spans": "查看引用原文坐标",
     "get_document_tags": "查看文档标签",
     "get_editor_state": "查看编辑器状态",
     "get_knowledge_info": "查看知识信息",
@@ -294,6 +295,11 @@ _LABEL_ZH: dict[str, str] = {
     "check_prompt_template_name": "校验提示词模板名称",
     "publish_template_scenario": "发布模板场景",
     "list_impacted_knowledge_bases": "受影响知识库列表",
+    # ---- 分级访问（B6）----
+    "classification_access_denied": "分级访问拒绝",
+    "classification_clearance_update": "用户密级变更",
+    # ---- 平台监控 ----
+    "monitor.access_denied": "监控访问拒绝",
     # ---- 企业身份集成 ----
     "update_identity_integration": "更新企业身份集成配置",
     "test_identity_integration_connection": "测试企业身份集成连接",
@@ -421,6 +427,7 @@ _LABEL_EN: dict[str, str] = {
     "get_document": "View Document",
     "get_document_chunks": "View Document Chunks",
     "get_document_parse_result": "View Document Parse Result",
+    "get_document_source_spans": "View Source Spans",
     "get_document_tags": "View Document Tags",
     "get_editor_state": "View Editor State",
     "get_knowledge_info": "View Knowledge Info",
@@ -558,6 +565,11 @@ _LABEL_EN: dict[str, str] = {
     "check_prompt_template_name": "Check Prompt Template Name",
     "publish_template_scenario": "Publish Template Scenario",
     "list_impacted_knowledge_bases": "List Impacted Knowledge Bases",
+    # ---- 分级访问（B6）----
+    "classification_access_denied": "Classification access denied",
+    "classification_clearance_update": "User clearance updated",
+    # ---- 平台监控 ----
+    "monitor.access_denied": "Monitor access denied",
     # ---- 企业身份集成 ----
     "update_identity_integration": "Update Identity Integration Config",
     "test_identity_integration_connection": "Test Identity Integration Connection",
@@ -591,6 +603,9 @@ class AuditAction(str, Enum):
     AUTH_EXCHANGE_TICKET = "auth.exchange_ticket"
     AUTH_LOGOUT = "auth.logout"
     AUTH_BACKCHANNEL_LOGOUT = "auth.backchannel_logout"
+
+    # ---- 平台监控 ----
+    MONITOR_ACCESS_DENIED = "monitor.access_denied"
 
     # ---- 文档 ----
     DOCUMENT_UPLOAD = "document.upload"

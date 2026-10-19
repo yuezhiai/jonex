@@ -67,6 +67,19 @@ class SystemConfigListResponse(BaseModel):
     items: list[SystemConfigResponse]
 
 
+# ============ 租户级安全配置（租户管理员自助）============
+
+class TenantSecurityConfigUpdateRequest(BaseModel):
+    """租户级安全配置的更新请求。
+
+    ⛔ **不接收 tenant_id**：租户只从鉴权上下文取（``extract_tenant_id(request)``）。
+    请求体里出现 tenant_id 就等于把「越权改别的租户的安全配置」做成 API。
+    """
+
+    config_value: str
+    description: Optional[str] = None
+
+
 # ============ 审计日志 ============
 
 class AuditLogResponse(BaseModel):

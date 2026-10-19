@@ -14,6 +14,16 @@ from capabilities.platform.models.audit_enums import LogType, Outcome, LogLevel,
 from capabilities.platform.models.task_schedule import TaskSchedule
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
 from capabilities.platform.models.mcp_service import McpServicePublish
+# 调用明细实体住在共享内核：三个采集腿（Sidecar / llm-gateway / 各 capability）多进程
+# 直写同一 PG 的 monitor schema，模型必须对所有进程可见，见 jonex_core/common/monitor_models.py。
+from jonex_core.common.monitor_models import (
+    AttemptStatus,
+    CallAttempt,
+    CallDirection,
+    CallFinalStatus,
+    CallLog,
+    Protocol,
+)
 from capabilities.platform.models.identity_integration import (
     LoginPolicy,
     SyncTaskStatus,
@@ -47,6 +57,12 @@ __all__ = [
     "McpKey",
     "McpKeyServiceMapping",
     "McpServicePublish",
+    "CallLog",
+    "CallAttempt",
+    "CallDirection",
+    "CallFinalStatus",
+    "AttemptStatus",
+    "Protocol",
     "LoginPolicy",
     "SyncTaskStatus",
     "SyncType",

@@ -460,7 +460,12 @@ class AuditLogService:
     # ===== 清理 =====
 
     async def cleanup_expired(self, retention_days: int = 90) -> int:
-        """删除超过保留天数的过期审计日志"""
+        """删除超过保留天数的过期审计日志，返回删除条数。
+
+        ``retention_days <= 0`` ⇒ 不清理（0 = 不自动到期，不是「立即删除」），
+        由 repository 的 ``delete_expired`` 统一判定。cutoff 与分批语义也都在
+        repository（naive 本地时间、每批 1000 条且逐批 commit）。
+        """
         if self.repo is None:
             raise RuntimeError("cleanup_expired 需要 AsyncSession")
         return await self.repo.delete_expired(retention_days)

@@ -142,7 +142,7 @@ async def login(
 async def me(authorization: str = Header(...), db=Depends(get_db)):
     if not authorization.startswith("Bearer "):
         raise InvalidParameterError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))  # 原消息: 缺少 Bearer token
-    token = authorization[7:]
+    token = authorization[7:].strip()
     svc = AuthService(db)
     result = await svc.me(token)
     return success_response(data=result.dict())
@@ -208,7 +208,7 @@ async def login_ticket(
 ):
     if not authorization.startswith("Bearer "):
         raise InvalidParameterError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))  # 原消息: 缺少 Bearer token
-    token = authorization[7:]
+    token = authorization[7:].strip()
     client_ip = request.client.host if request and request.client else None
     user_agent = request.headers.get("User-Agent", "")[:1024] if request else None
     svc = AuthService(db)

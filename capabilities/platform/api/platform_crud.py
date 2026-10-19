@@ -18,12 +18,14 @@ from capabilities.platform.services.user_service import UserService
 from capabilities.platform.services.role_service import RoleService
 from capabilities.platform.services.menu_service import MenuService
 from capabilities.platform.services.role_binding import ensure_default_role_binding
+from capabilities.platform.services.security_config_service import SecurityConfigService
 from capabilities.platform.services.misc_services import (
     ApplicationService,
     PermissionService,
     SystemConfigService,
     TaskScheduleService,
     TenantService,
+    tenant_matches_keyword,
 )
 from capabilities.platform.dtos.platform import (
     UserCreateRequest,
@@ -43,6 +45,7 @@ from capabilities.platform.dtos.misc import (
     TaskScheduleCreateRequest,
     TaskScheduleUpdateRequest,
     TenantCreateRequest,
+    TenantSecurityConfigUpdateRequest,
     TenantUpdateRequest,
 )
 
@@ -102,11 +105,26 @@ async def _resolve_target_tenant(
     return tenant_id
 
 
+def _menu_code_matches(permission_code: str, perms: set[str]) -> bool:
+    """菜单码判定：支持**逗号分隔的多码**，任一命中即可（单码行为不变）。
+
+    为什么需要多码：同一个菜单项可能要对两套权限都开放。合并后的「系统配置」页就是这样 ——
+    同一页既按 `platform:config:*` 渲染平台块，又按 `tenant:security:*` 渲染租户块，于是菜单码
+    写成 `'platform:config:read,tenant:security:read'`。
+
+    只支持单码等值时只能挂其中一个，两边都要吃亏：
+      - 挂平台码 → 租户管理员侧栏里没有入口（接口通了却没有入口）；
+      - 挂租户码 → 只持平台码的角色看不到入口（今天靠「平台管理员恰好持全部 tenant 码」侥幸成立）。
+    与子应用 `routes.config.ts` 的 `permissionCode` **数组**语义保持一致（见 router/menu.ts）。
+    """
+    return any(code.strip() in perms for code in permission_code.split(",") if code.strip())
+
+
 def _filter_visible_menus(menus: list, perms: set[str]) -> list:
     """菜单权限过滤纯函数。
 
     规则（写死）：
-      ① permission_code IS NULL 或持有该码 → 节点可见；
+      ① permission_code IS NULL，或其中**任一个**码被持有（逗号分隔多码）→ 节点可见；
       ② 父节点不可见 → 子节点连带隐藏；
       ③ 组头判定：在原树中有子节点的节点视为「组头」——组头自身可见但
         所有子节点不可见 → 裁剪组头；无子节点的叶子按自身码判定。
@@ -118,7 +136,7 @@ def _filter_visible_menus(menus: list, perms: set[str]) -> list:
         if m.parent_id not in (0, None):
             parent_of[m.parent_id].append(m.id)
 
-    visible = {m for m in menus if not m.permission_code or m.permission_code in perms}
+    visible = {m for m in menus if not m.permission_code or _menu_code_matches(m.permission_code, perms)}
     visible_ids = {m.id for m in visible}
 
     # 规则 ②：父不可见 → 子连带隐藏（自顶向下传播，迭代到不动点）
@@ -160,6 +178,7 @@ def _filter_visible_menus(menus: list, perms: set[str]) -> list:
 async def list_tenants(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    keyword: str | None = Query(None, max_length=128, description="按租户 ID / 名称 / 描述模糊匹配"),
     db=Depends(get_db),
     current: dict = Depends(get_current_user),
 ):
@@ -172,12 +191,14 @@ async def list_tenants(
         perms=current.get("perms") or [],
     ):
         offset = (page - 1) * page_size
-        result = await svc.list(offset, page_size)
+        result = await svc.list(offset, page_size, keyword)
         return success_response(data=result)
     # 无平台级权限：仅返回当前租户；租户行缺失时降级为空列表（避免整页报错）
     try:
         tenant = await svc.get(current["tenant_id"])
-        return success_response(data={"items": [tenant], "total": 1})
+        # 这一支走 get()，不过 SQL 过滤 —— 关键字在这里补一道，否则会出现「搜 A 却列出 B」
+        items = [tenant] if tenant_matches_keyword(tenant, keyword) else []
+        return success_response(data={"items": items, "total": len(items)})
     except ResourceNotFoundError:
         return success_response(data={"items": [], "total": 0})
 
@@ -663,6 +684,60 @@ async def update_system_config(config_key: str, req: SystemConfigUpdateRequest, 
     svc = SystemConfigService(db)
     result = await svc.update_config(config_key, req)
     return success_response(data=result.dict())
+
+
+# ==================== 租户级安全配置（租户管理员自助）====================
+#
+# 与上面「系统配置」的区别，改代码前先读：
+#   · 系统配置（/system-configs）是**平台共享的一份全局值**，权限码 platform:config:*
+#     （scope=platform）⇒ 只有平台管理员能改，改一次全平台生效。
+#   · 这里是**每个租户自己的覆盖值**（platform.tenant_security_configs），权限码
+#     tenant:security:*（scope=tenant）⇒ 租户管理员即可自助，只影响本租户。
+# 读取链为 租户覆盖 → 平台默认 → 代码默认，定义在 services/security_config_service.py。
+#
+# ⛔ 租户只能来自鉴权上下文（extract_tenant_id(request)），不得从 body/query 取 ——
+#   否则就是把「改别的租户的安全配置」做成 API。
+
+
+@router.get("/tenant-security-config")
+async def list_tenant_security_config(
+    request: Request,
+    db=Depends(get_db),
+    _p: dict = Depends(require_permission("tenant:security:read")),
+):
+    """本租户的安全配置（生效值 + 平台默认 + 是否被本租户覆盖）。"""
+    tenant_id = extract_tenant_id(request)
+    svc = SecurityConfigService(db)
+    return success_response(data={"items": await svc.list_effective(tenant_id)})
+
+
+@router.put("/tenant-security-config/{config_key}")
+async def update_tenant_security_config(
+    config_key: str,
+    request: Request,
+    req: TenantSecurityConfigUpdateRequest,
+    db=Depends(get_db),
+    _p: dict = Depends(require_permission("tenant:security:write")),
+):
+    """设置本租户对某个安全配置的覆盖值（范围校验后 upsert）。"""
+    tenant_id = extract_tenant_id(request)
+    svc = SecurityConfigService(db)
+    item = await svc.set_value(tenant_id, config_key, req.config_value, req.description)
+    return success_response(data=item)
+
+
+@router.delete("/tenant-security-config/{config_key}")
+async def reset_tenant_security_config(
+    config_key: str,
+    request: Request,
+    db=Depends(get_db),
+    _p: dict = Depends(require_permission("tenant:security:write")),
+):
+    """删除本租户的覆盖值 = 恢复平台默认。"""
+    tenant_id = extract_tenant_id(request)
+    svc = SecurityConfigService(db)
+    item = await svc.reset_value(tenant_id, config_key)
+    return success_response(data=item)
 
 
 # ==================== 任务调度 ====================

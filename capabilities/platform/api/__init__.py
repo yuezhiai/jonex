@@ -36,4 +36,7 @@ def create_platform_router() -> APIRouter:
         identity_sync_router, prefix="/platform", tags=["企业身份同步"]
     )
 
+    from capabilities.platform.api.monitor import router as monitor_router
+    router.include_router(monitor_router, prefix="/platform", tags=["平台监控"])
+
     return router

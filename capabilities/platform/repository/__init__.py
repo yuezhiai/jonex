@@ -8,6 +8,9 @@ from capabilities.platform.repository.mcp_key_repository import McpKeyRepository
 from capabilities.platform.repository.menu_repository import MenuRepository
 from capabilities.platform.repository.application_repository import ApplicationRepository
 from capabilities.platform.repository.system_config_repository import SystemConfigRepository
+from capabilities.platform.repository.tenant_security_config_repository import (
+    TenantSecurityConfigRepository,
+)
 from capabilities.platform.repository.audit_log_repository import AuditLogRepository
 from capabilities.platform.repository.task_schedule_repository import TaskScheduleRepository
 
@@ -23,6 +26,7 @@ __all__ = [
     "MenuRepository",
     "ApplicationRepository",
     "SystemConfigRepository",
+    "TenantSecurityConfigRepository",
     "AuditLogRepository",
     "TaskScheduleRepository",
 ]

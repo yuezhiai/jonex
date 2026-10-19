@@ -48,6 +48,7 @@ from capabilities.platform.models.identity_integration import (
 )
 from capabilities.platform.services.user_service import UserService
 from capabilities.platform.services.role_binding import ensure_default_role_binding
+from capabilities.platform.services.security_config_service import SecurityConfigService
 from jonex_core.security.user_auth import get_user_auth
 from capabilities.platform.dtos.auth import (
     LoginRequest,
@@ -256,6 +257,10 @@ class AuthService:
         self.user_service = UserService(session)
         self.tenant_repo = TenantRepository(session)
         self.system_config_repo = SystemConfigRepository(session)
+        # 安全配置（租户覆盖 → 平台默认 → 代码默认）：默认值定义在 SecurityConfigService，
+        # 本类不再自带默认值 —— 改造前「这里 30 分钟 / USER_JWT_EXPIRE_HOURS 24 小时」
+        # 两处默认值互相矛盾，正是「改了配置不生效」的成因。
+        self.security_config_service = SecurityConfigService(session)
         self.user_auth = get_user_auth()
         self.config = get_config()
 
@@ -436,7 +441,7 @@ class AuthService:
         - session_timeout：访问令牌有效期（分钟）
         """
         tenant_id = require_tenant(tenant_id)
-        security = await self._get_security_config()
+        security = await self._get_security_config(tenant_id)
         username = (req.username or "").strip()
 
         # 1) 账户锁定检查
@@ -544,27 +549,14 @@ class AuthService:
             # 将未预期的异常（如数据库连接失败）包装为 JonexException
             raise InternalError(message=str(e))
 
-    async def _get_security_config(self) -> dict:
-        """读取安全配置（DB 缺失/异常时回退默认值，不阻断登录）。"""
-        defaults = {
-            "session_timeout": 30,       # 访问令牌有效期（分钟）。30 分钟短效令牌 + 前端自动刷新滑动续期；长会话安全性更好
-            "password_min_length": 8,    # 密码最小长度
-            "login_lock_threshold": 5,   # 连续失败锁定阈值（0=不锁定）
-            "lock_duration": 15,         # 锁定时长（分钟）
-        }
-        result = dict(defaults)
-        try:
-            for key in defaults:
-                raw = await self.system_config_repo.get_value(key)
-                if raw is None:
-                    continue
-                raw = str(raw).strip()
-                if not raw:
-                    continue
-                result[key] = int(float(raw))
-        except Exception:
-            logger.warning("读取安全配置失败，使用默认值", exc_info=True)
-        return result
+    async def _get_security_config(self, tenant_id: str) -> dict:
+        """读取**该租户**的安全配置，三层回落：租户覆盖 → 平台默认 → 代码默认。
+
+        - `tenant_id` 是必填：不按租户读就等于还用全局值，租户级的 session_timeout 完全不生效；
+        - 默认值与解析语义统一定义在 `SecurityConfigService`（本类不再自带一份默认值）；
+        - DB 读不到/读异常只告警、回落默认，**不阻断登录**（与改造前口径一致）。
+        """
+        return await self.security_config_service.resolve(tenant_id)
 
     @staticmethod
     def _login_lock_keys(tenant_id: str, username: str) -> tuple[str, str]:
@@ -667,7 +659,10 @@ class AuthService:
         from jonex_core.security.permission import get_user_permissions
 
         perms = await get_user_permissions(user.tenant_id, user.id)
-        security = await self._get_security_config()
+        # ⚠ 这里是 `user.tenant_id`，不是 `tenant_id` —— 本方法没有 `tenant_id` 这个局部名
+        # （全程用 user.tenant_id）。写成 tenant_id 的后果：参数个数、语法、单测全都正常，
+        # 但线上**每次登录都 500 `name 'tenant_id' is not defined`**，只有真实登录才暴露。
+        security = await self._get_security_config(user.tenant_id)
         session_minutes = max(1, security["session_timeout"])
         access_token = self.user_auth.create_access_token(user, role_names, expires_minutes=session_minutes)
         refresh_token = self.user_auth.create_refresh_token(user, role_names)
@@ -940,7 +935,7 @@ class AuthService:
         from jonex_core.security.permission import get_user_permissions
 
         perms = await get_user_permissions(tenant_id, user.id)
-        security = await self._get_security_config()
+        security = await self._get_security_config(tenant_id)
         session_minutes = max(1, security["session_timeout"])
         access_token = self.user_auth.create_access_token(
             user, role_names, expires_minutes=session_minutes
@@ -1028,7 +1023,7 @@ class AuthService:
         from jonex_core.security.permission import get_user_permissions
 
         perms = await get_user_permissions(tenant_id, user.id)
-        security = await self._get_security_config()
+        security = await self._get_security_config(tenant_id)
         session_minutes = max(1, security["session_timeout"])
         access_token = self.user_auth.create_access_token(
             user, role_names, expires_minutes=session_minutes

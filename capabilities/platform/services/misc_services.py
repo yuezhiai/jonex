@@ -3,6 +3,7 @@
 """
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -399,6 +400,31 @@ async def seed_tenant_roles(session, tenant_id: str) -> None:
     await session.flush()
 
 
+def normalize_keyword(keyword: Any) -> str:
+    """把列表检索的关键字收敛成「干净字符串」，非字符串一律当没传。
+
+    ⚠ 这里必须防一手类型：直接调用路由函数（单测、内部调用）时，没显式传的参数拿到的是
+    FastAPI 的 `Query(None)` **对象**而不是 `None` —— 它既不是 str（`.strip()` 会
+    AttributeError），又是 truthy（会被误当成"有关键字"，把列表过滤成空）。收敛放在服务层，
+    路由层照常声明并透传，调用方不必关心这个坑。
+    """
+    return keyword.strip() if isinstance(keyword, str) else ""
+
+
+def tenant_matches_keyword(tenant: dict, keyword: Any) -> bool:
+    """Python 侧的关键字匹配（ID / 名称 / 描述，忽略大小写），**口径与仓储里的 SQL 一致**。
+
+    只服务于「无平台权限 → 仅返回本租户」那条降级分支：那条路走 `svc.get()`，不过 SQL 过滤，
+    不在这里补一下就会出现「搜了 A 却列出 B」。⚠ 列数多一列少一列都会与 SQL 口径漂移，
+    改 `TenantRepository.keyword_conditions` 时必须同步改这里（test_tenant_search.py 有守卫）。
+    """
+    text = normalize_keyword(keyword).casefold()
+    if not text:
+        return True
+    haystack = f"{tenant['id']} {tenant['name']} {tenant.get('description') or ''}"
+    return text in haystack.casefold()
+
+
 class TenantService:
     def __init__(self, db: AsyncSession):
         from capabilities.platform.repository.tenant_repository import TenantRepository
@@ -419,9 +445,14 @@ class TenantService:
             "updated_at": t.updated_at.isoformat() if t.updated_at else None,
         }
 
-    async def list(self, offset: int = 0, limit: int = 20) -> dict:
-        items = await self.repo.list_all_shared(offset, limit)
-        total = await self.repo.count_shared()
+    async def list(self, offset: int = 0, limit: int = 20, keyword: Any = None) -> dict:
+        """租户分页列表；`keyword` 同时匹配 ID / 名称 / 描述（过滤与分页都在库里做）。
+
+        原先没有这个参数，前端只能「拉前 100 条再本地过滤」—— 第 101 个之后的租户搜不到。
+        """
+        text = normalize_keyword(keyword)
+        items = await self.repo.list_by_keyword(offset, limit, text)
+        total = await self.repo.count_by_keyword(text)
         return {"items": [self._to_dict(t) for t in items], "total": total}
 
     async def get(self, tenant_id: str) -> dict:
