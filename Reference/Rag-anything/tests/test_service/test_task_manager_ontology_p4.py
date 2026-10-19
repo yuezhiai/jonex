@@ -321,7 +321,7 @@ class TestRunOntologyExtractionP4:
                  "NativeOntologyExtractor",
              ) as extractor_cls, \
              mock.patch(
-                 "raganything.service.task_manager.logger",
+                 "jonex_core.capability.atomic.ontology_compile.extract.logger",
              ) as logger_mock:
             client.get_document_chunks = mock.AsyncMock(
                 return_value={"doc_id": "doc-1", "total": 1,
@@ -498,7 +498,7 @@ class TestTableSupplement:
                  "NativeOntologyExtractor",
              ) as extractor_cls, \
              mock.patch(
-                 "raganything.service.task_manager.logger",
+                 "jonex_core.capability.atomic.ontology_compile.extract.logger",
              ) as logger_mock:
             # 类被整体 mock 后恢复真实 _is_table_chunk（补跑筛表格 chunk 用）
             extractor_cls._is_table_chunk = staticmethod(

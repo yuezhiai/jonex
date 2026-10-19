@@ -1471,7 +1471,37 @@ class LightRAG:
             for id_, content_data in contents.items()
         }
 
-        # 3. [jonex] Atomic insert-if-absent — replaces the non-atomic
+        if not new_docs:
+            logger.warning("No new unique documents were found.")
+            return
+
+        # 3. [jonex] **先写正文，再让 doc_status 可见** —— 顺序承重。
+        #
+        # ⚠️ `apipeline_process_enqueue_documents()` 的 inconsistent 清理
+        #    (`lightrag.py` 的 `inconsistent_docs` 分支) 会在「status 有、
+        #    full_docs 没有」时**直接删掉这条 status**。而 `/documents/text`
+        #    每条都会起一个后台任务，并发的处理循环完全可能在
+        #    `insert_if_absent()` 返回后、`full_docs.upsert()` 之前快照到新行
+        #    ⇒ chunk 静默丢失（上传接口仍回 `success`）。
+        #    2026-10-19 实测：68 条丢 1、93 条丢 1，日志是
+        #    `Deleted inconsistent entry: … (chunk=54)`。
+        #    上游原顺序就是 full_docs 先于 doc_status；`b570691f` 修孤儿
+        #    track_id 时把两者对调了，这里改回来（原子插入仍保留）。
+        #
+        # 重复内容（doc_id 相同）写 full_docs 是幂等的：id 就是内容哈希，
+        # 重复上传写进去的正文与被命中的那条完全一致。
+        full_docs_data = {
+            doc_id: {
+                "content": contents[doc_id]["content"],
+                "file_path": contents[doc_id]["file_path"],
+            }
+            for doc_id in new_docs.keys()
+        }
+        await self.full_docs.upsert(full_docs_data)
+        # Persist data to disk immediately
+        await self.full_docs.index_done_callback()
+
+        # 4. [jonex] Atomic insert-if-absent — replaces the non-atomic
         #    filter_keys + upsert pair that could produce orphan track_ids
         #    (TOCTOU race: two concurrent calls both see "new", then the
         #    later upsert overwrites the earlier track_id → orphan).
@@ -1538,19 +1568,7 @@ class LightRAG:
             logger.warning("No new unique documents were found.")
             return
 
-        # 4. Store document content in full_docs and status in doc_status
-        #    Store full document content separately
-        full_docs_data = {
-            doc_id: {
-                "content": contents[doc_id]["content"],
-                "file_path": contents[doc_id]["file_path"],
-            }
-            for doc_id in new_docs.keys()
-        }
-        await self.full_docs.upsert(full_docs_data)
-        # Persist data to disk immediately
-        await self.full_docs.index_done_callback()
-
+        # 正文已在第 3 步（`insert_if_absent` 之前）写入 full_docs。
         # [jonex] doc_status records were already inserted atomically by
         # insert_if_absent above (with the correct track_id). No upsert needed here.
         logger.debug(f"Stored {len(new_docs)} new unique documents")

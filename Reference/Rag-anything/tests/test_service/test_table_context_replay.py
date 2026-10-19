@@ -21,8 +21,9 @@ P10 零产出兜底三条既有逻辑原样生效，判据一个不改；存档�
      非空（回放）；把「本来就没表格」误报成「存档丢失」是回归。
   ② 存档条目一律扁平化、不带 ``_mapped_tables`` 嵌套，否则读回后同一个表
      会被 _merge_table_objects 当作顶层 item 和内层条目各消费一次。
-  ③ 落盘必须发生在所有早退之前（chunk 读回失败 / native 抽取异常都拦不住
-     本体重试，但存档要在）。
+  ③ 存档须由上游调用点保证落在早退之前；早退不得毁档（chunk 读回失败 /
+     native 抽取异常都拦不住本体重试，但存档要在；调用点守卫见
+     TestPersistCallSites）。
   ④ **无存档 + 本文档确有表格 chunk → 拒绝抽取**，落 ontology_status=failed
      且不调 extract / 不调 _merge_table_objects（降级会以更差口径全量替换
      首轮的好结果，还要多烧一小时 LLM）；无表格 chunk 的纯文本文档不受影响。
@@ -51,6 +52,7 @@ from raganything.service.task_manager import (
     _persist_table_context,
     _sweep_table_context,
     _table_context_path,
+    _write_table_context,
 )
 
 
@@ -158,7 +160,7 @@ class TestTableContextArchive:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
             fh.write(b"{ not json")
-        with mock.patch("raganything.service.task_manager.logger") as logger_mock:
+        with mock.patch("jonex_core.capability.atomic.ontology_compile.table_context.logger") as logger_mock:
             assert _load_table_context(task) is None
         assert any("读取失败" in str(c) for c in logger_mock.warning.call_args_list)
 
@@ -181,7 +183,7 @@ class TestTableContextArchive:
         task = _make_task()
         # ≈20KB 原始、压缩后仅几百字节 —— 按压缩后判会放行，按解压后判要拒绝
         body = "| 2020 | Q1 | 12345 |\n" * 1000
-        with mock.patch("raganything.service.task_manager.logger") as logger_mock:
+        with mock.patch("jonex_core.capability.atomic.ontology_compile.table_context.logger") as logger_mock:
             assert _persist_table_context(task, [
                 {"type": "table", "table_body": body},
             ]) is None
@@ -247,13 +249,91 @@ class TestTableContextArchive:
         assert entries[0]["table_body"] == body
         assert entries[0]["table_caption"] == ["表1", "登记表"]
 
+    def test_write_table_context_writes_empty_list_unconditionally(self, tmp_path, monkeypatch):
+        """[A18] 底层写口**无条件可写**：空列表是合法值（前置段恒写档用）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        task = _make_task()
+        assert _write_table_context(task, []) == 0
+        assert _load_table_context(task) == []
 
-class TestPersistOnFullPath:
-    """落盘时机必须在所有早退之前。"""
+    def test_persist_write_when_empty_false_preserves_existing_archive(
+        self, tmp_path, monkeypatch,
+    ):
+        """[A18] wrapper 语义保持：write_when_empty=False + 抽到 0 条 ⇒ 不写、
+        磁盘上原有存档原样保留（提炼不得改这条）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        task = _make_task()
+        assert _persist_table_context(task, [_mapped_table()]) == 1
+        assert _persist_table_context(
+            task, [{"type": "text", "text": "无表正文"}], write_when_empty=False,
+        ) is None
+        assert len(_load_table_context(task) or []) == 1
+
+    def test_extract_failure_warns_and_writes_nothing(self, tmp_path, monkeypatch):
+        """[A18 复审] wrapper 的抽取 except 分支：`_table_context_items` 抛错
+        ⇒ 返回 None、warning 文案含「抽取失败」、磁盘不产生存档（best-effort）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        task = _make_task()
+        with mock.patch(
+            "jonex_core.capability.atomic.ontology_compile.table_context._table_context_items",
+            side_effect=RuntimeError("boom"),
+        ), mock.patch("jonex_core.capability.atomic.ontology_compile.table_context.logger") as logger_mock:
+            assert _persist_table_context(
+                task, [{"type": "table", "table_body": "| a |"}],
+            ) is None
+        assert any("抽取失败" in str(c) for c in logger_mock.warning.call_args_list)
+        assert not os.path.exists(_table_context_path(task))
+
+    def test_write_failure_is_swallowed_returns_none(self, tmp_path, monkeypatch):
+        """[A18 复审] 写口内层异常（如 os.replace 失败）必须被吞掉：返回 None
+        不抛出（best-effort 不得阻断本体链路），且不产生完整存档。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        task = _make_task()
+        with mock.patch(
+            "raganything.service.task_manager.os.replace",
+            side_effect=OSError("disk full"),
+        ):
+            assert _write_table_context(
+                task, [{"type": "table", "table_body": "| a |"}],
+            ) is None
+        assert _load_table_context(task) is None
+
+    def test_sweep_called_on_success(self, tmp_path, monkeypatch):
+        """[A18 复审] 成功路径必须触发 TTL 清扫（兜底磁盘泄漏；防误删靠 TTL）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        task = _make_task()
+        with mock.patch(
+            "jonex_core.capability.atomic.ontology_compile.table_context._sweep_table_context",
+        ) as sweep:
+            assert _write_table_context(
+                task, [{"type": "table", "table_body": "| a |"}],
+            ) == 1
+        sweep.assert_called_once()
+
+
+class TestPersistCallSites:
+    """落盘调用点与存档存活（不再声称「落盘时机在所有早退之前」）。
+
+    历史：本类原名 TestPersistOnFullPath，断言的是「落盘发生在 _run_ontology_
+    extraction 内的所有早退之前」（de8b4235 引入）。4e5b71ad（2026-09-17 三步
+    拆分）把落盘上移到 push 时的三个调用点后，该断言恒红，且无任何测试再覆盖
+    「调用点真的落盘」。现按实际语义重写：① 真实调用点（prepare_only /
+    push_only 入口）必须落盘；② 抽取读回失败不得毁掉已落的存档。full 链路的
+    第三个调用点（`_execute_pipeline_http` push 时）同点**未加守卫**——mock
+    面过大、成本/收益不划算；盲区影响是「响的」：该处缺失会让走完整链路的
+    文档在日后 ontology_only 重抽时命中 P0-b 闸门判 FAILED，而不是静默丢表。
+    """
 
     @pytest.mark.asyncio
-    async def test_persist_happens_before_chunk_readback_failure(self, tmp_path, monkeypatch):
-        """chunk 读回失败会 return（本体重试拦不住），但存档必须已经就位。"""
+    async def test_archive_survives_chunk_readback_failure(self, tmp_path, monkeypatch):
+        """抽取读回失败（任务判 failed）不得毁掉上游已落的存档。
+
+        [A18 修订] 原用例名 test_persist_happens_before_chunk_readback_failure，
+        断言的是「落盘发生在 `_run_ontology_extraction` 内的所有早退之前」
+        （de8b4235 引入）；4e5b71ad（2026-09-17 三步拆分）把落盘上移到 push 时的
+        三个调用点后该断言恒红、也不再是被测属性。现按实际断言语义重写（对当前
+        代码通过 = 测试修正，不是驱动新代码）；调用点落盘由下面两条入口用例守卫。
+        """
         monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
         mgr = TaskManager(base_dir=str(tmp_path))
         task = _make_task()
@@ -261,6 +341,8 @@ class TestPersistOnFullPath:
         ctx.content_list = [
             {"type": "text", "text": "正文", "_mapped_tables": [_mapped_table()]},
         ]
+        # 上游（push 之后落盘形态）先落盘：
+        assert _persist_table_context(task, ctx.content_list) == 1
         with mock.patch.object(mgr, "_http_client", new=mock.MagicMock()) as client:
             client.get_document_chunks = mock.AsyncMock(
                 side_effect=RuntimeError("boom"),
@@ -270,6 +352,62 @@ class TestPersistOnFullPath:
         # 抽取失败（chunk 读回失败）
         assert task.ontology_status == "failed"
         # 存档仍在，重抽可回放同一口径
+        assert len(_load_table_context(task) or []) == 1
+
+    @pytest.mark.asyncio
+    async def test_prepare_only_call_site_persists_archive(self, tmp_path, monkeypatch):
+        """调用点行为守卫：走真实 `_run_prepare_only`，pipeline 产出 content_list
+        后必须落盘（删掉该处 `_persist_table_context` 调用本用例即红；只 mock
+        executor 与产物落盘函数，其余走真实路径）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        mgr = TaskManager(base_dir=str(tmp_path))
+        task = _make_task()
+        executor = mock.MagicMock()
+        result = mock.MagicMock(success=True)
+
+        async def _prepare_only(ctx):
+            ctx.content_list = [
+                {"type": "table", "table_body": "| a |\n| - |\n| 1 |"},
+            ]
+            return result
+
+        executor.prepare_only = _prepare_only
+        with mock.patch.object(mgr, "_pipeline_executor", new=executor), \
+             mock.patch(
+                 "raganything.service.task_manager._persist_ingest_artifacts",
+                 return_value=(True, ""),
+             ):
+            await mgr._run_prepare_only(task, _make_handle())
+
+        assert len(_load_table_context(task) or []) == 1
+
+    @pytest.mark.asyncio
+    async def test_push_only_call_site_persists_archive(self, tmp_path, monkeypatch):
+        """调用点行为守卫：走真实 `_run_push_only`，切片推完（含 push 阶段刚登记
+        `_mapped_tables` 的形态）后必须落盘（删掉该处调用本用例即红）。"""
+        monkeypatch.setenv("RAG_TABLE_CTX_DIR", str(tmp_path))
+        mgr = TaskManager(base_dir=str(tmp_path))
+        task = _make_task()
+        executor = mock.MagicMock()
+        result = mock.MagicMock(success=True)
+
+        async def _push_only(ctx):
+            ctx.content_list = [
+                {"type": "text", "text": "正文", "_mapped_tables": [_mapped_table()]},
+            ]
+            return result
+
+        executor.push_chunks_only = _push_only
+        with mock.patch.object(mgr, "_pipeline_executor", new=executor), \
+             mock.patch(
+                 "raganything.service.task_manager._load_ingest_artifacts",
+                 return_value=([{"type": "text", "text": "正文"}], [], {}),
+             ), mock.patch.object(
+                 mgr, "_read_result_summary_http",
+                 new=mock.AsyncMock(return_value=mock.MagicMock()),
+             ):
+            await mgr._run_push_only(task, _make_handle())
+
         assert len(_load_table_context(task) or []) == 1
 
 
@@ -357,7 +495,7 @@ class TestOntologyOnlyReplay:
         task = _make_task()
         merge = mock.AsyncMock(return_value=True)
 
-        with mock.patch("raganything.service.task_manager.logger") as logger_mock:
+        with mock.patch("jonex_core.capability.atomic.ontology_compile.extract.logger") as logger_mock:
             extractor_cls, _ = await self._run_ontology_only(mgr, task, merge=merge)
 
         assert task.ontology_status == "failed"
@@ -394,7 +532,7 @@ class TestOntologyOnlyReplay:
         task = _make_task()
         _persist_table_context(task, [{"type": "text", "text": "纯文本，无表"}])
 
-        with mock.patch("raganything.service.task_manager.logger") as logger_mock:
+        with mock.patch("jonex_core.capability.atomic.ontology_compile.extract.logger") as logger_mock:
             extractor_cls, _ = await self._run_ontology_only(mgr, task)
 
         kwargs = extractor_cls.return_value.extract.await_args_list[0].kwargs
@@ -432,7 +570,7 @@ class TestTableContextSweep:
         old = time.time() - age_sec
         os.utime(path, (old, old))
         # 节流时间戳是模块级全局，重置后本次扫描才会真的执行
-        monkeypatch.setattr(task_manager, "_last_table_ctx_sweep", 0.0)
+        monkeypatch.setattr("jonex_core.capability.atomic.ontology_compile.table_context._last_table_ctx_sweep", 0.0)
         return path
 
     def test_expired_archive_is_removed(self, tmp_path, monkeypatch):

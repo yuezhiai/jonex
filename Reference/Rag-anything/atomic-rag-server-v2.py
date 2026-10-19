@@ -845,6 +845,9 @@ async def handle_retry_ontology_extract(params: dict, tenant_id: str, task_manag
     schema_hash = params.get("schema_hash", "") or ""
     force_retry = bool(params.get("force_retry", False))
     content_generation = int(params.get("content_generation", 0) or 0)
+    # [jonex] A18：引擎链 compile 步随提交携带的引擎全量 chunk（任务体灌库 +
+    # 读回校验用）。rag 链不传 ⇒ 空列表，任务体跳过前置段（行为与从前一致）。
+    engine_chunks = params.get("engine_chunks") or []
 
     if not document_id:
         raise HTTPException(400, "document_id 不能为空")
@@ -874,6 +877,17 @@ async def handle_retry_ontology_extract(params: dict, tenant_id: str, task_manag
                 }
             continue  # failed/cancelled 或 force_retry → 允许新建
         # 非终态在途任务 → 复用
+        # [jonex] A18/I3：复用会静默丢弃本次带来的 engine_chunks（幂等键不含
+        # chunks 指纹与 content_generation）——留声记录 key 与丢弃量；跨世代
+        # 场景由任务体读回校验 + 下轮对账兜底（spec §4.6）。
+        if engine_chunks:
+            logger.warning(
+                "[jonex][A18] retry_ontology_extract 复用在途任务，engine_chunks 被丢弃"
+                "（idempotency_key=%s, dropped=%d, reused_task=%s, "
+                "reused_generation=%s, req_generation=%s, force_retry=%s）",
+                idempotency_key, len(engine_chunks), t.task_id,
+                t.content_generation, content_generation, force_retry,
+            )
         return {
             "success": True, "code": 0, "message": "success",
             "data": {"status": t.status.value, "task_id": t.task_id},
@@ -891,6 +905,7 @@ async def handle_retry_ontology_extract(params: dict, tenant_id: str, task_manag
         schema_hash=schema_hash,
         force_retry=force_retry,
         content_generation=content_generation,
+        engine_chunks=engine_chunks,
         # [jonex] 与 insert/retry 同口径透传（ontology_only 不写产物，但保持构造一致）
         kb_type=params.get("kb_type", "") or "",
     )

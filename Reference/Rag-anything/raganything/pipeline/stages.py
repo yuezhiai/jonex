@@ -62,6 +62,14 @@ from raganything.utils import (
 # 防两条链再次漂移（2026-10-08 事故根因）。
 from raganything.video_processor import route_video
 
+# [jonex] P1：ns token 注入的定义方已迁到平台侧（跨仓契约 3），此处保留同名别名。
+# ⚠️ 这是导入期硬依赖：自此本 pipeline 层不再是「无平台也可导入」——本文件其它
+# 平台依赖（见下方函数级 import）都带 try/except 降级，只有这一条在模块导入期
+# 就要求 jonex_core 可导入。atomic-rag 镜像两者都 COPY（deploy/docker/atomic-rag.Dockerfile），故可满足。
+from jonex_core.capability.atomic.ontology_compile.nstoken import (
+    inject_ns_token as _inject_ns_token,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -1223,23 +1231,6 @@ def _generate_doc_id(content_list: List[Dict[str, Any]]) -> str:
 
 
 # ── v2 HTTP mode: PushChunksStage ──────────────────────────────────────
-
-
-def _inject_ns_token(
-    text: str, tenant_id: str, kb_id: str, document_id: str
-) -> str:
-    """[jonex] 注入命名空间 token，使 chunk 内容 hash 带上 (tenant, kb, doc) 维度。
-
-    对齐 v1 LightRAGAdapter 的行为（原 lightrag_adapter.py 上传前注入）：
-    LightRAG 按 chunk 内容 hash 全局去重，跨文档/跨 KB 的相同文本会被去重合并，
-    导致只有首篇文档抽到实体、其余文档图为空（本体阶段"无候选实体"→失败）。
-    在文本末尾追加短 hash 的 HTML 注释 marker，使每个 (tenant, kb, doc) 拥有独立
-    抽取记录、保证 ABox 隔离；同文档幂等重传时 token 相同 → hash 不变 → 仍可去重，
-    不浪费 LLM。消费侧（task_manager 本体抽取）按 `<!--yx:[a-f0-9]{8}-->` 过滤该 token。
-    """
-    ns_raw = f"{tenant_id}|{kb_id}|{document_id}"
-    ns_hash = hashlib.md5(ns_raw.encode()).hexdigest()[:8]
-    return text + f"\n<!--yx:{ns_hash}-->"
 
 
 def _split_long_text(text: str, max_chars: int) -> list[str]:

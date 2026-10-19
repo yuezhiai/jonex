@@ -181,6 +181,13 @@ class TaskInfo(BaseModel):
     # 超限即落 FAILED，不再自动重跑（见 ONTOLOGY_RECOVERY_MAX_ATTEMPTS）。
     recovery_attempts: int = 0
 
+    # [jonex] A18：引擎链 compile 任务随任务携带的引擎全量 chunk
+    # （[{chunk_index, content, file_source}]；平台读口产物）。任务体
+    # `_run_ontology_only` 前置段用它灌 LightRAG + 读回校验
+    # （§4.3）。
+    # 随任务 JSON 落盘（task_repository.save → model_dump），留存清理沿用 v2 策略。
+    engine_chunks: list[dict[str, Any]] = Field(default_factory=list)
+
     # ── HTTP mode track tracking ──
     lightrag_doc_ids: list[str] = Field(default_factory=list)
     pending_track_ids: list[str] = Field(default_factory=list)
@@ -277,6 +284,10 @@ class CreateTaskRequest(BaseModel):
     schema_hash: str = ""              # 版本号兜底
     strict_push: bool = False          # 严格推送模式
     force_retry: bool = False          # 允许对 completed 幂等任务新建 attempt
+
+    # [jonex] A18：平台随提交携带的引擎全量 chunk（仅 引擎链 compile 步填充；
+    # rag 链恒空 ⇒ 行为与从前逐字一致）。
+    engine_chunks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CreateTaskResponse(BaseModel):
