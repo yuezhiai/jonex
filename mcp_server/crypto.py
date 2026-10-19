@@ -35,6 +35,14 @@ _INSECURE_JWT_SECRETS = frozenset(
 _ESCAPE_HATCH_ENV = "ALLOW_INSECURE_JWT_SECRET"
 _ESCAPE_HATCH_TRUE = frozenset({"1", "true", "yes", "on"})
 
+#: 判定为「生产」的 ENV 取值，与 ``jonex_core/common/security_guards.py`` 同一政策。
+_PRODUCTION_ENVS = frozenset({"prod", "production"})
+
+
+def _is_production_env() -> bool:
+    """``ENV=prod`` / ``production`` 才算生产；未设置按非生产处理。"""
+    return os.getenv("ENV", "").strip().lower() in _PRODUCTION_ENVS
+
 
 def assert_secure_jwt_secret() -> None:
     """校验 JWT_SECRET 已配置为真实随机值，否则拒绝启动（fail-closed）。
@@ -46,8 +54,15 @@ def assert_secure_jwt_secret() -> None:
     所有 Key 都会验不过——轮换 JWT_SECRET 时 ``deploy/.env`` 与 ``deploy/.env.mcp``
     必须同批修改。
 
+    两档判据**分档不同**（2026-10-15 对齐 security_guards）：
+
+    - **空值**：任何环境都拒绝启动 —— 空 secret 不是任何一种环境的合法配置，
+      且 ``_current_hash_secret`` 随后也会拒绝（纵深防御）；
+    - **仓库内公开默认值**：只有生产档（``ENV=prod``）拒绝启动，其余环境打一条
+      warning 后放行（用户口径：非生产画像沿用公开值本来就是预期）。
+
     Raises:
-        RuntimeError: JWT_SECRET 缺失或为空（公开默认值判定已于 2026-09-22 停用）。
+        RuntimeError: JWT_SECRET 为空（任何环境），或生产档下仍为仓库内公开的默认值。
     """
     if os.getenv(_ESCAPE_HATCH_ENV, "").strip().lower() in _ESCAPE_HATCH_TRUE:
         logger.warning(
@@ -58,22 +73,30 @@ def assert_secure_jwt_secret() -> None:
 
     value = os.getenv("JWT_SECRET", "").strip()
     if not value:
-        reason = "未配置或为空"
-    # 2026-09-22 停用公开默认值判定，与 jonex_core/common/security_guards.py 保持同步
-    # （原因见该文件 _classify_jwt_secret）。注意本服务读的是环境变量：.env.mcp 中
-    # JWT_SECRET 被留空或整行删除时，上面的空值判定仍会拒绝启动。
-    # elif value in _INSECURE_JWT_SECRETS:
-    #     reason = "仍为仓库内公开的默认值"
-    else:
-        return
+        raise RuntimeError(
+            "JWT_SECRET 不安全，拒绝启动：未配置或为空。"
+            "MCP Server 用它对 MCP Key 做 HMAC 校验。"
+            "请在 .env.mcp 中设置为与 deploy/.env 一致的真实随机值；"
+            f"若确需在本地开发沿用默认值，显式设置 {_ESCAPE_HATCH_ENV}=1。"
+        )
 
-    raise RuntimeError(
-        f"JWT_SECRET 不安全，拒绝启动：{reason}。"
-        "MCP Server 用它对 MCP Key 做 HMAC 校验，使用公开默认值意味着任何持有该"
-        "公开值的一方都能推导出校验逻辑，且与写入侧 platform 服务必然分叉。"
-        "请在 .env.mcp 中设置为与 deploy/.env 一致的真实随机值；"
-        f"若确需在本地开发沿用默认值，显式设置 {_ESCAPE_HATCH_ENV}=1。"
-    )
+    # 公开默认值判定：2026-09-22 曾整段停用（当时与 security_guards 同步停用），
+    # 10-14 security_guards 已恢复、本文件漏了 —— 10-15 补回，并按生产档分档。
+    if value in _INSECURE_JWT_SECRETS:
+        message = (
+            "JWT_SECRET 不安全：仍为仓库内公开的默认值。"
+            "MCP Server 用它对 MCP Key 做 HMAC 校验，使用公开默认值意味着任何持有该"
+            "公开值的一方都能推导出校验逻辑，且与写入侧 platform 服务必然分叉。"
+            "请在 .env.mcp 中设置为与 deploy/.env 一致的真实随机值。"
+        )
+        if _is_production_env():
+            raise RuntimeError(f"{message}（生产档 ENV=prod，拒绝启动）")
+        logger.warning(
+            "JWT_SECRET 启动守卫已跳过（ENV=%s，非生产档，只告警不拦）：%s"
+            "⚠️ 若这是对外实例，请显式设置 ENV=prod —— 不设时这一层保护不会生效。",
+            os.getenv("ENV", "").strip() or "<未设置>",
+            message,
+        )
 
 MCP_KEY_SECRET_ENV = "MCP_KEY_SECRET"
 MCP_KEY_SECRET_LEGACY_ENV = "MCP_KEY_SECRET_LEGACY"

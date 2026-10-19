@@ -88,6 +88,21 @@ def set_http_client(client: httpx.AsyncClient | None) -> None:
 # Block 2: call_gateway() — POST Gateway /internal/kb/invoke
 # ============================================================================
 
+# 业务码：内容重复（ResourceConflictError，jonex_core/common/exceptions.py:86）
+_BIZ_CODE_CONTENT_DUPLICATE = 1003
+
+
+def _resp_biz_code(resp) -> int | None:
+    """从 HTTP 错误响应体里取业务码；取不到返回 None（绝不让解析失败顶掉原有兜底分支）。"""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("code"), int):
+        return body["code"]
+    return None
+
+
 async def call_gateway(
     action: str,
     tenant_id: str,
@@ -110,6 +125,7 @@ async def call_gateway(
 
     Raises:
         McpToolError(code=-32000): 知识库服务不可用（HTTP 错误 / 超时 / 传输错误 / 业务失败）
+        McpToolError(code=-32003): 内容重复（409 + 业务码 1003），调用方应按「已存在」处理而非重试
     """
     client = await get_http_client()
     try:
@@ -157,6 +173,18 @@ async def call_gateway(
                     code=_ERROR_AUTH,
                     message="认证失败或权限不足",
                 )
+            # 内容重复（409 + 业务码 1003）→ 独立分档。它被压在「参数有误」里会被
+            # 调用方误读成「调参后重试即可」，而重复上传重试多少次都是同一堵墙。
+            # 注意：400/404/422 仍映射 _ERROR_INVALID_PARAMS —— 搜索链路的
+            # fallback 判据依赖它（见 search_llmwiki / search_jonex_wiki）。
+            if (
+                e.response.status_code == 409
+                and _resp_biz_code(e.response) == _BIZ_CODE_CONTENT_DUPLICATE
+            ):
+                raise McpToolError(
+                    code=_ERROR_CONFLICT,
+                    message="知识库中已存在相同内容的文档，请勿重复上传",
+                )
             # 其他客户端错误（400/404/422）→ 参数或管线问题，允许上游 safe-fallback
             raise McpToolError(
                 code=_ERROR_INVALID_PARAMS,
@@ -197,6 +225,12 @@ async def call_gateway(
             tenant_id,
             biz_code,
         )
+        # 内容重复：与上面的 409 分支保持同一分档（防中间层把 409 吞成 200 的情形）
+        if biz_code == _BIZ_CODE_CONTENT_DUPLICATE:
+            raise McpToolError(
+                code=_ERROR_CONFLICT,
+                message="知识库中已存在相同内容的文档，请勿重复上传",
+            )
         # 1xxx = 通用参数/管线不匹配错误，映射为 INVALID_PARAMS 以便上游安全 fallback
         mcp_code = _ERROR_INVALID_PARAMS if isinstance(biz_code, int) and 1000 <= biz_code < 2000 else _ERROR_INTERNAL
         raise McpToolError(code=mcp_code, message="知识库服务暂不可用")
@@ -543,6 +577,7 @@ _ERROR_INVALID_PARAMS = -32602  # 参数校验失败（JSON-RPC standard）
 _ERROR_INTERNAL = -32000  # 内部服务错误
 _ERROR_RATE_LIMITED = -32001  # 限流（自定义 MCP extension）
 _ERROR_AUTH = -32002  # 认证/授权失败（401/403 → 禁止管线 fallback）
+_ERROR_CONFLICT = -32003  # 资源冲突/内容重复（409 + 业务码 1003；同样禁止管线 fallback）
 
 # NOTE: SEARCH_LLMWIKI_ENABLED 是进程级状态。多 worker 场景下各 worker 独立进行
 # 健康检查，可能在不同时刻得出不同结论（部分 worker 启用、部分禁用）。

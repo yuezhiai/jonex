@@ -40,7 +40,9 @@ def _decode(request: Request) -> Optional[dict]:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
-    token = auth[7:]
+    # 与 `require_auth_header` 保持同一口径：容忍 Bearer 与 token 之间的多余空白，
+    # 否则认证门放行的 token 在这里解不出身份（密级守卫会因 user_id 为空而失效）。
+    token = auth[7:].strip()
     config = get_config()
     try:
         return jwt.decode(

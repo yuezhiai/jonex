@@ -12,7 +12,8 @@ import json
 import os
 import random
 import re
-from typing import Any
+import uuid
+from typing import Any, Optional
 
 import httpx
 import redis.asyncio as aioredis
@@ -30,7 +31,8 @@ from jonex_core.common import (
     transmit_locale_header,
 )
 from jonex_core.common.audit import schedule_emit
-from jonex_core.common.exceptions import ResourceNotFoundError
+from jonex_core.common.exceptions import JonexException, ResourceNotFoundError
+from jonex_core.common.monitor_collector import attempt_span
 from jonex_core.common.tenant import require_tenant
 
 logger = get_logger("api_internal")
@@ -128,6 +130,7 @@ async def _call_kb_capability_mcp(
     mcp_key_id: str,
     action: str,
     data: dict[str, Any] | None = None,
+    request_id: str = "",
 ) -> dict:
     """Invoke the knowledge-base capability via Sidecar for an MCP request.
 
@@ -141,6 +144,11 @@ async def _call_kb_capability_mcp(
     ``context.mcp_key_id`` for audit tracking (SEC-06).
     """
     config = get_config()
+
+    # 采集用 request_id：MCP 路没有用户 `Request` 对象，调用方拿不到时按本次调用
+    # **新生成**（N2 仅作「一次物理尝试」的归属键、不参与 N1 的 `X-Request-ID` 链路，
+    # 故可自造；正常由 `mcp_kb_invoke` 从 `request.state.request_id` 透传）。
+    request_id = request_id or uuid.uuid4().hex
 
     sidecar_payload: dict[str, Any] = {
         "capability_id": "business.knowledge_base.v1",
@@ -160,59 +168,82 @@ async def _call_kb_capability_mcp(
     transmit_locale_header(headers)
 
     last_exc: BaseException | None = None
+    wait_before_ms: Optional[int] = None
     async with httpx.AsyncClient(timeout=_SIDECAR_TIMEOUT) as client:
         for attempt in range(_SIDECAR_MAX_RETRIES + 1):
-            try:
-                response = await client.post(
-                    f"{config.SIDECAR_URL}/invoke",
-                    json=sidecar_payload,
-                    headers=headers,
-                )
-                result = response.json()
-                if response.status_code != 200 or not result.get("success", False):
-                    from api_gateway.deps import raise_from_capability_result
+            # N2 物理 Attempt 埋点（监控旁路，采不到不影响主链路）。
+            with attempt_span(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                attempt_no=attempt + 1,
+                # 先按「最后一次尝试」记；只有下面真会重试的 transport 分支才降级为 False。
+                is_final=True,
+                wait_before_ms=wait_before_ms,
+            ) as att:
+                try:
+                    response = await client.post(
+                        f"{config.SIDECAR_URL}/invoke",
+                        json=sidecar_payload,
+                        headers=headers,
+                    )
+                    result = response.json()
+                    if response.status_code != 200 or not result.get("success", False):
+                        from api_gateway.deps import raise_from_capability_result
 
-                    raise_from_capability_result(result)
-                return result.get("data") or {}
-            except httpx.TimeoutException:
-                raise CapabilityInvokeError(
-                    message="知识库能力调用超时",
-                    details={"action": action},
-                )
-            except httpx.TransportError as e:
-                last_exc = e
-                if attempt < _SIDECAR_MAX_RETRIES:
-                    delay = min(_SIDECAR_BASE_DELAY * (2 ** attempt), _SIDECAR_MAX_DELAY)
-                    jitter = random.uniform(0, delay)
-                    logger.warning(
-                        "MCP KB Sidecar 调用 %s 瞬断 (attempt %s/%s)，"
-                        "%.1fs 后重试: %s",
-                        action, attempt + 1, _SIDECAR_MAX_RETRIES + 1, jitter, e,
-                    )
-                    await asyncio.sleep(jitter)
-                else:
-                    logger.error(
-                        "MCP KB Sidecar 调用 %s 失败，已重试 %s 次: %s",
-                        action, _SIDECAR_MAX_RETRIES, e,
-                    )
+                        raise_from_capability_result(result)
+                    return result.get("data") or {}
+                except httpx.TimeoutException as e:
+                    att.fail(error_code=504, error_message=e)
                     raise CapabilityInvokeError(
-                        message=_sanitize_error_message(
-                            getattr(e, "message", "") or str(e)
-                        ),
+                        message="知识库能力调用超时",
                         details={"action": action},
                     )
-            except CapabilityInvokeError:
-                raise
-            except Exception as exc:
-                logger.error(
-                    "MCP KB capability call failed: action=%s error=%s type=%s",
-                    action, exc, type(exc).__name__,
-                    exc_info=True,
-                )
-                raise CapabilityInvokeError(
-                    message=_sanitize_error_message(str(exc)),
-                    details={"action": action},
-                )
+                except httpx.TransportError as e:
+                    att.fail(error_code=502, error_message=e)
+                    last_exc = e
+                    if attempt < _SIDECAR_MAX_RETRIES:
+                        # 还会重试 ⇒ 本次不是最后一次尝试。is_final 无 setter，就地降级快照。
+                        att.mark_final(False)
+                        delay = min(_SIDECAR_BASE_DELAY * (2 ** attempt), _SIDECAR_MAX_DELAY)
+                        jitter = random.uniform(0, delay)
+                        wait_before_ms = int(jitter * 1000)
+                        logger.warning(
+                            "MCP KB Sidecar 调用 %s 瞬断 (attempt %s/%s)，"
+                            "%.1fs 后重试: %s",
+                            action, attempt + 1, _SIDECAR_MAX_RETRIES + 1, jitter, e,
+                        )
+                        await asyncio.sleep(jitter)
+                    else:
+                        logger.error(
+                            "MCP KB Sidecar 调用 %s 失败，已重试 %s 次: %s",
+                            action, _SIDECAR_MAX_RETRIES, e,
+                        )
+                        raise CapabilityInvokeError(
+                            message=_sanitize_error_message(
+                                getattr(e, "message", "") or str(e)
+                            ),
+                            details={"action": action},
+                        )
+                except CapabilityInvokeError:
+                    raise
+                except JonexException as exc:
+                    # 下游业务异常（含 ResourceConflictError/ResourceNotFoundError 等，
+                    # 由 raise_from_capability_result 按 code 还原）必须穿透：它们的
+                    # status_code/code 已是正确业务语义，重包成 500 会把「内容重复」
+                    # 「未找到」一律掩盖成「服务不可用」。
+                    # message 仍须脱敏——放行异常类型不等于放行原文。
+                    exc.message = _sanitize_error_message(exc.message)
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "MCP KB capability call failed: action=%s error=%s type=%s",
+                        action, exc, type(exc).__name__,
+                        exc_info=True,
+                    )
+                    raise CapabilityInvokeError(
+                        message=_sanitize_error_message(str(exc)),
+                        details={"action": action},
+                    )
 
 
 # ── Endpoints ────────────────────────────────────────────────────
@@ -278,6 +309,7 @@ async def mcp_kb_invoke(
             mcp_key_id=mcp_key_id,
             action=action,
             data=data or {},
+            request_id=getattr(request.state, "request_id", ""),
         )
     except CapabilityInvokeError as exc:
         raise CapabilityInvokeError(

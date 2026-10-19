@@ -30,7 +30,12 @@ from jonex_core.common import (
     require_tenant,
 )
 from jonex_core.common.tenant import require_test_token_allowed
-from jonex_core.common.security_guards import assert_secure_jwt_secret
+from jonex_core.common.security_guards import (
+    assert_secure_gateway_api_key,
+    assert_secure_internal_api_key,
+    assert_secure_jwt_secret,
+)
+from jonex_core.common.monitor_collector import get_monitor_collector
 
 config = get_config()
 logger = get_logger("api_gateway")
@@ -149,36 +154,59 @@ def create_app() -> FastAPI:
         setup_logging(enable_file=True)
         logger.info("API Gateway 本地文件日志已启用")
 
-        # 安全守卫: JWT_SECRET 必须为真实随机值（无条件校验，不依赖 ENV=prod——
-        # ENV 未显式设置时默认 "dev"，生产实例会静默落进 dev 分支使守卫失效）。
+        # 安全守卫: JWT_SECRET 必须为真实随机值。**硬拦只在生产档（ENV=prod）**；
+        # dev/test/uat/未设置只打一条 warning 后放行（2026-10-15 用户口径：非生产画像
+        # 沿用仓库内公开值本来就是预期，不该被启动守卫拦成重启循环）。
         # 泄漏 JWT_SECRET 可伪造任意用户 JWT（含管理员）与 ingest key。
         assert_secure_jwt_secret(config)
 
-        # 安全守卫: INTERNAL_API_KEY 必须已从默认哨兵修改
-        _internal_key = config.INTERNAL_API_KEY
-        if not _internal_key or _internal_key == "change-me-in-production":
-            raise RuntimeError(
-                "INTERNAL_API_KEY 未配置或仍为默认哨兵值。"
-                "请在 .env 或环境变量中设置 INTERNAL_API_KEY 为真实随机 key。"
-                "未配置将导致 /internal/* 端点无认证保护。"
-            )
+        # 安全守卫: INTERNAL_API_KEY 必须已从仓库内公开值修改。
+        # ⚠️ 2026-10-14：原先只比对哨兵 change-me-in-production，漏掉
+        # 历史 deploy/.env.example:98 发出的 4ppCfZrqnQ4AE4... 模板值。
+        # ⚠️ 2026-10-15：这段判定从内联挪进 security_guards，并改为按生产档分档
+        # （原先无条件，非生产画像起不来）。
+        assert_secure_internal_api_key(config)
 
-        # 安全守卫: GATEWAY_API_KEY 在生产必须已从默认哨兵修改
-        # （对齐 INTERNAL_API_KEY 的哨兵模式；dev/test 允许哨兵默认值，Gateway 与
+        # 安全守卫: GATEWAY_API_KEY 必须已从**仓库内公开值**修改
+        # （对齐 INTERNAL_API_KEY 的哨兵模式；dev/test 允许测试态默认值，Gateway 与
         # Sidecar 读同一 config 精确比对即可自洽）
-        if config.is_production:
-            _gateway_key = config.GATEWAY_API_KEY
-            if not _gateway_key or _gateway_key == "change-me-in-production":
-                raise RuntimeError(
-                    "GATEWAY_API_KEY 未配置或仍为默认哨兵值。"
-                    "生产环境必须在 .env 或环境变量中设置 GATEWAY_API_KEY 为真实随机 key，"
-                    "否则 Gateway→Sidecar 内部认证可被伪造。"
-                )
+        # ⚠️ 2026-10-14：原先只比对哨兵串 change-me-in-production，漏掉
+        # deploy/.env.example 实际发出的 jonex_test_gateway（实测生产在用）。
+        # 现改用共享判定 is_insecure_gateway_api_key，覆盖仓库内全部曾公开的值。
+        assert_secure_gateway_api_key(config)
+
+        # 监控采集写口（N1/N2）：启动后台消费协程，否则路由里埋的 N2 会静默全丢。
+        _start_monitor_collector()
+
+    @app.on_event("shutdown")
+    async def stop_monitor_collector():
+        await _stop_monitor_collector()
 
     # ==================== 路由注册 ====================
     register_routes(app)
 
     return app
+
+
+# ==================== 监控采集写口（N1/N2）====================
+# 采集器是**每进程独立实例**（独立队列 + 独立连接），网关进程必须自己启动它，
+# 否则 api_gateway 路由里埋的 N2 调用明细会**静默全丢**（put_* 在未启动时是 no-op）。
+# 网关此前不连库，采集器会经 `get_db_session()` 直写 PG（compose 已注入 DB_* 环境变量）。
+# 采集是旁路：起不来只记日志，绝不拖垮网关启动/关闭。
+def _start_monitor_collector():
+    try:
+        get_monitor_collector().start()
+        logger.info("[Gateway] MonitorCollector 已启动")
+    except Exception:
+        logger.exception("[Gateway] MonitorCollector 启动失败")
+
+
+async def _stop_monitor_collector():
+    try:
+        await get_monitor_collector().stop()
+        logger.info("[Gateway] MonitorCollector 已停止并 flush")
+    except Exception:
+        logger.exception("[Gateway] MonitorCollector 停止失败")
 
 
 def register_routes(app: FastAPI):
@@ -253,11 +281,13 @@ def register_routes(app: FastAPI):
         from api_gateway.routes import knowledge_base_router, tcadp_router, auth_router, platform_router, ecosystem_router
         from api_gateway.routes import knowledge_base_ingest_router, internal_router
         from api_gateway.routes import task_center_router
+        from api_gateway.routes.data_governance import router as data_governance_router
         app.include_router(auth_router, prefix="/api/v1/auth", tags=["认证"])
         app.include_router(platform_router, prefix="/api/v1/platform", tags=["平台管理"])
         app.include_router(knowledge_base_router, prefix="/api/v1/knowledge-base", tags=["知识库"])
         app.include_router(knowledge_base_ingest_router, prefix="/api/v1/knowledge-base", tags=["知识库-入站推送"])
         app.include_router(task_center_router, prefix="/api/v1/task-center", tags=["任务中心"])
+        app.include_router(data_governance_router, prefix="/api/v1", tags=["数据治理"])
         app.include_router(ecosystem_router, tags=["生态管理"])
         app.include_router(internal_router, prefix="/internal", tags=["内部"])
         app.include_router(tcadp_router)

@@ -10,9 +10,9 @@
 一个模式，只是 action 名字不同。
 
 这一组是 §4.4「任务中心不提供面向浏览器/前端的网络接口」那条边界**开的口子**：
-两个**只读**接口（任务列表 / 子任务列表）加**四个写接口** —— 停止任务、停止子任务、
-重试任务、重试子任务（后三个 2026-09-29 加）。**删除 / 详情这些写操作仍然一概没有**
-—— 再加新接口之前，先回设计文档确认 §4.4 的边界。
+**四个只读**接口（任务列表 / 子任务列表 / **任务详情 / 子任务详情**）加**四个写接口** ——
+停止任务、停止子任务、重试任务、重试子任务（三个写 2026-09-29 加；两个**详情读**
+2026-10-13 加）。**删除接口仍然一概没有** —— 再加新接口之前，先回设计文档确认 §4.4 的边界。
 
 **四个写接口都只改任务中心自己的库**：其中三个（停止子任务 / 重试任务 / 重试子任务）
 **一律不出站**；`task.stop` 唯一例外 —— 它**收口完成之后**会尽力而为地给运行方发一条
@@ -42,6 +42,7 @@ from jonex_core.common import (
     transmit_locale_header,
 )
 from jonex_core.common.i18n import translate
+from jonex_core.common.monitor_collector import attempt_span
 from jonex_core.common.tenant import extract_tenant_id
 
 logger = get_logger("api_task_center")
@@ -81,7 +82,7 @@ async def _call_tc_capability(
         "tenant_id": tenant_id,
     }
     # 调用者身份进 invoke 报文体（用户 JWT 到不了 Sidecar，只能网关自己解，详见
-    # `api_gateway/identity.py`）。**六个路由一律带上**：读接口带了没坏处，而四个写接口
+    # `api_gateway/identity.py`）。**八个路由一律带上**：读接口带了没坏处，而四个写接口
     # 都要它 —— 判权看它（`_ACTION_PERMISSIONS` 那张表），`task.stop` / `stop_subtask`
     # 还靠它落 `tasks.updated_by`。⚠️ 漏带的方向是「**悄悄放行**」不是报错
     # （`has_permission` 的口径是「没有 `user_id` 就放行」），加新路由时别忘。
@@ -100,66 +101,83 @@ async def _call_tc_capability(
     max_delay = float(os.getenv("GATEWAY_SIDECAR_MAX_DELAY", "8.0"))
     timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
+    wait_before_ms: Optional[int] = None
     for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{config.SIDECAR_URL}/invoke",
-                    json=sidecar_payload,
-                    headers=headers,
-                )
-            result = response.json()
-            if response.status_code != 200 or not result.get("success", False):
-                raise_from_capability_result(result)
-            return result.get("data")
-        except httpx.TimeoutException:
-            raise CapabilityInvokeError(
-                message=translate(
-                    "err.task_center.console.timeout", fallback="任务中心能力调用超时"
-                ),
-                details={"action": action},
-            )
-        except httpx.TransportError as e:
-            if attempt < max_retries:
-                delay = min(base_delay * (2**attempt), max_delay)
-                jitter = random.uniform(0, delay)
-                logger.warning(
-                    "任务中心 Sidecar 调用 %s 瞬断 (attempt %s/%s)，%.1fs 后重试: %s",
-                    action,
-                    attempt + 1,
-                    max_retries + 1,
-                    jitter,
-                    e,
-                )
-                await asyncio.sleep(jitter)
-            else:
-                logger.error(
-                    "任务中心 Sidecar 调用 %s 失败，已重试 %s 次: %s",
-                    action,
-                    max_retries,
-                    e,
-                )
+        # N2 物理 Attempt 埋点（监控旁路，采不到不影响主链路）。wait_before_ms 为
+        # 「进入本次尝试前」等的那段 jitter 毫秒（首传 None）。
+        with attempt_span(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            attempt_no=attempt + 1,
+            # 先按「最后一次尝试」记；只有下面真会重试的 transport 分支才降级为 False
+            # （成功 / 超时 / 其它异常都立即结束、不重试 ⇒ 都是本次逻辑调用的最后一次）。
+            is_final=True,
+            wait_before_ms=wait_before_ms,
+        ) as att:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        f"{config.SIDECAR_URL}/invoke",
+                        json=sidecar_payload,
+                        headers=headers,
+                    )
+                result = response.json()
+                if response.status_code != 200 or not result.get("success", False):
+                    raise_from_capability_result(result)
+                return result.get("data")
+            except httpx.TimeoutException as e:
+                att.fail(error_code=504, error_message=e)
                 raise CapabilityInvokeError(
                     message=translate(
-                        "err.task_center.console.unavailable",
-                        fallback="任务中心能力不可用",
+                        "err.task_center.console.timeout", fallback="任务中心能力调用超时"
                     ),
                     details={"action": action},
                 )
-        except JonexException:
-            raise
-        except Exception as exc:
-            if hasattr(exc, "code") and hasattr(exc, "status_code"):
+            except httpx.TransportError as e:
+                att.fail(error_code=502, error_message=e)
+                if attempt < max_retries:
+                    # 还会重试 ⇒ 本次不是最后一次尝试。is_final 无 setter，就地降级快照。
+                    att.mark_final(False)
+                    delay = min(base_delay * (2**attempt), max_delay)
+                    jitter = random.uniform(0, delay)
+                    wait_before_ms = int(jitter * 1000)
+                    logger.warning(
+                        "任务中心 Sidecar 调用 %s 瞬断 (attempt %s/%s)，%.1fs 后重试: %s",
+                        action,
+                        attempt + 1,
+                        max_retries + 1,
+                        jitter,
+                        e,
+                    )
+                    await asyncio.sleep(jitter)
+                else:
+                    logger.error(
+                        "任务中心 Sidecar 调用 %s 失败，已重试 %s 次: %s",
+                        action,
+                        max_retries,
+                        e,
+                    )
+                    raise CapabilityInvokeError(
+                        message=translate(
+                            "err.task_center.console.unavailable",
+                            fallback="任务中心能力不可用",
+                        ),
+                        details={"action": action},
+                    )
+            except JonexException:
                 raise
-            logger.error(
-                "Task Center capability call failed: action=%s error=%s", action, exc
-            )
-            raise CapabilityInvokeError(
-                message=translate(
-                    "err.task_center.console.unavailable", fallback="任务中心能力不可用"
-                ),
-                details={"action": action},
-            )
+            except Exception as exc:
+                if hasattr(exc, "code") and hasattr(exc, "status_code"):
+                    raise
+                logger.error(
+                    "Task Center capability call failed: action=%s error=%s", action, exc
+                )
+                raise CapabilityInvokeError(
+                    message=translate(
+                        "err.task_center.console.unavailable", fallback="任务中心能力不可用"
+                    ),
+                    details={"action": action},
+                )
 
 
 # 注意：字面量路径要声明在 `{param}` 路径之前（FastAPI 按注册顺序匹配）。
@@ -188,6 +206,15 @@ async def list_tasks(
         max_length=64,
         description="按任务落在哪个空间筛（精确匹配，字段名与任务行上的 space_id 同名）；不传为全部",
     ),
+    task_source: Optional[str] = Query(
+        None,
+        max_length=64,
+        description=(
+            "按任务来源筛（∈ 协议层 TASK_SOURCES，如 knowledge_base.file.manual_upload；"
+            "精确匹配）；不传为全部。⚠️ 域外值由能力侧当场拒（1001）。"
+            "筛它永远筛不到平台侧自己触发的任务 —— 那些行这一列为空"
+        ),
+    ),
     page: int = Query(1, ge=1, description="页码"),
     # 不设上限：原先卡了 `le=100`，但这是照抄知识库那套路由抄来的，任务中心没有
     # 对应的理由 —— 后台循环跑的是 `TASK_CENTER_SCHEDULER_BATCH`（默认 10），跟这个
@@ -210,7 +237,20 @@ async def list_tasks(
         payload["status"] = status
     if space_id:
         payload["space_id"] = space_id
+    if task_source:
+        payload["task_source"] = task_source
     result = await _call_tc_capability(request, "task.console_page", payload)
+    return success_response(data=result)
+
+
+@router.get("/tasks/{task_id}", summary="任务详情")
+async def get_task(request: Request, task_id: str):
+    """任务详情：**返回体与任务列表里的一行完全一致**（§4.4）。
+
+    没有 `<列表行>` 之外的东西 —— 要多给什么字段，改 `dtos/console.py` 的
+    `TaskConsoleItem`，**两个口子一起给**（详情不是"另一份 DTO"）。
+    """
+    result = await _call_tc_capability(request, "task.console_detail", {"task_id": task_id})
     return success_response(data=result)
 
 
@@ -225,6 +265,24 @@ async def list_subtasks(
     if attempt is not None:
         payload["attempt"] = attempt
     result = await _call_tc_capability(request, "task.console_subtask_list", payload)
+    return success_response(data=result)
+
+
+@router.get("/tasks/{task_id}/subtasks/{node_id}", summary="子任务详情")
+async def get_subtask(request: Request, task_id: str, node_id: str):
+    """子任务详情：**返回体与子任务列表里的一行完全一致**（§4.4）。
+
+    ⚠️ 入参**只有 `task_id` + `node_id`**（2026-10-13 定）：页面手上就这两个。
+
+    ⚠️ 按 **`node_id`（节点名，如 `parse_1`）** 寻址，**不是**子任务行的主键 `id`
+    —— 与那两条子任务级写接口同口径。取的是**当前那次运行**里的那一行
+    （`node_id` 只在同一次运行内唯一，跨运行会重复出现）。
+    """
+    result = await _call_tc_capability(
+        request,
+        "task.console_subtask_detail",
+        {"task_id": task_id, "node_id": node_id},
+    )
     return success_response(data=result)
 
 

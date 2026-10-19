@@ -35,7 +35,9 @@ async def _proxy_platform(request: Request, path: str):
     }
     auth_header = request.headers.get("Authorization")
     if auth_header:
-        headers["Authorization"] = auth_header
+        # 原样透传 ``Bearer   ``（尾部空白）会让 httpx 抛 LocalProtocolError
+        # （Illegal header value），表现为畸形头 500 而不是 401。
+        headers["Authorization"] = auth_header.strip()
     tenant_header = request.headers.get("X-Tenant-ID")
     if tenant_header:
         headers["X-Tenant-ID"] = tenant_header
@@ -336,6 +338,34 @@ async def update_system_config(config_key: str, request: Request):
     return await _proxy_platform(request, f"system-configs/{config_key}")
 
 
+# ==================== 租户级安全配置（租户管理员自助）====================
+#
+# ⚠ 网关对 platform 是**逐条登记**的（不像 sidecar 有 /platform/{path:path} 兜底），
+# 所以 platform 侧每加一个对外口，这里必须同步加一条 —— 漏了就是 404。
+# tests/unit/test_hide_task_center.py 里有一条通用对照测试盯着这件事
+# （platform 全部路由 − 网关两个模块登记 = 一份写明原因的白名单）。
+#
+# 与上面「系统配置」的区别：那是平台共享的全局值（只有平台管理员能改），
+# 这里改的是**本租户的覆盖值**（租户管理员即可），读取链三层回落。
+
+@router.get("/tenant-security-config", summary="获取本租户安全配置")
+async def list_tenant_security_config(request: Request):
+    """本租户的安全配置（生效值 + 平台默认 + 是否被本租户覆盖）"""
+    return await _proxy_platform(request, "tenant-security-config")
+
+
+@router.put("/tenant-security-config/{config_key}", summary="设置本租户安全配置")
+async def update_tenant_security_config(config_key: str, request: Request):
+    """设置本租户对某个安全配置的覆盖值"""
+    return await _proxy_platform(request, f"tenant-security-config/{config_key}")
+
+
+@router.delete("/tenant-security-config/{config_key}", summary="恢复本租户安全配置默认值")
+async def reset_tenant_security_config(config_key: str, request: Request):
+    """删除本租户的覆盖值 = 恢复平台默认"""
+    return await _proxy_platform(request, f"tenant-security-config/{config_key}")
+
+
 # ==================== 审计日志 ====================
 
 @router.get("/audit-logs", summary="获取审计日志列表")
@@ -558,3 +588,109 @@ async def list_identity_sync_records(request: Request):
 async def get_identity_sync_record(record_id: int, request: Request):
     """同步记录详情（含失败明细）"""
     return await _proxy_platform(request, f"identity-integration/sync-records/{record_id}")
+
+
+# ==================== 平台监控 · 调用监控（C1–C9 + M1）+ Token 监控（K1–K4）====================
+#
+# ⚠ 网关对 platform 是**逐条登记**的（不像 sidecar 有 /platform/{path:path} 兜底）
+# ⇒ platform 侧 14 条监控端点必须在**同一批**登记在这里：只加 platform 不登记
+# 网关 = 浏览器侧 404；只登记网关不加 platform = `test_gateway_has_no_stale_routes` 红。
+# tests/unit/test_hide_task_center.py 的正反双向断言盯着这件事。
+
+
+@router.get("/monitor/calls/external/summary", summary="外部依赖统计卡")
+async def monitor_external_summary(request: Request):
+    return await _proxy_platform(request, "monitor/calls/external/summary")
+
+
+@router.get("/monitor/calls/external/objects", summary="外部依赖对象列表")
+async def monitor_external_objects(request: Request):
+    return await _proxy_platform(request, "monitor/calls/external/objects")
+
+
+@router.get("/monitor/calls/open/summary", summary="开放能力统计卡")
+async def monitor_open_summary(request: Request):
+    return await _proxy_platform(request, "monitor/calls/open/summary")
+
+
+@router.get("/monitor/calls/open/objects", summary="开放能力对象列表")
+async def monitor_open_objects(request: Request):
+    return await _proxy_platform(request, "monitor/calls/open/objects")
+
+
+@router.get("/monitor/calls/trend", summary="调用趋势")
+async def monitor_call_trend(request: Request):
+    return await _proxy_platform(request, "monitor/calls/trend")
+
+
+@router.get("/monitor/calls/records", summary="调用记录列表")
+async def monitor_call_records(request: Request):
+    return await _proxy_platform(request, "monitor/calls/records")
+
+
+@router.get("/monitor/calls/objects/{object_id}/detail", summary="对象 / 能力详情")
+async def monitor_object_detail(object_id: str, request: Request):
+    return await _proxy_platform(request, f"monitor/calls/objects/{object_id}/detail")
+
+
+@router.get("/monitor/calls/{request_id}/detail", summary="单次调用详情")
+async def monitor_call_detail(request_id: str, request: Request):
+    return await _proxy_platform(request, f"monitor/calls/{request_id}/detail")
+
+
+@router.get("/monitor/calls/{request_id}/attempts", summary="Attempt 明细列表")
+async def monitor_call_attempts(request_id: str, request: Request):
+    return await _proxy_platform(request, f"monitor/calls/{request_id}/attempts")
+
+
+@router.get("/monitor/meta/filters", summary="筛选元数据")
+async def monitor_meta_filters(request: Request):
+    return await _proxy_platform(request, "monitor/meta/filters")
+
+
+# ---------------------------------------------------------------- Token 监控族（K1–K4）
+# 上游路径串 = platform 侧路径去掉 `/platform` 前缀，逐字符对齐。
+
+
+@router.get("/monitor/tokens/summary", summary="Token 用量统计卡")
+async def monitor_token_summary(request: Request):
+    return await _proxy_platform(request, "monitor/tokens/summary")
+
+
+@router.get("/monitor/tokens/trend", summary="Token 用量趋势")
+async def monitor_token_trend(request: Request):
+    return await _proxy_platform(request, "monitor/tokens/trend")
+
+
+@router.get("/monitor/tokens/models/top", summary="Token 用量模型 TOP N")
+async def monitor_token_models_top(request: Request):
+    return await _proxy_platform(request, "monitor/tokens/models/top")
+
+
+@router.get("/monitor/tokens/usage", summary="Token 用量明细列表")
+async def monitor_token_usage(request: Request):
+    return await _proxy_platform(request, "monitor/tokens/usage")
+
+
+# ---------------------------------------------------------------- 任务监控族（T1–T4）
+# 上游路径串 = platform 侧路径去掉 `/platform` 前缀，逐字符对齐。
+
+
+@router.get("/monitor/tasks/summary", summary="任务监控统计卡")
+async def monitor_task_summary(request: Request):
+    return await _proxy_platform(request, "monitor/tasks/summary")
+
+
+@router.get("/monitor/tasks/trend", summary="任务监控趋势")
+async def monitor_task_trend(request: Request):
+    return await _proxy_platform(request, "monitor/tasks/trend")
+
+
+@router.get("/monitor/tasks/failures", summary="失败任务列表")
+async def monitor_task_failures(request: Request):
+    return await _proxy_platform(request, "monitor/tasks/failures")
+
+
+@router.get("/monitor/tasks/overview", summary="任务运行概览")
+async def monitor_task_overview(request: Request):
+    return await _proxy_platform(request, "monitor/tasks/overview")

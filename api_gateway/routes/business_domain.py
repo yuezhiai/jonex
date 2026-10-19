@@ -24,6 +24,7 @@ from jonex_core.common import (
 )
 from jonex_core.common.tenant import extract_tenant_id
 from jonex_core.common.i18n import translate
+from jonex_core.common.monitor_collector import attempt_span
 from api_gateway.deps import require_auth_header, raise_from_capability_result
 # 身份解析统一在 `api_gateway/identity.py`（原先这里和 knowledge_base.py 各抄了一份）。
 # 用别名导入是为了不动下面 20 多处既有的 `_extract_*` 调用点 —— 换名字只是噪音。
@@ -83,38 +84,53 @@ async def _call_bd_capability(request: Request, action: str, payload: dict):
     timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
     last_exc: BaseException | None = None
+    wait_before_ms: Optional[int] = None
     for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{sidecar_url}/invoke", json=sidecar_payload, headers=headers,
-                )
-                result = response.json()
-                if response.status_code != 200 or not result.get("success", False):
-                    raise_from_capability_result(result)
-                return result.get("data", {})
-        except httpx.TimeoutException:
-            raise CapabilityTimeoutError()
-        except httpx.TransportError as e:
-            last_exc = e
-            if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt), max_delay)
-                jitter = random.uniform(0, delay)
-                logger.warning(
-                    f"Sidecar 调用 {action} 瞬断 (attempt {attempt+1}/{max_retries+1})，"
-                    f"{jitter:.1f}s 后重试: {e}",
-                )
-                await asyncio.sleep(jitter)
-            else:
-                logger.error(
-                    f"Sidecar 调用 {action} 失败，已重试 {max_retries} 次: {e}",
-                )
+        # N2 物理 Attempt 埋点（监控旁路，采不到不影响主链路）。
+        with attempt_span(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            attempt_no=attempt + 1,
+            # 先按「最后一次尝试」记；只有下面真会重试的 transport 分支才降级为 False。
+            is_final=True,
+            wait_before_ms=wait_before_ms,
+        ) as att:
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        f"{sidecar_url}/invoke", json=sidecar_payload, headers=headers,
+                    )
+                    result = response.json()
+                    if response.status_code != 200 or not result.get("success", False):
+                        raise_from_capability_result(result)
+                    return result.get("data", {})
+            except httpx.TimeoutException as e:
+                att.fail(error_code=504, error_message=e)
+                raise CapabilityTimeoutError()
+            except httpx.TransportError as e:
+                att.fail(error_code=502, error_message=e)
+                last_exc = e
+                if attempt < max_retries:
+                    # 还会重试 ⇒ 本次不是最后一次尝试。is_final 无 setter，就地降级快照。
+                    att.mark_final(False)
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = random.uniform(0, delay)
+                    wait_before_ms = int(jitter * 1000)
+                    logger.warning(
+                        f"Sidecar 调用 {action} 瞬断 (attempt {attempt+1}/{max_retries+1})，"
+                        f"{jitter:.1f}s 后重试: {e}",
+                    )
+                    await asyncio.sleep(jitter)
+                else:
+                    logger.error(
+                        f"Sidecar 调用 {action} 失败，已重试 {max_retries} 次: {e}",
+                    )
+                    raise ServiceUnavailableError(details={"action": action})
+            except JonexException:
+                raise
+            except Exception as e:
+                logger.error(f"业务领域调用异常: action={action}, error={e}")
                 raise ServiceUnavailableError(details={"action": action})
-        except JonexException:
-            raise
-        except Exception as e:
-            logger.error(f"业务领域调用异常: action={action}, error={e}")
-            raise ServiceUnavailableError(details={"action": action})
 
 
 # ════════════════════════════════════════════════════════════
@@ -302,6 +318,109 @@ async def delete_template_scenario(request: Request, scenario_id: str):
 async def publish_template_scenario(request: Request, scenario_id: str):
     """发布指定模板场景，更新版本号/发布时间/结构哈希"""
     result = await _call_bd_capability(request, "publish_template_scenario", {"scenario_id": scenario_id})
+    return success_response(data=result)
+
+
+@ecosystem_router.post(
+    "/templates/scenarios/{scenario_id}/publish-requests",
+    summary="提交模板场景发布申请",
+)
+async def submit_publish_request(request: Request, scenario_id: str):
+    result = await _call_bd_capability(
+        request, "submit_publish_request", {"scenario_id": scenario_id},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.get(
+    "/templates/scenarios/{scenario_id}/publish-requests",
+    summary="模板场景发布申请列表",
+)
+async def list_publish_requests(request: Request, scenario_id: str):
+    result = await _call_bd_capability(
+        request, "list_publish_requests", {"scenario_id": scenario_id},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.post(
+    "/templates/publish-requests/{request_id}/approve",
+    summary="审批通过发布申请（审批即发布）",
+)
+async def approve_publish_request(
+    request: Request, request_id: str, payload: dict = Body(default={}),
+):
+    result = await _call_bd_capability(
+        request, "approve_publish_request",
+        {"request_id": request_id, "comment": payload.get("comment")},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.post(
+    "/templates/publish-requests/{request_id}/reject",
+    summary="驳回发布申请",
+)
+async def reject_publish_request(
+    request: Request, request_id: str, payload: dict = Body(default={}),
+):
+    result = await _call_bd_capability(
+        request, "reject_publish_request",
+        {"request_id": request_id, "comment": payload.get("comment")},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.post(
+    "/templates/publish-requests/{request_id}/cancel",
+    summary="撤回发布申请",
+)
+async def cancel_publish_request(request: Request, request_id: str):
+    result = await _call_bd_capability(
+        request, "cancel_publish_request", {"request_id": request_id},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.post(
+    "/templates/scenarios/{scenario_id}/versions/{version}/rollback",
+    summary="回滚到指定发布版本（恢复工作副本并发布新版本）",
+)
+async def rollback_scenario_version(
+    request: Request, scenario_id: str, version: int,
+):
+    result = await _call_bd_capability(
+        request, "rollback_scenario_version",
+        {"scenario_id": scenario_id, "version": version},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.get("/templates/scenarios/{scenario_id}/versions", summary="模板场景发布版本历史")
+async def list_scenario_versions(
+    request: Request,
+    scenario_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """列出版本历史（不含 snapshot）"""
+    result = await _call_bd_capability(
+        request, "list_scenario_versions",
+        {"scenario_id": scenario_id, "offset": offset, "limit": limit},
+    )
+    return success_response(data=result)
+
+
+@ecosystem_router.get(
+    "/templates/scenarios/{scenario_id}/versions/{version}",
+    summary="模板场景指定发布版本（含快照）",
+)
+async def get_scenario_version(request: Request, scenario_id: str, version: int):
+    """取单个发布版本（含完整 snapshot）"""
+    result = await _call_bd_capability(
+        request, "get_scenario_version",
+        {"scenario_id": scenario_id, "version": version},
+    )
     return success_response(data=result)
 
 

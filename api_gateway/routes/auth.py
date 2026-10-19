@@ -40,7 +40,8 @@ async def _proxy_auth(request: Request, path: str):
     # 透传用户 Authorization header（如已认证）
     auth_header = request.headers.get("Authorization")
     if auth_header:
-        headers["Authorization"] = auth_header
+        # 同 platform.py：尾部空白会让 httpx 拒发（Illegal header value）。
+        headers["Authorization"] = auth_header.strip()
     tenant_id = request.headers.get("X-Tenant-ID") or request.headers.get("x-tenant-id")
     if tenant_id:
         headers["X-Tenant-ID"] = tenant_id

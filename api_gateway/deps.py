@@ -8,12 +8,41 @@ from jonex_core.common.i18n import translate
 
 
 async def require_auth_header(authorization: str = Header(None)) -> str:
-    """检查 Authorization: Bearer 头是否存在"""
+    """认证门：校验 Authorization 的**签名**，不只检查前缀。
+
+    历史实现只检查 ``Bearer `` 前缀，``Bearer x`` 也能放行；Sidecar 随后走
+    API Key 认证、user_id 为空，能力层的分级守卫（依赖真实用户身份）整段跳过。
+    这里在网关入口完成验签，让所有 invoke 路由拿到确定的用户身份。
+
+    * 缺头 / 非 Bearer / 空 token → 401；
+    * ``jonex_test_*`` 仍受 ``require_test_token_allowed()`` 的环境门控；
+    * 其余 token 走 ``UserAuth.decode_token``，验签失败/过期由它抛 401；
+    * ``type`` 非 ``user``（如 refresh）不能当访问令牌。
+
+    身份解析仍由 ``api_gateway.identity`` 独立完成；本依赖只做认证门。
+    """
     if not authorization:
         raise MissingApiKeyError(message=translate("err.auth.missing_auth_header", fallback="缺少 Authorization 请求头"))
     if not authorization.startswith("Bearer "):
         raise MissingApiKeyError(
             message=translate("err.auth.invalid_auth_format", fallback="Authorization 格式无效，请使用: Bearer <token>")
+        )
+    token = authorization[7:].strip()
+    if not token:
+        raise MissingApiKeyError(
+            message=translate("err.auth.empty_bearer_token", fallback="Authorization 令牌为空")
+        )
+    if token.startswith("jonex_test_"):
+        from jonex_core.common.tenant import require_test_token_allowed
+
+        require_test_token_allowed()
+        return authorization
+    from jonex_core.security.user_auth import get_user_auth
+
+    payload = get_user_auth().decode_token(token)
+    if payload.get("type") != "user":
+        raise MissingApiKeyError(
+            message=translate("err.auth.user_token_required", fallback="需要用户访问令牌")
         )
     return authorization
 

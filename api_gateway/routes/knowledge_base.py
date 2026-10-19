@@ -8,16 +8,19 @@ Authorization token and is forwarded to Sidecar; request bodies never accept
 """
 
 import asyncio
+import base64
 import os
 import random
 import re
 import uuid
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from datetime import date
+from typing import Any, List, Optional
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Path, Query, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 from api_gateway.deps import require_auth_header, raise_from_capability_result
@@ -28,8 +31,14 @@ from api_gateway.identity import (
     extract_user_id as _extract_user_id,
     extract_username as _extract_username,
 )
-from jonex_core.common.crypto import generate_view_token, verify_view_token
-from pydantic.v1 import BaseModel
+from jonex_core.common.crypto import (
+    generate_query_image_token,
+    generate_view_token,
+    verify_query_image_token,
+    verify_view_token,
+)
+from jonex_core.common.monitor_collector import attempt_span
+from pydantic.v1 import BaseModel, Field
 
 from jonex_core.common.object_storage import build_object_key, get_object_storage, get_object_storage_for
 from capabilities.knowledge_base.dtos import (
@@ -125,6 +134,15 @@ def _capability_error_keys(capability_id: str) -> tuple[str, str]:
     return "err.capability.kb_timeout", "err.capability.kb_unavailable"
 
 
+@asynccontextmanager
+async def _sidecar_client(timeout, client=None):
+    if client is not None:
+        yield client
+    else:
+        async with httpx.AsyncClient(timeout=timeout) as owned:
+            yield owned
+
+
 async def _invoke_sidecar_capability(
     request: Request,
     action: str,
@@ -134,6 +152,7 @@ async def _invoke_sidecar_capability(
     user_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
     timeout: Optional[float] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
 ) -> dict:
     """经 Sidecar invoke 转发到指定能力服务(Gateway 唯一能力调用出口)。"""
     config = get_config()
@@ -173,59 +192,74 @@ async def _invoke_sidecar_capability(
     timeout = timeout if timeout is not None else float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
 
     last_exc: BaseException | None = None
+    wait_before_ms: Optional[int] = None
     for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{config.SIDECAR_URL}/invoke",
-                    json=sidecar_payload,
-                    headers=headers,
+        # N2 物理 Attempt 埋点（监控旁路）。kb / rag 两条链路共用本循环，故一处埋点即覆盖两条。
+        with attempt_span(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            attempt_no=attempt + 1,
+            # 先按「最后一次尝试」记；只有下面真会重试的 transport 分支才降级为 False。
+            is_final=True,
+            wait_before_ms=wait_before_ms,
+        ) as att:
+            try:
+                async with _sidecar_client(timeout, http_client) as client:
+                    response = await client.post(
+                        f"{config.SIDECAR_URL}/invoke",
+                        json=sidecar_payload,
+                        headers=headers,
+                    )
+                result = response.json()
+                if response.status_code != 200 or not result.get("success", False):
+                    raise_from_capability_result(result)
+                return result.get("data") or {}
+            except httpx.TimeoutException as e:
+                att.fail(error_code=504, error_message=e)
+                timeout_key, _ = _capability_error_keys(capability_id)
+                raise CapabilityInvokeError(
+                    message=translate(timeout_key, fallback="能力调用超时"),
+                    details={"action": action, "capability_id": capability_id},
                 )
-            result = response.json()
-            if response.status_code != 200 or not result.get("success", False):
-                raise_from_capability_result(result)
-            return result.get("data") or {}
-        except httpx.TimeoutException:
-            timeout_key, _ = _capability_error_keys(capability_id)
-            raise CapabilityInvokeError(
-                message=translate(timeout_key, fallback="能力调用超时"),
-                details={"action": action, "capability_id": capability_id},
-            )
-        except httpx.TransportError as e:
-            last_exc = e
-            if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt), max_delay)
-                jitter = random.uniform(0, delay)
-                logger.warning(
-                    "Sidecar 调用 %s/%s 瞬断 (attempt %s/%s)，"
-                    "%.1fs 后重试: %s",
-                    capability_id, action, attempt + 1, max_retries + 1, jitter, e,
-                )
-                await asyncio.sleep(jitter)
-            else:
+            except httpx.TransportError as e:
+                att.fail(error_code=502, error_message=e)
+                last_exc = e
+                if attempt < max_retries:
+                    # 还会重试 ⇒ 本次不是最后一次尝试。is_final 无 setter，就地降级快照。
+                    att.mark_final(False)
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = random.uniform(0, delay)
+                    wait_before_ms = int(jitter * 1000)
+                    logger.warning(
+                        "Sidecar 调用 %s/%s 瞬断 (attempt %s/%s)，"
+                        "%.1fs 后重试: %s",
+                        capability_id, action, attempt + 1, max_retries + 1, jitter, e,
+                    )
+                    await asyncio.sleep(jitter)
+                else:
+                    logger.error(
+                        "Sidecar 调用 %s/%s 失败，已重试 %s 次: %s",
+                        capability_id, action, max_retries, e,
+                    )
+                    _, unavailable_key = _capability_error_keys(capability_id)
+                    raise CapabilityInvokeError(
+                        message=translate(unavailable_key, fallback="能力不可用"),
+                        details={"action": action, "capability_id": capability_id},
+                    )
+            except JonexException:
+                raise
+            except Exception as exc:
+                if hasattr(exc, "code") and hasattr(exc, "status_code"):
+                    raise
                 logger.error(
-                    "Sidecar 调用 %s/%s 失败，已重试 %s 次: %s",
-                    capability_id, action, max_retries, e,
+                    "Sidecar capability call failed: capability_id=%s action=%s error=%s",
+                    capability_id, action, exc,
                 )
                 _, unavailable_key = _capability_error_keys(capability_id)
                 raise CapabilityInvokeError(
                     message=translate(unavailable_key, fallback="能力不可用"),
                     details={"action": action, "capability_id": capability_id},
                 )
-        except JonexException:
-            raise
-        except Exception as exc:
-            if hasattr(exc, "code") and hasattr(exc, "status_code"):
-                raise
-            logger.error(
-                "Sidecar capability call failed: capability_id=%s action=%s error=%s",
-                capability_id, action, exc,
-            )
-            _, unavailable_key = _capability_error_keys(capability_id)
-            raise CapabilityInvokeError(
-                message=translate(unavailable_key, fallback="能力不可用"),
-                details={"action": action, "capability_id": capability_id},
-            )
 
 
 async def _call_kb_capability(
@@ -235,12 +269,13 @@ async def _call_kb_capability(
     *,
     user_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
 ) -> dict:
     """知识库能力 invoke 转发(向后兼容委托,capability_id 固定 business.knowledge_base.v1)。"""
     return await _invoke_sidecar_capability(
         request, action, payload,
         capability_id="business.knowledge_base.v1",
-        user_id=user_id, tenant_id=tenant_id,
+        user_id=user_id, tenant_id=tenant_id, http_client=http_client,
     )
 
 
@@ -374,6 +409,11 @@ async def get_view_ticket(request: Request, document_id: str):
     用于 `<video>/<audio>` 等无法携带 Authorization 头的直连流式播放，
     以及 PDF/图片新标签内联预览。token 绑定当前租户 + 该文档 + TTL。
     """
+    # [jonex] B6 §5.2：先校验文档可读（租户 + KB 空间/授权 + 密级），
+    # 通过后才签 token；被拦截时 404 原样透传，绝不签发。
+    await _call_kb_capability(
+        request, "assert_document_readable", {"document_id": document_id},
+    )
     tenant_id = extract_tenant_id(request)
     ttl = int(os.getenv("RAW_VIEW_TOKEN_TTL", "300"))
     token = generate_view_token(tenant_id, document_id, ttl)
@@ -448,6 +488,45 @@ async def get_document(
     return success_response(data=result)
 
 
+class DocumentQualityReportsRequest(BaseModel):
+    knowledge_base_id: str = Field(..., min_length=1, max_length=128)
+    document_ids: List[str] = Field(..., min_items=1, max_items=100)
+
+
+@router.get("/documents/{document_id}/quality-report", summary="获取文档解析质量报告")
+async def get_document_quality_report(
+    request: Request,
+    document_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128),
+):
+    """单文档质量报告（含 md 证据的预签名 URL）。
+
+    非引擎链文档返回 `supported=false`（不报错）；从未摄取的文档返回 404。
+    """
+    result = await _call_kb_capability(
+        request,
+        "get_document_quality_report",
+        {"document_id": document_id, "knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/documents/quality-reports", summary="批量获取文档质量摘要")
+async def get_document_quality_reports(
+    request: Request, body: DocumentQualityReportsRequest,
+):
+    """批量质量摘要（列表页用）：只回档位与原因，不签 md URL。"""
+    result = await _call_kb_capability(
+        request,
+        "get_document_quality_reports",
+        {
+            "knowledge_base_id": body.knowledge_base_id,
+            "document_ids": body.document_ids,
+        },
+    )
+    return success_response(data=result)
+
+
 @router.get("/documents/{document_id}/chunks", summary="查看文档 Chunk 列表")
 async def get_document_chunks(request: Request, document_id: str):
     """按文档 id 查看 chunk 列表（含行号/时间轴位置元数据）。
@@ -458,6 +537,46 @@ async def get_document_chunks(request: Request, document_id: str):
         request,
         "get_document_chunks",
         {"document_id": document_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/documents/{document_id}/source-spans", summary="查看引用片段的原文坐标")
+async def get_document_source_spans(
+    request: Request,
+    document_id: str,
+    chunk_index: Optional[int] = Query(None),
+    page_no: Optional[int] = Query(None),
+    table_idx: Optional[int] = Query(None),
+    row_start: Optional[int] = Query(None),
+    row_end: Optional[int] = Query(None),
+    image_idx: Optional[int] = Query(None),
+):
+    """按 chunk 与引用侧位置锚点读取原文 bbox span（打开原文时的框选定位）。
+
+    `expect` 只携带传入的定位键；服务端拿它与 chunk 的 `file_source` 比对，
+    对不上时降级为只跳页，不抛错。
+    """
+    expect = {
+        key: value
+        for key, value in (
+            ("page_no", page_no),
+            ("table_idx", table_idx),
+            ("row_start", row_start),
+            ("row_end", row_end),
+            ("image_idx", image_idx),
+        )
+        if value is not None
+    }
+    data = {"document_id": document_id}
+    if chunk_index is not None:
+        data["chunk_index"] = chunk_index
+    if expect:
+        data["expect"] = expect
+    result = await _call_kb_capability(
+        request,
+        "get_document_source_spans",
+        data,
     )
     return success_response(data=result)
 
@@ -523,6 +642,97 @@ async def reparse_document(request: Request, document_id: str, body: ReparseRequ
     return success_response(data=result)
 
 
+@router.get("/documents/{document_id}/versions", summary="文档版本历史")
+async def list_document_versions(request: Request, document_id: str):
+    result = await _call_kb_capability(
+        request, "list_document_versions", {"document_id": document_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/documents/{document_id}/versions", summary="上传文档新版本")
+async def upload_document_version(
+    request: Request,
+    document_id: str,
+    knowledge_base_id: str = Form(..., min_length=1, max_length=128),
+    file: UploadFile = File(None),
+    storage_key: Optional[str] = Form(None),
+    storage_backend: Optional[str] = Form(None),
+    file_name: Optional[str] = Form(None),
+    mime_type: Optional[str] = Form(None),
+):
+    """上传新版本（新版生效、旧版存档）。
+
+    两种模式与首次上传一致：multipart 文件（网关写对象存储）或 COS 直传后确认。
+    ⚠ 版本文件必须使用**独占 key**，否则会覆盖旧版本仍在引用的对象。
+    """
+    tenant_id = extract_tenant_id(request)
+    payload: dict[str, Any] = {
+        "document_id": document_id,
+        "knowledge_base_id": knowledge_base_id,
+    }
+
+    if storage_key:
+        payload["storage_key"] = storage_key
+        payload["file_name"] = file_name or storage_key.rsplit("/", 1)[-1]
+        _env_backend = (os.getenv("OBJECT_STORAGE_BACKEND", "local") or "local").strip().lower()
+        payload["storage_backend"] = storage_backend or (
+            _env_backend if _env_backend in ("cos", "s3") else "local"
+        )
+        if mime_type:
+            payload["mime_type"] = mime_type
+    else:
+        if file is None:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.upload_file_required",
+                    fallback="上传文件不能为空",
+                )
+            )
+        content = await file.read()
+        if not content:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.upload_file_required",
+                    fallback="上传文件不能为空",
+                )
+            )
+        backend = os.getenv("OBJECT_STORAGE_BACKEND", "local").strip().lower()
+        new_key = build_object_key(
+            tenant_id,
+            knowledge_base_id,
+            document_id,
+            f"{uuid4().hex}_{file.filename or 'unnamed'}",
+        )
+        await get_object_storage().put_bytes(
+            new_key, content, content_type=_media_type_with_charset(file.content_type),
+        )
+        payload.update({
+            "storage_key": new_key,
+            "storage_backend": backend,
+            "file_name": file.filename or "unnamed",
+            "mime_type": file.content_type,
+            "file_size": len(content),
+        })
+
+    result = await _call_kb_capability(request, "upload_document_version", payload)
+    return success_response(data=result)
+
+
+@router.get(
+    "/documents/{document_id}/versions/{version_no}/url",
+    summary="文档历史版本下载地址",
+)
+async def get_document_version_url(
+    request: Request, document_id: str, version_no: int,
+):
+    result = await _call_kb_capability(
+        request, "get_document_version_url",
+        {"document_id": document_id, "version_no": version_no},
+    )
+    return success_response(data=result)
+
+
 @router.delete("/documents/{document_id}", summary="删除知识文档")
 async def delete_document(
     request: Request,
@@ -534,6 +744,59 @@ async def delete_document(
     result = await _call_kb_capability(
         request,
         "delete_document",
+        {"document_id": document_id, **_schema_payload(payload)},
+    )
+    return success_response(data=result)
+
+
+# ── 第 3 期生命周期：归档 / 恢复 / 销毁（KB 能力执行）──────────────
+# 三条都是薄转发；权限口径在能力层（归档/恢复按空间写权限，销毁额外要求租户管理员，
+# 拒绝时由 service 抛 403 经现有能力错误映射上浮）。
+
+
+@router.post("/documents/{document_id}/archive", summary="归档文档")
+async def archive_document(
+    request: Request,
+    document_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """把文档移出检索但保留原文与元数据（可恢复）。"""
+    payload = DocumentScopeRequest(knowledge_base_id=knowledge_base_id)
+    result = await _call_kb_capability(
+        request,
+        "archive_document",
+        {"document_id": document_id, **_schema_payload(payload)},
+    )
+    return success_response(data=result)
+
+
+@router.post("/documents/{document_id}/restore", summary="恢复已归档文档")
+async def restore_document(
+    request: Request,
+    document_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """恢复已归档文档（按归档前状态重新可检索）。"""
+    payload = DocumentScopeRequest(knowledge_base_id=knowledge_base_id)
+    result = await _call_kb_capability(
+        request,
+        "restore_document",
+        {"document_id": document_id, **_schema_payload(payload)},
+    )
+    return success_response(data=result)
+
+
+@router.post("/documents/{document_id}/destroy", summary="销毁已归档文档")
+async def destroy_document(
+    request: Request,
+    document_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """彻底销毁已归档文档（仅租户管理员；不可恢复）。"""
+    payload = DocumentScopeRequest(knowledge_base_id=knowledge_base_id)
+    result = await _call_kb_capability(
+        request,
+        "destroy_document",
         {"document_id": document_id, **_schema_payload(payload)},
     )
     return success_response(data=result)
@@ -806,6 +1069,92 @@ async def search_jonex_wiki(request: Request, payload: JonexWikiSearchRequest):
     return success_response(data=result)
 
 
+@router.post("/search/jonex_wiki/stream", summary="Wiki 检索实时进度")
+async def stream_jonex_wiki(request: Request, payload: JonexWikiSearchRequest):
+    import json
+    user_id = _extract_user_id(request)
+    client = httpx.AsyncClient(timeout=180)
+    try:
+        started = await _call_kb_capability(request, "start_jonex_wiki_search",
+                                          _schema_payload(payload), user_id=user_id, http_client=client)
+    except BaseException:
+        await client.aclose()
+        raise
+    session_data = {"session_id": started["session_id"]}
+
+    async def events():
+        terminal = False
+        previous = None
+        try:
+            yield "event: progress\ndata: " + json.dumps({"events": [], "status": "running",
+                                                                     "session_id": started["session_id"]}) + "\n\n"
+            for _ in range(1200):
+                if await request.is_disconnected():
+                    break
+                state = await _call_kb_capability(request, "poll_jonex_wiki_search", session_data, user_id=user_id, http_client=client)
+                status = state["status"]
+                if status == "done":
+                    terminal = True
+                    public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
+                    if public != previous:
+                        yield "event: progress\ndata: " + public + "\n\n"
+                    yield "event: complete\ndata: " + json.dumps(state["result"], ensure_ascii=False) + "\n\n"
+                    return
+                if status in ("failed", "cancelled"):
+                    terminal = True
+                    yield "event: error\ndata: " + json.dumps({"message": state.get("error") or status}) + "\n\n"
+                    return
+                public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
+                if public != previous:
+                    yield "event: progress\ndata: " + public + "\n\n"
+                    previous = public
+                else:
+                    yield ": heartbeat\n\n"
+                await asyncio.sleep(0.5)
+            yield 'event: error\ndata: {"message":"Wiki search timed out"}\n\n'
+        finally:
+            async def cleanup():
+                try:
+                    if not terminal:
+                        await _call_kb_capability(request, "cancel_jonex_wiki_search", session_data,
+                                                  user_id=user_id, http_client=client)
+                finally:
+                    await client.aclose()
+            # Both native cancellation and socket cleanup outlive the browser disconnect.
+            pending = asyncio.create_task(cleanup())
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                pass
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+class WikiCancelRequest(BaseModel):
+    session_id: str = Field(..., regex=r"^[a-f0-9]{32}$")
+
+
+@router.post("/search/jonex_wiki/cancel", summary="停止本人发起的 Wiki 检索")
+async def cancel_jonex_wiki(request: Request, payload: WikiCancelRequest):
+    result = await _call_kb_capability(request, "cancel_jonex_wiki_search", _schema_payload(payload),
+                                      user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+class WikiEvidenceRequest(BaseModel):
+    knowledge_base_id: str
+    query_id: str
+    handle: str
+
+
+@router.post("/search/jonex_wiki/evidence", summary="查看 Wiki 查询的原文证据位置")
+async def wiki_evidence(request: Request, payload: WikiEvidenceRequest):
+    result = await _call_kb_capability(request, "resolve_wiki_evidence",
+                                      _schema_payload(payload), user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
 @router.post("/search/mix", summary="混合管线检索统一入口（分流器）")
 async def search_mix(request: Request, payload: MixSearchRequest):
     """统一检索入口：按 pipeline_type 分组扇出到 LightRAG / OpenKB，支持混合选库。"""
@@ -853,11 +1202,44 @@ async def search_documents_stream(
     mode: str = Query("hybrid", description="检索模式: naive/local/global/hybrid/mix/bypass"),
     top_k: int = Query(5, ge=1, le=50, description="返回结果数量"),
     domain_id: str | None = Query(None, description="领域 ID"),
-    knowledge_base_id: str = Query("", description="知识库 ID（按知识库隔离检索；空表示沿用默认行为）"),
+    knowledge_base_id: str = Query("", description="知识库 ID（必填，按知识库隔离检索）"),
 ):
-    """流式语义搜索，返回 OpenAI 兼容的 SSE 流（delta 格式）"""
+    """流式语义搜索，返回 OpenAI 兼容的 SSE 流（delta 格式）。
+
+    ⚠ 本路由直连 Sidecar `/invoke/stream/rag`，不经过能力层 dispatch；
+    因此必须在下发流之前调用 ``assert_kb_searchable``，让能力层按**检索口径**
+    完成空间 member / KB 授权与密级校验（超密级 404），否则流式检索会成为
+    密级绕过通道（B2）。不能改用 ``get_knowledge_info``：那是 KB 浏览口径，
+    不含仅凭空间成员身份检索的场景。
+    """
     from fastapi.responses import StreamingResponse
     import httpx, json, time, uuid, re
+
+    kb_id = (knowledge_base_id or "").strip()
+    if not kb_id:
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.stream_kb_required",
+                fallback="流式检索必须指定 knowledge_base_id",
+            )
+        )
+
+    # 发流前的权限/密级预检：失败（含 404）直接以普通 HTTP 错误返回，
+    # 不会进入 SSE 生成器。`_call_kb_capability` 会从 Authorization 解出
+    # user_id 透传，密级守卫才能拿到真实用户身份。
+    await _call_kb_capability(
+        request, "assert_kb_searchable", {"knowledge_base_id": kb_id},
+    )
+
+    # 流式检索请求埋点：本路由直连 Sidecar，不经过能力层 execute，若不再补一笔
+    # 「检索次数/入口」指标会永久漏计。失败不阻断检索。
+    try:
+        await _call_kb_capability(
+            request, "record_stream_search",
+            {"knowledge_base_id": kb_id, "query": query, "mode": mode, "top_k": top_k},
+        )
+    except Exception as exc:  # noqa: BLE001 —— 埋点失败不影响检索
+        logger.warning("流式检索埋点失败（不影响检索）: %s", exc)
 
     config = get_config()
     sidecar_url = config.SIDECAR_URL
@@ -867,8 +1249,7 @@ async def search_documents_stream(
     if domain_id and domain_id != "all":
         stream_params["domain_id"] = domain_id
     # 知识库作用域：透传到 sidecar → atomic，按 (tenant, kb) workspace 隔离检索
-    if knowledge_base_id:
-        stream_params["knowledge_base_id"] = knowledge_base_id
+    stream_params["knowledge_base_id"] = kb_id
 
     _RESPONSE_RE = re.compile(r'"response"\s*:\s*"((?:[^"\\]|\\.)*)"')
     # 急切捕获 locale：流式生成器 body 在中间件 reset 后迭代，惰性读会拿到 None
@@ -980,6 +1361,151 @@ async def resolve_references(request: Request, payload: ReferenceResolveRequest)
     return success_response(data=result)
 
 
+# ══════════════════════════════════════════════════════════════
+# [jonex] 以图问知识（图片 → 查询文本 → 复用现有检索链路）
+# 设计：docs/knowledge-base/image-query-search-execution-plan.md §4-B6
+#
+# 三步式的第一步只在这里：把图交给能力服务识别成一段文本。**检索不在这里** ——
+# 前端拿到 `query` 后照常调 `/search/mix` 等现有接口（方案 D1 两步式），
+# 所以现有检索路由与 DTO 一行未改。
+# ══════════════════════════════════════════════════════════════
+
+
+def _image_query_message(key: str, fallback: str, **params: Any) -> str:
+    return translate(key, params=params or None, fallback=fallback)
+
+
+@router.post("/search/image-query", summary="以图问知识：图片转查询文本")
+async def image_query(
+    request: Request,
+    files: List[UploadFile] = File(..., description="图片文件（可多张，顺序即展示顺序）"),
+    question: Optional[str] = Form(None, max_length=500, description="可选的提问文字"),
+):
+    """把图片识别成一段可直接用于检索的文本。
+
+    Gateway 在这里只做四件事：**逐张读字节、按同一份配置挡上限、base64 编码、转发**。
+    识别与拼 query 全在能力服务里（`ImageQueryService.resolve`）。
+
+    ⚠️ **不落盘**：与上传文档那条路有意不同 —— 那里的字节会在网关写进对象存储，
+    这里不会。识别成功后字节只暂存在能力侧的 Redis，等前端保存检索历史时才由
+    能力服务写对象存储（D4：「识别了但没检索」的图两个系统里都不留痕）。
+    网关若先落盘，就绕开了这条规则、也绕开了 magic bytes 校验（未校验的字节进桶）。
+
+    ⚠️ 超时用 `IMAGE_QUERY_GATEWAY_TIMEOUT`（默认 55s），**必须低于本地
+    dev-gateway 写死的 60s**，否则本地联调会被它先掐成 502（F5）。
+    `_invoke_sidecar_capability` 已有 `timeout:` 参数，直接传，不改签名。
+    """
+    config = get_config()
+    max_images = int(config.IMAGE_QUERY_MAX_IMAGES)
+    max_bytes = int(config.IMAGE_QUERY_MAX_BYTES)
+    max_total = int(config.IMAGE_QUERY_MAX_TOTAL_BYTES)
+
+    if not files:
+        raise InvalidParameterError(
+            message=_image_query_message("err.image_query.empty_result", "未识别出可检索的内容")
+        )
+    if len(files) > max_images:
+        raise InvalidParameterError(
+            message=_image_query_message(
+                "err.image_query.too_many", f"最多支持 {max_images} 张图片",
+                max_images=max_images,
+            ),
+            details={"max_images": max_images},
+        )
+
+    images: list[dict[str, Any]] = []
+    total = 0
+    for index, upload in enumerate(files):
+        raw = await upload.read()
+        # 读到超总量就**停止继续读**：后面还有几张更大的图没必要全读进内存再拒
+        total += len(raw)
+        if len(raw) > max_bytes:
+            raise InvalidParameterError(
+                message=_image_query_message("err.image_query.too_large", "图片超过大小限制"),
+                details={"index": index, "max_bytes": max_bytes},
+            )
+        if total > max_total:
+            raise InvalidParameterError(
+                message=_image_query_message("err.image_query.too_large_total", "图片总大小超过限制"),
+                details={"max_total_bytes": max_total},
+            )
+        if not raw:
+            raise InvalidParameterError(
+                message=_image_query_message("err.image_query.unsupported_type", "不支持的图片格式"),
+                details={"index": index},
+            )
+        images.append(
+            {
+                "image_base64": base64.b64encode(raw).decode("ascii"),
+                "mime_type": (upload.content_type or "").split(";", 1)[0].strip().lower() or "image/jpeg",
+                "file_size": len(raw),
+            }
+        )
+
+    # 不打印请求体（里面是 base64）
+    logger.info("以图问知识：网关收到 %d 张图（共 %d 字节）", len(images), total)
+
+    data: dict[str, Any] = {"images": images}
+    if question and question.strip():
+        data["question"] = question.strip()
+
+    result = await _invoke_sidecar_capability(
+        request,
+        "image_to_query",
+        data,
+        timeout=float(config.IMAGE_QUERY_GATEWAY_TIMEOUT),
+    )
+    return success_response(data=result)
+
+
+def _query_image_raw_url(image_id: str, token: str) -> str:
+    return f"/api/v1/knowledge-base/search/query-images/{image_id}/raw?token={token}"
+
+
+def _sign_query_images(request: Request, items: Any) -> None:
+    """给历史条目里的 `query_images[]` 补签 `view_url`（就地改）。
+
+    纯签发，与 `view-ticket` 同性质；归属已由能力服务的列表查询按 user 过滤过，
+    这里不再校验（真要看图还得过 raw 端点那道 token 校验，D10）。
+    """
+    ttl = int(get_config().IMAGE_QUERY_VIEW_TOKEN_TTL)
+    tenant_id = extract_tenant_id(request)
+    user_id = _extract_user_id(request)
+    if not user_id:
+        return
+    for item in items or []:
+        images = item.get("query_images") if isinstance(item, dict) else None
+        if not images:
+            continue
+        for image in images:
+            image_id = image.get("id")
+            if not image_id:
+                continue
+            token = generate_query_image_token(tenant_id, user_id, image_id, ttl)
+            image["view_url"] = _query_image_raw_url(image_id, token)
+
+
+@router.get("/search/query-images/{image_id}/view-ticket", summary="签发查询图片查看票据（以图问知识）")
+async def get_query_image_view_ticket(request: Request, image_id: str):
+    """签发只读、单图、短时效的查看 URL。
+
+    与文档原文那条 `view-ticket` 的两处差异，都是有意为之：
+    - **票里带 user**（查询图片按 tenant + user 隔离，只绑租户等于同租户人人可看）；
+    - 归属校验**走能力服务**（本人 + 仍被未删除历史引用），不是只签不发。
+    """
+    ttl = int(get_config().IMAGE_QUERY_VIEW_TOKEN_TTL)
+    # 能力侧只认它自己存的 user_id；这里解出来的就是「谁在请求」，
+    # 由能力侧判「这张图是不是他的」（不是他的会 404，不暴露存在性）
+    await _call_kb_capability(
+        request, "get_query_image_ticket", {"image_id": image_id},
+        user_id=_extract_user_id(request),
+    )
+    token = generate_query_image_token(
+        extract_tenant_id(request), _extract_user_id(request) or "", image_id, ttl
+    )
+    return success_response(data={"url": _query_image_raw_url(image_id, token), "expires_in": ttl})
+
+
 @router.get("/search/overview", summary="知识检索概览")
 async def get_search_overview(
     request: Request,
@@ -993,16 +1519,21 @@ async def get_search_overview(
         {"knowledge_base_id": knowledge_base_id, "domain_space_id": domain_space_id},
         user_id=_extract_user_id(request),
     )
+    # [jonex] 以图问知识：概览里的近期条目同样带图，补签 view_url（纯签发）
+    _sign_query_images(request, result.get("recent_items"))
     return success_response(data=result)
 
 
-@router.get("/search/history", summary="查询检索历史（全局可不传 kb_id）")
+@router.get("/search/history", summary="查询检索历史（全局可不传 kb_id；传 history_id 则单条取快照）")
 async def list_search_history(
     request: Request,
     knowledge_base_id: str = Query("", min_length=0, max_length=128, description="知识库 ID（空表示全局）"),
     domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（按空间隔离历史数据）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    # [jonex] 传了只取这一条并带快照（answer / references / reasoning），供点击历史时回放；
+    # 不传就是列表，列表**不带**快照 —— 快照占响应体积 83%（实测 222 KB 中的 185 KB），侧栏不用。
+    history_id: Optional[str] = Query(None, max_length=64, description="历史 ID（传了则只取这一条并带快照）"),
 ):
     """查询当前租户当前用户的检索历史"""
     result = await _call_kb_capability(
@@ -1013,9 +1544,13 @@ async def list_search_history(
             "domain_space_id": domain_space_id,
             "page": page,
             "page_size": page_size,
+            "history_id": history_id,
         },
         user_id=_extract_user_id(request),
     )
+    # [jonex] 以图问知识：给每条历史的 `query_images[]` 补签 view_url（纯签发）。
+    # 归属已由能力服务的列表查询按 user 过滤过；真看图还要过 raw 端点那道 token 校验。
+    _sign_query_images(request, result.get("items"))
     return success_response(data=result)
 
 
@@ -1028,6 +1563,16 @@ async def save_search_history(request: Request, payload: SearchHistoryCreateRequ
         _schema_payload(payload),
         user_id=_extract_user_id(request),
     )
+    # [jonex] 以图问知识：**保存接口同样要补签** `view_url`。
+    #
+    # ⚠️ 这里漏签过一次，现象很有辨识度：以图检索完，侧栏那条历史的缩略图是**空白**，
+    #    **刷新页面**（走 list 接口）才出现 —— 因为前端拿保存回包直接 `setHistory`
+    #    插进侧栏，而能力侧回的 `view_url` 恒为 None（`row.to_ref()` 写死），
+    #    补签本来就是 Gateway 的职责。
+    # 教训：凡是**会返回历史条目**的接口都要补签，三个（save / list / overview）一个不能漏；
+    # `tests/integration/test_api_gateway_image_query.py::test_save_history_signs_view_url`
+    # 锁住这一条。
+    _sign_query_images(request, [result])
     return success_response(data=result)
 
 
@@ -2331,16 +2876,19 @@ async def search_ontology_entities(
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
     keyword: str = Query("", min_length=0, max_length=256, description="搜索关键词（模糊匹配实例名称/别名；空串返回空列表）"),
     limit: int = Query(20, ge=1, le=200, description="返回条数上限"),
+    document_id: Optional[str] = Query(None, description="限定候选实体所属文档 ID（文档页表单带；KB 级表单不带）"),
 ):
     """模糊搜索本体实例，用于实例/关系表单中快速定位实体。
 
     复用 Neo4j 全文索引 ont_entity_ft（cjk analyzer）实现中文模糊匹配。
     按租户和知识库隔离，仅返回非 stub 正式实体。
+    `document_id` 有值 → 只在该文档关联的实体里选（文档页建关系时不该看到全库实体）。
     """
     payload = OntologyEntitySearchRequest(
         knowledge_base_id=knowledge_base_id,
         keyword=keyword,
         limit=limit,
+        document_id=document_id,
     )
     result = await _call_kb_capability(request, "search_ontology_entities", _schema_payload(payload))
     return success_response(data=result, message="success")
@@ -2356,7 +2904,11 @@ async def create_ontology_instance(
     request: Request,
     body: CreateOntologyInstanceRequest = Body(..., description="创建本体实例"),
 ):
-    """创建本体实例（实体节点）。"""
+    """创建本体实例（实体节点）。
+
+    body 里的 `document_id`（可选）区分入口语义：文档结果页创建时带上 → 节点 `doc_ids`
+    含该文档，`GET /ontology/instances?document_id=` 可见；KB 级「编译资产」页不带 → 全库实例。
+    """
     result = await _call_kb_capability(request, "create_ontology_instance", _schema_payload(body))
     return success_response(data=result, message="本体实例已创建")
 
@@ -2370,9 +2922,10 @@ async def create_ontology_relation(
     relation_type: str = Query(..., min_length=1, max_length=128, description="关系类型"),
     target_entity_type: str = Query(..., min_length=1, max_length=128, description="目标实体类型"),
     target_canonical_name: str = Query(..., min_length=1, max_length=128, description="目标实体规范名"),
+    document_id: Optional[str] = Query(None, description="来源文档 ID（从文档页创建时带；写入 doc_ids 关联）"),
     attributes: Optional[dict] = Body(None, description="扩展属性"),
 ):
-    """创建本体关系（实体间关系边）。"""
+    """创建本体关系（实体间关系边）。`document_id` 口径同创建实例。"""
     payload = {
         "knowledge_base_id": knowledge_base_id,
         "source_entity_type": source_entity_type,
@@ -2381,6 +2934,8 @@ async def create_ontology_relation(
         "target_entity_type": target_entity_type,
         "target_canonical_name": target_canonical_name,
     }
+    if document_id:
+        payload["document_id"] = document_id
     if attributes is not None:
         payload["attributes"] = attributes
     result = await _call_kb_capability(request, "create_ontology_relation", payload)
@@ -2688,7 +3243,11 @@ async def get_raw_document(
             raise InvalidApiKeyError(message=translate("err.kb.view_ticket_invalid", fallback="查看票据无效或已过期"))
         tenant_id = info["tenant_id"]
     else:
-        # 兼容旧路径：从 Authorization 头 / X-Tenant-ID 解析租户
+        # 兼容旧路径：无票据时必须能解出用户。仅凭 X-Tenant-ID 不能证明用户身份
+        # （B6 §5.2）——否则未登录即可按租户头读原文。注意这里必须判「解出 user_id」，
+        # 不能只判 Authorization 头存在：`Basic ...`、`Bearer`（空 token）都解不出人。
+        if not _extract_user_id(request):
+            raise InvalidApiKeyError(message="需要登录或查看票据")
         tenant_id = extract_tenant_id(request)
 
     loc = await _call_kb_capability(
@@ -2802,6 +3361,9 @@ async def get_raw_document_asset(
             raise InvalidApiKeyError(message=translate("err.kb.view_ticket_invalid", fallback="查看票据无效或已过期"))
         tenant_id = info["tenant_id"]
     else:
+        # 同 `/raw`：无票据时必须能解出用户，不能只靠 X-Tenant-ID（B6 §5.2）
+        if not _extract_user_id(request):
+            raise InvalidApiKeyError(message="需要登录或查看票据")
         tenant_id = extract_tenant_id(request)
 
     loc = await _call_kb_capability(
@@ -2828,9 +3390,105 @@ async def get_raw_document_asset(
     )
 
 
+@ingest_router.get(
+    "/search/query-images/{image_id}/raw",
+    summary="查询图片查看（只认 token；302 / 本地流式）",
+)
+async def get_query_image_raw(
+    request: Request,
+    image_id: str,
+    token: Optional[str] = Query(None, description="短时查看票据（<img> 直连用）"),
+):
+    """[jonex] 以图问知识：查看检索历史里的图片。
+
+    挂在 `ingest_router` 上是因为 ``<img src=…>`` **带不了 Authorization 头**
+    （同 `/documents/{id}/raw` 的图片/音视频场景）。
+
+    ⚠️ **只认 token，没有回退**：与文档原文那条端点不同 —— 那里无票时回退
+    `X-Tenant-ID` 头（历史包袱），这里不回退。少了「无票也能读」的路径，
+    与「图片只有本人可看」（D10）一致。
+
+    ⚠️ 身份用 **token 里的** tenant / user 组装，不是从请求头解 ——
+    raw 请求本身没有用户 JWT，用头里那点信息会读成别人的图或读不到图。
+    """
+    info = verify_query_image_token(token or "")
+    if not info or info.get("image_id") != image_id:
+        raise InvalidApiKeyError(
+            message=_image_query_message(
+                "err.query_image.view_ticket_invalid", "查看链接无效或已过期"
+            )
+        )
+
+    loc = await _call_kb_capability(
+        request,
+        "get_query_image_location",
+        {"image_id": image_id},
+        user_id=info["user_id"],
+        tenant_id=info["tenant_id"],
+    )
+    presigned = loc.get("presigned_url")
+    if presigned:
+        # COS/S3：浏览器直连，<img> 加载无 CORS 门槛（部署需配 CSP_STORAGE_ORIGIN）
+        # 302 也带上 nosniff：与 local 分支的 FileResponse 同一口径
+        return RedirectResponse(
+            url=presigned, status_code=302,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
+    # local：从共享卷流式返回
+    storage_key = loc.get("storage_key")
+    backend = (loc.get("storage_backend") or "local").strip().lower()
+    fs_path = get_object_storage_for(backend).fs_path(storage_key) if storage_key else None
+    if not fs_path or not os.path.exists(fs_path):
+        raise InvalidParameterError(
+            message=_image_query_message("err.query_image.not_found", "图片不存在或已清理")
+        )
+    return FileResponse(
+        path=fs_path,
+        media_type=_safe_inline_media_type(loc.get("mime_type")),
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
 # ════════════════════════════════════════════════════════════
 # 数据运营 /api/v1/knowledge-base/data-operations
 # ════════════════════════════════════════════════════════════
+
+# 自定义时间区间的跨度上限。与能力层 `analytics_service._RANGE_MAX_DAYS` 对齐：
+# 网关拒绝在前（面向客户端，非法入参要立刻 400），能力侧只做保守夹取。
+_TREND_RANGE_MAX_DAYS = 366
+
+
+def _parse_trend_range(start_date: Optional[date], end_date: Optional[date]):
+    """校验数据运营趋势的自定义时间区间，返回 `(start, end)`；都没传时返回 `(None, None)`。
+
+    ⚠️ **成对出现才有意义**：只传一边、或给了个反的区间都直接 400。这里是面向客户端的
+    边界，非法入参要立刻拒掉；能力层对同一组参数只做「当没传」的保守降级 —— 它还会被
+    内部调用方经 invoke 打进来，不该因为新参数缺一半就 500。
+
+    两个都不传时返回 `(None, None)`，下游照旧走 `days` 的相对窗口（向后兼容）。
+    """
+    if start_date is None and end_date is None:
+        return None, None
+    if start_date is None or end_date is None:
+        raise InvalidParameterError(
+            message=translate("err.kb.trend_range_pair_required",
+                              fallback="start_date 与 end_date 必须成对提供（只传一个无法确定时间区间）")
+        )
+    if start_date > end_date:
+        raise InvalidParameterError(
+            message=translate("err.kb.trend_range_reversed",
+                              fallback="start_date 不能晚于 end_date")
+        )
+    if (end_date - start_date).days + 1 > _TREND_RANGE_MAX_DAYS:
+        raise InvalidParameterError(
+            message=translate("err.kb.trend_range_too_long",
+                              params={"max_days": _TREND_RANGE_MAX_DAYS},
+                              fallback=f"时间区间不能超过 {_TREND_RANGE_MAX_DAYS} 天")
+        )
+    return start_date, end_date
+
 
 @router.get("/data-operations/overview", summary="数据运营总览")
 async def get_data_operations_overview(
@@ -2854,7 +3512,10 @@ async def get_data_assets_analytics(
     days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
     unused_threshold_days: int = Query(30, ge=1, le=365, description="长期未使用阈值天数"),
     kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（空表示空间/租户全量）"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
 ):
+    start_date, end_date = _parse_trend_range(start_date, end_date)
     result = await _call_kb_capability(
         request,
         "get_data_assets_analytics",
@@ -2863,6 +3524,8 @@ async def get_data_assets_analytics(
             "days": days,
             "unused_threshold_days": unused_threshold_days,
             "kb_id": kb_id,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
         },
         user_id=_extract_user_id(request),
     )
@@ -2875,11 +3538,20 @@ async def get_knowledge_assets_analytics(
     domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
     days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
     unused_threshold_days: int = Query(30, ge=1, le=365, description="长期未使用阈值天数"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
 ):
+    start_date, end_date = _parse_trend_range(start_date, end_date)
     result = await _call_kb_capability(
         request,
         "get_knowledge_assets_analytics",
-        {"domain_space_id": domain_space_id, "days": days, "unused_threshold_days": unused_threshold_days},
+        {
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "unused_threshold_days": unused_threshold_days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
         user_id=_extract_user_id(request),
     )
     return success_response(data=result)
@@ -2890,11 +3562,19 @@ async def get_search_analytics(
     request: Request,
     domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
     days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
 ):
+    start_date, end_date = _parse_trend_range(start_date, end_date)
     result = await _call_kb_capability(
         request,
         "get_search_analytics",
-        {"domain_space_id": domain_space_id, "days": days},
+        {
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
         user_id=_extract_user_id(request),
     )
     return success_response(data=result)
@@ -2926,6 +3606,163 @@ async def get_abnormal_assets_analytics(
             "handled": handled,
             "page": page,
             "page_size": page_size,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/quality-anomalies", summary="解析质量异常清单")
+async def get_quality_anomalies(
+    request: Request,
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（空表示空间/租户全量）"),
+):
+    """最近 `verdict='bad'` 的 解析质量异常（观测档，最近 50 条）。
+
+    与 `abnormal-assets` 不同：这是**质量观测**，不是处理失败；档位差不拦截检索。
+    """
+    result = await _call_kb_capability(
+        request,
+        "get_quality_anomalies",
+        {"domain_space_id": domain_space_id, "kb_id": kb_id},
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+# ── 三期：列表钻取详情（原型「点名称进抽屉」）──
+#
+# 三个接口都**接受与列表同一组时间/范围参数**（`days` 或 `start_date`+`end_date`，
+# 加 `domain_space_id`），抽屉里的「引用次数 / 命中次数 / 检索请求数」才等于列表里
+# 那个数字。⚠️ 前端打开抽屉时必须把打开列表时用的那组参数原样带上：不传不会报错，
+# 只会按默认 `days=7` 算，用户看到「列表 2,864 / 抽屉 1,208」而**没有任何提示**。
+
+
+@router.get("/data-operations/assets/{asset_id}", summary="数据资产详情（抽屉 A）")
+async def get_data_asset_detail(
+    request: Request,
+    asset_id: str = Path(..., max_length=64, description="资产 ID（= knowledge_documents.id）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（可选，传了做交叉校验）"),
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数（与列表一致）"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+):
+    """数据资产详情。资产不存在 / 已删除 / 不在本次范围内 → 404。"""
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_data_asset_detail",
+        {
+            "asset_id": asset_id,
+            "kb_id": kb_id,
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/ontology-entities/detail", summary="Ontology 对象详情（抽屉 B）")
+async def get_data_ontology_entity_detail(
+    request: Request,
+    kb_id: str = Query(..., max_length=64, description="知识库 ID"),
+    entity_type: str = Query(..., max_length=128, description="实体类型（如「金融产品」）"),
+    canonical_name: str = Query(..., max_length=512, description="实体规范名（列表里的 canonical_name）"),
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数（与列表一致）"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+):
+    """Ontology 对象详情。
+
+    ⚠️ 定位键是 **`kb_id` + `entity_type` + `canonical_name` 三元组**，不是列表里的
+    `object_id` —— 后者是 `sha256(tenant|kb|type|name)` 的单向哈希，反解不回三元组，
+    而且 `canonical_name` 改名后历史哈希指向一个不存在的键。
+
+    ⚠️ 用查询参数而不是路径参数：`canonical_name` 是中文实体名，可能含 `/`、空格。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_data_ontology_entity_detail",
+        {
+            "kb_id": kb_id,
+            "entity_type": entity_type,
+            "canonical_name": canonical_name,
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/kbs/{kb_id}", summary="知识库详情（抽屉 C）")
+async def get_data_kb_detail(
+    request: Request,
+    kb_id: str = Path(..., max_length=64, description="知识库 ID"),
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数（与列表一致）"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+):
+    """知识库详情。
+
+    ⚠️ 无权限时整体 **404**（不是空壳）：判据复用 `get_knowledge_info` 的防探测口径
+    （非空间管理者且无 KB 授权）。前端**不要**把它提示成「无权限」—— 那等于确认了
+    这个知识库存在。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_data_kb_detail",
+        {
+            "kb_id": kb_id,
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/services/{service_id}", summary="领域服务详情（抽屉 D）")
+async def get_data_service_detail(
+    request: Request,
+    service_id: str = Path(..., max_length=64, description="领域服务 ID（= service_usage[].service_id）"),
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数（与列表一致）"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+):
+    """领域服务详情。
+
+    ⚠️ **本接口不返回 404**（与 A/B/C 三处有意不同）：抽屉的主体是「领域服务使用情况」
+    表里那一行**归因记录**，服务实体只是装饰。列表在服务已被删 / 服务实体查不到时
+    本来就回落显示 `service_id`，所以「行在、实体不在」是列表已承认的状态（历史回填
+    把空间 id 写进 `entry_service_id` 的遗留数据就是这种）。这里报 404 会变成
+    「列表上明明有一行，点开说它不存在」。取不到就把 `service_name` 回落成 `service_id`、
+    `status` / `enabled` 给 `null`、`knowledge_bases` 给空数组，**使用情况照常返回**。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_data_service_detail",
+        {
+            "service_id": service_id,
+            "domain_space_id": domain_space_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
         },
         user_id=_extract_user_id(request),
     )
