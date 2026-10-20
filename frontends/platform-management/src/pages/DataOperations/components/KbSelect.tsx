@@ -1,6 +1,6 @@
 import { Select } from 'antd';
 import { useTranslation } from 'react-i18next';
-import { DO_KB_ALL } from '../constant';
+import { DO_KB_ALL } from '../../../constants/dataOperations';
 import type { DoKbOption } from '../types';
 
 interface Props {

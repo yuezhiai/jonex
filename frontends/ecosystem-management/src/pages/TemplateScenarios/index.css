@@ -1,11 +1,21 @@
 .template-scenarios-card {
   padding: 0;
   overflow: hidden;
+  /* 卡片固定为一屏高：右栏定义表可以有几千 px，若让卡片按内容长高，
+     左栏会被一起拉到同样的高度（滚到下面时左半屏是空白）。
+     高度由视口定、不给内容长高的机会，滚动交给下面的右栏自己 */
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
+/* 撑满卡片余量。min-height 设 0：否则会取内容的 min-content 高度（几千 px），
+   把卡片顶开后被 overflow:hidden 裁掉 —— 右栏就再也滚不到了 */
 .template-scenarios-split {
   display: flex;
-  min-height: 500px;
+  flex: 1;
+  min-height: 0;
 }
 
 .template-scenarios-left {
@@ -112,6 +122,18 @@
   flex: 1;
   min-width: 0;
   padding: 20px 24px 24px;
+  /* 场景标题、标签页留在原地，只有标签内容区滚 —— 见 .template-scenarios-tab-body */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 定义表 pagination={false}，几百行全渲染。滚的是这一层而不是整个右栏，
+   否则翻长表时标签页和「新建」按钮会一起滚出视口 */
+.template-scenarios-tab-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .template-scenarios-right-header {
@@ -160,7 +182,14 @@
 .template-scenarios-tab-toolbar {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: 14px;
+  /* 钉在滚动区顶部：翻长表时「新建」按钮留在手边。
+     用 padding 而非 margin 留白 —— sticky 会把外边距一起带上，
+     下面留一条 14px 的缝让表格从缝里透出来。底色不透明同理 */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-bottom: 14px;
+  background: #fff;
 }
 
 .template-scenarios-table-actions {
@@ -239,12 +268,32 @@
 }
 
 @media (max-width: 960px) {
+  /* 两栏堆叠后改回整块滚（右栏再自己滚会被压成很矮一条）。
+     横向也收：表格没有 scroll.x，比面板宽时自会溢出，这一层不收就没人能滚到右边的列 */
   .template-scenarios-split {
     flex-direction: column;
+    overflow: auto;
   }
 
+  .template-scenarios-right {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+
+  .template-scenarios-tab-body {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+
+  /* 没有滚动区可钉，再 sticky 会盖在表格上 */
+  .template-scenarios-tab-toolbar {
+    position: static;
+  }
+
+  /* width 交给 stretch：本文件没有全局 border-box，
+     width:100% 会再叠上左右各 16px 内边距，比卡片宽 32px 被裁掉 */
   .template-scenarios-left {
-    width: 100%;
+    width: auto;
     min-width: 0;
     border-right: 0;
     border-bottom: 1px solid #e2e8f0;

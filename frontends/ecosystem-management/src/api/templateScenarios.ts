@@ -261,3 +261,80 @@ export async function importScenarioOntologyYaml(
     { headers: { 'Content-Type': 'multipart/form-data' } },
   )
 }
+
+/* ── 发布与审批（标准侧第二增量：强制审批） ───────────────────────── */
+
+export interface PublishResult {
+  scenario_id: string
+  domain_id: string
+  version: number
+  structure_hash: string
+  published_at: string
+  object_count: number
+  relation_count: number
+  constraint_count: number
+  impacted?: Record<string, unknown>
+}
+
+export type PublishRequestStatus = 'pending' | 'approved' | 'rejected' | 'cancelled'
+
+export interface PublishRequestItem {
+  id: string
+  tenant_id?: string
+  domain_id: string
+  scenario_id: string
+  status: PublishRequestStatus
+  structure_hash: string
+  submitted_by: string | null
+  submitted_at: string | null
+  decided_by: string | null
+  decided_at: string | null
+  comment: string | null
+  published_version: number | null
+}
+
+/** 直接发布（仅租户管理员；编辑会收到 403，需走申请）。 */
+export async function publishTemplateScenario(scenarioId: string): Promise<PublishResult> {
+  return apiClient.post<PublishResult>(`/ecosystem/templates/scenarios/${scenarioId}/publish`)
+}
+
+/** 提交发布申请（普通编辑）。 */
+export async function submitPublishRequest(scenarioId: string): Promise<PublishRequestItem> {
+  return apiClient.post<PublishRequestItem>(
+    `/ecosystem/templates/scenarios/${scenarioId}/publish-requests`,
+  )
+}
+
+export async function listPublishRequests(
+  scenarioId: string,
+): Promise<TemplateListResponse<PublishRequestItem>> {
+  return apiClient.get<TemplateListResponse<PublishRequestItem>>(
+    `/ecosystem/templates/scenarios/${scenarioId}/publish-requests`,
+  )
+}
+
+export async function approvePublishRequest(
+  requestId: string,
+  comment?: string,
+): Promise<{ request: PublishRequestItem; published: PublishResult }> {
+  return apiClient.post<{ request: PublishRequestItem; published: PublishResult }>(
+    `/ecosystem/templates/publish-requests/${requestId}/approve`,
+    { comment },
+  )
+}
+
+export async function rejectPublishRequest(
+  requestId: string,
+  comment?: string,
+): Promise<PublishRequestItem> {
+  return apiClient.post<PublishRequestItem>(
+    `/ecosystem/templates/publish-requests/${requestId}/reject`,
+    { comment },
+  )
+}
+
+export async function cancelPublishRequest(requestId: string): Promise<PublishRequestItem> {
+  return apiClient.post<PublishRequestItem>(
+    `/ecosystem/templates/publish-requests/${requestId}/cancel`,
+  )
+}

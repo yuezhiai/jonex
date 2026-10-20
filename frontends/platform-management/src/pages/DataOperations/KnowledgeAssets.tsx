@@ -15,12 +15,14 @@ import StatCards, { type StatCardItem } from './components/StatCards';
 import TrendAreaChart from './components/TrendAreaChart';
 import ProportionList from './components/ProportionList';
 import SegmentedFilter from './components/SegmentedFilter';
-import type { DoHotInstance, DoIdleKnowledge, DoKnowledgeKpi, DoScope } from './types';
+import WindowRangePicker from './components/WindowRangePicker';
+import EntityDetailDrawer from './drawers/EntityDetailDrawer';
+import { DO_DEFAULT_WINDOW } from '../../constants/dataOperations';
+import type { DoEntityTarget, DoHotInstance, DoIdleKnowledge, DoKnowledgeKpi, DoScope, DoWindow } from './types';
 import './index.scss';
 
 type KnowledgeOverview = Awaited<ReturnType<typeof getKnowledgeOverview>>;
 type IdleWindow = 30 | 90;
-type TrendRange = 7 | 14;
 
 export default function KnowledgeAssets() {
   const { t } = useTranslation();
@@ -28,7 +30,7 @@ export default function KnowledgeAssets() {
   const spaceId = useCurrentSpace();
 
   const [scope, setScope] = useState<DoScope>('ontology');
-  const [trendRange, setTrendRange] = useState<TrendRange>(7);
+  const [window, setWindow] = useState<DoWindow>(DO_DEFAULT_WINDOW);
   const [idleWindow, setIdleWindow] = useState<IdleWindow>(30);
 
   const [kpis, setKpis] = useState<DoKnowledgeKpi[]>([]);
@@ -36,9 +38,13 @@ export default function KnowledgeAssets() {
   const [overview, setOverview] = useState<KnowledgeOverview | null>(null);
   const [scopeLoading, setScopeLoading] = useState(true);
   const [hotInstances, setHotInstances] = useState<DoHotInstance[]>([]);
+  const [hotLoading, setHotLoading] = useState(true);
   const [idleKnowledge, setIdleKnowledge] = useState<DoIdleKnowledge[]>([]);
   const [idleLoading, setIdleLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // 正在查看的本体对象（点列表里的名称打开抽屉 B）
+  const [entityTarget, setEntityTarget] = useState<DoEntityTarget | null>(null);
 
   const loadKpis = useCallback(async () => {
     setKpiLoading(true);
@@ -52,20 +58,30 @@ export default function KnowledgeAssets() {
     }
   }, [t, spaceId]);
 
-  // 分析对象切换只影响下方三块，KPI 行不参与，避免无谓的闪烁
+  // 分析对象切换只影响「分布 + 活跃度」，KPI 行不参与，避免无谓的闪烁
   const loadByScope = useCallback(async () => {
     setScopeLoading(true);
     try {
-      const [ov, hot] = await Promise.all([getKnowledgeOverview(scope, spaceId), listHotInstances(scope, spaceId)]);
-      setOverview(ov);
-      setHotInstances(hot);
+      setOverview(await getKnowledgeOverview(scope, spaceId));
     } catch {
       setOverview(null);
-      setHotInstances([]);
     } finally {
       setScopeLoading(false);
     }
   }, [scope, spaceId]);
+
+  // 高频实例表随区间变化（「命中次数」就是在这个窗口里算的），所以从 loadByScope 里拆出来，
+  // 让切区间只重取这一块而不是整排（分布与活跃度维持近 7 天）
+  const loadHot = useCallback(async () => {
+    setHotLoading(true);
+    try {
+      setHotInstances(await listHotInstances(scope, spaceId, window));
+    } catch {
+      setHotInstances([]);
+    } finally {
+      setHotLoading(false);
+    }
+  }, [scope, spaceId, window]);
 
   useEffect(() => {
     void loadKpis();
@@ -76,9 +92,13 @@ export default function KnowledgeAssets() {
   }, [loadByScope]);
 
   useEffect(() => {
+    void loadHot();
+  }, [loadHot]);
+
+  useEffect(() => {
     let cancelled = false;
     setIdleLoading(true);
-    listIdleKnowledge(scope, idleWindow, spaceId)
+    listIdleKnowledge(scope, idleWindow, spaceId, window)
       .then((list) => {
         if (!cancelled) setIdleKnowledge(list);
       })
@@ -91,7 +111,7 @@ export default function KnowledgeAssets() {
     return () => {
       cancelled = true;
     };
-  }, [scope, idleWindow, spaceId]);
+  }, [scope, idleWindow, spaceId, window]);
 
   const kpiItems: StatCardItem[] = useMemo(
     () =>
@@ -110,16 +130,35 @@ export default function KnowledgeAssets() {
     [kpis, t],
   );
 
-  // 增长趋势的窗口是卡片自己的事：切 7/14 天只重取这一块，KPI、分布、活跃度都还按近 7 天
-  const loadTrend = useCallback(() => getKnowledgeTrend(scope, spaceId, trendRange), [scope, spaceId, trendRange]);
+  // 增长趋势的窗口是卡片自己的事：切区间只重取趋势、高频实例与未使用知识三块，
+  // KPI、分布、活跃度都还按近 7 天
+  const loadTrend = useCallback(() => getKnowledgeTrend(scope, spaceId, window), [scope, spaceId, window]);
   const { data: trend, loading: trendLoading } = useAsyncData(loadTrend);
+
+  /**
+   * 点名称进抽屉 B。定位键是**三元组**（kbId + 类型 + 规范名），不是行上的 `id`
+   * —— 那个 `object_id` 是单向哈希，反解不回三元组、也查不了详情。
+   * `kbId` 富化不到时没有可用的定位键，退回纯文本（后端也拦不住串库查询）。
+   */
+  const renderEntityName = (row: DoHotInstance | DoIdleKnowledge) => {
+    const kbId = row.kbId;
+    if (!kbId) return <strong>{row.name}</strong>;
+    return (
+      <a
+        className="yx-do-link"
+        onClick={() => setEntityTarget({ kbId, entityType: row.objectType, canonicalName: row.name })}
+      >
+        {row.name}
+      </a>
+    );
+  };
 
   const hotColumns = [
     {
       title: t('dataOperations.column.instanceName'),
       dataIndex: 'name',
       key: 'name',
-      render: (v: string) => <strong>{v}</strong>,
+      render: (_: string, row: DoHotInstance) => renderEntityName(row),
     },
     { title: t('dataOperations.column.objectType'), dataIndex: 'objectType', key: 'objectType', width: 150 },
     { title: t('dataOperations.column.kbName'), dataIndex: 'kbName', key: 'kbName', width: 180 },
@@ -152,7 +191,7 @@ export default function KnowledgeAssets() {
       title: t('dataOperations.column.instanceName'),
       dataIndex: 'name',
       key: 'name',
-      render: (v: string) => <strong>{v}</strong>,
+      render: (_: string, row: DoIdleKnowledge) => renderEntityName(row),
     },
     { title: t('dataOperations.column.objectType'), dataIndex: 'objectType', key: 'objectType', width: 150 },
     { title: t('dataOperations.column.kbName'), dataIndex: 'kbName', key: 'kbName', width: 180 },
@@ -218,16 +257,7 @@ export default function KnowledgeAssets() {
       <div className="yx-do-two-col">
         <SectionCard
           title={t('dataOperations.section.growthTitle')}
-          extra={
-            <SegmentedFilter
-              value={trendRange}
-              onChange={setTrendRange}
-              options={[
-                { value: 7, label: t('dataOperations.filter.last7d') },
-                { value: 14, label: t('dataOperations.filter.last14d') },
-              ]}
-            />
-          }
+          extra={<WindowRangePicker value={window} onChange={setWindow} />}
         >
           <TrendAreaChart
             data={trend ?? []}
@@ -257,7 +287,7 @@ export default function KnowledgeAssets() {
           size="small"
           columns={hotColumns}
           dataSource={hotInstances}
-          loading={scopeLoading}
+          loading={hotLoading}
           pagination={false}
         />
       </SectionCard>
@@ -284,6 +314,13 @@ export default function KnowledgeAssets() {
           pagination={false}
         />
       </SectionCard>
+
+      <EntityDetailDrawer
+        target={entityTarget}
+        spaceId={spaceId}
+        window={window}
+        onClose={() => setEntityTarget(null)}
+      />
     </>
   );
 }

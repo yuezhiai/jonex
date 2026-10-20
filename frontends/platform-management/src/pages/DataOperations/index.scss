@@ -171,6 +171,11 @@
   background: #eff6ff;
 }
 
+.yx-do-type-tag.yx-do-type-tag--text {
+  color: #0d9488;
+  background: #f0fdfa;
+}
+
 .yx-do-type-tag.yx-do-type-tag--table {
   color: #10b981;
   background: #ecfdf5;
@@ -200,6 +205,149 @@
 .yx-do-type-tag.yx-do-type-tag--other {
   color: #6b7280;
   background: #f3f4f6;
+}
+
+/* ── 钻取抽屉的详情区 ──
+   头部（实体名 + 一行灰色标识）+ 若干个「节」，节内是标签在上的两列字段网格。
+   头部下面、以及节与节之间的发丝线都由 CSS 画，不进 DOM：
+   在 JSX 里插 Divider 的话第一节顶上会多出一条线，还得反过来用选择器去掉。 */
+.yx-do-detail-header {
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--yx-border-light);
+}
+
+/* 文件名 / 规范名 / 库名都可能很长且不含空格，break-all 好过撑破抽屉 */
+.yx-do-detail-header-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--yx-text-primary);
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.yx-do-detail-header-meta {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--yx-text-muted);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.yx-do-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.yx-do-detail-section + .yx-do-detail-section {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--yx-border-light);
+}
+
+.yx-do-detail-section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--yx-text-primary);
+  line-height: 1.4;
+}
+
+/* 压 antd Descriptions 的默认排版，双类名提高特异性（与上面 .yx-do-type-tag 同一手法）。
+   ⚠️ 竖排布局下 label 与 content 各占一行 <tr>，而两个格子里面装的都是 <span>、padding 全挂在
+   <th>/<td>（.ant-descriptions-item）上 —— 去压 span 的 padding 对行高没有任何影响，间隔必须压在格子上 */
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-row > .ant-descriptions-item {
+  padding-inline-end: 24px;
+}
+
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-row > .ant-descriptions-item:last-child {
+  padding-inline-end: 0;
+}
+
+/* 标签行与取值行之间的 2px */
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-row > th.ant-descriptions-item {
+  padding-bottom: 2px;
+}
+
+/* 一组字段与下一组之间的行距 */
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-row > td.ant-descriptions-item {
+  padding-bottom: 18px;
+}
+
+/* 最后一格不留行距：后面要么是分隔线、要么是本节的其它内容，间距交给 section 的 gap */
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-row:last-child > td.ant-descriptions-item {
+  padding-bottom: 0;
+}
+
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-item-label {
+  font-size: 13px;
+  color: var(--yx-text-muted);
+}
+
+.yx-do-detail-fields.yx-do-detail-fields .ant-descriptions-item-content {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--yx-text-primary);
+}
+
+/* ── 处理状态标签 ──
+   软底 pill，与资产类型 tag 同一套视觉语言 */
+.yx-do-status-tag.yx-do-status-tag {
+  margin-inline-end: 0;
+  padding: 0 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.yx-do-status-tag.yx-do-status-tag--success {
+  color: var(--yx-success-text);
+  background: var(--yx-success-bg);
+}
+
+.yx-do-status-tag.yx-do-status-tag--danger {
+  color: #dc2626;
+  background: var(--yx-danger-bg);
+}
+
+.yx-do-status-tag.yx-do-status-tag--neutral {
+  color: var(--yx-text-secondary);
+  background: var(--yx-row-border);
+}
+
+/* ── 属性卡片（本体对象详情） ──
+   属性是抽取管线给的任意 key/value 对，条数不定、key 长短不齐 ——
+   一条一张浅底卡、两列排布，与「基本信息」那种两列字段网格在视觉上区分开。
+   用 grid 而非 flex-wrap：卡片宽度相等，右侧不会因最后一行不满而参差 */
+.yx-do-attr-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.yx-do-attr-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--yx-bg-page);
+}
+
+.yx-do-attr-card-key {
+  font-size: 12px;
+  color: var(--yx-text-muted);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* 去掉 dd 默认的 40px 缩进；值可能是长串编码 / URL，允许在任意位置断行 */
+.yx-do-attr-card-value {
+  margin: 2px 0 0;
+  font-size: 14px;
+  color: var(--yx-text-primary);
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 /* ── 占比条列表 ── */

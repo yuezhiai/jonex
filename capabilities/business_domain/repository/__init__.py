@@ -6,6 +6,7 @@ from capabilities.business_domain.models import (
     Adapter, DataAccessMethod, ModelProvider,
     ParserConfig, SkillCatalog, TenantSkill, TemplateAttribute, TemplateConstraint,
     TemplateDomain, TemplateObject, TemplateRelation, TemplateScenario,
+    TemplateScenarioVersion, TemplatePublishRequest,
 )
 
 
@@ -64,3 +65,88 @@ class PromptTemplateRepository(BaseRepository[PromptTemplate]):
     model = PromptTemplate
 class TemplateConstraintRepository(BaseRepository[TemplateConstraint]):
     model = TemplateConstraint
+
+
+class TemplateScenarioVersionRepository(BaseRepository[TemplateScenarioVersion]):
+    """模板场景发布快照（append-only）。"""
+
+    model = TemplateScenarioVersion
+
+    async def list_for_scenario(
+        self, tenant_id: str, scenario_id: str, offset: int = 0, limit: int = 20,
+    ) -> list[TemplateScenarioVersion]:
+        return await self.list_all(
+            tenant_id, offset, limit,
+            extra_conditions=[TemplateScenarioVersion.scenario_id == scenario_id],
+        )
+
+    async def get_version(
+        self, tenant_id: str, scenario_id: str, version: int,
+    ) -> TemplateScenarioVersion | None:
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(TemplateScenarioVersion).where(
+                TemplateScenarioVersion.tenant_id == tenant_id,
+                TemplateScenarioVersion.scenario_id == scenario_id,
+                TemplateScenarioVersion.version == version,
+            )
+        )
+        return result.scalars().first()
+
+
+class TemplatePublishRequestRepository(BaseRepository[TemplatePublishRequest]):
+    """模板场景发布申请（审批流）。"""
+
+    model = TemplatePublishRequest
+
+    async def list_for_scenario(
+        self,
+        tenant_id: str,
+        scenario_id: str,
+        *,
+        submitted_by: str | None = None,
+        limit: int = 100,
+    ) -> list[TemplatePublishRequest]:
+        from sqlalchemy import select
+
+        conditions = [
+            TemplatePublishRequest.tenant_id == tenant_id,
+            TemplatePublishRequest.scenario_id == scenario_id,
+        ]
+        if submitted_by:
+            conditions.append(TemplatePublishRequest.submitted_by == submitted_by)
+        result = await self.session.execute(
+            select(TemplatePublishRequest)
+            .where(*conditions)
+            .order_by(TemplatePublishRequest.submitted_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars())
+
+    async def get_pending(
+        self, tenant_id: str, scenario_id: str,
+    ) -> TemplatePublishRequest | None:
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(TemplatePublishRequest).where(
+                TemplatePublishRequest.tenant_id == tenant_id,
+                TemplatePublishRequest.scenario_id == scenario_id,
+                TemplatePublishRequest.status == "pending",
+            )
+        )
+        return result.scalars().first()
+
+    async def get_for_tenant(
+        self, request_id: str, tenant_id: str,
+    ) -> TemplatePublishRequest | None:
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(TemplatePublishRequest).where(
+                TemplatePublishRequest.id == request_id,
+                TemplatePublishRequest.tenant_id == tenant_id,
+            )
+        )
+        return result.scalars().first()

@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { Area } from '@ant-design/plots';
-import { Empty, Skeleton } from 'antd';
+import { Empty, Flex, Skeleton } from 'antd';
 import { useTranslation } from 'react-i18next';
 import type { DoTrendPoint } from '../types';
 
@@ -58,14 +58,19 @@ export default function TrendAreaChart({
     [fill],
   );
 
-  if (loading) return <Skeleton active paragraph={{ rows: 5 }} />;
-  if (!data.length)
-    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('dataOperations.empty.noData')} />;
+  const isEmpty = !data.length;
 
   return (
-    <div ref={measure} style={fill ? { flex: 1, minHeight: 0 } : undefined}>
-      {/* 首次量测前先不画，避免以默认高度画一帧再跳高 */}
-      {fill && !filledHeight ? null : (
+    // 与 PlatformMonitor 那份同一处改动：三态共用一块高度，切指标重取时卡片不上下跳
+    <div ref={measure} style={fill ? { flex: 1, minHeight: 0 } : { height }}>
+      {/* 骨架只在「还没拿到过任何数据」时上，换指标重取期间保留上一帧，避免闪一下 */}
+      {loading && isEmpty ? (
+        <Skeleton active paragraph={{ rows: 5 }} />
+      ) : isEmpty ? (
+        <Flex align="center" justify="center" style={{ height: '100%' }}>
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('dataOperations.empty.noData')} />
+        </Flex>
+      ) : fill && !filledHeight ? null : (
         <Area
           data={data}
           xField="date"

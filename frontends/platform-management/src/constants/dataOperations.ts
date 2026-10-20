@@ -12,8 +12,8 @@
  * 日期统一 `YYYY-MM-DD HH:mm`（与 formatDateTime 输出一致），趋势图的 X 轴用 `MM-DD`。
  */
 
-import type { DoKnowledgeKpi, DoKpiCard, DoProportionItem, DoSearchMode } from './types';
-import { fmtCount, fmtRate, fmtSigned } from './utils';
+import type { DoKnowledgeKpi, DoKpiCard, DoProportionItem, DoSearchMode, DoWindow } from '../pages/DataOperations/types';
+import { fmtCount, fmtRate, fmtSigned } from '../pages/DataOperations/utils';
 
 /* ══════════════════════ 数字源 ══════════════════════ */
 
@@ -73,20 +73,25 @@ export const DO_ASSET_KPIS: DoKpiCard[] = [
 ];
 
 /**
- * 按数据类型分组 —— 这里是**行的定义**（key 与文案），count 是占位值：
+ * 按数据类型分组 —— 这里是**行的定义**（key、文案、颜色与顺序），count 是占位值：
  * 取数层会用后端返回的 `asset_type` 计数覆盖，页面上的数字不是这里的。
  *
- * 七个展示位与后端 7 类分类一一对应（含 `other`）。少一行，那一类资产就会在
- * 构成图上凭空消失 —— 而后端的 `other` 正是靠这一行才有落点。
+ * ⚠️ **只展示五类是有意的**（文档/文本/图像/音频/视频，与平台「解析器配置」的
+ * 文档/文本/图像/音频/视频五档同口径）；表格、结构化数据、其他三类**隐藏**。
+ * 注意「隐藏」只作用于展示 —— 它们**仍计入占比分母**（页面口径是「占全部资产」），
+ * 所以五类百分比之和小于 100%。分母由取数层单独给（`getAssetComposition` 的
+ * `total`），不要指望 `ProportionList` 从这五行里自己加出来。
+ *
+ * 知识库详情抽屉复用同一份定义（见 KbDetailDrawer），两处的类别、顺序、颜色因此天然一致。
+ *
+ * 颜色逐个写死、不靠下标：`ProportionList` 的默认色板是共享的，按新顺序取会撞色。
  */
 export const DO_ASSET_COMPOSITION: DoProportionItem[] = [
-  { key: 'document', labelKey: 'dataOperations.assetType.document', count: 6040 },
-  { key: 'table', labelKey: 'dataOperations.assetType.table', count: 3460 },
-  { key: 'image', labelKey: 'dataOperations.assetType.image', count: 1680 },
-  { key: 'structured', labelKey: 'dataOperations.assetType.structured', count: 730 },
-  { key: 'video', labelKey: 'dataOperations.assetType.video', count: 510 },
-  { key: 'audio', labelKey: 'dataOperations.assetType.audio', count: 420 },
-  { key: 'other', labelKey: 'dataOperations.assetType.other', count: 0 },
+  { key: 'document', labelKey: 'dataOperations.assetType.document', count: 6040, color: '#3b82f6' },
+  { key: 'text', labelKey: 'dataOperations.assetType.text', count: 3460, color: '#0d9488' },
+  { key: 'image', labelKey: 'dataOperations.assetType.image', count: 1680, color: '#8b5cf6' },
+  { key: 'audio', labelKey: 'dataOperations.assetType.audio', count: 420, color: '#ec4899' },
+  { key: 'video', labelKey: 'dataOperations.assetType.video', count: 510, color: '#f97316' },
 ];
 
 /* ══════════════════════ 页 2：知识资产 ══════════════════════ */
@@ -177,3 +182,14 @@ export const DO_SEARCH_MODES: DoSearchMode[] = [
 
 /** 知识库筛选的「全部知识库」值 —— 页面与取数层共用，避免两处各写一遍字面量 */
 export const DO_KB_ALL = 'all';
+
+/* ══════════════════════ 列表钻取：时间窗口 ══════════════════════ */
+
+/** 默认窗口天数（近 7 天）—— 与 KPI 卡的「近 7 天」同口径 */
+export const DO_DEFAULT_WINDOW_DAYS = 7;
+
+/** 默认窗口。趋势、喂抽屉的列表、抽屉都以它起步，改一处即可全页同步 */
+export const DO_DEFAULT_WINDOW: DoWindow = { days: DO_DEFAULT_WINDOW_DAYS };
+
+/** 趋势卡区间选择器的预设天数（顺序即下拉里的顺序） */
+export const DO_WINDOW_PRESET_DAYS: readonly number[] = [7, 14, 30, 90];

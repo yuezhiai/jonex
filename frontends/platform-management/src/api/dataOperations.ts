@@ -9,6 +9,14 @@
  * 后端仍未实现的只剩两处（均为三期，后端侧自己写死）：提问主题聚类（`question_topics` 硬编码空数组）
  * 与 Wiki 侧指标（恒零值）。其余块都能取到真实数据 —— 取不到时各自在函数上就地标注。
  *
+ * 三期另接了 4 个「列表钻取详情」端点（原型「点名称进抽屉」）：assets/{id} / ontology-entities/detail /
+ * kbs/{id} / services/{id}，分别对应 A/B/C/D 四个抽屉。它们与列表**共享同一组时间/范围参数**。
+ *
+ * ── 时间窗口 ──
+ * 窗口有预设（`{ days }`）与自定义区间（`{ startDate, endDate }`）两种形态，统一由 `windowParams`
+ * 解析成 query。**列表与抽屉必须传同一个窗口**，否则抽屉里的「引用/命中/检索次数」会与列表那一行对不上，
+ * 而且不报错、只是静默算错。页面把窗口 state 同时喂给列表取数与抽屉，是唯一保证点。
+ *
  * ── 领域空间 ──
  * 后端按 `knowledge_info.space_id` 圈定统计范围，前端只不过把这个空间作为 `domain_space_id` 下发
  * （不带该参数即租户级全量）。知识库筛选下拉（见 listKbOptions）也按同一个字段取，与图表同口径。
@@ -16,32 +24,41 @@
 import {
   DO_ASSET_COMPOSITION,
   DO_ASSET_KPIS,
+  DO_DEFAULT_WINDOW,
   DO_KB_ALL,
   DO_KNOWLEDGE_KPIS,
   DO_SEARCH_KPIS,
   DO_SEARCH_MODES,
-} from '../pages/DataOperations/constant';
+} from '../constants/dataOperations';
 import type {
   DoAnomalyAsset,
   DoAnomalySummary,
+  DoAssetDetail,
+  DoAssetTarget,
   DoAssetType,
+  DoEntityDetail,
+  DoEntityTarget,
   DoHotAsset,
   DoHotInstance,
   DoHotQuestion,
   DoIdleAsset,
   DoIdleKnowledge,
+  DoKbDetail,
   DoKbOption,
   DoKnowledgeKpi,
   DoKpiCard,
   DoPipelineOverview,
   DoPipelineStats,
   DoProportionItem,
+  DoQualityAnomaly,
   DoScope,
   DoScopeActivity,
   DoSearchMode,
+  DoServiceDetail,
   DoStage,
   DoTrendPoint,
   DoUsageItem,
+  DoWindow,
 } from '../pages/DataOperations/types';
 import { fmtCount, fmtRate, fmtSigned } from '../pages/DataOperations/utils';
 import { formatDateTime } from '@jonex/shared-lib';
@@ -221,16 +238,89 @@ export interface SearchAnalyticsApi {
   }[];
 }
 
-/** 统计窗口：后端默认 7 天，前端各块共用同一个值 */
-const DO_WINDOW_DAYS = 7;
+/* ══════════════════════ 后端契约：列表钻取详情 ══════════════════════ */
+
+interface ApiAssetDetail {
+  asset_id: string;
+  file_name: string;
+  asset_type: string | null;
+  file_format: string | null;
+  file_size: number | null;
+  source: string | null;
+  kb_id: string | null;
+  kb_name: string | null;
+  uploaded_at: string | null;
+  last_processed_at: string | null;
+  status: string | null;
+  ontology_status: string | null;
+  llm_wiki_compile_status: string | null;
+  cite_count: number;
+  last_cited_at: string | null;
+}
+
+interface ApiEntityDetail {
+  kb_id: string;
+  kb_name: string | null;
+  canonical_name: string;
+  entity_type: string;
+  aliases: string[];
+  description: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  attributes: { key: string; value: string }[];
+  relation_total: number;
+  relation_groups: {
+    relation_type: string;
+    targets: { canonical_name: string; entity_type: string | null }[];
+  }[];
+  relation_truncated: boolean;
+  hit_count: number;
+  adopted_count: number;
+  last_used_at: string | null;
+  degraded: boolean;
+}
+
+interface ApiKbDetail {
+  kb_id: string;
+  kb_name: string;
+  kb_type: string | null;
+  ontology: { object_instances: number | null; relation_instances: number | null; degraded: boolean };
+  asset_total: number;
+  assets_by_type: { asset_type: string; count: number }[];
+  services: { service_id: string; service_name: string }[];
+  updated_at: string | null;
+  request_count: number;
+  last_request_at: string | null;
+}
+
+interface ApiServiceDetail {
+  service_id: string;
+  service_name: string;
+  status: string | null;
+  enabled: boolean | null;
+  knowledge_bases: { kb_id: string; kb_name: string }[];
+  request_count: number;
+  last_request_at: string | null;
+}
 
 /** 知识库列表的翻页大小：网关 limit 上限就是 100 */
 const KB_PAGE_SIZE = 100;
 
+/**
+ * 窗口 → query。预设走 `days`；自定义区间走 `start_date`/`end_date`（后端成对给出时覆盖 `days`）。
+ * 列表与抽屉共用这一个函数，是「同窗口」的唯一保证点。
+ */
+const windowParams = (window: DoWindow) =>
+  'startDate' in window ? { start_date: window.startDate, end_date: window.endDate } : { days: window.days };
+
+/** 窗口 → coalesce key 片段：不同窗口绝不能命中同一份缓存，否则切区间看着没生效 */
+const windowKey = (window: DoWindow) =>
+  'startDate' in window ? `${window.startDate}~${window.endDate}` : `${window.days}d`;
+
 /** 领域空间为空时不下发该参数，后端即按租户级全量统计 */
-const scopeParams = (spaceId?: string | null, extra: Record<string, unknown> = {}) => ({
+const scopeParams = (spaceId: string | null | undefined, window: DoWindow, extra: Record<string, unknown> = {}) => ({
   ...(spaceId ? { domain_space_id: spaceId } : {}),
-  days: DO_WINDOW_DAYS,
+  ...windowParams(window),
   ...extra,
 });
 
@@ -259,19 +349,17 @@ const narrowKbId = (kbId?: string) => (kbId && kbId !== DO_KB_ALL ? kbId : undef
 
 /**
  * data-assets 一次取回「趋势 + 构成 + KPI」，三块各有自己的收窄条件与窗口，
- * 所以 key 里带上 days / kb_id：条件相同的并发调用合并成一次请求，不同的各发各的。
+ * 所以 key 里带上窗口 / kb_id：条件相同的并发调用合并成一次请求，不同的各发各的。
  */
 const fetchDataAssets = (
-  spaceId?: string | null,
-  opts: { days?: number; kbId?: string; unusedThresholdDays?: number } = {},
+  spaceId: string | null | undefined,
+  window: DoWindow,
+  opts: { kbId?: string; unusedThresholdDays?: number } = {},
 ) => {
-  const days = opts.days ?? DO_WINDOW_DAYS;
   const kbId = narrowKbId(opts.kbId);
-  return coalesce(`assets|${spaceId ?? ''}|${days}|${opts.unusedThresholdDays ?? ''}|${kbId ?? ''}`, () =>
+  return coalesce(`assets|${spaceId ?? ''}|${windowKey(window)}|${opts.unusedThresholdDays ?? ''}|${kbId ?? ''}`, () =>
     apiClient.get<DataAssetsApi>('/knowledge-base/data-operations/data-assets', {
-      // scopeParams 的 extra 在 days 之后展开，所以这里传进去的 days 会覆盖默认窗口
-      params: scopeParams(spaceId, {
-        days,
+      params: scopeParams(spaceId, window, {
         ...(opts.unusedThresholdDays ? { unused_threshold_days: opts.unusedThresholdDays } : {}),
         kb_id: kbId,
       }),
@@ -280,30 +368,25 @@ const fetchDataAssets = (
 };
 
 /**
- * 同上：知识/检索两页里，趋势卡有自己的窗口，所以 days 也进 key，与其他块各取各的。
+ * 同上：知识/检索两页里，趋势卡有自己的窗口，所以窗口也进 key，与其他块各取各的。
  *
  * `unusedThresholdDays` 只有「长期未使用知识」那一块用（30/90 切换）—— 后端按它算出
  * 阈值窗口、只把窗口内没命中过的实体放进 `unused_entities`。它必须进 coalesce key，
- * 否则两个窗口会复用同一份响应，切换看着像没生效。
+ * 否则两个阈值会复用同一份响应，切换看着像没生效。
  */
-const fetchKnowledgeAssets = (
-  spaceId?: string | null,
-  days: number = DO_WINDOW_DAYS,
-  unusedThresholdDays?: number,
-) =>
-  coalesce(`knowledge|${spaceId ?? ''}|${days}|${unusedThresholdDays ?? ''}`, () =>
+const fetchKnowledgeAssets = (spaceId: string | null | undefined, window: DoWindow, unusedThresholdDays?: number) =>
+  coalesce(`knowledge|${spaceId ?? ''}|${windowKey(window)}|${unusedThresholdDays ?? ''}`, () =>
     apiClient.get<KnowledgeAssetsApi>('/knowledge-base/data-operations/knowledge-assets', {
-      params: scopeParams(spaceId, {
-        days,
+      params: scopeParams(spaceId, window, {
         ...(unusedThresholdDays ? { unused_threshold_days: unusedThresholdDays } : {}),
       }),
     }),
   );
 
-const fetchSearchAnalytics = (spaceId?: string | null, days: number = DO_WINDOW_DAYS) =>
-  coalesce(`search|${spaceId ?? ''}|${days}`, () =>
+const fetchSearchAnalytics = (spaceId: string | null | undefined, window: DoWindow) =>
+  coalesce(`search|${spaceId ?? ''}|${windowKey(window)}`, () =>
     apiClient.get<SearchAnalyticsApi>('/knowledge-base/data-operations/search-analytics', {
-      params: scopeParams(spaceId, { days }),
+      params: scopeParams(spaceId, window),
     }),
   );
 
@@ -337,7 +420,7 @@ export async function listKbOptions(spaceId?: string | null): Promise<DoKbOption
 
 /** 四张 KPI 卡取自 data-assets 的汇总字段；引用率后端给 0~1 小数，展示要乘 100 */
 export async function getAssetKpis(spaceId?: string | null): Promise<DoKpiCard[]> {
-  const data = await fetchDataAssets(spaceId);
+  const data = await fetchDataAssets(spaceId, DO_DEFAULT_WINDOW);
   const values: Record<string, string> = {
     total: fmtCount(data.total_assets),
     source: fmtCount(data.total_data_sources),
@@ -348,15 +431,15 @@ export async function getAssetKpis(spaceId?: string | null): Promise<DoKpiCard[]
 }
 
 /**
- * 数据接入趋势。单库筛选按 kb_id 收窄；窗口由页面按「近 7 / 近 14 天」直接给定 ——
- * 切换会各取一次（7 天是 14 天的子集，但两个窗口的 X 轴、以及用户在切的那一下的反馈，都靠这次请求）。
+ * 数据接入趋势。单库筛选按 kb_id 收窄；窗口由页面的区间选择器给定 ——
+ * 切换会各取一次（近 7 天是近 14 天的子集，但两个窗口的 X 轴、以及用户在切的那一下的反馈，都靠这次请求）。
  */
 export async function getAssetTrend(
   kbId: string,
-  spaceId?: string | null,
-  days: number = DO_WINDOW_DAYS,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
 ): Promise<DoTrendPoint[]> {
-  const data = await fetchDataAssets(spaceId, { days, kbId });
+  const data = await fetchDataAssets(spaceId, window, { kbId });
   return toTrend(data.access_trend);
 }
 
@@ -365,23 +448,33 @@ export async function getAssetComposition(
   kbId: string,
   spaceId?: string | null,
 ): Promise<{
-  /** 按数据类型分组的构成 */
+  /** 按数据类型分组的构成（只含 `DO_ASSET_COMPOSITION` 那五类，顺序即展示顺序） */
   composition: DoProportionItem[];
+  /**
+   * 占比分母 = 后端返回的**全部**类别计数之和（含被隐藏的表格/结构化/其他）。
+   *
+   * 口径是「占全部资产」，所以不能拿上面五行的 count 去加 —— 那样会把隐藏类别
+   * 从分母里摘掉，百分比被重新归一（「文档」会从 42.9% 涨到 66.7%）。
+   */
+  total: number;
 }> {
-  const data = await fetchDataAssets(spaceId, { kbId });
+  // 构成不受区间控件驱动（KPI/构成维持近 7 天），故固定默认窗口
+  const data = await fetchDataAssets(spaceId, DO_DEFAULT_WINDOW, { kbId });
   // 后端已直出前端口径的 asset_type（表格替前端做了 spreadsheet → table），
   // 前端不再自己按 category 映射一遍 —— 两处各映射一次必然会漂。
-  const counts = new Map(data.composition.map((item) => [item.asset_type, item.count]));
+  const raw = data.composition;
+  const counts = new Map(raw.map((item) => [item.asset_type, item.count]));
   return {
     composition: DO_ASSET_COMPOSITION.map((item) => ({
       ...item,
       count: counts.get(item.key) ?? 0,
     })),
+    total: raw.reduce((sum, item) => sum + item.count, 0),
   };
 }
 
-/** 前端资产类型全集：6 个业务类 + `other` 兜底展示位 */
-const ASSET_TYPES: readonly DoAssetType[] = ['document', 'table', 'image', 'structured', 'video', 'audio', 'other'];
+/** 前端资产类型全集：7 个业务类 + `other` 兜底展示位（须与后端 8 类逐一对齐） */
+const ASSET_TYPES: readonly DoAssetType[] = ['document', 'text', 'table', 'image', 'structured', 'video', 'audio', 'other'];
 
 /**
  * 后端 `asset_type` → 前端类型标签。
@@ -389,7 +482,7 @@ const ASSET_TYPES: readonly DoAssetType[] = ['document', 'table', 'image', 'stru
  * 直读后端字段，不在前端按 mime 再判一次：后端用的是 `(mime, 扩展名)`，
  * 而 `.json` / `.yaml` / `.parquet` 的 mime 常是 `application/octet-stream`，
  * 只看 mime 会把它们判成文档，与同一页的构成统计对不上号。
- * 后端对 7 类之外的资产照直输出 `other`，落到兜底位。
+ * 后端对 8 类之外的资产照直输出 `other`，落到兜底位。
  */
 function toAssetType(assetType: string | null | undefined): DoAssetType {
   return ASSET_TYPES.includes(assetType as DoAssetType) ? (assetType as DoAssetType) : 'other';
@@ -401,8 +494,11 @@ function toAssetType(assetType: string | null | undefined): DoAssetType {
  * `kbName` 只作展示、`kbId` 是「前往知识库」的跳转目标，两者不是一回事：
  * 后端富化不到库名时回落 kb_id，所以只有 kb_id 为 null 时才真的没得跳。
  */
-export async function listHotAssets(spaceId?: string | null): Promise<DoHotAsset[]> {
-  const data = await fetchDataAssets(spaceId);
+export async function listHotAssets(
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoHotAsset[]> {
+  const data = await fetchDataAssets(spaceId, window);
   return data.top_cited_assets.map((item) => ({
     id: item.asset_id,
     name: item.file_name || item.asset_id,
@@ -417,9 +513,15 @@ export async function listHotAssets(spaceId?: string | null): Promise<DoHotAsset
 /**
  * 长期未使用资产：READY 资产中「最近一次被采用」为空或早于阈值。
  * 阈值真下发给后端（`unused_threshold_days`），30/90 切换各取各的。
+ * ⚠️ 阈值与统计窗口是两回事：阈值决定「哪些资产算长期未使用」，窗口决定抽屉里 `cite_count` 的算法
+ * —— 从这张表点进抽屉时，抽屉要带的是页面窗口，不是这个 30/90。
  */
-export async function listIdleAssets(windowDays: 30 | 90, spaceId?: string | null): Promise<DoIdleAsset[]> {
-  const data = await fetchDataAssets(spaceId, { unusedThresholdDays: windowDays });
+export async function listIdleAssets(
+  thresholdDays: 30 | 90,
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoIdleAsset[]> {
+  const data = await fetchDataAssets(spaceId, window, { unusedThresholdDays: thresholdDays });
   return data.unused_assets.map((item) => ({
     id: item.asset_id,
     name: item.file_name || item.asset_id,
@@ -442,7 +544,7 @@ export async function getPipeline(spaceId?: string | null): Promise<{
   data: DoPipelineOverview;
   stats: DoPipelineStats;
 }> {
-  const res = await fetchDataAssets(spaceId);
+  const res = await fetchDataAssets(spaceId, DO_DEFAULT_WINDOW);
   const stats = res.pipeline_task_stats;
   return {
     data: res.processing_pipeline,
@@ -466,7 +568,7 @@ export async function getAbnormalAssets(spaceId?: string | null): Promise<{
   summary: DoAnomalySummary;
   latest: DoAnomalyAsset | null;
 }> {
-  const data = await fetchDataAssets(spaceId);
+  const data = await fetchDataAssets(spaceId, DO_DEFAULT_WINDOW);
   const latest = data.abnormal_assets[0];
   return {
     summary: {
@@ -486,11 +588,41 @@ export async function getAbnormalAssets(spaceId?: string | null): Promise<{
   };
 }
 
+/** 解析质量异常（观测档）：`verdict='bad'` 的最近 50 条任务。 */
+interface ApiQualityAnomalyItem {
+  document_id: string;
+  document_name: string | null;
+  kb_id: string;
+  kb_name: string | null;
+  task_id: string;
+  verdict: string;
+  reasons: string[];
+  occurred_at: string | null;
+}
+
+export async function getQualityAnomalies(
+  spaceId?: string | null,
+): Promise<DoQualityAnomaly[]> {
+  const data = await apiClient.get<{ items: ApiQualityAnomalyItem[] }>(
+    '/knowledge-base/data-operations/quality-anomalies',
+    { params: spaceId ? { domain_space_id: spaceId } : {} },
+  );
+  return (data?.items ?? []).map((x) => ({
+    documentId: x.document_id,
+    documentName: x.document_name || x.document_id,
+    kbId: x.kb_id,
+    kbName: x.kb_name || x.kb_id,
+    verdict: x.verdict || '',
+    reasons: x.reasons || [],
+    occurredAt: formatDateTime(x.occurred_at),
+  }));
+}
+
 /* ══════════════════════ 页 2：知识资产 ══════════════════════ */
 
 /** 四张卡：本体两项取 ontology，Wiki 两项后端恒 0（Wiki 侧未接入） */
 export async function getKnowledgeKpis(spaceId?: string | null): Promise<DoKnowledgeKpi[]> {
-  const data = await fetchKnowledgeAssets(spaceId);
+  const data = await fetchKnowledgeAssets(spaceId, DO_DEFAULT_WINDOW);
   const values: Record<string, number> = {
     object: data.ontology.entities,
     relation: data.ontology.relations,
@@ -517,7 +649,7 @@ export async function getKnowledgeOverview(
   dist: DoProportionItem[];
   activity: DoScopeActivity;
 }> {
-  const data = await fetchKnowledgeAssets(spaceId);
+  const data = await fetchKnowledgeAssets(spaceId, DO_DEFAULT_WINDOW);
   if (scope === 'wiki') {
     // ⚠️ 后端只有 ontology 一侧的数据，wiki 全为 0 —— 切到 Wiki 都是空态，不是没取数
     return {
@@ -539,26 +671,32 @@ export async function getKnowledgeOverview(
   };
 }
 
-/** 知识资产增长趋势。窗口由页面的「近 7 / 近 14 天」给定 —— 切一次取一次 */
+/** 知识资产增长趋势。窗口由页面的区间选择器给定 —— 切一次取一次 */
 export async function getKnowledgeTrend(
   scope: DoScope,
-  spaceId?: string | null,
-  days: number = DO_WINDOW_DAYS,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
 ): Promise<DoTrendPoint[]> {
-  const data = await fetchKnowledgeAssets(spaceId, days);
+  const data = await fetchKnowledgeAssets(spaceId, window);
   // ⚠️ 后端只有 ontology 的增长趋势，wiki 侧全为 0 —— 切到 Wiki 是空态
   return scope === 'wiki' ? [] : toTrend(data.entity_growth_trend);
 }
 
 /** 高频使用本体实例（后端 Top10）。后端只统计本体实体，Wiki 侧没这一项 —— 切到 Wiki 是空表 */
-export async function listHotInstances(scope: DoScope, spaceId?: string | null): Promise<DoHotInstance[]> {
-  const data = await fetchKnowledgeAssets(spaceId);
+export async function listHotInstances(
+  scope: DoScope,
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoHotInstance[]> {
+  const data = await fetchKnowledgeAssets(spaceId, window);
   if (scope === 'wiki') return [];
   return data.top_used_entities.map((item) => ({
     id: item.object_id,
     name: item.canonical_name,
     objectType: item.entity_type,
     kbName: item.kb_name ?? '',
+    // 抽屉 B 的定位键是三元组，kb_id 是其中一项；富化不到时为 null，该行就不可下钻
+    kbId: item.kb_id ?? null,
     hitCount: item.hit_count,
     adoptCount: item.adopted_count,
     lastUsedAt: item.last_used_at ? formatDateTime(item.last_used_at) : '',
@@ -571,10 +709,12 @@ export async function listHotInstances(scope: DoScope, spaceId?: string | null):
  */
 export async function listIdleKnowledge(
   scope: DoScope,
-  windowDays: 30 | 90,
+  thresholdDays: 30 | 90,
   spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
 ): Promise<DoIdleKnowledge[]> {
-  const data = await fetchKnowledgeAssets(spaceId, DO_WINDOW_DAYS, windowDays);
+  // 阈值（30/90）与统计窗口是两回事：前者决定「哪些算长期未使用」，后者决定抽屉里的 hit_count
+  const data = await fetchKnowledgeAssets(spaceId, window, thresholdDays);
   // 同 listHotInstances：后端只有本体实体
   if (scope === 'wiki') return [];
   return data.unused_entities.map((item) => ({
@@ -582,6 +722,8 @@ export async function listIdleKnowledge(
     name: item.canonical_name,
     objectType: item.entity_type,
     kbName: item.kb_name ?? '',
+    // 抽屉 B 定位键之一；富化不到时为 null，该行就不可下钻
+    kbId: item.kb_id ?? null,
     // 保持 null：页面靠它区分「从未使用过」与「有日期」
     lastUsedAt: item.last_used_at ? formatDateTime(item.last_used_at) : null,
     updatedAt: formatDateTime(item.updated_at),
@@ -595,7 +737,7 @@ export async function getSearchOverview(spaceId?: string | null): Promise<{
   kpis: DoKpiCard[];
   modes: DoSearchMode[];
 }> {
-  const data = await fetchSearchAnalytics(spaceId);
+  const data = await fetchSearchAnalytics(spaceId, DO_DEFAULT_WINDOW);
   const values: Record<string, string> = {
     requests: fmtCount(data.total_requests),
     kbs: `${data.searched_kbs}/${data.total_kbs}`,
@@ -614,14 +756,17 @@ export async function getSearchOverview(spaceId?: string | null): Promise<{
   };
 }
 
-/** 检索请求趋势。窗口由页面的「近 7 / 近 14 天」给定 —— 切一次取一次 */
-export async function getSearchTrend(spaceId?: string | null, days: number = DO_WINDOW_DAYS): Promise<DoTrendPoint[]> {
-  const data = await fetchSearchAnalytics(spaceId, days);
+/** 检索请求趋势。窗口由页面的区间选择器给定 —— 切一次取一次 */
+export async function getSearchTrend(
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoTrendPoint[]> {
+  const data = await fetchSearchAnalytics(spaceId, window);
   return toTrend(data.request_trend);
 }
 
 export async function listHotQuestions(spaceId?: string | null): Promise<DoHotQuestion[]> {
-  const data = await fetchSearchAnalytics(spaceId);
+  const data = await fetchSearchAnalytics(spaceId, DO_DEFAULT_WINDOW);
   return data.top_questions.map((item, index) => ({
     rank: index + 1,
     question: item.query,
@@ -633,23 +778,27 @@ export async function listHotQuestions(spaceId?: string | null): Promise<DoHotQu
 
 /** 提问主题分类。后端 `question_topics` 是硬编码空数组（离线聚类，三期），此块必然是空表 */
 export async function getQuestionTopics(spaceId?: string | null): Promise<DoProportionItem[]> {
-  await fetchSearchAnalytics(spaceId);
+  await fetchSearchAnalytics(spaceId, DO_DEFAULT_WINDOW);
   return [];
 }
 
 /**
- * 后端 `kb_type` → i18n key。未知取值（含 null）不拼 key，列上显示「—」，
+ * 后端 `kb_type` → i18n key。未知取值不拼 key（回落原始码），
  * 免得把 `dataOperations.kbType.xxx` 这种原始 key 漏到界面上。
+ * ⚠️ 表里存的是 key 不是译文，调用方要自己 `t()`（用 `translateCode()`）。
  */
-const KB_TYPE_KEYS: Record<string, string> = {
+export const KB_TYPE_KEYS: Record<string, string> = {
   lightrag: 'dataOperations.kbType.lightrag',
   openkb: 'dataOperations.kbType.openkb',
   jonex_wiki: 'dataOperations.kbType.jonex_wiki',
 };
 
-/** 知识库使用情况。后端按检索历史聚合 —— 表里只会出现近 7 天真有检索记录的库 */
-export async function listKbUsage(spaceId?: string | null): Promise<DoUsageItem[]> {
-  const data = await fetchSearchAnalytics(spaceId);
+/** 知识库使用情况。后端按检索历史聚合 —— 表里只会出现窗口内真有检索记录的库 */
+export async function listKbUsage(
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoUsageItem[]> {
+  const data = await fetchSearchAnalytics(spaceId, window);
   return data.kb_usage.map((item) => ({
     id: item.kb_id,
     name: item.kb_name,
@@ -659,13 +808,173 @@ export async function listKbUsage(spaceId?: string | null): Promise<DoUsageItem[
   }));
 }
 
-/** 领域服务使用情况。后端按「请求经哪个服务发起」归因 —— 表里只会出现近 7 天有请求的服务 */
-export async function listServiceUsage(spaceId?: string | null): Promise<DoUsageItem[]> {
-  const data = await fetchSearchAnalytics(spaceId);
+/** 领域服务使用情况。后端按「请求经哪个服务发起」归因 —— 表里只会出现窗口内有请求的服务 */
+export async function listServiceUsage(
+  spaceId?: string | null,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoUsageItem[]> {
+  const data = await fetchSearchAnalytics(spaceId, window);
   return data.service_usage.map((item) => ({
     id: item.service_id,
     name: item.service_name,
     count: item.request_count,
     lastUsedAt: item.last_used_at ? formatDateTime(item.last_used_at) : '',
   }));
+}
+
+/* ══════════════════════ 列表钻取：四个详情端点 ══════════════════════ */
+
+/**
+ * 数据来源原始码 → i18n key。后端给的是 `file / api / api_push / storage`，
+ * 未知取值不拼 key（回落原始码），免得原始 key 漏到界面。
+ * ⚠️ 表里存的是 key 不是译文，调用方要自己 `t()`（用 `translateCode()`）。
+ */
+export const ASSET_SOURCE_KEYS: Record<string, string> = {
+  file: 'dataOperations.sourceType.file',
+  api: 'dataOperations.sourceType.api',
+  api_push: 'dataOperations.sourceType.apiPush',
+  storage: 'dataOperations.sourceType.storage',
+};
+
+/**
+ * 抽屉 A · 数据资产详情。
+ *
+ * `kbId` 是可选的交叉校验：传了而该资产不属于此库，后端一律 **404**（连同「不存在 / 无权限 /
+ * 不在本空间」共用一个 404，不区分 —— 那是防探测口径）。所以调用方拿到 404 时**不能说「无权限」**。
+ *
+ * 详情端点按次开一次、每次只发一个请求，不走列表那套 `coalesce`（那里是为了把一次页面加载里
+ * 3-4 个同源块合并成一次请求，这里没有可合并的）。
+ */
+export async function getAssetDetail(
+  target: DoAssetTarget,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoAssetDetail> {
+  const data = await apiClient.get<ApiAssetDetail>(
+    `/knowledge-base/data-operations/assets/${encodeURIComponent(target.assetId)}`,
+    { params: scopeParams(spaceId, window, target.kbId ? { kb_id: target.kbId } : {}) },
+  );
+  return {
+    assetId: data.asset_id,
+    fileName: data.file_name,
+    // 后端契约允许空（未知类型），列表侧同样落 other —— 两处一致
+    assetType: data.asset_type ? toAssetType(data.asset_type) : null,
+    fileFormat: data.file_format,
+    fileSize: data.file_size,
+    source: data.source,
+    kbId: data.kb_id,
+    kbName: data.kb_name,
+    uploadedAt: data.uploaded_at ? formatDateTime(data.uploaded_at) : null,
+    lastProcessedAt: data.last_processed_at ? formatDateTime(data.last_processed_at) : null,
+    status: data.status,
+    ontologyStatus: data.ontology_status,
+    llmWikiCompileStatus: data.llm_wiki_compile_status,
+    citeCount: data.cite_count,
+    // 保住 null：「从未被引用」与「有个日期」是两种信息，格式化会把它抹成 '-'
+    lastCitedAt: data.last_cited_at ? formatDateTime(data.last_cited_at) : null,
+  };
+}
+
+/**
+ * 抽屉 B · Ontology 对象详情。
+ *
+ * ⚠️ 定位键是 `kb_id` + `entityType` + `canonicalName` **三元组**，不是列表里的 `object_id`
+ * （那是单向哈希，反解不回三元组）。走 query 而不是路径 —— `canonicalName` 是中文实体名，
+ * 可能含 `/` 与空格。404 口径同抽屉 A。
+ */
+export async function getOntologyEntityDetail(
+  target: DoEntityTarget,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoEntityDetail> {
+  const data = await apiClient.get<ApiEntityDetail>('/knowledge-base/data-operations/ontology-entities/detail', {
+    params: scopeParams(spaceId, window, {
+      kb_id: target.kbId,
+      entity_type: target.entityType,
+      canonical_name: target.canonicalName,
+    }),
+  });
+  return {
+    kbId: data.kb_id,
+    kbName: data.kb_name,
+    canonicalName: data.canonical_name,
+    entityType: data.entity_type,
+    aliases: data.aliases ?? [],
+    description: data.description,
+    createdAt: data.created_at ? formatDateTime(data.created_at) : null,
+    updatedAt: data.updated_at ? formatDateTime(data.updated_at) : null,
+    attributes: data.attributes ?? [],
+    relationTotal: data.relation_total,
+    relationGroups: (data.relation_groups ?? []).map((group) => ({
+      relationType: group.relation_type,
+      targets: (group.targets ?? []).map((t) => ({
+        canonicalName: t.canonical_name,
+        entityType: t.entity_type,
+      })),
+    })),
+    relationTruncated: data.relation_truncated,
+    hitCount: data.hit_count,
+    adoptedCount: data.adopted_count,
+    lastUsedAt: data.last_used_at ? formatDateTime(data.last_used_at) : null,
+    degraded: data.degraded,
+  };
+}
+
+/** 抽屉 C · 知识库详情。无权限/不存在共用一个 404 —— 前端提示「不存在或无权访问」，不要写「无权限」 */
+export async function getKbDetail(
+  kbId: string,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoKbDetail> {
+  const data = await apiClient.get<ApiKbDetail>(`/knowledge-base/data-operations/kbs/${encodeURIComponent(kbId)}`, {
+    params: scopeParams(spaceId, window),
+  });
+  return {
+    kbId: data.kb_id,
+    kbName: data.kb_name,
+    kbType: data.kb_type,
+    ontology: {
+      objectInstances: data.ontology.object_instances,
+      relationInstances: data.ontology.relation_instances,
+      degraded: data.ontology.degraded,
+    },
+    assetTotal: data.asset_total,
+    // ⚠️ 与页 1 的构成不同：这里只含非零项、长度不固定，组件要按数组渲染而不是 7 个固定位
+    assetsByType: (data.assets_by_type ?? []).map((item) => ({
+      assetType: toAssetType(item.asset_type),
+      count: item.count,
+    })),
+    services: (data.services ?? []).map((s) => ({ serviceId: s.service_id, serviceName: s.service_name })),
+    updatedAt: data.updated_at ? formatDateTime(data.updated_at) : null,
+    requestCount: data.request_count,
+    lastRequestAt: data.last_request_at ? formatDateTime(data.last_request_at) : null,
+  };
+}
+
+/**
+ * 抽屉 D · 领域服务详情。
+ *
+ * ⚠️ 本端点**不会 404**（与 A/B/C 有意不同）：列表行来自事件归因，服务实体查不到时列表本身就
+ * 回落显示 `service_id`，所以「行在、实体不在」是列表已承认的合法状态。取不到时
+ * `serviceName` 回落成 `serviceId`、`status`/`enabled` 为 null、`knowledgeBases` 为 []，
+ * **使用情况照常返回** —— 组件不要为它写「不存在」的报错分支。
+ */
+export async function getServiceDetail(
+  serviceId: string,
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+): Promise<DoServiceDetail> {
+  const data = await apiClient.get<ApiServiceDetail>(
+    `/knowledge-base/data-operations/services/${encodeURIComponent(serviceId)}`,
+    { params: scopeParams(spaceId, window) },
+  );
+  return {
+    serviceId: data.service_id,
+    serviceName: data.service_name,
+    status: data.status,
+    enabled: data.enabled,
+    knowledgeBases: (data.knowledge_bases ?? []).map((kb) => ({ kbId: kb.kb_id, kbName: kb.kb_name })),
+    requestCount: data.request_count,
+    lastRequestAt: data.last_request_at ? formatDateTime(data.last_request_at) : null,
+  };
 }

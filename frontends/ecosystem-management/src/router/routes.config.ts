@@ -56,7 +56,12 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           title: 'navigation.templateDomains',
           menu: { icon: 'CopyOutlined', order: 6, permissionCode: 'template:read' },
         },
-        { path: 'template-scenarios', element: TemplateScenarios, title: 'navigation.templateScenarios' },
+        {
+          path: 'template-scenarios',
+          element: TemplateScenarios,
+          title: 'navigation.templateScenarios',
+          menu: { icon: 'CopyOutlined', order: 5, permissionCode: 'template:read' },
+        },
         { path: 'template-objects', element: TemplateObjects, title: 'navigation.templateObjects' },
         { path: 'template-relations', element: TemplateRelations, title: 'navigation.templateRelations' },
         {

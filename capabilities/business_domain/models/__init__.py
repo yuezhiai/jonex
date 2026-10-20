@@ -27,6 +27,8 @@ from capabilities.business_domain.models.template import (
     TemplateObject,
     TemplateRelation,
     TemplateScenario,
+    TemplateScenarioVersion,
+    TemplatePublishRequest,
 )
 from capabilities.business_domain.models.prompt_template import PromptTemplate
 
@@ -44,7 +46,8 @@ __all__ = [
     "SkillCatalog", "TenantSkill",
     # Template
     "TemplateAttribute", "TemplateDomain", "TemplateObject",
-    "TemplateRelation", "TemplateScenario",
+    "TemplateRelation", "TemplateScenario", "TemplateScenarioVersion",
+    "TemplatePublishRequest",
     # Prompt Template
     "PromptTemplate",
     "TemplateAttribute", "TemplateConstraint", "TemplateDomain",

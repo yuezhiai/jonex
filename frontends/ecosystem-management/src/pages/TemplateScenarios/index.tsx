@@ -24,7 +24,11 @@ import {
   fetchTemplateRelations,
   fetchTemplateScenarios,
   importScenarioOntologyYaml,
+  publishTemplateScenario,
+  submitPublishRequest,
 } from '../../api/templateScenarios';
+import PublishApprovalModal from './PublishApprovalModal';
+import { usePermission } from '@jonex/shared-lib';
 import type {
   TemplateAttribute,
   TemplateConstraint,
@@ -125,6 +129,14 @@ export default function TemplateScenarios() {
   const [importModalVisible, setImportModalVisible] = useState(false);
   const [importResult, setImportResult] = useState<YamlImportResult | null>(null);
   const [importLoading, setImportLoading] = useState(false);
+
+  // 发布与审批：管理员可直接发布；编辑提交申请，由管理员审批后生效。
+  const { permissions } = usePermission();
+  const canApprove =
+    permissions.includes('tenant:admin') || permissions.includes('platform:admin');
+  const [publishing, setPublishing] = useState(false);
+  const [requesting, setRequesting] = useState(false);
+  const [approvalOpen, setApprovalOpen] = useState(false);
 
   const domainNameMap = useMemo(() => {
     return new Map(domains.map((domain) => [domain.id, getTemplateDomainDisplay(domain, t, english).name]));
@@ -534,6 +546,36 @@ export default function TemplateScenarios() {
     }
   }
 
+  // ── 发布 / 发布申请 ──
+
+  async function handleDirectPublish() {
+    if (!selectedSceneId || publishing) return;
+    setPublishing(true);
+    try {
+      const result = await publishTemplateScenario(selectedSceneId);
+      message.success(t('templateScenarios.publish.published', { version: result.version }));
+      await refreshCurrentView();
+    } catch (error) {
+      message.error(getErrorMessage(error, t('templateScenarios.publish.publishFailed')));
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  async function handleSubmitPublishRequest() {
+    if (!selectedSceneId || requesting) return;
+    setRequesting(true);
+    try {
+      await submitPublishRequest(selectedSceneId);
+      message.success(t('templateScenarios.publish.submitted'));
+      setApprovalOpen(true);
+    } catch (error) {
+      message.error(getErrorMessage(error, t('templateScenarios.publish.submitFailed')));
+    } finally {
+      setRequesting(false);
+    }
+  }
+
   // ── YAML Import/Export handlers ──
 
   const handleExportYaml = useCallback(async () => {
@@ -744,6 +786,24 @@ export default function TemplateScenarios() {
                       </p>
                     </div>
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                      {canApprove && (
+                        <Button
+                          type="primary"
+                          onClick={() => void handleDirectPublish()}
+                          loading={publishing}
+                        >
+                          {t('templateScenarios.publish.publish')}
+                        </Button>
+                      )}
+                      <Button
+                        onClick={() => void handleSubmitPublishRequest()}
+                        loading={requesting}
+                      >
+                        {t('templateScenarios.publish.request')}
+                      </Button>
+                      <Button onClick={() => setApprovalOpen(true)}>
+                        {t('templateScenarios.publish.openApprovals')}
+                      </Button>
                       <Button icon={<ExportOutlined />} onClick={handleExportYaml}>
                         {t('templateScenarios.exportYaml')}
                       </Button>
@@ -794,7 +854,7 @@ export default function TemplateScenarios() {
                   </p>
 
                   {activeTab === 'objects' && (
-                    <div>
+                    <div className="template-scenarios-tab-body">
                       <div className="template-scenarios-tab-toolbar">
                         <Button type="primary" icon={<PlusOutlined />} onClick={openCreateObject}>
                           {t('templateScenarios.createObject')}
@@ -811,7 +871,7 @@ export default function TemplateScenarios() {
                     </div>
                   )}
                   {activeTab === 'relations' && (
-                    <div>
+                    <div className="template-scenarios-tab-body">
                       <div className="template-scenarios-tab-toolbar">
                         <Button type="primary" icon={<PlusOutlined />} onClick={openCreateRelation}>
                           {t('templateScenarios.createRelation')}
@@ -828,7 +888,7 @@ export default function TemplateScenarios() {
                     </div>
                   )}
                   {activeTab === 'constraints' && (
-                    <div>
+                    <div className="template-scenarios-tab-body">
                       <div className="template-scenarios-tab-toolbar">
                         <Button
                           type="primary"
@@ -960,6 +1020,19 @@ export default function TemplateScenarios() {
           </>
         )}
       </Modal>
+
+      <PublishApprovalModal
+        open={approvalOpen}
+        scenarioId={selectedSceneId}
+        scenarioName={
+          selectedScene
+            ? getTemplateScenarioDisplay(selectedScene, english, t).name
+            : undefined
+        }
+        canApprove={canApprove}
+        onClose={() => setApprovalOpen(false)}
+        onChanged={() => void refreshCurrentView()}
+      />
     </>
   );
 }

@@ -184,3 +184,93 @@ class TemplateConstraint(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class TemplateScenarioVersion(TenantMixin, Base):
+    """模板场景的发布快照。
+
+    每次 `publish_scenario` 成功时写入一行，`version` 与 `template_scenarios.version`
+    对齐；`snapshot` 保存发布当时的完整结构（场景 + 对象/属性 + 关系 + 约束），
+    用于历史查看与后续 diff / 落标校验。**只写不改**：不提供更新/删除。
+    """
+
+    __tablename__ = "template_scenario_versions"
+    __table_args__ = {"schema": "business_domain"}
+
+    id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
+    domain_id = Column(String(64), nullable=False, index=True)
+    scenario_id = Column(String(64), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    structure_hash = Column(String(64), nullable=False)
+    snapshot = Column(JSONB, nullable=False, default=dict)
+    published_by = Column(String(128), nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self, *, include_snapshot: bool = False):
+        data = {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "domain_id": self.domain_id,
+            "scenario_id": self.scenario_id,
+            "version": self.version,
+            "structure_hash": self.structure_hash,
+            "published_by": self.published_by,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_snapshot:
+            data["snapshot"] = self.snapshot or {}
+        return data
+
+
+class TemplatePublishRequest(TenantMixin, Base):
+    """模板场景发布申请（强制审批）。
+
+    普通编辑提交申请（同时冻结一份 candidate snapshot）；租户管理员审批时
+    与当前内容比对：内容已变 ⇒ 409（防止「审的和发的不一致」）。
+    审批通过后由 `TemplatePublishService.publish_scenario` 落版本快照。
+    """
+
+    __tablename__ = "template_publish_requests"
+    __table_args__ = {"schema": "business_domain"}
+
+    id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
+    domain_id = Column(String(64), nullable=False, index=True)
+    scenario_id = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="pending")
+    structure_hash = Column(String(64), nullable=False)
+    snapshot = Column(JSONB, nullable=False, default=dict)
+    submitted_by = Column(String(128), nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=False)
+    decided_by = Column(String(128), nullable=True)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+    comment = Column(Text)
+    published_version = Column(Integer, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self, *, include_snapshot: bool = False):
+        data = {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "domain_id": self.domain_id,
+            "scenario_id": self.scenario_id,
+            "status": self.status,
+            "structure_hash": self.structure_hash,
+            "submitted_by": self.submitted_by,
+            "submitted_at": (
+                self.submitted_at.isoformat() if self.submitted_at else None
+            ),
+            "decided_by": self.decided_by,
+            "decided_at": (
+                self.decided_at.isoformat() if self.decided_at else None
+            ),
+            "comment": self.comment,
+            "published_version": self.published_version,
+            "updated_at": (
+                self.updated_at.isoformat() if self.updated_at else None
+            ),
+        }
+        if include_snapshot:
+            data["snapshot"] = self.snapshot or {}
+        return data

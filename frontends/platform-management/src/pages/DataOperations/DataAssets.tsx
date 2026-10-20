@@ -8,6 +8,7 @@ import {
   getAssetKpis,
   getAssetTrend,
   getPipeline,
+  getQualityAnomalies,
   listHotAssets,
   listIdleAssets,
   listKbOptions,
@@ -21,12 +22,15 @@ import ProportionList from './components/ProportionList';
 import SegmentedFilter from './components/SegmentedFilter';
 import AssetTypeTag from './components/AssetTypeTag';
 import KbSelect from './components/KbSelect';
+import WindowRangePicker from './components/WindowRangePicker';
 import PipelineOverview from './components/PipelineOverview';
 import AnomalySummary from './components/AnomalySummary';
-import { DO_KB_ALL } from './constant';
+import AssetDetailDrawer from './drawers/AssetDetailDrawer';
+import { DO_DEFAULT_WINDOW, DO_KB_ALL } from '../../constants/dataOperations';
 import type {
   DoAnomalyAsset,
   DoAnomalySummary,
+  DoAssetTarget,
   DoAssetType,
   DoHotAsset,
   DoIdleAsset,
@@ -34,11 +38,12 @@ import type {
   DoKpiCard,
   DoPipelineOverview,
   DoPipelineStats,
+  DoQualityAnomaly,
+  DoWindow,
 } from './types';
 import './index.scss';
 
 type IdleWindow = 30 | 90;
-type TrendRange = 7 | 14;
 
 export default function DataAssets() {
   const { t } = useTranslation();
@@ -49,13 +54,17 @@ export default function DataAssets() {
   const [error, setError] = useState<string | null>(null);
   const [kpis, setKpis] = useState<DoKpiCard[]>([]);
   const [kbOptions, setKbOptions] = useState<DoKbOption[]>([]);
-  const [hotAssets, setHotAssets] = useState<DoHotAsset[]>([]);
   const [pipeline, setPipeline] = useState<{ data: DoPipelineOverview; stats: DoPipelineStats } | null>(null);
   const [abnormal, setAbnormal] = useState<{ summary: DoAnomalySummary; latest: DoAnomalyAsset | null } | null>(null);
+  const [qualityAnomalies, setQualityAnomalies] = useState<DoQualityAnomaly[]>([]);
 
-  const [trendRange, setTrendRange] = useState<TrendRange>(7);
+  const [window, setWindow] = useState<DoWindow>(DO_DEFAULT_WINDOW);
 
   const [idleWindow, setIdleWindow] = useState<IdleWindow>(30);
+
+  // 正在查看的资产（点列表里的名称打开抽屉 A）。状态放这里而不是抽屉内部：
+  // 关闭时要能把它清空，且窗口/空间变化时抽屉自己会按新参数重取
+  const [assetTarget, setAssetTarget] = useState<DoAssetTarget | null>(null);
 
   // 趋势与构成各有一个知识库筛选，切其中一张不牵动同排的另一张
   const [trendKb, setTrendKb] = useState(DO_KB_ALL);
@@ -70,19 +79,19 @@ export default function DataAssets() {
     setLoading(true);
     setError(null);
     try {
-      // 这五块同属 data-assets，取数层按 key 合并成一次请求，不是五个 HTTP 调用
-      const [kpiList, options, hot, pipelineData, abnormalData] = await Promise.all([
+      // 这四块同属 data-assets，取数层按 key 合并成一次请求，不是四个 HTTP 调用
+      const [kpiList, options, pipelineData, abnormalData, qualityData] = await Promise.all([
         getAssetKpis(spaceId),
         listKbOptions(spaceId),
-        listHotAssets(spaceId),
         getPipeline(spaceId),
         getAbnormalAssets(spaceId),
+        getQualityAnomalies(spaceId),
       ]);
       setKpis(kpiList);
       setKbOptions(options);
-      setHotAssets(hot);
       setPipeline(pipelineData);
       setAbnormal(abnormalData);
+      setQualityAnomalies(qualityData);
     } catch (e) {
       setError(e instanceof Error ? e.message : t('dataOperations.error.loadFailed'));
     } finally {
@@ -95,16 +104,20 @@ export default function DataAssets() {
   }, [loadMain]);
 
   const loadTrend = useCallback(
-    () => getAssetTrend(effectiveTrendKb, spaceId, trendRange),
-    [effectiveTrendKb, spaceId, trendRange],
+    () => getAssetTrend(effectiveTrendKb, spaceId, window),
+    [effectiveTrendKb, spaceId, window],
   );
   const loadComposition = useCallback(() => getAssetComposition(effectiveCompKb, spaceId), [effectiveCompKb, spaceId]);
-  const loadIdle = useCallback(() => listIdleAssets(idleWindow, spaceId), [idleWindow, spaceId]);
+  const loadIdle = useCallback(() => listIdleAssets(idleWindow, spaceId, window), [idleWindow, spaceId, window]);
+  // 高频引用资产表随区间变化（它的「引用次数」就在这个窗口里算），所以不属于首屏那批。
+  // 拉出来单独取数，切区间时只有它和趋势图回到骨架态，KPI 与流水维持近 7 天不动。
+  const loadHot = useCallback(() => listHotAssets(spaceId, window), [spaceId, window]);
 
-  // 这三块与首屏分开取数：切筛选器时只让所在卡片回到骨架态，不牵动整页
+  // 这几块与首屏分开取数：切筛选器时只让所在卡片回到骨架态，不牵动整页
   const { data: trend, loading: trendLoading } = useAsyncData(loadTrend);
   const { data: composition, loading: compLoading } = useAsyncData(loadComposition);
   const { data: idleAssets, loading: idleLoading } = useAsyncData(loadIdle);
+  const { data: hotAssets, loading: hotLoading } = useAsyncData(loadHot);
 
   const kpiItems: StatCardItem[] = useMemo(
     () =>
@@ -147,12 +160,20 @@ export default function DataAssets() {
     [goToKb, t],
   );
 
+  // 点名称进抽屉 A。带上本行的 kbId 做交叉校验：该资产若不属于这个库，后端一律回 404
+  // （与「不存在 / 无权限」共用一个口径），比串库展示别的库的数据安全
+  const openAsset = useCallback((id: string, kbId: string | null) => setAssetTarget({ assetId: id, kbId }), []);
+
   const hotColumns = [
     {
       title: t('dataOperations.column.assetName'),
       dataIndex: 'name',
       key: 'name',
-      render: (v: string) => <strong>{v}</strong>,
+      render: (v: string, row: DoHotAsset) => (
+        <a className="yx-do-link" onClick={() => openAsset(row.id, row.kbId)}>
+          {v}
+        </a>
+      ),
     },
     {
       title: t('dataOperations.column.type'),
@@ -189,7 +210,11 @@ export default function DataAssets() {
       title: t('dataOperations.column.assetName'),
       dataIndex: 'name',
       key: 'name',
-      render: (v: string) => <strong>{v}</strong>,
+      render: (v: string, row: DoIdleAsset) => (
+        <a className="yx-do-link" onClick={() => openAsset(row.id, row.kbId)}>
+          {v}
+        </a>
+      ),
     },
     { title: t('dataOperations.column.type'), dataIndex: 'assetType', key: 'assetType', width: 110, render: typeLabel },
     { title: t('dataOperations.column.kbName'), dataIndex: 'kbName', key: 'kbName' },
@@ -235,14 +260,8 @@ export default function DataAssets() {
           extra={
             <>
               <KbSelect value={effectiveTrendKb} options={kbOptions} onChange={setTrendKb} loading={loading} />
-              <SegmentedFilter
-                value={trendRange}
-                onChange={setTrendRange}
-                options={[
-                  { value: 7, label: t('dataOperations.filter.last7d') },
-                  { value: 14, label: t('dataOperations.filter.last14d') },
-                ]}
-              />
+              {/* 区间同时驱动趋势、下面两张喂抽屉的表与抽屉本身 —— KPI 与构成图固定近 7 天 */}
+              <WindowRangePicker value={window} onChange={setWindow} />
             </>
           }
         >
@@ -259,7 +278,8 @@ export default function DataAssets() {
           title={t('dataOperations.section.compositionTitle')}
           extra={<KbSelect value={effectiveCompKb} options={kbOptions} onChange={setCompKb} loading={loading} />}
         >
-          <ProportionList items={compositionData} loading={compLoading} />
+          {/* total 用后端全量口径：图上只列五类，隐藏的三类仍要在分母里 */}
+          <ProportionList items={compositionData} total={composition?.total} loading={compLoading} />
         </SectionCard>
       </div>
 
@@ -268,8 +288,8 @@ export default function DataAssets() {
           rowKey="id"
           size="small"
           columns={hotColumns}
-          dataSource={hotAssets}
-          loading={loading}
+          dataSource={hotAssets ?? []}
+          loading={hotLoading}
           pagination={false}
         />
       </SectionCard>
@@ -309,6 +329,58 @@ export default function DataAssets() {
           <AnomalySummary summary={abnormal?.summary ?? null} latest={abnormal?.latest ?? null} loading={loading} />
         </SectionCard>
       </div>
+
+      <SectionCard
+        title={t('dataOperations.section.qualityAnomalyTitle')}
+        description={t('dataOperations.section.qualityAnomalyDesc')}
+      >
+        <Table
+          rowKey="documentId"
+          size="small"
+          loading={loading}
+          dataSource={qualityAnomalies}
+          pagination={false}
+          locale={{ emptyText: t('dataOperations.empty.qualityAnomaly') }}
+          columns={[
+            {
+              title: t('dataOperations.quality.document'),
+              dataIndex: 'documentName',
+              key: 'documentName',
+              ellipsis: true,
+            },
+            {
+              title: t('dataOperations.quality.kb'),
+              dataIndex: 'kbName',
+              key: 'kbName',
+              width: 180,
+              ellipsis: true,
+            },
+            {
+              title: t('dataOperations.quality.reasons'),
+              dataIndex: 'reasons',
+              key: 'reasons',
+              render: (reasons: string[]) =>
+                (reasons || [])
+                  .map((r) => t(`dataOperations.quality.reason.${r}`, { defaultValue: r }))
+                  .join('；'),
+            },
+            {
+              title: t('dataOperations.quality.occurredAt'),
+              dataIndex: 'occurredAt',
+              key: 'occurredAt',
+              width: 170,
+            },
+          ]}
+        />
+      </SectionCard>
+
+      <AssetDetailDrawer
+        target={assetTarget}
+        spaceId={spaceId}
+        window={window}
+        onClose={() => setAssetTarget(null)}
+        onGoToKb={goToKb}
+      />
     </>
   );
 }

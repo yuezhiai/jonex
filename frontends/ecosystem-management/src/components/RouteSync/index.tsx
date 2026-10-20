@@ -1,32 +1,26 @@
 import { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
+import { syncShellRoute } from '@jonex/shell-sdk';
 
+const APP_ID = 'ecosystem-management';
+
+/**
+ * 将子应用的内部路由同步到浏览器地址栏（并通知 shell 跟上）。
+ * 嵌入模式（iframe）下以父窗口 /apps/ 路径为准。
+ */
 export default function RouteSync() {
   const location = useLocation();
+  const path = location.pathname + location.search + location.hash;
 
   useEffect(() => {
-    const path = location.pathname + location.search + location.hash;
-    if (path === '/' || path === '/home') return;
-
-    const inIframe = window.parent !== window;
-    const win = (inIframe ? window.parent : window) as any;
-    const shellCtx = win.__SHELL_CONTEXT__;
-
-    let basePath;
-    if (inIframe) {
-      basePath = '/apps/ecosystem-management';
-    } else if (shellCtx?.basePath) {
-      basePath = shellCtx.basePath;
-    } else if (shellCtx) {
-      basePath = '/apps/ecosystem-management';
-    } else {
-      basePath = '/ecosystem-management';
-    }
-
-    if (basePath.endsWith('/')) basePath = basePath.slice(0, -1);
-
-    win.history.replaceState({}, '', `${basePath}${path}`);
-  }, [location]);
+    syncShellRoute(APP_ID, path);
+    // bfcache 还原不会重跑 effect：地址栏与 shell 都还停在离开时的位置，得补一次
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) syncShellRoute(APP_ID, path);
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, [path]);
 
   return null;
 }

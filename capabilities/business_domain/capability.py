@@ -21,6 +21,8 @@ from capabilities.business_domain.services import (
 )
 from capabilities.business_domain.services.prompt_template_service import PromptTemplateService
 from capabilities.business_domain.services.template_publish_service import TemplatePublishService
+from capabilities.business_domain.services.template_approval_service import TemplateApprovalService
+from capabilities.business_domain.services.template_rollback_service import TemplateRollbackService
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,15 @@ _ACTION_PERMISSIONS = {
     "import_template_ontology_yaml": "template:write",
     "export_template_ontology_yaml": "template:write",
     "publish_template_scenario": "template:write",
+    "list_scenario_versions": "template:read",
+    "get_scenario_version": "template:read",
+    # 审批流：提交/撤回是编辑动作；列表是读动作；通过/驳回另在 service 内查租户管理员。
+    "submit_publish_request": "template:write",
+    "cancel_publish_request": "template:write",
+    "approve_publish_request": "template:write",
+    "reject_publish_request": "template:write",
+    "list_publish_requests": "template:read",
+    "rollback_scenario_version": "template:write",
 }
 
 
@@ -89,6 +100,32 @@ async def _check_action_permission(request) -> None:
         )
 
 
+async def _require_tenant_admin_for_publish(request) -> None:
+    """强制审批：直接发布只允许租户管理员（编辑走 submit_publish_request）。
+
+    无 user_id（测试 token / 系统链路）一律拒绝 —— 发布是提权动作，不能匿名。
+    """
+    if not request.user_id:
+        raise PermissionDeniedError(
+            message="发布标准需要租户管理员；请提交发布申请",
+        )
+    try:
+        uid = int(request.user_id)
+    except (TypeError, ValueError):
+        raise PermissionDeniedError(
+            message="发布标准需要租户管理员；请提交发布申请",
+        )
+    from jonex_core.security.permission import has_permission
+
+    if not (
+        await has_permission(request.tenant_id, uid, "tenant:admin")
+        or await has_permission(request.tenant_id, uid, "platform:admin")
+    ):
+        raise PermissionDeniedError(
+            message="发布标准需要租户管理员；请提交发布申请（审批通过后生效）",
+        )
+
+
 class BusinessDomainCapability(BaseCapability):
     """业务领域 + 生态管理能力"""
 
@@ -99,21 +136,44 @@ class BusinessDomainCapability(BaseCapability):
         self._template = TemplateService()
         self._prompt_template = PromptTemplateService()
         self._publish = TemplatePublishService()
+        self._approval = TemplateApprovalService()
+        self._rollback = TemplateRollbackService()
         self._dispatch = self._build_dispatch()
         super().__init__()
 
     async def initialize(self) -> None:
-        # 安全守卫：JWT_SECRET 必须为真实随机值（无条件）。本服务校验用户 JWT，
+        # 安全守卫：JWT_SECRET 必须为真实随机值（**生产档 ENV=prod 硬拦**，非生产只告警；
+        # 见 jonex_core/common/security_guards.py 约束 2）。本服务校验用户 JWT，
         # 使用公开默认值即可被伪造管理员 token。
         assert_secure_jwt_secret()
         await super().initialize()
 
     def register_routes(self, app):
-        """注册业务领域 REST API 路由"""
-        from capabilities.business_domain.api import create_router
+        """**不注册任何并行 REST 层** —— 该层已于 2026-10 物理删除。
 
-        router = create_router()
-        app.include_router(router, prefix="/api/v1")
+        历史背景（2026-10 渗透测试 RC-A）：business_domain 除 `/invoke`（生产链路，
+        强制内部服务 JWT）外，还额外挂了一层并行 REST（`/api/v1/templates`、
+        `/api/v1/prompt-templates` 等 53 条）。该层**不在生产链路上** —— Gateway 对
+        business_domain 一律经 Sidecar `/invoke`（`api_gateway/routes/business_domain.py`
+        的 `ecosystem_router`，其本身还带 router 级 `require_auth_header`）；却
+        **无任何鉴权**且按客户端 `X-Tenant-ID` 决定租户，容器端口一旦可达即为
+        未授权目录读取与跨租户写入面（报告 3.3/3.4/3.5）。
+
+        处置过程：
+        1. P1 先加 `CONTAINER_REST_ENABLED` 开关（默认 `false`）→ 生产不挂载，
+           攻击面 137 → 0；
+        2. 随后**物理删除**该层实现与开关本身（纯清理，生产行为不变），使「误挂载」
+           这一类风险从根上消失。
+        3. 原 `api/__init__.py` 里 `prompt_templates_router` 的 `prefix="/api/v1"`
+           **双前缀缺陷**（与外层叠加成 `/api/v1/api/v1/prompt-templates`，报告 3.5）
+           随文件删除一并消失。
+
+        ⚠️ **不要再往这里加路由**。需要新的对外能力时：
+        - 在 `_build_dispatch` 里加 invoke action（`/invoke` 注册在
+          `deploy/start_capability.py`，与本方法无关）
+        - 同步 `api_gateway/routes/business_domain.py` 与 Sidecar 契约
+        """
+        return super().register_routes(app)
 
     def _build_dispatch(self) -> dict:
         e = self._engine
@@ -122,6 +182,23 @@ class BusinessDomainCapability(BaseCapability):
         t = self._template
         pt = self._prompt_template
         p = self._publish
+        ap = self._approval
+        rb = self._rollback
+
+        async def _publish_as_admin(r, publish, scenario_id):
+            await _require_tenant_admin_for_publish(r)
+            return await publish.publish_scenario(
+                r.tenant_id, scenario_id,
+                published_by=r.username or r.user_id,
+            )
+
+        async def _rollback_as_admin(r, rollback, scenario_id, version):
+            await _require_tenant_admin_for_publish(r)
+            return await rollback.rollback(
+                r.tenant_id, scenario_id, version,
+                published_by=r.username or r.user_id,
+            )
+
         return {
             # ── 引擎管理 ──
             "list_access_methods":    lambda r, d: e.list_access_methods(d.get("offset", 0), d.get("limit", 20)),
@@ -215,7 +292,37 @@ class BusinessDomainCapability(BaseCapability):
                 dry_run=d.get("dry_run", True), mode=d.get("mode", "merge"),
             ),
             # ── 模板发布 / 编译预览 / 影响范围 ──
-            "publish_template_scenario":     lambda r, d: p.publish_scenario(r.tenant_id, d["scenario_id"]),
+            "publish_template_scenario":     lambda r, d: _publish_as_admin(
+                r, p, d["scenario_id"],
+            ),
+            # ── 发布审批（强制审批） ──
+            "submit_publish_request":        lambda r, d: ap.submit(
+                r.tenant_id, d["scenario_id"], r.user_id, r.username,
+            ),
+            "list_publish_requests":         lambda r, d: ap.list_requests(
+                r.tenant_id, d["scenario_id"], r.user_id, r.username,
+            ),
+            "approve_publish_request":       lambda r, d: ap.approve(
+                r.tenant_id, d["request_id"], r.user_id, r.username,
+                d.get("comment"),
+            ),
+            "reject_publish_request":        lambda r, d: ap.reject(
+                r.tenant_id, d["request_id"], r.user_id, r.username,
+                d.get("comment"),
+            ),
+            "cancel_publish_request":        lambda r, d: ap.cancel(
+                r.tenant_id, d["request_id"], r.user_id, r.username,
+            ),
+            "rollback_scenario_version":     lambda r, d: _rollback_as_admin(
+                r, rb, d["scenario_id"], d.get("version"),
+            ),
+            "list_scenario_versions":        lambda r, d: p.list_versions(
+                r.tenant_id, d.get("scenario_id", ""),
+                d.get("offset", 0), d.get("limit", 20),
+            ),
+            "get_scenario_version":          lambda r, d: p.get_version(
+                r.tenant_id, d.get("scenario_id", ""), d.get("version", 0),
+            ),
             "preview_compiled_schema":       lambda r, d: p.compile_preview(r.tenant_id, d["scenario_id"]),
             "list_impacted_knowledge_bases": lambda r, d: p.list_impacted_kbs(r.tenant_id, d["scenario_id"]),
         }
