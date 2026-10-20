@@ -199,8 +199,15 @@ class RAGClient(ABC):
         page_size: int = 20,
         keyword: Optional[str] = None,
         status: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> dict:
-        """获取知识库文档列表（分页）"""
+        """获取知识库文档列表（分页）。
+
+        `document_id` 走 LightRAG 的 jonex 扩展：按 `file_source` 里
+        `doc=<id>` 锚点过滤（部分 chunk 的 file_name 为 null，关键词筛不到它们）。
+        `file_path` 是精确匹配。两者都为 None 时行为与从前一致。
+        """
         pass
 
     @abstractmethod
@@ -279,8 +286,12 @@ class RAGClient(ABC):
         schema_hash: str = "",
         force_retry: bool = False,
         content_generation: int = 0,
+        engine_chunks: Optional[list] = None,
     ) -> dict:
-        """重新触发文档的本体抽取（ontology-only 模式）"""
+        """重新触发文档的本体抽取（ontology-only 模式）
+
+        engine_chunks: 引擎全量 chunk（rag 链恒 None）。
+        """
         pass
 
     # ── 提示词配置 CRUD（KB 主解析提示词联动）──
@@ -530,11 +541,14 @@ class LocalRAGClient(RAGClient):
         page_size: int = 20,
         keyword: Optional[str] = None,
         status: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> dict:
         await self._ensure_initialized()
         return await self._adapter.get_storage_documents(
             tenant_id, knowledge_base_id=knowledge_base_id,
             page=page, page_size=page_size, keyword=keyword or "", status=status or "",
+            doc_id=document_id or "", file_path=file_path or "",
         ) or {}
 
     async def get_storage_entities(
@@ -627,15 +641,18 @@ class LocalRAGClient(RAGClient):
         schema_hash: str = "",
         force_retry: bool = False,
         content_generation: int = 0,
+        engine_chunks: Optional[list] = None,
     ) -> dict:
         await self._ensure_initialized()
         # [jonex] v1 退役：v2 adapter 形参序为 (document_id, tenant_id, *, knowledge_base_id)，
         # 位置传参会把 knowledge_base_id 错位到 tenant_id —— 必须关键字传参。
         # schema_version / schema_hash / force_retry / content_generation 为 v1 独有控制项，
-        # v2 无对应透传，LOCAL 面忽略（开发环境专用，生产走 REMOTE）。
+        # v2 无对应透传，LOCAL 面忽略（开发环境专用，生产走 REMOTE）；
+        # [jonex] A18：engine_chunks 是 v2 载荷，**透传**。
         return await self._adapter.retry_ontology_extract(
             document_id, tenant_id,
             knowledge_base_id=knowledge_base_id, file_path=file_path,
+            engine_chunks=engine_chunks,
         ) or {}
 
     # ── 提示词配置 CRUD：[jonex] v1 退役后 LOCAL 面委托 v2 adapter 薄转发 ──
@@ -968,6 +985,8 @@ class RemoteRAGClient(RAGClient):
         page_size: int = 20,
         keyword: Optional[str] = None,
         status: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> dict:
         payload: dict = {
             "action": "get_storage_documents",
@@ -980,6 +999,11 @@ class RemoteRAGClient(RAGClient):
             payload["keyword"] = keyword
         if status:
             payload["status"] = status
+        # jonex 扩展：按 `doc=` 锚点过滤（部分 chunk 的 file_name 为 null）
+        if document_id:
+            payload["doc_id"] = document_id
+        if file_path:
+            payload["file_path"] = file_path
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -1110,6 +1134,7 @@ class RemoteRAGClient(RAGClient):
         schema_hash: str = "",
         force_retry: bool = False,
         content_generation: int = 0,
+        engine_chunks: Optional[list] = None,
     ) -> dict:
         payload: dict = {
             "action": "retry_ontology_extract",
@@ -1125,6 +1150,10 @@ class RemoteRAGClient(RAGClient):
             payload["ontology_schema"] = ontology_schema
         if schema_hash:
             payload["schema_hash"] = schema_hash
+        # [jonex] A18：引擎全量 chunk（严格载荷；None ⇒ 不加键，
+        # rag 链 payload 与从前逐字一致）
+        if engine_chunks:
+            payload["engine_chunks"] = engine_chunks
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -1452,6 +1481,8 @@ class MockRAGClient(RAGClient):
         page_size: int = 20,
         keyword: Optional[str] = None,
         status: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> dict:
         require_tenant(tenant_id)
         require_knowledge_base(knowledge_base_id)
@@ -1542,6 +1573,7 @@ class MockRAGClient(RAGClient):
         schema_hash: str = "",
         force_retry: bool = False,
         content_generation: int = 0,
+        engine_chunks: Optional[list] = None,
     ) -> dict:
         require_tenant(tenant_id)
         require_knowledge_base(knowledge_base_id)

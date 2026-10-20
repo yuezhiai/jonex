@@ -22,6 +22,23 @@ from jonex_core.common.tenant import require_tenant, require_test_token_allowed
 logger = logging.getLogger(__name__)
 
 
+def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """从 ``Authorization`` 头取出 token，并去掉首尾空白。
+
+    ``Bearer  <jwt>``（双空格）会让直接切片 ``authorization[7:]`` 得到
+    ``" <jwt>"``，JWT 验签失败 —— 这与网关 ``require_auth_header`` /
+    ``identity._decode`` / ``tenant._tenant_from_bearer_token`` 的 ``.strip()``
+    口径不一致：同一个头在 invoke 路径可用、在 REST 透传却 401。
+
+    非 ``Bearer`` 方案、空 token、缺头一律返回 ``None``，由调用方按既有
+    认证失败路径处理（不在这里抛异常，避免改变各入口的错误码）。
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[7:].strip()
+    return token or None
+
+
 class UserAuth:
     """用户认证 — 密码哈希 + 用户 JWT"""
 
@@ -147,8 +164,12 @@ def get_user_auth() -> UserAuth:
     return _user_auth_instance
 
 
-async def get_current_user(authorization: str = Header(...)) -> dict:
+async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     """FastAPI 依赖：从 Bearer token 解析当前用户（Sidecar / platform 共用）。
+
+    ``Authorization`` 声明为可选、缺失时由本函数抛 ``TokenExpiredError``
+    （401 / 3003），而不是交给 FastAPI 的必填 Header 校验（会变成 422 / 1001）：
+    前端与网关都把「未认证」统一当 401 处理，422 会让「该跳登录页」的判断漏掉。
 
     platform 侧 require_admin 收严后，mcp_* 30 端点经此依赖做 JWT 校验。
     本地调试/演示用测试 token ``jonex_test_{tenant_id}`` 无法 JWT 解码，
@@ -159,9 +180,13 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
     （tenant 模块），仅开发环境（ENV=dev）放行，test/uat/prod 一律拒绝，
     杜绝无验签 admin 绕过（对齐 api_gateway GATEWAY_API_KEY 生产哨兵守卫模式）。
     """
+    if not authorization:
+        raise TokenExpiredError(message=translate("err.auth.missing_auth_header", fallback="缺少 Authorization 请求头"))
     if not authorization.startswith("Bearer "):
         raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
-    token = authorization[7:]
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
     if token.startswith("jonex_test_"):
         require_test_token_allowed()
         return {
@@ -175,6 +200,11 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
         }
     auth = get_user_auth()
     payload = auth.decode_token(token)
+    # `decode_token` 同时接受 user / refresh（续期端点要靠它解 refresh），
+    # 访问令牌的判别必须由调用方做：refresh token 有效期 30 天，当成 access
+    # 用等于给了一条长效通行证（B6 终审只堵了网关 invoke 路径）。
+    if payload.get("type") != "user":
+        raise TokenExpiredError(message=translate("err.auth.user_token_required", fallback="需要用户访问令牌"))
     return {
         "user_id": int(payload["sub"]),
         "tenant_id": payload["tenant_id"],

@@ -57,6 +57,10 @@ def require_test_token_allowed() -> None:
 
 
 def _tenant_from_bearer_token(token: str) -> str:
+    # `extract_tenant_id` 用 `partition(" ")` 切分，`Bearer  <jwt>`（双空格）
+    # 会把前导空格带进来；与 `require_auth_header` / `identity._decode` 的
+    # `.strip()` 保持同一口径，否则认证通过、身份解得出，租户却解不出来。
+    token = token.strip()
     if token.startswith("jonex_test_"):
         require_test_token_allowed()
         return _normalize_tenant_id(token.removeprefix("jonex_test_"))

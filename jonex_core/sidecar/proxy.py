@@ -8,6 +8,7 @@ Sidecar 通过 HTTP 代理方式调用远程能力服务，实现与能力实现
 """
 
 import os
+from contextlib import asynccontextmanager
 import httpx
 from typing import AsyncGenerator, Optional, Dict
 
@@ -30,6 +31,7 @@ class CapabilityProxy:
     """能力服务反向代理"""
 
     def __init__(self):
+        self._wiki_progress_client = None
         self.config = get_config()
         self.registry = get_service_registry()
         self.auth = get_internal_auth()
@@ -37,12 +39,31 @@ class CapabilityProxy:
         self._static_endpoints = {
             "knowledge_base": self.config.KNOWLEDGE_BASE_URL,
             "business_domain": self.config.BUSINESS_DOMAIN_URL,
+            "data_governance": self.config.DATA_GOVERNANCE_URL,
             "task_center": self.config.TASK_CENTER_URL,
             "rag.lightrag": self.config.ATOMIC_RAG_URL,
             "platform": self.config.PLATFORM_URL,
             "openkb": self.config.OPENKB_URL,  # [jonex]
             "jonex_wiki": self.config.JONEX_WIKI_URL,  # [jonex] Sidecar → 适配器容器
+            "ontology_compile": self.config.ONTOLOGY_COMPILE_URL,  # [jonex] Sidecar → 本体编译容器（P2 独立容器）
         }
+
+    @asynccontextmanager
+    async def _invoke_client(self, capability_id, payload, timeout):
+        if (capability_id == "business.knowledge_base.v1" and
+                payload.get("action") in ("poll_jonex_wiki_search", "cancel_jonex_wiki_search")):
+            if self._wiki_progress_client is None:
+                self._wiki_progress_client = httpx.AsyncClient(
+                    timeout=timeout, limits=httpx.Limits(max_connections=16, max_keepalive_connections=8))
+            yield self._wiki_progress_client
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                yield client
+
+    async def close_wiki_progress_client(self):
+        if self._wiki_progress_client is not None:
+            await self._wiki_progress_client.aclose()
+            self._wiki_progress_client = None
 
     @property
     def capability_endpoints(self) -> Dict[str, str]:
@@ -61,6 +82,7 @@ class CapabilityProxy:
         impersonated: bool = False,
         perms: Optional[list] = None,
         original_tenant_id: Optional[str] = None,
+        context: Optional[dict] = None,
     ):
         """
         转发调用到对应的能力服务
@@ -90,7 +112,7 @@ class CapabilityProxy:
         )
 
         timeout = float(os.getenv("SIDECAR_PROXY_TIMEOUT", "180"))
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with self._invoke_client(capability_id, payload, timeout) as client:
             try:
                 # 生成内部服务认证 Token
                 internal_token = self.auth.generate_token("sidecar")
@@ -114,6 +136,9 @@ class CapabilityProxy:
                         "impersonated": impersonated,
                         "perms": perms or [],
                         "original_tenant_id": original_tenant_id,
+                        # 调用方上下文（如 MCP 的 source/mcp_key_id）必须透传：
+                        # 能力层靠它区分机器调用并执行密级守卫。
+                        "context": context,
                     },
                     headers=_headers,
                 )

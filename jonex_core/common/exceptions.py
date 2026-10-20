@@ -519,6 +519,33 @@ class SyncTaskStateError(DataError):
     default_message = "同步任务状态非法"
 
 
+class MonitorDataUnavailableError(DataError):
+    """平台监控 · 监控数据源缺失 / 历史重算未完成（``4100``）。
+
+    两种同源场景共用一个码：
+
+    * **监控数据源缺失** —— 监控读接口起来时发现其取数表 / 采集链路根本不在位
+      （不是「查询没命中」，那是空集 ``200``）；
+    * **历史重算未完成** —— 聚合口径切换后历史数据尚在重算，此刻给不出可信数。
+
+    两者都是「**服务端侧暂时给不出这份数**，稍后再来」，故 ``status_code`` 取
+    ``503``（取值曾议 503 或 409，此处定为 503；与「采集链路 / 数据源
+    不可用」的 5001 同读感，但那是**上游调用失败**，与这里「自家数缺」不同源，故另立一码）。
+
+    ⛔ **本类必须保持「无必填位置参数」** —— ``EXCEPTION_REGISTRY`` 的反查链路
+    （``api_gateway/deps.py:raise_from_capability_result`` → ``get_exception_class``）会按
+    通用形状 ``exc_cls(message=..., details=..., params=...)`` 重建异常；带必填位参会
+    在重建时 ``TypeError`` → 500（先例：``3027 OidcAccessDeniedError`` 因此**刻意不登记**）。
+    本类不覆写 ``__init__``，天然满足 —— 后人若加必填参数，请连同登记一起摘掉。
+
+    「超出保留期 / 自定义查询上限」**不归本码**：沿用既有 ``4004``
+    （``QuotaExceededError``），``41xx`` 只此一枚。
+    """
+    code = 4100
+    status_code = 503
+    default_message = "监控数据源缺失或历史重算未完成，请稍后重试"
+
+
 # ==================== 5xxx 服务依赖错误 ====================
 class ServiceError(JonexException):
     """服务错误基类"""
@@ -648,6 +675,7 @@ EXCEPTION_REGISTRY: Dict[int, type] = {
     4003: DataIntegrityError,
     4004: QuotaExceededError,
     4005: SyncTaskStateError,
+    4100: MonitorDataUnavailableError,
     # 服务依赖
     5000: ServiceError,
     5001: ServiceUnavailableError,

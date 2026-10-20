@@ -11,9 +11,12 @@ Sidecar 代理主应用
 - 能力服务反向代理
 """
 
+import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Optional
 
 import httpx
@@ -31,6 +34,13 @@ from jonex_core.sidecar.hooks import (
     get_audit_forwarder,
 )
 from jonex_core.common.audit_enums import _ACTION_TO_RESOURCE, _RESOURCE_TO_ID_FIELD
+from jonex_core.common.monitor_collector import get_monitor_collector
+from jonex_core.common.monitor_models import (
+    CallDirection,
+    CallFinalStatus,
+    CallTrigger,
+    Protocol,
+)
 from jonex_core.common import (
     error_response,
     register_exception_handlers,
@@ -47,8 +57,12 @@ from jonex_core.common import (
 from jonex_core.common.tenant import require_test_token_allowed
 from jonex_core.common.exceptions import RateLimitExceededError
 from jonex_core.common.config import get_config
-from jonex_core.common.security_guards import assert_secure_jwt_secret
-from jonex_core.security.user_auth import get_user_auth
+from jonex_core.common.security_guards import (
+    assert_secure_jwt_secret,
+    is_insecure_gateway_api_key,
+    is_insecure_keycloak_client_secret,
+)
+from jonex_core.security.user_auth import extract_bearer_token, get_user_auth
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +161,9 @@ def _tenant_from_authorization(auth_header: str | None) -> str | None:
         return None
 
     scheme, _, token = auth_header.partition(" ")
+    # `Bearer  <jwt>` 双空格会把前导空格带进 token，与 verify_any_auth /
+    # gateway / tenant 的解析口径不一致 —— 统一 strip。
+    token = token.strip()
     if scheme.lower() != "bearer" or not token:
         return None
 
@@ -175,31 +192,42 @@ def _gateway_api_key_matches(api_key: Optional[str]) -> bool:
 
 
 def _assert_gateway_api_key_configured(config) -> None:
-    """生产环境守卫：GATEWAY_API_KEY 必须已从默认哨兵值修改。
+    """生产环境守卫：GATEWAY_API_KEY 必须已从**仓库内公开值**修改。
 
-    生产漏配时 Sidecar 会接受公开可知的哨兵字符串 "change-me-in-production"
-    为合法内部 X-API-Key，攻击者直连 Sidecar 发送该哨兵 + 任意 X-Tenant-ID
-    即可任意租户身份调用能力，造成租户隔离旁路。fail-closed：生产未正确
-    配置则抛 RuntimeError，让 uvicorn 启动失败拒绝服务。
+    生产漏配时 Sidecar 会接受公开可知的字符串（``change-me-in-production``，
+    或 ``deploy/.env.example`` 发出的 ``jonex_test_gateway``）为合法内部
+    X-API-Key；而 ``_gateway_api_key_matches`` **不校验租户**，攻击者直连
+    Sidecar 发送该值 + 任意 ``X-Tenant-ID`` 即可任意租户身份调用能力，
+    造成租户隔离旁路。
+
+    > ⚠️ 2026-10-14：原先只比对哨兵串 ``change-me-in-production``，**漏掉实际
+    > 发出的 ``jonex_test_gateway``**（实测生产正在用）。现改用共享判定
+    > :func:`is_insecure_gateway_api_key`，覆盖仓库内全部曾公开的值。
+
+    fail-closed：生产未正确配置则抛 RuntimeError，让 uvicorn 启动失败拒绝服务。
     """
     if not config.is_production:
         return
-    gateway_key = config.GATEWAY_API_KEY
-    if not gateway_key or gateway_key == "change-me-in-production":
+    if is_insecure_gateway_api_key(config.GATEWAY_API_KEY):
         raise RuntimeError(
-            "GATEWAY_API_KEY 未配置或仍为默认哨兵值。"
+            "GATEWAY_API_KEY 未配置或仍为仓库内公开的默认值"
+            "（含 change-me-in-production、jonex_test_gateway）。"
             "生产环境必须在 .env 或环境变量中设置 GATEWAY_API_KEY 为真实随机 key，"
-            "否则 Gateway→Sidecar 内部认证可被伪造。"
+            "否则 Gateway→Sidecar 内部认证可被伪造（且该 key 不绑定租户）。"
         )
 
 
 def _assert_keycloak_client_secret_configured(config) -> None:
-    """生产环境守卫：KEYCLOAK_CLIENT_SECRET 必须已从默认哨兵值覆盖。
+    """生产环境守卫：KEYCLOAK_CLIENT_SECRET 必须已从**仓库内公开值**覆盖。
 
-    生产漏配时服务会静默使用公开可知的哨兵字符串 "change-me-in-production"
-    作为 Keycloak confidential client secret，攻击者可据此伪造 client 身份
-    （Admin API / backchannel 调用）。fail-closed：生产未正确配置则抛
-    RuntimeError，让 uvicorn 启动失败拒绝服务。
+    生产漏配时服务会静默使用公开可知的字符串作为 Keycloak confidential client
+    secret，攻击者可据此伪造 client 身份（Admin API / backchannel 调用）。
+
+    > ⚠️ 2026-10-14：原先只比对哨兵串 ``change-me-in-production``，**漏掉公开的
+    > ``jonex-platform-public-pkce-client``**（实测生产正在用，那是 PKCE **公开**
+    > client id）。现改用共享判定 :func:`is_insecure_keycloak_client_secret`。
+
+    fail-closed：生产未正确配置则抛 RuntimeError，让 uvicorn 启动失败拒绝服务。
     """
     if not config.is_production:
         return
@@ -207,10 +235,10 @@ def _assert_keycloak_client_secret_configured(config) -> None:
     # 不得让与 SSO 无关的部署因哨兵值而启动失败。
     if not config.sso_enabled:
         return
-    client_secret = config.KEYCLOAK_CLIENT_SECRET
-    if not client_secret or client_secret == "change-me-in-production":
+    if is_insecure_keycloak_client_secret(config.KEYCLOAK_CLIENT_SECRET):
         raise RuntimeError(
-            "KEYCLOAK_CLIENT_SECRET 未配置或仍为默认哨兵值。"
+            "KEYCLOAK_CLIENT_SECRET 未配置或仍为仓库内公开的默认值"
+            "（含 change-me-in-production、jonex-platform-public-pkce-client）。"
             "生产环境必须在 .env 或环境变量中设置 KEYCLOAK_CLIENT_SECRET 为真实随机 secret，"
             "否则 Keycloak confidential client secret 可被攻击者猜到。"
         )
@@ -345,6 +373,196 @@ def _resolve_invoke_tenant_optional(
         return canonical
     except Exception:
         return None
+
+
+@lru_cache(maxsize=1)
+def _error_code_to_http_status() -> dict[int, int]:
+    """错误码 → HTTP 状态的映射，取自异常类自身的 `status_code`。"""
+    from jonex_core.common import exceptions as _exceptions
+
+    mapping: dict[int, int] = {}
+    for _obj in vars(_exceptions).values():
+        if isinstance(_obj, type) and issubclass(_obj, _exceptions.JonexException):
+            mapping.setdefault(_obj.code, _obj.status_code)
+    return mapping
+
+
+def _derive_invoke_status_code(result: dict) -> int:
+    """由能力返回体推导「记录用」状态码（审计 / 计量侧）。
+
+    能力侧 `/invoke` 端点（`deploy/start_capability.py:177`）恒以 **HTTP 200** 返回，
+    业务成败只体现在响应体的 `success` / `code` 上 —— `CapabilityRegistry.invoke`
+    会把 `JonexException` 与未捕获异常**都转成** `CapabilityResponse.error` 返回
+    （`jonex_core/capability/registry.py:86-101`），因此这里 `raise_for_status()`
+    对业务失败**不触发**。若沿用写死的 200，审计与调用监控会把每一次失败调用都记成
+    成功（监控 N1 的 `final_status` 恒为成功）。
+
+    只用于审计 / 计量记录，**不改回给调用方的 HTTP 响应**（仍由 FastAPI 按
+    `InvokeResult` 返回 200，成败由 body 的 `success` / `code` 承载）。
+
+    判定顺序：
+    1. `success` 为真 ⇒ 200；
+    2. `code` 落在 HTTP **失败**区间（4xx/5xx）⇒ 原样使用（能力侧对「能力未找到」
+       填 404、对未捕获异常填 500，见 `registry.py:77`/`:99`）；
+    3. 否则查异常类的 `status_code`；查不到保守记 500。
+
+    ⚠️ 失败态下的 2xx/3xx `code` 属矛盾数据，**不**按 HTTP 语义原样返回，
+    一律落到第 3 条（查不到即 500），避免把失败记成成功。
+    """
+    if result.get("success", True):
+        return 200
+    code = result.get("code")
+    if isinstance(code, int):
+        if 400 <= code < 600:
+            return code
+        mapped = _error_code_to_http_status().get(code)
+        if mapped is not None:
+            return mapped
+    return 500
+
+
+def _caller_from_auth(auth: dict) -> tuple:
+    """从认证结果推导「真实调用方」与「触发方」。
+
+    返回 ``(source, trigger_type)``。
+
+    ``source`` 记**真实发起方**，不记内部中转站：网关代用户发起的业务请求会带上
+    用户 JWT，此处解析出的就是用户本人。取不到用户身份时退回认证类型
+    （``apikey`` 等），表示「另一个系统在调」而非某个用户。
+
+    ``trigger_type``：带上用户身份 ⇒ ``user``；否则视为系统/后台调用 ⇒ ``system``。
+    ⚠️ **已知不精确**：外部系统经 MCP 发起的调用若无用户身份，会落在 ``system``
+    一侧 —— 待调用方透传显式标识后再细分。
+    """
+    auth_type = (auth or {}).get("auth_type") or ""
+    username = (auth or {}).get("username") or ""
+    user_id = (auth or {}).get("user_id")
+    if auth_type == "user" and (username or user_id):
+        return (username or f"user:{user_id}", CallTrigger.USER.value)
+    return (auth_type or "unknown", CallTrigger.SYSTEM.value)
+
+
+def _monitor_n1_fields(
+    *,
+    request_id: str,
+    tenant_id: str,
+    capability_id: str,
+    start_time: float,
+    status_code: int,
+    source: str = "unknown",
+    trigger_type: str = CallTrigger.USER.value,
+    error_code: Optional[Any] = None,
+    error_message: Optional[Any] = None,
+    final_status: Optional[str] = None,
+) -> dict:
+    """拼一次 ``/invoke`` 的 N1（``monitor.call_log``）字段。
+
+    Sidecar 腿采 **N1 主记录**：它是唯一同时握有租户上下文 + 能力标识 + 耗时的采集点。
+    N2 的 Attempt 语义（``attempt_no`` /
+    ``is_final`` / ``wait_before_ms``）这一腿采不到，归发起重试的 capability 采。
+
+    ``direction`` 恒 ``inbound`` —— 记录的是「进入能力」的调用；llm-gateway 腿记 ``outbound``。
+    时间列走 tz-aware（DDL 是 TIMESTAMPTZ，朴素值会踩 asyncpg 编解码坑）。
+    ``error_*`` 只判状态码，成功时留空。
+    """
+    success = status_code < 400
+    # 流式端点无法在开流后改 HTTP 状态码，取消等三态必须由调用方显式指定。
+    resolved_status = final_status or (
+        CallFinalStatus.SUCCESS.value if success else CallFinalStatus.FAILED.value
+    )
+    return {
+        "request_id": request_id,
+        "trace_id": request_id,  # 现与 request_id 同源，是否分离待定
+        "tenant_id": tenant_id,
+        "direction": CallDirection.INBOUND.value,
+        "source": source,
+        "target": capability_id,
+        "protocol": Protocol.INVOKE.value,
+        "trigger_type": trigger_type,
+        "logical_started_at": datetime.fromtimestamp(start_time, timezone.utc),
+        "final_ended_at": datetime.now(timezone.utc),
+        "final_status": resolved_status,
+        "error_code": (
+            None
+            if resolved_status == CallFinalStatus.SUCCESS.value or error_code is None
+            else str(error_code)
+        ),
+        "error_message": (
+            None if resolved_status == CallFinalStatus.SUCCESS.value else error_message
+        ),
+    }
+
+
+def _collect_monitor_n1(**kwargs) -> None:
+    """投递一条 N1 到采集器，**吞掉一切异常**。
+
+    硬红线：采集是旁路，投递失败 / 队列满**不得**影响业务请求。
+    ``put_call_log`` 本身已是非阻塞（``put_nowait``），这里再兜一层，防止字段拼装
+    阶段（如时间转换）的意外异常冒到主链路。
+    """
+    try:
+        get_monitor_collector().put_call_log(_monitor_n1_fields(**kwargs))
+    except Exception:
+        logger.exception("[Sidecar] 监控采集投递失败（已吞异常，不影响调用）")
+
+
+async def _monitored_stream(
+    source,
+    *,
+    request_id: str,
+    tenant_id: str,
+    capability_id: str,
+    start_time: float,
+    source_name: str,
+    trigger_type: str,
+):
+    """把上游流包一层 N1 采集：成功 / 失败 / 取消三态各记一条，且只记一条。
+
+    ⚠️ 流式响应一旦开流，HTTP 状态码就改不了了，N1 的结局只能按**流内结果**判定：
+
+    - 正常迭代完 ⇒ ``success``（``status_code=200``，仅用于走既有 success 分支）；
+    - ``asyncio.CancelledError`` / ``GeneratorExit``（客户端断开）⇒ ``cancelled`` 后重抛；
+    - 其他异常 ⇒ ``failed``（带 error_code/message）后重抛。
+
+    不采 N2：流式路径没有 per-attempt 语义，避免与能力侧重试记录重复。
+    ``recorded`` 标志保证「异常路径记过之后，finally / 关闭路径不会补记第二条」。
+    """
+    recorded = False
+
+    def _record_once(*, status_code: int, **kwargs) -> None:
+        nonlocal recorded
+        if recorded:
+            return
+        recorded = True
+        _collect_monitor_n1(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            capability_id=capability_id,
+            start_time=start_time,
+            status_code=status_code,
+            source=source_name,
+            trigger_type=trigger_type,
+            **kwargs,
+        )
+
+    try:
+        async for line in source:
+            yield line + "\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        _record_once(
+            status_code=499,  # 仅占位；终态由 final_status 决定
+            final_status=CallFinalStatus.CANCELLED.value,
+        )
+        raise
+    except Exception as exc:
+        _record_once(
+            status_code=500,
+            error_code=getattr(exc, "code", None),
+            error_message=str(exc),
+        )
+        raise
+    else:
+        _record_once(status_code=200)
 
 
 async def _record_platform_metrics(
@@ -540,7 +758,8 @@ class SidecarApp:
             # 安全守卫：生产环境 GATEWAY_API_KEY 必须已从默认哨兵修改。
             # 放在 try 块外，确保 RuntimeError 不被吞掉，fail-closed 拒绝启动。
             _assert_gateway_api_key_configured(get_config())
-            # 安全守卫：JWT_SECRET 必须为真实随机值（无条件；Sidecar 用它对用户 JWT
+            # 安全守卫：JWT_SECRET 必须为真实随机值（**生产档 ENV=prod 硬拦**；非生产只告警，
+            # 见 jonex_core/common/security_guards.py 约束 2。Sidecar 用它对用户 JWT
             # 验签，使用公开默认值即可被伪造管理员 token）。
             assert_secure_jwt_secret(get_config())
             _assert_keycloak_client_secret_configured(get_config())
@@ -551,6 +770,16 @@ class SidecarApp:
                 logger.info("[Sidecar] AuditForwarder 定时 flush 已启动")
             except Exception:
                 logger.exception("[Sidecar] AuditForwarder 启动失败")
+            # 调用明细采集写口（N1 主记录）。同审计的理由：采集是旁路，起不来不能拖垮 Sidecar。
+            try:
+                get_monitor_collector().start()
+                logger.info("[Sidecar] MonitorCollector 已启动")
+            except Exception:
+                logger.exception("[Sidecar] MonitorCollector 启动失败")
+
+        @self.app.on_event("shutdown")
+        async def close_wiki_progress_connections():
+            await self.proxy.close_wiki_progress_client()
 
         @self.app.on_event("shutdown")
         async def _stop_audit_forwarder():
@@ -559,6 +788,14 @@ class SidecarApp:
                 logger.info("[Sidecar] AuditForwarder 已停止并 flush")
             except Exception:
                 logger.exception("[Sidecar] AuditForwarder 停止失败")
+
+        @self.app.on_event("shutdown")
+        async def _stop_monitor_collector():
+            try:
+                await get_monitor_collector().stop()
+                logger.info("[Sidecar] MonitorCollector 已停止并 flush")
+            except Exception:
+                logger.exception("[Sidecar] MonitorCollector 停止失败")
 
         @self.app.on_event("shutdown")
         async def _stop_rate_limiter():
@@ -583,7 +820,11 @@ class SidecarApp:
             API Key 只负责认证调用方，不从 key 文本推导业务租户。
             """
             if authorization and authorization.startswith("Bearer "):
-                token = authorization[7:]
+                # 与网关 require_auth_header / identity._decode 同口径：
+                # 《Bearer  <jwt>》（双空格）也要能解出 token。
+                token = extract_bearer_token(authorization)
+                if not token:
+                    raise MissingApiKeyError()
                 if token.startswith("jonex_test_"):
                     require_test_token_allowed()
                     return {
@@ -591,6 +832,12 @@ class SidecarApp:
                         "tenant_id": require_tenant(token.removeprefix("jonex_test_")),
                     }
                 payload = get_user_auth().decode_token(token)
+                # decode_token 同时接受 user / refresh；访问令牌必须显式判别，
+                # 否则 30 天有效的 refresh token 可当 access 用（/platform/* 透传）。
+                if payload.get("type") != "user":
+                    raise TokenExpiredError(
+                        message=translate("err.auth.user_token_required", fallback="需要用户访问令牌")
+                    )
                 return {
                     "auth_type": "user",
                     "tenant_id": require_tenant(payload.get("tenant_id")),
@@ -741,6 +988,9 @@ class SidecarApp:
             # 链路追踪 ID：透传入站 X-Request-ID，缺失则生成，贯穿整条能力调用链路
             import uuid as _uuid
             trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+            # 监控采集：真实调用方 + 触发方。「来源服务」列记发起方本人，
+            # 来源列记真实调用方，不记内部中转站。
+            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
             limiter = get_rate_limiter()
             breaker = get_circuit_breaker()
             metering = get_metering()
@@ -785,17 +1035,21 @@ class SidecarApp:
                     impersonated=impersonated,
                     perms=perms,
                     original_tenant_id=original_tenant_id,
+                    context=invoke_request.context,
                 )
 
                 latency = (time.time() - start_time) * 1000
+                # 能力侧 /invoke 恒返回 HTTP 200，业务成败只体现在响应体上；
+                # 记录用状态码必须由 result 推导，否则审计/监控把失败调用记成成功。
+                record_status = _derive_invoke_status_code(result)
                 await breaker.on_success(service_name)
-                await metering.record(tenant_id, invoke_request.capability_id, latency, 200, user_id)
+                await metering.record(tenant_id, invoke_request.capability_id, latency, record_status, user_id)
 
                 await get_audit_forwarder().collect(
                     tenant_id=tenant_id,
                     method="POST",
                     path=f"invoke/{invoke_request.capability_id}",
-                    status_code=200,
+                    status_code=record_status,
                     latency_ms=latency,
                     trace_id=trace_id,
                     user_id=user_id,
@@ -807,6 +1061,19 @@ class SidecarApp:
                     resource_id=_resource_id,
                     impersonated=impersonated,
                     original_tenant_id=original_tenant_id,
+                )
+
+                # 监控采集（旁路，非阻塞）：N1 主记录。失败恒不抛出。
+                _collect_monitor_n1(
+                    request_id=trace_id,
+                    tenant_id=tenant_id,
+                    capability_id=invoke_request.capability_id,
+                    start_time=start_time,
+                    status_code=record_status,
+                    source=_monitor_source,
+                    trigger_type=_monitor_trigger,
+                    error_code=result.get("code"),
+                    error_message=result.get("message"),
                 )
 
                 logger.info(
@@ -846,6 +1113,19 @@ class SidecarApp:
                     impersonated=impersonated,
                     original_tenant_id=original_tenant_id,
                 )
+                # 监控采集（旁路，非阻塞）：异常路径记 failed（status_code=500）。
+                # 异常可能是 JonexException（带 code）也可能是裸异常（无 code）。
+                _collect_monitor_n1(
+                    request_id=trace_id,
+                    tenant_id=tenant_id,
+                    capability_id=invoke_request.capability_id,
+                    start_time=start_time,
+                    status_code=500,
+                    source=_monitor_source,
+                    trigger_type=_monitor_trigger,
+                    error_code=getattr(e, "code", None),
+                    error_message=str(e),
+                )
                 msg = str(e)
                 cid = invoke_request.capability_id
                 if "Name or service not known" in msg:
@@ -869,6 +1149,7 @@ class SidecarApp:
         ):
             from fastapi.responses import StreamingResponse
 
+            start_time = time.time()
             tenant_id = _resolve_invoke_tenant(invoke_request, auth, x_tenant_id)
             user_id = invoke_request.user_id or str(auth.get("user_id", ""))
             impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
@@ -876,21 +1157,32 @@ class SidecarApp:
             perms = invoke_request.perms or auth.get("perms") or []
             import uuid as _uuid
             trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+            # 来源 / 触发方取法与 /invoke 一致：记真实调用方，不记中转站。
+            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
 
-            async def _generate():
-                async for line in self.proxy.stream_invoke(
-                    capability_id=invoke_request.capability_id,
-                    payload=invoke_request.payload,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
+            # 直接把采集生成器交给 StreamingResponse：`body_iterator` 就是它，
+            # 客户端断开时 aclose/GeneratorExit 能直达采集层，记成 cancelled。
+            return StreamingResponse(
+                _monitored_stream(
+                    self.proxy.stream_invoke(
+                        capability_id=invoke_request.capability_id,
+                        payload=invoke_request.payload,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        request_id=trace_id,
+                        impersonated=impersonated,
+                        perms=perms,
+                        original_tenant_id=original_tenant_id,
+                    ),
                     request_id=trace_id,
-                    impersonated=impersonated,
-                    perms=perms,
-                    original_tenant_id=original_tenant_id,
-                ):
-                    yield line + "\n"
-
-            return StreamingResponse(_generate(), media_type="application/x-ndjson")
+                    tenant_id=tenant_id,
+                    capability_id=invoke_request.capability_id,
+                    start_time=start_time,
+                    source_name=_monitor_source,
+                    trigger_type=_monitor_trigger,
+                ),
+                media_type="application/x-ndjson",
+            )
 
         @self.app.get("/invoke/stream/rag")
         async def invoke_rag_stream(
@@ -904,6 +1196,7 @@ class SidecarApp:
         ):
             from fastapi.responses import StreamingResponse
 
+            start_time = time.time()
             tenant_id = _assert_tenant_matches(
                 x_tenant_id,
                 _candidate_tenant(auth.get("tenant_id"), "auth"),
@@ -914,14 +1207,24 @@ class SidecarApp:
 
             import uuid as _uuid2
             _trace_id = request.headers.get("X-Request-ID") or _uuid2.uuid4().hex
-            async def _generate():
-                async for line in self.proxy.stream_rag_query(
-                    query=query, tenant_id=tenant_id, mode=mode, top_k=top_k,
-                    knowledge_base_id=knowledge_base_id, request_id=_trace_id,
-                ):
-                    yield line + "\n"
+            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
 
-            return StreamingResponse(_generate(), media_type="application/x-ndjson")
+            return StreamingResponse(
+                _monitored_stream(
+                    self.proxy.stream_rag_query(
+                        query=query, tenant_id=tenant_id, mode=mode, top_k=top_k,
+                        knowledge_base_id=knowledge_base_id, request_id=_trace_id,
+                    ),
+                    request_id=_trace_id,
+                    tenant_id=tenant_id,
+                    # 调用链终点是原子能力（proxy 侧服务名 rag.lightrag 的完整能力 ID）。
+                    capability_id="atomic.rag.lightrag.v1",
+                    start_time=start_time,
+                    source_name=_monitor_source,
+                    trigger_type=_monitor_trigger,
+                ),
+                media_type="application/x-ndjson",
+            )
 
     def get_app(self) -> FastAPI:
         """获取 FastAPI 应用"""

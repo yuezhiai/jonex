@@ -19,6 +19,9 @@
   IPv6）仍然保留，服务对 HTTP 30x redirect 目标地址的逐跳校验
   （:func:`validate_redirect_url`），由出站 HTTP 适配器在决定是否跟随 redirect
   前调用 —— 放宽不涉及这一档。
+- **知识库数据源**走独立的一档 :func:`validate_kb_ingestion_url`：网段用上面这条
+  严格档的阻断逻辑（默认安全），scheme 按 D2 结论沿用 http + https；需要放行内网
+  源时用 ``KB_INGESTION_ALLOWED_HOSTS`` 白名单显式开洞，不复用上面两条放宽档。
 
 思路对齐 jonex_core/security/oidc.py 的 issuer 白名单防 SSRF：出站目标必须先通过
 安全校验，才允许发起网络请求。
@@ -102,11 +105,13 @@ def validate_target_url(
     allowed_hosts: Optional[List[str]] = None,
     allow_private: bool = False,
     error_cls: type = UnsafeTargetUrlError,
+    allow_http: bool = False,
 ) -> None:
     """校验出站目标 URL，不合法则抛 ``error_cls``（默认 :class:`UnsafeTargetUrlError`）。
 
     规则：
-    - scheme 必须为 https（``allow_private=True`` 时放宽为 http / https）；
+    - scheme 必须为 https（``allow_private=True`` 或 ``allow_http=True`` 时放宽为
+      http / https）；
     - 必须含主机名；
     - 主机名解析出的任一 IP 落在阻断网段即拒绝（``allow_private=True`` 时跳过）。
 
@@ -121,6 +126,11 @@ def validate_target_url(
 
     ⚠️ 默认分支（``allow_private=False``）必须与新增本开关之前逐字一致：SSO
     ``issuer_url`` 路径不传该参数，其行为不得受数据源放宽影响。
+
+    ``allow_http=True`` **只**放宽 scheme（http / https 均接受），**不**放宽网段阻断
+    （私网 / 回环 / 链路本地 / 云元数据照旧拦截）—— 供
+    :func:`validate_kb_ingestion_url` 使用：内网 API 常是 http，但目标网段必须收紧。
+    默认 ``False`` 时 scheme 口径与新增该参数之前逐字一致。
 
     校验通过无返回值；DNS 解析失败不在此拒绝（连接阶段按连接失败处理）。
     """
@@ -140,7 +150,7 @@ def validate_target_url(
         # 白名单命中：完全放行（跳过 scheme + 私网/回环检查）。
         return
 
-    allowed_schemes = ("http", "https") if allow_private else ("https",)
+    allowed_schemes = ("http", "https") if (allow_private or allow_http) else ("https",)
     if parsed.scheme.lower() not in allowed_schemes:
         raise error_cls()
 
@@ -191,6 +201,39 @@ def validate_sso_url(url: str, allowed_hosts: Optional[List[str]] = None) -> Non
         url,
         allowed_hosts=allowed_hosts,
         allow_private=True,
+        error_cls=InvalidTargetUrlError,
+    )
+
+
+def validate_kb_ingestion_url(url: str, allowed_hosts: Optional[List[str]] = None) -> None:
+    """校验知识库「数据源」出站地址（严格档：阻断私网 / 回环 / 链路本地 / 云元数据）。
+
+    ⛔ **不得**改用 :func:`validate_datasource_url` / :func:`validate_sso_url`：那两条是
+    ``allow_private=True`` 的**产品放宽档**（客户业务系统与平台同机部署），本次修复
+    有意**不**收紧它们，KB 数据源也**不**复用它们。
+
+    KB 数据源的 ``config_json.endpoint``、外部 API 响应体里的文件下载地址（``rf.uri``）
+    与 S3 ``endpoint_url`` 都是**用户可控的出站目标**（渗透报告 3.1，SSRF，严重），
+    默认**安全**取向是全部阻断内网 —— 需要拉私有化部署内网源时，由部署方通过
+    ``KB_INGESTION_ALLOWED_HOSTS``（见 ``jonex_core/common/config.py``）显式登记主机，
+    白名单是**逃生阀**，而不是把整类私网地址放开。
+
+    规则 = :func:`validate_target_url` 的 ``allow_private=False`` 阻断逻辑
+    （:data:`_BLOCKED_IPV4_NETWORKS` / :data:`_BLOCKED_IPV6_NETWORKS`：私网 / 回环 /
+    链路本地 / CGNAT / 未指定 / 组播 / 保留地址，覆盖 IPv4 与 IPv6）；scheme 按 D2
+    结论沿用既有 ``_is_valid_http_url`` 的 http + https 口径（内网 API 常为 http，
+    收紧为 https-only 会打断更多现存数据源）。
+
+    违规（网段命中、scheme 非法如 ``file://`` / ``gopher://`` / ``ftp://``、缺主机名）
+    抛 :class:`InvalidTargetUrlError`(1007)。``allowed_hosts`` 命中的主机名
+    （大小写不敏感、不含 scheme 与端口）跳过 scheme 与网段双重检查、完全放行；
+    为空或未命中不影响上述规则。
+    """
+    validate_target_url(
+        url,
+        allowed_hosts=allowed_hosts,
+        allow_private=False,
+        allow_http=True,
         error_cls=InvalidTargetUrlError,
     )
 

@@ -168,6 +168,7 @@ def _normalize_citations(raw) -> list:
             continue
         out.append({
             "document_id": doc_id,
+            "handle": str(item.get("handle") or ""),
             "chunk_id": str(item.get("chunk_id") or ""),
             "passage_id": str(item.get("passage_id") or ""),
             "source_id": str(item.get("source_id") or ""),
@@ -183,8 +184,8 @@ def _normalize_citations(raw) -> list:
 _ACTIONS = {
     "init_kb", "compile_parsed_document", "compile_parsed_documents", "query", "status", "list_contents",
     "recompile", "remove_document", "delete_kb", "list_graph", "read_page",
-    "list_wiki_contents", "get_compile_status", "list_compile_tasks",
-    "apply_schema", "reparse", "cancel_task",
+    "list_wiki_contents", "get_compile_status", "list_compile_tasks", "get_document_chunks",
+    "apply_schema", "reparse", "cancel_task", "cancel_query", "resolve_evidence",
     "compilation_state", "pause_compilation", "resume_compilation",
     # [jonex] 阅读侧：反向链接（链入本页）与 claim 级溯源审计
     "get_wiki_backlinks", "get_wiki_claims",
@@ -241,7 +242,7 @@ class JonexWikiCapability(BaseCapability):
             return bool(data.get("source_path") and data.get("source_name"))
         if action == "query":
             return bool(str(data.get("question") or "").strip())
-        if action in ("remove_document", "reparse", "recompile"):
+        if action in ("remove_document", "reparse", "recompile", "get_document_chunks"):
             return bool(data.get("document_id"))
         if action == "read_page":
             return bool(str(data.get("path") or "").strip())
@@ -294,9 +295,21 @@ class JonexWikiCapability(BaseCapability):
         if action == "query":
             return await self._query_sync(app, tenant_id, kb_id,
                                           str(data.get("question") or ""),
-                                          bool(data.get("return_trace")))
+                                          bool(data.get("return_trace")),
+                                          thinking_mode=data.get("thinking_mode", "fast"),
+                                          progress_session=data.get("progress_session"))
+        if action == "resolve_evidence":
+            from jonex_wiki.adapters.evidence_view import resolve_evidence
+            return await resolve_evidence(app, tenant_id, kb_id, data["query_id"], data["handle"])
+        if action == "cancel_query":
+            state = await app.get_task(tenant_id, data["query_id"])
+            if state.get("kb_id") != kb_id:
+                raise ValueError("Query does not belong to this knowledge base")
+            return await app.cancel_task(tenant_id, data["query_id"])
         if action == "remove_document":
             return await app.remove_document(tenant_id, kb_id, data["document_id"])
+        if action == "get_document_chunks":
+            return await app.get_document_chunks(tenant_id, kb_id, data["document_id"])
         if action == "reparse":
             return await app.reparse_document(tenant_id, kb_id, data["document_id"])
         if action == "recompile":
@@ -351,7 +364,8 @@ class JonexWikiCapability(BaseCapability):
         return {"error": f"未实现 action {action}"}
 
     async def _query_sync(self, app, tenant_id: str, kb_id: str,
-                          question: str, want_trace: bool) -> dict:
+                          question: str, want_trace: bool,
+                          *, thinking_mode: str | None = None, progress_session: str | None = None) -> dict:
         """[jonex] 引擎 query 是异步任务(app.query 返回 task_id)，这里提交后同步等待完成。
 
         投影为平台契约，服务三条消费线（平台 /search/jonex_wiki）：
@@ -362,40 +376,68 @@ class JonexWikiCapability(BaseCapability):
                         已做白名单投影的检索/阅读轨迹（检索词、候选页、实读页），
                         spans 是 CR-TRACE-002 公开时间线（工具/模型/证据/合成 + 耗时）。
         """
-        task = await app.query(tenant_id, kb_id, question)
+        task = (await app.query(tenant_id, kb_id, question) if thinking_mode is None else
+                await app.query(tenant_id, kb_id, question, thinking_mode=thinking_mode))
         task_id = str(task.get("task_id") or "") if isinstance(task, dict) else ""
         if not task_id:
             raise RuntimeError("jonex_wiki query: missing task_id")
-        deadline = time.monotonic() + _QUERY_POLL_TIMEOUT_S
-        while True:
-            st = await app.get_task(tenant_id, task_id)
-            if not isinstance(st, dict):
-                raise RuntimeError("jonex_wiki query: invalid task state")
-            status = str(st.get("status") or "")
-            if status == "done":
-                result = st.get("result") or {}
-                out: dict = {
-                    "answer": str(result.get("answer") or ""),
-                    "citations": _normalize_citations(result.get("citations")),
-                }
-                if want_trace:
-                    out["trace"] = list(result.get("trace") or [])
-                    out["spans"] = list(result.get("spans") or [])
-                    out["counts"] = {
-                        "search_calls": _as_int(result.get("search_calls")),
-                        "read_calls": _as_int(result.get("read_calls")),
-                        "tool_calls": _as_int(result.get("tool_calls")),
-                        "model_calls": _as_int(result.get("model_calls")),
+        try:
+            redis = key = None
+            last_progress = None
+            if progress_session:
+                from jonex_core.common.cache import get_redis_client
+                from jonex_core.common.wiki_search_session import session_key
+                redis = get_redis_client()
+                key = session_key(tenant_id, progress_session)
+                await redis.hset(key, f"query:{kb_id}", task_id)
+            deadline = time.monotonic() + _QUERY_POLL_TIMEOUT_S
+            while True:
+                st = await app.get_task(tenant_id, task_id)
+                if not isinstance(st, dict):
+                    raise RuntimeError("jonex_wiki query: invalid task state")
+                status = str(st.get("status") or "")
+                if redis is not None:
+                    session_status = await redis.hget(key, "status")
+                    if session_status not in ("running", b"running"):
+                        await app.cancel_task(tenant_id, task_id)
+                        raise RuntimeError("Wiki search cancelled")
+                    progress = st.get("progress") or {}
+                    if progress.get("seq") != last_progress:
+                        import json
+                        await redis.hset(key, f"progress:{kb_id}", json.dumps(progress, ensure_ascii=False))
+                        last_progress = progress.get("seq")
+                if status == "done":
+                    result = st.get("result") or {}
+                    out: dict = {
+                        "answer": str(result.get("answer") or ""),
+                        "citations": [dict(c, query_id=task_id, bundle_sha=result.get("bundle_sha"))
+                                      for c in _normalize_citations(result.get("citations"))],
                     }
-                    out["latency_ms"] = _as_int(result.get("latency_ms"))
-                return out
-            if status in ("failed", "cancelled"):
-                # 任务失败是可诊断错误，抛异常走 execute→error response→client→
-                # search_jonex_wiki 的 except 分支，避免被静默吞成「无答案」。
-                raise RuntimeError(f"jonex_wiki query {status}: {st.get('error') or 'no detail'}")
-            if time.monotonic() >= deadline:
-                raise RuntimeError("jonex_wiki query timeout")
-            await asyncio.sleep(_QUERY_POLL_INTERVAL_S)
+                    if want_trace:
+                        out["trace"] = list(result.get("trace") or [])
+                        out["spans"] = list(result.get("spans") or [])
+                        out["counts"] = {
+                            "search_calls": _as_int(result.get("search_calls")),
+                            "read_calls": _as_int(result.get("read_calls")),
+                            "tool_calls": _as_int(result.get("tool_calls")),
+                            "model_calls": _as_int(result.get("model_calls")),
+                        }
+                        out["latency_ms"] = _as_int(result.get("latency_ms"))
+                    return out
+                if status in ("failed", "cancelled"):
+                    # 任务失败是可诊断错误，抛异常走 execute→error response→client→
+                    # search_jonex_wiki 的 except 分支，避免被静默吞成「无答案」。
+                    raise RuntimeError(f"jonex_wiki query {status}: {st.get('error') or 'no detail'}")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("jonex_wiki query timeout")
+                await asyncio.sleep(_QUERY_POLL_INTERVAL_S)
+        except BaseException:
+            # A stopped/disconnected streaming search must not leave model work running.
+            if progress_session:
+                from contextlib import suppress
+                with suppress(Exception):
+                    await app.cancel_task(tenant_id, task_id)
+            raise
 
     async def _list_wiki_contents(self, app, tenant_id: str, kb_id: str,
                                   document_id: str) -> dict:

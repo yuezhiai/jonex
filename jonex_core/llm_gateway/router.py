@@ -3,14 +3,25 @@
 LLM 网关路由：OpenAI 兼容端点 + 计量查询。
 """
 
+import asyncio
 import time
 import logging
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from jonex_core.common.config import get_config
+from jonex_core.common.monitor_collector import (
+    classify_trigger_by_scene,
+    get_monitor_collector,
+)
+from jonex_core.common.monitor_models import (
+    CallDirection,
+    CallFinalStatus,
+    Protocol,
+)
 from jonex_core.llm_gateway.context import MeteringContext, derive_request_id, parse_ctx
 from jonex_core.llm_gateway.metering import (
     extract_usage_chat,
@@ -20,7 +31,12 @@ from jonex_core.llm_gateway.metering import (
 )
 from jonex_core.llm_gateway.recorder import UsageRecord, get_recorder
 from jonex_core.llm_gateway.rerank_profiles import get_profile
-from jonex_core.llm_gateway.upstream import proxy_nonstream, proxy_rerank, proxy_stream
+from jonex_core.llm_gateway.upstream import (
+    UpstreamError,
+    proxy_nonstream,
+    proxy_rerank,
+    proxy_stream,
+)
 
 logger = logging.getLogger("llm_gateway")
 
@@ -69,7 +85,10 @@ async def chat_completions(request: Request, ctx: MeteringContext = Depends(pars
     )
 
     # 计量记录
-    _record_usage(ctx, model, usage, stream=False, estimated=(usage is None), latency_ms=latency_ms, body=body)
+    _record_usage(
+        ctx, model, usage, stream=False, estimated=(usage is None),
+        latency_ms=latency_ms, status_code=status_code, body=body, response=data,
+    )
 
     return JSONResponse(data, status_code=status_code)
 
@@ -87,9 +106,39 @@ async def _stream_chat(
 
     async def generate():
         nonlocal usage
-        async for chunk in proxy_stream(request, body, ctx):
-            chunks.append(chunk)
-            yield chunk
+        try:
+            async for chunk in proxy_stream(request, body, ctx):
+                chunks.append(chunk)
+                yield chunk
+        except UpstreamError as exc:
+            # 上游首字节前报错（旧行为是安静 return ⇒ 被记成成功）。记 failed 后**重新抛出**，
+            # 让流中断、客户端能看出失败 —— 与「网络断线」路径早已在跑的行为一致。
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            usage = extract_usage_stream(chunks)  # 多半为 None ⇒ estimated=True
+            logger.warning(
+                "chat 流式失败 | req_id=%s model=%s status=%s chunks=%s latency_ms=%s err=%s",
+                ctx.request_id, model, exc.status_code, len(chunks), latency_ms, exc.message,
+            )
+            _record_usage(
+                ctx, model, usage, stream=True, estimated=(usage is None),
+                latency_ms=latency_ms, status_code=exc.status_code,
+                body=body, error_message=exc.message,
+            )
+            raise
+        except asyncio.CancelledError:
+            # 客户端断开：记 cancelled 后继续传播取消信号（中途取消也要留痕）
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            usage = extract_usage_stream(chunks)
+            logger.warning(
+                "chat 流式取消 | req_id=%s model=%s chunks=%s latency_ms=%s",
+                ctx.request_id, model, len(chunks), latency_ms,
+            )
+            _record_usage(
+                ctx, model, usage, stream=True, estimated=(usage is None),
+                latency_ms=latency_ms, status_code=200,
+                final_status=CallFinalStatus.CANCELLED.value, body=body,
+            )
+            raise
         # 流结束后提取 usage
         latency_ms = int((time.monotonic() - t0) * 1000)
         usage = extract_usage_stream(chunks)
@@ -97,7 +146,10 @@ async def _stream_chat(
             "chat 流式完成 | req_id=%s model=%s chunks=%s latency_ms=%s usage=%s",
             ctx.request_id, model, len(chunks), latency_ms, usage,
         )
-        _record_usage(ctx, model, usage, stream=True, estimated=(usage is None), latency_ms=latency_ms, body=body)
+        _record_usage(
+            ctx, model, usage, stream=True, estimated=(usage is None),
+            latency_ms=latency_ms, status_code=200, body=body,
+        )
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -123,7 +175,11 @@ async def embeddings(request: Request, ctx: MeteringContext = Depends(parse_ctx)
         ctx.request_id, model, status_code, latency_ms, usage,
     )
 
-    _record_usage(ctx, model, usage, stream=False, estimated=("prompt_tokens" not in data.get("usage", {})), latency_ms=latency_ms, body=body)
+    _record_usage(
+        ctx, model, usage, stream=False,
+        estimated=("prompt_tokens" not in data.get("usage", {})),
+        latency_ms=latency_ms, status_code=status_code, body=body, response=data,
+    )
 
     return JSONResponse(data, status_code=status_code)
 
@@ -163,7 +219,7 @@ async def rerank(request: Request, ctx: MeteringContext = Depends(parse_ctx)):
     )
 
     _record_usage(ctx, model, usage, stream=False, estimated=True,
-                  latency_ms=latency_ms, body=body)
+                  latency_ms=latency_ms, status_code=status_code, body=body, response=data)
 
     return JSONResponse(data, status_code=status_code)
 
@@ -230,6 +286,63 @@ async def metering_usage(
         )
 
 
+def _error_text_from_response(response: Any) -> Optional[str]:
+    """从上游返回体里取错误文本（脱敏由采集侧 ``_sanitize_error_message`` 做）。"""
+    if not isinstance(response, dict):
+        return None
+    err = response.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or err.get("type") or None
+    if err is not None:
+        return str(err)
+    return None
+
+
+def _collect_monitor_n1_outbound(
+    *,
+    ctx: MeteringContext,
+    model: str,
+    request_id: str,
+    latency_ms: int,
+    final_status: str,
+    error_code: Optional[str] = None,
+    error_message: Optional[Any] = None,
+) -> None:
+    """投递一条 llm-gateway **出站** N1（``monitor.call_log``），**吞掉一切异常**。
+
+    拼行范式照抄 ``sidecar/main.py`` 的 ``_monitor_n1_fields`` / ``_collect_monitor_n1``。
+    两处刻意的取值：
+
+    - ``direction=outbound`` —— 记录的是「网关**发出**的调用」，与 Sidecar 的
+      ``inbound``（进入能力）相对。
+    - ``source`` = 用户身份，拿不到时记 ``platform``（表示平台自身发起，不是某个用户）。
+
+    ``tenant_id`` 直接取 ``ctx.tenant_id``：非法（空 / ``unknown`` 等）时整条会被
+    采集侧丢弃 —— **既定行为，不造假租户兜底**。
+    """
+    try:
+        ended = datetime.now(timezone.utc)
+        failed = final_status == CallFinalStatus.FAILED.value
+        get_monitor_collector().put_call_log({
+            "request_id": request_id,
+            "trace_id": ctx.trace_id,
+            "tenant_id": ctx.tenant_id,
+            "direction": CallDirection.OUTBOUND.value,
+            "source": ctx.user_id or "platform",
+            "target": model,
+            "protocol": Protocol.OPENAI.value,
+            "trigger_type": classify_trigger_by_scene(ctx.scene),
+            # DDL 是 TIMESTAMPTZ ⇒ 必须 tz-aware（朴素值会踩 asyncpg 编解码坑）
+            "logical_started_at": ended - timedelta(milliseconds=latency_ms),
+            "final_ended_at": ended,
+            "final_status": final_status,
+            "error_code": str(error_code) if (failed and error_code is not None) else None,
+            "error_message": error_message if failed else None,
+        })
+    except Exception:
+        logger.exception("[llm-gateway] 监控采集投递失败（已吞异常，不影响调用）")
+
+
 def _record_usage(
     ctx: MeteringContext,
     model: str,
@@ -237,9 +350,13 @@ def _record_usage(
     stream: bool,
     estimated: bool,
     latency_ms: int,
+    status_code: int = 200,
     body: dict | None = None,
+    response: Any = None,
+    final_status: Optional[str] = None,
+    error_message: Optional[Any] = None,
 ):
-    """统一计量记录入口"""
+    """统一计量记录入口（同时投递一条出站 N1 调用明细）。"""
     prompt_tokens = (usage or {}).get("prompt_tokens", 0) or 0
     completion_tokens = (usage or {}).get("completion_tokens", 0) or 0
     total_tokens = (usage or {}).get("total_tokens", 0) or (prompt_tokens + completion_tokens)
@@ -265,5 +382,22 @@ def _record_usage(
         trace_id=ctx.trace_id,
     )
     recorder = get_recorder()
-    import asyncio
     asyncio.create_task(recorder.record(rec))
+
+    # 出站 N1 调用明细（旁路；投递同步非阻塞、吞异常，不影响计量与业务）
+    if final_status is None:
+        final_status = (
+            CallFinalStatus.SUCCESS.value if status_code < 400 else CallFinalStatus.FAILED.value
+        )
+    failed = final_status == CallFinalStatus.FAILED.value
+    if failed and error_message is None:
+        error_message = _error_text_from_response(response)
+    _collect_monitor_n1_outbound(
+        ctx=ctx,
+        model=model,
+        request_id=request_id,
+        latency_ms=latency_ms,
+        final_status=final_status,
+        error_code=str(status_code) if failed else None,
+        error_message=error_message,
+    )

@@ -28,12 +28,15 @@ class JonexWikiClient(ABC):
     async def remove_document(self, kb_name: str, document_id: str,
                               tenant_id: str, kb_id: str) -> dict: ...
 
+    async def get_document_chunks(self, document_id: str, tenant_id: str, kb_id: str) -> dict:
+        raise NotImplementedError
+
     @abstractmethod
     async def delete_kb(self, kb_name: str, tenant_id: str, kb_id: str) -> dict: ...
 
     @abstractmethod
     async def query(self, kb_name: str, question: str, tenant_id: str, kb_id: str,
-                    return_trace: bool = False) -> dict: ...
+                    return_trace: bool = False, thinking_mode: str | None = None) -> dict: ...
 
     @abstractmethod
     async def status(self, kb_name: str, tenant_id: str, kb_id: str) -> dict: ...
@@ -147,12 +150,18 @@ class RemoteJonexWikiClient(JonexWikiClient):
         return await self._invoke("remove_document", {"kb": kb_name, "document_id": document_id},
                                   tenant_id, kb_id)
 
+    async def get_document_chunks(self, document_id, tenant_id, kb_id):
+        return await self._invoke("get_document_chunks", {"document_id": document_id}, tenant_id, kb_id)
+
     async def delete_kb(self, kb_name, tenant_id, kb_id):
         return await self._invoke("delete_kb", {"kb": kb_name}, tenant_id, kb_id)
 
-    async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False):
+    async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False,
+                    thinking_mode: str | None = None, progress_session: str | None = None):
         return await self._invoke("query", {
             "kb": kb_name, "question": question, "return_trace": return_trace,
+            **({"progress_session": progress_session} if progress_session else {}),
+            **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
         }, tenant_id, kb_id)
 
     async def status(self, kb_name, tenant_id, kb_id):
@@ -225,6 +234,8 @@ class MockJonexWikiClient(JonexWikiClient):
     async def compile_parsed_document(self, *a, **kw): return {"status": "compiled"}
     async def apply_schema(self, *a, **kw): return {"applied": True, "schema_version": kw.get("schema_version", 1)}
     async def remove_document(self, *a, **kw): return {"status": "removed"}
+    async def get_document_chunks(self, document_id, *a, **kw):
+        return {"doc_id": document_id, "total": 0, "chunks": [], "kb_type": "jonex_wiki"}
     async def delete_kb(self, *a, **kw): return {"status": "deleted"}
     async def query(self, *a, **kw): return {"answer": "mock answer"}
     async def status(self, *a, **kw): return {"documents": 0}

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from functools import lru_cache
 
 from jonex_core.common import get_logger
@@ -89,6 +90,25 @@ def asset_content_type(ext: str | None) -> str:
     return _ASSET_EXT_MIME.get(name or "", "application/octet-stream")
 
 
+#: `_ASSET_EXT_MIME` 的逆向表（MIME → 规范扩展名）。jpg/jpeg 撞同一个 MIME，
+#: 靠 `setdefault` 取**先出现的那个**。
+#: ⚠️ 必须遍历 `_ASSET_EXT_MIME`（dict，插入有序）而**不是** `_ASSET_EXT_WHITELIST`
+#: （set，遍历顺序不确定）—— 用后者会让 image/jpeg 的扩展名在 jpg/jpeg 之间随机漂。
+_ASSET_MIME_EXT: dict[str, str] = {}
+for _ext, _mime in _ASSET_EXT_MIME.items():
+    _ASSET_MIME_EXT.setdefault(_mime, _ext)
+
+
+def asset_ext_for_mime(mime: str | None) -> str | None:
+    """MIME → 规范扩展名（`asset_content_type` 的逆向）；不认识返回 ``None``。
+
+    用于「先有 MIME、要反推对象键扩展名」的场景（如以图问知识的查询图片：
+    MIME 由 magic bytes 判定，扩展名只是为了键好看与后端 Content-Type 推断）。
+    """
+    base = (mime or "").split(";", 1)[0].strip().lower()
+    return _ASSET_MIME_EXT.get(base)
+
+
 def build_asset_key(
     tenant_id: str,
     knowledge_base_id: str,
@@ -133,6 +153,43 @@ def build_preview_key(
     """
     prefix = os.getenv("COS_KEY_PREFIX", "jonex").strip("/")
     return f"{prefix}/kb/{tenant_id}/{knowledge_base_id}/{doc_id}/preview.pdf"
+
+
+def build_parse_md_key(tenant_id: str, knowledge_base_id: str, doc_id: str) -> str:
+    """解析产物 markdown 的对象键（解析质量报告的证据载体）。
+
+    形如 ``{COS_KEY_PREFIX}/kb/{tenant}/{kb}/{doc}/parse.md``
+    —— 与 build_preview_key 同前缀同层级（无 ext 参数、固定文件名），便于按文档前缀批量清理。
+    """
+    prefix = os.getenv("COS_KEY_PREFIX", "jonex").strip("/")
+    return f"{prefix}/kb/{tenant_id}/{knowledge_base_id}/{doc_id}/parse.md"
+
+
+def build_query_image_key(
+    tenant_id: str,
+    image_id: str,
+    ext: str | None,
+    created_at: "datetime | None" = None,
+) -> str:
+    """以图问知识的查询图片对象键（执行计划 §4-B10）。
+
+    形如 ``{COS_KEY_PREFIX}/kb/{tenant}/query-images/{yyyymm}/{image_id}.{ext}``。
+
+    ⚠️ **必须落在 ``{prefix}/kb/{tenant}/`` 之下**：COS 预签名用的 STS policy 只授权
+    ``{prefix}/kb/{tenant_id}/*``（`sts_client.py`），放别处签出来的 URL 一律 403。
+    ``query-images`` 这个段名不会与 KB 段冲突 —— KB id 是 32 位 hex。
+
+    按月分目录（``yyyymm``）纯为便于运维按前缀排查与批量清理，不参与任何业务判定。
+
+    ext 经 `normalize_asset_ext` 白名单化（非白名单按 png 并打 WARNING），
+    因此它永远不构成路径注入面；空值抛 ValueError。
+    """
+    safe_ext = normalize_asset_ext(ext)
+    if not safe_ext:
+        raise ValueError("查询图片 ext 为空，调用前应先判定有值")
+    month = (created_at or datetime.now()).strftime("%Y%m")
+    prefix = os.getenv("COS_KEY_PREFIX", "jonex").strip("/")
+    return f"{prefix}/kb/{tenant_id}/query-images/{month}/{image_id}.{safe_ext}"
 
 
 @lru_cache(maxsize=1)
@@ -190,9 +247,12 @@ def get_object_storage_for(backend: str | None):
 
 __all__ = [
     "asset_content_type",
+    "asset_ext_for_mime",
     "build_asset_key",
     "build_object_key",
+    "build_parse_md_key",
     "build_preview_key",
+    "build_query_image_key",
     "get_object_storage",
     "get_object_storage_for",
     "normalize_asset_ext",

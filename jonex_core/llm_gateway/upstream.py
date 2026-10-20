@@ -16,10 +16,41 @@ import httpx
 from fastapi import Request
 
 from jonex_core.common.config import get_config
-from jonex_core.llm_gateway.context import MeteringContext
+from jonex_core.common.monitor_collector import attempt_span
+from jonex_core.llm_gateway.context import MeteringContext, derive_request_id
 from jonex_core.llm_gateway.rerank_profiles import get_profile
 
 logger = logging.getLogger("llm_gateway")
+
+
+class UpstreamError(RuntimeError):
+    """上游在**首字节前**返回 >=400（流式路径）。
+
+    旧行为是 ``proxy_stream`` 直接 ``return`` —— 流**安静结束**，客户端当正常答完，
+    计量侧也照常记成功（失真）。改为抛本异常：调用方据此记 ``failed`` 并让流中断，
+    客户端能看到失败 —— 与「网络断线」路径早已在跑的行为一致。
+
+    ``status_code`` 供采集侧填 ``error_code``；``message`` 是截断后的上游响应文本。
+    """
+
+    def __init__(self, status_code: int, message: str = ""):
+        self.status_code = int(status_code)
+        self.message = message or ""
+        super().__init__(f"upstream returned {self.status_code}: {self.message}")
+
+
+def _seal_final(att) -> None:
+    """把当前 Attempt 标为「本次逻辑调用的最后一次尝试」。
+
+    ``attempt_span`` 只在**进入**时接收 ``is_final``，而「是否最后一次」必须等上游
+    响应到手才知道（成功即终止；失败还要看是否还有重试额度 / 预算），
+    故由冻结接口的 ``mark_final()`` 承担（采集是旁路，兜一层异常）。
+
+    """
+    try:
+        att.mark_final()
+    except Exception:  # pragma: no cover - 采集是旁路，绝不冒到主链路
+        logger.exception("N2 Attempt is_final 标记失败（已吞异常）")
 
 
 # 预留：按 model 名细化到多上游的映射表
@@ -198,51 +229,67 @@ async def proxy_nonstream(
     total_waited = 0.0
     resp = None
     t_attempt = t0  # 每次 attempt 的真实请求计时起点（不含重试 sleep）
+    # N2（monitor.call_attempt）埋点：与计量同一幂等键，同一逻辑调用的重试稳定
+    monitor_request_id = derive_request_id(ctx, body)
+    wait_before_ms = None  # 进入本次 attempt 前的等待毫秒数；首次无等待
 
     while True:
         # 每次 attempt 独立 try/except；网络异常不重试直接返回 502
         t_attempt = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=cfg.LLMGW_REQUEST_TIMEOUT) as cli:
-                resp = await cli.post(
-                    url,
-                    json=body,
-                    headers=upstream_headers(key, request),
+        with attempt_span(
+            request_id=monitor_request_id,
+            tenant_id=ctx.tenant_id,
+            attempt_no=attempt + 1,  # 物理尝试从 1 起（attempt 变量从 0 起）
+            is_final=attempt >= max_retries,  # 无重试额度时本次必为末次；成功时下面补正
+            wait_before_ms=wait_before_ms,
+        ) as att:
+            try:
+                async with httpx.AsyncClient(timeout=cfg.LLMGW_REQUEST_TIMEOUT) as cli:
+                    resp = await cli.post(
+                        url,
+                        json=body,
+                        headers=upstream_headers(key, request),
+                    )
+            except Exception as e:
+                latency_ms = int((time.monotonic() - t_attempt) * 1000)
+                att.fail(error_code=502, error_message=e)
+                _seal_final(att)
+                logger.exception(
+                    "上游请求异常 | req_id=%s url=%s latency_ms=%s err=%s",
+                    ctx.request_id, url, latency_ms, e,
                 )
-        except Exception as e:
-            latency_ms = int((time.monotonic() - t_attempt) * 1000)
-            logger.exception(
-                "上游请求异常 | req_id=%s url=%s latency_ms=%s err=%s",
-                ctx.request_id, url, latency_ms, e,
-            )
-            return (
-                {"error": {"message": f"upstream request failed: {e}", "type": "upstream_error"}},
-                502,
-                latency_ms,
-            )
+                return (
+                    {"error": {"message": f"upstream request failed: {e}", "type": "upstream_error"}},
+                    502,
+                    latency_ms,
+                )
 
-        # 限流且未达重试上限 → 计算退避并重试
-        if retry_enabled and resp.status_code in retry_statuses and attempt < max_retries:
-            wait = _decide_wait(resp, attempt, cfg)
-            if total_waited + wait <= total_budget:
-                logger.warning(
-                    "upstream 429 retry | req_id=%s attempt=%d/%d wait=%.1fs "
-                    "total_waited=%.1fs retry_after=%s",
-                    ctx.request_id, attempt + 1, max_retries, wait, total_waited,
-                    resp.headers.get("Retry-After"),
-                )
-                await asyncio.sleep(wait)
-                total_waited += wait
-                attempt += 1
-                continue
-            else:
+            # 限流且未达重试上限 → 计算退避并重试
+            if retry_enabled and resp.status_code in retry_statuses and attempt < max_retries:
+                wait = _decide_wait(resp, attempt, cfg)
+                if total_waited + wait <= total_budget:
+                    att.fail(error_code=resp.status_code)  # 本次尝试失败，还要重试
+                    logger.warning(
+                        "upstream 429 retry | req_id=%s attempt=%d/%d wait=%.1fs "
+                        "total_waited=%.1fs retry_after=%s",
+                        ctx.request_id, attempt + 1, max_retries, wait, total_waited,
+                        resp.headers.get("Retry-After"),
+                    )
+                    await asyncio.sleep(wait)
+                    total_waited += wait
+                    attempt += 1
+                    wait_before_ms = int(wait * 1000)
+                    continue
                 logger.warning(
                     "upstream 429 giving_up=budget_exceeded | req_id=%s attempt=%d/%d "
                     "total_waited=%.1fs budget=%.1fs wait_needed=%.1fs retry_after=%s",
                     ctx.request_id, attempt + 1, max_retries, total_waited, total_budget,
                     wait, resp.headers.get("Retry-After"),
                 )
-        break
+            if resp.status_code >= 400:
+                att.fail(error_code=resp.status_code)  # 走到这里 = 不再重试的末次失败
+            _seal_final(att)
+            break
 
     # latency_ms = 最后一次 attempt 的真实请求耗时（不含重试 sleep），
     # 避免把 60s 等待污染延迟看板；total_wall_ms 保留全貌供排障。
@@ -311,46 +358,62 @@ async def proxy_stream(
 
     attempt = 0
     total_waited = 0.0
+    # N2（monitor.call_attempt）埋点：与计量同一幂等键，同一逻辑调用的重试稳定
+    monitor_request_id = derive_request_id(ctx, body)
+    wait_before_ms = None  # 进入本次 attempt 前的等待毫秒数；首次无等待
 
     async with httpx.AsyncClient(timeout=cfg.LLMGW_REQUEST_TIMEOUT) as cli:
         while True:
-            # 手动 build_request + send（不用 async with cli.stream，否则无法 continue 外层 while）
-            try:
-                req = cli.build_request(
-                    "POST", url,
-                    json=body,
-                    headers=upstream_headers(key, request),
-                )
-                resp = await cli.send(req, stream=True)
-            except Exception as e:
-                logger.exception(
-                    "上游流式请求异常 | req_id=%s url=%s err=%s", ctx.request_id, url, e,
-                )
-                raise
-
-            # 首字节前：429 且未达上限 → 关掉本次响应并重试
-            if retry_enabled and resp.status_code in retry_statuses and attempt < max_retries:
-                wait = _decide_wait(resp, attempt, cfg)
-                if total_waited + wait <= total_budget:
-                    logger.warning(
-                        "upstream 429 retry(stream) | req_id=%s attempt=%d/%d wait=%.1fs "
-                        "total_waited=%.1fs retry_after=%s",
-                        ctx.request_id, attempt + 1, max_retries, wait, total_waited,
-                        resp.headers.get("Retry-After"),
+            with attempt_span(
+                request_id=monitor_request_id,
+                tenant_id=ctx.tenant_id,
+                attempt_no=attempt + 1,  # 物理尝试从 1 起（attempt 变量从 0 起）
+                is_final=attempt >= max_retries,  # 无重试额度时本次必为末次；成功时下面补正
+                wait_before_ms=wait_before_ms,
+            ) as att:
+                # 手动 build_request + send（不用 async with cli.stream，否则无法 continue 外层 while）
+                try:
+                    req = cli.build_request(
+                        "POST", url,
+                        json=body,
+                        headers=upstream_headers(key, request),
                     )
-                    await resp.aclose()
-                    await asyncio.sleep(wait)
-                    total_waited += wait
-                    attempt += 1
-                    continue
-                else:
+                    resp = await cli.send(req, stream=True)
+                except Exception as e:
+                    att.fail(error_code=502, error_message=e)
+                    _seal_final(att)
+                    logger.exception(
+                        "上游流式请求异常 | req_id=%s url=%s err=%s", ctx.request_id, url, e,
+                    )
+                    raise
+
+                # 首字节前：429 且未达上限 → 关掉本次响应并重试
+                if retry_enabled and resp.status_code in retry_statuses and attempt < max_retries:
+                    wait = _decide_wait(resp, attempt, cfg)
+                    if total_waited + wait <= total_budget:
+                        att.fail(error_code=resp.status_code)  # 本次尝试失败，还要重试
+                        logger.warning(
+                            "upstream 429 retry(stream) | req_id=%s attempt=%d/%d wait=%.1fs "
+                            "total_waited=%.1fs retry_after=%s",
+                            ctx.request_id, attempt + 1, max_retries, wait, total_waited,
+                            resp.headers.get("Retry-After"),
+                        )
+                        await resp.aclose()
+                        await asyncio.sleep(wait)
+                        total_waited += wait
+                        attempt += 1
+                        wait_before_ms = int(wait * 1000)
+                        continue
                     logger.warning(
                         "upstream 429 giving_up=budget_exceeded(stream) | req_id=%s attempt=%d/%d "
                         "total_waited=%.1fs budget=%.1fs wait_needed=%.1fs retry_after=%s",
                         ctx.request_id, attempt + 1, max_retries, total_waited, total_budget,
                         wait, resp.headers.get("Retry-After"),
                     )
-            break
+                if resp.status_code >= 400:
+                    att.fail(error_code=resp.status_code)  # 走到这里 = 不再重试的末次失败
+                _seal_final(att)
+                break
 
         # 最终响应（2xx 或耗尽后的错误）
         if resp.status_code >= 400:
@@ -371,8 +434,12 @@ async def proxy_stream(
                     "retry_after": resp.headers.get("Retry-After"),
                 },
             )
-            # aread() 已消费 body，与旧行为一致：错误时不向客户端 yield chunks
-            return
+            # aread() 已消费 body，不向客户端 yield 任何 chunk；改为**抛异常**而非
+            # 安静 return —— 否则流就此结束，客户端当正常答完、采集侧也照记成功。
+            raise UpstreamError(
+                status_code=resp.status_code,
+                message=err_body.decode("utf-8", "replace"),
+            )
 
         async for chunk in resp.aiter_bytes():
             yield chunk

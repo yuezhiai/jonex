@@ -577,14 +577,20 @@ class LightRAGAdapterV2(BaseRAGCapability):
         knowledge_base_id: str = "",
         file_path: str = "",
         ontology_schema: Optional[dict] = None,
+        engine_chunks: Optional[list] = None,
     ) -> Optional[dict]:
-        """重新触发本体抽取（含幂等保护）。对应 action retry_ontology_extract。"""
+        """重新触发本体抽取（含幂等保护）。对应 action retry_ontology_extract。
+
+        engine_chunks: 引擎全量 chunk（rag 链恒 None ⇒ 不加键）。
+        """
         payload = {
             "document_id": document_id,
             "knowledge_base_id": knowledge_base_id,
             "file_path": file_path,
             "ontology_schema": ontology_schema,
         }
+        if engine_chunks:
+            payload["engine_chunks"] = engine_chunks
         return self._unwrap(
             await self._dispatch("retry_ontology_extract", payload, tenant_id),
             "retry_ontology_extract",

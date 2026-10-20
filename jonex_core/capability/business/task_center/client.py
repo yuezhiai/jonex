@@ -14,7 +14,8 @@ ABC 里：**方法名都在，但"谁实现、谁调用"是反的**，别搞混�
 | 方向 | 方法 | 谁实现 | 谁调用 | 归哪节 |
 | --- | --- | --- | --- | --- |
 | **运行方 → 任务中心** | `init_task` / `report_status` / `retry_subtask` / `retry_subtasks` | 任务中心（管理方） | **运行方** | §4.2 |
-| **任务中心 → 运行方** | `execute` / `remove_task` | **运行方** | 任务中心（管理方） | §4.1 |
+| **任务中心 → 运行方** | `execute` / `remove_task` / `task_stopped` | **运行方** | 任务中心（管理方） | §4.1 |
+| **任务中心 → 运行方**（读） | `query_step_status` | **运行方**（可不实现） | 任务中心（管理方） | §4.1 ④ |
 
 - **运行方**：拿 `get_task_center_client()` **调** `init_task` / `report_status`
   / `retry_subtask` / `retry_subtasks`；同时**在自己那边实现** `execute` / `remove_task`（§4.1，这是接入门槛）；
@@ -246,6 +247,7 @@ class TaskCenterClient(ABC):
         name: Optional[str] = None,
         operator_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        task_source: Optional[str] = None,
     ) -> ApiResponse[TaskItemResponse]:
         """**初始化一条任务**（§4.2 ②）：`data` 是 `TaskItemResponse`。
 
@@ -279,6 +281,13 @@ class TaskCenterClient(ABC):
         `tasks.created_by`。**纯记账** —— 不校验、不参与任何判定，拿不到就留空
         （触发器自动触发、内部系统调用本来就没有人，空着是对的，不是漏记）。
 
+        **`task_source` = 任务来源**（2026-10-13 加）：∈ 协议层 `TASK_SOURCES`
+        （写死枚举，如 `knowledge_base.file.manual_upload`），管理方原样落 `tasks.task_source`。
+        标注 `Optional` 只是签名兼容；**这条路（`init_task`）上它是必传的** ——
+        `TaskRuntime.submit` 出站前判一次、管理方收到再判一次（域外值 1001）。
+        ⚠️ **它必须走 `data` 这条通道**（同 `operator_id` / `task_id`）：local 模式下
+        `data` 是三层 client 唯一共用的通道，塞报文体顶层会丢。
+
         **超时**（只对 `mode: remote` 有意义）：用 `TASK_CENTER_CLIENT_INIT_TASK_TIMEOUT`
         （默认 5 秒），**不是** `TASK_CENTER_CLIENT_TIMEOUT`（默认 30 秒）—— 后者管的是
         `report_status` 那条。单独给一个更短的值，是因为**上传路径是在事务里调它的**：
@@ -298,8 +307,18 @@ class TaskCenterClient(ABC):
         error_message: Optional[str] = None,
         ts: Optional[int] = None,
         output_refs: Optional[List[Dict[str, Any]]] = None,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+        input_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> ApiResponse[None]:
         """上报结果（**运行方改状态的唯一入口**，§4.2 ①）：`data` 为空。
+
+        ⚠️ **`error_code` / `error_params`（2026-10-10 加）**：失败原因的**代号 + 参数**。
+        代号取自协议层写死的枚举 `ERROR_REASON_CODES`（**域外值当场拒**，不允许运行方乱填），
+        管理方存下来、**读的时候**按请求的 `X-Lang` 现场渲染 —— 写上报的往往是后台循环，
+        那一刻没有请求上下文、`translate()` 只能拿到默认语言，所以「写的那一刻就翻译」
+        会把语言冻住（这是它存在的唯一理由）。`error_message` 仍然要带（引擎自由文本 /
+        排障快照 / 老数据兜底）。
 
         **入参全部平铺**（没有 `event` 这层嵌套），`execution_id` 是定位符 ——
         管理方按 `tenant_id` + `space_id` + `execution_id`（三者缺一不可）定位到唯一那一行
@@ -314,6 +333,10 @@ class TaskCenterClient(ABC):
         - `outputs`：`status=success` 时必带（**契约字段**：下游 `@节点.outputs.x` 取的就是它）；
         - `output_refs`：可选，产出「**去哪儿看**」的引用（对象数组，展示用、**不参与取参**）——
           管理方只搬运、原样回给控制台；`kind` / `label` / `href` 由运行方自定义，未知键忽略；
+        - `input_refs`：可选，输入「**从哪儿来**」的引用（同款对象数组，展示用、**不参与取参**）——
+          元素只有 `kind` + `params`，`kind` 必须 ∈ 协议层 `INPUT_REF_PARAMS`（写死枚举，
+          **值要带运行方前缀**，如 `knowledge_base.document`）；管理方只搬运、原样回给控制台。
+          **可选**是给老运行方留的：不带照常受理（设成必填会把失败上报本身拒掉）；
         - `error_message`：`status=failed` 时必带；
         - `ts`：运行方侧的事件时间（13 位毫秒时间戳）—— 管理方**只落库留痕**
           （`subtask_reports.ts` 一列，**不打日志**）、**不参与任何裁决**
@@ -403,8 +426,25 @@ class TaskCenterClient(ABC):
            白跑，直接拒，让调用方先去解决上游。
 
         `success` 那一步**也允许重试**（「重跑这一步」就是这么用的）：新的产出会**覆盖**
-        旧的；但**已经 `success` 的下游不会自动重跑**（它们依赖一直满足、不会再被派活），
-        要连带刷新下游得整条任务重跑。
+        旧的；**依赖它的下游会跟着一起重跑**（见下）。
+
+        ── **连带下游**（2026-10-11 起）──
+
+        点某一步重跑时，**依赖它的下游会被一起重置、按原顺序重跑**。因为下游的入参是从
+        上游产出里按 `bind_inputs` 填出来的：上游出了新产出、下游还用旧的，整条链就是
+        「上游新、下游旧」，而调用方**看不出来**（下游那一步还是 `success`）。
+
+        前提因此变成**两条**：
+
+        · **上游必须 `success`**（原来那条，没变）；
+        · **下游必须都已经是终态**（`success` / `failed` / `timeout`）—— 有任何一个下游
+          还在 `pending` / `running`，整次重跑被**明确拒绝**（它正拿着上一轮的输入在跑，
+          这时候把上游重做一遍，两边就对不上了）。
+
+        返回的仍是**起点那一步**的快照；被连带重置的下游不在返回里（要看它们的新状态
+        请查子任务列表）。
+
+        验证与重置**全程在任务锁内、同一个事务**：要么整批重置、要么一个字不动。
 
         ── 幂等：**上一次其实成了、只是响应没回来，也一样回成功** ──
 
@@ -565,6 +605,7 @@ class _TaskCenterActions(ABC):
         name=None,
         operator_id=None,
         task_id=None,
+        task_source=None,
     ):
         return await self._call(
             tenant_id,
@@ -582,6 +623,9 @@ class _TaskCenterActions(ABC):
                 # 调用方自己生成的 id（不传/传 `None` = 管理方生成）。同样只有 `data`
                 # 这一条通道 —— 塞报文体顶层在 local 模式下会丢。
                 "task_id": task_id,
+                # 任务来源（协议层写死枚举），管理方落 `tasks.task_source`。
+                # 同上：只有 `data` 这一条通道。
+                "task_source": task_source,
             },
         )
 
@@ -596,6 +640,9 @@ class _TaskCenterActions(ABC):
         error_message=None,
         ts=None,
         output_refs=None,
+        error_code=None,
+        error_params=None,
+        input_refs=None,
     ):
         return await self._call(
             tenant_id,
@@ -609,8 +656,16 @@ class _TaskCenterActions(ABC):
                 "status": status,
                 "outputs": outputs,
                 "error_message": error_message,
+                # 失败原因的代号 + 参数（可选）：管理方存下来、读时按 `X-Lang` 渲染。
+                # 不传（老运行方）就只落 `error_message`，行为一字不变。
+                "error_code": error_code,
+                "error_params": error_params,
                 "ts": ts,
                 "output_refs": output_refs,
+                # 输入「从哪儿来」的引用（可选，与 `output_refs` 对称的那份）。
+                # 新字段一律加在末尾：上面那几个是**承重的位置参数**（见 `ports.py`），
+                # 插在中间就等于重排。
+                "input_refs": input_refs,
             },
         )
 
@@ -970,6 +1025,7 @@ class MockTaskCenterClient(_TaskCenterActions, TaskCenterClient):
         space_id: Optional[str] = None,
         status: str = "pending",
         task_name: Optional[str] = None,
+        task_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """凑一个 `TaskItemResponse` 形状（键跟 DTO 对齐，接入方离线联调取值得走得通）。"""
         return {
@@ -980,6 +1036,7 @@ class MockTaskCenterClient(_TaskCenterActions, TaskCenterClient):
             "space_id": space_id,
             "task_name": task_name,
             "trigger_id": None,
+            "task_source": task_source,
             "inputs": {},
             "current_attempt": 1,
             "status": status,
@@ -1052,6 +1109,9 @@ class MockTaskCenterClient(_TaskCenterActions, TaskCenterClient):
                     definition_id=data.get("definition_id") or "mock-def",
                     space_id=data.get("space_id"),
                     task_name=data.get("name"),
+                    # 来源也原样回（同 `task_id` 那条理由：真实现落库后原样回，
+                    # 桩不回的话接入方在 mock 下取不到值）。
+                    task_source=data.get("task_source"),
                 )
             )
         # ⚠️ **两个读也必须回形状对得上的 dict，`data=None` 是错的** —— 与上面

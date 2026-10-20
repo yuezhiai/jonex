@@ -245,6 +245,14 @@ class KeycloakSettings(BaseSettings):
     # 公网目标不受影响，仍走全量 SSRF 校验；白名单为空 = 保持默认全阻断。
     IDENTITY_INTEGRATION_ALLOWED_HOSTS: str = ""
 
+    # ── 知识库数据源出站白名单（P2 / RC-C，SSRF 修复）──
+    # 逗号分隔的 host 列表（不含 scheme 与端口，如 "minio.internal,10.20.0.5"）。
+    # KB 数据源（api / storage）出站默认走**严格档**（``validate_kb_ingestion_url``：
+    # 阻断私网 / 回环 / 链路本地 / 云元数据），命中的目标跳过网段检查。
+    # 这是**安全默认**下的逃生阀：私有化部署确实要拉内网源时，由部署方逐个显式登记
+    # 主机名，而不是把整类私网地址放开。公网目标不受影响；为空 = 保持默认全阻断。
+    KB_INGESTION_ALLOWED_HOSTS: str = ""
+
     @validator("*", pre=True)
     def _blank_env_falls_back_to_default(cls, v, values, field):
         """空串 / 纯空白串 → 回退该字段**自己的默认值**（仅白名单内的 int/bool 字段）。
@@ -282,6 +290,16 @@ class KeycloakSettings(BaseSettings):
         return [
             h.strip().lower()
             for h in self.IDENTITY_INTEGRATION_ALLOWED_HOSTS.split(",")
+            if h.strip()
+        ]
+
+    @property
+    def kb_ingestion_allowed_hosts(self) -> list[str]:
+        if not self.KB_INGESTION_ALLOWED_HOSTS:
+            return []
+        return [
+            h.strip().lower()
+            for h in self.KB_INGESTION_ALLOWED_HOSTS.split(",")
             if h.strip()
         ]
 
@@ -469,6 +487,28 @@ class AppSettings(BaseSettings):
     CIRCUIT_BREAKER_ENABLED: bool = False
     CIRCUIT_BREAKER_THRESHOLD: int = 5
 
+    # 平台监控采集配置（monitor.call_log / monitor.call_attempt 异步写口）
+    # ⚠️ 独立队列，**不与审计队列共享 maxsize**（一个卡住不牵另一个）
+    MONITOR_COLLECT_ENABLED: bool = True
+    MONITOR_QUEUE_MAX_SIZE: int = 10000
+    MONITOR_FLUSH_BATCH_SIZE: int = 100
+    MONITOR_FLUSH_INTERVAL_MS: int = 200
+    # 「系统后台发起」的场景标签表（逗号分隔）。命中即 trigger_type=system，
+    # 其余算 user。默认只收**入库侧批量**场景（文档向量化 / 本体抽取）——
+    # 检索链路（ontology_qa / rag_fusion 等）由用户提问触发，归 user。
+    # 新场景上线后在此补一行即可，不必改代码。
+    MONITOR_SYSTEM_SCENES: str = (
+        "lightrag_embed,ontology_embed,ontology_extract,lightrag_extract"
+    )
+    # 明细表保留期（天）。<= 0 = 不清理（0 不是「立即删除」）。
+    # 与 AUDIT_RETENTION_DAYS 对齐：监控明细同属运维数据，保留 90 天。
+    MONITOR_RETENTION_DAYS: int = 90
+    # 保留清理调度器的轮询间隔（秒）。<= 0 = 显式关闭（本地/测试可关）。
+    MONITOR_RETENTION_SCHEDULER_INTERVAL_SECONDS: int = 86400
+    # 单次查询允许的最大时间跨度（天）。<= 0 = 不限制。
+    # 三族读接口（调用 / 任务 / Token）共用；超限返回 4004（不属于参数格式错误）。
+    MONITOR_QUERY_MAX_RANGE_DAYS: int = 30
+
     # 审计日志配置
     AUDIT_LOG_ENABLED: bool = True
     AUDIT_LOG_ASYNC: bool = True
@@ -477,6 +517,9 @@ class AppSettings(BaseSettings):
     AUDIT_FLUSH_INTERVAL_MS: int = 200
     AUDIT_HTTP_METHODS: str = "POST,PUT,PATCH,DELETE"
     AUDIT_RETENTION_DAYS: int = 90
+    # 审计保留清理调度器的轮询间隔（秒）。**<= 0 = 显式关闭**（不启动后台任务）。
+    # 默认一天一轮：审计日志淘汰是低频维护，没必要更密。
+    AUDIT_RETENTION_SCHEDULER_INTERVAL_SECONDS: int = 86400
     AUDIT_INGEST_URL: str = ""
     # 仅记录关键行为：invoke 能力调用按 payload.action 关键字过滤，
     # 读类动作（list/get/search/query/preview 等）不入库
@@ -505,12 +548,22 @@ class AppSettings(BaseSettings):
     # 能力服务地址
     KNOWLEDGE_BASE_URL: str = "http://localhost:8003"
     BUSINESS_DOMAIN_URL: str = "http://localhost:8005"
+    DATA_GOVERNANCE_URL: str = "http://localhost:8011"
     ATOMIC_RAG_URL: str = "http://localhost:8004"
     PLATFORM_URL: str = "http://localhost:8006"
     OPENKB_URL: str = "http://localhost:7566"  # [jonex]
     JONEX_WIKI_URL: str = "http://localhost:7567"  # [jonex] Sidecar → 适配器容器（实现 /invoke）
     JONEX_WIKI_ENGINE_URL: str = "http://localhost:8007"  # [jonex] 适配器 → 引擎容器（jonex_wiki REST）
     JONEX_WIKI_API_KEY: str = "jonex_wiki_engine_key"  # [jonex] 适配器→引擎内部 key（方案 B 单一 key，与引擎 JONEX_WIKI_API_KEY 一致）
+    ONTOLOGY_COMPILE_URL: str = "http://ontology-compile:8009"  # [jonex] Sidecar → 本体编译独立容器（P2，B1 单容器，实现 /invoke）
+
+    # 注：此处原有 `CONTAINER_REST_ENABLED`（能力容器并行 REST 层开关）。
+    # 该层（kb 84 条 + business_domain 53 条）已于 2026-10 渗透测试整改中
+    # **物理删除**：它不在生产链路上（一律经 Sidecar `/invoke`），却无鉴权且按
+    # 客户端 `X-Tenant-ID` 决定租户，是报告 3.2/3.3/3.4/3.5 的根因。
+    # 开关随实现一并移除 —— 不留「一个 env 就能把攻击面开回来」的隐患。
+    # `platform` 不受影响：它的 `/api/v1/*` 是**生产链路**（Sidecar REST 透传，
+    # 承载登录引导），见 `capabilities/platform/capability.py`。
 
     @property
     def is_production(self) -> bool:
@@ -724,8 +777,8 @@ class TaskCenterSettings(BaseSettings):
     # 基础设施档上报，把那条子任务永久钉在 `running`**：
     #   · 子任务收不掉 → 任务永远不终态 → `retry_task` / `task.delete` 全都要求终态
     #     → **那条任务彻底无法处置**；
-    #   · 那个 `running` 还**占着并发名额**（全平台按 `step_code` 共用额度）→ 攒够上限
-    #     → **这一步全平台派不出活**。
+    #   · 那个 `running` 还**占着并发名额**（按「目录 + `step_code`」共用额度）→ 攒够上限
+    #     → **这一步在本目录派不出活**。
     #
     # 解药：一条上报在收件箱里躺过本值（判据 `now - reported_at`，也就是「它等了多久」），
     # 就**不管是谁的错**一律判死信、让它出队 —— 躺这么久已经不是「等一等就好」，
@@ -752,6 +805,15 @@ class TaskCenterSettings(BaseSettings):
     #
     # ⚠️ **本值只用于这一个动作**：`execute` / `remove_task` 仍用 `TASK_CENTER_RUNNER_TIMEOUT`。
     TASK_CENTER_NOTIFY_TIMEOUT: float = 5.0
+    # **对账（拉）**：子任务派出去多久没消息，才值得主动去问运行方一句（秒，§4.1 ④）。
+    #
+    # 背景：推进编排原来**只能等运行方上报**，上报丢了子任务就挂到编排硬超时（预置 7 小时）。
+    # 现在多一条路 —— 管理方**主动问**（`query_step_status`），问不到下一拍再问，**不存在永久丢**。
+    #
+    # 这个值只决定「**多久算沉默**」，不决定对账本身的节拍：问早一点没有代价（问到就收口、
+    # 问到「还在跑」就再等），唯一的成本是打扰运行方。默认 120 秒 —— 比派活的 30 秒超时宽，
+    # 比谁都短的硬超时（编排 7 小时、看门狗 30 分钟）窄得多。
+    TASK_CENTER_QUERY_QUIET_SEC: int = 120
     # 触发抢占「读—算—写」撞车后的重试次数（§4.3 M5b）：这几步走的是带 `state_version`
     # 条件的更新，命中 0 行说明别的副本刚推过、版本号 +1 了 → 重读再来；试满仍撞车就报冲突。
     TASK_CENTER_CAS_ATTEMPTS: int = 3
@@ -812,6 +874,99 @@ class IdentityIntegrationSettings(BaseSettings):
         env_file = ".env"
 
 
+class ImageQuerySettings(BaseSettings):
+    """以图问知识（图片转查询）的全部配置。
+
+    设计：docs/knowledge-base/image-query-search-execution-plan.md §4-B8 / §2-D5
+
+    ⚠️ 本模块所有 `IMAGE_QUERY_*` 配置**只在这个类里**，不散到别处。
+    网关（`api_gateway`）与知识库能力服务都从 `jonex_core` 取，所以默认值只有这一份
+    —— 两边各写一套默认正是「前端按 4 张判、后端按别的数拒」的来源。
+
+    ⚠️ **`IMAGE_QUERY_VLM_TIMEOUT` 与 `IMAGE_QUERY_GATEWAY_TIMEOUT` 的关系是死约束**，
+    改之前先读那两条的注释。
+    """
+
+    # ── VLM 调用（§4-B1）──
+    # 网关地址 / api key / 模型名：留空则逐级回落
+    # （`ONTOLOGY_LLM_BINDING_HOST` → 容器内默认；模型名 → `VLM_MODEL_NAME`），
+    # 解析逻辑在 `jonex_core/common/vision_llm.py`，这里只做透传。
+    IMAGE_QUERY_VLM_BINDING_HOST: str = ""
+    IMAGE_QUERY_VLM_BINDING_API_KEY: str = ""
+    IMAGE_QUERY_VLM_MODEL: str = ""
+    # 单张识别的超时（秒）。**交互场景**：超时报错，由前端提示「可改用文字检索」，
+    # 不重试、不静默降级成纯文字检索（D2）。
+    #
+    # 取 40s 的依据（B0 实测 2026-10-09）：关思考下单图 3.7~5.3s（素材 498KB~1790KB），
+    # 即约 7.5 倍余量 —— 40 不是「够用」，是「上游抖动时的容忍上限」。
+    # ⚠️ 改大它必须同步 `IMAGE_QUERY_GATEWAY_TIMEOUT`，且要守住两条：
+    #   ① ≤ 部署的 `SIDECAR_PROXY_TIMEOUT`（docker-compose 默认 300，代码默认 180）；
+    #   ② 本地联调要 **< 60s** —— `frontends/dev-gateway/index.js` 的
+    #      `proxyTimeout` / `timeout` 写死 60000，超了会被它先掐成 502（F5）。
+    IMAGE_QUERY_VLM_TIMEOUT: float = 40.0
+    # 一次请求内并行识别的张数。B0 实测 4 张并行无 429 / 限流迹象，墙钟 6.03s。
+    # ⚠️ 调低会让总耗时按 `ceil(MAX_IMAGES / CONCURRENCY)` 翻倍，
+    # 进而顶穿下面那个 55s 的网关超时（本地还会顶穿 dev-gateway 的 60s）。
+    IMAGE_QUERY_VLM_CONCURRENCY: int = 4
+
+    # ── 限制（§2-D5）── 前端内置同样的默认值，但**识别接口回包里的 `limits` 为准**
+    IMAGE_QUERY_MAX_BYTES: int = 5 * 1024 * 1024      # 单张 5MB（压缩后的那份）
+    IMAGE_QUERY_MAX_IMAGES: int = 4                    # 一次检索最多几张
+    IMAGE_QUERY_MAX_TOTAL_BYTES: int = 12 * 1024 * 1024  # 总量 12MB（限制 invoke 报文与 Redis 暂存体积）
+    # 拼接后的查询文本截断上限。检索 DTO 的上限是 2000，这里远小于它是有意的：
+    # 拼进来的主体是「实体 + 提问」，B0 实测 4 图描述拼样仅 177 字。
+    # 截断优先级是「实体完整保留 → 提问 → 描述」（实体打头才不会让本体 exact/prefix
+    # 匹配被长文本挤掉，F11）。
+    IMAGE_QUERY_MAX_QUERY_CHARS: int = 500
+
+    # ── 时效 ──
+    IMAGE_QUERY_CACHE_TTL: int = 86400       # 识别文本缓存（按图 sha256，租户级）
+    IMAGE_QUERY_PENDING_TTL: int = 1800      # 识别后等待保存历史的暂存（30 分钟；过期即丢弃）
+    IMAGE_QUERY_VIEW_TOKEN_TTL: int = 900    # 图片查看票据（与 COS 预签名默认一致）
+
+    # ── 网关侧 ──
+    # 网关调识别 action 的单路由超时 = `VLM_TIMEOUT × ceil(MAX_IMAGES / CONCURRENCY) + 15`。
+    # 按默认值 = 40 × 1 + 15 = 55s。那 15s 是本地解 base64、校验、组报文与回程的余量。
+    # ⚠️ 必须 ≤ 部署的 `SIDECAR_PROXY_TIMEOUT`，且本地 < dev-gateway 的 60s（F5）。
+    IMAGE_QUERY_GATEWAY_TIMEOUT: float = 55.0
+
+    # ── 持久化与兜底清理 ──
+    # 关掉它 = 不暂存、不返回 image_id，退化为「识别文本可用、历史不带图」。
+    # 这是本需求的**回滚开关**（§8）：不需要动检索链路。
+    IMAGE_QUERY_PERSIST_ENABLED: bool = True
+    IMAGE_QUERY_SWEEP_INTERVAL: int = 3600        # 兜底扫描间隔（秒）
+    # 兜底扫描只收「最后一次被引用」早于该时长的无引用图片。
+    # 它只为避开「刚落盘、历史事务还没提交」的窗口；正常路径下图片与历史前后脚提交。
+    IMAGE_QUERY_ORPHAN_GRACE_MINUTES: int = 60
+
+    class Config:
+        env_file = ".env"
+
+
+class DataGovernanceSettings(BaseSettings):
+    """数据治理保留策略的全局默认值（第 3 期）。
+
+    ⚠️ 本模块的 `RETENTION_*` 配置只在这里，不散到别处。
+    解析链路：`data_governance.retention_policy` 三级作用域 → 本类默认值。
+    """
+
+    # 系统默认保留天数。**0 = 不自动到期**（不是「立即删除」）。
+    RETENTION_DEFAULT_DAYS: int = 0
+    # 系统默认宽限天数：到期后进入待删除宽限期，期间仍可恢复。
+    RETENTION_GRACE_DAYS: int = 30
+    # 保留扫描调度器的轮询间隔（秒）。**<= 0 = 显式关闭调度**（不启动后台任务）。
+    RETENTION_SCHEDULER_INTERVAL_SECONDS: int = 3600
+    # 每轮归档候选与销毁候选**各自**最多处理多少条（两个独立批次，不是合计）。
+    # 同租户每轮另有 `max(1, batch // 10)` 的公平性上限（防止大租户积压饿死其它租户）。
+    RETENTION_SCAN_BATCH: int = 200
+    # 同一文档归档/销毁失败后的进程内冷却秒数：冷却期内不再尝试。
+    # ⚠️ 仅进程内状态、不落库，见 `services/retention_scheduler.py` 的「单副本假设」。
+    RETENTION_FAILURE_COOLDOWN_SECONDS: int = 3600
+
+    class Config:
+        env_file = ".env"
+
+
 # ==================== 主配置类 ====================
 class Settings(
     DatabaseSettings,
@@ -826,6 +981,8 @@ class Settings(
     LLMGatewaySettings,
     TaskCenterSettings,
     IdentityIntegrationSettings,
+    ImageQuerySettings,
+    DataGovernanceSettings,
 ):
     """全局配置类"""
 

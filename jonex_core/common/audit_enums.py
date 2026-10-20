@@ -367,6 +367,7 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "get_document": "document",
     "get_document_chunks": "document",
     "get_document_parse_result": "document",
+    "get_document_source_spans": "document",
     "get_document_tags": "document",
     "get_editor_state": "editor_state",
     "get_knowledge_info": "knowledge_info",

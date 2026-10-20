@@ -216,6 +216,58 @@ def generate_view_token(tenant_id: str, doc_id: str, ttl: int = 300) -> str:
     return jwt.encode(payload, cfg.JWT_SECRET, algorithm=cfg.JWT_ALGORITHM)
 
 
+# ── 查询图片（以图问知识）查看短时 token ──
+# 与上面那个原文查看 token 两处关键差异，都是有意为之：
+#   ① **claims 带 user** —— 查询图片按 tenant + user 隔离（D10），只绑租户就等于
+#      同租户任何人拿到链接都能看图；
+#   ② **raw 端点只认 token、不回退 `X-Tenant-ID` 头** —— 原文查看那条回退是历史包袱，
+#      查询图片没有它，少了「无票也能读」的路径。
+_QUERY_IMAGE_TOKEN_SCOPE = "kb_query_image_view"
+
+
+def generate_query_image_token(
+    tenant_id: str, user_id: str, image_id: str, ttl: int = 900
+) -> str:
+    """签发只读、单图、短时效的查询图片查看 token。"""
+    import time
+
+    import jwt
+
+    payload = {
+        "scope": _QUERY_IMAGE_TOKEN_SCOPE,
+        "tid": tenant_id,
+        "uid": user_id,
+        "img": image_id,
+        "exp": int(time.time()) + int(ttl),
+    }
+    cfg = get_config()
+    return jwt.encode(payload, cfg.JWT_SECRET, algorithm=cfg.JWT_ALGORITHM)
+
+
+def verify_query_image_token(token: str) -> dict | None:
+    """校验查询图片查看 token，返回 ``{"tenant_id", "user_id", "image_id"}``；无效返回 None。
+
+    scope 对不上（例如拿原文查看 token 来换）也算无效。
+    """
+    if not token:
+        return None
+    import jwt
+
+    cfg = get_config()
+    try:
+        payload = jwt.decode(token, cfg.JWT_SECRET, algorithms=[cfg.JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        return None
+    if payload.get("scope") != _QUERY_IMAGE_TOKEN_SCOPE:
+        return None
+    tid = payload.get("tid")
+    uid = payload.get("uid")
+    img = payload.get("img")
+    if not tid or not uid or not img:
+        return None
+    return {"tenant_id": tid, "user_id": uid, "image_id": img}
+
+
 def verify_view_token(token: str) -> dict | None:
     """校验查看 token，返回 ``{"tenant_id", "doc_id"}``，无效返回 None。"""
     if not token:
@@ -245,6 +297,8 @@ __all__ = [
     "decode_ingest_key",
     "generate_view_token",
     "verify_view_token",
+    "generate_query_image_token",
+    "verify_query_image_token",
     "generate_mcp_key",
     "hash_mcp_key",
     "verify_mcp_key",
