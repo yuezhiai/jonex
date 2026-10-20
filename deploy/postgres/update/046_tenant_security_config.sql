@@ -87,7 +87,13 @@ SELECT 30, 26, 'navigation.tenantSecurity', '/apps/platform-management/tenant-se
        'SafetyCertificateOutlined', NULL, 4, 'tenant:security:read'
 WHERE NOT EXISTS (
     SELECT 1 FROM platform.menus WHERE name = 'navigation.tenantSecurity'
-);
+)
+-- [合并 2026-10-18] 演化台菜单（xgb 线）也用 id=30：本菜单随后被 047 删除并并入
+-- 「系统配置」，故 id 被占时直接跳过，不要撞主键（否则 046 整套迁移中断）。
+AND NOT EXISTS (
+    SELECT 1 FROM platform.menus WHERE id = 30
+)
+ON CONFLICT DO NOTHING;
 
 -- 显式 id 插入后推进序列，避免后续新增菜单撞主键（006 结尾有同类 setval）
 SELECT setval('platform.menus_id_seq', (SELECT COALESCE(MAX(id), 1) FROM platform.menus));
