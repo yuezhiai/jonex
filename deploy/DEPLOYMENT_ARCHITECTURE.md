@@ -65,8 +65,14 @@ PostgreSQL / Redis / Milvus / etcd / MinIO
 
 | 模式 | 对外端口 | 说明 |
 |---|---|---|
-| 生产 | `frontend-gateway:80` 或上层 HTTPS LB | 唯一浏览器入口。后端、能力服务和基础设施仅容器网络访问。 |
-| 开发 | `80`、`8000`、`8001`、`8003`、`8004`、`8005`、`8006`、`9621` | 通过 override 暴露，方便本机调试。 |
+| 生产 | `frontend-gateway:80` / `:443` | 唯一浏览器入口是 gateway。**后端、能力服务和基础设施仅容器网络访问** —— 2026-10 起 `docker-compose.yml` 里这些 `ports:` 已全部移除（渗透测试 RC-B），不再只靠防火墙。 |
+| 开发 | `80`/`443`、`8000`(gateway)、`8001`(sidecar)、`8002`(mcp)、`8003`(kb)、`8004`(atomic-rag)、`8005`(bd)、`8006`(platform)、`8007`(task-center)、`7566`(openkb)、`8788`(llm-gateway，见下注)、`9000`/`9001`(minio)、`9621`(lightrag)、`5432`/`6379`/`19530`/`9091`/`7474`/`7687`(中间件) | **全部只在 `docker-compose.override.yml` 里**，仅 `make up` 加载。 |
+
+> **注**：`llm-gateway` 容器内监听 `8787`，但宿主映射是 **`8788:8787`**（`8787` 常被本机 bun 进程占用）。
+> 因此开发时访问 LLM 网关请用 `http://localhost:8788`，**不是** `8787`。
+>
+> **注**：上述开发端口清单是 `docker compose -f docker-compose.yml -f docker-compose.override.yml config`
+> 的实测结果（22 条）。`make up-prod` / `up-server` **不加载** override，因此生产只剩 gateway 与 39301。
 
 生产浏览器路径：
 

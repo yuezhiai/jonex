@@ -88,6 +88,9 @@ pytest.ini
 # RAG数据
 data/
 
+# 本地测评数据不参与镜像构建
+financebench-eval/
+
 # 文档（递归匹配各层级 README/说明文档）
 docs/
 **/docs/

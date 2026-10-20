@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_hit_event (
     id VARCHAR(64) PRIMARY KEY,
     tenant_id VARCHAR(64) NOT NULL,
     request_id VARCHAR(64) NOT NULL,
-    target_type VARCHAR(16) NOT NULL,
+    -- 32 而非 16：本体命中事件写 'ontology_instance'（17 字符），
+    -- 16 会报 value too long 并连带回滚整批埋点。与 004 全量 DDL 对齐，见 049 增量。
+    target_type VARCHAR(32) NOT NULL,
     target_id VARCHAR(128) NOT NULL,
     entity_type VARCHAR(64),
     canonical_name VARCHAR(256),
@@ -70,7 +72,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_adoption_event (
     tenant_id VARCHAR(64) NOT NULL,
     answer_id VARCHAR(64) NOT NULL,
     request_id VARCHAR(64),
-    target_type VARCHAR(16) NOT NULL,
+    -- 同 search_hit_event.target_type：32 而非 16
+    target_type VARCHAR(32) NOT NULL,
     target_id VARCHAR(128) NOT NULL,
     entity_type VARCHAR(64),
     canonical_name VARCHAR(256),

@@ -89,7 +89,7 @@ PostgreSQL / Redis / Neo4j / Milvus / etcd / MinIO / Keycloak（SSO，独立仓�
 | `knowledge-base-service` | `8003` | 知识库、文档状态机、RAG 接入、Neo4j 本体图、增强搜索、数据源接入。 |
 | `atomic-rag` | `8004` | 多模态解析、RAG 任务、LightRAG 调用、`ontology_data` 产出。 |
 | `business-domain-service` | `8005` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
-| `task-center-service` | `8007` | 任务编排（定义 / 版本 / 发版）、触发、任务与子任务调度。**自己不监听任何 HTTP 业务端点**：只收发对内的函数调用，并出站派活给运行方。对前端唯一的入口是 Gateway 的 `/api/v1/task-center/**`（经 Sidecar `/invoke`），共六个：两个只读接口（任务列表 / 子任务列表）加四个写接口（停止任务 / 停止子任务 / 重试任务 / 重试子任务，统一判 `task_center:write`）；删除 / 详情不开。 |
+| `task-center-service` | `8007` | 任务编排（定义 / 版本 / 发版）、触发、任务与子任务调度。**自己不监听任何 HTTP 业务端点**：只收发对内的函数调用，并出站派活给运行方。对前端唯一的入口是 Gateway 的 `/api/v1/task-center/**`（经 Sidecar `/invoke`），共八个：四个只读（任务列表 / 子任务列表 / 任务详情 / 子任务详情，两个详情与各自的列表行同形）加四个写接口（停止任务 / 停止子任务 / 重试任务 / 重试子任务，统一判 `task_center:write`）；删除 / 详情不开。 |
 | `platform-service` | `8006` | 登录、RBAC、菜单、应用注册、审计、任务。 |
 | `lightrag` | `9621` | 文档索引、RAG 检索、生成、WebUI。 |
 | `neo4j` | `7474`/`7687` dev | 本体 ABox 图存储，承载 `:OntologyEntity` 节点和 `[:ONT_REL]` 边。 |
@@ -191,7 +191,12 @@ Gateway → Sidecar → 能力服务存在两种代理模式，二者都经过 S
 
 - **platform 保持 REST 透传**：它承载认证引导（`/auth/login` 无 token、无租户）和无租户的平台共享元数据（`Application`/`Menu`/`Permission`/`SystemConfig`，走 `*_shared`）。invoke 契约强制 `verify_any_auth` + 必有租户，会把登录和共享元数据接口挡掉，因此 platform 不走 invoke。
 - **业务能力一律走 invoke action 契约**：`business_domain`、`knowledge_base` 等租户业务能力统一经 `/invoke`，由能力内 action 分发承载业务路由，便于按 `capability_id/action` 维度做计量、限流、熔断和流式。
-- 能力容器自身可能仍保留一套并行 REST `api/` 层（`register_routes` 挂在容器端口上），仅用于直连调试；**Gateway 链路不使用它**，以 invoke `execute()` 为唯一权威入口。
+- 能力容器**不再保留**并行 REST `api/` 层（2026-10 渗透测试整改中已物理删除）；**Gateway 链路从来不用它**，以 invoke `execute()` 为唯一权威入口。
+  - **为什么删掉**：`knowledge_base`（84 条）与 `business_domain`（53 条）历史上在 `/invoke` 之外还挂了一层并行 REST（`/api/v1/knowledge-info`、`/api/v1/prompt-templates` 等）。该层**不在生产链路上** —— Gateway 对这两个能力一律经 Sidecar `/invoke`，前端只打网关前缀 —— 却**无任何鉴权**、且按客户端 `X-Tenant-ID` 决定租户；容器端口一旦可达（宿主端口发布，RC-B）即为跨租户读写面（报告 3.2/3.3/3.4/3.5）。
+  - **处置过程**：先加 `CONTAINER_REST_ENABLED` 开关（默认 `false` → 生产不挂载，攻击面 137 → 0，挂载时强制内部服务 JWT），随后**把该层实现（12 文件 / 2295 行）与开关一并物理删除**。删除后「误挂载」从根上不可能，也不再存在「一个 env 就能把攻击面开回来」的隐患。
+  - `platform` **不适用**上述删除 —— 它的 `/api/v1/*` 就是生产链路（上行 REST 透传），必须始终挂载；对它改用「路由清单守卫」测试（`tests/unit/test_container_rest_auth_guard.py`）保证未鉴权路由集合**恰等于**认证引导白名单（11 条 `/api/v1/auth/*`）。
+  - 因此**新增能力 action 时只能加到 `_build_dispatch()`**（`register_routes` 已不再注册任何路由）。若确有「只在容器内被其他服务调用」的需求，同样走 `/invoke`（内部 JWT + 租户取自请求体），例如 `get_compiled_schema_for_extraction`。
+  - 回归闸：`tests/unit/test_container_rest_auth_guard.py` 的 `TestContainerRestLayerRemoved` 锁住「不可导入 / 开关不存在 / 即便写回历史 env 也挂载 0 条路由」。
 - 受控例外见 §6.4（知识库入站推送 `api_push`：免 JWT 公开端点 + 自包含 ingest key 解析真实租户）。
 
 ### 4.2 Sidecar
@@ -253,7 +258,7 @@ capabilities/{capability_name}/
 | `platform` | 登录、用户、角色、权限、菜单、应用、审计、任务调度。 |
 | `business_domain` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
 | `knowledge_base` | 知识库、文档状态机、检索历史、RAG 接入、Neo4j 本体图、增强搜索、数据源接入。 |
-| `task_center` | 任务编排定义与版本（草稿→发布，发布后不可变）、触发、任务 / 子任务 / 尝试记录，以及后台派活与超时巡检。是**管理方**：自己不执行任何一步业务动作、自己不监听 HTTP 端点；对浏览器**只经 Gateway `/api/v1/task-center/**` 开六个口子**（两个只读 + 四个写，见上表 `task-center-service` 那一行）。 |
+| `task_center` | 任务编排定义与版本（草稿→发布，发布后不可变）、触发、任务 / 子任务 / 尝试记录（任务的**来源**记在 `tasks.task_source`，取值是协议层 `TASK_SOURCES` 写死枚举 —— 运行方经 `init_task` 发起时必传，平台侧自己触发的任务留空），以及后台派活与超时巡检。是**管理方**：自己不执行任何一步业务动作、自己不监听 HTTP 端点；对浏览器**只经 Gateway `/api/v1/task-center/**` 开八个口子**（四个只读 + 四个写，见上表 `task-center-service` 那一行）。 |
 
 ---
 
@@ -278,7 +283,7 @@ capabilities/{capability_name}/
 |---|---|
 | `business.knowledge_base.v1` | 知识库业务能力。 |
 | `business.business_domain.v1` | 业务领域能力。 |
-| `business.task_center.v1` | 任务中心能力（编排 / 触发 / 调度）；自己不监听 HTTP 端点，前端只经 Gateway `/api/v1/task-center/**` 的六条路（两个只读 + 停止任务 / 停止子任务 / 重试任务 / 重试子任务）进来。 |
+| `business.task_center.v1` | 任务中心能力（编排 / 触发 / 调度）；自己不监听 HTTP 端点，前端只经 Gateway `/api/v1/task-center/**` 的**八条路**（四个只读 —— 任务列表 / 子任务列表 / 任务详情 / 子任务详情，加四个写 —— 停止任务 / 停止子任务 / 重试任务 / 重试子任务）进来。 |
 | `atomic.rag.lightrag.v1` | 基于 LightRAG 的 RAG 原子能力。 |
 
 ### 5.2 能力 SDK

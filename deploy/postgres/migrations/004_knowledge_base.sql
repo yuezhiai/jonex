@@ -84,6 +84,12 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_info (
 CREATE INDEX IF NOT EXISTS idx_kb_tenant ON knowledge_base.knowledge_info(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_kb_is_deleted ON knowledge_base.knowledge_info(is_deleted);
 CREATE INDEX IF NOT EXISTS idx_kb_space ON knowledge_base.knowledge_info(space_id);
+-- [jonex] 同领域空间内知识库不可重名；软删记录不占名（与 services / folders / tags 同口径）。
+-- 应用层同口径校验见 KnowledgeInfoService._ensure_name_unique；存量库由
+-- deploy/postgres/update/055_knowledge_info_name_unique.sql 补建同名索引。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_info_name_per_space
+    ON knowledge_base.knowledge_info (tenant_id, space_id, name)
+    WHERE is_deleted = 0;
 
 -- ------------------------------------------------------------
 -- 领域服务及其关联
@@ -292,6 +298,60 @@ CREATE INDEX IF NOT EXISTS idx_kb_hist_tenant_user_kb_time
     ON knowledge_base.knowledge_search_history(tenant_id, user_id, knowledge_base_id, searched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_kb_hist_domain_space_id
     ON knowledge_base.knowledge_search_history(domain_space_id) WHERE domain_space_id IS NOT NULL;
+
+-- ------------------------------------------------------------
+-- [jonex] 以图问知识：查询图片表 + 历史-图片关联表
+-- 设计：docs/knowledge-base/image-query-search-execution-plan.md §4-B11
+-- 存量库增量脚本：deploy/postgres/update/045_kb_query_images.sql
+-- 历史表本身一列不加；图片的存活判据是「至少还有一条未删除的历史引用它」
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_query_images (
+    id               VARCHAR(64)  PRIMARY KEY,
+    tenant_id        VARCHAR(64)  NOT NULL,
+    user_id          VARCHAR(128) NOT NULL,
+    storage_backend  VARCHAR(16)  NOT NULL,          -- local / cos / s3（落盘时的全局后端）
+    storage_key      VARCHAR(512) NOT NULL,
+    mime_type        VARCHAR(64)  NOT NULL,          -- magic bytes 判定的真实类型
+    file_size        INTEGER      NOT NULL,
+    sha256           VARCHAR(64)  NOT NULL,
+    recognized_query TEXT,
+    description      TEXT,
+    ocr_text         TEXT,
+    entities         JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    prompt_version   VARCHAR(16),
+    vlm_model        VARCHAR(128),
+    purged_at        TIMESTAMP,                      -- 被判定无引用、软删的时刻
+    object_deleted   SMALLINT     NOT NULL DEFAULT 0, -- 软删后对象已删除为 1；删失败保持 0，兜底扫描补删
+    created_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,  -- 最后一次被引用
+    is_deleted       SMALLINT     NOT NULL DEFAULT 0
+);
+
+-- 同用户同图只存一份（并发落盘靠它兜底：插入撞唯一索引 → 改用已有行）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_qimg_tenant_user_sha
+    ON knowledge_base.knowledge_query_images (tenant_id, user_id, sha256)
+    WHERE is_deleted = 0;
+CREATE INDEX IF NOT EXISTS idx_kb_qimg_sweep
+    ON knowledge_base.knowledge_query_images (updated_at)
+    WHERE is_deleted = 0;
+CREATE INDEX IF NOT EXISTS idx_kb_qimg_pending_object_delete
+    ON knowledge_base.knowledge_query_images (purged_at)
+    WHERE is_deleted = 1 AND object_deleted = 0;
+
+-- 检索历史 ⇄ 查询图片 多对多（关联行不做软删：有效性以历史行 is_deleted 为准）
+CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_search_history_images (
+    history_id  VARCHAR(64)  NOT NULL,
+    image_id    VARCHAR(64)  NOT NULL,
+    tenant_id   VARCHAR(64)  NOT NULL,
+    user_id     VARCHAR(128) NOT NULL,
+    sort_order  SMALLINT     NOT NULL DEFAULT 0,     -- 用户附图顺序
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (history_id, image_id)
+);
+CREATE INDEX IF NOT EXISTS idx_kb_hist_img_image
+    ON knowledge_base.knowledge_search_history_images (image_id);
+CREATE INDEX IF NOT EXISTS idx_kb_hist_img_history
+    ON knowledge_base.knowledge_search_history_images (history_id);
 
 -- ------------------------------------------------------------
 -- KB 数据源实例表（access_type: api / api_push / storage / file）
@@ -698,7 +758,9 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_hit_event (
     id VARCHAR(64) PRIMARY KEY,
     tenant_id VARCHAR(64) NOT NULL,
     request_id VARCHAR(64) NOT NULL,
-    target_type VARCHAR(16) NOT NULL,
+    -- 32 而非 16：写入器对本体命中事件写 'ontology_instance'（17 字符）；
+    -- 16 会让 INSERT 报 value too long，连带回滚同一事务里的步骤/命中/采用事件。
+    target_type VARCHAR(32) NOT NULL,
     target_id VARCHAR(128) NOT NULL,
     entity_type VARCHAR(64),
     canonical_name VARCHAR(256),
@@ -718,7 +780,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_adoption_event (
     tenant_id VARCHAR(64) NOT NULL,
     answer_id VARCHAR(64) NOT NULL,
     request_id VARCHAR(64),
-    target_type VARCHAR(16) NOT NULL,
+    -- 同 search_hit_event.target_type：32 而非 16（'ontology_instance' 17 字符）
+    target_type VARCHAR(32) NOT NULL,
     target_id VARCHAR(128) NOT NULL,
     entity_type VARCHAR(64),
     canonical_name VARCHAR(256),

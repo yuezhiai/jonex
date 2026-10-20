@@ -8,6 +8,23 @@
 #   etcd        3.5.18      (Milvus 硬性要求 ≥3.5.0)
 #   MinIO       2025-04-22  (S3 v4 签名兼容)
 # ============================================================
+# 【宿主端口策略】2026-10 渗透测试 RC-B 修复
+# ------------------------------------------------------------
+# **本文件在生产被加载**（`make up-prod` / `up-server` 只用它），
+# 因此这里**只保留真正的对外入口**：`frontend-gateway` 的 80/443。
+#
+# 其余服务的 `ports:` 一律不在这里发布 —— 容器之间经 `jonex-network`
+# 用服务名（`postgres` / `redis` / `knowledge-base-service` …）互访，
+# 与 `ports:` 无关，删掉不影响任何内部调用（已核对 `deploy/.env`：
+# `DB_HOST=postgres`、`REDIS_URL=redis://redis:6379/0`、`MILVUS_HOST=milvus` …）。
+#
+# 本地调试需要的端口映射在 `docker-compose.override.yml`（仅 `make up` 加载），
+# 因此「生产不发布 / 开发照旧」两边同时成立。
+#
+# 例外与保留：
+#   - `frontend-gateway` 80/443：唯一对外的**用户入口**，保留。
+#   - `identity-sync-gateway` `127.0.0.1:8099`：已绑回环，是正确范式，保留。
+# ============================================================
 
 networks:
   jonex-network:
@@ -55,8 +72,7 @@ services:
     hostname: postgres
     networks:
       - jonex-network
-    ports:
-      - "5432:5432"
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       POSTGRES_USER: ${DB_USERNAME:-jonex}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
@@ -81,16 +97,29 @@ services:
     hostname: redis
     networks:
       - jonex-network
-    ports:
-      - "6379:6379"
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       TZ: Asia/Shanghai
+      # Redis 访问口令。留空 ⇒ 不启用认证（保持既有 dev 行为）。
+      # 生产请在各 profile env 文件里设置 REDIS_PASSWORD，并同步把 REDIS_URL 写成
+      #   redis://:<REDIS_PASSWORD>@redis:6379/0
+      # 否则应用连不上（认证失败）。
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     volumes:
       - jonex-redis-data:/data
       - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    # 仅当 REDIS_PASSWORD 非空时才加 --requirepass，避免空口令把认证搞成半残状态。
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server /usr/local/etc/redis/redis.conf --requirepass "$$REDIS_PASSWORD"
+        fi
+        exec redis-server /usr/local/etc/redis/redis.conf
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # 有口令时必须带 -a，否则 redis-cli ping 返回 NOAUTH、容器永远不健康。
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+--no-auth-warning -a $REDIS_PASSWORD} ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -138,8 +167,13 @@ services:
     networks:
       - jonex-network
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # ⚠️ 生产必须覆盖（`deploy/env/<profile>/.env.<profile>` 里设 MINIO_ROOT_USER /
+      #    MINIO_ROOT_PASSWORD）。默认 minioadmin 仅为兼容既有 dev 与未轮换的 profile；
+      #    这是**已登记的已知风险**（bd jonex-platform-yot）。
+      #    milvus 服务的 MinIO 凭据取自同一组变量（但变量名不同，见 milvus 服务的注释），
+      #    改一处即两者一致。
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       TZ: Asia/Shanghai
     volumes:
       - jonex-minio-data:/minio_data
@@ -160,15 +194,20 @@ services:
     hostname: milvus
     networks:
       - jonex-network
-    ports:
-      - "19530:19530"   # gRPC
-      - "9091:9091"     # HTTP / metrics
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       TZ: Asia/Shanghai
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # ⚠️ 变量名必须用 Milvus 2.5.x 的名字：MILVUS 只认 MINIO_ACCESS_KEY_ID /
+      #    MINIO_SECRET_ACCESS_KEY（见镜像内 /milvus/configs/milvus.yaml 的注释），
+      #    旧名 MINIO_ACCESS_KEY / MINIO_SECRET_KEY 被**静默忽略**、回落到内置默认
+      #    minioadmin/minioadmin。dev 里 MinIO 恰好也是 minioadmin 所以一直蒙对；
+      #    一旦按 RC-F 轮换 MINIO_ROOT_USER/PASSWORD，Milvus 就会
+      #    "The Access Key Id you provided does not exist in our records." 并因
+      #    healthz 持续 Unhealthy 而拖垮 up（实测 2026-10-15）。
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - jonex-milvus-data:/var/lib/milvus
     command: ["milvus", "run", "standalone"]
@@ -201,8 +240,7 @@ services:
     hostname: knowledge-base
     networks:
       - jonex-network
-    ports:
-      - "8003:8000"
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       TZ: Asia/Shanghai
       CAPABILITY_NAME: knowledge_base
@@ -233,7 +271,7 @@ services:
       ONTOLOGY_RECONCILE_DEGRADE_GUARD_THRESHOLD: ${ONTOLOGY_RECONCILE_DEGRADE_GUARD_THRESHOLD:-0.3}
       # Ontology LLM (分流问答)
       ONTOLOGY_LLM_BINDING_HOST: ${ONTOLOGY_LLM_BINDING_HOST:-http://llm-gateway:8787/v1}
-      ONTOLOGY_LLM_BINDING_API_KEY: ${ONTOLOGY_LLM_BINDING_API_KEY:-gw_lightrag}
+      ONTOLOGY_LLM_BINDING_API_KEY: ${ONTOLOGY_LLM_BINDING_API_KEY:-${LLM_BINDING_API_KEY:-}}
       ONTOLOGY_LLM_MODEL: ${ONTOLOGY_LLM_MODEL:-deepseek/deepseek-flash}
       # RAG 降级路径（平台取回答作权）自 2026-09-22 起为唯一路径，原灰度开关已删除
       RAG_ANSWER_MAX_CONTEXT_CHARS: ${RAG_ANSWER_MAX_CONTEXT_CHARS:-12000}
@@ -242,7 +280,7 @@ services:
       # [jonex] §block-packing §10 L2：跨页打包 chunk 引用页精算（页段打分，默认开）
       RAG_REF_PAGE_SCORING_ENABLED: ${RAG_REF_PAGE_SCORING_ENABLED:-true}
       RERANK_BINDING_HOST: ${RERANK_BINDING_HOST:-http://llm-gateway:8787/v1}
-      RERANK_BINDING_API_KEY: ${RERANK_BINDING_API_KEY:-gw_lightrag}
+      RERANK_BINDING_API_KEY: ${RERANK_BINDING_API_KEY:-${LLM_BINDING_API_KEY:-}}
       # [jonex] 默认值改为现网 vLLM 的 served-model-name。旧默认 `awenleven/Qwen3-Reranker-4B:Q4_K_M`
       # 是已下线的 Ollama tag：上游收到不认识的模型名会**回 200 + 空 results**（静默），
       # kb-service 侧只表现成「reranker 返回空结果」→ 统一 rerank 真分覆盖率 0%、整池退化
@@ -275,6 +313,11 @@ services:
       S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-auto}
       S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       KB_INPUT_DIR: /app/inputs               # 与 gateway/atomic-rag 共享上传文件（local 后端原文查看/读取）
+    # [jonex] 以图问知识的 `IMAGE_QUERY_*`（上限 / VLM / 暂存 / 兜底扫描等）**不经这里
+    # 逐个透传** —— 下面这行 env_file 已把整份 deploy/.env 注入本容器（见 .env.example §19）。
+    # 这与 task-center-service 那句注释同一个口径：两处各写一份，改了一处就会忘另一处。
+    # ⚠️ 但 **gateway 没有 env_file**（它只有显式 environment 清单），所以那 5 个
+    # 「网关侧要用的」必须在 gateway 段显式列出来 —— 见下面 gateway 服务里的那段。
     env_file:
       - .env
     volumes:
@@ -320,8 +363,7 @@ services:
     hostname: business-domain
     networks:
       - jonex-network
-    ports:
-      - "8005:8000"
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       TZ: Asia/Shanghai
       CAPABILITY_NAME: business_domain
@@ -334,6 +376,58 @@ services:
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
       SIDECAR_URL: http://sidecar:8000
+      # 审计日志转发到 platform（非 platform 容器必须设置，否则审计静默丢弃）
+      AUDIT_INGEST_URL: http://platform-service:8000
+    env_file:
+      - .env
+    volumes:
+      - jonex-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # ============================================================
+  # 数据治理能力服务（资产目录 + 元数据 + 文档级双向血缘）
+  # ============================================================
+  data-governance-service:
+    build:
+      context: ..
+      dockerfile: deploy/docker/data-governance.Dockerfile
+      args:
+        CAPABILITY_NAME: data_governance
+        PYTHON_BASE: python-base                            # 共享基础镜像
+      additional_contexts:
+        python-base: "docker-image://jonex/python-base:local"
+    container_name: jonex-data-governance
+    hostname: data-governance-service
+    networks:
+      - jonex-network
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
+    environment:
+      TZ: Asia/Shanghai
+      CAPABILITY_NAME: data_governance
+      CAPABILITY_KIND: business
+      SERVICE_PORT: 8000
+      SERVICE_ENDPOINT: http://data-governance-service:8000
+      LOG_LEVEL: INFO
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${DB_USERNAME:-jonex}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
+      DB_NAME: ${DB_NAME:-jonex}
+      REDIS_URL: redis://redis:6379/0
+      SIDECAR_URL: http://sidecar:8000
+      # 血缘来源经 Sidecar 调 business.knowledge_base.v1，内部 key 必须与 Sidecar 一致
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-jonex_test_gateway}
       # 审计日志转发到 platform（非 platform 容器必须设置，否则审计静默丢弃）
       AUDIT_INGEST_URL: http://platform-service:8000
     env_file:
@@ -373,8 +467,7 @@ services:
     hostname: task-center
     networks:
       - jonex-network
-    ports:
-      - "8007:8000"
+    # 不发布宿主端口（生产）：本地调试映射见 docker-compose.override.yml
     environment:
       TZ: Asia/Shanghai
       CAPABILITY_NAME: task_center
@@ -388,6 +481,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       # 派活给运行方（知识库）经 Sidecar 反代
       SIDECAR_URL: http://sidecar:8000
+      # 任务派发使用与 Sidecar/知识库一致的内部认证配置。
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-jonex_test_gateway}
       # 审计日志转发到 platform（非 platform 容器必须设置，否则审计静默丢弃）
       AUDIT_INGEST_URL: http://platform-service:8000
       # 派活目标（business.knowledge_base.v1）的落地方式在这份清单里；
@@ -431,8 +526,9 @@ services:
     hostname: platform
     networks:
       - jonex-network
-    ports:
-      - "8006:8000"
+    # 不发布宿主端口（生产）：platform 的 `/api/v1/*` 是生产链路，但走 443 →
+    # frontend-gateway → gateway → sidecar → platform，容器间用服务名互访，
+    # 无需宿主端口。本地调试映射见 docker-compose.override.yml。
     environment:
       TZ: Asia/Shanghai
       CAPABILITY_NAME: platform
@@ -493,11 +589,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_BASE_URL: http://knowledge-base-service:8000
       BUSINESS_DOMAIN_URL: http://business-domain-service:8000
+      DATA_GOVERNANCE_URL: http://data-governance-service:8000
       TASK_CENTER_URL: http://task-center-service:8000
       ATOMIC_RAG_URL: http://atomic-rag:8000
       PLATFORM_URL: http://platform-service:8000
       OPENKB_URL: http://openkb:7566
       JONEX_WIKI_URL: http://jonex-wiki:8007
+      ONTOLOGY_COMPILE_URL: http://ontology-compile:8009
       # 内部 X-API-Key：Sidecar 是校验方，必须与调用方一致——
       # gateway（Gateway→Sidecar）与 knowledge-base（RAG/openkb/jonex_wiki client→Sidecar）
       # 都发这个 key；与下方 gateway 服务、knowledge_base 服务注入同一值。
@@ -550,9 +648,18 @@ services:
     # Gateway 仅容器间通信，不对外暴露 —— MCP 下载走 COS 直链，前端经 Nginx 反代
     expose:
       - "8000"
+    # ⚠️ gateway 是本文件里**唯一只有显式清单、没有 env_file** 的应用服务。
+    # 因此 `ENV` 必须在这里显式给出：否则 config.ENV 落到字段默认值 "dev"，
+    # **生产也会进开发模式**，使 api_gateway/main.py 的
+    # `X-API-Key: jonex_test_<租户>` 兜底在**前门**放行（渗透报告 RC-E）。
+    # 取值与其余服务**同源**（都来自部署的 .env：开发 dev / 生产 prod），缺省倒向 prod。
+    # ⚠️ **不要**为此给 gateway 加 `env_file: .env`：那会把整份 .env 注入这个前门容器
+    # （变量数 35→305，含 MinIO root / Redis / Keycloak realm admin / 上游 LLM key 等
+    #  29 个它并不读取的凭据），是最小权限上的净损失。
     environment:
       TZ: Asia/Shanghai
       LOG_LEVEL: INFO
+      ENV: ${ENV:-prod}                       # 运行模式（dev/prod），必须由本行显式给出
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USERNAME: ${DB_USERNAME:-jonex}
@@ -585,6 +692,18 @@ services:
       S3_PRESIGN_EXPIRES: ${S3_PRESIGN_EXPIRES:-900}
       # 网关对外公开地址（用于构造文档下载等公开 URL），生产环境需覆盖为实际 IP/域名
       GATEWAY_PUBLIC_BASE_URL: ${GATEWAY_PUBLIC_BASE_URL:-http://localhost:8000}
+      # ── [jonex] 以图问知识（图片转查询）──────────────────────────
+      # 网关**只需要**这五个：三个上限用于在网关侧先挡一道（能力侧会按同一份配置再核），
+      # 超时是识别 action 的单路由预算，票据 TTL 用于给历史条目补签 view_url。
+      # ⚠️ 识别本身不在这里发生 —— 网关只读字节、编码、转发（不落盘，见 B6）。
+      # ⚠️ 这三个上限**必须与 knowledge-base-service 段取同值**：两处不一致正是
+      #    「前端按 4 张判、后端按别的数拒」的来源。
+      IMAGE_QUERY_MAX_IMAGES: ${IMAGE_QUERY_MAX_IMAGES:-4}
+      IMAGE_QUERY_MAX_BYTES: ${IMAGE_QUERY_MAX_BYTES:-5242880}
+      IMAGE_QUERY_MAX_TOTAL_BYTES: ${IMAGE_QUERY_MAX_TOTAL_BYTES:-12582912}
+      # ⚠️ 必须 ≤ 本服务的 GATEWAY_SIDECAR_TIMEOUT，且本地联调要 < dev-gateway 的 60s
+      IMAGE_QUERY_GATEWAY_TIMEOUT: ${IMAGE_QUERY_GATEWAY_TIMEOUT:-55}
+      IMAGE_QUERY_VIEW_TOKEN_TTL: ${IMAGE_QUERY_VIEW_TOKEN_TTL:-900}
     volumes:
       - jonex-logs:/app/logs
       - jonex-rag-inputs:/app/inputs             # 与 atomic-rag 共享上传文件（named volume）
@@ -643,7 +762,7 @@ services:
       LLMGW_RERANK_MAX_DOCS: ${LLMGW_RERANK_MAX_DOCS:-12}
       LLMGW_RERANK_CONCURRENCY: ${LLMGW_RERANK_CONCURRENCY:-4}
       LLMGW_RERANK_TIMEOUT: ${LLMGW_RERANK_TIMEOUT:-30}
-      LLMGW_INTERNAL_TOKENS: ${LLMGW_INTERNAL_TOKENS:-gw_lightrag,gw_platform}
+      LLMGW_INTERNAL_TOKENS: ${LLMGW_INTERNAL_TOKENS:-${LLM_BINDING_API_KEY:-}}
       LLMGW_METERING_ENABLED: ${LLMGW_METERING_ENABLED:-true}
       LLMGW_PG_FLUSH_MAX_ROWS: ${LLMGW_PG_FLUSH_MAX_ROWS:-20}
     env_file:
@@ -974,6 +1093,12 @@ services:
       LIGHTRAG_API_URL: http://lightrag:9621
       LIGHTRAG_API_KEY: ${LIGHTRAG_API_KEY}
       LIGHTRAG_API_TIMEOUT: "300"                 # LightRAG 入库超时（秒）
+      # 容器内地址（与 sidecar 的同名变量一致）：compiled schema 客户端经
+      # knowledge-base 的 /invoke 读取（内部服务 JWT 守卫），**不是** 容器 REST 层。
+      # ⚠️ 必须用服务名 + 容器端口 8000；不要写宿主映射端口（8003 已不再发布）。
+      #    宿主态调试（VSCode 跑 atomic-rag）由 .env.local / config 默认值
+      #    http://localhost:8003 承担 —— 宿主上解析不了 Docker 服务名。
+      KNOWLEDGE_BASE_URL: http://knowledge-base-service:8000
 
       # ---- Webhook 回调 ----
       RAG_WEBHOOK_URL: ${RAG_WEBHOOK_URL:-}       # 处理完成后回调地址（空则不回调）
@@ -983,7 +1108,7 @@ services:
       ONTOLOGY_SCHEMA_PATH: ${ONTOLOGY_SCHEMA_PATH:-/app/deploy/config/ontology/default.yaml}
       ONTOLOGY_EXTRACT_MAX_RETRIES: ${ONTOLOGY_EXTRACT_MAX_RETRIES:-3}
       ONTOLOGY_LLM_BINDING_HOST: ${ONTOLOGY_LLM_BINDING_HOST:-http://llm-gateway:8787/v1}
-      ONTOLOGY_LLM_BINDING_API_KEY: ${ONTOLOGY_LLM_BINDING_API_KEY:-gw_lightrag}
+      ONTOLOGY_LLM_BINDING_API_KEY: ${ONTOLOGY_LLM_BINDING_API_KEY:-${LLM_BINDING_API_KEY:-}}
       ONTOLOGY_LLM_MODEL: ${ONTOLOGY_LLM_MODEL:-deepseek/deepseek-flash}
       ONTOLOGY_LLM_TIMEOUT: ${ONTOLOGY_LLM_TIMEOUT:-60}
       # 独立抽取器单批 LLM 输出 token 上限（P5：4096→8192，§5.4 截断风险）
@@ -1174,6 +1299,9 @@ services:
       - jonex-network
     expose:
       - "8007"                      # 仅容器内，Sidecar 通过此端口调用 /invoke
+    environment:
+      # Short-lived query progress sessions use the same Redis as knowledge-base.
+      REDIS_URL: redis://redis:6379/0
     env_file:
       - .env.jonex_wiki             # 引擎专属环境变量（JONEX_WIKI_* / LLM_BINDING_* / DB_*）
     volumes:
@@ -1193,6 +1321,87 @@ services:
         condition: service_started
 
   # ============================================================
+  # ontology-compile - 本体编译独立容器（P2）：能力 + worker 同进程（8009）
+  # ============================================================
+  # 运行 deploy/docker/ontology-compile.Dockerfile：start_capability.py（8009）。
+  # 无引擎源码、无 GPU、无迁移 —— 只装 jonex_core + 平台依赖。
+  # Sidecar 通过 ONTOLOGY_COMPILE_URL 指向本容器（8009）；能力 ID atomic.ontology_compile.v1。
+  # 端口 8009 没有被任何其它服务用作 SERVICE_PORT/ports，且本服务只 expose 不发布宿主端口
+  # ⇒ 容器网络内无冲突（本文件 :551 的 ONTOLOGY_COMPILE_URL 即指向本容器的 8009）。
+  # 灰度开关是 ONTOLOGY_COMPILE_BACKEND（库级列 + KB 侧接线）；**P4a 2026-10-17 起
+  #   提交默认已是 `ontology_compile`** —— 本容器就是 compile 步的默认执行方
+  #   （回滚 = 设 `ONTOLOGY_COMPILE_BACKEND=rag` + 重启 knowledge-base）。
+  # ============================================================
+  ontology-compile:
+    build:
+      context: ..
+      dockerfile: deploy/docker/ontology-compile.Dockerfile
+      args:
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    container_name: ontology-compile
+    hostname: ontology-compile
+    image: ontology-compile-server
+    networks:
+      - jonex-network
+    expose:
+      - "8009"
+    env_file:
+      - .env.ontology_compile
+    # ⚠ 必须与 atomic-rag **逐值同口径**，否则两边算出的存档目录不同（静默读空，见下）
+    environment:
+      KB_INPUT_DIR: /app/inputs
+      WORKING_DIR: /app/rag_storage
+      # ⚠ 能力清单：locator 找清单的顺序是 CAPABILITY_RUNTIME_FILE → cwd/capability_runtime.yaml
+      #   → 内置默认（**全部 LOCAL**）。容器 WORKDIR=/app、清单却在 /app/deploy/config/
+      #   下 ⇒ 不指这条就**读不到清单**，LOCAL 分支会抛
+      #   OperationNotSupportedError（client.py 有意不静默回落）。
+      #   与 knowledge-base-service / atomic-rag 同款：值 + 挂载**成对**，缺一不可。
+      CAPABILITY_RUNTIME_FILE: /app/config/capability_runtime.yaml
+      # DB 连接：**照房规用 compose 插值拼**（同本文件各能力容器的 `${DB_*}` 注入），
+      #   而不是在 .env.ontology_compile 里写死口令 —— 口令若写死，改 `DB_PASSWORD` 时
+      #   不会被 rotate_secrets 同步（它在 FILL_MISSING_EXCLUDED + ROTATE_REQUIRES_OPT_IN 里），
+      #   容器必然崩循环（`docker compose ps` 永远 Restarting、日志只有连接失败）。
+      #   同类服务上已踩过（见 deploy/README.md）。
+      #   compose 的 `environment:` 优先级高于 `env_file:`，故模板里那行已注释掉。
+      ONTOLOGY_COMPILE_DATABASE_URL: postgresql+asyncpg://${DB_USERNAME:-jonex}:${DB_PASSWORD:-change-me}@postgres:5432/${DB_NAME:-jonex}
+    volumes:
+      # ⚠️ 设计 §4.5：extract_only 要读 atomic-rag 写在共享卷上的表格上下文存档；
+      # 漏了它不报错，只是 _load_table_context 读回 None → P0-b 把有表格的文档判为拒绝重抽。
+      # ✅ 2026-10-16 **真机实测**（controller 已跑，值即下文，照抄）：
+      #   $ docker exec jonex-atomic-rag printenv WORKING_DIR KB_INPUT_DIR RAG_TABLE_CTX_DIR
+      #     /app/rag_storage          ← WORKING_DIR
+      #     /app/inputs               ← KB_INPUT_DIR   （RAG_TABLE_CTX_DIR 未设，无第三行）
+      #   $ docker inspect jonex-atomic-rag --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{println}}{{end}}'
+      #     deploy_jonex-rag-storage -> /app/rag_storage (rw)
+      #     deploy_jonex-rag-inputs  -> /app/inputs      (rw)
+      #   $ docker exec jonex-atomic-rag ls /app/inputs
+      #     _table_ctx  jonex  parsed    ← **_table_ctx 真实存在且非空**
+      # 结论：存档 = `_table_context_dir()` 回落链 RAG_TABLE_CTX_DIR(未设) → KB_INPUT_DIR(= /app/inputs)
+      #       ⇒ 落在 **jonex-rag-inputs** 卷；故本服务必须挂它并设同值 KB_INPUT_DIR。
+      # 挂 rw（非 ro）：本服务在编译时**自己写档**（设计 §4.5）。
+      # ⚠ 存量注释曾把 lightrag 段（compose :914-915 的 /app/data/…）误当 atomic-rag，已订正。
+      - jonex-rag-inputs:/app/inputs
+      - jonex-rag-storage:/app/rag_storage
+      # 与 knowledge-base-service / atomic-rag 同款的两个只读配置挂载（Task 5 补充）：
+      #   ① 能力清单 —— 见上面 CAPABILITY_RUNTIME_FILE 那条（缺它 chunk 自取直接失败）；
+      #   ② TBox yaml —— compiled schema 缺失时 compiled_schema_client 回落它。
+      #      ⚠ 必须**挂载**而不是只靠镜像里 COPY deploy/ 的那一份：同一份 TBox 在
+      #      kb / atomic-rag 两侧都是活挂载，本服务若独用一份烘死的旧副本，
+      #      抽取就会被另一版 TBox 约束（差异静默，只在实体/关系种类上显形）。
+      - ./config/capability_runtime.yaml:/app/config/capability_runtime.yaml:ro
+      - ./config/ontology:/app/deploy/config/ontology:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8009/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ============================================================
   # MCP Server - 知识库 MCP Tool 注册与鉴权
   # ============================================================
   # 配置文件：deploy/.env.mcp（MCP Server 专用，与平台主配置分离）
@@ -1207,8 +1416,9 @@ services:
     hostname: mcp-server
     networks:
       - jonex-network
-    ports:
-      - "8002:8002"
+    # 不发布宿主端口（生产）：MCP 客户端经 443 进来
+    # （deploy/nginx/app-locations.conf 的 `location /mcp` 已 proxy_pass http://mcp-server:8002）。
+    # 本地调试映射见 docker-compose.override.yml。
     env_file:
       - .env.mcp                    # 仅 mcp-server 加载此文件
     healthcheck:
@@ -1234,9 +1444,7 @@ services:
     hostname: neo4j
     networks:
       - jonex-network
-    ports:
-      - "7474:7474"     # dev 期 browser 调试
-      - "7687:7687"     # dev 期 bolt 连接
+    # 不发布宿主端口（生产）：本地调试（browser / bolt）映射见 docker-compose.override.yml
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
       NEO4J_PLUGINS: '["apoc"]'

@@ -39,6 +39,12 @@ services:
   atomic-rag:
     ports:
       - "8004:8000"  # 开发模式对外暴露 atomic-rag 调试端口，不用于前端调用
+    environment:
+      # 本模式下 kb 与各能力服务跑在**宿主机**，故必须覆盖 base 的容器内地址。
+      # 与 sidecar 的 KNOWLEDGE_BASE_URL 保持同值（两者都是「kb 的 /invoke 基址」）。
+      # compiled_schema_client 读的是同一个配置项；不覆盖会连到不存在的
+      # knowledge-base-service 容器 → 静默回落 default.yaml。
+      KNOWLEDGE_BASE_URL: http://host.docker.internal:8003
     extra_hosts:
       - "host.docker.internal:host-gateway"   # 宿主机调试：atomic-rag 可访问宿主服务
       - "lightrag:host-gateway"               # 宿主机调试 LightRAG 时，解析 lightrag → 宿主机
@@ -46,10 +52,19 @@ services:
   knowledge-base-service:
     ports:
       - "8003:8000"  # 开发模式对外暴露知识库服务端口
+    # 注：原 CONTAINER_REST_ENABLED 调试层开关已随该层实现一并删除
+    # （2026-10 渗透测试整改）。直连容器调试请用 `/invoke` + 内部服务 JWT，
+    # 或走 Gateway 前缀 `/api/v1/knowledge-base/**`。
 
   business-domain-service:
     ports:
       - "8005:8000"  # 开发模式对外暴露业务领域服务端口
+    # 注：同上，容器 REST 调试层已删除。走 `/invoke` 或 Gateway
+    # 前缀 `/api/v1/ecosystem/**`。
+
+  data-governance-service:
+    ports:
+      - "8011:8000"  # 开发模式对外暴露数据治理服务端口
 
   task-center-service:
     ports:

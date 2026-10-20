@@ -145,7 +145,11 @@ if [[ $DRY -eq 0 ]]; then
   echo "入口："
   echo "  界面  : http://localhost/core-business/domain-knowledge/$kb_id/compile-results"
   echo "  网关  : http://localhost:8000/docs        Sidecar : http://localhost:8001/docs"
-  echo "  知识库: http://localhost:8003/docs        引擎    : docker exec -it jonex-wiki sh"
+  # 注：知识库的容器并行 REST 层（/api/v1/knowledge-info 等 84 条）已于 2026-10
+  # 渗透测试整改中物理删除，故 8003/docs 现在只列出 /invoke 与 /health —— 直连调试
+  # 请用 POST /invoke（需内部服务 JWT），或走网关前缀 /api/v1/knowledge-base/**。
+  echo "  知识库: http://localhost:8003/docs        （仅 /invoke；REST 层已删除）"
+  echo "  引擎  : docker exec -it jonex-wiki sh"
   echo "  日志  : docker logs -f jonex-wiki        （或 make logs-service SERVICE=jonex-wiki）"
   echo "  基线已记录: $MARKER（下次 --changed 从这里开始算）"
 fi

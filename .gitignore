@@ -203,6 +203,7 @@ frontends/dev-gateway/package-lock.json
 !deploy/.env.mcp.example
 !deploy/.env.openkb.example
 !deploy/.env.jonex_wiki.example
+!deploy/.env.ontology_compile.example
 
 # ===== Reference 引用项目（排除非项目文件） =====
 Reference/Rag-anything/.github/

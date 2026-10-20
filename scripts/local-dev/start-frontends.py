@@ -5,9 +5,14 @@
 """
 import os
 import pathlib
+import shutil
 import signal
 import subprocess
 import sys
+
+# Windows 上 pnpm 是 .cmd 垫片，`Popen(["pnpm", ...])` 会 FileNotFoundError
+# （报「系统找不到指定的文件」，看不出是缺扩展名）——POSIX 上 which 也照样返回它。
+PNPM = shutil.which("pnpm") or "pnpm"
 
 # 仓库根 = 本文件的上两层（scripts/local-dev/ → 仓库根）
 WS = pathlib.Path(__file__).resolve().parents[2]
@@ -23,6 +28,10 @@ APPS = {
 
 
 def start():
+    # 首次运行这两个目录还不存在，open(.../"ab") 与 write_text 会先炸在这儿
+    # （launch.py 里有同样的两行，这里原先漏了）。
+    LOGS.mkdir(parents=True, exist_ok=True)
+    PIDS.mkdir(parents=True, exist_ok=True)
     for app, port in APPS.items():
         pid_file = PIDS / f"fe-{app}.pid"
         if pid_file.exists():
@@ -34,7 +43,7 @@ def start():
                 pid_file.unlink(missing_ok=True)
         log = open(LOGS / f"fe-{app}.log", "ab", buffering=0)
         proc = subprocess.Popen(
-            ["pnpm", "-C", "frontends", "run", "dev:gateway" if app == "dev-gateway" else f"dev:{app}"],
+            [PNPM, "-C", "frontends", "run", "dev:gateway" if app == "dev-gateway" else f"dev:{app}"],
             cwd=WS, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
             start_new_session=True,
         )

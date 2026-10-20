@@ -145,9 +145,9 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('platform:audit:read', '查看审计日志', 'audit_log', 'read', '平台级：审计日志', 'platform'),
     ('platform:task:read', '查看任务', 'task_schedule', 'read', '平台级：任务调度', 'platform'),
     ('platform:task:write', '管理任务', 'task_schedule', 'write', '平台级：任务写', 'platform'),
-    -- [jonex] 全局系统监控（方案 docs/permissions/PERMISSIONS_REDESIGN.md §11.2）。
-    -- 页面当前为占位（研发中），先建码是为了让菜单与角色权限页有真实落点。
-    ('platform:monitor:read', '查看系统监控', 'monitor', 'read', '平台级：全平台服务/任务/组件运行状态', 'platform')
+    -- [jonex] 全局平台监控（方案 docs/permissions/PERMISSIONS_REDESIGN.md §11.2）。
+    -- 页面覆盖全平台的任务 / 调用 / Token 运行状态，名称统一为「平台监控」。
+    ('platform:monitor:read', '查看平台监控', 'monitor', 'read', '平台级：全平台服务/任务/组件运行状态', 'platform')
 ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
 
 -- 兜底：旧种子 6 条废弃 platform:* 码（platform:user/role/app:*）无同名新码覆盖，
@@ -190,7 +190,15 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     -- 与 analytics:read 不同，这两个码**是**接口防线：能力侧 capabilities/task_center 按它们判权
     -- （task.console_page / task.console_subtask_list → read，task.stop → write）。
     ('task_center:read', '查看任务中心', 'task_center', 'read', '租户级：任务中心页面与两个只读接口', 'tenant'),
-    ('task_center:write', '管理任务中心', 'task_center', 'write', '租户级：停止任务（task.stop）', 'tenant')
+    ('task_center:write', '管理任务中心', 'task_center', 'write', '租户级：停止任务（task.stop）', 'tenant'),
+    -- 租户级安全配置（/apps/platform-management/tenant-security，2026-10-10）：
+    -- session_timeout / password_min_length / login_lock_threshold / lock_duration 四个键
+    -- 原先只存在于平台共享表 platform.system_configs（platform:config:* ⇒ 只有平台管理员能改，
+    -- 且改一次全平台生效）。本组码让**租户管理员自助**设置本租户的覆盖值，只影响本租户。
+    -- 与 task_center:* 不同，这两个码**是**接口防线：/tenant-security-config 三个口按它们判权。
+    -- 存量库由 deploy/postgres/update/046_tenant_security_config.sql 补（含授权）。
+    ('tenant:security:read', '查看安全配置', 'tenant_security', 'read', '租户级：本租户安全配置（令牌有效期/密码策略/锁定策略）查看', 'tenant'),
+    ('tenant:security:write', '管理安全配置', 'tenant_security', 'write', '租户级：设置本租户安全配置覆盖值、恢复平台默认', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
 -- RBAC 权限系统：租户业务权限码（scope='tenant'）
@@ -371,30 +379,44 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     -- 平台管理分组 → 数据运营（直接项，按需求排在「账号与权限」之前）
     (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, NULL),
     (29, 5, 'navigation.dataOperations', '/apps/platform-management/data-operations', 'BarChartOutlined', NULL, 1, 'analytics:read'),
+    -- 平台管理分组 → 资产目录（第 2 期数据治理；复用 knowledge:read，不新增权限码）
+    -- id 30 曾在 update/046 中使用（后被 047 删除）；这里取 31，避免全新库迁移链 046 撞主键。
+    (31, 5, 'navigation.dataGovernance', '/apps/platform-management/data-governance/assets', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
     -- 平台管理分组 → 账号与权限组（可折叠）
-    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 2, NULL),
+    (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 3, NULL),
     (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
     (12, 25, 'navigation.userManagement', '/apps/platform-management/user-management', 'UserOutlined', NULL, 2, 'user:read'),
     (13, 25, 'navigation.rolePermission', '/apps/platform-management/role-permission', 'SafetyOutlined', NULL, 3, 'role:read'),
     -- 平台管理分组 → 提示词与模板（直接项）
-    (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 3, 'prompt:read'),
+    (9, 5, 'navigation.promptTemplates', '/apps/ecosystem-management/prompt-templates', 'FileTextOutlined', NULL, 4, 'prompt:read'),
     -- 平台管理分组 → 系统运维组（可折叠）
-    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 4, NULL),
-    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read'),
+    (26, 5, 'navigation.systemOperations', NULL, 'SettingOutlined', NULL, 5, NULL),
+    -- [jonex] 2026-10-10 合并：系统配置页现在同时承载平台块（platform:config:*）与租户块
+    -- （tenant:security:*），所以菜单码挂**两个**（逗号分隔，任一命中即可）——
+    -- `_filter_visible_menus` → `_menu_code_matches`（platform_crud.py）会按逗号拆分后逐个比对。
+    -- 只挂平台码 → 租户管理员侧栏里没有入口（接口通了却没入口）；只挂租户码 →
+    -- 只持平台码的角色看不到（今天靠「平台管理员恰好持全部 tenant 码」侥幸成立，不该依赖它）。
+    (14, 26, 'navigation.systemConfig', '/apps/platform-management/system-config', 'SettingOutlined', NULL, 1, 'platform:config:read,tenant:security:read'),
     -- [jonex] B1：操作日志菜单码由 platform:audit:read 改为 audit:read（tenant scope）。
     -- 接口已改成双码放行（platform:audit:read 或 audit:read），但菜单码若还是平台码，
     -- 租户管理员会被 _filter_visible_menus 裁掉这一项 → 组头「系统运维」也被连带裁掉
     -- → 「接口通了但没有入口」。菜单与接口必须一起改。
     -- 平台管理员天然持全部 tenant 码，所以他仍然看得到。
     (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'audit:read'),
-    -- [jonex] 系统监控：占位页（研发中），与系统配置/操作日志同属系统运维组
-    (28, 26, 'navigation.systemMonitor', '/apps/platform-management/system-monitor', 'DashboardOutlined', NULL, 3, 'platform:monitor:read')
+    -- [jonex] 平台监控：与系统配置/操作日志同属系统运维组
+    (28, 26, 'navigation.platformMonitor', '/apps/platform-management/platform-monitor', 'MonitorOutlined', NULL, 3, 'platform:monitor:read')
+    -- [jonex] 2026-10-10 合并：原有一条独立的「租户安全设置」菜单（navigation.tenantSecurity，
+    -- 指向 /apps/platform-management/tenant-security，码 tenant:security:read）**已删除**。
+    -- 该页并入「系统配置」/apps/platform-management/system-config：同一页按权限分段渲染
+    -- 平台信息 + 平台安全设置（platform:config:*）与租户安全设置（tenant:security:*）。
+    -- 权限码 tenant:security:read/write 保留（接口仍在用），只是不再单独占一个菜单。
+    -- 存量库删这一行见 update/047_merge_tenant_security_menu.sql。
 ON CONFLICT DO NOTHING;
 
--- 隐藏「模型适配」与「系统监控」两个菜单（软删除；恢复时改回 0）
+-- 隐藏「模型适配」菜单（软删除；恢复时改回 0）
 UPDATE platform.menus
 SET is_deleted = 1
-WHERE name IN ('navigation.modelAdapter', 'navigation.systemMonitor');
+WHERE name = 'navigation.modelAdapter';
 
 
 -- 默认应用注册

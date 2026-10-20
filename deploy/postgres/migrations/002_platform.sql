@@ -220,6 +220,26 @@ CREATE TABLE IF NOT EXISTS platform.system_configs (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 租户级安全配置表（只存**覆盖值**；某租户没配过的键在这里没有行）
+-- 读取链：租户覆盖 → 平台默认(system_configs) → 代码默认(SECURITY_CONFIG_DEFAULTS)
+-- 为什么不给上面那张表加 tenant_id：它是平台共享元数据（无 tenant_id、config_key 全局唯一、
+-- 后台用 list_all_shared() 读），混进租户运行数据会同时违反项目规范并让既有读法语义变味。
+-- 唯一键必须是 (tenant_id, config_key)：只按 config_key 唯一会让第一个租户设过之后别人再也设不了。
+CREATE TABLE IF NOT EXISTS platform.tenant_security_configs (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    config_key VARCHAR(128) NOT NULL,
+    config_value TEXT,
+    value_type VARCHAR(32) DEFAULT 'int',
+    description VARCHAR(512),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_tenant_security_configs_tenant_key UNIQUE (tenant_id, config_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_security_configs_tenant
+    ON platform.tenant_security_configs(tenant_id);
+
 -- 审计日志表
 CREATE TABLE IF NOT EXISTS platform.audit_logs (
     id BIGSERIAL PRIMARY KEY,
@@ -380,6 +400,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_scene
     ON metering.llm_usage_log (scene);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_trace
     ON metering.llm_usage_log (trace_id);
+-- ✅ 2026-10-12 拍板：K1–K4 只按时间扫，补独立时间索引（存量库见 update/052）
+CREATE INDEX IF NOT EXISTS idx_llm_usage_created
+    ON metering.llm_usage_log (created_at);
 
 -- 日汇总表（Phase 3）：明细清理后仍可查长期趋势/对账。由手动 `make metering-rollup`
 -- 用 INSERT...SELECT...ON CONFLICT DO UPDATE（整天重聚合、replace 语义、幂等可重跑）刷新。
@@ -511,3 +534,89 @@ CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_tenant
 
 CREATE INDEX IF NOT EXISTS idx_mcp_svc_api_keys_service
     ON platform.mcp_service_api_keys(tenant_id, service_id);
+-- ============================================================
+-- 平台监控 · 外部调用明细（monitor schema，2026-10-12 新增）
+-- 归属：capabilities/platform（monitor 模块），走 Gateway _proxy_platform REST 透传
+-- 增量：deploy/postgres/update/050_platform_monitor.sql（存量库，同逻辑）
+-- N3（Token 幂等）本期不做：metering.llm_usage_log 保持原样
+-- 两表均不建 space_id 列（采 01-SDD §3.4 口径）；保留期 / 分区本期不含
+-- ============================================================
+
+CREATE SCHEMA IF NOT EXISTS monitor;
+
+-- N1：逻辑调用表（一行 = 一次逻辑调用；request_id 在本表内唯一）
+CREATE TABLE IF NOT EXISTS monitor.call_log (
+    id                  BIGSERIAL     PRIMARY KEY,
+    request_id          VARCHAR(64)   NOT NULL,
+    trace_id            VARCHAR(64)   NULL,
+    tenant_id           VARCHAR(64)   NOT NULL,
+    direction           VARCHAR(16)   NOT NULL,
+    source              VARCHAR(128)  NULL,
+    target              VARCHAR(128)  NULL,
+    protocol            VARCHAR(32)   NULL,
+    trigger_type        VARCHAR(16)   NOT NULL DEFAULT 'user',
+    logical_started_at  TIMESTAMPTZ   NULL,
+    final_ended_at      TIMESTAMPTZ   NULL,
+    final_status        VARCHAR(16)   NOT NULL,
+    error_code          VARCHAR(64)   NULL,
+    error_message       TEXT          NULL,
+    attempt_count       INTEGER       NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_monitor_call_log_request_id UNIQUE (request_id),
+    -- 枚举取值集未定（direction / final_status）
+    CONSTRAINT ck_monitor_call_log_direction  CHECK (direction IN ('outbound','inbound')),
+    CONSTRAINT ck_monitor_call_log_final_status
+        CHECK (final_status IN ('success','failed','cancelled','running','unknown')),
+    -- 触发方取值集已定（user 用户直接发起 / system 系统后台批量）
+    CONSTRAINT ck_monitor_call_log_trigger CHECK (trigger_type IN ('user','system'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_tenant_started
+    ON monitor.call_log (tenant_id, logical_started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_trace
+    ON monitor.call_log (trace_id);
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_dir_status_started
+    ON monitor.call_log (direction, final_status, logical_started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_target_started
+    ON monitor.call_log (target, logical_started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_created
+    ON monitor.call_log (created_at DESC);
+-- I9：按触发方（用户/系统后台）筛选 + 时间倒序（调用列表的筛选维度）
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_trigger_started
+    ON monitor.call_log (trigger_type, logical_started_at DESC);
+-- I10：只按时间的范围扫（C5 不传 direction / C6 / 降级判定）；
+--      既有索引时间列均非前导列，无该索引时只能顺扫 90 天明细。
+--      增量：deploy/postgres/update/073_platform_monitor_time_index.sql
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_logical_started
+    ON monitor.call_log (logical_started_at, id);
+
+-- N2：物理 Attempt 表（request_id 不唯一 —— 降级模式取数表）
+CREATE TABLE IF NOT EXISTS monitor.call_attempt (
+    id                  BIGSERIAL     PRIMARY KEY,
+    attempt_id          VARCHAR(64)   NOT NULL,
+    request_id          VARCHAR(64)   NOT NULL,
+    attempt_no          INTEGER       NOT NULL,
+    tenant_id           VARCHAR(64)   NOT NULL,
+    attempt_started_at  TIMESTAMPTZ   NULL,
+    attempt_ended_at    TIMESTAMPTZ   NULL,
+    status              VARCHAR(16)   NOT NULL,
+    error_code          VARCHAR(64)   NULL,
+    error_message       TEXT          NULL,
+    is_final            BOOLEAN       NOT NULL DEFAULT FALSE,
+    wait_before_ms      INTEGER       NULL,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_monitor_call_attempt_id UNIQUE (attempt_id),
+    CONSTRAINT uq_monitor_call_attempt_req_no UNIQUE (request_id, attempt_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_call_attempt_request
+    ON monitor.call_attempt (request_id);
+CREATE INDEX IF NOT EXISTS idx_monitor_call_attempt_started
+    ON monitor.call_attempt (attempt_started_at DESC);
+-- I11：保留期清理按 created_at 分批删除（ORDER BY created_at, id LIMIT :batch）；
+--      attempt_started_at 不是删除锚点，无该索引时 DELETE 会全表扫。
+--      增量：deploy/postgres/update/072_platform_monitor_retention.sql
+CREATE INDEX IF NOT EXISTS idx_monitor_call_attempt_created
+    ON monitor.call_attempt (created_at, id);

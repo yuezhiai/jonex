@@ -91,7 +91,7 @@ LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(
 
 .PHONY: help init version \
 	build-python-base build build-local build-overseas build-gpu build-prod build-server build-infra build-rag build-backend build-frontend build-service build-sidecar build-knowledge-base build-business-domain build-platform \
-	up up-local up-detached up-gpu up-server up-prod up-infra up-rag up-backend up-frontend up-service up-sidecar up-knowledge-base up-business-domain up-platform \
+	up up-local up-detached up-gpu up-server up-prod up-backend up-frontend up-service up-sidecar up-knowledge-base up-business-domain up-platform \
 	down down-local down-gpu down-server down-prod down-v stop stop-service down-service down-gateway down-sidecar down-frontend down-knowledge-base down-business-domain down-platform \
 	restart restart-gpu restart-server restart-prod restart-service recreate-service rebuild-service \
 	ps ps-gpu ps-server ps-prod \
@@ -108,6 +108,7 @@ LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(
 	scale-knowledge-base up-postgres up-redis up-milvus up-lightrag pull-lightrag init-db db-migrate db-migrate-after-up test clean \
 	exec-postgres exec-gateway exec-sidecar exec-knowledge-base exec-business-domain exec-platform exec-lightrag exec-shell-frontend \
 	shell-postgres shell-gateway shell-sidecar shell-knowledge-base shell-business-domain shell-platform shell-lightrag shell-frontend \
+	up-ontology-compile logs-ontology-compile exec-ontology-compile rebuild-ontology-compile \
 	_require-service
 
 # ------------------------------------------------------------
@@ -117,7 +118,7 @@ help: ## 显示帮助信息
 	@echo "=== Jonex 平台 Makefile ==="
 	@echo ""
 	@echo "初始化:"
-	@echo "  make init                         初始化 deploy/.env、deploy/.env.rag、deploy/.env.mcp、前端 .env"
+	@echo "  make init                         初始化 deploy/.env、deploy/.env.rag、deploy/.env.mcp、deploy/.env.openkb、deploy/.env.jonex_wiki、deploy/deploy/.env.ontology_compile、前端 .env"
 	@echo "  make frontends-env                仅初始化各前端子应用的 .env（从 .env.example 复制）"
 	@echo "  make version                      查看 Docker / Compose 版本"
 	@echo ""
@@ -239,7 +240,21 @@ init: ## 初始化环境配置
 	else \
 		echo "Jonex Wiki 配置已存在: deploy/.env.jonex_wiki"; \
 	fi
-	@echo "下一步: 按需修改 deploy/.env、deploy/.env.rag、deploy/.env.mcp、deploy/.env.openkb 和 deploy/.env.jonex_wiki"
+	@if [ ! -f deploy/.env.ontology_compile ]; then \
+		cp deploy/.env.ontology_compile.example deploy/.env.ontology_compile; \
+		echo "已创建 Ontology Compile 配置: deploy/.env.ontology_compile"; \
+	else \
+		echo "Ontology Compile 配置已存在: deploy/.env.ontology_compile"; \
+	fi
+	@# 必须在**全部文件拷齐之后**再做一次整 profile 补齐：脚本的「跨文件同值」不变式
+	@# 只对它拿到的文件生效。逐个文件单独补会制造不一致 —— 例如 INTERNAL_API_KEY 在
+	@# deploy/.env 与 deploy/.env.mcp 各生成一个随机值（mcp-server 401），
+	@# 或 llm-gw 令牌组在本文件与 .env.rag/.env.jonex_wiki 之间分叉。
+	@# `--keep-llmgw-tokens` 让本地 dev 保留公开的 gw_* —— 宿主机调试栈（根级 .env.local
+	@# 与 .vscode/launch.json）依赖它们，而 launch.json 里那份是写死的，承载不了随机 token。
+	@# ⚠️ 生产不要带这个开关。
+	@$(PYTHON) scripts/security/rotate_secrets.py --fill-missing --profile deploy --keep-llmgw-tokens
+	@echo "下一步: 按需修改 deploy/.env、deploy/.env.rag、deploy/.env.mcp、deploy/.env.openbk、deploy/.env.jonex_wiki 和 deploy/.env.ontology_compile"
 	@$(MAKE) frontends-env
 
 frontends-env: ## 初始化各前端子应用 .env
@@ -254,6 +269,21 @@ frontends-env: ## 初始化各前端子应用 .env
 			echo "已存在: frontends/$$app/.env"; \
 		fi; \
 	done
+
+# ------------------------------------------------------------
+# .env 基线校验
+#   init 创建实例、env-check 校验实例与模板的漂移，两者成对使用。
+#   与 .\jonex.ps1 env-check 转调**同一份** deploy/env-check.sh，
+#   Windows 侧经 Resolve-GitBash 定位的 Git Bash 执行，两端输出逐字一致。
+#
+#   ⚠️ 有「缺失/多余」时**故意**以退出码 1 结束（make 会打印 Error 1）——
+#      这是给 pre-commit / CI 留的挂载点，不是故障。「未登记」不计入退出码。
+# ------------------------------------------------------------
+env-check: ## 校验 .env 实例与模板基线的差异（缺失/多余/未登记）
+	@bash deploy/env-check.sh
+
+env-check-all: ## 同 env-check，但列出全部键名（默认按前缀聚合）
+	@bash deploy/env-check.sh --all
 
 version: ## 显示 Docker/Compose 版本
 	@docker --version
@@ -333,12 +363,6 @@ up-server: ## 服务器/生产部署（不含 GPU，仅 docker-compose.yml）
 	$(DOCKER_BASE) up -d
 
 up-prod: up-server ## 别名: 服务器/生产部署
-
-up-infra: ## 只启动中间件
-	$(DOCKER_OVERRIDE) up -d $(MIDDLEWARE_SERVICES)
-
-up-rag: ## 只启动 RAG 服务
-	$(DOCKER_OVERRIDE) up -d $(RAG_SERVICES)
 
 up-backend: ## 只启动后端服务
 	$(DOCKER_OVERRIDE) up -d $(BACKEND_SERVICES)
@@ -505,6 +529,18 @@ exec-jonex-wiki: ## 进入 jonex-wiki 容器
 rebuild-jonex-wiki: ## 重建 jonex-wiki 镜像
 	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build --no-cache jonex-wiki
 
+# ── ontology-compile（P2 独立容器：本体编译能力 + worker 同进程）──
+up-ontology-compile: ## 启动 ontology-compile（本体编译独立容器）
+	$(DOCKER_OVERRIDE) up -d ontology-compile
+
+logs-ontology-compile: ## 查看 ontology-compile 日志
+	@$(MAKE) logs-service SERVICE=ontology-compile
+
+exec-ontology-compile: ## 进入 ontology-compile 容器
+	$(DOCKER_OVERRIDE) exec ontology-compile bash
+
+rebuild-ontology-compile: ## 重建 ontology-compile 镜像
+	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build --no-cache ontology-compile
 logs-postgres: ## 查看 Postgres 日志
 	@$(MAKE) logs-service SERVICE=postgres
 

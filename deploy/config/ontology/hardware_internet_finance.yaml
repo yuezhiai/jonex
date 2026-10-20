@@ -1,0 +1,495 @@
+# ============================================================
+# 硬件互联网上市公司 · 财报分析本体定义（TBox）
+# ============================================================
+# 对应知识库：kb_demo_hw_inet_finance「硬件互联网财报知识库」（租户 tenant_jonex_demo）
+# 来源模板：tpl_domain_hardware_internet「硬件互联网」/ tpl_scenario_hw_inet_finance「财报分析」
+# 版本：模板 v3 / 编译 schema_version 3（source_hash d5e6f7a8…d5e6，schema_mode=template_seeded，
+#       2026-10-14 自 PG knowledge_base.ontology_compiled_schemas 导出，未经页面编辑，
+#       与 deploy/postgres/migrations/006_seed_data.sql §10 种子一致）
+# 语料基线：小米集团 2025 年度报告（股份代号 1810/81810）逆向定义。
+#
+# 规模：19 类实体 / 26 类关系。v3 在 v2（13 类实体 / 16 类关系）基础上补充
+#   地区市场 / 销售渠道 / 子公司 / 风险因素 / 法律诉讼 / 可持续举措 6 类实体与 10 类关系。
+#
+# 字段来源（汇总口径）：
+#   - name / aliases / attributes(name,type,required) / relation(source,target,cardinality,aliases)
+#     取自编译 schema（entity_types / relation_types 列），即该 KB 抽取实际使用的 TBox；
+#   - entity.description / attribute.description / relation.description 取自模板侧
+#     business_domain.template_objects / template_attributes / template_relations 的说明，
+#     格式为「显示名：说明」。
+#   - 实体/关系类型名保持编译 schema 原样（snake_case / UPPER_SNAKE），与该 KB 的 Neo4j
+#     本体图类型名一致——改名会导致存量图谱与新抽取类型分裂。
+#
+# 结构参考 deploy/config/ontology/default.yaml：
+#   - attribute.type 取值：string | text | number | date | enum | boolean
+#   - attribute 只允许 name / type / required / description 四个键（AttributeDef(**a) 构造）；
+#   - 金额类属性统一以「万元」为单位（见 constraints.currency_unit_consistency）。
+#
+# ⚠️ 该 KB 运行时以 PG 编译 schema 为准，本文件是汇总存档 / 离线加载用 TBox，
+#    修改本文件不会自动同步到线上 KB；要生效需走模板发版或 KB 本体编辑。
+
+version: 3
+domain: hardware_internet_finance
+
+entity_types:
+  - name: listed_company
+    display_name: 上市公司
+    description: "财报披露主体（硬件互联网上市公司）"
+    aliases: ["上市公司", "公司", "集团", "发行人", "Issuer"]
+    attributes:
+      - { name: stock_code, type: string, required: true, description: "股票代码：交易所股票代码（如 HK01810）" }
+      - { name: company_name, type: string, required: true, description: "公司名称：公司全称" }
+      - { name: exchange, type: enum, required: false, description: "上市交易所：如港交所、上交所、深交所、纳斯达克" }
+      - { name: industry, type: enum, required: false, description: "所属行业：如硬件互联网、消费电子、智能出行" }
+      - { name: founded_date, type: date, required: false, description: "成立日期：公司成立日期" }
+      - { name: chairman, type: string, required: false, description: "董事长：董事长姓名" }
+      - { name: ceo, type: string, required: false, description: "首席执行官：CEO 姓名" }
+      - { name: headquarters, type: string, required: false, description: "总部：总部所在地" }
+      - { name: company_description, type: text, required: false, description: "公司简介：主营业务与核心竞争力概述" }
+
+  - name: financial_report
+    display_name: 财务报告
+    description: "年度/季度/中期财务报告"
+    aliases: ["财务报告", "财报", "年报", "年度报告", "季报", "中期报告", "Annual Report"]
+    attributes:
+      - { name: report_id, type: string, required: true, description: "报告ID：报告唯一标识" }
+      - { name: report_type, type: enum, required: false, description: "报告类型：annual/quarterly/interim" }
+      - { name: fiscal_year, type: number, required: true, description: "财年：财报所属财年" }
+      - { name: reporting_period, type: string, required: false, description: "报告期：如 2025FY / 2025Q4" }
+      - { name: release_date, type: date, required: false, description: "发布日期：财报发布日期" }
+      - { name: currency, type: string, required: false, description: "币种：如人民币、美元" }
+      - { name: total_revenue, type: number, required: false, description: "总营收：报告期总营收（万元）" }
+      - { name: revenue_yoy, type: number, required: false, description: "营收同比：总营收同比增长率（%）" }
+      - { name: cost_of_sales, type: number, required: false, description: "销售成本：报告期销售成本（万元）" }
+      - { name: gross_profit, type: number, required: false, description: "毛利：报告期毛利（万元）" }
+      - { name: gross_margin, type: number, required: false, description: "毛利率：毛利率（%）" }
+      - { name: selling_expense, type: number, required: false, description: "销售及推广开支：报告期销售及推广开支（万元）" }
+      - { name: admin_expense, type: number, required: false, description: "行政开支：报告期行政开支（万元）" }
+      - { name: rnd_expense, type: number, required: false, description: "研发开支：报告期研发开支（万元）" }
+      - { name: operating_profit, type: number, required: false, description: "经营利润：报告期经营利润（万元）" }
+      - { name: finance_income_net, type: number, required: false, description: "财务收入净额：报告期财务收入净额（万元）" }
+      - { name: profit_before_tax, type: number, required: false, description: "除所得税前利润：报告期除所得税前利润（万元）" }
+      - { name: income_tax_expense, type: number, required: false, description: "所得税费用：报告期所得税费用（万元）" }
+      - { name: net_profit, type: number, required: false, description: "年度利润：报告期年度利润（万元）" }
+      - { name: adjusted_net_profit, type: number, required: false, description: "经调整净利润：经调整净利润（万元）" }
+      - { name: adjusted_net_profit_yoy, type: number, required: false, description: "经调整净利润同比：经调整净利润同比增长率（%）" }
+
+  - name: business_segment
+    display_name: 业务分部
+    description: "公司业务分部（如手机×AIoT、智能电动汽车及AI等创新业务）"
+    aliases: ["业务分部", "分部", "板块", "业务线", "Segment"]
+    attributes:
+      - { name: segment_code, type: string, required: true, description: "分部代码：分部唯一标识" }
+      - { name: segment_name, type: string, required: true, description: "分部名称：如手机×AIoT、智能电动汽车及AI等创新业务" }
+      - { name: segment_type, type: enum, required: false, description: "分部类型：如核心业务、创新业务" }
+      - { name: revenue, type: number, required: false, description: "分部营收：分部营收（万元）" }
+      - { name: revenue_yoy, type: number, required: false, description: "营收同比：分部营收同比增长率（%）" }
+      - { name: revenue_ratio, type: number, required: false, description: "营收占比：分部营收占总营收比例（%）" }
+      - { name: cost_of_sales, type: number, required: false, description: "分部销售成本：分部销售成本（万元）" }
+      - { name: gross_profit, type: number, required: false, description: "分部毛利：分部毛利（万元）" }
+      - { name: gross_margin, type: number, required: false, description: "分部毛利率：分部毛利率（%）" }
+      - { name: operating_result, type: number, required: false, description: "分部经营收益：分部经营收益/(亏损)（万元）" }
+      - { name: adjusted_net_profit, type: number, required: false, description: "经调整净利润：分部经调整净利润（万元）" }
+      - { name: adjusted_net_loss, type: number, required: false, description: "经调整净亏损：分部经调整净亏损（万元）" }
+      - { name: segment_description, type: text, required: false, description: "分部描述：分部业务范围与表现说明" }
+
+  - name: product_line
+    display_name: 产品线
+    description: "分部下的产品线（如智能手机、IoT与生活消费产品、互联网服务、智能电动汽车）"
+    aliases: ["产品线", "业务类别", "Product Line"]
+    attributes:
+      - { name: line_code, type: string, required: true, description: "产品线代码：产品线唯一标识" }
+      - { name: line_name, type: string, required: true, description: "产品线名称：如智能手机、IoT与生活消费产品、互联网服务、智能电动汽车" }
+      - { name: category, type: enum, required: false, description: "类别：产品线类别" }
+      - { name: revenue, type: number, required: false, description: "产品线营收：产品线营收（万元）" }
+      - { name: revenue_yoy, type: number, required: false, description: "营收同比：产品线营收同比增长率（%）" }
+      - { name: revenue_ratio, type: number, required: false, description: "营收占比：产品线营收占总营收比例（%）" }
+      - { name: cost_of_sales, type: number, required: false, description: "产品线销售成本：产品线销售成本（万元）" }
+      - { name: gross_profit, type: number, required: false, description: "产品线毛利：产品线毛利（万元）" }
+      - { name: gross_margin, type: number, required: false, description: "产品线毛利率：产品线毛利率（%）" }
+      - { name: description, type: text, required: false, description: "描述：产品线业务说明" }
+
+  - name: product
+    display_name: 产品
+    description: "具体产品/机型/应用/服务/车型"
+    aliases: ["产品", "机型", "应用", "服务", "车型", "Product"]
+    attributes:
+      - { name: product_code, type: string, required: true, description: "产品代码：产品唯一标识" }
+      - { name: product_name, type: string, required: true, description: "产品名称：如小米SU7、小米SU7 Ultra、小米YU7、米家APP" }
+      - { name: product_category, type: enum, required: false, description: "产品类别：如智能手机、电动汽车、家电、应用" }
+      - { name: launch_date, type: date, required: false, description: "上市日期：产品上市/发布日期" }
+      - { name: shipment_volume, type: number, required: false, description: "出货量：产品出货量/交付量" }
+      - { name: shipment_yoy, type: number, required: false, description: "出货量同比：出货量同比增长率（%）" }
+      - { name: asp, type: number, required: false, description: "平均售价：产品平均售价（元）" }
+      - { name: asp_yoy, type: number, required: false, description: "ASP同比：平均售价同比增长率（%）" }
+      - { name: gross_margin, type: number, required: false, description: "毛利率：产品毛利率（%）" }
+      - { name: market_share, type: number, required: false, description: "市占率：产品市场份额（%）" }
+      - { name: product_description, type: text, required: false, description: "产品描述：产品定位与核心卖点" }
+
+  - name: financial_metric
+    display_name: 财务指标
+    description: "营收/利润/毛利等财务指标"
+    aliases: ["财务指标", "财务数据", "Financial Metric"]
+    attributes:
+      - { name: metric_code, type: string, required: true, description: "指标代码：指标唯一标识" }
+      - { name: metric_name, type: string, required: true, description: "指标名称：如总营收、毛利、经营利润" }
+      - { name: metric_value, type: number, required: false, description: "指标值：指标数值" }
+      - { name: metric_unit, type: string, required: false, description: "单位：如万元、亿元、%" }
+      - { name: metric_yoy, type: number, required: false, description: "同比：指标同比增长率（%）" }
+      - { name: metric_period, type: string, required: false, description: "指标期间：如 2025FY / 2025Q4" }
+      - { name: metric_category, type: enum, required: false, description: "指标分类：如营收、利润、成本" }
+
+  - name: operational_metric
+    display_name: 运营指标
+    description: "出货量/月活/市占率/连接设备数等运营指标"
+    aliases: ["运营指标", "经营数据", "Operational Metric"]
+    attributes:
+      - { name: metric_code, type: string, required: true, description: "指标代码：指标唯一标识" }
+      - { name: metric_name, type: string, required: true, description: "指标名称：如月活、出货量、连接设备数" }
+      - { name: metric_value, type: number, required: false, description: "指标值：指标数值" }
+      - { name: metric_unit, type: string, required: false, description: "单位：如万台、百万、亿、%" }
+      - { name: metric_yoy, type: number, required: false, description: "同比：指标同比增长率（%）" }
+      - { name: metric_category, type: enum, required: false, description: "指标分类：如 user/shipment/market_share/iot_device" }
+      - { name: region, type: string, required: false, description: "统计区域：如全球、中国大陆、拉美、东南亚" }
+      - { name: metric_description, type: text, required: false, description: "指标描述：指标口径与统计说明" }
+
+  - name: rnd_metric
+    display_name: 研发指标
+    description: "研发投入/研发人员等研发指标"
+    aliases: ["研发指标", "研发投入", "RnD Metric"]
+    attributes:
+      - { name: metric_code, type: string, required: true, description: "指标代码：指标唯一标识" }
+      - { name: metric_name, type: string, required: true, description: "指标名称：如研发投入、研发人员数、累计研发" }
+      - { name: metric_value, type: number, required: false, description: "指标值：指标数值" }
+      - { name: metric_unit, type: string, required: false, description: "单位：如万元、人" }
+      - { name: metric_yoy, type: number, required: false, description: "同比：指标同比增长率（%）" }
+      - { name: rnd_headcount, type: number, required: false, description: "研发人员数：研发人员数量" }
+      - { name: cumulative_rnd, type: number, required: false, description: "累计研发投入：过去若干年累计研发投入（万元）" }
+
+  - name: cost_expense
+    display_name: 成本费用
+    description: "销售成本/销售推广/行政/研发/所得税等成本费用"
+    aliases: ["成本费用", "费用", "支出", "Cost Expense"]
+    attributes:
+      - { name: expense_code, type: string, required: true, description: "费用代码：费用项唯一标识" }
+      - { name: expense_name, type: string, required: true, description: "费用名称：如销售成本、销售推广、行政、研发、所得税" }
+      - { name: expense_category, type: enum, required: false, description: "费用分类：如 cost/selling/admin/rnd/tax" }
+      - { name: expense_value, type: number, required: false, description: "费用金额：费用金额（万元）" }
+      - { name: expense_yoy, type: number, required: false, description: "同比：费用同比增长率（%）" }
+      - { name: expense_ratio, type: number, required: false, description: "占营收比：费用占总营收比例（%）" }
+      - { name: expense_period, type: string, required: false, description: "费用期间：如 2025FY / 2025Q4" }
+
+  - name: shareholder_return
+    display_name: 股东回报
+    description: "股息/配售/回购等股东回报事项"
+    aliases: ["股东回报", "股息", "分红", "配售", "回购", "Shareholder Return"]
+    attributes:
+      - { name: return_code, type: string, required: true, description: "事项代码：事项唯一标识" }
+      - { name: return_type, type: enum, required: true, description: "事项类型：如 dividend/placement/buyback" }
+      - { name: return_description, type: string, required: false, description: "事项描述：如末期股息、2025年配售及认购" }
+      - { name: return_amount, type: number, required: false, description: "金额/规模：事项金额或规模（万元/万股）" }
+      - { name: per_share_price, type: number, required: false, description: "每股价格：每股价格（港元/元）" }
+      - { name: return_date, type: date, required: false, description: "事项日期：事项发生/完成日期" }
+      - { name: return_status, type: enum, required: false, description: "事项状态：如已宣派/不宣派/已完成" }
+
+  - name: esg_metric
+    display_name: ESG指标
+    description: "环境/社会/管治相关指标"
+    aliases: ["ESG指标", "ESG", "环境社会管治", "ESG Metric"]
+    attributes:
+      - { name: metric_code, type: string, required: true, description: "指标代码：指标唯一标识" }
+      - { name: metric_name, type: string, required: true, description: "指标名称：如CDP评级、碳排放、光伏用电" }
+      - { name: metric_category, type: enum, required: false, description: "指标分类：如 environment/social/governance" }
+      - { name: metric_value, type: number, required: false, description: "指标值：指标数值" }
+      - { name: metric_unit, type: string, required: false, description: "单位：如吨CO2e、万度、级" }
+      - { name: metric_yoy, type: number, required: false, description: "同比：指标同比变化（%）" }
+      - { name: metric_description, type: text, required: false, description: "指标描述：指标口径与说明" }
+
+  - name: key_person
+    display_name: 关键人员
+    description: "高管/创始人/核心管理人员/董事会成员"
+    aliases: ["关键人员", "高管", "管理层", "董事", "Key Person"]
+    attributes:
+      - { name: person_name, type: string, required: true, description: "姓名：人员姓名" }
+      - { name: title, type: string, required: true, description: "职位：职级/头衔" }
+      - { name: role, type: enum, required: false, description: "角色：如董事长、副董事长、CEO、总裁、独立非执行董事" }
+      - { name: director_type, type: enum, required: false, description: "董事类型：如执行董事、非执行董事、独立非执行董事" }
+      - { name: affiliated_company, type: string, required: false, description: "所属公司：任职公司" }
+
+  - name: business_event
+    display_name: 业务事件
+    description: "财报披露的业务事件/里程碑"
+    aliases: ["业务事件", "事件", "里程碑", "Business Event"]
+    attributes:
+      - { name: event_name, type: string, required: true, description: "事件名称：事件标题" }
+      - { name: event_type, type: enum, required: false, description: "事件类型：如财报发布、产品交付、战略发布、配售" }
+      - { name: event_date, type: date, required: false, description: "事件日期：事件发生日期" }
+      - { name: event_description, type: text, required: false, description: "事件描述：事件详情摘要" }
+
+  - name: geographic_market
+    display_name: 地区市场
+    description: "收入/门店/用户分地区披露的市场（如中国大陆、境外、欧洲、印度）"
+    aliases: ["地区市场", "市场", "区域", "地区", "Region", "Market"]
+    attributes:
+      - { name: market_name, type: string, required: true, description: "市场名称：地区/市场名称（如中国大陆、境外、欧洲、印度）" }
+      - { name: region_type, type: enum, required: false, description: "区域类型：中国大陆/境外/区域/国家" }
+      - { name: revenue, type: number, required: false, description: "地区营收：该地区营收（万元）" }
+      - { name: revenue_ratio, type: number, required: false, description: "营收占比：该地区营收占总营收比例（%）" }
+      - { name: store_count, type: number, required: false, description: "门店数：该地区门店/服务点数量" }
+      - { name: market_description, type: text, required: false, description: "市场描述：地区市场表现与布局说明" }
+
+  - name: sales_channel
+    display_name: 销售渠道
+    description: "线上/线下销售与服务渠道（如小米之家、直营店、授权店、经销商、小米商城）"
+    aliases: ["销售渠道", "渠道", "门店", "零售网络", "Channel"]
+    attributes:
+      - { name: channel_name, type: string, required: true, description: "渠道名称：渠道名称（如小米之家、直营店、授权店、经销商、小米商城）" }
+      - { name: channel_type, type: enum, required: false, description: "渠道类型：线上/线下/直营/授权/经销" }
+      - { name: store_count, type: number, required: false, description: "门店数：渠道门店/网点数量" }
+      - { name: region, type: string, required: false, description: "覆盖地区：渠道覆盖地区" }
+      - { name: channel_description, type: text, required: false, description: "渠道描述：渠道运营与布局说明" }
+
+  - name: subsidiary
+    display_name: 子公司
+    description: "附属公司/集团实体（如小米印度、境外附属公司）"
+    aliases: ["子公司", "附属公司", "集团实体", "Subsidiary"]
+    attributes:
+      - { name: subsidiary_name, type: string, required: true, description: "子公司名称：附属公司/集团实体名称（如小米印度）" }
+      - { name: location, type: string, required: false, description: "所在地：子公司所在国家/地区" }
+      - { name: ownership, type: number, required: false, description: "持股比例：母公司持股比例（%）" }
+      - { name: business_scope, type: string, required: false, description: "经营范围：子公司主营业务范围" }
+      - { name: subsidiary_description, type: text, required: false, description: "子公司描述：子公司情况说明" }
+
+  - name: risk_factor
+    display_name: 风险因素
+    description: "年报披露的风险因素（如竞争、舆情、地缘政治、气候、外汇风险）"
+    aliases: ["风险因素", "风险", "Risk Factor"]
+    attributes:
+      - { name: risk_name, type: string, required: true, description: "风险名称：风险因素名称（如竞争风险、地缘政治风险）" }
+      - { name: risk_category, type: enum, required: false, description: "风险类别：竞争/市场/政治/气候/财务/运营/合规" }
+      - { name: risk_description, type: text, required: false, description: "风险描述：风险成因与潜在影响说明" }
+      - { name: mitigation, type: text, required: false, description: "应对措施：风险缓释/应对措施" }
+
+  - name: legal_proceeding
+    display_name: 法律诉讼
+    description: "诉讼/监管调查/或然负债事项（如小米印度调查与资产冻结）"
+    aliases: ["法律诉讼", "诉讼", "监管调查", "或然负债", "Legal Proceeding"]
+    attributes:
+      - { name: case_name, type: string, required: true, description: "案件名称：诉讼/监管事项名称" }
+      - { name: jurisdiction, type: string, required: false, description: "司法管辖：涉及国家/地区/监管机构（如印度税务局）" }
+      - { name: status, type: enum, required: false, description: "案件状态：调查中/聽證/已结案等" }
+      - { name: amount_involved, type: number, required: false, description: "涉及金额：涉案/冻结/撥備金额（万元）" }
+      - { name: case_description, type: text, required: false, description: "案件描述：事项详情与进展说明" }
+
+  - name: sustainability_initiative
+    display_name: 可持续举措
+    description: "ESG/可持续发展举措与行动（如物流低碳、绿电采购、以旧换新、碳减排）"
+    aliases: ["可持续举措", "ESG举措", "可持续发展", "Sustainability Initiative"]
+    attributes:
+      - { name: initiative_name, type: string, required: true, description: "举措名称：可持续/ESG 举措名称（如物流低碳、以旧换新）" }
+      - { name: esg_pillar, type: enum, required: false, description: "ESG支柱：环境/社会/管治" }
+      - { name: target, type: string, required: false, description: "目标：举措目标（如碳减排目标）" }
+      - { name: progress, type: string, required: false, description: "进展：举措进展/成效（如减少约2,471吨CO2e）" }
+      - { name: initiative_description, type: text, required: false, description: "举措描述：举措内容与方法说明" }
+
+relation_types:
+  - name: ISSUES_REPORT
+    source: listed_company
+    target: financial_report
+    cardinality: one_to_many
+    aliases: ["发布报告", "披露", "出具"]
+    description: "发布报告：上市公司发布财务报告"
+
+  - name: HAS_SEGMENT
+    source: financial_report
+    target: business_segment
+    cardinality: one_to_many
+    aliases: ["包含分部", "涵盖分部"]
+    description: "包含分部：财务报告包含的业务分部"
+
+  - name: SEGMENT_INCLUDES_LINE
+    source: business_segment
+    target: product_line
+    cardinality: one_to_many
+    aliases: ["包含产品线", "下设产品线"]
+    description: "分部含产品线：业务分部下的产品线"
+
+  - name: LINE_PRODUCES_PRODUCT
+    source: product_line
+    target: product
+    cardinality: one_to_many
+    aliases: ["产出", "生产", "包含产品"]
+    description: "产品线产出产品：产品线产出的具体产品"
+
+  - name: REPORT_HAS_FINANCIAL_METRIC
+    source: financial_report
+    target: financial_metric
+    cardinality: one_to_many
+    aliases: ["披露指标", "含指标"]
+    description: "报告财务指标：财务报告披露的财务指标"
+
+  - name: SEGMENT_HAS_METRIC
+    source: business_segment
+    target: financial_metric
+    cardinality: one_to_many
+    aliases: ["分部指标"]
+    description: "分部财务指标：业务分部披露的财务指标"
+
+  - name: PRODUCT_HAS_OPERATIONAL_METRIC
+    source: product
+    target: operational_metric
+    cardinality: one_to_many
+    aliases: ["产品指标"]
+    description: "产品运营指标：产品对应的运营指标"
+
+  - name: COMPANY_HAS_KEYPERSON
+    source: listed_company
+    target: key_person
+    cardinality: one_to_many
+    aliases: ["高管", "管理层"]
+    description: "关键人员：上市公司关键管理人员"
+
+  - name: PARTICIPATES_EVENT
+    source: listed_company
+    target: business_event
+    cardinality: many_to_many
+    aliases: ["参与", "披露事件"]
+    description: "参与事件：上市公司参与/披露的业务事件"
+
+  - name: COMPANY_HAS_RND_METRIC
+    source: listed_company
+    target: rnd_metric
+    cardinality: one_to_many
+    aliases: ["研发投入"]
+    description: "研发指标：上市公司研发指标"
+
+  - name: COMPANY_HAS_OPERATIONAL_METRIC
+    source: listed_company
+    target: operational_metric
+    cardinality: one_to_many
+    aliases: ["运营指标"]
+    description: "公司运营指标：上市公司整体运营指标"
+
+  - name: LINE_HAS_METRIC
+    source: product_line
+    target: financial_metric
+    cardinality: one_to_many
+    aliases: ["产品线指标"]
+    description: "产品线财务指标：产品线披露的财务指标"
+
+  - name: REPORT_HAS_COST_EXPENSE
+    source: financial_report
+    target: cost_expense
+    cardinality: one_to_many
+    aliases: ["含费用", "披露费用"]
+    description: "报告成本费用：财务报告披露的成本费用"
+
+  - name: SEGMENT_HAS_COST_EXPENSE
+    source: business_segment
+    target: cost_expense
+    cardinality: one_to_many
+    aliases: ["分部费用"]
+    description: "分部成本费用：业务分部披露的成本费用"
+
+  - name: COMPANY_HAS_SHAREHOLDER_RETURN
+    source: listed_company
+    target: shareholder_return
+    cardinality: one_to_many
+    aliases: ["股息", "配售", "回购"]
+    description: "股东回报：上市公司股东回报事项"
+
+  - name: COMPANY_HAS_ESG_METRIC
+    source: listed_company
+    target: esg_metric
+    cardinality: one_to_many
+    aliases: ["ESG", "环境社会管治"]
+    description: "ESG指标：上市公司ESG相关指标"
+
+  - name: COMPANY_OPERATES_IN_MARKET
+    source: listed_company
+    target: geographic_market
+    cardinality: one_to_many
+    aliases: ["地区经营", "分地区", "市场布局"]
+    description: "地区经营：上市公司在各地区市场运营"
+
+  - name: SEGMENT_SELLS_IN_MARKET
+    source: business_segment
+    target: geographic_market
+    cardinality: many_to_many
+    aliases: ["分地区营收", "地区收入"]
+    description: "分地区营收：业务分部在各地区的营收分布"
+
+  - name: COMPANY_USES_CHANNEL
+    source: listed_company
+    target: sales_channel
+    cardinality: one_to_many
+    aliases: ["销售渠道", "渠道布局"]
+    description: "销售渠道：上市公司通过渠道销售"
+
+  - name: CHANNEL_COVERS_MARKET
+    source: sales_channel
+    target: geographic_market
+    cardinality: many_to_many
+    aliases: ["渠道覆盖", "渠道分布"]
+    description: "渠道覆盖：销售渠道覆盖的地区市场"
+
+  - name: COMPANY_HAS_SUBSIDIARY
+    source: listed_company
+    target: subsidiary
+    cardinality: one_to_many
+    aliases: ["子公司", "附属公司"]
+    description: "子公司：上市公司拥有的子公司"
+
+  - name: SUBSIDIARY_LOCATED_IN_MARKET
+    source: subsidiary
+    target: geographic_market
+    cardinality: many_to_one
+    aliases: ["所在地", "注册地"]
+    description: "子公司所在地：子公司所在的地区市场"
+
+  - name: COMPANY_FACES_RISK
+    source: listed_company
+    target: risk_factor
+    cardinality: one_to_many
+    aliases: ["面临风险", "风险披露"]
+    description: "面临风险：上市公司面临的风险因素"
+
+  - name: SUBSIDIARY_INVOLVED_IN_PROCEEDING
+    source: subsidiary
+    target: legal_proceeding
+    cardinality: one_to_many
+    aliases: ["涉及诉讼", "涉诉"]
+    description: "涉及诉讼：子公司涉及的法律诉讼/监管事项"
+
+  - name: COMPANY_UNDERTAKES_INITIATIVE
+    source: listed_company
+    target: sustainability_initiative
+    cardinality: one_to_many
+    aliases: ["开展举措", "可持续行动"]
+    description: "开展举措：上市公司开展的可持续举措"
+
+  - name: INITIATIVE_IMPROVES_ESG
+    source: sustainability_initiative
+    target: esg_metric
+    cardinality: many_to_many
+    aliases: ["改善指标", "支撑ESG"]
+    description: "改善指标：可持续举措改善的ESG指标"
+
+constraints:
+  - { type: entity, severity: warning }
+  - { type: relation, severity: warning, rule: relation_source_target_must_exist }
+  - type: value
+    severity: warning
+    rule: currency_unit_consistency
+    expected_unit: 万元
+    fields: [total_revenue, gross_profit, operating_profit, net_profit, adjusted_net_profit, rnd_expense, cost_of_sales, selling_expense, admin_expense, income_tax_expense]
+
+disambiguation:
+  case_insensitive: true
+  alias_merge: true
+  currency_normalization: CNY
+  unit_million: true
+  # 业务分部名称别名归一（年报中同一分部的多种写法）
+  segment_aliases:
+    "手机×AIoT": ["手机×AIoT", "手机xAIoT", "手机 AIoT", "手机AIoT"]
+    "智能电动汽车及AI等创新业务": ["智能电动汽车及AI等创新业务", "智能电动汽车", "汽车业务", "EV业务"]

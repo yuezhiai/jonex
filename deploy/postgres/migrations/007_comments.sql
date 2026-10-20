@@ -38,7 +38,7 @@ COMMENT ON TABLE platform.identity_sync_failures IS '身份同步失败明细表
 
 -- knowledge_base
 COMMENT ON TABLE knowledge_base.knowledge_documents IS '知识库文档元数据表（业务层独有，含状态机和 RAG 对账字段）';
-COMMENT ON TABLE knowledge_base.knowledge_search_history IS '知识检索历史表（按 tenant+user+query+knowledge_base 去重，软删除）';
+COMMENT ON TABLE knowledge_base.knowledge_search_history IS '知识检索历史表（按 tenant+user 追加，同一问题可保留多条，软删除；超 200 条由 save 链路 trim_for_user 清理）';
 COMMENT ON COLUMN knowledge_base.knowledge_documents.id IS '知识文档 ID';
 COMMENT ON COLUMN knowledge_base.knowledge_documents.tenant_id IS '租户 ID，所有普通请求必须按租户隔离';
 COMMENT ON COLUMN knowledge_base.knowledge_documents.file_name IS '原始文件名';
@@ -79,6 +79,35 @@ COMMENT ON COLUMN knowledge_base.knowledge_search_history.duration_ms IS '检索
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.extra_metadata IS '检索扩展元数据，不承载租户或知识库隔离字段';
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.searched_at IS '检索发生时间';
 COMMENT ON COLUMN knowledge_base.knowledge_search_history.is_deleted IS '软删除标记：0 正常，1 删除';
+
+-- [jonex] 以图问知识：查询图片表 + 历史-图片关联表（设计 §4-B11）
+COMMENT ON TABLE knowledge_base.knowledge_query_images IS '以图问知识的查询图片：按 tenant+user 隔离；仅保存历史时落盘；无未删除历史引用时删除对象并软删';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.id IS '查询图片 ID（uuid4 hex），同时是对象键的文件名段';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.tenant_id IS '租户 ID';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.user_id IS '上传该图的用户 ID（可见范围与保留均跟随本人历史）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.storage_backend IS '对象存储后端：local / cos / s3（落盘时的全局后端，读取时按它选择实例）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.storage_key IS '对象键：{COS_KEY_PREFIX}/kb/{tenant}/query-images/{yyyymm}/{id}.{ext}';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.mime_type IS 'MIME 类型，按 magic bytes 判定的真实类型（不信任上传声明）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.file_size IS '字节数（前端压缩后的那份，不是用户原图）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.sha256 IS '内容 sha256；同用户同图只存一份（部分唯一索引兜底）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.recognized_query IS '该图对应的检索查询文本（识别产出）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.description IS 'VLM 客观描述';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.ocr_text IS 'VLM 抄录的图中文字';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.entities IS 'VLM 抽出的实体名列表（JSONB 数组）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.prompt_version IS '识别提示词版本；与当前版本不一致时该行会被重新识别并更新';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.vlm_model IS '识别所用模型名';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.purged_at IS '被判定无引用、软删的时刻';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.object_deleted IS '对象存储里的文件已删除为 1；软删后删对象失败保持 0，由兜底扫描补删';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.updated_at IS '最后一次被引用的时刻（兜底扫描据此判断宽限期）';
+COMMENT ON COLUMN knowledge_base.knowledge_query_images.is_deleted IS '软删除标记：0 正常，1 删除';
+
+COMMENT ON TABLE knowledge_base.knowledge_search_history_images IS '检索历史与查询图片的关联（多对多），引用是否有效以历史行 is_deleted 为准';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.history_id IS '检索历史 ID（knowledge_search_history.id）';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.image_id IS '查询图片 ID（knowledge_query_images.id）';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.tenant_id IS '租户 ID';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.user_id IS '用户 ID';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.sort_order IS '用户附图顺序（列表按它排序）';
+COMMENT ON COLUMN knowledge_base.knowledge_search_history_images.created_at IS '关联建立时刻';
 COMMENT ON TABLE knowledge_base.spaces IS '领域空间表';
 COMMENT ON TABLE knowledge_base.space_permissions IS '领域空间权限表';
 COMMENT ON TABLE knowledge_base.services IS '领域服务表';

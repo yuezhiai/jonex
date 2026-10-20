@@ -38,6 +38,17 @@
   # 单服务重建: .\jonex.ps1 rebuild <服务名>   例: gateway / core-business-frontend
   # 也可用 local- 前缀形式: local-build / local-up / local-ps / local-logs / local-down
 
+【3.1 数据库增量迁移（存量库迭代，不重建数据）】
+  前提: jonex-postgres 容器在跑（.\jonex.ps1 dev-infra-up 或 up）
+  .\jonex.ps1 db-migrate-dry    # 预览待应用迁移（不执行）
+  .\jonex.ps1 db-migrate        # 应用待应用迁移（列清单 + 确认）
+  .\jonex.ps1 db-migrate-yes    # 跳过确认直接执行（CI / 自动化）
+  # 状态记在 public.schema_migrations：已应用的跳过、失败的登记不上，重复执行安全
+
+【3.2 配置基线校验（.env 实例 vs 模板）】
+  .\jonex.ps1 env-check         # 比对差异（缺失/多余/未登记）
+  .\jonex.ps1 env-check-all     # 同上，但列出全部键名（默认按前缀聚合）
+
  更多命令（GPU / 单服务 / 性能日志等）: .\jonex.ps1 help
 ============================================================
 #>
@@ -162,6 +173,203 @@ function Invoke-Pnpm {
     finally {
         Pop-Location
     }
+}
+
+function Resolve-GitBash {
+    # 显式定位 Git for Windows 的 bash，**不靠 PATH 解析**。
+    #
+    # ⚠️ 为什么不能用 `Get-Command bash`：Windows 上这个名字有**三个**来源，
+    # 而 `Get-Command` 返回哪个取决于调用方 PATH 的顺序 ——
+    #   ① Git for Windows 的 bash（我们要的：有 mktemp/shop 等，且继承 Windows PATH
+    #      因而能用 docker.exe）；
+    #   ② `C:\Windows\System32\bash.exe` —— WSL 的启动器；
+    #   ③ `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` —— WSL 的 App Execution Alias。
+    # ②③ 在没装发行版时会直接炸（`execvpe /bin/bash failed 2`），而且**即使装了发行版**
+    # 那个环境里也没有宿主机的 docker —— 拿它跑 apply.sh 必然失败。
+    # 实测：同一条命令在 `-NoProfile` 下解析到 ①，在用户带 profile 的会话里解析到 ②，
+    # 于是"在我这儿能跑"。所以这里绕开 PATH，按已知安装位置找，找不到就明确报错。
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($env:ProgramFiles) {
+        $candidates.Add((Join-Path $env:ProgramFiles 'Git\bin\bash.exe'))
+        $candidates.Add((Join-Path $env:ProgramFiles 'Git\usr\bin\bash.exe'))
+    }
+    $pf86 = ${env:ProgramFiles(x86)}
+    if ($pf86) {
+        $candidates.Add((Join-Path $pf86 'Git\bin\bash.exe'))
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe'))
+    }
+    # 兜底：git.exe 的路径能反推 Git 安装根（...\Git\mingw64\bin\git.exe → ...\Git）
+    $git = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($git -and $git.Source) {
+        $gitRoot = Split-Path -Parent (Split-Path -Parent $git.Source)
+        if ($gitRoot) {
+            $candidates.Add((Join-Path $gitRoot 'bin\bash.exe'))
+            $candidates.Add((Join-Path $gitRoot 'usr\bin\bash.exe'))
+        }
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+function Invoke-DbMigrate {
+    # 增量 DDL：跑 deploy/postgres/update/apply.sh（与 Makefile 的 make db-migrate 同一份脚本，
+    # 行为一致：只应用 public.schema_migrations 里没登记过的文件、成功才登记、失败不登记）。
+    #
+    # ⚠️ 为什么交互确认放在 PowerShell 这边、而不是留给 apply.sh：
+    #    apply.sh 里有一句「stdin 非 TTY（或 CI 环境）时自动视为 --yes」，本意是防 CI 卡死。
+    #    但从 PowerShell 调 bash 时 stdin 算不算 TTY 并不可靠 —— 一旦判成非 TTY，
+    #    `db-migrate` 会在用户**没看到任何提示**的情况下把待应用迁移全部执行掉。
+    #    所以这里自己问、问完显式传 --yes：提示一定看得见，脚本一侧的行为也就不再依赖 TTY 判定。
+    param(
+        [switch]$DryRun,
+        [switch]$Yes
+    )
+
+    $scriptPath = Join-Path $RepoRoot "deploy\postgres\update\apply.sh"
+    if (-not (Test-Path $scriptPath)) {
+        Write-Host "找不到迁移脚本: $scriptPath" -ForegroundColor Red
+        exit 1
+    }
+
+    # apply.sh 是 bash 脚本（从宿主机读文件、经 stdin 送进容器执行）。
+    # 用显式定位的 Git Bash，**不用 PATH 里的 `bash`** —— 理由见 Resolve-GitBash 的注释。
+    $bashPath = Resolve-GitBash
+    if (-not $bashPath) {
+        Write-Host "未找到 Git Bash —— apply.sh 需要它（装 Git for Windows 即可）。" -ForegroundColor Red
+        Write-Host "⚠️ 注意：PATH 里的 `bash` 可能是 WSL 的启动器（System32 或 WindowsApps 下），" -ForegroundColor DarkGray
+        Write-Host "   那个跑不了本脚本（WSL 里没有宿主机的 docker）。" -ForegroundColor DarkGray
+        Write-Host "可手工执行：" -ForegroundColor Yellow
+        Write-Host '  & "C:\Program Files\Git\bin\bash.exe" deploy/postgres/update/apply.sh --dry-run   # 预览' -ForegroundColor Yellow
+        Write-Host '  & "C:\Program Files\Git\bin\bash.exe" deploy/postgres/update/apply.sh             # 执行（会问一次）' -ForegroundColor Yellow
+        exit 1
+    }
+
+    if (-not $DryRun -and -not $Yes) {
+        # ⚠️ **失败即拒绝**：stdin 被重定向时 `Read-Host` 的行为不可靠 ——
+        # 它可能读到管道里的值、可能立刻返回空、也可能在无控制台时直接抛。
+        # 实测踩过一次：`... | & .\jonex.ps1 db-migrate` 这种调用下确认被跳过、
+        # 迁移**直接应用了**（那正是这条护栏存在的理由）。
+        # 与其赌它会问，不如问不了就不做 —— 要无人值守请显式用 db-migrate-yes。
+        if ([Console]::IsInputRedirected) {
+            Write-Host "标准输入被重定向，无法交互确认（Read-Host 在此环境下不可靠）。" -ForegroundColor Red
+            Write-Host "本命令**不会**在没有确认的情况下执行迁移。请改用：" -ForegroundColor Yellow
+            Write-Host "  .\jonex.ps1 db-migrate-dry   # 先预览待应用清单" -ForegroundColor Yellow
+            Write-Host "  .\jonex.ps1 db-migrate-yes   # 确认无误后跳过询问直接执行" -ForegroundColor Yellow
+            exit 1
+        }
+
+        Write-Host "即将把 deploy/postgres/update/ 里**尚未应用**的迁移应用到 jonex-postgres。" -ForegroundColor Yellow
+        Write-Host "（迁移状态记在 public.schema_migrations：已应用的跳过、失败的不登记，重复执行安全）" -ForegroundColor DarkGray
+        Write-Host "建议先预览: .\jonex.ps1 db-migrate-dry" -ForegroundColor Yellow
+        $answer = Read-Host "确认执行？[y/N]"
+        if ($answer -notmatch '^(y|yes)$') {
+            Write-Host "已取消，未执行任何迁移。"
+            exit 0
+        }
+    }
+
+    # ⚠️ 用 Push-Location 到仓库根再调：apply.sh 自己会定位目录，但相对路径参数与
+    # 出错信息的可读性都以仓库根为基准最自然。
+    # ⚠️ `exit` **不放在 try 里** —— 避免依赖「exit 会不会触发 finally」这种细节，
+    # 出口统一在函数末尾。
+    # 两处**必须在调用原生命令时**做的处理，缺一个输出就不能看：
+    #
+    # ① `[Console]::OutputEncoding = UTF8`：apply.sh 输出的是 UTF-8（脚本里全是中文），
+    #    而 PowerShell 5.1 默认按控制台 OEM 码页（中文 Windows 上是 GBK/936）去解 ——
+    #    结果是中文乱码，而且部分字节序列会**吃掉换行**，几十行挤成一坨。
+    #    用完恢复，别把调用方的会话编码改掉。
+    #
+    # ② `2>&1 | ForEach-Object { Write-Host "$_" }`：psql 会把
+    #    `NOTICE: relation ... already exists` 这类**正常提示**写到 stderr，
+    #    PowerShell 会把它包成 NativeCommandError、打一整块红字。
+    #    命令其实成功了，看起来却像失败。转成字符串再 Write-Host 就只剩 message 本身
+    #    （注意必须是 `"$_"` 而不是 `$_` —— 后者会打印 ErrorRecord 的格式化块）。
+    #
+    # `$LASTEXITCODE` 不受这两处影响，仍是 apply.sh 的真实退出码。
+    # ③ `$ErrorActionPreference` 必须临时降到 Continue：本脚本头部设的是 **Stop**
+    #    （`jonex.ps1:66`），而 Stop 下「原生命令写了 stderr」会被当成**终止性**错误 ——
+    #    上面那个 `2>&1 | ForEach-Object` 根本来不及跑，整条管道直接中断并打出一大块
+    #    NativeCommandError。而 psql 的 NOTICE（"relation ... already exists, skipping"）
+    #    是**正常提示**，不是失败 —— 命令确实成功了。
+    #    真实的成败仍由 `$LASTEXITCODE` 承载，末尾原样透传出去。
+    $exitCode = 0
+    $oldEncoding = [Console]::OutputEncoding
+    $oldEap = $ErrorActionPreference
+    Push-Location $RepoRoot
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $ErrorActionPreference = 'Continue'
+        if ($DryRun) {
+            & $bashPath "deploy/postgres/update/apply.sh" --dry-run 2>&1 | ForEach-Object { Write-Host "$_" }
+        }
+        else {
+            & $bashPath "deploy/postgres/update/apply.sh" --yes 2>&1 | ForEach-Object { Write-Host "$_" }
+        }
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+        [Console]::OutputEncoding = $oldEncoding
+        Pop-Location
+    }
+    exit $exitCode
+}
+
+function Invoke-EnvCheck {
+    # .env 基线校验：跑 deploy/env-check.sh（与 Makefile 的 make env-check 同一份脚本，
+    # 行为一致：比对每个 .env 实例与它的 .example 模板，报「缺失/多余/未登记」三类差异）。
+    #
+    # ⚠️ 与 db-migrate 同源的两个坑（完整理由见 Invoke-DbMigrate 的注释）：
+    #   ① 脚本输出的是 UTF-8 中文，PowerShell 5.1 默认按控制台 OEM 码页（中文 Windows
+    #      上是 GBK/936）去解 → 中文乱码，且部分字节序列会**吃掉换行**、几十行挤成一坨。
+    #   ② 本脚本头部设了 $ErrorActionPreference = "Stop"，Stop 下「原生命令写了 stderr」
+    #      会被当成终止性错误。env-check.sh 本身不写 stderr，但保持与 db-migrate 同一形状
+    #      （临时降到 Continue + 2>&1 转字符串），免得日后脚本一改 stderr 就炸。
+    param([switch]$All)
+
+    $scriptPath = Join-Path $RepoRoot "deploy\env-check.sh"
+    if (-not (Test-Path $scriptPath)) {
+        Write-Host "找不到校验脚本: $scriptPath" -ForegroundColor Red
+        exit 1
+    }
+
+    # env-check.sh 是与 Makefile 共用的 bash 脚本（同 apply.sh）：必须用显式定位的
+    # Git Bash，**不用 PATH 里的 bash** —— 理由见 Resolve-GitBash 的注释。
+    $bashPath = Resolve-GitBash
+    if (-not $bashPath) {
+        Write-Host "未找到 Git Bash —— env-check.sh 需要它（装 Git for Windows 即可）。" -ForegroundColor Red
+        Write-Host "可手工执行：" -ForegroundColor Yellow
+        Write-Host '  & "C:\Program Files\Git\bin\bash.exe" deploy/env-check.sh' -ForegroundColor Yellow
+        exit 1
+    }
+
+    $exitCode = 0
+    $oldEncoding = [Console]::OutputEncoding
+    $oldEap = $ErrorActionPreference
+    Push-Location $RepoRoot
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $ErrorActionPreference = 'Continue'
+        if ($All) {
+            & $bashPath "deploy/env-check.sh" --all 2>&1 | ForEach-Object { Write-Host "$_" }
+        }
+        else {
+            & $bashPath "deploy/env-check.sh" 2>&1 | ForEach-Object { Write-Host "$_" }
+        }
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+        [Console]::OutputEncoding = $oldEncoding
+        Pop-Location
+    }
+    # ⚠️ 有「缺失/多余」时 env-check.sh **故意**返回 1（给 pre-commit / CI 留的挂载点），
+    #    不是 PowerShell 出错 —— 原样透传，语义与 make env-check 保持一致。
+    exit $exitCode
 }
 
 function Invoke-PerfLog {
@@ -403,6 +611,17 @@ switch ($Command) {
         Write-Host "  .\jonex.ps1 restart                     重启整套服务"
         Write-Host "  # 也可用 local- 前缀形式: local-build / local-up / local-ps / local-logs / local-down / local-restart"
         Write-Host ""
+        Write-Host "数据库增量迁移（存量库迭代，不重建数据；前提: jonex-postgres 在跑）:"
+        Write-Host "  .\jonex.ps1 db-migrate-dry              预览待应用迁移（不执行）"
+        Write-Host "  .\jonex.ps1 db-migrate                  应用待应用迁移（列清单 + 确认）"
+        Write-Host "  .\jonex.ps1 db-migrate-yes              跳过确认直接执行（CI/自动化）"
+        Write-Host "  # 状态记在 public.schema_migrations：已应用的跳过、失败的登记不上，重复执行安全"
+        Write-Host ""
+        Write-Host "配置基线校验（.env 实例 vs 模板；与 make env-check 同一份脚本）:"
+        Write-Host "  .\jonex.ps1 env-check                   比对差异（缺失/多余/未登记）"
+        Write-Host "  .\jonex.ps1 env-check-all               同上，但列出全部键名（默认按前缀聚合）"
+        Write-Host "  # 有「缺失/多余」时退出码为 1（给 pre-commit / CI 留的挂载点）"
+        Write-Host ""
         Write-Host "GPU/服务器 Docker:"
         Write-Host "  .\jonex.ps1 gpu-build                    构建 GPU 镜像"
         Write-Host "  .\jonex.ps1 gpu-up                       启动 GPU 部署"
@@ -537,11 +756,11 @@ switch ($Command) {
         Invoke-Compose -Mode Base -ComposeArgs @("up", "-d")
     }
 
-    { $_ -in "up-infra", "dev-infra-up" } {
+    "dev-infra-up" {
         Invoke-Compose -Mode Dev -ComposeArgs (@("up", "-d") + $MiddlewareServices)
     }
 
-    { $_ -in "up-rag", "dev-rag-up" } {
+    "dev-rag-up" {
         Invoke-Compose -Mode Dev -ComposeArgs (@("up", "-d") + $RagServices)
     }
 
@@ -824,6 +1043,36 @@ switch ($Command) {
     "init-db" {
         Set-LocalBackendEnv
         Invoke-Compose -Mode Dev -ComposeArgs @("exec", "postgres", "psql", "-U", $env:DB_USERNAME, "-d", $env:DB_NAME, "-f", "/docker-entrypoint-initdb.d/init.sql")
+    }
+
+    # ── 增量 DDL（存量库迭代，不重建数据）──
+    # 与 Makefile 的 db-migrate / db-migrate-dry / db-migrate-yes 一一对应，
+    # 都转调 deploy/postgres/update/apply.sh。前提：jonex-postgres 容器在跑。
+    "db-migrate" {
+        Invoke-DbMigrate
+    }
+
+    "db-migrate-dry" {
+        Invoke-DbMigrate -DryRun
+    }
+
+    "db-migrate-yes" {
+        # CI / 自动化用：跳过确认。⚠️ 这是「我知道自己在做什么」的开关，
+        # 日常手工执行请用 db-migrate（它会先把待应用清单列出来问一次）。
+        Invoke-DbMigrate -Yes
+    }
+
+    # ── .env 基线校验（与 Makefile 的 env-check / env-check-all 一一对应）──
+    # 比对每个 .env 实例与它的 .example 模板：报「缺失/多余/未登记」。
+    # 有「缺失/多余」时以退出码 1 结束（故意的，给 pre-commit / CI 留挂载点）。
+    "env-check" {
+        Invoke-EnvCheck
+    }
+
+    "env-check-all" {
+        # 默认按前缀聚合（实测真实 .env.local 缺 59 项，逐条刷屏没人看）；
+        # 这个开关列出全部键名。
+        Invoke-EnvCheck -All
     }
 
     "keycloak-db-init" {
