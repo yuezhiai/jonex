@@ -1,7 +1,11 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
+// Windows 上 `new URL(import.meta.url).pathname` 是 `/C:/...`，再经 path.resolve
+// 会拼成 `C:\C:\...`，root 指向不存在的目录，vitest 会以「No test files found」退出。
+// 与 core-business / platform-management 的修复保持同一写法。
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pathSrc = path.resolve(__dirname, 'src');
 
 /**

@@ -22,6 +22,7 @@ export { bootstrapStandaloneAuth } from './authBootstrap';
 export * from './sessionExpired';
 export * from './logoutNavigation';
 export * from './crossAppNavigation';
+export * from './routeSync';
 export { revokeServerSession } from './logout';
 export { refreshTokens, scheduleAutoRefresh, stopAutoRefresh } from './autoRefresh';
 export { isImpersonating, readAccessTokenExpiresAtMs } from './impersonation';

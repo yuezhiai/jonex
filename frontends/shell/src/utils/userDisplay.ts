@@ -16,15 +16,3 @@ export function userDisplayName(user: ShellUser, t: Translate): string {
 export function userRoleLabel(user: ShellUser, t: Translate): string {
   return user.roles?.length ? user.roles.join(' / ') : t('auth.user');
 }
-
-export function tenantDisplayName(tenant: { tenant_id: string; tenant_name: string }, t: Translate): string {
-  const builtIns: Record<string, { raw: string; key: string }> = {
-    tenant_jonex_demo: { raw: 'Jonex演示租户', key: 'demo' },
-    tenant_jonex_alpha: { raw: 'Jonex Alpha 测试租户', key: 'alpha' },
-    tenant_jonex_beta: { raw: 'Jonex Beta 测试租户', key: 'beta' },
-  };
-  const builtIn = builtIns[tenant.tenant_id];
-  return builtIn && tenant.tenant_name === builtIn.raw
-    ? t(`shell.builtInTenants.${builtIn.key}`)
-    : tenant.tenant_name || tenant.tenant_id;
-}

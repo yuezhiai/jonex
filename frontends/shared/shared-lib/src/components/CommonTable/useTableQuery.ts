@@ -28,7 +28,10 @@ export interface UseTableQueryOptions<Row, F extends Record<string, unknown>> {
   fetch: (params: TableQueryParams<F>) => Promise<{ list: Row[]; total: number }>;
   paginated: boolean;
   defaultPageSize: number;
-  onError?: (e: unknown) => void;
+  /** 挂载时的筛选初值，只在第一次渲染读取 */
+  initialFilters?: Partial<F>;
+  /** silent 标记这次失败来自静默重取（轮询），页面据此决定要不要弹提示。 */
+  onError?: (e: unknown, info: { silent: boolean }) => void;
   onQueryChange?: (params: TableQueryParams<F>) => void;
 }
 
@@ -42,7 +45,7 @@ export interface UseTableQueryResult<Row, F extends Record<string, unknown>> {
   setPage: (page: number) => void;
   setPageSize: (pageSize: number) => void;
   setFilter: <K extends keyof F>(key: K, value: F[K]) => void;
-  refresh: (options?: { resetPage?: boolean }) => void;
+  refresh: (options?: { resetPage?: boolean; silent?: boolean }) => void;
   reset: () => void;
   filterContext: FilterContext<F>;
 }
@@ -51,6 +54,7 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
   fetch,
   paginated,
   defaultPageSize,
+  initialFilters,
   onError,
   onQueryChange,
 }: UseTableQueryOptions<Row, F>): UseTableQueryResult<Row, F> {
@@ -59,7 +63,8 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(defaultPageSize);
-  const [filters, setFilters] = useState<Partial<F>>({});
+  // useState 的初值只取首帧：之后 initialFilters 再变也不会回写，避免父组件覆盖用户已改的筛选
+  const [filters, setFilters] = useState<Partial<F>>(initialFilters ?? {});
   const [tick, setTick] = useState(0);
 
   // fetch / onError 通常是页面内联的箭头函数，每次渲染都是新引用。把它们放进
@@ -74,10 +79,18 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
 
   // 快慢请求竞态：慢的旧请求可能后于新请求返回，只接受最后一次发出的结果。
   const seqRef = useRef(0);
+  // 被标记为「静默」的那次 tick 值，见 refresh。记 tick 而不是记布尔量，是为了让
+  // 「refresh 之后又改了筛选」这种同批次变更落到非静默：那时 effect 只跑一次，
+  // 但 tick 还是旧值，命中不了。
+  const silentTickRef = useRef(-1);
+  const tickRef = useRef(0);
 
   useEffect(() => {
     const seq = ++seqRef.current;
-    setLoading(true);
+    const silent = silentTickRef.current === tick;
+    if (silent) silentTickRef.current = -1;
+    // 静默重取不动 loading：页面正看着的这份数据要原地换掉，不该整块罩上遮罩
+    if (!silent) setLoading(true);
     fetchRef
       .current(buildQueryParams(page, pageSize, filters, paginated))
       .then((res) => {
@@ -87,15 +100,19 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
       })
       .catch((err: unknown) => {
         if (seq !== seqRef.current) return;
-        // 失败时清空列表：残留的旧数据会被误读成「筛选后的最新结果」。
-        // 失败本身不在这里呈现——表格照常渲染成空态，报警由页面在 onError 里自己发
-        setList([]);
-        setTotal(0);
-        onErrorRef.current?.(err);
+        // 静默重取失败保留列表：清空会让表格在「有数据」与「是空的」之间来回跳，
+        // 而轮询的失败该由调用方的退避消化，不该由界面呈现
+        if (!silent) {
+          // 失败时清空列表：残留的旧数据会被误读成「筛选后的最新结果」。
+          // 失败本身不在这里呈现——表格照常渲染成空态，报警由页面在 onError 里自己发
+          setList([]);
+          setTotal(0);
+        }
+        onErrorRef.current?.(err, { silent });
       })
       .finally(() => {
         if (seq !== seqRef.current) return;
-        setLoading(false);
+        if (!silent) setLoading(false);
       });
   }, [page, pageSize, filters, paginated, tick]);
 
@@ -111,11 +128,14 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
     setPage(1);
   }, []);
 
-  const refresh = useCallback((options?: { resetPage?: boolean }) => {
+  const refresh = useCallback((options?: { resetPage?: boolean; silent?: boolean }) => {
     if (options?.resetPage) setPage(1);
     // 无论页码是否真的变过都要 +1：页面停在第 1 页时 setPage(1) 是空操作，
     // 只靠它取数 effect 不会重跑，切换目录这类请求就会丢。
-    setTick((t) => t + 1);
+    const next = tickRef.current + 1;
+    tickRef.current = next;
+    if (options?.silent) silentTickRef.current = next;
+    setTick(next);
   }, []);
 
   // 整体清空，filterExtra 写进来的 key 一并清掉（它与配置项共用这一份 state）。

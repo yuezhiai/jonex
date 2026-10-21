@@ -23,6 +23,7 @@ const FILTER_WRAPPER_COL = { flex: '1 1 0%', style: { minWidth: 0 } };
 function CommonTableInner<Row extends object, F extends Record<string, unknown>>(
   {
     filters = [],
+    initialFilters,
     filterColsPerRow = DEFAULT_FILTER_COLS,
     filterExtra,
     filterExtraRow,
@@ -61,7 +62,7 @@ function CommonTableInner<Row extends object, F extends Record<string, unknown>>
     refresh,
     reset,
     filterContext,
-  } = useTableQuery<Row, F>({ fetch, paginated, defaultPageSize, onError, onQueryChange });
+  } = useTableQuery<Row, F>({ fetch, paginated, defaultPageSize, initialFilters, onError, onQueryChange });
 
   const handleReset = useCallback(() => {
     reset();

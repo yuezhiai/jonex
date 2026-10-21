@@ -44,8 +44,12 @@ export interface CommonTableRef {
    * resetPage 是给「页面自己管理的查询条件」用的——比如 DocumentLibrary 左侧目录树选中的文件夹。
    * 这类条件进不了 filters（不是控件），CommonTable 看不见它变了；而页面本来就停在第 1 页时，
    * 光 setPage(1) 不产生状态变化，也就不会重取。所以这里始终靠 tick 兜底触发一次取数。
+   *
+   * silent 只改「怎么呈现」，不改「取什么」：不置 loading（表格不罩遮罩、不闪），
+   * 失败也不清空列表。给轮询这类「用户没要求、但数据得跟上」的重取用；用户主动的
+   * 刷新别用它——点了按钮却什么都没发生，会比闪一下更让人不安。
    */
-  refresh: (options?: { resetPage?: boolean }) => void;
+  refresh: (options?: { resetPage?: boolean; silent?: boolean }) => void;
   /**
    * 清空全部筛选条件并回到第 1 页 —— 与筛选区那枚内置「重置」按钮是**同一个动作**
    * （含清掉输入框尚未落地的防抖值那步）。
@@ -69,6 +73,13 @@ export type TableQueryParams<F> = { page: number; pageSize: number } & Partial<F
 
 export interface CommonTableProps<Row, F extends Record<string, unknown>> {
   filters?: FilterConfig[];
+  /**
+   * 首次挂载时的筛选初值（如从别的页面带过来的状态 / 时间区间）。
+   *
+   * **只在挂载时读一次**：之后由用户在本组件里的操作决定筛选值。做成受控 prop 的话，
+   * 父组件每次渲染都可能把用户已经改过的筛选回写覆盖掉。想换初值只能换 `key` 重挂载。
+   */
+  initialFilters?: Partial<F>;
   /** 筛选区每行放几个筛选项，默认 4。按 24 栅格整除，建议取 2 / 3 / 4 / 6。 */
   filterColsPerRow?: number;
   /**
@@ -100,7 +111,12 @@ export interface CommonTableProps<Row, F extends Record<string, unknown>> {
    * pagination 为 false 时只会被调用一次，page 恒为 1，忽略这两个字段即可。
    */
   fetch: (params: TableQueryParams<F>) => Promise<{ list: Row[]; total: number }>;
-  onError?: (e: unknown) => void;
+  /**
+   * 取数失败。`silent` 为 true 表示这次失败来自 `refresh({ silent: true })`（轮询）——
+   * 组件已经按静默处理了（保留列表、不动 loading），页面通常只该记一笔、别弹提示，
+   * 否则轮询会把同一个错误按间隔反复弹给用户。
+   */
+  onError?: (e: unknown, info: { silent: boolean }) => void;
   ref?: React.Ref<CommonTableRef>;
 
   /** 'server'：服务端分页；false：不分页（只拉一次）。 */

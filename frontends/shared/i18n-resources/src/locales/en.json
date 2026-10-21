@@ -89,6 +89,7 @@
     "domainSpaceManagement": "Domain Space Management",
     "platformManagement": "Platform Management",
     "dataOperations": "Data Operations",
+    "dataGovernance": "Asset Catalog",
     "accountPermission": "Accounts & Permissions",
     "systemOperations": "System Operations",
     "administration": "Administration",
@@ -104,6 +105,7 @@
     "systemConfig": "System Settings",
     "operationLog": "Audit Logs",
     "systemMonitor": "System Monitoring",
+    "platformMonitor": "Platform Monitoring",
     "taskCenter": "Task Center",
     "integrationExtension": "Integration & Extensions",
     "ecosystemManagement": "Integrations",
@@ -112,6 +114,7 @@
     "skills": "Skill Library",
     "skillManagement": "Skill Management",
     "templateDomains": "Ontology Templates",
+    "templateScenarios": "Domain Template Scenarios",
     "mcpKeyManagement": "MCP Key Management",
     "mcpServiceDirectory": "MCP Ecosystem"
   },
@@ -181,12 +184,7 @@
     "openInNewWindow": "Open in new window",
     "appRunError": "App error",
     "selectSpace": "Select space",
-    "addSpace": "Add space",
-    "builtInTenants": {
-      "demo": "Jonex Demo Tenant",
-      "alpha": "Jonex Alpha Test Tenant",
-      "beta": "Jonex Beta Test Tenant"
-    }
+    "addSpace": "Add space"
   },
   "mcpKeyManagement": {
     "permissionWrite": "Write",

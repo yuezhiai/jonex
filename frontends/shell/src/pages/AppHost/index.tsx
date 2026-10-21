@@ -6,7 +6,7 @@ import { fetchAppManifest } from '../../api/manifest';
 import { getAccessToken, getUser, logout } from '../../api/auth';
 import { loadRemoteApp } from '../../app-registry/loadRemoteApp';
 import { EMBED_QUERY_PARAM } from '@jonex/shell-sdk';
-import type { AppManifestEntry, ShellUser } from '@jonex/shell-sdk';
+import type { AppManifestEntry } from '@jonex/shell-sdk';
 
 type MountFn = (container: HTMLElement, context: unknown) => () => void;
 
@@ -27,6 +27,15 @@ const joinStandalonePath = (baseUrl: string, subPath: string, search: string, ha
   const normalizedBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
   const normalizedSubPath = subPath ? (subPath.startsWith('/') ? subPath : `/${subPath}`) : '';
   return `${normalizedBase}${normalizedSubPath || '/'}${search}${hash}`;
+};
+
+/** iframe 当前实际所在的地址；跨域读不到时返回 null，由调用方当作「不在目标页」。 */
+const readFrameUrl = (frame: HTMLIFrameElement): string | null => {
+  try {
+    return frame.contentWindow?.location?.href ?? null;
+  } catch {
+    return null;
+  }
 };
 
 export default function AppHost() {
@@ -50,6 +59,8 @@ export default function AppHost() {
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const [embeddedUrl, setEmbeddedUrl] = useState<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const appliedSrcRef = useRef<string | null>(null);
 
   useEffect(() => {
     fetchAppManifest()
@@ -243,6 +254,24 @@ export default function AppHost() {
     preferStandalone,
   ]);
 
+  // iframe 的 src 走命令式赋值，而不是渲染 prop：浏览器返回时会连同子应用文档一起恢复，
+  // 而 shell 据此把路由和 embeddedUrl 拉回来 —— 那时 iframe 往往**已经**在目标页了，
+  // 再把 src 渲染一遍等于让它整页重载。只在真的换了页面时才驱动。
+  useEffect(() => {
+    const frame = iframeRef.current;
+    if (!frame || !embeddedUrl) {
+      appliedSrcRef.current = null;
+      return;
+    }
+    if (appliedSrcRef.current === embeddedUrl) return;
+    if (readFrameUrl(frame) === new URL(embeddedUrl, window.location.href).href) {
+      appliedSrcRef.current = embeddedUrl;
+      return;
+    }
+    appliedSrcRef.current = embeddedUrl;
+    frame.src = embeddedUrl;
+  }, [embeddedUrl]);
+
   if (loading) {
     return (
       <div style={{ textAlign: 'center', padding: 120 }}>
@@ -299,8 +328,8 @@ export default function AppHost() {
     <div style={{ height: '100%', position: 'relative' }}>
       {embeddedUrl ? (
         <iframe
+          ref={iframeRef}
           title={`${appConfig.name}-standalone`}
-          src={embeddedUrl}
           style={{
             width: '100%',
             minHeight: 'calc(100vh - 132px)',

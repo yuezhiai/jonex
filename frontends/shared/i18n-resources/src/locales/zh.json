@@ -89,6 +89,7 @@
     "domainSpaceManagement": "领域空间管理",
     "platformManagement": "平台管理",
     "dataOperations": "数据运营",
+    "dataGovernance": "资产目录",
     "accountPermission": "账号与权限",
     "systemOperations": "系统运维",
     "administration": "管理后台",
@@ -104,6 +105,7 @@
     "systemConfig": "系统设置",
     "operationLog": "审计日志",
     "systemMonitor": "系统监控",
+    "platformMonitor": "平台监控",
     "taskCenter": "任务中心",
     "integrationExtension": "集成扩展",
     "ecosystemManagement": "集成",
@@ -112,6 +114,7 @@
     "skills": "技能库",
     "skillManagement": "技能管理",
     "templateDomains": "本体模板",
+    "templateScenarios": "领域模板场景",
     "mcpKeyManagement": "MCP Key 管理",
     "mcpServiceDirectory": "MCP生态"
   },
@@ -181,12 +184,7 @@
     "openInNewWindow": "在新窗口打开",
     "appRunError": "应用运行出错",
     "selectSpace": "选择领域空间",
-    "addSpace": "添加领域空间",
-    "builtInTenants": {
-      "demo": "Jonex演示租户",
-      "alpha": "Jonex Alpha 测试租户",
-      "beta": "Jonex Beta 测试租户"
-    }
+    "addSpace": "添加领域空间"
   },
   "mcpKeyManagement": {
     "permissionWrite": "写入",
