@@ -66,6 +66,14 @@ export interface KnowledgeSearchHistoryItem {
   reasoning?: ReasoningTrace | null;
   /** [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件） */
   strictConfig?: KnowledgeSearchStrictConfig | null;
+  /**
+   * [jonex] 以图问知识：这条历史附带的查询图片（按用户附图顺序）。
+   * 已清理的图不会出现在这里；无图时是空数组。
+   * `viewUrl` 由后端补签（短时票据），local 后端下也可能为空。
+   */
+  queryImages?: QueryImageRef[];
+  /** [jonex] 以图问知识：用户当时输入的原话（可为空；`query` 存的是识别产出的检索文本） */
+  imageQuestion?: string;
 }
 
 export interface SaveKnowledgeSearchHistoryPayload {
@@ -86,6 +94,75 @@ export interface SaveKnowledgeSearchHistoryPayload {
   reasoning?: ReasoningTrace | null;
   /** [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件） */
   strictConfig?: KnowledgeSearchStrictConfig | null;
+  /**
+   * [jonex] 以图问知识：本次检索附带的查询图片 id（**顺序即展示顺序**）。
+   * 后端在保存历史这一刻才把图片落盘（识别阶段只暂存），所以这里传的是识别接口
+   * 回包里的 `imageId`；过期 / 没识别成功的图会被后端跳过，历史照常保存。
+   */
+  queryImageIds?: string[];
+  /** [jonex] 以图问知识：用户原话（存进历史 metadata，与识别产出的 `query` 分开） */
+  imageQuestion?: string;
+}
+
+// ── 以图问知识（图片 → 识别文本 → 复用现有检索链路）────────────────
+// 设计：docs/knowledge-base/image-query-search-execution-plan.md §5-F1
+
+/** 单张图片的识别结果（与后端 `ImageQueryImageOut` 对齐） */
+export interface ImageQueryImageResult {
+  /** 对应提交时的顺序 */
+  index: number;
+  status: 'ok' | 'failed';
+  /** 失败时的平台错误码（用于挑文案） */
+  errorCode?: number | null;
+  /** 保存历史时回传；失败 / 暂存失败 / 开关关闭时为 null */
+  imageId?: string | null;
+  description: string;
+  ocrText: string;
+  entities: string[];
+  /** 识别结果来自缓存或已持久化记录 */
+  cached: boolean;
+  /** imageId 是否已是持久化图片（同图复用） */
+  persisted: boolean;
+}
+
+/** 识别接口回包（与后端 `ImageQueryResponse` 对齐） */
+export interface ImageQueryResult {
+  /** 合并后直接交给检索接口的文本 */
+  query: string;
+  images: ImageQueryImageResult[];
+  entities: string[];
+  model: string;
+  /** 是否有图片识别失败 */
+  partial: boolean;
+  durationMs: number;
+  /** 后端生效中的限制值，前端缓存后以此为准 */
+  limits?: ImageQueryLimits;
+}
+
+export interface ImageQueryLimits {
+  maxImages: number;
+  maxBytes: number;
+  maxTotalBytes: number;
+}
+
+/** 历史条目上的图片引用 */
+export interface QueryImageRef {
+  id: string;
+  mimeType: string;
+  fileSize: number;
+  /** 短时查看地址（后端补签；可能为空） */
+  viewUrl?: string | null;
+}
+
+/** 输入区待检索的一张图（前端本地态） */
+export interface AttachedImage {
+  /** 压缩后的字节（识别与落盘用的都是这份，原图不出浏览器） */
+  file: Blob;
+  /** 本地预览地址（objectURL，需在移除/卸载时 revoke） */
+  objectUrl: string;
+  name: string;
+  /** 压缩后的字节数（用于前端预判上限，与后端判据同源） */
+  size: number;
 }
 
 /** 严格模式配置项（随搜索请求下发，普通/深度共用前 5 项，深度额外含后 2 项） */
@@ -100,6 +177,8 @@ export interface KnowledgeSearchStrictConfig {
   /** 深度检索专属 */
   allow_common_sense: boolean;
 }
+
+export type WikiThinkingMode = 'fast' | 'standard' | 'deep';
 
 export interface KnowledgeSearchStreamParams {
   query: string;
@@ -120,13 +199,15 @@ export interface KnowledgeSearchStreamParams {
    * 该端点拒绝异管线知识库，调用方需先把 kbIds 收敛为 kb_type=jonex_wiki 的库。
    */
   wiki?: boolean;
+  wikiThinkingMode?: WikiThinkingMode;
   /** 严格模式配置（缺省时后端使用默认值） */
   strictConfig?: KnowledgeSearchStrictConfig;
 }
 
 /** 引用位置（与后端 SourceLocation 对齐） */
 export interface KnowledgeReferenceLocation {
-  type: 'chunk' | 'char' | 'page' | 'timestamp' | 'document' | 'image';
+  type: 'chunk' | 'char' | 'page' | 'timestamp' | 'document' | 'image' | 'table_row';
+  evidence_ref?: Record<string, unknown> | null;
   chunk_index?: number | null;
   char_start?: number | null;
   char_end?: number | null;
@@ -135,6 +216,14 @@ export interface KnowledgeReferenceLocation {
   time_end?: number | null;
   /** [jonex] §image-refs：图片位置——文档内嵌图片的模态序号（全局枚举） */
   image_idx?: number | null;
+  /** [jonex] 表格行引用：表格在页面内的序号（0-based） */
+  table_idx?: number | null;
+  /** [jonex] 表格行引用：行起止（0-based，闭区间） */
+  row_start?: number | null;
+  row_end?: number | null;
+  /** [jonex] 表格单元格列起止（0-based，闭区间） */
+  cell_start?: number | null;
+  cell_end?: number | null;
   /** [jonex] §image-refs：图片资产预览地址（预签名 URL；local 后端/未上传为空，前端降级） */
   asset_url?: string | null;
   /** [jonex] §image-refs B2：图片资产扩展名（持久标识；resolve 回传据此重新推导 asset_url） */
@@ -145,6 +234,9 @@ export interface KnowledgeReferenceLocation {
 
 /** 结构化引用（与后端 SourceReference 对齐） */
 export interface KnowledgeReference {
+  query_id?: string | null;
+  evidence_handle?: string | null;
+  bundle_sha?: string | null;
   doc_id: string;
   kb_id?: string | null;
   kb_name?: string | null; // [jonex] 知识库名称（冗余，方便前端展示，无需二次查询）
@@ -183,7 +275,29 @@ export interface KnowledgeSearchStreamMeta {
   history_id?: string;
 }
 
+export interface WikiProgressEvent {
+  seq: number;
+  kb_id?: string;
+  type?: string;
+  title?: string;
+  tool?: string;
+  duration_ms?: number;
+  input_summary?: unknown;
+  result_summary?: unknown;
+  details?: WikiProgressDetails;
+}
+
+export interface WikiProgressDetails {
+  query?: string;
+  paths?: string[];
+  table_id?: string;
+  operation?: string;
+  range?: [number, number];
+  previews?: { title?: string; path?: string; excerpt?: string }[];
+}
+
 export interface KnowledgeSearchStreamHandlers {
+  onProgress?: (events: WikiProgressEvent[]) => void;
   onDelta: (content: string, meta?: KnowledgeSearchStreamMeta) => void;
   onDone?: (meta?: KnowledgeSearchStreamMeta) => void;
   onError?: (error: Error) => void;
@@ -227,7 +341,16 @@ export interface SearchFeedbackStats {
   dislike_count: number;
 }
 
-export type KnowledgeSearchRunStatus = 'idle' | 'searching' | 'done' | 'empty' | 'stopped' | 'error';
+export type KnowledgeSearchRunStatus =
+  | 'idle'
+  | 'searching'
+  | 'done'
+  | 'empty'
+  | 'stopped'
+  | 'error'
+  /** [jonex] 以图问知识：正在识别图片（检索还没开始）。卡片上分两段显示
+   *  「识别图片中… → 检索中…」，用户才知道这会儿在等什么。 */
+  | 'recognizing';
 
 /** 搜索结果反馈类型 */
 export type SearchFeedbackType = 'like' | 'dislike';

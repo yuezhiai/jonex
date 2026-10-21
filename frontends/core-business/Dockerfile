@@ -42,9 +42,16 @@ COPY frontends/vite.base.config.ts ./
 ARG VITE_LOGIN=/login
 ENV VITE_LOGIN=${VITE_LOGIN}
 
+ENV NODE_OPTIONS=--max-old-space-size=2048 GOMAXPROCS=2
 RUN pnpm --filter @jonex/core-business build
 
 FROM nginx:1.27-alpine
+# pdf.js 的 worker 是 .mjs；基础镜像的 mime.types 不含 mjs，默认落成
+# application/octet-stream，浏览器会拒绝把它当 ES module 加载。
+# 直接在标准类型表里补一项（不能在被 include 的 types 块里再 include
+# mime.types —— 它本身就是一个 types 块）。
+RUN sed -i 's|application/javascript *js;|application/javascript js mjs;|' /etc/nginx/mime.types \
+    && grep -q 'mjs' /etc/nginx/mime.types
 WORKDIR /usr/share/nginx/html
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
 

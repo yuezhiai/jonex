@@ -118,16 +118,23 @@ const SpaceSwitcher = ({ collapsed }: SpaceSwitcherProps) => {
         }))
       : []),
     { type: 'divider' as const },
-    {
-      key: 'add-space',
-      label: (
-        <span style={S.addItem}>
-          <PlusOutlined style={{ marginRight: 6 }} />
-          {t('domainSpace.addSpace')}
-        </span>
-      ),
-      onClick: handleAddSpace,
-    },
+    // [jonex] W2（2026-10-19）：入口按后端 can_create_space 显示（判据 = 租户管理员
+    // 或 space:write）。原先这个入口没有任何权限判据 —— 无创建权的用户点进去会一路
+    // 填完表单才在提交时吃 403「创建空间需要租户管理员权限」。
+    ...(global.canCreateSpace
+      ? [
+          {
+            key: 'add-space',
+            label: (
+              <span style={S.addItem}>
+                <PlusOutlined style={{ marginRight: 6 }} />
+                {t('domainSpace.addSpace')}
+              </span>
+            ),
+            onClick: handleAddSpace,
+          },
+        ]
+      : []),
     {
       key: 'manage-space',
       label: (
@@ -149,7 +156,8 @@ const SpaceSwitcher = ({ collapsed }: SpaceSwitcherProps) => {
         menu={{
           items,
           style: {
-            boxShadow: '0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05)',
+            boxShadow:
+              '0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05)',
           },
         }}
         open={dropdownOpen}

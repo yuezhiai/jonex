@@ -52,7 +52,13 @@ export interface DomainSpaceListResult {
   total: number;
   offset: number;
   limit: number;
-  /** 租户级：当前用户能否创建空间（持有 service:write） */
+  /**
+   * 租户级：当前用户能否创建空间。后端判据 = tenant:admin / platform:admin
+   * 或租户级能力码 space:write，与 create 准入同源。
+   *
+   * [jonex] W2（2026-10-19）：前端一律读本字段决定入口显隐，不自己拼码名
+   * （历史上注释写 service:write，B1 后又只认 tenant:admin，均与后端漂移过）。
+   */
   can_create_space: boolean;
 }
 

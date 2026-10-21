@@ -50,6 +50,19 @@ const KB_TYPE_TAG_COLOR: Record<KnowledgeBaseType, string> = {
   jonex_wiki: 'magenta',
 };
 
+/**
+ * 字段长度上限（2026-10-16）。
+ *
+ * 描述框的卡顿不是这段代码的问题：Chromium 在 macOS 系统字体（`-apple-system`，
+ * 即平台主题字体栈）下给 `<textarea>` 排「数千字符且**不含换行**」的单行文本时，
+ * 每次按键都要对整段重做软换行布局，成本随字数超线性增长 —— 实测 8k 字符
+ * 94ms/键、20k 字符 570ms/键，同一段文本每 80 字换行则 20k 也只要 13ms/键，
+ * 换成 monospace / Arial 同样回到 13ms。限长是唯一既治本又不改主题的手段：
+ * 上限之内这个输入框根本到不了那个量级。
+ */
+const KB_NAME_MAX_LENGTH = 50;
+const KB_DESCRIPTION_MAX_LENGTH = 200;
+
 export default function CreateEditModal({ open, editingKb, submitting, onOk, onCancel, kbTypes, defaultKbType }: CreateEditModalProps) {
   const { t } = useTranslation();
   const [form] = Form.useForm();
@@ -127,7 +140,11 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
           label={t('domainKnowledge.knowledgeBaseName')}
           rules={[{ required: true, message: t('domainKnowledge.knowledgeBaseNameRequired') }]}
         >
-          <Input placeholder={t('domainKnowledge.namePlaceholder')} />
+          <Input
+            placeholder={t('domainKnowledge.namePlaceholder')}
+            maxLength={KB_NAME_MAX_LENGTH}
+            showCount
+          />
         </Form.Item>
 
         {/* [jonex] 知识库类型：创建时可选，创建后不可变 → 编辑模式只读展示 */}
@@ -194,7 +211,12 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
         </Form.Item>
 
         <Form.Item name="description" label={t('domainKnowledge.description')}>
-          <Input.TextArea rows={3} placeholder={t('domainKnowledge.descPlaceholder')} />
+          <Input.TextArea
+            rows={3}
+            placeholder={t('domainKnowledge.descPlaceholder')}
+            maxLength={KB_DESCRIPTION_MAX_LENGTH}
+            showCount
+          />
         </Form.Item>
 
         {/* [jonex] 新建 KB 默认配置说明（仅创建模式） */}

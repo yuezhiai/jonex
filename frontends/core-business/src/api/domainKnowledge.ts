@@ -23,6 +23,8 @@ import type {
   DomainKnowledgeResultStats,
   GraphSummary,
   DocumentChunk,
+  DocumentQualityReport,
+  DocumentQualitySummary,
   ManualDocItem,
   ManualDocListParams,
   DocumentStatsResult,
@@ -80,6 +82,8 @@ import { readAccessToken } from '@jonex/shell-sdk';
 import { listDataSources } from './dataSource';
 import type { DataSourceInstance } from '@/types/dataSource';
 import { dataSourceInstanceDisplayName } from '@/utils/dataSourceDisplay';
+import type { SourceSpan } from '@/components/bboxOverlay';
+import type { SpanExpect } from '@/components/documentBBox';
 
 export function getDomainKnowledgeSpaces(): Promise<DomainKnowledgeSpace[]> {
   return getData<{ items: DomainKnowledgeSpace[] }>(
@@ -531,12 +535,14 @@ export function reseedOntologyCompiledSchema(
   kbId: string,
   templateScenarioId: string,
   templateDomainId?: string,
+  applyToDocuments = false,
 ): Promise<CompiledSchema> {
   return postData<CompiledSchema>('/knowledge-base/ontology/compiled-schema/reseed', {
     knowledge_base_id: kbId,
     template_domain_id: templateDomainId,
     template_scenario_id: templateScenarioId,
     source_type: 'business_template',
+    apply_to_documents: applyToDocuments,
   });
 }
 
@@ -583,7 +589,7 @@ function formatLocalDateTime(isoStr: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: (key: string) => string): ManualDocItem {
+export function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: (key: string) => string): ManualDocItem {
   // [jonex] 修正历史 bug：后端 to_dict 输出键是 metadata（非 extra_metadata），
   // 此前 meta 恒为空对象（uploader 等字段全空）。顺带提取 OpenKB 编译状态。
   const meta = doc.metadata || {};
@@ -594,17 +600,16 @@ function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: (key: s
     size: typeof doc.file_size === 'number' ? formatFileSize(doc.file_size) : '-',
     uploader: (meta.uploader as string) || '-',
     uploadTime: doc.created_at ? formatLocalDateTime(doc.created_at) : '-',
+    updatedAt: doc.updated_at,
     // status 保留旧展示字符串以兼容其他调用点；新的状态列改用 docStatus/ontologyStatus 派生 phase。
     status:
       doc.status === 'ready'
         ? '入库·解析·编译'
         : doc.status === 'parsing'
           ? '入库·解析中'
-          : doc.status === 'parsed'
-            ? '入库·待抽取'
-            : doc.status === 'pending'
-              ? '入库'
-              : doc.status,
+          : doc.status === 'pending'
+            ? '入库'
+            : doc.status,
     docStatus: doc.status,
     ontologyStatus: doc.ontology_status,
     errorMessage: doc.error_message,
@@ -614,6 +619,8 @@ function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: (key: s
     llmWikiCompileError: doc.llm_wiki_compile_error || (meta.openkb_compile_error as string) || undefined,
     // [jonex] 管线类型：metadata.kb_type（upload/reparse 时写入）——与 doc 详情同一次请求到达
     kbType: (meta.kb_type as KnowledgeBaseType) || undefined,
+    // [jonex] 文档粘性入库后端：详情页据此决定是否显示独立的质量报告 Tab。
+    ingestBackend: (meta.ingest_backend as string) || undefined,
     knowledgeBaseId,
     dataSourceType: doc.data_source_type,
     mimeType: doc.mime_type,
@@ -654,6 +661,25 @@ export async function getManualDocList(
   // 后端已支持 keyword 过滤（DocumentListRequest.keyword，对 file_name/file_path 做 ilike），
   // 且返回真实 total（repo.count），分页直接采用后端结果，不再做客户端二次过滤。
   const list = backendResult.items.map((d) => mapBackendDoc(d, params.knowledgeBaseId, _t));
+
+  // 解析质量摘要：一页一次批量请求（不做 N+1）。**失败不拖垮列表** ——
+  // 质量是附加信息，列退化为「—」；这是与「列表本身加载失败」不同的失败面。
+  try {
+    const summaries = await getDocumentQualityReports(
+      params.knowledgeBaseId,
+      list.map((d) => d.id),
+    );
+    const byId = new Map(summaries.map((s) => [s.document_id, s]));
+    for (const item of list) {
+      const summary = byId.get(item.id);
+      item.qualitySupported = summary?.supported ?? false;
+      item.qualityVerdict = summary?.verdict ?? null;
+      item.qualityReasons = summary?.reasons ?? [];
+    }
+  } catch {
+    // 静默：徽标列显示「—」即可，不弹错。
+  }
+
   return {
     list,
     pagination: {
@@ -723,8 +749,35 @@ export async function getDocumentChunks(documentId: string): Promise<DocumentChu
     ...c,
     // 兼容映射：旧代码通过 content_summary/content_length 读内容
     content_summary: c.content ?? c.content_summary,
-    content_length: c.content?.length ?? c.content_length ?? 0,
+    content_length: c.content_length ?? c.content?.length ?? 0,
   }))
+}
+
+/** 单文档解析质量报告（含 md 证据的短时预签名 URL）。 */
+export async function getDocumentQualityReport(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<DocumentQualityReport> {
+  return getData<DocumentQualityReport>(
+    request.get(`/knowledge-base/documents/${documentId}/quality-report`, {
+      params: { knowledge_base_id: knowledgeBaseId },
+    }),
+  )
+}
+
+/** 批量质量摘要（列表页用，最多 100 条）。 */
+export async function getDocumentQualityReports(
+  knowledgeBaseId: string,
+  documentIds: string[],
+): Promise<DocumentQualitySummary[]> {
+  if (!documentIds.length) return []
+  const data = await getData<{ items: DocumentQualitySummary[] }>(
+    request.post('/knowledge-base/documents/quality-reports', {
+      knowledge_base_id: knowledgeBaseId,
+      document_ids: documentIds,
+    }),
+  )
+  return data.items ?? []
 }
 
 export async function deleteManualDocument(knowledgeBaseId: string, documentId: string): Promise<void> {
@@ -823,6 +876,38 @@ export async function getDocumentViewTicket(documentId: string): Promise<{ url: 
     request.get(`/knowledge-base/documents/${documentId}/view-ticket`),
   );
   return { url: res.url, expiresIn: res.expires_in };
+}
+
+/**
+ * 取引用 chunk 在原文中的坐标（bbox）span 列表。
+ *
+ * 后端按 chunk_index 找候选 chunk，再用 page_no/table_idx/row_start/row_end/image_idx
+ * 缩小到具体片段；拿不到坐标时返回 `degraded: true`（调用方回退 iframe，不报错）。
+ */
+export async function getDocumentSourceSpans(
+  documentId: string,
+  chunkIndex: number,
+  expect: SpanExpect,
+  signal?: AbortSignal,
+): Promise<{ spans: SourceSpan[]; degraded: boolean; reason?: string | null }> {
+  const params: Record<string, number> = { chunk_index: chunkIndex };
+  if (expect.page_no != null) params.page_no = expect.page_no;
+  if (expect.table_idx != null) params.table_idx = expect.table_idx;
+  if (expect.row_start != null) params.row_start = expect.row_start;
+  if (expect.row_end != null) params.row_end = expect.row_end;
+  if (expect.image_idx != null) params.image_idx = expect.image_idx;
+  const res = await getData<{
+    document_id: string;
+    chunk_index: number | null;
+    spans: SourceSpan[];
+    degraded: boolean;
+    reason?: string | null;
+  }>(request.get(`/knowledge-base/documents/${documentId}/source-spans`, { params, signal }));
+  return {
+    spans: Array.isArray(res.spans) ? res.spans : [],
+    degraded: Boolean(res.degraded),
+    reason: res.reason ?? null,
+  };
 }
 
 // ── Parse Result Mappers ─────────────────────────────────
@@ -1877,11 +1962,16 @@ export function getChunkDetail(
   return getData(request.get(`/knowledge-base/documents/${documentId}/chunks/${chunkId}`));
 }
 
-/** 搜索本体实例（GET /knowledge-base/ontology/entities/search） */
+/** 搜索本体实例（GET /knowledge-base/ontology/entities/search）
+ *
+ * `documentId` 用于**文档结果页**的表单：限定候选实体只来自该文档关联的实体
+ * （后端按 `$doc_id IN e.doc_ids` 过滤），避免在单篇文档里列出整个 KB 的实体。
+ */
 export function searchOntologyInstances(
   kbId: string,
   keyword?: string,
   limit = 20,
+  documentId?: string,
 ): Promise<{
   items: OntologyInstanceRow[];
   total: number;
@@ -1891,6 +1981,7 @@ export function searchOntologyInstances(
   const params: Record<string, string> = { knowledge_base_id: kbId };
   if (keyword) params.keyword = keyword;
   params.limit = String(limit);
+  if (documentId) params.document_id = documentId;
   return getData<{
     items: OntologyInstanceRow[];
     total: number;
@@ -2003,7 +2094,11 @@ export async function deleteOntologyInstance(
   );
 }
 
-/** 创建本体关系（Neo4j 关系边） */
+/** 创建本体关系（Neo4j 关系边）
+ *
+ * `documentId` 仅在**文档结果页**创建时传（写入关系/端点 stub 的 `doc_ids`，该文档的关系视图
+ * 才按 `document_id` 过滤得到它）；KB 级「编译资产」页不传 → 全库关系。
+ */
 export async function createOntologyRelation(
   knowledgeBaseId: string,
   sourceEntityType: string,
@@ -2012,6 +2107,7 @@ export async function createOntologyRelation(
   targetEntityType: string,
   targetCanonicalName: string,
   attributes?: Record<string, unknown>,
+  documentId?: string,
 ): Promise<CreateOntologyRelationResponse> {
   const params = new URLSearchParams({
     knowledge_base_id: knowledgeBaseId,
@@ -2021,6 +2117,7 @@ export async function createOntologyRelation(
     target_entity_type: targetEntityType,
     target_canonical_name: targetCanonicalName,
   });
+  if (documentId) params.set('document_id', documentId);
   return postData<CreateOntologyRelationResponse>(
     `/knowledge-base/ontology/relations?${params.toString()}`,
     attributes && Object.keys(attributes).length > 0 ? { attributes } : undefined,
@@ -2379,4 +2476,94 @@ export function getWikiContentsStats(
     concepts: res.concepts || 0,
     entities: res.entities || 0,
   }));
+}
+
+// ─── 文档版本链（第 2 项：版本链 + 新版生效） ─────────────────────
+
+export interface DocumentVersionItem {
+  id: string;
+  versionNo: number;
+  fileName: string;
+  fileSize: number;
+  mimeType: string | null;
+  storageBackend: string;
+  contentHash: string | null;
+  source: string;
+  createdBy: string | null;
+  createdAt: string | null;
+}
+
+interface BackendDocumentVersion {
+  id: string;
+  version_no: number;
+  file_name: string;
+  file_size: number;
+  mime_type?: string | null;
+  storage_backend: string;
+  content_hash?: string | null;
+  source: string;
+  created_by?: string | null;
+  created_at?: string | null;
+}
+
+function mapDocumentVersion(row: BackendDocumentVersion): DocumentVersionItem {
+  return {
+    id: row.id,
+    versionNo: row.version_no,
+    fileName: row.file_name,
+    fileSize: row.file_size,
+    mimeType: row.mime_type ?? null,
+    storageBackend: row.storage_backend,
+    contentHash: row.content_hash ?? null,
+    source: row.source,
+    createdBy: row.created_by ?? null,
+    createdAt: row.created_at ?? null,
+  };
+}
+
+export async function listDocumentVersions(
+  documentId: string,
+): Promise<{ items: DocumentVersionItem[]; total: number }> {
+  const data = await getData<{ items?: BackendDocumentVersion[]; total?: number }>(
+    request.get(`/knowledge-base/documents/${documentId}/versions`),
+  );
+  const items = (data.items ?? []).map(mapDocumentVersion);
+  return { items, total: data.total ?? items.length };
+}
+
+export async function uploadDocumentVersion(
+  documentId: string,
+  knowledgeBaseId: string,
+  file: File,
+  options?: UploadDocumentOptions,
+): Promise<{ documentId: string; version: DocumentVersionItem }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('knowledge_base_id', knowledgeBaseId);
+  const data = await getData<{
+    document_id: string;
+    version: BackendDocumentVersion;
+  }>(
+    request.post(`/knowledge-base/documents/${documentId}/versions`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000,
+      onUploadProgress: options?.onUploadProgress,
+      signal: options?.signal,
+    }),
+  );
+  return { documentId: data.document_id, version: mapDocumentVersion(data.version) };
+}
+
+export async function getDocumentVersionUrl(
+  documentId: string,
+  versionNo: number,
+): Promise<{ url: string; fileName: string; versionNo: number }> {
+  const data = await getData<{
+    url: string;
+    file_name: string;
+    version_no: number;
+  }>(
+    request.get(`/knowledge-base/documents/${documentId}/versions/${versionNo}/url`),
+  );
+  return { url: data.url, fileName: data.file_name, versionNo: data.version_no };
 }

@@ -1,10 +1,14 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { Button, Modal, message } from 'antd';
 import { DownloadOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { getShellContext, isPlatformAdmin } from '@jonex/shell-sdk';
-import { getDocumentViewTicket } from '@/api/domainKnowledge';
+import { getDocumentSourceSpans, getDocumentViewTicket } from '@/api/domainKnowledge';
 import MarkdownContent from '@/components/MarkdownContent';
+import { PdfBboxViewer } from '@/components/PdfBboxViewer';
+import { shouldUseBboxViewer } from '@/components/bboxOverlay';
+import type { SourceSpan } from '@/components/bboxOverlay';
+import type { SpanExpect } from '@/components/documentBBox';
 import { clickDownloadLink } from '@/utils/batchDocumentDownload';
 
 // 全平台统一的文档查看器：音视频/图片/PDF/文本全部在弹层内预览，
@@ -44,6 +48,10 @@ interface OpenOptions {
   timeEnd?: number | null;
   /** 文档页码（1-based；PDF 追加 #page=N 定位。后端 page_no 为 0-based，调用方须 +1） */
   page?: number | null;
+  /** 引用命中的 chunk 序号；有值时 PDF 按需加载 bbox 并增强预览 */
+  chunkIndex?: number | null;
+  /** 引用位置中用于缩小 span 范围的字段（page/table/row/image） */
+  spanExpect?: SpanExpect;
 }
 
 interface ViewerState {
@@ -57,11 +65,18 @@ interface ViewerState {
   timeEnd?: number | null;
   /** PDF 定位页码（1-based） */
   page?: number | null;
+  chunkIndex?: number | null;
+  spanExpect?: SpanExpect;
+  /** 引用 bbox；加载成功才切换 PdfBboxViewer，空/失败保持 iframe */
+  spans?: SourceSpan[] | null;
   /** 文本原文：Markdown 保留格式，其他文本直接显示，避免 iframe 空白。 */
   content?: string;
 }
 
 const INITIAL: ViewerState = { open: false, kind: 'other', url: '', name: '', docId: '' };
+
+/** bbox 加载上限：超时就保持 iframe，不让弹层等后端。 */
+const SOURCE_SPANS_TIMEOUT_MS = 4000;
 
 /**
  * 统一文档查看 hook。返回 openDocument(打开查看) 和 viewer(需渲染到页面的弹层节点)。
@@ -69,6 +84,9 @@ const INITIAL: ViewerState = { open: false, kind: 'other', url: '', name: '', do
 export function useDocumentViewer() {
   const { t } = useTranslation();
   const [state, setState] = useState<ViewerState>(INITIAL);
+  /** 打开序号：旧文档的 bbox 响应晚到时不得覆盖新文档。 */
+  const openSeq = useRef(0);
+  const spansAbort = useRef<AbortController | null>(null);
 
   const openDocument = useCallback((opts: OpenOptions) => {
     let kind = opts.mediaType ?? inferMediaType(opts.fileName);
@@ -81,10 +99,31 @@ export function useDocumentViewer() {
     const timeStart = opts.timeStart ?? null;
     const timeEnd = opts.timeEnd ?? null;
     const page = opts.page ?? null;
+    const chunkIndex = opts.chunkIndex ?? null;
+    const spanExpect = opts.spanExpect ?? {};
+    const seq = ++openSeq.current;
+    // 取消上一份文档尚未返回的请求（含 4s 超时计时）
+    spansAbort.current?.abort();
+    spansAbort.current = null;
+
+    // 引用 bbox 与 view-ticket 并行取：ticket 到了就先开 iframe，
+    // spans 到了再把渲染增强为 PdfBboxViewer；空/失败/超时保持 iframe。
+    let spansPromise: Promise<SourceSpan[] | null> | null = null;
+    if (kind === 'pdf' && chunkIndex != null) {
+      const controller = new AbortController();
+      spansAbort.current = controller;
+      const timer = window.setTimeout(() => controller.abort(), SOURCE_SPANS_TIMEOUT_MS);
+      spansPromise = getDocumentSourceSpans(opts.docId, chunkIndex, spanExpect, controller.signal)
+        .then((res) => (res.degraded ? null : res.spans))
+        .catch(() => null)
+        .finally(() => window.clearTimeout(timer));
+    }
+
     // md / markdown 文件：拉取原文用 MarkdownContent 渲染（保留格式）
     const isMarkdown = /\.(md|markdown)$/i.test(opts.fileName || '');
     getDocumentViewTicket(opts.docId)
       .then(async ({ url }) => {
+        if (seq !== openSeq.current) return;
         const sep = url.includes('?') ? '&' : '?';
         let finalUrl = url;
         if (kind === 'video' || kind === 'audio') {
@@ -99,9 +138,7 @@ export function useDocumentViewer() {
           finalUrl = `${url}${sep}proxy=1`;
           // PDF 页码定位：#page=N 是浏览器 PDF viewer 的本地 fragment（不发送到
           // 服务器），Chrome/Firefox 均支持；N 为 1-based。
-          if (kind === 'pdf' && page != null) {
-            finalUrl = `${finalUrl}#page=${page}`;
-          }
+          // 注意：fragment 只在 iframe 分支拼（见渲染处），PdfBboxViewer 的 url 不带。
         }
         // 文本复用同源原文代理；Markdown 保留格式，其他文本直接显示。
         if (kind === 'text' || (isMarkdown && kind === 'other')) {
@@ -109,7 +146,10 @@ export function useDocumentViewer() {
             const resp = await fetch(finalUrl);
             if (resp.ok) {
               const text = await resp.text();
-              setState({ open: true, kind, url: finalUrl, name: opts.fileName, docId: opts.docId, timeStart, timeEnd, page, content: text });
+              setState({
+                open: true, kind, url: finalUrl, name: opts.fileName, docId: opts.docId,
+                timeStart, timeEnd, page, chunkIndex, spanExpect, spans: null, content: text,
+              });
               return;
             }
           } catch {
@@ -117,12 +157,29 @@ export function useDocumentViewer() {
           }
         }
         // image：302 直连对象存储即可（来源须在 CSP img-src 白名单内）
-        setState({ open: true, kind, url: finalUrl, name: opts.fileName, docId: opts.docId, timeStart, timeEnd, page });
+        setState({
+          open: true, kind, url: finalUrl, name: opts.fileName, docId: opts.docId,
+          timeStart, timeEnd, page, chunkIndex, spanExpect, spans: null,
+        });
+        // bbox 增强：仅当仍是本次打开且拿到有效 spans 时切换查看器。
+        if (spansPromise) {
+          void spansPromise.then((spans) => {
+            if (seq !== openSeq.current) return;
+            if (!spans || spans.length === 0) return;
+            setState((s) => (s.open && s.docId === opts.docId ? { ...s, spans } : s));
+          });
+        }
       })
       .catch((err: any) => message.error(err?.message || t('common.openDocumentFailed')));
   }, []);
 
-  const close = useCallback(() => setState((s) => ({ ...s, open: false })), []);
+  const close = useCallback(() => {
+    // 关窗即作废在途的 bbox 请求，避免响应回来后改到下一次打开的弹层。
+    openSeq.current += 1;
+    spansAbort.current?.abort();
+    spansAbort.current = null;
+    setState((s) => ({ ...s, open: false }));
+  }, []);
 
   // [jonex] 下载原始文件：仅平台管理员可见，与 DocumentLibrary 批量下载同口径
   // （/raw 的 download 参数只有前端做门禁，网关侧不校验，故这里必须显式判权）。
@@ -192,6 +249,9 @@ export function useDocumentViewer() {
       ) : null}
     </div>
   );
+  // PDF 页码 fragment 只拼在 iframe 分支；PdfBboxViewer 用不带 fragment 的原始 url。
+  const iframeSrc =
+    state.kind === 'pdf' && state.page != null ? `${state.url}#page=${state.page}` : state.url;
   const viewer = (
     <Modal
       open={state.open}
@@ -234,10 +294,18 @@ export function useDocumentViewer() {
             <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{state.content}</pre>
           )}
         </div>
+      ) : state.kind === 'pdf' && shouldUseBboxViewer(state.spans ?? []) ? (
+        // 有引用 bbox：pdf.js 渲染 + 高亮；加载/渲染失败回退 iframe。
+        <PdfBboxViewer
+          url={state.url}
+          spans={state.spans ?? []}
+          targetPage={state.page ?? null}
+          onError={() => setState((s) => ({ ...s, spans: null }))}
+        />
       ) : (
         // pdf / text / other：iframe 内嵌预览（浏览器按 Content-Type 渲染）。
         // office 已在 openDocument 归到 pdf（解析侧 preview.pdf + #page 定位）。
-        <iframe src={state.url} title={state.name} style={{ width: '100%', height: '80vh', border: 'none' }} />
+        <iframe src={iframeSrc} title={state.name} style={{ width: '100%', height: '80vh', border: 'none' }} />
       )}
     </Modal>
   );

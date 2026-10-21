@@ -1,3 +1,4 @@
+import { consumeWikiSearchStream } from './wikiSearchStream';
 import { readAccessToken } from '@jonex/shell-sdk';
 import { request, getData } from './request';
 import { getDomainKnowledgeSpaces, getDomainKnowledgeList } from './domainKnowledge';
@@ -30,6 +31,7 @@ import type {
   AnswerFeedbackEchoResponse,
   AnswerFeedbackListResponse,
   AnswerFeedbackStats,
+  ImageQueryResult,
 } from '../types/knowledgeSearch';
 
 type NormalizedSearchParams = {
@@ -73,6 +75,45 @@ interface RawKnowledgeSearchHistoryItem {
     domain_id?: string;
     domainId?: string;
     strict_config?: KnowledgeSearchStrictConfig | null;
+    /** [jonex] 以图问知识：用户原话（`query` 存的是识别产出的检索文本） */
+    image_question?: string;
+  };
+  /** [jonex] 以图问知识：这条历史附带的查询图片（后端已按顺序返回） */
+  query_images?: RawQueryImageRef[];
+}
+
+interface RawQueryImageRef {
+  id: string;
+  mime_type?: string;
+  mimeType?: string;
+  file_size?: number;
+  fileSize?: number;
+  view_url?: string | null;
+  viewUrl?: string | null;
+}
+
+/** 后端识别的回包（snake_case；与 `ImageQueryResponse` 对齐） */
+interface RawImageQueryResponse {
+  query: string;
+  images?: Array<{
+    index: number;
+    status: string;
+    error_code?: number | null;
+    image_id?: string | null;
+    description?: string;
+    ocr_text?: string;
+    entities?: string[];
+    cached?: boolean;
+    persisted?: boolean;
+  }>;
+  entities?: string[];
+  model?: string;
+  partial?: boolean;
+  duration_ms?: number;
+  limits?: {
+    max_images?: number;
+    max_bytes?: number;
+    max_total_bytes?: number;
   };
 }
 
@@ -108,6 +149,14 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
     references: item.references,
     reasoning: item.reasoning,
     strictConfig: item.strictConfig ?? (metadata.strict_config as KnowledgeSearchStrictConfig | null | undefined),
+    // [jonex] 以图问知识：缺字段时给空数组（调用方不必判 undefined）
+    queryImages: (item.query_images ?? []).map((image) => ({
+      id: image.id,
+      mimeType: image.mimeType ?? image.mime_type ?? 'image/jpeg',
+      fileSize: image.fileSize ?? image.file_size ?? 0,
+      viewUrl: image.viewUrl ?? image.view_url ?? null,
+    })),
+    imageQuestion: metadata.image_question,
   };
 }
 
@@ -243,6 +292,27 @@ export async function getKnowledgeSearchHistory(
 }
 
 /**
+ * [jonex] 按 id 单取一条历史的**快照**（answer / references / reasoning）。
+ *
+ * 列表接口默认不再返回快照 —— 实测 18 条历史 222 KB 里 **83% 是
+ * `references[].locations[].text`（整段 chunk 正文）**，而侧栏只渲染
+ * query / resultCount / 时间，一个字都用不上。点击某条历史要回放时才取这一条。
+ *
+ * 取不到（老数据没有快照 / 已被清理）返回 `null`，由调用方回退为「重新检索」。
+ */
+export async function getKnowledgeSearchHistorySnapshot(
+  historyId: string,
+): Promise<KnowledgeSearchHistoryItem | null> {
+  const result = await getData<{ items: RawKnowledgeSearchHistoryItem[] }>(
+    request.get('/knowledge-base/search/history', {
+      params: { history_id: historyId, page: 1, page_size: 1 },
+    }),
+  );
+  const item = result.items?.[0];
+  return item ? normalizeHistoryItem(item) : null;
+}
+
+/**
  * [jonex] 历史快照引用补预签名 URL：快照里 raw_url / asset_url 会过期（COS 约 1 小时），
  * 展示前按 doc_id / image_idx 从 resolve 端点取新的补回快照（点击历史时调用）。
  *
@@ -334,6 +404,77 @@ export async function saveKnowledgeSearchHistory(
   return normalizeHistoryItem(('item' in result ? result.item : result) as RawKnowledgeSearchHistoryItem);
 }
 
+/**
+ * [jonex] 以图问知识：把图片识别成一段可直接检索的文本。
+ *
+ * 两步式的第一步 —— **它不检索**。拿到 `query` 后照常调 `streamKnowledgeSearch`，
+ * 走现成的快速 / 深度 / Wiki 三条链路（那三条一行未改）。
+ *
+ * ⚠️ **不要手动设 `Content-Type`**：multipart 的 boundary 必须由浏览器生成，
+ * 手写会把 boundary 写死，后端解析不出分片。
+ * ⚠️ 图片字节在这里、也只在这里上传 —— 后端在「保存历史」那一刻才把它落到对象存储
+ * （识别阶段只进 Redis 暂存），所以「识别了但没检索」的图不会留痕。
+ */
+export async function recognizeImageQuery(
+  files: Blob[],
+  question?: string,
+  signal?: AbortSignal,
+): Promise<ImageQueryResult> {
+  const form = new FormData();
+  files.forEach((file, index) => {
+    form.append('files', file, `image_${index + 1}`);
+  });
+  if (question?.trim()) form.append('question', question.trim());
+
+  const raw = await getData<RawImageQueryResponse>(
+    request.post('/knowledge-base/search/image-query', form, {
+      signal,
+      // 识别比普通请求慢（VLM 往返），但仍是交互场景：实际超时由后端与 dev-gateway 决定
+      timeout: 90_000,
+    }),
+  );
+  return {
+    query: raw.query,
+    images: (raw.images ?? []).map((image) => ({
+      index: image.index,
+      status: image.status === 'ok' ? 'ok' : 'failed',
+      errorCode: image.error_code ?? undefined,
+      imageId: image.image_id ?? null,
+      description: image.description ?? '',
+      ocrText: image.ocr_text ?? '',
+      entities: image.entities ?? [],
+      cached: Boolean(image.cached),
+      persisted: Boolean(image.persisted),
+    })),
+    entities: raw.entities ?? [],
+    model: raw.model ?? '',
+    partial: Boolean(raw.partial),
+    durationMs: raw.duration_ms ?? 0,
+    limits: raw.limits
+      ? {
+          maxImages: raw.limits.max_images ?? 4,
+          maxBytes: raw.limits.max_bytes ?? 5 * 1024 * 1024,
+          maxTotalBytes: raw.limits.max_total_bytes ?? 12 * 1024 * 1024,
+        }
+      : undefined,
+  };
+}
+
+/**
+ * [jonex] 以图问知识：取一张查询图片的短时查看地址。
+ *
+ * 用于历史条目的图片 `onError` 重试 —— 后端补签的 `viewUrl` 会过期（默认 15 分钟），
+ * 而历史列表是快照，长时间停留在页面上就会失效。
+ */
+export async function getQueryImageViewTicket(
+  imageId: string,
+): Promise<{ url: string; expiresIn: number }> {
+  const result = await getData<{ url: string; expires_in?: number; expiresIn?: number }>(
+    request.get(`/knowledge-base/search/query-images/${imageId}/view-ticket`),
+  );
+  return { url: result.url, expiresIn: result.expires_in ?? result.expiresIn ?? 900 };
+}
+
 export async function deleteKnowledgeSearchHistory(knowledgeBaseId: string, id: string): Promise<void> {
   // if (useMock) {
   //   deleteMockKnowledgeSearchHistory(id)
@@ -385,7 +526,8 @@ export async function streamKnowledgeSearch(
         : engineType === 'openkb'
           ? '/knowledge-base/search/llmwiki'
           : '/knowledge-base/search/mix';
-  const url = new URL(`${baseUrl}${endpoint}`, window.location.origin);
+  const wikiStream = endpoint === '/knowledge-base/search/jonex_wiki';
+  const url = new URL(`${baseUrl}${endpoint}${wikiStream ? '/stream' : ''}`, window.location.origin);
 
   const strict = normalized.strictConfig;
   const body: Record<string, unknown> = {
@@ -394,6 +536,9 @@ export async function streamKnowledgeSearch(
     top_k: normalized.topK,
     with_reasoning: true,
   };
+  if (endpoint === '/knowledge-base/search/jonex_wiki') {
+    body.thinking_mode = params.wikiThinkingMode ?? 'fast';
+  }
   if (strict && !wikiEndpoint) {
     // 严格模式参数（普通 / 深度检索共用）：strict_mode 关闭时仅传开关，不传其它严格参数
     body.strict_mode = strict.strict_mode;
@@ -435,6 +580,30 @@ export async function streamKnowledgeSearch(
   }
 
   try {
+    if (wikiStream) {
+      let sessionId = '';
+      let completed = false;
+      let cancellation: Promise<unknown> | undefined;
+      const stop = () => {
+        if (!sessionId) return;
+        cancellation ??= fetch(new URL(`${baseUrl}${endpoint}/cancel`, window.location.origin).toString(), {
+          method: 'POST', keepalive: true,
+          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId }),
+        }).catch(() => undefined);
+        return cancellation;
+      };
+      signal?.addEventListener('abort', stop, { once: true });
+      try {
+        await consumeWikiSearchStream(response, { ...handlers,
+          onDone: (meta) => { completed = true; handlers.onDone?.(meta); },
+        }, (id) => { sessionId = id; if (signal?.aborted) void stop(); });
+      } finally {
+        signal?.removeEventListener('abort', stop);
+        if (!completed) await stop();
+      }
+      return;
+    }
     const result = await response.json();
 
     if (!result.success || !result.data?.answer) {
@@ -665,4 +834,26 @@ export async function getSearchFeedbackStats(
   if (!response.ok) throw new Error('Failed to fetch feedback statistics');
   const result = await response.json();
   return result.data ?? { total: 0, like_count: 0, dislike_count: 0 };
+}
+
+export interface WikiEvidenceView {
+  kind: string;
+  exact_location: boolean;
+  query_id: string;
+  bundle_sha: string;
+  segments: { text: string; highlight: boolean }[];
+  spans?: number[][];
+  page_number?: number | null;
+  sheet_name?: string | null;
+  table_title?: string;
+  rows?: number[];
+  columns?: number[];
+  cells?: { row: number; column: number; coordinate: string; value: string | null; formula?: string | null; highlight: boolean }[];
+  truncated?: boolean;
+}
+
+export async function resolveWikiEvidence(ref: KnowledgeReference, signal?: AbortSignal): Promise<WikiEvidenceView> {
+  return getData<WikiEvidenceView>(request.post('/knowledge-base/search/jonex_wiki/evidence', {
+    knowledge_base_id: ref.kb_id, query_id: ref.query_id, handle: ref.evidence_handle,
+  }, { signal }));
 }

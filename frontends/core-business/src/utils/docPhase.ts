@@ -11,7 +11,6 @@ import { isLlmWikiType } from './kbType';
 export type DocPhase =
   | 'pending_parse'
   | 'parsing'
-  | 'parsed'
   | 'ingesting'
   | 'parse_failed'
   | 'pending_compile'
@@ -56,10 +55,6 @@ export function deriveDocPhase(
       return 'pending_parse';
     case 'parsing':
       return 'parsing';
-    // [jonex] 解析产物已落盘、切片还没推入库（lightrag 三步链第 1 步的收口态）。
-    // 只可能出现在 lightrag 库：两种 llm-wiki 库没有 ingest 那一段，解析完直接 ready。
-    case 'parsed':
-      return 'parsed';
     case 'ingesting':
       return 'ingesting';
     case 'failed':
@@ -123,20 +118,6 @@ export const PHASE_DISPLAY: Record<DocPhase, PhaseDisplay> = {
     canReparse: false,
     canRecompile: false,
     canDelete: false,
-  },
-  parsed: {
-    // 「待抽取」：解析完了但**没入库**，所以和 parsing 一样不可搜、也**没有 hint**
-    // （不写「已可搜索」—— 那时候搜不到）。
-    // 但两个操作必须放开：这正是它存在的意义。文档停在这个相位**只可能**是因为
-    // 任务中心那条任务被停了（或后面那步没派下来），此刻没有后台任务在跑，重新解析
-    // 和删除都是安全的；照抄 parsing 把按钮全禁掉，用户就彻底没出路了。
-    label: 'docPhase.parsed',
-    color: '#8b5cf6',
-    icon: 'hourglass',
-    searchable: false,
-    canReparse: true,
-    canRecompile: false, // 还没入库，编译无从谈起
-    canDelete: true,
   },
   ingesting: {
     label: 'docPhase.ingesting',
@@ -215,12 +196,16 @@ export const PHASE_DISPLAY: Record<DocPhase, PhaseDisplay> = {
   },
 };
 
-/** 列表筛选顺序（不含 deleting；它是正交删除态）。 */
+/**
+ * 列表筛选顺序（不含 deleting；它是正交删除态）。
+ *
+ * 不含 `ingesting`（2026-10-16）：现役任务中心链是 `parse(full) → compile`，解析与推切片
+ * 一趟干完，文档在链上只会停 `PARSING`，这个选项长期筛不到东西。状态映射与徽标**保留**
+ * ——旧链路存量文档、被交还的文档仍可能落进它，删了映射行会直接不展示。
+ */
 export const FILTER_PHASES: DocPhase[] = [
   'pending_parse',
   'parsing',
-  'parsed',
-  'ingesting',
   'parse_failed',
   'pending_compile',
   'compiling',

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Input, Button, message, Empty, Spin, Dropdown, Tag } from 'antd';
+import { Input, Button, message, Empty, Spin, Dropdown, Tag, Tooltip } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
@@ -35,6 +35,33 @@ import './index.scss';
 
 // 一页取满后端 limit 上限（Query(le=100)），列表不再分页，底部分页器已移除
 const PAGE_SIZE = 100;
+
+// 描述被 CSS 截断为两行，仅溢出时 hover 出 tooltip：未溢出还弹会让用户以为内容被裁掉了
+function OverflowTooltip({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <Tooltip
+      title={text}
+      open={open}
+      // 关闭交给触发器（含移入弹层后的离开），我们只负责「溢出才允许打开」
+      onOpenChange={(next) => {
+        if (!next) setOpen(false);
+      }}
+      styles={{
+        root: { maxWidth: 480, maxHeight: 240, overflowY: 'auto' },
+        container: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+      }}
+    >
+      <div
+        className="kb-card-desc"
+        onMouseEnter={(e) => setOpen(e.currentTarget.scrollHeight > e.currentTarget.clientHeight + 1)}
+      >
+        {text}
+      </div>
+    </Tooltip>
+  );
+}
 
 const DomainKnowledge = function DomainKnowledge() {
   const { global } = useStore();
@@ -415,7 +442,7 @@ const DomainKnowledge = function DomainKnowledge() {
 
                 {/* Card Body - Description */}
                 <div className="kb-card-body">
-                  <div className="kb-card-desc">{item.description || t('domainKnowledge.noDescription')}</div>
+                  <OverflowTooltip text={item.description || t('domainKnowledge.noDescription')} />
                 </div>
 
                 {/* Card Tags Row */}

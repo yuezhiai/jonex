@@ -28,11 +28,12 @@ export interface ProcessingStage {
 interface StageDetailCardProps {
   stage: ProcessingStage;
   docId?: string;
+  refreshKey?: string;
   mediaType?: 'video' | 'document';
   onPlayVideo?: (timeStart?: number | null) => void;
 }
 
-export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }: StageDetailCardProps) {
+export default function StageDetailCard({ stage, docId, refreshKey, mediaType, onPlayVideo }: StageDetailCardProps) {
   const { t } = useTranslation();
   const [chunks, setChunks] = useState<DocumentChunk[]>([]);
   const [selectedChunkId, setSelectedChunkId] = useState<string | null>(null);
@@ -50,18 +51,19 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
 
   useEffect(() => {
     if (stage.key === 'parse' && docId) {
+      let cancelled = false;
       setChunksLoading(true);
       getDocumentChunks(docId)
         .then((items) => {
+          if (cancelled) return;
           setChunks(items);
-          if (items.length > 0) {
-            setSelectedChunkId(items[0].chunk_id);
-          }
+          setSelectedChunkId((current) => items.some((c) => c.chunk_id === current) ? current : items[0]?.chunk_id ?? null);
         })
         .catch(() => {})
-        .finally(() => setChunksLoading(false));
+        .finally(() => { if (!cancelled) setChunksLoading(false); });
+      return () => { cancelled = true; };
     }
-  }, [stage.key, docId]);
+  }, [stage.key, docId, refreshKey]);
 
   if (stage.key !== 'parse') return null;
 
@@ -142,7 +144,7 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
         }}
       >
         {selectedChunk && (
-          <>
+          <div style={{ maxWidth: 960, margin: '0 auto' }}>
             <div
               style={{
                 display: 'flex',
@@ -171,7 +173,7 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    {getChunkTitle(selectedChunk)}
+                    {getChunkTitle(selectedChunk) || t('domainKnowledge.chunkLabel', { index: selectedIndex + 1 })}
                   </span>
                 </div>
                 <Tag
@@ -201,10 +203,10 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
                 )}
               </div>
             </div>
-            <div style={{ marginBottom: 12 }}>
-              <MarkdownContent content={selectedChunk.content_summary ?? ''} />
+            <div className="yx-doc-passage" style={{ marginBottom: 12 }}>
+              <MarkdownContent content={selectedChunk.content ?? selectedChunk.content_summary ?? ''} />
             </div>
-          </>
+          </div>
         )}
       </div>
     </div>
@@ -214,14 +216,14 @@ export default function StageDetailCard({ stage, docId, mediaType, onPlayVideo }
 }
 
 function getChunkTitle(chunk: DocumentChunk): string {
-  const firstHeading = chunk.content_summary?.match(/^#\s+(.+)$/m)?.[1];
+  const firstHeading = (chunk.content ?? chunk.content_summary)?.match(/^#{1,6}\s+(.+)$/m)?.[1];
   if (firstHeading) return firstHeading.replace(/\\/g, '');
-  const fileName = chunk.file_path?.match(/file=([^|]+)/)?.[1];
+  const fileName = chunk.file_name || chunk.file_path?.match(/file=([^|]+)/)?.[1];
   if (fileName) {
     const cleanName = fileName
       .replace(/\.[^.|]+$/u, '')
       .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_/gi, '');
     return cleanName.replace(/_+/g, ' ').trim() || 'Unnamed Document';
   }
-  return `Chunk ${chunk.chunk_id}`;
+  return '';
 }

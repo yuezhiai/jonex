@@ -124,7 +124,7 @@ export async function listDataSourceDocuments(
   const statusText = (s: string) =>
     s === 'ready'
       ? `${_t('common.statusImported')}·${_t('common.statusParsing')}·${_t('common.statusCompiling')}`
-      : s === 'parsing' || s === 'parsed'
+      : s === 'parsing'
         ? `${_t('common.statusImported')}·${_t('common.statusParsing')}`
         : s === 'pending'
           ? _t('common.statusImported')

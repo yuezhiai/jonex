@@ -62,13 +62,19 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           title: T('domainSpace.management'),
           // [jonex] 权限重构 B6（方案 §12.4 / §12.3 / 执行文档 §7.4-§7.5）：
           // 路由守卫用 space:read（「能否打开页面」的读通道）——普通用户持有 space:read，
-          // 所以进得来。⚠️ 绝不能用 space:write：那是租户级写（建空间），
-          // 空间管理者不一定有 space:write，用它守卫会把管理者挡在自己空间外。
+          // 所以进得来。⚠️ 不能用 space:write 守卫：后端「建空间」的准入是
+          // tenant:admin/platform:admin **或** space:write（can_create_space，W2 2026-10-19），
+          // 单看码会把「仅持 space:write 的租户管理员兜底路径」判漏；而空间管理者即便没有
+          // space:write 也得能打开本页看自己的空间。
           // 单个空间内的编辑/删除/管成员按钮走 can_manage_permissions（资源身份字段），不在这里。
+          // 建空间入口的判据统一用后端 can_create_space 字段（SpaceSwitcher 隐藏入口、
+          // DomainSpaceCreate 页内拦截），前端不硬编码码名。
           // order:2 补齐 standalone 侧边栏序列（search=1 / knowledge=3 / management=4）；
           // hosted（shell）模式导航走 DB 菜单树、DB 菜单树按设计不含此项，故此改只影响 standalone。
           menu: { icon: 'BlockOutlined', order: 2, permissionCode: 'space:read' },
         },
+        // /domain-space/new 若加 permissionCode 只能写码名，与后端「字段优先」口径不一致，
+        // 故不在此设守卫：DomainSpaceCreate 页内按 can_create_space 拦截（含直接输 URL）。
         { path: 'domain-space/new', element: DomainSpaceCreate, title: T('domainSpace.create') },
         { path: 'domain-space/:id/settings', element: DomainSpaceSettings, title: T('route.domainSpaceSettings') },
         { path: 'domain-space/permissions', element: DomainSpacePermission, title: T('domainPermission.title') },

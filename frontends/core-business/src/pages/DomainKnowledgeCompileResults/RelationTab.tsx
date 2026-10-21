@@ -7,7 +7,12 @@ import type { RelationInstanceSummary, RelationInstanceRow } from '@/types/domai
 import { useTranslation } from 'react-i18next';
 import EditRelationModal from './EditRelationModal';
 import useFillHeight from '@/hooks/useFillHeight';
-import { getOntologyRelationInstances, createOntologyRelation, deleteOntologyRelation } from '@/api/domainKnowledge';
+import {
+  getOntologyRelationInstances,
+  getOntologyRelationTypes,
+  createOntologyRelation,
+  deleteOntologyRelation,
+} from '@/api/domainKnowledge';
 import debounce from 'lodash/debounce';
 import './index.scss';
 
@@ -65,17 +70,37 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
   }, [keyword, kbId, fetchList]);
 
   // ── relation type display map & options for modal ──
+  // 关系类型是 KB 级概念（来自编译 schema），而文档页拿到的 data 被裁过：只留本文档 count>0 的类型。
+  // 文档里还没有关系时那是空数组 → 建关系弹窗的类型下拉无选项可下、根本建不了关系。
+  // 所以文档上下文里补一次 KB 全量（schema 全部类型 + 图里已存在的 unschematized 类型，如「包含」）。
+  const [kbWideTypes, setKbWideTypes] = useState<RelationInstanceSummary[] | null>(null);
+  useEffect(() => {
+    if (!docId) return;
+    let alive = true;
+    getOntologyRelationTypes(kbId)
+      .then((res) => {
+        if (alive) setKbWideTypes(res.items);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [kbId, docId]);
+
+  // 文档页：KB 全量（加载中先退回文档级列表）；KB 级资产页：data 本身就是全量
+  const typeSource = useMemo(() => (docId ? (kbWideTypes ?? data ?? []) : (data ?? [])), [docId, kbWideTypes, data]);
+
   const relationTypeDisplayMap = useMemo(() => {
     const map: Record<string, string> = {};
-    (data ?? []).forEach((item) => {
+    (typeSource ?? []).forEach((item) => {
       map[item.name] = item.display_name || item.name;
     });
     return map;
-  }, [data]);
+  }, [typeSource]);
 
   const relationTypeOptions = useMemo(
-    () => (data ?? []).map((item) => ({ value: item.name, label: item.display_name || item.name })),
-    [data],
+    () => (typeSource ?? []).map((item) => ({ value: item.name, label: item.display_name || item.name })),
+    [typeSource],
   );
 
   // ── modal ──
@@ -129,6 +154,8 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         form.targetType,
         form.targetName,
         form.attributes,
+        // 文档结果页（带 docId）建的关系归属该文档；KB 级「编译资产」页不带 → 全库关系
+        docId,
       );
       message.success(t('common.createSuccess'));
       closeModal();
@@ -164,7 +191,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         return;
       }
 
-      // 标识符变化 → 删除旧关系 + 创建新关系
+      // 标识符变化 → 删除旧关系 + 创建新关系（重建时同样保留文档关联）
       await deleteOntologyRelation(
         kbId,
         old.sourceType,
@@ -180,6 +207,8 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         form.relationType,
         form.targetType,
         form.targetName,
+        undefined,
+        docId,
       );
       message.success(t('common.saveSuccess'));
       closeModal();
@@ -365,6 +394,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         open={modalOpen}
         mode={isCreate ? 'create' : 'edit'}
         kbId={kbId}
+        docId={docId}
         relationTypeOptions={relationTypeOptions}
         initialData={editData}
         onSave={isCreate ? handleCreate : handleEdit}

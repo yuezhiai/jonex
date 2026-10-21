@@ -813,6 +813,10 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
                 />
               </div>
 
+              {/* 后处理（自动摘要 / 自动标签）暂时隐藏 —— 代码与 i18n 文案都保留，
+                  恢复时把这层注释去掉即可。分隔线跟着一起注释：它本来只为引出这一组，
+                  留下会在表单末尾多出一条悬空的线 */}
+              {/*
               <div className="parser-modal-divider" />
 
               <div className="parser-form-row parser-post-row">
@@ -881,6 +885,7 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
                   </div>
                 )}
               </div>
+              */}
             </div>
 
             <div className="parser-modal-footer">

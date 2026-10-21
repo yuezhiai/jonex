@@ -52,6 +52,7 @@ import ConstraintFormModal from './ConstraintFormModal';
 import StepFormModal from './StepFormModal';
 import PromptViewModal from './PromptViewModal';
 import TemplateImportModal from './TemplateImportModal';
+import TemplateBindModal from './TemplateBindModal';
 
 interface Props {
   kbId: string;  canWrite?: boolean;
@@ -139,6 +140,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
     mode: 'object' | 'relation' | 'constraint';
   }>({ open: false, mode: 'object' });
   const [submitting, setSubmitting] = useState(false);
+  const [bindModalOpen, setBindModalOpen] = useState(false);
 
   // YAML import state
   const yamlFileInputRef = useRef<HTMLInputElement>(null);
@@ -589,6 +591,13 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
               >
                 {activeActions.importLabel}
               </Button>
+              <Button
+                disabled={!canWrite}
+                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                onClick={() => setBindModalOpen(true)}
+              >
+                {t('compile.binding.button')}
+              </Button>
               <Button icon={<span>&#x1F4E4;</span>} loading={yamlExporting} onClick={handleExportYaml}>
                 {t('compile.exportYaml')}
               </Button>
@@ -663,6 +672,19 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         desc={promptModal.desc}
         content={promptModal.content}
         onClose={() => setPromptModal((s) => ({ ...s, open: false }))}
+      />
+      <TemplateBindModal
+        open={bindModalOpen}
+        kbId={kbId}
+        currentScenarioId={compiledSchema?.template_scenario_id ?? null}
+        onClose={() => setBindModalOpen(false)}
+        onBound={() => {
+          reloadCompiledSchema();
+          loadObjects();
+          loadRelations();
+          loadConstraints();
+          loadTargetOptions();
+        }}
       />
       <TemplateImportModal
         open={importModal.open}

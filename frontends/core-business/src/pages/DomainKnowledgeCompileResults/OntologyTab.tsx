@@ -13,6 +13,7 @@ import {
   updateOntologyInstance,
   deleteOntologyInstance,
   getOntologyInstances,
+  getOntologyEntityTypes,
 } from '@/api/domainKnowledge';
 import './index.scss';
 
@@ -69,20 +70,39 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
   }, [keyword, kbId, docId, fetchData]);
 
   // ── 实体类型显示映射及弹窗下拉框选项 ──
+  // 实体类型是 KB 级概念：文档页拿到的 data 被裁过（只留本文档已有的类型，本文档没有实体时是空数组，
+  // 建实例弹窗就会无类型可选），所以文档上下文里补一次 KB 全量，作为下拉/映射的来源。
+  const [kbWideTypes, setKbWideTypes] = useState<OntologyInstanceSummary[] | null>(null);
+  useEffect(() => {
+    if (!docId) return;
+    let alive = true;
+    getOntologyEntityTypes(kbId)
+      .then((res) => {
+        if (alive) setKbWideTypes(res.items);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [kbId, docId]);
+
+  // 文档页：KB 全量（加载中先退回文档级列表）；KB 级资产页：data 本身就是全量
+  const typeSource = useMemo(() => (docId ? (kbWideTypes ?? data ?? []) : (data ?? [])), [docId, kbWideTypes, data]);
+
   const entityTypeDisplayMap = useMemo(() => {
     const map: Record<string, string> = {};
-    (data ?? []).forEach((item) => {
+    (typeSource ?? []).forEach((item) => {
       map[item.name] = item.display_name || item.name;
     });
     return map;
-  }, [data]);
+  }, [typeSource]);
 
   const ontologyOptions = useMemo(() => {
-    return (data ?? []).map((item) => ({
+    return (typeSource ?? []).map((item) => ({
       value: item.description || item.display_name || item.name,
       label: item.description || item.display_name || item.name,
     }));
-  }, [data]);
+  }, [typeSource]);
 
   // ── modal ──
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -133,6 +153,8 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
         aliases: data.aliases,
         description: data.description,
         attributes: data.attributes,
+        // 文档结果页（带 docId）建的实例归属该文档；KB 级「编译资产」页不带 → 全库实例
+        ...(docId ? { document_id: docId } : {}),
       });
       message.success(t('compile.instanceCreated'));
       closeEditModal();
@@ -158,7 +180,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
       const identityChanged = data.type !== old.type;
 
       if (identityChanged) {
-        // 实体类型变化 → 删除旧实例 + 创建新实例
+        // 实体类型变化 → 删除旧实例 + 创建新实例（重建时同样保留文档关联）
         await deleteOntologyInstance(kbId, old.type, old.name);
         await createOntologyInstance({
           knowledge_base_id: kbId,
@@ -167,6 +189,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           aliases: data.aliases,
           description: data.description,
           attributes: data.attributes,
+          ...(docId ? { document_id: docId } : {}),
         });
       } else {
         const updates: Record<string, unknown> = {};

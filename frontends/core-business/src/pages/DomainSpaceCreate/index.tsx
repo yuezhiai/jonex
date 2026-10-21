@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { Input, Button, message } from 'antd';
+import { Input, Button, Result, Spin, message } from 'antd';
 import { PlusCircleOutlined } from '@ant-design/icons';
 import { emitSpacesInvalidated } from '@jonex/shell-sdk';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
@@ -15,6 +15,25 @@ export default function DomainSpaceCreate() {
   const { global } = useStore();
   const [form, setForm] = useState<DomainSpaceFormData>({ name: '', description: '' });
   const [submitting, setSubmitting] = useState(false);
+
+  // [jonex] W2（2026-10-19）：本页原先无任何权限守卫，无创建权的用户
+  // （既非租户管理员、也没有 space:write）能一路填完表单，提交时才吃 403。
+  // 现在按后端 can_create_space 判（与 create 准入同源），直接拦在表单之前。
+  // 复用全局 store 的列表请求（AppLayout 已 loadSpaces，幂等），不额外发请求。
+  const { loadSpaces } = global;
+  // 列表请求失败时不能把用户永久卡在 loading：fail-open 回落到表单，
+  // 真正的准入仍由后端 can_create_space（create）兜底。
+  const [loadFailed, setLoadFailed] = useState(false);
+  useEffect(() => {
+    if (global.spacesLoaded) return undefined;
+    let cancelled = false;
+    void loadSpaces().catch(() => {
+      if (!cancelled) setLoadFailed(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadSpaces, global.spacesLoaded]);
 
   const handleCreate = async () => {
     if (!form.name.trim()) {
@@ -40,6 +59,41 @@ export default function DomainSpaceCreate() {
       setSubmitting(false);
     }
   };
+
+  // 列表还没回来时先给 loading：否则首屏 canCreateSpace 恒为 false 会误闪「无权限」。
+  // loadFailed 时放行到表单（fail-open），准入仍由后端拦截。
+  if (!global.spacesLoaded && !loadFailed) {
+    return (
+      <>
+        <PageHeader title={t('domainSpace.create')} />
+        <PageContent showCard={false}>
+          <div style={{ display: 'flex', justifyContent: 'center', padding: '80px 0' }}>
+            <Spin />
+          </div>
+        </PageContent>
+      </>
+    );
+  }
+
+  if (!global.canCreateSpace) {
+    return (
+      <>
+        <PageHeader title={t('domainSpace.create')} />
+        <PageContent showCard={false}>
+          <Result
+            status="403"
+            title={t('domainSpace.noCreatePermission')}
+            subTitle={t('domainSpace.noCreatePermissionHint')}
+            extra={
+              <Button onClick={() => navigate('/domain-space', { replace: true })}>
+                {t('domainSpace.backToList')}
+              </Button>
+            }
+          />
+        </PageContent>
+      </>
+    );
+  }
 
   return (
     <>

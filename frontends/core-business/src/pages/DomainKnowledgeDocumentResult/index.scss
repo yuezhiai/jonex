@@ -43,3 +43,23 @@
   flex-direction: column;
   overflow: hidden;
 }
+
+/* 质量报告 Tab：独立滚动容器。报告卡高度随指标表/摘要变化，
+   不能让它参与解析结果 Tab 的纵向 flex —— 那会挤占片段查看器。 */
+.yx-doc-result-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 24px;
+}
+
+.yx-doc-passage {
+  p, li {
+    font-size: 15px;
+    line-height: 1.9;
+  }
+
+  p + :is(h1, h2, h3, h4, h5, h6) {
+    padding-top: 12px;
+  }
+}

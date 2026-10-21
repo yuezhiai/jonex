@@ -17,6 +17,14 @@ interface GlobalState {
   spacesLoaded: boolean;
   spacesLoading: boolean;
   currentSpaceId: string | null;
+  /**
+   * 租户级：当前用户能否创建空间。取后端 list 返回的 can_create_space，
+   * 判据 = tenant:admin/platform:admin 或租户级能力码 space:write（与 create 准入同源）。
+   *
+   * [jonex] W2（2026-10-19）：前端不自己拼码名判权限，一律用后端字段，
+   * 避免「前端按 space:write 放行、后端按 is_tenant_admin 拒绝」的口径不一致。
+   */
+  canCreateSpace: boolean;
   /** 派生：当前空间对象（由 actions 同步更新） */
   currentSpace?: DomainSpace;
 
@@ -35,6 +43,7 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
   spacesLoaded: false,
   spacesLoading: false,
   currentSpaceId: null,
+  canCreateSpace: false,
   currentSpace: undefined,
 
   setUserInfo: (data) => {
@@ -78,6 +87,8 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
     try {
       const result = await listSpaces(0, 100);
       const data = result.items;
+      // 后端权威字段：create 准入同源（tenant admin 或 space:write）
+      set({ canCreateSpace: result.can_create_space ?? false });
       // 初始化：localStorage > 首个
       const { currentSpaceId } = get();
       if (!currentSpaceId) {
@@ -99,6 +110,7 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
     try {
       const result = await listSpaces(0, 100);
       const data = result.items;
+      set({ canCreateSpace: result.can_create_space ?? false });
       get().setSpaces(data);
     } finally {
       set({ spacesLoading: false, spacesLoaded: true });

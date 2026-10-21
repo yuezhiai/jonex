@@ -11,6 +11,8 @@ interface EditRelationModalProps {
   open: boolean;
   mode: 'create' | 'edit';
   kbId: string;
+  /** 文档结果页传入：源/目标实体候选只列该文档关联的实体；KB 级页面不传 → 全库候选 */
+  docId?: string;
   /** 关系类型选项 */
   relationTypeOptions: Array<{ value: string; label: string }>;
   /** 编辑模式时传入初始数据 */
@@ -35,6 +37,7 @@ export default function EditRelationModal({
   open,
   mode,
   kbId,
+  docId,
   relationTypeOptions,
   initialData,
   onSave,
@@ -80,8 +83,8 @@ export default function EditRelationModal({
             : [],
         );
       }
-      // 打开时预取实体列表
-      searchOntologyInstances(kbId, '', 20)
+      // 打开时预取实体列表（文档页只预取该文档关联的实体）
+      searchOntologyInstances(kbId, '', 20, docId)
         .then((res) => {
           const opts = buildEntityOptions(res.items || []);
           setSourceOptions((prev) => {
@@ -103,7 +106,7 @@ export default function EditRelationModal({
         })
         .catch(() => {});
     }
-  }, [open, initialData, isCreate, kbId, form]);
+  }, [open, initialData, isCreate, kbId, docId, form]);
 
   const buildEntityOptions = (items: any[]) =>
     items.map((item: any) => ({
@@ -114,7 +117,7 @@ export default function EditRelationModal({
   const debouncedSourceSearch = debounce(async (kw: string) => {
     if (!kw.trim()) return;
     try {
-      const res = await searchOntologyInstances(kbId, kw.trim(), 20);
+      const res = await searchOntologyInstances(kbId, kw.trim(), 20, docId);
       setSourceOptions(buildEntityOptions(res.items || []));
     } catch {
       /* silent */
@@ -124,7 +127,7 @@ export default function EditRelationModal({
   const debouncedTargetSearch = debounce(async (kw: string) => {
     if (!kw.trim()) return;
     try {
-      const res = await searchOntologyInstances(kbId, kw.trim(), 20);
+      const res = await searchOntologyInstances(kbId, kw.trim(), 20, docId);
       setTargetOptions(buildEntityOptions(res.items || []));
     } catch {
       /* silent */

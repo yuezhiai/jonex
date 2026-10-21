@@ -544,6 +544,8 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
           value={adjustText}
           maxLength={2000}
           showCount
+          // showCount 绝对定位在输入框下方一行，不占文档流，会压到弹窗 footer 的按钮
+          style={{ marginBottom: 16 }}
           placeholder={t('domainKnowledge.wikiReader.adjustPlaceholder')}
           onChange={(e) => setAdjustText(e.target.value)}
         />

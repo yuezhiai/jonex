@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Input, Button, Table, Tag, Modal, Space, message, Result, Spin } from 'antd';
+import { Input, Button, Table, Tag, Modal, Popconfirm, Space, message, Result, Spin } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
@@ -19,6 +19,16 @@ import SpaceFormModal from '../../features/SpaceForm/SpaceFormModal';
 import SpacePermissionModal from './SpacePermissionModal';
 import type { SpacePermissionModalHandle } from './SpacePermissionModal';
 import './index.scss';
+
+/**
+ * 状态切换的目标：启用中的转禁用，其余（禁用 / 维护中）转启用。
+ *
+ * 抽出来是因为它有两个消费点 —— 切换本身与操作列那个按钮的文案。分开写，
+ * 迟早出现「按钮写着启用、点下去变成禁用」。
+ */
+function nextStatus(status: DomainSpace['status']): DomainSpace['status'] {
+  return status === 'active' ? 'disabled' : 'active';
+}
 
 export default function DomainSpace() {
   const { t } = useTranslation();
@@ -105,14 +115,8 @@ export default function DomainSpace() {
     }
   };
 
-  // 状态切换：启用 → 禁用 → 启用；维护中 → 启用
   const toggleStatus = async (space: DomainSpace) => {
-    let newStatus: DomainSpace['status'];
-    if (space.status === 'active') {
-      newStatus = 'disabled';
-    } else {
-      newStatus = 'active';
-    }
+    const newStatus = nextStatus(space.status);
     try {
       await updateSpace(space.id, { status: newStatus });
       setSpaces((prev) => prev.map((s) => (s.id === space.id ? { ...s, status: newStatus } : s)));
@@ -157,13 +161,10 @@ export default function DomainSpace() {
       dataIndex: 'status',
       key: 'status',
       width: 90,
-      render: (v: string, r: DomainSpace) => {
+      // 只作答、不做操作：改状态挪到操作列，那里有二次确认，也不会误点
+      render: (v: string) => {
         const cfg = getSpaceStatusMap(t)[v] || { label: v, color: 'default' };
-        return (
-          <Tag color={cfg.color} style={{ cursor: 'pointer' }} onClick={() => toggleStatus(r)}>
-            {cfg.label}
-          </Tag>
-        );
+        return <Tag color={cfg.color}>{cfg.label}</Tag>;
       },
     },
     // 权限设置（无管理权时置灰禁用——后端最终校验）
@@ -186,31 +187,53 @@ export default function DomainSpace() {
     {
       title: t('domainSpace.actions'),
       key: 'actions',
-      width: 120,
-      render: (_: unknown, r: DomainSpace) => (
-        <Space>
-          <a
-            className="yx-table-action"
-            style={r.can_manage_permissions ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
-            title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
-            onClick={() => r.can_manage_permissions && openEdit(r)}
-          >
-            {t('common.edit')}
-          </a>
-          <a
-            className="yx-table-action"
-            style={
-              r.can_manage_permissions
-                ? { color: '#dc2626' }
-                : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
-            }
-            title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
-            onClick={() => r.can_manage_permissions && setDeleting(r)}
-          >
-            {t('common.delete')}
-          </a>
-        </Space>
-      ),
+      width: 150,
+      render: (_: unknown, r: DomainSpace) => {
+        // 文案给的是**下一步**（现在是启用就该写「禁用」），所以用 nextStatus 而不是当前状态 ——
+        // 与 toggleStatus 同一个判定，不会出现「写着启用、点下去变禁用」
+        const nextLabel = getSpaceStatusMap(t)[nextStatus(r.status)].label;
+        return (
+          <Space>
+            <a
+              className="yx-table-action"
+              style={r.can_manage_permissions ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+              title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => r.can_manage_permissions && openEdit(r)}
+            >
+              {t('common.edit')}
+            </a>
+            {/* 改状态从状态列的标签挪到这里：标签是「读数」，点一下就改动一个空间太轻率。
+                无管理权时 disabled —— 拦在弹窗之前，别再让用户确认完才被后端拒 */}
+            <Popconfirm
+              title={t('domainSpace.confirmStatusChange', { name: r.name, status: nextLabel })}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+              disabled={!r.can_manage_permissions}
+              onConfirm={() => toggleStatus(r)}
+            >
+              <a
+                className="yx-table-action"
+                style={r.can_manage_permissions ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
+                title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+              >
+                {nextLabel}
+              </a>
+            </Popconfirm>
+            <a
+              className="yx-table-action"
+              style={
+                r.can_manage_permissions
+                  ? { color: '#dc2626' }
+                  : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
+              }
+              title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
+              onClick={() => r.can_manage_permissions && setDeleting(r)}
+            >
+              {t('common.delete')}
+            </a>
+          </Space>
+        );
+      },
     },
   ];
 

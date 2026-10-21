@@ -11,6 +11,7 @@ import {
   FilePdfOutlined,
   BranchesOutlined,
   FileOutlined,
+  FileSearchOutlined,
   HddOutlined,
   ClockCircleOutlined,
 } from '@ant-design/icons';
@@ -25,7 +26,11 @@ import {
 } from '@/api/domainKnowledge';
 import type { ManualDocItem, OntologyInstanceSummary, RelationInstanceSummary, KnowledgeBaseType } from '@/types/domainKnowledge';
 import StageDetailCard from './StageDetailCard';
+import DocumentQualityCard from '@/components/DocumentQualityCard';
 import CompileResultPanel from './CompileResultPanel';
+import DocumentVersionsTab from './DocumentVersionsTab';
+import { buildDocumentStageKeys } from './documentTabs';
+import type { DocumentStageKey } from './documentTabs';
 import type { ProcessingStage } from './StageDetailCard';
 import VideoPlayerModal from './VideoPlayerModal';
 import { isLlmWikiType } from '@/utils/kbType';
@@ -184,22 +189,31 @@ export default function DomainKnowledgeDocumentResult() {
     return <FileTextOutlined style={{ color: '#3b82f6', fontSize: 24 }} />;
   };
 
-  const stages: ProcessingStage[] = [
-    {
-      key: 'parse',
+  // 质量报告独立成 Tab：它与片段查看器同处一个纵向 flex 时，报告高度会挤占
+  // 片段区；无报告的空态块也会把原文片段往下推（2026-10-18 用户反馈）。
+  const stageMeta: Record<DocumentStageKey, { label: string; icon: React.ReactNode }> = {
+    parse: {
       label: t('domainKnowledge.stage.parseResult'),
       icon: <FileOutlined />,
     },
-    {
-      key: 'compile',
+    quality: {
+      label: t('domainKnowledge.stage.qualityReport'),
+      icon: <FileSearchOutlined />,
+    },
+    compile: {
       label: t('domainKnowledge.stage.compileResult'),
       icon: <BranchesOutlined />,
     },
-  ];
+  };
+  const stages: ProcessingStage[] = buildDocumentStageKeys().map(
+    (key) => ({ key, ...stageMeta[key] }),
+  );
 
-  const activeStage = stages.find((s) => s.key === activeTab) || stages[0];
-
-  const tabItems = stages.map((stage) => ({
+  const tabItems: Array<{
+    key: string;
+    label: React.ReactNode;
+    children: React.ReactNode;
+  }> = stages.map((stage) => ({
     key: stage.key,
     label: (
       <Space size={6}>
@@ -220,22 +234,62 @@ export default function DomainKnowledgeDocumentResult() {
           entityTypes={entityTypes}
           relationTypes={relationTypes}
         />
+      ) : stage.key === 'quality' ? (
+        <div className="yx-doc-result-scroll">
+          <DocumentQualityCard
+            kbId={id}
+            docId={docId}
+            refreshKey={doc?.updatedAt}
+            canWrite={canWrite}
+            onReparse={handleReparse}
+          />
+        </div>
       ) : (
-        <StageDetailCard
-          stage={stage}
-          docId={docId}
-          mediaType={doc?.mediaType}
-          onPlayVideo={(timeStart?: number | null) => {
-            if (!videoUrl) {
-              message.error(t('domainKnowledge.videoLoadFailed'));
-              return;
-            }
-            setVideoTimeStart(timeStart ?? null);
-            setVideoOpen(true);
-          }}
-        />
+        <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+          <StageDetailCard
+            stage={stage}
+            docId={docId}
+            refreshKey={kbType === 'jonex_wiki' ? doc?.updatedAt : undefined}
+            mediaType={doc?.mediaType}
+            onPlayVideo={(timeStart?: number | null) => {
+              if (!videoUrl) {
+                message.error(t('domainKnowledge.videoLoadFailed'));
+                return;
+              }
+              setVideoTimeStart(timeStart ?? null);
+              setVideoOpen(true);
+            }}
+          />
+        </div>
       ),
   }));
+
+  // 版本链对所有文档类型都适用：新版生效、旧版仅存档可下载。
+  tabItems.push({
+    key: 'versions',
+    label: (
+      <Space size={6}>
+        <ClockCircleOutlined />
+        <span>{t('domainKnowledge.stage.versions')}</span>
+      </Space>
+    ),
+    children: (
+      <div className="yx-doc-result-scroll">
+        <DocumentVersionsTab
+          kbId={id}
+          docId={docId}
+          canWrite={canWrite}
+          onVersionApplied={() => {
+            if (id && docId) {
+              getManualDocumentDetail(id, docId, t)
+                .then(setDoc)
+                .catch(() => undefined);
+            }
+          }}
+        />
+      </div>
+    ),
+  });
 
   return (
     <>

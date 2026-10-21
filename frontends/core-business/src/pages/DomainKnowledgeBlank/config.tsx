@@ -1,4 +1,3 @@
-import React from 'react';
 import { Tag, Space, Button, Dropdown } from 'antd';
 import type { MenuProps } from 'antd';
 import {
@@ -13,105 +12,13 @@ import {
   PauseOutlined,
   CaretRightOutlined,
 } from '@ant-design/icons';
-import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import type { ColumnsType } from 'antd/es/table';
 import type { ManualDocItem } from '@/types/domainKnowledge';
 import type { AccessMethodItem } from '@/types/dataSource';
 import DocumentStatusBadge from '@/components/DocumentStatusBadge';
+import DocumentQualityBadge from '@/components/DocumentQualityBadge';
 import { accessMethodDisplayName } from '@/utils/dataSourceDisplay';
-
-type StepState = 'done' | 'active' | 'pending';
-const stepColors: Record<StepState, { bg: string; text: string }> = {
-  done: { bg: '#ecfdf5', text: '#10b981' },
-  active: { bg: '#eff6ff', text: '#3b82f6' },
-  pending: { bg: '#f1f5f9', text: '#cbd5e1' },
-};
-
-const getStepStates = (status: string): StepState[] => {
-  const steps = status.split('·').map((s) => s.trim());
-  const result: StepState[] = ['pending', 'pending', 'pending'];
-  for (let i = 0; i < Math.min(steps.length, 3); i++) {
-    result[i] = steps[i].includes('中') ? 'active' : 'done';
-  }
-  return result;
-};
-
-function getStatusSteps(t: TFunction) {
-  return [t('status.imported'), t('status.parsing'), t('status.compiling')];
-}
-
-export const renderStatus = (v: string, t: TFunction) => {
-  if (!v.includes('·')) {
-    const isError = v === 'failed';
-    return (
-      <Tag
-        style={{
-          fontSize: 11,
-          padding: '2px 8px',
-          border: 'none',
-          fontWeight: 500,
-          background: isError ? '#fef2f2' : '#f1f5f9',
-          color: isError ? '#ef4444' : '#64748b',
-        }}
-      >
-        {isError ? t('status.failed') : v}
-      </Tag>
-    );
-  }
-  const states = getStepStates(v);
-  const STATUS_STEPS = getStatusSteps(t);
-  return (
-    <Space size={4}>
-      {STATUS_STEPS.map((label, i) => {
-        const s = states[i];
-        return (
-          <React.Fragment key={i}>
-            <span
-              style={{
-                display: 'inline-block',
-                fontSize: 11,
-                padding: '2px 8px',
-                border: 'none',
-                fontWeight: 500,
-                background: stepColors[s].bg,
-                color: stepColors[s].text,
-                borderRadius: 4,
-                lineHeight: '18px',
-              }}
-            >
-              {label}
-            </span>
-            {i < STATUS_STEPS.length - 1 && <span style={{ color: '#d1d5db', fontSize: 10 }}>·</span>}
-          </React.Fragment>
-        );
-      })}
-    </Space>
-  );
-};
-
-export const typeOptions = (t: TFunction) => [
-  { value: 'all', label: t('common.typeAll') },
-  { value: 'pdf', label: 'PDF' },
-  { value: 'docx', label: 'DOCX' },
-  { value: 'xlsx', label: 'XLSX' },
-  { value: 'pptx', label: 'PPTX' },
-  { value: 'video', label: t('common.video') },
-  { value: 'audio', label: t('common.audio') },
-];
-
-export const statusOptions = (t: TFunction) => [
-  { value: 'all', label: t('common.statusAll') },
-  {
-    value: 'compiled',
-    label: t('common.statusCompiled'),
-  },
-  { value: 'parsing', label: t('status.compiling') },
-  {
-    value: 'pending',
-    label: t('common.statusPending'),
-  },
-];
 
 const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFunction, canWrite: boolean, paused?: boolean, onToggleCompilation?: () => void, controlDisabled?: boolean): MenuProps['items'] => [
   ...(onToggleCompilation ? [{
@@ -262,6 +169,18 @@ export const createColumns = (
       dataIndex: 'uploadTime',
       key: 'uploadTime',
       width: 160,
+    },
+    {
+      title: t('domainKnowledge.quality.column'),
+      key: 'quality',
+      width: 100,
+      render: (_: unknown, record: ManualDocItem) => (
+        <DocumentQualityBadge
+          supported={record.qualitySupported}
+          verdict={record.qualityVerdict}
+          reasons={record.qualityReasons}
+        />
+      ),
     },
     {
       title: t('common.status'),

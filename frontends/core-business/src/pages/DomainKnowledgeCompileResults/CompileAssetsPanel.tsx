@@ -10,8 +10,6 @@ import type {
   WikiStats,
 } from '@/types/domainKnowledge';
 import { getOntologyStatistics, getOntologyEntityTypes, getOntologyRelationTypes } from '@/api/domainKnowledge';
-import { useWikiCompilation } from '@/hooks/useWikiCompilation';
-import WikiCompilationControl from '@/components/WikiCompilationControl';
 import { getSearchFeedbackStats } from '@/api/knowledgeSearch';
 import type { SearchFeedbackStats } from '@/types/knowledgeSearch';
 import { buildTabs, buildOpenkbTabs } from './config';
@@ -89,8 +87,6 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
   // （与文档级 CompileResultPanel 一致），后者保持原页面树 + 实体关系图。
   const isJonexWiki = kbType === 'jonex_wiki';
   const isLlmWiki = isOpenKB || isJonexWiki;
-
-  const compilation = useWikiCompilation(kbId, isJonexWiki);
 
   // [jonex] kbType 异步加载：挂载瞬间默认 lightrag（activeTab='ontology' 对 llm-wiki 无效），
   // kbType 返回 llm-wiki 后把 activeTab 对齐到有效 key（openkb: wikiPages/wikiGraph；
@@ -185,7 +181,6 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
 
   return (
     <div style={PANEL_FILL_STYLE}>
-      {isJonexWiki && <WikiCompilationControl kbId={kbId} control={compilation} />}
       {/* Tabs & Table —— 不再套 Card：与同页「文档列表」tab 的落法一致（内容直接落在页面上，
           子 tab 与子组件各自带内边距），少一层白底容器嵌套 */}
       <div style={CARD_BODY_FILL_STYLE}>
