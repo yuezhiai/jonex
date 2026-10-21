@@ -1,0 +1,633 @@
+/* ── 平台监控模块样式 ──
+   类名统一 yx-pm- 前缀：与 DataOperations 的 yx-do- 分属两个命名空间，
+   避免两页共存时（如从监控跳到数据运营）撞名。 */
+
+/* PageContent(showCard=false) 是 flex:1 的滚动容器，本容器只需撑满它。
+   必须是可收缩的（1 1 auto + min-height:0）：调用记录那一支要「表格吃满剩余高度」，
+   前提是这一层已经是确定高度；不可收缩时高度由内容决定，下面所有 flex:1 都没得分。
+   高出来的内容不受影响 —— 溢出可见会照旧并进外层 PageContent 的滚动区。 */
+.yx-pm-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 一级页签比 antd 默认（14px）大一档：本页没有页面大标题，页签自己就是一级导航，
+   与下方卡片标题同字号会分不出层级。
+   必须用「直接子选择器」限死一级：调用监控的三个二级页签渲染在本层 Tabs 的 tabpane 里，
+   写成后代选择器会把它们一并放大。 */
+.yx-pm-tabs > .ant-tabs-nav .ant-tabs-tab {
+  font-size: 16px;
+}
+
+/* 工具条：作为 Tabs 的 tabBarExtraContent 渲染，天然落在页签栏右侧 */
+.yx-pm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 用 min-width 而不是 width：写死的 108px 是按中文「24小时」定的，
+   英文 "Last 24 hours" 会被截断成 "Last 24 h..."。 */
+.yx-pm-window-select {
+  min-width: 108px;
+}
+
+/* 自定义区间：日期 + 时间两个输入，给足宽度免得时间被省略号吞掉 */
+.yx-pm-window-range {
+  width: 300px;
+}
+
+.yx-pm-updated-at {
+  font-size: 12px;
+  color: var(--yx-text-muted);
+  white-space: nowrap;
+}
+
+/* 分区间距的落点。
+   不给 .ant-tabs-tabpane 上 display:flex —— 我们的选择器特异性更高，
+   会盖掉 antd 用来隐藏非活动页签的 display:none。所以每个页签自己返回这个容器。 */
+.yx-pm-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── 分区卡片 ──
+   卡片纵向 flex：标题行固定，内容区吃掉剩余高度。配合 .yx-pm-two-col 的 stretch，
+   同排两卡才能等高（首版两卡各取各的内容高度，实测差 49 ~ 69px）。 */
+.yx-pm-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.yx-pm-card-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  /* min-height 归零：否则内容（表格 / 图表）的固有高度会顶破 flex 的收缩计算 */
+  min-height: 0;
+}
+
+.yx-pm-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* 允许换行：窄卡放不下「筛选器 + 分段器」时整组落到第二行，而不是把标题挤出去 */
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 12px;
+}
+
+.yx-pm-card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--yx-brand-dark);
+  line-height: 1.4;
+}
+
+.yx-pm-card-extra {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  /* 换到第二行时仍贴右边，与单行时视觉一致 */
+  margin-left: auto;
+}
+
+.yx-pm-card-hint {
+  font-size: 12px;
+  color: var(--yx-text-muted);
+  white-space: nowrap;
+}
+
+/* 卡片标题里的红色计数徽标（失败任务 N） */
+.yx-pm-title-with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.yx-pm-count-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: #dc2626;
+  background: #fef2f2;
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 20px;
+}
+
+/* ── KPI 卡 ──
+   用 grid 而非 antd Row/Col：gutter 靠「行负外边距 + 列内边距」实现，行会比容器宽 16px，
+   在 PageContent 这个滚动容器里会多出一条横向滚动条。断点与 xs/sm/xl 对齐：1 / 2 / 4 列 */
+.yx-pm-kpi-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 576px) {
+  .yx-pm-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1200px) {
+  .yx-pm-kpi-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  /* Token 页多一张「用量完整率」：不加这条第 5 张会孤零零掉到下一行 */
+  .yx-pm-kpi-grid.yx-pm-kpi-grid--five {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}
+
+/* 双类名压过全局 .yx-card 的 16px 内边距：这四张卡比数据运营的矮一档，靠紧一点 */
+.yx-pm-kpi.yx-pm-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 14px;
+  /* 不设 min-height：卡片高度由两行内容决定（≈77px）。骨架卡已在 StatCards 里
+     按同一组行高（17 / 33）渲染，加载前后高度一致，不需要再用下限硬撑。 */
+}
+
+/* 失败数这类可下钻的卡：给可点反馈，否则用户不会去点它 */
+.yx-pm-kpi.yx-pm-kpi--clickable {
+  cursor: pointer;
+  transition: border-color 0.2s;
+
+  &:hover,
+  &:focus-visible {
+    border-color: var(--yx-accent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--yx-accent);
+    outline-offset: 2px;
+  }
+}
+
+.yx-pm-kpi-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.yx-pm-kpi-label {
+  font-size: 12px;
+  color: var(--yx-text-secondary);
+  line-height: 1.4;
+}
+
+.yx-pm-kpi-badge {
+  font-size: 11px;
+  color: var(--yx-text-muted);
+  border: 1px solid var(--yx-border);
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.yx-pm-kpi-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.yx-pm-kpi-value {
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--yx-text-primary);
+  line-height: 1.25;
+  /* 等宽数字：四张卡的数字位数不同，不等宽会让它们的小数点对不齐 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 双列区 ── */
+/* 不加 align-items: start —— 那是首版两卡不等高的直接原因（各取内容高度）。
+   默认的 stretch 让同排两卡等高等到 grid 行高，卡片内部再由 .yx-pm-card 的纵向 flex 分配。 */
+.yx-pm-two-col {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 1200px) {
+  .yx-pm-two-col {
+    /* 左宽右窄：趋势图比失败列表 / 分布条需要更多横向空间 */
+    grid-template-columns: 2fr 1fr;
+  }
+
+  /* 模型使用分布比趋势图矮，给个更窄的右列 */
+  .yx-pm-two-col--wide-left {
+    grid-template-columns: 3fr 2fr;
+  }
+}
+
+/* ── 失败任务列表 ── */
+/* 列表撑满内容区，「更多前往任务中心」就始终贴着卡片底边。
+   这里**不**像占比条那样 space-between 拉开条目：项间有 antd 的分割线，拉稀了反而难看。 */
+.yx-pm-card-body > .ant-list {
+  flex: 1;
+  min-height: 0;
+}
+
+/* List.Item 默认是 flex + space-between，三列排下来中间那列的间距会飘，
+   改成 grid 让「名称 / 原因 / 时间」三列固定对齐 */
+.yx-pm-failure-item.yx-pm-failure-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 52px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+
+.yx-pm-failure-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.yx-pm-failure-id {
+  font-size: 12px;
+  color: var(--yx-text-muted);
+  line-height: 1.4;
+}
+
+.yx-pm-failure-name {
+  font-size: 14px;
+  color: var(--yx-text-primary);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.yx-pm-failure-time {
+  font-size: 12px;
+  color: var(--yx-text-secondary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「更多前往任务中心」：整行右对齐的可点区，不是 antd Button —— 设计稿里没有按钮外观 */
+.yx-pm-more {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--yx-border-light);
+  font-size: 13px;
+  color: var(--yx-accent);
+  cursor: pointer;
+}
+
+.yx-pm-more:hover {
+  color: var(--yx-accent-hover);
+}
+
+/* ── 横向占比条（模型使用分布） ── */
+/* 骨架 / 空态 / 列表三态共用一块高度下限：宽屏下这张卡被同排的趋势卡撑着、高度不看自己，
+   但窄屏（<1200px 两列塌成一列）时由自身内容定高，三态三种高度会让下方内容上下跳。
+   取值与 TrendAreaChart 的 FILL_MIN_HEIGHT 对齐 —— 两张卡是一对，同排时本就等高。 */
+.yx-pm-bar-slot {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 264px;
+}
+
+/* 撑满内容区并把条目均匀铺开：这张卡常比同排的趋势卡矮，不铺开底部会空一截。
+   gap 仍是最小间距，space-between 只在 gap 之外分配剩余空间。 */
+.yx-pm-bar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  flex: 1;
+  min-height: 0;
+  gap: 14px;
+}
+
+.yx-pm-bar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+/* 模型名可能很长，截断而不是换行 —— 换行会让每条的条高不一致 */
+.yx-pm-bar-label {
+  font-size: 13px;
+  color: var(--yx-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.yx-pm-bar-value {
+  font-size: 13px;
+  color: var(--yx-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.yx-pm-bar-percent {
+  display: inline-block;
+  width: 40px;
+  margin-left: 10px;
+  text-align: right;
+  font-style: normal;
+  color: var(--yx-text-secondary);
+}
+
+.yx-pm-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--yx-border-light);
+  overflow: hidden;
+}
+
+.yx-pm-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+/* ── 筛选栏 ── */
+.yx-pm-filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 12px;
+}
+
+.yx-pm-search-input {
+  width: 220px;
+}
+
+/* 卡片右上角的下拉统一宽度，免得每个卡片的标题行高度不一。
+   同样用 min-width：英文项（如 "All capabilities"）比中文长，写死宽度会截断。 */
+.yx-pm-scope-select {
+  min-width: 128px;
+}
+
+/* ── 高度链路：页签 → 面板 → 表格 ──
+   调用记录要「表格撑满剩余高度、只有表体滚」，而剩余高度得沿 DOM 一层层传下来，
+   所以下面四段是**一组**，缺一段就会退回内容高度（表体也就不滚了）：
+     .yx-pm-page → .ant-tabs → content-holder → content → tabpane → .yx-pm-pane--fill
+   一级、二级两套页签都要接（记录页签在一级 tabpane 里嵌着二级 tabpane）。
+
+   tabpane 只上 height:100%、**不**上 display:flex —— 那会盖掉 antd 用来隐藏非活动页签的
+   display:none（同 core-business 的 .kb-detail-tabs 做法）。 */
+.yx-pm-page > .ant-tabs,
+.yx-pm-subtabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.yx-pm-page > .ant-tabs > .ant-tabs-nav,
+.yx-pm-subtabs > .ant-tabs-nav {
+  flex-shrink: 0;
+}
+
+.yx-pm-page > .ant-tabs > .ant-tabs-content-holder,
+.yx-pm-subtabs > .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.yx-pm-page > .ant-tabs > .ant-tabs-content-holder > .ant-tabs-content,
+.yx-pm-subtabs > .ant-tabs-content-holder > .ant-tabs-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.yx-pm-page > .ant-tabs > .ant-tabs-content-holder > .ant-tabs-content > .ant-tabs-tabpane,
+.yx-pm-subtabs > .ant-tabs-content-holder > .ant-tabs-content > .ant-tabs-tabpane {
+  height: 100%;
+}
+
+/* ── 调用记录：撑满剩余高度，只有表体滚 ── */
+/* 用 height 而不是 flex:1：tabpane 是 display:block（不能给它上 flex，见上），
+   面板不是 flex item，flex:1 没有可分配的空间，只会退回内容高度。 */
+.yx-pm-pane--fill {
+  height: 100%;
+  min-height: 0;
+}
+
+/* 量高度的宿主，也是「剩余高度」的落点 */
+.yx-pm-records-host {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 表格内部的高度分配。antd 的 DOM 是
+   .ant-table-wrapper > .ant-spin > .ant-spin-container > (.ant-table + .ant-pagination)，
+   分页在 spin 容器里，所以那一层要是纵向 flex —— 表体 flex:1、表头与分页 flex-shrink:0。
+   `y` 的 inline max-height 只是上限，真正的高度由这条链给出。 */
+.yx-pm-records-table {
+  height: 100%;
+}
+
+.yx-pm-records-table > .ant-form {
+  flex-shrink: 0;
+}
+
+.yx-pm-records-table > .ant-table-wrapper {
+  flex: 1;
+  min-height: 0;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-spin {
+  height: 100%;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-spin-container {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-table {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-table-container {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-table-header {
+  flex-shrink: 0;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-table-body {
+  flex: 1;
+  overflow-y: auto !important;
+  overflow-x: auto !important;
+}
+
+.yx-pm-records-table > .ant-table-wrapper .ant-pagination {
+  flex-shrink: 0;
+  padding-top: 12px;
+  margin: 0 !important;
+}
+
+/* CommonTable 的筛选区是 antd Row/Col，Row 自带 -8px 左右外边距（gutter 16 的一半，本该由
+   Col 的 8px 内边距抵消）。上一版套着卡片，内边距替它兜住了；现在列表满宽，这 8px 直接顶出
+   容器，在外层 PageContent 上多出一条横向滚动条。补等量内边距抵消 —— 首列可见位置不变，
+   被抵消掉的 8px 正好对上表格单元格自身的内边距。 */
+.yx-pm-records-table > .ant-form {
+  padding-inline: 8px;
+}
+
+/* ── 表格单元 ── */
+.yx-pm-cell-strong {
+  color: var(--yx-text-primary);
+}
+
+.yx-pm-cell-sub {
+  display: block;
+  font-size: 12px;
+  color: var(--yx-text-muted);
+  line-height: 1.4;
+}
+
+/* 请求 ID 是等宽串，用等宽字体才不会在视觉上长短不一 */
+.yx-pm-request-id {
+  font-family: var(--yx-font-mono);
+  font-size: 12px;
+  color: var(--yx-text-code);
+  white-space: nowrap;
+}
+
+/* ── 下钻抽屉（C7 调用详情 / C9 对象详情） ── */
+
+/* 可下钻的行给手型光标，提示能点开。加在 <tr> 上，td 会继承 */
+.yx-pm-row-clickable {
+  cursor: pointer;
+}
+
+.yx-pm-drawer-alert {
+  margin-bottom: 16px;
+}
+
+.yx-pm-drawer-block {
+  margin-top: 20px;
+}
+
+.yx-pm-drawer-title {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--yx-brand-dark);
+  line-height: 1.4;
+}
+
+/* List.Item 默认是 flex + space-between，左主右次的两列用 grid 更稳 */
+.yx-pm-drawer-row.yx-pm-drawer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.yx-pm-drawer-failure {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.yx-pm-drawer-failure-id {
+  font-family: var(--yx-font-mono);
+  font-size: 12px;
+  color: var(--yx-text-code);
+  line-height: 1.4;
+}
+
+/* 错误信息要换行：它常常是一整句栈顶异常，截断后看不出是哪一类错 */
+.yx-pm-drawer-failure-msg {
+  font-size: 13px;
+  color: var(--yx-text-primary);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.yx-pm-drawer-failure-time {
+  font-size: 12px;
+  color: var(--yx-text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 抽屉内的两处短列表。自己画而不是用 antd List：v6 已把 List 标为废弃 */
+.yx-pm-drawer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* 条目间给分割线，与 antd 的表列观感一致 */
+.yx-pm-drawer-list > .yx-pm-drawer-row + .yx-pm-drawer-row {
+  border-top: 1px solid var(--yx-border-light);
+}
+
+.yx-pm-drawer-count {
+  font-size: 13px;
+  color: var(--yx-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.yx-pm-drawer-empty {
+  margin: 0;
+  padding: 12px 0;
+  font-size: 13px;
+  color: var(--yx-text-muted);
+}
+
+/* 请求 / 响应报文的展示区。限高 + 内部滚动：整段 JSON 可能几百行，
+   不设上限会把抽屉里后面的内容全部顶到看不见的地方 */
+.yx-pm-payload {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  background: #f8fafc;
+  border: 1px solid var(--yx-border-light);
+  border-radius: 6px;
+  font-family: var(--yx-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--yx-text-code);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.yx-pm-payload-error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
