@@ -1,0 +1,109 @@
+.yx-dg-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.yx-dg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.yx-dg-muted {
+  color: var(--yx-text-muted);
+}
+
+// 血缘图视口：固定高度，图不再撑高抽屉；缩放/平移由 SVG transform 承担。
+.yx-dg-lineage-viewport {
+  position: relative;
+  width: 100%;
+  height: 420px;
+  overflow: hidden;
+  border: 1px solid var(--yx-border);
+  border-radius: var(--yx-card-radius);
+  background: var(--yx-bg-white);
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  // 触屏拖拽不应滚动外层抽屉
+  touch-action: none;
+
+  &.is-dragging {
+    cursor: grabbing;
+  }
+
+  svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+}
+
+// 右上角悬浮工具条：按钮点击不触发画布拖拽。
+.yx-dg-lineage-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 6px;
+  border: 1px solid var(--yx-border);
+  border-radius: 8px;
+  background: var(--yx-bg-white);
+  box-shadow: var(--yx-card-shadow);
+  cursor: default;
+  user-select: none;
+}
+
+// 仅供读屏的提示文本（视口 aria-describedby 指向它）。
+.yx-dg-lineage-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  white-space: nowrap;
+  border: 0;
+  clip: rect(0, 0, 0, 0);
+}
+
+.yx-dg-lineage-zoom-value {
+  min-width: 44px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--yx-text-muted);
+  text-align: center;
+}
+
+// 抽屉生命周期区：标题与二级标题同层级（不引入新的字体族/字号）。
+.yx-dg-section-title {
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.yx-dg-subtitle {
+  margin: 8px 0;
+  font-weight: 500;
+}
+
+.yx-dg-lifecycle {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+// 保留期 / 宽限期两列；窄抽屉下自动折成单列。
+.yx-dg-lifecycle-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0 12px;
+}
+
+.yx-dg-policy-hints {
+  margin: 0;
+  padding-left: 18px;
+}
