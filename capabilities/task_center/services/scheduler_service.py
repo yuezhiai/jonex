@@ -1,10 +1,10 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
-"""后台循环：扫到点的定时触发器并起任务 + 扫能跑的子任务派活 + 超时巡检 + 补收口（§7.4、§7.5）。
+"""后台循环：扫到点的定时触发器并起任务 + 扫能跑的子任务派活 + 消化上报 + 拉式对账 + 超时巡检 + 补收口（§7.4、§7.5）。
 
 设计出处：`docs/superpowers/specs/2026-09-09-task-center-design.md` §7.4、§7.5、§十第 7 步。
 
-每轮干**五件事**（§7.5，顺序固定，见 `run_once`）：
+每轮干**六件事**（§7.5，顺序固定，见 `run_once`）：
 
 - **⓪ 触发抢占**：扫「到点了、还开着」的 `cron` 触发器 → CAS 抢占 → `trig.fire`；
 - **① 派活**：扫还能跑的任务（`tasks.status` 是 `pending` / `running`）→ 看它下面能跑的子
@@ -20,8 +20,14 @@
   ⚠️ **「不计数」那一档另有一条绝对上限**（`TASK_CENTER_REPORT_INFRA_MAX_HOURS`，默认
   24 小时：躺过就一律判死信出队）—— 少了它那一档会变成死锁：不计数 ⇒ 永远留在收件箱
   ⇒ 超时巡检**永久让路** ⇒ 那条子任务再也判不了超时（详见 `_record_report_failure`）；
-- **③ 超时巡检**：跑着超过 `timeout_seconds` 的子任务置 `timeout` 收口；
-- **④ 补收口**（2026-09-29 加）：把「当次运行早跑完、任务快照却没收到口」的任务补成终态
+- **③ 拉式对账**（2026-10-11 加，`_query_pass`）：主动去问运行方「这一步现在什么情况」
+  （§4.1 ④ `query_step_status`），把问到终态的结果**当一条上报塞进收件箱**、走 ② 的消化
+  路径 —— 专兜「运行方既没回执也没上报」的那些**沉默**子任务；日常仍靠 ② 的推式上报，
+  这一趟只是兜底（问到 `unknown` 时**不改状态**，交给超时巡检兜）。⚠️ **这一趟是 2026-10-11
+  新加的，下面前四条 ⓪①② 之外的编号据此重排** —— 设计文档 §7.5 的圈号尚未同步（那边仍是
+  「③ 超时巡检 / ④ 补收口」），以本文件的 `run_once` 顺序为准；
+- **④ 超时巡检**：跑着超过 `timeout_seconds` 的子任务置 `timeout` 收口；
+- **⑤ 补收口**（2026-09-29 加）：把「当次运行早跑完、任务快照却没收到口」的任务补成终态
   （`_settle_pass`）—— 那一格从前只能人工改库。
 
 三件要看清的事：
@@ -33,9 +39,10 @@
 CAS（§7.5 ③）。**锁和 CAS 任一层拦住，都算本轮跳过**：锁没抢到就跳过这条看下一条
 （扫描类调用的固定处置），CAS 命中 0 行同理。任何一个副本挂了都不影响其余副本。
 
-> **锁的边界写死**（§7.2「锁不跨出站调用」）：**没出站的动作**（超时巡检、防僵尸）
-> 拿锁盖住整段「读—改—写」就完事；**要出站的派活**拆成两段，锁只护前后两次写库，
-> 中间那次调运行方**不持锁、不占事务**（见 `_dispatch_one`）。
+> **锁的边界写死**（§7.2「锁不跨出站调用」）：**没出站的动作**（防僵尸、`_timeout_one`
+> 单条判死）拿锁盖住整段「读—改—写」就完事；**要出站的**（派活、以及 ③ 超时巡检判死前
+> 那一问）一律把出站排在**拿锁之前** —— 调运行方那一段**不持锁、不占事务**
+> （见 `_dispatch_one` / `_patrol_pass`）。
 
 **二、扫描和动手分两个事务。** 扫描只取一批 id（跨租户，扫完就结束），
 每个 id 再单开一个会话重新取行、单独提交。这样一个子任务出问题只回滚它自己，
@@ -53,8 +60,9 @@ CAS（§7.5 ③）。**锁和 CAS 任一层拦住，都算本轮跳过**：锁�
 
 - ① 里的**防僵尸**（`list_stuck_pending`）：它是「派活一路失败、状态又退不回去」那条死路
   的兜底，卡上限等于把兜底砍掉（§7.5 D2b、附录 A.4）；
-- ③ **超时巡检**（`list_timed_out_for_patrol`）：同族的兜底判死，而且**完全不出站**，
-  卡上限只会让积压的 `running` 排队等判死、排多久没有上限；
+- ③ **超时巡检**（`list_timed_out_for_patrol`）：同族的兜底判死，卡上限只会让积压的
+  `running` 排队等判死、排多久没有上限。（⚠️ 它 2026-10-16 起**判死前会先出站问一次**
+  运行方，见 `_patrol_pass`；但一次只问一条、问到终态就收口，量级仍与派活不可同日而语。）
 - ① 的**扫描面**：放宽到 `BATCH × TASK_CENTER_SCHEDULER_SCAN_FACTOR`（默认 5）。
   这是**「派活受 BATCH 限制」的正确读法** —— `BATCH` 卡的是**一轮真派出去几条**，
   不是「一轮扫几条候选」。被 `max_concurrency` 挡下的候选一个字都不写库、**排序也不动**，
@@ -72,7 +80,11 @@ from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 
 from jonex_core.common.config import get_config
 from jonex_core.common.database import get_db_session
-from jonex_core.common.exceptions import JonexException
+from jonex_core.common.exceptions import (
+    InvalidParameterError,
+    JonexException,
+    ResourceNotFoundError,
+)
 from jonex_core.task_protocol.models import ExecutionDispatch
 from jonex_core.task_protocol.results import (
     TASK_CENTER_RETRYABLE_CODES,
@@ -81,6 +93,15 @@ from jonex_core.task_protocol.results import (
 
 from ..flows.runner_adapter import RunnerAdapter, call_with_retry
 from ..models import MisfirePolicy
+from jonex_core.task_protocol.models import (
+    STEP_STATUS_PENDING_DISPATCH,
+    STEP_STATUS_RUNNING,
+    STEP_STATUS_SUCCEEDED,
+    STEP_STATUS_UNKNOWN,
+    ExecutionEnvelope,
+    check_error_reason,
+    check_output_refs,
+)
 from ..repository.execution_repository import SubtaskRepository, TaskRepository
 from ..repository.report_repository import SubtaskReportRepository
 from ..repository.trigger_repository import TaskTriggerRepository
@@ -128,6 +149,14 @@ async def _dispatch_with_retry(
         lambda: adapter.dispatch(capability_id, dispatch),
         what=f"派活 execution={dispatch.execution_id} capability={capability_id}",
         sleep=sleep,
+        # 采集上下文：`request_id` 用 `execution_id` —— 它正是这次重发循环的幂等键
+        # （重发的就是同一个 `execution_id`，见 `call_with_retry` 的 docstring），
+        # 也是运行方那边能认出「这是重派」的那个 id。租户从报文里取（它必然合法：
+        # 派活报文在更早的步骤里已经过 `require_tenant`）。`target` 记这次派给谁 ——
+        # N1 的「目标对象」列就是它。
+        request_id=dispatch.execution_id,
+        tenant_id=dispatch.tenant_id,
+        target=capability_id,
     )
 
 
@@ -252,6 +281,12 @@ class TaskScheduler:
     # ── 循环体 ────────────────────────────────────────────
 
     async def _loop(self) -> None:
+        """循环外壳：定时跑 `run_once`。
+
+        ⚠️ 这里这一层**只是兜底**（循环不能死）—— 真正的逐趟兜异常在 `run_once` 里。
+        从前六趟是一条直线、只有这一层兜，于是「一趟炸 = 后面几趟全跳过」；现在
+        `run_once` 自己把每一趟都包住了，能冒到这里的只剩循环壳本身的问题（如取配置失败）。
+        """
         first_run = True
         while True:
             try:
@@ -261,17 +296,49 @@ class TaskScheduler:
                 await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # 一轮失败不该让循环死掉，下一轮接着来
+            except Exception as exc:  # 循环绝不能死，下一轮接着来
                 logger.warning("[TaskCenter] 后台循环本轮出错，跳过本轮：%s", exc)
 
     async def run_once(self) -> None:
-        """跑一轮：触发抢占 → 派活（含防僵尸）→ 消化上报 → 超时巡检 → **补收口**。
-        单测直接调这个方法，不必等定时器。"""
-        await self._fire_pass()
-        await self._dispatch_pass()
-        await self._report_pass()
-        await self._patrol_pass()
-        await self._settle_pass()
+        """跑一轮：触发抢占 → 派活（含防僵尸）→ 消化上报 → **对账（拉）** → 超时巡检 → 补收口。
+        单测直接调这个方法，不必等定时器。
+
+        ⚠️ **每趟各兜各的异常**（2026-10-14 修）：从前这里是一条直线，任何一趟抛出异常都会
+        冲出 `run_once`，而 `_loop` 只在**轮**这一层兜 —— 于是**一趟炸、同一轮后面的趟次
+        一律不跑**。生产上实测到的样子：
+
+        > 16:20:38 某一趟抛了异常，此后 **39 分钟内一次库写入都没有**
+        > （`16:20:38 → 16:59:39`）：卡在 `running` 的子任务没人判死（超时巡检是第 5 趟）、
+        > 上报没人消化、任务中心整体停摆 —— 而现场**只留一条 warning**，
+        > 看上去像「这一轮只是空跑」。
+
+        现在逐趟兜：一趟炸只损失它自己这一轮的工作，其余照跑。**绝不让某一趟的失败决定
+        别的趟次能不能跑** —— 六趟本来就是各扫各的表，彼此之间没有「前一趟成功才有意义」
+        的依赖（只有 `_query_pass` → 下一轮 `_report_pass` 那种**跨轮**的顺序约定）。
+
+        `CancelledError` **照旧穿透**：它是「停循环」的信号，不是业务错误。
+        """
+        # 顺序固定、不许调：对账（拉）排在「消化上报」**之后** —— 它塞进收件箱的那些，
+        # 下一轮由 `_report_pass` 消化，走的是与上报**完全相同**的一条路（§4.1 ④）。
+        passes = (
+            ("触发抢占", self._fire_pass),
+            ("派活", self._dispatch_pass),
+            ("消化上报", self._report_pass),
+            ("对账（拉）", self._query_pass),
+            ("超时巡检", self._patrol_pass),
+            ("补收口", self._settle_pass),
+        )
+        for pass_name, run_pass in passes:
+            try:
+                await run_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[TaskCenter] 本轮「%s」这趟出错，跳过它、继续跑后面的趟次：%s",
+                    pass_name,
+                    exc,
+                )
 
     # ── 触发抢占（§7.5 ⓪）─────────────────────────────────
 
@@ -296,7 +363,7 @@ class TaskScheduler:
             ]
         for tenant_id, trigger_id, expect_next_fire_at, cron_expr, misfire_policy in targets:
             # **逐条兜异常**（与派活 / 消化上报 / 超时巡检三趟同构）。
-            # 这一趟跑在五趟的**最前面**，异常一旦冲出去，同一轮的另外四趟**一趟都不会跑**
+            # 这一趟跑在六趟的**最前面**，异常一旦冲出去，同一轮的另外五趟**一趟都不会跑**
             # （`_loop` 只按「轮」兜异常，兜完就跳过整轮）—— 一行毒触发器 + 每轮必现，
             # 任务中心就整体停摆：子任务卡在 `running`、上报积压、超时巡检不再判死。
             try:
@@ -452,8 +519,12 @@ class TaskScheduler:
             # **其它异常按瞬态处置、不暂停** —— 暂停一个健康触发器要人来救，代价更大。
             # **刻意不做「连续 N 次才暂停」**：本表没有失败计数器列，加列 + 迁移的代价
             # 远大于收益，而按「配置类」判已经精确命中这一档、且不会误伤瞬态。
+            # ⚠️ **取异常常量、不写字面量**（2026-10-13 改）：从前这里写死 `(1001, 1002)`，
+            # 而模块内别处（`task_lock.py` / `results.py`）一律取 `SomeError.code` ——
+            # 哪天那两个异常的码变了，这里会**静默失配**（配置类失败不再触发熔断，
+            # 退化成「每个点空响一次」）。
             code = getattr(exc, "code", None)
-            if code in (1001, 1002):
+            if code in (InvalidParameterError.code, ResourceNotFoundError.code):
                 async with get_db_session() as session:
                     await TaskTriggerRepository(session).pause_on_cron_failure(
                         tenant_id, trigger_id
@@ -505,7 +576,7 @@ class TaskScheduler:
         `updated_at` 没动、**排序键也没动**
         → 下一轮**还在候选集里、还在原来的位置**。若扫描面就等于 `BATCH`，队头那 10 条
         一旦全卡在同一个瓶颈上（比如 `ingest` 上限 2 且配额占满），**每一轮都被它们吃满
-        名额**，排在它们后面、配额明明空着的活（别的 `step_code`、别的租户）连窗口都进不去
+        名额**，排在它们后面、配额明明空着的活（别的目录、别的 `step_code`）连窗口都进不去
         —— 一直堵到队头被防僵尸判死（`timeout_seconds × 3`，内置步骤 = 21 小时）。
         这不是猜的：`list_stuck_pending` 自己的 docstring 就承认「满载时连『正常在排队』
         的也会被它判掉 —— 这是有意的取舍」，那条取舍本来是防「派活一路失败、状态退不
@@ -608,7 +679,7 @@ class TaskScheduler:
         的（跨库跨租户同一份，内置步骤各 10 个），占一个就是少 10%。
 
         **为什么决定不修**：窗口只有「标记提交完 → 请求发到运行方」那几十毫秒到几秒，
-        要正好在这一瞬被杀才中招；攒够 10 个（把某一步全平台堵死）需要十次精确命中，
+        要正好在这一瞬被杀才中招；攒够 10 个（把某一步在**本目录**堵死）需要十次精确命中，
         实际上不可能。为它加一列「派活已确认送达」不划算。
 
         **万一真碰上，手工恢复只有一步**：把那一步的状态改成 `failed` 即可 ——
@@ -709,6 +780,194 @@ class TaskScheduler:
 
     # ── 消化上报（§7.5 ②）────────────────────────────────
 
+    # ── 对账（拉）：问运行方「那一步现在什么情况」（§4.1 ④，2026-10-11 加）──
+
+    async def _query_pass(self) -> None:
+        """扫「**派出去很久、却一直没消息**」的子任务，逐个问运行方（§7.5）。
+
+        ## 为什么要有这一趟
+
+        推进编排原来**只能等运行方主动上报**（`report_status`）—— 上报是「单次尝试 +
+        最多 3 次重发」，全丢了子任务就一直挂 `running`，直到编排硬超时（预置 7 小时）
+        才被兜。**而丢的原因多半不在网络**：运行方那侧「什么时候该上报」的判断错了、
+        或者它压根没走到那一步。
+
+        **这一趟是「拉」**：问不到就下一拍再问，**不存在永久丢**。
+
+        ## 为什么把答案「塞进收件箱」而不是自己收口
+
+        **收口只有一条路才不会有分叉**：`_report_pass` 消化 `subtask_reports` 那一趟
+        负责裁决、落库、填下游、收尾。这里把答案**写成同样形状的一行**塞进去，两者走的是
+        **同一段代码** —— 不是为了省代码，是为了**保证「推走的」和「拉回来的」结果一模一样**
+        （同样的下游派活、同样的聚合、同样的收尾）。
+
+        ## 只问「沉默够久、而且真派出去过」的
+
+        口径全在 `ExecutionRepository.list_silent_in_flight` 里（`execution_id IS NOT NULL`
+        那条尤其要紧：没派过活的问了也白问）。
+        """
+        quiet = int(getattr(get_config(), "TASK_CENTER_QUERY_QUIET_SEC", 120) or 120)
+        try:
+            async with get_db_session() as session:
+                rows = await SubtaskRepository(session).list_silent_in_flight(
+                    quiet_seconds=quiet, limit=self._batch,
+                )
+                # 扫描事务只取「要问哪几条」，取完就结束（跟另外几趟同一条纪律）。
+                targets = [
+                    (
+                        r.id, r.tenant_id, r.task_id, r.task_attempt_id,
+                        r.node_id, r.step_code, r.execution_id, r.space_id,
+                    )
+                    for r in rows
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[TaskCenter] 对账扫描出错，本轮跳过：%s", exc)
+            return
+        for target in targets:
+            # **逐条兜异常**（另外几趟同构）：一条问不动不该拖垮整轮。
+            try:
+                await self._query_one(*target)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[TaskCenter] 对账问一条出错 task=%s node=%s：%s",
+                    target[2], target[4], exc,
+                )
+            finally:
+                # ⚠️ **无论问到什么都没关系，都要记一笔「问过了」**：
+                # 问到「还在跑」也算问过 —— 不记的话它还留在队头，
+                # 下一拍又问同一批，把名额一直占住（`list_silent_in_flight` 有说明）。
+                try:
+                    async with get_db_session() as session:
+                        await SubtaskRepository(session).mark_queried(target[0])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[TaskCenter] 记对账时间戳失败 subtask=%s：%s", target[0], exc,
+                    )
+
+    async def _query_one(
+        self,
+        subtask_id: str,
+        tenant_id: str,
+        task_id: str,
+        task_attempt_id: str,
+        node_id: str,
+        step_code: str,
+        execution_id: str,
+        space_id: str,
+    ) -> bool:
+        """问一条，问到终态就**当一条上报塞进收件箱**（下一拍由 `_report_pass` 消化）。
+
+        **返回「这条是不是已经有结论了」**（2026-10-16 加）：`True` = 问到终态并成功入队，
+        `False` = 没问到 / 还在跑 / 运行方说不归它 / 报文不合格 —— 一律「本轮不改结论」。
+        ⚠️ 调用方（超时巡检）拿它决定「这一条还要不要照常判超时」：**只有 `True` 才跳过**。
+
+        三档处置：
+
+        - **没问到 / 还在跑 / 还没开始跑** → 什么都不做，下一拍再来（**这就是「拉」的意义**）；
+        - **`unknown`（运行方说「这活不归我」）** → **只记一条 warning、不塞收件箱** ——
+          它不是失败（理由见协议层 `STEP_STATUS_UNKNOWN`）。真把「找错运行方」写成失败，
+          一次**配置错误**就变成了一条**业务失败**；
+        - **`succeeded` / `failed`** → 把它带回的那份报文（**形状就是上报接口的入参**）
+          塞进收件箱，走与上报**完全相同**的消化路径。
+        """
+        # ① 找这一步该谁干（与派活同一套解析：编排快照里的 runner → 在册的 capability_id）
+        async with get_db_session() as session:
+            svc = TaskService(session, runner_adapter=self._adapter)
+            ctx = await svc._load_context(tenant_id, task_id, task_attempt_id)
+            if ctx is None:
+                return
+            subtask = next((s for s in ctx.subtasks if s.node_id == node_id), None)
+            if subtask is None:
+                return
+            capability_id = await svc._resolve_runner_capability(ctx, subtask)
+        if capability_id is None:
+            # 这一步没绑到在册的运行方 —— 那是派活那侧的问题（它有自己的判死），
+            # 对账这一趟不该替它处置。
+            return False
+
+        # ② 问。**不入参 `inputs`**（`ExecutionEnvelope` 就是派活报文去掉它的那个形状）。
+        answer = await self._adapter.query_step_status(
+            capability_id,
+            ExecutionEnvelope(
+                tenant_id=tenant_id,
+                space_id=space_id,
+                task_id=task_id,
+                step_code=step_code,
+                node_id=node_id,
+                execution_id=execution_id,
+            ),
+        )
+
+        # ③ 处置
+        if answer is None or answer.status in (
+            STEP_STATUS_PENDING_DISPATCH, STEP_STATUS_RUNNING,
+        ):
+            return False  # 没问到 / 还早 —— 下一拍再来
+        if answer.status == STEP_STATUS_UNKNOWN:
+            logger.warning(
+                "[TaskCenter] 对账：运行方说这活不归它（按配置错处理，不当失败）"
+                "task=%s node=%s detail=%s",
+                task_id, node_id, answer.detail,
+            )
+            return False
+        report = dict(answer.report or {})
+        # ⚠️ **状态以 `answer.status`（五档那个）为准，不信 `report["status"]`**：
+        # 后者是运行方按**上报接口**的词汇填的，但运行方完全可能回它**自己的词汇**
+        # （比如 `"succeeded"`）—— 那种值入队后在**消化那一步被静默丢弃**
+        # （`_absorb` 闸④ 判「状态取值非法」只记一条 warning），子任务一路挂到硬超时，
+        # 而表面上「对账已经问到了」。这里归一化，非法值**不可能入队**。
+        report["status"] = (
+            "success" if answer.status == STEP_STATUS_SUCCEEDED else "failed"
+        )
+        if report["status"] == "success" and not isinstance(report.get("outputs"), dict):
+            # **成功必须带产出**：管理方写完「成功」就要拿 `outputs` 按 `bind_inputs`
+            # 填下一步的输入，没有产出 = 派不出下游 = 卡在下一步。
+            # 按 `ERROR` 记（这是协议/实现错，不该静默）。
+            logger.error(
+                "[TaskCenter] 对账：运行方答成功却没带产出（派不出下游），不入队 "
+                "task=%s node=%s report=%r",
+                task_id, node_id, str(answer.report)[:200],
+            )
+            return False
+        # ⚠️ **拉式通道也要过与推式同一套协议校验**（2026-10-13 补）：推式上报在受理点会跑
+        # `_check_report_payload`（内含 `check_error_reason` / `check_output_refs`），
+        # 而这条「管理方主动问回来」的路从前**只归一化 `status`、其余一字不校验** ——
+        # 运行方在 `StepStatusQuery.report` 里填个自造 / 拼错的 `error_code`、或形状错误的
+        # `output_refs`，会被**原样落库**，读侧按码渲染时翻不出来（正是 `ERROR_REASON_CODES`
+        # 那段注释要防的「往管理方界面上写任意文本」）。判据只有一份，这里复用、不另写。
+        _proto_problem = check_error_reason(
+            report.get("error_code"), report.get("error_params")
+        )
+        if _proto_problem is None:
+            _proto_problem = check_output_refs(report.get("output_refs"))
+        if _proto_problem is not None:
+            logger.error(
+                "[TaskCenter] 对账：运行方回的报文没通过协议校验，不入队 "
+                "task=%s node=%s reason=%s",
+                task_id, node_id, _proto_problem[0],
+            )
+            return False
+        async with get_db_session() as session:
+            await SubtaskReportRepository(session).enqueue(
+                tenant_id=tenant_id,
+                space_id=space_id,
+                execution_id=execution_id,
+                task_id=task_id,
+                status=report.get("status"),
+                outputs=report.get("outputs"),
+                output_refs=report.get("output_refs"),
+                error_message=report.get("error_message"),
+                error_code=report.get("error_code"),
+                error_params=report.get("error_params"),
+                reported_at=datetime.now(),
+            )
+        logger.info(
+            "[TaskCenter] 对账：问到终态，已当一条上报入队（下一拍消化）"
+            "task=%s node=%s status=%s",
+            task_id, node_id, report.get("status"),
+        )
+        return True
+
     async def _report_pass(self) -> None:
         """扫「运行方报了、还没消化」的上报，逐条消化（§7.5 ②）。
 
@@ -785,7 +1044,7 @@ class TaskScheduler:
                 #
                 # 代价是它拿不到基础设施档那条 24 小时绝对上限 —— 从前的后果是一条死锁链：
                 # 某个任务的锁被**一直**占着 ⇒ 这条上报永远留在收件箱 ⇒ 超时巡检的「让路」
-                # 判据永远命中 ⇒ 那条 `running` 永远判不了超时 ⇒ 全平台共用的并发名额收不回来。
+                # 判据永远命中 ⇒ 那条 `running` 永远判不了超时 ⇒ 本目录共用的并发名额收不回来。
                 # **今天（拿不到锁本身）到不了**：锁有 `PX 30000` 自然过期、持有段又都是
                 # 不跨出站的短事务，竞争是瞬时的。但这一档**不能因此不设兜底** ——
                 # 兜底是给「我们没想到的那种一直占着」准备的。
@@ -813,7 +1072,7 @@ class TaskScheduler:
 
         不判死的后果是一条死锁链（完整链条写在 `_report_one` 那条 `except` 的注释上）：
         这条上报永远留在收件箱 ⇒ 超时巡检永久给它「让路」⇒ 那条 `running` 永远判不了超时
-        ⇒ 全平台共用的并发名额收不回来。
+        ⇒ 本目录共用的并发名额收不回来。
 
         **任何异常都只记 warning** —— 兜底本身不能把调度循环带崩（与 `_record_report_failure`
         同一条纪律）。
@@ -869,8 +1128,8 @@ class TaskScheduler:
         > 判据**永远命中**（`list_timed_out_for_patrol` 只看「收件箱里还有没有这条
         > 子任务的未消化上报」）⇒ 那条子任务**永远判不了超时** ⇒ `running` 收不掉
         > ⇒ 任务永远不终态（`retry_task` / `task.delete` 全都要求终态，**那条任务
-        > 彻底无法处置**）⇒ 那个 `running` 还占着并发名额（全平台按 `step_code` 共用
-        > 额度，攒够上限就**这一步全平台派不出活**）。
+        > 彻底无法处置**）⇒ 那个 `running` 还占着并发名额（按「目录 + `step_code`」共用
+        > 额度，攒够上限就**这一步在本目录派不出活**）。
 
         判据是 **`now - reported_at`**（= 这条上报自己等了多久，它进了收件箱就是
         「待处理」）。判死时**一并出队**（`is_deleted=1`）—— 让路随即失效、超时巡检
@@ -988,16 +1247,64 @@ class TaskScheduler:
         - 判死一条就离开候选集，所以卡 `BATCH` 的话积压 N 条要 `ceil(N / BATCH)` 轮
           × `interval` 秒才消化完，而且**没有上限** —— 积压越大拖越久。运行方整体
           重启一次，几十上百条子任务一起堆进来是真实场景；
-        - 而这一趟**完全不出站**（拿锁 + 一个事务，见 `_timeout_one`），比派活便宜
+        - 而这一趟原来**完全不出站**（拿锁 + 一个事务，见 `_timeout_one`），比派活便宜
           得多，一轮多判几条不构成负担。
+
+        ⚠️ **2026-10-16 起这一趟会先出站问一次**（下面那段）：判死之前先问运行方
+        「这一步现在什么情况」—— 为的是接住「**运行方早就干完了、只是上报没送到**」那种情形。
+        出站排在拿锁之前（§7.2「锁不跨出站调用」），所以锁那一段还是原来那么短。
 
         判死不是判错：真卡住的任务早收口一分钟，用户早一分钟能重试 / 重传。
         """
         now = datetime.now()
         async with get_db_session() as session:
             running = await SubtaskRepository(session).list_timed_out_for_patrol(now)
-            subtask_ids = [row.id for row in running]
-        for subtask_id in subtask_ids:
+            # ⚠️ **把「问」要用的字段一并抄出来**：下面要出站，而这段会话一关这些 ORM 行
+            # 就 detached（同 `_StepSnapshot` 那条纪律），出站之后再读它们的属性会炸。
+            # 所以这里不留 id 列表，直接抄成标量元组。
+            pending = [
+                (
+                    row.id,
+                    row.tenant_id,
+                    row.task_id,
+                    row.task_attempt_id,
+                    row.node_id,
+                    row.step_code,
+                    row.execution_id,
+                    row.space_id,
+                )
+                for row in running
+            ]
+        for (
+            subtask_id,
+            tenant_id,
+            task_id,
+            task_attempt_id,
+            node_id,
+            step_code,
+            execution_id,
+            space_id,
+        ) in pending:
+            # ✅ **判死之前先问一次**（2026-10-16 用户口径）：
+            #   · 运行方说「早就完事了」→ 问到终态、当一条上报入队（`_query_one` 回 True）
+            #     ⇒ **这一条本轮不判超时**（下一拍消化那条上报，状态按实数落）；
+            #   · 说「还在跑」/ 没问到 / 说不归它 → 照常判超时（**这才是超时该有的结论**）。
+            # 为什么必须问：运行方的上报可能压根没送到（网络、代理、它自己被重启……），
+            # 而它那侧已经收口、接管行也交还了 —— 只盯着本地超时那一列，就会把一条
+            # **其实早已成功**的活判成超时。
+            # ⚠️ **没派出去的不问**（`execution_id` 为空）：那是「还没轮到它」，
+            # 运行方压根没收到这一步，问了也只回 `unknown`（白打扰一次）。
+            if execution_id and await self._query_one(
+                subtask_id,
+                tenant_id,
+                task_id,
+                task_attempt_id,
+                node_id,
+                step_code,
+                execution_id,
+                space_id,
+            ):
+                continue
             await self._timeout_one(subtask_id, now)
 
     # ── 防僵尸（§7.5 D2b）─────────────────────────────────
@@ -1039,7 +1346,8 @@ class TaskScheduler:
             logger.warning("[TaskCenter] 防僵尸出错 subtask=%s：%s", subtask_id, exc)
 
     async def _timeout_one(self, subtask_id: str, now: datetime) -> None:
-        """超时巡检到一个子任务。跟防僵尸同构：**不出站** → 锁盖住整个「读—改—写」，
+        """超时巡检**判死一条**子任务（⚠️ 调用方 `_patrol_pass` 会先出站问一次运行方，
+        那一问在**锁外**；这里只管判死这一段）。跟防僵尸同构：**这一步不出站** → 锁盖住整个「读—改—写」，
         抢不到锁就跳过这条、看下一条（§7.2）。
         """
         try:
@@ -1117,7 +1425,7 @@ class TaskScheduler:
             await self._settle_one(tenant_id, task_id)
 
     async def _settle_one(self, tenant_id: str, task_id: str) -> None:
-        """补收口一条任务。跟超时巡检同构：**不出站** → 锁盖住整个「读—改—写」，
+        """补收口一条任务。跟超时巡检**判死那一段**同构：**不出站** → 锁盖住整个「读—改—写」，
         抢不到锁就跳过这条、看下一条（§7.2）。
         """
         try:
@@ -1159,7 +1467,7 @@ def get_scheduler() -> TaskScheduler:
 
 
 async def start_scheduler() -> None:
-    """起后台循环。**恒开、不设开关** —— 这五趟是任务中心的心脏，没有「关掉」这个状态。"""
+    """起后台循环。**恒开、不设开关** —— 这**六趟**是任务中心的心脏，没有「关掉」这个状态。"""
     await get_scheduler().start()
 
 

@@ -70,8 +70,17 @@ class Task(Base, TimestampMixin, AuditMixin):
         # 下面这条 CHECK 同 `TaskDefinition.__table_args__`：出处是 DDL，重复一份只为让
         # `create_all` 跟 DDL 对齐 —— 少了它，本地库会少一道生产有的闸。
         CheckConstraint(
-            "status IN ('pending','running','completed','failed')",
+            "status IN ('pending','running','completed','failed','stopped')",
             name="ck_tc_task_status",
+        ),
+        # 任务来源的取值范围（2026-10-13 加）：**出处是 DDL**（`update/050_task_source.sql`），
+        # 这里重复一份只为让 `create_all` 跟 DDL 对齐 —— 少了它，本地库会少一道生产有的闸。
+        # 取值与协议层 `TASK_SOURCES` 同源；对账用例（`_ENUM_BY_CONSTRAINT` 里那条
+        # `ck_tc_task_source`）会把 DDL 侧的取值逐个对照那个集合。
+        CheckConstraint(
+            "task_source IN ('knowledge_base.file.manual_upload','knowledge_base.file.api_pull',"
+            "'knowledge_base.file.api_push','knowledge_base.file.storage_upload')",
+            name="ck_tc_task_source",
         ),
         {"schema": "task_center"},
     )
@@ -89,7 +98,7 @@ class Task(Base, TimestampMixin, AuditMixin):
     # **为什么冗余而不反查**：版本会被「删定义」带成假删（`get_version` 把
     # `is_deleted=1` 当找不到），而那时任务多半还在跑 —— 反查一断，`_load_context`
     # 返回 None，**消化上报 / 停止任务 / 超时巡检三条路全灭**，那条 `running` 子任务
-    # 永远收不掉、并发名额（全平台上限 10）永久泄漏。编排是这条任务的「施工图纸」，
+    # 永远收不掉、并发名额（该目录上限 10）永久泄漏。编排是这条任务的「施工图纸」，
     # 任务行自己带一份，就不怕图纸被归档。
     definition_config = Column(JSONB, nullable=False)
     # 内置清单编码（`task_definitions.task_catalog_code`）的快照。理由同上，而且是**更隐蔽**
@@ -102,6 +111,18 @@ class Task(Base, TimestampMixin, AuditMixin):
     task_name = Column(String(256), nullable=True)
     # 是哪个触发触发的；只有直接 fire 不挂触发器时才为 NULL
     trigger_id = Column(String(64), nullable=True)
+    # **任务来源**（2026-10-13 加）：这条任务是哪个入口来的。取值是**协议层写死的枚举**
+    # （`jonex_core.task_protocol.models.TASK_SOURCES`，格式 `{运行方 code}.{对象}.{通道}`，
+    # 如 `knowledge_base.file.manual_upload`）—— 运行方填、这里存**原码**、前端按码映射文案。
+    #
+    # ⚠️ **可空，而且空是有意义的**（不是漏记，也**不要**给它加 NOT NULL）：
+    #   · 平台侧自己建的任务（定时触发 `fire_trigger`、人点「立即触发」）不是运行方发起的，
+    #     本来就没有「来源入口」这个概念，留空是对的；
+    #   · 这列诞生之前的存量任务行也没值。回填不了、也不该编一个。
+    # 「必传」只落在 `init_task` 那条路上 —— 由 `TaskService.init_task` 用协议层的
+    # `check_task_source` 判（非法值 1001），`fire` 本身不强制（`task.fire` 那条内部
+    # 触发路径不传）。
+    task_source = Column(String(64), nullable=True)
     # 这次运行的任务级入参（按 config.input_schema 收口后的实值）。
     # 必须落库：编排里的 `@task.inputs.<key>` 在「下游某步依赖齐了、轮到填它的值」时才求值，
     # 那一刻离 fire 已经过去很久，只有这一列能给出任务级入参（§6.2）。
@@ -121,6 +142,14 @@ class Task(Base, TimestampMixin, AuditMixin):
     current_attempt = Column(Integer, nullable=False, default=1)
     status = Column(String(16), nullable=False, default=TaskStatus.PENDING.value)
     error_message = Column(Text, nullable=True)
+    # 失败原因的**代号 + 参数**（2026-10-10 加）：可翻译的那半。管理方存代号，
+    # **读的时候**按请求的 `X-Lang` 现场渲染 —— 写它的多半是后台循环（超时 / 防僵尸 /
+    # 派活判死），那些帧里没有请求上下文、`translate()` 只能拿到默认语言，所以
+    # 「在写的那一刻翻译」这条路治不好，只能存代号延后渲染。
+    # `error_message` **不被替换**：它继续当「原文槽」（引擎/下下游的自由文本，永远没有
+    # 代号）+ 老数据兜底 + 排障快照。判据见协议层 `check_error_reason`（128 = 它的上限）。
+    error_code = Column(String(128), nullable=True)
+    error_params = Column(JSONB, nullable=True)
     state_version = Column(Integer, nullable=False, default=0)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -134,10 +163,13 @@ class Task(Base, TimestampMixin, AuditMixin):
             "space_id": self.space_id,
             "task_name": self.task_name,
             "trigger_id": self.trigger_id,
+            "task_source": self.task_source,
             "inputs": self.inputs or {},
             "current_attempt": self.current_attempt,
             "status": self.status,
             "error_message": self.error_message,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
             "state_version": self.state_version,
             "created_by": self.created_by,
             "updated_by": self.updated_by,
@@ -164,7 +196,7 @@ class TaskAttempt(Base):
         Index("idx_tc_ta_tenant", "tenant_id"),
         # 同 `Task`：出处是 DDL，重复一份只为让 `create_all` 跟它对齐
         CheckConstraint(
-            "status IN ('pending','running','completed','failed')",
+            "status IN ('pending','running','completed','failed','stopped')",
             name="ck_tc_ta_status",
         ),
         {"schema": "task_center"},
@@ -179,6 +211,14 @@ class TaskAttempt(Base):
     attempt = Column(Integer, nullable=False)
     status = Column(String(16), nullable=False, default=AttemptStatus.PENDING.value)
     error_message = Column(Text, nullable=True)
+    # 失败原因的**代号 + 参数**（2026-10-10 加）：可翻译的那半。管理方存代号，
+    # **读的时候**按请求的 `X-Lang` 现场渲染 —— 写它的多半是后台循环（超时 / 防僵尸 /
+    # 派活判死），那些帧里没有请求上下文、`translate()` 只能拿到默认语言，所以
+    # 「在写的那一刻翻译」这条路治不好，只能存代号延后渲染。
+    # `error_message` **不被替换**：它继续当「原文槽」（引擎/下下游的自由文本，永远没有
+    # 代号）+ 老数据兜底 + 排障快照。判据见协议层 `check_error_reason`（128 = 它的上限）。
+    error_code = Column(String(128), nullable=True)
+    error_params = Column(JSONB, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     # 带 Python 侧默认值：`BaseRepository.create` 只 flush 不 refresh，没有默认值的话
@@ -194,6 +234,8 @@ class TaskAttempt(Base):
             "attempt": self.attempt,
             "status": self.status,
             "error_message": self.error_message,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
             "started_at": iso(self.started_at),
             "finished_at": iso(self.finished_at),
             "created_at": iso(self.created_at),
@@ -230,7 +272,7 @@ class Subtask(Base, TimestampMixin):
         # 那两条为什么不建，见 `Task.__table_args__` 那段（同一条规矩）。
         # 下面这条 CHECK 同样出自 DDL。
         CheckConstraint(
-            "status IN ('pending','running','success','failed','timeout')",
+            "status IN ('pending','running','success','failed','timeout','stopped')",
             name="ck_tc_sub_status",
         ),
         {"schema": "task_center"},
@@ -268,12 +310,37 @@ class Subtask(Base, TimestampMixin):
     # 控制台读接口原样回给前端，前端据此调运行方自己的接口看详情（权限归运行方那侧判）。
     # 形状见 DDL 注释与 `hand_over_in_flight_task_id` 同一族的说明；未知键忽略、可空。
     output_refs = Column(JSONB, nullable=True)
+    # 输入「**从哪儿来**」的引用（展示用，**不参与下游取参**，2026-10-16 加）：与
+    # `output_refs` 对称的那一份 —— 那边说「这一步的成果去哪儿看」，这边说「这一步吃的是什么」。
+    # 形状同款（元素只有 `kind` + `params`，`kind` ∈ 协议层 `INPUT_REF_PARAMS`）、同样不带地址。
+    # 可空：老运行方不上报、或将来真没有输入引用的任务。
+    input_refs = Column(JSONB, nullable=True)
     # 当前第几次尝试（指针，指向 subtask_attempts.attempt）；首次=1，retry_subtask 时 +1
     current_attempt = Column(Integer, nullable=False, default=1)
     # 管理方生成的受理凭证（派活前生成、随 execute 传给运行方；重试时重新生成）
     execution_id = Column(String(128), nullable=True)
+    # **对账上一次问过它的时刻**（2026-10-11 加，只服务 `_query_pass`）。
+    #
+    # ⚠️ **没有这一列，对账会每拍重问一遍**：`TASK_CENTER_QUERY_QUIET_SEC` 只能当
+    # 「**第一次**发问」的门槛 —— 一旦某步沉默超过它，此后**永远**满足条件，
+    # 而主循环 3 秒一拍 ⇒ 一个跑几分钟的步骤被问上百次，白打运行方。
+    # 更糟的是排序：按 `started_at` 取最老的 N 条，**最老的那批（也最可能一直在跑、
+    # 一直答「还在跑」）每拍占满名额**，后面新沉默的**永远排不进来**。
+    #
+    # 现在判据 / 排序都用 `COALESCE(last_queried_at, started_at)`：
+    # 问过就往后排，自然轮转；`_query_one` **无论问到什么都回写**这一列
+    # （问到「还在跑」也算问过 —— 否则它还留在队头）。
+    last_queried_at = Column(DateTime, nullable=True)
     state_version = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
+    # 失败原因的**代号 + 参数**（2026-10-10 加）：可翻译的那半。管理方存代号，
+    # **读的时候**按请求的 `X-Lang` 现场渲染 —— 写它的多半是后台循环（超时 / 防僵尸 /
+    # 派活判死），那些帧里没有请求上下文、`translate()` 只能拿到默认语言，所以
+    # 「在写的那一刻翻译」这条路治不好，只能存代号延后渲染。
+    # `error_message` **不被替换**：它继续当「原文槽」（引擎/下下游的自由文本，永远没有
+    # 代号）+ 老数据兜底 + 排障快照。判据见协议层 `check_error_reason`（128 = 它的上限）。
+    error_code = Column(String(128), nullable=True)
+    error_params = Column(JSONB, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
 
@@ -295,10 +362,13 @@ class Subtask(Base, TimestampMixin):
             "inputs": self.inputs or {},
             "outputs": self.outputs,
             "output_refs": self.output_refs,
+            "input_refs": self.input_refs,
             "current_attempt": self.current_attempt,
             "execution_id": self.execution_id,
             "state_version": self.state_version,
             "error_message": self.error_message,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
             "created_at": iso(self.created_at),
             "started_at": iso(self.started_at),
             "finished_at": iso(self.finished_at),
@@ -330,7 +400,7 @@ class SubtaskAttempt(Base):
         Index("idx_tc_sa_created", "created_at"),
         # 同 `Task`：出处是 DDL，重复一份只为让 `create_all` 跟它对齐
         CheckConstraint(
-            "status IN ('pending','running','success','failed','timeout')",
+            "status IN ('pending','running','success','failed','timeout','stopped')",
             name="ck_tc_sa_status",
         ),
         {"schema": "task_center"},
@@ -349,7 +419,29 @@ class SubtaskAttempt(Base):
         String(16), nullable=False, default=SubtaskAttemptStatus.PENDING.value
     )
     error_message = Column(Text, nullable=True)
+    # 失败原因的**代号 + 参数**（2026-10-10 加）：可翻译的那半。管理方存代号，
+    # **读的时候**按请求的 `X-Lang` 现场渲染 —— 写它的多半是后台循环（超时 / 防僵尸 /
+    # 派活判死），那些帧里没有请求上下文、`translate()` 只能拿到默认语言，所以
+    # 「在写的那一刻翻译」这条路治不好，只能存代号延后渲染。
+    # `error_message` **不被替换**：它继续当「原文槽」（引擎/下下游的自由文本，永远没有
+    # 代号）+ 老数据兜底 + 排障快照。判据见协议层 `check_error_reason`（128 = 它的上限）。
+    error_code = Column(String(128), nullable=True)
+    error_params = Column(JSONB, nullable=True)
     outputs = Column(JSONB, nullable=True)
+    # 这一次尝试的**入参快照**（`bind_inputs` 填出来的那份，2026-10-16 加）。
+    # ⚠️ **与 `outputs` 对称的那一格缺口**：产出一直存着、入参却只在 `subtasks` 上（那行是
+    # 「最新一次尝试」的现状，重试时会被 `_fill_inputs` **重算**）—— 于是「第 2 次尝试吃的是
+    # 什么」在重试之后就查不到了。历史要能复盘，两份都得按次留。
+    inputs = Column(JSONB, nullable=True)
+    # 这一次尝试的**输入引用**（输入「从哪儿来」的入口，2026-10-16 加）：展示用、
+    # **不参与下游取参**（取参走 `subtasks.inputs`）。
+    # ⚠️ **这里存一份不是冗余**：重试会把 `subtasks.inputs` 按上游现在的产出**重算**，
+    # 于是「第 2 次尝试吃的是什么」在 `subtasks` 那行上看不到 —— 它是「最新一次尝试」的现状。
+    # 可空：老运行方不上报、或将来真没有输入引用的任务。
+    input_refs = Column(JSONB, nullable=True)
+    # 这一次尝试的**产出引用**（产出「去哪儿看」的入口，2026-10-16 加，与 `outputs` 对称）：
+    # 同样是「按次留一份」的理由 —— 重试之后要能查到「第 2 次尝试的产物在哪儿」。
+    output_refs = Column(JSONB, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     # 带 Python 侧默认值：`BaseRepository.create` 只 flush 不 refresh，没有默认值的话
@@ -367,7 +459,12 @@ class SubtaskAttempt(Base):
             "execution_id": self.execution_id,
             "status": self.status,
             "error_message": self.error_message,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
+            "inputs": self.inputs or {},
             "outputs": self.outputs,
+            "input_refs": self.input_refs,
+            "output_refs": self.output_refs,
             "started_at": iso(self.started_at),
             "finished_at": iso(self.finished_at),
             "created_at": iso(self.created_at),

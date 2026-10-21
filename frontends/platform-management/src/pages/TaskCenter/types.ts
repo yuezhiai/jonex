@@ -13,31 +13,8 @@ import type { Dayjs } from 'dayjs';
  * 必须是 type 别名而非 interface：CommonTable 的 `F extends Record<string, unknown>`
  * 要求隐式索引签名，TS 只给类型别名补、不给 interface 补（TS #15300）。
  */
-/**
- * 任务来源。取值**照后端取**：与知识库侧 `dtos/data_source.py` 的 `ACCESS_TYPES` 逐字一致
- * （后端那集合就是这四个：api / api_push / storage / file）。
- */
-export type TaskSource = 'file' | 'api' | 'api_push' | 'storage';
-
-/**
- * 任务类型。⚠️ **页面层的聚合视图，后端没有这个字段** —— 后端靠 `definition_id` 区分
- * 一份定义跑几步（三步 Ontology / 两步 Wiki），不存在「只跑某个阶段」这个类型维度。
- * 取值与文案是接接口前的遗留，保留是为对齐将来的筛选参数，语义待后端补齐时确认。
- */
-export type TaskType = 'parse' | 'ontology' | 'wiki' | 'full';
-
 export type TaskFilters = {
   keyword?: string;
-  /**
-   * 任务类型 / 任务来源。⚠️ 这两个参数**后端 `page_tasks` 目前不接收** —— 它只取
-   * keyword / start_time / end_time / statuses / page / page_size，多传的键被
-   * `d.get(...)` 逐个取值那层静默忽略（不报错、也不生效）。
-   *
-   * 照发是既定决定：前端一次接好，后端补齐参数后自动生效。参数名按后端 snake_case
-   * 风格取，与 start_time / page_size 一致。
-   */
-  task_type?: string;
-  source?: string;
   /**
    * 日期区间 [起始, 结束]；fetch 里拆成 start_time / end_time。
    *
@@ -47,4 +24,10 @@ export type TaskFilters = {
   range?: [Dayjs, Dayjs] | null;
   /** 由状态标签栏经 filterExtraRow 写入 —— 它不在 filters 数组里，但同属这份筛选值。 */
   status?: string;
+  /**
+   * 任务来源码（`knowledge_base.file.*`）。不选为全部。
+   *
+   * ⚠️ 空值那种情况**筛不到** —— 后端是「有值才加条件」，没有「平台自建」这一档。
+   */
+  task_source?: string;
 };

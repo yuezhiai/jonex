@@ -57,13 +57,16 @@ dispatch.update(ExampleRunner().bind())
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, ClassVar, Dict, Optional
+from typing import Any, Awaitable, Callable, ClassVar, Dict, List, Optional
 
 from jonex_core.capability.response import ApiResponse
 from jonex_core.common.i18n import translate
 from jonex_core.task_protocol.models import (
+    STEP_STATUS_VALUES,
     ExecutionDispatch,
+    ExecutionEnvelope,
     RemoveTaskDispatch,
+    StepStatusQuery,
     TaskStoppedDispatch,
 )
 from jonex_core.task_protocol.results import TerminalSubmitResult
@@ -113,16 +116,20 @@ class RunnerBase(ABC):
     # ========================================================
 
     def bind(self) -> Dict[str, Callable[..., Awaitable[Dict[str, Any]]]]:
-        """返回三个可直接 `dispatch.update()` 进去的入口。
+        """返回四个可直接 `dispatch.update()` 进去的入口。
 
         **签名与返回值形状都由 SDK 保证**（见模块 docstring 的两条硬坑）：
         两个位置参数 `(request, data)`，返回**裸 dict**（已 `.to_dict()` 过）。
         运行方不需要知道能力层这两条约定存在。
+
+        （`query_step_status` 是 2026-10-11 加的第四个 —— 老运行方**不用改**
+        `_build_dispatch`：`bind()` 返回的 dict 一并更新，它们白捡一个「管理方能来问」的入口。）
         """
         return {
             "execute": self._on_execute,
             "remove_task": self._on_remove_task,
             "task_stopped": self._on_task_stopped,
+            "query_step_status": self._on_query_step_status,
         }
 
     async def _on_execute(self, request: Any, data: Any) -> Dict[str, Any]:
@@ -210,6 +217,78 @@ class RunnerBase(ABC):
                 )
             ).to_dict()
         return result.to_dict()
+
+    # ========================================================
+    # §4.1 ④ 子任务状态查询（管理方主动问）
+    # ========================================================
+
+    async def _on_query_step_status(self, request: Any, data: Any) -> Dict[str, Any]:
+        """管理方**主动问**：这个子任务现在什么情况（§4.1 ④，2026-10-11 加）。
+
+        ## 与「上报」是同一件事的两个方向
+
+        上报是运行方**推**（跑完一步说一声），这个是管理方**拉**（我不知道你那步怎么样了，
+        问一句）。**拉的意义是幂等**：上报丢了（单次尝试 + 最多 3 次重发全丢）子任务就挂到
+        编排硬超时（预置 7 小时），而**问不到就下一拍再问**，不存在永久丢。
+
+        ## ⚠️ 老运行方**什么都没做，也完全正常**
+
+        基类 `query_step_status` 默认 `raise NotImplementedError`，这里**把它接住并转成
+        `data=None`** —— 意思是「**这个运行方不提供查询**」。管理方看到 `None` 就退回原来的
+        「等上报」，**行为与从前一字不变**。所以这个方法是**纯加法**，不实现它不会被判错。
+
+        ## 只读
+
+        运行方实现 `query_step_status` 时**不许改任何东西** —— 它是「看一眼」，不是「推一把」。
+        想改状态的走它自己的收口路径。
+        """
+        try:
+            envelope = ExecutionEnvelope(**data)
+        except (ValidationError, TypeError) as exc:
+            return ApiResponse.fail(f"状态查询报文不合法：{exc}").to_dict()
+
+        try:
+            result = await self.query_step_status(envelope)
+        except NotImplementedError:
+            # 「我不提供查询」—— **不是错**，转成 `None` 让管理方走老路。
+            result = None
+
+        if result is not None and not isinstance(result, StepStatusQuery):
+            return ApiResponse.fail(
+                translate(
+                    "err.task_runtime.bad_handler_result",
+                    params={"handler": "query_step_status"},
+                    fallback=(
+                        f"query_step_status 返回了 {type(result).__name__}，"
+                        "不是 StepStatusQuery"
+                    ),
+                )
+            ).to_dict()
+        if result is not None and result.status not in STEP_STATUS_VALUES:
+            # 域外取值**当场拒**：管理方靠这一列分支，放行等于让它猜。
+            return ApiResponse.fail(
+                translate(
+                    "err.task_runtime.bad_handler_result",
+                    params={"handler": "query_step_status"},
+                    fallback=f"query_step_status 返回了域外状态 {result.status!r}",
+                )
+            ).to_dict()
+        # ⚠️ 用 `.dict()`：协议层的 DTO 是 **pydantic v1 的 `BaseModel`**，它**没有
+        # `to_dict()`**（那是业务模型的习惯写法）—— 写成 `to_dict` 会在**运行时**才炸，
+        # 而语法检查与单测都抓不到（单测走的是替身，不经过这个包装）。
+        return ApiResponse.ok(result.dict() if result is not None else None).to_dict()
+
+    async def query_step_status(
+        self, envelope: ExecutionEnvelope
+    ) -> Optional[StepStatusQuery]:
+        """这个子任务现在什么情况（§4.1 ④）。**默认不提供** —— 覆写它就能被管理方问到。
+
+        返回 `None`（或抛 `NotImplementedError`，两条等价）都表示「我不提供查询」，
+        管理方据此退回「等上报」。**所以覆写是可选的，不覆写不会出任何错。**
+
+        ⚠️ **必须只读**：这是「看一眼」，不是「推一把」—— 实现里不许改任何状态。
+        """
+        raise NotImplementedError
 
     # ========================================================
     # §4.1 ① 派活
@@ -412,8 +491,21 @@ class RunnerBase(ABC):
     # §4.2 的封装：定位字段从上下文取，运行方不用手传
     # ========================================================
 
-    async def report_success(self, outputs: Dict[str, Any]) -> TerminalSubmitResult:
+    async def report_success(
+        self,
+        outputs: Dict[str, Any],
+        *,
+        output_refs: Optional[List[Dict[str, Any]]] = None,
+        input_refs: Optional[List[Dict[str, Any]]] = None,
+        ts: Optional[int] = None,
+    ) -> TerminalSubmitResult:
         """报「跑完了」。`outputs` 必填（§4.2 ①）。
+
+        `output_refs` / `input_refs` / `ts` 可选、**关键字传**（后两者 2026-10-13 /
+        2026-10-16 补）：与 `TerminalReport.success` 同一套字段 —— 少了它们，这条
+        「handler 内上报」的推荐路径就**带不出「产出去哪儿看 / 输入从哪儿来」**，
+        调用方只能绕过本方法、自己去 `require_execution_context()` 再调
+        `TaskRuntime.report_terminal`。
 
         **只能在 `execute` 的 handler 里调** —— 它从 ContextVar 取定位字段；
         巡检 / 后台循环那条路没有这一帧，请改用 `TaskRuntime.report_terminal(carrier, ...)`。
@@ -422,16 +514,45 @@ class RunnerBase(ABC):
         handler 里不用自己写重试。返回的档位仍然是「重发完之后」的结论。
         """
         return await self._runtime.report_terminal(
-            require_execution_context(), TerminalReport.success(outputs)
+            require_execution_context(),
+            TerminalReport.success(
+                outputs, ts=ts, output_refs=output_refs, input_refs=input_refs
+            ),
         )
 
-    async def report_failed(self, error_message: str) -> TerminalSubmitResult:
+    async def report_failed(
+        self,
+        error_message: str,
+        *,
+        output_refs: Optional[List[Dict[str, Any]]] = None,
+        input_refs: Optional[List[Dict[str, Any]]] = None,
+        ts: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+    ) -> TerminalSubmitResult:
         """报「没跑成」。`error_message` 必填 —— 它是人看失败原因的唯一来源（§4.2 ①）。
+
+        `output_refs` / `ts` / `error_code` / `error_params` 可选、**关键字传**
+        （2026-10-13 补）：与 `TerminalReport.failed` 同一套字段 —— 少了
+        `error_code` / `error_params`，这条推荐路径只能**冻住一句原文**，
+        管理方没法按读的人的语言渲染（两条约定见 `TerminalReport.failed` 的 docstring）。
+
+        `input_refs`（2026-10-16 加，同款关键字传）：**失败时也要带** —— 用户在这一步
+        栽了跟头时，最想知道的恰恰是「它当时吃的是哪份东西」。与 `TerminalReport.failed`
+        同一口径。
 
         同上：**只能在 handler 里调**；**没被受理会自动重发**。
         """
         return await self._runtime.report_terminal(
-            require_execution_context(), TerminalReport.failed(error_message)
+            require_execution_context(),
+            TerminalReport.failed(
+                error_message,
+                ts=ts,
+                output_refs=output_refs,
+                input_refs=input_refs,
+                error_code=error_code,
+                error_params=error_params,
+            ),
         )
 
 

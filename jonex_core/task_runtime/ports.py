@@ -28,7 +28,7 @@
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from jonex_core.capability.response import ApiResponse
-from jonex_core.task_protocol.models import ExecutionDispatch
+from jonex_core.task_protocol.models import ExecutionDispatch, ExecutionEnvelope, StepStatusQuery
 
 
 @runtime_checkable
@@ -51,8 +51,17 @@ class ControlPlaneClient(Protocol):
         name: Optional[str] = None,
         operator_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        task_source: Optional[str] = None,
     ) -> ApiResponse[Dict[str, Any]]:
         """起一条新任务（§4.2 ②）。
+
+        ── `task_source`（2026-10-13 加，**只做加法**：排在末尾、不影响任何已有参数）──
+
+        任务来源，∈ 协议层 `TASK_SOURCES`（写死枚举）。**在这条路上它是必传的** ——
+        标注写 `Optional` 只是为了让实现这个端口的假实现不至于签名对不上；真正的
+        「必传」由 `TaskRuntime.submit` 的 `_check_task_source` 保证（调用方唯一）。
+        管理方原样落 `tasks.task_source`；平台侧自己发起的任务不经这条路，那些任务的
+        该列留空。
 
         `task_id` 是**可选**的「发起方自己生成的 id」：给了就用它，不给由管理方生成。
         发起方要先把 id 落到自己的行上、又不想等管理方回包时才用得上。
@@ -82,6 +91,9 @@ class ControlPlaneClient(Protocol):
         error_message: Optional[str] = None,
         ts: Optional[int] = None,
         output_refs: Optional[List[Dict[str, Any]]] = None,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+        input_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> ApiResponse[None]:
         """上报终态（§4.2 ①）。
 
@@ -91,6 +103,13 @@ class ControlPlaneClient(Protocol):
         把 `output_refs`(list) 塞进 `ts`。`LegacyControlPlaneAdapter.report_status`
         （`task_runtime/client.py`）与真实现 `TaskCenterClient.report_status`
         （`capability/business/task_center/client.py`）都是这个顺序，改这里要三处一起改。
+
+        `error_code` / `error_params`（2026-10-10 加）与 `input_refs`（2026-10-16 加）
+        **一律加在最末尾、且由调用方关键字传** —— 就是为了让上面那条「顺序承重」的坑不再
+        扩面：新字段不在位置参数序列里，谁排错也排不到它们头上。
+
+        `input_refs` 与 `output_refs` 对称：输入「**从哪儿来**」的引用（这一步吃的是什么），
+        运行方上报时捎上，管理方只搬运、原样回给控制台。**可选** —— 老运行方不带照常受理。
 
         **没被受理就重发**，且**不需要任何前提**：重复上报在服务端是安全的（收件箱不加
         唯一约束，重复那条会被「已是终态」那道闸吸收掉）。这件事由 `TaskRuntime.report_terminal`
@@ -191,11 +210,11 @@ class ControlPlaneClient(Protocol):
 
 @runtime_checkable
 class RunnerPort(Protocol):
-    """运行方必须实现的**三个**方法（§4.1）。
+    """运行方的接口契约（§4.1）。前三 个是**必须**的，第四个 `query_step_status` 是**可选**的。
 
     **这是结构契约，不是基类**：运行方继承 `RunnerBase`（`runner.py`）就自动满足它，
-    但也可以自己实现这三个方法 —— `isinstance(runner, RunnerPort)` 一样为真。
-    存在的意义是让「运行方必须实现这三个」从散文变成可断言的东西。
+    存在的意义是让「运行方必须实现哪些」从散文变成可断言的东西
+    （`query_step_status` 例外 —— 见下，它有默认实现）。
     """
 
 
@@ -213,6 +232,35 @@ class RunnerPort(Protocol):
         self, tenant_id: str, space_id: str, task_id: str
     ) -> ApiResponse[None]:
         """**通知**：这条任务被用户停了（§4.1 ③）。**停不停自己决定、必须幂等**。"""
+        ...
+
+    async def query_step_status(
+        self, envelope: ExecutionEnvelope
+    ) -> Optional[StepStatusQuery]:
+        """**管理方主动问**：这个子任务现在什么情况（§4.1 ④，2026-10-11 加）。
+
+        ## 它替代的是「等上报」里的「等」
+
+        管理方推进编排原来**只能等运行方主动上报** —— 上报是「单次尝试 + 最多 3 次重发」，
+        全丢了子任务就挂到编排硬超时（预置 7 小时）。而丢的原因多半不在网络：运行方那侧
+        「什么时候该上报」的判断错了、或者它压根没走到那一步。**主动问是幂等的** ——
+        问不到就下一拍再问，**不存在「永久丢」**。
+
+        ## 入参就是派活报文去掉 `inputs`
+
+        `ExecutionEnvelope`（`tenant_id` / `space_id` / `task_id` / `step_code` / `node_id` /
+        `execution_id`）—— 运行方拿到的**定位钥匙与受理派活时完全一致**，不用另发明一套。
+        ⚠️ **`execution_id` 可能为空**：那就是「收下了、还没等到派活」那一档。
+
+        ## 返回
+
+        - `StepStatusQuery` —— 五档之一，见协议层 `STEP_STATUS_*`；
+        - **`None` = 这个运行方不提供查询**（老运行方没实现）。管理方据此**退回原来的
+          「等上报」**，行为与从前一字不变 —— 这条路的**向后兼容就靠这个 `None`**。
+
+        **必须只读**：查询里**不许**改任何东西（它是「看一眼」，不是「推一把」）。
+        谁想改状态，走它自己的收口路径。
+        """
         ...
 
 

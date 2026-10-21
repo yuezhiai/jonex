@@ -279,9 +279,11 @@ class TaskRef:
     - `definition_version_no`：没指定 `version_no` 时，服务端替它解析并钉死的那个版本；
     - `id`：不传 `task_id` 时由管理方生成的那个（传了就是原值，冗余但便宜）。
 
-    完整快照 `TaskItemResponse` 有 18 个字段，其余对发起方全是**它自己刚传进去的值**
-    （`definition_id` / `space_id` / `inputs` / `name`）或**管理方内部信息**（`state_version`
-    / `created_by` / `updated_by` / 四个时间戳），不进 SDK 的返回。
+    完整快照 `TaskItemResponse` 的**其余字段**，对发起方全是**它自己刚传进去的值**
+    （`definition_id` / `space_id` / `inputs` / `name`）或**管理方内部信息**（`task_source`
+    / `state_version` / `created_by` / `updated_by` / 四个时间戳），不进 SDK 的返回。
+    （**此处刻意不写具体字段数** —— 它已随 `task_source` 之类的新列漂移过一次，
+    写死数字只会再漂。）
     """
 
     id: str

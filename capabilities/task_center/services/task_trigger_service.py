@@ -361,8 +361,14 @@ class TaskTriggerService:
         # **绝不拿库里的旧值顶上** —— 那是替调用方猜一条他这轮没声明的策略；文档的
         # 「所有可能」表把这一格钉死成「拒绝」：`cron_expr` 有、`misfire_policy` 没给
         # （或反之）→ `success=false` + 非 0 `code`。两个都不给才算「没碰 cron」。
-        has_expr = fields.get("cron_expr") is not None
-        has_policy = fields.get("misfire_policy") is not None
+        # ⚠️ **判据是「键在不在」，不是「值是不是 `None`」**（2026-10-13 改，与上面
+        # `fixed_version` 同款）：报文里**显式给 `null`** 从前被当成「没改」而静默 no-op
+        # （回 `code=0`，调用方以为生效了），但它其实与「只给一个 cron 字段」是同一类
+        # 输入、结局却一个报错一个静默成功。改判「键在不在」之后，`cron_expr: null`
+        # 会落进下面那支 `cron_fields_incomplete`，**明确告诉调用方「要改就得两个一起给」**。
+        # （`cron_expr` / `misfire_policy` 的取值都用 `ge` 挡住了 `0` / 空，`None` 不是合法值。）
+        has_expr = "cron_expr" in fields
+        has_policy = "misfire_policy" in fields
         if has_expr or has_policy:
             if not (has_expr and has_policy):
                 raise InvalidParameterError(
@@ -744,6 +750,11 @@ class TaskTriggerService:
         ⚠️ **那一版查不到时直接拒绝**（2026-10-09 补，原先的缺口是「静默清空入参」）：
         `version is None` → 不拿空 schema 去筛（空表筛什么都返回空、还不报 issue，
         调用方会以为成了，实际入参整份没了）→ 抛 `InvalidParameterError` 让调用方看见。
+
+        ⚠️ **「版本在、但这一版没声明 `input_schema`」是另一回事、不拦**（2026-10-13 澄清）：
+        那是**定义本身就没声明入参**（发版校验 N8b 保证没人引用得到它们），收口成空集是
+        **对的**，与 `fire` 那条路同一套口径（`config.get("input_schema") or {}`），两处一致。
+        上面那句「缺口」**只指 `version is None` 这一扇门** —— 别读成「所有静默清空都堵了」。
         """
         version_no = await self._resolve_version_no(
             tenant_id, definition_id, fixed_version, required=False
@@ -770,6 +781,26 @@ class TaskTriggerService:
                 details={"definition_id": definition_id, "version_no": version_no},
             )
         schema = (version.config or {}).get("input_schema") or {}
+        # ⚠️ **schema 里没声明的键当场拒**（2026-10-13 补）：`normalize_by_schema` 对这类键是
+        # **静默丢弃**（既不报错、也不保留）—— 触发入参多写一个字段名（拼错、或定义改版后
+        # 字段被删）时接口会回 `code=0`，那个键被**无声删掉**，到点触发时下游
+        # `@task.inputs.<key>` 变 MISSING。这正是发版校验 **N11** 专门防的「静默失踪」，
+        # 触发这一层从前没有等价闸门。判据只补在这里；`fire` 那条路自带收口，不受影响。
+        unknown_keys = sorted(set(values or {}) - set(schema or {}))
+        if unknown_keys:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.invalid",
+                    params={
+                        "errors": f"触发入参里有没声明的字段：{', '.join(unknown_keys)}"
+                    },
+                    fallback=(
+                        "参数没通过校验：触发入参里有没声明的字段："
+                        f"{', '.join(unknown_keys)}"
+                    ),
+                ),
+                details={"definition_id": definition_id, "unknown_keys": unknown_keys},
+            )
         normalized, issues = normalize_by_schema(
             schema, values, path=f"触发 {definition_id} 的入参"
         )

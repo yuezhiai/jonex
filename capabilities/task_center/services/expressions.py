@@ -244,6 +244,12 @@ def _dig(container: Any, path: Sequence[str]) -> Any:
                 return MISSING
             current = current[segment]
         elif isinstance(current, (list, tuple)) and segment.isdigit():
+            # ⚠️ **这一段当前不可达**（2026-10-13 标注）：`path` 只来自 `_parse_ref`，
+            # 而它对每段强制 `_SEGMENT_RE = ^[A-Za-z_][A-Za-z0-9_\-]*$`（**段首必须字母 /
+            # 下划线**）—— 纯数字段（按下标取项，如 `@node.outputs.items.0`）**过不了解析、
+            # 在发版校验就被打回**。留着它是为「将来放开数字段、支持多来源合并出数组后按
+            # 位置取项」预留；真要放开，得**同时**改 `_SEGMENT_RE` / `_parse_ref` 的语义，
+            # 别只删这半段。
             index = int(segment)
             if index >= len(current):
                 return MISSING

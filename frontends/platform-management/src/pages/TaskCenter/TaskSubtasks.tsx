@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
 import { Button, Empty, Space, Spin, Tag, Timeline, Typography } from 'antd';
 import { useTranslation } from 'react-i18next';
-import { listSubtasks } from '../../api/taskCenter';
-import type { SubtaskConsoleItem, TaskStatus } from '../../api/taskCenter';
-import { SUBTASK_STATUS_COLORS, SUBTASK_STATUS_DOT_COLORS, SUBTASK_STATUS_LABEL_KEY, subtaskAction } from './constant';
+import type { TaskStatus } from '../../api/taskCenter';
+import { SUBTASK_STATUS_COLORS, SUBTASK_STATUS_DOT_COLORS, SUBTASK_STATUS_LABEL_KEY, subtaskAction } from '../../constants/taskCenter';
 import { fmtDateTime, fmtDuration } from './format';
+import SubtaskResult from './SubtaskResult';
+import useSubtasks from './useSubtasks';
 
 /**
  * 子任务动作的回调。带任务 id 是因为同一套回调同时服务展开行与抽屉（两个不同的任务）；
@@ -29,11 +29,9 @@ interface Props {
 }
 
 /**
- * 子任务列表（展开行用）。挂载即取数 —— 展开行只在展开时渲染、抽屉只在打开时渲染，
- * 所以这天然是懒加载，不需要额外缓存（同一个任务两处都打开时多取一次的成本可以忽略）。
+ * 子任务列表（展开行用）。
  *
- * 不传 `attempt`：接口支持 `?attempt=N`，但列表接口返回的任务对象里没有任何 attempt
- * 信息，页面无从知道该传第几次，走「最新一次运行」的默认。
+ * 取数与自动轮询走 `useSubtasks`（与抽屉共用）；这里只管 Timeline 怎么画。
  */
 export default function TaskSubtasks({
   taskId,
@@ -45,38 +43,11 @@ export default function TaskSubtasks({
   indent = 48,
 }: Props) {
   const { t } = useTranslation();
-  const [items, setItems] = useState<SubtaskConsoleItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<unknown>(null);
+  const { items, loading, error, reload } = useSubtasks(taskId, reloadToken);
 
-  const load = useCallback(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    listSubtasks(taskId)
-      .then((rows) => {
-        if (!cancelled) setItems(rows ?? []);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) {
-          setItems([]);
-          setError(e);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    // 卸载后不再写 state：展开行折叠、抽屉关闭都会走到这里
-    return () => {
-      cancelled = true;
-    };
-    // reloadToken 是「该重取了」的触发信号，函数体里读不到它，所以 lint 会误判成多余依赖
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, reloadToken]);
-
-  useEffect(() => load(), [load]);
-
-  if (loading) {
+  // 只在「还没有数据」时整块换 Spin。轮询会持续重取，若 loading 就把列表卸载，
+  // 用户正看着的时间线会每几秒闪一次
+  if (loading && !items.length) {
     return (
       <div style={{ padding: 16, textAlign: 'center' }}>
         <Spin />
@@ -87,7 +58,7 @@ export default function TaskSubtasks({
   if (error) {
     return (
       <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.loadFailed')}>
-        <Button onClick={load}>{t('common.retry')}</Button>
+        <Button onClick={reload}>{t('common.retry')}</Button>
       </Empty>
     );
   }
@@ -108,26 +79,36 @@ export default function TaskSubtasks({
             loading: item.status === 'running',
             color: SUBTASK_STATUS_DOT_COLORS[item.status],
             content: (
-              <Space size={12}>
-                <span>{item.subtask_name ?? '-'}</span>
-                <Tag color={SUBTASK_STATUS_COLORS[item.status]}>{t(SUBTASK_STATUS_LABEL_KEY[item.status])}</Tag>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {fmtDateTime(item.started_at)}
-                </Typography.Text>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {fmtDuration(item.duration_seconds)}
-                </Typography.Text>
-                {/* 动作回调带的是 node_id（写接口的寻址键），不是 item.id */}
-                {action === 'stop' && (
-                  <Typography.Link onClick={() => onStopSubtask(taskId, item.node_id, name)}>
-                    {t('taskCenter.action.stop')}
-                  </Typography.Link>
-                )}
-                {action === 'retry' && (
-                  <Typography.Link onClick={() => onRetrySubtask(taskId, item.node_id, name)}>
-                    {t('taskCenter.action.retry')}
-                  </Typography.Link>
-                )}
+              // 竖排两层：上面一行是本来的「名称 / 状态 / 时刻 / 耗时 / 动作」，
+              // 失败原因另起一行（它有长有短，挤进那一行会把时间线撑烂）
+              <Space direction="vertical" size={4}>
+                <Space size={12}>
+                  <span>{item.subtask_name ?? '-'}</span>
+                  <Tag color={SUBTASK_STATUS_COLORS[item.status]}>{t(SUBTASK_STATUS_LABEL_KEY[item.status])}</Tag>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {fmtDateTime(item.started_at)}
+                  </Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {fmtDuration(item.duration_seconds)}
+                  </Typography.Text>
+                  {/* 动作回调带的是 node_id（写接口的寻址键），不是 item.id */}
+                  {action === 'stop' && (
+                    <Typography.Link onClick={() => onStopSubtask(taskId, item.node_id, name)}>
+                      {t('taskCenter.action.stop')}
+                    </Typography.Link>
+                  )}
+                  {action === 'retry' && (
+                    <Typography.Link onClick={() => onRetrySubtask(taskId, item.node_id, name)}>
+                      {t('taskCenter.action.retry')}
+                    </Typography.Link>
+                  )}
+                  {/* 执行结果跟着引用走（列表已带上 input_refs / output_refs），点开不再发请求；
+                      组件内部只在 success 时渲染入口，非成功状态这一项自己消失 */}
+                  <SubtaskResult item={item} />
+                </Space>
+                {/* 原因用红字、不套 Alert：时间线里每条都顶一个卡片框会糊成一片，
+                    这里只需要「这一条为什么失败」在视觉上跳出来 */}
+                {item.error_message && <Typography.Text type="danger">{item.error_message}</Typography.Text>}
               </Space>
             ),
           };

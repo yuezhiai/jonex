@@ -54,6 +54,7 @@ class LegacyControlPlaneAdapter:
         name: Optional[str] = None,
         operator_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        task_source: Optional[str] = None,
     ) -> ApiResponse[TaskItemResponse]:
         """起一条新任务（§4.2 ②）。原样转发 —— 返回的 `data` 是不是模型由调用方解析，
         见 `TaskRuntime.submit` 里那句 `TaskRef.from_payload`。"""
@@ -66,6 +67,7 @@ class LegacyControlPlaneAdapter:
             name=name,
             operator_id=operator_id,
             task_id=task_id,
+            task_source=task_source,
         )
 
     async def report_status(
@@ -79,6 +81,9 @@ class LegacyControlPlaneAdapter:
         error_message: Optional[str] = None,
         ts: Optional[int] = None,
         output_refs: Optional[List[Dict[str, Any]]] = None,
+        error_code: Optional[str] = None,
+        error_params: Optional[Dict[str, Any]] = None,
+        input_refs: Optional[List[Dict[str, Any]]] = None,
     ) -> ApiResponse[None]:
         """上报终态（§4.2 ①）。"""
         return await self._client.report_status(
@@ -91,6 +96,10 @@ class LegacyControlPlaneAdapter:
             error_message,
             ts,
             output_refs,
+            # 与端口同口径：新字段走关键字，不进那条承重的位置参数序列。
+            error_code=error_code,
+            error_params=error_params,
+            input_refs=input_refs,
         )
 
     async def retry_subtask(

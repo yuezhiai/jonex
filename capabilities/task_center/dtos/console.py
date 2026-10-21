@@ -31,6 +31,17 @@ class TaskConsoleItem(BaseModel):
             "里没列在这里的键静默丢掉（`node_id` 当初就这么丢过一次）"
         )
     )
+    task_source: Optional[str] = Field(
+        default=None,
+        description=(
+            "任务来源（∈ 协议层 `TASK_SOURCES`，如 `knowledge_base.file.manual_upload`）。"
+            "**空 = 不是运行方提交的**（平台侧自己建的任务：定时触发 / 人工立即触发），"
+            "或这列诞生之前的存量行。⚠️ **存的是码、不是文案** —— 中文名由前端按码映射。"
+            "与列表的 `task_source` 筛选参数同名同值。"
+            "⚠️ 它是**逐个列出来的**：本 DTO 的 `extra=\"ignore\"` 会把 `tasks.to_dict()` "
+            "里没列在这里的键静默丢掉"
+        ),
+    )
     status: str = Field(
         default="pending", description="pending / running / completed / failed"
     )
@@ -97,10 +108,27 @@ class SubtaskConsoleItem(BaseModel):
             "每个 kind 要哪些写死在协议层 `OUTPUT_REF_PARAMS`，判据也共用 `check_output_refs`）。"
             "**引用里不带地址** —— 运行方碰不到 url，也就填不出外站地址 / `javascript:` / "
             "目录穿越那一类东西；**未知键原样透传**。"
-            "⚠️ **只给入口、不给内容** —— 正文要走运行方那侧（**权限也在那边判**），"
-            "免得把产物内容塞进这个**不判权**的读接口里。"
+            "⚠️ **只给入口、不给内容** —— 正文要走运行方那侧（**权限也在那边判**）："
+            "这是**设计选择**（内容与它的权限都留在运行方那侧）。\n"
+            "⚠️ 这条早先的理由写的是「这个读接口**不判权**」—— **那已经过时**：同一批改动"
+            "（2026-10-13）给两个控制台读口子补上了 `require_space_visible`（租户 + 空间可见性）。"
+            "「不放内容」仍然成立，但**别再拿「接口不判权」当依据**。"
             "⚠️ **空（null）或空数组 = 没东西可看**：老运行方不上报、或这一步还没终态"
             "（列可空，所以这里原样是 `None` —— 前端按 `?? []` 处理即可）。"
+        ),
+    )
+    input_refs: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "输入「**从哪儿来**」的引用（**展示用**，不参与下游取参，2026-10-16 加）："
+            "由运行方在上报里带上来，与 `output_refs` 同款 —— 元素只有 `kind` + `params`，"
+            "`kind` 写死枚举（协议层 `INPUT_REF_PARAMS`：`knowledge_base.document` / "
+            "`knowledge_base.chunks`，**值必须带运行方前缀**），判据共用 `check_input_refs`。"
+            "只给入口、不给内容：正文走运行方那侧的接口。"
+            "⚠️ **空（null）= 没东西可看**：老运行方不上报、或这一步还没终态 —— 前端按 "
+            "`?? []` 处理即可。\n"
+            "⚠️ 它**只有终态上报那一刻才有值**（跟 `output_refs` 一样）：`running` 期间为空 "
+            "—— 「输入是什么」只有运行方知道该指向哪个页面，所以只能等它上报。"
         ),
     )
     status: str = Field(

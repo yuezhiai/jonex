@@ -132,6 +132,20 @@ class FlowStep(BaseModel):
     bind_inputs: Dict[StrictStr, Any] = Field(
         default_factory=dict, description="键=该步骤 input_schema 的字段名，值=来源表达式"
     )
+    # ── 下游联动的两个开关（2026-10-15 加，§6.1）──
+    #
+    # 语义是**出边**：字段挂在上游节点上，管的是「从我这个节点出发的那几条边」。
+    # `None`（不填）= `true` = 从前的口径（重跑某步带上下游 / 停某步带上下游），
+    # 所以库里那几条预置编排一个字都不用改。详细取舍见
+    # `TaskService._downstream_chain` 与 `_stop_cascade_targets`。
+    downstream_on_retry: Optional[StrictBool] = Field(
+        default=None,
+        description="重跑这个节点时，它的下游跟不跟着重跑；不填 = true（跟）",
+    )
+    downstream_on_stop: Optional[StrictBool] = Field(
+        default=None,
+        description="停止这个节点时，它的下游跟不跟着停；不填 = true（跟）",
+    )
 
     @validator("depends_on", "next_steps", "bind_inputs", pre=True)
     def _null_counts_as_empty(cls, value, field):

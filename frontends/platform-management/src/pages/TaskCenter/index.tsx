@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
   Button,
   Collapse,
   DatePicker,
@@ -21,36 +22,44 @@ import {
 } from 'antd';
 import type { GlobalToken, TableColumnsType } from 'antd';
 import { CopyOutlined, ReloadOutlined } from '@ant-design/icons';
+import copyToClipboard from 'copy-to-clipboard';
 import dayjs from 'dayjs';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import { CommonTable, PageContent, PageHeader, usePermission } from '@jonex/shared-lib';
 import type { CommonTableRef, FilterConfig, FilterContext, TableQueryParams } from '@jonex/shared-lib';
 import { onSpaceChanged, readPersistedSpaceId } from '@jonex/shell-sdk';
 import {
   TASK_CENTER_READ_PERMISSION,
   TASK_CENTER_WRITE_PERMISSION,
-  listSubtasks,
   listTasks,
   retrySubtask,
   retryTask,
   stopSubtask,
   stopTask,
 } from '../../api/taskCenter';
-import type { SubtaskConsoleItem, TaskConsoleItem, TaskStatus, TaskWriteResult } from '../../api/taskCenter';
+import type { TaskConsoleItem, TaskStatus, TaskWriteResult } from '../../api/taskCenter';
 import TaskSubtasks from './TaskSubtasks';
 import type { SubtaskActionHandler } from './TaskSubtasks';
+import SubtaskResult from './SubtaskResult';
+import useSubtasks from './useSubtasks';
+import useSilentPolling from './useSilentPolling';
 import { fmtDateTime, fmtDuration } from './format';
 import {
   SUBTASK_STATUS_COLORS,
   SUBTASK_STATUS_LABEL_KEY,
+  TASK_POLL_INTERVAL_MS,
   TASK_SOURCE_LABEL_KEY,
+  TASK_SOURCE_VALUES,
   TASK_STATUS_COLORS,
   TASK_STATUS_LABEL_KEY,
   TASK_STATUS_ORDER,
-  TASK_TYPE_LABEL_KEY,
+  backoffPollInterval,
+  hasExecutionResult,
   isTaskTerminal,
   subtaskAction,
-} from './constant';
+  taskSourceLabel,
+} from '../../constants/taskCenter';
 import type { TaskFilters } from './types';
 
 const { RangePicker } = DatePicker;
@@ -70,13 +79,9 @@ const FILTER_WRAPPER_COL = { flex: '1 1 0%', style: { minWidth: 0 } };
 function CopyButton({ text }: { text: string }) {
   const { t } = useTranslation();
   const onCopy = async (): Promise<void> => {
-    try {
-      // clipboard 在非安全上下文（http 非 localhost）不可用，失败要有反馈而不是静默
-      await navigator.clipboard.writeText(text);
-      message.success(t('common.copySuccess'));
-    } catch {
-      message.error(t('common.copyFailed'));
-    }
+    // 线上是 http 非安全上下文，clipboard API 不可用，copy-to-clipboard 内部自带 execCommand 降级
+    if (await copyToClipboard(text)) message.success(t('common.copySuccess'));
+    else message.error(t('common.copyFailed'));
   };
   return <Button type="text" size="small" icon={<CopyOutlined />} onClick={onCopy} aria-label={t('common.copy')} />;
 }
@@ -90,6 +95,29 @@ export default function TaskCenter() {
   const canWrite = hasPerm(TASK_CENTER_WRITE_PERMISSION);
   const { token } = theme.useToken();
   const tableRef = useRef<CommonTableRef>(null);
+  const [searchParams] = useSearchParams();
+  /**
+   * 从 URL 带来的初始筛选（平台监控的「更多前往任务中心」深链：`?status=failed&from=&to=`）。
+   *
+   * 用 useState 的惰性初值而不是 useMemo：CommonTable 只在挂载时读一次 `initialFilters`，
+   * 之后 URL 再变也不该回写 —— 用户进来之后改的筛选才是准的。
+   */
+  const [initialFilters] = useState<TaskFilters>(() => {
+    const filters: TaskFilters = {};
+    const status = searchParams.get('status');
+    if (status && (TASK_STATUS_ORDER as readonly string[]).includes(status)) {
+      filters.status = status;
+    }
+    // dayjs(undefined) 是「现在」而不是「无效」，所以两个参数都拿到了才解析
+    const fromRaw = searchParams.get('from');
+    const toRaw = searchParams.get('to');
+    if (fromRaw && toRaw) {
+      const from = dayjs(fromRaw);
+      const to = dayjs(toRaw);
+      if (from.isValid() && to.isValid()) filters.range = [from, to];
+    }
+    return filters;
+  });
   const [detail, setDetail] = useState<TaskConsoleItem | null>(null);
   /**
    * 抽屉里那条任务的最新状态。
@@ -108,6 +136,15 @@ export default function TaskCenter() {
   const [subtaskReloadToken, setSubtaskReloadToken] = useState(0);
   /** 各状态数量由接口随列表一并返回；标签栏的角标读它。 */
   const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
+  /**
+   * 当前这一页还有没有没跑完的任务 —— 有才轮询，全终态就停。
+   *
+   * 判据由 `fetchRows` 每次取数后重算，取自刚拿到的那一页，比另发一次探活准，
+   * 也不多花一次请求。
+   */
+  const [hasActiveTasks, setHasActiveTasks] = useState(false);
+  /** 轮询间隔。失败后退避推远，取数通了拉回基准值。 */
+  const [taskPollInterval, setTaskPollInterval] = useState(TASK_POLL_INTERVAL_MS);
   /**
    * 当前空间。**取自主应用（Shell）的空间切换器**，页面上不再有自己的空间下拉。
    *
@@ -136,24 +173,28 @@ export default function TaskCenter() {
   }, [spaceId]);
 
   const fetchRows = useCallback(
-    async ({ page, pageSize, keyword, task_type, source, range, status }: TableQueryParams<TaskFilters>) => {
+    async ({ page, pageSize, keyword, range, status, task_source }: TableQueryParams<TaskFilters>) => {
       const res = await listTasks({
         page,
         page_size: pageSize,
         keyword: keyword || undefined,
-        // 空间来自主应用（页面自己那份 state），另有三个筛选参数后端目前不接收
+        // 空间来自主应用（页面自己那份 state），后端 page_tasks 目前不接收
         // （见 TaskListParams 的注释），照发以备补齐
         space_id: spaceId || undefined,
-        task_type: task_type || undefined,
-        source: source || undefined,
         // 区间取「当天 00:00:00」到「当天 23:59:59.999」，与同子应用 OperationLog 的口径一致
         start_time: range?.[0]?.startOf('day').toISOString(),
         end_time: range?.[1]?.endOf('day').toISOString(),
         // 接口的 status 是多选；页面当前是单选，传单元素数组
         status: status ? [status as TaskStatus] : undefined,
+        // 没选时是 undefined（antd Select 的 allowClear 回的就是它），换算成「不发这个参数」
+        task_source: task_source || undefined,
       });
       setStatusCounts(res.status_counts ?? {});
-      return { list: res.items ?? [], total: res.total ?? 0 };
+      const items = res.items ?? [];
+      setHasActiveTasks(items.some((row) => !isTaskTerminal(row.status)));
+      // 请求通了，轮询节奏退回基准值（失败退避是它推远的）
+      setTaskPollInterval(TASK_POLL_INTERVAL_MS);
+      return { list: items, total: res.total ?? 0 };
     },
     [spaceId],
   );
@@ -161,9 +202,16 @@ export default function TaskCenter() {
   /**
    * 取数失败的报警。CommonTable 只清空列表、不再自己渲染「加载失败」兜底，
    * 表格会照常显示成空态 —— 少了这条提示，「接口挂了」与「确实没有任务」在页面上就分不出来。
+   *
+   * 轮询赶上的失败（`silent`）反过来：不弹，只把下一拍推远。同一个错误按间隔反复弹，
+   * 比「数据没动」更打扰 —— 页面还留着上一份数据，用户点「刷新」就能看到真实报错。
    */
   const handleListError = useCallback(
-    (e: unknown) => {
+    (e: unknown, info: { silent: boolean }) => {
+      if (info.silent) {
+        setTaskPollInterval(backoffPollInterval);
+        return;
+      }
       message.error(e instanceof Error && e.message ? e.message : t('common.loadFailed'));
     },
     [t],
@@ -178,18 +226,15 @@ export default function TaskCenter() {
         placeholder: t('taskCenter.filter.keywordPlaceholder'),
       },
       {
-        key: 'task_type',
-        label: t('taskCenter.filter.type'),
-        type: 'select',
-        placeholder: t('taskCenter.filter.typeAll'),
-        options: Object.entries(TASK_TYPE_LABEL_KEY).map(([value, key]) => ({ value, label: t(key) })),
-      },
-      {
-        key: 'source',
+        key: 'task_source',
         label: t('taskCenter.filter.source'),
         type: 'select',
-        placeholder: t('taskCenter.filter.sourceAll'),
-        options: Object.entries(TASK_SOURCE_LABEL_KEY).map(([value, key]) => ({ value, label: t(key) })),
+        placeholder: t('taskCenter.filter.sourcePlaceholder'),
+        // 码 → 文案复用详情那一份：两处各写一套，加了新来源迟早只补一处
+        options: TASK_SOURCE_VALUES.map((code) => ({
+          label: t(TASK_SOURCE_LABEL_KEY[code]),
+          value: code,
+        })),
       },
     ],
     [t],
@@ -221,13 +266,35 @@ export default function TaskCenter() {
   );
 
   /**
+   * 「刷新」的统一出口：表格行 + 展开行/抽屉里的子任务列表。
+   *
+   * 光调 `tableRef.refresh()` 只重取表格行：`rowKey` 稳定，展开行的子节点不会重新挂载，
+   * `TaskSubtasks` 的取数 effect 不重跑，展开着的行会一直停着展开那一刻的子任务数据。
+   */
+  const refreshAll = useCallback(() => {
+    tableRef.current?.refresh();
+    setSubtaskReloadToken((n) => n + 1);
+  }, []);
+
+  /**
+   * 任务行的自动刷新。与子任务列表那条轮询各走各的节奏：任务收口后，已经派出去的子任务
+   * 还在等上报或超时（那时任务行不动、子任务还在动），所以「有非终态任务」只决定这一条。
+   *
+   * 走静默路径：轮询是页面自己在追数据，不该每 5 秒给用户罩一次加载遮罩。
+   */
+  const pollRows = useCallback(() => {
+    tableRef.current?.refresh({ silent: true });
+  }, []);
+  useSilentPolling(hasActiveTasks, pollRows, taskPollInterval);
+
+  /**
    * 状态标签栏。计数直接用接口给的 `status_counts` —— 它的口径就是「只受除 status 外的
    * 筛选条件影响」，与标签栏的语义逐字一致，页面不需要自己算。
    *
    * 这一行同时承载「刷新 / 重置」：分类靠左、按钮靠右。按钮因此不能再由 CommonTable
-   * 渲染（内置那对固定在筛选行右侧），改成本页自己摆 —— 「刷新」直接调 ref，「重置」
-   * 走组件新开的 `ref.reset()`（它比 `ctx.set` 逐 key 清多一步：把输入框尚未落地的
-   * 防抖值一并作废），所以要让 `actions` 关掉内置那对，免得两处并存。
+   * 渲染（内置那对固定在筛选行右侧），改成本页自己摆 —— 「刷新」走 `refreshAll`（表格行
+   * 与展开行一起刷），「重置」走组件新开的 `ref.reset()`（它比 `ctx.set` 逐 key 清多一步：
+   * 把输入框尚未落地的防抖值一并作废），所以要让 `actions` 关掉内置那对，免得两处并存。
    */
   const renderStatusBar = useCallback(
     (ctx: FilterContext<TaskFilters>) => {
@@ -247,7 +314,7 @@ export default function TaskCenter() {
             ]}
           />
           <Space>
-            <Button icon={<ReloadOutlined />} onClick={() => tableRef.current?.refresh()}>
+            <Button icon={<ReloadOutlined />} onClick={refreshAll}>
               {t('common.refresh')}
             </Button>
             <Button onClick={() => tableRef.current?.reset()}>{t('common.reset')}</Button>
@@ -255,7 +322,7 @@ export default function TaskCenter() {
         </Row>
       );
     },
-    [statusCounts, t],
+    [statusCounts, t, refreshAll],
   );
 
   /** 打开详情：连状态一起重置，免得抽屉里残留上一条任务操作后的 status。 */
@@ -267,11 +334,6 @@ export default function TaskCenter() {
   const closeDetail = useCallback(() => {
     setDetail(null);
     setDetailStatus(null);
-  }, []);
-
-  const refreshAll = useCallback(() => {
-    tableRef.current?.refresh();
-    setSubtaskReloadToken((n) => n + 1);
   }, []);
 
   /**
@@ -379,6 +441,12 @@ export default function TaskCenter() {
         ),
       },
       {
+        title: t('taskCenter.column.source'),
+        key: 'source',
+        // 与详情抽屉共用一份映射：两边各写一套的话，后端加新来源时必然漏改一处
+        render: (_, row) => taskSourceLabel(t, row.task_source ?? null),
+      },
+      {
         title: t('common.status'),
         key: 'status',
         render: (_, row) => <Tag color={TASK_STATUS_COLORS[row.status]}>{t(TASK_STATUS_LABEL_KEY[row.status])}</Tag>,
@@ -432,6 +500,7 @@ export default function TaskCenter() {
         <CommonTable<TaskConsoleItem, TaskFilters>
           ref={tableRef}
           filters={filters}
+          initialFilters={initialFilters}
           filterExtra={renderRange}
           filterExtraRow={renderStatusBar}
           // 刷新 / 重置跟着状态标签栏走（见 renderStatusBar），内置那对关掉
@@ -482,6 +551,9 @@ export default function TaskCenter() {
               <Descriptions.Item label={t('taskCenter.detail.totalDuration')}>
                 {fmtDuration(detail.duration_seconds)}
               </Descriptions.Item>
+              <Descriptions.Item label={t('taskCenter.detail.source')}>
+                {taskSourceLabel(t, detail.task_source ?? null)}
+              </Descriptions.Item>
             </Descriptions>
 
             <Divider style={{ margin: 0 }} />
@@ -511,8 +583,8 @@ export default function TaskCenter() {
  * 抽屉里的子任务卡片。与展开行的 Timeline 展示同一份数据、不同的形态：
  * 抽屉要给出子任务编号与两个时刻，折叠起来才装得下。
  *
- * 不复用 TaskSubtasks：那个是 Timeline、且不需要编号；两处共用的只是取数，
- * 为这 20 行抽一个 hook 会多引一个文件，不值得（若出现第三处就该抽了）。
+ * 展示不复用 TaskSubtasks（那个是 Timeline、且不需要编号）；取数与自动轮询走共用的
+ * `useSubtasks`，两处的刷新节奏因此一致。
  */
 function DrawerSubtasks({
   taskId,
@@ -532,44 +604,16 @@ function DrawerSubtasks({
   token: GlobalToken;
 }) {
   const { t } = useTranslation();
-  const [items, setItems] = useState<SubtaskConsoleItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<unknown>(null);
-
-  const load = useCallback(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    listSubtasks(taskId)
-      .then((rows) => {
-        if (!cancelled) setItems(rows ?? []);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) {
-          setItems([]);
-          setError(e);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // reloadToken 是「该重取了」的触发信号，函数体里读不到它，所以 lint 会误判成多余依赖
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, reloadToken]);
-
-  useEffect(() => load(), [load]);
+  const { items, loading, error, reload } = useSubtasks(taskId, reloadToken);
 
   if (error) {
     return (
       <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.loadFailed')}>
-        <Button onClick={load}>{t('common.retry')}</Button>
+        <Button onClick={reload}>{t('common.retry')}</Button>
       </Empty>
     );
   }
-  // 只在「还没有数据」时整块换 Spin：写操作后每次都要重载，若 loading 就把列表整个卸载，
+  // 只在「还没有数据」时整块换 Spin：轮询与写操作都会持续重载，若 loading 就把列表整个卸载，
   // 用户展开着的那张卡片会被折叠回去
   if (loading && !items.length) return <Spin />;
   if (!items.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.noData')} />;
@@ -584,15 +628,42 @@ function DrawerSubtasks({
         return {
           // key 用行 id（React 需要一个稳定键）；node_id 只进写接口的 URL
           key: item.id,
-          // 状态与耗时贴右、名称贴左：卡片头的两端对齐靠中间的弹性空档撑开
+          // 名称、状态、耗时依次靠左（它们是这一条的「读数」，凑在一起才读得顺）；
+          // 弹性空档留在耗时之后，把动作顶到卡片头最右端
           label: (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1 }}>
               <span>{item.subtask_name || '-'}</span>
-              <div style={{ flex: 1 }} />
               <Tag color={SUBTASK_STATUS_COLORS[item.status]}>{t(SUBTASK_STATUS_LABEL_KEY[item.status])}</Tag>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 {fmtDuration(item.duration_seconds)}
               </Typography.Text>
+              <div style={{ flex: 1 }} />
+              {/* 动作放卡片头而不是展开内容里：失败时用户要的就是「重试」，不该先展开一层
+                  才够得着。点击**必须吞掉冒泡** —— 整条卡片头都是展开/折叠的点击区，
+                  不吞就会点一下按钮、卡片跟着收起（antd 的折叠挂在卡片头的 onClick 上） */}
+              {action === 'stop' && (
+                <Button
+                  size="small"
+                  danger
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onStopSubtask(taskId, item.node_id, name);
+                  }}
+                >
+                  {t('taskCenter.action.stop')}
+                </Button>
+              )}
+              {action === 'retry' && (
+                <Button
+                  size="small"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRetrySubtask(taskId, item.node_id, name);
+                  }}
+                >
+                  {t('taskCenter.action.retry')}
+                </Button>
+              )}
             </div>
           ),
           children: (
@@ -624,23 +695,23 @@ function DrawerSubtasks({
                 <Typography.Text strong>
                   {t(`taskCenter.result.${item.status}`, { name: item.subtask_name || '-' })}
                 </Typography.Text>
+                {/* 与展开行同一个入口、同一份数据（引用随列表下发），两处不各造一套 */}
+                {hasExecutionResult(item) && (
+                  <div style={{ marginTop: 4 }}>
+                    <SubtaskResult item={item} />
+                  </div>
+                )}
               </div>
 
-              {/* 动作放在 children 里、不放 label：label 整块都是展开/折叠的点击区，
-                  按钮挤进去点一下会连带把卡片收起来 */}
-              {action && (
-                <Space size={12}>
-                  {action === 'stop' && (
-                    <Button size="small" danger onClick={() => onStopSubtask(taskId, item.node_id, name)}>
-                      {t('taskCenter.action.stop')}
-                    </Button>
-                  )}
-                  {action === 'retry' && (
-                    <Button size="small" onClick={() => onRetrySubtask(taskId, item.node_id, name)}>
-                      {t('taskCenter.action.retry')}
-                    </Button>
-                  )}
-                </Space>
+              {/* 这一步的原因。与上面那条「处理结果」是两回事：那条是按状态拼的固定文案
+                  （「X 失败」），这条才是为什么失败 —— 判死与运行方回失败都会写 */}
+              {item.error_message && (
+                <Alert
+                  type="error"
+                  showIcon
+                  message={t('taskCenter.detail.failureReason')}
+                  description={item.error_message}
+                />
               )}
             </Space>
           ),

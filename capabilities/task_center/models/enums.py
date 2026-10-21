@@ -60,28 +60,46 @@ class MisfirePolicy(str, Enum):
 
 
 class TaskStatus(str, Enum):
-    """任务实例「最新一次运行」的状态快照（§7.2）。"""
+    """任务实例「最新一次运行」的状态快照（§7.2）。
+
+    `stopped` 与 `failed` **都是终态，但含义不许合并**：`failed` 是「跑挂了」，
+    `stopped` 是「被人停的」。分开是为了让控制台一眼看出「这条不是我这边出错、
+    是用户自己停的」，也是为了让收尾表（§7.2）有话可说 —— 塞进 `failed` 的话，
+    用户点完「停止」看到的仍是「已失败」，那正是这一档要治的病。
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class AttemptStatus(str, Enum):
-    """任务尝试（一次运行）的状态（§3.5）。"""
+    """任务尝试（一次运行）的状态（§3.5）。
+
+    `stopped` 与 `TaskStatus.STOPPED` 同值同义：任务被用户停掉时，**运行行与任务快照
+    一起收口**（`_settle_stopped`），两边保持同一个字面量，排障时不会撞见
+    「任务说已停止、运行记录说已失败」。
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class SubtaskStatus(str, Enum):
     """子任务状态（§6.4 状态流转）。
 
-    **一期只有这 5 个**——没有 `skipped`：失败 / 超时一律 hold 下游（不改下游状态、
+    **六个取值**——没有 `skipped`：失败 / 超时一律 hold 下游（不改下游状态、
     也不派活），不会被「按策略跳过」（§6.3、§4.3 附录 A.7）。
+
+    `stopped` 是**管理方置的终态**（用户停整条任务时判给还没开始的那些步骤，或停某一步时
+    按 `downstream_on_stop` 连带判给下游），运行方报不了它（见 `RUNTIME_REPORTABLE_STATUSES`）。
+    它**不进「失败」那一族**（`SUBTASK_FAILED_STATUSES`）：进去的话任务收尾会把
+    「被人停的」算成「跑失败的」，任务状态又回到 `failed`。
     """
 
     PENDING = "pending"
@@ -89,29 +107,43 @@ class SubtaskStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     TIMEOUT = "timeout"
+    STOPPED = "stopped"
 
 
 class SubtaskAttemptStatus(str, Enum):
-    """子任务单次尝试的状态（诞生时先插一条 pending）。"""
+    """子任务单次尝试的状态（诞生时先插一条 pending）。
+
+    取值与 `SubtaskStatus` **逐字对齐**（含 `stopped`）：子任务那一行被置停时，
+    它本次尝试的历史行同一时刻收成同一个终态（§7.2），两边不对齐就会出现
+    「子任务说已停止、它的第 N 次尝试说已失败」。
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
     TIMEOUT = "timeout"
+    STOPPED = "stopped"
 
 
-# 「结束态」判定用（§7.2：结束状态一旦写入就改不回去）
+# 「结束态」判定用（§7.2：结束状态一旦写入就改不回去）。
+# `stopped` 在这里（它确实是终态：不会再被派活、也不许再改），
+# 但它**不在下面的失败集合里** —— 两件事别混。
 SUBTASK_TERMINAL_STATUSES = frozenset(
     {
         SubtaskStatus.SUCCESS.value,
         SubtaskStatus.FAILED.value,
         SubtaskStatus.TIMEOUT.value,
+        SubtaskStatus.STOPPED.value,
     }
 )
-# 「依赖已满足」判定用（§6.3：依赖里每个节点都 success 才算就绪；一期没有 skipped）
+# 「依赖已满足」判定用（§6.3：依赖里每个节点都 success 才算就绪；一期没有 skipped）。
+# **`stopped` 不算满足**：被停掉的那一步没有产出，下游拿不到入参，也就跑不起来 ——
+# 这正是「停一步、下游跟着停」那条联动的判据基础。
 SUBTASK_SATISFIED_STATUSES = frozenset({SubtaskStatus.SUCCESS.value})
-# 任务终态推导里算「失败」的集合（§7.2 收尾表：timeout 算失败、一样是「没跑成」）
+# 任务终态推导里算「失败」的集合（§7.2 收尾表：timeout 算失败、一样是「没跑成」）。
+# ⚠️ **`stopped` 刻意不进这里**：这是本轮最容易写反的一处 —— 加进去之后，收尾表会把
+# 「被人停的」判成「跑失败的」，任务状态又变回 `failed`，整个「已停止」需求当场白做。
 SUBTASK_FAILED_STATUSES = frozenset(
     {SubtaskStatus.FAILED.value, SubtaskStatus.TIMEOUT.value}
 )

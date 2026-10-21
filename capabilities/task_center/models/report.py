@@ -105,8 +105,17 @@ class SubtaskReport(Base):
     # 产出「去哪儿看」的引用（展示用，**不参与下游取参**）。它**跟着报文走**，所以收件箱
     # 也要存一列 —— 否则后台消化那一刻拿不到；消化时原样落到 `subtasks.output_refs`。
     output_refs = Column(JSONB, nullable=True)
+    # 输入「**从哪儿来**」的引用（展示用，**不参与下游取参**，2026-10-16 加）：与
+    # `output_refs` 同一条理由必须存 —— 它也**跟着报文走**，消化是另一趟，那一刻
+    # 只有收件箱这一份报文；消化时原样落到 `subtasks.input_refs`。可空（老运行方不带）。
+    input_refs = Column(JSONB, nullable=True)
     # status=failed 的失败原因（同步阶段已保证非空）
     error_message = Column(Text, nullable=True)
+    # 失败原因的代号 + 参数（2026-10-10 加）。收件箱是**来源**：消化时要把它们原样搬到
+    # `subtasks` / `subtask_attempts`，所以这里必须存 —— 否则后台消化那一刻拿不到，
+    # 又多一处「渲染后冻住」的文本。语义同 `execution.py` 里那两列的注释。
+    error_code = Column(String(128), nullable=True)
+    error_params = Column(JSONB, nullable=True)
     # 运行方侧的事件时间（13 位毫秒）；**只落库留痕、不参与任何裁决**（运行方的钟不可信）。
     # 注意它**不进日志**——管理方侧没有任何一条 logger 带它，唯一的落点就是这一列。
     ts = Column(BigInteger, nullable=True)
@@ -139,6 +148,8 @@ class SubtaskReport(Base):
             "status": self.status,
             "outputs": self.outputs,
             "error_message": self.error_message,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
             "ts": self.ts,
             "reported_at": iso(self.reported_at),
             "attempts": self.attempts,

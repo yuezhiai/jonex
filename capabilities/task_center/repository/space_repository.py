@@ -10,8 +10,11 @@
 而空间的权威归属在知识库 schema 的 `knowledge_base.spaces` 里。所以这里破一次
 「能力只碰自己 schema」的分层，**只读**跨过去看一眼——写路径一概不碰。
 
-为什么不走知识库的能力接口（`get_space`）：那个接口要 `user_id` 做空间成员过滤
-（`knowledge_base/capability.py`），任务中心手上只有租户、没有用户身份，够不着。
+为什么不走知识库的能力接口（`get_space`）：那条路要求**能调别的 capability**，而任务中心
+这边的纪律是一律不调（跨 schema 只读走本文件这种 raw SQL）。另外它的入参要 `user_id` 才能
+做空间成员过滤 —— 早期任务中心手上只有租户、没有用户身份，够不着；**2026-10-10 起
+`console_page` 这条路上 `user_id` 是有的**（网关 `identity.py` 透传、能力分派读 `r.user_id`），
+所以「空间成员权限」这件事现在判得了，判据在 `services/space_guard.py`。
 
 为什么不用 ORM 映射那张表：它不属于本 capability，没有本侧的迁移与模型来保证列不漂移；
 用 `sa.text()` 原始 SQL 把要用的两列显式写出来，反而更稳。
@@ -59,6 +62,61 @@ class SpaceRepository:
             {"space_id": space_id, "tenant_id": tenant_id},
         )
         return row.first() is not None
+
+    async def user_space_roles(
+        self, tenant_id: str, space_id: str, user_id: str
+    ) -> list[str]:
+        """这个用户在这个租户的这个空间里有哪些角色（可能有多个成员行）。
+
+        权威仍是知识库 schema 的 `knowledge_base.space_permissions`（见模块 docstring
+        的跨 schema 纪律）。角色取值收为 `space_manager` / `member`（`space.py` 的注释），
+        但这里**不认角色名**、只回原样 —— 「哪个角色算够」是 `space_guard` 的事，
+        免得同一套判据在本文件与守卫里各写一遍。
+        """
+        if not tenant_id or not space_id or not user_id:
+            return []
+        tenant_id = require_tenant(tenant_id)
+        rows = await self.session.execute(
+            sa_text(
+                """
+                SELECT role
+                FROM knowledge_base.space_permissions
+                WHERE tenant_id = :tenant_id
+                  AND space_id = :space_id
+                  AND user_id = :user_id
+                  AND is_deleted = 0
+                """
+            ),
+            {"tenant_id": tenant_id, "space_id": space_id, "user_id": str(user_id)},
+        )
+        return [row[0] for row in rows if row[0]]
+
+    async def visible_space_ids_for_user(self, tenant_id: str, user_id: str) -> list[str]:
+        """这个用户在这个租户下**有任意角色**的空间 id 列表。
+
+        JOIN `knowledge_base.spaces` 是为了把**已软删的空间**一并排掉 —— 与知识库那边
+        `get_visible_space_ids` 的口径一致（那里也是 spaces JOIN space_permissions）。
+        """
+        if not tenant_id or not user_id:
+            return []
+        tenant_id = require_tenant(tenant_id)
+        rows = await self.session.execute(
+            sa_text(
+                """
+                SELECT DISTINCT p.space_id
+                FROM knowledge_base.space_permissions p
+                JOIN knowledge_base.spaces s
+                  ON s.id = p.space_id
+                 AND s.tenant_id = p.tenant_id
+                 AND s.is_deleted = 0
+                WHERE p.tenant_id = :tenant_id
+                  AND p.user_id = :user_id
+                  AND p.is_deleted = 0
+                """
+            ),
+            {"tenant_id": tenant_id, "user_id": str(user_id)},
+        )
+        return [row[0] for row in rows if row[0]]
 
 
 __all__ = ["SpaceRepository"]

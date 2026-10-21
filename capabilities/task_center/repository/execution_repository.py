@@ -28,7 +28,7 @@
 两边传同一个值，别让两个仓库各取一次 `datetime.now()`。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple
 
 from sqlalchemy import exists, func, literal, or_, select, text, update
@@ -52,12 +52,16 @@ from ..models import (
 # 「这次运行还在跑」的任务状态：只有这两种才值得扫子任务派活（§7.5）
 TASK_ACTIVE_STATUSES = (TaskStatus.PENDING.value, TaskStatus.RUNNING.value)
 
-#: **运行行「已经收口」的两个状态**（`task_attempts.status`）。
+#: **运行行「已经收口」的几个状态**（`task_attempts.status`）。
 #: 给「补收口」当候选判据用（`list_tasks_needing_settle`）：运行行收了口、任务快照还停在
 #: 活跃态，就是那一趟专治的格子。健康在跑的任务，运行行还是 `pending` / `running`。
+#: `stopped` 在册：被用户停掉的运行**同样已经收口**（`_settle_stopped` 写的就是它），
+#: 漏掉它会让「运行行已停、任务快照却没跟上」那一格**永远进不了补收口的候选** ——
+#: 而它的成因（收口那一刻任务快照的 CAS 落空）与 `failed` 那一档一模一样。
 ATTEMPT_TERMINAL_STATUSES = (
     AttemptStatus.COMPLETED.value,
     AttemptStatus.FAILED.value,
+    AttemptStatus.STOPPED.value,
 )
 
 
@@ -87,7 +91,7 @@ class TaskRepository(BaseRepository[Task]):
         super().__init__(session)
 
     # task.list / task.get 支持的筛选项（可组合，§4.3）
-    _FILTER_FIELDS = ("definition_id", "status", "space_id", "trigger_id")
+    _FILTER_FIELDS = ("definition_id", "status", "space_id", "trigger_id", "task_source")
 
     def _filter_conditions(self, filters: dict | None) -> list:
         conditions = []
@@ -150,14 +154,22 @@ class TaskRepository(BaseRepository[Task]):
         end_time: datetime | None = None,
         statuses: list[str] | None = None,
         space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
+        task_source: str | None = None,
     ) -> list:
         """管理端列表的筛选条件（**不含租户与软删**，那两个由调用方补）。
 
         `statuses` 只在分页与总数上用：各状态数量的统计（`count_console_by_status`）
         按 §4.4 的口径**不带 status 条件** —— 那是给页签角标用的，切页签时得稳住。
 
-        `space_id` 与之同理，**三个查询都要带**：它跟状态页签是两回事（用户的筛选），
-        切页签时角标得跟着它变，所以 `count_console_by_status` 也得收它。
+        **`space_id` 与 `allowed_space_ids` 是两件事，别合并**：
+
+          · `space_id` —— **用户显式选的**那个空间，精确匹配（网关收的对外参数就叫这个名）；
+          · `allowed_space_ids` —— **权限收敛后的可见范围**（授权，不是筛选），落成
+            `IN (...)`。服务层算好传下来，`None` = 不过滤（租户管理员 / 无用户身份的内部
+            链路），`[]` = 一个都不给看（翻成恒假；「他没有可见空间」必须是 0 行，不是全部）。
+
+        两者都跟着用户的筛选走，所以**三个查询都要带**（角标也得跟着变）。
         """
         conditions = []
         if keyword:
@@ -172,10 +184,17 @@ class TaskRepository(BaseRepository[Task]):
         if statuses:
             conditions.append(Task.status.in_(statuses))
         if space_id:
-            # 精确等值。任务表的 `space_id` 是 **NOT NULL**（§3.5 执行侧一律空间级），
-            # 所以不需要像定义表那样考虑 `scope=system/tenant` 留下的 NULL 行。
-            # 空串/None 都当「不过滤」—— 与上面几个参数的判空口径一致。
+            # 任务表的 `space_id` 是 **NOT NULL**（§3.5 执行侧一律空间级），所以不需要像
+            # 定义表那样考虑 `scope=system/tenant` 留下的 NULL 行。
             conditions.append(Task.space_id == space_id)
+        if allowed_space_ids is not None:
+            conditions.append(Task.space_id.in_(allowed_space_ids))
+        if task_source:
+            # 任务来源（2026-10-13 加）。**可空列**，所以「筛某个来源」永远筛不到
+            # 平台侧自己发起的任务（它们的值为 NULL）—— 那是刻意的：来源是「运行方
+            # 从哪个入口提交的」，NULL 表示「不是运行方提交的」，不是一个来源。
+            # 在不在册由服务层判（非法值 1001），这里只拼条件。
+            conditions.append(Task.task_source == task_source)
         return conditions
 
     def _console_base_conditions(self, tenant_id: str, filters: dict) -> list:
@@ -195,6 +214,8 @@ class TaskRepository(BaseRepository[Task]):
         end_time: datetime | None = None,
         statuses: list[str] | None = None,
         space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
+        task_source: str | None = None,
         offset: int = 0,
         limit: int = 20,
     ) -> list[Task]:
@@ -211,6 +232,8 @@ class TaskRepository(BaseRepository[Task]):
                 "end_time": end_time,
                 "statuses": statuses,
                 "space_id": space_id,
+                "allowed_space_ids": allowed_space_ids,
+                "task_source": task_source,
             },
         )
         stmt = (
@@ -232,6 +255,8 @@ class TaskRepository(BaseRepository[Task]):
         end_time: datetime | None = None,
         statuses: list[str] | None = None,
         space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
+        task_source: str | None = None,
     ) -> int:
         """总数 —— 条件跟 `page_console_tasks` **完全一致**（含 status），否则对不上页数。"""
         conditions = self._console_base_conditions(
@@ -242,6 +267,8 @@ class TaskRepository(BaseRepository[Task]):
                 "end_time": end_time,
                 "statuses": statuses,
                 "space_id": space_id,
+                "allowed_space_ids": allowed_space_ids,
+                "task_source": task_source,
             },
         )
         result = await self.session.execute(
@@ -257,12 +284,15 @@ class TaskRepository(BaseRepository[Task]):
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
+        task_source: str | None = None,
     ) -> dict[str, int]:
         """各状态各多少条（§4.4）。
 
         **故意不收 `statuses`**：这个数是页签角标，口径是「只看其它筛选条件」，
         切页签时不能跟着变。库里没有的状态不会出现在返回的字典里，由调用方补 0。
-        `space_id` 是用户主动选的筛选，**要收** —— 它一换，四个角标都该跟着变。
+        `space_id` / `allowed_space_ids` / `task_source` **要收** —— 它们一换，
+        四个角标都该跟着变（它们是「其它筛选条件」，不是页签）。
         """
         conditions = self._console_base_conditions(
             tenant_id,
@@ -271,6 +301,8 @@ class TaskRepository(BaseRepository[Task]):
                 "start_time": start_time,
                 "end_time": end_time,
                 "space_id": space_id,
+                "allowed_space_ids": allowed_space_ids,
+                "task_source": task_source,
             },
         )
         result = await self.session.execute(
@@ -456,7 +488,11 @@ class TaskRepository(BaseRepository[Task]):
             expect_version,
             current_attempt=current_attempt,
             status=TaskStatus.PENDING.value,
+            # 重跑 = 把「上一轮为什么失败」整组清掉：**三个一起清**。只清 `error_message`
+            # 的话，读接口按 `error_code` 渲染会把上一轮的原因又渲染回来。
             error_message=None,
+            error_code=None,
+            error_params=None,
             finished_at=None,
         )
 
@@ -493,7 +529,10 @@ class TaskRepository(BaseRepository[Task]):
         """
         values = {
             "status": TaskStatus.RUNNING.value,
+            # 与 `error_message` 一组清掉（读接口会按 `error_code` 重渲染，留着就是旧原因）
             "error_message": None,
+            "error_code": None,
+            "error_params": None,
             "finished_at": None,
         }
         if operator_id:
@@ -771,6 +810,8 @@ class TaskAttemptRepository(BaseRepository[TaskAttempt]):
             .values(
                 status=AttemptStatus.RUNNING.value,
                 error_message=None,
+                error_code=None,
+                error_params=None,
                 finished_at=None,
             )
         )
@@ -1057,9 +1098,25 @@ class SubtaskRepository(BaseRepository[Subtask]):
             # （上报路径那处「`None` 就不动这一列」是**另一条路**、语义不同：
             # 那是「老运行方不上报时保持原值」，不是「重置」。）
             output_refs=None,
+            # ⚠️ **`input_refs` 同理一起清**（2026-10-16 加）：它是**输入**那一侧的引用，
+            # 而重试会把这一步的 `inputs` 按上游现在的产出**重算一遍**（见
+            # `_fill_inputs`）—— 旧引用指向的是旧输入，留着就是「重跑了、输入入口还是老的」。
+            input_refs=None,
+            # 失败原因**一组三个一起清**（`error_message` / `error_code` / `error_params`）——
+            # 与上面「产出那两个一起清」是同一条理由：只清一半，读接口会把上一轮的原因
+            # 按代号重新渲染出来，用户看到「重跑了、原因还是老的」。
             error_message=None,
+            error_code=None,
+            error_params=None,
             started_at=None,
             finished_at=None,
+            # ⚠️ **`last_queried_at` 跟 `started_at` 一起清**（2026-10-13 补）：对账候选
+            # （`list_silent_in_flight`）的判据与排序都用 `COALESCE(last_queried_at, started_at)`。
+            # 只清 `started_at` 的话，这一行还留着**上一轮尝试**被问过的旧时间戳 → `COALESCE`
+            # 取到旧值 → 新尝试一派活（`started_at` 已是新值），只要旧值早于 `now - quiet_sec`，
+            # 它**下一拍就被立刻问一次**（白打一次运行方），排序还被推到队头。
+            # 清掉后 `COALESCE` 落到新的 `started_at`，与「新尝试还没被问过」的语义一致。
+            last_queried_at=None,
         )
         if depends_on is not None:
             values["depends_on"] = depends_on
@@ -1072,6 +1129,10 @@ class SubtaskRepository(BaseRepository[Subtask]):
                 SubtaskStatus.SUCCESS.value,
                 SubtaskStatus.FAILED.value,
                 SubtaskStatus.TIMEOUT.value,
+                # `stopped` 与上面三个同档：被停掉的那一步**已经结束了**，重跑它是
+                # 「把这一步重新排队」—— 与重跑一个失败步骤没有任何区别。
+                # 少了它，用户停错一步就再也点不动「重跑」（CAS 命中 0 行 → 报状态冲突）。
+                SubtaskStatus.STOPPED.value,
             ],
             next_status=SubtaskStatus.PENDING.value,
             expect_version=expect_version,
@@ -1204,6 +1265,78 @@ class SubtaskRepository(BaseRepository[Subtask]):
         result = await self.session.execute(stmt)
         return list(result.scalars())
 
+    async def list_silent_in_flight(
+        self,
+        now: datetime | None = None,
+        *,
+        quiet_seconds: int,
+        limit: int = 50,
+    ) -> list[Subtask]:
+        """扫「**派出去了、却一直没消息**」的在途子任务（跨租户，后台循环用，§7.5）。
+
+        这是**对账**（拉）的输入：管理方主动去问运行方「这一步现在什么情况」。
+
+        ## 判据
+
+        - `status IN ('pending', 'running')` —— 在途；
+        - **`execution_id IS NOT NULL`** —— **派出过活**。空的那是「还没派」，
+          问运行方没有任何意义（它压根没收到这一步）；
+        - `现在 − started_at > quiet_seconds` —— **沉默够久**才问。
+
+        ⚠️ **`quiet_seconds` 是一个固定秒数，不是按子任务的 `timeout_seconds` 算倍率**
+        （与 `list_stuck_pending` 那种「各算各的」刻意不同）：对账问的是
+        「**你那边到底怎么样了**」—— 问早一点没有代价（问到就收口、问到「还在跑」就再等），
+        唯一的成本是**打扰运行方**，所以定一个全局节拍就够了。
+
+        ⚠️ **`limit` 必须有**（与 `list_stuck_pending` 的「默认不限」相反）：
+        对账每问一条就是**一次跨服务调用**，不限量会在积压时把运行方打爆。
+        """
+        now = now or datetime.now()
+        deadline = now - timedelta(seconds=quiet_seconds)
+        # **判据与排序都用 `COALESCE(last_queried_at, started_at)`**：
+        # 问过就往后排（自然轮转），没问过就用派活时刻当起点。
+        # ⚠️ 只用 `started_at` 会「每拍重问最老的那批、新的永远排不进来」
+        # （详见模型上 `last_queried_at` 那一列的说明）。
+        last_touch = func.coalesce(Subtask.last_queried_at, Subtask.started_at)
+        stmt = (
+            select(Subtask)
+            .join(Task, Task.id == Subtask.task_id)
+            .where(
+                Subtask.status.in_(
+                    [SubtaskStatus.PENDING.value, SubtaskStatus.RUNNING.value]
+                ),
+                Subtask.execution_id.isnot(None),
+                Subtask.started_at.isnot(None),
+                last_touch <= deadline,
+                Task.is_deleted == 0,
+                # ⚠️ **只要活跃任务**（与 `list_stuck_pending` / `list_pending_for_dispatch`
+                # 同口径）：`task.stop` 只判死**还没开始**的步骤，**正在跑的那一步仍是
+                # `running`** —— 那种残留如果进了候选，会**每拍问一次、而运行方恒答
+                # 「这活不归我」**（接管行早被 `task_stopped` 交还了），一直刷到硬超时。
+                Task.status.in_(list(TASK_ACTIVE_STATUSES)),
+            )
+            .order_by(last_touch)
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars())
+
+    async def mark_queried(self, subtask_id: str, *, at: datetime | None = None) -> None:
+        """记下「对账在 `at` 这个时刻问过这条子任务」（`_query_pass` 专用）。
+
+        ⚠️ **无论问到什么都必须调**（问到「还在跑」也算问过）—— 否则它还留在队头，
+        下一拍又问同一批（`list_silent_in_flight` 的注释里讲了后果）。
+
+        ⚠️ 这是**对账这条只读通路唯一的写**，写的是「我什么时候问过」这种**运行痕迹**，
+        不是任何业务状态 —— 别把它当成「查询可以有副作用」的先例。
+        """
+        await self.session.execute(
+            update(Subtask)
+            .where(Subtask.id == subtask_id)
+            .values(last_queried_at=at or datetime.now())
+        )
+        await self.session.flush()
+
     async def list_pending_for_dispatch(self, limit: int = 10) -> list[Subtask]:
         """扫「能跑的子任务」（跨租户，后台循环用，§6.3、§7.5 ①）。
 
@@ -1236,35 +1369,53 @@ class SubtaskRepository(BaseRepository[Subtask]):
         result = await self.session.execute(stmt)
         return list(result.scalars())
 
-    async def count_running_by_step_code(self, step_code: str) -> int:
-        """数某个**内置步骤**当前全局有多少个在跑（并发上限判定用，§6.3）。
+    async def count_running_by_catalog_step(
+        self, step_code: str, task_catalog_code: str
+    ) -> int:
+        """数「**同一个内置目录下的同一个步骤**」当前有多少个在跑（并发上限判定用，§6.3）。
 
-        口径：`subtasks.status = running` 且**用的是同一个内置步骤**、且子任务行未被假删。
+        口径：`subtasks.status = running`、`subtasks.step_code` 相同、**且所属任务的
+        `tasks.task_catalog_code` 相同**、且两侧都未被假删。
 
-        ⚠️ **「已删任务的残留不会被数进来」不是本查询给的**：底下那条 SQL 只有三个条件、
-        **不 join `tasks`**，那条保证完全靠 `delete_task` 在同一把锁的同一个事务里
-        「任务与它的子任务一起假删」这个级联（`task_service.py` 的 `delete_task`）。
-        所以**动那个级联之前先回来看这里** —— 一旦出现「任务已假删、子任务还在跑」的
-        可见状态，这一格数得到它、而超时巡检那边（`list_timed_out_for_patrol` 内连接
-        `tasks` 且要求未假删）收不到它，名额就被永久吃掉。
+        ── 为什么是「目录 + 步骤」，不是「全平台 + 步骤」（2026-10-14 改）──
 
-        **只看 `step_code`，不看它挂在哪个 `task_catalog_code` 下**（§6.3）：限流管的是
-        「**这类活**全局最多同时几个」—— 同一个步骤名的活，不管属于哪个内置任务，
-        都从同一份额度里出。`parse` 配了 5，说的就是「全平台同时最多 5 个 `parse`
-        在跑」，不是「每个内置任务各 5 个」。同一个内置步骤的多个节点
-        （`parse_1` / `parse_2`）自然也共享这一个上限。
+        改之前只按 `step_code` 数：**全平台所有目录、所有租户共用一份名额**。后果实测过：
 
-        上限**数值**仍取「当前这个节点所属目录」配的那个（调用方从 `ctx.catalog_steps`
-        拿，那份清单本来就是按本任务的 `task_catalog_code` 查出来的），本方法只负责数。
-        `subtasks` 自带 `step_code` 列，因此不需要 join 任何表。
+        > `file_processing_jonex_wiki` 的 10 个 `compile` 卡住不结束，
+        > **另一个目录 `file_processing_ontology` 的 `compile` 一个都派不出去** ——
+        > 两者互不相干，却排在同一份额度后面，队头一堵全体饿死（2026-10-14 那次
+        > 三条任务从头到尾没被派发，就是这么来的）。
+
+        现在：**每个目录的每个步骤各有一份名额**，上限数值取该目录那一行配置的
+        `max_concurrency`（`ctx.catalog_steps` 本来就是按本任务的目录查出来的）。
+        同一个目录内、同一个步骤挂在多个节点上（`parse_1` / `parse_2`）**仍然共享**
+        这一份 —— **这一条没变**，变的是「跨目录不再互相占位」。
+
+        ⚠️ **总量会翻**：全平台最大并发从「N」变成「Σ(每个目录各 N)」。这是 2026-10-14
+        明确接受的代价（上限数值仍按目录各配 10）。要收紧就得逐目录调那个数。
+
+        ── 为什么现在要 join `tasks` ──
+
+        目录码在 `tasks` 上，`subtasks` 没有这一列，所以必须 join（改之前是「不 join
+        任何表」）。join 之后顺手带上 `Task.is_deleted == 0`：「已删任务的残留不吃名额」
+        这条保证从**只靠 `delete_task` 的级联**，变成**级联 + 本查询显式过滤**两道。
+        多这一道不改变正常行为，只是把那条依赖显式写出来。
+
+        ⚠️ 仍然要盯的可见状态：**「任务已假删、子任务还在跑」**（级联漏了才会出现）——
+        此时本查询数不到它（好事，不吃名额），**但超时巡检也收不到它**（那边内连接
+        `tasks` 且要求未假删），那行就再没有任何出口。**动 `delete_task` 的级联之前
+        先回来看这里。**
         """
         stmt = (
             select(func.count())
             .select_from(Subtask)
+            .join(Task, Task.id == Subtask.task_id)
             .where(
                 Subtask.step_code == step_code,
+                Task.task_catalog_code == task_catalog_code,
                 Subtask.status == SubtaskStatus.RUNNING.value,
                 Subtask.is_deleted == 0,
+                Task.is_deleted == 0,
             )
         )
         result = await self.session.execute(stmt)
@@ -1329,8 +1480,8 @@ class SubtaskRepository(BaseRepository[Subtask]):
         **不按运行筛**（`task_service.handle_timeout` 里也照着复核）。
 
         不筛运行的理由是**旧运行遗留的 `running` 必须能被收掉**：它照样占着
-        `count_running_by_step_code` 数出来的并发名额（那个统计只认 `step_code` 与
-        `running`，**不 join 任务、也不分运行**），而除了这一趟它再没有别的出路 ——
+        `count_running_by_catalog_step` 数出来的并发名额（那个统计只认 `step_code`、
+        目录码与 `running`，**不分运行**），而除了这一趟它再没有别的出路 ——
         派活只捞当前运行的 `pending`、防僵尸只捞 `pending`、控制台只列当前运行。
         典型来源：任务被「停止」时那个杀不掉的 `running`（§4.4），用户随后 `retry_task`
         换了运行，旧那行就永远挂在 `running`。早先这里是**按当前运行筛**的，理由写的

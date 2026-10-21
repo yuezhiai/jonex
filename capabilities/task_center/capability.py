@@ -12,10 +12,12 @@
   `get_task`），走的是能力注册中心的 `execute`，落到本文件的
   `task.init_task` / `task.report_status` / `task.subtask_retry` /
   `task.subtask_retry_batch` / `task.subtask_get` / `task.get`；
-- **后台循环**自己去出站（§7.5：⓪ 触发抢占、① 派活、② 消化上报、③ 超时巡检，外加**不出站的**
-  ④ 补收口），由 `scheduler_service` 负责；派活走 §4.1 ① 的 `execute`；
-- **前端任务页面**（§4.4）经 Gateway → Sidecar `/invoke` 调**六个**接口：`task.console_page` /
-  `task.console_subtask_list` 两个**只读**接口看任务列表与子任务，外加四个写接口 ——
+- **后台循环**自己去出站（§7.5：⓪ 触发抢占、① 派活、② 消化上报、③ 超时巡检 —— 这三趟会
+  出站，其中 ③ 是 2026-10-16 起「**判死之前先问一次运行方**」；④ 补收口不出站），由
+  `scheduler_service` 负责；派活走 §4.1 ① 的 `execute`；
+- **前端任务页面**（§4.4）经 Gateway → Sidecar `/invoke` 调**八个**接口：`task.console_page` /
+  `task.console_subtask_list` 两个列表 + `task.console_detail` / `task.console_subtask_detail`
+  两个**详情**（都只读，返回体与各自的列表行一致），外加四个写接口 ——
   `task.stop`（停止整条任务）、`task.console_subtask_stop`（停止某一步）、
   `task.console_task_retry`（整条任务原地重跑）、`task.console_subtask_retry`（重跑某一步）。
   这是 §4.4 那条「不提供面向浏览器/前端的网络接口」的边界**开的口子**。
@@ -27,9 +29,10 @@
 `TaskCenterClient`**（那个 client 里只有 §4.1 **三个** + §4.2 **四个** + §4.3 的**两个读**
 （`get_subtask` / `get_task`），再加一个纯内部
 的 `_call`（远端调用的实现细节，不是契约），§4.3 其余的一个都不进）。
-给前端的那**六个**（两个只读 `task.console_*` 加四个写接口 `task.stop` /
-`task.console_subtask_stop` / `task.console_task_retry` / `task.console_subtask_retry`）
-同样注册在这个 dispatch 里。
+给前端的那**八个**（四个只读 —— 两个列表 `task.console_page` / `task.console_subtask_list`
+加两个详情 `task.console_detail` / `task.console_subtask_detail`；另加四个写接口
+`task.stop` / `task.console_subtask_stop` / `task.console_task_retry` /
+`task.console_subtask_retry`）同样注册在这个 dispatch 里。
 
 **管理端调用方里有一类特殊的：平台自己。** 建系统级定义（`def.create` +
 `scope='system'`，§3.1「平台自己的，无租户、无空间」）时调用方**本来就没有租户**，
@@ -37,7 +40,7 @@
 其余操作在入口就要求有租户。
 
 所以这里**仍然不覆写 `register_routes`**（基类默认空实现）：任务中心不自己开 REST
-路由。给前端的那两个只读接口走的是**能力注册中心的 `execute`**（`task.console_*`），
+路由。给前端的那几个只读接口走的是**能力注册中心的 `execute`**（`task.console_*`），
 由 Sidecar `/invoke` 转进来，不是本能力监听的端点 —— 前端也不许直连能力服务
 （CLAUDE.md 编辑要求）。要加 REST 路由，先回设计文档确认 §4.4 的边界。
 
@@ -93,8 +96,8 @@ from .services import TaskDefinitionService, TaskService, TaskTriggerService
 logger = logging.getLogger(__name__)
 
 
-#: `action` → 需要的权限码。**§4.4 开给前端的六个口全部登记**（2026-10-08 定）：
-#: 两个只读接口用 `:read`、四个写接口用 `:write`（写的就 write、只读的就 read）——
+#: `action` → 需要的权限码。**§4.4 开给前端的八个口全部登记**（2026-10-08 定、2026-10-13 补两个详情）：
+#: 四个只读接口用 `:read`、四个写接口用 `:write`（写的就 write、只读的就 read）——
 #: 与前端一致：`shell/src/utils/taskCenterEntry.ts` 的菜单码是 `task_center:read`，
 #: `pages/TaskCenter/index.tsx` 的 `canRead` / `canStop` 分别按这两个码收敛。
 #:
@@ -108,6 +111,9 @@ _ACTION_PERMISSIONS: Dict[str, str] = {
     # 两个只读接口（租户内只读视图）
     "task.console_page": "task_center:read",
     "task.console_subtask_list": "task_center:read",
+    # 详情两个（2026-10-13 加）：返回体与各自的**列表行完全一致**，所以同样只需读码。
+    "task.console_detail": "task_center:read",
+    "task.console_subtask_detail": "task_center:read",
     # 四个写接口共用同一个写码：粒度到「能不能改任务中心」为止，不再往下分
     # 「停止」与「重试」两档 —— 分开只会多出一批授权行，而实际授权口径是一样的
     # （见 `deploy/postgres/update/043_task_center_permission.sql`）。
@@ -224,13 +230,22 @@ class TaskCenterCapability(BaseCapability):
         "task.subtask_retry_batch": ("space_id", "task_id", "node_ids"),
         "task.stop": ("task_id",),
         "task.delete": ("task_id",),
-        "task.init_task": ("definition_id", "space_id"),
+        # `task_source` **必传**（2026-10-13 加）：这条路的语义就是「运行方发起」，
+        # 来源是它的身份信息之一。⚠️ 这里只查「键在不在」；**取值对不对由 service 的
+        # `_check_task_source` 判**（协议层那份判据，非法值 1001）—— 与这张表的分工一致。
+        "task.init_task": ("definition_id", "space_id", "task_source"),
         "task.report_status": ("space_id", "execution_id", "task_id", "status"),
         # `task.list` 也**全参数可选**（`filters` / `space_id` / 分页都不传 = 首页全量），
         # 所以不在表里 —— 跟下面 `task.console_page` 同一个道理。
         # ── 管理端（§4.4）──
-        # `task.console_page` 全参数可选（不传就是不过滤），所以不在表里
+        # `task.console_page` 全参数可选，所以不在表里。⚠️ 但它**不是**「不传就不过滤」：
+        # `space_id` 不传时收敛到「调用者有权访问的空间集合」（见 `page_tasks` 的
+        # 空间维度那段），必填列表管的是「参数在不在」，管不了这种权限收敛。
         "task.console_subtask_list": ("task_id",),
+        # 详情两个（2026-10-13 加）。子任务详情与上面那条列表**同口径寻址**：
+        # `node_id`（节点名，如 `parse_1`）—— **不是**子任务行的主键 `id`。
+        "task.console_detail": ("task_id",),
+        "task.console_subtask_detail": ("task_id", "node_id"),
         # 三个写接口（2026-09-29 新增，2026-09-29 起前端可调）：
         #   · `node_id` 寻址（同一个 `step_code` 允许在编排里出现多次，唯一的是 `node_id`）；
         #   · **不需要 `space_id`** —— 那是 `task.subtask_retry` 给运行方的一致性核对，
@@ -255,6 +270,23 @@ class TaskCenterCapability(BaseCapability):
         **恒开、不设开关**：这五趟是这个服务的心脏，没有「关掉」这个状态；
         多副本下不选主、靠 CAS 抢占，所以每一份都跑。
         """
+        # 调用明细采集写口（monitor.call_log / monitor.call_attempt）。
+        # 采集器住在共享内核（`jonex_core/common/monitor_collector.py`），**每个进程
+        # 各自起一份**（单例 + 独立队列 + 独立连接）—— 所以本能力得自己起，不能指望
+        # 别的进程替它采。⚠️ **不起 = 埋点静默失效**：`put_call_attempt` 在采集器未启动
+        # 时直接返回（那条「旁路不得影响主链路」的保证），派活重试的 N2 一条都落不了库，
+        # 而业务侧看不出任何异常。
+        # **排在 `start_scheduler()` 之前**：后台循环一起跑就会出站派活、投 N2，采集器
+        # 得先就位，否则那一段窗口里的量直接丢。
+        # 与 platform 同一口径：采集是旁路，**起不来绝不能拖垮任务中心本体**（只丢一行
+        # ERROR，N2 不落库而已）。
+        try:
+            from jonex_core.common.monitor_collector import get_monitor_collector
+            get_monitor_collector().start()
+            logger.info("MonitorCollector 已启动")
+        except Exception:
+            logger.exception("MonitorCollector 启动失败（不影响任务中心功能）")
+
         from .services import start_scheduler
 
         await start_scheduler()
@@ -263,6 +295,14 @@ class TaskCenterCapability(BaseCapability):
         from .services import stop_scheduler
 
         await stop_scheduler()
+        # 采集器**最后停**：后台循环这一轮已经投进队列的 N2 才有机会落库
+        # （`stop()` 会 flush 剩余队列再退出）。同样只记日志，不挡停机。
+        try:
+            from jonex_core.common.monitor_collector import get_monitor_collector
+            await get_monitor_collector().stop()
+            logger.info("MonitorCollector 已停止")
+        except Exception:
+            logger.exception("MonitorCollector 停止失败")
         # 释放本能力共用适配器的连接池。
         await self._adapter.close()
 
@@ -298,6 +338,27 @@ class TaskCenterCapability(BaseCapability):
     async def execute(self, request: CapabilityRequest) -> CapabilityResponse:
         action = request.payload.get("action")
         data = request.payload.get("data") or {}
+        if not isinstance(data, dict):
+            # ⚠️ **`data` 必须是对象**（§4.0）：非对象（字符串 / 数组 / 标量）会让下面
+            # `_require_keys` / handler 里的 `data.get(...)` 抛 `AttributeError` →
+            # 落 `except Exception` → 1000（`CLASS_UNKNOWN` =「未知、可原样重发」），
+            # 而它其实是**报文形态错误**，正解是 1001（明确拒绝、**不重发**）——
+            # 不拦的话，一个永久无效的请求会被反复原样重发（2026-10-13 修）。
+            # 与上面「不认识的 action」同一个处置口径、同一个码。
+            return CapabilityResponse.error(
+                request.request_id,
+                InvalidParameterError.code,
+                translate(
+                    "err.task_center.param.invalid",
+                    params={
+                        "errors": f"payload.data 必须是对象，收到 {type(data).__name__}"
+                    },
+                    fallback=(
+                        "参数没通过校验：payload.data 必须是对象，"
+                        f"收到 {type(data).__name__}"
+                    ),
+                ),
+            )
 
         handler = self._dispatch.get(action)
         if handler is None:
@@ -608,7 +669,10 @@ class TaskCenterCapability(BaseCapability):
             # 留给它的上报按实际结果填。
             "task.stop": lambda r, d: self._execute(
                 lambda s: self._task_service(s).stop_task(
-                    d["task_id"], r.tenant_id, r.user_id or None
+                    d["task_id"], r.tenant_id, r.user_id or None,
+                    # 空间可见性判定要身份（同 `task.console_page` / `task.console_detail`）。
+                    # 拿不到身份（内部链路 / 测试 token）就是 `None` → 守卫按既有口径放行。
+                    user_id=r.user_id,
                 )
             ),
             "task.delete": lambda r, d: self._execute(
@@ -631,6 +695,9 @@ class TaskCenterCapability(BaseCapability):
                     # `ResourceAlreadyExistsError`（1006）—— 对自带 id 的调用方那是
                     # 「复用既有任务」而不是拒绝（`SubmissionDisposition.REUSED`）。
                     task_id=d.get("task_id") or None,
+                    # 任务来源（**必传**，已在 `_REQUIRED_KEYS` 里查过「键在不在」；
+                    # 取值合不合法由 service 判，非法 1001）。
+                    task_source=d.get("task_source"),
                 )
             ),
             # ── 运行方上报（§4.2 ①，运行方改子任务状态的唯一入口）──
@@ -657,12 +724,37 @@ class TaskCenterCapability(BaseCapability):
                     end_time=_parse_iso_time(d.get("end_time"), "end_time"),
                     statuses=_flatten_status_param(d.get("status")),
                     space_id=d.get("space_id"),
+                    # 任务来源筛选（2026-10-13 加，**非必填**）：∈ 协议层 `TASK_SOURCES`，
+                    # 非法值由 service 当场拒（1001）。不传 = 不按来源筛。
+                    task_source=d.get("task_source"),
+                    # 空间权限判定要身份（成员 / 租户管理员两档，见 `space_guard`）。
+                    # 身份只从 invoke 报文来（网关 `identity.py` 解 JWT 后透传），
+                    # 拿不到就是 `None` → 守卫按既有口径放行（内部链路 / 测试 token）。
+                    user_id=r.user_id,
                     **_page_params(d),
                 )
             ),
             "task.console_subtask_list": lambda r, d: self._execute(
                 lambda s: self._task_service(s).list_subtasks_console(
-                    d["task_id"], _attempt_param(d), r.tenant_id
+                    d["task_id"], _attempt_param(d), r.tenant_id,
+                    # 空间可见性判定要身份（2026-10-13 补齐，与 `task.console_page` 同口径）。
+                    user_id=r.user_id,
+                )
+            ),
+            # ── 详情两个（§4.4，2026-10-13 加）──
+            #     返回体与上面两个列表**各取一行完全一致**，闸门也照各自的列表镜像：
+            #     两处都带**空间可见性判定**（2026-10-13 补齐）—— 列表那侧是靠收敛可见空间
+            #     集合实现的，详情没有「列表」可收敛，必须显式判一次；子任务那侧同理
+            #     （原先它「只判租户归属」，是自记在 §4.4 的缺口）。
+            "task.console_detail": lambda r, d: self._execute(
+                lambda s: self._task_service(s).get_task_console(
+                    r.tenant_id, d["task_id"], user_id=r.user_id
+                )
+            ),
+            "task.console_subtask_detail": lambda r, d: self._execute(
+                lambda s: self._task_service(s).get_subtask_console(
+                    d["task_id"], d["node_id"], tenant_id=r.tenant_id,
+                    user_id=r.user_id,
                 )
             ),
             # ── 管理端写（§4.4，2026-09-29 新增的三个）──
@@ -675,20 +767,26 @@ class TaskCenterCapability(BaseCapability):
             # 见 `TaskService._do_stop_subtask`）。判死之后**必须自己让任务收口**。
             "task.console_subtask_stop": lambda r, d: self._execute(
                 lambda s: self._task_service(s).stop_subtask(
-                    d["task_id"], d["node_id"], r.tenant_id, r.user_id or None
+                    d["task_id"], d["node_id"], r.tenant_id, r.user_id or None,
+                    user_id=r.user_id,
                 )
             ),
             # 重试整条任务：同一条任务**原地重跑**（新建一次运行、任务 id 不换），不是
-            # 新建一条任务。底层就是 §4.3 的 `retry_task`，这里只是给它开了个前端面。
+            # 新建一条任务。底层就是 §4.3 的 `retry_task`，这里只是给它开了个前端面
+            # —— **空间可见性那道闸就由 `user_id` 触发**（内部那条 `task.retry` 不传，
+            # 行为一字不变）。
             "task.console_task_retry": lambda r, d: self._execute(
-                lambda s: self._task_service(s).retry_task(d["task_id"], r.tenant_id)
+                lambda s: self._task_service(s).retry_task(
+                    d["task_id"], r.tenant_id, user_id=r.user_id
+                )
             ),
             # 重试某一步：底层是 §4.2 ③ / §4.3 的 `retry_subtask`，差在 `space_id` ——
             # 那条契约要运行方传它做一致性核对，前端没有空间上下文，由 service 从任务行
             # 推导（见 `TaskService.console_retry_subtask`），**既有 action 一个字不动**。
             "task.console_subtask_retry": lambda r, d: self._execute(
                 lambda s: self._task_service(s).console_retry_subtask(
-                    d["task_id"], d["node_id"], r.tenant_id, r.user_id or None
+                    d["task_id"], d["node_id"], r.tenant_id, r.user_id or None,
+                    user_id=r.user_id,
                 )
             ),
         }
@@ -749,8 +847,17 @@ class TaskCenterCapability(BaseCapability):
             payload.status,
             outputs=payload.outputs,
             error_message=payload.error_message,
+            # 失败原因的代号 + 参数（2026-10-10 加）。⚠️ **必须在这里透传** ——
+            # DTO 的 `extra="ignore"` 会静默吃掉没声明的键，而"漏传"的方向是**功能静默失效**
+            # （代号写不进库 → 读侧只能显示冻住的那句话），不报错、测试也不红。
+            error_code=payload.error_code,
+            error_params=payload.error_params,
             ts=payload.ts,
             output_refs=payload.output_refs,
+            # 输入「从哪儿来」的引用（2026-10-16 加）：**同样必须在这里透传**。
+            # 这一层是**逐字段显式传参**的 —— DTO 收到了、service 也认这个参数，
+            # 中间漏一笔就是「报文明明带了、库里却是 NULL」，而且不报错、测试也不红。
+            input_refs=payload.input_refs,
         )
 
     async def _retry_subtask_action(

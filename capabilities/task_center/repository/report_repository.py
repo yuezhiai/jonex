@@ -42,8 +42,11 @@ class SubtaskReportRepository(BaseRepository[SubtaskReport]):
         status: str,
         outputs: dict | None = None,
         error_message: str | None = None,
+        error_code: str | None = None,
+        error_params: dict | None = None,
         ts: int | None = None,
         output_refs: list | None = None,
+        input_refs: list | None = None,
         reported_at: datetime | None = None,
     ) -> SubtaskReport:
         """收下一条上报，落一行「未消化」。
@@ -65,8 +68,14 @@ class SubtaskReportRepository(BaseRepository[SubtaskReport]):
             status=status,
             outputs=outputs,
             error_message=error_message,
+            # 失败原因的代号 + 参数（2026-10-10 加）：**收件箱也得存** —— 消化是另一趟
+            # （后台循环），那一刻拿不到原始报文；不存就退化成「只有渲染好的文本」。
+            error_code=error_code,
+            error_params=error_params,
             ts=ts,
             output_refs=output_refs,
+            # 输入引用同理（2026-10-16 加）：跟着报文走，消化那一趟只有收件箱这一份。
+            input_refs=input_refs,
             reported_at=reported_at or datetime.now(),
             attempts=0,
             dead_lettered=0,

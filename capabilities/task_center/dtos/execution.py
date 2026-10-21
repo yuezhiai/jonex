@@ -57,6 +57,25 @@ class ReportStatusRequest(BaseModel):
     error_message: Optional[str] = Field(
         default=None, description="status=failed 时必带"
     )
+    error_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "失败原因的**消息键**（可选，2026-10-10 加）：管理方存下来，**读的时候**按请求的 "
+            "`X-Lang` 现场渲染 —— 否则「哪国语言」由运行方上报的那一刻决定，而写它的多半是后台"
+            "循环，那会儿只有默认语言。**代号必须 ∈ 协议层的 `ERROR_REASON_CODES`**"
+            "（写死枚举，如 `err.kb.task_center.runner_abandoned`）—— 不在枚举里**当场拒**"
+            "（1001），好让运行方只能填登记过的那些。"
+            "⚠️ 与 `error_message` 的分工：**可翻译的外层包装走代号，内嵌的原文（引擎报错那种）"
+            "放 `error_params.detail`、并原样写进 `error_message`** —— 翻不了的不假装能翻。"
+        ),
+    )
+    error_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "`error_code` 的渲染实参（可选）：`{占位符名: 值}`。上限与形状判据在协议层 "
+            "`check_error_reason`（SDK 与服务端共用同一份），超了当场拒（1001）。"
+        ),
+    )
     ts: Optional[int] = Field(
         default=None,
         description="运行方侧的事件时间（13 位毫秒时间戳）—— 管理方**只落库留痕**（`subtask_reports.ts` 一列）、**不参与任何裁决**（运行方的钟不可信）",
@@ -76,6 +95,19 @@ class ReportStatusRequest(BaseModel):
             "未知键原样透传；前端据 `kind` 查自己的映射、带上 `params` 去看详情，"
             "**权限归运行方那侧判**。⚠️ 与 `outputs` 分工不同：`outputs` 是下游取入参的"
             "**契约字段**，这里只给前端做入口，**绝不参与 `@节点.outputs.x` 取值**。"
+        ),
+    )
+
+    input_refs: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "输入「**从哪儿来**」的引用（可选，2026-10-16 加）：与 `output_refs` 对称的那一份 "
+            "—— 那边说「这一步的成果去哪儿看」，这边说「这一步吃的是什么」。同款数组，元素"
+            "只有 `kind` + `params`，`kind` 必须 ∈ 协议层 `INPUT_REF_PARAMS`（写死枚举，"
+            "**值要带运行方前缀**，如 `knowledge_base.document` / `knowledge_base.chunks`），"
+            "判据共用 `check_input_refs`。\n"
+            "**协议上可选**（老运行方不带照常受理），知识库那条运行方当前**总是带**（成功、"
+            "失败都带）—— 但将来会出现真没有输入引用的任务。"
         ),
     )
 
@@ -146,6 +178,15 @@ class SubtaskItemResponse(BaseModel):
             "控制台读接口据此给前端渲染入口。**不给内容** —— 正文走运行方那侧的接口。"
         ),
     )
+    input_refs: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "输入「**从哪儿来**」的引用（**展示用**，不参与下游取参，2026-10-16 加）：与 "
+            "`output_refs` 对称 —— 运行方上报时带的数组，元素只有 `kind` + `params`"
+            "（判据见协议层 `check_input_refs` / `INPUT_REF_PARAMS`）。"
+            "**空 = 没东西可看**（老运行方不上报、或这一步还没终态）。"
+        ),
+    )
     current_attempt: int = Field(default=1, description="当前第几次尝试（指针，首次=1）")
     execution_id: Optional[str] = Field(default=None, description="管理方生成的受理凭证")
     state_version: int = Field(default=0, description="每行版本号（防重复改）")
@@ -174,7 +215,34 @@ class SubtaskAttemptItem(BaseModel):
         description="pending / running / success / failed / timeout（一期没有 skipped）"
     )
     error_message: Optional[str] = Field(default=None, description="这次尝试的失败原因")
+    inputs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "这次尝试的**入参快照**（2026-10-16 加）：与 `outputs` 对称的那一份。\n"
+            "⚠️ 与子任务行上的 `inputs` **不是同一份**：那边是「最新一次尝试」的现状、"
+            "重试时会被重算；这份是**每次尝试各存一份** —— 「第 N 次尝试吃的是什么」"
+            "只有这里查得到。"
+        ),
+    )
     outputs: Optional[Dict[str, Any]] = Field(default=None, description="这次尝试的产出快照")
+    output_refs: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "这次尝试的**产出引用**（展示用，2026-10-16 加）：与 `outputs` 配套的那一份。\n"
+            "⚠️ 与子任务行上那份（`SubtaskItemResponse.output_refs`）**不是同一份**："
+            "那边是「最新一次尝试」的现状，这份是**每次尝试各存一份**。"
+        ),
+    )
+    input_refs: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "这次尝试的**输入引用**（展示用，2026-10-16 加）：与 `output_refs` 对称的那一份，"
+            "只是挂在**每一次尝试**上。\n"
+            "⚠️ 与子任务行上那份（`SubtaskItemResponse.input_refs`）**不是同一份**：那边是"
+            "「最新一次尝试」的现状、重试后会按上游现在的产出重算；这份是**每次尝试各存一份**，"
+            "所以「第 2 次尝试当时吃的是什么」只有这里查得到。"
+        ),
+    )
     started_at: Optional[str] = Field(default=None, description="这次尝试开始")
     finished_at: Optional[str] = Field(default=None, description="这次尝试结束")
     created_at: Optional[str] = Field(default=None, description="创建时间")

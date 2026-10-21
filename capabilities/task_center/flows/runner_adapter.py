@@ -75,7 +75,9 @@ dict，走不到这一支。而**手写 `RunnerPort` / 直接挂 `dispatch["exec
 """
 
 import asyncio
+import contextlib
 import logging
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
@@ -84,7 +86,14 @@ from jonex_core.capability import ApiResponse, get_capability_registry
 from jonex_core.capability.locator import CapabilityMode, get_locator
 from jonex_core.capability.models import CapabilityRequest
 from jonex_core.common.config import get_config
+from jonex_core.common.monitor_collector import attempt_span, emit_logical_call
+from jonex_core.common.monitor_models import CallFinalStatus
 from jonex_core.common.tenant import require_tenant
+from jonex_core.task_protocol.models import (
+    STEP_STATUS_VALUES,
+    ExecutionEnvelope,
+    StepStatusQuery,
+)
 from jonex_core.task_protocol.results import (
     OUTBOUND_RETRY_BACKOFF_SEC,
     RETRY_MAX_ATTEMPTS,
@@ -107,6 +116,11 @@ RUNNER_REMOVE_TASK_ACTION = "remove_task"
 # 运行方那边「这条任务被用户停了」的**通知**动作名（§4.1 ③，2026-09-30 加）。
 # ⚠️ 是通知不是命令 —— 停不停由运行方自己决定，见 `TaskStoppedDispatch`。
 RUNNER_TASK_STOPPED_ACTION = "task_stopped"
+
+# 运行方那边「这个子任务现在什么情况」的**查询**动作名（§4.1 ④，2026-10-11 加）。
+# ⚠️ 与上面三个都不同：它**要拿数据**（不是只判收没收下），所以不走 `_send`/`DispatchResult`。
+# 详见 `RunnerAdapter.query_step_status`。
+RUNNER_QUERY_STEP_STATUS_ACTION = "query_step_status"
 
 
 def has_dispatch_target(capability_id: str) -> bool:
@@ -143,6 +157,9 @@ async def call_with_retry(
     *,
     what: str,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    request_id: str = "",
+    tenant_id: str = "",
+    target: str = "",
 ) -> DispatchResult:
     """出站调用 + **传送层重发**。**本函数不抛。**
 
@@ -196,45 +213,153 @@ async def call_with_retry(
     两个动作的报文不同（派活是 `ExecutionDispatch`、删除是 `RemoveTaskDispatch`），把
     适配器与报文都塞进来的话签名就得为每个动作长一个参数。传一个已经绑好的零参调用，
     循环只关心「它返回哪个 disposition」—— 重发逻辑与报文形状无关。
+
+    ── 采集：N1（一条逻辑调用）+ N2（每次循环迭代 = 一次**物理尝试**）──
+
+    `request_id` / `tenant_id` / `target` 是**可选**的采集上下文（前两个默认空 =
+    不采集）：本函数是共享内核里那两个 ID 都拿不到的地方，所以由调用方透传进来。
+    **两个 ID 都非空**才采 —— 拿不到合法租户就**让它不采**，绝不填个假值兜底
+    （采集侧对 `default` / `system` / `unknown` / 空串同样整条丢弃，两处口径一致）。
+
+    **N2**（`attempt_span`，每次迭代一条）：
+
+    - `attempt_no` = 循环变量 `attempt`（1 起，与 `RETRY_MAX_ATTEMPTS` 同一套）；
+    - `wait_before_ms` = **进入本次尝试前**等的毫秒数（首次 `None`；就是上一轮那句
+      `sleep(delay)` 的值，不是本次调用自己的耗时）；
+    - `is_final` = 「本次是这条逻辑调用的最后一次尝试」：`ACCEPTED` / `REJECTED` 当场
+      就是最后一次（本次给的那次调用到此结束）；`DELIVERY_UNKNOWN` 只有用满预算那次
+      才是 —— ⚠️ 冻结接口的 `is_final` 在构造时定形，而这一档**只有拿到判决才知道**，
+      所以在 span 投递前就地改对（见下面那句注释），不改任何重发判定；
+    - 结局：`ACCEPTED` 什么都不标（默认 `success`）；`REJECTED` /
+      `DELIVERY_UNKNOWN` 标 `att.fail(...)`，`error_code` 取 disposition 名、
+      `error_message` 取 `DispatchResult.message`（都是现成的，不另造文案）。
+
+    **N1**（`emit_logical_call`，**整个循环只一条**，在 `finally` 里发）：这条出站链路
+    原先只采 N2，而 N1 是 per-逻辑调用的 —— 缺了它平台里就没有以同一个 `request_id` 建的 N1，
+    `attempt_count` 的 COUNT 补正永远回填不上（`retry_count` 恒 0）。所在位置与结局：
+
+    - **必须放在循环之外**：放进循环会因 `UNIQUE(request_id)` + `ON CONFLICT DO NOTHING`
+      只留第一次尝试那条，`final_status` 就记反了；
+    - 结局与 N2 对齐（不另立口径）：`ACCEPTED` → `success`；`REJECTED` /
+      `DELIVERY_UNKNOWN`（含试满预算）→ `failed`（`error_code` 取 disposition 名）；
+      被取消 → `cancelled`（`CancelledError` 上抛前标好）；
+    - `target` 由调用方给（派活 / 删除两处传的都是运行方的 `capability_id`），
+      `direction` / `trigger_type` 取 `emit_logical_call` 的默认值。
+
+    **采集是纯旁路**：`attempt_span` 不吞业务异常（异常照常上抛、只是记一笔），
+    `emit_logical_call` 与投递失败一律吞掉 —— 本函数的重发判定、退避、返回值
+    **一个字节都不因采集而变**。
     """
     last: Optional[DispatchResult] = None
-    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
-        try:
-            last = await call()
-        except Exception as exc:
-            # 出站调用自己炸了。能漏到这里的 = **请求肯定没落到运行方**（客户端没构造出来 /
-            # LOCAL 进程内抛 / 报文 DTO 校验不过）→ 与「没够着」同档，进同一个循环重发。
-            # 真实适配器已经把 `httpx.HTTPError`、非 JSON 响应、LOCAL 超时翻成判决了。
-            logger.warning("[TaskCenter] %s 出站调用抛异常：%s", what, exc)
-            last = DispatchResult(
-                disposition=DispatchDisposition.DELIVERY_UNKNOWN,
-                message=f"{what} 调用失败：{exc}",
+    # N2 采集守卫：两个 ID 都非空才采（拿不到上下文就不采，不造假值兜底 —— 见 docstring）。
+    collect = bool(request_id) and bool(tenant_id)
+    waited_ms: Optional[int] = None  # 进入本次尝试前等的毫秒数（首次 None）
+    # N1 补发状态：**整个重发循环只让这里决定那一条 N1 的结局**（在 `finally` 里发）。
+    # 循环内逐次投递会因 `UNIQUE(request_id)` + `ON CONFLICT DO NOTHING` 只留下第一次
+    # 尝试那条 —— 「试满预算、最后一次才够着」的调用会被记成失败。
+    n1_started_at = datetime.now(timezone.utc)
+    n1_status = CallFinalStatus.FAILED.value
+    n1_error_code: Optional[str] = None
+    n1_error_message: Optional[str] = None
+    try:
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            span_cm = (
+                attempt_span(
+                    request_id=request_id,
+                    tenant_id=tenant_id,
+                    attempt_no=attempt,
+                    # 占位，拿到判决后改对（见下面那句注释）
+                    is_final=False,
+                    wait_before_ms=waited_ms,
+                )
+                if collect
+                else contextlib.nullcontext()
             )
+            with span_cm as att:
+                try:
+                    last = await call()
+                except Exception as exc:
+                    # 出站调用自己炸了。能漏到这里的 = **请求肯定没落到运行方**（客户端没构造出来 /
+                    # LOCAL 进程内抛 / 报文 DTO 校验不过）→ 与「没够着」同档，进同一个循环重发。
+                    # 真实适配器已经把 `httpx.HTTPError`、非 JSON 响应、LOCAL 超时翻成判决了。
+                    logger.warning("[TaskCenter] %s 出站调用抛异常：%s", what, exc)
+                    last = DispatchResult(
+                        disposition=DispatchDisposition.DELIVERY_UNKNOWN,
+                        message=f"{what} 调用失败：{exc}",
+                    )
 
-        if last.disposition is not DispatchDisposition.DELIVERY_UNKNOWN:
-            # `ACCEPTED` / `REJECTED` 都是「运行方给了话」，当场收工、不烧剩余预算。
-            return last
+                if att is not None:
+                    # `is_final` 构造时只能按「还剩几次重试」预判；终态判决
+                    # （`ACCEPTED`/`REJECTED`）当场就是最后一次，故拿到判决后用冻结
+                    # 接口的公开入口 `mark_final()` 就地改写。
+                    att.mark_final(
+                        last.disposition is not DispatchDisposition.DELIVERY_UNKNOWN
+                        or attempt >= RETRY_MAX_ATTEMPTS
+                    )
+                    if last.disposition is not DispatchDisposition.ACCEPTED:
+                        # 默认 success；失败的两档显式标注（`error_code` 取 disposition 名，
+                        # `error_message` 取现成的那句原因）。`error_message` 由采集侧脱敏 + 截断。
+                        att.fail(
+                            error_code=last.disposition.value,
+                            error_message=last.message,
+                        )
 
-        if attempt < RETRY_MAX_ATTEMPTS:
-            delay = retry_delay(attempt, OUTBOUND_RETRY_BACKOFF_SEC)
-            logger.warning(
-                "[TaskCenter] %s 没够着运行方（第 %d/%d 次），%.1fs 后重发：%s",
-                what,
-                attempt,
-                RETRY_MAX_ATTEMPTS,
-                delay,
-                last.message,
+            if last.disposition is not DispatchDisposition.DELIVERY_UNKNOWN:
+                # `ACCEPTED` / `REJECTED` 都是「运行方给了话」，当场收工、不烧剩余预算。
+                if last.disposition is DispatchDisposition.ACCEPTED:
+                    n1_status = CallFinalStatus.SUCCESS.value
+                else:
+                    n1_error_code = last.disposition.value
+                    n1_error_message = last.message
+                return last
+
+            if attempt < RETRY_MAX_ATTEMPTS:
+                delay = retry_delay(attempt, OUTBOUND_RETRY_BACKOFF_SEC)
+                logger.warning(
+                    "[TaskCenter] %s 没够着运行方（第 %d/%d 次），%.1fs 后重发：%s",
+                    what,
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    delay,
+                    last.message,
+                )
+                await sleep(delay)
+                # 记成**下一次尝试前**等的毫秒数（本次这次调用自己的耗时不算在内）。
+                waited_ms = int(delay * 1000)
+
+        assert last is not None  # RETRY_MAX_ATTEMPTS >= 1，循环至少跑一次
+        # 耗尽预算。能走到这里的必然是 `DELIVERY_UNKNOWN`（`ACCEPTED` / `REJECTED` 在上面的
+        # 循环体内就 return 了），如实记失败 + 最后一次那一档的成因。
+        n1_error_code = last.disposition.value
+        n1_error_message = last.message
+        logger.warning(
+            "[TaskCenter] %s 连续 %d 次没够着运行方，交回调用方处置：%s",
+            what,
+            RETRY_MAX_ATTEMPTS,
+            last.message,
+        )
+        return last
+    except asyncio.CancelledError:
+        # 中途取消：与「压根没发出去」区分开（记 cancelled，不是 failed）。
+        n1_status = CallFinalStatus.CANCELLED.value
+        raise
+    finally:
+        # —— N1 补发（`monitor.call_log`）——
+        # 这一路的重发**是同一个逻辑调用**（重发的就是同一个 `execution_id` / `task_id`），
+        # 故 N1 只在循环收工后发一条，`request_id` 与 N2 逐字相同 ⇒ 两表关联得上、
+        # `attempt_count` 的 COUNT 补正能回填。**必须放在循环之外**（理由见
+        # `emit_logical_call` 的 docstring）。
+        # 采集是纯旁路：投递失败一律吞掉，本函数的返回值与异常传播一个字节都不变。
+        if collect:
+            emit_logical_call(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                status=n1_status,
+                target=target,
+                started_at=n1_started_at,
+                error_code=n1_error_code,
+                error_message=n1_error_message,
             )
-            await sleep(delay)
-
-    assert last is not None  # RETRY_MAX_ATTEMPTS >= 1，循环至少跑一次
-    logger.warning(
-        "[TaskCenter] %s 连续 %d 次没够着运行方，交回调用方处置：%s",
-        what,
-        RETRY_MAX_ATTEMPTS,
-        last.message,
-    )
-    return last
 
 
 class RunnerAdapter:
@@ -325,6 +450,123 @@ class RunnerAdapter:
             identity=f"task={execution.task_id}",
             timeout=get_config().TASK_CENTER_NOTIFY_TIMEOUT,
         )
+
+    async def query_step_status(
+        self, capability_id: str, envelope: ExecutionEnvelope
+    ) -> Optional[StepStatusQuery]:
+        """问运行方「这个子任务现在什么情况」（§4.1 ④，2026-10-11 加）。
+
+        ## 与另外三个动作的三处不同，都是刻意的
+
+        1. **要拿数据**，不只要判决 —— 所以**不走 `_send` 那套 `DispatchResult`**
+           （它把 `data` 丢掉，那是给「写动作」用的：写动作只关心收没收下）。
+        2. **不重发** —— 它是**幂等只读**的：问不到就**下一拍再问**，
+           重发只会把一次对账变成三倍流量，收益为零。
+        3. **失败一律回 `None`**、不抛也不判死 —— 对账循环拿到 `None` 就是
+           「这次没问到」，**不做任何处置**。这正是「拉」比「推」稳的地方：
+           推丢了要有人兜，拉丢了下一拍就是兜。
+
+        ## 通道
+
+        按 `capability_runtime.yaml` 的落地方式分流，与派活走**同一个
+        `capability_id`**、同一套 `get_locator()`。
+
+        ⚠️ **`LOCAL` 模式暂不支持**（回 `None` = 「这个运行方不提供查询」）：
+        `LOCAL` 那条通道的分发是按「回执壳 → 判决」写的，拿数据要另一套。
+        当前部署（`business:` 走 `REMOTE`）用不到它；真需要时再补，
+        **而在此之前 `LOCAL` 的部署行为与从前一字不变**（回 `None` = 管理方走老路）。
+        """
+        data = envelope.dict()
+        spec = get_locator().get_spec(capability_id)
+
+        if spec.mode != CapabilityMode.REMOTE:
+            # MOCK 是桩（答不出）、LOCAL 见 docstring —— 都回「不提供查询」。
+            return None
+
+        try:
+            # ⚠️ **`require_tenant` 也在 try 里**（2026-10-13 修）：envelope 的 `tenant_id`
+            # 缺失 / 非法时会抛 `TenantIsolationError` —— 那也要落「这次没问到」，
+            # **不能冒出去**破坏本方法「失败一律回 `None`、不抛也不判死」的承诺（docstring 第 3 条）。
+            tenant_id = require_tenant(data.get("tenant_id"))
+            client = self._get_client(spec.endpoint)
+            resp = await client.post(
+                "/invoke",
+                json={
+                    "capability_id": capability_id,
+                    "payload": {
+                        "action": RUNNER_QUERY_STEP_STATUS_ACTION,
+                        "data": data,
+                    },
+                    "tenant_id": tenant_id,
+                },
+                headers={"X-Tenant-ID": tenant_id},
+                timeout=get_config().TASK_CENTER_RUNNER_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            # **不抛、不判死**：这次没问到，下一拍再来（§本方法 docstring 第 3 条）。
+            logger.warning(
+                "[TaskCenter] 查询运行方状态没问到：capability=%s task=%s node=%s err=%s",
+                capability_id, envelope.task_id, envelope.node_id, exc,
+            )
+            return None
+
+        if not isinstance(payload, dict):
+            # ⚠️ **body 不是 JSON 对象**（数组 / 字符串 / 标量）时不能直接 `.get` ——
+            # 那会抛 `AttributeError` 冒出去，同样破坏「失败一律回 `None`」的承诺
+            # （2026-10-13 修）。按「这次没问到」处置。
+            logger.warning(
+                "[TaskCenter] 查询运行方状态回了非对象 body：capability=%s type=%s",
+                capability_id, type(payload).__name__,
+            )
+            return None
+        if not payload.get("success"):
+            logger.warning(
+                "[TaskCenter] 查询运行方状态被拒（Sidecar 外层）：capability=%s task=%s node=%s msg=%s",
+                capability_id, envelope.task_id, envelope.node_id,
+                str(payload.get("message"))[:200],
+            )
+            return None
+        # ⚠️ **两层壳**（与 `_dispatch_remote` 那条逐句同形，别自己另发明一套）：
+        #   外层是 **Sidecar** 的（`payload["success"]` 只说 Sidecar 代理成没成）；
+        #   `payload["data"]` 是**能力层**自己的回执壳；
+        #   **再里面的 `data` 才是运行方回的内容**。
+        # 少了这一层，就会把整个壳当成运行方的回答 —— 表现是「形状认不出、静默丢结果」。
+        receipt = payload.get("data")
+        if isinstance(receipt, dict) and "success" in receipt:
+            if not receipt.get("success"):
+                # 运行方**明确**失败了（比如报文不合法）—— 同样按「没问到」处置。
+                logger.warning(
+                    "[TaskCenter] 查询运行方状态被拒（能力层）：capability=%s task=%s node=%s msg=%s",
+                    capability_id, envelope.task_id, envelope.node_id,
+                    str(receipt.get("message"))[:200],
+                )
+                return None
+            raw = receipt.get("data")
+        else:
+            # 没有内层壳的通道（比如将来补 LOCAL）—— 那 `payload["data"]` 就是答案本身。
+            raw = receipt
+        if not isinstance(raw, dict) or raw.get("status") not in STEP_STATUS_VALUES:
+            # 回了个认不出的东西 —— 当作「没问到」，**别硬解释**。
+            logger.warning(
+                "[TaskCenter] 查询运行方状态回了认不出的形状：capability=%s task=%s data=%r",
+                capability_id, envelope.task_id, str(raw)[:200],
+            )
+            return None
+        try:
+            # ⚠️ **构造也要在 try 里**：`status` 合法不代表整个报文合法
+            # （`report` 不是 dict、`detail` 超 `max_length` …）—— pydantic v1 会抛
+            # `ValidationError`。本方法对外承诺「**失败一律回 `None`**、不抛也不判死」，
+            # 让它冒出去会破坏契约，而且那个错**每拍都会重放一次**（调度循环按拍调它）。
+            return StepStatusQuery(**raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[TaskCenter] 查询运行方状态的报文过不了 DTO 校验（当作没问到）："
+                "capability=%s task=%s err=%s data=%r",
+                capability_id, envelope.task_id, exc, str(raw)[:200],
+            )
+            return None
 
     async def close(self) -> None:
         """释放连接池（进程退出 / 测试收尾时调）。"""
@@ -768,6 +1010,7 @@ class RunnerAdapter:
 
 __all__ = [
     "RUNNER_EXECUTE_ACTION",
+    "RUNNER_QUERY_STEP_STATUS_ACTION",
     "RUNNER_REMOVE_TASK_ACTION",
     "RUNNER_TASK_STOPPED_ACTION",
     "RunnerAdapter",

@@ -64,6 +64,10 @@ from .expressions import (
 
 IN_FIELD_TYPES = ("string", "number", "boolean", "file", "object", "array")
 
+#: 节点级「下游联动」的两个开关（2026-10-15 加，校验编号 N23）。
+#: 语义是出边（挂在上游节点上），不填 = `True`；两个名字与 `FlowStep` 的字段逐字一致。
+DOWNSTREAM_SWITCHES = ("downstream_on_retry", "downstream_on_stop")
+
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -445,6 +449,15 @@ def validate_flow_config(
         next_by_node[node_id] = next_steps
         refs_by_node[node_id] = []
 
+        # ---- N23：下游联动的两个开关（2026-10-15 加）只查类型 ----
+        # 不填 = true = 从前那条口径，所以存量编排一个字不改也照样过。
+        # ⚠️ **一致性那半边不在这里**：它要等 `depends_by_node` 全部建完，
+        #    放在本循环之后（见那里）。
+        for switch in DOWNSTREAM_SWITCHES:
+            raw = item.get(switch)
+            if raw is not None and not isinstance(raw, bool):
+                issues.append(f"{where}.{switch} 必须是 true / false（N23）")
+
         # ---- N2：depends_on / next_steps 引用的节点都要存在、不能指自己 ----
         for name, targets in (("depends_on", depends_on), ("next_steps", next_steps)):
             for target in targets:
@@ -669,6 +682,35 @@ def validate_flow_config(
     # 要让值真的到位，得让使用者把被引用的节点写进 `depends_on`。**别在这里补一条
     # 「引用必须是上游」的判据**：那会把上面这条 N10 变成死代码，也与该设计冲突。
     issues.extend(_detect_cycles(refs_by_node, label="引用关系", rule="N10"))
+
+    # ---- N23：同一个节点的所有上游，下游联动开关必须同值（2026-10-15 加）----
+    #
+    # 一条边（上游 U → 下游 D）跟不跟，只看 **U 自己**那个字段（见
+    # `TaskService._downstream_chain`）。于是「D 有多个上游、而它们态度不一致」时，
+    # D 到底跟不跟**说不清** —— 点 A 重跑时从 A 看该跟、从 B 看不该跟。
+    # 这种编排当场拦下，别让它发出去。
+    #
+    # ⚠️ **只有「汇聚」才可能触发**：线性链（解析 → 编译）每个节点只有一个上游；
+    #    分叉（A 同时喂 B 和 C）也不会 —— B、C 各自只有一个上游。
+    #    所以库里那几条预置编排永远不会碰到这一条。
+    #
+    # ⚠️ **上游里那些不存在的节点先摘掉**：那种情况上面 N2 已经报过了，
+    #    这里再报一遍只是噪音（而且「不存在的节点」的开关根本无从取值）。
+    for switch in DOWNSTREAM_SWITCHES:
+        for node_id, upstreams in depends_by_node.items():
+            known = [up for up in upstreams if up in steps_by_node]
+            if len(known) < 2:
+                continue
+            values = {up: steps_by_node[up].get(switch, True) for up in known}
+            if len(set(values.values())) < 2:
+                continue
+            detail = "、".join(
+                f"{up}={str(value).lower()}" for up, value in sorted(values.items())
+            )
+            issues.append(
+                f"节点 {node_id!r} 的上游对 {switch} 的配置不一致（{detail}）——"
+                "同一个节点的所有上游必须同值，否则「它跟不跟」说不清（N23）"
+            )
     # ---- 最后一道：**类型外壳自己也要认**（2026-09-30 接进来）----
     #
     # `FlowConfig` / `FlowStep` / `FieldSpec` 从前是「声明了但全仓没人构造」的类型外壳，
