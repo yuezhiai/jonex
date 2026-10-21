@@ -9,9 +9,6 @@ import apiClient from './request';
 export const TENANT_READ_PERMISSION = 'platform:tenant:read';
 export const TENANT_WRITE_PERMISSION = 'platform:tenant:write';
 
-/** 后端列表 `page_size` 上限；搜索走单页拉取时用它兜住匹配范围 */
-export const TENANT_PAGE_SIZE_MAX = 100;
-
 export interface TenantListResponse {
   items: TenantItem[];
   total: number;
@@ -46,9 +43,17 @@ export interface TenantUpdatePayload {
   expire_time?: string | null;
 }
 
-export async function listTenants(page = 1, pageSize = 100): Promise<TenantListResponse> {
+/**
+ * 租户分页列表。
+ *
+ * `keyword` 由**后端**按租户 ID / 名称 / 描述模糊匹配（含分页与 total 一起算）。前端不再「拉一页上限
+ * 数据 + 本地过滤」—— 那种做法搜不到第 100 个之后的租户，还得在页面上挂一条范围受限的提示。
+ * 空关键字不传该参数（后端按「不过滤」处理，与传空串等价）。
+ */
+export async function listTenants(page = 1, pageSize = 100, keyword?: string): Promise<TenantListResponse> {
+  const trimmed = keyword?.trim();
   return apiClient.get<TenantListResponse>('/platform/tenants', {
-    params: { page, page_size: pageSize },
+    params: { page, page_size: pageSize, ...(trimmed ? { keyword: trimmed } : {}) },
   });
 }
 

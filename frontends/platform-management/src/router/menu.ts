@@ -11,6 +11,8 @@ import {
   CloudServerOutlined,
   CodeOutlined,
   BarChartOutlined,
+  DatabaseOutlined,
+  MonitorOutlined,
 } from '@ant-design/icons';
 
 /** 侧边栏菜单项 */
@@ -19,7 +21,7 @@ export interface MenuItem {
   path?: string;
   icon?: string;
   label: string;
-  permissionCode?: string;
+  permissionCode?: string | string[];
   children?: MenuItem[];
 }
 
@@ -27,8 +29,23 @@ export interface MenuItem {
 export interface RouteMenuMeta {
   icon?: string;
   order?: number;
-  permissionCode?: string;
+  permissionCode?: string | string[];
   hidden?: boolean;
+}
+
+/**
+ * 菜单 / 路由可见性判定：`permissionCode` 可以是单个码，也可以是**码数组（任意一个命中即可）**。
+ *
+ * 数组语义是合并「系统配置」页时引入的：该页对平台管理员和租户管理员都可见，但两人持的码不同
+ * （`platform:config:read` / `tenant:security:read`），页面内部再按码分段渲染。
+ *
+ * ⚠ 空数组等于「谁都看不见」（`some` 为空为 false）——这是刻意的：写成 `[]` 是配置错误，
+ *   宁可不显示，也不要无码放行。
+ */
+export function hasMenuPermission(permissionCode: string | string[] | undefined, permissions: string[]): boolean {
+  if (!permissionCode) return true;
+  const codes = Array.isArray(permissionCode) ? permissionCode : [permissionCode];
+  return codes.some((code) => permissions.includes(code));
 }
 
 /** 图标注册表：icon 字符串 → 组件 */
@@ -44,6 +61,8 @@ export const IconMap: Record<string, ComponentType> = {
   CloudServerOutlined,
   CodeOutlined,
   BarChartOutlined,
+  DatabaseOutlined,
+  MonitorOutlined,
 };
 
 interface MenuRoute {

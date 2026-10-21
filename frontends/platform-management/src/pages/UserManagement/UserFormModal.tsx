@@ -13,7 +13,11 @@ import {
 import { listRoles, type RoleItem } from '../../api/roles';
 import type { TenantItem } from '../../api/tenants';
 import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sdk';
-import { tenantDisplay } from '../../utils/tenantDisplay';
+
+/** 用户名 / 密码的允许字符集：大小写字母、数字、点、下划线 */
+const ACCOUNT_CHARS_PATTERN = /^[A-Za-z0-9._]+$/;
+/** 邮箱要求有 @、域名与顶级域；比 antd 内置 email 规则更严格 */
+const EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/;
 
 export interface UserFormModalHandle {
   open: (user?: UserItem) => void;
@@ -190,7 +194,14 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           <Form.Item
             name="username"
             label={t('userManagement.username')}
-            rules={editing ? [] : [{ required: true, whitespace: true, message: t('userManagement.requiredUsername') }]}
+            rules={
+              editing
+                ? []
+                : [
+                    { required: true, whitespace: true, message: t('userManagement.requiredUsername') },
+                    { pattern: ACCOUNT_CHARS_PATTERN, message: t('userManagement.invalidUsername') },
+                  ]
+            }
             getValueFromEvent={(e) => e.target.value.replace(/\s+/g, '')}
           >
             <Input placeholder={t('userManagement.placeholderUsername')} disabled={!!editing} autoComplete="off" />
@@ -207,7 +218,10 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
         <Form.Item
           name="email"
           label={t('userManagement.email')}
-          rules={[{ required: true, message: t('userManagement.requiredEmail'), type: 'email' }]}
+          rules={[
+            { required: true, message: t('userManagement.requiredEmail') },
+            { pattern: EMAIL_PATTERN, message: t('userManagement.invalidEmail') },
+          ]}
         >
           <Input type="email" placeholder={t('userManagement.placeholderEmail')} autoComplete="off" />
         </Form.Item>
@@ -226,7 +240,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
           >
             <Select
               options={tenants.map((tenant) => ({
-                label: tenantDisplay(tenant, t).name,
+                label: tenant.name,
                 value: tenant.id,
               }))}
             />
@@ -260,6 +274,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
               // 对齐后端统一校验：密码长度 8~128（与登录 password_min_length / max_length 一致）
               { min: 8, message: t('userManagement.passwordTooShort') },
               { max: 128, message: t('userManagement.passwordTooLong') },
+              { pattern: ACCOUNT_CHARS_PATTERN, message: t('userManagement.invalidPassword') },
             ]}
           >
             <Input.Password placeholder={t('userManagement.placeholderPassword')} autoComplete="new-password" />
@@ -277,6 +292,9 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
                   }
                   if (value && value.length > 128) {
                     return Promise.reject(new Error(t('userManagement.passwordTooLong')));
+                  }
+                  if (value && !ACCOUNT_CHARS_PATTERN.test(value)) {
+                    return Promise.reject(new Error(t('userManagement.invalidPassword')));
                   }
                   return Promise.resolve();
                 },

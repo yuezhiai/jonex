@@ -20,6 +20,7 @@ import {
   theme,
 } from 'antd';
 import { ApiOutlined, CopyOutlined, SaveOutlined, SettingOutlined } from '@ant-design/icons';
+import copyToClipboard from 'copy-to-clipboard';
 import { useTranslation } from 'react-i18next';
 import SectionHeading from '../../components/SectionHeading';
 import { fmtDateTime } from '../../utils/datetime';
@@ -318,13 +319,9 @@ export default function SsoConfigDrawer({ open, status, onClose, onChanged }: Ss
   };
 
   const onCopy = async (text: string) => {
-    try {
-      // clipboard 在非安全上下文（http 非 localhost）不可用，失败要有反馈而不是静默
-      await navigator.clipboard.writeText(text);
-      message.success(t('common.copySuccess'));
-    } catch {
-      message.error(t('common.copyFailed'));
-    }
+    // 线上是 http 非安全上下文，clipboard API 不可用，copy-to-clipboard 内部自带 execCommand 降级
+    if (await copyToClipboard(text)) message.success(t('common.copySuccess'));
+    else message.error(t('common.copyFailed'));
   };
 
   // 映射关系固定不可编辑：三条基础字段落到 users 列，sub 作为唯一标识不落列

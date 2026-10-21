@@ -8,15 +8,29 @@ import apiClient from './request';
  */
 
 /** 任务状态。与子任务状态**不是同一套**取值：成功在这里叫 completed。 */
-export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped';
 
-/** 子任务状态。成功叫 success，且多一个 timeout。 */
-export type SubtaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'timeout';
+/**
+ * 子任务状态。成功叫 success，且多一个 timeout。
+ *
+ * `stopped` 是**管理方置的终态**（2026-10-15）：用户停整条任务时判给还没开始的那些步骤，
+ * 或停某一步时按 `downstream_on_stop` 连带判给下游 —— 运行方报不了它。
+ */
+export type SubtaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'timeout' | 'stopped';
 
 export interface TaskConsoleItem {
   id: string;
   /** 发起时没给就为空；后端会退化成编排定义名。 */
   task_name: string | null;
+  /**
+   * 任务来源（后端 `TaskConsoleItem.task_source`）。取值 ∈ 协议层 `TASK_SOURCES`，
+   * 如 `knowledge_base.file.manual_upload`。
+   *
+   * ⚠️ **存的是码不是文案**，中文名由页面按码映射（见 `TaskCenter/constant.ts` 的
+   * `taskSourceLabel`）。**空 = 不是运行方提交的**（定时触发 / 人工立即触发），
+   * 或这一列诞生之前的存量行 —— 不是漏记。
+   */
+  task_source?: string | null;
   status: TaskStatus;
   /** ISO 8601。 */
   started_at: string | null;
@@ -34,6 +48,18 @@ export interface TaskConsolePage {
   status_counts: Record<string, number>;
 }
 
+/**
+ * 一条「引用」：`kind` + `params`，**没有正文、没有地址**（协议层 2026-10-09 拍板）。
+ *
+ * `kind` 带运行方前缀（如 `knowledge_base.document`），前端按它决定「这是什么、
+ * 去哪儿看」；`params` 是运行方自己接口要的字段，每个 kind 要哪些写死在协议层
+ * `INPUT_REF_PARAMS` / `OUTPUT_REF_PARAMS`。
+ */
+export interface SubtaskRef {
+  kind: string;
+  params: Record<string, unknown>;
+}
+
 export interface SubtaskConsoleItem {
   id: string;
   /**
@@ -46,16 +72,30 @@ export interface SubtaskConsoleItem {
   /** 内置清单里的步骤名（文件解析 / 知识抽取 / 知识编译），查不到才退化成 step_code。 */
   subtask_name: string | null;
   status: SubtaskStatus;
+  /**
+   * 这一步自己的失败原因（判死 / 运行方回失败时写）。成功、或还在跑就是 `null`。
+   *
+   * ⚠️ 与任务列表那一行的 `error_message` **不是同一份**：那条是失败节点的这条拼出来的
+   * （`<节点名>: <原因>`），条数多一条少一条看的是失败节点有几个。
+   */
+  error_message: string | null;
   started_at: string | null;
   finished_at: string | null;
   duration_seconds: number | null;
   /**
-   * 产出「去哪儿看」的引用（后端 `List[Dict[str, Any]]`）。**形状由运行方定义**，
-   * 管理方只搬运 —— 所以这里不发明字段名，本轮也**不渲染**（`href` 是运行方自己的
-   * API 路径，浏览器直接跳会丢 `Authorization` 头，得先定「API 路径 → 子应用页面」
-   * 的映射另案处理）。
+   * 输入「**从哪儿来**」的引用（2026-10-16 加，与 `output_refs` 对称）。
+   *
+   * **只有终态上报那一刻才有值**：`running` 期间为空 —— 输入指向哪个页面只有运行方知道，
+   * 只能等它上报。老运行方不上报时同样为空，页面按 `?? []` 处理，不把它读成「没有输入」。
    */
-  output_refs?: Record<string, unknown>[] | null;
+  input_refs?: SubtaskRef[] | null;
+  /**
+   * 产出「**去哪儿看**」的引用。**只给入口、不给内容** —— 正文与它的权限都留在运行方那侧，
+   * 页面据 `kind` 查本地映射（见 `pages/TaskCenter/resultRefs.ts`）跳到对应子应用页面。
+   *
+   * 空（null / 空数组）= 没东西可看：老运行方不上报，或这一步还没终态。
+   */
+  output_refs?: SubtaskRef[] | null;
 }
 
 /**
@@ -74,18 +114,23 @@ export interface TaskListParams {
   /** 模糊匹配任务名或任务 id。 */
   keyword?: string;
   /**
+   * 按任务来源筛（∈ 协议层 `TASK_SOURCES`）。**单值精确匹配**，非法取值后端当场回 1001。
+   *
+   * ⚠️ 筛它永远筛不到平台侧自己触发的任务 —— 那些行这一列为空（后端口径：
+   * 「有值才加条件」）。
+   */
+  task_source?: string;
+  /**
    * 领域空间（取值是**主应用当前选中的空间**，不是页面上的下拉）。
    *
-   * ⚠️ 与 `task_type` / `source` 一样，后端 `page_tasks` 目前**不接收** —— 它只取
-   * keyword / start_time / end_time / statuses / page / page_size，多传的键被 dispatch
-   * 那层逐个取值时静默忽略。照发是既定决定：前端一次接好，后端补齐后自动生效。
+   * ⚠️ 后端 `page_tasks` 目前**不接收** —— 它只取 keyword / start_time / end_time /
+   * statuses / page / page_size，多传的键被 dispatch 那层逐个取值时静默忽略。
+   * 照发是既定决定：前端一次接好，后端补齐后自动生效。
    *
    * 注意任务**确实有空间归属**（`retry_subtask` 的 `space_id` 是必传的归属凭据，
    * 见 `_require_space_match`），所以这个参数不是凭空加的维度，只是列表口还没开。
    */
   space_id?: string;
-  task_type?: string;
-  source?: string;
   /** 按**建任务时间**筛（含两端）。 */
   start_time?: string;
   end_time?: string;

@@ -57,7 +57,8 @@
     "searchLabel": "检索",
     "loadFailed": "加载失败",
     "refresh": "刷新",
-    "noPermission": "无权限"
+    "noPermission": "无权限",
+    "readOnlyHint": "当前角色只有查看权限，如需修改请联系管理员"
   },
   "auth": {
     "signIn": "登录",
@@ -117,13 +118,14 @@
     "operationLog": "操作日志",
     "dataAccessMethods": "数据接入方式",
     "parserManagement": "解析器管理",
-    "systemMonitor": "系统监控",
+    "platformMonitor": "平台监控",
     "knowledgeCompile": "知识编译",
     "compileSearch": "编译检索",
     "compileGraph": "知识图谱",
     "compileVector": "向量检索",
     "compileCompile": "编译管理",
-    "dataOperations": "数据运营"
+    "dataOperations": "数据运营",
+    "dataGovernance": "资产目录"
   },
   "site": {
     "title": ""
@@ -331,42 +333,32 @@
     "filter": {
       "keyword": "任务名称",
       "keywordPlaceholder": "搜索任务名称或编号",
-      "type": "任务类型",
-      "typeAll": "全部类型",
+      "range": "时间范围",
       "source": "任务来源",
-      "sourceAll": "全部来源",
-      "range": "时间范围"
-    },
-    "type": {
-      "full": "全流程"
+      "sourcePlaceholder": "全部来源"
     },
     "source": {
-      "file": "文件上传",
-      "api": "API 拉取",
-      "apiPush": "入站推送",
-      "storage": "存储同步"
-    },
-    "stage": {
-      "parse": "文档解析",
-      "ontology": "本体编译",
-      "wiki": "Wiki 编译"
+      "platform": "平台自建"
     },
     "status": {
       "all": "全部",
       "pending": "排队中",
       "running": "处理中",
       "completed": "已完成",
-      "failed": "已失败"
+      "failed": "已失败",
+      "stopped": "已停止"
     },
     "subtaskStatus": {
-      "pending": "排队中",
+      "pending": "等待中",
       "running": "处理中",
       "success": "已完成",
       "failed": "已失败",
-      "timeout": "已超时"
+      "timeout": "已超时",
+      "stopped": "已停止"
     },
     "column": {
       "name": "任务名称",
+      "source": "任务来源",
       "startedAt": "开始时间",
       "finishedAt": "结束时间",
       "duration": "耗时"
@@ -392,17 +384,50 @@
       "title": "任务详情",
       "taskId": "任务 ID",
       "basic": "基本信息",
+      "source": "任务来源",
       "subtasks": "子任务",
       "subtaskId": "子任务 ID",
       "totalDuration": "总耗时",
-      "result": "处理结果"
+      "result": "处理结果",
+      "failureReason": "失败原因"
     },
     "result": {
       "pending": "{{name}}等待执行",
       "running": "{{name}}处理中",
       "success": "{{name}}完成",
       "failed": "{{name}}失败",
-      "timeout": "{{name}}超时"
+      "timeout": "{{name}}超时",
+      "stopped": "{{name}}已停止"
+    },
+    "execution": {
+      "trigger": "执行结果",
+      "title": "执行结果",
+      "close": "关闭",
+      "input": "输入",
+      "output": "输出",
+      "artifacts": "任务产物（{{count}}）",
+      "duration": "耗时",
+      "artifactTypes": "产物类型",
+      "inputFile": "输入文件",
+      "inputChunks": "输入切片",
+      "chunksValue": "文档切片",
+      "notReported": "未记录",
+      "emptyInput": "暂无输入引用",
+      "emptyOutput": "暂无产出引用",
+      "viewChunks": "查看解析结果",
+      "viewOntology": "查看知识图谱",
+      "viewWiki": "查看 Wiki 页面",
+      "kind": {
+        "document": "文档",
+        "chunks": "切片",
+        "ontology": "本体",
+        "wiki": "Wiki"
+      },
+      "artifact": {
+        "chunks": "文档解析结果",
+        "ontology": "知识图谱",
+        "wiki": "Wiki 页面"
+      }
     }
   },
   "parserManagement": {
@@ -629,10 +654,278 @@
     "user": "用户",
     "userLabel": "用户"
   },
-  "systemMonitor": {
-    "title": "系统监控",
-    "description": "查看全平台服务、任务与组件的运行状态",
-    "underDevelopment": "功能研发中，敬请期待"
+  "platformMonitor": {
+    "refresh": "刷新",
+    "realtime": "实时",
+    "updatedAt": "数据更新于 {{time}}",
+    "allTypes": "全部类型",
+    "tabs": {
+      "task": "任务监控",
+      "call": "调用监控",
+      "token": "Token监控"
+    },
+    "window": {
+      "h1": "1小时",
+      "h24": "24小时",
+      "d7": "近7天",
+      "d30": "近30天",
+      "custom": "自定义",
+      "start": "开始时间",
+      "end": "结束时间",
+      "tooLong": "时间范围不能超过 {{max}} 天"
+    },
+    "error": {
+      "title": "加载失败",
+      "retry": "重试",
+      "loadFailed": "数据加载失败，请稍后重试",
+      "unknown": {
+        "title": "加载失败"
+      },
+      "rangeTooLong": {
+        "title": "时间范围超出上限",
+        "description": "自定义时间范围最多 {{maxDays}} 天，请缩短后再查询。"
+      },
+      "outOfRetention": {
+        "title": "查询起点超出数据保留期",
+        "description": "监控数据仅保留最近 {{days}} 天，可查询 {{from}} 至 {{to}}。"
+      },
+      "forbidden": {
+        "title": "没有查看平台监控的权限",
+        "description": "当前账号缺少 platform:monitor:read 权限，请联系平台管理员开通。"
+      },
+      "unavailable": {
+        "title": "监控数据暂不可用",
+        "description": "数据源尚未就绪或历史数据仍在重算，请稍后重试。"
+      },
+      "upstream": {
+        "title": "依赖服务不可用",
+        "description": "监控数据的上游服务暂时不可达，请稍后重试。"
+      }
+    },
+    "trend": {
+      "inProgress": "进行中"
+    },
+    "duration": {
+      "minuteSecond": "{{m}}分{{s}}秒",
+      "second": "{{s}}秒"
+    },
+    "empty": {
+      "noData": "暂无数据"
+    },
+    "column": {
+      "value": "数值",
+      "total": "任务总量",
+      "running": "执行中",
+      "waiting": "等待中",
+      "failed": "失败",
+      "successRate": "成功率",
+      "avgDuration": "平均耗时"
+    },
+    "stage": {
+      "parse": "解析",
+      "extract": "本体抽取",
+      "compile": "编译",
+      "detect": "文件检测",
+      "aggregate": "结果汇总"
+    },
+    "failureReason": {
+      "ontology": "本体抽取失败",
+      "compile": "编译失败",
+      "format": "文件格式异常",
+      "parse": "解析失败",
+      "detect": "文件检测失败"
+    },
+    "task": {
+      "allTasks": "全部任务",
+      "trend": "运行趋势",
+      "failures": "失败任务",
+      "overview": "任务运行概览",
+      "overviewHint": "点击任务类型展开执行阶段",
+      "moreToTaskCenter": "更多前往任务中心",
+      "kpi": {
+        "total": "任务总量",
+        "successRate": "任务成功率",
+        "avgDuration": "平均任务耗时",
+        "waiting": "当前等待任务"
+      },
+      "metric": {
+        "volume": "任务量",
+        "successRate": "成功率",
+        "avgDuration": "平均耗时",
+        "failures": "失败任务数"
+      },
+      "column": {
+        "taskType": "任务类型",
+        "stage": "执行阶段"
+      }
+    },
+    "call": {
+      "sub": {
+        "external": "外部依赖",
+        "capability": "开放能力",
+        "records": "调用记录"
+      },
+      "trend": "调用趋势",
+      "targets": "调用对象",
+      "capabilities": "开放能力",
+      "allObjects": "全部对象",
+      "allCapabilities": "全部能力",
+      "rowCount": "共 {{n}} {{unit}}",
+      "unitObject": "个对象",
+      "unitCapability": "个能力",
+      "kpi": {
+        "total": "调用总量",
+        "successRate": "调用成功率",
+        "avgLatency": "平均响应时间",
+        "failed": "失败调用数"
+      },
+      "metric": {
+        "volume": "调用量",
+        "successRate": "成功率",
+        "avgDuration": "平均响应时间",
+        "failures": "失败调用数"
+      },
+      "column": {
+        "targetName": "对象名称",
+        "capabilityName": "能力名称",
+        "protocol": "开放协议",
+        "calls": "调用量",
+        "successRate": "成功率",
+        "avgLatency": "平均响应时间",
+        "failures": "失败调用数",
+        "lastCallAt": "最近调用时间"
+      }
+    },
+    "callStatus": {
+      "success": "成功",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "running": "执行中",
+      "unknown": "未知"
+    },
+    "callDirection": {
+      "inbound": "能力开放调用",
+      "outbound": "外部依赖调用"
+    },
+    "callTrigger": {
+      "user": "用户发起",
+      "system": "系统后台"
+    },
+    "callProtocol": {
+      "invoke": "invoke",
+      "mcp": "MCP",
+      "http": "HTTP",
+      "openai": "OpenAI"
+    },
+    "records": {
+      "allDirections": "全部方向",
+      "allStatuses": "全部状态",
+      "allTriggers": "全部触发方",
+      "allProtocols": "全部协议",
+      "filterSource": "来源服务",
+      "filterTarget": "目标对象",
+      "filterKeyword": "关键词",
+      "sourcePlaceholder": "筛选来源服务",
+      "targetPlaceholder": "按对象标识精确筛选",
+      "searchPlaceholder": "搜索来源、目标或 Request ID",
+      "column": {
+        "time": "调用时间",
+        "direction": "调用方向",
+        "triggerType": "触发方",
+        "caller": "来源服务 / 调用方",
+        "target": "目标对象 / 能力",
+        "method": "调用方式",
+        "status": "状态",
+        "latency": "响应时间",
+        "errorCode": "错误码",
+        "requestId": "Request ID",
+        "traceId": "Trace ID"
+      }
+    },
+    "callDetail": {
+      "title": "调用详情",
+      "thinShellTitle": "本期仅采集部分字段",
+      "thinShellDescription": "调用明细目前只落库 Request ID 与错误信息，方法、路径、状态码、请求/响应报文与 Token 字段暂未采集。",
+      "method": "HTTP 方法",
+      "statusCode": "响应状态码",
+      "path": "请求路径",
+      "stage": "执行阶段",
+      "retryCount": "重试次数",
+      "errorMessage": "错误信息",
+      "tokens": "Token 消耗",
+      "promptTokens": "Input Token",
+      "completionTokens": "Output Token",
+      "totalTokens": "总 Token",
+      "requestPayload": "请求报文",
+      "responsePayload": "响应报文",
+      "meta": "采集元数据",
+      "notFound": {
+        "title": "没有找到这条调用记录",
+        "description": "记录可能已被清理，或不在当前时间范围内。"
+      },
+      "degradedMode": {
+        "title": "当前为降级口径",
+        "description": "该记录按物理调用（含重试）逐条定位，不是一次逻辑调用。"
+      },
+      "attempts": "重试明细",
+      "attempt": {
+        "no": "序号",
+        "startedAt": "开始时间",
+        "duration": "耗时",
+        "status": "状态",
+        "errorCode": "错误码",
+        "waitBefore": "等待时长"
+      }
+    },
+    "objectDetail": {
+      "objectId": "对象 / 能力",
+      "topSources": "来源分布",
+      "recentFailures": "最近失败",
+      "viewAllCalls": "查看全部调用",
+      "notFound": "该时间范围内没有这个对象的调用记录",
+      "degradedMode": {
+        "title": "当前为降级统计口径",
+        "description": "基础指标按物理调用（重试各计一次）统计，数值会高于按逻辑调用统计的口径。"
+      }
+    },
+    "token": {
+      "trend": "Token 消耗趋势",
+      "share": "模型使用分布",
+      "shareHint": "按 Token 消耗",
+      "models": "模型用量明细",
+      "modelCount": "共 {{n}} 个模型",
+      "searchModel": "搜索模型名称",
+      "kpi": {
+        "modelCalls": "模型调用次数",
+        "totalTokens": "Token 总消耗",
+        "avgTokens": "平均单次 Token",
+        "modelCount": "使用模型数",
+        "completeness": "用量回传完整率"
+      },
+      "kind": {
+        "total": "总 Token",
+        "input": "Input Token",
+        "output": "Output Token"
+      },
+      "column": {
+        "model": "模型名称",
+        "calls": "调用次数",
+        "inputTokens": "Input Token",
+        "outputTokens": "Output Token",
+        "totalTokens": "总 Token",
+        "unmetered": "未回传用量",
+        "avgTokens": "平均单次 Token",
+        "lastCallAt": "最近调用时间"
+      }
+    },
+    "degraded": {
+      "title": "数据降级",
+      "description": "部分数据源不可用，以下指标可能不完整。"
+    },
+    "metaUnavailable": {
+      "title": "筛选候选加载失败",
+      "description": "下拉选项已回退为内置清单，部分候选可能缺失。"
+    }
   },
   "systemConfig": {
     "basicSettings": "基本设置",
@@ -642,20 +935,21 @@
     "chinese": "简体中文",
     "defaultLanguage": "默认语言",
     "english": "English",
-    "lockAfter3": "3 次后锁定",
-    "lockAfter5": "5 次后锁定",
     "lockDuration": "锁定时间（分钟）",
-    "loginLockThreshold": "登录失败锁定",
+    "loginLockThreshold": "登录失败锁定阈值（次，0 表示不锁定）",
     "logoUrl": "Logo URL",
     "noChanges": "没有变更",
-    "noLock": "不锁定",
     "passwordMinLength": "密码最小长度（位）",
     "platformName": "平台名称",
     "resetToDefault": "恢复默认",
     "resetToDefaultMsg": "已恢复默认值，点击保存生效",
     "saveAll": "保存全部配置",
-    "securitySettings": "安全设置",
+    "securitySettings": "平台安全设置",
     "sessionTimeout": "会话超时（分钟）",
+    "tabs": {
+      "platform": "平台设置",
+      "tenant": "租户设置"
+    },
     "timezone": "时区",
     "title": "系统配置"
   },
@@ -671,8 +965,7 @@
     "requiredName": "请填写租户名称",
     "requiredTenantId": "请填写租户 ID",
     "saveFailed": "保存失败",
-    "searchTenants": "搜索租户...",
-    "searchLimitHint": "当前共 {{total}} 个租户；后端列表暂不支持关键字查询，搜索仅在已加载的前 {{limit}} 个租户中匹配。",
+    "searchTenants": "搜索租户 ID 或名称...",
     "tenantId": "租户 ID",
     "title": "租户管理",
     "updated": "已更新",
@@ -852,21 +1145,31 @@
       "colEntityType": "实体类型",
       "colEntityId": "实体标识",
       "colReason": "失败原因"
-    },
-    "builtInTenants": {
-      "demo": {
-        "name": "Jonex演示租户",
-        "description": "本地开发与演示租户"
-      },
-      "alpha": {
-        "name": "Jonex Alpha 测试租户",
-        "description": "用于多租户登录选择流程测试"
-      },
-      "beta": {
-        "name": "Jonex Beta 测试租户",
-        "description": "用于多租户登录选择流程测试"
-      }
     }
+  },
+  "tenantSecurity": {
+    "changedItems": "已修改 {{count}} 项",
+    "empty": "暂无安全设置项",
+    "loginLockThreshold": "登录失败锁定阈值（次，0 表示不锁定）",
+    "lockDuration": "锁定时长（分钟）",
+    "noChanges": "没有变更",
+    "overridden": "已自定义",
+    "passwordMinLength": "密码最小长度（位）",
+    "platformDefaultHint": "平台默认值：{{value}}",
+    "rangeError": "请输入 {{min}}–{{max}} 之间的整数",
+    "requiredField": "请填写该安全参数",
+    "resetConfirmDesc": "将删除本租户对「{{field}}」的自定义值，立即改用平台默认值。",
+    "resetConfirmTitle": "确认恢复平台默认值？",
+    "resetFailed": "恢复默认失败，请稍后重试",
+    "resetSuccess": "已恢复为平台默认值",
+    "resetToDefault": "恢复默认",
+    "saveAll": "保存修改",
+    "saveFailed": "保存失败，请稍后重试",
+    "saveSuccess": "安全设置已保存",
+    "sessionTimeout": "访问令牌有效期（分钟）",
+    "subtitle": "以下参数仅作用于本租户。恢复默认后立即改用平台默认值，不影响其他租户。",
+    "title": "租户安全设置",
+    "usingPlatformDefault": "继承平台默认"
   },
   "userManagement": {
     "allRoles": "全部角色",
@@ -887,6 +1190,9 @@
     "email": "邮箱",
     "enable": "启用",
     "enabled": "已启用",
+    "invalidEmail": "请输入有效的邮箱地址",
+    "invalidPassword": "密码只能包含字母、数字、点和下划线",
+    "invalidUsername": "用户名只能包含字母、数字、点和下划线",
     "listTruncated": "用户数超出单次加载上限，当前仅展示前 {{loaded}} 条。搜索与筛选只在已加载数据内生效。",
     "newPassword": "新密码（留空不修改）",
     "operationFailed": "操作失败",
@@ -939,12 +1245,14 @@
       "loadFailed": "数据加载失败，请稍后重试"
     },
     "empty": {
-      "noData": "暂无数据"
+      "noData": "暂无数据",
+      "qualityAnomaly": "暂无质量异常"
     },
     "assetType": {
       "document": "文档",
+      "text": "文本",
       "table": "表格",
-      "image": "图片",
+      "image": "图像",
       "structured": "结构化数据",
       "video": "视频",
       "audio": "音频",
@@ -979,6 +1287,8 @@
       "pipelineTitle": "数据处理流水",
       "pipelineDesc": "解析 → 抽取 → 编译 全链路处理状态",
       "anomalyTitle": "异常资产",
+      "qualityAnomalyTitle": "解析质量异常",
+      "qualityAnomalyDesc": "最近 50 条质量为「较差」的解析任务（观测档，不拦截检索）",
       "growthTitle": "知识资产增长趋势",
       "distTitle": "知识库本体实例分布",
       "idleKnowledgeTitle": "长期未使用知识",
@@ -1077,6 +1387,16 @@
         "retryCount": "已重试次数"
       }
     },
+    "quality": {
+      "document": "文档",
+      "kb": "知识库",
+      "reasons": "判据",
+      "occurredAt": "发生时间",
+      "reason": {
+        "page_yield_zero": "所有页面均未解析出可用文本",
+        "zero_spans": "解析结果为空"
+      }
+    },
     "scope": {
       "label": "分析对象",
       "ontology": "本体",
@@ -1103,10 +1423,478 @@
       "other": "其他"
     },
     "sourceType": {
-      "upload": "文件上传",
+      "file": "文件上传",
       "api": "API 拉取",
       "storage": "对象存储",
       "apiPush": "入站推送"
+    },
+    "window": {
+      "preset": "近 {{days}} 天",
+      "start": "开始日期",
+      "end": "结束日期",
+      "tooLong": "统计区间不能超过 {{max}} 天"
+    },
+    "assetStatus": {
+      "pending": "待处理",
+      "parsing": "解析中",
+      "ingesting": "入库中",
+      "ready": "已完成",
+      "failed": "失败"
+    },
+    "ontologyStatus": {
+      "pending": "待抽取",
+      "extracting": "抽取中",
+      "ready": "已完成",
+      "failed": "失败"
+    },
+    "wikiStatus": {
+      "compiling": "编译中",
+      "compiled": "已编译",
+      "stale": "待更新",
+      "failed": "失败"
+    },
+    "drawer": {
+      "notFound": "该记录不存在或无权访问",
+      "sectionBasic": "基本信息",
+      "sectionProcessing": "处理信息",
+      "sectionUsage": "使用情况",
+      "sectionOntology": "本体",
+      "sectionAliases": "别名与描述",
+      "assetTitle": "数据资产详情",
+      "assetId": "资产 ID",
+      "assetType": "资产类型",
+      "fileFormat": "文件格式",
+      "fileSize": "文件大小",
+      "source": "数据来源",
+      "belongKb": "所属知识库",
+      "uploadedAt": "上传时间",
+      "lastProcessedAt": "最近处理时间",
+      "statusParse": "解析状态",
+      "statusOntology": "本体状态",
+      "statusWiki": "Wiki 编译状态",
+      "citeCount": "引用次数",
+      "lastCitedAt": "最近引用时间",
+      "entityTitle": "本体对象详情",
+      "entityType": "实体类型",
+      "aliases": "别名",
+      "description": "描述",
+      "createdAt": "创建时间",
+      "updatedAt": "更新时间",
+      "hitCount": "命中次数",
+      "adoptCount": "采用次数",
+      "lastUsedAt": "最近使用时间",
+      "attributes": "属性",
+      "attributesEmpty": "暂无属性",
+      "attributesDegraded": "本体服务暂不可用，暂无法展示属性",
+      "relations": "主要关系",
+      "relationTotal": "共 {{total}} 条关系",
+      "relationTruncated": "关系过多，仅展示前 {{shown}} 条",
+      "relationsEmpty": "暂无关系",
+      "relationsDegraded": "本体服务暂不可用，暂无法展示关系",
+      "degraded": "本体服务暂不可用，属性与关系无法展示；命中次数来自检索记录，不受影响",
+      "kbTitle": "知识库详情",
+      "kbId": "知识库 ID",
+      "kbTypeLabel": "知识库类型",
+      "objectInstances": "对象实例数",
+      "relationInstances": "关系实例数",
+      "assetTotal": "数据资产数",
+      "requestCount": "检索次数",
+      "lastRequestAt": "最近检索时间",
+      "assetsByType": "资产构成",
+      "relatedServices": "关联领域服务",
+      "noneRelated": "暂无关联",
+      "serviceTitle": "领域服务详情",
+      "serviceId": "服务 ID",
+      "runStatus": "运行状态",
+      "running": "运行中",
+      "disabled": "已停用",
+      "statusRaw": "服务状态",
+      "callCount": "调用次数",
+      "lastCallAt": "最近调用时间",
+      "relatedKbs": "关联知识库"
+    }
+  },
+  "dataGovernance": {
+    "title": "资产目录",
+    "standards": {
+      "title": "标准目录",
+      "templateTab": "模板标准",
+      "kbTab": "知识库应用",
+      "domains": "标准领域",
+      "scenarios": "标准场景",
+      "objects": "对象与属性",
+      "attributes": "属性",
+      "relations": "关系",
+      "constraints": "约束",
+      "impact": "影响分析",
+      "version": "版本",
+      "publishedAt": "发布时间",
+      "unpublished": "未发布",
+      "structureHash": "结构哈希",
+      "copyStructureHash": "复制结构哈希",
+      "sourceVersion": "来源版本",
+      "schemaVersion": "Schema 版本",
+      "bindingStatus": "绑定状态",
+      "mismatch": "绑定场景与编译场景不一致",
+      "docStats": "文档统计",
+      "docTotal": "文档总数",
+      "docNoTarget": "无适用目标",
+      "docNotApplied": "未应用",
+      "docAppliedCurrent": "已应用当前版本",
+      "docOntologyReady": "本体就绪",
+      "truncated": "仅展示前 200 个",
+      "noBinding": "未绑定",
+      "sourceIdNote": "仅统计记录了来源 ID 的 schema，可能漏计。",
+      "viewReferencedKbs": "查看引用知识库",
+      "viewScenario": "查看模板场景",
+      "publishedNote": "版本与哈希为最近发布值；目录展示当前工作副本，可能包含未发布编辑。",
+      "versions": {
+        "tab": "发布版本",
+        "loadFailed": "版本历史加载失败",
+        "diffFailed": "版本对比失败",
+        "empty": "暂无发布记录（发布后这里会出现版本快照）",
+        "version": "版本",
+        "publishedAt": "发布时间",
+        "publishedBy": "发布人",
+        "hash": "结构哈希",
+        "comparePrev": "与上一版对比",
+        "diffFrom": "基线版本",
+        "diffTo": "目标版本",
+        "diffAction": "对比",
+        "field": "字段",
+        "from": "旧值",
+        "to": "新值",
+        "added": "新增",
+        "removed": "删除",
+        "changed": "修改",
+        "scenarioChanges": "场景字段变更",
+        "noChanges": "两个版本结构一致",
+        "rollback": "回滚",
+        "rollbackConfirm": "确定回滚到 v{{version}}？将恢复工作副本并发布为新版本。",
+        "rollbackDone": "已从 v{{from}} 回滚，并发布 v{{to}}",
+        "rollbackFailed": "版本回滚失败"
+      },
+      "compliance": {
+        "tab": "落标校验",
+        "loadFailed": "落标校验加载失败",
+        "empty": "暂无 compiled schema 可校验",
+        "total": "共",
+        "latestVersion": "最新发布版本",
+        "notPublished": "未发布",
+        "kb": "知识库",
+        "status": "状态",
+        "version": "来源/最新版本",
+        "schemaVersion": "Schema 版本",
+        "syncStatus": "同步状态",
+        "diffCount": "差异数",
+        "docStats": "文档统计",
+        "missingObjects": "标准有、编译缺失的对象",
+        "extraObjects": "编译多出的对象",
+        "missingAttributes": "标准有、编译缺失的属性",
+        "extraAttributes": "编译多出的属性",
+        "changedAttributes": "属性不一致",
+        "statuses": {
+          "current": "一致",
+          "outdated": "版本落后",
+          "mismatch": "结构不一致",
+          "no_schema": "无 schema",
+          "no_source_version": "无来源版本",
+          "not_published": "标准未发布"
+        }
+      },
+      "constraintsEmpty": "模板约束当前未编译进执行链路。",
+      "openInTemplate": "在模板管理中打开",
+      "back": "返回",
+      "keywordPlaceholder": "知识库名称关键词",
+      "refresh": "刷新",
+      "domain": "领域",
+      "scenario": "场景",
+      "status": "状态",
+      "description": "描述",
+      "kb": "知识库",
+      "spaceId": "空间 ID",
+      "domainScenario": "领域 / 场景",
+      "sourceType": "来源类型",
+      "sourceHash": "来源哈希",
+      "schemaMode": "Schema 模式",
+      "syncStatus": "同步状态",
+      "compiledAt": "编译时间",
+      "scenarioCount": "场景数",
+      "objectCount": "对象数",
+      "attributeCount": "属性数",
+      "relationCount": "关系数",
+      "constraintCount": "约束数",
+      "latestPublishedAt": "最近发布时间",
+      "object": "对象",
+      "attribute": "属性",
+      "attrName": "属性名",
+      "attrType": "类型",
+      "isPrimaryKey": "主键",
+      "isRequired": "必填",
+      "ontologyCode": "本体编码",
+      "constraintsJson": "约束 JSON",
+      "relationType": "关系类型",
+      "sourceObject": "源对象",
+      "targetObject": "目标对象",
+      "constraintType": "约束类型",
+      "expression": "表达式",
+      "target": "目标",
+      "scopeObject": "对象：{{name}}",
+      "scopeAttribute": "属性：{{name}}",
+      "scopeScenario": "场景影响",
+      "backToScenario": "返回场景影响",
+      "emptyDomains": "暂无标准领域",
+      "emptyScenarios": "该领域暂无标准场景",
+      "emptyObjects": "暂无对象",
+      "emptyAttributes": "暂无属性",
+      "emptyRelations": "暂无关系",
+      "emptyImpact": "暂无引用的知识库",
+      "emptyKb": "暂无知识库应用",
+      "loadFailed": "加载失败，请稍后重试",
+      "detailLoadFailed": "标准领域加载失败",
+      "scenarioLoadFailed": "标准场景加载失败",
+      "referencesLoadFailed": "引用知识库加载失败",
+      "kbLoadFailed": "知识库应用加载失败",
+      "errorForbidden": "无权访问标准目录",
+      "errorNotFound": "标准目录资源不存在或无权访问",
+      "retry": "重试"
+    },
+    "filter": {
+      "assetType": "资产类型",
+      "space": "空间",
+      "kb": "知识库",
+      "domain": "主题域",
+      "owner": "责任人",
+      "sensitivity": "密级",
+      "status": "状态",
+      "keyword": "名称关键词",
+      "all": "全部",
+      "search": "查询",
+      "reset": "重置"
+    },
+    "column": {
+      "type": "类型",
+      "name": "名称",
+      "kb": "所属知识库",
+      "status": "状态",
+      "quality": "解析质量",
+      "owner": "责任人",
+      "domain": "主题域",
+      "sensitivity": "密级",
+      "updatedAt": "更新时间"
+    },
+    "assetType": {
+      "document": "文档",
+      "data_source": "数据源"
+    },
+    "status": {
+      "document": {
+        "pending": "待处理",
+        "parsing": "解析中",
+        "ingesting": "入库中",
+        "ready": "就绪",
+        "archived": "已归档",
+        "failed": "失败",
+        "deleting": "删除中",
+        "deleted": "已删除"
+      },
+      "dataSource": {
+        "active": "启用",
+        "paused": "暂停",
+        "error": "异常"
+      }
+    },
+    "sensitivity": {
+      "public": "公开",
+      "internal": "内部",
+      "confidential": "机密",
+      "unclassified": "未分级"
+    },
+    "classification": {
+      "title": "分级分类",
+      "config": "分级配置",
+      "batch": "批量分级",
+      "level": "分级",
+      "categories": "分类",
+      "unclassified": "未分级",
+      "none": "无分类",
+      "inherit": "继承",
+      "keep": "不修改",
+      "set": "设置",
+      "source": {
+        "asset": "资产级",
+        "kb": "知识库级",
+        "tenant": "租户级",
+        "none": "未设置"
+      },
+      "levelManage": "等级",
+      "categoryManage": "分类",
+      "defaults": "默认值",
+      "tenantDefault": "租户默认",
+      "kbDefault": "知识库默认",
+      "code": "编码",
+      "name": "名称",
+      "rank": "等级序",
+      "active": "启用",
+      "addLevel": "新增等级",
+      "addCategory": "新增分类",
+      "edit": "编辑",
+      "batchTitle": "批量设置分级（{{count}} 个资产）",
+      "emptySelection": "请先选择资产",
+      "saved": "分级配置已保存",
+      "batchSaved": "已更新 {{count}} 个资产",
+      "levelRequired": "请选择等级",
+      "categoryRequired": "请选择分类",
+      "noBatchChange": "没有任何修改",
+      "codeInvalid": "编码需以小写字母开头，只能包含小写字母、数字和下划线，长度 2-32 位",
+      "codeReserved": "unclassified 是保留编码，请换一个",
+      "nameRequired": "请输入名称",
+      "nameTooLong": "名称最多 64 个字符",
+      "rankInvalid": "等级序必须为 1-1000 的整数",
+      "configLoadFailed": "分级配置加载失败",
+      "inheritHint": "留空或选择“继承”表示沿用上级默认值",
+      "effective": "生效分级",
+      "effectiveCategories": "生效分类",
+      "assetOverride": "资产覆盖",
+      "noCategories": "无分类",
+      "tenantDefaultForbidden": "仅租户管理员可维护租户默认值",
+      "defaultsLoadFailed": "默认值加载失败",
+      "saveFailed": "保存失败，请稍后重试",
+      "clearance": {
+        "title": "用户密级",
+        "user": "用户",
+        "username": "用户名",
+        "level": "可读最高等级",
+        "default": "默认（最低等级）",
+        "clear": "清除",
+        "saveFailed": "保存失败，请重试",
+        "loadFailed": "加载用户密级失败"
+      }
+    },
+    "quality": {
+      "ok": "正常",
+      "suspect": "可疑",
+      "bad": "较差",
+      "unknown": "未评估"
+    },
+    "retention": {
+      "never": "不自动到期",
+      "days": "{{count}} 天",
+      "days_one": "{{count}} 天",
+      "daysUnit": "天",
+      "source": {
+        "document": "文档级",
+        "kb": "知识库级",
+        "tenant": "租户级",
+        "system": "系统默认"
+      }
+    },
+    "unset": "未设置",
+    "total": "共 {{total}} 条",
+    "empty": {
+      "noData": "暂无资产"
+    },
+    "error": {
+      "loadFailed": "资产列表加载失败",
+      "retry": "重试",
+      "forbidden": "无权访问资产目录"
+    },
+    "drawer": {
+      "title": "资产详情",
+      "basic": "基本信息",
+      "metadata": "治理元数据",
+      "mime": "MIME",
+      "size": "大小",
+      "ontology": "本体状态",
+      "access": "接入方式",
+      "sync": "同步方式",
+      "lastSync": "最近同步",
+      "docs": "文档数",
+      "owner": "责任人",
+      "ownerPlaceholder": "请输入责任人",
+      "domain": "主题域",
+      "domainPlaceholder": "请输入主题域",
+      "sensitivity": "密级",
+      "sensitivityPlaceholder": "未分级",
+      "save": "保存",
+      "saving": "保存中",
+      "saved": "已保存",
+      "saveForbidden": "仅租户管理员、空间管理者或知识库管理者可修改",
+      "saveFailed": "保存失败，请稍后重试",
+      "noChange": "没有修改",
+      "loadFailed": "资产详情加载失败",
+      "notFound": "资产不存在或无权访问",
+      "ownerMax": "责任人最多 128 个字符",
+      "domainMax": "主题域最多 64 个字符"
+    },
+    "lineage": {
+      "title": "血缘",
+      "colSource": "来源",
+      "colDocument": "文档",
+      "colDownstream": "下游",
+      "colChunk": "切片",
+      "direction": "方向",
+      "depth": "深度",
+      "up": "上游",
+      "down": "下游",
+      "both": "双向",
+      "depth1": "1 层",
+      "depth2": "2 层",
+      "empty": "暂无血缘数据",
+      "loadFailed": "血缘加载失败",
+      "truncated": "仅展示前 {{count}} 条",
+      "truncatedEntities": "实体仅展示前 {{count}} 条",
+      "truncatedRelations": "关系仅展示前 {{count}} 条",
+      "truncatedChunks": "切片仅展示前 {{count}} 条",
+      "collapsed": "另有 {{count}} 个节点未展示",
+      "counts": "实体 {{entities}} · 关系 {{relations}} · 引用 {{citations}} · 切片 {{chunks}}",
+      "zoomIn": "放大",
+      "zoomOut": "缩小",
+      "fit": "适配",
+      "zoomHint": "拖拽平移，滚轮缩放"
+    },
+    "lifecycle": {
+      "title": "生命周期",
+      "createdAt": "创建时间",
+      "archivedAt": "归档时间",
+      "effectivePolicy": "生效策略",
+      "retentionDays": "保留期",
+      "graceDays": "宽限期",
+      "effectiveFrom": "生效层级",
+      "source": "来源",
+      "documentOverride": "文档覆盖",
+      "inherit": "继承",
+      "saveOverride": "保存覆盖",
+      "saved": "保留策略已保存",
+      "archive": "归档",
+      "restore": "恢复",
+      "destroy": "销毁",
+      "archiveConfirm": "归档「{{name}}」后将退出检索但保留原文，可恢复。",
+      "restoreConfirm": "恢复「{{name}}」后会重新解析入库。",
+      "destroyConfirm": "销毁「{{name}}」不可逆，将清理索引与原文。",
+      "archiveSuccess": "归档成功",
+      "restoreSuccess": "恢复成功",
+      "destroySuccess": "销毁成功",
+      "actionFailed": "操作失败，请稍后重试"
+    },
+    "policy": {
+      "title": "保留策略",
+      "tenant": "租户默认",
+      "kb": "知识库覆盖",
+      "selectKb": "选择知识库",
+      "save": "保存",
+      "saved": "保留策略已保存",
+      "saveFailed": "保存失败，请稍后重试",
+      "forbidden": "仅租户管理员、空间管理者或知识库管理者可修改",
+      "viewForbidden": "无权查看该保留策略",
+      "loadFailed": "保留策略加载失败",
+      "kbLoadFailed": "知识库列表加载失败",
+      "empty": "选择知识库后可查看并编辑其保留策略",
+      "effective": "当前生效策略",
+      "inheritHint": "留空表示继承上级策略，已生效的值见上方。",
+      "hintRetention": "保留期填 0 表示不自动到期。",
+      "hintGrace": "宽限期填 0 表示归档后下一轮清理即销毁。",
+      "hintDestroy": "销毁不可逆，将清理索引与原文。"
     }
   }
 }

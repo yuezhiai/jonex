@@ -13,7 +13,7 @@ import {
 import { Result } from 'antd';
 import i18next from 'i18next';
 import { getRoutes } from './routes.config';
-import { getMenuFromRoutes } from '@/router/menu';
+import { getMenuFromRoutes, hasMenuPermission } from '@/router/menu';
 import AppLayout from '@/components/AppLayout';
 import { readAccessToken, readCachedUser, clearAuthStorage, redirectToLogin } from '@jonex/shell-sdk';
 
@@ -23,11 +23,6 @@ interface RouteConfigItem {
   children?: RouteConfigItem[];
   element?: React.ComponentType;
   index?: boolean;
-}
-
-interface MenuItem {
-  path?: string;
-  permissionCode?: string;
 }
 
 interface AuthLoaderOptions {
@@ -95,7 +90,7 @@ const createAuthLoader =
       if (user) {
         const userPerms: string[] = user.permissions || [];
         const menuItem = getMenuFromRoutes(getRoutes(), (s: string) => s).find((item) => item.path === path);
-        if (menuItem?.permissionCode && !userPerms.includes(menuItem.permissionCode)) {
+        if (menuItem?.permissionCode && !hasMenuPermission(menuItem.permissionCode, userPerms)) {
           return redirect('/error?page=403');
         }
       }
@@ -114,7 +109,7 @@ const createAuthLoader =
     const userInfo = readCachedUser<Record<string, any>>() || {};
     const userPerms: string[] = Array.isArray(userInfo?.permissions) ? userInfo.permissions : [];
     const menuItem = getMenuFromRoutes(getRoutes(), (s: string) => s).find((item) => item.path === path);
-    if (menuItem?.permissionCode && !userPerms.includes(menuItem.permissionCode)) {
+    if (menuItem?.permissionCode && !hasMenuPermission(menuItem.permissionCode, userPerms)) {
       return redirect('/error?page=403');
     }
 

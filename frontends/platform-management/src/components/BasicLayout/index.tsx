@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { switchLocale } from '@jonex/i18n-resources';
 import { useStore } from '@/store';
 import { usePermission } from '@jonex/shared-lib';
-import { getMenuFromRoutes, IconMap } from '@/router/menu';
+import { getMenuFromRoutes, hasMenuPermission, IconMap } from '@/router/menu';
 import type { MenuItem } from '@/router/menu';
 import { getRoutes } from '@/router/routes.config';
 import { clearAuthStorage, finishLogout, revokeServerSession } from '@jonex/shell-sdk';
@@ -29,10 +29,9 @@ const BasicLayout = () => {
   const allMenuItems = useMemo(() => getMenuFromRoutes(getRoutes(), t), [t]);
 
   const visibleMenuItems = useMemo(() => {
-    return allMenuItems.filter((item) => {
-      if (!item.permissionCode) return true;
-      return userPermissions.includes(item.permissionCode);
-    });
+    // 判定收敛到 hasMenuPermission：支持 permissionCode 为码数组（任一命中即可），
+    // 与 router/index.tsx 的守卫同一套语义，避免出现「菜单看得见但点进去 403」的两头不一致。
+    return allMenuItems.filter((item) => hasMenuPermission(item.permissionCode, userPermissions));
   }, [allMenuItems, userPermissions]);
 
   // 路由菜单元 → 引擎受控数据（icon 名解析为 ReactNode）

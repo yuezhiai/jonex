@@ -57,7 +57,8 @@
     "searchLabel": "Search",
     "loadFailed": "Load failed",
     "refresh": "Refresh",
-    "noPermission": "No permission"
+    "noPermission": "No permission",
+    "readOnlyHint": "You have view-only access. Contact an administrator to make changes."
   },
   "auth": {
     "signIn": "Sign In",
@@ -117,13 +118,14 @@
     "operationLog": "Audit Logs",
     "dataAccessMethods": "Data Access Methods",
     "parserManagement": "Parser Management",
-    "systemMonitor": "System Monitoring",
+    "platformMonitor": "Platform Monitoring",
     "knowledgeCompile": "Knowledge Compilation",
     "compileSearch": "Compilation Search",
     "compileGraph": "Knowledge Graph",
     "compileVector": "Vector Search",
     "compileCompile": "Compilation Management",
-    "dataOperations": "Data Operations"
+    "dataOperations": "Data Operations",
+    "dataGovernance": "Asset Catalog"
   },
   "site": {
     "title": ""
@@ -331,42 +333,32 @@
     "filter": {
       "keyword": "Task name",
       "keywordPlaceholder": "Search task name or ID",
-      "type": "Task type",
-      "typeAll": "All types",
-      "source": "Source",
-      "sourceAll": "All sources",
-      "range": "Time range"
-    },
-    "type": {
-      "full": "Full pipeline"
+      "range": "Time range",
+      "source": "Task source",
+      "sourcePlaceholder": "All sources"
     },
     "source": {
-      "file": "File upload",
-      "api": "API pull",
-      "apiPush": "Inbound push",
-      "storage": "Storage sync"
-    },
-    "stage": {
-      "parse": "Document parsing",
-      "ontology": "Ontology build",
-      "wiki": "Wiki compile"
+      "platform": "Platform"
     },
     "status": {
       "all": "All",
       "pending": "Queued",
       "running": "Running",
       "completed": "Completed",
-      "failed": "Failed"
+      "failed": "Failed",
+      "stopped": "Stopped"
     },
     "subtaskStatus": {
       "pending": "Queued",
       "running": "Running",
       "success": "Completed",
       "failed": "Failed",
-      "timeout": "Timed out"
+      "timeout": "Timed out",
+      "stopped": "Stopped"
     },
     "column": {
       "name": "Task name",
+      "source": "Task source",
       "startedAt": "Started at",
       "finishedAt": "Finished at",
       "duration": "Duration"
@@ -392,17 +384,50 @@
       "title": "Task details",
       "taskId": "Task ID",
       "basic": "Basic info",
+      "source": "Task source",
       "subtasks": "Subtasks",
       "subtaskId": "Subtask ID",
       "totalDuration": "Total duration",
-      "result": "Result"
+      "result": "Result",
+      "failureReason": "Failure reason"
     },
     "result": {
       "pending": "{{name}} waiting to run",
       "running": "{{name}} in progress",
       "success": "{{name}} completed",
       "failed": "{{name}} failed",
-      "timeout": "{{name}} timed out"
+      "timeout": "{{name}} timed out",
+      "stopped": "{{name}} stopped"
+    },
+    "execution": {
+      "trigger": "Execution result",
+      "title": "Execution result",
+      "close": "Close",
+      "input": "Input",
+      "output": "Output",
+      "artifacts": "Artifacts ({{count}})",
+      "duration": "Duration",
+      "artifactTypes": "Artifact types",
+      "inputFile": "Input file",
+      "inputChunks": "Input chunks",
+      "chunksValue": "Document chunks",
+      "notReported": "Not recorded",
+      "emptyInput": "No input references",
+      "emptyOutput": "No output references",
+      "viewChunks": "View parse result",
+      "viewOntology": "View knowledge graph",
+      "viewWiki": "View wiki pages",
+      "kind": {
+        "document": "Document",
+        "chunks": "Chunks",
+        "ontology": "Ontology",
+        "wiki": "Wiki"
+      },
+      "artifact": {
+        "chunks": "Document parse result",
+        "ontology": "Knowledge graph",
+        "wiki": "Wiki pages"
+      }
     }
   },
   "parserManagement": {
@@ -629,10 +654,278 @@
     "user": "User",
     "userLabel": "User"
   },
-  "systemMonitor": {
-    "title": "System Monitoring",
-    "description": "View the runtime status of platform services, tasks and components",
-    "underDevelopment": "Under development, coming soon"
+  "platformMonitor": {
+    "refresh": "Refresh",
+    "realtime": "Real-time",
+    "updatedAt": "Updated at {{time}}",
+    "allTypes": "All types",
+    "tabs": {
+      "task": "Task Monitoring",
+      "call": "Call Monitoring",
+      "token": "Token Monitoring"
+    },
+    "window": {
+      "h1": "Last hour",
+      "h24": "Last 24 hours",
+      "d7": "Last 7 days",
+      "d30": "Last 30 days",
+      "custom": "Custom",
+      "start": "Start",
+      "end": "End",
+      "tooLong": "The range cannot exceed {{max}} days"
+    },
+    "error": {
+      "title": "Failed to load",
+      "retry": "Retry",
+      "loadFailed": "Failed to load data, please try again later",
+      "unknown": {
+        "title": "Failed to load"
+      },
+      "rangeTooLong": {
+        "title": "Time range too long",
+        "description": "A custom range can cover at most {{maxDays}} days. Please shorten it and try again."
+      },
+      "outOfRetention": {
+        "title": "Start time is outside the retention window",
+        "description": "Monitoring data is retained for {{days}} days. Queryable range: {{from}} to {{to}}."
+      },
+      "forbidden": {
+        "title": "No permission to view platform monitoring",
+        "description": "This account lacks the platform:monitor:read permission. Please ask a platform administrator to grant it."
+      },
+      "unavailable": {
+        "title": "Monitoring data is unavailable",
+        "description": "The data source is not ready or history is still being recalculated. Please try again later."
+      },
+      "upstream": {
+        "title": "Upstream service unavailable",
+        "description": "The upstream service behind monitoring data is temporarily unreachable. Please try again later."
+      }
+    },
+    "trend": {
+      "inProgress": "in progress"
+    },
+    "duration": {
+      "minuteSecond": "{{m}}m {{s}}s",
+      "second": "{{s}}s"
+    },
+    "empty": {
+      "noData": "No data"
+    },
+    "column": {
+      "value": "Value",
+      "total": "Total tasks",
+      "running": "Running",
+      "waiting": "Waiting",
+      "failed": "Failed",
+      "successRate": "Success rate",
+      "avgDuration": "Avg. duration"
+    },
+    "stage": {
+      "parse": "Parsing",
+      "extract": "Ontology extraction",
+      "compile": "Compilation",
+      "detect": "File detection",
+      "aggregate": "Result aggregation"
+    },
+    "failureReason": {
+      "ontology": "Ontology extraction failed",
+      "compile": "Compilation failed",
+      "format": "Unsupported file format",
+      "parse": "Parsing failed",
+      "detect": "File detection failed"
+    },
+    "task": {
+      "allTasks": "All tasks",
+      "trend": "Execution trend",
+      "failures": "Failed tasks",
+      "overview": "Task execution overview",
+      "overviewHint": "Click a task type to expand its stages",
+      "moreToTaskCenter": "More in Task Center",
+      "kpi": {
+        "total": "Total tasks",
+        "successRate": "Task success rate",
+        "avgDuration": "Avg. task duration",
+        "waiting": "Tasks waiting"
+      },
+      "metric": {
+        "volume": "Tasks",
+        "successRate": "Success rate",
+        "avgDuration": "Avg. duration",
+        "failures": "Failed tasks"
+      },
+      "column": {
+        "taskType": "Task type",
+        "stage": "Stage"
+      }
+    },
+    "call": {
+      "sub": {
+        "external": "External dependencies",
+        "capability": "Exposed capabilities",
+        "records": "Call records"
+      },
+      "trend": "Call trend",
+      "targets": "Call targets",
+      "capabilities": "Exposed capabilities",
+      "allObjects": "All targets",
+      "allCapabilities": "All capabilities",
+      "rowCount": "{{n}} {{unit}}",
+      "unitObject": "targets",
+      "unitCapability": "capabilities",
+      "kpi": {
+        "total": "Total calls",
+        "successRate": "Call success rate",
+        "avgLatency": "Avg. response time",
+        "failed": "Failed calls"
+      },
+      "metric": {
+        "volume": "Calls",
+        "successRate": "Success rate",
+        "avgDuration": "Avg. response time",
+        "failures": "Failed calls"
+      },
+      "column": {
+        "targetName": "Target name",
+        "capabilityName": "Capability name",
+        "protocol": "Protocol",
+        "calls": "Calls",
+        "successRate": "Success rate",
+        "avgLatency": "Avg. response time",
+        "failures": "Failed calls",
+        "lastCallAt": "Last call"
+      }
+    },
+    "callStatus": {
+      "success": "Success",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "running": "Running",
+      "unknown": "Unknown"
+    },
+    "callDirection": {
+      "inbound": "Capability exposure",
+      "outbound": "External dependency"
+    },
+    "callTrigger": {
+      "user": "User",
+      "system": "System"
+    },
+    "callProtocol": {
+      "invoke": "invoke",
+      "mcp": "MCP",
+      "http": "HTTP",
+      "openai": "OpenAI"
+    },
+    "records": {
+      "allDirections": "All directions",
+      "allStatuses": "All statuses",
+      "allTriggers": "All triggers",
+      "allProtocols": "All protocols",
+      "filterSource": "Caller",
+      "filterTarget": "Target",
+      "filterKeyword": "Keyword",
+      "sourcePlaceholder": "Filter by caller",
+      "targetPlaceholder": "Filter by exact object ID",
+      "searchPlaceholder": "Search caller, target or Request ID",
+      "column": {
+        "time": "Time",
+        "direction": "Direction",
+        "triggerType": "Trigger",
+        "caller": "Caller",
+        "target": "Target / capability",
+        "method": "Method",
+        "status": "Status",
+        "latency": "Response time",
+        "errorCode": "Error code",
+        "requestId": "Request ID",
+        "traceId": "Trace ID"
+      }
+    },
+    "callDetail": {
+      "title": "Call detail",
+      "thinShellTitle": "Only part of the fields are collected",
+      "thinShellDescription": "Call details currently store only the request ID and error message. Method, path, status code, payloads and token fields are not collected yet.",
+      "method": "HTTP method",
+      "statusCode": "Status code",
+      "path": "Path",
+      "stage": "Stage",
+      "retryCount": "Retries",
+      "errorMessage": "Error message",
+      "tokens": "Token usage",
+      "promptTokens": "Input tokens",
+      "completionTokens": "Output tokens",
+      "totalTokens": "Total tokens",
+      "requestPayload": "Request payload",
+      "responsePayload": "Response payload",
+      "meta": "Collection metadata",
+      "notFound": {
+        "title": "Call record not found",
+        "description": "It may have been purged, or it falls outside the current time range."
+      },
+      "degradedMode": {
+        "title": "Degraded mode",
+        "description": "This record is located among physical calls (including retries), not as one logical call."
+      },
+      "attempts": "Attempts",
+      "attempt": {
+        "no": "No.",
+        "startedAt": "Started at",
+        "duration": "Duration",
+        "status": "Status",
+        "errorCode": "Error code",
+        "waitBefore": "Wait before"
+      }
+    },
+    "objectDetail": {
+      "objectId": "Object / capability",
+      "topSources": "Top sources",
+      "recentFailures": "Recent failures",
+      "viewAllCalls": "View all calls",
+      "notFound": "No calls for this object in the selected range",
+      "degradedMode": {
+        "title": "Degraded aggregation",
+        "description": "Base metrics count physical calls (each retry separately), so values are higher than the logical-call view."
+      }
+    },
+    "token": {
+      "trend": "Token consumption trend",
+      "share": "Model usage share",
+      "shareHint": "By token consumption",
+      "models": "Model usage details",
+      "modelCount": "{{n}} models",
+      "searchModel": "Search model name",
+      "kpi": {
+        "modelCalls": "Model calls",
+        "totalTokens": "Total tokens",
+        "avgTokens": "Avg. tokens per call",
+        "modelCount": "Models in use",
+        "completeness": "Usage reporting rate"
+      },
+      "kind": {
+        "total": "Total tokens",
+        "input": "Input tokens",
+        "output": "Output tokens"
+      },
+      "column": {
+        "model": "Model",
+        "calls": "Calls",
+        "inputTokens": "Input tokens",
+        "outputTokens": "Output tokens",
+        "totalTokens": "Total tokens",
+        "unmetered": "Unreported usage",
+        "avgTokens": "Avg. tokens per call",
+        "lastCallAt": "Last call"
+      }
+    },
+    "degraded": {
+      "title": "Degraded data",
+      "description": "Some data sources are unavailable; the metrics below may be incomplete."
+    },
+    "metaUnavailable": {
+      "title": "Filter options unavailable",
+      "description": "Dropdowns fell back to the built-in list; some options may be missing."
+    }
   },
   "systemConfig": {
     "basicSettings": "Basic Settings",
@@ -642,20 +935,21 @@
     "chinese": "Simplified Chinese",
     "defaultLanguage": "Default Language",
     "english": "English",
-    "lockAfter3": "After 3 failed attempts",
-    "lockAfter5": "After 5 failed attempts",
     "lockDuration": "Lockout Duration (minutes)",
-    "loginLockThreshold": "Failed Login Lockout",
+    "loginLockThreshold": "Failed Login Lockout Threshold (attempts; 0 disables locking)",
     "logoUrl": "Logo URL",
     "noChanges": "No changes",
-    "noLock": "No lock",
     "passwordMinLength": "Minimum Password Length",
     "platformName": "Platform Name",
     "resetToDefault": "Reset to Default",
     "resetToDefaultMsg": "Defaults restored. Save to apply the changes.",
     "saveAll": "Save All Settings",
-    "securitySettings": "Security Settings",
+    "securitySettings": "Platform Security Settings",
     "sessionTimeout": "Session Timeout (minutes)",
+    "tabs": {
+      "platform": "Platform Settings",
+      "tenant": "Tenant Settings"
+    },
     "timezone": "Timezone",
     "title": "System Settings"
   },
@@ -671,8 +965,7 @@
     "requiredName": "Please enter a tenant name",
     "requiredTenantId": "Please enter a tenant ID",
     "saveFailed": "Save failed",
-    "searchTenants": "Search tenants...",
-    "searchLimitHint": "{{total}} tenants in total; the list API does not support keyword search yet, so matching runs over the first {{limit}} loaded tenants only.",
+    "searchTenants": "Search tenant ID or name...",
     "tenantId": "Tenant ID",
     "title": "Tenants",
     "updated": "Updated",
@@ -852,21 +1145,31 @@
       "colEntityType": "Entity type",
       "colEntityId": "Entity ID",
       "colReason": "Reason"
-    },
-    "builtInTenants": {
-      "demo": {
-        "name": "Jonex Demo Tenant",
-        "description": "Local development and product demonstrations"
-      },
-      "alpha": {
-        "name": "Jonex Alpha Test Tenant",
-        "description": "Tests the tenant-selection sign-in flow"
-      },
-      "beta": {
-        "name": "Jonex Beta Test Tenant",
-        "description": "Tests the tenant-selection sign-in flow"
-      }
     }
+  },
+  "tenantSecurity": {
+    "changedItems": "{{count}} item(s) modified",
+    "empty": "No security settings available",
+    "loginLockThreshold": "Failed Login Lockout Threshold (attempts; 0 disables locking)",
+    "lockDuration": "Lockout Duration (minutes)",
+    "noChanges": "No changes",
+    "overridden": "Customized",
+    "passwordMinLength": "Minimum Password Length (characters)",
+    "platformDefaultHint": "Platform default: {{value}}",
+    "rangeError": "Enter an integer between {{min}} and {{max}}",
+    "requiredField": "This value is required",
+    "resetConfirmDesc": "The tenant-specific value for \"{{field}}\" will be removed and the platform default will apply immediately.",
+    "resetConfirmTitle": "Reset to the platform default?",
+    "resetFailed": "Failed to reset. Please try again later.",
+    "resetSuccess": "Restored to the platform default",
+    "resetToDefault": "Reset to Default",
+    "saveAll": "Save Changes",
+    "saveFailed": "Failed to save. Please try again later.",
+    "saveSuccess": "Security settings saved",
+    "sessionTimeout": "Session Timeout (minutes)",
+    "subtitle": "These parameters apply to this tenant only. Resetting a value restores the platform default immediately and does not affect other tenants.",
+    "title": "Tenant Security Settings",
+    "usingPlatformDefault": "Platform default"
   },
   "userManagement": {
     "allRoles": "All Roles",
@@ -887,6 +1190,9 @@
     "email": "Email",
     "enable": "Enable",
     "enabled": "Enabled",
+    "invalidEmail": "Please enter a valid email address",
+    "invalidPassword": "Password can only contain letters, digits, dots and underscores",
+    "invalidUsername": "Username can only contain letters, digits, dots and underscores",
     "listTruncated": "User count exceeds the single-load limit; showing the first {{loaded}} only. Search and filters apply to loaded data only.",
     "newPassword": "New Password (leave blank to keep current)",
     "operationFailed": "Operation failed",
@@ -939,10 +1245,12 @@
       "loadFailed": "Failed to load data. Please try again later."
     },
     "empty": {
-      "noData": "No data"
+      "noData": "No data",
+      "qualityAnomaly": "No quality anomalies"
     },
     "assetType": {
       "document": "Documents",
+      "text": "Text",
       "table": "Tables",
       "image": "Images",
       "structured": "Structured Data",
@@ -979,6 +1287,8 @@
       "pipelineTitle": "Data Processing Pipeline",
       "pipelineDesc": "Parse → Extract → Compile pipeline status",
       "anomalyTitle": "Anomalous Assets",
+      "qualityAnomalyTitle": "Parse Quality Anomalies",
+      "qualityAnomalyDesc": "Latest 50 parse tasks graded Poor (observational; never blocks search)",
       "growthTitle": "Knowledge Asset Growth",
       "distTitle": "Ontology Instances by Knowledge Base",
       "idleKnowledgeTitle": "Long-Unused Knowledge",
@@ -1077,6 +1387,16 @@
         "retryCount": "Retries"
       }
     },
+    "quality": {
+      "document": "Document",
+      "kb": "Knowledge Base",
+      "reasons": "Reasons",
+      "occurredAt": "Occurred At",
+      "reason": {
+        "page_yield_zero": "No page yielded usable text",
+        "zero_spans": "The parse produced no spans"
+      }
+    },
     "scope": {
       "label": "Analysis Target",
       "ontology": "Ontology",
@@ -1103,10 +1423,478 @@
       "other": "Other"
     },
     "sourceType": {
-      "upload": "File Upload",
+      "file": "File Upload",
       "api": "API Pull",
       "storage": "Object Storage",
       "apiPush": "Inbound Push"
+    },
+    "window": {
+      "preset": "Last {{days}} days",
+      "start": "Start date",
+      "end": "End date",
+      "tooLong": "The range cannot exceed {{max}} days"
+    },
+    "assetStatus": {
+      "pending": "Pending",
+      "parsing": "Parsing",
+      "ingesting": "Ingesting",
+      "ready": "Done",
+      "failed": "Failed"
+    },
+    "ontologyStatus": {
+      "pending": "Pending",
+      "extracting": "Extracting",
+      "ready": "Done",
+      "failed": "Failed"
+    },
+    "wikiStatus": {
+      "compiling": "Compiling",
+      "compiled": "Compiled",
+      "stale": "Stale",
+      "failed": "Failed"
+    },
+    "drawer": {
+      "notFound": "This record does not exist or you have no access to it",
+      "sectionBasic": "Basic information",
+      "sectionProcessing": "Processing",
+      "sectionUsage": "Usage",
+      "sectionOntology": "Ontology",
+      "sectionAliases": "Aliases and description",
+      "assetTitle": "Asset detail",
+      "assetId": "Asset ID",
+      "assetType": "Asset type",
+      "fileFormat": "Format",
+      "fileSize": "File size",
+      "source": "Source",
+      "belongKb": "Knowledge base",
+      "uploadedAt": "Uploaded at",
+      "lastProcessedAt": "Last processed",
+      "statusParse": "Parse status",
+      "statusOntology": "Ontology status",
+      "statusWiki": "Wiki compile status",
+      "citeCount": "Citations",
+      "lastCitedAt": "Last cited",
+      "entityTitle": "Ontology object detail",
+      "entityType": "Entity type",
+      "aliases": "Aliases",
+      "description": "Description",
+      "createdAt": "Created at",
+      "updatedAt": "Updated at",
+      "hitCount": "Hits",
+      "adoptCount": "Adoptions",
+      "lastUsedAt": "Last used",
+      "attributes": "Attributes",
+      "attributesEmpty": "No attributes",
+      "attributesDegraded": "Ontology service is unavailable, attributes cannot be displayed",
+      "relations": "Relations",
+      "relationTotal": "{{total}} relations in total",
+      "relationTruncated": "Too many relations; showing the first {{shown}}",
+      "relationsEmpty": "No relations",
+      "relationsDegraded": "Ontology service is unavailable, relations cannot be displayed",
+      "degraded": "Ontology service is unavailable, so attributes and relations cannot be displayed. Hit counts come from search records and are unaffected",
+      "kbTitle": "Knowledge base detail",
+      "kbId": "Knowledge base ID",
+      "kbTypeLabel": "KB type",
+      "objectInstances": "Object instances",
+      "relationInstances": "Relation instances",
+      "assetTotal": "Assets",
+      "requestCount": "Search requests",
+      "lastRequestAt": "Last searched",
+      "assetsByType": "Asset composition",
+      "relatedServices": "Related domain services",
+      "noneRelated": "None",
+      "serviceTitle": "Domain service detail",
+      "serviceId": "Service ID",
+      "runStatus": "Run status",
+      "running": "Running",
+      "disabled": "Disabled",
+      "statusRaw": "Service status",
+      "callCount": "Calls",
+      "lastCallAt": "Last called",
+      "relatedKbs": "Related knowledge bases"
+    }
+  },
+  "dataGovernance": {
+    "title": "Asset Catalog",
+    "standards": {
+      "title": "Standards Catalog",
+      "templateTab": "Template Standards",
+      "kbTab": "Knowledge Base Usage",
+      "domains": "Standard Domains",
+      "scenarios": "Standard Scenarios",
+      "objects": "Objects & Attributes",
+      "attributes": "Attributes",
+      "relations": "Relations",
+      "constraints": "Constraints",
+      "impact": "Impact Analysis",
+      "version": "Version",
+      "publishedAt": "Published At",
+      "unpublished": "Unpublished",
+      "structureHash": "Structure Hash",
+      "copyStructureHash": "Copy structure hash",
+      "sourceVersion": "Source Version",
+      "schemaVersion": "Schema Version",
+      "bindingStatus": "Binding Status",
+      "mismatch": "Bound scenario differs from compiled scenario",
+      "docStats": "Document Stats",
+      "docTotal": "Total docs",
+      "docNoTarget": "No applicable target",
+      "docNotApplied": "Not applied",
+      "docAppliedCurrent": "Applied current",
+      "docOntologyReady": "Ontology ready",
+      "truncated": "Showing first 200 only",
+      "noBinding": "Not bound",
+      "sourceIdNote": "Only schemas that recorded a source ID are counted; totals may be incomplete.",
+      "viewReferencedKbs": "View referencing KBs",
+      "viewScenario": "View template scenario",
+      "publishedNote": "Version and hash are the latest published values; the catalog shows the current working copy and may include unpublished edits.",
+      "versions": {
+        "tab": "Published versions",
+        "loadFailed": "Failed to load version history",
+        "diffFailed": "Failed to compare versions",
+        "empty": "No published versions yet (a snapshot appears after publishing)",
+        "version": "Version",
+        "publishedAt": "Published at",
+        "publishedBy": "Published by",
+        "hash": "Structure hash",
+        "comparePrev": "Compare with previous",
+        "diffFrom": "Base version",
+        "diffTo": "Target version",
+        "diffAction": "Compare",
+        "field": "Field",
+        "from": "Before",
+        "to": "After",
+        "added": "Added",
+        "removed": "Removed",
+        "changed": "Changed",
+        "scenarioChanges": "Scenario field changes",
+        "noChanges": "The two versions are structurally identical",
+        "rollback": "Rollback",
+        "rollbackConfirm": "Roll back to v{{version}}? The working copy will be restored and published as a new version.",
+        "rollbackDone": "Rolled back from v{{from}} and published v{{to}}",
+        "rollbackFailed": "Version rollback failed"
+      },
+      "compliance": {
+        "tab": "Compliance check",
+        "loadFailed": "Failed to load the compliance report",
+        "empty": "No compiled schema to check",
+        "total": "Total",
+        "latestVersion": "Latest published version",
+        "notPublished": "Not published",
+        "kb": "Knowledge base",
+        "status": "Status",
+        "version": "Source / latest",
+        "schemaVersion": "Schema version",
+        "syncStatus": "Sync status",
+        "diffCount": "Differences",
+        "docStats": "Documents",
+        "missingObjects": "Objects in standard but missing from compiled schema",
+        "extraObjects": "Extra objects in compiled schema",
+        "missingAttributes": "Attributes in standard but missing from compiled schema",
+        "extraAttributes": "Extra attributes in compiled schema",
+        "changedAttributes": "Attribute mismatches",
+        "statuses": {
+          "current": "Current",
+          "outdated": "Outdated",
+          "mismatch": "Structural mismatch",
+          "no_schema": "No schema",
+          "no_source_version": "No source version",
+          "not_published": "Standard not published"
+        }
+      },
+      "constraintsEmpty": "Template constraints are not yet compiled into the execution path.",
+      "openInTemplate": "Open in template management",
+      "back": "Back",
+      "keywordPlaceholder": "Knowledge base name keyword",
+      "refresh": "Refresh",
+      "domain": "Domain",
+      "scenario": "Scenario",
+      "status": "Status",
+      "description": "Description",
+      "kb": "Knowledge Base",
+      "spaceId": "Space ID",
+      "domainScenario": "Domain / Scenario",
+      "sourceType": "Source Type",
+      "sourceHash": "Source Hash",
+      "schemaMode": "Schema Mode",
+      "syncStatus": "Sync Status",
+      "compiledAt": "Compiled At",
+      "scenarioCount": "Scenarios",
+      "objectCount": "Objects",
+      "attributeCount": "Attributes",
+      "relationCount": "Relations",
+      "constraintCount": "Constraints",
+      "latestPublishedAt": "Latest Published At",
+      "object": "Object",
+      "attribute": "Attribute",
+      "attrName": "Attribute Name",
+      "attrType": "Type",
+      "isPrimaryKey": "Primary Key",
+      "isRequired": "Required",
+      "ontologyCode": "Ontology Code",
+      "constraintsJson": "Constraints JSON",
+      "relationType": "Relation Type",
+      "sourceObject": "Source Object",
+      "targetObject": "Target Object",
+      "constraintType": "Constraint Type",
+      "expression": "Expression",
+      "target": "Target",
+      "scopeObject": "Object: {{name}}",
+      "scopeAttribute": "Attribute: {{name}}",
+      "scopeScenario": "Scenario Impact",
+      "backToScenario": "Back to scenario impact",
+      "emptyDomains": "No standard domains",
+      "emptyScenarios": "No standard scenarios in this domain",
+      "emptyObjects": "No objects",
+      "emptyAttributes": "No attributes",
+      "emptyRelations": "No relations",
+      "emptyImpact": "No referencing knowledge bases",
+      "emptyKb": "No knowledge base usage",
+      "loadFailed": "Failed to load. Please try again.",
+      "detailLoadFailed": "Failed to load the standard domain",
+      "scenarioLoadFailed": "Failed to load the standard scenario",
+      "referencesLoadFailed": "Failed to load referencing knowledge bases",
+      "kbLoadFailed": "Failed to load knowledge base usage",
+      "errorForbidden": "You do not have access to the standards catalog",
+      "errorNotFound": "The standards catalog resource does not exist or access is denied",
+      "retry": "Retry"
+    },
+    "filter": {
+      "assetType": "Asset Type",
+      "space": "Space",
+      "kb": "Knowledge Base",
+      "domain": "Domain",
+      "owner": "Owner",
+      "sensitivity": "Sensitivity",
+      "status": "Status",
+      "keyword": "Name keyword",
+      "all": "All",
+      "search": "Search",
+      "reset": "Reset"
+    },
+    "column": {
+      "type": "Type",
+      "name": "Name",
+      "kb": "Knowledge Base",
+      "status": "Status",
+      "quality": "Parse Quality",
+      "owner": "Owner",
+      "domain": "Domain",
+      "sensitivity": "Sensitivity",
+      "updatedAt": "Updated At"
+    },
+    "assetType": {
+      "document": "Document",
+      "data_source": "Data Source"
+    },
+    "status": {
+      "document": {
+        "pending": "Pending",
+        "parsing": "Parsing",
+        "ingesting": "Ingesting",
+        "ready": "Ready",
+        "archived": "Archived",
+        "failed": "Failed",
+        "deleting": "Deleting",
+        "deleted": "Deleted"
+      },
+      "dataSource": {
+        "active": "Active",
+        "paused": "Paused",
+        "error": "Error"
+      }
+    },
+    "sensitivity": {
+      "public": "Public",
+      "internal": "Internal",
+      "confidential": "Confidential",
+      "unclassified": "Unclassified"
+    },
+    "classification": {
+      "title": "Classification",
+      "config": "Classification Settings",
+      "batch": "Batch classification",
+      "level": "Sensitivity Level",
+      "categories": "Categories",
+      "unclassified": "Unclassified",
+      "none": "None",
+      "inherit": "Inherit",
+      "keep": "Keep unchanged",
+      "set": "Set",
+      "source": {
+        "asset": "Asset",
+        "kb": "Knowledge base",
+        "tenant": "Tenant",
+        "none": "Not set"
+      },
+      "levelManage": "Levels",
+      "categoryManage": "Categories",
+      "defaults": "Defaults",
+      "tenantDefault": "Tenant default",
+      "kbDefault": "Knowledge base default",
+      "code": "Code",
+      "name": "Name",
+      "rank": "Rank",
+      "active": "Enabled",
+      "addLevel": "Add level",
+      "addCategory": "Add category",
+      "edit": "Edit",
+      "batchTitle": "Set classification for {{count}} assets",
+      "emptySelection": "Select assets first",
+      "saved": "Classification settings saved",
+      "batchSaved": "Updated {{count}} assets",
+      "levelRequired": "Select a level",
+      "categoryRequired": "Select a category",
+      "noBatchChange": "No changes",
+      "codeInvalid": "Code must start with a lowercase letter and contain only lowercase letters, digits and underscores (2-32 characters)",
+      "codeReserved": "unclassified is a reserved code. Choose another one.",
+      "nameRequired": "Enter a name",
+      "nameTooLong": "Name must be at most 64 characters",
+      "rankInvalid": "Rank must be an integer between 1 and 1000",
+      "configLoadFailed": "Failed to load classification settings",
+      "inheritHint": "Leave blank or choose \"Inherit\" to use the parent default.",
+      "effective": "Effective Level",
+      "effectiveCategories": "Effective Categories",
+      "assetOverride": "Asset Override",
+      "noCategories": "No category",
+      "tenantDefaultForbidden": "Only tenant admins can maintain tenant defaults",
+      "defaultsLoadFailed": "Failed to load defaults",
+      "saveFailed": "Failed to save. Please try again.",
+      "clearance": {
+        "title": "User Clearance",
+        "user": "User",
+        "username": "Username",
+        "level": "Maximum Readable Level",
+        "default": "Default (lowest level)",
+        "clear": "Clear",
+        "saveFailed": "Failed to save. Please try again.",
+        "loadFailed": "Failed to load user clearances"
+      }
+    },
+    "quality": {
+      "ok": "OK",
+      "suspect": "Suspect",
+      "bad": "Bad",
+      "unknown": "Not evaluated"
+    },
+    "retention": {
+      "never": "Never expires",
+      "days": "{{count}} days",
+      "days_one": "{{count}} day",
+      "daysUnit": "days",
+      "source": {
+        "document": "Document",
+        "kb": "Knowledge base",
+        "tenant": "Tenant",
+        "system": "System default"
+      }
+    },
+    "unset": "Not set",
+    "total": "{{total}} total",
+    "empty": {
+      "noData": "No assets"
+    },
+    "error": {
+      "loadFailed": "Failed to load the asset list",
+      "retry": "Retry",
+      "forbidden": "You do not have access to the asset catalog"
+    },
+    "drawer": {
+      "title": "Asset Details",
+      "basic": "Basic Information",
+      "metadata": "Governance Metadata",
+      "mime": "MIME",
+      "size": "Size",
+      "ontology": "Ontology",
+      "access": "Access",
+      "sync": "Sync",
+      "lastSync": "Last sync",
+      "docs": "Docs",
+      "owner": "Owner",
+      "ownerPlaceholder": "Enter owner",
+      "domain": "Domain",
+      "domainPlaceholder": "Enter domain",
+      "sensitivity": "Sensitivity",
+      "sensitivityPlaceholder": "Unclassified",
+      "save": "Save",
+      "saving": "Saving",
+      "saved": "Saved",
+      "saveForbidden": "Only tenant admins, space managers or knowledge base managers can edit",
+      "saveFailed": "Failed to save. Please try again.",
+      "noChange": "No changes",
+      "loadFailed": "Failed to load asset details",
+      "notFound": "Asset not found or access denied",
+      "ownerMax": "Owner must be at most 128 characters",
+      "domainMax": "Domain must be at most 64 characters"
+    },
+    "lineage": {
+      "title": "Lineage",
+      "colSource": "Source",
+      "colDocument": "Document",
+      "colDownstream": "Downstream",
+      "colChunk": "Chunks",
+      "direction": "Direction",
+      "depth": "Depth",
+      "up": "Upstream",
+      "down": "Downstream",
+      "both": "Both",
+      "depth1": "1 level",
+      "depth2": "2 levels",
+      "empty": "No lineage data",
+      "loadFailed": "Failed to load lineage",
+      "truncated": "Showing first {{count}} only",
+      "truncatedEntities": "Entities: showing first {{count}} only",
+      "truncatedRelations": "Relations: showing first {{count}} only",
+      "truncatedChunks": "Chunks: showing first {{count}} only",
+      "collapsed": "{{count}} more nodes not shown",
+      "counts": "Entities {{entities}} · Relations {{relations}} · Citations {{citations}} · Chunks {{chunks}}",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "fit": "Fit",
+      "zoomHint": "Drag to pan, scroll to zoom"
+    },
+    "lifecycle": {
+      "title": "Lifecycle",
+      "createdAt": "Created At",
+      "archivedAt": "Archived At",
+      "effectivePolicy": "Effective Policy",
+      "retentionDays": "Retention",
+      "graceDays": "Grace Period",
+      "effectiveFrom": "Effective Level",
+      "source": "Source",
+      "documentOverride": "Document Override",
+      "inherit": "Inherit",
+      "saveOverride": "Save override",
+      "saved": "Retention policy saved",
+      "archive": "Archive",
+      "restore": "Restore",
+      "destroy": "Destroy",
+      "archiveConfirm": "Archiving \"{{name}}\" removes it from search but keeps the original; it can be restored.",
+      "restoreConfirm": "Restoring \"{{name}}\" will re-parse it into the knowledge base.",
+      "destroyConfirm": "Destroying \"{{name}}\" is irreversible; indexes and the original file will be deleted.",
+      "archiveSuccess": "Archived",
+      "restoreSuccess": "Restored",
+      "destroySuccess": "Destroyed",
+      "actionFailed": "Action failed. Please try again."
+    },
+    "policy": {
+      "title": "Retention Policy",
+      "tenant": "Tenant default",
+      "kb": "Knowledge base override",
+      "selectKb": "Select a knowledge base",
+      "save": "Save",
+      "saved": "Retention policy saved",
+      "saveFailed": "Failed to save. Please try again.",
+      "forbidden": "Only tenant admins, space managers or knowledge base managers can edit",
+      "viewForbidden": "You do not have access to this retention policy",
+      "loadFailed": "Failed to load the retention policy",
+      "kbLoadFailed": "Failed to load knowledge bases",
+      "empty": "Select a knowledge base to view and edit its retention policy",
+      "effective": "Current effective policy",
+      "inheritHint": "Leave blank to inherit from the parent level; the effective value is shown above.",
+      "hintRetention": "A retention of 0 means the asset never expires automatically.",
+      "hintGrace": "A grace period of 0 destroys archived assets on the next cleanup run.",
+      "hintDestroy": "Destroying is irreversible; indexes and the original file will be deleted."
     }
   }
 }

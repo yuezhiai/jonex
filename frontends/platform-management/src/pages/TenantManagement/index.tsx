@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Input, Modal, Result, Space, Table, Tag, message } from 'antd';
+import { Button, Input, Modal, Result, Space, Table, Tag, message } from 'antd';
 import type { TableProps } from 'antd';
 import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
@@ -7,14 +7,12 @@ import { useTranslation } from 'react-i18next';
 import { readCachedUser, type ShellUser } from '@jonex/shell-sdk';
 import { PageContent, PageHeader, PermButton, usePermission } from '@jonex/shared-lib';
 import {
-  TENANT_PAGE_SIZE_MAX,
   TENANT_READ_PERMISSION,
   TENANT_WRITE_PERMISSION,
   deleteTenant,
   listTenants,
   type TenantItem,
 } from '../../api/tenants';
-import { tenantDisplay } from '../../utils/tenantDisplay';
 import DisabledTip from '../../components/DisabledTip';
 import TenantFormModal, { type TenantFormModalRef } from '../../components/TenantFormModal';
 
@@ -42,14 +40,12 @@ export default function TenantManagement() {
   const [searchTerm, setSearchTerm] = useState('');
   const modalRef = useRef<TenantFormModalRef>(null);
 
-  const searching = searchTerm.length > 0;
-
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      // 列表接口没有关键字参数：搜索时退化为「拉一页上限数据 + 前端过滤」
-      const r = searching ? await listTenants(1, TENANT_PAGE_SIZE_MAX) : await listTenants(page, pageSize);
+      // 关键字交给后端（ID / 名称 / 描述模糊匹配），分页与 total 都由后端算 —— 本地过滤只看得到当前页
+      const r = await listTenants(page, pageSize, searchTerm);
       setTenants(r.items);
       setTotal(r.total);
     } catch (e: unknown) {
@@ -57,7 +53,7 @@ export default function TenantManagement() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, searching, t]);
+  }, [page, pageSize, searchTerm, t]);
 
   useEffect(() => {
     if (canRead) load();
@@ -71,15 +67,6 @@ export default function TenantManagement() {
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [search]);
-
-  const filtered = searching
-    ? tenants.filter((tenant) => {
-        const display = tenantDisplay(tenant, t);
-        return `${display.name} ${display.description} ${tenant.name} ${tenant.id}`
-          .toLowerCase()
-          .includes(searchTerm.toLowerCase());
-      })
-    : tenants;
 
   const openCreate = () => modalRef.current?.openCreate();
   const openEdit = (item: TenantItem) => modalRef.current?.openEdit(item);
@@ -120,17 +107,18 @@ export default function TenantManagement() {
       ),
     },
     {
+      // [jonex] 2026-10-15 名称/描述一律显示库里的原值。此前这里过 tenantDisplay()，
+      // 会把三个内置租户（tenant_jonex_{demo,alpha,beta}）的值换成 i18n 文案，
+      // 造成界面与库不一致（改个描述还会让名称跟着跳）；该层已整体去掉。
       title: t('tenantManagement.name'),
       dataIndex: 'name',
       key: 'name',
-      render: (_: string, tenant: TenantItem) => tenantDisplay(tenant, t).name,
     },
     {
       title: t('tenantManagement.description'),
       dataIndex: 'description',
       key: 'description',
       ellipsis: true,
-      render: (_: string | null, tenant: TenantItem) => tenantDisplay(tenant, t).description,
     },
     {
       title: t('common.status'),
@@ -230,28 +218,20 @@ export default function TenantManagement() {
               {t('tenantManagement.createTenant')}
             </PermButton>
           </div>
-          {searching && total > TENANT_PAGE_SIZE_MAX && (
-            <Alert
-              type="warning"
-              showIcon
-              style={{ marginBottom: 12 }}
-              message={t('tenantManagement.searchLimitHint', { total, limit: TENANT_PAGE_SIZE_MAX })}
-            />
-          )}
           <Table
             columns={columns}
-            dataSource={filtered}
+            dataSource={tenants}
             loading={loading}
             rowKey="id"
             pagination={{
               current: page,
-              pageSize: searching ? PAGE_SIZE_DEFAULT : pageSize,
-              total: searching ? filtered.length : total,
-              showSizeChanger: !searching,
+              pageSize,
+              total,
+              showSizeChanger: true,
               pageSizeOptions: ['10', '20', '50'],
               onChange: (p, ps) => {
                 setPage(p);
-                if (!searching) setPageSize(ps);
+                setPageSize(ps);
               },
             }}
             size="middle"

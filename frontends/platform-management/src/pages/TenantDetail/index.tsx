@@ -34,7 +34,6 @@ import {
   type SyncRecordSummary,
 } from '../../api/identityIntegration';
 import { fmtDateTime } from '../../utils/datetime';
-import { tenantDisplay } from '../../utils/tenantDisplay';
 import DisabledTip from '../../components/DisabledTip';
 import TenantFormModal, { type TenantFormModalRef } from '../../components/TenantFormModal';
 import SsoConfigDrawer from './SsoConfigDrawer';
@@ -236,8 +235,6 @@ export default function TenantDetail() {
     );
   }
 
-  const display = tenantDisplay(tenant, t);
-
   const dl = (key: string) => t(`tenantManagement.detail.${key}`);
   const di = (key: string, options?: Record<string, unknown>) => t(`tenantManagement.identity.${key}`, options);
   /** 同步抽屉/弹窗共用的一批文案（与 SyncNowModal / SyncConfigDrawer 的 dl 同命名空间） */
@@ -265,7 +262,7 @@ export default function TenantDetail() {
 
   // 基本信息：一行四个（名称/ID/状态/备注）
   const basicItems: DescriptionsProps['items'] = [
-    { key: 'name', label: dl('name'), children: <Text strong>{display.name}</Text> },
+    { key: 'name', label: dl('name'), children: <Text strong>{tenant.name}</Text> },
     { key: 'id', label: dl('id'), children: <Text code>{tenant.id}</Text> },
     {
       key: 'status',
@@ -280,7 +277,7 @@ export default function TenantDetail() {
     {
       key: 'remark',
       label: dl('remark'),
-      children: display.description || <Text type="secondary">—</Text>,
+      children: tenant.description || <Text type="secondary">—</Text>,
     },
   ];
 
@@ -402,7 +399,7 @@ export default function TenantDetail() {
         backTo={() => navigate('/tenant-management')}
         title={
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
-            {display.name}
+            {tenant.name}
             <Tag style={{ fontFamily: 'var(--yx-font-mono)' }}>{tenant.id}</Tag>
           </span>
         }
@@ -445,7 +442,7 @@ export default function TenantDetail() {
               type="warning"
               showIcon
               message={di('tenantMismatchTitle')}
-              description={di('tenantMismatchDesc', { current: currentTenantId || DASH, target: display.name })}
+              description={di('tenantMismatchDesc', { current: currentTenantId || DASH, target: tenant.name })}
             />
           ) : (
             <>

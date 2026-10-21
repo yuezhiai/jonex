@@ -6,7 +6,6 @@ import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sd
 import { PageContent, PageHeader } from '@jonex/shared-lib';
 import { listAllUsers, listUsers, type UserItem } from '../../api/users';
 import { listTenants, getTenantUserCounts, type TenantItem } from '../../api/tenants';
-import { tenantDisplay } from '../../utils/tenantDisplay';
 import UserFormModal, { type UserFormModalHandle } from './UserFormModal';
 import ToggleStatusModal, { type ToggleStatusModalHandle } from './ToggleStatusModal';
 import DeleteConfirmModal, { type DeleteConfirmModalHandle } from './DeleteConfirmModal';
@@ -248,7 +247,7 @@ export default function UserManagement() {
                   className={`tenant-item${activeTenant === tenant.id ? ' active' : ''}`}
                   onClick={() => setActiveTenant(tenant.id)}
                 >
-                  <span>{tenantDisplay(tenant, t).name}</span>
+                  <span>{tenant.name}</span>
                   <span className="tenant-count">{tenant.userCount}</span>
                 </div>
               ))}
