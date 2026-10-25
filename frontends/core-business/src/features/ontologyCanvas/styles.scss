@@ -1,0 +1,518 @@
+@use '@xyflow/react/dist/style.css';
+
+/**
+ * 本体画布样式。
+ *
+ * 选择器与规则提取自 nexonto 的 `apps/web/src/styles.css`（原文件 4477 行，
+ * 画布相关只占 70 条规则 / 331 行——其余是 AI Shell / 抽取会话那些被裁掉的部分）。
+ *
+ * ⚠️ 变量用 `.ontology-canvas-page` 作用域而不是 `:root`：这些色值取自 nexonto 的
+ * 设计系统，与 Jonex 的 token 不是一套。写在 :root 会全局覆盖 Jonex 的样式。
+ */
+
+.ontology-canvas-page {
+  --navy: #0b2b5c;
+  --blue: #3b82f6;
+  --blue-dark: #2563eb;
+  --border: #d9e2ec;
+  --muted: #65758b;
+  --surface: #fff;
+  --danger: #dc2626;
+  --shadow: 0 5px 18px rgba(18, 49, 86, .08);
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #f0f4f8;
+}
+
+.ontology-canvas-loading {
+  display: grid;
+  place-items: center;
+  height: 100%;
+}
+
+.ontology-canvas-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.ontology-canvas-issues {
+  margin: 8px 16px 0;
+  flex: none;
+}
+
+/* 回落提示条：**只占一行**。
+   对比 .ontology-canvas-issues 那种整块 Alert（message + description 两行起步），
+   画布页的垂直空间是稀缺的——提示、校验条各占一块，编辑区就所剩无几。
+   单行 + 省略号，完整解释走 tooltip。 */
+.ontology-canvas-notice {
+  flex: none;
+  padding: 5px 16px;
+  background: #eef4ff;
+  border-bottom: 1px solid #d3e2fb;
+  color: #1d4ed8;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 抽象投影只读条：比「回落」信息条更重的警示（保存已停用） */
+.ontology-canvas-notice--blocked {
+  background: #fff7e6;
+  border-bottom-color: #ffe0a3;
+  color: #b45309;
+}
+
+.ontology-canvas-body {
+  display: grid;
+  grid-template-columns: 240px 1fr 340px;
+  min-height: 0;
+  flex: 1;
+}
+
+.ontology-canvas-list {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  padding: 8px;
+}
+
+.ontology-canvas-list-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 12px 8px;
+}
+
+.ontology-canvas-list-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+
+  &:hover { background: #f5f8fc; }
+
+  &.is-selected {
+    background: #eaf2ff;
+    border-color: var(--blue);
+  }
+
+  .name {
+    font-size: 13px;
+    color: var(--navy);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .code {
+    grid-column: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .count {
+    grid-row: 1 / span 2;
+    grid-column: 2;
+    align-self: center;
+    font-size: 11px;
+    color: var(--muted);
+  }
+}
+
+.form-field  {
+
+ display: grid; gap: 6px; min-width: 0;
+
+}
+.form-row  {
+
+ display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+
+}
+.properties-panel  {
+
+ min-width: 0; background: #fff; overflow: auto; position: relative; z-index: 5;
+
+}
+.properties-panel  {
+
+ border-left: 1px solid var(--border);
+
+}
+/* 数据集常驻区块:钉在左栏底部(flex:none 不参与上方伸缩),标题行可折叠 + 右侧上传按钮。
+   自包含定位属性(不复用 .subsection-heading)——避免与其 margin/padding/border 覆盖顺序耦合。 */
+.dataset-block  {
+
+ /* flex 列:头(标题/上传)与操作区 flex:none,中间文件列表伸缩内滚 —— 选中文件后
+    出现的操作按钮因此固定在区块底部,不随列表滚走 */
+ display: flex; flex-direction: column; flex: none; border-top: 1px solid #e9eef4; background: #fff;
+
+}
+.canvas-wrap  {
+
+ position: relative; min-width: 0; min-height: 0; background-color: #edf2f7; background-image: radial-gradient(#cbd7e5 1px, transparent 1px); background-size: 18px 18px;
+
+}
+.canvas-wrap .react-flow  {
+
+ position: absolute; inset: 0;
+
+}
+.entity-node  {
+
+ width: 220px; background: #fff; border: 1px solid #b9c9dc; border-radius: 9px; box-shadow: 0 5px 16px rgba(15,46,82,.12); overflow: hidden;
+
+}
+.entity-node-selected  {
+
+ border: 2px solid var(--blue); box-shadow: 0 0 0 3px rgba(59,130,246,.13), 0 6px 18px rgba(15,46,82,.15);
+
+}
+.entity-node-header  {
+
+ background: #eaf2ff; border-bottom: 1px solid #d5e2f3; padding: 9px 11px; display: flex; flex-direction: column; gap: 2px;
+
+}
+.entity-node-header strong  {
+
+ color: var(--navy);
+
+}
+.entity-node-header code  {
+
+ color: var(--muted); font-size: 10px;
+
+}
+.entity-node-sources  {
+ display: flex; flex-wrap: wrap; gap: 3px; margin-top: 3px;
+}
+.entity-node-source  {
+ display: inline-block; color: #fff; font-size: 9px; line-height: 16px; border-radius: 999px; padding: 0 6px; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.entity-node-attributes  {
+
+ padding: 6px 10px; min-height: 38px;
+
+}
+.entity-node-attributes > div  {
+
+ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eef2f6; font-size: 11px;
+
+}
+.entity-node-attributes > div span  {
+
+ display: flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis;
+
+}
+/* AI 合入新增属性行:绿标(与 node-added 同族);应用确认后清 addedMark 回常规色 */
+.entity-node-attributes > div.entity-attr-added  {
+
+ color: #047857; font-weight: 600;
+
+}
+.entity-node-attributes > div.entity-attr-added small  {
+
+ color: #059669;
+
+}
+.entity-node-attributes small, .node-empty  {
+
+ color: var(--muted);
+
+}
+/* 节点属性「展开」:节点只预览 6 条,余下折成一条整行可悬停的「+N」;
+   悬停时在节点正下方续出**未显示过**的属性行 —— 同宽、顶边无缝、节点底角改方,
+   拼起来就是「节点向下长出了几行」。浮层走 portal 挂到 body:避开 .entity-node 的
+   overflow:hidden(会裁剪)与画布 transform(fixed 会退化成跟随缩放),故这里用 fixed 定位。 */
+.entity-node-more { display: block; width: 100%; padding: 5px 0; border: none; border-top: 1px dashed #dbe5f0; background: transparent; color: #3478ee; font-size: 11px; line-height: 1.5; cursor: pointer; }
+.entity-node-more:hover, .entity-node-more:focus-visible { background: #f2f7ff; outline: none; }
+/* 展开态:节点底角改方、底边与投影让位给下方浮层,两块拼成一个整体(不再是「节点 + 独立面板」) */
+.entity-node-expanded { border-bottom-left-radius: 0; border-bottom-right-radius: 0; border-bottom-color: transparent; box-shadow: none; }
+.entity-attr-panel { position: fixed; z-index: 40; overflow-y: auto; padding-bottom: 4px; background: #fff; border: 1px solid #b9c9dc; border-top: none; border-radius: 0 0 9px 9px; box-shadow: 0 5px 16px rgba(15,46,82,.12); }
+.entity-attr-panel > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 10px; border-bottom: 1px solid #eef2f6; font-size: 11px; }
+.entity-attr-panel > div:last-child { border-bottom: none; }
+.entity-attr-panel > div span { display: flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; }
+.entity-attr-panel > div.entity-attr-added { color: #047857; font-weight: 600; }
+.entity-attr-panel small { color: var(--muted); }
+.entity-node .react-flow__handle  {
+
+ width: 9px; height: 9px; background: var(--blue); border: 2px solid #fff;
+
+}
+.canvas-empty  {
+
+ pointer-events: none; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+
+}
+.canvas-hint  {
+
+ position: absolute; left: 12px; bottom: 10px; background: rgba(255,255,255,.9); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--muted); font-size: 10px; pointer-events: none;
+
+}
+.properties-empty  {
+
+ display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted);
+
+}
+.properties-empty h3  {
+
+ font-size: 15px; margin-bottom: 5px;
+
+}
+.properties-content  {
+
+ padding: 15px; display: grid; gap: 13px;
+
+}
+.panel-heading, .subsection-heading  {
+
+ display: flex; align-items: center; justify-content: space-between; gap: 8px;
+
+}
+.panel-heading h2  {
+
+ margin: 0; font-size: 16px;
+
+}
+.subsection-heading  {
+
+ margin-top: 5px; padding-top: 13px; border-top: 1px solid var(--border);
+
+}
+.subsection-heading h3  {
+
+ margin: 0; font-size: 13px;
+
+}
+.attribute-editor-list  {
+
+ display: grid; gap: 10px;
+
+}
+.attribute-editor  {
+
+ border: 1px solid var(--border); border-radius: 8px; background: #f9fbfd; padding: 10px; display: grid; gap: 9px;
+
+}
+.attribute-editor-top  {
+
+ display: flex; align-items: center; justify-content: space-between; gap: 8px;
+
+}
+.attribute-editor-top > div  {
+
+ display: flex;
+
+}
+.rule-list {
+
+ display: grid; gap: 6px;
+
+}
+.rule-list-item {
+
+ display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: #f9fbfd; font: inherit; font-size: 12px; text-align: left; cursor: pointer;
+
+}
+.rule-list-item.is-selected {
+
+ background: #eaf2ff; border-color: var(--blue);
+
+}
+.rule-list-type {
+
+ color: #5b6b83;
+
+}
+.rule-list-target {
+
+ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #0b2b5c;
+
+}
+.rule-expression {
+
+ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.6;
+
+}
+.check-row  {
+
+ display: flex; align-items: center; gap: 14px;
+
+}
+.check-row label  {
+
+ display: flex; align-items: center; gap: 6px; font-size: 12px;
+
+}
+.check-row input  {
+
+ width: auto;
+
+}
+.relation-mode-hint  {
+
+ position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 4; padding: 8px 12px; border-radius: 7px; background: #0b2b5c; color: #fff; box-shadow: var(--shadow); font-size: 12px; font-weight: 650; pointer-events: none;
+
+}
+.induction-panel-heading  {
+
+ display: flex; align-items: center; padding-bottom: 11px; border-bottom: 1px solid #d9e1ec;
+
+}
+/* 实体浏览「展开浏览」区样式已随该功能下线(2026-09-11) */
+
+/* 续抽入库「新增」高亮:实体头 + 关系边(仅当前会话,重开恢复统一色) */
+.react-flow__node.node-added .entity-node  {
+
+ border-color: #34d399;
+
+}
+.react-flow__node.node-added .entity-node-header  {
+
+ background: #d7f4e6; border-bottom-color: #b9e8d2;
+
+}
+.react-flow__node.node-added .entity-node-header strong  {
+
+ color: #065f46;
+
+}
+.react-flow__node.node-added .entity-node-header code  {
+
+ color: #047857;
+
+}
+.canvas-added-hint  {
+
+ position: absolute; right: 12px; bottom: 10px; z-index: 4; padding: 5px 9px; border: 1px solid #b9e8d2; border-radius: 6px; background: rgba(255, 255, 255, .94); color: #047857; font-size: 11px; box-shadow: 0 2px 10px rgba(15, 46, 82, .1); pointer-events: none;
+
+}
+.guard-mono  {
+
+ font-family: Consolas, monospace;
+
+}
+/* 草稿预览页(frontend-design:只读画布 + 绿色新增提示条) */
+/* 单画布全宽:preview 只挂 canvas-wrap 一个子元素,三列 grid 会把它 auto-placement 进 260px 首列 → 覆盖成单列 */
+.model-workspace-preview { grid-template-columns: minmax(0, 1fr); }
+.model-workspace-preview .canvas-wrap { background-color: #f6f9fc; }
+/* ══ TBox 字段控件(关系端点/逆关系/基数 + 实体抽取技能)══════════════
+   语言约定:机器词汇(类型 code、基数、技能 id)一律 mono —— 与 .guard-mono 同字面,
+   把「这是 wire 格式,不是文案」编码进字形;
+   结构即信息:端点集合里**声明的本类型是锁定芯片**(知识库编译器要求集合必含它),
+   额外允许的类型是可移除芯片 —— 用户一眼看出哪些是底线、哪些是自己加的。
+   签名元素 = 关系基数的「形状格」:基数本身就是一个形状(ER 图里画的就是箭头两端的 1/N)。 */
+.type-chips  {
+
+ position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+
+}
+.type-chip  {
+
+ display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 3px 9px; font-size: 11.5px; max-width: 100%;
+
+}
+.type-chip-name  {
+
+ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;
+
+}
+.type-chip--core  {
+
+ background: #e8eefb; border: 1px solid #c7d7f0; color: var(--navy); font-weight: 600;
+
+}
+.type-chip-lock  {
+
+ flex: none; opacity: .55;
+
+}
+.type-chip--extra  {
+
+ background: #fff; border: 1px solid var(--border); color: var(--blue-dark);
+
+}
+.type-chip-remove  {
+
+ flex: none; border: 0; background: transparent; padding: 0; line-height: 0; color: #7f9bc4;
+
+}
+.type-chip-remove:hover  {
+
+ color: var(--danger);
+
+}
+.type-add  {
+
+ display: inline-flex; align-items: center; gap: 4px; border: 1px dashed #c2d2e6; background: transparent;
+ color: var(--muted); border-radius: 999px; padding: 3px 9px; font-size: 11.5px;
+
+}
+.type-add:hover  {
+
+ border-color: var(--blue); color: var(--blue-dark); background: #f5f9ff;
+
+}
+.type-picker  {
+
+ position: absolute; top: calc(100% + 6px); left: 0; z-index: 60; min-width: 220px; max-height: 240px; overflow: auto;
+ background: #fff; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgba(5, 25, 55, .16);
+ padding: 5px; display: flex; flex-direction: column; gap: 2px;
+
+}
+.type-picker-item  {
+
+ display: flex; align-items: baseline; gap: 8px; width: 100%; border: 0; background: transparent; border-radius: 7px;
+ padding: 6px 8px; text-align: left; font-size: 12.5px; color: #334155;
+
+}
+.type-picker-item:hover  {
+
+ background: #eef4ff; color: #1d4ed8;
+
+}
+.type-picker-name  {
+
+ flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+
+}
+.type-picker-code  {
+
+ flex: none; font-family: Consolas, monospace; font-size: 10.5px; color: var(--muted);
+
+}
+.type-picker-empty  {
+
+ margin: 0; padding: 8px; font-size: 12px; color: var(--muted);
+
+}
+
+/* 画布容器：React Flow 需要一个明确高度的父级 */
+.canvas-wrap {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}

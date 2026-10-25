@@ -1,0 +1,253 @@
+/**
+ * 多源视图样式。与编辑画布（../styles.scss）同族配色，但**不复用**
+ * `.ontology-canvas-*` 作用域——两边可以单独演进。
+ */
+
+.ms-view {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  background: #f0f4f8;
+}
+
+.ms-side {
+  width: 240px;
+  flex: none;
+  background: #fff;
+  border-right: 1px solid #d9e2ec;
+  overflow: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ms-side-block h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #0b2b5c;
+}
+
+.ms-side-empty {
+  margin: 0;
+  font-size: 12px;
+  color: #65758b;
+  line-height: 1.6;
+}
+
+.ms-source-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ms-source-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.ms-source-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-source-count {
+  color: #65758b;
+  flex: none;
+}
+
+.ms-concept-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 1px solid #d9e2ec;
+  background: #fff;
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ms-concept-row.is-selected {
+  border-color: #9333ea;
+  background: #faf5ff;
+}
+
+.ms-concept-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-concept-links {
+  color: #9333ea;
+  flex: none;
+}
+
+.ms-concept-stale {
+  color: #d97706;
+  flex: none;
+}
+
+.ms-canvas {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ms-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: #fff;
+  border-bottom: 1px solid #d9e2ec;
+  font-size: 12px;
+}
+
+.ms-toolbar-counts {
+  color: #65758b;
+  flex: 1;
+}
+
+.ms-canvas-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* 区域框：画在 React Flow 视口坐标系里（ViewportPortal），负 z 让它垫在节点/边下面。
+   视口 div 带 transform（形成层叠上下文），负 z 子元素仍画在其背景之上、其余子元素之下。 */
+.ms-region {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px dashed;
+  border-radius: 12px;
+  z-index: -1;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.ms-region-label {
+  position: absolute;
+  top: 6px;
+  left: 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* ── 节点（只读）── */
+.ms-node {
+  width: 220px;
+  background: #fff;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  box-shadow: 0 5px 18px rgba(18, 49, 86, 0.08);
+  overflow: hidden;
+}
+
+.ms-node-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.ms-node-header strong {
+  flex: 1;
+  font-size: 13px;
+  color: #0b2b5c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-node-badge {
+  flex: none;
+  color: #fff;
+  font-size: 10px;
+  border-radius: 999px;
+  padding: 1px 7px;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-node-code {
+  display: block;
+  padding: 4px 10px 0;
+  font-size: 11px;
+  color: #65758b;
+}
+
+.ms-node-attributes {
+  padding: 4px 10px 8px;
+  font-size: 12px;
+  color: #334155;
+}
+
+.ms-node-attributes > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ms-node-attributes small {
+  color: #94a3b8;
+}
+
+.ms-node-more {
+  padding: 0 10px 6px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.ms-node-concepts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 10px 8px;
+}
+
+.ms-node-concept {
+  font-size: 10px;
+  color: #7c3aed;
+  border: 1px solid #ddd6fe;
+  background: #f5f3ff;
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.ms-node-hl .ms-node {
+  box-shadow: 0 0 0 2px #9333ea, 0 5px 18px rgba(18, 49, 86, 0.08);
+}
+
+.ms-node-dim .ms-node {
+  opacity: 0.18;
+}
+
+.ms-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 8px;
+  font-size: 11px;
+  color: #65758b;
+  pointer-events: none;
+  z-index: 5;
+}
