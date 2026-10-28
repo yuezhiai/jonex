@@ -51,6 +51,12 @@ It is an end-to-end enterprise AI knowledge platform that turns raw content into
   <img src="./docs/assets/jonex-knowledge-pipeline.png" alt="Jonex knowledge pipeline: from multimodal raw data to actionable knowledge" width="100%" />
 </p>
 
+## Jonex Wiki
+
+Ontology+Wiki, one of Jonex's core engines, is powered by [Jonex Wiki](https://github.com/yuezhiai/jonex-wiki). Jonex Wiki is an LLM Wiki processing engine that follows the OKF format. As a sub-project spun out of Jonex, it offers semantic understanding and intelligent retrieval, knowledge structuring and automatic linking, natural language Q&A, continuous knowledge accumulation and collaborative updates, and full source traceability — lowering the barrier to knowledge access and improving knowledge reuse efficiency.
+
+Welcome to try it out! [Get started](https://github.com/yuezhiai/jonex-wiki)
+
 ## Quick Start
 
 Docker Compose is the fastest way to run the complete platform.

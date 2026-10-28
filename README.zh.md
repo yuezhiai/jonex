@@ -52,6 +52,12 @@ Jonex 将一站式多模态解析引擎与 AI 就绪的知识引擎融为一体�
   <img src="./docs/assets/jonex-knowledge-pipeline-zh.png" alt="Jonex 知识流水线：从多模态原始数据到可行动的知识" width="100%" />
 </p>
 
+## Jonex Wiki
+
+Jonex 的核心引擎之一 Ontology+Wiki 由 [Jonex Wiki](https://github.com/yuezhiai/jonex-wiki) 提供支持；Jonex Wiki 是一款遵循 OKF 格式的 LLM Wiki 处理引擎，作为从 Jonex 独立出去的子项目，它具备语义理解与智能检索、知识结构化与自动关联、自然语言问答、知识持续沉淀与协作更新以及来源可追溯等优点，能降低知识获取门槛并提升知识复用效率。
+
+欢迎试用！[点击跳转](https://github.com/yuezhiai/jonex-wiki)
+
 ## 快速开始
 
 Docker Compose 是运行完整平台最快的方式。
