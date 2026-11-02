@@ -1369,37 +1369,27 @@ class SubtaskRepository(BaseRepository[Subtask]):
         result = await self.session.execute(stmt)
         return list(result.scalars())
 
-    async def count_running_by_catalog_step(
-        self, step_code: str, task_catalog_code: str
-    ) -> int:
-        """数「**同一个内置目录下的同一个步骤**」当前有多少个在跑（并发上限判定用，§6.3）。
+    async def count_running_by_step(self, step_code: str) -> int:
+        """数「**同一个步骤**」当前有多少个在跑（并发上限判定用，§6.3）。
 
-        口径：`subtasks.status = running`、`subtasks.step_code` 相同、**且所属任务的
-        `tasks.task_catalog_code` 相同**、且两侧都未被假删。
+        口径：`subtasks.status = running`、`subtasks.step_code` 相同、两侧都未被假删。
 
-        ── 为什么是「目录 + 步骤」，不是「全平台 + 步骤」（2026-10-14 改）──
+        ── 2026-10-23：目录维度已删除 ──
 
-        改之前只按 `step_code` 数：**全平台所有目录、所有租户共用一份名额**。后果实测过：
+        以前按「内置任务目录 + 步骤」各给一份名额（2026-10-14 改），为的是避免
+        `file_processing_jonex_wiki` 的 10 个 `compile` 堵死另一个目录的 `compile`。
+        任务类型这一层随「可自由编排」一起下线后，步骤清单全局唯一，只剩
+        `runner_code + step_code` 这一组口径 —— 而 `runner_code` 由 `step_code`
+        唯一决定，所以查询退化为**按 `step_code` 数全平台在跑数**。
 
-        > `file_processing_jonex_wiki` 的 10 个 `compile` 卡住不结束，
-        > **另一个目录 `file_processing_ontology` 的 `compile` 一个都派不出去** ——
-        > 两者互不相干，却排在同一份额度后面，队头一堵全体饿死（2026-10-14 那次
-        > 三条任务从头到尾没被派发，就是这么来的）。
-
-        现在：**每个目录的每个步骤各有一份名额**，上限数值取该目录那一行配置的
-        `max_concurrency`（`ctx.catalog_steps` 本来就是按本任务的目录查出来的）。
-        同一个目录内、同一个步骤挂在多个节点上（`parse_1` / `parse_2`）**仍然共享**
-        这一份 —— **这一条没变**，变的是「跨目录不再互相占位」。
-
-        ⚠️ **总量会翻**：全平台最大并发从「N」变成「Σ(每个目录各 N)」。这是 2026-10-14
-        明确接受的代价（上限数值仍按目录各配 10）。要收紧就得逐目录调那个数。
+        ⚠️ **这是明确接受的回归**：跨任务/跨定义的饿死会重新出现。要隔离时，
+        把这里换成按 `tasks.definition_id` 分组（`Task` 已经在 join，加一个条件即可）。
 
         ── 为什么现在要 join `tasks` ──
 
-        目录码在 `tasks` 上，`subtasks` 没有这一列，所以必须 join（改之前是「不 join
-        任何表」）。join 之后顺手带上 `Task.is_deleted == 0`：「已删任务的残留不吃名额」
-        这条保证从**只靠 `delete_task` 的级联**，变成**级联 + 本查询显式过滤**两道。
-        多这一道不改变正常行为，只是把那条依赖显式写出来。
+        即使不再比目录码，也要靠 `Task.is_deleted == 0` 把「已删任务的残留」排除在
+        名额之外。join 之后顺手带上这条，「已删任务的残留不吃名额」就从**只靠
+        `delete_task` 的级联**，变成**级联 + 本查询显式过滤**两道。
 
         ⚠️ 仍然要盯的可见状态：**「任务已假删、子任务还在跑」**（级联漏了才会出现）——
         此时本查询数不到它（好事，不吃名额），**但超时巡检也收不到它**（那边内连接
@@ -1412,7 +1402,6 @@ class SubtaskRepository(BaseRepository[Subtask]):
             .join(Task, Task.id == Subtask.task_id)
             .where(
                 Subtask.step_code == step_code,
-                Task.task_catalog_code == task_catalog_code,
                 Subtask.status == SubtaskStatus.RUNNING.value,
                 Subtask.is_deleted == 0,
                 Task.is_deleted == 0,
@@ -1480,7 +1469,7 @@ class SubtaskRepository(BaseRepository[Subtask]):
         **不按运行筛**（`task_service.handle_timeout` 里也照着复核）。
 
         不筛运行的理由是**旧运行遗留的 `running` 必须能被收掉**：它照样占着
-        `count_running_by_catalog_step` 数出来的并发名额（那个统计只认 `step_code`、
+        `count_running_by_step` 数出来的并发名额（那个统计只认 `step_code`、
         目录码与 `running`，**不分运行**），而除了这一趟它再没有别的出路 ——
         派活只捞当前运行的 `pending`、防僵尸只捞 `pending`、控制台只列当前运行。
         典型来源：任务被「停止」时那个杀不掉的 `running`（§4.4），用户随后 `retry_task`

@@ -415,6 +415,8 @@ ERROR_PARAMS_MAX_BYTES = 4096
 ERROR_REASON_CODES: Tuple[str, ...] = (
     # ── 任务中心**自己产生**的（运行方不会发这些）──
     "err.task_center.task.stopped_by_user",
+    # 2026-10-23：内置任务清单下线时，由迁移 SQL 直接判失败的在途任务
+    "err.task_center.task.catalog_removed",
     # 任务级收口那条「零件拼接」的外壳（零件放在 `error_params["parts"]`）
     "err.task_center.task.aggregate_failed",
     "err.task_center.subtask.runner_unbound",

@@ -762,19 +762,16 @@ class TaskService:
         # 运行方名单在**这里**钉死。只有这一刻版本必然还在（上面刚 `get_version` 过），
         # 而 `task.delete` 需要在「定义已经被删掉」的情况下照样知道该找谁清残留 ——
         # 详见 `_runner_capabilities_for_task` 的说明。
-        runner_capability_ids = await self._runner_capabilities(
-            definition.task_catalog_code, config
-        )
+        runner_capability_ids = await self._runner_capabilities(config)
 
         now = datetime.now()
         task_values: dict[str, Any] = {
             "tenant_id": tenant_id,
             "definition_id": definition_id,
             "definition_version_no": locked_no,
-            # 编排快照 + 内置清单编码快照：钉在这里，此后推进这条任务**再不反查**
-            # 版本与定义（理由见 `Task.definition_config` 的说明）。
+            # 编排快照：钉在这里，此后推进这条任务**再不反查**版本与定义
+            # （理由见 `Task.definition_config` 的说明）。
             "definition_config": config,
-            "task_catalog_code": definition.task_catalog_code,
             "space_id": task_space_id,
             "task_name": task_name,
             "trigger_id": trigger_id,
@@ -1186,7 +1183,7 @@ class TaskService:
         #
         #    **不属于当前运行的上报从前是直接丢弃的**，理由是不许它去动任务快照。但丢弃
         #    等于把一条真的跑完的活记成「还在跑」——**并发名额永远收不回来**（
-        #    `count_running_by_catalog_step` 只数 `running`、不分运行）。它会积在哪个场景：
+        #    `count_running_by_step` 只数 `running`、不分运行）。它会积在哪个场景：
         #    任务被「停止」时那个正在跑的子任务杀不掉、留在 `running`（§4.4），用户随后
         #    `retry_task` 换了运行，旧那行就再没有任何一趟捞得到它。
         #
@@ -1474,7 +1471,7 @@ class TaskService:
         """列子任务；不给 `attempt` 默认列**最新一次运行**的（§4.3）。
 
         **回裸数组、不回对象**：`task.subtask_list` 在 §4.0「分页」的「不设分页」名单里
-        （`runner.list` / `def.catalog_list` / `def.catalog_steps` 也在那个名单），§4.3
+        （`runner.list` / `def.catalog_steps` 也在那个名单），§4.3
         它自己的「返回」写的正是「`data` = 子任务数组（不分页）」。包一层
         `{"items": [...]}` 会让照文档写的调用方取不到东西。
         """
@@ -2738,7 +2735,7 @@ class TaskService:
         **一律不动它们的状态**：它们会一直跑到自己结束，届时照常上报，`_advance` 照常
         把状态按上报填进去（`running → success/failed` 这条 CAS 只看子任务自己，不看任务）。
 
-        那条还在跑的行**必须有出口，否则它会一直占着并发名额**（`count_running_by_catalog_step`
+        那条还在跑的行**必须有出口，否则它会一直占着并发名额**（`count_running_by_step`
         只数 `running`、不分运行）。两个出口都给足了：**跑完上报能收它**（即使用户停完又
         `retry_task` 换了运行 —— `_absorb` 不再丢弃旧运行的上报，只收它自己那一行）；**真卡死
         就靠超时巡检兜底**（`list_timed_out_for_patrol` 不按运行筛）。两条路都碰不到任务快照
@@ -3510,7 +3507,7 @@ class TaskService:
             #    **代价（有意接受）**：真·临时故障（502/503/504 抖那么一下、运行方自己
             #    依赖的东西正好在重启）也会在约 7 秒内被判死。换来的是不用挂满
             #    `timeout_seconds`（内置步骤 25200 秒）才有人过问，而且并发名额当场释放
-            #    （`count_running_by_catalog_step` 只认 `running`）。
+            #    （`count_running_by_step` 只认 `running`）。
             if result.dead_after_retry:
                 logger.error(
                     "[TaskCenter] 派活连撞 %d 次都没成，判死 node=%s capability=%s：%s",
@@ -3761,7 +3758,7 @@ class TaskService:
         真卡死时就**只剩这一趟能兜住它**。加一道「任务得活跃」的闸，它就会永远挂着。
 
         ⚠️ **也不看「是不是当前运行」**（从前看）。旧运行遗留的 `running` 一样要收：它
-        同样占着 `count_running_by_catalog_step` 数出来的并发名额（那个统计**只认目录码、
+        同样占着 `count_running_by_step` 数出来的并发名额（那个统计**只认目录码、
         `step_code` 与 `running`，不分运行**），而旧运行这一行已经没有任何别的出路 —— 派活只捞当前
         运行的 `pending`、防僵尸只捞 `pending`、控制台只列当前运行。不收就成了一个谁也
         看不见、却一直在吃名额的僵尸，攒够 `max_concurrency` 条就再也派不出这一步的活。
@@ -3948,9 +3945,7 @@ class TaskService:
         if attempt is None:
             return None
         subtasks = await self._subtasks.list_by_attempt(tenant_id, task_attempt_id)
-        catalog_steps = await self._catalog_steps.map_by_step_code(
-            task.task_catalog_code or ""
-        )
+        catalog_steps = await self._catalog_steps.map_by_step_code()
         return RunContext(
             task=task,
             attempt=attempt,
@@ -3975,11 +3970,8 @@ class TaskService:
         **身份是 `node_id`，`step_code` 只用来查内置清单**（§3.5）：`subtask_name` 按
         `step_code` 去 `task_catalog_steps` 取人名，`node_id` 原样落库做节点身份。
         """
-        # 内置清单编码取任务行上的快照（建任务时抄的），不反查定义 —— 理由同
-        # `Task.task_catalog_code` 的说明。
-        catalog_steps = await self._catalog_steps.map_by_step_code(
-            task.task_catalog_code or ""
-        )
+        # 步骤清单是全局只读表（parse / compile），直接整表读，不再按任务类型过滤。
+        catalog_steps = await self._catalog_steps.map_by_step_code()
 
         rows = []
         for step in config.get("steps") or []:
@@ -4064,12 +4056,11 @@ class TaskService:
             # 上游后面的节点两条路都不经过（填值只在依赖满足时发生），漂移会一条日志都没有。
             # ⚠️ 下面这句别读成「运行方会收到一份空入参」—— 它指的是这一列被收口成了空值。
             logger.warning(
-                "[TaskCenter] 步骤 %s（节点 %s）在内置清单 %s 里没有定义，"
+                "[TaskCenter] 步骤 %s（节点 %s）不在全局步骤清单里，"
                 "本步入参将按无 schema 收口（值可能整批丢空）；"
                 "该步在派活时也会因同一原因判死: task=%s",
                 subtask.step_code,
                 subtask.node_id,
-                ctx.task.task_catalog_code,
                 ctx.task.id,
             )
         inputs = evaluate_bindings(
@@ -4126,24 +4117,27 @@ class TaskService:
     # ========================================================
 
     async def _over_concurrency(self, ctx: RunContext, subtask: Subtask) -> bool:
-        """这一步在**本目录内**的在跑数是否已达 `max_concurrency`（§6.3）。没配就是不限。
+        """这一步的在跑数是否已达 `max_concurrency`（§6.3）。没配就是不限。
 
-        **统计口径＝`task_catalog_code` + `step_code`**（2026-10-14 改，原文写的是
-        「全局只看 `step_code`」）：限流管的是「**本目录里这类活**最多同时几个」。
+        **统计口径＝`runner_code` + `step_code`**（2026-10-23 随「内置任务」下线调整）。
 
-        改的原因实测过：`file_processing_jonex_wiki` 的 10 个 `compile` 卡住不结束，
-        **另一个目录 `file_processing_ontology` 的 `compile` 就一个都派不出去** ——
-        两个目录互不相干，却共用一份名额，队头一堵全体饿死。改完两个目录各有一份。
+        为什么不按「每个目录各一份」了：目录 / 任务类型这一层已经删除，`step_code`
+        在全局步骤清单里唯一，`runner_code` 也由它唯一决定 —— 所以这一口径在 SQL 上
+        退化为「按 `step_code` 统计全平台在跑数」。把 `runner_code` 写进口径是为了将来
+        同一个 `step_code` 能绑不同运行方时语义不变（那时统计要 join 全局步骤表）。
 
-        **同目录内不变的那部分**：同一个 `step_code` 挂在多个节点上
-        （`parse_1` / `parse_2`）**仍然共享**这一个上限，跟 `node_id` 无关。
+        **同一个 `step_code` 挂在多个节点上**（`parse_1` / `parse_2`）**仍然共享**
+        这一个上限，跟 `node_id` 无关。
 
-        上限**数值**取本节点所属目录配的那个：`ctx.catalog_steps` 是按本任务的
-        `task_catalog_code` 查出来的（`_load_context` / `_build_context` 都这么装），所以
-        `catalog_steps.get(step_code)` 拿到的正是它自己那一行的 `max_concurrency`。
+        上限**数值**取全局步骤清单里那一行：`ctx.catalog_steps` 是整表读出来的
+        （`_load_context` / `_build_context` 都这么装），`catalog_steps.get(step_code)`
+        拿到的正是它自己的 `max_concurrency`。
 
-        ⚠️ **总量会翻**：全平台最大并发从「N」变成「Σ(每个目录各 N)」，这是明确接受的
-        代价（上限数值仍按目录各配 10）。
+        ⚠️ **已知取舍（2026-10-14 那次修复的回归）**：以前按目录隔离，是为了避免
+        `file_processing_jonex_wiki` 的 10 个 `compile` 堵死另一个目录的 `compile`。
+        目录删除后全平台共用一份名额，这种跨任务饿死会重新出现 —— 这是「任务中心
+        可自由编排」这个目标带来的明确代价；真要隔离，得为编排定义另立一个维度
+        （例如 `tasks.definition_id`）。
 
         ⚠️ **它是「软上限」：多副本下最多可被超出「副本数 − 1」条**。判据是「数 → 判 →
         抢占」三步，而抢占那条 UPDATE（`claim_pending`）里**没有任何并发数条件**；两个副本
@@ -4160,14 +4154,10 @@ class TaskService:
         limit = getattr(catalog_step, "max_concurrency", None) if catalog_step else None
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
             return False
-        catalog_code = ctx.task.task_catalog_code
-        running = await self._subtasks.count_running_by_catalog_step(
-            subtask.step_code, catalog_code
-        )
+        running = await self._subtasks.count_running_by_step(subtask.step_code)
         if running >= limit:
             logger.info(
-                "[TaskCenter] 目录 %s 的步骤 %s 并发已达上限 %d（在跑 %d），本轮跳过",
-                catalog_code,
+                "[TaskCenter] 步骤 %s 并发已达上限 %d（在跑 %d），本轮跳过",
                 subtask.step_code,
                 limit,
                 running,
@@ -4204,20 +4194,17 @@ class TaskService:
             )
             return None
 
-    async def _runner_capabilities(
-        self, task_catalog_code: str, config: Dict[str, Any]
-    ) -> List[str]:
+    async def _runner_capabilities(self, config: Dict[str, Any]) -> List[str]:
         """这份编排用到哪些运行方（去重后的 capability_id 列表）。
 
-        **内置清单编码由调用方给**（建任务时用定义的、删任务回落时用任务行上的快照），
-        本方法不反查 —— 反查在这条路上会断（删定义之后定义和版本一起取不到）。
+        步骤清单是全局只读表，**不依赖定义 / 版本** —— 删定义之后这里照样读得到，
+        所以建任务与删任务两条路可以共用（删任务优先用 `runner_capability_ids` 快照，
+        没有快照时才回落到这里现推）。
 
         运行方不在册的跳过 —— 没有可删的目标，不该因此拦下删除。编排里引用了清单里
         没有的 `step_code` 同理（`catalog_step is None`）。
         """
-        catalog_steps = await self._catalog_steps.map_by_step_code(
-            task_catalog_code or ""
-        )
+        catalog_steps = await self._catalog_steps.map_by_step_code()
         capabilities: List[str] = []
         for step in config.get("steps") or []:
             catalog_step = catalog_steps.get(step.get("step_code"))
@@ -4275,17 +4262,16 @@ class TaskService:
                 task.id, task.definition_id, task.definition_version_no,
             )
             return []
-        capabilities = await self._runner_capabilities(task.task_catalog_code, config)
+        capabilities = await self._runner_capabilities(config)
         if not capabilities:
             # 第 2 种成因（见 docstring）：编排快照里有步骤，却一个 capability_id 都解
             # 不出来 —— 多半是那些 `step_code` 已经从内置清单里下线了。**必须吼**：
             # 不吼的话「运行方残留一件没清」和「本来就没运行方」长得一模一样。
             logger.warning(
                 "[TaskCenter] 删任务按编排快照推不出该请哪些运行方清残留"
-                "（快照里 %d 个步骤，在内置清单 %s 里一个都没对上）"
+                "（快照里 %d 个步骤，在全局步骤清单里一个都没对上）"
                 "——**本次不会清理运行方残留**: task=%s",
                 len(config.get("steps") or []),
-                task.task_catalog_code,
                 task.id,
             )
             return []

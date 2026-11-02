@@ -101,10 +101,6 @@ class Task(Base, TimestampMixin, AuditMixin):
     # 永远收不掉、并发名额（该目录上限 10）永久泄漏。编排是这条任务的「施工图纸」，
     # 任务行自己带一份，就不怕图纸被归档。
     definition_config = Column(JSONB, nullable=False)
-    # 内置清单编码（`task_definitions.task_catalog_code`）的快照。理由同上，而且是**更隐蔽**
-    # 的一条：反查定义断掉之后 `catalog_steps` 会静默变成空字典 —— 并发上限 / `runner_code`
-    # / 超时时间全取不到，却**不报错、也不返回「找不到」**，任务就这么带着空值继续跑。
-    task_catalog_code = Column(String(64), nullable=False)
     # 空间 ID：这次运行落在哪个空间（§3.5）
     space_id = Column(String(64), nullable=False)
     # 任务实例名：调用方在 `init_task` / `fire` 传了 `name` 就用它，没传（或只给空白）退回定义名 `task_definitions.name`

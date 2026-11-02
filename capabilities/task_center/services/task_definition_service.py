@@ -32,7 +32,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import TenantContext, require_tenant
 
-from ..dtos.catalog import TaskCatalogItem, TaskCatalogStepItem
+from ..dtos.catalog import TaskCatalogStepItem
 from ..dtos.definition import (
     FlowConfig,
     TaskDefinitionDetail,
@@ -42,10 +42,7 @@ from ..dtos.definition import (
     VersionSummary,
 )
 from ..models import DefinitionScope, VersionStatus
-from ..repository.catalog_repository import (
-    TaskCatalogRepository,
-    TaskCatalogStepRepository,
-)
+from ..repository.catalog_repository import TaskCatalogStepRepository
 from ..repository.definition_repository import (
     TaskDefinitionRepository,
     TaskDefinitionVersionRepository,
@@ -116,28 +113,23 @@ class TaskDefinitionService:
         self.session = session
         self._definitions = TaskDefinitionRepository(session)
         self._versions = TaskDefinitionVersionRepository(session)
-        self._catalogs = TaskCatalogRepository(session)
         self._catalog_steps = TaskCatalogStepRepository(session)
         self._runners = RunnerDefinitionRepository(session)
         self._triggers = TaskTriggerRepository(session)
 
     # ========================================================
-    # 内置清单（§4.3 def.catalog_*）
+    # 内置步骤清单（§4.3 def.catalog_steps）
     # ========================================================
 
-    async def list_catalogs(self) -> List[TaskCatalogItem]:
-        """列内置任务清单：编排时「有哪些任务可选」。"""
-        return [
-            TaskCatalogItem(**row.to_dict())
-            for row in await self._catalogs.list_catalogs()
-        ]
+    async def list_catalog_steps(self) -> List[TaskCatalogStepItem]:
+        """列全局可选步骤：编排时「这版能用哪些节点」。
 
-    async def list_catalog_steps(self, task_catalog_code: str) -> List[TaskCatalogStepItem]:
-        """列某内置任务下的可选步骤：编排时「这任务能用哪些步骤」。"""
-        await self._require_catalog(task_catalog_code)
+        2026-10-23 起没有「内置任务」这一层，也不再需要先选任务类型 —— 节点清单
+        是全局的，按 `step_code` 唯一。
+        """
         return [
             TaskCatalogStepItem(**row.to_dict())
-            for row in await self._catalog_steps.list_by_catalog(task_catalog_code)
+            for row in await self._catalog_steps.list_all()
         ]
 
     # ========================================================
@@ -147,7 +139,6 @@ class TaskDefinitionService:
     async def create_definition(
         self,
         scope: str,
-        task_catalog_code: str,
         name: str,
         *,
         tenant_id: Optional[str] = None,
@@ -155,7 +146,11 @@ class TaskDefinitionService:
         description: Optional[str] = None,
         initial_config: Optional[Dict[str, Any]] = None,
     ) -> TaskDefinitionDetail:
-        """建定义：选一个内置任务（`task_catalog_code`）+ 指明 `scope`（§4.3 `def.create`）。
+        """建定义：指明 `scope` + 名字即可（§4.3 `def.create`）。
+
+        ⚠️ 2026-10-23 起**不再需要先选一个内置任务**：任务类型这一层已删除，
+        一版定义就是一份自由编排（节点从全局步骤清单里选）。历史定义行上那份
+        `task_catalog_code` 也随迁移一起丢弃。
 
         `scope` 与 `tenant_id` / `space_id` 必须配套（跟 DDL 的 `ck_tc_def_scope_fields`
         一个口径，这里先挡一道、给出看得懂的错）：`system` 两个都不给、`tenant` 只给租户、
@@ -172,12 +167,10 @@ class TaskDefinitionService:
         if space_id:
             # 空间级定义绑死一个空间，那空间得先是当前租户自己的（§四）。
             await require_owned_space(self.session, tenant_id, space_id)
-        await self._require_catalog(task_catalog_code)
 
         definition = await self._definitions.create(
             tenant_id=tenant_id,
             scope=scope,
-            task_catalog_code=task_catalog_code,
             space_id=space_id,
             name=name,
             description=description,
@@ -607,19 +600,6 @@ class TaskDefinitionService:
     # 内部：取数与建行
     # ========================================================
 
-    async def _require_catalog(self, task_catalog_code: str):
-        catalog = await self._catalogs.get_catalog(task_catalog_code)
-        if catalog is None:
-            raise ResourceNotFoundError(
-                message=translate(
-                    "err.task_center.catalog.not_found",
-                    params={"task_catalog_code": task_catalog_code},
-                    fallback=f"内置任务清单里没有 {task_catalog_code}",
-                ),
-                details={"task_catalog_code": task_catalog_code},
-            )
-        return catalog
-
     async def _require_version(self, definition_id: str, version_no: int):
         row = await self._versions.get_version(definition_id, version_no)
         if row is None:
@@ -694,11 +674,10 @@ class TaskDefinitionService:
 
     async def _validate(self, definition, config: Dict[str, Any]) -> List[str]:
         """发版前的 §6.5 整体校验（交给校验器，服务层只负责把料凑齐）。"""
-        catalog_steps = await self._catalog_steps.map_by_step_code(definition.task_catalog_code)
+        catalog_steps = await self._catalog_steps.map_by_step_code()
         runners = await self._runners.map_by_code()
         return validate_flow_config(
             config,
-            task_catalog_code=definition.task_catalog_code,
             catalog_steps=catalog_steps,
             runners=runners,
         )

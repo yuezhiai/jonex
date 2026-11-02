@@ -5,7 +5,7 @@
 设计出处：`docs/superpowers/specs/2026-09-09-task-center-design.md` §6.5、附录 A.14。
 
 `publish_version` 必须全过，任何一条不过就打回草稿。**附录 A.14 是这份校验的全表**
-（`N0`~`N22` 加 `N8b` 共 24 条，其中 **`N20` 已作废**、实际生效 **23 条**）——
+（`N0`~`N24` 加 `N8b` 共 26 条，其中 **`N20` 已作废**、实际生效 **25 条**）——
 **发版时一次性查清楚，跑起来就不存在"跑不通的编排"**。本模块按 N 编号逐条落地，
 每条 issue 文案都带编号，方便对着 A.14 核对：
 
@@ -16,11 +16,11 @@
 | 引用 | N8 / N8b / N9 / N10 | 引用的节点存在 / `@task.inputs` 的键存在 / 字段已声明 / 无自引用 |
 | 绑定 | N11 / N12 | `bind_inputs` 对得上 `input_schema` / 类型对得上 |
 | 字段定义 | N13 / N14 / N15 / N16 / N17 | `type` / `required` / `default` / `enum` / object·array 子结构 |
-| 其他 | N18 / N19 / N21 / N22 | 枚举 / 超时必填正整数 / 步骤合法 / 运行方合法 |
+| 其他 | N18 / N19 / N21 / N22 / N23 / N24 | 枚举 / 超时必填正整数 / 步骤合法 / 运行方合法 / 下游联动开关 / 任务级产出声明 |
 
 **两处刻意不校验，别加回来**：
 
-- **N20 已作废**：`max_concurrency` 定义在内置只读表 `task_catalog_steps`、
+- **N20 已作废**：`max_concurrency` 定义在全局只读表 `task_catalog_steps`、
   **不在编排 `config.steps[]` 里**，发版校验管不到它；
 - **`required` 不进发版校验**：§6.2 末尾写明「引用一个没有产出的上游」时
   **即使字段是 `required: true` 也照样按类型填空值、不拒绝这条编排** ——
@@ -353,7 +353,6 @@ def _string_list(value: Any, where: str, issues: List[str], code: str) -> List[s
 def validate_flow_config(
     config: Optional[Dict[str, Any]],
     *,
-    task_catalog_code: str,
     catalog_steps: Dict[str, TaskCatalogStep],
     runners: Dict[str, RunnerDefinition],
 ) -> List[str]:
@@ -385,6 +384,13 @@ def validate_flow_config(
     if not isinstance(task_schema, dict):
         task_schema = {}
 
+    # ---- N24：任务级 output_schema（画布结束节点的参数面板）----
+    # 一期只校验字段定义合法，**不校验「声明的字段有没有节点产出」** —— 任务级产出
+    # 的运行期汇总还没做（口径 A），此时做来源校验会把「先声明、后接产出」的路堵死。
+    validate_schema(
+        config.get("output_schema") or {}, "config.output_schema", issues
+    )
+
     steps = config.get("steps")
     if not isinstance(steps, list) or not steps:
         issues.append("config.steps 不能为空——一版编排至少要选一个节点（N0）")
@@ -411,7 +417,7 @@ def validate_flow_config(
         if sort is not None and not _is_int(sort):
             issues.append(f"{where}.sort 必须是整数（N3）")
 
-    # ---- N21：每个节点的 step_code 必须在该任务的内置步骤清单里 ----
+    # ---- N21：每个节点的 step_code 必须在全局内置步骤清单里 ----
     # 注意：`step_code` 是「用哪个内置步骤」、**可以重复**（parse_1 / parse_2 都是 parse），
     # 所以查的是"在不在清单里"，不是"唯不唯一"。
     node_step_code: Dict[str, str] = {}
@@ -424,7 +430,7 @@ def validate_flow_config(
         if step_code not in (catalog_steps or {}):
             issues.append(
                 f"节点 {node_id!r} 用的步骤 {step_code!r} "
-                f"不在内置任务 {task_catalog_code!r} 的可选步骤清单里（N21）"
+                "不在平台内置步骤清单里（N21）"
             )
 
     # ---- 逐节点：N2 / N3 / N4 / N11 / N12 / N19 ----

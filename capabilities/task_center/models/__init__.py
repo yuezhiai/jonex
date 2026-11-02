@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
-"""任务中心 ORM 导出（十一张表，§二）。
+"""任务中心 ORM 导出（十张表，§二）。
 
 加载该包时，下列模型会在各自模块的类定义处注册到 SQLAlchemy 元数据。
 任一模型导入或注册失败时，模块级 import 抛出的异常会直接向上传播，
@@ -10,15 +10,15 @@
 
 **ORM 与 DDL 的一处已知差异**（有意保留的，**别当 bug 去「修」**）：
 
-1. **默认值**：**只对 DDL 里确实有 `DEFAULT` 的那 6 列**写 `server_default`
-   （`task_catalog` / `task_catalog_steps` / `runner_definitions` 各自的
-   `created_at` / `updated_at`，DDL 给的是 `DEFAULT CURRENT_TIMESTAMP`），**其余列一律不写**
+1. **默认值**：**只对 DDL 里确实有 `DEFAULT` 的那 4 列**写 `server_default`
+   （`task_catalog_steps` / `runner_definitions` 各自的 `created_at` / `updated_at`，
+   DDL 给的是 `DEFAULT CURRENT_TIMESTAMP`），**其余列一律不写**
    —— 业务代码一律显式写值、从不依赖数据库默认值（`create` 都是把字段拼全了才 insert），
    而生产建表只走 DDL。
 
    ⚠️ **2026-09-30 改准**：这一段从前写的是「这里的列**一律**不写 `server_default`……
    **别为了让本地 `create_all`「跟 DDL 一样」去补**」—— **那句是错的，而且方向正好反了**：
-   那 6 列本来就写着 `server_default`，而 `test_task_center_schema_parity.py` 有一条判据
+   那 4 列本来就写着 `server_default`，而 `test_task_center_schema_parity.py` 有一条判据
    （「DDL 有 `DEFAULT` 而 ORM 没有」就红）**正是要求它们留着**。照旧话去删，测试当场红。
    反过来，给**别的**列补 `server_default` 才是该拦的（DDL 里它们没有 `DEFAULT`）。
    准确的判据是「**与 DDL 逐列对齐**」，不是「一律不写」。
@@ -35,7 +35,7 @@
 > 现在把索引也纳入比对，走错就会红。
 """
 
-from .catalog import TaskCatalog, TaskCatalogStep
+from .catalog import TaskCatalogStep
 from .definition import TaskDefinition, TaskDefinitionVersion
 from .enums import (
     AttemptStatus,
@@ -72,7 +72,6 @@ __all__ = [
     "SubtaskStatus",
     "Task",
     "TaskAttempt",
-    "TaskCatalog",
     "TaskCatalogStep",
     "TaskDefinition",
     "TaskDefinitionVersion",

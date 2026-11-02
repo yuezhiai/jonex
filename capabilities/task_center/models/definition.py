@@ -72,7 +72,6 @@ class TaskDefinition(Base, TimestampMixin):
     tenant_id = Column(String(64), nullable=True)
     # scope=space 时必有；其余为空
     space_id = Column(String(64), nullable=True)
-    task_catalog_code = Column(String(64), nullable=False)
     name = Column(String(128), nullable=False)
     description = Column(String(512), nullable=True)
     # 最新已发布版本号；0 = 还没发过版
@@ -86,7 +85,6 @@ class TaskDefinition(Base, TimestampMixin):
             "id": self.id,
             "scope": self.scope,
             "tenant_id": self.tenant_id,
-            "task_catalog_code": self.task_catalog_code,
             "space_id": self.space_id,
             "name": self.name,
             "description": self.description,

@@ -7,7 +7,7 @@ DTO 是接口参数、以及响应里 `data` 字段的类型外壳，也是「�
 配套的统一响应壳是 `jonex_core.capability.response.ApiResponse`。
 """
 
-from .catalog import TaskCatalogItem, TaskCatalogStepItem
+from .catalog import TaskCatalogStepItem
 from .console import SubtaskConsoleItem, TaskConsoleItem, TaskConsolePage
 from .definition import (
     FieldSpec,
@@ -54,7 +54,6 @@ __all__ = [
     "SubtaskItemResponse",
     "TaskAttemptItem",
     "TaskAttemptList",
-    "TaskCatalogItem",
     "TaskCatalogStepItem",
     "TaskConsoleItem",
     "TaskConsolePage",

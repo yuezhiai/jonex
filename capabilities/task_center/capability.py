@@ -197,8 +197,8 @@ class TaskCenterCapability(BaseCapability):
     # 「缺少必填参数 cron_expr」有用得多。
     _REQUIRED_KEYS: Dict[str, tuple] = {
         # ── 定义 def.* ──
-        "def.catalog_steps": ("task_catalog_code",),
-        "def.create": ("scope", "task_catalog_code", "name"),
+        # `def.catalog_steps` 无必填参数（列全局步骤清单）；`def.create` 不再要任务类型。
+        "def.create": ("scope", "name"),
         "def.get": ("definition_id",),
         "def.version_create": ("definition_id",),
         "def.version_update": ("definition_id", "version_no", "config"),
@@ -270,22 +270,9 @@ class TaskCenterCapability(BaseCapability):
         **恒开、不设开关**：这五趟是这个服务的心脏，没有「关掉」这个状态；
         多副本下不选主、靠 CAS 抢占，所以每一份都跑。
         """
-        # 调用明细采集写口（monitor.call_log / monitor.call_attempt）。
-        # 采集器住在共享内核（`jonex_core/common/monitor_collector.py`），**每个进程
-        # 各自起一份**（单例 + 独立队列 + 独立连接）—— 所以本能力得自己起，不能指望
-        # 别的进程替它采。⚠️ **不起 = 埋点静默失效**：`put_call_attempt` 在采集器未启动
-        # 时直接返回（那条「旁路不得影响主链路」的保证），派活重试的 N2 一条都落不了库，
-        # 而业务侧看不出任何异常。
-        # **排在 `start_scheduler()` 之前**：后台循环一起跑就会出站派活、投 N2，采集器
-        # 得先就位，否则那一段窗口里的量直接丢。
-        # 与 platform 同一口径：采集是旁路，**起不来绝不能拖垮任务中心本体**（只丢一行
-        # ERROR，N2 不落库而已）。
-        try:
-            from jonex_core.common.monitor_collector import get_monitor_collector
-            get_monitor_collector().start()
-            logger.info("MonitorCollector 已启动")
-        except Exception:
-            logger.exception("MonitorCollector 启动失败（不影响任务中心功能）")
+        # 调用明细采集器（MonitorCollector）由 deploy/start_capability.py 的 lifespan
+        # 统一启动（早于本 initialize，因此也早于下面的 start_scheduler()）——
+        # 本能力不再自己启动，避免两处生命周期漂移。
 
         from .services import start_scheduler
 
@@ -295,14 +282,8 @@ class TaskCenterCapability(BaseCapability):
         from .services import stop_scheduler
 
         await stop_scheduler()
-        # 采集器**最后停**：后台循环这一轮已经投进队列的 N2 才有机会落库
-        # （`stop()` 会 flush 剩余队列再退出）。同样只记日志，不挡停机。
-        try:
-            from jonex_core.common.monitor_collector import get_monitor_collector
-            await get_monitor_collector().stop()
-            logger.info("MonitorCollector 已停止")
-        except Exception:
-            logger.exception("MonitorCollector 停止失败")
+        # 采集器由 deploy/start_capability.py 在本 shutdown() 返回后统一停止并 flush
+        # —— 排在后台循环停摆之后，这一轮已投进队列的 call_attempt 才有机会落库。
         # 释放本能力共用适配器的连接池。
         await self._adapter.close()
 
@@ -456,16 +437,14 @@ class TaskCenterCapability(BaseCapability):
     def _build_dispatch(self) -> Dict[str, Callable[[CapabilityRequest, Dict], Any]]:
         return {
             # ── 定义 def.* ──
-            "def.catalog_list": lambda r, d: self._execute(
-                lambda s: TaskDefinitionService(s).list_catalogs()
-            ),
+            # 2026-10-23：`def.catalog_list` 随「内置任务」一起下线；`def.catalog_steps`
+            # 改为无参，直接列全局步骤清单。
             "def.catalog_steps": lambda r, d: self._execute(
-                lambda s: TaskDefinitionService(s).list_catalog_steps(d["task_catalog_code"])
+                lambda s: TaskDefinitionService(s).list_catalog_steps()
             ),
             "def.create": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).create_definition(
                     d["scope"],
-                    d["task_catalog_code"],
                     d["name"],
                     tenant_id=r.tenant_id,
                     space_id=d.get("space_id"),

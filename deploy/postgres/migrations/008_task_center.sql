@@ -65,25 +65,14 @@
 CREATE SCHEMA IF NOT EXISTS task_center;
 
 -- ------------------------------------------------------------
--- 内置任务清单：平台支持哪些任务可选（平台预置、只读，不带租户）
--- ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS task_center.task_catalog (
-    id            VARCHAR(64) PRIMARY KEY,
-    code          VARCHAR(64) NOT NULL,
-    name          VARCHAR(128) NOT NULL,
-    description   VARCHAR(512),
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tc_catalog_code ON task_center.task_catalog(code);
-
--- ------------------------------------------------------------
--- 内置步骤清单：每个任务下有哪些步骤可选（平台预置、只读）
+-- 内置步骤清单：编排里能选哪些节点（平台预置、只读）
 -- 步骤的「固有形状」——交给哪个运行方、名字、默认超时、并发上限、输入输出 schema——都在这
+--
+-- ⚠️ 2026-10-23 起没有「内置任务」这一层：任务中心要支持自由编排，任务类型不再
+-- 约束可选节点，步骤清单变成**全局一张表**（`step_code` 唯一）。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS task_center.task_catalog_steps (
     id                VARCHAR(64) PRIMARY KEY,
-    task_catalog_code VARCHAR(64) NOT NULL,
     step_code         VARCHAR(64) NOT NULL,
     name              VARCHAR(128) NOT NULL,
     runner_code       VARCHAR(64) NOT NULL,
@@ -94,7 +83,7 @@ CREATE TABLE IF NOT EXISTS task_center.task_catalog_steps (
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tc_cs_code ON task_center.task_catalog_steps(task_catalog_code, step_code);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tc_cs_step_code ON task_center.task_catalog_steps(step_code);
 
 -- ------------------------------------------------------------
 -- 运行方清单：平台内置（平台预置，不通过接口写；不带租户）
@@ -121,7 +110,6 @@ CREATE TABLE IF NOT EXISTS task_center.task_definitions (
     scope               VARCHAR(16) NOT NULL,
     tenant_id           VARCHAR(64),
     space_id            VARCHAR(64),
-    task_catalog_code   VARCHAR(64) NOT NULL,
     name                VARCHAR(128) NOT NULL,
     description         VARCHAR(512),
     current_version_no  INTEGER NOT NULL DEFAULT 0,
@@ -230,9 +218,6 @@ CREATE TABLE IF NOT EXISTS task_center.tasks (
     -- 版本会被「删定义」带成假删，那时任务多半还在跑，反查一断，消化上报 / 停止 / 超时
     -- 巡检三条路全灭，那条 running 子任务永远收不掉、并发名额永久泄漏）。见 models/execution.py
     definition_config     JSONB NOT NULL,
-    -- 内置清单编码快照（task_definitions.task_catalog_code）。理由同上，而且更隐蔽：
-    -- 反查定义断了之后 catalog_steps 会静默变空，并发上限 / runner_code / 超时全取不到
-    task_catalog_code     VARCHAR(64) NOT NULL,
     space_id              VARCHAR(64) NOT NULL,
     task_name             VARCHAR(256),
     trigger_id            VARCHAR(64),
@@ -405,37 +390,18 @@ CREATE INDEX IF NOT EXISTS idx_tc_report_exec ON task_center.subtask_reports(ten
 -- 内置清单预置数据（§3.4 内置数据示例）
 -- 平台预置、只读；ON CONFLICT DO NOTHING 保证可重复执行
 -- ============================================================
--- 三个内置任务清单。**页面上显示的名字与代码里的键是三套叫法**，
--- 混起来最容易看花眼，先把对照钉在这（认 code 和 kb_type，别认中文名）：
+-- 全局内置步骤清单（2026-10-23 起没有「内置任务」这一层）。
+-- 任务中心要支持自由编排：定义不再绑定某种任务类型，一版编排直接从下面这些步骤里选节点。
+-- 目前只有两类节点 —— `parse`（文件解析）/ `compile`（知识编译），都交给知识库运行方。
+-- 「哪类库」现在由**编排定义名**承载，不再靠目录/步骤名区分。
 --
---   页面「知识库类型」   kb_type       本文件的 catalog code                几步
---   ─────────────────────────────────────────────────────────────────────
---   Ontology         lightrag      file_processing_ontology              2
---   Ontology Wiki    openkb        file_processing_ontology_wiki         2
---   Jonex Wiki       jonex_wiki    file_processing_jonex_wiki            2
---
--- 于是「文件处理（Ontology Wiki）」就是**建库时选 Ontology Wiki 那种库**传文件后跑的任务。
--- 注意 kb_type 这一列：`lightrag` 才是页面上的 Ontology，`openkb` 才是 Ontology Wiki ——
--- 引擎名与页面名是两套词，认 id 和后缀（`-ontology` / `-ontology-wiki` / `-jonex-wiki`）。
---
--- 为什么要分三个目录而不是共用一个：**目录是菜单**，三类活的步骤集合与超时口径都不同。
--- `code` 上有唯一索引 `uq_tc_catalog_code`，所以四个目录必须取不同的 code。
---
--- 两种 llm-wiki 库的形状**确实一模一样**（都是 文件解析 → 知识编译 两步），为什么仍分两份：
--- 「用哪个 step_code 干哪件事」在两边是同一套（运行方只认 parse / ingest / compile），
--- 差别全在运行方内部按 **KB 的 kb_type** 分流（parse 落 content.md 还是 content_list.json、
--- compile 走 recompile_openkb 还是 recompile_jonex_wiki）。所以**编排不承载这个差别**，
--- 分成两份只是为了任务中心页面上「这条任务属于哪类库」一眼可读，不是为了跑得不一样。
--- 代价是多两份预置行；收益是别人不用靠 kb_type 去猜那条任务到底是什么活。
-INSERT INTO task_center.task_catalog (id, code, name, description) VALUES
-  ('catalog-file-processing-ontology', 'file_processing_ontology', '文件处理（Ontology）', '上传文件 → 文件解析 → 知识编译'),
-  ('catalog-file-processing-ontology-wiki', 'file_processing_ontology_wiki', '文件处理（Ontology Wiki）', '上传文件 → 文件解析 → 知识编译'),
-  ('catalog-file-processing-jonex-wiki', 'file_processing_jonex_wiki', '文件处理（Jonex Wiki）', '上传文件 → 文件解析 → 知识编译')
-ON CONFLICT DO NOTHING;
+-- 三类知识库（Ontology / Ontology Wiki / Jonex Wiki）的差异
+-- 全在运行方内部按 KB 的 `kb_type` 分流（parse 落 content.md 还是 content_list.json、
+-- compile 走 recompile_openkb 还是 recompile_jonex_wiki），编排不承载这个差别。
 
 -- 步骤超时必须**大于知识库自己的看门狗阈值**，否则会出现「任务中心先判超时、
 -- 知识库后上报却被幂等吸收」——用户看到「任务超时失败」而文档状态是另一回事，
--- 两头说法不一致。六个步骤（三个目录 2 × 3）统一取 25200（7 小时），比知识库那道晚一档。
+-- 两头说法不一致。两类步骤统一取 25200（7 小时），比知识库那道晚一档。
 --
 -- 知识库侧对**上传链路建的那些文档**（带任务中心标记的），对账循环那套超时巡检
 -- （`patrol_parsing_timeout`，SOFT 3600 只探活 / HARD 21600 才判死）整条跳过 ——
@@ -451,9 +417,9 @@ ON CONFLICT DO NOTHING;
 -- jonex_wiki 是 `JONEX_WIKI_COMPILE_TIMEOUT_SEC`，都回落到 1800，到点**直接判死**，
 -- `patrol_openkb_compile` / `patrol_jonex_wiki_compile` 都不探活），同样早于这里的 25200。
 --
--- max_concurrency：六个步骤统一取 10。
+-- max_concurrency：两类步骤统一取 10。
 --
--- 这个上限是**全局按 `step_code` 统计**的（跨库、跨内置任务一起算、共用同一份额度，见
+-- 这个上限是**全局按 `runner_code + step_code` 统计**的（全平台共用同一份额度，见
 -- 设计文档 §6.3）—— 不是「每个库各 10」。原来的 parse=5 / ingest=2 / compile=2 是按
 -- 「单份文档走到这一步有多重」定的（ingest 逐 chunk 抽实体关系 + 写图/向量库，最重所以
 -- 最保守），但会让人看见的瓶颈不在单份有多重，而在名额太少让批次走不动：「整库重抽」
@@ -463,43 +429,23 @@ ON CONFLICT DO NOTHING;
 -- 10 是让「一次重抽十几份」这种批次能整体推进的量级。代价是同一时刻最多有 10 份文档
 -- 一起压 LLM 与图库；真要回退，这三个数是并发调优的第一顺位。
 --
--- 步骤名**全平台只有三个字面量**：文件解析 / 知识抽取 / 知识编译。各目录那几步都从这三个
--- 里取同一个字面量 —— 同一件事在不同库里叫不同名字（曾经 openkb 那步叫「知识编译（LLM-Wiki）」、
--- jonex_wiki 那步叫「知识编译（Jonex Wiki）」）会让用户对着页面找不到任务。
--- **「哪类库」由任务定义名承载，不由步骤名承载**。名字是给人看的；运行方认的是 `step_code`
--- （parse / ingest / compile），改名不影响派活。
+-- 步骤名**全平台只有两个字面量**：文件解析 / 知识编译。同一件事叫不同名字会让用户
+-- 对着页面找不到任务；**「哪类库」由任务定义名承载，不由步骤名承载**。
+-- 名字是给人看的；运行方认的是 `step_code`（parse / compile），改名不影响派活。
 --
--- ⚠️ 现役三条链只用到 **parse + compile** 两个字面量：`step-file-processing-ontology-ingest`
--- （「知识抽取」，其实是推切片）**不再预置** —— Ontology 链 2026-09-29 由三步改两步，
--- `parse` 自己推切片，没有任何现役编排引用它。运行方代码里仍留着 `ingest` 的 handler，
--- 那是给「别的环境里改版前遗留的在途任务」兜底的；要在这套库里临时补回来，就是下面这段
--- （去掉注释即可，与旧 008 的行逐字相同）：
--- INSERT INTO task_center.task_catalog_steps
---   (id, task_catalog_code, step_code, name, runner_code, max_concurrency, timeout_seconds, input_schema, output_schema) VALUES
---   ('step-file-processing-ontology-ingest', 'file_processing_ontology', 'ingest', '知识抽取', 'knowledge_base', 10, 25200,
---    '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
---    '{"document_id":{"type":"string","required":true}}');
+-- ⚠️ 2026-10-23 起只预置 **parse + compile**：`ingest`（「知识抽取」，其实是推切片）
+-- **不再预置** —— Ontology 链 2026-09-29 由三步改两步，`parse` 自己推切片。
+-- 运行方代码里仍留着 `ingest` 的 handler，只服务改版前遗留的在途任务；存量库里的
+-- 那些任务由 `update/055` 在迁移时直接判失败。
 --
 -- output_schema 里声明 document_id，是给下游 `@<节点>.outputs.document_id` 用的
 -- （见下方「数据怎么传」）：运行方上报成功时把它带回来。
 INSERT INTO task_center.task_catalog_steps
-  (id, task_catalog_code, step_code, name, runner_code, max_concurrency, timeout_seconds, input_schema, output_schema) VALUES
-  ('step-file-processing-ontology-parse', 'file_processing_ontology', 'parse', '文件解析', 'knowledge_base', 10, 25200,
+  (id, step_code, name, runner_code, max_concurrency, timeout_seconds, input_schema, output_schema) VALUES
+  ('step-parse', 'parse', '文件解析', 'knowledge_base', 10, 25200,
    '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
    '{"document_id":{"type":"string","required":true}}'),
-  ('step-file-processing-ontology-compile', 'file_processing_ontology', 'compile', '知识编译', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{}'),
-  ('step-file-processing-ontology-wiki-parse', 'file_processing_ontology_wiki', 'parse', '文件解析', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{"document_id":{"type":"string","required":true}}'),
-  ('step-file-processing-ontology-wiki-compile', 'file_processing_ontology_wiki', 'compile', '知识编译', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{}'),
-  ('step-file-processing-jonex-wiki-parse', 'file_processing_jonex_wiki', 'parse', '文件解析', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{"document_id":{"type":"string","required":true}}'),
-  ('step-file-processing-jonex-wiki-compile', 'file_processing_jonex_wiki', 'compile', '知识编译', 'knowledge_base', 10, 25200,
+  ('step-compile', 'compile', '知识编译', 'knowledge_base', 10, 25200,
    '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
    '{}')
 ON CONFLICT DO NOTHING;
@@ -518,8 +464,8 @@ ON CONFLICT DO NOTHING;
 -- ⚠️ Ontology 那条 2026-09-29 由**三步**（文件解析 → 知识抽取 → 知识编译）改成两步 ——
 -- 理由见上一段 `ingest` 那几行；另外两条 wiki 链本来就是两步。
 -- 定义名就是任务中心页面上的「这条任务属于哪类库」，所以带上库类型后缀；步骤名不带。
--- 上传时按 kb_type 挑一个（task_definitions.task_catalog_code 上没有唯一索引，一个目录挂
--- 多个定义是允许的；这里仍各挂各的，菜单和定义一一对应更好读）。
+-- 上传时按 kb_type 挑一个（知识库侧用固定 definition_id 映射，见
+-- `task_runner_service.definition_for_kb_type`）。
 -- scope=system，所以 tenant_id / space_id 都为 NULL（ck_tc_def_scope_fields 强制）
 --
 -- 数据怎么传：**优先从上游产出取**（`@<节点>.outputs.<字段>`），哪一步都不产出它
@@ -535,33 +481,31 @@ ON CONFLICT DO NOTHING;
 -- 代价：运行方上报时必须带回 outputs.document_id；漏报不静默 —— 下游拿到空值就失败。
 -- ------------------------------------------------------------
 INSERT INTO task_center.task_definitions
-  (id, scope, tenant_id, space_id, task_catalog_code, name, description, current_version_no) VALUES
-  ('definition-file-processing-ontology', 'system', NULL, NULL, 'file_processing_ontology', '文件处理（Ontology）', '上传文件后自动解析并编译本体知识', 1),
-  ('definition-file-processing-ontology-wiki', 'system', NULL, NULL, 'file_processing_ontology_wiki', '文件处理（Ontology Wiki）', '上传文件后自动解析并编译 Ontology Wiki', 1),
-  ('definition-file-processing-jonex-wiki', 'system', NULL, NULL, 'file_processing_jonex_wiki', '文件处理（Jonex Wiki）', '上传文件后自动解析并编译 Jonex Wiki', 1)
+  (id, scope, tenant_id, space_id, name, description, current_version_no) VALUES
+  ('definition-file-processing-ontology', 'system', NULL, NULL, '文件处理（Ontology）', '上传文件后自动解析并编译本体知识', 1),
+  ('definition-file-processing-ontology-wiki', 'system', NULL, NULL, '文件处理（Ontology Wiki）', '上传文件后自动解析并编译 Ontology Wiki', 1),
+  ('definition-file-processing-jonex-wiki', 'system', NULL, NULL, '文件处理（Jonex Wiki）', '上传文件后自动解析并编译 Jonex Wiki', 1)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO task_center.task_definition_versions
   (id, scope, tenant_id, definition_id, space_id, version_no, status, config, published_at) VALUES
   ('version-file-processing-ontology-v1', 'system', NULL, 'definition-file-processing-ontology', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
    CURRENT_TIMESTAMP),
   ('version-file-processing-ontology-wiki-v1', 'system', NULL, 'definition-file-processing-ontology-wiki', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
    CURRENT_TIMESTAMP),
   ('version-file-processing-jonex-wiki-v1', 'system', NULL, 'definition-file-processing-jonex-wiki', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   CURRENT_TIMESTAMP),
    CURRENT_TIMESTAMP)
 ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- 注释
 -- ============================================================
-COMMENT ON TABLE task_center.task_catalog IS '内置任务清单：平台支持哪些任务可选（平台预置、只读，不带租户）';
-COMMENT ON COLUMN task_center.task_catalog.code IS '任务标识（逻辑键），如 file_processing_ontology —— 定义与步骤都按它引用';
-
-COMMENT ON TABLE task_center.task_catalog_steps IS '内置步骤清单：每个任务下有哪些步骤可选（步骤交给谁跑 runner_code、输入输出 schema、默认超时 timeout_seconds、并发上限 max_concurrency 都在这）';
-COMMENT ON COLUMN task_center.task_catalog_steps.step_code IS '步骤名，如 parse / ingest / compile（编排里 steps[].step_code 引用它 —— 两边**同名**，就是这一列的值；运行方按这个值分流到不同执行模式）';
+COMMENT ON TABLE task_center.task_catalog_steps IS '内置步骤清单：编排里能选哪些节点（步骤交给谁跑 runner_code、输入输出 schema、默认超时 timeout_seconds、并发上限 max_concurrency 都在这；2026-10-23 起全局一张表，step_code 唯一）';
+COMMENT ON COLUMN task_center.task_catalog_steps.step_code IS '步骤名，如 parse / compile（编排里 steps[].step_code 引用它 —— 两边**同名**，就是这一列的值；运行方按这个值分流到不同执行模式）';
 COMMENT ON COLUMN task_center.task_catalog_steps.runner_code IS '这步交给哪个运行方（runner_definitions.code），一对一绑定';
 COMMENT ON COLUMN task_center.task_catalog_steps.max_concurrency IS '这步最多同时跑几个（运行方对此类活的并发上限）；空=不限；派活时按它数全局在跑数、到上限就跳过';
 COMMENT ON COLUMN task_center.task_catalog_steps.timeout_seconds IS '这步的默认超时时间（秒）；建编排时预填到 config.steps[].timeout_seconds（必填、可改）';
@@ -573,7 +517,6 @@ COMMENT ON COLUMN task_center.runner_definitions.capability_id IS '运行方对�
 
 COMMENT ON TABLE task_center.task_definitions IS '任务定义：一类任务的「身份证」，按 scope 分系统级/租户级/空间级';
 COMMENT ON COLUMN task_center.task_definitions.scope IS 'system(系统级，无租户无空间)/tenant(租户级，有租户无空间)/space(空间级，租户+空间都有)';
-COMMENT ON COLUMN task_center.task_definitions.task_catalog_code IS '从内置任务清单里选的任务（task_catalog.code，逻辑键）';
 COMMENT ON COLUMN task_center.task_definitions.space_id IS '空间 ID：scope=space 时必有；任务执行哪一版就用哪一版的 space_id';
 COMMENT ON COLUMN task_center.task_definitions.current_version_no IS '最新已发布版本号；0 = 还没发过版';
 
@@ -581,7 +524,7 @@ COMMENT ON TABLE task_center.task_definition_versions IS '任务定义版本：�
 COMMENT ON COLUMN task_center.task_definition_versions.scope IS '跟所属定义一致：system / tenant / space';
 COMMENT ON COLUMN task_center.task_definition_versions.space_id IS '空间 ID：scope=space 时必有；任务执行哪一版就用哪一版的 space_id';
 COMMENT ON COLUMN task_center.task_definition_versions.status IS 'draft(草稿)/published(已发布，终点)；发布后不可改、不可删、不可逆回 draft';
-COMMENT ON COLUMN task_center.task_definition_versions.config IS '编排内容：{ input_schema, entry, steps[] }（entry 是单个 node_id；没有 fail_policy —— 失败一律 hold）';
+COMMENT ON COLUMN task_center.task_definition_versions.config IS '编排内容：{ input_schema, output_schema, entry, steps[] }（entry 是单个 node_id；input/output 同时承载画布开始/结束节点的参数面板；没有 fail_policy —— 失败一律 hold）';
 COMMENT ON COLUMN task_center.task_definition_versions.is_deleted IS '假删除标记：只由「删定义」带出来（定义删了，版本一并假删），版本本身不能被单独删';
 
 COMMENT ON TABLE task_center.task_triggers IS '触发：什么时候、用什么参数把任务跑起来（空间级）；触发器只等于定时，没有类型列';
@@ -598,7 +541,6 @@ COMMENT ON COLUMN task_center.task_triggers.state_version IS '每行版本号：
 COMMENT ON TABLE task_center.tasks IS '任务实例：一次触发的产物，是子任务树的根，也是这条任务的稳定身份（重跑不换 id）';
 COMMENT ON COLUMN task_center.tasks.definition_version_no IS '用的是哪个版本号（钉死，仅作溯源；编排内容本身见 definition_config）';
 COMMENT ON COLUMN task_center.tasks.definition_config IS '编排快照：建任务时从 task_definition_versions.config 抄来的整份编排。推进任务读它、不反查版本——版本会被「删定义」带成假删，反查一断任务就永远收不了尾';
-COMMENT ON COLUMN task_center.tasks.task_catalog_code IS '内置清单编码快照（task_definitions.task_catalog_code），推进任务读它、不反查定义：反查断了 catalog_steps 会静默变空，并发上限 / runner_code 取不到（超时不受影响——它优先读编排快照里的 timeout_seconds、并已冻结在 subtasks 行上）';
 COMMENT ON COLUMN task_center.tasks.space_id IS '空间 ID：这次运行落在哪个空间';
 COMMENT ON COLUMN task_center.tasks.inputs IS '这次运行的任务级入参（按 config.input_schema 收口后的实值），供 @task.inputs.x 在运行期求值、retry_task 复用';
 COMMENT ON COLUMN task_center.tasks.current_attempt IS '当前跑到第几次运行（指针，指向 task_attempts.attempt）；首次=1，retry_task 时 +1';
@@ -612,7 +554,7 @@ COMMENT ON COLUMN task_center.task_attempts.attempt IS '第几次运行（首次
 
 COMMENT ON TABLE task_center.subtasks IS '子任务实例：挂在某一次运行（task_attempt_id）下的一步；一行存该子任务最新一次尝试';
 COMMENT ON COLUMN task_center.subtasks.node_id IS '是编排里的哪个节点（对应 config.steps[].node_id）；同一次运行里不重复';
-COMMENT ON COLUMN task_center.subtasks.step_code IS '这个节点用的是哪个内置步骤（如 parse / ingest / compile）；管理方用来判并发上限、发版校验、查历史，并填进 execute 派活报文供运行方分流';
+COMMENT ON COLUMN task_center.subtasks.step_code IS '这个节点用的是哪个内置步骤（如 parse / compile）；管理方用来判并发上限、发版校验、查历史，并填进 execute 派活报文供运行方分流';
 COMMENT ON COLUMN task_center.subtasks.subtask_name IS '给人看的名字：诞生时取内置步骤的 name（按 step_code 查 task_catalog_steps.step_code）';
 COMMENT ON COLUMN task_center.subtasks.depends_on IS '它依赖哪些节点（一堆 node_id），诞生时从 config 固化';
 COMMENT ON COLUMN task_center.subtasks.next_steps IS '我成功后激活哪些节点（一堆 node_id），诞生时从 config 固化；不参与调度判定，只供对偶校验与排查';

@@ -171,14 +171,23 @@ class FlowStep(BaseModel):
 class FlowConfig(BaseModel):
     """`task_definition_versions.config` 的类型化外壳（§6.1）。
 
-    **空草稿骨架**就是全默认值：`{"input_schema": {}, "entry": None, "steps": []}`。
+    **空草稿骨架**就是全默认值：
+    `{"input_schema": {}, "output_schema": {}, "entry": None, "steps": []}`。
 
     **没有 `fail_policy`** —— 失败 / 超时一律 **hold**（下游原地不动、不派活、
     一直 `pending`），任务的唯一出路是 `retry_subtask`（§6.3）。
+
+    `input_schema` / `output_schema` 同时承载画布上「开始节点 / 结束节点」的参数面板：
+    开始节点的入参落 `input_schema`，结束节点的产出声明落 `output_schema`；
+    Start / End 本身**不进 `steps`**（见 `entry` 与叶子节点）。
     """
 
     input_schema: Dict[StrictStr, FieldSpec] = Field(
         default_factory=dict, description="任务级入参声明，触发时校验 task_triggers.inputs"
+    )
+    output_schema: Dict[StrictStr, FieldSpec] = Field(
+        default_factory=dict,
+        description="任务级产出声明（画布结束节点的参数面板）；一期只做声明与格式校验",
     )
     entry: Optional[StrictStr] = Field(
         default=None,
@@ -186,9 +195,9 @@ class FlowConfig(BaseModel):
     )
     steps: List[FlowStep] = Field(default_factory=list, description="这版要干哪些节点、怎么排")
 
-    @validator("input_schema", pre=True)
+    @validator("input_schema", "output_schema", pre=True)
     def _null_counts_as_empty(cls, value):
-        """`input_schema: null` 当 `{}` —— 与 `flow_validator` 那句 `or {}` 对齐（同上）。"""
+        """`input_schema` / `output_schema: null` 都当 `{}` —— 与 `flow_validator` 的 `or {}` 对齐。"""
         return value if value is not None else {}
 
     class Config:
@@ -232,7 +241,6 @@ class TaskDefinitionItem(BaseModel):
     id: str = Field(description="主键")
     scope: str = Field(description="system(系统级) / tenant(租户级) / space(空间级)")
     tenant_id: Optional[str] = Field(default=None, description="租户；scope=system 时为空")
-    task_catalog_code: str = Field(description="基于哪个内置任务建的")
     space_id: Optional[str] = Field(default=None, description="空间 ID；scope=space 时才有")
     name: str = Field(description="给人看的名字")
     description: Optional[str] = Field(default=None, description="描述")

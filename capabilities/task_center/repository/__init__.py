@@ -4,13 +4,13 @@
 
 分层对应 §九 的目录结构：
 
-- 内置清单（任务 / 步骤 / 运行方）：平台预置、只读、不带租户 → `*_shared` 系列；
+- 内置清单（步骤 / 运行方）：平台预置、只读、不带租户 → `*_shared` 系列；
 - 定义 + 版本：按租户隔离，版本表的写操作全部带 `status='draft'` 条件；
 - 触发：按租户隔离，删除走状态位；
 - 任务 + 任务尝试 + 子任务 + 子任务尝试：状态推进一律走带版本号的 CAS。
 """
 
-from .catalog_repository import TaskCatalogRepository, TaskCatalogStepRepository
+from .catalog_repository import TaskCatalogStepRepository
 from .definition_repository import (
     TaskDefinitionRepository,
     TaskDefinitionVersionRepository,
@@ -33,7 +33,6 @@ __all__ = [
     "SubtaskReportRepository",
     "SubtaskRepository",
     "TaskAttemptRepository",
-    "TaskCatalogRepository",
     "TaskCatalogStepRepository",
     "TaskDefinitionRepository",
     "TaskDefinitionVersionRepository",
