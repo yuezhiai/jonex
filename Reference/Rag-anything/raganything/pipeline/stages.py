@@ -674,6 +674,24 @@ class MultimodalStage(Stage):
                 f"Multimodal processing: {len(valid)}/{len(ctx.multimodal_items)} items"
             )
 
+        # [jonex] KB 级 VLM 覆盖 P2a：降级比例护栏。
+        # 只有「有 KB 覆盖 + strict_mode=record（full/parse_only）」才判定失败；
+        # reparse_strict 是 fail 模式（旧数据已删，运行期只留痕，靠预检兜底）；
+        # 无覆盖时本函数直接返回 —— 与改造前行为逐字一致。
+        # 分母只数**图片**：P2a 的覆盖只管 VLM 图片理解；视频走 MPS/mineru 视频
+        # 后端、音频走 ASR，它们的模型不在这轮范围内，混进来会把比例算歪
+        # （一个视频 = 一个 item，但内部几十帧 VLM 调用）。没有图片则天然空判。
+        try:
+            from raganything.service.vlm_guard import guard_vlm_degraded
+        except ImportError:  # pragma: no cover
+            guard_vlm_degraded = None  # type: ignore[assignment]
+        if guard_vlm_degraded is not None:
+            _vlm_items = sum(
+                1 for _it in (ctx.multimodal_items or [])
+                if isinstance(_it, dict) and str(_it.get("type") or "") == "image"
+            )
+            guard_vlm_degraded(_vlm_items, stage="multimodal")
+
         # ── Callback: multimodal complete ──
         if cb:
             cb.dispatch("on_multimodal_complete", file_path=ctx.file_name,

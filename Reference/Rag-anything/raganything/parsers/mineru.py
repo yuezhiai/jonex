@@ -1294,6 +1294,9 @@ class MineruSelfHostParser(MineruParser):
     POLL_INTERVAL_ENV = "MINERU_SELFHOST_POLL_INTERVAL"
     POLL_TIMEOUT_ENV = "MINERU_SELFHOST_POLL_TIMEOUT"
     RETURN_IMAGES_ENV = "MINERU_SELFHOST_RETURN_IMAGES"
+    # 入站鉴权（2026-10-28）：125 的 20490 由 nginx auth-proxy 接管，必须带
+    # `Authorization: Bearer <key>`。空值 = 不发头，兼容还没加鉴权的旧端点。
+    API_KEY_ENV = "MINERU_SELFHOST_API_KEY"
 
     def __init__(self) -> None:
         super().__init__()
@@ -1315,8 +1318,15 @@ class MineruSelfHostParser(MineruParser):
         self.return_images = os.environ.get(
             self.RETURN_IMAGES_ENV, "false"
         ).strip().lower() in ("1", "true", "yes", "on")
+        self.api_key = os.environ.get(self.API_KEY_ENV, "").strip()
 
     # ── HTTP helpers ─────────────────────────────────────────────
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """入站鉴权头；未配置 key 时返回空 dict（不发 `Bearer `）。"""
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     @staticmethod
     def _ascii_safe_filename(name: str) -> str:
@@ -1402,6 +1412,7 @@ class MineruSelfHostParser(MineruParser):
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Accept": "application/json",
+            **self._auth_headers(),
         }
         req = urllib.request.Request(
             url, data=bytes(body), headers=headers, method="POST"
@@ -1413,7 +1424,9 @@ class MineruSelfHostParser(MineruParser):
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         req = urllib.request.Request(
-            url, headers={"Accept": "application/json"}, method="GET"
+            url,
+            headers={"Accept": "application/json", **self._auth_headers()},
+            method="GET",
         )
         return self._read_json_response(req, f"GET {path}", timeout)
 

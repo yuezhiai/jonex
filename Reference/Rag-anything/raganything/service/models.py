@@ -42,6 +42,8 @@ class ErrorCode(str, Enum):
     CONFIG_INVALID = "CONFIG_INVALID"
     # [jonex] R7-2b：COS 对象下载失败（FetchObjectStage）
     OBJECT_FETCH_FAILED = "OBJECT_FETCH_FAILED"
+    # [jonex] KB 级 VLM 覆盖 P2a：多模态降级比例超阈值，任务判失败
+    VLM_STRICT_MODE = "VLM_STRICT_MODE"
     TASK_CANCELLED = "TASK_CANCELLED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     UNKNOWN = "UNKNOWN"
@@ -210,6 +212,10 @@ class TaskInfo(BaseModel):
     schema_version: int = 0            # 本任务使用的 compiled schema 版本
     schema_hash: str = ""              # 版本号兜底比对
     strict_push: bool = False          # 严格推送模式（全量成功才算成功 + 失败补偿）
+    # [jonex] KB 级模型覆盖：多模态理解的模型名（空=不覆盖，引擎走自己的默认链）
+    vlm_override: str = ""
+    # [jonex] KB 级模型覆盖：本体抽取的模型名（空=不覆盖，用 ONTOLOGY_LLM_MODEL）
+    ontology_model: str = ""
     old_rag_doc_ids: list[str] = Field(default_factory=list)       # reparse 旧 doc 快照
     new_rag_doc_ids: list[str] = Field(default_factory=list)       # 本次成功推送的新 doc
     delete_pending_ids: list[str] = Field(default_factory=list)    # cleanup 待删旧 doc（old−new）
@@ -283,6 +289,10 @@ class CreateTaskRequest(BaseModel):
     schema_version: int = 0            # compiled schema 版本
     schema_hash: str = ""              # 版本号兜底
     strict_push: bool = False          # 严格推送模式
+    # [jonex] KB 级模型覆盖：多模态理解用的模型名（平台按 KB 配置下发；空=不覆盖）
+    vlm_override: str = ""
+    # [jonex] KB 级模型覆盖：本体抽取用的模型名（平台按 KB 配置下发；空=不覆盖）
+    ontology_model: str = ""
     force_retry: bool = False          # 允许对 completed 幂等任务新建 attempt
 
     # [jonex] A18：平台随提交携带的引擎全量 chunk（仅 引擎链 compile 步填充；

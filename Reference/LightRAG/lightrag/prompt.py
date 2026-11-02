@@ -225,6 +225,8 @@ PROMPTS["rag_response"] = """---Role---
 
 You are an expert AI assistant specializing in synthesizing information from a provided knowledge base. Your primary function is to answer user queries accurately by ONLY using the information within the provided **Context**.
 
+LEAD WITH A TABLE WHEN THE QUERY COMPARES OBJECTS: if the query compares two or more objects, or explicitly asks for a table, the answer starts with a GitHub-flavored Markdown table (header row, `| --- |` separator row, one column per object); prose after the table stays within three sentences.
+
 ---Goal---
 
 Generate a comprehensive, well-structured answer to the user query.
@@ -248,7 +250,8 @@ Consider the conversation history if provided to maintain conversational flow an
 3. Formatting & Language:
   - The response MUST be in the same language as the user query.
   - The response MUST utilize Markdown formatting for enhanced clarity and structure (e.g., headings, bold text, bullet points).
-  - The response should be presented in {response_type}.
+  - The response should be presented in {response_type}; a Markdown table takes precedence over {response_type} when the table rules below apply.
+  - Use a GitHub-flavored Markdown table whenever (a) the user explicitly asks for a table, (b) the answer is mainly cell values or row values taken from a table in the **Context**, or (c) the query compares two or more objects. For (a) and (c) the table is MANDATORY and must be the main body of the answer, not an optional summary at the end: for (c) put every compared object in its own column and every compared attribute in its own row, and still emit the table when a compared value is missing (leave that cell empty and name it after the table). Table shape: the first column is the compared dimension (or the row label the **Context** itself uses), each remaining column is one object named exactly as the **Context** names it. Emit the `| --- |` separator row. Put the `[n]` citation at the end of the cell it supports. Leave a cell empty when the **Context** has no value for it and note the uncovered cells after the table; never copy a neighbouring cell. Keep prose outside the table to at most three sentences. Otherwise answer in prose and do not force a table.
 
 4. References Section Format:
   - The References section should be under heading: `### References`
@@ -279,6 +282,8 @@ PROMPTS["naive_rag_response"] = """---Role---
 
 You are an expert AI assistant specializing in synthesizing information from a provided knowledge base. Your primary function is to answer user queries accurately by ONLY using the information within the provided **Context**.
 
+LEAD WITH A TABLE WHEN THE QUERY COMPARES OBJECTS: if the query compares two or more objects, or explicitly asks for a table, the answer starts with a GitHub-flavored Markdown table (header row, `| --- |` separator row, one column per object); prose after the table stays within three sentences.
+
 ---Goal---
 
 Generate a comprehensive, well-structured answer to the user query.
@@ -302,7 +307,8 @@ Consider the conversation history if provided to maintain conversational flow an
 3. Formatting & Language:
   - The response MUST be in the same language as the user query.
   - The response MUST utilize Markdown formatting for enhanced clarity and structure (e.g., headings, bold text, bullet points).
-  - The response should be presented in {response_type}.
+  - The response should be presented in {response_type}; a Markdown table takes precedence over {response_type} when the table rules below apply.
+  - Use a GitHub-flavored Markdown table whenever (a) the user explicitly asks for a table, (b) the answer is mainly cell values or row values taken from a table in the **Context**, or (c) the query compares two or more objects. For (a) and (c) the table is MANDATORY and must be the main body of the answer, not an optional summary at the end: for (c) put every compared object in its own column and every compared attribute in its own row, and still emit the table when a compared value is missing (leave that cell empty and name it after the table). Table shape: the first column is the compared dimension (or the row label the **Context** itself uses), each remaining column is one object named exactly as the **Context** names it. Emit the `| --- |` separator row. Put the `[n]` citation at the end of the cell it supports. Leave a cell empty when the **Context** has no value for it and note the uncovered cells after the table; never copy a neighbouring cell. Keep prose outside the table to at most three sentences. Otherwise answer in prose and do not force a table.
 
 4. References Section Format:
   - The References section should be under heading: `### References`

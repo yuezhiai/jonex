@@ -56,9 +56,19 @@ class OpenAIDriver(BaseModelDriver):
         if spec.api_key:
             headers["Authorization"] = f"Bearer {spec.api_key}"
 
+        # [jonex] KB 级 VLM 覆盖（P2a）：只有**视觉请求**改用覆盖模型。
+        # 文本 LLM / embedding 调用不带图片块，仍用 spec.model_id —— 否则同一个
+        # 解析任务里的摘要/标签模型会被一起改掉。无覆盖时返回 spec.model_id，
+        # 与改造前逐字节一致。
+        try:
+            from raganything.models.vlm_override import resolve_vision_model as _resolve_vlm
+        except ImportError:  # pragma: no cover
+            _resolve_vlm = lambda default, _messages: default  # noqa: E731
+        model_id = _resolve_vlm(spec.model_id, messages)
+
         # Merge lightrag extras (temperature, max_tokens, top_p, etc.) into payload
         payload: dict = {
-            "model": spec.model_id,
+            "model": model_id,
             "messages": messages,
         }
         # [jonex] timeout 是 httpx 控制参数，不是上游请求字段——pop 后再合并，
@@ -67,6 +77,33 @@ class OpenAIDriver(BaseModelDriver):
         for k, v in kwargs.items():
             if v is not None:
                 payload[k] = v
+
+        # [jonex] 思考控制：**仅对含图片的请求**注入（文本抽取保持原行为，
+        # 避免误伤解析链）。写法由 VLM_THINKING_FIELDS 决定，缺省即历史
+        # TokenHub 的 {"thinking": {"type": "disabled"}}。
+        try:
+            from raganything.models.vlm_override import has_image_part as _has_image
+        except ImportError:  # pragma: no cover
+            _has_image = None
+        if _has_image is not None and _has_image(messages):
+            try:
+                from jonex_core.common.thinking import (
+                    DEFAULT_FIELDS as _THINK_DEFAULT,
+                    apply_thinking_fields as _apply_think,
+                )
+            except ImportError:  # 独立运行（无 jonex_core）时不注入
+                _apply_think = None
+            if _apply_think is not None:
+                _think_spec = (
+                    os.getenv("VLM_THINKING_FIELDS")
+                    or ""
+                ).strip()
+                _apply_think(
+                    payload,
+                    _think_spec or _THINK_DEFAULT,
+                    log_prefix="raganything.openai",
+                )
+
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{spec.host}/chat/completions",

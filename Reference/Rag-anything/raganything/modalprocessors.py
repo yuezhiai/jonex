@@ -1256,6 +1256,15 @@ class ImageModalProcessor(BaseModalProcessor):
                 "Error generating image description [%s]: %s",
                 type(e).__name__, e,
             )
+            # [jonex] KB 级 VLM 覆盖 P2a：记一次降级（占位 = 这张图没描述成功）。
+            # 计数走 contextvar，父任务据此判断"整份文档是否大片降级"，避免
+            # "任务成功但图片全空"。任何异常都不影响描述生成主流程。
+            try:
+                from raganything.service.jonex_metering_ctx import record_vlm_degraded
+
+                record_vlm_degraded("image_caption_failed")
+            except Exception:  # pragma: no cover - 计数不该影响主流程
+                pass
             # Fallback processing
             fallback_entity = {
                 "entity_name": entity_name
@@ -1263,6 +1272,8 @@ class ImageModalProcessor(BaseModalProcessor):
                 else f"image_{compute_mdhash_id(str(modal_content))}",
                 "entity_type": "image",
                 "summary": f"Image content: {str(modal_content)[:100]}",
+                # 机器可读标记：区分"真描述"与"占位兜底"，不必解析自然语言
+                "_vlm_degraded": True,
             }
             # [jonex] §standalone-image-whole-vlm：兜底文本用剥离 _whole_image_ocr
             # 的副本，防止异常时把大段 OCR 文本写进兜底 chunk。

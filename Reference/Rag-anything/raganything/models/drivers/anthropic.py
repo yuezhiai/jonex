@@ -80,8 +80,14 @@ class AnthropicDriver(BaseModelDriver):
                 parts = self._convert_content_parts(content)
                 anthropic_messages.append({"role": anthropic_role, "content": parts})
 
+        # [jonex] KB 级 VLM 覆盖：只有视觉请求改用覆盖模型（同 openai driver）。
+        try:
+            from raganything.models.vlm_override import resolve_vision_model as _resolve_vlm
+        except ImportError:  # pragma: no cover
+            _resolve_vlm = lambda default, _messages: default  # noqa: E731
+
         body: dict[str, Any] = {
-            "model": spec.model_id,
+            "model": _resolve_vlm(spec.model_id, anthropic_messages),
             "max_tokens": kwargs.pop("max_tokens", 1024),
             "messages": anthropic_messages,
         }

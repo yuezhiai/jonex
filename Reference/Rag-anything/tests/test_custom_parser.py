@@ -1,6 +1,7 @@
 """Tests for the custom parser plugin system (addresses #151)."""
 
 import json
+import urllib.request
 
 import pytest
 
@@ -325,6 +326,64 @@ class TestMineruSelfHostParser:
             parser, "_get_json", lambda *a, **k: {"results": {"onlyone": {"k": 1}}}
         )
         assert parser._fetch_result_item("t", "missing") == {"k": 1}
+
+    def test_get_json_sends_bearer_when_key_configured(self, monkeypatch):
+        """125 的 20490 由 nginx auth-proxy 接管后必须带 Bearer key，否则 401。
+
+        断言**真正发出去的 Request**，而不是 helper 的返回值 —— 否则「读到了
+        env 但没用上」照样是绿的。
+        """
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"status": "completed"}'
+
+        captured: dict = {}
+
+        def _fake_urlopen(req, timeout=60):
+            captured["req"] = req
+            return _Resp()
+
+        monkeypatch.setenv("MINERU_SELFHOST_BASE_URL", "http://svc:20490")
+        monkeypatch.setenv("MINERU_SELFHOST_API_KEY", "sk-test")
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+        MineruSelfHostParser()._get_json("/tasks/t1")
+
+        assert captured["req"].get_header("Authorization") == "Bearer sk-test"
+
+    def test_get_json_omits_authorization_when_key_empty(self, monkeypatch):
+        """未配置 key 时**不发**该头：兼容还没加鉴权的旧端点，也不发空 Bearer。"""
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"status": "completed"}'
+
+        captured: dict = {}
+
+        def _fake_urlopen(req, timeout=60):
+            captured["req"] = req
+            return _Resp()
+
+        monkeypatch.setenv("MINERU_SELFHOST_BASE_URL", "http://svc:20490")
+        monkeypatch.delenv("MINERU_SELFHOST_API_KEY", raising=False)
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+        MineruSelfHostParser()._get_json("/tasks/t1")
+
+        assert captured["req"].get_header("Authorization") is None
 
 
 class TestCliIntegration:

@@ -207,6 +207,9 @@ async def handle_insert(params: dict, tenant_id: str, task_manager, **kwargs):
         schema_hash=params.get("schema_hash", "") or "",
         # [jonex] llm-wiki 产物分支（openkb→content.md / jonex_wiki→content_list.json）
         kb_type=params.get("kb_type", "") or "",
+        # [jonex] KB 级 VLM 覆盖（P2a）：多模态理解用的模型名。空 = 不下发覆盖，
+        # 引擎走自己的默认链（注册表 → VLM_MODEL_NAME），与"没配置"完全等价。
+        vlm_override=params.get("kb_vlm_override", "") or "",
     )
 
     # [jonex] R1：幂等键复用 —— 同一 (doc, generation) 返回同一 task_id
@@ -472,6 +475,9 @@ async def handle_retry(params: dict, tenant_id: str, task_manager, **kwargs):
         schema_hash=params.get("schema_hash", "") or "",
         # [jonex] llm-wiki 产物分支（openkb→content.md / jonex_wiki→content_list.json）
         kb_type=params.get("kb_type", "") or "",
+        # [jonex] KB 级 VLM 覆盖（P2a）：多模态理解用的模型名。空 = 不下发覆盖，
+        # 引擎走自己的默认链（注册表 → VLM_MODEL_NAME），与"没配置"完全等价。
+        vlm_override=params.get("kb_vlm_override", "") or "",
     )
 
     # [jonex] R1：幂等键复用
@@ -908,6 +914,10 @@ async def handle_retry_ontology_extract(params: dict, tenant_id: str, task_manag
         engine_chunks=engine_chunks,
         # [jonex] 与 insert/retry 同口径透传（ontology_only 不写产物，但保持构造一致）
         kb_type=params.get("kb_type", "") or "",
+        # [jonex] P3a：KB 级本体抽取模型（空 = 不覆盖，用 ONTOLOGY_LLM_MODEL）。
+        # 幂等键**不含**它 —— 所以两个写入者都传 force_retry=True，避免复用在途
+        # 任务时把新模型丢掉（见非终态复用分支的日志）。
+        ontology_model=params.get("ontology_model", "") or "",
     )
     result = await task_manager.create(req, tenant_id, idempotency_key=idempotency_key)
     task_id = result.task_id if hasattr(result, "task_id") else ""

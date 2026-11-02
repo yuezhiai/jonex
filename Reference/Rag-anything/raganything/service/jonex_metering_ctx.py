@@ -22,28 +22,96 @@ from typing import Optional
 
 _ingest_ctx: ContextVar[Optional[dict]] = ContextVar("jonex_ingest_ctx", default=None)
 
+# [jonex] KB 级模型覆盖 P2a：VLM 降级计数。
+#
+# 用 **可变 list** 而不是 int：解析任务用 asyncio.gather 开子 task 并发跑多模态项，
+# contextvar 在 create_task 时按引用复制 —— 子 task 与父 task 共享同一个 list 对象，
+# 子 task 里的 append 父 task 直接可见（换成 int 就必须在父 task 汇总子 task 的返回值，
+# 而多模态项分散在 stages.py / task_manager.py 两处，改不动）。
+_vlm_degraded: ContextVar[Optional[list]] = ContextVar("jonex_vlm_degraded", default=None)
+
 
 def set_ingest_ctx(
     tenant_id: str = "",
     kb_id: str = "",
     doc_id: str = "",
     trace_id: str = "",
+    vlm_override: str = "",
+    vlm_strict_mode: str = "",
 ) -> Token:
-    """在任务入口设置当前入库任务的计量维度上下文。
+    """在任务入口设置当前入库任务的维度上下文。
 
     调用方应在 finally 中用返回的 Token 调用 reset_ingest_ctx。
+
+    Args:
+        vlm_override: [jonex] KB 级 VLM 覆盖（模型名）。空 = 不下发覆盖，引擎用
+            自己的默认链（注册表 → ``VLM_MODEL_NAME``）—— 这与"没有配置"完全等价。
+        vlm_strict_mode: [jonex] 降级处理策略：
+            ``"fail"`` = reparse_strict（旧数据已删，运行期降级只留痕，靠预检兜底）；
+            ``"record"`` = full / parse_only（降级比例超阈值即失败）；
+            ``""`` = 不做严格判定（无覆盖时的默认，行为与从前逐字一致）。
     """
+    # 新任务清零降级计数（同一事件循环里上一个任务的残留不能带进来）
+    _vlm_degraded.set([])
     return _ingest_ctx.set({
         "tenant_id": tenant_id or "",
         "kb_id": kb_id or "",
         "doc_id": doc_id or "",
         "trace_id": trace_id or "",
+        "vlm_override": vlm_override or "",
+        "vlm_strict_mode": vlm_strict_mode or "",
     })
 
 
 def get_ingest_ctx() -> Optional[dict]:
     """读取当前任务的计量维度上下文；无上下文返回 None。"""
     return _ingest_ctx.get()
+
+
+def get_vlm_override() -> str:
+    """[jonex] 当前任务的 KB 级 VLM 覆盖模型名；无覆盖返回空字符串。"""
+    ctx = _ingest_ctx.get()
+    if not ctx:
+        return ""
+    return str(ctx.get("vlm_override") or "")
+
+
+def get_vlm_strict_mode() -> str:
+    """[jonex] 当前任务的 VLM 降级策略：``fail`` | ``record`` | ``""``。"""
+    ctx = _ingest_ctx.get()
+    if not ctx:
+        return ""
+    return str(ctx.get("vlm_strict_mode") or "")
+
+
+def record_vlm_degraded(reason: str = "") -> None:
+    """[jonex] 记录一次 VLM 降级（占位/失败/空描述）。
+
+    跨线程/子 task 共享同一个 list；计数只在任务内有效，由
+    ``set_ingest_ctx`` 清零、``reset_vlm_degraded`` 收尾。
+    """
+    counter = _vlm_degraded.get()
+    if counter is None:
+        _vlm_degraded.set([reason or "unknown"])
+        return
+    counter.append(reason or "unknown")
+
+
+def get_vlm_degraded_count() -> int:
+    """[jonex] 当前任务累计的 VLM 降级次数。"""
+    counter = _vlm_degraded.get()
+    return len(counter) if counter else 0
+
+
+def get_vlm_degraded_reasons() -> list:
+    """[jonex] 降级原因列表（写任务结果/日志用，不含敏感信息）。"""
+    counter = _vlm_degraded.get()
+    return list(counter) if counter else []
+
+
+def reset_vlm_degraded() -> None:
+    """[jonex] 清空降级计数（任务收尾，避免污染下一任务）。"""
+    _vlm_degraded.set([])
 
 
 def reset_ingest_ctx(token: Token) -> None:
