@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """文档版本链仓储（append-only）。"""
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from jonex_core.common.repository import BaseRepository
 
@@ -46,3 +46,14 @@ class KnowledgeDocumentVersionRepository(BaseRepository[KnowledgeDocumentVersion
         )
         current = result.scalar_one_or_none()
         return int(current or 0) + 1
+
+    async def delete_by_ids(self, tenant_id: str, ids: list[str]) -> int:
+        if not ids:
+            return 0
+        result = await self.session.execute(
+            delete(KnowledgeDocumentVersion).where(
+                KnowledgeDocumentVersion.tenant_id == tenant_id,
+                KnowledgeDocumentVersion.id.in_(ids),
+            )
+        )
+        return result.rowcount or 0

@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
-import { Alert, Button, Empty, Modal, Space, Table, Tag, message } from 'antd';
+import { Alert, Button, Empty, Modal, Popconfirm, Space, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { CloudUploadOutlined, DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import {
+  activateDocumentVersion,
+  confirmDocumentVersionUpload,
+  discardDocumentVersionUpload,
   getDocumentVersionUrl,
   listDocumentVersions,
   uploadDocumentVersion,
 } from '@/api/domainKnowledge';
-import type { DocumentVersionItem } from '@/api/domainKnowledge';
+import type { DocumentVersionItem, VersionSimilarityHint } from '@/api/domainKnowledge';
+import { versionSourceLabel } from './versionSourceLabel';
 
 interface Props {
   kbId: string;
@@ -73,15 +77,56 @@ export default function DocumentVersionsTab({
     void load();
   }, [load]);
 
+  const applyUploaded = async (versionNo: number) => {
+    message.success(
+      t('domainKnowledge.versions.uploaded', { version: versionNo }),
+    );
+    await load();
+    onVersionApplied();
+  };
+
+  /** 询问「是否同一文档的新版本」；取消时删除临时对象。 */
+  const askSimilarity = (hint: VersionSimilarityHint) => {
+    Modal.confirm({
+      title: t('domainKnowledge.versions.similarityConfirmTitle'),
+      content: t('domainKnowledge.versions.similarityConfirmBody', {
+        name: hint.fileName,
+        percent: Math.round(hint.similarity * 100),
+      }),
+      okText: t('domainKnowledge.versions.similarityConfirmOk'),
+      cancelText: t('common.cancel'),
+      onOk: async () => {
+        setUploading(true);
+        try {
+          const result = await confirmDocumentVersionUpload(docId, kbId, hint);
+          await applyUploaded(result.version.versionNo);
+        } catch (err: unknown) {
+          message.error(
+            (err as { message?: string })?.message ||
+              t('domainKnowledge.versions.uploadFailed'),
+          );
+        } finally {
+          setUploading(false);
+        }
+      },
+      onCancel: () => {
+        void discardDocumentVersionUpload(docId, hint.storageKey, hint.storageBackend)
+          .catch(() => {
+            message.warning(t('domainKnowledge.versions.similarityDiscardFailed'));
+          });
+      },
+    });
+  };
+
   const doUpload = async (file: File) => {
     setUploading(true);
     try {
       const result = await uploadDocumentVersion(docId, kbId, file);
-      message.success(
-        t('domainKnowledge.versions.uploaded', { version: result.version.versionNo }),
-      );
-      await load();
-      onVersionApplied();
+      if (result.kind === 'needs_confirmation') {
+        askSimilarity(result.hint);
+        return;
+      }
+      await applyUploaded(result.version.versionNo);
     } catch (err: unknown) {
       message.error(
         (err as { message?: string })?.message ||
@@ -105,6 +150,25 @@ export default function DocumentVersionsTab({
     });
   };
 
+  const handleActivate = async (row: DocumentVersionItem) => {
+    setUploading(true);
+    try {
+      await activateDocumentVersion(docId, row.versionNo);
+      message.success(
+        t('domainKnowledge.versions.activated', { version: row.versionNo }),
+      );
+      await load();
+      onVersionApplied();
+    } catch (err: unknown) {
+      message.error(
+        (err as { message?: string })?.message ||
+          t('domainKnowledge.versions.activateFailed'),
+      );
+    } finally {
+      setUploading(false);
+    }
+  };
+
   const handleDownload = async (row: DocumentVersionItem) => {
     try {
       const { url } = await getDocumentVersionUrl(docId, row.versionNo);
@@ -122,7 +186,16 @@ export default function DocumentVersionsTab({
       title: t('domainKnowledge.versions.version'),
       dataIndex: 'versionNo',
       width: 90,
-      render: (value: number) => <Tag color="blue">v{value}</Tag>,
+      render: (value: number, row) => (
+        <Space size={4}>
+          <Tag color="blue">v{value}</Tag>
+          {row.isCurrent && (
+            <Tag color="green">
+              {t('domainKnowledge.versions.current')}
+            </Tag>
+          )}
+        </Space>
+      ),
     },
     {
       title: t('domainKnowledge.versions.fileName'),
@@ -139,10 +212,7 @@ export default function DocumentVersionsTab({
       title: t('domainKnowledge.versions.source'),
       dataIndex: 'source',
       width: 110,
-      render: (value: string) =>
-        value === 'backfill'
-          ? t('domainKnowledge.versions.sourceBackfill')
-          : t('domainKnowledge.versions.sourceUpload'),
+      render: (value: string) => versionSourceLabel(value, t),
     },
     {
       title: t('domainKnowledge.versions.createdBy'),
@@ -159,15 +229,30 @@ export default function DocumentVersionsTab({
     {
       title: '',
       key: 'actions',
-      width: 120,
+      width: 240,
       render: (_: unknown, row) => (
-        <Button
-          size="small"
-          icon={<DownloadOutlined />}
-          onClick={() => void handleDownload(row)}
-        >
-          {t('domainKnowledge.versions.download')}
-        </Button>
+        <Space size={4}>
+          <Button
+            size="small"
+            icon={<DownloadOutlined />}
+            onClick={() => void handleDownload(row)}
+          >
+            {t('domainKnowledge.versions.download')}
+          </Button>
+          {canWrite && !row.isCurrent && (
+            <Popconfirm
+              title={t('domainKnowledge.versions.activateConfirm', {
+                version: row.versionNo,
+              })}
+              okText={t('domainKnowledge.versions.activate')}
+              onConfirm={() => void handleActivate(row)}
+            >
+              <Button size="small" type="link">
+                {t('domainKnowledge.versions.activate')}
+              </Button>
+            </Popconfirm>
+          )}
+        </Space>
       ),
     },
   ];

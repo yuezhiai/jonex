@@ -68,42 +68,134 @@ def jonex_wiki_artifact_exists(document_id: str) -> bool:
     return jonex_wiki_artifact_path(document_id).is_file()
 
 
+# ── [jonex] 编译前「解析身份」预检（整库级）──────────────────────────────────
+# 一次 jonex_wiki 编译产出的是**整库一个 bundle**：引擎 source_port 会拉本库全部已
+# 解析文档，任何一份产物的解析身份与当前解析规则不一致，就在「取源材料」阶段硬失败
+# （跳过它 = 静默丢页）。于是**单文档「重新编译」照样会被别的文档卡住**。
+# 判据只有引擎能回答（规则清单/代码/打包预算/体检策略/编码/MinerU 版本），平台只读
+# 结论、不复制第二份。预检是**增强项**：引擎没实现或此刻读不到，一律放行 —— 不然一次
+# 只读调用故障就会让所有「重新编译」全线不可用，而下游本来就有硬校验兜底。
+
+async def fetch_stale_parsed_sources(client, tenant_id: str, kb_id: str) -> list[dict]:
+    """本库需要重新解析的文档（读不到就当没有，绝不阻断编译）。"""
+    try:
+        result = await client.parse_status(
+            kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id)
+    except NotImplementedError:
+        return []
+    except Exception as exc:   # noqa: BLE001 — 预检绝不阻断编译
+        logger.warning(
+            "[jonex] 解析身份预检不可用，跳过（不影响编译）: kb=%s err=%s", kb_id, exc)
+        return []
+    documents = (result or {}).get("documents") or []
+    return [item for item in documents if item.get("needs_reparse")]
+
+
+def raise_unhealable_stale(kb_id: str, stale: list[dict]) -> None:
+    """[jonex] 过期且**搬不动**时才拒编译：把是哪几份、过期在哪一项一起交给调用方。
+
+    「搬不动」= 平台侧文档不在 ready（还在解析 / 解析失败）或共享卷上没有解析产物 ——
+    这两种情况重编一定失败，提前说清楚比让引擎在取源材料阶段抛 ValidationError 强。
+    """
+    names = [str(item.get("source_name") or item.get("document_id") or "")
+             for item in stale]
+    shown = "、".join(names[:3]) + ("…" if len(names) > 3 else "")
+    raise ResourceConflictError(
+        message=translate(
+            "err.jonex_wiki.stale_parse_identity",
+            params={"count": len(stale), "names": shown},
+            fallback=(f"本知识库有 {len(stale)} 份文档的解析产物缺失或尚未解析完成（{shown}），"
+                      "无法编译；请先对这些文档执行「重新解析」，等它们完成后再次编译"),
+        ),
+        details={
+            "kb_id": kb_id,
+            "needs_reparse_count": len(stale),
+            # 每份带 drift：identity 里到底哪一项变了（["unknown"] = 旧产物没记分量）
+            "documents": [
+                {"document_id": item.get("document_id"),
+                 "source_name": item.get("source_name"),
+                 "status": item.get("status"),
+                 "drift": item.get("drift") or [],
+                 "refresh_method": item.get("refresh_method")}
+                for item in stale
+            ],
+        },
+    )
+
+
+async def assert_kb_parsed_sources_current(tenant_id: str, kb_id: str) -> None:
+    """模块级入口：用户点按钮那条路（ontology_service）的预检。
+
+    **只做自愈**（把已解析好的过期产物重新 ingest 一遍），搬不动的才拒 —— 见
+    `JonexWikiService.refresh_stale_sources` 里「为什么必须自愈，而不是拒绝」。
+
+    构造服务失败（D 只是增强项）就记一条 warning 放行：下游 `recompile_jonex_wiki`
+    还会再预检一次，不会漏。
+    """
+    try:
+        service = JonexWikiService()
+        await service.refresh_stale_sources(tenant_id, kb_id)
+    except ResourceConflictError:
+        raise
+    except Exception as exc:   # noqa: BLE001 — 预检绝不阻断编译
+        logger.warning("[jonex] 解析身份预检不可用，跳过（不影响编译）: kb=%s err=%s", kb_id, exc)
+
+
 async def stage_jonex_wiki_ingest_source(
     document_id: str, *, file_name: str = "", storage_key: str = "",
     storage_backend: str = "", file_path: str = "",
+    tenant_id: str = "", kb_id: str = "", content_generation: int | None = None,
+    ingest_backend: str = "",
+    source_context: dict | None = None,
 ) -> str:
     """返回 jonex_wiki ingest 用的相对 source_path。
 
-    原生表格(.xlsx/.xlsm)把**原始二进制**落到共享卷 ``parsed/{document_id}/source{ext}``，
-    让引擎按扩展名走 ``SPREADSHEET_NATIVE`` 确定性解析;其余文档转发 MinerU 结构化
-    产物 ``content_list.json``(引擎走 MINERU 路由,不做 markdown 重组)。
+    原件、版本化解析观察和资产组成不可变消费目录；原生表格以原件为入口，
+    其他模态以 content_list.json 为入口，均通过同一份范围和代次回执校验。
     """
-    suffix = Path(file_name or "").suffix.lower()
-    if suffix not in _NATIVE_SHEET_SUFFIXES:
-        return f"parsed/{document_id}/{_JONEX_WIKI_CONTENT_LIST}"
-
-    inputs_root = Path(os.getenv("KB_INPUT_DIR", "/app/inputs"))
-    dst_dir = inputs_root / "parsed" / document_id
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / f"source{suffix}"
-
+    from .wiki_input_delivery import publish_input_bundle
+    if not tenant_id or not kb_id:
+        raise ValueError("WIKI_INPUT_SCOPE_REQUIRED")
+    if content_generation is None or not ingest_backend:
+        from ..repository import KnowledgeDocumentRepository
+        from .ingest_backend import backend_for_document
+        async with get_db_session() as session:
+            row = await KnowledgeDocumentRepository(session).get_required(document_id, tenant_id)
+            if row.knowledge_base_id != kb_id:
+                raise ValueError("WIKI_INPUT_SCOPE_MISMATCH")
+            content_generation = row.content_generation
+            ingest_backend = backend_for_document(row)
+            source_context = source_context or dict(row.extra_metadata or {})
+    inputs_root = Path(os.getenv("KB_INPUT_DIR", "/app/inputs")).resolve()
     storage = get_object_storage_for(storage_backend)
     key = storage_key or file_path
-    data = await storage.get_bytes(key) if key else None
-    if data is None and file_path:
-        p = Path(file_path)
-        if p.is_file():
-            data = p.read_bytes()
-    if data is None:
-        raise ResourceNotFoundError(
-            message=translate(
-                "err.jonex_wiki.no_original_source",
-                fallback="无法读取文档原始文件，无法按原生表格入库，请先执行「重新解析」",
-            ),
-            details={"document_id": document_id},
-        )
-    dst.write_bytes(data)
-    return f"parsed/{document_id}/source{suffix}"
+    legacy = inputs_root / "parsed" / document_id
+    if legacy.resolve().parent != (inputs_root / "parsed").resolve():
+        raise ValueError("WIKI_INPUT_UNSAFE_DOCUMENT_ID")
+    raw_path = legacy / _JONEX_WIKI_CONTENT_LIST
+    raw = raw_path.read_bytes() if raw_path.is_file() else None
+    snapshot = None
+    assets = {}
+    import asyncio
+    import tempfile
+    inputs_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".wiki-original-", dir=inputs_root) as folder:
+        original_path = Path(folder) / "source"
+        try:
+            if key:
+                await storage.get_to_path(key, str(original_path))
+            elif file_path and Path(file_path).is_file():
+                original_path = Path(file_path)
+            else:
+                raise FileNotFoundError(document_id)
+        except Exception as exc:
+            raise ResourceNotFoundError(message=translate("err.jonex_wiki.no_original_source",
+                fallback="无法读取文档原始文件，请先执行「重新解析」"),
+                details={"document_id": document_id}) from exc
+        return await asyncio.to_thread(publish_input_bundle, root=inputs_root,
+            tenant_id=tenant_id, kb_id=kb_id, document_id=document_id,
+            generation=int(content_generation or 0), file_name=file_name, original=original_path,
+            snapshot=snapshot, raw=raw, legacy_dir=legacy, asset_bytes=assets, source_context=source_context)
 
 
 class JonexWikiService:
@@ -114,6 +206,9 @@ class JonexWikiService:
         # [jonex] DB 辅助方法复用 openkb 的 KnowledgeCompilerService（引擎无关，
         # 都写 llm_wiki_compile_* 列）。它只用 DB、不碰 openkb client。
         self._db = KnowledgeCompilerService()
+
+    async def query_resources(self, tenant_id: str, kb_id: str, operation: str, options: dict) -> dict:
+        return await self._client.query_resources(tenant_id, kb_id, operation, options)
 
     # ── 基础能力（对 jonex_wiki 容器的薄封装）──
 
@@ -128,6 +223,21 @@ class JonexWikiService:
             "created": False,
             "note": "jonex_wiki 首次 ingest 即建",
         }
+
+    async def _compile_model(self, tenant_id: str, kb_id: str) -> str:
+        """[jonex] P3b（方案 B）：本次任务该用的编译模型（空 = 不下发）。
+
+        只有 `model_setting_service.resolve_dispatch_models` 一处能回答这个问题；
+        取不到就返回空串，报文不带这个键，引擎回落自己的部署默认 —— 平台**不替
+        引擎决定默认值**。
+
+        取值时机是**发起任务时**：模型随任务报文进引擎的任务快照，所以之后改配置
+        只影响新任务，在途任务保持原样。
+        """
+        from .model_setting_service import resolve_dispatch_models
+
+        resolved = await resolve_dispatch_models(tenant_id, kb_id, kb_type="jonex_wiki")
+        return resolved.get("compile_wiki", "")
 
     async def compile_document(
         self,
@@ -153,12 +263,14 @@ class JonexWikiService:
         引擎行还活着 —— 所以「本 KB 内已软删的同名文档」就是孤儿的唯一合法来源。
         全程不读引擎报错文案，也就不会因引擎本地化/改词而静默失效。
         """
+        model = await self._compile_model(tenant_id, kb_id)
         try:
             return await self._client.compile_parsed_document(
                 kb_name=kb_name,
                 parsed_artifact=parsed_artifact,
                 tenant_id=tenant_id,
                 kb_id=kb_id,
+                model=model,
             )
         except Exception as exc:
             if not is_engine_document_conflict(exc):
@@ -188,12 +300,15 @@ class JonexWikiService:
                 parsed_artifact=parsed_artifact,
                 tenant_id=tenant_id,
                 kb_id=kb_id,
+                model=model,
             )
 
     async def compile_documents(self, kb_name: str, tenant_id: str, kb_id: str,
                                 parsed_artifacts: list[dict]) -> dict:
+        model = await self._compile_model(tenant_id, kb_id)
         try:
-            return await self._client.compile_parsed_documents(kb_name, parsed_artifacts, tenant_id, kb_id)
+            return await self._client.compile_parsed_documents(
+                kb_name, parsed_artifacts, tenant_id, kb_id, model=model)
         except Exception as exc:
             if not is_engine_document_conflict(exc):
                 raise
@@ -205,7 +320,8 @@ class JonexWikiService:
                     released |= await self._release_engine_orphan(kb_name, tenant_id, kb_id, stale_id)
             if not released:
                 raise
-            return await self._client.compile_parsed_documents(kb_name, parsed_artifacts, tenant_id, kb_id)
+            return await self._client.compile_parsed_documents(
+                kb_name, parsed_artifacts, tenant_id, kb_id, model=model)
 
     async def _deleted_same_name_documents(
         self, tenant_id: str, kb_id: str, source_name: str, exclude_id: str,
@@ -269,10 +385,13 @@ class JonexWikiService:
         self, kb_name: str, tenant_id: str, kb_id: str, question: str,
         return_trace: bool = False,  # [jonex]
         thinking_mode: str | None = None,
+        query_context: dict | None = None,
         progress_session: str | None = None,
     ) -> dict:
         """搜索已编译的 Wiki 知识。"""
         options = {"thinking_mode": thinking_mode} if thinking_mode is not None else {}
+        if query_context is not None:
+            options['query_context'] = query_context
         if progress_session:
             options["progress_session"] = progress_session
         return await self._client.query(
@@ -284,10 +403,11 @@ class JonexWikiService:
     async def remove_document(
         self, kb_name: str, tenant_id: str, kb_id: str, document_id: str,
     ) -> dict:
-        """删除 jonex_wiki 中指定 document_id 的编译产物。"""
+        """删除 jonex_wiki 中指定 document_id 的编译产物（引擎侧会顺带排一次重编）。"""
         return await self._client.remove_document(
             kb_name=kb_name, document_id=document_id,
             tenant_id=tenant_id, kb_id=kb_id,
+            model=await self._compile_model(tenant_id, kb_id),
         )
 
     async def delete_kb(self, kb_name: str, tenant_id: str, kb_id: str) -> dict:
@@ -295,6 +415,9 @@ class JonexWikiService:
         return await self._client.delete_kb(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
         )
+
+    async def query_graph(self, tenant_id: str, kb_id: str, operation: str, **options) -> dict:
+        return await self._client.query_graph(tenant_id, kb_id, operation, **options)
 
     async def get_graph(self, kb_name: str, tenant_id: str, kb_id: str,
                         document_id: str = "") -> dict:
@@ -354,6 +477,9 @@ class JonexWikiService:
     async def draft_outline(self, kb_name: str, tenant_id: str, kb_id: str,
                             request: dict, user_id=None) -> dict:
         """LLM 起草目录（action draft_wiki_outline），覆盖旧 active。"""
+        request = dict(request or {})
+        if not request.get("model"):
+            request["model"] = await self._compile_model(tenant_id, kb_id)
         return await self._client.draft_outline(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
             request=request, user_id=user_id,
@@ -362,6 +488,9 @@ class JonexWikiService:
     async def adjust_outline(self, kb_name: str, tenant_id: str, kb_id: str,
                              request: dict, user_id=None) -> dict:
         """按指令调整目录（action adjust_wiki_outline）。"""
+        request = dict(request or {})
+        if not request.get("model"):
+            request["model"] = await self._compile_model(tenant_id, kb_id)
         return await self._client.adjust_outline(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
             request=request, user_id=user_id,
@@ -398,35 +527,90 @@ class JonexWikiService:
 
         产物不存在时抛 ResourceNotFoundError（调用方已前置校验过，这里是兜底）。
         """
-        suffix = Path(file_name or "").suffix.lower()
-        if suffix in _NATIVE_SHEET_SUFFIXES:
-            rel_source = await stage_jonex_wiki_ingest_source(
-                document_id, file_name=file_name, storage_key=storage_key,
-                storage_backend=storage_backend, file_path=source_file_path,
-            )
-        else:
-            art_abs = jonex_wiki_artifact_path(document_id)
-            if not art_abs.is_file():
-                raise ResourceNotFoundError(
-                    message=translate(
-                        "err.jonex_wiki.no_parsed_artifact",
-                        fallback="未找到该文档的解析产物，无法重新编译，请先执行「重新解析」",
-                    ),
-                    details={"document_id": document_id, "expected_path": str(art_abs)},
-                )
-            # 传「相对 inputs 卷根」路径：两端各自解析（platform 与 jonex_wiki 挂载点不同）
-            rel_source = f"parsed/{document_id}/{_JONEX_WIKI_CONTENT_LIST}"
-
-        artifact = {
-            "source_path": rel_source,
-            "source_name": title or file_name or document_id,
-            "document_id": document_id,
-        }
-
+        artifact = await self.parsed_ingest_artifact(
+            document_id=document_id, file_name=file_name, storage_key=storage_key,
+            storage_backend=storage_backend, source_file_path=source_file_path,
+            source_name=title, tenant_id=tenant_id, kb_id=kb_id,
+        )
         return await self.compile_document(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
             parsed_artifact=artifact,
         )
+
+    async def parsed_ingest_artifact(
+        self, *, document_id: str, file_name: str = "", storage_key: str = "",
+        storage_backend: str = "", source_file_path: str = "", source_name: str = "",
+        tenant_id: str = "", kb_id: str = "",
+    ) -> dict:
+        """[jonex] 构造 jonex_wiki ingest 形状的产物引用（重新编译与本库自愈共用）。"""
+        rel_source = await stage_jonex_wiki_ingest_source(
+            document_id, file_name=file_name, storage_key=storage_key,
+            storage_backend=storage_backend, file_path=source_file_path,
+            tenant_id=tenant_id, kb_id=kb_id)
+
+        return {
+            "source_path": rel_source,
+            "source_name": source_name or file_name or document_id,
+            "document_id": document_id,
+        }
+
+    async def refresh_stale_sources(
+        self, tenant_id: str, kb_id: str, stale: list[dict] | None = None,
+    ) -> int:
+        """[jonex] 自愈：把「平台已解析好、但引擎侧产物过期」的文档重新 ingest 一遍。
+
+        ── 为什么必须自愈，而不是拒绝 ──
+
+        引擎产物的代次（``content_generation``）只在 **ingest** 时前进，不在「重新解析」
+        时前进：平台重新解析只换共享卷上的 ``content_list.json``，引擎仍是旧代次。而
+        ingest 恰恰发生在**编译**这条路里（``recompile_document`` → ``compile_document``）。
+        所以「过期就拒编译」会把唯一的刷新路径也关掉 —— 用户按提示重新解析后仍然编不过，
+        **死锁**（2026-10-21 现网复现）。
+
+        这里先对过期文档逐份补一次 ingest（只搬平台已有的解析产物，不重新解析、不造数据），
+        再让正常编译过去。搬不动（文档不在 ready / 产物缺失）的才交给调用方明确拒绝。
+
+        返回补了几份。
+        """
+        from ..models import DocStatus
+        from ..repository import KnowledgeDocumentRepository
+
+        if stale is None:
+            stale = await self.stale_parsed_sources(tenant_id, kb_id)
+        if not stale:
+            return 0
+
+        artifacts: list[dict] = []
+        blocked: list[dict] = []
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            for item in stale:
+                document_id = str(item.get("document_id") or "")
+                row = await repo.get_by_id(document_id, tenant_id)
+                if row is None or (row.status or "") != DocStatus.READY.value:
+                    blocked.append(item)
+                    continue
+                try:
+                    artifacts.append(await self.parsed_ingest_artifact(
+                        document_id=document_id,
+                        tenant_id=tenant_id, kb_id=kb_id,
+                        file_name=row.file_name or "",
+                        storage_key=row.storage_key or "",
+                        storage_backend=(row.storage_backend or "local").strip().lower(),
+                        source_file_path=row.file_path or "",
+                        source_name=row.file_name or document_id,
+                    ))
+                except ResourceNotFoundError:
+                    blocked.append(item)
+
+        if blocked:
+            raise_unhealable_stale(kb_id, blocked)
+        if not artifacts:
+            return 0
+        await self.compile_documents(kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
+                                     parsed_artifacts=artifacts)
+        logger.info("[jonex] 解析产物自愈：已重新导入 %d 份过期文档 kb=%s", len(artifacts), kb_id)
+        return len(artifacts)
 
     # ── [jonex] 重新编译编排（从 ontology_service.retry_extract 调用）──
 
@@ -482,6 +666,29 @@ class JonexWikiService:
             doc.llm_wiki_compiled_at = None
             await session.commit()
 
+    async def stale_parsed_sources(self, tenant_id: str, kb_id: str) -> list[dict]:
+        """[jonex] 本库哪些文档的解析产物已过期（只读预检）。"""
+        return await fetch_stale_parsed_sources(self._client, tenant_id, kb_id)
+
+    async def ensure_parsed_sources_current(self, tenant_id: str, kb_id: str) -> int:
+        """[jonex] 过期就**先自愈**（重新 ingest 已解析好的产物），搬不动的才拒。
+
+        返回补 ingest 的份数。「搬不动」时抛 `ResourceConflictError`（details 里带每份的
+        drift），由调用方决定怎么呈现：
+        - 用户点「重新编译」/ 任务中心 compile 步（都走 `recompile_jonex_wiki`）：直接抛给
+          用户，带份数与文件名；
+        - 对账巡检（`ReconciliationService._ensure_jonex_parse_identity`）：**不抛给用户**，
+          改成逐份回写 failed 并跳过本轮（见那里的注释）。
+        """
+        stale = await self.stale_parsed_sources(tenant_id, kb_id)
+        if not stale:
+            return 0
+        healed = await self.refresh_stale_sources(tenant_id, kb_id, stale)
+        remaining = await self.stale_parsed_sources(tenant_id, kb_id)
+        if remaining:
+            raise_unhealable_stale(kb_id, remaining)
+        return healed
+
     async def recompile_jonex_wiki(
         self, tenant_id: str, document_id: str, kb_id: str,
         *, doc_status: str = "", source_file_path: str = "", title: str = "",
@@ -531,13 +738,19 @@ class JonexWikiService:
                     details={"document_id": document_id, "status": doc_status},
                 )
 
-        # ── 产物前置校验：缺失时立即报错，不 claim、不投任务（避免假成功）──
-        if not jonex_wiki_artifact_exists(document_id):
-            raise ResourceNotFoundError(
-                message=translate("err.jonex_wiki.no_parsed_artifact",
-                                  fallback="未找到该文档的解析产物，无法重新编译，请先执行「重新解析」"),
-                details={"document_id": document_id},
-            )
+        # The consumer receipt, not a legacy shared filename, decides readiness.
+
+        # ── [jonex] 整库解析身份预检 + 自愈 ──
+        # 一次 jonex_wiki 编译产出的是**整库一个 bundle**：引擎 source_port 会拉本库
+        # 全部已解析文档，任何一份产物的解析身份与当前解析规则不一致就在「取源材料」
+        # 阶段硬失败（跳过它 = 静默丢页）。于是**单文档「重新编译」照样会被别的文档
+        # 卡住**。
+        #
+        # 但「过期就拒」会死锁：产物代次只在 **ingest** 时前进（平台「重新解析」只换共享
+        # 卷上的 content_list.json），而 ingest 就发生在这条编译路径里。所以这里先自愈
+        # （把过期文档按平台已有解析产物重新导入），搬不动的才当场拒 —— 详见
+        # `refresh_stale_sources` 的文档串。
+        await self.ensure_parsed_sources_current(tenant_id, kb_id)
 
         # ── [jonex] LLM-Wiki Schema fencing（方案 §6）：读 active 版本 → claim
         # 绑定 target。无 schema 返回 None = 未启用 fencing，按旧行为编译。──

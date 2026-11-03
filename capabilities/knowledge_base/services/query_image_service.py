@@ -76,6 +76,44 @@ class QueryImageService:
     def __init__(self) -> None:
         self._config = get_config()
 
+    async def search_context(
+        self, tenant_id: str, user_id: str, image_ids: Sequence[str], question: str = "",
+    ) -> dict:
+        """Reuse owned recognition once per search, without another VLM or object read."""
+        if not user_id or user_id == "anonymous":
+            raise InvalidParameterError(message="以图检索需要登录")
+        tenant_id = require_tenant(tenant_id)
+        limit = min(8, int(self._config.IMAGE_QUERY_MAX_IMAGES))
+        if len(image_ids) > limit:
+            raise InvalidParameterError(message="查询图片超过数量限制")
+        images = []
+        for image_id in dict.fromkeys(image_ids):
+            pending = await self._read_pending(tenant_id, user_id, image_id)
+            if pending is not None:
+                data = pending
+            else:
+                async with get_db_session() as session:
+                    row = await KnowledgeQueryImageRepository(session).get_owned(tenant_id, user_id, image_id)
+                    data = {
+                        "sha256": row.sha256,
+                        "description": row.description,
+                        "ocr_text": row.ocr_text,
+                        "entities": row.entities,
+                        "model": row.vlm_model,
+                        "prompt_version": row.prompt_version,
+                    } if row else None
+            if data is None:
+                raise ResourceNotFoundError(message="查询图片已过期或不可用，请重新选择图片")
+            images.append({
+                "image_id": image_id, "sha256": data["sha256"],
+                "description": str(data.get("description") or "")[:512],
+                "ocr_text": str(data.get("ocr_text") or "")[:1024],
+                "entities": [str(v)[:64] for v in (data.get("entities") or [])[:8]],
+                "model": str(data.get("model") or "")[:128],
+                "prompt_version": str(data.get("prompt_version") or "")[:128],
+            })
+        return {"kind": "query_images", "question": question.strip()[:500], "images": images}
+
     # ── 保存历史：落盘 + 关联（四步） ────────────────
 
     async def bind_for_history(
