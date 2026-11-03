@@ -96,7 +96,8 @@ class OntologyCompileClient(ABC):
                       mode: str = "ingest_extract", schema: dict[str, Any] | None = None,
                       chunks: list[dict[str, Any]] | None = None,
                       options: dict[str, Any] | None = None,
-                      content_generation: int | None = None) -> dict[str, Any]:
+                      content_generation: int | None = None,
+                      ontology_model: str = "") -> dict[str, Any]:
         """投递一次编译，**立刻**返回 `{"compile_id": ..., "status": "queued"}`。
 
         执行在容器内 worker 后台跑（能力 action 只入队），所以本调用**不是**长调用：
@@ -119,6 +120,11 @@ class OntologyCompileClient(ABC):
         （全新上传的文档就是 0），故这里「没给」与「给了 0」在容器侧同解 —— 与
         `schema`/`chunks` 那条「`None` 不上线」的纪律不冲突：那两处 `None` 与 `{}`/`[]`
         是两种不同意图，而这里两种取值落到容器是同一个数。
+
+        `ontology_model`（[jonex] KB 级本体抽取模型覆盖）：与 rag 链
+        `retry_ontology_extract(ontology_model=…)` **同语义** —— 空串 = 不带该键 ⇒ 引擎用
+        自己的 `ONTOLOGY_LLM_MODEL`。容器把它写进任务的 `config_snapshot["options"]`，
+        `extract.py` 再透给 `NativeOntologyExtractor` 的 `options["model"]`。
         """
         ...
 
@@ -278,7 +284,8 @@ class RemoteOntologyCompileClient(OntologyCompileClient):
                       mode: str = "ingest_extract", schema: dict[str, Any] | None = None,
                       chunks: list[dict[str, Any]] | None = None,
                       options: dict[str, Any] | None = None,
-                      content_generation: int | None = None) -> dict[str, Any]:
+                      content_generation: int | None = None,
+                      ontology_model: str = "") -> dict[str, Any]:
         data: dict[str, Any] = {"document_id": document_id, "mode": mode}
         # 只带**实际给了值**的可选字段：`None` 上线路由成「对面显式置空」的歧义。
         # `chunks` 尤其致命：能力侧 `data.get("chunks")` 有值就不再自取（设计 §4.3），
@@ -292,6 +299,11 @@ class RemoteOntologyCompileClient(OntologyCompileClient):
         # `0` 是合法代次（全新上传）且要真的送出去，故判据是 `is not None` 而不是真值判断。
         if content_generation is not None:
             data["content_generation"] = content_generation
+        # [jonex] KB 级本体抽取模型：空串 = 不带该键。与 rag 链
+        # `retry_ontology_extract(ontology_model=…)` 同纪律 —— 空值上线等于让容器去猜
+        # 「是没配，还是显式要空」，而「没配」本来就可观测（键不出现）。
+        if (ontology_model or "").strip():
+            data["ontology_model"] = ontology_model.strip()
         return await self._invoke("compile", data, tenant_id, knowledge_base_id)
 
     async def get_compile_status(self, *, compile_id: str, tenant_id: str,

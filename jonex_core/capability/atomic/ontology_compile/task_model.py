@@ -65,6 +65,16 @@ class CompileTask(BaseModel):
     progress: float = 0.0
     status: Any = TaskStatus.CREATED          # 允许枚举或字符串（str-Enum 两者相等）
     config_snapshot: dict = Field(default_factory=dict)
+
+    @property
+    def ontology_model(self) -> str:
+        """[jonex] KB 级本体抽取模型覆盖（提交时由能力写进 config_snapshot.options）。
+
+        空串 = 没配 ⇒ 引擎走自己的 `ONTOLOGY_LLM_MODEL`（与「显式要空」同解，故不区分）。
+        读法集中在这一处：`extract.py` 两个抽取入口都从这里取，避免各写一份 dict.get 链。
+        """
+        opts = (self.config_snapshot or {}).get("options") or {}
+        return str(opts.get("ontology_model") or "").strip()
     ontology_schema: Optional[dict] = None
     ontology_status: str = ""
     ontology_data: Optional[dict] = None

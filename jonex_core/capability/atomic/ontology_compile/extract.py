@@ -40,6 +40,15 @@ async def run_ontology_extraction(deps: CompileDeps, task, ctx, doc_id: str) -> 
 
     try:
         kb_id = task.kb_id or ""
+        # [jonex] KB 级本体抽取模型（提交时冻结在任务快照里；空 = 引擎用默认模型）。
+        # 主抽取与「表格零产出回补」两次调用都吃同一个值 —— 同一份文档不该因为
+        # 走了回补分支就换模型，否则同一任务里会出现两种模型产出的实体。
+        _snapshot = getattr(task, "config_snapshot", None) or {}
+        kb_ontology_model = str(
+            getattr(task, "ontology_model", "")
+            or ((_snapshot.get("options") or {}).get("ontology_model"))
+            or ""
+        ).strip()
 
         # [jonex] P0-b：表格子集落盘已上移到「推完切片」处，见
         # _execute_pipeline_http。原因：解析与编译拆成两次任务后，首次任务
@@ -186,6 +195,8 @@ async def run_ontology_extraction(deps: CompileDeps, task, ctx, doc_id: str) -> 
             options={
                 "procedural": procedural_opt,
                 "table_objects_handled": table_handled,
+                # 空串 ⇒ 提取器按 scope/env 回落（`_openai_chat(model=None)`）
+                "model": kb_ontology_model,
             },
         )
         # [jonex] P0-b（2026-09-13 OOM 复盘）：主抽取的返回值此前**完全未被
@@ -280,6 +291,7 @@ async def run_ontology_extraction(deps: CompileDeps, task, ctx, doc_id: str) -> 
                         options={
                             "procedural": procedural_opt,
                             "table_objects_handled": False,
+                            "model": kb_ontology_model,
                         },
                     )
                     if supplement.ok:

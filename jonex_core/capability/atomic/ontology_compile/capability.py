@@ -89,6 +89,21 @@ def _coerce_generation(value) -> int:
         return 0
 
 
+def _merge_ontology_model(data: dict) -> dict:
+    """把 KB 级本体抽取模型并进任务 options（空值不落键）。
+
+    单独一个函数是为了让「什么算配了模型」只有一处判据：调用方可能传 `None` /
+    `""` / 带空白的字符串，三种都按「没配」处理 —— 落一个空键进 snapshot 会让
+    `extract.py` 分不清「没配」与「配了空」，也会让 `CompileTask.ontology_model` 的
+    回落逻辑多一层特判。
+    """
+    options = dict(data.get("options") or {})
+    model = str(data.get("ontology_model") or "").strip()
+    if model:
+        options["ontology_model"] = model
+    return options
+
+
 class OntologyCompileCapability(BaseCapability):
     """编译能力：只做入队 / 查状态 / 重投；真正的执行在 worker 里。"""
 
@@ -151,7 +166,10 @@ class OntologyCompileCapability(BaseCapability):
             ontology_schema=_extract_compiled_schema(data.get("schema")),
             config_snapshot={
                 "mode": data.get("mode") or "ingest_extract",
-                "options": data.get("options") or {},
+                # [jonex] KB 级本体抽取模型（空 = 不写这个键 ⇒ 引擎用 ONTOLOGY_LLM_MODEL）。
+                # 与 mode/options 一起冻结在任务行里：worker 重投（retry_compile）时沿用
+                # 提交那一刻的配置，不会因为中途改了 KB 设置而换模型。
+                "options": _merge_ontology_model(data),
             },
             # 过渡兼容：任务参数带 chunks 时优先用之（P4 后删）
             engine_chunks=data.get("chunks"),
