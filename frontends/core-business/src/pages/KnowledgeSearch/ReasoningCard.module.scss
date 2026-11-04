@@ -1,0 +1,500 @@
+// [jonex] 推理链统一卡片（方案 C）：本体/RAG 链与 jonex_wiki 链共用同一套外壳、
+// 头部 chips、编号卡与状态点；两条链的差异只留在卡片正文里（本体链是实体/事实
+// chips，wiki 链是「调用 / 返回」两行 + 片段盒）。
+//
+// 设计稿：docs/knowledge-base/knowledge-search-reasoning-trace-unified-prototype.html
+// 方案 C（?only=C），下列数值照抄原型 token。
+
+$purple: #7c3aed;
+$purpleDeep: #6d28d9;
+$purpleSoft: #f5f3ff;
+$line: #ece9fb;
+$muted: #64748b;
+$ink2: #475569;
+
+// 正文两列的几何（标签列宽 + 列间距）。片段、路径、展开按钮都按这个缩进，
+// 视觉上续在「返回」的值下面，而不是另起一个块。
+$ioLabel: 40px;
+$ioGap: 10px;
+$ioIndent: $ioLabel + $ioGap;
+
+// ── 外壳 ──
+.shell {
+  padding: 12px 16px 14px;
+  margin-bottom: 16px;
+  background: #fbfaff;
+  border: 1px solid $line;
+  border-radius: 12px;
+}
+
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.caret {
+  flex: none;
+  color: #b6bdc7;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+
+  &.caretOpen {
+    transform: rotate(90deg);
+  }
+}
+
+.headIcon {
+  flex: none;
+  color: #8b5cf6;
+}
+
+.headTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: $purpleDeep;
+}
+
+.meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+// ── chips ──
+.chip {
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 18px;
+  color: $muted;
+  white-space: nowrap;
+  background: #f1f5f9;
+  border-radius: 4px;
+
+  &.chipPrimary {
+    color: $purple;
+    background: $purpleSoft;
+  }
+
+  &.chipSuccess {
+    color: #059669;
+    background: #ecfdf5;
+  }
+
+  &.chipWarn {
+    color: #b45309;
+    background: #fffbeb;
+  }
+
+  &.chipDanger {
+    color: #dc2626;
+    background: #fef2f2;
+  }
+}
+
+// 运行中的「当前动作」徽标：只在 wiki 链（有当前步）出现
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 44%;
+  padding: 1px 8px;
+  overflow: hidden;
+  font-size: 11px;
+  color: $purple;
+  white-space: nowrap;
+  background: #f3ecff;
+  border-radius: 999px;
+}
+
+.pulse {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  background: #8b5cf6;
+  border-radius: 50%;
+  animation: trace-pulse 1.4s ease-in-out infinite;
+}
+
+.liveText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes trace-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+// ── 卡片流 ──
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.card {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid $line;
+  border-radius: 10px;
+
+  &.clickable .row {
+    cursor: pointer;
+  }
+
+  &.hot {
+    border-color: #ddd3f8;
+
+    .idx {
+      color: $purple;
+      background: $purpleSoft;
+    }
+  }
+}
+
+.idx {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: #94a3b8;
+  background: #f4f2fb;
+  border-radius: 7px;
+}
+
+.cardBody {
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  line-height: inherit;
+  text-align: left;
+
+  &:hover {
+    background: transparent;
+  }
+}
+
+// 图标底块：按 step 语义着色（与原型 .k-* 一致）
+.kib {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+.kIntent {
+  color: #2563eb;
+  background: #eff6ff;
+}
+
+.kMatch {
+  color: $purple;
+  background: $purpleSoft;
+}
+
+.kRoute {
+  color: #4f46e5;
+  background: #eef2ff;
+}
+
+.kFact {
+  color: #0891b2;
+  background: #ecfeff;
+}
+
+.kRead {
+  color: #059669;
+  background: #ecfdf5;
+}
+
+.kTable {
+  color: #b45309;
+  background: #fffbeb;
+}
+
+.kPlan {
+  color: $ink2;
+  background: #f1f5f9;
+}
+
+.kSynth {
+  color: #a21caf;
+  background: #fdf4ff;
+}
+
+.cardTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.summary {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: $muted;
+}
+
+// 状态点
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.dotOk {
+  background: #10b981;
+}
+
+.dotRun {
+  background: #8b5cf6;
+  box-shadow: 0 0 0 3px #f3ecff;
+}
+
+.dotBad {
+  background: #ef4444;
+}
+
+.dotWarn {
+  background: #f59e0b;
+}
+
+.dotSkip {
+  background: #cbd5e1;
+}
+
+// 耗时：永远贴右，tabular 对齐
+.ms {
+  margin-left: auto;
+  font-size: 11px;
+  color: #a3adbb;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.chevron {
+  flex: none;
+  color: #b6bdc7;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+
+  &.chevronOpen {
+    transform: rotate(90deg);
+  }
+}
+
+// ── 正文：统一「标签 / 值」两列语法 ──
+// 本体链用 输入 / 输出，wiki 链用 调用 / 返回（文案由调用方传入）
+.io {
+  display: grid;
+  grid-template-columns: $ioLabel minmax(0, 1fr);
+  gap: 3px $ioGap;
+  margin-top: 6px;
+}
+
+.ioK {
+  font-size: 11px;
+  line-height: 20px;
+  color: #a6b0bf;
+  letter-spacing: 0.3px;
+
+  &.ioKHot {
+    color: #8b5cf6;
+  }
+}
+
+.ioV {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 20px;
+  color: $ink2;
+
+  &.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    overflow-wrap: anywhere;
+  }
+
+  b {
+    color: $purple;
+    font-weight: 600;
+  }
+
+  em {
+    color: #0f766e;
+    font-style: normal;
+  }
+}
+
+.pending {
+  color: #8b5cf6;
+}
+
+.out {
+  color: $ink2;
+  font-variant-numeric: tabular-nums;
+}
+
+// 片段区：不另起一个描边盒，而是续在「返回」的值下面——左边缘对齐值列，
+// 用一条竖线把若干片段收成一组；片段之间只留间距，不再各自套边框
+// （一屏出现三四个片段时，框叠框会显得很吵）。
+.snippets {
+  padding-left: 10px;
+  margin: 6px 0 0 $ioIndent;
+  border-left: 2px solid #e6ddff;
+}
+
+.pv {
+  & + & {
+    margin-top: 8px;
+  }
+}
+
+// 标题一行，path 缩到第二行的小字（path 一般比标题长得多，同行会把它挤成省略号）
+.pvTitle {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: #334155;
+  overflow-wrap: anywhere;
+
+  i {
+    overflow: hidden;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px;
+    font-style: normal;
+    font-weight: 400;
+    color: #a3adbb;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.pvText {
+  display: -webkit-box;
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: $muted;
+  font-size: 12px;
+  line-height: 1.6;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.paths {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin-top: 8px;
+
+  button,
+  code {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+
+  button {
+    color: #1d4ed8;
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }
+
+  code {
+    color: $muted;
+  }
+}
+
+.more {
+  display: inline-block;
+  padding: 0;
+  margin-top: 6px;
+  font-size: 11px;
+  color: #8b5cf6;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+// 窄屏：值列只剩很少的宽度，退掉缩进把整行留给片段
+@media (max-width: 640px) {
+  .snippets {
+    padding-left: 8px;
+    margin-left: 0;
+  }
+}
+
+// 本体链步骤级「输入 / 输出」开关
+.toggle {
+  display: inline-block;
+  padding: 0;
+  margin-top: 6px;
+  font-size: 12px;
+  color: $purple;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}

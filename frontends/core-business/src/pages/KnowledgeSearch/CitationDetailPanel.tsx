@@ -10,6 +10,7 @@ import {
 } from '@ant-design/icons';
 import { getShellContext, isPlatformAdmin } from '@jonex/shell-sdk';
 import { getDocumentViewTicket } from '@/api/domainKnowledge';
+import { buildDocumentAssetProxyUrl, buildDocumentRawProxyUrl } from '@/utils/documentUrls';
 import MarkdownContent from '@/components/MarkdownContent';
 import { clickDownloadLink } from '@/utils/batchDocumentDownload';
 import type { KnowledgeReference, KnowledgeReferenceLocation } from '@/types/knowledgeSearch';
@@ -92,8 +93,53 @@ export default function CitationDetailPanel({
 
   // 图片画面有两个来源：文档内嵌图资产（§image-refs 的 asset_url）、以及「文档本身就是图片」。
   // 后者拿不到内嵌资产时（未上传 / local 后端 presign 返回空串）整条引用会只剩一段文字，
-  // 故 media_type 为 image 时退到 raw_url 直连——raw_url 是文档原件，也就是那张图。
-  const imageUrl = activeImage?.asset_url || (isImage ? reference.raw_url || '' : '');
+  // 故 media_type 为 image 时退到 raw_url——raw_url 是文档原件，也就是那张图。
+  //
+  // ⚠️ 2026-10-22 真机：asset_url / raw_url 都是**预签名直链**，签的是部署内域名
+  // （如 `http://minio:9000/...`），浏览器解析不了 → 相关图片全部加载失败。
+  // 有 view-ticket 时优先走同源代理（`?token=...&proxy=1`），取不到票才回退预签名直连。
+  const [viewToken, setViewToken] = React.useState('');
+  const needsViewToken = Boolean(reference.doc_id)
+    && (isImage || isVideo || activeImage?.image_idx != null);
+  React.useEffect(() => {
+    if (!needsViewToken || !reference.doc_id) {
+      setViewToken('');
+      return undefined;
+    }
+    let alive = true;
+    getDocumentViewTicket(reference.doc_id)
+      .then(({ url }) => {
+        if (!alive) return;
+        try {
+          setViewToken(new URL(url, window.location.origin).searchParams.get('token') || '');
+        } catch {
+          setViewToken('');
+        }
+      })
+      .catch(() => {
+        if (alive) setViewToken('');
+      });
+    return () => {
+      alive = false;
+    };
+  }, [needsViewToken, reference.doc_id]);
+
+  const rawProxyUrl = React.useMemo(
+    () => (reference.doc_id && viewToken
+      ? buildDocumentRawProxyUrl(reference.doc_id, viewToken)
+      : ''),
+    [reference.doc_id, viewToken],
+  );
+  const assetProxyUrl = React.useMemo(
+    () => (reference.doc_id && viewToken && activeImage?.image_idx != null
+      ? buildDocumentAssetProxyUrl(
+        reference.doc_id, viewToken, activeImage.image_idx, activeImage.asset_ext)
+      : ''),
+    [reference.doc_id, viewToken, activeImage?.image_idx, activeImage?.asset_ext],
+  );
+  const imageUrl = assetProxyUrl
+    || activeImage?.asset_url
+    || (isImage ? rawProxyUrl || reference.raw_url || '' : '');
 
   // 媒体类引用的文本详情进 meta 列表（位置行之后），内容区只留画面；
   // 画面确实出不来（两个 URL 都没有）时才把文字留在内容区，不当成「详情」重复一份
@@ -107,9 +153,10 @@ export default function CitationDetailPanel({
     setImageState('ready');
   }, [imageUrl]);
 
-  // 视频画面：后端不产封面图，前端直接吃 raw_url 的预签名直连，自己解一帧出来。
+  // 视频画面：后端不产封面图，前端取 raw 的**同源代理**地址自己解一帧出来
+  // （预签名直链的域名浏览器解析不了，见上方注释；取不到票才回退直连）。
   // 取不到 URL（local 存储后端 presigned_url 返回空串）或解不了码（mkv/3gp）时退回首帧底图。
-  const posterUrl = isVideo ? reference.raw_url || '' : '';
+  const posterUrl = isVideo ? (rawProxyUrl || reference.raw_url || '') : '';
   // 有定位锚点就显示「即将播放的那一帧」，否则退到开头；不用 0 是因为部分浏览器在 0 不渲染
   const posterTime = tsLoc?.time_start != null ? tsLoc.time_start : 0.1;
   React.useEffect(() => {

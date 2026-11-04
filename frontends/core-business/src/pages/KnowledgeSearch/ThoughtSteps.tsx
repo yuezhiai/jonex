@@ -1,49 +1,69 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { ThoughtChain } from '@ant-design/x';
-import type { ThoughtChainItemType } from '@ant-design/x';
 import {
+  ApartmentOutlined,
+  BranchesOutlined,
+  BulbOutlined,
   CaretDownOutlined,
   CaretRightOutlined,
-  CheckCircleFilled,
-  CloseCircleFilled,
-  LoadingOutlined,
-  MinusCircleFilled,
-  NodeIndexOutlined,
+  DatabaseOutlined,
+  FileTextOutlined,
+  ReadOutlined,
+  ToolOutlined,
 } from '@ant-design/icons';
-import { toThoughtStatus } from './thoughtStatus';
+import type { ReasoningIOItem } from '@/types/knowledgeSearch';
+import { ReasoningRawJson, ReasoningStepIO } from './ReasoningStepIO';
+import { fmtTraceMs, TraceCard, TraceChip, TraceShell, traceStyles, type TraceTone } from './ReasoningCard';
 
 /** 只声明渲染用得上的字段，避免把后端整包 detail 结构绑进这一层 */
 export interface ReasoningStepLike {
   stage: string;
   title: string;
-  status: string;
+  status: 'running' | 'done' | 'skipped' | 'failed' | 'degraded';
   summary?: string | null;
   duration_ms?: number | null;
   detail?: Record<string, unknown> | null;
+  /** 展示型输入/输出（已脱敏；旧历史快照可能缺失） */
+  input?: ReasoningIOItem[] | null;
+  output?: ReasoningIOItem[] | null;
 }
 
 /** `status.*` 这套 i18n key 只覆盖这四种；其余状态直接显示原文 */
 const KNOWN_STATUS = ['running', 'done', 'skipped', 'failed'];
 
-const STATUS_ICON: Record<string, React.ReactNode> = {
-  loading: <LoadingOutlined style={{ color: '#3b82f6' }} />,
-  success: <CheckCircleFilled style={{ color: '#10b981' }} />,
-  error: <CloseCircleFilled style={{ color: '#ef4444' }} />,
-  skipped: <MinusCircleFilled style={{ color: '#94a3b8' }} />,
-};
+/** stage → 图标底块语义色 + 图标；同一套语义色与 wiki 链共用（见 ReasoningCard） */
+const STAGE_VISUAL: Array<{ test: RegExp; tone: TraceTone; icon: React.ReactNode }> = [
+  { test: /intent|rewrite|clarif/i, tone: 'intent', icon: <BulbOutlined /> },
+  { test: /match|entit|ontology/i, tone: 'match', icon: <ApartmentOutlined /> },
+  { test: /route|router|dispatch/i, tone: 'route', icon: <BranchesOutlined /> },
+  { test: /fact|inverse|stub/i, tone: 'fact', icon: <DatabaseOutlined /> },
+  { test: /context|recall|rag|retriev/i, tone: 'read', icon: <ReadOutlined /> },
+  { test: /wiki|openkb|synth|answer/i, tone: 'synth', icon: <FileTextOutlined /> },
+];
 
-const CHIP_TONE: Record<string, { color: string; bg: string }> = {
-  loading: { color: '#3b82f6', bg: '#eff6ff' },
-  success: { color: '#10b981', bg: '#ecfdf5' },
-  error: { color: '#ef4444', bg: '#fef2f2' },
-  skipped: { color: '#94a3b8', bg: '#f1f5f9' },
-};
+const FALLBACK_VISUAL = { tone: 'plan' as TraceTone, icon: <ToolOutlined /> };
+
+function stageVisual(stage: string) {
+  return STAGE_VISUAL.find((item) => item.test.test(stage)) ?? FALLBACK_VISUAL;
+}
+
+/** 检索策略 chip 文案：兼容后端 llm_wiki / jonex_wiki 两种写法。 */
+function strategyLabel(t: (key: string) => string, value?: string | null): string {
+  const raw = String(value || '').toLowerCase();
+  if (!raw) return '—';
+  const key = raw.replace(/_/g, '-');
+  const known = new Set(['mixed', 'ontology', 'rag', 'llm-wiki', 'jonex-wiki', 'none']);
+  return known.has(key) ? t(`knowledgeSearch.strategy_${key}`) : String(value);
+}
 
 interface ThoughtStepsProps {
   steps: ReasoningStepLike[];
   totalMs?: number | null;
   finalSource?: string;
+  /** 实际检索策略（mixed / ontology / rag / …）；旧快照缺失时回退 finalSource */
+  strategy?: string | null;
+  /** 整份 trace 因体积被服务端裁剪过 */
+  ioTruncated?: boolean;
   /** 整块推理链的展开态，由页面持有（一次检索一张卡片，只有一份） */
   expanded: boolean;
   onToggle: () => void;
@@ -51,87 +71,89 @@ interface ThoughtStepsProps {
   renderDetail: (step: ReasoningStepLike) => React.ReactNode;
 }
 
+/**
+ * 本体 / RAG 链的推理过程：外壳与编号卡与 wiki 链统一（方案 C），
+ * 卡片正文保留各自的详情 chips 与步骤级「输入 / 输出」。
+ */
 export default function ThoughtSteps({
   steps,
   totalMs,
   finalSource,
+  strategy,
+  ioTruncated,
   expanded,
   onToggle,
   renderDetail,
 }: ThoughtStepsProps) {
   const { t } = useTranslation();
+  // 步骤级展开态：默认全部收起，展开某步才渲染输入/输出。
+  // 按 `stage-index` 存（同一 stage 在一条链里可能出现多次，如 mix 的双侧融合）。
+  const [openSteps, setOpenSteps] = React.useState<Record<string, boolean>>({});
   if (steps.length === 0) return null;
 
-  const items: ThoughtChainItemType[] = steps.map((step, index) => {
-    const { status, skipped } = toThoughtStatus(step.status);
-    const toneKey = skipped ? 'skipped' : status;
-    const tone = CHIP_TONE[toneKey];
-    // 与 toThoughtStatus 同样只认四个已知状态，其余原样透出（后端加了新状态时不至于变成空白）
-    const chipLabel = KNOWN_STATUS.includes(step.status) ? t(`status.${step.status}`) : step.status;
-    return {
-      key: `${step.stage}-${index}`,
-      status,
-      icon: STATUS_ICON[toneKey],
-      // ⚠️ 不设 collapsible：步骤详情一直可见，与替换前的行为一致。
-      // ThoughtChain 在这里给的是状态图标 + 连接线，不是新的折叠层级。
-      content: renderDetail(step),
-      title: (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: '#334155' }}>{step.title}</span>
-          <span style={{ fontSize: 11, color: tone.color, background: tone.bg, borderRadius: 4, padding: '0 6px' }}>
-            {chipLabel}
-          </span>
-          {step.duration_ms != null && <span style={{ fontSize: 11, color: '#a3adbb' }}>{step.duration_ms}ms</span>}
-        </span>
-      ),
-      description: step.summary ? (
-        <span style={{ fontSize: 12, color: '#64748b', lineHeight: 1.6 }}>{step.summary}</span>
-      ) : undefined,
-    };
-  });
+  const failedCount = steps.filter((s) => s.status === 'failed').length;
 
   return (
-    <div
-      style={{
-        background: '#fbfaff',
-        border: '1px solid #ece9fb',
-        borderRadius: 10,
-        padding: '12px 16px',
-        marginBottom: 16,
-      }}
+    <TraceShell
+      title={t('knowledgeSearch.reasoningProcess')}
+      expanded={expanded}
+      onToggle={onToggle}
+      meta={
+        <>
+          {failedCount > 0 ? (
+            <TraceChip tone="danger">{t('knowledgeSearch.reasoningPartialFailed', { count: failedCount })}</TraceChip>
+          ) : (
+            <TraceChip tone="success">{t('knowledgeSearch.reasoningDone')}</TraceChip>
+          )}
+          <TraceChip>{t('knowledgeSearch.stepCount', { count: steps.length })}</TraceChip>
+          {totalMs != null && <TraceChip>{fmtTraceMs(totalMs)}</TraceChip>}
+          <TraceChip tone="primary">{strategyLabel(t, strategy || finalSource)}</TraceChip>
+          {ioTruncated && <TraceChip>{t('knowledgeSearch.ioTraceTruncated')}</TraceChip>}
+        </>
+      }
     >
-      <button
-        onClick={onToggle}
-        style={{
-          width: '100%',
-          padding: 0,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          justifyContent: 'flex-start',
-          height: 'auto',
-          lineHeight: 'inherit',
-          border: 'none',
-          background: 'transparent',
-          cursor: 'pointer',
-          fontSize: 13,
-        }}
-      >
-        {expanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
-        <NodeIndexOutlined style={{ color: '#8b5cf6' }} />
-        <span style={{ fontSize: 13, fontWeight: 600, color: '#6d28d9' }}>
-          {t('knowledgeSearch.reasoningProcess')}
-        </span>
-        <span style={{ fontSize: 12, color: '#a78bda' }}>
-          {t('knowledgeSearch.steps', { count: steps.length, source: finalSource })}
-          {totalMs != null ? ` · ${totalMs}ms` : ''}
-        </span>
-      </button>
-      {expanded && (
-        <div style={{ marginTop: 12 }}>
-          <ThoughtChain items={items} line="dashed" />
-        </div>
-      )}
-    </div>
+      {steps.map((step, index) => {
+        const key = `${step.stage}-${index}`;
+        const open = Boolean(openSteps[key]);
+        const hasIO = (step.input?.length ?? 0) > 0 || (step.output?.length ?? 0) > 0;
+        const visual = stageVisual(step.stage);
+        // 只给四个已知状态配 i18n 文案，其余原样透出（后端加了新状态时不至于变成空白）
+        const chipLabel = KNOWN_STATUS.includes(step.status) ? t(`status.${step.status}`) : step.status;
+        return (
+          <TraceCard
+            key={key}
+            index={index + 1}
+            tone={visual.tone}
+            icon={visual.icon}
+            title={step.title}
+            status={step.status}
+            statusLabel={step.status !== 'done' ? <TraceChip tone="warn">{chipLabel}</TraceChip> : undefined}
+            duration={step.duration_ms != null ? fmtTraceMs(step.duration_ms) : null}
+            summary={step.summary}
+          >
+            {renderDetail(step)}
+            {hasIO && (
+              <>
+                <button
+                  type="button"
+                  className={traceStyles.toggle}
+                  aria-expanded={open}
+                  onClick={() => setOpenSteps((prev) => ({ ...prev, [key]: !prev[key] }))}
+                >
+                  {open ? <CaretDownOutlined /> : <CaretRightOutlined />}{' '}
+                  {t('knowledgeSearch.ioInput')} / {t('knowledgeSearch.ioOutput')}
+                </button>
+                {open && (
+                  <div>
+                    <ReasoningStepIO step={step} />
+                    <ReasoningRawJson step={step} />
+                  </div>
+                )}
+              </>
+            )}
+          </TraceCard>
+        );
+      })}
+    </TraceShell>
   );
 }

@@ -63,14 +63,15 @@ interface RawKnowledgeSearchHistoryItem {
   referenceCount?: number;
   duration_ms?: number;
   durationMs?: number;
-  mode?: string;
-  top_k?: number;
-  topK?: number;
+  mode?: string | null;
+  top_k?: number | null;
+  topK?: number | null;
   answer?: string;
   references?: KnowledgeReference[];
   reasoning?: ReasoningTrace | null;
   strictConfig?: KnowledgeSearchStrictConfig | null;
   metadata?: {
+    pipeline?: string;
     domain?: string;
     domain_id?: string;
     domainId?: string;
@@ -143,12 +144,12 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
     answerPreview: item.answerPreview ?? item.answer_preview,
     referenceCount: item.referenceCount ?? item.reference_count,
     durationMs: item.durationMs ?? item.duration_ms,
-    mode: item.mode === 'hybrid' ? 'hybrid' : undefined,
-    topK: item.topK ?? item.top_k,
+    mode: metadata.pipeline !== 'jonex_wiki' && item.mode === 'hybrid' ? 'hybrid' : undefined,
+    topK: metadata.pipeline === 'jonex_wiki' ? undefined : item.topK ?? item.top_k ?? undefined,
     answer: item.answer,
     references: item.references,
     reasoning: item.reasoning,
-    strictConfig: item.strictConfig ?? (metadata.strict_config as KnowledgeSearchStrictConfig | null | undefined),
+    strictConfig: metadata.pipeline === 'jonex_wiki' ? undefined : item.strictConfig ?? (metadata.strict_config as KnowledgeSearchStrictConfig | null | undefined),
     // [jonex] 以图问知识：缺字段时给空数组（调用方不必判 undefined）
     queryImages: (item.query_images ?? []).map((image) => ({
       id: image.id,
@@ -189,16 +190,6 @@ export const DEFAULT_DEEP_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
   strict_require_grounded: true,
   max_subqueries: 6,
   allow_common_sense: true,
-};
-
-/**
- * [jonex] Wiki 检索的严格模式默认值（与快速检索一致）。
- * 注意：/search/jonex_wiki 端点的契约是「只收 query/mode/top_k/knowledge_base_ids」，
- * 严格模式参数不会下发（见 streamKnowledgeSearch 的 wikiEndpoint 判定），
- * 该配置仅用于面板切换时保持各档位的参数快照一致。
- */
-export const DEFAULT_WIKI_STRICT_CONFIG: KnowledgeSearchStrictConfig = {
-  ...DEFAULT_FAST_STRICT_CONFIG,
 };
 
 export async function getKnowledgeSearchOverview(): Promise<KnowledgeSearchOverview> {
@@ -346,6 +337,12 @@ export async function resolveKnowledgeReferences(
         // 推导对象键并生成新的 asset_url（历史快照里 asset_url 已剥离且会过期）。
         image_idx: loc?.image_idx ?? undefined,
         asset_ext: loc?.asset_ext ?? undefined,
+        asset_id: loc?.asset_id ?? undefined,
+        bundle_sha: loc?.bundle_sha ?? undefined,
+        source_locator: loc?.source_locator ?? undefined,
+        usage: loc?.usage ?? undefined,
+        association_method: loc?.association_method ?? undefined,
+        visual_read_id: loc?.visual_read_id ?? undefined,
       });
     }
   }
@@ -370,20 +367,20 @@ function mergeResolvedUrls(
   snapshot: KnowledgeReference[],
   resolved: KnowledgeReference[],
 ): KnowledgeReference[] {
-  const byDoc = new Map(resolved.map((r) => [r.doc_id, r]));
+  const byDoc = new Map(resolved.map((r) => [`${r.kb_id}:${r.doc_id}`, r]));
   return snapshot.map((ref) => {
-    const hit = byDoc.get(ref.doc_id);
+    const hit = byDoc.get(`${ref.kb_id}:${ref.doc_id}`);
     if (!hit) return ref;
     const assetByIdx = new Map(
       (hit.locations ?? [])
-        .filter((l) => l.image_idx != null && l.asset_url)
-        .map((l) => [l.image_idx, l.asset_url] as const),
+        .filter((l) => (l.asset_id || l.image_idx != null) && l.asset_url)
+        .map((l) => [l.asset_id ? `${l.bundle_sha}:${l.asset_id}` : String(l.image_idx), l.asset_url] as const),
     );
     return {
       ...ref,
       raw_url: hit.raw_url ?? ref.raw_url,
       locations: (ref.locations ?? []).map((loc) => {
-        const assetUrl = loc.image_idx != null ? assetByIdx.get(loc.image_idx) : undefined;
+        const assetUrl = loc.asset_id || loc.image_idx != null ? assetByIdx.get(loc.asset_id ? `${loc.bundle_sha}:${loc.asset_id}` : String(loc.image_idx)) : undefined;
         return assetUrl ? { ...loc, asset_url: assetUrl } : loc;
       }),
     };
@@ -515,31 +512,47 @@ export async function streamKnowledgeSearch(
   const deep = params.deep === true;
   // [jonex] Wiki 检索（按钮组第三档）：显式走 jonex_wiki 专用端点，不看 kbTypes 的推断结果
   const wiki = params.wiki === true && !deep;
+  // [jonex] 「本体 + 数据」档：本体检索后追加数据库查询结果（旧档恢复，与纯数据档并存）
+  const ontologyDataRoute = params.ontologyData === true && !deep && !wiki;
+  // [jonex] 纯「数据检索」档：直接 NL→SQL，不走本体
+  const dataRoute = params.data === true && !deep && !wiki;
   // 专用 wiki 引擎端点：接收 query/mode/top_k/knowledge_base_ids，不接受严格模式参数
   const wikiEndpoint = wiki || (!deep && !!engineType);
-  const endpoint = wiki
-    ? '/knowledge-base/search/jonex_wiki'
-    : deep
-      ? '/knowledge-base/search/deep'
-      : engineType === 'jonex_wiki'
-        ? '/knowledge-base/search/jonex_wiki'
-        : engineType === 'openkb'
-          ? '/knowledge-base/search/llmwiki'
-          : '/knowledge-base/search/mix';
+  const endpoint = ontologyDataRoute
+    ? '/knowledge-base/search/ontology-data'
+    : dataRoute
+      ? '/knowledge-base/search/data'
+      : wiki    ? '/knowledge-base/search/jonex_wiki'
+      : deep
+        ? '/knowledge-base/search/deep'
+        : engineType === 'jonex_wiki'
+          ? '/knowledge-base/search/jonex_wiki'
+          : engineType === 'openkb'
+            ? '/knowledge-base/search/llmwiki'
+            : '/knowledge-base/search/mix';
   const wikiStream = endpoint === '/knowledge-base/search/jonex_wiki';
   const url = new URL(`${baseUrl}${endpoint}${wikiStream ? '/stream' : ''}`, window.location.origin);
 
+  // [jonex] 只有两个 wiki 专用端点不接受严格模式参数（它们的请求 DTO 里没有 strict_* 字段）；
+  // /search/mix 与 /search/deep 都接受（前者按管线分桶后再透传给 lightrag 一侧）。
+  // 不能拿「选中范围是否同一引擎」来判断：全 lightrag 的快速检索同样满足该条件，但它
+  // 实际走的是 /search/mix —— 那样判会让面板里保存的严格模式参数在请求体里整段消失。
+  const strictUnsupported =
+    endpoint === '/knowledge-base/search/jonex_wiki' || endpoint === '/knowledge-base/search/llmwiki';
   const strict = normalized.strictConfig;
   const body: Record<string, unknown> = {
     query: normalized.query,
-    mode: normalized.mode,
-    top_k: normalized.topK,
+    ...(!wikiStream ? { mode: normalized.mode, top_k: normalized.topK } : {}),
     with_reasoning: true,
   };
   if (endpoint === '/knowledge-base/search/jonex_wiki') {
     body.thinking_mode = params.wikiThinkingMode ?? 'fast';
   }
-  if (strict && !wikiEndpoint) {
+  if (params.queryImageIds?.length && (wikiStream || endpoint === '/knowledge-base/search/mix')) {
+    body.query_image_ids = params.queryImageIds;
+    body.image_question = params.imageQuestion || undefined;
+  }
+  if (strict && !strictUnsupported) {
     // 严格模式参数（普通 / 深度检索共用）：strict_mode 关闭时仅传开关，不传其它严格参数
     body.strict_mode = strict.strict_mode;
     if (strict.strict_mode) {
@@ -557,6 +570,11 @@ export async function streamKnowledgeSearch(
   // [jonex] 检索维度改为领域空间后，不再下发 domain_id（后端检索只认 knowledge_base_ids）
   if (normalized.kbIds.length > 0) {
     body.knowledge_base_ids = normalized.kbIds;
+  }
+  // [①②] 点名 pin（可选）：给路由层用（钉死 ② 的 entity_name）；路由转发 Jonex 前会剥掉。
+  // ⚠️ 走 `params`（`normalize` 是新构造对象、不会带上这个可选键）。
+  if (params.pins && Object.keys(params.pins).length > 0) {
+    body.entity_pins = params.pins;
   }
 
   const response = await fetch(url.toString(), {
@@ -612,7 +630,6 @@ export async function streamKnowledgeSearch(
       return;
     }
 
-    // 模拟流式输出：逐字输出 answer 模拟打字效果
     const answer = result.data.answer;
     const meta = {
       source: result.data.source,
@@ -621,7 +638,33 @@ export async function streamKnowledgeSearch(
       rag_used: result.data.rag_used,
       // [jonex] answer-feedback 锚点：后端检索响应下发检索历史记录 id
       history_id: result.data.history_id,
+      // [①②] 数据路径结构化块（router 下发；不存在的后端/开关关 ⇒ null，渲染零回归）
+      data_blocks: result.data.data_blocks ?? null,
+      // [①②] 文档答案 + 数据补充的并置标记（router 补充路径下发）
+      data_supplement: result.data.data_supplement === true,
+      // [①②] `/search/data` 路线的数据引用（SQL/表格单独展示）
+      data_references: result.data.data_references ?? null,
+      // [A] 血缘解释块（后端只在有内容时下发；无键 ⇒ null，渲染零回归）
+      data_lineage: result.data.data_lineage ?? null,
+      // 实时数据：问答调用了动作绑定的外部工具（总闸关 / 未调用时无键 ⇒ null）
+      tool_results: result.data.tool_results ?? null,
     };
+
+    // [①②] 数据路径跳过模拟打字：正文与结构化块是 router 纯 Python 一次性渲染的产物
+    // （非 LLM 流式生成）——逐字「打字」没有语义，且正文可达数千字（50 行表格 + SQL）
+    // 要打几十秒。一次性交付：表格与答案同时呈现；RAG / 本体路径保留下方逐字模拟。
+    const isDataPath =
+      result.data.source === 'data'
+      || (Array.isArray(result.data.data_blocks) && result.data.data_blocks.length > 0
+          && result.data.data_supplement !== true);
+    if (isDataPath) {
+      if (signal?.aborted) return;
+      handlers.onDelta(answer, meta);
+      handlers.onDone?.(meta);
+      return;
+    }
+
+    // 模拟流式输出：逐字输出 answer 模拟打字效果（RAG / 本体路径的产品观感，勿动）
     for (let i = 0; i < answer.length; i += 2) {
       if (signal?.aborted) return;
       handlers.onDelta(answer.slice(i, i + 2), meta);
@@ -733,14 +776,23 @@ export async function getAnswerFeedback(historyId: string): Promise<AnswerFeedba
   return result.data ?? { feedback: null };
 }
 
+/** 反馈来源筛选：web=浏览器检索、mcp=MCP 客户端检索；缺省不过滤 */
+export type AnswerFeedbackSource = 'web' | 'mcp';
+
 /** 按知识库聚合查询回答反馈列表（情况追踪页使用） */
 export async function getAnswerFeedbackList(
   knowledgeBaseId: string,
-  params?: { feedbackType?: SearchFeedbackType; page?: number; pageSize?: number },
+  params?: {
+    feedbackType?: SearchFeedbackType;
+    source?: AnswerFeedbackSource;
+    page?: number;
+    pageSize?: number;
+  },
 ): Promise<AnswerFeedbackListResponse> {
   const token = readAccessToken();
   const searchParams = new URLSearchParams({ knowledge_base_id: knowledgeBaseId });
   if (params?.feedbackType) searchParams.set('feedback_type', params.feedbackType);
+  if (params?.source) searchParams.set('source', params.source);
   if (params?.page) searchParams.set('page', String(params.page));
   if (params?.pageSize) searchParams.set('page_size', String(params.pageSize));
 

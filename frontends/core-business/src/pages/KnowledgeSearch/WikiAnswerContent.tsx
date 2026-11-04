@@ -7,8 +7,9 @@ import styles from './WikiSearch.module.scss';
  * Wiki 链路的答案正文。
  *
  * 只做两件 Wiki 专属的事：走 `formatWikiAnswer` 预处理、套 `.answerText` 的排版口径
- * （它用 `:global(p)` 一类的后代选择器给 markdown 元素定样式）。引用角标、流式装配
- * 都交给 `AnswerMarkdown`，与主链路共用同一套逻辑。
+ * （它用 `:global(p)` 一类的后代选择器给 markdown 元素定样式）。引用角标、流式装配、
+ * 表格渲染都交给 `AnswerMarkdown`，与主链路共用同一套逻辑 —— 表格原先在 Wiki 侧单独
+ * 覆盖过一份 `.answerTable`，现已并入 `@/components/MarkdownTable`，故此处不再传 `components`。
  */
 export default function WikiAnswerContent({ content, referenceCount, activeIndex, onCitation }: {
   content: string;
@@ -26,13 +27,6 @@ export default function WikiAnswerContent({ content, referenceCount, activeIndex
         referenceCount={referenceCount}
         activeCitationIndex={activeIndex}
         onCitation={onCitation}
-        components={{
-          table: ({ children }) => (
-            <div className={styles.answerTable}>
-              <table>{children}</table>
-            </div>
-          ),
-        }}
       />
     </div>
   );

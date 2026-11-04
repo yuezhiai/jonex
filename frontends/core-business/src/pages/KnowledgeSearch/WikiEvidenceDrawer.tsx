@@ -24,8 +24,17 @@ export default function WikiEvidenceDrawer({ reference, onClose, onOriginal }: {
     return () => controller.abort();
   }, [reference]);
   const cells = new Map(view?.cells?.map((c) => [`${c.row}:${c.column}`, c]) ?? []);
+  // 显式分层：叠放顺序不能靠 portal 的增删顺序（2026-10-30 实测复现的错位就出在这里）。
+  // 两层抽屉都用 antd 默认 z-index（1000）时，谁在上面只由 DOM 里谁后出现决定；而
+  // 「引用详情」带 `destroyOnHidden` —— 每次打开都会重建 portal 并追加到 body 末尾，
+  // 「原文证据」（本组件）不带，portal 一直留着。于是「关掉两层再重开」的第二轮里，
+  // 引用详情反而压到原文证据之上（用户看到的就是原文证据掉到下面）。
+  // 固定成：引用详情 1000（antd 默认）→ 原文证据 1100 → 文档查看弹层 1200（DocumentViewer）。
+  // 三者都低于 antd message / notification（zIndexPopupBase + CONTAINER_MAX_OFFSET + 10
+  // = 2110），下载失败这类轻提示仍浮在最上面。
   return <Drawer open={!!reference} onClose={onClose} width="min(880px, 100vw)"
-    title={t('knowledgeSearch.wikiEvidenceTitle')}>
+    title={t('knowledgeSearch.wikiEvidenceTitle')}
+    zIndex={1100}>
     <div className={styles.evidenceHeader}>
       <strong>{reference?.file_name}</strong>
       {view && <span>{view.sheet_name || (view.page_number != null

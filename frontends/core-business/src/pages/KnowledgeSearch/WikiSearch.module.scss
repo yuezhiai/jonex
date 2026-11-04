@@ -41,54 +41,6 @@
   :global(blockquote) { margin: 16px 0; padding: 6px 16px; border-left: 3px solid #3b82f6; color: #475569; background: #f8fafc; }
   :global(pre) { overflow: auto; padding: 12px 16px; background: #f8fafc; border-radius: 6px; font-size: 13px; }
 }
-.answerTable {
-  overflow: auto;
-  margin: 16px 0;
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border: 1px solid #e2e8f0; padding: 8px 12px; font-size: 13px; text-align: left; }
-  th { background: #f8fafc; font-weight: 600; }
-}
-.progress { margin-bottom: 16px; color: #475569; padding: 12px 16px;
-  background: #fbfaff; border: 1px solid #ece9fb; border-radius: 10px; }
-.progressSummary {
-  border: 0;
-  background: transparent;
-  padding: 0;
-  cursor: pointer;
-  color: #334155;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%; flex-wrap: wrap; font-size: 13px; text-align: left;
-  :global(.anticon) { font-size: 12px; }
-  strong { color: #6d28d9; font-size: 13px; font-weight: 600; }
-}
-.progressIcon { color: #8b5cf6; }
-.progressMeta { color: #a78bda; font-size: 12px; }
-.progressFeed { padding-top: 16px; }
-.progressItem { margin-bottom: 18px; .progressStep { margin-bottom: 6px; } }
-.progressContent {
-  padding-left: 25px; max-width: 86ch; font-size: 13px; line-height: 1.85;
-  color: #475569; overflow-wrap: anywhere;
-  p { margin: 3px 0; }
-  > p > span { color: #8492a6; margin-right: 8px; }
-}
-.progressPath { color: #64748b; font-size: 12px; }
-.progressPreview { margin: 8px 0; strong { color: #334155; font-size: 13px; font-weight: 500; } }
-.progressExcerpt { border-left: 2px solid #e2e8f0; padding-left: 12px; white-space: pre-wrap; }
-.previewLabel { color: #94a3b8; font-size: 11px; margin-left: 8px; }
-.progressStep {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 16px;
-  color: #8a8f98;
-  font-size: 13px;
-  line-height: 1.65;
-  > :global(.anticon) { font-size: 15px; flex-shrink: 0; }
-  small { font-size: 12px; color: #a0a6b0; }
-  .stepStatus { font-size: 11px; margin-left: 2px; }
-}
 .sources { background: #f8fafc; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 18px 0; }
 .sourcesSummary {
   border: 0; background: transparent; padding: 0; cursor: pointer;

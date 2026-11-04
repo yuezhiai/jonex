@@ -6,24 +6,27 @@ import TelegramFilled from '@/components/TelegramFilled';
 import { Sender } from '@ant-design/x';
 import classNames from 'classnames';
 import type { AttachedImage, KnowledgeSearchDomain, KnowledgeSearchStrictConfig, KnowledgeSearchUiMode, WikiThinkingMode } from '@/types/knowledgeSearch';
-import { DEFAULT_FAST_STRICT_CONFIG, DEFAULT_DEEP_STRICT_CONFIG, DEFAULT_WIKI_STRICT_CONFIG } from '@/api/knowledgeSearch';
+import { DEFAULT_FAST_STRICT_CONFIG, DEFAULT_DEEP_STRICT_CONFIG } from '@/api/knowledgeSearch';
 import { canSubmitSearch } from './searchPanelUtils';
 import styles from './SearchPanel.module.scss';
 
 /** 档位元数据：label/desc 的 i18n key + 是否支持严格模式配置 */
-const MODE_META: { mode: KnowledgeSearchUiMode; labelKey: string; descKey: string; configurable: boolean }[] = [
+export const MODE_META: { mode: KnowledgeSearchUiMode; labelKey: string; descKey: string; configurable: boolean }[] = [
   { mode: 'fast', labelKey: 'knowledgeSearch.fastSearch', descKey: 'knowledgeSearch.fastSearchDesc', configurable: true },
   { mode: 'deep', labelKey: 'knowledgeSearch.deepSearch', descKey: 'knowledgeSearch.deepSearchDesc', configurable: true },
   { mode: 'wiki', labelKey: 'knowledgeSearch.wikiSearch', descKey: 'knowledgeSearch.wikiSearchDesc', configurable: true },
+  { mode: 'ontologyData', labelKey: 'knowledgeSearch.ontologyDataSearch', descKey: 'knowledgeSearch.ontologyDataSearchDesc', configurable: true },
+  { mode: 'data', labelKey: 'knowledgeSearch.dataSearch', descKey: 'knowledgeSearch.dataSearchDesc', configurable: true },
 ];
 
 const WIKI_THINKING_ICONS: Record<WikiThinkingMode, string> = { fast: '⚡', standard: '◐', deep: '✦' };
 const WIKI_THINKING_MODES: WikiThinkingMode[] = ['fast', 'standard', 'deep'];
 
-const DEFAULT_CONFIG_BY_MODE: Record<KnowledgeSearchUiMode, KnowledgeSearchStrictConfig> = {
+export const DEFAULT_CONFIG_BY_MODE: Record<Exclude<KnowledgeSearchUiMode, 'wiki'>, KnowledgeSearchStrictConfig> = {
   fast: DEFAULT_FAST_STRICT_CONFIG,
   deep: DEFAULT_DEEP_STRICT_CONFIG,
-  wiki: DEFAULT_WIKI_STRICT_CONFIG,
+  ontologyData: DEFAULT_FAST_STRICT_CONFIG,
+  data: DEFAULT_FAST_STRICT_CONFIG,
 };
 
 interface SearchPanelProps {
@@ -31,7 +34,7 @@ interface SearchPanelProps {
   visibleDomains: KnowledgeSearchDomain[];
   query: string;
   isSearching: boolean;
-  /** 检索模式：快速 / 深度 / Wiki（Wiki 走 /search/jonex_wiki 专用端点） */
+  /** 检索模式：快速 / 深度 / Wiki / 本体 + 数据 / 数据检索（Wiki 走 /search/jonex_wiki 专用端点） */
   searchMode: KnowledgeSearchUiMode;
   onSearchModeChange: (mode: KnowledgeSearchUiMode) => void;
   wikiThinkingMode: WikiThinkingMode;
@@ -98,7 +101,7 @@ export default function SearchPanel({
 
   // [jonex] 各档位各自保留一份严格模式配置：切档位时把该档位的配置回传给页面（当前生效配置）
   const [modeConfigs, setModeConfigs] =
-    useState<Record<KnowledgeSearchUiMode, KnowledgeSearchStrictConfig>>(DEFAULT_CONFIG_BY_MODE);
+    useState<Record<Exclude<KnowledgeSearchUiMode, 'wiki'>, KnowledgeSearchStrictConfig>>(DEFAULT_CONFIG_BY_MODE);
   const [modalOpen, setModalOpen] = useState(false);
   const [editingMode, setEditingMode] = useState<KnowledgeSearchUiMode>('fast');
   const [draftConfig, setDraftConfig] = useState<KnowledgeSearchStrictConfig>(DEFAULT_FAST_STRICT_CONFIG);
@@ -116,13 +119,13 @@ export default function SearchPanel({
       return;
     }
     onSearchModeChange(next);
-    onStrictConfigChange(modeConfigs[next]);
+    if (next !== 'wiki') onStrictConfigChange(modeConfigs[next]);
     setDropdownOpen(false);
   };
 
   const openConfigModal = (mode: KnowledgeSearchUiMode) => {
     setEditingMode(mode);
-    setDraftConfig(modeConfigs[mode]);
+    if (mode !== 'wiki') setDraftConfig(modeConfigs[mode]);
     setDraftWikiThinking(wikiThinkingMode);
     setModalOpen(true);
     setDropdownOpen(false);

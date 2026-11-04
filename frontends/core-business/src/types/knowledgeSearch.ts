@@ -1,15 +1,18 @@
 import type { KnowledgeBaseType } from './domainKnowledge';
+import type { ResultBlock } from './resultBlocks';
 
 export type KnowledgeSearchMode = 'local' | 'global' | 'hybrid' | 'naive' | 'mix' | 'bypass';
 
 /**
- * [jonex] 检索模式（搜索框右侧按钮组的三个档位）：
+ * [jonex] 检索模式（搜索框下方档位下拉）：
  * - fast：快速检索 → /search/mix（按 kb_type 分流 lightrag / openkb / jonex_wiki）
  * - deep：深度检索 → /search/deep
  * - wiki：Wiki 检索 → 强制走 jonex_wiki 专用端点 /search/jonex_wiki，
  *   只检索 jonex_wiki 链路的库，展示 Wiki 检索链路（stage=jonex_wiki_query）与页面级来源引用
+ * - ontologyData：本体 + 数据 → /search/ontology-data（本体检索后追加数据库查询结果）
+ * - data：数据检索 → /search/data（纯 NL→SQL，不走本体）
  */
-export type KnowledgeSearchUiMode = 'fast' | 'deep' | 'wiki';
+export type KnowledgeSearchUiMode = 'fast' | 'deep' | 'wiki' | 'ontologyData' | 'data';
 
 export interface KnowledgeSearchOverview {
   totalDocuments: number;
@@ -182,6 +185,8 @@ export type WikiThinkingMode = 'fast' | 'standard' | 'deep';
 
 export interface KnowledgeSearchStreamParams {
   query: string;
+  queryImageIds?: string[];
+  imageQuestion?: string;
   mode?: KnowledgeSearchMode;
   topK?: number;
   domainId?: string;
@@ -194,6 +199,10 @@ export interface KnowledgeSearchStreamParams {
   kbTypes?: KnowledgeBaseType[];
   /** 是否深度检索：true 时调用 /search/deep，默认 /search/ontology */
   deep?: boolean;
+  /** 显式「本体 + 数据」路线：true 时调用 /search/ontology-data（本体检索后追加数据库查询结果） */
+  ontologyData?: boolean;
+  /** 显式纯「数据检索」路线：true 时调用 /search/data（直接 NL→SQL，不走本体） */
+  data?: boolean;
   /**
    * [jonex] 是否 Wiki 检索：true 时强制调用 /search/jonex_wiki（jonex_wiki 专用链路）。
    * 该端点拒绝异管线知识库，调用方需先把 kbIds 收敛为 kb_type=jonex_wiki 的库。
@@ -202,6 +211,11 @@ export interface KnowledgeSearchStreamParams {
   wikiThinkingMode?: WikiThinkingMode;
   /** 严格模式配置（缺省时后端使用默认值） */
   strictConfig?: KnowledgeSearchStrictConfig;
+  /**
+   * [①②] 点名 pin `{data_source_id: entity_name}`：点 ② 模糊块的候选 chip 重问时带上。
+   * 路由层用来钉死该源 ② 调用的 `entity_name`；**转发 Jonex 前会被剥掉**（检索本身不受影响）。
+   */
+  pins?: Record<string, string>;
 }
 
 /** 引用位置（与后端 SourceLocation 对齐） */
@@ -228,6 +242,14 @@ export interface KnowledgeReferenceLocation {
   asset_url?: string | null;
   /** [jonex] §image-refs B2：图片资产扩展名（持久标识；resolve 回传据此重新推导 asset_url） */
   asset_ext?: string | null;
+  asset_id?: string | null;
+  bundle_sha?: string | null;
+  work_title?: string | null;
+  author?: string | null;
+  source_locator?: Record<string, unknown> | null;
+  usage?: 'illustration' | 'visual_evidence' | null;
+  association_method?: string | null;
+  visual_read_id?: string | null;
   /** 命中片段原文文本（RAG 链路带 chunk content 时有值） */
   text?: string | null;
 }
@@ -249,21 +271,130 @@ export interface KnowledgeReference {
   locations: KnowledgeReferenceLocation[];
 }
 
+/** 推理步骤单个输入/输出展示项（与后端 ReasoningIOItem 对齐，已脱敏、已裁剪） */
+export interface ReasoningIOColumn {
+  key: string;
+  label: string;
+}
+
+export interface ReasoningIOItem {
+  label: string;
+  type: 'text' | 'list' | 'kv' | 'table' | 'json';
+  value?: unknown;
+  /** table：列定义 */
+  columns?: ReasoningIOColumn[];
+  /** table：行数据（服务端最多 50 行） */
+  rows?: Record<string, unknown>[];
+  /** table：真实总条数（可能大于 rows.length） */
+  total?: number | null;
+  /** table：默认展示行数 */
+  preview_rows?: number | null;
+  /** table：rows 是否已被服务端截断 */
+  truncated?: boolean;
+  note?: string | null;
+}
+
 /** 推理链单步（与后端 ReasoningStep 对齐） */
 export interface ReasoningStep {
   stage: string;
   title: string;
-  status: 'running' | 'done' | 'skipped' | 'failed';
+  status: 'running' | 'done' | 'skipped' | 'failed' | 'degraded';
   summary?: string | null;
   detail?: Record<string, unknown> | null;
   duration_ms?: number | null;
+  /** 步骤输入参数（展示型，已脱敏；旧历史快照可能缺失） */
+  input?: ReasoningIOItem[] | null;
+  /** 步骤输出结果（展示型，已脱敏；旧历史快照可能缺失） */
+  output?: ReasoningIOItem[] | null;
 }
 
 /** 推理链（与后端 ReasoningTrace 对齐） */
 export interface ReasoningTrace {
   steps: ReasoningStep[];
   final_source: string;
+  /** 实际检索策略（mixed / ontology / rag / llm-wiki / jonex-wiki / none）；旧快照缺失 */
+  strategy?: string | null;
   total_ms?: number | null;
+  /** 整份 trace 因体积被服务端裁剪过 */
+  io_truncated?: boolean;
+  /** {kb_id: 名称}；旧快照缺失时前端回落显示 kb_id */
+  kb_names?: Record<string, string>;
+}
+
+/** [①②] ②（NL→SQL）`ambiguous` 时回的候选（抽象层概念候选的归一化形状）。 */
+export interface DataBlockCandidate {
+  entity_name: string;
+  /** 中文展示名（抽象的 display_name；空/与 entity_name 相同 ⇒ 仍用原文，附在括号里）。 */
+  display_name?: string | null;
+  /** 指标候选落点实体的中文名（如「集团吨发日汇总」；概念候选为空）。 */
+  entity_display_name?: string | null;
+  /** 候选来源：concept = 概念候选，metric = 指标候选。 */
+  kind?: 'concept' | 'metric' | string | null;
+  /** 指标名（仅 kind=metric）。 */
+  metric?: string | null;
+  /** 命中方式：exact/alias/attribute/core/description/aggregate（聚合词兜底）。 */
+  match_kind?: string | null;
+  concept?: string | null;
+  matched_term?: string | null;
+  data_source_id?: string | null;
+  /** 数据源名（wte_a 生产库等；候选 chip 用它区分 A/B 两个同名实体）。 */
+  source_name?: string | null;
+}
+
+/** [①②] 数据路径的**结构化按源块**（router 的 `_merge` 下发）。
+ *
+ * DI 块本期只有 `text`；NL→SQL（②）块带 `table`/`sql`，前端渲染真表格 + 引擎标。
+ * 老的/开关关的后端**不带这个字段** ⇒ 前端渲染路径逐字不变。 */
+export interface DataBlock {
+  data_source_id: string;
+  source_name: string;
+  engine: 'di' | 'nl2sql';
+  kind: 'answer' | 'clarify' | 'error' | 'not_wired';
+  text: string;
+  table?: { columns: string[]; rows: unknown[][] } | null;
+  sql?: string | null;
+  row_count?: number | null;
+  truncated?: boolean | null;
+  reason?: string | null;
+  /** ② ambiguous 的候选（点名用）；其余场合为 null。 */
+  candidates?: DataBlockCandidate[] | null;
+  /** W4.6 结果契约；老后端/无契约 → null 或键缺席，前端走旧渲染。 */
+  blocks?: ResultBlock[] | null;
+}
+
+/** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示，不混进正文）。 */
+export interface DataReference {
+  data_source_id?: string | null;
+  source_name: string;
+  sql?: string | null;
+  table?: { columns: string[]; rows: unknown[][] } | null;
+  row_count?: number | null;
+  truncated?: boolean | null;
+}
+
+/** 血缘解释块的单条边端点（上游/下游各一条）。 */
+export interface DataLineageEndpoint {
+  endpoint: string;
+  column?: string;
+  origin?: string;
+  confidence?: number;
+}
+
+/** 一个命中实体落到物理表后的「来源/下游」条目。 */
+export interface DataLineageItem {
+  entity_type: string;
+  data_source_id: string;
+  table: string;
+  upstream: DataLineageEndpoint[];
+  downstream: DataLineageEndpoint[];
+  /** true = 血缘没读到（读不到 ≠ 没有）——UI 必须显式渲染，不能当空。 */
+  unknown: boolean;
+}
+
+/** 本体问答的「数据来源/下游」解释块（后端 `data_lineage`；无内容时整个键缺席）。 */
+export interface DataLineageBlock {
+  items: DataLineageItem[];
+  truncated?: boolean;
 }
 
 export interface KnowledgeSearchStreamMeta {
@@ -273,6 +404,30 @@ export interface KnowledgeSearchStreamMeta {
   rag_used?: boolean;
   /** [jonex] answer-feedback 锚点：后端检索响应下发的检索历史记录 id（回放历史用 history item id） */
   history_id?: string;
+  /** [①②] 数据路径结构化块（router 扇出路径的下发；不存在即无此数据路径）。 */
+  data_blocks?: DataBlock[] | null;
+  /** [①②] 文档答案 + 数据补充的并置标记；为 true 时保留打字、表格在下方渲染。 */
+  data_supplement?: boolean;
+  /** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示）。 */
+  data_references?: DataReference[] | null;
+  /** [A] 血缘解释块（后端只在有内容时下发；不存在即无该块，渲染零回归）。 */
+  data_lineage?: DataLineageBlock | null;
+  /** 实时数据：本次问答调用动作绑定外部工具的摘要（后端只在调用过时下发）。 */
+  tool_results?: ToolCallResult[] | null;
+}
+
+/** 问答调用外部工具的一条摘要（不含入参与输出原文；输出已作为答案依据）。 */
+export interface ToolCallResult {
+  seq: number;
+  action: string;
+  tool_name?: string | null;
+  tool_label?: string | null;
+  tool_source?: 'platform' | 'kb' | null;
+  /** executed / failed / no_runtime / invalid_input / not_callable / needs_confirmation / not_allowed / rate_limited / tool_unavailable */
+  status?: string | null;
+  http_status?: number | null;
+  called_at?: string | null;
+  fact_no?: number | null;
 }
 
 export interface WikiProgressEvent {
@@ -281,6 +436,8 @@ export interface WikiProgressEvent {
   type?: string;
   title?: string;
   tool?: string;
+  /** 起始时刻（ISO 8601）：运行中的步骤用它算自己的耗时 */
+  started_at?: string;
   duration_ms?: number;
   input_summary?: unknown;
   result_summary?: unknown;
@@ -292,7 +449,12 @@ export interface WikiProgressDetails {
   paths?: string[];
   table_id?: string;
   operation?: string;
+  /** table_locate 的字面检索词与目标字段 */
+  literal?: string;
+  field_id?: string;
   range?: [number, number];
+  /** table_read 的行窗口（引擎从 scope.row_start/row_end 摊平） */
+  rows?: [number, number];
   previews?: { title?: string; path?: string; excerpt?: string }[];
 }
 
@@ -435,9 +597,10 @@ export interface AnswerFeedbackEchoResponse {
 export interface AnswerFeedbackListItem {
   id: string;
   tenant_id: string;
-  user_id: string;
-  history_id: string;
-  query: string;
+  /** Web 反馈有值；MCP 反馈不保存问答快照，user_id / history_id / query 均为 null */
+  user_id: string | null;
+  history_id: string | null;
+  query: string | null;
   answer: string | null;
   feedback_type: SearchFeedbackType;
   feedback_reason: FeedbackReason | null;
@@ -446,6 +609,9 @@ export interface AnswerFeedbackListItem {
   source: string | null;
   mode: string | null;
   source_missing_reason: string | null;
+  /** MCP 反馈归因字段；Web 反馈为 null。有 mcp_key_id 即视为 MCP 来源 */
+  mcp_key_id: string | null;
+  mcp_key_name: string | null;
   adopted: boolean;
   version: number;
   created_at: string | null;

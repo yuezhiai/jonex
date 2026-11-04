@@ -9,6 +9,7 @@ import {
   CaretDownOutlined,
   CaretRightOutlined,
   BulbOutlined,
+  DatabaseOutlined,
   FileTextOutlined,
   PictureOutlined,
   LikeOutlined,
@@ -19,20 +20,28 @@ import {
 } from '@ant-design/icons';
 import MarkdownContent from '@/components/MarkdownContent';
 import type {
+  DataBlock,
+  DataReference,
   KnowledgeReference,
   KnowledgeReferenceLocation,
   SearchFeedbackType,
   FeedbackReason,
+  WikiProgressEvent,
 } from '@/types/knowledgeSearch';
 import type { OntologyInstanceRow } from '@/types/domainKnowledge';
 import type { SearchSession } from './index';
-import { getChunkDetail } from '@/api/domainKnowledge';
+import { getChunkDetail, getDocumentViewTicket } from '@/api/domainKnowledge';
 import { getQueryImageViewTicket } from '@/api/knowledgeSearch';
+import { buildDocumentAssetProxyUrl } from '@/utils/documentUrls';
 import OntologyEntityDrawer from './OntologyEntityDrawer';
 import RagRecallDrawer, { type RagRecallItem } from './RagRecallDrawer';
 import CitationDrawer from './CitationDrawer';
 import AnswerMarkdown from './AnswerMarkdown';
-import {
+import DataBlocksView from './DataBlocksView';
+import DataLineageView from './DataLineageView';
+import ToolResultsView from './ToolResultsView';
+import OntologyToolCallsView, { type OntologyToolCallView } from './OntologyToolCallsView';
+import { stripDataReference } from './dataAnswerText';import {
   formatTimestamp,
   isMarkdownSnippet,
   preferredLocation,
@@ -40,9 +49,12 @@ import {
 } from './citationIndex';
 import styles from './Citation.module.scss';
 import wikiStyles from './WikiSearch.module.scss';
-import { WikiProgress, WikiSources } from './WikiSearchDetails';
+import { WikiSources } from './WikiSearchDetails';
+import WikiTrace from './WikiTrace';
+import { buildWikiTrace, type WikiChainCall } from './wikiTraceModel';
 import WikiAnswerContent from './WikiAnswerContent';
 import ThoughtSteps from './ThoughtSteps';
+import { searchModeLabelKey } from './sessionModeLabel';
 // ── Helper: 媒体类型标签 ──
 function getMediaLabel(type: string, t: (key: string) => string): string {
   const map: Record<string, string> = {
@@ -59,8 +71,13 @@ function getMediaLabel(type: string, t: (key: string) => string): string {
 // ── [jonex] §image-refs P3-2: 图片资产（answer 图片条 / 卡片缩略图共用） ──
 interface ImageAsset {
   docId: string;
-  imageIdx: number;
+  imageIdx?: number | null;
+  assetId?: string | null;
+  usage?: 'illustration' | 'visual_evidence' | null;
+  visualReadId?: string | null;
   assetUrl: string;
+  /** 资产扩展名（检索侧 `asset_ext`；同源代理 URL 用它派生对象键） */
+  assetExt?: string | null;
   pageNo?: number | null;
   description?: string;
 }
@@ -74,14 +91,18 @@ function collectImageAssets(references?: KnowledgeReference[] | null): ImageAsse
   const out: ImageAsset[] = [];
   for (const ref of references || []) {
     for (const loc of ref.locations || []) {
-      if (loc.type !== 'image' || !loc.asset_url || loc.image_idx == null) continue;
-      const key = `${ref.doc_id}:${loc.image_idx}`;
+      if (loc.type !== 'image' || !loc.asset_url || !loc.asset_id && loc.image_idx == null) continue;
+      const key = `${ref.kb_id}:${ref.doc_id}:` + (loc.asset_id ? `${loc.bundle_sha}:${loc.asset_id}` : String(loc.image_idx));
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({
         docId: ref.doc_id,
         imageIdx: loc.image_idx,
+        assetId: loc.asset_id,
+        usage: loc.usage,
+        visualReadId: loc.visual_read_id,
         assetUrl: loc.asset_url,
+        assetExt: loc.asset_ext,
         pageNo: loc.page_no,
         description: (loc.text || '').replace(/^图片描述：/, '').trim(),
       });
@@ -91,6 +112,22 @@ function collectImageAssets(references?: KnowledgeReference[] | null): ImageAsse
 }
 
 // ── [jonex] §image-refs P3-2: 单张图片资产缩略图（loading 骨架 / 失败降级 / 页码角标） ──
+/** 同源代理视图票据缓存（按 doc 去重；票据 300s，提前 30s 过期）。 */
+const _viewTokenCache = new Map<string, { token: string; exp: number }>();
+
+async function resolveViewToken(docId: string): Promise<string> {
+  const now = Date.now();
+  const hit = _viewTokenCache.get(docId);
+  if (hit && hit.exp > now) return hit.token;
+  const { url, expiresIn } = await getDocumentViewTicket(docId);
+  const token = new URL(url, window.location.origin).searchParams.get('token') || '';
+  _viewTokenCache.set(docId, {
+    token,
+    exp: now + Math.max(30, (expiresIn || 300) - 30) * 1000,
+  });
+  return token;
+}
+
 function ImageAssetThumb({
   asset,
   compact = false,
@@ -101,6 +138,31 @@ function ImageAssetThumb({
   t: (key: string, opts?: any) => string;
 }) {
   const [failed, setFailed] = React.useState(false);
+  // ⚠️ asset_url 是预签名直链，签的是对象存储的部署内域名（如 minio:9000），
+  // 浏览器解析不了 → 相关图片全挂。有短时票据就改走同源代理（2026-10-22 真机）。
+  const [src, setSrc] = React.useState(asset.assetUrl);
+  React.useEffect(() => {
+    let alive = true;
+    setFailed(false);
+    const imageIdx = asset.imageIdx;
+    if (!asset.docId || imageIdx == null) {
+      setSrc(asset.assetUrl);
+      return undefined;
+    }
+    resolveViewToken(asset.docId)
+      .then((token) => {
+        if (!alive) return;
+        setSrc(token
+          ? buildDocumentAssetProxyUrl(asset.docId, token, imageIdx, asset.assetExt)
+          : asset.assetUrl);
+      })
+      .catch(() => {
+        if (alive) setSrc(asset.assetUrl);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [asset.docId, asset.imageIdx, asset.assetExt, asset.assetUrl]);
   const size = compact ? 72 : 96;
   return (
     <div
@@ -132,7 +194,7 @@ function ImageAssetThumb({
           </div>
         ) : (
           <Image
-            src={asset.assetUrl}
+            src={src}
             alt={asset.description || `img_${asset.imageIdx}`}
             width={size}
             height={size}
@@ -218,6 +280,7 @@ function StepDetail({
   onRecallClick,
   references,
   onOpenReference,
+  kbNames,
 }: {
   step: any;
   t: (key: string, opts?: any) => string;
@@ -225,17 +288,16 @@ function StepDetail({
   onRecallClick?: (item: RagRecallItem, rank: number, score?: number | null) => void;
   references?: any[];
   onOpenReference?: (ref: any) => void;
+  kbNames?: Record<string, string>;
 }) {
+  const [showAllRecalls, setShowAllRecalls] = React.useState(false);
   if (!step.detail) return null;
   const d = step.detail as Record<string, any>;
+  const kbName = (id: unknown) => (id ? kbNames?.[String(id)] || String(id) : '—');
 
-  const wrap = (children: React.ReactNode) => (
-    <div
-      style={{ marginTop: 8, background: '#fff', border: '1px solid #efeafc', borderRadius: 8, padding: '8px 10px' }}
-    >
-      {children}
-    </div>
-  );
+  // [jonex] 方案 C：步骤正文直接落在编号卡里（卡片已自带白底 + 描边），
+  // 这里只留上间距。再套一层带边框的盒子会让每一步都像框里再套一个框。
+  const wrap = (children: React.ReactNode) => <div style={{ marginTop: 8 }}>{children}</div>;
 
   switch (step.stage) {
     case 'ontology_match': {
@@ -298,7 +360,7 @@ function StepDetail({
                       .join(' · ')}
                   </span>
                 )}
-                {h.kb_id && <span style={{ fontSize: 10, color: '#b6bdc7' }}>{h.kb_id}</span>}
+                {h.kb_id && <span style={{ fontSize: 10, color: '#b6bdc7' }}>{kbName(h.kb_id)}</span>}
               </Button>
             ))}
           </div>
@@ -348,13 +410,20 @@ function StepDetail({
       );
     }
     case 'fact_lookup': {
+      // [jonex] fact_lookup 有多个发送点：邻域事实检索、stub 事实过滤、
+      // 枚举意图处置，以及 P8「inverse 语义翻译」。除邻域检索外，其余几条的
+      // detail 里没有 entity / fact_count / kb_id（如 inverse 只有 inverse_map），
+      // 无条件 wrap 就会渲染出一个没有内容的描边空盒——看着就是一条空白横条。
+      // 本 case 能渲染的只有这三项，全空时直接不渲染。
+      const hasFactContent = Boolean(d.entity) || d.fact_count != null || Boolean(d.kb_id);
+      if (!hasFactContent) return null;
       return wrap(
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
           {d.entity && <ReasoningChip tone="primary">{t('knowledgeSearch.entity', { name: d.entity })}</ReasoningChip>}
           {d.fact_count != null && (
             <ReasoningChip tone="success">{t('knowledgeSearch.factsCount', { count: d.fact_count })}</ReasoningChip>
           )}
-          {d.kb_id && <ReasoningChip>{d.kb_id}</ReasoningChip>}
+          {d.kb_id && <ReasoningChip>{kbName(d.kb_id)}</ReasoningChip>}
         </div>,
       );
     }
@@ -368,6 +437,8 @@ function StepDetail({
       const ok: string[] = Array.isArray(d.kb_ok) ? d.kb_ok : [];
       const failed: string[] = Array.isArray(d.kb_failed) ? d.kb_failed : [];
       const recalls: RagRecallItem[] = Array.isArray(d.recalls) ? d.recalls : [];
+      // 召回可能有几十条：默认只展示前 5 条，其余按需展开（原型口径）。
+      const shownRecalls = showAllRecalls ? recalls : recalls.slice(0, 5);
       const hasContent = ok.length > 0 || failed.length > 0 || recalls.length > 0;
       if (!hasContent) return null;
       return wrap(
@@ -377,7 +448,7 @@ function StepDetail({
               <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('knowledgeSearch.hitKbs')}</span>
               {ok.map((k) => (
                 <ReasoningChip key={k} tone="success">
-                  {k}
+                  {kbName(k)}
                 </ReasoningChip>
               ))}
             </div>
@@ -387,7 +458,7 @@ function StepDetail({
               <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('knowledgeSearch.failedKbs')}</span>
               {failed.map((k) => (
                 <ReasoningChip key={k} tone="danger">
-                  {k}
+                  {kbName(k)}
                 </ReasoningChip>
               ))}
             </div>
@@ -396,7 +467,7 @@ function StepDetail({
             <div>
               <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>{t('knowledgeSearch.recallChunks')}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {recalls.map((item, idx) => {
+                {shownRecalls.map((item, idx) => {
                   const rank = idx + 1;
                   // 每条自带分（后端 recalls[].score，走统一分、缺失退 relevance）。
                   // 旧实现是按位次对齐另一份 prellm 分数数组，后端已不再产出。
@@ -431,6 +502,18 @@ function StepDetail({
                   );
                 })}
               </div>
+              {recalls.length > 5 && (
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ padding: 0, height: 'auto', fontSize: 12, marginTop: 4 }}
+                  onClick={() => setShowAllRecalls((v) => !v)}
+                >
+                  {showAllRecalls
+                    ? t('knowledgeSearch.ioCollapse')
+                    : t('knowledgeSearch.ioViewAll', { total: recalls.length })}
+                </Button>
+              )}
             </div>
           )}
         </div>,
@@ -564,8 +647,11 @@ function StepDetail({
       const labelOf = (tool: string) => {
         if (tool === 'wiki_search') return t('knowledgeSearch.jonexSearch');
         if (tool === 'wiki_read') return t('knowledgeSearch.jonexRead');
+        if (tool === 'image_find') return t('knowledgeSearch.wikiImageFind');
+        if (tool === 'image_inspect') return t('knowledgeSearch.wikiImageInspect');
         if (tool === 'query_rewrite') return t('knowledgeSearch.jonexRewrite');
         if (tool === 'query_constraints') return t('knowledgeSearch.jonexConstraints');
+        if (tool === 'table_material') return t('wikiTableReading.readScope');
         return tool;
       };
       // 引擎公开 span 的耗时（只投 tool/evidence/synthesis，见后端 _jonex_wiki_chain_spans）
@@ -626,6 +712,10 @@ function StepDetail({
                       {paths.length > shown.length ? ' +' + (paths.length - shown.length) : ''}
                     </span>
                   )}
+                  {tool === 'table_material' && <span style={{ color: '#64748b' }}>
+                    {c.status === 'budget_limited' ? t('wikiTableReading.budgetExceeded') :
+                      t(`wikiTableReading.${c.selected_level || 'full_table'}`)}
+                  </span>}
                   {c.count != null && (
                     <span style={{ fontSize: 10, color: '#b6bdc7' }}>
                       {t('knowledgeSearch.jonexCandidates', { count: c.count })}
@@ -642,6 +732,12 @@ function StepDetail({
           )}
         </>,
       );
+    }
+    case 'ontology_tools': {
+      // 本体查询工具化：模型每轮发出的工具调用，单条展开看入参与返回给模型的结果
+      const calls: OntologyToolCallView[] = Array.isArray(d.calls) ? d.calls : [];
+      if (calls.length === 0) return null;
+      return wrap(<OntologyToolCallsView calls={calls} total={d.tool_calls_total} rounds={d.rounds} />);
     }
     default:
       return null;
@@ -946,6 +1042,8 @@ interface SessionCardProps {
   /** [jonex] 以图问知识：把**整个会话**交回去 —— 重新检索要沿用它的图片、原话等，
    *  只传 query+domainId 会丢掉附图，且新历史不带图。 */
   onReSearch: (session: SearchSession) => void;
+  /** [①②] 候选 chip 提交：`{ds_id: entity_name}`（可多个源），父级走 handleSearch 的 pins 通道 */
+  onPickCandidate?: (pins: Record<string, string>) => void;
   onClear: () => void;
   // ── [jonex] 以图问知识：识别失败后的两个出口（**不自动降级**，用户自己选）──
   /** 仅用文字检索（保留会话里保存的原话） */
@@ -978,6 +1076,7 @@ export default function SessionCard({
   onToggleRefs,
   onStop,
   onReSearch,
+  onPickCandidate,
   onClear,
   onTextOnlyRetry,
   onImageRetry,
@@ -992,9 +1091,14 @@ export default function SessionCard({
   onDislikeConfirm,
 }: SessionCardProps) {
   const { t } = useTranslation();
+  // [①②] 数据引用默认收起（与「引用原文」同款折叠样式，位于其下方）
+  const [dataRefsExpanded, setDataRefsExpanded] = React.useState(false);
 
   const parsedAnswer = parseThink(session.rawAnswer);
-  const { body: responseBody } = parseReferences(parsedAnswer.answer);
+  const { body: parsedBody } = parseReferences(parsedAnswer.answer);
+  // 数据答案 = LLM 总结 + 「数据引用」段；有结构化块时后者由 DataBlocksView 渲染
+  // 真表格（SQL 折叠可见），正文再贴一遍就是重复 —— 切掉，只留总结。
+  const responseBody = stripDataReference(parsedBody, Boolean(session.dataBlocks?.length));
   const running = isSearchRunning(session.status);
   const isWiki = session.wiki || session.source === 'jonex_wiki' || session.references?.some((ref) => !!ref.query_id);
   const wikiKbNames = [...new Set((session.references ?? []).map((ref) => ref.kb_name || ref.kb_id).filter(Boolean))].join('、');
@@ -1005,6 +1109,23 @@ export default function SessionCard({
 
   // [jonex] §image-refs P3-2: 答案旁图片资产（与 prompt 同源的 references 中筛出）
   const imageAssets = React.useMemo(() => collectImageAssets(session.references), [session.references]);
+  // [jonex] Wiki 检索轨迹：流式读 session.wikiProgress，历史回放读后端落库的
+  // `detail.trace_events` —— 两者是同一份引擎公开事件，所以渲染完全一致。
+  // calls 只在检索结束后才有，用来把「候选 N 页」补成精确的「命中 N 页」。
+  const wikiTraceSteps = React.useMemo(() => {
+    const steps = session.reasoning?.steps ?? [];
+    const details = steps.map((step) => (step.detail ?? {}) as Record<string, unknown>);
+    const storedEvents = details.flatMap((detail) =>
+      Array.isArray(detail.trace_events) ? (detail.trace_events as WikiProgressEvent[]) : []);
+    const calls = details.flatMap((detail) =>
+      Array.isArray(detail.calls) ? (detail.calls as WikiChainCall[]) : []);
+    return buildWikiTrace(session.wikiProgress?.length ? session.wikiProgress : storedEvents, calls);
+  }, [session.wikiProgress, session.reasoning]);
+  // 轨迹里的页面路径如果命中某条引用的 wiki_path，点它就能直接打开原文
+  const openWikiPath = React.useCallback((path: string) => {
+    const ref = (session.references ?? []).find((item) => item.wiki_path === path);
+    if (ref) onOpenReference?.(ref);
+  }, [session.references, onOpenReference]);
   // [jonex] 以图问知识：历史长期停留时，后端补签的 view_url 会过期（默认 15 分钟），
   // 图片加载失败就按 image_id 重签一次并缓存。
   // ⚠️ 用 ref 记账「已经刷过哪些」而不是在 setState 的更新函数里发请求 ——
@@ -1044,6 +1165,9 @@ export default function SessionCard({
   // 归 SessionCard 自己持有：每会话一个实例，天然隔离，无需上提到 index.tsx。
   const [activeCitationIndex, setActiveCitationIndex] = React.useState<number | null>(null);
   const referenceCount = session.references?.length ?? 0;
+  // [①②] 本条答案是否带数据库结果：标题行挂「数据」角标，与文档引用 [n] 区分。
+  const hasDataSources = (session.dataBlocks?.length ?? 0) > 0
+    || (session.dataReferences?.length ?? 0) > 0;
 
   // 重新检索后归零，避免面板指向上一轮的下标。
   // 只依赖 session.id：每次检索都生成新 id（index.tsx `Date.now().toString()`），
@@ -1131,7 +1255,7 @@ export default function SessionCard({
                 flexShrink: 0,
               }}
             >
-              {t(`knowledgeSearch.${session.mode === 'fast' ? 'fastSearch' : session.mode === 'deep' ? 'deepSearch' : 'wikiSearch'}`)}
+              {t(searchModeLabelKey(session.mode))}
             </span>
           )}
           <span
@@ -1407,17 +1531,23 @@ export default function SessionCard({
         </div>
       )}
 
-      {isWiki && <WikiProgress events={session.wikiProgress?.length ? session.wikiProgress : (session.reasoning?.steps ?? []).flatMap((step) =>
-        Array.isArray(step.detail?.spans) ? step.detail!.spans as any[] : []).map((event, seq) => ({ ...event, seq }))} running={running} completed={session.status === 'done'}
-        startedAt={session.startedAt} durationMs={session.elapsedMs ?? session.reasoning?.total_ms}
+      {isWiki && <WikiTrace
+        steps={wikiTraceSteps}
+        running={running}
+        startedAt={session.startedAt}
+        durationMs={session.elapsedMs ?? session.reasoning?.total_ms}
         source={session.reasoning?.final_source || session.source || (session.wiki ? 'jonex_wiki' : undefined)}
-        expanded={reasoningExpanded} onToggle={() => onToggleReasoning(session.id)} />}
+        expanded={reasoningExpanded}
+        onToggle={() => onToggleReasoning(session.id)}
+        onOpenPath={openWikiPath} />}
       {/* Reasoning chain */}
       {!isWiki && (
         <ThoughtSteps
           steps={session.reasoning?.steps ?? []}
           totalMs={session.reasoning?.total_ms}
           finalSource={session.reasoning?.final_source}
+          strategy={session.reasoning?.strategy}
+          ioTruncated={session.reasoning?.io_truncated}
           expanded={reasoningExpanded}
           onToggle={() => onToggleReasoning(session.id)}
           renderDetail={(step) => (
@@ -1428,6 +1558,7 @@ export default function SessionCard({
               onRecallClick={openRagRecallDrawer}
               references={session.references}
               onOpenReference={onOpenReference}
+              kbNames={session.reasoning?.kb_names}
             />
           )}
         />
@@ -1443,6 +1574,12 @@ export default function SessionCard({
                 marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
               <BulbOutlined />
               {t('knowledgeSearch.searchResult')}
+              {!isWiki && hasDataSources && (
+                <span className={styles.dataBadge} title={t('knowledgeSearch.dataBadgeHint')}>
+                  <DatabaseOutlined style={{ fontSize: 10 }} />
+                  {t('knowledgeSearch.dataBadge')}
+                </span>
+              )}
               <span style={isWiki ? undefined : { fontWeight: 400, fontSize: 12, color: '#94a3b8' }}>
                 {isWiki ? wikiKbNames : t('knowledgeSearch.knowledgeAnalysis', { domain: domainName })}
               </span>
@@ -1480,6 +1617,8 @@ export default function SessionCard({
                 }}
               />
             </div>}
+            {/* [①②] 数据路径结构化块（NL→SQL 表格 + 引擎标；无字段时组件返回 null ⇒ 零回归） */}
+            <DataBlocksView blocks={session.dataBlocks} onPick={onPickCandidate} />
             {running && hasContent && (
               <div style={{ marginTop: 8 }}>
                 <Spin size="small" />
@@ -1550,10 +1689,11 @@ export default function SessionCard({
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {imageAssets.map((a) => (
               <div
-                key={`${a.docId}-${a.imageIdx}`}
+                key={`${a.docId}-${a.assetId || a.imageIdx}`}
                 style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center', maxWidth: 96 }}
               >
                 <ImageAssetThumb asset={a} t={t} />
+                <span style={{ fontSize: 11, color: '#64748b' }}>{t(a.usage === 'visual_evidence' && a.visualReadId ? 'knowledgeSearch.sourceImageRead' : 'knowledgeSearch.sourceImageIllustration')}</span>
                 {a.description && (
                   <div
                     style={{
@@ -1626,7 +1766,7 @@ export default function SessionCard({
                 // [jonex] §image-refs P3-2: 本卡片内可直开的图片 location
                 // （有 asset_url 才给 location 级打开，无则回落文档级）
                 const imageLocs = locs.filter(
-                  (l: KnowledgeReferenceLocation) => l.type === 'image' && l.asset_url && l.image_idx != null,
+                  (l: KnowledgeReferenceLocation) => l.type === 'image' && l.asset_url && (l.asset_id || l.image_idx != null),
                 );
                 // 命中片段含块级结构（或本身就是 md 文件）才走 MarkdownContent 保留格式，其余纯文本
                 const renderAsMarkdown = isMarkdownSnippet(ref.file_name, snippet);
@@ -1720,12 +1860,14 @@ export default function SessionCard({
                       <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
                         {imageLocs.map((l: KnowledgeReferenceLocation) => (
                           <ImageAssetThumb
-                            key={`${ref.doc_id}-${l.image_idx}`}
+                            key={`${ref.kb_id}:${ref.doc_id}:${l.bundle_sha}:${l.asset_id || l.image_idx}`}
                             compact
                             asset={{
                               docId: ref.doc_id,
                               imageIdx: l.image_idx!,
+                              assetId: l.asset_id,
                               assetUrl: l.asset_url!,
+                              assetExt: l.asset_ext,
                               pageNo: l.page_no,
                               description: (l.text || '').replace(/^图片描述：/, '').trim(),
                             }}
@@ -1773,6 +1915,65 @@ export default function SessionCard({
           )}
         </div>
       )}
+
+      {/* [①②] 数据引用（默认收起；位于「引用原文」下方） */}
+      {session.dataReferences && session.dataReferences.length > 0 && (
+        <div
+          style={{
+            background: '#f8fafc',
+            borderLeft: '3px solid #0ea5e9',
+            borderRadius: '0 8px 8px 0',
+            padding: '14px 18px',
+            marginBottom: 16,
+          }}
+        >
+          <button
+            onClick={() => setDataRefsExpanded((v) => !v)}
+            style={{
+              width: '100%',
+              padding: 0,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              justifyContent: 'flex-start',
+              fontSize: 12,
+              color: '#0284c7',
+              fontWeight: 600,
+              height: 'auto',
+              lineHeight: 'inherit',
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+            }}
+          >
+            {dataRefsExpanded ? <CaretDownOutlined /> : <CaretRightOutlined />}
+            {t('knowledgeSearch.dataReferences')} ({session.dataReferences.length})
+          </button>
+          {dataRefsExpanded && (
+            <div style={{ marginTop: 12 }}>
+              <DataBlocksView
+                blocks={session.dataReferences.map((r: DataReference, i: number): DataBlock => ({
+                  data_source_id: r.data_source_id ?? `data-ref-${i}`,
+                  source_name: r.source_name,
+                  engine: 'nl2sql',
+                  kind: 'answer',
+                  text: '',
+                  table: r.table ?? undefined,
+                  sql: r.sql ?? undefined,
+                  row_count: r.row_count ?? undefined,
+                  truncated: r.truncated ?? undefined,
+                }))}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* [A] 血缘解释块（数据来源/下游；样式同数据引用；位于其下方；默认收起） */}
+      <DataLineageView block={session.dataLineage} />
+
+      {/* 实时数据：问答调用了动作绑定的外部工具（无调用时不渲染） */}
+      <ToolResultsView results={session.toolResults} />
 
       {/* Searching spinner */}
       {running && !hasContent && !isWiki && (

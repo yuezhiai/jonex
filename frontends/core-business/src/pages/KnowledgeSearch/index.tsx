@@ -14,6 +14,7 @@ import {
   DislikeOutlined,
   DislikeFilled,
   LoadingOutlined,
+  ArrowDownOutlined,
 } from '@ant-design/icons';
 import {
   getKnowledgeSearchOverview,
@@ -55,10 +56,15 @@ import type {
   ReasoningStep,
   SearchFeedbackType,
   FeedbackReason,
+  DataBlock,
+  DataReference,
+  DataLineageBlock,
+  ToolCallResult,
 } from '@/types/knowledgeSearch';
 import { PageContent } from '@jonex/shared-lib';
 import SearchPanel from './SearchPanel';
 import SearchHistorySidebar from './SearchHistorySidebar';
+import { useStickyScroll } from './useStickyScroll';
 import SessionCard from './SessionCard';
 import WelcomeEmpty from './WelcomeEmpty';
 import WikiEvidenceDrawer from './WikiEvidenceDrawer';
@@ -137,6 +143,14 @@ export interface SearchSession {
    * 识别成功或卡片被移除后即可丢弃。
    */
   retryFiles?: Blob[];
+  /** [①②] 数据路径结构化块（router 扇出路径下发；历史回放不带，无则 null）。 */
+  dataBlocks?: DataBlock[] | null;
+  /** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示）。 */
+  dataReferences?: DataReference[] | null;
+  /** [A] 血缘解释块（后端有内容才下发；历史回放不带，无则 null）。 */
+  dataLineage?: DataLineageBlock | null;
+  /** 实时数据：问答调用外部工具的摘要（调用过才下发；历史回放不带，无则 null）。 */
+  toolResults?: ToolCallResult[] | null;
 }
 
 export interface SessionQueryImage {
@@ -436,6 +450,20 @@ const KnowledgeSearch = function KnowledgeSearch() {
   useEffect(() => {
     activeSearchRef.current = activeSearch;
   }, [activeSearch]);
+
+  // [jonex] 结果区流式跟随：吸附底部、用户接管即停、可一键回到最新（详见 useStickyScroll）
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const scrollContentRef = useRef<HTMLDivElement | null>(null);
+  const { pinned: scrollPinned, hasNew: scrollHasNew, scrollToLatest, reset: resetScroll } =
+    useStickyScroll(scrollContainerRef, scrollContentRef);
+  // 换会话（新检索 / 点开历史）从顶部开始读：进行中的检索重新吸附以便继续跟随，
+  // 历史回放则停在顶部——否则内容一次性变高会被当成「新进展」直接拽到底部。
+  useEffect(() => {
+    if (!activeSearch) return;
+    resetScroll(isSearchRunning(activeSearch.status));
+    // 只在会话切换时重置；status 从 running 变 done 不能再跳一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSearch?.id]);
 
   /**
    * 当前空间 id 的**实时值**。
@@ -901,6 +929,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
          * 这次"仅用文字"会把那些图一起拿去识别，与用户的意图正好相反。
          */
         ignoreAttached?: boolean;
+        /** [①②] 点名 pin：{ds_id: entity_name} —— 点候选 chip 重问时带上，router 用它钉死 ② 的实体 */
+        pins?: Record<string, string>;
       },
     ) => {
       const trimmedQuery = (nextQuery ?? query).trim();
@@ -1005,6 +1035,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
         queryImages: localImages,
         imageQuestion: userQuestion || undefined,
         retryFiles: filesForRetry,
+        dataBlocks: null,
+        dataReferences: null,
+        dataLineage: null,
+        toolResults: null,
       });
 
       // 最终交给检索接口的文本：有图时是识别产出，无图时就是用户输入
@@ -1051,8 +1085,14 @@ const KnowledgeSearch = function KnowledgeSearch() {
           kbTypes,
           deep: searchMode === 'deep',
           wiki: searchMode === 'wiki',
+          ontologyData: searchMode === 'ontologyData',
+          data: searchMode === 'data',
           wikiThinkingMode,
+          queryImageIds: imageIdsForHistory,
+          imageQuestion: userQuestion || undefined,
           strictConfig: effectiveStrictConfig,
+          // [①②] 点名 pin（可选）：只影响 router→② 的 entity_name，不影响检索本身
+          pins: options?.pins,
         };
         let streamError: Error | null = null;
         let accumulatedAnswer = '';
@@ -1071,12 +1111,26 @@ const KnowledgeSearch = function KnowledgeSearch() {
                 if (!delta.includes('<think>')) return prev;
                 return { ...prev, [sessionId]: true };
               });
+              // [①②] 表格随 meta 即渲染：数据路径的正文与结构化块同源、随同一次 onDelta
+              // 到达（见 streamKnowledgeSearch 的一次性交付）——不再等 onDone 才出表格。
+              // 无该字段（RAG / 本体路径、老后端）⇒ 沿用 prev.dataBlocks（同引用，无多余变更）；
+              // onDone 里的同源赋值保留作覆盖兜底。
+              const metaBlocks =
+                Array.isArray(meta?.data_blocks) && meta.data_blocks.length > 0
+                  ? (meta.data_blocks as DataBlock[])
+                  : null;
+              const metaRefs =
+                Array.isArray(meta?.data_references) && meta.data_references.length > 0
+                  ? (meta.data_references as DataReference[])
+                  : null;
               setActiveSearch((prev) =>
                 prev?.id === sessionId
                   ? {
                       ...prev,
                       rawAnswer: prev.rawAnswer + delta,
                       source: meta?.source || prev.source,
+                      dataBlocks: metaBlocks ?? prev.dataBlocks,
+                      dataReferences: metaRefs ?? prev.dataReferences,
                     }
                   : prev,
               );
@@ -1126,6 +1180,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
                       elapsedMs: Date.now() - startTime,
                       source: meta?.source || prev.source,
                       historyId,
+                      // [①②] 数据路径结构化块（router 下发；无字段 ⇒ null，渲染零回归）
+                      dataBlocks: (meta?.data_blocks as DataBlock[] | null) ?? null,
+                      dataReferences: (meta?.data_references as DataReference[] | null) ?? null,
+                      // [A] 血缘解释块（后端只在有内容时下发；无字段 ⇒ null，渲染零回归）
+                      dataLineage: meta?.data_lineage ?? null,
+                      // 实时数据（问答调用了外部工具才下发）
+                      toolResults: meta?.tool_results ?? null,
                     }
                   : prev,
               );
@@ -1210,6 +1271,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
                 return { ...prev, queryImages: merged };
               });
             }
+            // [jonex] 反馈锚回接：让反馈挂「最终答案快照」而非服务端「本体层快照」
+            // （2026-10-13 用户拍板；此前点踩恒挂服务端快照 → 反馈 answer 常为基座文案）
+            setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, historyId: item.id } : prev));
           })
           .catch(() => {
             // save failed, silently ignore
@@ -1576,6 +1640,11 @@ const KnowledgeSearch = function KnowledgeSearch() {
         // 自动用纯文字检索会让用户以为图片参与了（D2）。
         onTextOnlyRetry={() => handleTextOnlyRetry(activeSearch)}
         onImageRetry={() => void handleImageRetry(activeSearch)}
+        // [①②] 候选 chip 提交：带点名 pin（可多个源）重问**当前会话那条问句**
+        // （router 用它钉死 ② 的实体；多 pin = 多源并行扇出）
+        onPickCandidate={(pins) =>
+          void handleSearch(activeSearch.query, { pins })
+        }
         onClear={handleClearSearch}
         onVote={handleVoteAnswer}
         dislikeOpen={dislikeOpen}
@@ -1599,19 +1668,55 @@ const KnowledgeSearch = function KnowledgeSearch() {
           <div className={styles.shell}>
             {/* 结果区自己滚，输入区固定在它下方；底部留白让最后一条结果能滚到输入区上方 */}
             <div
+              ref={scrollContainerRef}
               style={{
                 flex: 1,
                 minHeight: 0,
                 overflowY: 'auto',
                 padding: '28px 28px 180px',
+                // [jonex] 关掉浏览器自带的滚动锚定：跟随逻辑由 useStickyScroll 接管，
+                // 两套锚定同时生效会互相拉扯，表现为流式时视口一顿一顿地跳。
+                overflowAnchor: 'none',
                 // 顶部渐隐：结果往上滚时淡出，避免文字被卡片上沿硬切。
                 // 用 mask 而不是盖一层白色，才能跟着卡片的径向渐变背景走。
                 maskImage: 'linear-gradient(to bottom, transparent 0, #000 24px)',
                 WebkitMaskImage: 'linear-gradient(to bottom, transparent 0, #000 24px)',
               }}
             >
-              {renderMainContent()}
+              {/* 内容包一层：ResizeObserver 盯的是「正文高度」，而不是定高的滚动容器 */}
+              <div ref={scrollContentRef}>{renderMainContent()}</div>
             </div>
+            {/*
+              回到最新：用户滚上去看历史时，新内容不再抢视口，只在这里提示。
+              位置贴着输入区上沿，避免盖住正文最后一行。
+            */}
+            {!scrollPinned && (
+              <button
+                type="button"
+                onClick={scrollToLatest}
+                style={{
+                  position: 'absolute',
+                  left: '50%',
+                  bottom: 172,
+                  transform: 'translateX(-50%)',
+                  zIndex: 21,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '5px 12px',
+                  borderRadius: 999,
+                  border: '1px solid #e2e8f5',
+                  background: scrollHasNew ? '#ffffff' : 'rgba(255,255,255,.92)',
+                  boxShadow: '0 6px 18px rgba(11,43,92,.12)',
+                  color: scrollHasNew ? '#4c1d95' : '#64748b',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                }}
+              >
+                <ArrowDownOutlined style={{ fontSize: 11 }} />
+                {scrollHasNew ? t('knowledgeSearch.backToLatestNew') : t('knowledgeSearch.backToLatest')}
+              </button>
+            )}
             {/*
               输入区浮在结果之上：绝对定位不占正文空间，结果从它下方穿过，
               位置始终贴着可视区底部（滚到结果底部时也一样）。
@@ -1668,6 +1773,12 @@ const KnowledgeSearch = function KnowledgeSearch() {
             loadingId={historySnapshotLoadingId}
           />
         </div>
+
+        {/* 2026-10-22 按用户要求隐藏检索页底部品牌行（如需恢复，取消下面注释）：
+        <div style={{ textAlign: 'center', padding: '32px 0 8px', fontSize: 13, color: '#cbd5e1' }}>
+          {t('knowledgeSearch.footer')}
+        </div>
+        */}
 
         {/* 统一文档查看弹层（视频/音频可定位到时间点） */}
         {viewer}
