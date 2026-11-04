@@ -10,8 +10,9 @@
 两个页签的切分
 --------------
 ``monitor.call_log`` **没有** ``object_type`` 列，切不开「外部依赖」与「开放能力」。
-改用 ``direction`` 作两页签的分界 —— ``outbound``=外部依赖（C1/C2）、
-``inbound``=开放能力（C3/C4）。故 C1/C3 与 C2/C4 是同一方法换 direction 调用。
+用 ``direction`` + ``call_scope`` 两个维度切分 —— 外部依赖（C1/C2）=
+``outbound`` + ``external``（排除任务中心派活/回报等平台内部互调），开放能力
+（C3/C4）= ``inbound``。故 C1/C3 与 C2/C4 是同一方法换筛选条件调用。
 
 租户
 ----
@@ -26,7 +27,7 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,7 +47,13 @@ from capabilities.platform.repository.monitor_aggregate import (
     OBJECT_TYPE_BY_PROTOCOL,
     MonitorAggregateRepository,
 )
+from capabilities.platform.repository.monitor_caller import (
+    MonitorCallerRepository,
+    SourceKey,
+    parse_source_token,
+)
 from capabilities.platform.repository.monitor_detail import MonitorDetailRepository
+from capabilities.platform.services.monitor_buckets import FIVE_MINUTES, bucket_starts
 from capabilities.platform.services.monitor_range import enforce_max_range
 from capabilities.platform.services.monitor_resilience import (
     MODULE_ERROR,
@@ -56,7 +63,11 @@ from jonex_core.common.exceptions import (
     InvalidParameterError,
     ResourceNotFoundError,
 )
-from jonex_core.common.monitor_models import CallAttempt, CallLog
+from jonex_core.common.monitor_identity import (
+    format_user_identity,
+    is_user_identity,
+)
+from jonex_core.common.monitor_models import CallAttempt, CallLog, CallScope
 
 #: 降级态 ``module_error`` 取值（脱敏：只标「本模块暂不可用」，不带底层异常内容）。
 _MODULE_ERROR = MODULE_ERROR
@@ -68,7 +79,24 @@ _MODE_VERSION = "v1"
 _DIRECTION_EXTERNAL = "outbound"  # 外部依赖（C1/C2）
 _DIRECTION_OPEN = "inbound"  # 开放能力（C3/C4）
 
+#: 外部依赖页的调用边界。``direction=outbound`` 仍会混入任务中心派活/回报等
+#: 平台内部互调，故外部依赖统计卡 / 对象列表 / 趋势统一再按 ``call_scope`` 收窄。
+_CALL_SCOPE_EXTERNAL = CallScope.EXTERNAL.value
+
+#: 外部依赖页允许的对象类型对应协议。
+#: ⚠️ 当前 ``call_scope=external`` 与「``direction=outbound`` 且 ``protocol=openai``」
+#: 等价（见 ``monitor_collector._fallback_call_scope``）。未来新增外部协议时，
+#: 这里与前端 ``pmFailureDrillParams`` 的下钻口径须同步扩展。
+_EXTERNAL_PROTOCOLS = frozenset({"openai"})
+
 _MODE_DEGRADED = "degraded"
+
+#: C5 桶粒度 → 桶宽（用于判断 ``closed``）。``5m`` 只有本 service 会补空桶。
+_BUCKET_SPANS = {
+    "5m": FIVE_MINUTES,
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+}
 
 #: ``object_type`` → ``protocol`` 反查（对象类型由 ``protocol`` 推导，
 #: 筛选同源，见 :func:`repository.monitor_aggregate.list_objects`）。
@@ -132,7 +160,7 @@ def _degraded_flags() -> MonitorFlags:
     return MonitorFlags(module_error=_MODULE_ERROR)
 
 
-def _empty_summary(frm: str, to: str, *, direction: str) -> CallSummary:
+def _empty_summary(frm: str, to: str, *, direction: str, **_kwargs) -> CallSummary:
     """C1 / C3 统计卡降级空壳（结构完整：全零 / ``None`` / 空 as-of）。"""
     return CallSummary(
         total_calls=0,
@@ -212,6 +240,7 @@ class MonitorCallService:
         self.session = session
         self.agg = MonitorAggregateRepository(session)
         self.det = MonitorDetailRepository(session)
+        self.caller = MonitorCallerRepository(session)
 
     # ------------------------------------------------------------------
     # 编排内部工具
@@ -271,12 +300,22 @@ class MonitorCallService:
     # ------------------------------------------------------------------
 
     @_resilient(_empty_summary)
-    async def summary(self, frm: str, to: str, *, direction: str) -> CallSummary:
-        """统计卡取数（C1 ``direction='outbound'`` / C3 ``direction='inbound'``）。"""
+    async def summary(
+        self, frm: str, to: str, *, direction: str, call_scope: Optional[str] = None
+    ) -> CallSummary:
+        """统计卡取数（C1 ``direction='outbound'`` / C3 ``direction='inbound'``）。
+
+        ``call_scope`` 可选：外部依赖页传 ``external``，把平台内部互调排除在外；
+        开放能力页不传（``direction=inbound`` 本身即外部调用方进入平台）。
+        """
         start, end = self._parse_range(frm, to)
         mode = await self.agg.resolve_metric_mode(start, end)
         data = await self.agg.summary(
-            start, end, direction=direction, degraded=(mode == _MODE_DEGRADED)
+            start,
+            end,
+            direction=direction,
+            call_scope=call_scope,
+            degraded=(mode == _MODE_DEGRADED),
         )
         return CallSummary(
             total_calls=data["total_calls"],
@@ -289,8 +328,10 @@ class MonitorCallService:
         )
 
     async def external_summary(self, frm: str, to: str) -> CallSummary:
-        """C1 外部依赖统计卡。"""
-        return await self.summary(frm, to, direction=_DIRECTION_EXTERNAL)
+        """C1 外部依赖统计卡：``outbound`` + ``call_scope=external``。"""
+        return await self.summary(
+            frm, to, direction=_DIRECTION_EXTERNAL, call_scope=_CALL_SCOPE_EXTERNAL
+        )
 
     async def open_summary(self, frm: str, to: str) -> CallSummary:
         """C3 开放能力统计卡。"""
@@ -307,6 +348,7 @@ class MonitorCallService:
         to: str,
         *,
         direction: str,
+        call_scope: Optional[str] = None,
         object_type: Optional[str] = None,
         protocol: Optional[str] = None,
         page: int = 1,
@@ -318,11 +360,17 @@ class MonitorCallService:
         旧的「按对象名精确匹配 ``target``」用法已作废。未知 ``object_type``
         （如无采集写入方的「外部服务 / 外部平台」）或 ``object_type`` 与
         ``protocol`` 互斥 ⇒ 直接返空结果（筛选语义，不抛错）。
+
+        ``call_scope=external`` 时还会校验推导出的 ``protocol`` 是否属于外部集合
+        （当前只有 ``openai``）：``object_type=能力`` 推导出 ``invoke`` 属平台内部
+        互调，与外部依赖互斥，直接返空而不发查询。
         """
         start, end = self._parse_range(frm, to)
         if object_type is not None:
             derived = _PROTOCOL_BY_OBJECT_TYPE.get(object_type)
             if derived is None or (protocol is not None and protocol != derived):
+                return [], 0, None
+            if call_scope == _CALL_SCOPE_EXTERNAL and derived not in _EXTERNAL_PROTOCOLS:
                 return [], 0, None
             protocol = derived
         mode = await self.agg.resolve_metric_mode(start, end)
@@ -330,6 +378,7 @@ class MonitorCallService:
             start,
             end,
             direction=direction,
+            call_scope=call_scope,
             protocol=protocol,
             degraded=(mode == _MODE_DEGRADED),
             offset=self._offset(page, page_size),
@@ -359,9 +408,9 @@ class MonitorCallService:
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[CallObjectItem], int, Optional[CallModeMeta]]:
-        """C2 外部依赖对象列表（不含 ``protocol`` 筛选）。"""
+        """C2 外部依赖对象列表（不含 ``protocol`` 筛选，固定 ``call_scope=external``）。"""
         return await self.object_list(
-            frm, to, direction=_DIRECTION_EXTERNAL,
+            frm, to, direction=_DIRECTION_EXTERNAL, call_scope=_CALL_SCOPE_EXTERNAL,
             object_type=object_type, page=page, page_size=page_size,
         )
 
@@ -395,10 +444,12 @@ class MonitorCallService:
         bucket: str,
         object_id: Optional[str] = None,
         direction: Optional[str] = None,
+        call_scope: Optional[str] = None,
     ) -> Tuple[List[TrendPoint], Optional[CallModeMeta]]:
         """趋势取数。未闭合桶（右边界 > now）标 ``closed=False``。
 
         ``direction`` 切两个页签口径（outbound 外部依赖 / inbound 开放能力）；
+        ``call_scope`` 进一步排除平台内部互调（外部依赖页传 ``external``）；
         不传 = 全量（与原有行为一致）。
         """
         start, end = self._parse_range(frm, to)
@@ -410,10 +461,38 @@ class MonitorCallService:
             bucket=bucket,
             target=object_id,
             direction=direction,
+            call_scope=call_scope,
             degraded=(mode == _MODE_DEGRADED),
         )
         now = datetime.now(timezone.utc)
-        span = timedelta(hours=1) if bucket == "hour" else timedelta(days=1)
+        span = _BUCKET_SPANS.get(bucket, timedelta(days=1))
+
+        # 全部粒度按固定时间网格补空桶（``value=None``，⛔ 不兜 0）。
+        # ``start`` / ``end`` 是 tz-aware UTC，网格同形态；仓储行可能带任意 tz，
+        # 统一换算到 UTC 后作 key（aware datetime 相等/哈希按同一时刻比较）。
+        # 真实行里落在网格之外的桶（窗口首部不完整桶）直接丢弃。
+        if bucket in _BUCKET_SPANS:
+            rows_by_start = {}
+            for row in rows:
+                bucket_start = row["bucket_start"]
+                if bucket_start is None:
+                    continue
+                if bucket_start.tzinfo is None:
+                    bucket_start = bucket_start.replace(tzinfo=timezone.utc)
+                rows_by_start[bucket_start] = row
+            grid_points: List[TrendPoint] = []
+            for bucket_start in bucket_starts(start, end, bucket):
+                row = rows_by_start.get(bucket_start)
+                value = None if row is None else row["value"]
+                grid_points.append(
+                    TrendPoint(
+                        bucket_start=_iso(bucket_start) or "",
+                        value=None if value is None else float(value),
+                        closed=(bucket_start + span) <= now,
+                    )
+                )
+            return grid_points, self._mode_meta(mode, start, end)
+
         points: List[TrendPoint] = []
         for row in rows:
             bucket_start = row["bucket_start"]
@@ -429,6 +508,104 @@ class MonitorCallService:
                 )
             )
         return points, self._mode_meta(mode, start, end)
+
+    # ------------------------------------------------------------------
+    # 调用方展示名解析（读侧兜底历史数字 ID）
+    # ------------------------------------------------------------------
+
+    async def _resolve_callers(self, pairs: set[SourceKey]) -> dict:
+        """批量解析 ``(tenant_id, source)`` → 用户名；非用户形态不进入解析集合。
+
+        解析失败只返回空映射（仓储内已降级），展示层回退原始 source。
+        """
+        if not pairs:
+            return {}
+        return await self.caller.resolve_sources(pairs)
+
+    @staticmethod
+    def _caller_pairs(items) -> set[SourceKey]:
+        """从 ``(tenant_id, source)`` 候选里筛出可解析的用户形态。"""
+        pairs: set[SourceKey] = set()
+        for tenant_id, source in items:
+            if tenant_id and parse_source_token(source):
+                pairs.add((tenant_id, source))
+        return pairs
+
+    async def _top_sources_with_callers(
+        self, rows: Sequence[dict], *, limit: int = 3
+    ) -> List[dict]:
+        """来源条目：按**身份**合并同一个人 / 同一个系统标识的全部历史形态。
+
+        聚合仓储额外带回 ``tenant_ids``（该 source 出现过的租户）；逐租户调用
+        :meth:`MonitorCallerRepository.resolve_identities` 后分组：
+
+        - 解析到用户 ⇒ 组键 ``("user", user_id)``，``name`` 输出规范形态
+          ``user:<id>``，``caller_name`` 为该用户的 ``username``；
+        - 解析不到（系统保留字 / 未知值）⇒ 组键 ``("raw", source)``，
+          ``name`` 保持原值、``caller_name=None``。
+        - 同一原始 source 在不同租户解析出**不同用户**（计数已跨租户合并、
+          无法拆分归因）⇒ 归入 ``("raw", source)``，绝不把整份计数算到其中一人头上。
+
+        ``call_count`` 组内求和，结果按计数降序、``name`` 升序稳定排序，
+        最后截断到 ``limit`` 条（C9 契约为 TOP3）。
+
+        上游聚合仓储按原始 ``source`` 取候选，这里按身份合并后条数会变少，
+        因此上游多取一批候选（见 ``MonitorAggregateRepository.object_detail``），
+        避免合并后不足 ``limit`` 项或漏掉落在截断外的形态。
+        """
+        pairs: set[SourceKey] = {
+            (tenant_id, row["name"])
+            for row in rows
+            for tenant_id in (row.get("tenant_ids") or [])
+            if tenant_id and row.get("name")
+        }
+        identities = await self.caller.resolve_identities(pairs) if pairs else {}
+
+        grouped: Dict[Tuple[str, Any], dict] = {}
+        order: List[Tuple[str, Any]] = []
+        for row in rows:
+            source = row["name"]
+            tenant_ids = [t for t in (row.get("tenant_ids") or []) if t]
+            resolved = [
+                identities[(tenant_id, source)]
+                for tenant_id in tenant_ids
+                if (tenant_id, source) in identities
+            ]
+            distinct_ids = {identity.user_id for identity in resolved}
+            if len(distinct_ids) == 1:
+                user_id = distinct_ids.pop()
+                key = ("user", user_id)
+                name = format_user_identity(user_id) or f"user:{user_id}"
+            else:
+                # 无命中，或同一 source 跨租户解析出多个用户（计数不可拆）⇒ 原值。
+                key = ("raw", source)
+                name = source
+                resolved = []
+            entry = grouped.get(key)
+            if entry is None:
+                entry = {
+                    "name": name,
+                    "call_count": 0,
+                    "caller_name": None,
+                    "_usernames": set(),
+                }
+                grouped[key] = entry
+                order.append(key)
+            entry["call_count"] += int(row["call_count"] or 0)
+            entry["_usernames"].update(
+                identity.username for identity in resolved if identity.username
+            )
+
+        result: List[dict] = []
+        for key in order:
+            entry = grouped[key]
+            usernames = entry.pop("_usernames")
+            # 同一 id 跨租户解析出不同用户名属异常数据：取字典序最小者，保证稳定。
+            entry["caller_name"] = min(usernames) if usernames else None
+            result.append(entry)
+        # 合并会改变相对计数，重新按 TOP 语义排序（同分按 name 稳定）。
+        result.sort(key=lambda item: (-item["call_count"], item["name"]))
+        return result[:limit]
 
     # ------------------------------------------------------------------
     # C6 · 调用记录列表
@@ -447,6 +624,7 @@ class MonitorCallService:
         source: Optional[str] = None,
         target: Optional[str] = None,
         keyword: Optional[str] = None,
+        target_any: Optional[List[str]] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[CallRecordItem], int, Optional[CallModeMeta]]:
@@ -454,8 +632,36 @@ class MonitorCallService:
 
         ``target`` 是**精确匹配**（对象详情下钻用）：同一个对象标识可能互为前缀
         （如 ``svc-a`` / ``svc-ab``），模糊匹配会把别的对象一并带进来。
+        其语义是「对外对象标识 = ``COALESCE(mcp_tool, target)``」，仓储按
+        「``target`` 等于该值 或 ``mcp_tool`` 等于该值」匹配；出参的目标列同样
+        取对外对象标识（MCP 调用显示工具名）。
+
+        ``keyword`` 除既有 raw ILIKE 外，还会按 ``users.username`` 展开成
+        ``(tenant_id, source)`` 精确对（按显示名搜索）；``target_any`` 是
+        前端把能力释义展开后的原始标识列表，按同一目标列口径并入 OR 组。
+        原始 ``caller`` / ``target`` 筛选值始终不变。
+
+        ``source`` 是**单值**筛选（前端零改动），后端按 ``user:<id>`` 别名展开成
+        该用户的全部历史形态 ``(tenant_id, source)``；展开结果与 keyword 的
+        ``source_pairs`` **分开传参**（两者是 AND 关系，不能并入同一个 OR 组）。
+        解析不到（保留字 / 未知值）时回退原有精确匹配。
         """
         start, end = self._parse_range(frm, to)
+        source_pairs = (
+            await self.caller.expand_keyword_sources(keyword) if keyword else []
+        )
+        source_filter_pairs = (
+            await self.caller.expand_source_filter(source) if source else []
+        )
+        # 规范形态 ``user:<id>`` 以全局主键为准：模拟态下记录的租户是目标租户、
+        # 用户属于原租户，按 ``(tenant, source)`` 对匹配会漏掉这些行。主键全局
+        # 唯一，补一路「只按 source 匹配」不会串人；只对已能解析到用户的规范
+        # 形态生效，解析不到时仍走原有精确匹配。
+        source_global_forms = (
+            [source]
+            if source_filter_pairs and is_user_identity(source)
+            else []
+        )
         mode = await self.det.resolve_metric_mode(start, end)
         degraded = mode == _MODE_DEGRADED
         rows, total = await self.det.list_records(
@@ -468,25 +674,61 @@ class MonitorCallService:
             source=source,
             target=target,
             keyword=keyword,
+            target_any=target_any,
+            source_pairs=source_pairs,
+            source_filter_pairs=source_filter_pairs,
+            source_global_forms=source_global_forms,
             degraded=degraded,
             offset=self._offset(page, page_size),
             limit=page_size,
         )
         mode_meta = self._mode_meta(mode, start, end)
         if not degraded:
-            return [self._record_from_log(row) for row in rows], total, mode_meta
+            mapping = await self._resolve_callers(
+                self._caller_pairs((row.tenant_id, row.source) for row in rows)
+            )
+            return [
+                self._record_from_log(
+                    row,
+                    caller_name=mapping.get((row.tenant_id, row.source)),
+                )
+                for row in rows
+            ], total, mode_meta
 
         # 降级模式的行是 N2（call_attempt），缺 direction/trigger_type/target/source/trace_id
         # 五个 N1 列。按 request_id 批量回查 N1 补上（一页至多 page_size 行，一次 IN 查询）；
         # 补不到的（N2 先于 N1 落库的孤儿 attempt）留 None → 组装时空串兜底。
         n1 = await self.det.get_call_logs_by_request_ids([row.request_id for row in rows])
-        return [
-            self._record_from_attempt(row, n1.get(row.request_id)) for row in rows
-        ], total, mode_meta
+        # 降级模式下 source 借用 N1 字段，租户也取该 N1 行的 tenant_id。
+        mapping = await self._resolve_callers(
+            self._caller_pairs(
+                (log.tenant_id, log.source)
+                for log in (n1.get(row.request_id) for row in rows)
+                if log is not None
+            )
+        )
+        items = []
+        for row in rows:
+            log = n1.get(row.request_id)
+            key = None if log is None else (log.tenant_id, log.source)
+            items.append(
+                self._record_from_attempt(
+                    row,
+                    log,
+                    caller_name=None if key is None else mapping.get(key),
+                )
+            )
+        return items, total, mode_meta
 
     @staticmethod
-    def _record_from_log(row: CallLog) -> CallRecordItem:
-        """N1 行 → ``CallRecordItem``。"""
+    def _record_from_log(
+        row: CallLog, *, caller_name: Optional[str] = None
+    ) -> CallRecordItem:
+        """N1 行 → ``CallRecordItem``。
+
+        目标列输出**对外对象标识** ``COALESCE(mcp_tool, target)``：
+        MCP 调用展示工具名，其余链路回落能力标识 / 模型名。
+        """
         attempt_count = int(row.attempt_count or 0)
         return CallRecordItem(
             request_id=row.request_id,
@@ -495,7 +737,7 @@ class MonitorCallService:
             direction=row.direction,
             trigger_type=row.trigger_type,
             caller=row.source,
-            target=row.target or "",
+            target=row.mcp_tool or row.target or "",
             protocol=row.protocol,
             # `call_log` 无 method / path 列（已知缺口，见模块 docstring）
             method=None,
@@ -507,11 +749,21 @@ class MonitorCallService:
             final_ended_at=_iso(row.final_ended_at),
             attempt_count=attempt_count,
             retry_count=max(attempt_count - 1, 0),
+            caller_name=caller_name,
         )
 
     @staticmethod
-    def _record_from_attempt(row: CallAttempt, log: Optional[CallLog]) -> CallRecordItem:
-        """N2 行 → ``CallRecordItem``（``log`` 为该 attempt 的 N1 行，可能为 ``None``）。"""
+    def _record_from_attempt(
+        row: CallAttempt,
+        log: Optional[CallLog],
+        *,
+        caller_name: Optional[str] = None,
+    ) -> CallRecordItem:
+        """N2 行 → ``CallRecordItem``（``log`` 为该 attempt 的 N1 行，可能为 ``None``）。
+
+        目标列输出**对外对象标识** ``COALESCE(mcp_tool, target)``，工具名经 N1 借出
+        （N2 本身没有该列）。
+        """
         # 降级模式下 `attempt_count` 恰恰是与实际行数对不上的那一列，
         # 此处单行拿不到「本 request_id 的总行数」，退用 N1 值；N1 缺失时退用 attempt_no。
         attempt_count = int(getattr(log, "attempt_count", None) or row.attempt_no or 0)
@@ -522,7 +774,11 @@ class MonitorCallService:
             direction=getattr(log, "direction", None) or "",
             trigger_type=getattr(log, "trigger_type", None) or "",
             caller=getattr(log, "source", None),
-            target=getattr(log, "target", None) or "",
+            target=(
+                getattr(log, "mcp_tool", None)
+                or getattr(log, "target", None)
+                or ""
+            ),
             protocol=getattr(log, "protocol", None),
             method=None,
             path=None,
@@ -533,6 +789,7 @@ class MonitorCallService:
             final_ended_at=_iso(row.attempt_ended_at),
             attempt_count=attempt_count,
             retry_count=max(attempt_count - 1, 0),
+            caller_name=caller_name,
         )
 
     # ------------------------------------------------------------------
@@ -659,6 +916,7 @@ class MonitorCallService:
         )
         if data is None:
             raise ResourceNotFoundError(message=f"对象不存在：{object_id}")
+        top_sources = await self._top_sources_with_callers(data["top_sources"])
         return CallObjectDetail(
             object_id=data["object_id"] or object_id,
             # 未知类型回空串（同 C2 的 ``object_list``）：⛔ 不拿对象名充当类型。
@@ -667,10 +925,7 @@ class MonitorCallService:
             success_rate=data["success_rate"],
             avg_latency_ms=data["avg_latency_ms"],
             failed_count=data["failed_calls"],
-            top_sources=[
-                {"name": s["name"], "call_count": s["call_count"]}
-                for s in data["top_sources"]
-            ],
+            top_sources=top_sources,
             recent_failures=[
                 {
                     "request_id": f["request_id"],
@@ -694,12 +949,74 @@ class MonitorCallService:
         ``objects`` / ``call_sources`` 来自 ``monitor`` 数据层；``task_types``
         来自任务中心内置清单表（跨能力只读，见仓储该方法 docstring）；
         ``statuses`` 是静态映射常量。
+
+        ``call_source_options`` 按**用户身份合并**：同一个人的
+        ``username`` / 裸 ``id`` / ``user:<id>`` 等历史形态合并成一个选项，
+        ``value="user:<id>"``、``label=username``（跨租户同一 id 合并成一项）；
+        解析不到的系统标识（``apikey`` 等）原样输出 ``value=label=原值``。
+        ``call_sources`` 保留但取 ``call_source_options[].value``，避免两套词汇
+        并存 —— 前端把选中的值原样回传 ``source``，后端按身份展开命中全部形态。
         """
+        source_rows = await self.agg.list_call_source_tenants()
+        source_pairs: set[SourceKey] = {
+            (tenant_id, row["source"])
+            for row in source_rows
+            for tenant_id in (row.get("tenant_ids") or [])
+            if tenant_id and row.get("source")
+        }
+        identities = (
+            await self.caller.resolve_identities(source_pairs) if source_pairs else {}
+        )
+
+        grouped: Dict[Tuple[str, Any], dict] = {}
+        for row in source_rows:
+            source = row["source"]
+            for tenant_id in row.get("tenant_ids") or []:
+                if not tenant_id:
+                    continue
+                identity = identities.get((tenant_id, source))
+                if identity is None:
+                    entry = grouped.setdefault(
+                        ("raw", source),
+                        {"value": source, "label": source, "_usernames": set()},
+                    )
+                    continue
+                value = (
+                    format_user_identity(identity.user_id) or f"user:{identity.user_id}"
+                )
+                entry = grouped.setdefault(
+                    ("user", identity.user_id),
+                    {"value": value, "label": None, "_usernames": set()},
+                )
+                if identity.username:
+                    entry["_usernames"].add(identity.username)
+
+        call_source_options: List[dict] = []
+        seen_values: set[str] = set()
+        identity_first = sorted(
+            grouped, key=lambda key: (0 if key[0] == "user" else 1, str(key[1]))
+        )
+        for key in identity_first:
+            entry = grouped[key]
+            usernames = entry.pop("_usernames")
+            # 同一 id 跨租户解析出不同用户名属异常数据：取字典序最小者，保证稳定。
+            label = min(usernames) if usernames else entry["value"]
+            value = entry["value"]
+            if value in seen_values:
+                # ``user:7`` 原始形态在别的租户未解析时可能另成 raw 选项；
+                # 同一筛选值只保留身份项（身份项优先排序在前）。
+                continue
+            seen_values.add(value)
+            call_source_options.append({"value": value, "label": label})
+        call_source_options.sort(key=lambda opt: opt["value"])
+
         return MetaFilters(
             task_types=await self.agg.list_task_types(),
             statuses=[dict(item) for item in _STATUS_DICT],
             objects=await self.agg.list_objects(),
-            call_sources=await self.agg.list_call_sources(),
+            call_sources=[opt["value"] for opt in call_source_options],
+            call_source_options=call_source_options,
+            call_targets=await self.agg.list_call_targets(),
         )
 
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Alert, Empty, List, Select, Table } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { RightOutlined } from '@ant-design/icons';
@@ -14,7 +14,7 @@ import {
 import useAsyncData from '@/hooks/useAsyncData';
 import useMetaFilters from './useMetaFilters';
 import { PM_ALL } from '../../constants/platformMonitor';
-import { fmtCount, fmtDurationOrDash, fmtPercent1OrDash } from './format';
+import { fmtCompact, fmtCount, fmtDurationOrDash, fmtPercent, fmtPercent1, fmtPercentOrDash } from './format';
 import SectionCard from './components/SectionCard';
 import StatCards from './components/StatCards';
 import SegmentedFilter from './components/SegmentedFilter';
@@ -44,7 +44,7 @@ const TREND_METRICS: { value: PmTrendMetric; labelKey: string }[] = [
   { value: 'failures', labelKey: 'platformMonitor.task.metric.failures' },
 ];
 
-export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProps) {
+export default function TaskMonitor({ window, refreshKey, manualRefreshKey }: PmPaneProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const meta = useMetaFilters();
@@ -55,51 +55,72 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
   /** 失败列表的任务类型筛选。与趋势各管各的：两张卡挨着放，共用一个值会让人以为改一个动两处 */
   const [failureTaskType, setFailureTaskType] = useState<string>(PM_ALL);
 
+  // 手动刷新进依赖（要看得见的 loading），定时刷新走 silentKey（原地换数，不闪骨架屏）
   const loadStats = useCallback(
     () => getTaskStats(window),
-    // refreshKey 在函数体里没出现，但必须有：它变了才要重新取数
+    // manualRefreshKey 在函数体里没出现，但必须有：它变了才要重新取数
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, refreshKey],
+    [window, manualRefreshKey],
   );
-  const { data: stats, loading: statsLoading, error: statsError, reload: reloadStats } = useAsyncData(loadStats);
+  const {
+    data: stats,
+    loading: statsLoading,
+    error: statsError,
+    reload: reloadStats,
+  } = useAsyncData(loadStats, { silentKey: refreshKey });
 
   const loadTrend = useCallback(
     () => getTaskTrend(window, metric, trendTaskType === PM_ALL ? undefined : trendTaskType),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, metric, trendTaskType, refreshKey],
+    [window, metric, trendTaskType, manualRefreshKey],
   );
-  const { data: trend, loading: trendLoading, error: trendError, reload: reloadTrend } = useAsyncData(loadTrend);
+  const {
+    data: trend,
+    loading: trendLoading,
+    error: trendError,
+    reload: reloadTrend,
+  } = useAsyncData(loadTrend, { silentKey: refreshKey });
+
+  /**
+   * 趋势 tooltip 的主数值格式化。接口给的是裸数值（成功率 99.7529…、耗时 73.4），
+   * 单位和位数只能在展示层补：成功率补 % 收两位，耗时补时间单位（先取整再分段，避免出现 73.4 秒）。
+   */
+  /** Y 轴刻度：与 tooltip 同单位、但要更短（成功率轴上 1 位小数，耗时带单位后缀） */
+  const trendAxisFormat = useMemo(() => {
+    if (metric === 'successRate') return fmtPercent1;
+    if (metric === 'avgDuration') return (value: number) => `${Math.round(value)}s`;
+    return fmtCompact;
+  }, [metric]);
+
+  const trendValueFormat = useMemo(() => {
+    if (metric === 'successRate') return fmtPercent;
+    if (metric === 'avgDuration') return (value: number) => fmtDurationOrDash(Math.round(value), t);
+    return undefined;
+  }, [metric, t]);
 
   const loadFailures = useCallback(
     () => getTaskFailures(window, failureTaskType === PM_ALL ? undefined : failureTaskType),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, failureTaskType, refreshKey],
+    [window, failureTaskType, manualRefreshKey],
   );
   const {
     data: failures,
     loading: failuresLoading,
     error: failuresError,
     reload: reloadFailures,
-  } = useAsyncData(loadFailures);
+  } = useAsyncData(loadFailures, { silentKey: refreshKey });
 
   const loadOverview = useCallback(
     () => getTaskOverview(window),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, refreshKey],
+    [window, manualRefreshKey],
   );
   const {
     data: overview,
     loading: overviewLoading,
     error: overviewError,
     reload: reloadOverview,
-  } = useAsyncData(loadOverview);
-
-  // 工具条的「数据更新于」跟统计卡走：as-of 是后端落库时刻，不是列表的取数次。
-  // 失败时传 undefined（保留上一份），不要因为一次失败把时间戳清空。
-  useEffect(() => {
-    if (statsLoading) return;
-    onLoaded(stats?.asOf);
-  }, [statsLoading, stats, onLoaded]);
+  } = useAsyncData(loadOverview, { silentKey: refreshKey });
 
   const kpiItems: PmKpiCard[] = useMemo(() => {
     if (!stats) return [];
@@ -113,7 +134,7 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
         key: 'successRate',
         label: t('platformMonitor.task.kpi.successRate'),
         // 空窗口后端给 null，此时 0% 是错误表述（没有任务结束 ≠ 全部失败）
-        value: fmtPercent1OrDash(stats.successRate),
+        value: fmtPercentOrDash(stats.successRate),
       },
       {
         key: 'avgDuration',
@@ -125,7 +146,6 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
         label: t('platformMonitor.task.kpi.waiting'),
         // 只报一个实时数：本卡是快照（不套时间窗），等待占用本身不做细分
         value: fmtCount(stats.waiting),
-        badge: t('platformMonitor.realtime'),
       },
     ];
   }, [stats, t]);
@@ -210,7 +230,7 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
       title: t('platformMonitor.column.successRate'),
       dataIndex: 'successRate',
       align: 'right',
-      render: fmtPercent1OrDash,
+      render: fmtPercentOrDash,
     },
     {
       title: t('platformMonitor.column.avgDuration'),
@@ -245,7 +265,7 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
             <>
               <Select
                 size="small"
-                className="yx-pm-scope-select"
+                className="yx-pm-scope-select yx-pm-scope-select--wide"
                 value={trendTaskType}
                 onChange={setTrendTaskType}
                 // 候选来自 M1 的任务目录；拿不到时只剩「全部任务」，趋势仍可用
@@ -269,6 +289,8 @@ export default function TaskMonitor({ window, refreshKey, onLoaded }: PmPaneProp
               loading={trendLoading}
               fill
               valueName={t(TREND_METRICS.find((item) => item.value === metric)?.labelKey ?? '')}
+              valueFormat={trendValueFormat}
+              yFormat={trendAxisFormat}
             />
           )}
         </SectionCard>

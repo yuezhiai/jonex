@@ -59,6 +59,26 @@ class CallDirection(str, Enum):
     INBOUND = "inbound"
 
 
+class CallScope(str, Enum):
+    """调用边界 —— 与 :class:`CallDirection` **正交**的第二个维度。
+
+    ``direction`` 只回答「进还是出」；``call_scope`` 回答「跨不跨平台边界」。
+    两者组合后才足以切成三个业务口径（见 ``monitor_call`` 的 C1–C4）：
+
+    - ``external``：平台作为调用方，调**平台外部**的系统（模型、外部服务）；
+    - ``internal``：平台内部服务之间（如任务中心派活给运行方、运行方回报控制面）；
+    - ``open``：平台外部调用方进入平台能力（``direction=inbound``）。
+
+    ⚠️ 不要把它塞进 ``direction``：那会让「方向」同时承载两个概念，未来
+    「出站内部/入站内部」会把枚举撑散。采集侧**显式声明**；漏标的行由
+    :func:`monitor_collector._fallback_call_scope` 按「方向 + 协议」保守兜底。
+    """
+
+    EXTERNAL = "external"
+    INTERNAL = "internal"
+    OPEN = "open"
+
+
 class CallFinalStatus(str, Enum):
     """逻辑调用终态（五态）。**与既有枚举的映射待评审**。"""
 
@@ -118,6 +138,13 @@ class CallLog(TenantMixin, Base):
     source = Column(String(128))
     target = Column(String(128))
     protocol = Column(String(32))
+    # 调用边界（external / internal / open），与 direction 正交；见 CallScope。
+    # 可空是为了滚动发布安全：先上列的库能被旧采集器写入（NULL），读侧只把
+    # external 计入外部依赖页，NULL 自然不展示，不会污染口径。
+    call_scope = Column(String(16), nullable=True)
+    # MCP 工具名：仅 protocol='mcp' 时由 Sidecar 采集写入，其余链路恒 NULL。
+    # 读侧「对外对象标识」取 COALESCE(mcp_tool, target)，保留 target 的能力标识语义。
+    mcp_tool = Column(String(128))
     # 触发方：user（用户直接发起）/ system（系统后台批量，如入库向量化）。
     # 「调用记录」列表按此列筛选；采集侧按场景标签自动分类，DDL 侧写 CHECK。
     trigger_type = Column(

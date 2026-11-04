@@ -105,8 +105,41 @@ interface TaskTypeOverviewDto {
 /** 0–1 小数比率 → 百分数；null（空窗口）原样透传，⛔ 不兜 0 */
 const toPercent = (rate: number | null): number | null => (rate == null ? null : rate * 100);
 
-/** 毫秒 → 秒（取整）；null 原样透传 */
-const toSeconds = (ms: number | null): number | null => (ms == null ? null : Math.round(ms / 1000));
+/**
+ * 毫秒 → 秒（**向下取整**）；null 原样透传。
+ *
+ * ⚠️ 必须与任务中心的 `duration_seconds` 同口径：那边是
+ * `int((finished - started).total_seconds())`，截断小数而不是四舍五入。
+ * 用 `Math.round` 时，同一个子任务会在监控显示 61s、在任务中心显示 60s
+ * （实测 60.724769s → SQL ROUND 得 60725ms → round ⇒ 61）。
+ */
+const toSeconds = (ms: number | null): number | null => (ms == null ? null : Math.floor(ms / 1000));
+
+/**
+ * 趋势桶粒度（与后端 `bucket` 参数同一组取值）。
+ *
+ * `5m` 只用于 1 小时窗（预设 `1h` 或跨度 ≤1h 的自定义区间），后端返回补齐的 12 个点；
+ * 空桶 `value=null`，K2 的四个计数也可能为 null —— 一律原样透传，⛔ 不兜 0。
+ */
+type PmBucket = '5m' | 'hour' | 'day';
+
+/**
+ * 趋势横轴的标签格式。
+ *
+ * **5m 档固定 `HH:mm`**：窗口只有 1 小时，钟点不会重复，跨零点也不必补日期
+ * （23:55 / 00:05 已经足够区分，补 `MM-DD` 反而把刻度拉长）。
+ *
+ * 小时桶若只出 `HH:mm`，24h 窗口的首尾会撞成同一个刻度：起点 10-22 15:00 与终点
+ * 10-23 15:00 都格式化成 "15:00"，band 轴按字符串分类把它们当同一个点，后一个点
+ * 被画到前一个点的位置上（图上直接少一段）。跨天时补 `MM-DD`，同一天内仍是短标签，
+ * 单日窗口的刻度不会被无谓拉长。
+ */
+const trendLabelPattern = (points: { bucket_start: string }[], bucket: PmBucket): string => {
+  if (bucket === 'day') return PM_TIME_PATTERN.bucketDay;
+  if (bucket === '5m') return PM_TIME_PATTERN.bucketHour;
+  const days = new Set(points.map((point) => fmtPmTime(point.bucket_start, 'YYYY-MM-DD')));
+  return days.size > 1 ? PM_TIME_PATTERN.bucketHourCrossDay : PM_TIME_PATTERN.bucketHour;
+};
 
 /** 任务侧四档指标 → 接口 `metric`（与调用侧的取值**不同名**，故单列一张表） */
 const TASK_TREND_METRIC: Record<PmTrendMetric, string> = {
@@ -154,11 +187,10 @@ export const getTaskTrend = async (
       ...(taskType ? { task_type: taskType } : {}),
     },
   });
+  const labelPattern = trendLabelPattern(data.points ?? [], bucket);
   return (data.points ?? []).map((point) => ({
     // 横轴按平台时区出刻度：任务族接口给的是 +08:00，浏览器不在东八区时不能直接 format
-    date:
-      fmtPmTime(point.bucket_start, bucket === 'hour' ? PM_TIME_PATTERN.bucketHour : PM_TIME_PATTERN.bucketDay) ??
-      point.bucket_start,
+    date: fmtPmTime(point.bucket_start, labelPattern) ?? point.bucket_start,
     value:
       metric === 'successRate'
         ? toPercent(point.value)
@@ -251,7 +283,7 @@ interface MonitorFlagsDto {
   module_error?: string | null;
 }
 
-/** 统计口径元数据：`metric_mode='degraded'` 时数字按物理 attempt 计 */
+/** 统计口径元数据：`metric_mode='degraded'` 时数字按物理 attempt 计（无 attempt 的调用各计 1） */
 interface CallModeMetaDto {
   metric_mode?: string | null;
 }
@@ -311,6 +343,8 @@ interface CallRecordDto {
   direction: string;
   trigger_type: string;
   caller: string | null;
+  /** 纯增量字段：后端按行租户解析出的可读来源名；缺失时前端回退 `caller` */
+  caller_name?: string | null;
   target: string;
   protocol: string | null;
   status: string;
@@ -368,7 +402,7 @@ interface ObjectDetailDto {
   success_rate: number | null;
   avg_latency_ms: number | null;
   failed_count: number;
-  top_sources: { name: string; call_count: number }[];
+  top_sources: { name: string; caller_name?: string | null; call_count: number }[];
   recent_failures: { request_id: string; error_message: string | null; logical_started_at: string | null }[];
   /** 基础指标按逻辑调用还是物理 attempt 统计（降级时 `degraded`） */
   mode_meta?: CallModeMetaDto | null;
@@ -380,6 +414,10 @@ interface MetaFiltersDto {
   statuses?: { code: string | null; label: string; pm_label: string; in_denominator: boolean }[];
   objects?: { object_type: string; protocol: string | null }[];
   call_sources?: string[];
+  /** 纯增量：value=原始 source，label=解析后的账号名 / 认证类型 */
+  call_source_options?: { value: string; label: string }[];
+  /** 纯增量：对外对象标识候选（= COALESCE(mcp_tool, target)） */
+  call_targets?: string[];
 }
 
 /* ══════════════════════ 映射：接口字段 → types.ts ══════════════════════ */
@@ -402,8 +440,9 @@ const mapSummary = (dto: CallSummaryDto): PmCallStats => ({
 });
 
 const mapObject = (dto: CallObjectDto): PmCallScopeRow => ({
-  // `object_type` 是 openai/invoke 这类分类码，不能拿来当名字；兜底只在 object_id 缺失时发生
-  name: dto.object_id ?? dto.object_type,
+  // `object_type` 是「能力 / 模型服务」这类分类码，不是名字 —— 缺失时宁可显示占位符，
+  // 也绝不把它顶到名称列。
+  name: dto.object_id?.trim() || null,
   calls: dto.call_count,
   successRate: toPercent(dto.success_rate),
   avgLatencyMs: dto.avg_latency_ms,
@@ -418,6 +457,7 @@ const mapRecord = (dto: CallRecordDto): PmCallRecord => ({
   attemptId: dto.attempt_id,
   triggerType: dto.trigger_type as PmCallTrigger,
   caller: dto.caller,
+  callerName: dto.caller_name ?? null,
   target: dto.target,
   // 前端的「调用方式」列装的就是 protocol，不是 HTTP method（见 types.ts 该字段说明）
   method: (dto.protocol as PmCallProtocol | null) ?? null,
@@ -483,15 +523,18 @@ export const pmWindowBounds = (window: PmWindow): { from: string; to: string } =
 };
 
 /**
- * 桶粒度与横轴刻度一致：两档日内的窗口按小时，更长的按天。
- * 自定义区间按实际跨度判断（48h 为界），否则 30 天自定义会被切成 720 个小时桶。
+ * 桶粒度与横轴刻度一致：1 小时窗按 5 分钟（12 个点），两档日内的窗口按小时，更长的按天。
+ * 自定义区间按实际跨度判断（≤1h → 5m，≤48h → hour，更长 → day），否则 30 天自定义会被
+ * 切成 720 个小时桶。
  */
-const pmBucket = (window: PmWindow): 'hour' | 'day' => {
+const pmBucket = (window: PmWindow): PmBucket => {
   if (typeof window === 'object') {
     const spanHours = (Date.parse(window.to) - Date.parse(window.from)) / 3600_000;
+    if (spanHours <= 1) return '5m';
     return spanHours <= 48 ? 'hour' : 'day';
   }
-  return window === '1h' || window === '24h' ? 'hour' : 'day';
+  if (window === '1h') return '5m';
+  return window === '24h' ? 'hour' : 'day';
 };
 
 /** 页面侧的四档指标 → 接口的 metric 取值（两边命名不同，映射收在这里） */
@@ -619,8 +662,13 @@ export const getAllCallScopeObjects = async (
  *
  * `objectId` 传具体对象则只画那一条，不传即全量；按单个对象看时 `direction` 可省。
  *
+ * `callScope` 是调用边界（external / internal / open）：外部依赖页另传 `external`，
+ * 排除 `direction=outbound` 里混入的任务中心派活/回报等平台内部互调；开放能力页不传。
+ *
  * 返回值带 `metricMode`：趋势与同页统计卡同源，页面据此给出统一的口径提示。
  */
+export type PmCallScopeFilter = 'external' | 'internal' | 'open';
+
 export interface PmCallTrend {
   points: PmTrendPoint[];
   metricMode: PmCallMetricMode | null;
@@ -631,6 +679,7 @@ export const getCallTrend = async (
   metric: PmTrendMetric,
   direction?: PmCallDirection,
   objectId?: string,
+  callScope?: PmCallScopeFilter,
 ): Promise<PmCallTrend> => {
   const bucket = pmBucket(window);
   const data = await apiClient.get<CallTrendDto>('/platform/monitor/calls/trend', {
@@ -640,6 +689,7 @@ export const getCallTrend = async (
       bucket,
       ...(direction ? { direction } : {}),
       ...(objectId && objectId !== PM_ALL ? { object_id: objectId } : {}),
+      ...(callScope ? { call_scope: callScope } : {}),
     },
   });
   return { points: mapTrendPoints(data.points, metric, bucket), metricMode: toMetricMode(data.mode_meta?.metric_mode) };
@@ -649,23 +699,50 @@ export const getCallTrend = async (
 const mapTrendPoints = (
   points: TrendPointDto[] | undefined,
   metric: PmTrendMetric,
-  bucket: 'hour' | 'day',
-): PmTrendPoint[] =>
-  (points ?? []).map((point) => ({
+  bucket: PmBucket,
+): PmTrendPoint[] => {
+  const labelPattern = trendLabelPattern(points ?? [], bucket);
+  return (points ?? []).map((point) => ({
     // 横轴刻度由接口的桶起点决定，粒度与 bucket 一致；时区统一走平台时区（接口给 UTC `Z`）
-    date:
-      fmtPmTime(point.bucket_start, bucket === 'hour' ? PM_TIME_PATTERN.bucketHour : PM_TIME_PATTERN.bucketDay) ??
-      point.bucket_start,
+    date: fmtPmTime(point.bucket_start, labelPattern) ?? point.bucket_start,
     // 成功率点 ×100（接口给 0–1 小数），否则图上刻度是 0.96 而不是 96 —— 与 `getTaskTrend` 一致。
     // 耗时点**不换算**：调用延迟本就是毫秒，且卡片 / 表格的 `fmtLatency` 也按 ms，换秒会全变 0。
     value: metric === 'successRate' ? toPercent(point.value) : point.value,
     closed: point.closed,
   }));
+};
 
-/** 筛选值见 `PmCallRecordFilters`（与列表页的 CommonTable 共用同一份定义），这里只补分页。 */
+/**
+ * 数组参数序列化为**重复同名 query 参数**（`target_any=a&target_any=b`）。
+ *
+ * axios 默认会写成 `target_any[]=a`，后端 FastAPI 的 `target_any: List[str]` 读不到；
+ * 这里只给调用记录接口挂自定义序列化器，不影响其它接口。
+ */
+export function serializePmQueryParams(params: Record<string, unknown>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item === undefined || item === null || item === '') continue;
+        search.append(key, String(item));
+      }
+    } else {
+      search.append(key, String(value));
+    }
+  }
+  return search.toString();
+}
+
+/** 筛选值见 `PmCallRecordFilters`（与列表页的 CommonTable 共用同一份定义），这里只补分页与显示名展开值。 */
 export interface PmCallRecordQuery extends PmCallRecordFilters {
   page: number;
   pageSize: number;
+  /**
+   * keyword 按显示名（能力释义 / 对外对象标识）展开出的原始值。
+   * 与 `keyword` 并存，作为重复 query 参数 `target_any` 下发。
+   */
+  targetAny?: string[];
 }
 
 export interface PmCallRecordPage {
@@ -683,6 +760,7 @@ export interface PmCallRecordPage {
  * 排序交给后端默认的 `logical_started_at desc`，前端不传 `sort`。
  */
 export const getCallRecords = async (window: PmWindow, query: PmCallRecordQuery): Promise<PmCallRecordPage> => {
+  const targetAny = (query.targetAny ?? []).filter(Boolean);
   const data = await apiClient.get<CallRecordPageDto>(
     '/platform/monitor/calls/records',
     {
@@ -696,8 +774,13 @@ export const getCallRecords = async (window: PmWindow, query: PmCallRecordQuery)
         // 精确匹配（对象详情下钻），与 keyword 的模糊匹配是两套语义
         ...(query.target ? { target: query.target } : {}),
         ...(query.keyword ? { keyword: query.keyword } : {}),
+        // 显示名展开值，与 keyword 并存
+        ...(targetAny.length ? { target_any: targetAny } : {}),
         page: query.page,
         page_size: query.pageSize,
+      },
+      paramsSerializer: {
+        serialize: (params: unknown) => serializePmQueryParams(params as Record<string, unknown>),
       },
     },
   );
@@ -783,7 +866,12 @@ export const getCallObjectDetail = async (
     successRate: toPercent(dto.success_rate),
     avgLatencyMs: dto.avg_latency_ms,
     failedCount: dto.failed_count,
-    topSources: (dto.top_sources ?? []).map((item) => ({ name: item.name, callCount: item.call_count })),
+    topSources: (dto.top_sources ?? []).map((item) => ({
+      // name 保留原始 source（React key / 排查），callerName 只负责展示
+      name: item.name,
+      callerName: item.caller_name ?? null,
+      callCount: item.call_count,
+    })),
     recentFailures: (dto.recent_failures ?? []).map((item) => ({
       requestId: item.request_id,
       errorMessage: item.error_message,
@@ -812,6 +900,8 @@ export const getMetaFilters = async (): Promise<PmMetaFilters | null> => {
       })),
       objects: (dto.objects ?? []).map((item) => ({ objectType: item.object_type, protocol: item.protocol })),
       callSources: dto.call_sources ?? [],
+      callSourceOptions: (dto.call_source_options ?? []).map((item) => ({ value: item.value, label: item.label })),
+      callTargets: dto.call_targets ?? [],
     };
   } catch {
     return null;
@@ -835,12 +925,16 @@ interface TokenSummaryDto {
   flags?: MonitorFlagsDto | null;
 }
 
+/**
+ * Token 趋势点。**四个计数都可能为 null**：5m 档会补齐 12 个点，空桶里没有任何调用，
+ * 后端按同一套「无数据 ≠ 0」口径返回 null。映射层原样透传，⛔ 不兜 0。
+ */
 interface TokenTrendPointDto {
   bucket_start: string;
-  total_tokens: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  call_count: number;
+  total_tokens: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  call_count: number | null;
 }
 
 interface TokenModelTopDto {
@@ -901,17 +995,20 @@ export const getTokenTrend = async (window: PmWindow, kind: PmTokenTrendKind): P
   const data = await apiClient.get<{ points: TokenTrendPointDto[] }>('/platform/monitor/tokens/trend', {
     params: { ...pmRange(window), metric: kind, bucket },
   });
+  const labelPattern = trendLabelPattern(data.points ?? [], bucket);
   return (data.points ?? []).map((point) => ({
     // 刻度由接口的桶起点决定，粒度与 bucket 一致（与 C5/T2 同一处理）
-    date:
-      fmtPmTime(point.bucket_start, bucket === 'hour' ? PM_TIME_PATTERN.bucketHour : PM_TIME_PATTERN.bucketDay) ??
-      point.bucket_start,
+    date: fmtPmTime(point.bucket_start, labelPattern) ?? point.bucket_start,
+    // 空桶为 null，原样透传（⛔ 不兜 0，图表按缺口处理）
     value: point[field],
-    // 接口恒返四个量、只按 metric 校验不裁剪：另外三个塞进 tooltip，不必再发一次请求
+    // 接口恒返四个量、只按 metric 校验不裁剪：另外三个塞进 tooltip，不必再发一次请求。
+    // 空桶的计数同样可能是 null，消费端 `TrendAreaChart` 已按 `raw == null` 渲染 "-"。
     detail: {
       input: point.prompt_tokens,
       output: point.completion_tokens,
       calls: point.call_count,
+      // 接口恒返总量，浮框要按固定四行展示（调用次数 / 输入 / 输出 / 总量），这里一并交出去
+      total: point.total_tokens,
     },
   }));
 };

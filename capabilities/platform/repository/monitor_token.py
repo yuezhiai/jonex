@@ -37,15 +37,16 @@
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.repository.base import BaseRepository
 from jonex_core.common.exceptions import InvalidParameterError
 from jonex_core.common.monitor_models import LlmUsageLog
 
-#: 趋势桶粒度白名单（自然小时 / 自然日）。
-_BUCKETS = ("hour", "day")
+#: 趋势桶粒度白名单（5 分钟 / 自然小时 / 自然日）。
+#: ``5m`` 只有 service 层会补空桶；``hour`` / ``day`` 仍只返回有数据桶。
+_BUCKETS = ("5m", "hour", "day")
 
 #: 三族趋势统一按**北京自然时/日**切桶（固定口径，不读配置）。
 #: 平台设置里的 timezone 仅存不用，⛔ 不得作为配置源；固定常量，便于测试防回退。
@@ -201,7 +202,7 @@ class MonitorTokenRepository(BaseRepository[LlmUsageLog]):
     # ------------------------------------------------------------------
 
     async def trend(self, start: datetime, to: datetime, bucket: str) -> list:
-        """K2 Token 用量趋势：按 ``bucket``（hour/day）分桶，桶升序。
+        """K2 Token 用量趋势：按 ``bucket``（5m/hour/day）分桶，桶升序。
 
         ``bucket`` 越界抛 ``1001``（白名单校验，存储层职责）。
         每点含 ``bucket_start``（UTC ISO8601 字符串）/ ``total_tokens`` /
@@ -212,14 +213,26 @@ class MonitorTokenRepository(BaseRepository[LlmUsageLog]):
         """
         if bucket not in _BUCKETS:
             raise InvalidParameterError(
-                message="bucket 取值非法，仅支持 hour / day",
+                message="bucket 取值非法，仅支持 5m / hour / day",
                 details={"bucket": bucket, "allowed": list(_BUCKETS)},
             )
-        # 先转北京墙钟再 date_trunc，最后转回 timestamptz —— 显式时区，不依赖
+        # 先转北京墙钟再分桶，最后转回 timestamptz —— 显式时区，不依赖
         # DB session 的 TimeZone 设置。输出仍是 UTC ISO8601（``_iso``）。
-        bucket_expr = func.timezone(
-            _TZ, func.date_trunc(bucket, func.timezone(_TZ, LlmUsageLog.created_at))
-        )
+        # 5m 用 date_bin 对齐 5 分钟网格（北京 +8 为整小时偏移，不影响边界）；
+        # hour / day 仍走 date_trunc 自然时/日。
+        if bucket == "5m":
+            bucket_expr = func.timezone(
+                _TZ,
+                func.date_bin(
+                    sa_text("INTERVAL '5 minutes'"),
+                    func.timezone(_TZ, LlmUsageLog.created_at),
+                    sa_text("TIMESTAMP '1970-01-01'"),
+                ),
+            )
+        else:
+            bucket_expr = func.timezone(
+                _TZ, func.date_trunc(bucket, func.timezone(_TZ, LlmUsageLog.created_at))
+            )
         stmt = (
             select(
                 bucket_expr.label("bucket_start"),

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Typography } from 'antd';
+import { Form, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
@@ -17,9 +17,13 @@ import {
 } from '../../constants/platformMonitor';
 import { fmtLatencyOrDash } from './format';
 import { enumLabel } from './labels';
+import { capabilityLabel, expandKeywordTargets } from './capabilityLabels';
+import { buildCallTargetOptions, buildSourceOptions } from './identifierOptions';
+import IdentifierText from './components/IdentifierText';
 import { CallStatusTag } from './components/Tags';
 import ModuleError from './components/ModuleError';
 import MetaHint from './components/MetaHint';
+import TargetObjectFilter from './components/TargetObjectFilter';
 import CallDetailDrawer from './components/CallDetailDrawer';
 import type {
   PmCallDirection,
@@ -34,10 +38,11 @@ import type {
 const DIRECTIONS: PmCallDirection[] = ['inbound', 'outbound'];
 const STATUSES: PmCallStatus[] = ['success', 'failed', 'cancelled', 'running', 'unknown'];
 const TRIGGERS: PmCallRecord['triggerType'][] = ['user', 'system'];
-// 实际只有 invoke / openai 有写入方；mcp、http 不给选项（契约 §三.4）
-const PROTOCOLS: PmCallProtocol[] = ['invoke', 'openai'];
-// 下钻链接里的 protocol 仍按接口的全量枚举校验：将来出现 mcp / http 写入方时，
-// 记录页不会因为入口没列进下拉就把它当成脏链接丢掉。
+// 协议下拉候选：invoke / mcp / openai 均有写入方（mcp 来自 MCP 工具调用）；
+// http 仍无写入方，不提供选项。
+export const PROTOCOLS: PmCallProtocol[] = ['invoke', 'mcp', 'openai'];
+// 下钻链接里的 protocol 仍按接口的全量枚举校验（含暂未出现在下拉里的 http）：
+// 将来出现新的写入方时，记录页不会因为入口没列进下拉就把它当成脏链接丢掉。
 const PROTOCOL_PARAM_VALUES: PmCallProtocol[] = ['invoke', 'mcp', 'http', 'openai'];
 
 /** 读 URL 里的枚举筛选：不在候选里的值一律忽略，脏链接不该把列表筛成空 */
@@ -60,7 +65,7 @@ function readEnumFilter<T extends string>(
  * 表格撑满页签内容区的剩余高度、只有表体滚（表头与分页固定）。antd 的固定表头只认具体像素，
  * 所以在这里量宿主容器（理由与写法同 `pages/DomainKnowledgeBlank/DocumentLibrary`）。
  */
-export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProps) {
+export default function CallRecords({ window, refreshKey, manualRefreshKey }: PmPaneProps) {
   const { t } = useTranslation();
   const meta = useMetaFilters();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -185,14 +190,17 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
       ),
     ];
 
-    // 「来源」候选只有 M1 有；拿不到就退成自由输入，不然这个筛选直接不可用
-    const source: FilterConfig = meta?.callSources?.length
+    // 「来源」候选只有元信息接口有；该接口同时返回 value/label 分离的 call_source_options，
+    // 旧后端 call_sources 归一后仍可用；两者都没有就退成自由输入。
+    const sourceOptions = buildSourceOptions(meta);
+    const source: FilterConfig = sourceOptions.length
       ? {
           key: 'source',
           label: t('platformMonitor.records.filterSource'),
           type: 'select',
           placeholder: t('platformMonitor.records.sourcePlaceholder'),
-          options: meta.callSources.map((item) => ({ value: item, label: item })),
+          // value=原始 source（请求参数），label=账号名 / 认证类型（展示）
+          options: sourceOptions,
         }
       : {
           key: 'source',
@@ -204,13 +212,7 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
     return [
       ...base,
       source,
-      {
-        // 精确匹配，与下面的 keyword 是两套语义：对象详情下钻靠它把同前缀对象挡在外面
-        key: 'target',
-        label: t('platformMonitor.records.filterTarget'),
-        type: 'input',
-        placeholder: t('platformMonitor.records.targetPlaceholder'),
-      },
+      // 「目标对象」不再要求用户输入原始能力 ID —— 改用 filterExtra 里的对象选择器
       {
         key: 'keyword',
         label: t('platformMonitor.records.filterKeyword'),
@@ -219,6 +221,12 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
       },
     ];
   }, [meta, t]);
+
+  /**
+   * 目标对象选择器候选：优先元信息接口的 `callTargets`，缺失时回退能力映射表。
+   * 允许自由输入（模型名 / MCP 工具名本身就是可读名），提交的始终是原始标识。
+   */
+  const targetOptions = useMemo(() => buildCallTargetOptions(t, meta), [meta, t]);
 
   const fetchRecords = useCallback(
     async ({
@@ -232,47 +240,67 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
       target,
       keyword,
     }: TableQueryParams<PmCallRecordFilters>) => {
-      try {
-        const data = await getCallRecords(window, {
-          // 筛选控件被清空时值是 undefined，而接口契约用 'all' / 空串表示「不筛」
-          direction: direction ?? PM_ALL,
-          status: status ?? PM_ALL,
-          triggerType: triggerType ?? PM_ALL,
-          protocol: protocol ?? PM_ALL,
-          // 文本项去首尾空白：末尾多一个空格会让后端等值匹配一条都查不到，
-          // 而用户看不出来自己敲了空格
-          source: source?.trim() ?? '',
-          target: target?.trim() ?? '',
-          keyword: keyword?.trim() ?? '',
-          page,
-          pageSize,
-        });
-        return { list: data.items, total: data.total };
-      } finally {
-        // 成败都算「刷新过一次」；C6 没有 as_of，显式传空串让工具条退回本地取数时刻
-        onLoaded('');
-      }
+      const kw = keyword?.trim() ?? '';
+      // 显示名（能力中英文释义 + 元信息接口的对外对象标识）展开为原始值，作为 target_any 下发；
+      // 原 keyword 照常发送，两者并存（后端对 source 的用户名展开也继续生效）。
+      const targetAny = expandKeywordTargets(kw, meta?.callTargets ?? [], t);
+
+      const data = await getCallRecords(window, {
+        // 筛选控件被清空时值是 undefined，而接口契约用 'all' / 空串表示「不筛」
+        direction: direction ?? PM_ALL,
+        status: status ?? PM_ALL,
+        triggerType: triggerType ?? PM_ALL,
+        protocol: protocol ?? PM_ALL,
+        // 文本项去首尾空白：末尾多一个空格会让后端等值匹配一条都查不到，
+        // 而用户看不出来自己敲了空格
+        source: source?.trim() ?? '',
+        target: target?.trim() ?? '',
+        keyword: kw,
+        targetAny,
+        page,
+        pageSize,
+      });
+      return { list: data.items, total: data.total };
     },
-    [window, onLoaded],
+    [window, meta, t],
   );
 
-  const handleError = useCallback((e: unknown) => setError(e), []);
+  /**
+   * 定时刷新的失败不回错误态：弹一整屏错误会把正在看的列表整块换掉，
+   * 而下一秒的轮询可能就恢复了。真正的持续故障会由用户下一次手动刷新暴露。
+   */
+  const handleError = useCallback((e: unknown, info: { silent: boolean }) => {
+    if (info.silent) return;
+    setError(e);
+  }, []);
 
   /**
    * 时间窗与刷新信号是**页面外部**的查询条件，进不了 `filters`，CommonTable 看不见它们变 ——
    * 必须显式 `refresh()` 一次；那一次读的是最新渲染的 `fetchRecords`，`window` 也就是新值。
    *
-   * 首次挂载不补刀：组件自己已经取过第一份数。用「与上一次的值比较」而不是 mounted 标记，
-   * 顺带把「时间窗变了」和「只是点了刷新」分开 —— 前者要回第一页（旧页码在新窗口里可能已不存在），
-   * 后者该停在当前页。
+   * 三者姿态不同：换时间窗要回第一页（旧页码在新窗口里可能已不存在）、手动刷新停在当前页
+   * 且要有可见的 loading、定时刷新既不翻页也不亮遮罩（每 60 秒闪一次等于页面一直在重载）。
+   *
+   * 首次挂载不补刀：组件自己已经取过第一份数。用「与上一次的值比较」而不是 mounted 标记。
    */
-  const prevExtRef = useRef<{ window: PmWindow; refreshKey: number }>({ window, refreshKey });
+  const prevExtRef = useRef<{ window: PmWindow; refreshKey: number; manualRefreshKey: number }>({
+    window,
+    refreshKey,
+    manualRefreshKey,
+  });
   useEffect(() => {
     const prev = prevExtRef.current;
-    prevExtRef.current = { window, refreshKey };
-    if (prev.window === window && prev.refreshKey === refreshKey) return;
-    tableRef.current?.refresh({ resetPage: prev.window !== window });
-  }, [window, refreshKey]);
+    prevExtRef.current = { window, refreshKey, manualRefreshKey };
+    if (prev.window !== window) {
+      tableRef.current?.refresh({ resetPage: true });
+      return;
+    }
+    if (prev.manualRefreshKey !== manualRefreshKey) {
+      tableRef.current?.refresh();
+      return;
+    }
+    if (prev.refreshKey !== refreshKey) tableRef.current?.refresh({ silent: true });
+  }, [window, refreshKey, manualRefreshKey]);
 
   const columns = useMemo<TableColumnsType<PmCallRecord>>(
     () => [
@@ -293,12 +321,14 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
         title: t('platformMonitor.records.column.caller'),
         dataIndex: 'caller',
         width: 150,
-        render: (v: string | null) => v ?? '-',
+        // 优先后端解析出的账号名；解析不到时回退原始 source（认证类型 / platform 等）
+        render: (value: string | null, row: PmCallRecord) => row.callerName ?? value ?? '-',
       },
       {
         title: t('platformMonitor.records.column.target'),
         dataIndex: 'target',
-        render: (value: string) => <span className="yx-pm-cell-strong">{value}</span>,
+        // 能力 ID 显示释义，模型名 / MCP 工具名原样；原始值只在 hover 与复制入口
+        render: (value: string) => <IdentifierText value={value} label={capabilityLabel(t, value)} strong />,
       },
       {
         title: t('platformMonitor.records.column.method'),
@@ -377,6 +407,33 @@ export default function CallRecords({ window, refreshKey, onLoaded }: PmPaneProp
           className="yx-pm-records-table"
           filters={filters}
           initialFilters={initialFilters}
+          /**
+           * 页面顶部的「刷新」已经覆盖本表（manualRefreshKey → tableRef.refresh()），
+           * 还额外重置自动刷新计时、更新「统计截至」；表格自带的刷新会是第二个重复入口。
+           * 「重置」保留 —— 它只清本表筛选，页面级按钮没有这个职责。
+           */
+          actions={{ refresh: false }}
+          /**
+           * 对象选择器：配置项的 select 不支持自由输入，用 filterExtra 挂 AutoComplete。
+           * 输入框回显选项 label（如「文档解析」），下发给接口的 value 仍是原始标识；
+           * 打开下拉即列出全部候选（不用先清空），用户也可以直接输入模型名 / MCP 工具名。
+           * 「全部对象」用空值表示，与「清空筛选 = 不筛」的既有语义一致。
+           */
+          filterExtra={(ctx) => (
+            <Form.Item
+              label={t('platformMonitor.records.filterTarget')}
+              labelCol={{ flex: '0 0 5.5em', style: { textAlign: 'right' } }}
+              wrapperCol={{ flex: '1 1 0%', style: { minWidth: 0 } }}
+              style={{ marginBottom: 0 }}
+            >
+              <TargetObjectFilter
+                value={(ctx.get('target') as string | undefined) ?? ''}
+                options={targetOptions}
+                placeholder={t('platformMonitor.records.allObjects')}
+                onChange={(value) => ctx.set('target', value as PmCallRecordFilters['target'])}
+              />
+            </Form.Item>
+          )}
           columns={columns}
           // 降级模式下 requestId 会重复，只有 attemptId 唯一；正常模式（attemptId 为 null）回落
           // requestId + direction —— 同一次能力派发可能同时落 inbound/outbound 两条 N1，

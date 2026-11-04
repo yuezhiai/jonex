@@ -162,7 +162,7 @@ describe('任务监控取数层契约与映射', () => {
       expect(hits[0].params.range_preset).toBe('24h');
     });
 
-    it('1h / 24h 用 hour 桶，7d / 30d 用 day 桶', async () => {
+    it('1h 用 5m 桶，24h 用 hour 桶，7d / 30d 用 day 桶', async () => {
       routes[ENDPOINT_TREND] = () => ({ points: [] });
 
       await getTaskTrend('1h', 'volume');
@@ -170,7 +170,36 @@ describe('任务监控取数层契约与映射', () => {
       await getTaskTrend('7d', 'volume');
       await getTaskTrend('30d', 'volume');
 
-      expect(hits.map((h) => h.params.bucket)).toEqual(['hour', 'hour', 'day', 'day']);
+      expect(hits.map((h) => h.params.bucket)).toEqual(['5m', 'hour', 'day', 'day']);
+    });
+
+    it('自定义区间按实际跨度选桶：≤1h → 5m，≤48h → hour，更长 → day', async () => {
+      routes[ENDPOINT_TREND] = () => ({ points: [] });
+
+      await getTaskTrend({ preset: 'custom', from: '2026-10-13T00:00:00Z', to: '2026-10-13T00:45:00Z' }, 'volume');
+      // 恰 1 小时同样落 5m（契约边界为「≤1 小时」）
+      await getTaskTrend({ preset: 'custom', from: '2026-10-13T00:00:00Z', to: '2026-10-13T01:00:00Z' }, 'volume');
+      await getTaskTrend({ preset: 'custom', from: '2026-10-13T00:00:00Z', to: '2026-10-13T03:00:00Z' }, 'volume');
+      // 恰 48 小时仍按小时桶（与既有 48h 分界一致）
+      await getTaskTrend({ preset: 'custom', from: '2026-10-11T00:00:00Z', to: '2026-10-13T00:00:00Z' }, 'volume');
+      await getTaskTrend({ preset: 'custom', from: '2026-10-10T00:00:00Z', to: '2026-10-13T00:00:00Z' }, 'volume');
+
+      expect(hits.map((h) => h.params.bucket)).toEqual(['5m', '5m', 'hour', 'hour', 'day']);
+    });
+
+    it('1h 的 5m 档横轴固定 HH:mm，跨零点也不补日期', async () => {
+      routes[ENDPOINT_TREND] = () => ({
+        points: [
+          { bucket_start: '2026-10-13T23:55:00+08:00', value: 1, closed: true },
+          { bucket_start: '2026-10-14T00:05:00+08:00', value: 2, closed: true },
+        ],
+      });
+
+      const points = await getTaskTrend('1h', 'volume');
+
+      expect(hits[0].params.bucket).toBe('5m');
+      // 窗口只有 1 小时，HH:mm 不会重复；补 MM-DD 只会把刻度拉长
+      expect(points.map((p) => p.date)).toEqual(['23:55', '00:05']);
     });
 
     it('四档指标逐一对上契约取值（与调用侧命名不同）', async () => {
@@ -386,6 +415,42 @@ describe('任务监控取数层契约与映射', () => {
       expect(rows[0].avgDurationSec).toBeNull();
       expect(rows[0].stages[0].successRate).toBeNull();
       expect(rows[0].stages[0].avgDurationSec).toBeNull();
+    });
+
+    it('毫秒 → 秒按向下取整，与任务中心 duration_seconds（int 截断）同口径', async () => {
+      routes[ENDPOINT_OVERVIEW] = () => ({
+        items: [
+          {
+            task_type: 'file_processing_ontology',
+            total_count: 1,
+            running_count: 0,
+            waiting_count: 0,
+            failed_count: 0,
+            success_rate: 1,
+            // 任务级 106.9s：任务中心 int 截断 = 106s，四舍五入会错误地显示 107s
+            avg_duration_ms: 106900,
+            stages: [
+              {
+                stage_code: 'compile',
+                stage_name: '知识编译',
+                exec_count: 1,
+                running_count: 0,
+                waiting_count: 0,
+                failed_count: 0,
+                success_rate: 1,
+                // 子任务实测 60.724769s，SQL ROUND 到毫秒 = 60725ms。
+                // 任务中心 duration_seconds = int(60.724769) = 60s，监控必须同为 60。
+                avg_duration_ms: 60725,
+              },
+            ],
+          },
+        ],
+      });
+
+      const rows = await getTaskOverview('24h');
+
+      expect(rows[0].avgDurationSec).toBe(106);
+      expect(rows[0].stages[0].avgDurationSec).toBe(60);
     });
   });
 

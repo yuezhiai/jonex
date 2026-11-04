@@ -7,7 +7,7 @@
 - 分页换算 ``page`` / ``page_size`` → ``offset`` / ``limit``（T3 出参**不自加**
   ``page`` / ``page_size``，只回 ``items`` + ``total``）；
 - 两张表（``stage`` 白名单已落在 SQL；``reason`` 在此归并）；
-  ``task_type`` **不翻译** —— 直出原始 ``task_catalog_code``；
+  ``task_type`` **不翻译** —— 直出原始 ``definition_id``；
 - 组装 ``dtos/monitor.py`` 的出参 DTO。
 
 租户
@@ -17,7 +17,7 @@
 """
 
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,7 @@ from capabilities.platform.dtos.monitor import (
     TrendPoint,
 )
 from capabilities.platform.repository.monitor_task import MonitorTaskRepository
+from capabilities.platform.services.monitor_buckets import bucket_starts
 from capabilities.platform.services.monitor_range import enforce_max_range
 from capabilities.platform.services.monitor_resilience import (
     MODULE_ERROR,
@@ -56,7 +57,12 @@ _METRICS = {
 }
 
 #: T2 ``bucket`` 白名单 → 桶宽（用于计算 ``closed``）。
-_BUCKETS = {"hour": timedelta(hours=1), "day": timedelta(days=1)}
+#: ``5m`` 是唯一会补空桶的粒度；``hour`` / ``day`` 仍只返回有数据的桶。
+_BUCKETS = {
+    "5m": timedelta(minutes=5),
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+}
 
 #: ``reason`` 归并表（``tasks.error_code`` → 前端 5 档之一）。未命中的一切
 #: （含无 ``error_code`` 的老数据）一律回落 ``"ontology"``。
@@ -64,12 +70,15 @@ _REASON_COMPILE = frozenset(
     {
         "err.kb.task_center.compile_failed",
         "err.kb.task_center.wiki_compile_failed",
-        "err.task_center.task.aggregate_failed",
+        # ⚠️ ``err.task_center.task.aggregate_failed`` **不在这里**：它是任务收口外壳，
+        # 真正的失败节点在 ``error_params["parts"]``。只看外壳代号会把 parse 步挂掉
+        # 也标成编译失败（2026-10-23 bug），判档见 ``_translate_reason``。
     }
 )
 _REASON_PARSE = frozenset(
     {
         "err.kb.task_center.step_hard_timeout",
+        "err.kb.task_center.downstream_failed",
         "err.task_center.subtask.timed_out",
         "err.task_center.subtask.pending_stuck",
         "err.task_center.subtask.runner_unbound",
@@ -77,6 +86,47 @@ _REASON_PARSE = frozenset(
         "err.task_center.subtask.dispatch_exhausted",
     }
 )
+#: 任务中心收口时写的**外壳**代号（零件数组在 ``error_params["parts"]``）。
+_AGGREGATE_FAILED = "err.task_center.task.aggregate_failed"
+#: 归并兜底档：认不出阶段的一切（含无代号的老数据）。
+_REASON_FALLBACK = "ontology"
+#: 阶段先后 —— 一条任务同时挂了多个节点时，**取最早的那一步**（下游失败多半是后果）。
+_REASON_ORDER = ("detect", "format", "parse", "ontology", "compile")
+#: 步骤代号 / 编排节点 id 前缀 → 失败原因档。``step``（写在 ``error_params`` 里）
+#: 最精确；没有它才退回节点 id（``parse_1`` / ``compile_1`` / 改版前的 ``ingest_1``）。
+_STEP_REASON = {
+    "detect": "detect",
+    "format": "format",
+    "parse": "parse",
+    "ingest": "parse",  # 改版前遗留步骤，仍属解析入库阶段
+    "extract": "ontology",
+    "compile": "compile",
+}
+
+
+def _reason_from_one(
+    code: Optional[str], params: Any, node_id: Optional[str]
+) -> Optional[str]:
+    """单条失败原因（聚合零件 / 任务级直出）→ 五档之一；认不出返回 ``None``。
+
+    判据顺序：**编译代号最权威**（它本身就点名了阶段）→ ``params.step`` → 节点 id
+    前缀 → 其余代号表。``step_hard_timeout`` / ``downstream_failed`` 这类代号本身
+    不带阶段，必须靠 ``step`` 或 ``node_id`` 才能分清 parse / compile。
+    """
+    if code in _REASON_COMPILE:
+        return "compile"
+    if isinstance(params, dict):
+        step = str(params.get("step") or "").strip().lower()
+        if step in _STEP_REASON:
+            return _STEP_REASON[step]
+    node = str(node_id or "").strip().lower()
+    if node:
+        head = node.split("_", 1)[0]
+        if head in _STEP_REASON:
+            return _STEP_REASON[head]
+    if code in _REASON_PARSE:
+        return "parse"
+    return None
 
 
 def _parse_ts(value: str, field: str) -> datetime:
@@ -199,13 +249,38 @@ class MonitorTaskService:
         return (page - 1) * page_size
 
     @staticmethod
-    def _translate_reason(error_code: Optional[str]) -> str:
-        """``error_code`` → 前端失败原因档（默认 ``"ontology"``）。"""
-        if error_code in _REASON_COMPILE:
-            return "compile"
-        if error_code in _REASON_PARSE:
-            return "parse"
-        return "ontology"
+    def _translate_reason(
+        error_code: Optional[str], error_params: Optional[dict] = None
+    ) -> str:
+        """失败原因 → 前端五档之一（认不出一律 ``"ontology"``）。
+
+        ``error_code == "err.task_center.task.aggregate_failed"`` 时**必须看零件**：
+        那是任务中心的收口「外壳」代号，真正的失败节点在
+        ``error_params["parts"]``（每项 ``{node_id, code, params, message}``）。
+        只按外壳代号判档会把「parse 步挂掉」标成编译失败 —— 任务中心详情已经按零件
+        渲染成「解析失败」，监控列表却显示「编译失败」，两处对不上（2026-10-23 修复）。
+
+        零件之间取**最早失败的那一步**（``_REASON_ORDER``）：下游失败多半是上游的后果，
+        把后果当成原因读会指错方向。零件全都认不出时回落兜底档；无零件的旧数据
+        （``error_params`` 为空）也走兜底，不再沿用「外壳 ⇒ 编译」的猜测。
+        """
+        if error_code == _AGGREGATE_FAILED and isinstance(error_params, dict):
+            parts = error_params.get("parts")
+            if isinstance(parts, list):
+                reasons = set()
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    reason = _reason_from_one(
+                        part.get("code"), part.get("params"), part.get("node_id")
+                    )
+                    if reason:
+                        reasons.add(reason)
+                if reasons:
+                    return min(reasons, key=_REASON_ORDER.index)
+                return _REASON_FALLBACK
+        reason = _reason_from_one(error_code, error_params, None)
+        return reason or _REASON_FALLBACK
 
     # ------------------------------------------------------------------
     # T1 · 统计卡
@@ -256,7 +331,7 @@ class MonitorTaskService:
             )
         if bucket not in _BUCKETS:
             raise InvalidParameterError(
-                message="bucket 取值非法，仅支持 hour / day",
+                message="bucket 取值非法，仅支持 5m / hour / day",
                 details={"bucket": bucket, "allowed": sorted(_BUCKETS)},
             )
 
@@ -267,7 +342,29 @@ class MonitorTaskService:
         now = datetime.now(_BJS).replace(tzinfo=None)
         rows = await self.repo.trend(start, end, bucket, task_type)
 
-        points: List[TrendPoint] = []
+        # 全部粒度按固定时间网格补空桶（``value=None``，⛔ 不兜 0）。
+        # ``start`` / ``end`` 是 naive 北京墙钟，网格与仓储行同为 naive，可直接作 key。
+        # 真实行里落在网格之外的桶（窗口首部不完整桶）直接丢弃。
+        if bucket in _BUCKETS:
+            rows_by_start = {
+                row["bucket_start"]: row
+                for row in rows
+                if row["bucket_start"] is not None
+            }
+            points: List[TrendPoint] = []
+            for bucket_start in bucket_starts(start, end, bucket):
+                row = rows_by_start.get(bucket_start)
+                value = None if row is None else row[column]
+                points.append(
+                    TrendPoint(
+                        bucket_start=_iso(bucket_start) or "",
+                        value=None if value is None else float(value),
+                        closed=(bucket_start + width) <= now,
+                    )
+                )
+            return points
+
+        points = []
         for row in rows:
             bucket_start = row["bucket_start"]
             value = row[column]
@@ -305,12 +402,15 @@ class MonitorTaskService:
             FailedTaskItem(
                 task_id=row["task_id"],
                 task_name=row["task_name"],
-                # 直出原始 `task_catalog_code`，不再折叠成档位
-                task_type=row["task_catalog_code"],
+                # 直出原始 `definition_id`，不再折叠成档位
+                task_type=row["task_type"],
                 status=row["status"],
                 error_message=row["error_message"],
                 finished_at=_iso(row["finished_at"]),
-                reason=self._translate_reason(row["error_code"]),
+                # 聚合外壳要靠零件（error_params.parts）才判得准阶段；老行没有它
+                reason=self._translate_reason(
+                    row["error_code"], row.get("error_params")
+                ),
             )
             for row in rows
         ]
@@ -350,7 +450,7 @@ class MonitorTaskService:
 
         return [
             TaskTypeOverview(
-                # 分组键即原始 `task_catalog_code`（仓储已直出，本层不再归并）
+                # 分组键即原始 `definition_id`（仓储已直出，本层不再归并）
                 task_type=row["task_type"],
                 total_count=int(row["total_count"] or 0),
                 running_count=int(row["running_count"] or 0),

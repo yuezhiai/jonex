@@ -7,6 +7,8 @@ import useAsyncData from '@/hooks/useAsyncData';
 import { fmtCount, fmtLatencyOrDash, fmtPercentOrDash } from '../format';
 import { isNotFound } from '../errorText';
 import { enumLabel } from '../labels';
+import { capabilityLabel } from '../capabilityLabels';
+import IdentifierText from './IdentifierText';
 import ModuleError from './ModuleError';
 import type { PmCallProtocol, PmWindow } from '../types';
 
@@ -35,6 +37,8 @@ export default function ObjectDetailDrawer({
   onClose,
 }: Props) {
   const { t } = useTranslation();
+  /** 抽屉标题与「对象 / 能力」行都显示释义，原始 ID 只进 hover / 复制入口 */
+  const objectLabel = capabilityLabel(t, objectId);
 
   // 抽屉关着不发请求：组件一直挂着（只切 open），不挡的话关着也会打接口
   const load = useCallback(
@@ -51,7 +55,7 @@ export default function ObjectDetailDrawer({
       size={600}
       open={open}
       onClose={onClose}
-      title={objectId ?? ''}
+      title={<IdentifierText value={objectId} label={objectId ? objectLabel : ''} />}
       destroyOnHidden
       // 只有详情真正取到时才给入口：404 / 失败态下按这个对象筛记录页只会是一片空
       footer={
@@ -87,7 +91,17 @@ export default function ObjectDetailDrawer({
             size="small"
             bordered
             items={[
-              { key: 'name', label: t('platformMonitor.objectDetail.objectId'), children: detail.objectId },
+              {
+                key: 'name',
+                label: t('platformMonitor.objectDetail.objectId'),
+                children: (
+                  <IdentifierText
+                    value={detail.objectId}
+                    label={capabilityLabel(t, detail.objectId)}
+                    strong
+                  />
+                ),
+              },
               {
                 key: 'protocol',
                 label: t('platformMonitor.call.column.protocol'),
@@ -118,8 +132,11 @@ export default function ObjectDetailDrawer({
             {detail.topSources.length ? (
               <ul className="yx-pm-drawer-list">
                 {detail.topSources.map((item) => (
+                  // key 仍用原始 source：展示名可能因用户改名而变化，不能当稳定标识
                   <li key={item.name} className="yx-pm-drawer-row">
-                    <span className="yx-pm-cell-strong">{item.name}</span>
+                    <span className="yx-pm-cell-strong" title={item.name}>
+                      {item.callerName ?? item.name ?? '-'}
+                    </span>
                     <span className="yx-pm-drawer-count">{fmtCount(item.callCount)}</span>
                   </li>
                 ))}

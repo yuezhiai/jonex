@@ -12,7 +12,7 @@
  * 顶部时间窗预设。
  *
  * 契约档位：任务 / 调用 / Token = 1h / 24h / 7d / 30d / 自定义。
- * 1h 仍按 `hour` 分桶（后端 `bucket` 只认 hour/day），趋势只有一个点，属预期。
+ * 1h 按 `5m` 分桶（后端补齐 12 个点）；24h 按 `hour`，7d/30d 按 `day`。
  */
 export type PmWindowPreset = '1h' | '24h' | '7d' | '30d';
 
@@ -68,8 +68,10 @@ export interface PmTrendPoint {
    * tooltip 里要一并展示的额外量（原始数值，键由各页自行约定）。
    * K2 一次返回 `total / prompt / completion / call_count` 四个量，图只画一个，
    * 其余三个挂在这里由 tooltip 展示，避免为此多发一次请求。
+   *
+   * 值可为 `null`：5m 档的空桶没有任何调用，接口按「无数据 ≠ 0」返回 null。
    */
-  detail?: Record<string, number>;
+  detail?: Record<string, number | null>;
 }
 
 /**
@@ -81,16 +83,22 @@ export type PmTrendMetric = 'volume' | 'successRate' | 'avgDuration' | 'failures
 /** 三个一级页签的共同入参（index.tsx 统一注入） */
 export interface PmPaneProps {
   window: PmWindow;
-  /** 刷新计数。不在页签内部使用，只进取数 useCallback 的依赖，靠它变化触发重取 */
+  /**
+   * 定时刷新计数：每 60 秒递增，**静默重取**。
+   *
+   * 页签不把它放进取数依赖（那会连 loading 一起亮），而是作为 `useAsyncData` 的 `silentKey`
+   * 或 `CommonTable.refresh({ silent: true })` 的信号 —— 数据原地换掉，页面不闪骨架屏。
+   */
   refreshKey: number;
   /**
-   * 主取数完成时回调，工具条据此更新「数据更新于」。
+   * 手动刷新计数（仅点「刷新」按钮时递增）。
    *
-   * `asOf` 是后端各统计接口返回的落库时刻：它才是「数据截止到何时」的真值。
-   * 传空串（如只有列表、没有统计的页签）= 没有 as-of，工具条退回本地取数时刻；
-   * 不传 = 本次不涉及 as-of，保留上一份值。
+   * 手动刷新要走**非静默**路径（看得见的 loading），所以它才是取数 `useCallback` 的依赖。
+   *
+   * 另外，趋势下拉的对象清单可能翻 20 页，不该每 60 秒跟着定时刷新重拉，
+   * 所以那份清单只跟 `manualRefreshKey`。
    */
-  onLoaded: (asOf?: string) => void;
+  manualRefreshKey: number;
 }
 
 /* ══════════════════════ 任务监控 ══════════════════════ */
@@ -218,8 +226,13 @@ export interface PmCallStats {
  * 而不是拆两个类型 —— 两张表除这一列外完全同构，拆开只会多一份几乎相同的代码。
  */
 export interface PmCallScopeRow {
-  /** 对象 / 能力标识，来自接口的 `object_id`（`object_type` 只是分类码，不能当名字） */
-  name: string;
+  /**
+   * 对象 / 能力标识，来自接口的 `object_id`（`object_type` 只是分类码，不能当名字）。
+   *
+   * 可为 null：`object_id` 缺失时**不得**回退成「能力」「模型服务」这类分类码，
+   * 页面显示占位符且该行不可下钻。
+   */
+  name: string | null;
   calls: number;
   successRate: number | null;
   avgLatencyMs: number | null;
@@ -263,9 +276,14 @@ export interface PmCallRecord {
    */
   attemptId: string | null;
   triggerType: PmCallTrigger;
-  /** 来源 / 调用方 */
+  /** 来源 / 调用方原始值（`monitor.call_log.source`），筛选与排查用 */
   caller: string | null;
-  /** 被调对象 / 能力 */
+  /**
+   * 来源 / 调用方的可读名称（后端按行租户解析的历史数字 ID 兜底）。
+   * 为 null 时页面回退 `caller` —— 认证类型 / `platform` 等非用户身份保持既有语义。
+   */
+  callerName: string | null;
+  /** 被调对象 / 能力原始值；展示走能力释义，请求仍用原值 */
   target: string;
   /**
    * 调用方式。装的是接口的 `protocol` 码（不是 HTTP method）——
@@ -322,7 +340,10 @@ export interface PmCallAttempt {
 
 /** C9 对象详情里的来源条目 */
 export interface PmCallObjectSource {
+  /** 原始 source；React key 与排查都靠它 */
   name: string;
+  /** 可读名称；缺失时回退 `name` */
+  callerName: string | null;
   callCount: number;
 }
 
@@ -365,8 +386,12 @@ export interface PmMetaFilters {
   /** `code` 为 null 的档位（如「超时」）只能展示，不能作为筛选参数下发 */
   statuses: { code: string | null; label: string; pmLabel: string; inDenominator: boolean }[];
   objects: { objectType: string; protocol: string | null }[];
-  /** 「来源」下拉的候选 */
+  /** 「来源」下拉的候选原始值（旧字段，保留兼容） */
   callSources: string[];
+  /** 新增：来源候选的 value/label 分离形态（value=原始 source，label=可读名） */
+  callSourceOptions: { value: string; label: string }[];
+  /** 新增：对外对象标识候选（= `COALESCE(mcp_tool, target)`） */
+  callTargets: string[];
 }
 
 /* ══════════════════════ Token 监控 ══════════════════════ */

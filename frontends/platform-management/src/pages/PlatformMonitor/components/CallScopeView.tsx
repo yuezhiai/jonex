@@ -14,7 +14,10 @@ import {
 import useAsyncData from '@/hooks/useAsyncData';
 import useMetaFilters from '../useMetaFilters';
 import { PM_ALL, PM_OBJECT_PAGE_SIZE } from '../../../constants/platformMonitor';
-import { fmtCount, fmtLatencyOrDash, fmtPercentOrDash } from '../format';
+import { fmtCompact, fmtCount, fmtLatencyOrDash, fmtPercent, fmtPercent1, fmtPercentOrDash } from '../format';
+import { capabilityLabel, duplicateProtocolsByLabel } from '../capabilityLabels';
+import { buildScopeObjectOptions } from '../identifierOptions';
+import { IdentifierWithProtocols } from './IdentifierText';
 import SectionCard from './SectionCard';
 import StatCards from './StatCards';
 import SegmentedFilter from './SegmentedFilter';
@@ -32,10 +35,12 @@ const TREND_METRICS: { value: PmTrendMetric; labelKey: string }[] = [
 ];
 
 /**
- * 实际会出现的协议只有两类（契约 §三.4）：`openai`（外部依赖）与 `invoke`（开放能力）。
- * `mcp` / `http` 后端没有写入方，下拉里不再提供。
+ * 协议下拉的静态兜底候选（M1 元数据拿不到时使用）。
+ *
+ * `invoke` = 普通开放能力调用，`mcp` = MCP 工具调用（对象标识为工具名），
+ * `openai` = 外部依赖。`http` 后端仍无写入方，不提供。
  */
-const PROTOCOLS: PmCallProtocol[] = ['invoke', 'openai'];
+export const PROTOCOLS: PmCallProtocol[] = ['invoke', 'mcp', 'openai'];
 
 interface Props extends PmPaneProps {
   scope: PmCallScope;
@@ -56,7 +61,7 @@ export default function CallScopeView({
   scope,
   window,
   refreshKey,
-  onLoaded,
+  manualRefreshKey,
   onDrillFailures,
   onDrillObjectCalls,
 }: Props) {
@@ -79,13 +84,19 @@ export default function CallScopeView({
 
   // 统计卡与明细表**分开取**：统计是整窗口口径，与页码无关。曾经用一个 Promise.all
   // 一起取，于是翻页也会把 KPI 卡打回骨架态、并白跑一次统计请求。
+  // 手动刷新进依赖（要看得见的 loading），定时刷新走 silentKey（原地换数，不闪骨架屏）
   const loadStats = useCallback(
     () => (isTarget ? getCallStats(window) : getCapabilityStats(window)),
-    // refreshKey 在函数体里没出现，但必须有：它变了才要重新取数
+    // manualRefreshKey 在函数体里没出现，但必须有：它变了才要重新取数
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isTarget, window, refreshKey],
+    [isTarget, window, manualRefreshKey],
   );
-  const { data: stats, loading: statsLoading, error: statsError, reload: reloadStats } = useAsyncData(loadStats);
+  const {
+    data: stats,
+    loading: statsLoading,
+    error: statsError,
+    reload: reloadStats,
+  } = useAsyncData(loadStats, { silentKey: refreshKey });
 
   const loadRows = useCallback(
     () =>
@@ -98,18 +109,50 @@ export default function CallScopeView({
             protocol === PM_ALL ? undefined : (protocol as PmCallProtocol),
           ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isTarget, window, page, protocol, refreshKey],
+    [isTarget, window, page, protocol, manualRefreshKey],
   );
-  const { data: rowsData, loading: rowsLoading, error: rowsError, reload: reloadRows } = useAsyncData(loadRows);
+  const {
+    data: rowsData,
+    loading: rowsLoading,
+    error: rowsError,
+    reload: reloadRows,
+  } = useAsyncData(loadRows, { silentKey: refreshKey });
 
   const loadTrend = useCallback(
-    // direction 必传：两个页签共用 C5，不传就是同一条全量曲线（见 api.ts getCallTrend）
+    // direction 必传：两个页签共用 C5，不传就是同一条全量曲线（见 api.ts getCallTrend）。
+    // 外部依赖页再传 callScope=external：outbound 里还混着任务中心派活/回报等平台内部互调，
+    // 与统计卡 / 对象列表的口径对齐。开放能力页（inbound）不传。
     () =>
-      getCallTrend(window, metric, isTarget ? 'outbound' : 'inbound', trendTarget === PM_ALL ? undefined : trendTarget),
+      getCallTrend(
+        window,
+        metric,
+        isTarget ? 'outbound' : 'inbound',
+        trendTarget === PM_ALL ? undefined : trendTarget,
+        isTarget ? 'external' : undefined,
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, metric, isTarget, trendTarget, refreshKey],
+    [window, metric, isTarget, trendTarget, manualRefreshKey],
   );
-  const { data: trend, loading: trendLoading, error: trendError, reload: reloadTrend } = useAsyncData(loadTrend);
+  const {
+    data: trend,
+    loading: trendLoading,
+    error: trendError,
+    reload: reloadTrend,
+  } = useAsyncData(loadTrend, { silentKey: refreshKey });
+
+  /** 趋势 tooltip 主数值格式化：成功率补 % 收两位，平均耗时补 ms 单位（见任务侧同款逻辑） */
+  const trendValueFormat = useMemo(() => {
+    if (metric === 'successRate') return fmtPercent;
+    if (metric === 'avgDuration') return (value: number) => fmtLatencyOrDash(Math.round(value));
+    return undefined;
+  }, [metric]);
+
+  /** Y 轴刻度：与 tooltip 同单位、但更短（成功率 1 位小数，延迟按 ms 取整不缩略） */
+  const trendAxisFormat = useMemo(() => {
+    if (metric === 'successRate') return fmtPercent1;
+    if (metric === 'avgDuration') return (value: number) => `${Math.round(value)}ms`;
+    return fmtCompact;
+  }, [metric]);
 
   /**
    * 趋势卡下拉用的**全量**对象清单：独立按页拉对象列表，与明细表当前页解耦。
@@ -120,19 +163,15 @@ export default function CallScopeView({
    */
   const loadAllObjects = useCallback(
     () => getAllCallScopeObjects(window, scope),
-    // refreshKey 在函数体里没出现，但必须有：手动刷新时对象清单也要跟着重取
+    // 只跟手动刷新（manualRefreshKey），不挂 silentKey：自动刷新每 60 秒递增 refreshKey，
+    // 而这份清单最多翻 20 页，不该跟着自动刷新反复重拉。
+    // manualRefreshKey 在函数体里没出现，但必须有：手动刷新时对象清单也要跟着重取
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [window, scope, refreshKey],
+    [window, scope, manualRefreshKey],
   );
   const { data: allObjectsPage } = useAsyncData(loadAllObjects);
   /** null = 还没取到（取数中或失败），与「取到但为空」是两种状态 */
   const allObjects = allObjectsPage?.items ?? null;
-
-  // 工具条的「数据更新于」跟统计卡走；失败时传 undefined 保留上一份，不清空时间戳
-  useEffect(() => {
-    if (statsLoading) return;
-    onLoaded(stats?.asOf);
-  }, [statsLoading, stats, onLoaded]);
 
   // 稳定引用：下面 targetOptions 以 rows 作依赖，每次渲染新数组会让 useMemo 形同虚设
   const rows = useMemo(() => rowsData?.items ?? [], [rowsData]);
@@ -171,27 +210,32 @@ export default function CallScopeView({
    */
   const objectNames = useMemo(() => {
     const source = allObjects ?? rows;
-    return [...new Set(source.map((row) => row.name).filter(Boolean))];
+    return [
+      ...new Set(source.map((row) => row.name).filter((name): name is string => Boolean(name))),
+    ];
   }, [allObjects, rows]);
 
-  /** 趋势卡的「全部对象 / 全部能力」下拉 */
+  /** 同一展示名挂多个协议时，名称旁追加协议标签（仅这些名称才需要区分） */
+  const protocolsByLabel = useMemo(
+    () => duplicateProtocolsByLabel(allObjects ?? rows, t),
+    [allObjects, rows, t],
+  );
+
+  /** 趋势卡的「全部对象 / 全部能力」下拉：value 保持原始标识，label 走能力释义 */
   const targetOptions = useMemo(() => {
-    const allOption = {
-      value: PM_ALL,
-      label: t(isTarget ? 'platformMonitor.call.allObjects' : 'platformMonitor.call.allCapabilities'),
-    };
+    const allLabel = t(isTarget ? 'platformMonitor.call.allObjects' : 'platformMonitor.call.allCapabilities');
     if (objectNames.length) {
-      return [allOption, ...objectNames.map((name) => ({ value: name, label: name }))];
+      return buildScopeObjectOptions(t, objectNames, allLabel);
     }
     // 全量清单**成功**返回空（空窗口 / 降级空清单）时给明确空态；
     // 仍在取数或取数失败时只留「全部」，不谎报「窗口里没有对象」。
     if (allObjects !== null) {
       return [
-        allOption,
+        { value: PM_ALL, label: allLabel },
         { value: '__empty__', label: t('platformMonitor.empty.noData'), disabled: true },
       ];
     }
-    return [allOption];
+    return [{ value: PM_ALL, label: allLabel }];
   }, [objectNames, allObjects, isTarget, t]);
 
   // 换窗口后原先选中的对象可能已不在清单里：接口会返回空曲线，下拉却挂着一个不存在的值
@@ -213,19 +257,34 @@ export default function CallScopeView({
   }, [meta, t]);
 
   const columns = useMemo<TableColumnsType<PmCallScopeRow>>(() => {
+    /**
+     * 名称列显示释义；原始 ID 只在 hover 与复制入口。
+     * 同名不同协议时追加协议标签 —— 否则同一展示名两行看起来完全一样。
+     */
+    const renderName = (value: string | null) => {
+      const label = capabilityLabel(t, value);
+      return (
+        <IdentifierWithProtocols
+          value={value}
+          label={label}
+          protocols={(value && protocolsByLabel.get(label)) || []}
+        />
+      );
+    };
+
     const head: TableColumnsType<PmCallScopeRow> = isTarget
       ? [
           {
             title: t('platformMonitor.call.column.targetName'),
             dataIndex: 'name',
-            render: (value: string) => <span className="yx-pm-cell-strong">{value}</span>,
+            render: renderName,
           },
         ]
       : [
           {
             title: t('platformMonitor.call.column.capabilityName'),
             dataIndex: 'name',
-            render: (value: string) => <span className="yx-pm-cell-strong">{value}</span>,
+            render: renderName,
           },
           {
             // 接口传小写码，展示文案走 i18n
@@ -258,7 +317,7 @@ export default function CallScopeView({
         render: (value: string | null) => value ?? '-',
       },
     ];
-  }, [isTarget, t]);
+  }, [isTarget, t, protocolsByLabel]);
 
   return (
     <div className="yx-pm-pane">
@@ -287,7 +346,7 @@ export default function CallScopeView({
           <>
             <Select
               size="small"
-              className="yx-pm-scope-select"
+              className="yx-pm-scope-select yx-pm-scope-select--wide"
               value={trendTarget}
               onChange={setTrendTarget}
               options={targetOptions}
@@ -308,6 +367,8 @@ export default function CallScopeView({
             loading={trendLoading}
             height={264}
             valueName={t(TREND_METRICS.find((item) => item.value === metric)?.labelKey ?? '')}
+            valueFormat={trendValueFormat}
+            yFormat={trendAxisFormat}
           />
         )}
       </SectionCard>
@@ -336,16 +397,18 @@ export default function CallScopeView({
         ) : (
           <Table
             size="small"
-            // 后端按 (target, protocol) 分组，同一对象标识理论上可挂两个协议
-            rowKey={(row) => `${row.name}:${row.protocol ?? ''}`}
+            // 后端按 (target, protocol) 分组，同一对象标识理论上可挂两个协议；
+            // 空名用空串兜底，空名行本身不可下钻
+            rowKey={(row) => `${row.name ?? ''}:${row.protocol ?? ''}`}
             loading={rowsLoading}
             // 取数期间**保留**旧行，只靠 loading 的遮罩压住：清空会让表格从 N 行塌成空表，
             // 翻页与切筛选时整页高度跟着起伏（任务/Token 两张表也是这么做的）
             dataSource={rows}
             locale={{ emptyText: rowsLoading ? null : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('platformMonitor.empty.noData')} /> }}
             columns={columns}
-            rowClassName="yx-pm-row-clickable"
-            onRow={(row) => ({ onClick: () => setDetailRow(row) })}
+            // 空名行没有可下钻的对象标识 ⇒ 不给手型光标、不挂点击
+            rowClassName={(row) => (row.name ? 'yx-pm-row-clickable' : '')}
+            onRow={(row) => (row.name ? { onClick: () => setDetailRow(row) } : {})}
             pagination={{
               current: page,
               pageSize: PM_OBJECT_PAGE_SIZE,
@@ -367,9 +430,9 @@ export default function CallScopeView({
         protocol={isTarget ? null : (detailRow?.protocol ?? null)}
         window={window}
         onViewAllCalls={
-          detailRow && onDrillObjectCalls
+          detailRow?.name && onDrillObjectCalls
             ? () => {
-                onDrillObjectCalls(detailRow.name, isTarget ? null : detailRow.protocol);
+                onDrillObjectCalls(detailRow.name as string, isTarget ? null : detailRow.protocol);
                 setDetailRow(null);
               }
             : undefined

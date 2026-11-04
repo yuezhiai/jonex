@@ -32,7 +32,7 @@ class CallModeMeta(BaseModel):
 class CallSummary(BaseModel):
     """调用监控统计卡（C1 外部依赖 / C3 开放能力）"""
 
-    total_calls: int  # 调用总量（所选周期内逻辑调用数；降级模式改按 Attempt 数）
+    total_calls: int  # 调用总量（所选周期内逻辑调用数；降级模式按物理尝试数，无尝试的调用各计 1）
     success_rate: Optional[float]  # 成功率 = 成功 ÷（success + failed）；取消/执行中/未知不进分母
     avg_latency_ms: Optional[int]  # 平均响应时间（含重试与等待）= final_ended_at - logical_started_at，按毫秒取整
     failed_count: int  # 失败调用数
@@ -44,8 +44,8 @@ class CallSummary(BaseModel):
 class CallObjectItem(BaseModel):
     """对象/能力列表项（C2 / C4）"""
 
-    object_id: Optional[str] = None  # 对象标识（物理列 `monitor.call_log.target`：模型名 / 能力 ID）
-    object_type: str  # 对象类型：由 `protocol` 推导（`openai` ⇒ 模型服务、`invoke` ⇒ 能力）；其余 protocol 全后端无采集写入方，实际只出这 2 类
+    object_id: Optional[str] = None  # 对外对象标识 = `COALESCE(mcp_tool, target)`：MCP 调用为工具名，其余为模型名 / 能力 ID
+    object_type: str  # 对象类型：由 `protocol` 推导（`openai` ⇒ 模型服务、`invoke` ⇒ 能力、`mcp` ⇒ MCP 工具）；`http` 全后端无采集写入方，实际只出这 3 类
     protocol: Optional[str]  # C4 补列：值域 = 四值枚举 `invoke`/`mcp`/`http`/`openai`（物理列 `monitor.call_log.protocol`；枚举定义见 `jonex_core/common/monitor_models.py:81-89`）（C2 为 None）
     call_count: int  # 调用量（同 CallSummary.total_calls 口径）
     success_rate: Optional[float]  # 成功率
@@ -63,7 +63,7 @@ class CallRecordItem(BaseModel):
     direction: str
     trigger_type: str  # 触发方 → 物理列 `monitor.call_log.trigger_type`；值域 `user`（用户直接发起）/ `system`（系统后台批量，如入库向量化），见 `jonex_core/common/monitor_models.py:92-102`
     caller: Optional[str]  # 来源服务 / 调用方 → 物理列 `monitor.call_log.source`（勿与 protocol 混）
-    target: str  # 目标对象 / 能力 → 物理列 `monitor.call_log.target`
+    target: str  # 目标对象 / 能力 = 对外对象标识 `COALESCE(mcp_tool, target)`：MCP 调用输出工具名，其余输出能力 ID / 模型名
     protocol: Optional[str]  # 开放能力页签补充：值域 = 四值枚举 `invoke`/`mcp`/`http`/`openai`（物理列 `monitor.call_log.protocol`）
     method: Optional[str]
     path: Optional[str]
@@ -74,6 +74,9 @@ class CallRecordItem(BaseModel):
     final_ended_at: Optional[str]
     attempt_count: int = 0
     retry_count: int = 0  # max(attempt_count - 1, 0)
+    # 纯增量：解析出的调用方展示名（users.username）。
+    # ``caller`` 始终保留原始 source —— 筛选 / 下钻仍用原值。
+    caller_name: Optional[str] = None
 
 
 class AttemptItem(BaseModel):
@@ -84,7 +87,7 @@ class AttemptItem(BaseModel):
     attempt_started_at: str  # 物理列名冻结为 attempt_started_at（统一两表命名，勿用 started_at）
     attempt_ended_at: Optional[str]  # 物理列名冻结为 attempt_ended_at（勿用 ended_at）
     duration_ms: Optional[int]  # attempt_ended_at - attempt_started_at，按毫秒取整
-    status: str  # → 物理列 `monitor.call_attempt.status`（与 N1 复用同一套五态，见 `jonex_core/common/monitor_models.py`）
+    status: str  # → 物理列 `monitor.call_attempt.status`（与 call_log 复用同一套五态，见 `jonex_core/common/monitor_models.py`）
     error_code: Optional[str]
     error_message: Optional[str]  # 脱敏失败原因；缺失显示 -
     is_final: bool
@@ -112,13 +115,16 @@ class CallDetail(BaseModel):
 class CallObjectDetail(BaseModel):
     """对象/能力详情（C9）"""
 
-    object_id: str
-    object_type: str
+    object_id: str  # 对外对象标识 = `COALESCE(mcp_tool, target)`（C9 按此寻址：工具名或能力 ID / 模型名）
+    object_type: str  # 由 `protocol` 推导：模型服务 / 能力 / MCP 工具（3 类）
     call_count: int  # 基础指标
     success_rate: Optional[float]
     avg_latency_ms: Optional[int]
     failed_count: int
-    top_sources: List[dict] = []  # 来源/调用方 TOP3（每项 {name, call_count}）
+    # 来源/调用方 TOP3（每项 {name, call_count, caller_name}）。
+    # ``name`` 保持原始 source；``caller_name`` 是解析出的用户名展示名
+    # （多租户同 source 解析出不同用户名 ⇒ null，前端回退原值）。
+    top_sources: List[dict] = []
     recent_failures: List[dict] = []  # 最近失败调用（每项 {request_id, error_message, logical_started_at}）
     meta: Optional[dict] = None  # 采集元数据（如需）；恒 None，不与 mode_meta 复用
     mode_meta: Optional[CallModeMeta] = None  # 模式元数据（逻辑 / 降级口径声明）
@@ -138,10 +144,16 @@ class TrendPoint(BaseModel):
 class MetaFilters(BaseModel):
     """筛选元数据（M1）"""
 
-    task_types: List[dict] = []  # 任务类型列表（每项 {code, name}）；code = task_catalog_code 取值（供筛），name = task_catalog.name 中文名（供显，⛔ 前端不写死）
+    task_types: List[dict] = []  # 任务类型列表（每项 {code, name}）；code = definition_id 取值（供筛），name = task_definitions.name 定义名（供显，⛔ 前端不写死）
     statuses: List[dict] = []  # 状态字典（含既有 enum ↔ PM 六态映射；每项 {code, label, pm_label, in_denominator}）
     objects: List[dict] = []  # 对象类型列表（每项 {object_type, protocol}）
     call_sources: List[str] = []  # 供「来源」下拉的候选值，取自 `monitor.call_log.source` 的 distinct 值
+    # 来源下拉的 value/label 分离项（纯增量）：{value: 原始 source, label: 显示名或原值}。
+    # 多租户同 source 解析出不同用户名 ⇒ label 回退原值（不猜）。
+    call_source_options: List[dict] = []
+    # 对外对象标识 distinct 值（= COALESCE(mcp_tool, target)，MCP 工具名与
+    # 能力 ID / 模型名的并集），供「目标对象」下拉（纯增量）。
+    call_targets: List[str] = []
 
 
 # ==================== Token 监控族（K1–K4）====================
@@ -162,13 +174,17 @@ class TokenSummary(BaseModel):
 
 
 class TokenTrendPoint(BaseModel):
-    """Token 用量趋势点（K2）"""
+    """Token 用量趋势点（K2）
+
+    ⚠️ 四个计数仅在 ``bucket=5m`` 的**空桶**上为 ``null``（空桶 = 无数据，
+    不兜 0）；``hour`` / ``day`` 以及 5m 的有数据桶仍恒为整数，行为不变。
+    """
 
     bucket_start: str  # 桶起点（UTC ISO8601）
-    total_tokens: int
-    prompt_tokens: int
-    completion_tokens: int
-    call_count: int  # = SUM(call_count)
+    total_tokens: Optional[int] = None  # 仅 5m 空桶为 null；其余粒度保持原整数行为
+    prompt_tokens: Optional[int] = None  # 仅 5m 空桶为 null
+    completion_tokens: Optional[int] = None  # 仅 5m 空桶为 null
+    call_count: Optional[int] = None  # = SUM(call_count)；仅 5m 空桶为 null
 
 
 class TokenModelTopItem(BaseModel):
@@ -218,7 +234,7 @@ class FailedTaskItem(BaseModel):
 
     task_id: str
     task_name: Optional[str]
-    task_type: str  # = 任务目录 code（**原始** task_catalog_code，不再归并；取值见 M1 task_types[].code）
+    task_type: str  # = 编排定义 ID（**原始** definition_id，不再归并；取值见 M1 task_types[].code）
     status: str  # 任务级终态仅 completed/failed
     error_message: Optional[str]  # 异常原因（脱敏）
     finished_at: Optional[str]  # Asia/Shanghai ISO8601（+08:00）
@@ -244,7 +260,7 @@ class TaskStageItem(BaseModel):
 class TaskTypeOverview(BaseModel):
     """运行概览一行（T4）"""
 
-    task_type: str  # = 任务目录 code（**原始** task_catalog_code，不再归并；取值见 M1 task_types[].code）
+    task_type: str  # = 编排定义 ID（**原始** definition_id，不再归并；取值见 M1 task_types[].code）
     total_count: int
     running_count: int
     waiting_count: int

@@ -153,6 +153,12 @@ export function toPmWindowChoice(tab: PmTabKey, value: string | null): PmWindowC
  * 方向与趋势同一套口径（外部依赖 = outbound，开放能力 = inbound）：记录页没有
  * 「对象类型」这一维，方向是唯一能把两边数字对上的筛选。
  * 抽成纯函数是为了让「口径映射」能被单测钉住 —— 拼错一个值，下钻后就是空的。
+ *
+ * 外部依赖侧再补 `protocol=openai`：C6 调用记录本次不加 `call_scope` 参数，
+ * 而当前 `call_scope=external` 恰好等价于「`direction=outbound` 且 `protocol=openai`」
+ * （见后端 `monitor_call._EXTERNAL_PROTOCOLS`）。这是显式等价，不是巧合 ——
+ * 未来新增外部协议时，这里必须同步补上，否则下钻条数会小于 KPI。
+ * 开放能力侧保持 `direction=inbound`，不加协议筛选。
  */
 export function pmFailureDrillParams(scope: 'target' | 'capability', current: URLSearchParams): URLSearchParams {
   const next = new URLSearchParams(current);
@@ -162,6 +168,8 @@ export function pmFailureDrillParams(scope: 'target' | 'capability', current: UR
   next.set('sub', 'records');
   next.set(PM_RECORD_FILTER_PARAMS.status, 'failed');
   next.set(PM_RECORD_FILTER_PARAMS.direction, scope === 'target' ? 'outbound' : 'inbound');
+  // 与 KPI 的 external 口径对齐（当前 external ≡ outbound + openai）
+  if (scope === 'target') next.set(PM_RECORD_FILTER_PARAMS.protocol, 'openai');
   return next;
 }
 

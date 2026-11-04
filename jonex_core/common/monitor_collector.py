@@ -33,27 +33,30 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from sqlalchemy import bindparam
+from sqlalchemy import bindparam, func
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from jonex_core.common.config import get_config
 from jonex_core.common.database import get_db_session
 from jonex_core.common.logger import get_logger
-from jonex_core.common.tenant import require_tenant
-
 from jonex_core.common.monitor_models import (
     CallAttempt,
     CallDirection,
     CallFinalStatus,
     CallLog,
+    CallScope,
     CallTrigger,
+    Protocol,
 )
+from jonex_core.common.tenant import require_tenant
 
 logger = get_logger(__name__)
 
@@ -61,17 +64,41 @@ _KIND_CALL_LOG = "call_log"
 _KIND_CALL_ATTEMPT = "call_attempt"
 
 # 采集侧允许写入的列白名单（多一个键 = 整批 INSERT 报错，故先过滤）
-_CALL_LOG_FIELDS = frozenset({
-    "request_id", "trace_id", "tenant_id", "direction", "source", "target", "protocol",
-    "trigger_type",
-    "logical_started_at", "final_ended_at", "final_status", "error_code", "error_message",
-    "attempt_count",
-})
-_CALL_ATTEMPT_FIELDS = frozenset({
-    "attempt_id", "request_id", "attempt_no", "tenant_id",
-    "attempt_started_at", "attempt_ended_at", "status", "error_code", "error_message",
-    "is_final", "wait_before_ms",
-})
+_CALL_LOG_FIELDS = frozenset(
+    {
+        "request_id",
+        "trace_id",
+        "tenant_id",
+        "direction",
+        "source",
+        "target",
+        "protocol",
+        "call_scope",
+        "mcp_tool",
+        "trigger_type",
+        "logical_started_at",
+        "final_ended_at",
+        "final_status",
+        "error_code",
+        "error_message",
+        "attempt_count",
+    }
+)
+_CALL_ATTEMPT_FIELDS = frozenset(
+    {
+        "attempt_id",
+        "request_id",
+        "attempt_no",
+        "tenant_id",
+        "attempt_started_at",
+        "attempt_ended_at",
+        "status",
+        "error_code",
+        "error_message",
+        "is_final",
+        "wait_before_ms",
+    }
+)
 
 # 必填字段（缺一条即丢弃该条，避免单条脏数据炸掉整批）
 _CALL_LOG_REQUIRED = ("request_id", "tenant_id", "direction", "final_status")
@@ -86,6 +113,30 @@ _CALL_ATTEMPT_REQUIRED = ("request_id", "attempt_no", "tenant_id", "status")
 # 一个假租户。这里在采集侧单独拒收，**不改 `require_tenant`**（它是业务共享函数，
 # 改它风险外溢到所有调用方）。
 _ILLEGAL_TENANT_LITERALS = frozenset({"unknown"})
+
+# 丢弃原因枚举（**冻结**，口径见 docs/monitor/collector-drop-observability-sdd.md）。
+# 固定元组而非动态集合：stats() / 日志 / 测试都按这 5 个键对齐，不随外部输入增长。
+_DROP_REASONS = (
+    "illegal_tenant",
+    "missing_required",
+    "too_long",
+    "queue_full",
+    "write_failed",
+)
+
+# 单条告警与周期汇总的窗口（秒）：首条立即输出，之后每原因每窗口最多 1 条。
+_DROP_LOG_INTERVAL_SECONDS = 60.0
+
+# 丢弃日志的展示上限（仅日志侧截断，不影响入库校验口径）。
+_DROP_LOG_FIELD_LIMITS = {
+    "tenant": 64,
+    "request_id": 64,
+    "target": 128,
+    "source": 128,
+    "model": 128,
+    "scene": 128,
+    "field": 64,
+}
 
 # error_message 落库上限（与审计 MAX_BODY_BYTES 同量级，按字符计）
 _MAX_ERROR_MESSAGE_CHARS = 8000
@@ -103,9 +154,12 @@ _STRING_LIMITS = {
     "tenant_id": 64,
     "source": 128,
     "target": 128,
+    # MCP 工具名：与列宽 VARCHAR(128) 对齐；字符集由网关校验，采集侧只做长度兜底。
+    "mcp_tool": 128,
     "protocol": 32,
     "error_code": 64,
     "direction": 16,
+    "call_scope": 16,
     "final_status": 16,
     "status": 16,
     "trigger_type": 16,
@@ -198,13 +252,73 @@ def classify_trigger_by_scene(scene: Optional[Any]) -> str:
     if not text_value:
         return CallTrigger.USER.value
     system_scenes = {
-        s.strip() for s in (get_config().MONITOR_SYSTEM_SCENES or "").split(",") if s.strip()
+        s.strip()
+        for s in (get_config().MONITOR_SYSTEM_SCENES or "").split(",")
+        if s.strip()
     }
-    return CallTrigger.SYSTEM.value if text_value in system_scenes else CallTrigger.USER.value
+    return (
+        CallTrigger.SYSTEM.value
+        if text_value in system_scenes
+        else CallTrigger.USER.value
+    )
 
 
-def _normalize(kind: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """白名单过滤 + 必填校验 + 租户合法性校验 + 脱敏。返回 None 表示该条应丢弃。"""
+def _fallback_call_scope(row: Dict[str, Any]) -> str:
+    """按「方向 + 协议」兜底判定调用边界（``call_scope``）。
+
+    只在调用方**没显式声明**时使用（见 :func:`_normalize`）—— 显式值永远优先，
+    因为采集点自己最清楚这次调用跨不跨平台边界。兜底口径刻意保守：
+
+    - ``inbound`` ⇒ ``open``：外部调用方进入平台能力；
+    - ``outbound`` + ``openai`` ⇒ ``external``：平台调外部模型；
+    - 其余 ⇒ ``internal``：平台内部互调，**宁可归内部也不虚构外部依赖**
+      （外部依赖页只认 ``external``，猜错方向会污染口径）。
+    """
+    direction = row.get("direction")
+    if direction == CallDirection.INBOUND.value:
+        return CallScope.OPEN.value
+    if (
+        direction == CallDirection.OUTBOUND.value
+        and row.get("protocol") == Protocol.OPENAI.value
+    ):
+        return CallScope.EXTERNAL.value
+    return CallScope.INTERNAL.value
+
+
+def _safe_log_value(value: Any, limit: int) -> str:
+    """把不可信值净化成**单行、定长**的日志片段。
+
+    ``tenant`` / ``request_id`` / ``target`` 等来自调用方，不能原样拼进日志：
+    换行会伪造新日志行，超长值会刷爆日志。这里统一替换控制字符并截断，
+    缺失值渲染为 ``-``（与字符串 ``"None"`` 区分）。
+    """
+    if value is None:
+        return "-"
+    text = str(value)
+    if not text:
+        return "-"
+    text = "".join(
+        " " if (ch in "\r\n\t" or ord(ch) < 32 or ord(ch) == 127) else ch for ch in text
+    )
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)] + "…"
+    return text
+
+
+def _normalize_with_reason(
+    kind: str, fields: Dict[str, Any]
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """白名单过滤 + 必填校验 + 租户合法性校验 + 脱敏。
+
+    返回 ``(row, reason, detail)``：
+
+    - 通过校验 ⇒ ``(row, None, None)``；
+    - 被丢弃 ⇒ ``(None, reason, detail)``，``reason`` 取 :data:`_DROP_REASONS`
+      之一，``detail`` 是可选的归因补充（缺失字段名 / 超长字段名）。
+
+    **本函数不再自己打日志**：丢弃日志统一由采集器按原因计数并限流输出，
+    否则同一原因会在 ``_put`` 与 ``_normalize`` 两处各喊一次。
+    """
     allowed = _CALL_LOG_FIELDS if kind == _KIND_CALL_LOG else _CALL_ATTEMPT_FIELDS
     required = _CALL_LOG_REQUIRED if kind == _KIND_CALL_LOG else _CALL_ATTEMPT_REQUIRED
 
@@ -212,24 +326,26 @@ def _normalize(kind: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     missing = [k for k in required if row.get(k) in (None, "")]
     if missing:
-        logger.warning("监控采集：%s 缺必填字段 %s，丢弃一条", kind, missing)
-        return None
+        return None, "missing_required", ",".join(missing)
 
     # tenant_id 存储必填且必须合法，非法**不写**（两表均无 None 兜底位）
     if str(row["tenant_id"]).strip().lower() in _ILLEGAL_TENANT_LITERALS:
         # `unknown` 等「像租户但不是租户」的兜底字面量，`require_tenant` 会放行，
         # 故在采集侧单独拒收（否则租户维度会多出一个假租户）。
-        logger.warning("监控采集：%s 租户为兜底字面量，丢弃一条", kind)
-        return None
+        return None, "illegal_tenant", None
     try:
         row["tenant_id"] = require_tenant(row["tenant_id"])
     except Exception:
-        logger.warning("监控采集：%s 租户非法，丢弃一条", kind)
-        return None
+        return None, "illegal_tenant", None
 
     if kind == _KIND_CALL_LOG and not row.get("trigger_type"):
         # 兜底 user（**不进必填集**）：漏标只是分类不准，不该让整条 N1 静默消失
         row["trigger_type"] = CallTrigger.USER.value
+
+    if kind == _KIND_CALL_LOG and not row.get("call_scope"):
+        # 调用边界兜底（**不进必填集**）：显式声明优先，绝不被兜底覆盖。
+        # 漏标的行按方向 + 协议保守归类，保证「外部依赖页」口径不丢也不虚增。
+        row["call_scope"] = _fallback_call_scope(row)
 
     if kind == _KIND_CALL_ATTEMPT and not row.get("attempt_id"):
         # attempt_id 后台生成（uuid4 hex）
@@ -247,22 +363,31 @@ def _normalize(kind: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             continue
         length = len(str(value))
         if length > limit:
-            logger.warning(
-                "监控采集：%s 字段 %s 超长（%d > %d），丢弃一条",
-                kind,
-                name,
-                length,
-                limit,
-            )
-            return None
+            return None, "too_long", name
 
+    return row, None, None
+
+
+def _normalize(kind: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """白名单过滤 + 必填校验 + 租户合法性校验 + 脱敏。返回 None 表示该条应丢弃。
+
+    兼容入口：只返回规范化行，丢弃原因见 :func:`_normalize_with_reason`。
+    """
+    row, _reason, _detail = _normalize_with_reason(kind, fields)
     return row
 
 
 # UPSERT 的 SET 子句要用到的列。多行 VALUES 的列清单取自**首行**的键，某列若只出现在
 # 靠后的行里就会踩 SQLAlchemy 的多值 INSERT 限制（报错或静默丢值）—— 故落库前按批补齐。
 # 只列**可空且无服务端默认值**的列：这类列补 None 等价于「这行本就没给该字段」。
-_CALL_LOG_UPSERT_COLUMNS = ("final_ended_at", "error_code", "error_message")
+_CALL_LOG_UPSERT_COLUMNS = (
+    "final_ended_at",
+    "error_code",
+    "error_message",
+    "mcp_tool",
+    # 可空、无服务端默认值；正常路径 _normalize 必填，列进这里只为多行 INSERT 列清单一致。
+    "call_scope",
+)
 _CALL_ATTEMPT_UPSERT_COLUMNS = (
     "attempt_started_at",
     "attempt_ended_at",
@@ -320,7 +445,7 @@ class MonitorCollector:
         await collector.stop()   # flush 剩余后退出
     """
 
-    def __init__(self):
+    def __init__(self, clock: Optional[Callable[[], float]] = None):
         self._queue: Optional[asyncio.Queue] = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -331,6 +456,15 @@ class MonitorCollector:
         # 「没数据」到底是没调用还是采集没开。两者分开计数，各只告警一次。
         self.unstarted_count = 0
         self.disabled_count = 0
+        # 丢弃按原因拆分（冻结 5 键）。``dropped_count`` 恒等于五键之和；
+        # 未启动 / 开关关闭是「采集没开」而非「数据不合格」，故不并入这里。
+        self.dropped_reasons: Dict[str, int] = {reason: 0 for reason in _DROP_REASONS}
+        # 周期汇总窗口内的增量（每 60s 输出一次后清零）与日志限流时间戳。
+        self._drop_window: Dict[str, int] = {reason: 0 for reason in _DROP_REASONS}
+        self._last_reason_log_at: Dict[str, float] = {}
+        self._last_drop_summary_at: Optional[float] = None
+        # 时钟可注入：限流 / 周期汇总是时间相关行为，测试需要确定性地推进 60 秒。
+        self._clock = clock or time.monotonic
 
     # ---- 生命周期 ----
 
@@ -377,12 +511,16 @@ class MonitorCollector:
         self._put(_KIND_CALL_ATTEMPT, fields)
 
     def stats(self) -> Dict[str, Any]:
-        """排障快照：进程内计数 + 队列水位。只读、无副作用。"""
+        """排障快照：进程内计数 + 队列水位。只读、无副作用。
+
+        ``dropped_reasons`` 返回副本：调用方改动快照不会污染采集器内部计数。
+        """
         return {
             "running": self._running,
             "queue_size": self._queue.qsize() if self._queue is not None else 0,
             "queue_maxsize": self._queue.maxsize if self._queue is not None else 0,
             "dropped_count": self.dropped_count,
+            "dropped_reasons": dict(self.dropped_reasons),
             "written_count": self.written_count,
             "unstarted_count": self.unstarted_count,
             "disabled_count": self.disabled_count,
@@ -408,20 +546,139 @@ class MonitorCollector:
                     self.disabled_count,
                 )
             return
-        row = _normalize(kind, fields)
+        row, reason, detail = _normalize_with_reason(kind, fields)
         if row is None:
-            self.dropped_count += 1
+            # 统一入口：计数 +（限流）日志 + 周期汇总。
+            self._record_drop(reason or "missing_required", kind, fields, detail=detail)
             return
         try:
             self._queue.put_nowait((kind, row))
         except asyncio.QueueFull:
             # 满即丢 + 计数 + 告警，绝不 await（保持业务主链路零阻塞）
+            self._record_drop("queue_full", kind, fields)
+
+    # ---- 丢弃可观测 ----
+
+    def _record_drop(
+        self,
+        reason: str,
+        kind: str,
+        context: Optional[Dict[str, Any]],
+        *,
+        detail: Optional[str] = None,
+    ) -> None:
+        """记一次丢弃：按原因计数 + 限流告警 + 惰性触发周期汇总。
+
+        **所有 ``dropped_count`` 递增都必须走这里**，保证
+        ``dropped_count == sum(dropped_reasons.values())`` 恒成立。
+        本方法不 await、不做 I/O，异常一律吞掉（采集是旁路）。
+        """
+        try:
+            if reason not in self.dropped_reasons:
+                # 内部防御：调用点均为常量，正常不会命中。兜底归到 missing_required，
+                # 保证计数总和仍等于 dropped_count；不抛异常，避免可观测代码把错误
+                # 带进采集/业务主链路。
+                reason = "missing_required"
             self.dropped_count += 1
-            if self.dropped_count % 100 == 1:  # 限流告警噪声
-                logger.warning(
-                    "监控采集队列满，累计丢弃 %d 条（监控自身不可静默丢数据）",
-                    self.dropped_count,
+            self.dropped_reasons[reason] += 1
+            self._drop_window[reason] += 1
+
+            now = self._clock()
+            if self._last_drop_summary_at is None:
+                # 第一次丢弃开始计时；窗口到点才汇总，避免刚启动就空喊一条。
+                self._last_drop_summary_at = now
+
+            last_logged = self._last_reason_log_at.get(reason)
+            if last_logged is None or now - last_logged >= _DROP_LOG_INTERVAL_SECONDS:
+                self._last_reason_log_at[reason] = now
+                self._emit_drop_log(reason, kind, context, detail)
+
+            self._maybe_emit_drop_summary()
+        except Exception:
+            # 可观测性绝不能反过来影响采集/业务主链路。
+            logger.exception("监控采集：丢弃计数/日志异常（已吞异常）")
+
+    def _emit_drop_log(
+        self,
+        reason: str,
+        kind: str,
+        context: Optional[Dict[str, Any]],
+        detail: Optional[str],
+    ) -> None:
+        """输出一条**可归因**的丢弃告警（字段白名单见丢弃可观测性设计文档）。"""
+        context = context or {}
+        parts = [
+            f"reason={_safe_log_value(reason, 32)}",
+            f"kind={_safe_log_value(kind, 16)}",
+            f"tenant={_safe_log_value(context.get('tenant_id'), _DROP_LOG_FIELD_LIMITS['tenant'])}",
+            f"request_id={_safe_log_value(context.get('request_id'), _DROP_LOG_FIELD_LIMITS['request_id'])}",
+            f"target={_safe_log_value(context.get('target'), _DROP_LOG_FIELD_LIMITS['target'])}",
+            f"source={_safe_log_value(context.get('source'), _DROP_LOG_FIELD_LIMITS['source'])}",
+        ]
+        # model / scene 只在调用方**本来就有**时输出；本单不新增投递字段。
+        for optional in ("model", "scene"):
+            value = context.get(optional)
+            if value not in (None, ""):
+                parts.append(
+                    f"{optional}={_safe_log_value(value, _DROP_LOG_FIELD_LIMITS[optional])}"
                 )
+        if detail:
+            parts.append(
+                f"field={_safe_log_value(detail, _DROP_LOG_FIELD_LIMITS['field'])}"
+            )
+        parts.append(f"window_dropped={self._drop_window[reason]}")
+        parts.append(f"total_dropped={self.dropped_count}")
+        parts.append(f"pid={os.getpid()}")
+        try:
+            logger.warning(
+                "监控采集丢弃 %s（本进程计数，多 worker 各自独立）",
+                " ".join(parts),
+            )
+        except Exception:
+            pass
+
+    def _maybe_emit_drop_summary(self) -> None:
+        """每 60 秒输出一次各类丢弃计数；窗口内无新增则不输出。
+
+        由消费循环定时驱动 + 丢弃时惰性触发两条路径调用，保证即使 consumer
+        短暂卡住，下一次丢弃也能把到期汇总补出来。
+        """
+        try:
+            now = self._clock()
+            if self._last_drop_summary_at is None:
+                self._last_drop_summary_at = now
+                return
+            if now - self._last_drop_summary_at < _DROP_LOG_INTERVAL_SECONDS:
+                return
+            self._last_drop_summary_at = now
+
+            window_total = sum(self._drop_window.values())
+            try:
+                if window_total > 0:
+                    reasons = ",".join(
+                        f"{reason}:{count}"
+                        for reason, count in self._drop_window.items()
+                        if count
+                    )
+                    logger.warning(
+                        "监控采集丢弃汇总 window=%ds reasons=%s window_total=%d "
+                        "total_dropped=%d pid=%d（本进程计数，多 worker 需按进程累加）",
+                        int(_DROP_LOG_INTERVAL_SECONDS),
+                        reasons or "-",
+                        window_total,
+                        self.dropped_count,
+                        os.getpid(),
+                    )
+            except Exception:
+                logger.exception("监控采集：丢弃汇总日志异常（已吞异常）")
+            finally:
+                # 只在**窗口到期后**清零；未到期提前 return 时不能清，
+                # 否则窗口永远攒不满、汇总永远不触发。日志失败也要清，
+                # 避免下个窗口重复计旧账。
+                for reason in _DROP_REASONS:
+                    self._drop_window[reason] = 0
+        except Exception:
+            logger.exception("监控采集：丢弃汇总异常（已吞异常）")
 
     # ---- 后台消费 ----
 
@@ -433,6 +690,8 @@ class MonitorCollector:
         while self._running:
             try:
                 await self._flush_once(batch_size)
+                # 定时路径：即使投递侧长时间无丢弃，也要把到期的窗口汇总刷出来。
+                self._maybe_emit_drop_summary()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -533,7 +792,7 @@ class MonitorCollector:
                     "监控采集：单条 N1 写入失败，request_id=%s",
                     row.get("request_id"),
                 )
-                self.dropped_count += 1
+                self._record_drop("write_failed", _KIND_CALL_LOG, row)
             else:
                 self.written_count += 1
                 written_request_ids.add(row["request_id"])
@@ -546,7 +805,7 @@ class MonitorCollector:
                     row.get("request_id"),
                     row.get("attempt_id"),
                 )
-                self.dropped_count += 1
+                self._record_drop("write_failed", _KIND_CALL_ATTEMPT, row)
             else:
                 self.written_count += 1
                 written_request_ids.add(row["request_id"])
@@ -582,6 +841,12 @@ class MonitorCollector:
                             "final_ended_at": log_stmt.excluded.final_ended_at,
                             "error_code": log_stmt.excluded.error_code,
                             "error_message": log_stmt.excluded.error_message,
+                            # 调用边界是调用点位固有属性，正常重复投递值不变；
+                            # COALESCE 只为滚动发布兜底：旧采集器先写入 NULL，
+                            # 新采集器后到的非空值把它补齐，而 NULL 不会覆盖已有值。
+                            "call_scope": func.coalesce(
+                                log_stmt.excluded.call_scope, CallLog.call_scope
+                            ),
                             "updated_at": sa_text("NOW()"),
                         },
                     )
@@ -714,10 +979,14 @@ class AttemptSpan:
 
     # ---- 调用方标注结局 ----
 
-    def fail(self, error_code: Optional[Any] = None, error_message: Optional[Any] = None) -> None:
+    def fail(
+        self, error_code: Optional[Any] = None, error_message: Optional[Any] = None
+    ) -> None:
         self._mark(CallFinalStatus.FAILED.value, error_code, error_message)
 
-    def cancel(self, error_code: Optional[Any] = None, error_message: Optional[Any] = None) -> None:
+    def cancel(
+        self, error_code: Optional[Any] = None, error_message: Optional[Any] = None
+    ) -> None:
         self._mark(CallFinalStatus.CANCELLED.value, error_code, error_message)
 
     def mark(
@@ -745,7 +1014,9 @@ class AttemptSpan:
     def status(self) -> str:
         return self._row["status"]
 
-    def _mark(self, status: str, error_code: Optional[Any], error_message: Optional[Any]) -> None:
+    def _mark(
+        self, status: str, error_code: Optional[Any], error_message: Optional[Any]
+    ) -> None:
         self._row["status"] = status
         self._marked = True
         if error_code is not None:
@@ -799,6 +1070,7 @@ def emit_logical_call(
     source: Optional[str] = None,
     target: Optional[str] = None,
     protocol: Optional[str] = None,
+    call_scope: str = CallScope.INTERNAL.value,
     trigger_type: str = CallTrigger.SYSTEM.value,
     started_at: Optional[datetime] = None,
     error_code: Optional[Any] = None,
@@ -823,6 +1095,8 @@ def emit_logical_call(
     取值约定（⚠️ **枚举取值仍待评审**）：
 
     - ``direction`` 默认 ``outbound``：这些点位记的都是「本进程**发出**的调用」；
+    - ``call_scope`` 默认 ``internal``：本入口服务的点位（任务运行时 ↔ 任务中心
+      等）都是**平台内部互调**；确有外部调用时由调用方显式传 ``external``；
     - ``trigger_type`` 默认 ``system``：重发循环拿不到调用者身份，按「系统发起」记。
       **与 `_normalize` 的兜底值 ``user`` 刻意不同** —— 漏标时兜底 ``user`` 只是分类不准，
       而这里的调用确实不是用户直接点的；
@@ -832,24 +1106,27 @@ def emit_logical_call(
     """
     try:
         ended = datetime.now(timezone.utc)
-        get_monitor_collector().put_call_log({
-            "request_id": request_id,
-            "trace_id": request_id,  # 现与 request_id 同源，是否分离待定（同 Sidecar 侧）
-            "tenant_id": tenant_id,
-            "direction": direction,
-            "source": source,
-            "target": target,
-            "protocol": protocol,
-            "trigger_type": trigger_type,
-            # DDL 是 TIMESTAMPTZ ⇒ 必须 tz-aware（朴素值会踩 asyncpg 编解码坑）
-            "logical_started_at": started_at or ended,
-            "final_ended_at": ended,
-            "final_status": (
-                status.value if isinstance(status, CallFinalStatus) else str(status)
-            ),
-            "error_code": str(error_code) if error_code is not None else None,
-            "error_message": error_message,
-        })
+        get_monitor_collector().put_call_log(
+            {
+                "request_id": request_id,
+                "trace_id": request_id,  # 现与 request_id 同源，是否分离待定（同 Sidecar 侧）
+                "tenant_id": tenant_id,
+                "direction": direction,
+                "source": source,
+                "target": target,
+                "protocol": protocol,
+                "call_scope": call_scope,
+                "trigger_type": trigger_type,
+                # DDL 是 TIMESTAMPTZ ⇒ 必须 tz-aware（朴素值会踩 asyncpg 编解码坑）
+                "logical_started_at": started_at or ended,
+                "final_ended_at": ended,
+                "final_status": (
+                    status.value if isinstance(status, CallFinalStatus) else str(status)
+                ),
+                "error_code": str(error_code) if error_code is not None else None,
+                "error_message": error_message,
+            }
+        )
     except Exception:
         logger.exception("监控采集：N1 逻辑调用投递失败（已吞异常，不影响调用）")
 

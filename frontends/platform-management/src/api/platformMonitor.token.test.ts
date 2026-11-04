@@ -162,17 +162,51 @@ describe('Token 监控取数层契约与映射', () => {
   });
 
   describe('趋势', () => {
-    it('24h 用 bucket=hour，7d 用 bucket=day；metric 直接取口径名', async () => {
+    it('1h 用 5m 桶，24h 用 hour 桶，7d 用 day 桶；metric 直接取口径名', async () => {
       routes[ENDPOINT_TREND] = () => ({ points: [] });
 
+      await getTokenTrend('1h', 'total');
       await getTokenTrend('24h', 'input');
       await getTokenTrend('7d', 'output');
 
       expect(hits[0].url).toBe(ENDPOINT_TREND);
-      expect(hits[0].params.bucket).toBe('hour');
-      expect(hits[0].params.metric).toBe('input');
-      expect(hits[1].params.bucket).toBe('day');
-      expect(hits[1].params.metric).toBe('output');
+      expect(hits[0].params.bucket).toBe('5m');
+      expect(hits[0].params.metric).toBe('total');
+      expect(hits[1].params.bucket).toBe('hour');
+      expect(hits[1].params.metric).toBe('input');
+      expect(hits[2].params.bucket).toBe('day');
+      expect(hits[2].params.metric).toBe('output');
+    });
+
+    it('5m 空桶：value 与 detail 的计数都原样透传 null（禁兜 0）', async () => {
+      routes[ENDPOINT_TREND] = () => ({
+        points: [
+          // 后端补齐的 12 个点里，空桶四个计数均为 null
+          {
+            bucket_start: '2026-10-18T12:05:00Z',
+            total_tokens: null,
+            prompt_tokens: null,
+            completion_tokens: null,
+            call_count: null,
+          },
+          {
+            bucket_start: '2026-10-18T12:10:00Z',
+            total_tokens: 12,
+            prompt_tokens: 8,
+            completion_tokens: 4,
+            call_count: 1,
+          },
+        ],
+      });
+
+      const points = await getTokenTrend('1h', 'total');
+
+      expect(hits[0].params.bucket).toBe('5m');
+      expect(points[0].value).toBeNull();
+      expect(points[0].detail).toEqual({ input: null, output: null, calls: null });
+      expect(points[1].value).toBe(12);
+      // 5m 档横轴固定 HH:mm（UTC 12:05 = 北京 20:05）
+      expect(points.map((p) => p.date)).toEqual(['20:05', '20:10']);
     });
 
     it('三种口径取对应的 token 字段，另外三个量进 detail；刻度按平台时区', async () => {

@@ -43,7 +43,7 @@
 from datetime import datetime
 from typing import Any, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.repository.base import BaseRepository
@@ -122,6 +122,10 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
         source: Optional[str] = None,
         target: Optional[str] = None,
         keyword: Optional[str] = None,
+        target_any: Optional[Sequence[str]] = None,
+        source_pairs: Optional[Sequence[Tuple[str, str]]] = None,
+        source_filter_pairs: Optional[List[Tuple[str, str]]] = None,
+        source_global_forms: Optional[List[str]] = None,
         degraded: bool = False,
         offset: int = 0,
         limit: int = 20,
@@ -134,7 +138,15 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
           Attempt（``request_id`` **可重复属预期**，非 bug），
           排序 ``attempt_started_at DESC``。
 
-        筛选映射见模块 docstring「降级模式下 N1 专属筛选的落点」。
+        ``source_filter_pairs`` 是 ``source`` 筛选值按用户身份展开后的
+        ``(tenant_id, source)`` 精确对（非空时**替代** ``source`` 单值匹配）；
+        它与关键字展开的 ``source_pairs`` 是 **AND** 关系，各自独立成条件，
+        不得并入同一个 OR 组。筛选映射见模块 docstring
+        「降级模式下 N1 专属筛选的落点」。
+
+        ``source_global_forms`` 是规范形态 ``user:<id>`` 的全局兜底：主键全局唯一，
+        模拟态（管理员切租户）产生的记录租户是目标租户、用户属于原租户，
+        只按租户对会漏，因此额外按 ``source`` 单列匹配（与租户对是 OR）。
         """
         if degraded:
             conditions = self._attempt_record_conditions(
@@ -147,6 +159,10 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
                 protocol=protocol,
                 source=source,
                 target=target,
+                target_any=target_any,
+                source_pairs=source_pairs,
+                source_filter_pairs=source_filter_pairs,
+                source_global_forms=source_global_forms,
             )
             base = select(CallAttempt).where(*conditions)
             count_stmt = select(func.count()).select_from(CallAttempt).where(*conditions)
@@ -162,6 +178,10 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
                 source=source,
                 target=target,
                 keyword=keyword,
+                target_any=target_any,
+                source_pairs=source_pairs,
+                source_filter_pairs=source_filter_pairs,
+                source_global_forms=source_global_forms,
             )
             base = select(CallLog).where(*conditions)
             count_stmt = select(func.count()).select_from(CallLog).where(*conditions)
@@ -186,6 +206,10 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
         source: Optional[str],
         target: Optional[str],
         keyword: Optional[str],
+        target_any: Optional[Sequence[str]],
+        source_pairs: Optional[Sequence[Tuple[str, str]]],
+        source_filter_pairs: Optional[List[Tuple[str, str]]] = None,
+        source_global_forms: Optional[List[str]] = None,
     ) -> List[Any]:
         conditions: List[Any] = [
             CallLog.logical_started_at >= start,
@@ -199,23 +223,80 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
             conditions.append(CallLog.trigger_type == trigger_type)
         if protocol:
             conditions.append(CallLog.protocol == protocol)
-        if source:
+        if source_filter_pairs:
+            # ``source`` 按用户身份展开：同一个人的全部历史形态一次命中。
+            # 必须带租户，禁止跨租户同值误命中（独立 AND 条件，不并 keyword OR 组）。
+            # ``source_global_forms`` 是规范形态 ``user:<id>`` 的全局兜底：主键
+            # 全局唯一，模拟态下记录租户与用户所属租户不同，只按租户对会漏。
+            matched = tuple_(CallLog.tenant_id, CallLog.source).in_(
+                list(source_filter_pairs)
+            )
+            if source_global_forms:
+                matched = or_(matched, CallLog.source.in_(list(source_global_forms)))
+            conditions.append(matched)
+        elif source:
             # 精确匹配（候选值由 M1 的 call_sources 提供）
             conditions.append(CallLog.source == source)
         if target:
-            # 精确匹配：对象详情「查看全部调用」按 object_id（即 target）下钻，
+            # 精确匹配「对外对象标识」= COALESCE(mcp_tool, target)：
+            # 对象详情「查看全部调用」按 object_id 下钻（MCP 对象传工具名），
             # 用 keyword 会把同前缀的其他对象一并带进来。
-            conditions.append(CallLog.target == target)
-        if keyword:
-            pattern_value = _like(keyword)
             conditions.append(
-                or_(
-                    CallLog.source.ilike(pattern_value),
-                    CallLog.target.ilike(pattern_value),
-                    CallLog.request_id.ilike(pattern_value),
+                or_(CallLog.target == target, CallLog.mcp_tool == target)
+            )
+        if keyword or target_any or source_pairs:
+            conditions.append(
+                self._keyword_group(
+                    keyword=keyword,
+                    target_any=target_any,
+                    source_pairs=source_pairs,
+                    include_request_id=True,
                 )
             )
         return conditions
+
+    @staticmethod
+    def _keyword_group(
+        *,
+        keyword: Optional[str],
+        target_any: Optional[Sequence[str]],
+        source_pairs: Optional[Sequence[Tuple[str, str]]],
+        include_request_id: bool,
+    ) -> Any:
+        """关键字 OR 组。三部分同组 OR：
+
+        1. 既有 raw ``ILIKE``（source / target / mcp_tool，记录页另含 request_id）；
+        2. ``target_any``：前端把命中的能力释义展开成原始标识，
+           按记录页目标列口径 ``target IN (...) OR mcp_tool IN (...)``；
+        3. ``source_pairs``：后端按 ``users.username`` 展开的
+           ``(tenant_id, source)`` 精确对 —— **必须带租户**，禁止跨租户同值误命中。
+        """
+        clauses: List[Any] = []
+        if keyword:
+            pattern_value = _like(keyword)
+            clauses.extend(
+                [
+                    CallLog.source.ilike(pattern_value),
+                    CallLog.target.ilike(pattern_value),
+                    # 记录页目标列输出对外对象标识（MCP 为工具名），关键字同口径覆盖。
+                    CallLog.mcp_tool.ilike(pattern_value),
+                ]
+            )
+            if include_request_id:
+                clauses.append(CallLog.request_id.ilike(pattern_value))
+        if target_any:
+            values = list(target_any)
+            clauses.append(
+                or_(
+                    CallLog.target.in_(values),
+                    CallLog.mcp_tool.in_(values),
+                )
+            )
+        if source_pairs:
+            clauses.append(
+                tuple_(CallLog.tenant_id, CallLog.source).in_(list(source_pairs))
+            )
+        return or_(*clauses)
 
     def _attempt_record_conditions(
         self,
@@ -229,6 +310,10 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
         protocol: Optional[str],
         source: Optional[str],
         target: Optional[str],
+        target_any: Optional[Sequence[str]],
+        source_pairs: Optional[Sequence[Tuple[str, str]]],
+        source_filter_pairs: Optional[List[Tuple[str, str]]] = None,
+        source_global_forms: Optional[List[str]] = None,
     ) -> List[Any]:
         conditions: List[Any] = [
             CallAttempt.attempt_started_at >= start,
@@ -237,24 +322,32 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
         if status:
             conditions.append(CallAttempt.status == status)
 
-        if keyword:
-            pattern_value = _like(keyword)
-            # Attempt 可自证的部分（attempt_id / request_id）直接落在 N2 上；
-            # 「来源/调用方、目标」是 N1 列，用子查询下推求交集。
-            conditions.append(
-                or_(
-                    CallAttempt.attempt_id.ilike(pattern_value),
-                    CallAttempt.request_id.ilike(pattern_value),
-                    CallAttempt.request_id.in_(
-                        select(CallLog.request_id).where(
-                            or_(
-                                CallLog.source.ilike(pattern_value),
-                                CallLog.target.ilike(pattern_value),
-                            )
+        if keyword or target_any or source_pairs:
+            clauses: List[Any] = []
+            if keyword:
+                pattern_value = _like(keyword)
+                # Attempt 可自证的部分（attempt_id / request_id）直接落在 N2 上。
+                clauses.extend(
+                    [
+                        CallAttempt.attempt_id.ilike(pattern_value),
+                        CallAttempt.request_id.ilike(pattern_value),
+                    ]
+                )
+            # 「来源/调用方、目标」是 N1 列，用子查询下推求交集。降级模式下
+            # attempt 行的 source 借用 N1 字段，故 source_pairs 也落在同一子查询。
+            clauses.append(
+                CallAttempt.request_id.in_(
+                    select(CallLog.request_id).where(
+                        self._keyword_group(
+                            keyword=keyword,
+                            target_any=target_any,
+                            source_pairs=source_pairs,
+                            include_request_id=False,
                         )
-                    ),
+                    )
                 )
             )
+            conditions.append(or_(*clauses))
 
         # N1 专属精确筛选（direction / trigger_type / protocol / source / target）：
         # call_attempt 无这些列，下推到 call_log 求 request_id 交集。
@@ -265,10 +358,22 @@ class MonitorDetailRepository(BaseRepository[CallLog]):
             n1_conditions.append(CallLog.trigger_type == trigger_type)
         if protocol:
             n1_conditions.append(CallLog.protocol == protocol)
-        if source:
+        if source_filter_pairs:
+            # 与正常模式同口径：按用户身份展开的 ``(tenant_id, source)`` 精确对，
+            # 外加规范形态 ``user:<id>`` 的全局兜底（主键全局唯一）。
+            matched = tuple_(CallLog.tenant_id, CallLog.source).in_(
+                list(source_filter_pairs)
+            )
+            if source_global_forms:
+                matched = or_(matched, CallLog.source.in_(list(source_global_forms)))
+            n1_conditions.append(matched)
+        elif source:
             n1_conditions.append(CallLog.source == source)
         if target:
-            n1_conditions.append(CallLog.target == target)
+            # 与正常模式同口径：对外对象标识 = target 或 mcp_tool。
+            n1_conditions.append(
+                or_(CallLog.target == target, CallLog.mcp_tool == target)
+            )
         if n1_conditions:
             conditions.append(
                 CallAttempt.request_id.in_(

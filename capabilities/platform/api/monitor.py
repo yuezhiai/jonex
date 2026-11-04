@@ -11,7 +11,7 @@
 此处靠顺序 + 段数双重保险）。
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -135,7 +135,7 @@ async def external_summary(
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):
-    """C1 外部依赖（direction=outbound）统计卡。"""
+    """C1 外部依赖（direction=outbound + call_scope=external）统计卡。"""
     svc = MonitorCallService(db)
     data = await svc.external_summary(from_, to)
     return success_response(data=data.dict())
@@ -174,7 +174,7 @@ async def external_objects(
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):
-    """C2 外部依赖对象列表（分页）。"""
+    """C2 外部依赖对象列表（分页，固定 call_scope=external）。"""
     svc = MonitorCallService(db)
     items, total, mode_meta = await svc.external_objects(
         from_, to, object_type=object_type, page=page, page_size=page_size
@@ -237,19 +237,29 @@ async def call_trend(
     metric: str = Query(
         ..., description="指标：call_count / success_rate / avg_latency / failed_count"
     ),
-    bucket: str = Query(..., description="桶粒度：hour / day"),
+    bucket: str = Query(..., description="桶粒度：5m / hour / day"),
     object_id: Optional[str] = Query(None, description="对象 / 能力 ID（可选）"),
     direction: Optional[str] = Query(
         None,
         description="调用方向：outbound（外部依赖）/ inbound（开放能力）；不传 = 全量",
     ),
+    call_scope: Optional[str] = Query(
+        None,
+        description="调用边界：external / internal / open；不传 = 不筛",
+    ),
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):
-    """C5 调用趋势（按 metric 与 bucket 分桶；``direction`` 切两个页签口径）。"""
+    """C5 调用趋势（按 metric 与 bucket 分桶；``direction`` + ``call_scope`` 切页签口径）。"""
     svc = MonitorCallService(db)
     points, mode_meta = await svc.trend(
-        from_, to, metric=metric, bucket=bucket, object_id=object_id, direction=direction
+        from_,
+        to,
+        metric=metric,
+        bucket=bucket,
+        object_id=object_id,
+        direction=direction,
+        call_scope=call_scope,
     )
     return success_response(
         data={
@@ -281,6 +291,13 @@ async def call_records(
         None, description="目标对象 / 能力（精确匹配，降级模式下回查逻辑调用）"
     ),
     keyword: Optional[str] = Query(None, description="关键字（来源 / 目标 / Request ID）"),
+    target_any: Optional[List[str]] = Query(
+        None,
+        description=(
+            "目标对象标识列表（重复参数）；与关键字 OR 组合，"
+            "按 COALESCE(mcp_tool, target) 口径匹配"
+        ),
+    ),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数"),
     db=Depends(get_db),
@@ -298,6 +315,7 @@ async def call_records(
         source=source,
         target=target,
         keyword=keyword,
+        target_any=target_any,
         page=page,
         page_size=page_size,
     )
@@ -419,7 +437,7 @@ async def token_trend(
         "total",
         description="指标：total / input / output（选填，默认 total；仅校验，不裁剪响应）",
     ),
-    bucket: str = Query(..., description="桶粒度：hour / day"),
+    bucket: str = Query(..., description="桶粒度：5m / hour / day"),
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):
@@ -516,8 +534,8 @@ async def task_trend(
         ...,
         description="指标：task_count / success_rate / avg_duration / failed_count",
     ),
-    bucket: str = Query(..., description="桶粒度：hour / day"),
-    task_type: Optional[str] = Query(None, description="任务目录 code（= task_center.tasks.task_catalog_code；取值见 M1 `task_types[].code`，可选）"),
+    bucket: str = Query(..., description="桶粒度：5m / hour / day"),
+    task_type: Optional[str] = Query(None, description="编排定义 ID（= task_center.tasks.definition_id；取值见 M1 `task_types[].code`，可选）"),
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):
@@ -535,7 +553,7 @@ async def task_failures(
     from_: str = _FROM,
     to: str = _TO,
     range_preset: Optional[str] = _PRESET,
-    task_type: Optional[str] = Query(None, description="任务目录 code（= task_center.tasks.task_catalog_code；取值见 M1 `task_types[].code`，可选）"),
+    task_type: Optional[str] = Query(None, description="编排定义 ID（= task_center.tasks.definition_id；取值见 M1 `task_types[].code`，可选）"),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(5, ge=1, le=100, description="每页条数（默认 5）"),
     db=Depends(get_db),
@@ -560,7 +578,7 @@ async def task_overview(
     from_: str = _FROM,
     to: str = _TO,
     range_preset: Optional[str] = _PRESET,
-    task_type: Optional[str] = Query(None, description="任务目录 code（= task_center.tasks.task_catalog_code；取值见 M1 `task_types[].code`，可选）"),
+    task_type: Optional[str] = Query(None, description="编排定义 ID（= task_center.tasks.definition_id；取值见 M1 `task_types[].code`，可选）"),
     db=Depends(get_db),
     _p: dict = Depends(_MONITOR_READ),
 ):

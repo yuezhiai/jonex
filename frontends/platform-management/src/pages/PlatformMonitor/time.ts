@@ -21,6 +21,8 @@ export const PM_TIMEZONE = 'Asia/Shanghai';
 export const PM_TIME_PATTERN = {
   /** 趋势横轴：小时桶 */
   bucketHour: 'HH:mm',
+  /** 趋势横轴：小时桶且窗口跨天（首尾落在同一个钟点上，只用 HH:mm 会撞成同一个刻度） */
+  bucketHourCrossDay: 'MM-DD HH:mm',
   /** 趋势横轴：天桶 */
   bucketDay: 'MM-DD',
   /** 列表里的时间（失败任务、调用记录、最近调用） */

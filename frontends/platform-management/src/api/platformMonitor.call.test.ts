@@ -25,6 +25,7 @@ import {
   getCallTargets,
   getCallTrend,
   getCapabilityStats,
+  getMetaFilters,
   getOpenCapabilities,
 } from './platformMonitor';
 
@@ -37,6 +38,7 @@ const ENDPOINT_RECORDS = '/platform/monitor/calls/records';
 const ENDPOINT_DETAIL = '/platform/monitor/calls/req-1/detail';
 const ENDPOINT_ATTEMPTS = '/platform/monitor/calls/req-1/attempts';
 const ENDPOINT_OBJECT_DETAIL = '/platform/monitor/calls/objects/model.qwen/detail';
+const ENDPOINT_META = '/platform/monitor/meta/filters';
 
 /** 内存版 localStorage：请求拦截器要读 locale，node 环境没有原生实现 */
 function installLocalStorage(): void {
@@ -63,6 +65,8 @@ const adapterSlot = (): AdapterSlot => apiClient.raw.defaults as unknown as Adap
 interface Hit {
   url: string;
   params: Record<string, unknown>;
+  /** 数组参数的序列化器（`target_any` 要走重复 query 参数而不是 `target_any[]`） */
+  paramsSerializer?: { serialize?: (params: unknown) => string };
 }
 
 let hits: Hit[] = [];
@@ -72,7 +76,11 @@ let routes: Record<string, () => unknown> = {};
 function stub(): void {
   const adapter: AxiosAdapter = async (config) => {
     const url = String(config.url ?? '');
-    hits.push({ url, params: (config.params ?? {}) as Record<string, unknown> });
+    hits.push({
+      url,
+      params: (config.params ?? {}) as Record<string, unknown>,
+      paramsSerializer: config.paramsSerializer as Hit['paramsSerializer'],
+    });
     const handler = routes[url];
     if (!handler) throw new Error(`未桩化的请求：${url}`);
     return makeResponse(config, { success: true, code: 0, data: handler() });
@@ -282,6 +290,19 @@ describe('调用监控取数层契约与映射', () => {
       expect(page.items[0].lastCallAt).toBe('10-13 16:40:00');
     });
 
+    it('object_id 为空时 name 为 null，不回退 object_type 分类码', async () => {
+      routes[ENDPOINT_EXTERNAL_OBJECTS] = () => ({
+        items: [objectDto({ object_id: null, object_type: 'invoke' }), objectDto({ object_id: '   ' })],
+        total: 2,
+      });
+
+      const page = await getCallTargets('24h');
+
+      // 「能力」「模型服务」这类分类码不是对象名，绝不能顶替空名字
+      expect(page.items[0].name).toBeNull();
+      expect(page.items[1].name).toBeNull();
+    });
+
     it('metric_mode 缺失 / 未知时 metricMode 为 null', async () => {
       routes[ENDPOINT_EXTERNAL_OBJECTS] = () => ({ items: [], total: 0 });
 
@@ -352,6 +373,22 @@ describe('调用监控取数层契约与映射', () => {
       expect(hits[0].params.protocol).toBe('invoke');
       expect(page.items[0].name).toBe('model.qwen');
     });
+
+    it('协议下拉选中 mcp 后按 protocol=mcp 取数', async () => {
+      routes[ENDPOINT_OPEN_OBJECTS] = () => ({ items: [objectDto({ protocol: 'mcp' })], total: 1 });
+
+      await getOpenCapabilities('24h', 1, 20, 'mcp');
+
+      expect(hits[0].params.protocol).toBe('mcp');
+    });
+
+    it('既有 openai 筛选不回归', async () => {
+      routes[ENDPOINT_OPEN_OBJECTS] = () => ({ items: [objectDto()], total: 1 });
+
+      await getOpenCapabilities('24h', 1, 20, 'openai');
+
+      expect(hits[0].params.protocol).toBe('openai');
+    });
   });
 
   describe('调用趋势', () => {
@@ -373,6 +410,19 @@ describe('调用监控取数层契约与映射', () => {
 
       expect('direction' in hits[0].params).toBe(false);
       expect('object_id' in hits[0].params).toBe(false);
+      expect('call_scope' in hits[0].params).toBe(false);
+    });
+
+    it('callScope 原样进 params；外部依赖传 external，开放能力不传', async () => {
+      routes[ENDPOINT_TREND] = () => ({ points: [] });
+
+      await getCallTrend('24h', 'volume', 'outbound', undefined, 'external');
+      await getCallTrend('24h', 'volume', 'inbound');
+
+      expect(hits[0].params.call_scope).toBe('external');
+      expect(hits[0].params.direction).toBe('outbound');
+      // 开放能力页保持 direction=inbound，不额外下发调用边界
+      expect('call_scope' in hits[1].params).toBe(false);
     });
 
     it('metric 改名 + bucket 随窗口；返回 {points, metricMode}', async () => {
@@ -393,6 +443,10 @@ describe('调用监控取数层契约与映射', () => {
       await getCallTrend('7d', 'successRate', 'outbound');
       expect(hits[1].params.metric).toBe('success_rate');
       expect(hits[1].params.bucket).toBe('day');
+
+      // 1 小时档改为 5 分钟一个点（12 个点），与任务 / Token 族同一映射
+      await getCallTrend('1h', 'volume', 'outbound');
+      expect(hits[2].params.bucket).toBe('5m');
     });
 
     it('四档指标逐一对上契约取值', async () => {
@@ -483,6 +537,56 @@ describe('调用监控取数层契约与映射', () => {
         page_size: 5,
       });
     });
+
+    it('caller_name 映射为 callerName；缺失时保留 caller 原值语义', async () => {
+      routes[ENDPOINT_RECORDS] = () => ({
+        items: [
+          recordDto({ caller: '1', caller_name: 'admin' }),
+          recordDto({ caller: 'apikey', caller_name: null }),
+          recordDto({ caller: 'platform' }),
+        ],
+        total: 3,
+      });
+
+      const page = await getCallRecords('24h', baseQuery);
+
+      expect(page.items[0].caller).toBe('1');
+      expect(page.items[0].callerName).toBe('admin');
+      // 后端解析不到时 callerName 为 null，页面回退 caller（认证类型 / platform 等既有语义）
+      expect(page.items[1].callerName).toBeNull();
+      expect(page.items[2].callerName).toBeNull();
+    });
+
+    it('target_any 以数组下发，并序列化为重复 query 参数', async () => {
+      routes[ENDPOINT_RECORDS] = () => ({ items: [], total: 0 });
+      const targetAny = ['business.task_center.v1', 'text-embedding-v3'];
+
+      await getCallRecords('24h', { ...baseQuery, keyword: '任务中心', targetAny });
+
+      expect(hits[0].params.target_any).toEqual(targetAny);
+      // 后端只认重复的 `target_any`，axios 默认的 `target_any[]` 形式查不到
+      const serialized = hits[0].paramsSerializer?.serialize?.(hits[0].params) ?? '';
+      expect(new URLSearchParams(serialized).getAll('target_any')).toEqual(targetAny);
+    });
+
+    it('没有命中项时不下发 target_any', async () => {
+      routes[ENDPOINT_RECORDS] = () => ({ items: [], total: 0 });
+
+      await getCallRecords('24h', { ...baseQuery, keyword: 'nothing' });
+
+      expect('target_any' in hits[0].params).toBe(false);
+    });
+
+    it.each(['invoke', 'mcp', 'openai'] as const)(
+      '协议筛选 protocol=%s 原样下发，mcp 与既有取值同口径',
+      async (protocol) => {
+        routes[ENDPOINT_RECORDS] = () => ({ items: [], total: 0 });
+
+        await getCallRecords('24h', { ...baseQuery, protocol });
+
+        expect(hits[0].params.protocol).toBe(protocol);
+      },
+    );
 
     it('降级模式：attempt_id 映射进 attemptId，同 requestId 的多行仍可区分', async () => {
       routes[ENDPOINT_RECORDS] = () => ({
@@ -598,7 +702,7 @@ describe('调用监控取数层契约与映射', () => {
         success_rate: 0.962,
         avg_latency_ms: 120,
         failed_count: 4,
-        top_sources: [{ name: 'task-center', call_count: 99 }],
+        top_sources: [{ name: '1', caller_name: 'admin', call_count: 99 }],
         recent_failures: [
           { request_id: 'req-1', error_message: '上游超时', logical_started_at: '2026-10-13T08:40:00Z' },
         ],
@@ -612,7 +716,8 @@ describe('调用监控取数层契约与映射', () => {
       // 比率 ×100，延迟保持毫秒
       expect(detail.successRate).toBeCloseTo(96.2, 6);
       expect(detail.avgLatencyMs).toBe(120);
-      expect(detail.topSources).toEqual([{ name: 'task-center', callCount: 99 }]);
+      // `name` 保留原始 source（React key 与请求都用它），`callerName` 只用于展示
+      expect(detail.topSources).toEqual([{ name: '1', callerName: 'admin', callCount: 99 }]);
       expect(detail.recentFailures[0].time).toBe('10-13 16:40:00');
       expect(detail.metricMode).toBe('logical');
     });
@@ -635,6 +740,31 @@ describe('调用监控取数层契约与映射', () => {
       expect(detail.successRate).toBeNull();
       expect(detail.avgLatencyMs).toBeNull();
       expect(detail.metricMode).toBeNull();
+    });
+  });
+
+  describe('标识候选（纯增量字段）', () => {
+    it('call_source_options 遵循 value/label 分离，旧 call_sources 保留', async () => {
+      routes[ENDPOINT_META] = () => ({
+        call_sources: ['1', 'apikey'],
+        call_source_options: [{ value: '1', label: 'admin' }],
+        call_targets: ['business.task_center.v1', 'deepseek-v4-flash-202605'],
+      });
+
+      const meta = await getMetaFilters();
+
+      expect(meta?.callSources).toEqual(['1', 'apikey']);
+      expect(meta?.callSourceOptions).toEqual([{ value: '1', label: 'admin' }]);
+      expect(meta?.callTargets).toEqual(['business.task_center.v1', 'deepseek-v4-flash-202605']);
+    });
+
+    it('新字段缺失时给空数组（页面走能力映射 / 自由输入兜底）', async () => {
+      routes[ENDPOINT_META] = () => ({ call_sources: ['apikey'] });
+
+      const meta = await getMetaFilters();
+
+      expect(meta?.callSourceOptions).toEqual([]);
+      expect(meta?.callTargets).toEqual([]);
     });
   });
 });

@@ -34,6 +34,7 @@ from capabilities.platform.dtos.monitor import (
     TokenUsageItem,
 )
 from capabilities.platform.repository.monitor_token import MonitorTokenRepository
+from capabilities.platform.services.monitor_buckets import bucket_starts
 from capabilities.platform.services.monitor_range import enforce_max_range
 from capabilities.platform.services.monitor_resilience import (
     MODULE_ERROR,
@@ -198,16 +199,37 @@ class MonitorTokenService:
         start, end = self._parse_range(frm, to)
         self._validate_metric(metric)
         rows = await self.repo.trend(start, end, bucket)
-        return [
-            TokenTrendPoint(
-                bucket_start=row["bucket_start"],
-                total_tokens=int(row["total_tokens"] or 0),
-                prompt_tokens=int(row["prompt_tokens"] or 0),
-                completion_tokens=int(row["completion_tokens"] or 0),
-                call_count=int(row["call_count"] or 0),
-            )
-            for row in rows
-        ]
+
+        # 全部粒度按固定时间网格补空桶。仓储的 ``bucket_start`` 是 UTC ISO 字符串，
+        # 网格先用 datetime 生成、再用同一 ``_iso`` 格式化成同形字符串作 key。
+        # 空桶的四个计数一律 ``None``（⛔ 不兜 0）；网格之外的真实行直接丢弃。
+        # bucket 白名单由仓储校验（非法值在上一行已抛 1001）。
+        rows_by_start = {row["bucket_start"]: row for row in rows}
+        points: List[TokenTrendPoint] = []
+        for bucket_start in bucket_starts(start, end, bucket):
+            key = _iso(bucket_start) or ""
+            row = rows_by_start.get(key)
+            if row is None:
+                points.append(
+                    TokenTrendPoint(
+                        bucket_start=key,
+                        total_tokens=None,
+                        prompt_tokens=None,
+                        completion_tokens=None,
+                        call_count=None,
+                    )
+                )
+            else:
+                points.append(
+                    TokenTrendPoint(
+                        bucket_start=key,
+                        total_tokens=int(row["total_tokens"] or 0),
+                        prompt_tokens=int(row["prompt_tokens"] or 0),
+                        completion_tokens=int(row["completion_tokens"] or 0),
+                        call_count=int(row["call_count"] or 0),
+                    )
+                )
+        return points
 
     # ------------------------------------------------------------------
     # K3 · 模型 TOP N

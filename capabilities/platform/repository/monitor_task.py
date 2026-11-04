@@ -33,6 +33,10 @@
   ⛔ 不读平台设置里的 timezone（仅存不用），也不依赖 DB session 时区。
   ⚠️ **仅分桶边界统一**，输出仍按各族既有 ISO 口径：C5 / K2 回 UTC ``Z``，T2 回 ``+08:00``。
 - ``waiting_now`` 为**实时快照**（``status='pending'``，不套区间），不进任何分子/分母。
+- T4 阶段行 ``waiting_count`` 只算**父任务仍未结束**（``pending`` / ``running``）的
+  pending 子任务：父任务已终态时剩下的 pending 步骤永远不会再执行，属于「未执行」
+  而非「在排队」。不判父任务会与任务中心「处理中」对不上（2026-10-26 实测：解析
+  失败任务的下游 ``compile`` 子任务永远 ``pending``）。
 """
 
 from datetime import datetime
@@ -60,15 +64,18 @@ class MonitorTaskRepository(BaseRepository):
 
     @staticmethod
     def _type_filter(task_type: Optional[str]) -> Tuple[str, dict]:
-        """按 ``task_type`` 过滤 —— 它就是**原始 ``task_catalog_code``**，等值匹配。
+        """按 ``task_type`` 过滤 —— 2026-10-23 起它就是**编排定义 ID**，等值匹配。
 
-        ``task_type`` 不做归一：M1 的筛选项直接给出原始 ``task_catalog_code``，
-        T2/T3/T4 必须用同一取值等值匹配。曾把 4 个内置码折叠成同一个档位，
-        导致前端拿 M1 给的码来筛这里，恒为空集。
+        以前 ``task_type`` 是 ``task_catalog_code``（内置任务目录码）。目录这一层
+        删除后，监控的「任务类型」改由编排定义承载：``tasks.definition_id`` 是建任务
+        时的快照，定义被删了也还在，所以历史任务照样筛得到。
+
+        ``task_type`` 不做归一：M1 的筛选项直接给出原始 ``definition_id``，
+        T2/T3/T4 必须用同一取值等值匹配。
         """
         if task_type is None:
             return "", {}
-        return " AND t.task_catalog_code = :task_type", {"task_type": task_type}
+        return " AND t.definition_id = :task_type", {"task_type": task_type}
 
     # ------------------------------------------------------------------
     # T1 · 统计卡（1 段）
@@ -115,13 +122,21 @@ class MonitorTaskRepository(BaseRepository):
     async def trend(
         self, start: datetime, end: datetime, bucket: str, task_type: Optional[str]
     ) -> List[dict]:
-        """T2 趋势分桶（``bucket`` 白名单 ``hour`` / ``day``，由 service 校验）。"""
+        """T2 趋势分桶（``bucket`` 白名单 ``5m`` / ``hour`` / ``day``，由 service 校验）。
+
+        ``hour`` / ``day`` 走 ``date_trunc``；``5m`` 走 ``date_bin``（对齐 5 分钟
+        网格，起点固定为 1970-01-01，naive 北京墙钟下与墙钟截断等价）。
+        """
         type_sql, type_params = self._type_filter(task_type)
         # created_at 是北京 naive ⇒ date_trunc 直接得到北京自然桶，勿加 AT TIME ZONE
+        if bucket == "5m":
+            bucket_expr = "date_bin(INTERVAL '5 minutes', t.created_at, TIMESTAMP '1970-01-01')"
+        else:
+            bucket_expr = f"date_trunc('{bucket}', t.created_at)"
         sql = sa_text(
             f"""
             SELECT
-                date_trunc('{bucket}', t.created_at)                             AS bucket_start,
+                {bucket_expr}                                                    AS bucket_start,
                 count(*)                                                         AS task_count,
                 (count(*) FILTER (WHERE t.status = 'completed'))::numeric
                   / NULLIF(count(*) FILTER (WHERE t.status IN ('completed', 'failed')), 0)
@@ -169,10 +184,13 @@ class MonitorTaskRepository(BaseRepository):
             SELECT
                 t.id                 AS task_id,
                 t.task_name          AS task_name,
-                t.task_catalog_code  AS task_catalog_code,
+                t.definition_id      AS task_type,
                 t.status             AS status,
                 t.error_message      AS error_message,
                 t.error_code         AS error_code,
+                -- 聚合外壳（aggregate_failed）的失败节点在 error_params.parts 里，
+                -- T3 的 reason 归并按零件判阶段，少了它只能按外壳猜（2026-10-23 修）
+                t.error_params       AS error_params,
                 t.finished_at        AS finished_at
             FROM task_center.tasks t
             WHERE {base_where}
@@ -194,12 +212,12 @@ class MonitorTaskRepository(BaseRepository):
     async def overview_parent(
         self, start: datetime, end: datetime, task_type: Optional[str]
     ) -> List[dict]:
-        """T4 父表：按**原始 ``task_catalog_code``**（别名 ``task_type``）分组。"""
+        """T4 父表：按**编排定义 ID**（``tasks.definition_id``，别名 ``task_type``）分组。"""
         type_sql, type_params = self._type_filter(task_type)
         sql = sa_text(
             f"""
             SELECT
-                t.task_catalog_code                                              AS task_type,
+                t.definition_id                                                  AS task_type,
                 count(*)                                                         AS total_count,
                 count(*) FILTER (WHERE t.status = 'running')                     AS running_count,
                 count(*) FILTER (WHERE t.status = 'pending')                     AS waiting_count,
@@ -227,17 +245,28 @@ class MonitorTaskRepository(BaseRepository):
     async def overview_stages(
         self, start: datetime, end: datetime, task_type: Optional[str]
     ) -> List[dict]:
-        """T4 子表：按 (原始 ``task_catalog_code``, step_code) 分组；``step_code`` 走白名单。"""
+        """T4 子表：按 (``tasks.definition_id``, step_code) 分组；``step_code`` 走白名单。"""
         type_sql, type_params = self._type_filter(task_type)
+        # 任务级重跑会**新插一套 subtasks**、旧 attempt 的行不软删 ⇒ 只按 task_id 关联会把
+        # 历次重跑的步骤一起算进计数/成功率/耗时。必须与 ``tasks.current_attempt`` 对齐，
+        # 才与任务中心 ``list_current_by_task`` 同口径；孤儿 subtask 由 INNER JOIN 静默排除。
         sql = sa_text(
             f"""
             SELECT
-                t.task_catalog_code                                              AS task_type,
+                t.definition_id                                                  AS task_type,
                 s.step_code                                                      AS stage_code,
                 MAX(s.subtask_name)                                              AS stage_name,
                 count(*)                                                         AS exec_count,
                 count(*) FILTER (WHERE s.status = 'running')                     AS running_count,
-                count(*) FILTER (WHERE s.status = 'pending')                     AS waiting_count,
+                -- 「等待中」只算父任务**还没结束**的 pending 步骤。父任务已终态
+                -- （completed/failed/stopped）时，剩下的 pending 步骤永远不会再执行
+                -- ——那是「未执行」，不是「在排队」。不判父任务会把这类僵尸行算进
+                -- 等待：2026-10-26 实测，解析失败任务的下游 compile 子任务永远 pending，
+                -- 概览显示「知识编译 · 等待中 1」，而任务中心「处理中」为空。
+                count(*) FILTER (
+                    WHERE s.status = 'pending'
+                      AND t.status IN ('pending', 'running')
+                )                                                                AS waiting_count,
                 count(*) FILTER (WHERE s.status IN ('failed', 'timeout'))        AS failed_count,
                 (count(*) FILTER (WHERE s.status = 'success'))::numeric
                   / NULLIF(
@@ -252,6 +281,10 @@ class MonitorTaskRepository(BaseRepository):
                 )::int                                                           AS avg_duration_ms
             FROM task_center.subtasks s
             JOIN task_center.tasks t ON t.id = s.task_id
+            JOIN task_center.task_attempts a
+              ON a.id = s.task_attempt_id
+             AND a.task_id = t.id
+             AND a.attempt = t.current_attempt
             WHERE t.created_at >= :start AND t.created_at < :end
               AND t.is_deleted = 0
               AND s.is_deleted = 0

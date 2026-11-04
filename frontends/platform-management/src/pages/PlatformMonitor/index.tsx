@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Button, DatePicker, Select, Tabs, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
@@ -13,7 +13,7 @@ import {
   toPmWindowChoice,
   type PmWindowChoice,
 } from '../../constants/platformMonitor';
-import { PM_TIME_PATTERN, PM_TIMEZONE, fmtPmInstant, fmtPmTime } from './time';
+import { PM_TIME_PATTERN, PM_TIMEZONE, fmtPmInstant } from './time';
 import type { PmTabKey, PmWindow } from './types';
 
 const { RangePicker } = DatePicker;
@@ -35,6 +35,7 @@ const defaultCustomRange = (): CustomRange => {
 import TaskMonitor from './TaskMonitor';
 import CallMonitor from './CallMonitor';
 import TokenMonitor from './TokenMonitor';
+import { useAutoRefresh } from './useAutoRefresh';
 import './index.scss';
 
 /**
@@ -109,15 +110,13 @@ export default function PlatformMonitor() {
   };
 
   // 刷新：递增一个计数进各页的取数依赖。不用时间戳 —— 那会让每次渲染都变、把取数打成死循环。
+  // refreshKey 只跟**定时刷新**，作为静默重取的信号（不亮 loading）；手动刷新单独计数：
+  // 对象清单最多翻 20 页，不该每 60 秒跟着重拉，手动点刷新时才重取（见 PmPaneProps）。
   const [refreshKey, setRefreshKey] = useState(0);
-  /** 页签回传的后端落库时刻；空串/缺失时退回本地取数时刻 */
-  const [asOf, setAsOf] = useState<string | null>(null);
-  const [loadedAt, setLoadedAt] = useState(() => new Date());
-  const handleLoaded = useCallback((nextAsOf?: string) => {
-    setLoadedAt(new Date());
-    // undefined = 这次取数没有 as-of 信息（如只刷了列表），保留上一份，免得被清成空
-    if (nextAsOf !== undefined) setAsOf(nextAsOf.trim() ? nextAsOf : null);
-  }, []);
+  const [manualRefreshKey, setManualRefreshKey] = useState(0);
+
+  // 停留在页面时每 60 秒自动重取当前可见页签的数据（后台标签页暂停）
+  const resetAutoRefresh = useAutoRefresh(() => setRefreshKey((key) => key + 1));
 
   const choice = choices[tab];
   const customRange = customRanges[tab];
@@ -131,6 +130,18 @@ export default function PlatformMonitor() {
     const [from, to] = customRange;
     return { preset: 'custom', from: from.toISOString(), to: to.toISOString() };
   }, [choice, customRange]);
+
+  /**
+   * 工具条「统计截至」的时刻：取**本次取数触发时**的客户端时间，而不是后端 `as_of`。
+   * 「当前等待任务」是实时快照，`as_of` 只是窗口内最新数据时间，两者不是一回事。
+   *
+   * 与取数同一组依赖：`refreshKey` 覆盖定时刷新、`manualRefreshKey` 覆盖手动刷新，
+   * `window` 覆盖时间窗变化，`tab` 覆盖页签切换（页签切走即卸载、回来重新取数）。
+   */
+  const [statsAsOf, setStatsAsOf] = useState(() => new Date());
+  useEffect(() => {
+    setStatsAsOf(new Date());
+  }, [refreshKey, manualRefreshKey, window, tab]);
 
   const handleCustomRange = (range: (Dayjs | null)[] | null) => {
     const [from, to] = range ?? [];
@@ -147,7 +158,7 @@ export default function PlatformMonitor() {
     writeWindow(tab, 'custom', [platformFrom, platformTo]);
   };
 
-  const panes = { window, refreshKey, onLoaded: handleLoaded };
+  const panes = { window, refreshKey, manualRefreshKey };
 
   return (
     <PageContent showCard={false}>
@@ -192,18 +203,20 @@ export default function PlatformMonitor() {
                   placeholder={[t('platformMonitor.window.start'), t('platformMonitor.window.end')]}
                 />
               ) : null}
-              <Button size="small" icon={<ReloadOutlined />} onClick={() => setRefreshKey((key) => key + 1)}>
+              <span className="yx-pm-auto-refresh">{t('platformMonitor.autoRefresh')}</span>
+              <span className="yx-pm-stats-asof">
+                {t('platformMonitor.statsAsOf', { time: fmtPmInstant(statsAsOf, PM_TIME_PATTERN.clock) })}
+              </span>
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                onClick={() => {
+                  setManualRefreshKey((key) => key + 1);
+                  resetAutoRefresh();
+                }}
+              >
                 {t('platformMonitor.refresh')}
               </Button>
-              <span className="yx-pm-updated-at">
-                {/* 后端 as_of 才是「数据截止到何时」；降级空壳没有它，才退回本地取数时刻。
-                    两者都按平台时区显示：任务族的时刻带 +08:00，浏览器在别的时区时会差一截 */}
-                {t('platformMonitor.updatedAt', {
-                  time: asOf
-                    ? (fmtPmTime(asOf, PM_TIME_PATTERN.clock) ?? '-')
-                    : fmtPmInstant(loadedAt, PM_TIME_PATTERN.clock),
-                })}
-              </span>
             </div>
           }
           items={[

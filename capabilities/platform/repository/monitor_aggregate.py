@@ -8,7 +8,10 @@
   换算成毫秒（``*_ms: int``）；空集 ``AVG`` 返 ``NULL``，不得兜底为 0。
 - 空集取值：计数类返 ``0``；比率 / 均值类返 ``null``（本仓以 ``None`` 表达，未取到不给 0）。
 - 正常模式（``metric_mode='logical'``）取 ``monitor.call_log``。
-- 降级模式（``metric_mode='degraded'``）取 ``monitor.call_attempt``。
+- 降级模式（``metric_mode='degraded'``）取**物理尝试 ∪ 无尝试的逻辑调用**：
+  ``monitor.call_log FULL OUTER JOIN monitor.call_attempt ON request_id``。每个
+  attempt 一行；没有 attempt 的 call_log 各计 1 行；有 call_attempt 无 call_log 的孤儿行仍保留。
+  状态 / 起止列取 ``COALESCE(attempt, call_log)``。
 - 降级触发判定 —— ``call_log.attempt_count`` 与 ``call_attempt`` 行数对账，
   ``unlinkable_rows > 0`` ⇒ 整次查询走降级公式。落在 :meth:`count_unlinkable_rows`
   与 :meth:`resolve_metric_mode`。
@@ -35,14 +38,17 @@
 ------------------------------------
 * ``monitor.call_log`` **无 ``object_type`` 列**：C2/C4 的「对象类型」列与 ``object_type``
   筛选无物理落点。这里改用既有 ``protocol`` 列**推导**对象类型
-  （见 :data:`OBJECT_TYPE_BY_PROTOCOL`）—— ``object_id`` 仍映射 ``target``（C9 按对象标识
-  寻址），但 ``object_type`` **不再是** ``target`` 的别名：筛选入参在 service 层换算成
-  ``protocol``；「对象类型」实际只出推导得到的 2 类。
-* 「外部依赖」与「开放能力」两页签（C1/C2 vs C3/C4）**无区分列**：物理列只有 ``target``
-  与 ``protocol``。本仓只提供 ``target`` / ``protocol`` 两个通用筛选，两页签的切分留给 service。
-* ``monitor.call_attempt`` **无 ``target`` / ``protocol`` / ``source`` 列**：降级模式下做
-  对象聚合（C2/C4/C9）时，本仓以 ``call_attempt LEFT JOIN call_log ON request_id`` 借用
-  这三列（LEFT JOIN 保证「N2 先于 N1 落库」的孤儿 attempt 不被漏计，计数仍走降级口径）。
+  （见 :data:`OBJECT_TYPE_BY_PROTOCOL`）—— ``object_id`` 是**对外对象标识**
+  ``COALESCE(mcp_tool, target)``（MCP 调用展示工具名，其余链路回落能力标识 / 模型名；
+  C9 按对象标识寻址），但 ``object_type`` **不再是**对象标识的别名：筛选入参在 service
+  层换算成 ``protocol``；「对象类型」实际出推导得到的 3 类（openai / invoke / mcp）。
+* 「外部依赖」与「开放能力」两页签（C1/C2 vs C3/C4）由 ``direction`` +
+  ``call_scope`` 共同切分：外部依赖 = ``outbound`` + ``external``，开放能力 =
+  ``inbound``。本仓只提供通用筛选，具体取值由 service 传入。
+* ``monitor.call_attempt`` **无对象标识 / ``protocol`` / ``source`` 列**：降级模式下做
+  对象聚合（对象列表与对象详情）时，本仓以 ``call_log FULL OUTER JOIN call_attempt ON request_id``
+  借用三列（含 ``mcp_tool``）。FULL JOIN 同时满足两件事：没有 call_attempt 的 call_log 不被漏计
+  （本次修复核心），「call_attempt 先于 call_log 落库」的孤儿 attempt 也不被漏计。
 """
 
 from datetime import datetime
@@ -61,16 +67,19 @@ _DENOMINATOR_STATUSES = ("success", "failed")
 #: 对象类型推导表：``monitor.call_log`` **无**
 #: ``object_type`` 列，用既有 ``protocol`` 列推导对象类型 ——
 #: ``openai`` ⇒ 「模型服务」（llm-gateway 出站把模型名写进 ``target``）、
-#: ``invoke`` ⇒ 「能力」（sidecar 把能力 ID 写进 ``target``）。
-#: 「外部服务 / 外部平台」本对应 ``mcp`` / ``http``，但这两个 protocol
-#: 在全后端**无任何采集写入方** ⇒ 实际只能出 2 类，不补空列。
+#: ``invoke`` ⇒ 「能力」（sidecar 把能力 ID 写进 ``target``）、
+#: ``mcp`` ⇒ 「MCP 工具」（MCP 链路把工具名写进 ``mcp_tool``，对象标识取
+#: ``COALESCE(mcp_tool, target)``）。``http`` 在全后端**无采集写入方** ⇒ 不出，
+#: 不补空列。故实际出 3 类。
 OBJECT_TYPE_BY_PROTOCOL: dict[str, str] = {
     "openai": "模型服务",
     "invoke": "能力",
+    "mcp": "MCP 工具",
 }
 
-#: 趋势桶粒度白名单（自然小时 / 自然日）。
-_BUCKETS = ("hour", "day")
+#: 趋势桶粒度白名单（5 分钟 / 自然小时 / 自然日）。
+#: ``5m`` 只有 service 层会补空桶；``hour`` / ``day`` 仍只返回有数据桶。
+_BUCKETS = ("5m", "hour", "day")
 
 #: 三族趋势统一按**北京自然时/日**切桶（固定口径，不读配置）。
 #: 平台设置里的 timezone 仅存不用，⛔ 不得作为配置源；固定常量，便于测试防回退。
@@ -111,24 +120,32 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         super().__init__(session)
 
     # ------------------------------------------------------------------
-    # 取数源：正常模式 = call_log，降级模式 = call_attempt（借 call_log 的对象列）
+    # 取数源：正常模式 = call_log；降级模式 = call_log FULL JOIN call_attempt
+    # （物理尝试 ∪ 无尝试的逻辑调用，并借 call_log 的对象列）
     # ------------------------------------------------------------------
 
     def _metric_columns(
         self, degraded: bool
     ) -> Tuple[Any, Any, Any, Any, Any, Any]:
-        """按模式返回 ``(status, started, ended, target, protocol, source)`` 六列。
+        """按模式返回 ``(status, started, ended, object_id, protocol, source)`` 六列。
 
         * 正常模式：六列全部来自 ``monitor.call_log``。
-        * 降级模式：计数 / 时间 / 状态取自 ``monitor.call_attempt``；
-          ``target`` / ``protocol`` / ``source`` **借用** ``monitor.call_log``（见 docstring 缺口条）。
+        * 降级模式：状态 / 起止取 ``COALESCE(attempt, call_log)`` —— 有 attempt
+          的调用按 attempt 行展开，没有 attempt 的 call_log 回落逻辑调用的状态与时间；
+          ``object_id`` / ``protocol`` / ``source`` **借用** ``monitor.call_log``
+          （见 docstring 缺口条）。
+
+        ``object_id`` 是**对外对象标识**，两种模式统一取
+        ``COALESCE(mcp_tool, target)``：MCP 调用显示工具名，其余链路回落
+        能力标识 / 模型名。降级模式下经 ``FULL OUTER JOIN call_log`` 借出这两列。
         """
+        object_id_col = func.coalesce(CallLog.mcp_tool, CallLog.target)
         if degraded:
             return (
-                CallAttempt.status,
-                CallAttempt.attempt_started_at,
-                CallAttempt.attempt_ended_at,
-                CallLog.target,
+                func.coalesce(CallAttempt.status, CallLog.final_status),
+                func.coalesce(CallAttempt.attempt_started_at, CallLog.logical_started_at),
+                func.coalesce(CallAttempt.attempt_ended_at, CallLog.final_ended_at),
+                object_id_col,
                 CallLog.protocol,
                 CallLog.source,
             )
@@ -136,17 +153,23 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             CallLog.final_status,
             CallLog.logical_started_at,
             CallLog.final_ended_at,
-            CallLog.target,
+            object_id_col,
             CallLog.protocol,
             CallLog.source,
         )
 
     @staticmethod
     def _apply_from(stmt: Any, degraded: bool) -> Any:
-        """降级模式下挂上 ``call_attempt LEFT JOIN call_log``；正常模式从 ``call_log`` 起。"""
+        """降级模式下挂上 ``call_log FULL OUTER JOIN call_attempt``；正常模式原样返回。
+
+        有效行集 = 物理尝试 ∪ 无尝试的逻辑调用：每个 attempt 一行，没有 attempt 的
+        call_log 行各计 1 行，孤儿 attempt（有 call_attempt 无 call_log）也保留。
+        """
         if degraded:
-            return stmt.select_from(CallAttempt).outerjoin(
-                CallLog, CallLog.request_id == CallAttempt.request_id
+            return stmt.select_from(CallLog).join(
+                CallAttempt,
+                CallAttempt.request_id == CallLog.request_id,
+                full=True,
             )
         return stmt
 
@@ -157,6 +180,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         to: datetime,
         *,
         direction: Optional[str] = None,
+        call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
         source: Optional[str] = None,
@@ -164,22 +188,32 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
     ) -> list[Any]:
         """统一构造 ``[start, to)`` + 可选筛选的 WHERE 条件列表。
 
+        ``target`` 入参按**对外对象标识**匹配（``COALESCE(mcp_tool, target)``），
+        与 C2/C4 分组、C5 对象筛选、C9 寻址同口径。
+
         ``direction`` 恒取 ``CallLog.direction``：正常模式本就从 ``call_log`` 起，
-        降级模式由 :meth:`_apply_from` 挂上了 ``call_attempt LEFT JOIN call_log``，
+        降级模式由 :meth:`_apply_from` 挂上了 ``call_log FULL OUTER JOIN call_attempt``，
         故两种模式下这一列都可达（``call_attempt`` 自身没有 ``direction``）。
+
+        ``call_scope`` 同取 ``CallLog.call_scope``（调用边界 external / internal /
+        open）。降级模式经同一个 FULL JOIN 可达，孤儿 attempt 该列为 NULL，自然
+        不命中任何取值 —— 与「NULL 不计入外部依赖」的口径一致。
         """
-        _, started, _, target_col, protocol_col, source_col = self._metric_columns(degraded)
+        _, started, _, object_id_col, protocol_col, source_col = self._metric_columns(degraded)
         conditions: list[Any] = [started >= start, started < to]
         if direction is not None:
             conditions.append(CallLog.direction == direction)
+        if call_scope is not None:
+            conditions.append(CallLog.call_scope == call_scope)
         if target is not None:
-            conditions.append(target_col == target)
+            conditions.append(object_id_col == target)
         if protocol is not None:
             conditions.append(protocol_col == protocol)
         if source is not None:
             conditions.append(source_col == source)
         if exclude_null_target:
-            conditions.append(target_col.isnot(None))
+            # 合并表达式为 NULL ⇔ mcp_tool 与 target 同时为空。
+            conditions.append(object_id_col.isnot(None))
         return conditions
 
     @staticmethod
@@ -235,15 +269,22 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         to: datetime,
         *,
         direction: Optional[str] = None,
+        call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
         degraded: bool = False,
     ) -> dict:
-        """C1 外部依赖 / C3 开放能力统计卡取数（正常模式取 call_log、降级模式取 call_attempt）。
+        """外部依赖 / 开放能力统计卡取数。
+
+        正常模式取 ``call_log``；降级模式取「物理尝试 ∪ 无尝试的逻辑调用」
+        （``call_log FULL OUTER JOIN call_attempt``）。
 
         ``direction`` 是两个页签的唯一分界（``outbound``=外部依赖 /
         ``inbound``=开放能力）—— ``monitor.call_log`` 没有 ``object_type`` 列，
         不靠它切，C1 与 C3 会返回同一组数字。
+
+        ``call_scope`` 进一步收窄「跨不跨平台边界」：外部依赖页只传
+        ``external``，把任务中心派活/回报等平台内部互调排除在外。
 
         返回：``total_calls`` / ``success_calls`` / ``failed_calls`` / ``success_rate`` /
         ``avg_latency_ms`` / ``as_of``。成功率由本仓按口径算好（分母 0 ⇒ ``None``），
@@ -259,7 +300,13 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         stmt = self._apply_from(stmt, degraded)
         stmt = stmt.where(
             *self._time_and_filters(
-                degraded, start, to, direction=direction, target=target, protocol=protocol
+                degraded,
+                start,
+                to,
+                direction=direction,
+                call_scope=call_scope,
+                target=target,
+                protocol=protocol,
             )
         )
         row = (await self.session.execute(stmt)).one()
@@ -288,6 +335,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         to: datetime,
         *,
         direction: Optional[str] = None,
+        call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
         degraded: bool = False,
@@ -297,16 +345,18 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """C2 / C4 对象列表取数，返回 ``(items, total)``。
 
         ``direction`` 同 :meth:`summary`：``outbound``=外部依赖(C2) / ``inbound``=开放能力(C4)。
+        ``call_scope`` 同 :meth:`summary`：外部依赖页固定传 ``external``。
 
-        分组键 = ``(target, protocol)``（``target`` 即对象标识 ``object_id``）。行内
-        ``object_type`` **由 ``protocol`` 推导**，不再是 ``target`` 别名。
+        分组键 = ``(对外对象标识, protocol)``；对外对象标识为
+        ``COALESCE(mcp_tool, target)``（``object_id``）。行内 ``object_type``
+        **由 ``protocol`` 推导**，不再是对象标识的别名。
         每项含调用量 / 成功率 / 平均响应时间 / 失败数 / 最近调用时间。
-        ``target`` 为 NULL 的行不进对象列表（NULL 不构成「对象」）。
-        排序：调用量倒序，再按 ``target`` 升序稳定排序（契约未规定，取稳定排序的常用默认）。
+        对象标识为 NULL 的行不进对象列表（NULL 不构成「对象」）。
+        排序：调用量倒序，再按对象标识升序稳定排序（契约未规定，取稳定排序的常用默认）。
         """
-        status, started, ended, target_col, protocol_col, _ = self._metric_columns(degraded)
+        status, started, ended, object_id_col, protocol_col, _ = self._metric_columns(degraded)
         select_cols = (
-            target_col.label("object_id"),
+            object_id_col.label("object_id"),
             protocol_col.label("protocol"),
             func.count().label("call_count"),
             func.count().filter(status == "success").label("success_calls"),
@@ -319,6 +369,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             start,
             to,
             direction=direction,
+            call_scope=call_scope,
             target=target,
             protocol=protocol,
             exclude_null_target=True,
@@ -328,17 +379,17 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         page_stmt = self._apply_from(page_stmt, degraded)
         page_stmt = (
             page_stmt.where(*base_conditions)
-            .group_by(target_col, protocol_col)
-            .order_by(func.count().desc(), target_col.asc())
+            .group_by(object_id_col, protocol_col)
+            .order_by(func.count().desc(), object_id_col.asc())
             .offset(offset)
             .limit(limit)
         )
         rows = (await self.session.execute(page_stmt)).all()
 
-        count_stmt = select(target_col, protocol_col)
+        count_stmt = select(object_id_col, protocol_col)
         count_stmt = self._apply_from(count_stmt, degraded)
         grouped = (
-            count_stmt.where(*base_conditions).group_by(target_col, protocol_col).subquery()
+            count_stmt.where(*base_conditions).group_by(object_id_col, protocol_col).subquery()
         )
         total = int(
             (await self.session.execute(select(func.count()).select_from(grouped))).scalar() or 0
@@ -347,8 +398,8 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         items = [
             {
                 "object_id": row.object_id,
-                # object_type 由 protocol 推导（不再是 target 别名）；
-                # 未知 protocol（mcp / http / NULL）⇒ None，由 service 兜空串。
+                # object_type 由 protocol 推导（不再是对象标识的别名）；
+                # 未知 protocol（http / NULL）⇒ None，由 service 兜空串。
                 "object_type": OBJECT_TYPE_BY_PROTOCOL.get(row.protocol),
                 "protocol": row.protocol,
                 "call_count": int(row.call_count or 0),
@@ -376,10 +427,11 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         target: Optional[str] = None,
         protocol: Optional[str] = None,
         direction: Optional[str] = None,
+        call_scope: Optional[str] = None,
         tz: str = _TZ,
         degraded: bool = False,
     ) -> list[dict]:
-        """C5 趋势取数：按 ``metric`` 与 ``bucket``（hour/day）分桶，返回桶序列。
+        """C5 趋势取数：按 ``metric`` 与 ``bucket``（5m/hour/day）分桶，返回桶序列。
 
         每个桶返回 ``{bucket_start, value, call_count, success_calls, failed_calls, avg_latency_ms}``；
         ``value`` 由 ``metric`` 决定，比率 / 均值在空集时为 ``None``。
@@ -390,7 +442,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """
         if bucket not in _BUCKETS:
             raise InvalidParameterError(
-                message="bucket 取值非法，仅支持 hour / day",
+                message="bucket 取值非法，仅支持 5m / hour / day",
                 details={"bucket": bucket, "allowed": list(_BUCKETS)},
             )
         if metric not in _METRICS:
@@ -400,7 +452,19 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             )
 
         status, started, ended, _, _, _ = self._metric_columns(degraded)
-        bucket_expr = func.timezone(tz, func.date_trunc(bucket, func.timezone(tz, started)))
+        if bucket == "5m":
+            # 5m：先转北京墙钟，按 UTC 1970 起点对齐 5 分钟网格，再转回 timestamptz。
+            # （北京 +8 是整小时偏移，不影响 5 分钟边界；输出仍由 service 转 UTC ``Z``。）
+            bucket_expr = func.timezone(
+                tz,
+                func.date_bin(
+                    sa_text("INTERVAL '5 minutes'"),
+                    func.timezone(tz, started),
+                    sa_text("TIMESTAMP '1970-01-01'"),
+                ),
+            )
+        else:
+            bucket_expr = func.timezone(tz, func.date_trunc(bucket, func.timezone(tz, started)))
         stmt = select(
             bucket_expr.label("bucket_start"),
             func.count().label("call_count"),
@@ -412,7 +476,13 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         stmt = (
             stmt.where(
                 *self._time_and_filters(
-                    degraded, start, to, target=target, protocol=protocol, direction=direction
+                    degraded,
+                    start,
+                    to,
+                    target=target,
+                    protocol=protocol,
+                    direction=direction,
+                    call_scope=call_scope,
                 )
             )
             .group_by(bucket_expr)
@@ -476,9 +546,12 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             return None
         base = items[0]
 
+        # 多取几倍候选：同一个人的历史形态（用户名 / 裸 id / user:<id>）在 SQL 里是
+        # 不同的 source 值，服务层按身份合并后才截断到 ``top_sources_limit``。
+        # 按原始值只取 limit 条会让合并后的条目不足、或漏掉落在截断外的形态。
         top_sources = await self._top_sources(
             start, to, object_id=object_id, protocol=protocol, degraded=degraded,
-            limit=top_sources_limit,
+            limit=max(top_sources_limit * 8, 50),
         )
         recent_failures = await self._recent_failures(
             start, to, object_id=object_id, protocol=protocol, degraded=degraded,
@@ -508,11 +581,18 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         degraded: bool,
         limit: int,
     ) -> list[dict]:
-        """来源 / 调用方 TOP N（每项 ``{name, call_count}``）。"""
-        _, started, _, target_col, protocol_col, source_col = self._metric_columns(degraded)
+        """来源 / 调用方 TOP N（每项 ``{name, call_count, tenant_ids}``）。
+
+        ``object_id`` 按对外对象标识筛选（见 :meth:`_time_and_filters`）。
+        ``name`` 是**原始 source**（展示层保持原值）；``tenant_ids`` 是该 source
+        出现过的租户集合（``array_agg(DISTINCT tenant_id)``），供 service 用
+        「该行租户」解析用户名并判定多租户歧义 —— 计数与排序不变。
+        """
+        _, _, _, _, _, source_col = self._metric_columns(degraded)
         stmt = select(
             source_col.label("name"),
             func.count().label("call_count"),
+            func.array_agg(func.distinct(CallLog.tenant_id)).label("tenant_ids"),
         )
         stmt = self._apply_from(stmt, degraded)
         stmt = (
@@ -527,7 +607,14 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             .limit(limit)
         )
         rows = (await self.session.execute(stmt)).all()
-        return [{"name": row.name, "call_count": int(row.call_count or 0)} for row in rows]
+        return [
+            {
+                "name": row.name,
+                "call_count": int(row.call_count or 0),
+                "tenant_ids": list(row.tenant_ids or []),
+            }
+            for row in rows
+        ]
 
     async def _recent_failures(
         self,
@@ -541,11 +628,21 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
     ) -> list[dict]:
         """最近失败调用（每项 ``{request_id, error_message, logical_started_at}``），按时间倒序。
 
-        降级模式取 ``call_attempt``（其 ``request_id`` 可重复、``attempt_started_at`` 顶替时间列）。
+        降级模式的有效行集是「物理尝试 ∪ 无尝试的逻辑调用」，故 ``request_id`` /
+        ``error_message`` 取 ``COALESCE(attempt, call_log)`` —— 有 attempt 的调用
+        request_id 可重复（按 attempt 行展开），没有 attempt 的失败 call_log 也能进榜。
         """
-        status, started, _, target_col, protocol_col, _ = self._metric_columns(degraded)
-        request_col = CallAttempt.request_id if degraded else CallLog.request_id
-        error_col = CallAttempt.error_message if degraded else CallLog.error_message
+        status, started, _, _, _, _ = self._metric_columns(degraded)
+        request_col = (
+            func.coalesce(CallAttempt.request_id, CallLog.request_id)
+            if degraded
+            else CallLog.request_id
+        )
+        error_col = (
+            func.coalesce(CallAttempt.error_message, CallLog.error_message)
+            if degraded
+            else CallLog.error_message
+        )
         conditions = self._time_and_filters(
             degraded, start, to, target=object_id, protocol=protocol
         )
@@ -586,19 +683,63 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         result = await self.session.execute(stmt)
         return [value for value in result.scalars().all() if value]
 
-    async def list_task_types(self, limit: int = 200) -> list[dict]:
-        """任务类型列表（M1 ``task_types``，取自 ``task_center.task_catalog``）。
+    async def list_call_source_tenants(self, limit: int = 200) -> list[dict]:
+        """``source`` → 出现过的租户集合（``call_source_options`` 用）。
 
-        每项 ``{"code", "name"}``：``code`` 是**筛选值**（= ``task_catalog_code``，
-        与 T2/T3/T4 的 ``task_type`` 同源，前端拿它直接筛）；``name`` 是**中文名**
-        （``task_catalog.name``，前端下拉直接显示，⛔ 前端不得本地写死）。
+        与 :meth:`list_call_sources` 同源、同序、同上限；额外带上
+        ``array_agg(DISTINCT tenant_id)``，供 service 按「该 source 的租户」
+        解析用户名 —— 多租户解析出不同名字时回退原值，绝不猜。
+        """
+        stmt = (
+            select(
+                CallLog.source.label("source"),
+                func.array_agg(func.distinct(CallLog.tenant_id)).label("tenant_ids"),
+            )
+            .where(CallLog.source.isnot(None))
+            .group_by(CallLog.source)
+            .order_by(CallLog.source.asc())
+            .limit(limit)
+        )
+        rows = (await self.session.execute(stmt)).all()
+        return [
+            {"source": row.source, "tenant_ids": list(row.tenant_ids or [])}
+            for row in rows
+            if row.source
+        ]
+
+    async def list_call_targets(self, limit: int = 200) -> list[str]:
+        """对外对象标识的 distinct 值（``call_targets``）。
+
+        口径与记录页目标列一致：``COALESCE(mcp_tool, target)``（MCP 工具名与
+        能力 ID / 模型名的并集），排除 NULL。
+        """
+        object_id_col = func.coalesce(CallLog.mcp_tool, CallLog.target)
+        stmt = (
+            select(object_id_col)
+            .where(object_id_col.isnot(None))
+            .distinct()
+            .order_by(object_id_col.asc())
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return [value for value in result.scalars().all() if value]
+
+    async def list_task_types(self, limit: int = 200) -> list[dict]:
+        """任务类型列表（M1 ``task_types``，取自 ``task_center.task_definitions``）。
+
+        每项 ``{"code", "name"}``：``code`` 是**筛选值**（= ``definition_id``，
+        与 T2/T3/T4 的 ``task_type`` 同源，前端拿它直接筛）；``name`` 是**定义名**
+        （前端下拉直接显示，⛔ 前端不得本地写死）。
+
+        ⚠️ 2026-10-23 起「任务类型」由**编排定义**承载：``task_catalog`` 表已删除，
+        一版定义就是一种任务。历史任务的 ``tasks.definition_id`` 是快照，
+        所以这里读定义表即可覆盖存量任务；已删除的定义不再出现在下拉里
+        （那些任务仍可在「全部」下看到）。
 
         ⚠️ 这是本仓**唯一**一处跨能力取数：``task_types`` 是「任务监控」页的筛选下拉，
-        数据不在 ``monitor`` 数据层，唯一的真值源是任务中心的内置任务清单表
-        （``capabilities/task_center/models/catalog.py`` 明写「平台预置、只读、不带租户」）。
+        数据不在 ``monitor`` 数据层，真值源是任务中心的编排定义表。
         这里取「直读字典表」而非新建跨服务调用链，避免为一张只读字典引入运行时耦合。
 
-        该表是**全局字典**、无 ``tenant_id``、无软删列，故同样不涉及租户过滤。
         ⚠️ platform 容器不含 ``capabilities/task_center/`` 代码（见
         ``deploy/docker/capability.Dockerfile``），禁止 import task_center ORM 模型
         ——容器内必抛 ``ModuleNotFoundError``。故同 ``mcp_service_repository.py`` 先例，
@@ -606,9 +747,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """
         result = await self.session.execute(
             sa_text("""
-                SELECT code, name
-                FROM task_center.task_catalog
-                ORDER BY code
+                SELECT id AS code, name
+                FROM task_center.task_definitions
+                WHERE is_deleted = 0
+                ORDER BY name
                 LIMIT :limit
             """),
             {"limit": limit},
@@ -619,8 +761,9 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """对象类型列表（M1 ``objects``，每项 ``{object_type, protocol}``）。
 
         ``object_type`` 由 ``protocol`` 推导（见 :data:`OBJECT_TYPE_BY_PROTOCOL`）
-        —— **不再**按 ``target`` 出「对象名」，故只保留有写入方的两个 protocol
-        （``openai`` / ``invoke``），出参收口为 2 类。
+        —— **不再**按 ``target`` 出「对象名」，故只保留有写入方的三个 protocol
+        （``openai`` / ``invoke`` / ``mcp``），出参收口为 3 类；``http`` 无写入方，
+        不会出现。
         ⚠️ 任务类型列表（``task_types``）与状态字典（``statuses``）落在 task_center 枚举，
         不由本仓提供。
         """
