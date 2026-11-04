@@ -319,11 +319,31 @@ class McpKeyService:
                 details={"unpublished_service_ids": sorted(unpublished)},
             )
 
+    async def _get_soft_deleted_service_ids(
+        self, tenant_id: str, service_ids: list[str]
+    ) -> set[str]:
+        """返回 service_ids 中**已软删**的领域服务 id 集合（跨 schema 查询）。
+
+        写侧合并用：软删服务的旧映射按原权限级别隐式保留，提交里新出现的软删
+        service id 直接丢弃。调用前统一 require_tenant。
+        """
+        tenant_id = require_tenant(tenant_id)
+        if not service_ids:
+            return set()
+        result = await self.session.execute(
+            sa_text(
+                "SELECT id FROM knowledge_base.services "
+                "WHERE tenant_id = :tid AND id = ANY(:ids) AND is_deleted = 1"
+            ),
+            {"tid": tenant_id, "ids": list(service_ids)},
+        )
+        return {row[0] for row in result.fetchall()}
+
     async def _build_idempotent_response(self, existing: McpKey) -> dict:
         """幂等命中：返回脱敏信息 + delivery_failed=True，无明文/mcp_config。"""
         dto = McpKeyResponse.from_orm(existing)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
-        mappings = await mapping_repo.get_mappings(existing.id)
+        mappings = await mapping_repo.get_active_mappings(existing.id)
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl} for sid, pl in mappings
         ]
@@ -506,15 +526,15 @@ class McpKeyService:
         """全量返回租户下所有 Key 元数据（含已撤销），不含 key_hash 和明文 Key。
 
         委托给 self.repo.list_by_tenant()，通过 McpKeyResponse.from_orm() 转换为 DTO。
-        批量查询 service_ids 映射，一次 SQL 避免 N+1。
+        批量查询映射（仅有效服务：INNER JOIN 过滤已软删服务），一次 SQL 避免 N+1。
         """
         tenant_id = require_tenant(tenant_id)
         keys = await self.repo.list_by_tenant(tenant_id)
 
-        # 批量查询 service_ids 映射
+        # 批量查询有效映射（软删服务不计入可调用/仅查看计数）
         mapping_repo = McpKeyServiceMappingRepository(self.session)
         key_ids = [k.id for k in keys]
-        mappings_map = await mapping_repo.get_mappings_batch(key_ids)
+        mappings_map = await mapping_repo.get_active_mappings_batch(key_ids)
 
         result = []
         for k in keys:
@@ -545,7 +565,7 @@ class McpKeyService:
             )
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
-        mappings = await mapping_repo.get_mappings(key_id)
+        mappings = await mapping_repo.get_active_mappings(key_id)
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings
@@ -652,10 +672,10 @@ class McpKeyService:
         except Exception:
             logger.warning("MCP Key 停用/启用审计日志写入失败（不阻塞业务）")
 
-        # 查询映射构建响应 DTO
+        # 查询有效映射构建响应 DTO（软删服务不可见）
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
-        mappings = await mapping_repo.get_mappings(key_id)
+        mappings = await mapping_repo.get_active_mappings(key_id)
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings
@@ -802,7 +822,8 @@ class McpKeyService:
         except Exception:
             logger.warning("MCP Key 重新创建审计日志写入失败（不阻塞业务）")
 
-        # 查询最终映射用于响应
+        # 查询最终映射用于响应。这里用 raw 是安全的：上面写入新 Key 的
+        # filtered_mappings 已按 is_deleted=0 过滤，入库结果本身就只含活跃服务。
         final_mappings = await mapping_repo.get_mappings(new_id)
         service_permissions_dicts = [
             {"service_id": sid, "permission_level": pl}
@@ -952,29 +973,64 @@ class McpKeyService:
 
         await self.session.flush()
 
-        # service_permissions 全量替换（set_mappings）
+        # service_permissions 全量替换（set_mappings）—— 写侧合并软删服务的旧绑定。
+        # GET 已隐藏软删服务，前端提交的列表里不会出现它们；若此处直接 delete-then-insert，
+        # 管理员改个名字保存一次就会永久丢掉这些绑定。与 RBAC / KB 成员同口径：
+        # 「GET 隐藏 + 写侧按旧 permission_level 隐式保留（不借提交提权）」。
         if req.service_permissions is not None:
             mapping_repo = McpKeyServiceMappingRepository(self.session)
-            mappings = [
+            # 写侧口径：旧绑定是全量 raw（含软删服务）
+            old_raw = await mapping_repo.get_mappings(key_id)
+            old_levels = dict(old_raw)
+            submitted = [
                 (item.service_id, item.permission_level)
                 for item in req.service_permissions
             ]
-            new_sids = [sid for sid, _pl in mappings]
-            if new_sids and key.space_id:
-                await self._validate_service_ids_in_space(
-                    tenant_id, key.space_id, new_sids
-                )
-            await self._validate_service_publish(tenant_id, new_sids)
-            await mapping_repo.set_mappings(key_id, mappings)
+            candidate_sids = list(
+                {*old_levels.keys(), *(sid for sid, _pl in submitted)}
+            )
+            soft_deleted_sids = await self._get_soft_deleted_service_ids(
+                tenant_id, candidate_sids
+            )
 
-        # 最终态复查：更新后 Key 至少需保留一个已发布服务授权或写入授权
+            merged: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for sid, pl in submitted:
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                if sid in soft_deleted_sids:
+                    # 软删服务：只有旧绑定存在时才保留，且一律沿用旧级别（防提权）；
+                    # 旧绑定中没有 → 直接丢弃，不得新授权已删服务
+                    if sid in old_levels:
+                        merged.append((sid, old_levels[sid]))
+                else:
+                    # 提交中的活跃服务 → 用客户端传入的级别
+                    merged.append((sid, pl))
+            # 旧绑定中属于软删服务、但本次未提交的 → 按旧级别追加保留
+            for sid, pl in old_raw:
+                if sid in soft_deleted_sids and sid not in seen:
+                    seen.add(sid)
+                    merged.append((sid, pl))
+
+            # 空间/发布校验只覆盖合并结果中的「活跃」service id（软删服务跳过）
+            active_sids = [
+                sid for sid, _pl in merged if sid not in soft_deleted_sids
+            ]
+            if active_sids and key.space_id:
+                await self._validate_service_ids_in_space(
+                    tenant_id, key.space_id, active_sids
+                )
+            await self._validate_service_publish(tenant_id, active_sids)
+            await mapping_repo.set_mappings(key_id, merged)
+
+        # 最终态复查：更新后 Key 至少需保留一个服务授权或写入授权。
+        # 按库中最终态（raw）计算：保留的软删服务映射仍计为绑定（与 KB 空间级联
+        # 按 final 计算同口径），否则「唯一映射被软删」的 Key 改名字都会被拒。
         final_write_grants = key.write_grants
-        if req.service_permissions is not None:
-            final_service_permissions = req.service_permissions
-        else:
-            final_service_permissions = await McpKeyServiceMappingRepository(
-                self.session
-            ).get_mappings(key_id)
+        final_service_permissions = await McpKeyServiceMappingRepository(
+            self.session
+        ).get_mappings(key_id)
         if not final_write_grants and not final_service_permissions:
             raise InvalidParameterError(
                 message="更新后 Key 至少需保留一个已发布服务授权（service_permissions）或写入授权（write_grants）",
@@ -1000,10 +1056,10 @@ class McpKeyService:
         except Exception:
             logger.warning("MCP Key 更新审计日志写入失败（不阻塞业务）")
 
-        # 构建响应 DTO（含 service_permissions 查询）
+        # 构建响应 DTO（仅有效 service_permissions；软删服务对 GET 不可见）
         dto = McpKeyResponse.from_orm(key)
         mapping_repo = McpKeyServiceMappingRepository(self.session)
-        mappings = await mapping_repo.get_mappings(key_id)
+        mappings = await mapping_repo.get_active_mappings(key_id)
         dto.service_permissions = [
             {"service_id": sid, "permission_level": pl}
             for sid, pl in mappings

@@ -31,5 +31,7 @@ class McpServicePublish(Base):
     tool = Column(String(128))
     tool_description = Column(Text)
     service_type = Column(String(32), nullable=False, default="domain")
+    # 服务级最近调用时间：MCP 工具调用时由 mcp_server 写入
+    last_call_at = Column(TIMESTAMP(timezone=True))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, default=func.now())
     updated_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())

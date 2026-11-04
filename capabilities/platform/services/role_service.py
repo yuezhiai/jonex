@@ -229,4 +229,6 @@ class RoleService:
             raise ResourceNotFoundError(
             message=translate("err.role.not_found", params={"role_id": str(role_id)}, fallback=f"角色不存在: {role_id}")
         )  # 原消息: 角色不存在: {role_id}
-        return list(await self.user_role_repo.get_users_for_role(tenant_id, role_id))
+        # 弹窗只展示未被软删的用户；软删用户保留绑定（复活后角色要恢复），
+        # 故用 join users 过滤 is_deleted=0 的查询，而非删绑定。
+        return list(await self.user_role_repo.get_active_users_for_role(tenant_id, role_id))

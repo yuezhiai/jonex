@@ -311,8 +311,13 @@ class AuthService:
           每次登录**一次都不查**（否则每次登录都卡在 KEYCLOAK_TIMEOUT 上）。
         - 解析失败一律留空、**不阻断登录**（上游不可用不能变成平台登录不可用）。
 
-        IdP 字段映射：display_name/email 来自 id_token 的 name/email claim，仅在其非空时
-        写入（「IdP 为准的 refresh，空不覆盖」），用于补齐存量影子用户缺失的展示名/邮箱。
+        IdP 字段映射（三源权威：IdP 只负责认证身份，主数据源负责资料字段）：
+        - 存量用户：display_name/email 仅在本地为空（None/空串）时用 id_token 的
+          name/email 补齐，**不覆盖非空值**。否则登录会把主数据源给的展示名改写成
+          Keycloak 的 first+last 拼接名（如 ``kkone`` → ``kkone kkone``），随后身份同步
+          再改回并把这笔伪变更计入 user_updated。
+        - 新建影子用户：display_name 取 ``preferred_username``（回调层已回落为 ``sub``，
+          不会为空），不再使用 IdP ``name``；email 维持取 id_token email，为空则留空。
 
         并发兜底：新建 flush 若触发 (tenant_id, external_id) 唯一约束冲突（IntegrityError），
         回滚后重查 external_id 返回已存在用户，不裸抛数据库异常。
@@ -323,10 +328,11 @@ class AuthService:
 
         existing = await self.user_repo.get_by_external_id(tenant_id, external_id)
         if existing is not None:
-            # 存量影子用户（已建号）补字段：仅非空覆盖，空不抹掉已有值。
-            if display_name:
+            # 存量影子用户（已建号）补字段：只补空值，不覆盖非空。主数据源才是资料权威；
+            # IdP 的 name 是 first+last 拼接名，覆盖后会与同步互相拉扯。
+            if display_name and not existing.display_name:
                 existing.display_name = display_name
-            if email:
+            if email and not existing.email:
                 existing.email = email
             # 锚点为空的存量账号顺手补写；非空 ⇒ 一次都不出站（绝大多数登录走这条）。
             if existing.upstream_subject is None:
@@ -384,9 +390,10 @@ class AuthService:
                 )
             by_username.upstream_subject = by_username.upstream_subject or resolved
             by_username.external_id = external_id  # 换 sub
-            if display_name:
+            # 与 external_id 命中分支同口径：资料字段只补空值，不覆盖非空。
+            if display_name and not by_username.display_name:
                 by_username.display_name = display_name
-            if email:
+            if email and not by_username.email:
                 by_username.email = email
             await self.session.flush()
             return by_username
@@ -410,7 +417,9 @@ class AuthService:
             password_hash=None,
             role="user",
             status=1,
-            display_name=display_name,
+            # 新用户展示名取账号标识，不用 IdP name：主数据源同步前也能与登录名一致，
+            # 且避免 first+last 拼接名在列表里显示成「New User - q47rik user_q47rik」。
+            display_name=preferred_username,
             email=email,
         )
         self.session.add(user)
@@ -1644,15 +1653,21 @@ class AuthService:
         )
 
     async def end_impersonation(self, current_user: dict) -> None:
-        """退出模拟态：仅记审计，无服务端状态。"""
+        """退出模拟态：仅记审计，无服务端状态。
+
+        ``current_user["token_expired"]`` 由 ``/impersonate/end`` 专用依赖注入：
+        到期自动退出时 access token 已失效，宽限期内仍允许调用本方法，审计动作
+        记 ``impersonate_expired``；token 仍有效（手动退出）记 ``impersonate_end``。
+        """
         if not current_user.get("impersonated"):
             raise NotImpersonatedError()
 
         original_tenant_id = require_tenant(current_user.get("original_tenant_id"))
         target_tenant_id = require_tenant(current_user["tenant_id"])
+        action = "impersonate_expired" if current_user.get("token_expired") else "impersonate_end"
 
         await self._record_impersonation_audit(
-            "impersonate_end",
+            action,
             original_tenant_id,
             target_tenant_id,
             original_tenant_id,

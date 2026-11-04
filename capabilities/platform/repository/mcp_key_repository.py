@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, update, delete
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.models.mcp_key import McpKey, McpKeyServiceMapping
@@ -112,7 +113,13 @@ class McpKeyServiceMappingRepository:
         self.session = session
 
     async def get_mappings(self, key_id: str) -> list[tuple[str, str]]:
-        """查询某个 MCP Key 关联的所有 (service_id, permission_level) 对。"""
+        """查询某个 MCP Key 关联的**全量** (service_id, permission_level) 对。
+
+        ⚠️ 不过滤 knowledge_base.services 的软删状态 —— 这是「写侧」口径：
+        映射指向的服务被软删后行仍保留（服务复活/恢复授权依赖它）。全量替换
+        （set_mappings）前的旧值读取、空间变更校验、最终态计算必须用本方法。
+        对外响应构造请用 get_active_mappings（GET 隐藏软删服务）。
+        """
         result = await self.session.execute(
             select(
                 McpKeyServiceMapping.service_id,
@@ -123,14 +130,56 @@ class McpKeyServiceMappingRepository:
         )
         return [(row[0], row[1]) for row in result.all()]
 
-    async def get_service_ids(self, key_id: str) -> list[str]:
-        """查询某个 MCP Key 关联的所有 service_id（向后兼容）。"""
+    async def get_active_mappings(self, key_id: str) -> list[tuple[str, str]]:
+        """查询某个 MCP Key 关联的**有效** (service_id, permission_level) 对。
+
+        跨 schema INNER JOIN knowledge_base.services 且要求 s.is_deleted = 0：
+        - 服务被软删 → 映射行仍在库中，但不再构成有效授权，响应/计数不可见；
+        - 映射指向不存在的服务 → 同样无效（INNER JOIN 语义，与 RBAC
+          get_active_role_ids 一致）。
+
+        ⚠️ platform 容器不含 knowledge_base 代码，跨 schema 只读必须用 sa_text。
+        """
         result = await self.session.execute(
-            select(McpKeyServiceMapping.service_id).where(
-                McpKeyServiceMapping.mcp_key_id == key_id,
-            )
+            sa_text(
+                """
+                SELECT m.mcp_key_id, m.service_id, m.permission_level
+                  FROM platform.mcp_key_service_mappings m
+                  JOIN knowledge_base.services s
+                    ON s.id = m.service_id AND s.is_deleted = 0
+                 WHERE m.mcp_key_id = :key_id
+                """
+            ),
+            {"key_id": key_id},
         )
-        return [row[0] for row in result.all()]
+        return [(row[1], row[2]) for row in result.fetchall()]
+
+    async def get_active_mappings_batch(
+        self, key_ids: list[str]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """批量查询多个 MCP Key 的**有效** (service_id, permission_level) 对。
+
+        语义同 get_active_mappings（INNER JOIN knowledge_base.services 过滤软删）。
+        返回结构保证包含所有入参 key（无有效映射 → 空列表）。
+        """
+        if not key_ids:
+            return {}
+        result = await self.session.execute(
+            sa_text(
+                """
+                SELECT m.mcp_key_id, m.service_id, m.permission_level
+                  FROM platform.mcp_key_service_mappings m
+                  JOIN knowledge_base.services s
+                    ON s.id = m.service_id AND s.is_deleted = 0
+                 WHERE m.mcp_key_id = ANY(:key_ids)
+                """
+            ),
+            {"key_ids": list(key_ids)},
+        )
+        mapping: dict[str, list[tuple[str, str]]] = {k: [] for k in key_ids}
+        for row in result.fetchall():
+            mapping.setdefault(row[0], []).append((row[1], row[2]))
+        return mapping
 
     async def get_mcp_key_ids(self, service_id: str) -> list[str]:
         """按 Service 查询关联的所有 mcp_key_id（给 B2 前端筛选用）。"""
@@ -144,7 +193,10 @@ class McpKeyServiceMappingRepository:
     async def get_mappings_batch(
         self, key_ids: list[str]
     ) -> dict[str, list[tuple[str, str]]]:
-        """批量查询：一次 SQL 获取所有 key 的 (service_id, permission_level)。"""
+        """批量查询**全量** (service_id, permission_level)（不过滤软删服务）。
+
+        ⚠️ 写侧口径，与 get_active_mappings_batch 相对；对外响应构造请用 active 版本。
+        """
         if not key_ids:
             return {}
         result = await self.session.execute(
@@ -157,21 +209,6 @@ class McpKeyServiceMappingRepository:
         mapping: dict[str, list[tuple[str, str]]] = {k: [] for k in key_ids}
         for row in result.all():
             mapping.setdefault(row[0], []).append((row[1], row[2]))
-        return mapping
-
-    async def get_service_ids_batch(self, key_ids: list[str]) -> dict[str, list[str]]:
-        """批量查询 service_ids（向后兼容）。"""
-        if not key_ids:
-            return {}
-        result = await self.session.execute(
-            select(
-                McpKeyServiceMapping.mcp_key_id,
-                McpKeyServiceMapping.service_id,
-            ).where(McpKeyServiceMapping.mcp_key_id.in_(key_ids))
-        )
-        mapping: dict[str, list[str]] = {k: [] for k in key_ids}
-        for row in result.all():
-            mapping.setdefault(row[0], []).append(row[1])
         return mapping
 
     async def set_mappings(

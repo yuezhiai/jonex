@@ -15,7 +15,7 @@ class AuditLog(TenantMixin, TimestampMixin, Base):
     ip = Column(String(64))
     action = Column(String(64), nullable=False)
     resource = Column(String(128))
-    resource_id = Column(String(64))
+    resource_id = Column(String(255))
     status_code = Column(SmallInteger)
     duration_ms = Column(BigInteger)
     request_params = Column(JSONB)

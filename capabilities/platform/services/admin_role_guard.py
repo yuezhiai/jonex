@@ -18,7 +18,7 @@ D4 有三条入口，都必须守住，否则约束形同虚设：
 import logging
 from typing import Iterable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from jonex_core.common.exceptions import PermissionDeniedError
@@ -26,6 +26,7 @@ from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
 from capabilities.platform.models.permission import Permission
+from capabilities.platform.models.role import Role
 from capabilities.platform.models.role_permission import RolePermission
 
 logger = logging.getLogger(__name__)
@@ -48,8 +49,19 @@ async def find_admin_role_ids(
     if not ids:
         return []
 
+    # join roles 并过滤软删：角色删除只置 roles.is_deleted=1，绑定行保留。
+    # 不 join 的话，一个已删除的「租户管理员」角色仍会被当成管理员判据，
+    # 让「最后管理员」保护误判（例如错误阻止停用唯一真正在岗的管理员）。
     result = await session.execute(
         select(RolePermission.role_id)
+        .join(
+            Role,
+            and_(
+                Role.id == RolePermission.role_id,
+                Role.tenant_id == RolePermission.tenant_id,
+                Role.is_deleted == 0,
+            ),
+        )
         .join(Permission, Permission.id == RolePermission.permission_id)
         .where(
             RolePermission.tenant_id == tenant_id,

@@ -292,12 +292,14 @@ class UserService:
             raise ResourceNotFoundError(
             message=translate("err.user.not_found", params={"user_id": str(user_id)}, fallback=f"用户不存在: {user_id}")
         )  # 原消息: 用户不存在: {user_id}
-        return list(await self.user_role_repo.get_role_ids(tenant_id, user_id))
+        # 只返回未软删角色：软删角色的绑定会保留（可恢复），但不应出现在编辑弹窗里，
+        # 否则前端显示裸 id，保存时又因「角色不存在」整次失败。
+        return list(await self.user_role_repo.get_active_role_ids(tenant_id, user_id))
 
     async def get_role_names(self, tenant_id: str, user_id: int) -> list[str]:
         """用户角色名列表（登录/JWT 用）。"""
         tenant_id = require_tenant(tenant_id)
-        role_ids = list(await self.user_role_repo.get_role_ids(tenant_id, user_id))
+        role_ids = list(await self.user_role_repo.get_active_role_ids(tenant_id, user_id))
         if not role_ids:
             return []
         from sqlalchemy import select

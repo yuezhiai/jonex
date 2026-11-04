@@ -127,7 +127,8 @@ class McpServiceService:
             is_published=True,
             published_at=None,
             published_by=None,
-            last_call_at=None,
+            # 系统写服务同样由 MCP 工具调用打点（mcp_server 归因到固定 service_id）
+            last_call_at=getattr(row, "last_call_at", None),
             created_at=row.created_at,
             tool=SYSTEM_SERVICE_TOOL,
             tool_description=SYSTEM_SERVICE_DESCRIPTION,
@@ -215,6 +216,7 @@ class McpServiceService:
                     published_by=row.get("published_by"),
                     stopped_at=row.get("stopped_at"),
                     stopped_by=row.get("stopped_by"),
+                    last_call_at=row.get("last_call_at"),
                     created_at=row.get("created_at"),
                     tool=row.get("tool"),
                     tool_description=row.get("tool_description"),

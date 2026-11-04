@@ -55,6 +55,7 @@ _SERVICE_BASE_SQL = """
         p.tool,
         p.tool_description,
         p.service_type,
+        p.last_call_at,
         sp.name AS space_name
     FROM knowledge_base.services s
     LEFT JOIN LATERAL (

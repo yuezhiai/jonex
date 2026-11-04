@@ -24,7 +24,10 @@ from jonex_core.integrations.keycloak_oidc import (
     sanitize_oidc_error_value,
 )
 from jonex_core.security.permission import require_permission
-from jonex_core.security.user_auth import get_current_user
+from jonex_core.security.user_auth import (
+    get_current_user,
+    get_current_user_for_impersonation_end,
+)
 from capabilities.platform.auth.auth_service import AuthService, build_sso_error_url
 from capabilities.platform.dtos.auth import (
     LoginRequest,
@@ -421,8 +424,11 @@ async def impersonate(
 @router.post("/impersonate/end")
 async def impersonate_end(
     db=Depends(get_db),
-    current: dict = Depends(get_current_user),
+    current: dict = Depends(get_current_user_for_impersonation_end),
 ):
+    # 专用依赖：到期自动退出时 access token 已失效，仅本端点接受「模拟态 +
+    # 宽限期内过期」的 token（见 UserAuth.decode_impersonation_end_token）。
+    # 服务层据此区分审计动作 impersonate_expired / impersonate_end。
     svc = AuthService(db)
     await svc.end_impersonation(current)
     # 清「模拟态标记」cookie（现有行为与 body 不变）：还原后原租户续期重新合法。

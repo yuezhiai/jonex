@@ -89,18 +89,11 @@ class PlatformCapability(BaseCapability):
         except Exception:
             logger.exception("AuditLogSink 启动失败")
 
-        # 调用明细采集写口（monitor.call_log / monitor.call_attempt）。
-        # 同 AuditLogSink 的理由：采集是旁路，起不来绝不能拖垮 platform 本体。
-        # 采集器住在共享内核（jonex_core/common/monitor_collector.py），各采集方各自起一份。
-        try:
-            from jonex_core.common.monitor_collector import get_monitor_collector
-            get_monitor_collector().start()
-            logger.info("MonitorCollector 已启动")
-        except Exception:
-            logger.exception("MonitorCollector 启动失败（不影响平台功能）")
+        # 调用明细采集器（MonitorCollector）由 deploy/start_capability.py 的 lifespan
+        # 统一启动/停止 —— 本能力不再自己启动，避免两处生命周期漂移。
 
         # 企业身份集成「自动同步」调度器（闹钟 + 电池）：扫到期租户 → CAS 抢占 → 发起同步。
-        # ⚠️ **必须 try/except 包住**：`deploy/start_capability.py:98` 是裸的
+        # ⚠️ **必须 try/except 包住**：`deploy/start_capability.py` 的 lifespan 是裸的
         # `await capability.initialize()`，抛出即能力起不来 —— 而 platform 是认证关键
         # 服务（登录 / 刷新 / SSO 都走它），**自动同步起不来绝不能拖垮登录**。
         # 失败只丢一行 ERROR，调度器不跑而已（用户可继续用「立即同步」手动触发）。
@@ -146,8 +139,33 @@ class PlatformCapability(BaseCapability):
         except Exception:
             logger.exception("MonitorRetentionScheduler 启动失败（不影响平台功能）")
 
+        # attempt_count 周期对账调度器：call_log / call_attempt 跨进程写事务
+        # 重叠时互相不可见，批内补正双双落空，由本调度器把最近窗口的
+        # attempt_count 收敛到 call_attempt 实际行数。同上用 try/except 兜住 ——
+        # 对账起不来不能拖垮认证关键服务；``interval <= 0`` 时 start 返回 None，
+        # 即显式关闭。
+        try:
+            from capabilities.platform.services.monitor_attempt_reconciler import (
+                start_scheduler as start_monitor_attempt_reconciler,
+            )
+            monitor_attempt_reconciler = await start_monitor_attempt_reconciler()
+            if monitor_attempt_reconciler is None:
+                logger.info(
+                    "MonitorAttemptReconcileScheduler 已关闭"
+                    "（MONITOR_ATTEMPT_RECONCILE_INTERVAL_SECONDS<=0）"
+                )
+            else:
+                logger.info("MonitorAttemptReconcileScheduler 已启动")
+        except Exception:
+            logger.exception(
+                "MonitorAttemptReconcileScheduler 启动失败（不影响平台功能）"
+            )
+
     async def shutdown(self) -> None:
-        """停止审计日志 sink，flush 剩余条目；停自动同步调度器"""
+        """停止审计日志 sink，flush 剩余条目；停自动同步调度器
+
+        调用明细采集器由 deploy/start_capability.py 在本 shutdown() 返回后统一停止。
+        """
         try:
             from capabilities.platform.services.audit_log_sink import get_audit_log_sink
             sink = get_audit_log_sink()
@@ -155,13 +173,6 @@ class PlatformCapability(BaseCapability):
             logger.info("AuditLogSink 已停止")
         except Exception:
             logger.exception("AuditLogSink 停止失败")
-
-        try:
-            from jonex_core.common.monitor_collector import get_monitor_collector
-            await get_monitor_collector().stop()
-            logger.info("MonitorCollector 已停止")
-        except Exception:
-            logger.exception("MonitorCollector 停止失败")
 
         try:
             from capabilities.platform.services.identity_sync_scheduler import stop_scheduler
@@ -178,6 +189,15 @@ class PlatformCapability(BaseCapability):
             logger.info("MonitorRetentionScheduler 已停止")
         except Exception:
             logger.exception("MonitorRetentionScheduler 停止失败")
+
+        try:
+            from capabilities.platform.services.monitor_attempt_reconciler import (
+                stop_scheduler as stop_monitor_attempt_reconciler,
+            )
+            await stop_monitor_attempt_reconciler()
+            logger.info("MonitorAttemptReconcileScheduler 已停止")
+        except Exception:
+            logger.exception("MonitorAttemptReconcileScheduler 停止失败")
 
         try:
             from capabilities.platform.services.audit_retention_scheduler import (
