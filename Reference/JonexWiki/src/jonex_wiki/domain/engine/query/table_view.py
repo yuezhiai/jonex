@@ -1,14 +1,13 @@
 """Deterministic display of Markdown cells; never an answer or new citation.
 
-Column indexes and explicit empty cells are retained. Date serials are decoded
-only in a column-header row paired with weekday labels, not in arbitrary data.
+Column indexes, source-order data rows and explicit empty cells are retained.
+A Markdown display cannot prove extra header tiers or spreadsheet date epochs.
 """
 from __future__ import annotations
 
 import re
 import hashlib
-from datetime import datetime, timedelta
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Iterable
 
 
@@ -33,32 +32,12 @@ def table_view(text: str) -> list[dict]:
             return
         header = rows[:separator]
         data = rows[separator + 1:]
-        # Explicit repeated leading labels distinguish an Office header tier
-        # from ordinary values. Preserve both parent and leaf labels.
-        while data and len(header[0]) >= 3 and all(header[0][:2]) and data[0][:2] == header[0][:2] and data[0] != header[0]:
-            header.append(data.pop(0))
-        # Office exports often put an instructional tier above the real field
-        # names.  An explicit sequence field is structural evidence; it must
-        # not become a counted business row merely because its first labels do
-        # not repeat the instructional text.
-        while data and any(cell.strip() in {'序号', '编号'} for cell in data[0]):
-            header.append(data.pop(0))
-        # A secondary calendar header is data-shaped but explicitly contains
-        # weekdays or Excel date serials and blank leading row-label columns.
-        while data and not any(data[0][:2]) and (
-            any(re.fullmatch(r'星期[一二三四五六日天]', c) for c in data[0]) or
-            any(re.fullmatch(r'[345]\d{4}(?:\.0)?', c) for c in data[0])
-        ):
-            header.append(data.pop(0))
+        # GFM declares headers before its separator. Data values cannot prove
+        # extra header tiers; native formats provide that structure separately.
         width = max(map(len, rows))
         labels = []
-        calendar = any(re.fullmatch(r'星期[一二三四五六日天]', c) for row in header for c in row)
         for column in range(width):
             parts = list(dict.fromkeys(row[column] for row in header if column < len(row) and row[column]))
-            if calendar:
-                for part in list(parts):
-                    if re.fullmatch(r'[345]\d{4}(?:\.0)?', part):
-                        parts.append((datetime(1899, 12, 30) + timedelta(days=int(float(part)))).date().isoformat())
             labels.append({'index': column, 'labels': parts})
         raw_header = [list(row) for row in header]
         header_key = hashlib.sha256(repr(raw_header).encode('utf-8')).hexdigest()[:16]
@@ -89,7 +68,7 @@ _QUESTION_NOISE = {
 
 
 def _question_terms(question: str) -> set[str]:
-    compact = re.sub(r'\s+', '', question).casefold()
+    compact = question.casefold()
     chunks = re.findall(r'[A-Za-z]+\d*|\d+(?:\.\d+)?%?|[\u4e00-\u9fff]+', compact)
     terms = set()
     for chunk in chunks:
@@ -113,118 +92,96 @@ def table_analysis_records(
     records: Iterable[Any], question: str, *, max_documents: int = 2,
     max_columns: int = 4, max_values: int = 32,
 ) -> list[dict]:
-    """Aggregate question-relevant table statistics across passage fragments.
+    """Bounded statistics for each literal display fragment, never merged tables.
 
-    Rows are deduplicated by their source passage and exact cells. Statistics
-    stay within one document and column index, preventing unrelated tables from
-    being mixed while allowing a large table split across passages to be counted.
+    Matching column positions or labels cannot establish table identity or
+    prove that two passages contain disjoint rows. Native whole-table execution
+    belongs to the verified structured executor instead.
     """
     terms = _question_terms(question)
-    grouped: dict[tuple[str, int], dict[str, Any]] = {}
-    document_scores: Counter[str] = Counter()
-    document_rows: dict[str, set[tuple[str, tuple[str, ...]]]] = defaultdict(set)
+    candidates = []
     for record in records:
-        document_id = str(getattr(record, 'document_id', ''))
-        passage_id = str(getattr(record, 'passage_id', ''))
-        excerpt = str(getattr(record, 'excerpt', ''))
-        for view in table_view(excerpt):
-            rows = view['rows']
-            for row in rows:
-                document_rows[document_id].add((passage_id, tuple(row['cells'])))
+        document = str(getattr(record, 'document_id', ''))
+        passage = str(getattr(record, 'passage_id', ''))
+        for ordinal, view in enumerate(table_view(str(getattr(record, 'excerpt', '')))):
+            scored = []
             for column in view['columns']:
                 index = column['index']
-                labels = [str(value) for value in column['labels']]
-                values = [row['cells'][index] if index < len(row['cells']) else '' for row in rows]
-                label_hits = _maximal_hits(terms, '/'.join(labels).casefold())
+                values = [row['cells'][index] if index < len(row['cells']) else '' for row in view['rows']]
+                hits = _maximal_hits(terms, '/'.join(column['labels']).casefold())
                 value_hits = _maximal_hits(terms, '\n'.join(values).casefold())
-                score = sum(len(term) ** 2 for term in label_hits) * 4 + sum(len(term) ** 2 for term in value_hits)
-                if not score:
-                    continue
-                key = (document_id, index)
-                entry = grouped.setdefault(key, {'labels': [], 'hits': set(), 'score': 0})
-                entry['labels'] = list(dict.fromkeys(entry['labels'] + labels))
-                entry['hits'].update(label_hits + value_hits)
-                entry['score'] += score
-                document_scores[document_id] += score
-
-    selected_documents = {doc for doc, _ in document_scores.most_common(max_documents)}
+                score = sum(len(term) ** 2 for term in hits) * 4 + sum(len(term) ** 2 for term in value_hits)
+                if score:
+                    scored.append((score, index, column, values, hits + value_hits))
+            chosen = sorted(scored, key=lambda item: (-item[0], item[1]))[:max_columns]
+            if not chosen:
+                continue
+            profiles = []
+            for score, index, column, values, hits in chosen:
+                counts = Counter(value for value in values if value)
+                profiles.append({'index': index, 'labels': column['labels'],
+                    'matched_question_terms': sorted(set(hits), key=lambda value: (-len(value), value))[:12],
+                    'non_empty_count': sum(counts.values()), 'distinct_count': len(counts),
+                    'value_counts': [{'value': value[:160], 'count': count} for value, count in counts.most_common(max_values)]})
+            indexes = [item[1] for item in chosen]
+            joint = Counter(tuple(row['cells'][i] if i < len(row['cells']) else '' for i in indexes) for row in view['rows'])
+            candidates.append((sum(item[0] for item in chosen), {
+                'document_id': document, 'passage_id': passage, 'table_ordinal': ordinal,
+                'aggregation_scope': 'this_display_fragment_only', 'row_count': len(view['rows']),
+                'question_conditions': 'not_interpreted', 'column_profiles': profiles,
+                'joint_counts': [{'values': [{'index': i, 'value': value[:160]} for i, value in zip(indexes, key)], 'count': count}
+                    for key, count in joint.most_common(max_values)]}))
+    selected_documents = []
     output = []
-    for document_id in selected_documents:
-        columns = sorted(
-            ((data['score'], index, data) for (doc, index), data in grouped.items() if doc == document_id),
-            key=lambda item: (-item[0], item[1]),
-        )[:max_columns]
-        if not columns:
-            continue
-        indexes = [index for _, index, _ in columns]
-        rows = sorted(document_rows[document_id])
-        profiles = []
-        for _score, index, data in columns:
-            counts = Counter(cells[index] for _, cells in rows if index < len(cells) and cells[index])
-            profiles.append({
-                'index': index, 'labels': data['labels'],
-                'matched_question_terms': sorted(data['hits'], key=lambda value: (-len(value), value))[:12],
-                'non_empty_count': sum(counts.values()), 'distinct_count': len(counts),
-                'value_counts': [
-                    {'value': value[:160], 'count': count}
-                    for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:max_values]
-                ],
-            })
-        joint = Counter(
-            tuple(cells[index] if index < len(cells) else '' for index in indexes)
-            for _, cells in rows
-        )
-        output.append({
-            'document_id': document_id, 'row_count': len(rows),
-            'column_profiles': profiles,
-            'joint_counts': [
-                {'values': [{'index': index, 'value': value[:160]} for index, value in zip(indexes, key)], 'count': count}
-                for key, count in sorted(joint.items(), key=lambda item: (-item[1], item[0]))[:max_values]
-            ],
-        })
-    return sorted(output, key=lambda item: (-document_scores[item['document_id']], item['document_id']))
+    for _, item in sorted(candidates, key=lambda item: -item[0]):
+        document = item['document_id']
+        if document not in selected_documents:
+            if len(selected_documents) >= max_documents:
+                continue
+            selected_documents.append(document)
+        output.append(item)
+        if len(output) >= max(1, max_documents) * 4:
+            break
+    return output
 
 
-def table_projection(text: str, question: str, *, max_rows: int = 64) -> list[dict]:
-    """Return one compact table representation without duplicating Markdown."""
-    terms = _question_terms(question)
-    dates = {
-        '-{:02d}-{:02d}'.format(int(month), int(day))
-        for month, day in re.findall(r'(\d{1,2})月(\d{1,2})日', question)
-    }
+def table_projection(text: str, question: str, *, max_rows: int = 64,
+                     max_columns: int = 32) -> list[dict]:
+    """Display bounded source-order cells without interpreting question filters.
+
+    Both row and column omissions are measured against the original grid.
+    Display coverage is not question-condition coverage.
+    """
+    if (type(max_rows) is not int or type(max_columns) is not int
+            or max_rows < 1 or max_columns < 1):
+        raise ValueError("TABLE_PROJECTION_LIMIT_INVALID")
     output = []
-    meal_alias = {'早': '早餐', '中': '午餐', '晚': '晚餐'}
     for view in table_view(text):
-        columns = view['columns']
-        relevant = []
-        for column in columns:
-            label = '/'.join(column['labels']).casefold()
-            if _maximal_hits(terms, label) or any(date in label for date in dates):
-                relevant.append(column['index'])
-        row_matches = []
-        for row in view['rows']:
-            cells = row['cells']
-            row_key = '/'.join(meal_alias.get(value, value) for value in cells[:2]).casefold()
-            if _maximal_hits(terms, row_key):
-                row_matches.append(row)
-        indexes = sorted(set(range(min(5, len(columns)))) | set(relevant))
-        rows = row_matches or view['rows']
-        if not indexes or not rows:
+        columns, rows = view['columns'], view['rows']
+        if not columns or not rows:
             continue
+        selected_columns = columns[:max_columns]
+        selected_rows = rows[:max_rows]
         output.append({
             'section': view['section'],
             'columns': [
-                {'index': index, 'header_sequence': columns[index]['labels']}
-                for index in indexes
+                {'index': column['index'], 'header_sequence': column['labels']}
+                for column in selected_columns
             ],
             'rows': [
                 {'row': row['row'], 'cells': [
-                    {'index': index, 'value': (row['cells'][index] if index < len(row['cells']) else '')[:240]}
-                    for index in indexes
-                ]}
-                for row in rows[:max_rows]
+                    {'index': column['index'], 'value': (
+                        row['cells'][column['index']] if column['index'] < len(row['cells']) else '')[:240]}
+                    for column in selected_columns
+                ]} for row in selected_rows
             ],
-            'rows_omitted': max(0, len(rows) - max_rows),
+            'selection': 'source_order_no_question_filter',
+            'source_row_count': len(rows), 'source_column_count': len(columns),
+            'rows_omitted': len(rows) - len(selected_rows),
+            'columns_omitted': len(columns) - len(selected_columns),
+            'values_truncated': any(len(value) > 240 for row in selected_rows
+                for value in row['cells'][:max_columns]),
+            'question_conditions': 'not_interpreted',
         })
     return output
 

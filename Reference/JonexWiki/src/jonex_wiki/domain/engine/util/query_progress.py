@@ -4,10 +4,20 @@ from itertools import islice
 
 def tool_progress_details(args, *, pages=(), views=()):
     detail = {}
-    for key in ("query", "table_id", "operation"):
+    for key in ("query", "table_id", "operation", "literal", "field_id"):
         value = args.get(key)
         if isinstance(value, str) and value:
             detail[key] = value[:300]
+    # table_read 的定位信息藏在 scope / raw_scope 里，顶层没有 table_id/range。
+    scope = args.get("scope") or args.get("raw_scope")
+    if isinstance(scope, dict):
+        table_id = scope.get("table_id")
+        if "table_id" not in detail and isinstance(table_id, str) and table_id:
+            detail["table_id"] = table_id[:300]
+        row_start, row_end = scope.get("row_start"), scope.get("row_end")
+        if isinstance(row_start, int) and isinstance(row_end, int) \
+                and not isinstance(row_start, bool) and not isinstance(row_end, bool):
+            detail["rows"] = [row_start, row_end]
     paths = args.get("paths")
     if isinstance(paths, list):
         detail["paths"] = [path[:300] for path in islice(paths, 3) if isinstance(path, str)]

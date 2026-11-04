@@ -99,13 +99,18 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
     async def runner(row, *, start: float, input_restart_count: int,
                      previous_candidate=None) -> None:
         tenant_id, kb_id = row.tenant_id, row.kb_id
+        # [jonex] P3b（方案 B）：模型是**任务建立时**的快照，随任务行一起来。
+        # 空串 = 建任务时没带 ⇒ build() 回落部署 env。两次 build 读的都是这一个值，
+        # 所以「编译开始」与「发布前复核」不可能拿到不同模型。
+        compile_model = str((row.summary or {}).get("compile_model") or "")
         cancel = CancelPortAdapter(executor, row.task_id) if executor else None
         if cancel:
             cancel.raise_if_cancelled()
 
         # 1) manifest + 源文档快照（短 session；resolve_prompt 需要 session）
         async with layout.version_lock(tenant_id, kb_id), session_factory() as s:
-            manifest = await manifest_builder.build(s, tenant_id=tenant_id, kb_id=kb_id)
+            manifest = await manifest_builder.build(
+                s, tenant_id=tenant_id, kb_id=kb_id, compile_model=compile_model)
             docs = await DocumentRepo().list_parsed_for_compile(s, tenant_id, kb_id)
             has_sources = bool(docs)
             # compile_main = 固定骨架(COMPILE_MAIN_SKELETON) + 用户「编译偏好」suffix。
@@ -190,7 +195,8 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
         async with layout.publication_lock(tenant_id, kb_id, wait_resume):
             async with session_factory() as s:
                 latest_docs = await DocumentRepo().list_parsed_for_compile(s, tenant_id, kb_id)
-                latest_manifest = await manifest_builder.build(s, tenant_id=tenant_id, kb_id=kb_id)
+                latest_manifest = await manifest_builder.build(
+                    s, tenant_id=tenant_id, kb_id=kb_id, compile_model=compile_model)
                 latest_prompt = await resolve_prompt(s, tenant_id, kb_id, "compile_main")
             latest_suffix = (latest_prompt.template or "").strip()
             latest_effective_prompt = COMPILE_MAIN_SKELETON + (
@@ -228,7 +234,8 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
         if executor is not None and not reused_unchanged:
             async with session_factory() as s:
                 outline_task = await TaskRepo().create(
-                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.outline)
+                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.outline,
+                    compile_model=compile_model)
                 await s.commit()
             executor.submit(outline_task)
 

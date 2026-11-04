@@ -16,7 +16,9 @@ class QueryProgressAdapter:
 
     def record(self, event):
         self.seq += 1
-        fields = ("type", "title", "tool", "started_at", "duration_ms")
+        # result_summary 只承载计数（"12 hit(s)" / "status=complete; cells=24"），
+        # 与 details 一样是可公开的结果摘要；补进来后流式的「返回」不必等终态。
+        fields = ("type", "title", "tool", "started_at", "duration_ms", "result_summary")
         row = {k: event[k][:300] if isinstance(event[k], str) else event[k]
                for k in fields if event.get(k) is not None}
         row.setdefault("started_at", datetime.now(timezone.utc).isoformat())

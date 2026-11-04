@@ -146,7 +146,12 @@ class OutlineService:
 
     async def draft(self, tenant_id: str, kb_id: str, request: dict,
                     *, user_id: Optional[str] = None) -> dict:
-        """LLM 起草目录并落库（覆盖旧 active 行，决策 4：人工「重新生成」无条件覆盖）。"""
+        """LLM 起草目录并落库（覆盖旧 active 行，决策 4：人工「重新生成」无条件覆盖）。
+
+        ``request["model"]`` = 平台在发起时给的编译模型（方案 B：不读引擎侧配置）。
+        空/缺失 ⇒ 不传 model，由 GwClient 走部署默认链；自动起草由 outline 任务把
+        编译任务里那份快照原样带进来（见 `domain/outline/task.py`）。
+        """
         model = (request or {}).get("model")
         extra_instruction = (request or {}).get("extra_instruction")
         unclassified_title = (request or {}).get("unclassified_title")

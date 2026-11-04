@@ -1,3 +1,12 @@
+"""解析任务：跑 parser → 投影 SourceArtifact → 落 ``gen-N/source_artifacts.jsonl``。
+
+⚠️ 本文件是**编排**，不在 ``identity.PARSE_RULE_SOURCES``（解析规则清单）里 ——
+所以它改了不会让历史产物失效。因此：**凡是改动到产物内容/shape 的修改（往
+``source_metadata`` 加字段、改序列化、改组装顺序），必须把
+``identity.PARSE_OUTPUT_VERSION`` +1**，否则旧产物会被当成新的用。规则见
+``identity.py`` 文件头。
+"""
+
 import asyncio
 import json
 import logging
@@ -158,10 +167,15 @@ def create_parse_runner(session_factory, settings, layout: Layout, mineru, execu
             parser_version = result.parser_version or _PARSER_VERSIONS[parser_id]
             result.reading_materials = await asyncio.to_thread(prepare_reading_materials, result)
             artifacts = result.to_source_artifacts(content_generation=new_gen)
-            from jonex_wiki.domain.parsing.identity import parse_input_signature
+            from jonex_wiki.domain.parsing.identity import (
+                parse_input_components, parse_input_signature)
             parse_signature = parse_input_signature(settings)
+            # 分量摘要一并落盘：产物过期时 parse_status 才能说清「哪一项变了」，
+            # 而不是笼统的「解析规则已变化」。
+            parse_components = parse_input_components(settings)
             for artifact in artifacts:
                 artifact.source_metadata["parse_input_signature"] = parse_signature
+                artifact.source_metadata["parse_input_components"] = parse_components
             await asyncio.to_thread(_write_artifacts, layout, tenant_id, kb_id,
                                     meta.document_id, new_gen, artifacts)
 
@@ -212,8 +226,12 @@ def create_parse_runner(session_factory, settings, layout: Layout, mineru, execu
                             TaskRow.kind == TaskKind.compile.value,
                             TaskRow.status == "queued"))).scalars().first()
                         if existing is None:
-                            task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
-                                                           kind=TaskKind.compile)
+                            # [jonex] P3b（方案 B）：解析任务带着编译模型下来
+                            # （平台发起解析时给的值），原样沿给编译任务；没带就是空
+                            # ⇒ 编译走部署 env。
+                            task = await TaskRepo().create(
+                                s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile,
+                                compile_model=str((row.summary or {}).get("compile_model") or ""))
                             await s.commit()
                             executor.submit(task)
                         else:

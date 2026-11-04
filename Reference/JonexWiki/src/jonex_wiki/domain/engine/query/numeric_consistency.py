@@ -62,13 +62,6 @@ _ENGLISH_PERIOD_BEFORE = re.compile(
     r'fiscal|fy|year|period|quarter|q[1-4])\s*)$', re.I)
 _ENGLISH_PERIOD_AFTER = re.compile(
     r'\s*(?:fiscal year|fy|year ended|year|period|quarter|q[1-4]|ended)\b', re.I)
-#: Dated-metric labels: "the 2018 balance", "2019 revenue".  The literal dates
-#: the metric rather than asserting a value, so it stays a locator; a bare
-#: number followed by punctuation or a handle does not.
-_YEAR_ADJECTIVE_AFTER = re.compile(
-    r'\s+(?:balance|balances|revenue|revenues|sales|income|earnings|assets|'
-    r'liabilities|equity|cash|expenses?|costs?|profit|loss|results?|figures?|'
-    r'statements?|data|report|annual|comparative|period|quarter|end)\b', re.I)
 
 
 def locator_kind(literal: str, text: str, start: int, end: int) -> Optional[str]:
@@ -83,7 +76,8 @@ def locator_kind(literal: str, text: str, start: int, end: int) -> Optional[str]
     value even when it is a plausible year ("2022 百万美元" is money).  A bare
     four-digit literal in the year range is *not* a locator on its own: only an
     explicit date/period label (``2018 年``, ``FY2018``, ``in 2018``, a date
-    form, a dated-metric label such as ``2018 balance``) types it as one.
+    form) types it as one. An industry metric name alone cannot establish that
+    an adjacent four-digit number is a date rather than a measured value.
     """
     text = text or ""
     # The claim scanner keeps a trailing grouping comma in the literal
@@ -119,8 +113,7 @@ def locator_kind(literal: str, text: str, start: int, end: int) -> Optional[str]
             return None
         if (_FISCAL_AFTER.match(after) or _FISCAL_BEFORE.search(before)
                 or _ENGLISH_PERIOD_AFTER.match(after)
-                or _ENGLISH_PERIOD_BEFORE.search(before)
-                or _YEAR_ADJECTIVE_AFTER.match(after)):
+                or _ENGLISH_PERIOD_BEFORE.search(before)):
             return 'period'
         # Being a four-digit number in the year range is a shape, not a period.
         # "The balance is 2018 [E99]." states a value and has to be checked;

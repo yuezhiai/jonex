@@ -2,9 +2,8 @@
 
 Extracted verbatim from ``engines/llm_wiki_plus/query_algorithm.py``: the
 FTS5 index over knowledge pages, BM25 lexical search, snippet and
-passage machinery, deterministic query decomposition markers, and the
-query-corpus builder.  Pure with respect to the environment: only ``ModelPort``
-(optional LLM rerank) is called; no provider, network,
+passage machinery and the
+query-corpus builder. No provider, network,
 filesystem, storage or database access happens here beyond the in-memory
 SQLite FTS index.  The old import path stays available through the re-export
 shim.
@@ -21,7 +20,6 @@ import sqlite3
 import sys
 import time
 from collections import OrderedDict, defaultdict
-from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from jonex_wiki.domain.engine.compile.rendering import render_wiki_tree
@@ -56,20 +54,6 @@ def _bounded_preview(text: str, limit: int = TABLE_PREVIEW_LIMIT) -> tuple[str, 
     return encoded[:limit].decode("utf-8", errors="ignore"), True
 
 
-
-
-
-
-def _llm_rerank_min_candidates() -> int:
-    """LLM rerank minimum pool size, read through the legacy module namespace."""
-
-    from jonex_wiki.domain.engine.query.algorithm import (
-        LLM_RERANK_MIN_CANDIDATES as _impl,
-    )
-
-    return _impl
-
-
 def _segmenter_available() -> bool:
     """Delegate to the shim so ``query_algorithm._segmenter_available`` patches
     (e.g. tests simulating a jieba-less environment) stay effective."""
@@ -97,16 +81,8 @@ logger = logging.getLogger(__name__)
 from jonex_wiki.domain.engine.models.query_models import (
     QueryCorpus,
     RawWikiPage,
-    RerankResponse,
     SearchHit,
 )
-from jonex_wiki.domain.engine.util.model_io import (
-    _SpanBuilder,
-    _merge_usage,
-    _model_complete,
-    _record_model_span,
-)
-from jonex_wiki.kernel.ports import ModelPort
 from jonex_wiki.kernel.telemetry import (
     current_runtime_telemetry,
     telemetry_stage,
@@ -145,24 +121,6 @@ QUERY_SNIPPET_ENV = "QUERY_SNIPPET"
 # anywhere in the page.
 PASSAGE_MAX_CHARS = 600
 
-# Wave 3 P3: optional LLM rerank.  When enabled, up to ``LLM_RERANK_POOL``
-# search hits are compressed by one bounded model call to ``LLM_RERANK_KEEP``
-# paths while preserving distinct documents.  Default off; ``QUERY_LLM_RERANK=on``
-# enables it for a strict A/B.
-QUERY_LLM_RERANK_ENV = "QUERY_LLM_RERANK"
-LLM_RERANK_POOL = 24
-LLM_RERANK_KEEP = 10
-
-# Wave 3 P3b: deterministic diversity rerank (MMR-style).  The optional LLM
-# rerank compresses the hybrid pool with a diversity constraint, but its value
-# may come from the diversity compression rather than the LLM judgment.  This
-# zero-cost variant greedily keeps ``LLM_RERANK_KEEP`` pages balancing rank
-# score against novelty (token-overlap dissimilarity), so the two mechanisms
-# can be A/B'd independently.  Default off; ``QUERY_DIVERSITY_RERANK=on``.
-QUERY_DIVERSITY_RERANK_ENV = "QUERY_DIVERSITY_RERANK"
-DIVERSITY_RERANK_ALPHA = 0.6
-
-
 def _env_int(name: str, default: int) -> int:
     """Read a positive integer env override, falling back to ``default``."""
     raw = current_env().get(name, "")
@@ -172,28 +130,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _llm_rerank_enabled() -> bool:
-    raw = current_env().get(QUERY_LLM_RERANK_ENV, "off").strip().casefold()
-    return raw not in ("0", "off", "false", "no")
-
-
-def _diversity_rerank_enabled() -> bool:
-    raw = current_env().get(QUERY_DIVERSITY_RERANK_ENV, "off").strip().casefold()
-    return raw not in ("0", "off", "false", "no")
-
-
 def _max_search_hits() -> int:
     """Read the search-hit cap override (default ``MAX_SEARCH_HITS``)."""
     return _env_int(MAX_SEARCH_HITS_ENV, MAX_SEARCH_HITS)
-
-
-QUERY_DECOMPOSE_MULTIHOP_ENV = "QUERY_DECOMPOSE_MULTIHOP"
-
-
-def _multihop_decomposition_enabled() -> bool:
-    """Whether nested single-question decomposition is enabled."""
-    raw = current_env().get(QUERY_DECOMPOSE_MULTIHOP_ENV, "on").strip().casefold()
-    return raw not in ("0", "off", "false", "no")
 
 
 def _snippet_enabled() -> bool:
@@ -205,17 +144,6 @@ def _snippet_enabled() -> bool:
     return raw not in ("0", "off", "false", "no")
 
 
-
-
-
-
-
-
-
-
-
-
-
 FTS5_UNAVAILABLE = "FTS5_UNAVAILABLE"
 
 
@@ -225,39 +153,6 @@ FTS5_UNAVAILABLE = "FTS5_UNAVAILABLE"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]")
 
-
-# Wave 3 P1.1: deterministic composite-question markers.  A question is
-# composite when it contains a comparative marker, a clause conjunction, or two
-# or more distinct question words.  Single questions are left untouched so
-# decomposition costs nothing for them.
-_COMPOSITE_CONJUNCTIONS = (
-    " and ", " or ", " plus ", " 和 ", " 与 ", " 以及 ", " 同时 ",
-    " 或者 ", " 或 ",
-)
-_COMPOSITE_COMPARATIVES = (
-    "compare", "comparison", "difference", "differ", "between", " vs ",
-    " 对比 ", " 比较 ", " 区别 ", " 差异 ", " 不同之处 ",
-)
-_COMPOSITE_QUESTION_WORDS = (
-    "who", "what", "when", "where", "why", "how", "which",
-    "谁", "什么", "何时", "哪里", "为什么", "怎么", "如何", "哪些", "哪个",
-)
-
-# Wave 6 (W6-1): multi-hop single-question markers.  A single question that
-# nests an entity chain ("Who is the spouse of the X's Y?", "What A is B of C?")
-# is multi-hop: answering it needs the bridge entity (X) to be resolved before
-# the target (spouse).  The deterministic composite check misses these (one
-# question word, no conjunction), so musique 2-hop questions never decompose.
-# This is part of the default controller path.  It is deliberately bounded to
-# nested entity-chain syntax so ordinary single-hop questions still skip the
-# planner call.
-_MULTIHOP_ENTITY_OF = re.compile(
-    r"(who|what|when|where|which|how|谁|什么|何时|哪里|哪个|哪些|怎么)"
-    r"(?=.{5,100}(?:spouse|owner|parent|child|author|director|performer|team|company|"
-    r"territorial entity|league|plays? in|that|whose|配偶|子女|丈夫|妻子|母公司|所属|所在))"
-    r".{5,100}(?:\bof\b|\bthat\b|\bwhose\b|'s|的)",
-    re.IGNORECASE,
-)
 
 # Wave 3 P1.2: soft question phrasing and filler tokens dropped by the
 # deterministic empty-search rewrite so the re-search targets the content
@@ -272,48 +167,6 @@ _QUERY_STOPWORDS = frozenset({
     "如何", "为什么", "谁", "哪些", "哪个", "请问", "一下", "这个", "那个",
     "这些", "那些",
 })
-
-
-def _is_composite_question(question: str) -> bool:
-    """Deterministically decide whether a question is composite (multi-clause).
-
-    A question is composite when it contains a comparative marker, a clause
-    conjunction, or two or more distinct question words.  Single questions are
-    left untouched so decomposition costs nothing for them.
-    """
-    q = question.strip()
-    if not q:
-        return False
-    lowered = " " + q.casefold() + " "
-    for marker in _COMPOSITE_COMPARATIVES:
-        if marker in lowered:
-            return True
-    for marker in _COMPOSITE_CONJUNCTIONS:
-        if marker in lowered:
-            return True
-    hits = sum(1 for w in _COMPOSITE_QUESTION_WORDS if w in lowered)
-    return hits >= 2
-
-
-def _is_multihop_single_question(question: str) -> bool:
-    """Detect a single-question entity chain (multi-hop) deterministically.
-
-    Matches the musique 2-hop shape: exactly one question word, then an entity
-    chain ``X of the Y's Z`` / ``X of Y`` / ``X 的 Y``.  Examples that must hit:
-    - "Who is the spouse of the Green performer?"  (spouse of X → X=Green album)
-    - "What administrative territorial entity is the owner of Ciudad Deportiva?"
-    - "What league does the team that plays in Stadio Ciro Vigorito play for?"
-    The composite check deliberately misses these (single question word, no
-    conjunction); this heuristic catches the nested-entity shape only when the
-    multihop A/B switch is on, so normal single-hop questions are untouched.
-    """
-    q = question.strip()
-    if not q:
-        return False
-    if _is_composite_question(q):
-        return False  # composite already handled by the existing path
-    # Require exactly one leading question word and an entity-chain marker.
-    return bool(_MULTIHOP_ENTITY_OF.match(q))
 
 
 def _rewrite_query_for_search(question: str) -> str:
@@ -902,12 +755,10 @@ def _fts_search(
                     (fts, _max_search_hits() * 8),
                 )
                 bm25_ranked = [(r[0], float(r[1])) for r in cur.fetchall()]
-                # Numeric OR terms can fill the whole pool with financial
+                # Numeric OR terms can fill the whole pool with unrelated
                 # tables. Add an independent bounded topic pool before ranking.
                 topic_terms = [t for t in _search_terms(query)
                                if len(t) > 1 and not any(c.isdigit() for c in t)]
-                if any(t in query for t in ("早餐", "午餐", "晚餐", "菜品", "菜谱")):
-                    topic_terms.extend(["菜单", "早", "午", "晚"])
                 if topic_terms:
                     topic_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in topic_terms)
                     extra = conn.execute(
@@ -919,8 +770,8 @@ def _fts_search(
     except Exception:
         raise ValueError(FTS5_UNAVAILABLE)
 
-    # FTS uses OR so a short page matching only a common word (such as
-    # "menu") can outrank the page that matches the month, day and meal.
+    # FTS uses OR so a short page matching only a common word can outrank
+    # a page matching several distinct literal query terms.
     # Fetch a bounded wider pool and prefer distinct query-term coverage,
     # retaining BM25 as the tie-breaker.  This is deterministic and applies
     # to every lexical query, including numeric/date lookups.
@@ -931,30 +782,6 @@ def _fts_search(
             else _search_material(corpus, path)
         )
         score = sum(1 for term in set(terms) if term.casefold() in segmented)
-        # Spreadsheet headings commonly spell a Chinese date as ``4.14``
-        # or as an Excel serial, while the question says ``4月14日``.  The
-        # source title still carries the month.  Preserve that structured
-        # signal and meal-row labels without changing the FTS vocabulary.
-        for month in re.findall(r"(?<!\d)(\d{1,2})月", query):
-            if re.search(rf"(?<!\d){re.escape(month)}月|(?<!\d){re.escape(month)}[./-]", haystack):
-                score += 6
-        for day in re.findall(r"(?<!\d)(\d{1,2})日", query):
-            if re.search(rf"[./-]0?{re.escape(day)}(?:\D|$)|(?<!\d){re.escape(day)}日", haystack):
-                score += 3
-        # A combined month/day match is much more selective than either
-        # number alone.  This promotes the correct weekly table above
-        # unrelated reports that happen to mention both values far apart.
-        for month, day in re.findall(
-            r"(?<!\d)(\d{1,2})月\s*(\d{1,2})日", query
-        ):
-            if re.search(
-                rf"(?<!\d)0?{re.escape(month)}(?:月|[./-])\s*0?{re.escape(day)}(?:日|\D|$)",
-                haystack,
-            ):
-                score += 20
-        for question_term, row_label in (("早餐", "早"), ("午餐", "午"), ("晚餐", "晚")):
-            if question_term in query and re.search(rf"\|\s*{row_label}\s*\|", haystack):
-                score += 2
         return score
     ordered = sorted(
         bm25_ranked,
@@ -1447,8 +1274,8 @@ def build_workbook_concept_page(
     skeleton and links every table it describes.
 
     Two properties are deliberate.  It is built from the **full** grid, never
-    from the bounded 20-row parser preview, which stops mid-table on every real
-    menu sheet and would drop whole sections while still looking complete.  And
+    from the bounded parser preview, which can stop mid-table and drop whole
+    sections while still looking complete.  And
     it carries **structure only** — never a cell value — so it cannot become a
     second and staler source of truth beside the grid it describes.
     """
@@ -1525,8 +1352,7 @@ def build_workbook_concept_page(
         "",
         "| 需要什么 | 用什么 |",
         "|---|---|",
-        "| 某天某餐段的具体菜名 | 打开对应表格页，按「日期 → 星期 → 列」定位列、",
-        "按「行分组结构」定位行范围 |",
+        "| 指定字段或位置的原始取值 | 打开对应表格页，核对表头路径、行列坐标与原始值；存在日期或行分组时再使用相应导航 |",
         "| 整本工作簿原文 | `wiki_read` 本来源的 workbook 视图（一次交付完整工作簿） |",
         "| 精确计数或求和 | 表格 status 为 `accepted` 时用 `table_read` + `table_compute` |",
         "",
@@ -1556,8 +1382,8 @@ def build_workbook_concept_page(
             "table_count": len(described),
         },
         fields=[],
-        why_visit="Orient here first: which column a date occupies and which row band a "
-                  "meal or section covers. Then read the linked table page for values.",
+        why_visit="Inspect the saved sheet/table inventory, header paths and source "
+                  "coordinates. Then read linked table pages for values and notes.",
         limitations=limitations,
         capabilities=capabilities,
         interpretation_status="accepted" if accepted else "partial",
@@ -1607,8 +1433,8 @@ def build_source_navigation_page(
     body = (
         "# {}\n\nSource ID: `{}`\n\nDocument: `{}`\n\n"
         "Source SHA256: `{}`\n\nParser: `{}`\n\nContent generation: `{}`\n\n"
-        "原始全文入口：`wiki_read(path=\"{}\")`（含该来源工作表全部原文，日期/星期/空白原样保留）。"
-        "再用 `wiki_search` 定位片段，用下面列出的 table 工具读取已发布表格。\n\n"
+        "原文导航入口：`wiki_read(paths=[\"{}\"])`。继续读取导航列出的原文片段；来源摘要和目录本身不是答案证据。"
+        "也可用 `wiki_search` 定位片段，用下面列出的 table 工具读取已发布表格。\n\n"
     ).format(
         source_name, source_id, document_id, source_sha256, parser_id,
         content_generation, article_path,
@@ -2565,7 +2391,6 @@ def _build_query_corpus_legacy(
     )
 
 
-
 def _generated_pages(pages: Dict[str, WikiPageSnapshot]) -> List[str]:
     """Generated Wiki pages, identified by their explicit content kind."""
     return [
@@ -2684,146 +2509,3 @@ def attach_origin_links(
                     "limitations": list(entry.limitations) + ["origin_unresolved"],
                 }),
             })
-
-
-def _rerank_messages(question: str, candidates: List[SearchHit]) -> List[Dict[str, str]]:
-    """Build the single tool-free message pair for the LLM reranker."""
-    payload = {
-        "task": (
-            "Select up to {keep} wiki page paths from the candidates that are "
-            "most likely to contain evidence needed to answer the question. "
-            "Prefer paths from different documents and different hop "
-            "perspectives over near-duplicate pages. Do not invent paths."
-        ).format(keep=LLM_RERANK_KEEP),
-        "question": question,
-        "candidates": [
-            {"path": h.path, "title": h.title, "snippet": h.snippet[:200]}
-            for h in candidates
-        ],
-    }
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a retrieval reranker. Return only the ordered list of "
-                "selected paths as JSON with a single key \"paths\"."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ),
-        },
-    ]
-
-
-def _hit_tokens(hit: SearchHit) -> frozenset:
-    """Content tokens of one hit's title + snippet for overlap scoring."""
-    text = "{} {}".format(hit.title, hit.snippet)
-    return frozenset(
-        t.casefold()
-        for t in _search_terms(text)
-        if len(t) >= 2
-    )
-
-
-def _diversity_rerank(
-    hits: List[SearchHit],
-    *,
-    keep: int = LLM_RERANK_KEEP,
-    alpha: float = DIVERSITY_RERANK_ALPHA,
-) -> List[SearchHit]:
-    """Greedy MMR-style diversity rerank over the hybrid candidate pool.
-
-    The lexical list is already rank-ordered; this keeps at
-    most ``keep`` pages by balancing rank score against novelty:
-
-      score(h) = alpha * rank_score(h) + (1 - alpha) * max_{s in S}(1 - sim(h, s))
-
-    where ``sim`` is the Jaccard token overlap of title+snippet and ``S`` is the
-    already-selected set.  Distinct documents are therefore preferred over
-    near-duplicate pages without any LLM call.  Pure and deterministic: the
-    same pool yields the same selection.  A pool smaller than ``keep`` passes
-    through unchanged.
-    """
-    if len(hits) <= keep:
-        return list(hits)
-    token_sets = [_hit_tokens(h) for h in hits]
-    selected: List[SearchHit] = []
-    selected_indices: List[int] = []
-    remaining = set(range(len(hits)))
-    for _ in range(keep):
-        best_idx = -1
-        best_score = -1.0
-        for i in remaining:
-            rank_score = 1.0 / (i + 1)
-            novelty = 0.0
-            if selected_indices:
-                cur = token_sets[i]
-                if not cur:
-                    novelty = 0.0
-                else:
-                    best_overlap = 0.0
-                    for j in selected_indices:
-                        other = token_sets[j]
-                        if not other:
-                            continue
-                        overlap = len(cur & other) / len(cur | other)
-                        best_overlap = max(best_overlap, overlap)
-                    novelty = 1.0 - best_overlap
-            score = alpha * rank_score + (1.0 - alpha) * novelty
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        selected.append(hits[best_idx])
-        selected_indices.append(best_idx)
-        remaining.discard(best_idx)
-    return selected
-
-
-async def _llm_rerank(
-    model: ModelPort,
-    question: str,
-    hits: List[SearchHit],
-    routing: Dict[str, Any],
-    spans: Optional[_SpanBuilder],
-    usage_acc: Dict[str, int],
-    model_name: Optional[str],
-) -> Optional[List[str]]:
-    """One bounded rerank call over the candidate pool; ``None`` on failure.
-
-    The reranker never blocks the traversal: on any provider error, malformed
-    output, or too-small pool it returns ``None`` and the caller keeps the
-    original hybrid ranking.  ``thinking`` is disabled to keep the call small.
-    """
-    if len(hits) < _llm_rerank_min_candidates():
-        return None
-    start_dt = datetime.now(timezone.utc)
-    start_mono = time.monotonic()
-    try:
-        raw = await _model_complete(
-            model,
-            _rerank_messages(question, hits[:LLM_RERANK_POOL]),
-            RerankResponse.model_json_schema(),
-            max_tokens=256,
-            tools=None,
-            thinking={"type": "disabled"},
-            scene="jonex_wiki_query_rerank",
-            **routing,
-        )
-    except Exception:
-        logger.exception("LLM rerank failed; keeping original order")
-        return None
-    if spans is not None and usage_acc is not None:
-        _record_model_span(
-            spans, raw, model_name, start_dt,
-            int((time.monotonic() - start_mono) * 1000),
-            usage_acc,
-            title="LLM rerank",
-        )
-    try:
-        parsed = RerankResponse.model_validate(raw)
-    except Exception:
-        return None
-    return parsed.paths[:LLM_RERANK_KEEP]

@@ -90,23 +90,13 @@ def parse_grid(text: str) -> Optional[Tuple[List[str], List[List[str]]]]:
 
 
 def fill_down(rows: Sequence[Sequence[str]]) -> List[List[str]]:
-    """Carry a value down into the blank cells below it.
+    """Normalize text without inventing values for ordinary blank cells.
 
-    Merged cells reach us as blanks in every row but the first; without this
-    the grouping pass would treat "the rest of the exchange" as one nameless
-    group.
+    Merge inheritance belongs to the source-grid projection, where explicit
+    merge bounds and anchors are available. A Markdown blank alone is not
+    evidence that the preceding value applies to this row.
     """
-    last: Dict[int, str] = {}
-    filled: List[List[str]] = []
-    for row in rows:
-        current: List[str] = []
-        for index, value in enumerate(row):
-            text = (value or "").strip()
-            if text:
-                last[index] = text
-            current.append(text or last.get(index, ""))
-        filled.append(current)
-    return filled
+    return [[str(value or "").strip() for value in row] for row in rows]
 
 
 # ──────────────────────────────────────────────────────────────

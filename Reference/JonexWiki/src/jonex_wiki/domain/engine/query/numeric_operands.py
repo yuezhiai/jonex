@@ -478,7 +478,12 @@ def _resolve_table_cell(ref: OperandRef, state: Mapping[str, Any]) -> ResolvedOp
                 period = years[0]
             elif not years:
                 metric = label
-        if period:
+        # A numeric column label (often a mistaken header candidate) is not a
+        # financial metric. Read the delivered row label before interpreting a
+        # caption such as "millions, except per share amounts".
+        if metric and not re.search(r"[A-Za-z\u3400-\u9fff]", metric):
+            metric = None
+        if period or metric is None:
             for entry in _complete_reads(state, table_id):
                 cells = list((entry.get("seen_cells") or {}).values()) + list((entry.get("seen_context") or {}).values())
                 labels = [str(c.get("raw_value") or "") for c in cells

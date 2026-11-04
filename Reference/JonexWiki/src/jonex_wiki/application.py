@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -131,7 +132,7 @@ class WikiApplication:
         from jonex_wiki.tasks.executor import TaskExecutor
         setup_logging()
         from jonex_wiki.infra.metering import metered
-        self.gw = metered(GwClient(settings))
+        self.gw = metered(self.gateway_factory(settings) if hasattr(self, "gateway_factory") else GwClient(settings))
         mineru = None
         if settings.mineru_api_token:
             from jonex_wiki.domain.parsing.mineru import MineruCloudBackend
@@ -189,6 +190,8 @@ class WikiApplication:
         loop.set_default_executor(ThreadPoolExecutor(max_workers=settings.blocking_pool_size))
 
     async def stop(self) -> None:
+        if hasattr(self, "_scenarios"):
+            await self._scenarios.stop()
         if self.gw is not None:
             await self.gw.aclose()
         if self._lock_conn is not None:
@@ -202,12 +205,15 @@ class WikiApplication:
 
     async def ingest_parsed_document(self, tenant_id: str, kb_id: str,
                                      source_path: str, source_name: str,
-                                     document_id: str | None = None) -> dict:
+                                     document_id: str | None = None,
+                                     *, compile_model: str = "") -> dict:
         async with self.layout.version_lock(tenant_id, kb_id):
             return await self._ingest_parsed_document_locked(
-                tenant_id, kb_id, source_path, source_name, document_id)
+                tenant_id, kb_id, source_path, source_name, document_id,
+                compile_model=compile_model)
 
-    async def ingest_parsed_documents(self, tenant_id: str, kb_id: str, documents: list[dict]) -> dict:
+    async def ingest_parsed_documents(self, tenant_id: str, kb_id: str, documents: list[dict],
+                                      *, compile_model: str = "") -> dict:
         """Stage a drained platform upload window before submitting one KB compile.
 
         The version lock also excludes compile claiming. Parsed generations
@@ -227,7 +233,8 @@ class WikiApplication:
             results = []
             for d in documents:
                 results.append(await self._ingest_parsed_document_locked(
-                    tenant_id, kb_id, d["source_path"], d["source_name"], d["document_id"], submit=False))
+                    tenant_id, kb_id, d["source_path"], d["source_name"], d["document_id"],
+                    submit=False, compile_model=compile_model))
             async with self.session_factory() as session:
                 task = await TaskRepo().get(session, tenant_id, results[-1]["task_id"])
             self.executor.submit(task)
@@ -235,7 +242,8 @@ class WikiApplication:
 
     async def _ingest_parsed_document_locked(self, tenant_id: str, kb_id: str,
                                              source_path: str, source_name: str,
-                                             document_id: str | None = None, *, submit: bool = True) -> dict:
+                                             document_id: str | None = None, *, submit: bool = True,
+                                             compile_model: str = "") -> dict:
         """平台已解析产物入库:写 gen-1/source.txt + source_artifacts.jsonl 后触发编译,跳过 parse task。
 
         与 parse 的 direct 分支对齐:现场跑 blocks_from_direct_text + prepare_reading_materials
@@ -247,9 +255,21 @@ class WikiApplication:
         if rel.is_absolute() or ".." in rel.parts:
             raise ValidationError(f"source_path {source_path!r} 必须是共享卷内的相对路径")
         full = (Path(settings.input_root) / rel).resolve()
+        if not full.is_relative_to(Path(settings.input_root).resolve()):
+            raise ValidationError("source_path escapes the input root")
         if not full.is_file():
             raise ValidationError(f"共享卷解析产物不存在: {source_path}")
-        data = full.read_bytes()
+        data = await asyncio.to_thread(full.read_bytes)
+        from jonex_wiki.domain.parsing.consumer_input import read_consumer_receipt
+        try:
+            receipt = await asyncio.to_thread(read_consumer_receipt, full, tenant_id=tenant_id, kb_id=kb_id,
+                                              document_id=document_id or "")
+        except (ValueError, KeyError) as exc:
+            raise ValidationError(str(exc)) from exc
+        if receipt:
+            expected_input = receipt["original_sha256"] if receipt["input_path"] == receipt["original_path"] else receipt["parsed_sha256"]
+            if hashlib.sha256(data).hexdigest() != expected_input:
+                raise ValidationError("WIKI_INPUT_CHANGED_DURING_READ")
         # [jonex] 原生表格(.xlsx/.xlsm)走 core 的确定性 OOXML 解析;MinerU 结构化产物
         # (content_list.json)走引擎的 MinerU 归一化路由(与独立部署 parse task 的 MINERU
         # 分支一致,不再把 markdown 重组版当纯文本);其余保持平台已解析文本。
@@ -280,8 +300,39 @@ class WikiApplication:
                 raise ConflictError(f"同知识库已存在同名文档 {source_name}(document_id={dup.document_id})")
             if dup is None and await repo.count_active(s, tenant_id, kb_id) >= settings.compile_max_documents:
                 raise ValidationError(f"该知识库文档数已达上限 {settings.compile_max_documents}")
-            sha = hashlib.sha256(data).hexdigest()
+            input_sha = hashlib.sha256(data).hexdigest()
+            sha = receipt["original_sha256"] if receipt else input_sha
             if dup is not None:
+                previous = self.layout.raw_dir(tenant_id, kb_id, dup.document_id, dup.content_generation) / "wiki-input.json"
+                if receipt and previous.is_file():
+                    previous_receipt = json.loads(previous.read_text("utf-8"))
+                    if receipt["content_generation"] < previous_receipt["content_generation"]:
+                        raise ConflictError("WIKI_INPUT_STALE_GENERATION")
+                    if (receipt["content_generation"] == previous_receipt["content_generation"]
+                            and sha != previous_receipt["original_sha256"]):
+                        raise ConflictError("WIKI_INPUT_GENERATION_REUSED_FOR_DIFFERENT_SOURCE")
+                    from jonex_wiki.domain.parsing.identity import parse_input_signature
+                    previous_artifacts = self.layout.artifacts_path(tenant_id, kb_id, dup.document_id, dup.content_generation)
+                    first = {}
+                    if previous_artifacts.is_file():
+                        with previous_artifacts.open(encoding="utf-8") as stream:
+                            line = stream.readline()
+                            first = json.loads(line) if line.strip() else {}
+                    if (previous_receipt.get("receipt_sha256") == receipt.get("receipt_sha256")
+                            and dup.status == "parsed"
+                            and (first.get("source_metadata") or {}).get("parse_input_signature") == parse_input_signature(settings)):
+                        dup.recompile_generation += 1
+                        task = (await s.execute(select(TaskRow).where(TaskRow.tenant_id == tenant_id,
+                            TaskRow.kb_id == kb_id, TaskRow.kind == TaskKind.compile.value,
+                            TaskRow.status == TaskStatus.queued.value))).scalars().first()
+                        fresh_task = task is None
+                        if fresh_task:task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile, compile_model=compile_model)
+                        else:TaskRepo.restamp_compile_model(task, compile_model)
+                        await s.commit()
+                        if fresh_task and submit:self.executor.submit(task)
+                        return {"task_id": task.task_id, "document_id": dup.document_id,
+                            "status": task.status, "content_generation": dup.content_generation,
+                            "reused_parse": True, "warnings": [], "contract": {"route": route.value}}
                 # [jonex] 同名**且同 document_id** 的再次入库不是冲突，而是平台侧
                 # reparse(force) 的重放：同一文档的新一代内容。沿用 parse_task 的既有语义
                 # 升一代（content_generation+1），source_port 只读增量代，编译产出新 revision。
@@ -296,6 +347,22 @@ class WikiApplication:
                 new_gen = 1
             raw_dir = self.layout.raw_dir(tenant_id, kb_id, row.document_id, new_gen)
             raw_dir.mkdir(parents=True, exist_ok=True)
+            if receipt:
+                await asyncio.to_thread(shutil.copyfile, full.parent / receipt["original_path"], raw_dir / receipt["original_path"])
+                with (raw_dir / receipt["original_path"]).open("rb") as original_stream:
+                    if (await asyncio.to_thread(hashlib.file_digest, original_stream, "sha256")).hexdigest() != sha:
+                        raise ValidationError("WIKI_INPUT_ORIGINAL_CHANGED_DURING_COPY")
+                (raw_dir / "wiki-input.json").write_text(json.dumps(receipt, ensure_ascii=False), "utf-8")
+                if settings.pdf_text_layer_enabled and Path(receipt["original_path"]).suffix.lower() == ".pdf":
+                    from jonex_wiki.domain.parsing.pdf_text_layer import extract_text_layer
+                    await asyncio.to_thread(extract_text_layer, raw_dir / receipt["original_path"], raw_dir,
+                        max_pages=settings.pdf_text_layer_max_pages)
+                if (settings.media_keyframes_enabled and Path(receipt["original_path"]).suffix.lower()
+                        in {".mp4", ".mov", ".mkv", ".webm"}):
+                    from jonex_wiki.domain.parsing.media_timeline import supplement_video
+                    await asyncio.to_thread(supplement_video, raw_dir / receipt["original_path"], raw_dir,
+                        max_frames=settings.media_keyframes_max_frames,
+                        interval_seconds=settings.media_keyframes_interval_seconds)
             # [jonex] 图片随源搬入 data_root(共享卷 images/ → raw/images/)
             source_images = full.parent / _IMAGES_DIR
             if source_images.is_dir():
@@ -303,6 +370,8 @@ class WikiApplication:
                     await asyncio.to_thread(
                         shutil.copytree, source_images, raw_dir / _IMAGES_DIR, dirs_exist_ok=True)
                 except Exception:
+                    if receipt:
+                        raise ValidationError("WIKI_INPUT_ASSET_COPY_FAILED")
                     log.warning("[jonex] 复制共享卷 images 失败,继续编译: %s", source_images,
                                 exc_info=True)
             packing = PackingOptions.from_settings(settings)
@@ -313,10 +382,10 @@ class WikiApplication:
             if route is InputRoute.SPREADSHEET_NATIVE:
                 # core 原生 OOXML 解析:tables.sqlite + 工作簿级阅读材料。
                 result = await asyncio.to_thread(
-                    parse_spreadsheet, full, output_dir=raw_dir,
+                    parse_spreadsheet, raw_dir / receipt["original_path"] if receipt else full, output_dir=raw_dir,
                     source_id=row.document_id, document_id=row.document_id)
                 # 保留平台侧原始文件名:parse_spreadsheet 以暂存文件名作为 source_name,
-                # 会丢掉中文原名,而 dated_workbook_source_paths 依赖 name 里的「菜单/年份」。
+                # 保留原始来源身份，避免暂存文件名取代用户文件名。
                 result.source_name = source_name
                 for block in result.blocks:
                     if block.metadata and "source_name" in block.metadata:
@@ -333,12 +402,20 @@ class WikiApplication:
                     raise ValidationError(f"content_list.json 无法解析: {source_path}") from exc
                 if not isinstance(items, list):
                     raise ValidationError(f"content_list.json 必须是数组: {source_path}")
+                if receipt and Path(receipt["original_path"]).suffix == ".docx":
+                    from jonex_wiki.domain.engine.compile.source_prep.docx_native import supplement_docx
+                    items, native_inventory = await asyncio.to_thread(supplement_docx, items,
+                        full.parent / receipt["original_path"], raw_dir)
                 result = await asyncio.to_thread(
                     normalize_inline_content_list, items, output_dir=raw_dir,
                     source_name=source_name, parser_id=parser_id,
                     source_sha256=sha, source_id=row.document_id,
                     document_id=row.document_id, markdown="", packing=packing,
                     inspection=inspection, report=report)
+                if receipt and Path(receipt["original_path"]).suffix == ".docx" and result.blocks:
+                    result.blocks[0].metadata["native_inventory"] = {
+                        "objects": native_inventory["objects"], "gaps": native_inventory["gaps"],
+                        "warnings": native_inventory["warnings"], "alignment": native_inventory.get("alignment", [])}
                 # 表资产后处理:table_observation → tables.sqlite(对齐 parse_task MINERU 分支)
                 table_dir = self.layout.gen_dir(
                     tenant_id, kb_id, row.document_id, new_gen) / "tables"
@@ -367,10 +444,23 @@ class WikiApplication:
                             report.isolated_ratio * 100, archive_path)
             result.reading_materials = await asyncio.to_thread(prepare_reading_materials, result)
             artifacts = result.to_source_artifacts(content_generation=new_gen)
-            from jonex_wiki.domain.parsing.identity import parse_input_signature
+            from jonex_wiki.domain.parsing.identity import (
+                parse_input_components, parse_input_signature)
             parse_signature = parse_input_signature(settings)
+            # 与 domain/parsing/parse_task.py 同口径：分量摘要一并落盘，产物过期时
+            # parse_status 才能说清「哪一项变了」。两处都是产物的写入方，缺一处就会
+            # 让那条预检对这类产物只能回 "unknown"。
+            parse_components = parse_input_components(settings)
             for artifact in artifacts:
                 artifact.source_metadata["parse_input_signature"] = parse_signature
+                artifact.source_metadata["parse_input_components"] = parse_components
+                artifact.source_metadata["parsed_sha256"] = receipt["parsed_sha256"] if receipt else input_sha
+                artifact.source_metadata["source_sha256_kind"] = "original_bytes" if receipt or route is InputRoute.SPREADSHEET_NATIVE else "legacy_parser_input"
+                if receipt:
+                    artifact.source_metadata["consumer_receipt"] = receipt
+                    artifact.source_metadata["platform_content_generation"] = receipt["content_generation"]
+                    for key, value in receipt.get("source_context", {}).items():
+                        artifact.source_metadata[key] = value
             art_path = self.layout.artifacts_path(tenant_id, kb_id, row.document_id, new_gen)
             art_lines = [json.dumps(a.model_dump(mode="json"), ensure_ascii=False)
                          for a in artifacts]
@@ -392,7 +482,10 @@ class WikiApplication:
             new_task = task is None
             if new_task:
                 task = await TaskRepo().create(
-                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile)
+                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile,
+                    compile_model=compile_model)
+            else:
+                TaskRepo.restamp_compile_model(task, compile_model)
             await s.commit()
             if new_task and submit:
                 self.executor.submit(task)
@@ -412,13 +505,15 @@ class WikiApplication:
                                  "shape": "structured" if structured else "text",
                                  "unrepresented_items": unrepresented}}
 
-    async def remove_document(self, tenant_id: str, kb_id: str, document_id: str) -> dict:
+    async def remove_document(self, tenant_id: str, kb_id: str, document_id: str,
+                              *, compile_model: str = "") -> dict:
         """逻辑删除 + 自动触发编译(合并触发);删除豁免成本闸门。"""
         async with self.layout.version_lock(tenant_id, kb_id):
-            return await self._remove_document_locked(tenant_id, kb_id, document_id)
+            return await self._remove_document_locked(
+                tenant_id, kb_id, document_id, compile_model=compile_model)
 
     async def _remove_document_locked(self, tenant_id: str, kb_id: str,
-                                      document_id: str) -> dict:
+                                      document_id: str, *, compile_model: str = "") -> dict:
         async with self.session_factory() as s:
             repo = DocumentRepo()
             doc = await repo.get(s, tenant_id, kb_id, document_id)
@@ -441,7 +536,10 @@ class WikiApplication:
             await repo.soft_delete(s, doc)
             if compile_task is None:
                 compile_task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
-                                                       kind=TaskKind.compile)
+                                                       kind=TaskKind.compile,
+                                                       compile_model=compile_model)
+            else:
+                TaskRepo.restamp_compile_model(compile_task, compile_model)
             await s.commit()
             # 物理删除该文档的全部解析产物(parse/{document_id}/ 所有代次)。软删只标
             # deleted_at 并靠重编译的 removed_ids 清理 bundle 页面,解析产物目录需在
@@ -458,7 +556,8 @@ class WikiApplication:
             return {"document_id": document_id, "compile_task_id": compile_task.task_id,
                     "status": compile_task.status}
 
-    async def reparse_document(self, tenant_id: str, kb_id: str, document_id: str) -> dict:
+    async def reparse_document(self, tenant_id: str, kb_id: str, document_id: str,
+                               *, compile_model: str = "") -> dict:
         """重新解析原上传文件。"""
         async with self.session_factory() as s:
             doc = await DocumentRepo().get(s, tenant_id, kb_id, document_id)
@@ -471,7 +570,8 @@ class WikiApplication:
             if running is not None:
                 raise ConflictError("该文档已有进行中的解析任务")
             task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
-                                           kind=TaskKind.parse, document_id=document_id)
+                                           kind=TaskKind.parse, document_id=document_id,
+                                           compile_model=compile_model)
             await s.commit()
             self.executor.submit(task)
             return {"task_id": task.task_id, "document_id": document_id, "status": task.status}
@@ -508,9 +608,15 @@ class WikiApplication:
                 "kb_type": "jonex_wiki"}
 
     async def parse_status(self, tenant_id: str, kb_id: str) -> dict:
-        """Read-only inventory of documents needing reparse before compilation."""
-        from jonex_wiki.domain.parsing.identity import parse_input_signature
+        """Read-only inventory of documents needing reparse before compilation.
+
+        ``drift`` 说明这份产物**为什么**过期（identity 的哪个分量变了）：
+        ``["unknown"]`` = 旧产物没记分量；``[]`` = 各项一致。
+        """
+        from jonex_wiki.domain.parsing.identity import (
+            identity_drift, parse_input_components, parse_input_signature)
         expected = parse_input_signature(self.settings)
+        expected_components = parse_input_components(self.settings)
         async with self.session_factory() as s:
             docs = await DocumentRepo().list_parsed_for_compile(s, tenant_id, kb_id)
         items = []
@@ -518,22 +624,30 @@ class WikiApplication:
             path = self.layout.artifacts_path(
                 tenant_id, kb_id, doc.document_id, doc.content_generation)
             actual = None
+            drift = ["unknown"]
             status = "missing"
             if path.is_file():
                 with path.open("r", encoding="utf-8") as handle:
                     first = next((line for line in handle if line.strip()), None)
                 if first is not None:
                     try:
-                        actual = (json.loads(first).get("source_metadata") or {}).get(
-                            "parse_input_signature")
+                        metadata = (json.loads(first).get("source_metadata") or {})
+                        actual = metadata.get("parse_input_signature")
                         status = ("current" if actual == expected else
                                   "stale" if actual else "legacy")
+                        if actual != expected:
+                            drift = identity_drift(
+                                metadata.get("parse_input_components"),
+                                expected_components)
+                        else:
+                            drift = []
                     except (ValueError, TypeError, AttributeError):
                         status = "invalid"
             items.append({"document_id": doc.document_id,
                           "source_name": doc.source_name,
                           "content_generation": doc.content_generation,
                           "status": status, "needs_reparse": status != "current",
+                          "drift": drift,
                           "refresh_method": (
                               "reparse" if (self.layout.kb_dir(tenant_id, kb_id)
                                             / "uploads" / doc.document_id).is_dir()
@@ -541,13 +655,15 @@ class WikiApplication:
         return {"kb_id": kb_id, "documents": items,
                 "needs_reparse_count": sum(item["needs_reparse"] for item in items)}
 
-    async def recompile_document(self, tenant_id: str, kb_id: str, document_id: str) -> dict:
+    async def recompile_document(self, tenant_id: str, kb_id: str, document_id: str,
+                                 *, compile_model: str = "") -> dict:
         """单文档重新编译:recompile_generation +1 → 增量编译。"""
         async with self.layout.version_lock(tenant_id, kb_id):
-            return await self._recompile_document_locked(tenant_id, kb_id, document_id)
+            return await self._recompile_document_locked(
+                tenant_id, kb_id, document_id, compile_model=compile_model)
 
     async def _recompile_document_locked(self, tenant_id: str, kb_id: str,
-                                         document_id: str) -> dict:
+                                         document_id: str, *, compile_model: str = "") -> dict:
         async with self.session_factory() as s:
             doc = await DocumentRepo().get(s, tenant_id, kb_id, document_id)
             if doc is None or doc.deleted_at is not None:
@@ -561,7 +677,10 @@ class WikiApplication:
             doc.recompile_generation += 1
             if compile_task is None:
                 compile_task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
-                                                       kind=TaskKind.compile)
+                                                       kind=TaskKind.compile,
+                                                       compile_model=compile_model)
+            else:
+                TaskRepo.restamp_compile_model(compile_task, compile_model)
             await s.commit()
             if compile_task.status == TaskStatus.queued.value:
                 self.executor.submit(compile_task)
@@ -570,14 +689,16 @@ class WikiApplication:
                     "status": compile_task.status}
 
     async def rename_document(self, tenant_id: str, kb_id: str,
-                              document_id: str, source_name: str) -> dict:
+                              document_id: str, source_name: str,
+                              *, compile_model: str = "") -> dict:
         """Change only the display name, retaining document/source identity."""
         async with self.layout.version_lock(tenant_id, kb_id):
             return await self._rename_document_locked(
-                tenant_id, kb_id, document_id, source_name)
+                tenant_id, kb_id, document_id, source_name, compile_model=compile_model)
 
     async def _rename_document_locked(self, tenant_id: str, kb_id: str,
-                                      document_id: str, source_name: str) -> dict:
+                                      document_id: str, source_name: str,
+                                      *, compile_model: str = "") -> dict:
         name = source_name.strip()
         normalized = name.replace("\\", "/")
         if (not name or len(name) > 255 or normalized != Path(normalized).name
@@ -619,7 +740,10 @@ class WikiApplication:
             doc.source_name = name
             if compile_task is None:
                 compile_task = await TaskRepo().create(
-                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile)
+                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile,
+                    compile_model=compile_model)
+            else:
+                TaskRepo.restamp_compile_model(compile_task, compile_model)
             await s.commit()
         if compile_task.status == TaskStatus.queued.value:
             self.executor.submit(compile_task)
@@ -628,14 +752,19 @@ class WikiApplication:
                 "compile_task_id": compile_task.task_id, "status": compile_task.status}
 
     async def query(self, tenant_id: str, kb_id: str, question: str,
-                    *, thinking_mode: str | None = None) -> dict:
+                    *, thinking_mode: str | None = None, retrieval_strategy: str | None = None,
+                    query_context: dict | None = None) -> dict:
         """提交查询任务(异步,返回 task_id)。"""
         question = (question or "").strip()
+        from jonex_wiki.kernel.query_images import normalized_context
+        query_context = normalized_context(query_context)
         if not question or len(question) > 4096:
             raise ValidationError("question 必须为 1-4096 字符")
         if thinking_mode is not None:
             from jonex_wiki.domain.query.thinking import thinking_overrides
             thinking_overrides(thinking_mode)
+        if retrieval_strategy is not None and retrieval_strategy not in {"tree", "direct", "structure", "semantic"}:
+            raise ValidationError("QUERY_RETRIEVAL_STRATEGY_INVALID")
         async with self.layout.version_lock(tenant_id, kb_id):
             published = self.layout.resolve_published(tenant_id, kb_id)
             if published is None or not published.is_dir():
@@ -646,6 +775,10 @@ class WikiApplication:
                 row = await QueryTaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
                                                    question=question, bundle_sha=published.name)
                 query_id = row.query_id
+                if retrieval_strategy is not None or query_context is not None:
+                    self.layout.atomic_write(self.layout.kb_dir(tenant_id,kb_id) / "query-options" / (query_id+".json"),
+                        json.dumps({**({'retrieval_strategy':retrieval_strategy} if retrieval_strategy else {}),
+                            **({'query_context':query_context} if query_context else {})}, ensure_ascii=False).encode())
                 await s.commit()
         if thinking_mode is None:
             self.executor.submit_query(row)
@@ -770,9 +903,23 @@ class WikiApplication:
         return {"kb_id": kb_id, "counts": await asyncio.to_thread(_count_pages, pub)}
 
     async def read_page(self, tenant_id: str, kb_id: str, page_id: str) -> dict:
+        async with self.layout.version_lock(tenant_id, kb_id):
+            return await self._read_page_content(tenant_id, kb_id, page_id)
+
+    async def _read_page_content(self, tenant_id: str, kb_id: str, page_id: str) -> dict:
         from jonex_wiki.domain.reading import read_page as _read_page
         pub = self._published_dir(tenant_id, kb_id)
         result = await asyncio.to_thread(_read_page, pub, page_id)
+        from jonex_wiki.adapters.bundle_view import DirectoryBundleView
+        from jonex_wiki.domain.reading.image_service import page_images
+        image_view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
+        try:
+            body, images, total = await asyncio.to_thread(page_images, image_view,
+                result.get("merged_paths") or [result["path"]], result["body"])
+            result.update(body=body, content=body, images=images, images_total=total,
+                          bundle_sha=image_view.manifest_hash)
+        except (OSError, ValueError, sqlite3.Error, DomainError) as exc:
+            result.update(images=[], image_error=type(exc).__name__)
         result["kb_id"] = kb_id
         return result
 
@@ -796,6 +943,43 @@ class WikiApplication:
         if pub is None:
             return {"kb_id": kb_id, "documents": {}}
         return {"kb_id": kb_id, "documents": await asyncio.to_thread(_list_page_documents, pub)}
+
+    async def query_graph(self, tenant_id: str, kb_id: str, operation: str, **options) -> dict:
+        """Graph reads share the same immutable publication across UI and MCP."""
+        from jonex_wiki.domain.reading.graph_service import query_graph
+        return await query_graph(self.layout, tenant_id, kb_id, operation, options)
+
+    def scenario_service(self):
+        if not hasattr(self, "_scenarios"):
+            from jonex_wiki.scenarios.service import ScenarioService
+            self._scenarios = ScenarioService(self)
+        return self._scenarios
+
+    async def query_resources(self, tenant_id: str, kb_id: str, operation: str,
+                              options: dict, *, actor: str = "") -> dict:
+        if operation in {"find_images", "get_image"}:
+            from jonex_wiki.domain.reading.image_requests import query_images
+            return await query_images(self.layout, tenant_id, kb_id, operation, options)
+        if operation == "inspect_image":
+            from jonex_wiki.domain.reading.image_inspection import inspect_image
+            if not hasattr(self, "_visual_inspection_semaphore"):
+                self._visual_inspection_semaphore = asyncio.Semaphore(2)
+            return await inspect_image(self.layout, self.settings, self.gw, tenant_id, kb_id,
+                options, self._visual_inspection_semaphore)
+        if operation == "get_question":
+            # Old frozen publications remain readable. New bases never build
+            # these objects; their replacements are gated by the scene host.
+            view=self.scenario_service().view(tenant_id,kb_id,str(options.get("revision")or""))
+            if json.loads(view.read_bytes("query/resources.json")).get("schema")!="wiki.resources.v1":
+                raise ValidationError("SCENARIO_OPERATION_REQUIRED; use enabled scenario resources")
+        if operation == "inspect_visual":
+            from jonex_wiki.domain.reading.visual_inspection import inspect_visual
+            if not hasattr(self, "_visual_inspection_semaphore"):
+                self._visual_inspection_semaphore = asyncio.Semaphore(2)
+            return await inspect_visual(self.layout, self.settings, self.gw, tenant_id, kb_id,
+                options, self._visual_inspection_semaphore)
+        from jonex_wiki.domain.reading.resource_service import query_resources
+        return await query_resources(self.layout, tenant_id, kb_id, operation, options, actor=actor)
 
     # ── Wiki 阅读目录(目录功能下沉)──
 
@@ -839,13 +1023,16 @@ class WikiApplication:
                 "template": rp.template}
 
     async def put_prompt(self, tenant_id: str, kb_id: str, prompt_key: str,
-                         template: str, expected_version: int) -> dict:
+                         template: str, expected_version: int,
+                         *, compile_model: str = "") -> dict:
         async with self.layout.version_lock(tenant_id, kb_id):
             return await self._put_prompt_locked(
-                tenant_id, kb_id, prompt_key, template, expected_version)
+                tenant_id, kb_id, prompt_key, template, expected_version,
+                compile_model=compile_model)
 
     async def _put_prompt_locked(self, tenant_id: str, kb_id: str, prompt_key: str,
-                                 template: str, expected_version: int) -> dict:
+                                 template: str, expected_version: int,
+                                 *, compile_model: str = "") -> dict:
         if prompt_key not in PUBLIC_PROMPT_KEYS:
             raise ValidationError(f"未知 prompt_key: {prompt_key}")
         validate_template(prompt_key, template)
@@ -856,7 +1043,8 @@ class WikiApplication:
                                             expected_version=expected_version)
             task, created = (None, False)
             if previous.template.strip() != template.strip():
-                task, created = await self._queue_compile_after_prompt_edit(s, tenant_id, kb_id)
+                task, created = await self._queue_compile_after_prompt_edit(
+                    s, tenant_id, kb_id, compile_model)
             await s.commit()
         if created and self.executor is not None:
             self.executor.submit(task)
@@ -864,11 +1052,14 @@ class WikiApplication:
                 "template_sha": template_sha(row.template),
                 "compile_task_id": task.task_id if task is not None else None}
 
-    async def delete_prompt(self, tenant_id: str, kb_id: str, prompt_key: str) -> None:
+    async def delete_prompt(self, tenant_id: str, kb_id: str, prompt_key: str,
+                            *, compile_model: str = "") -> None:
         async with self.layout.version_lock(tenant_id, kb_id):
-            await self._delete_prompt_locked(tenant_id, kb_id, prompt_key)
+            await self._delete_prompt_locked(tenant_id, kb_id, prompt_key,
+                                             compile_model=compile_model)
 
-    async def _delete_prompt_locked(self, tenant_id: str, kb_id: str, prompt_key: str) -> None:
+    async def _delete_prompt_locked(self, tenant_id: str, kb_id: str, prompt_key: str,
+                                    *, compile_model: str = "") -> None:
         if prompt_key not in PUBLIC_PROMPT_KEYS:
             raise ValidationError(f"未知 prompt_key: {prompt_key}")
         async with self.session_factory() as s:
@@ -876,18 +1067,28 @@ class WikiApplication:
             await PromptRepo().delete(s, tenant_id, kb_id, prompt_key)
             task, created = (None, False)
             if previous.template.strip():
-                task, created = await self._queue_compile_after_prompt_edit(s, tenant_id, kb_id)
+                task, created = await self._queue_compile_after_prompt_edit(
+                    s, tenant_id, kb_id, compile_model)
             await s.commit()
         if created and self.executor is not None:
             self.executor.submit(task)
 
     async def _queue_compile_after_prompt_edit(self, session, tenant_id: str,
-                                               kb_id: str) -> tuple[TaskRow | None, bool]:
+                                               kb_id: str,
+                                               compile_model: str = "") -> tuple[TaskRow | None, bool]:
+        """确保该 KB 有一条排队中的编译任务（prompt/模型变化后调用）。
+
+        [jonex] P3b（方案 B）：``compile_model`` 是本次请求带来的模型快照。
+        已有排队任务时**刷新**它的快照（还没开跑 ⇒ 换模型该生效）；复用而不刷新
+        会出现「平台刚保存了新模型、这条 queued 任务仍用旧模型编完」。
+        """
         if not await DocumentRepo().list_parsed_for_compile(session, tenant_id, kb_id):
             return None, False
         queued = await TaskRepo().queued_compile_for_kb(session, tenant_id, kb_id)
         if queued is not None:
+            TaskRepo.restamp_compile_model(queued, compile_model)
             return queued, False
         task = await TaskRepo().create(
-            session, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile)
+            session, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile,
+            compile_model=compile_model)
         return task, True

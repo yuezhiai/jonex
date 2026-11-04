@@ -67,13 +67,9 @@ def unit_note(text: str, *, metric: Optional[str]=None) -> Optional[str]:
         value=parts[0]
     mixed = re.fullmatch(r'dollars and shares in (millions|thousands|billions)', value, re.I)
     if mixed:
-        if not metric:
-            return None
-        if re.search(r'shares? outstanding|股数|股份数', metric, re.I):
-            return {'millions': '百万股', 'thousands': '千股', 'billions': '十亿股'}[mixed[1].lower()]
-        if not re.search(r'cost|sales|revenue|profit|expense|earnings|income|asset|liabil|cash|debt|inventor|tax|收入|成本|利润|资产|负债', metric, re.I):
-            return None
-        value = 'dollars in ' + mixed[1].lower()
+        # A metric-name whitelist cannot identify the owner of two dimensions.
+        # Require a local declaration of a single unit instead.
+        return None
     dollar = re.fullmatch(r'\$ in (millions|thousands|billions)', value, re.I)
     if dollar:
         value = 'dollars in ' + dollar[1].lower()

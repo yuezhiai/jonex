@@ -208,6 +208,45 @@ class ArtifactStoreAdapter(ArtifactStore):
             remember_verified_file(DirectoryBundleView._file_identity(target.stat()),checksum)
             del data
 
+        # Source identities and media belong to this publication, independently
+        # of how the Wiki organizer groups its reading pages.
+        from jonex_wiki.domain.engine.compile.media_catalog import PATH as MEDIA_PATH, build_catalog
+        def resolve_media(doc, generation, relative):
+            base = self._layout.raw_dir(tenant_id, context_id, doc, generation).resolve()
+            # Parser paths must be relative to this document's parse generation.
+            if not relative or Path(relative).is_absolute() or not re.fullmatch(r"[A-Za-z0-9._-]+", doc):
+                return None
+            target = (base / relative).resolve()
+            return target if target.is_relative_to(base) else None
+        previous_publication = self._layout.resolve_published(tenant_id, context_id)
+        build_catalog(staging, resolve_media,
+                      reuse_assets=previous_publication / "media/assets" if previous_publication else None)
+        from jonex_wiki.domain.engine.compile.image_index import INDEX as IMAGE_INDEX
+        if (staging / IMAGE_INDEX).is_file():
+            file_digests[IMAGE_INDEX] = hashlib.sha256((staging / IMAGE_INDEX).read_bytes()).hexdigest()
+        from jonex_wiki.domain.engine.compile.resource_catalog import build_resources, PATH as RESOURCE_PATH
+        resources = build_resources(staging, resolve_media)
+        from jonex_wiki.domain.engine.compile.navigation_graph import build as build_navigation_graph, PATH as NAV_GRAPH_PATH
+        build_navigation_graph(staging)
+        file_digests[NAV_GRAPH_PATH] = hashlib.sha256((staging / NAV_GRAPH_PATH).read_bytes()).hexdigest()
+        file_digests[RESOURCE_PATH] = hashlib.sha256((staging / RESOURCE_PATH).read_bytes()).hexdigest()
+        for relative in resources.get("auxiliary_files", []):
+            file_digests[relative] = hashlib.sha256((staging / relative).read_bytes()).hexdigest()
+        media_paths = [staging / MEDIA_PATH, *(staging / "media/assets").glob("*")]
+        for target in media_paths:
+            with target.open("rb") as stream:
+                checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+            if target.parent.name == "assets" and re.fullmatch(r"[0-9a-f]{64}", target.stem) and checksum != target.stem:
+                raise ValueError("MEDIA_ASSET_CHANGED_DURING_PUBLICATION")
+            file_digests[target.relative_to(staging).as_posix()] = checksum
+
+        # Build the derived graph before hashing/sealing this new publication.
+        # Existing publications are immutable; pre-index bundles use a cache.
+        from jonex_wiki.domain.reading.knowledge_graph import INDEX_PATH, build_index
+        if (staging / "query/navigation.json").is_file():
+            build_index(staging, staging / INDEX_PATH, tenant_id, context_id)
+            file_digests[INDEX_PATH] = hashlib.sha256((staging / INDEX_PATH).read_bytes()).hexdigest()
+
         from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
         with telemetry_stage(current_runtime_telemetry(), "bundle_revision_enrich"):
             self._enrich_revision(

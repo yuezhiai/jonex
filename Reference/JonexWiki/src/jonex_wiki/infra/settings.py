@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     api_key: str = ""
     # 平台解析产物输入根(共享卷挂载点):ingest 端点从这里读 source_path
     input_root: str = "/app/inputs"
+    media_keyframes_enabled: bool = True
+    media_keyframes_max_frames: int = Field(default=32, ge=1, le=256)
+    media_keyframes_interval_seconds: float = Field(default=5.0, ge=0.25, le=120)
+    pdf_text_layer_enabled: bool = True
+    pdf_text_layer_max_pages: int = Field(default=128, ge=1, le=2048)
+    visual_inspection_enabled: bool = True
+    visual_inspection_model: str = ""
     # 产物根目录
     data_root: str = "~/.jonex-wiki"
     # 网关(环境变量不带 JONEX_WIKI_ 前缀,显式 alias)
@@ -50,8 +57,6 @@ class Settings(BaseSettings):
     # 单次 chat 调用超时。OpenAI SDK 默认 600s,一次挂起就能堵死整个页面串行链
     # (页面内 passage 逐条串行),也会让延迟统计彻底失真;超时后交给 complete 的重试预算
     llm_timeout: float = Field(default=120.0, validation_alias="LLM_TIMEOUT")
-    # core 的 QUERY_LLM_RERANK → query_rerank(现有字段,只做读点映射)
-    query_rerank: bool = Field(default=False, validation_alias="QUERY_RERANK")
     # query_tasks 终态行保留时长(秒)。done/failed/cancelled 且 finished_at 早于该窗口的
     # 行由启动 GC 清除,防 query_tasks 无界增长(方案 §6.4)。
     query_task_ttl_seconds: int = 7 * 24 * 3600
@@ -103,9 +108,6 @@ class Settings(BaseSettings):
     semantic_review: str = Field(default="off", validation_alias="LLM_WIKI_SEMANTIC_REVIEW")
     # QUERY_* 开关 + 证据/检索预算(不带前缀,显式 alias)
     query_snippet: bool = Field(default=True, validation_alias="QUERY_SNIPPET")
-    query_diversity_rerank: bool = Field(default=False, validation_alias="QUERY_DIVERSITY_RERANK")
-    query_decompose: bool = Field(default=True, validation_alias="QUERY_QUERY_DECOMPOSE")
-    query_decompose_multihop: bool = Field(default=True, validation_alias="QUERY_DECOMPOSE_MULTIHOP")
     query_answer_style: str = Field(default="natural", validation_alias="QUERY_ANSWER_STYLE")
     query_answer_target_hint: bool = Field(default=False, validation_alias="QUERY_ANSWER_TARGET_HINT")
     query_max_tool_calls: int = Field(default=24, validation_alias="QUERY_MAX_TOOL_CALLS")
@@ -124,16 +126,17 @@ class Settings(BaseSettings):
     query_evidence_excerpt_limit: int = Field(default=500, validation_alias="QUERY_EVIDENCE_EXCERPT_LIMIT")
     query_evidence_units_max: int = Field(default=12, validation_alias="QUERY_EVIDENCE_UNITS_MAX")
     query_evidence_per_doc_max: int = Field(default=6, validation_alias="QUERY_EVIDENCE_PER_DOC_MAX")
-    query_evidence_stall_limit: int = Field(default=2, validation_alias="QUERY_EVIDENCE_STALL_LIMIT")
     query_max_active_evidence: int = Field(default=32, validation_alias="QUERY_MAX_ACTIVE_EVIDENCE")
-    query_search_read_force_limit: int = Field(default=2, validation_alias="QUERY_SEARCH_READ_FORCE_LIMIT")
-    query_entity_answer_verbose_limit: int = Field(default=120, validation_alias="QUERY_ENTITY_ANSWER_VERBOSE_LIMIT")
     # model 超时重试
     query_model_call_timeout_seconds: float = Field(default=75.0, validation_alias="QUERY_MODEL_CALL_TIMEOUT_SECONDS")
     query_model_call_timeout_retries: int = Field(default=1, validation_alias="QUERY_MODEL_CALL_TIMEOUT_RETRIES")
     # prepared cache
     prepared_cache_bytes: int = 768 * 1024 * 1024
     query_material_cache_bytes: int = Field(default=16 * 1024 * 1024, ge=0)
+    # Deprecated configuration input: free-text condition inference is retired.
+    query_exact_identifier_lookup: bool = False
+    query_graph_discovery: bool = True
+    query_retrieval_strategy: Literal["tree", "direct", "structure", "semantic"] = "tree"
     # 解析杂项
     allow_private_urls: bool = False
     text_encoding: str = "utf-8"
@@ -228,9 +231,10 @@ class Settings(BaseSettings):
             "QUERY_MODEL_CALL_TIMEOUT_SECONDS": str(self.query_model_call_timeout_seconds),
             "QUERY_MODEL_CALL_TIMEOUT_RETRIES": str(self.query_model_call_timeout_retries),
             # query 检索/开关
-            "QUERY_LLM_RERANK": on_off(self.query_rerank),
-            "QUERY_DIVERSITY_RERANK": on_off(self.query_diversity_rerank),
             "QUERY_SNIPPET": on_off(self.query_snippet),
+            "QUERY_EXACT_IDENTIFIER_LOOKUP": "off",
+            "QUERY_GRAPH_DISCOVERY": on_off(self.query_graph_discovery),
+            "QUERY_RETRIEVAL_STRATEGY": self.query_retrieval_strategy,
             "QUERY_MAX_SEARCH_HITS": str(self.query_max_search_hits),
             "QUERY_EVIDENCE_EXCERPT_LIMIT": str(self.query_evidence_excerpt_limit),
             "QUERY_EVIDENCE_UNITS_MAX": str(self.query_evidence_units_max),
@@ -241,12 +245,7 @@ class Settings(BaseSettings):
             "QUERY_MAX_TOTAL_TOKENS": str(self.query_max_total_tokens),
             "QUERY_MAX_CONTEXT_TOKENS": str(self.query_max_context_tokens),
             "QUERY_MAX_SECONDS": str(self.query_max_seconds),
-            "QUERY_EVIDENCE_STALL_LIMIT": str(self.query_evidence_stall_limit),
-            "QUERY_SEARCH_READ_FORCE_LIMIT": str(self.query_search_read_force_limit),
             "QUERY_TRAVERSAL_MAX_TOKENS": str(self.query_traversal_max_tokens),
-            "QUERY_ENTITY_ANSWER_VERBOSE_LIMIT": str(self.query_entity_answer_verbose_limit),
-            "QUERY_QUERY_DECOMPOSE": on_off(self.query_decompose),
-            "QUERY_DECOMPOSE_MULTIHOP": on_off(self.query_decompose_multihop),
             "QUERY_ANSWER_TARGET_HINT": on_off(self.query_answer_target_hint),
             "QUERY_ANSWER_STYLE": self.query_answer_style,
             # 模型名(编译与查询都按**当下**的 env 走,见 current_llm_model)。

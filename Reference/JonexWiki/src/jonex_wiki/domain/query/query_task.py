@@ -40,11 +40,29 @@ def _dump_citations(citations) -> list:
 # 并回给前端，所以出网必须经白名单：只放行「检索/阅读轨迹」事件，且只保留公开字段。
 # 新增事件必须在此显式登记，未登记的一律丢弃（默认关闭，而不是默认放行）。
 _PUBLIC_TRACE_FIELDS = {
+    "query_constraint_policy": ("policy", "automatic_answer_replacement",
+        "natural_language_coverage", "mentioned_document_ids"),
+    'query_images_used': ('count',),
+    "image_tool_result": ("tool", "status", "total", "query", "asset_id", "read_id", "delivered_sha256", "actual_image_delivered"),
+    "retrieval_policy": ("strategy",),
+    "retrieval_entry": ("strategy", "paths", "navigation_paths", "semantic", "graph_used",
+        "named_document_ids", "named_source_paths", "semantic_applied_paths"),
+    "source_read_alias": ("requested_path", "resolved_path", "basis", "support"),
     # wiki_search: query + 候选前沿；wiki_read: 实读路径；表格读: 结果计数
     "tool_result": (
         "tool", "query", "paths", "candidate_paths", "frontier_paths",
         "count", "success", "cached", "table_id", "status", "cells", "has_more",
+        "operation", "matched_count",
+        "graph_candidate_paths", "graph_revision", "graph_backend",
     ),
+    "reading_material_delivered": ("path", "source_id", "unit_id", "unit_kind",
+        "selected_level", "pages", "page_count", "truncated", "whole_unit", "body_bytes"),
+    "reading_material_budget_limited": ("path", "source_id", "unit_id", "unit_kind", "reason"),
+    "table_material_too_large": ("tool", "source_id", "table_id", "unit_kind",
+        "reason", "body_bytes", "citation_count"),
+    "table_tool_normalized_to_table": ("tool", "source_id", "table_id", "body_bytes", "citation_count"),
+    "table_problem_coverage_validated": ("table_id", "literal", "combine", "branches", "coverage"),
+    "table_tool_normalized_to_workbook": ("tool", "source_id", "table_id", "body_bytes", "citation_count"),
     "search_rewritten": ("from", "to"),
     "search_constraints_preserved": ("terms", "query"),
     "source_evidence_read": ("paths", "kind"),
@@ -146,10 +164,23 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
             "revision_id": core_revision_id,
             "status": "active",
         }
-        request = {"question": row.question, "strategy": "browse-first"}
+        request = {"question": row.question}
 
         # 4) 核心查询算法；运行时旋钮经 Settings 注入
         environment = settings.runtime_env()
+        environment["QUERY_IMAGE_INSPECTION_ENABLED"] = "1" if settings.visual_inspection_enabled else "0"
+        environment["QUERY_IMAGE_MODEL"] = settings.visual_inspection_model or settings.llm_model
+        options_path = layout.kb_dir(tenant_id,kb_id) / "query-options" / (row.query_id+".json")
+        if options_path.is_file():
+            import json
+            query_options = json.loads(options_path.read_text())
+            strategy = query_options.get("retrieval_strategy")
+            if strategy is not None and strategy not in {"tree", "direct", "structure", "semantic"}:
+                raise ValueError("QUERY_RETRIEVAL_STRATEGY_INVALID")
+            if strategy is not None:
+                environment["QUERY_RETRIEVAL_STRATEGY"] = strategy
+            if query_options.get('query_context'):
+                request['query_context'] = query_options['query_context']
         if thinking_mode is not None:
             from jonex_wiki.domain.query.thinking import thinking_overrides
             environment.update(thinking_overrides(thinking_mode))
@@ -162,10 +193,15 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
                 )
         if thinking_mode is not None:
             result.config["thinking_mode"] = thinking_mode
+        result.config["retrieval_strategy"] = environment.get("QUERY_RETRIEVAL_STRATEGY", "tree")
 
+        from jonex_wiki.adapters.bundle_view import DirectoryBundleView
+        from jonex_wiki.domain.engine.query.media import attach_media
+        citations = attach_media(_dump_citations(result.citations), DirectoryBundleView(
+            tenant_id=tenant_id, context_id=kb_id, revision_dir=published), row.question, result.answer)
         out = {
             "answer": result.answer,
-            "citations": _dump_citations(result.citations),
+            "citations": citations,
             "incomplete": result.incomplete,
             "search_calls": result.search_calls,
             "read_calls": result.read_calls,

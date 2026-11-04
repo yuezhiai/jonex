@@ -153,10 +153,10 @@ def thinking_payload(value: str | None) -> dict | None:
 
 
 class GwClient:
-    """spec §12:所有模型调用走 llm-gateway;计量头强制注入;rerank 失败降级。"""
+    """spec §12:所有模型调用走 llm-gateway;计量头强制注入。"""
 
     def __init__(self, settings, transport: httpx.AsyncBaseTransport | None = None,
-                 backoff_schedule=(1.0, 2.0)):
+                 backoff_schedule=(1.0, 2.0), *, http_client=None):
         self.settings = settings
         self._backoff = backoff_schedule
         # chat 用 per-request timeout 收紧到 settings.llm_timeout
@@ -164,9 +164,9 @@ class GwClient:
                                api_key=settings.llm_binding_api_key,
                                max_retries=0,  # 重试预算由 GwClient 统一控制,禁用 SDK 自带重试
                                timeout=max(settings.llm_timeout, 300.0),
-                               http_client=httpx.AsyncClient(transport=transport) if transport else None)
+                               http_client=http_client if http_client is not None else (
+                                   httpx.AsyncClient(transport=transport) if transport else None))
         self.llm_model = settings.llm_model
-        self._httpx = httpx.AsyncClient(transport=transport, timeout=30.0)
 
     def _headers(self, *, scene, tenant_id, kb_id, trace_id, doc_id=None) -> dict:
         h = {"X-Jonex-Tenant-Id": tenant_id, "X-Jonex-Kb-Id": kb_id,
@@ -285,31 +285,9 @@ class GwClient:
         ) from last
 
 
-    async def rerank(self, query, documents, *, scene, tenant_id, kb_id, trace_id,
-                     top_n=10) -> list[dict] | None:
-        try:
-            base = self.settings.llm_binding_host.rstrip("/")
-            base = base.removesuffix("/v1")
-            r = await self._httpx.post(
-                f"{base}/v1/rerank",
-                headers={"Authorization": f"Bearer {self.settings.llm_binding_api_key}",
-                         **self._headers(scene=scene, tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id)},
-                json={"model": "awenleven/Qwen3-Reranker-4B:Q4_K_M",
-                      "query": query, "documents": documents, "top_n": top_n},
-                timeout=15.0)
-            if r.status_code >= 400:
-                log.warning("rerank 失败 HTTP %d,保留原序", r.status_code)
-                return None
-            results = r.json().get("results") or []
-            return [{"index": item.get("index"), "relevance_score": item.get("relevance_score")}
-                    for item in results]
-        except Exception as e:  # noqa: BLE001
-            log.warning("rerank 异常,保留原序: %s", e)
-            return None
 
     async def aclose(self) -> None:
         await self.llm.close()
-        await self._httpx.aclose()
 
 
 def parse_json_content(content: str) -> dict:
@@ -329,5 +307,27 @@ def parse_json_content(content: str) -> dict:
     # Read one complete object, ignoring surrounding prose or a repeated
     # transport rendering. The decoder handles braces inside quoted strings;
     # malformed/truncated objects still raise without another provider call.
-    value, _ = json.JSONDecoder(strict=False).raw_decode(text[start:])
+    candidate = text[start:]
+    decoder = json.JSONDecoder(strict=False)
+    try:
+        value, _ = decoder.raw_decode(candidate)
+    except json.JSONDecodeError:
+        # Some Chinese provider replies use full-width JSON separators. Only
+        # normalize punctuation OUTSIDE quoted strings; never rewrite source
+        # text, numbers, units or escaped quotes inside an answer.
+        quoted = escaped = False
+        repaired = []
+        for char in candidate:
+            if quoted:
+                repaired.append(char)
+                if escaped:escaped = False
+                elif char == "\\":escaped = True
+                elif char == '"':quoted = False
+            elif char == '"':
+                quoted = True;repaired.append(char)
+            else:
+                repaired.append({"，": ",", "：": ":"}.get(char, char))
+        normalized = "".join(repaired)
+        if normalized == candidate:raise
+        value, _ = decoder.raw_decode(normalized)
     return value

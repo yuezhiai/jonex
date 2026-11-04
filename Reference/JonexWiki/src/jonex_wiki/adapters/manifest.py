@@ -36,7 +36,12 @@ def _canonical_json(value: Any) -> bytes:
 
 # [jonex] 编译期模型名读**当下 env**（Settings 字段是进程启动时的快照，只作回落）。
 def _resolve_compile_model(settings: Settings) -> str:
-    """编译期模型名：以**当下**的环境变量为准，``Settings`` 字段仅作回落。
+    """编译期模型名的**部署默认值**：以当下 env 为准，``Settings`` 字段仅作回落。
+
+    [jonex] P3b 起这是**兜底**：KB 配了编译模型时它由**任务**带进来
+    （`TaskRow.summary["compile_model"]`，见 `ManifestBuilder.build` 的
+    ``compile_model`` 入参），取不到才落到这里。本函数只回答"部署层面这个模型
+    是什么"，不知道 KB 级配置的存在。
 
     ``Settings`` 在 app 工厂里只构造一次（``main.py``），``llm_model`` 等于**进程启动
     那一刻**的 env；而模型名是"部署当下"的属性 —— 每次编译都该按当时的 env 编，并把
@@ -58,6 +63,7 @@ class ManifestBuilder:
         self,
         session,
         *,
+        compile_model: str = "",
         tenant_id: str,
         kb_id: str,
         claim_policy: str = "production",
@@ -78,7 +84,13 @@ class ManifestBuilder:
 
         manifest: Dict[str, Any] = {
             "models": {
-                "curation": _resolve_compile_model(self._settings),
+                # [jonex] P3b（方案 B）：curation 取**任务**带来的 KB 编译模型，
+                # 任务没带才回落部署 env。模型不在引擎侧另存一份 —— 任务快照就是
+                # 唯一事实，所以这里不需要（也无法）去读 KB 配置表。
+                "curation": (compile_model or "").strip() or _resolve_compile_model(self._settings),
+                # 查询期模型**不受 KB 覆盖影响**：仍取部署当下 env（也仍会被记成
+                # 编译期快照，供审计），且 `_compilation_manifest` 把它剔出身份比较，
+                # 所以改部署 env 不会让有 KB 覆盖的库整库重编。
                 "query": _resolve_compile_model(self._settings),
             },
             "curation": {

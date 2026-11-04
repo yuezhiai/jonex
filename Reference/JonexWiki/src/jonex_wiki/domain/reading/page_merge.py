@@ -1,30 +1,11 @@
-"""展示侧「同名归并」：一个实体一页（**读取时投影**，不改发布产物）。
+"""Reading-side aliases require an explicit, authoritative identity.
 
-背景
-----
-LLM 在编译期给同一实体生成了多个不同 slug，并且会在「实体目录」
-（``artists/``）与每个「主题目录」（``lingnan*/``）下各建一份页面。
-真实产物实测（3835 页 / 1143 个候选页，KB ``bec1ef09…``，revision 95404d13）：
-
-* 同标题簇 **19** 个，涉及 66 页，归并后可减少 **47** 页；
-* 其中 **跨目录 16 簇 / 同目录仅 3 簇** —— 所以归并键**不能**限制在同一目录，
-  否则漏掉 84%（``陈树人`` 落在 artists / lingnan / lingnan-pai /
-  lingnan-school / lingnan/painters 五个目录）。
-
-归并键 = **归一标题**（不限制目录）。实测这 19 簇语义上都是同一实体；
-同音不同人这类真正的同名歧义在本库未出现。误伤防线是 ``_EXCLUDED_PREFIXES``
-——检索/证据侧页面（表格、源文档、证据片段、原始页）永不参与归并。
-
-为什么在读取时投影，而不是在 ``build_bundle_files`` 改 corpus
-------------------------------------------------------------
-``build_query_corpus`` 产出的 corpus **同时喂检索树与阅读树**，在那一层归并会
-改变检索产物。本模块只被 ``domain/reading``（展示链路）调用：发布 bundle
-一字不动，随时可回滚，且不需要重新编译。
-
-幂等性
-------
-``build_merge_map`` 是 (page_index, sizes) 的纯函数。对已归并的页面清单再跑一次，
-每个标题簇只剩一个成员 → 无 redirect，得到恒等映射。
+Same titles, equal normalized spellings, richer bodies or more claims cannot
+prove that two pages concern the same subject. The default is an identity
+mapping: preserve every page, reference and graph endpoint. A caller with a
+verified canonical identity may explicitly supply ``identity_of``. Such an
+identity is scoped by that caller to the current tenant, Bundle and subject;
+this module never derives it from a title or a domain-specific naming rule.
 """
 
 from __future__ import annotations
@@ -41,12 +22,7 @@ _INTERPUNCT_RE = re.compile(r"[·・\u00b7]")
 
 
 def normalize_title(title: str) -> str:
-    """标题归一：去掉所有空白与间隔号，再做 casefold。
-
-    空白差异（``"关 山 月"``）与间隔号差异（``"阿·Q"``）在真实产物里都出现过，
-    但它们指向同一实体，因此归一到同一个键。空标题返回空串——调用方据此跳过，
-    避免把所有无标题页面并成一页。
-    """
+    """Legacy cosmetic label normalization; never evidence of subject identity."""
     text = (title or "").strip()
     text = _INTERPUNCT_RE.sub("", _WHITESPACE_RE.sub("", text))
     return text.casefold()
@@ -92,19 +68,16 @@ def build_merge_map(
     weight_of: Optional[Callable[[str], int]] = None,
     size_of: Optional[Callable[[str], int]] = None,
     is_candidate: Optional[Callable[[str], bool]] = None,
+    identity_of: Optional[Callable[[str], Optional[str]]] = None,
 ) -> MergeMap:
-    """按归一标题聚类，给出 loser→winner 映射。
+    """Group only paths for which the caller supplies the same verified identity.
 
-    选主顺序（确定性，保证同一输入永远同一 winner）：
-    ① ``weight_of`` 更大（调用方传 claim 数——证据最多的那份是实体正页）；
-    ② ``size_of`` 更大（正文体量）；
-    ③ 路径层级更浅（``artists/x.md`` 优于 ``lingnan/painters/x.md``）；
-    ④ 路径字典序更小。
-
-    两个度量都要注入而不是写死：真实产物里「claim 最多」与「体量最大」在
-    19 簇中有 3 簇给出不同 winner（``高奇峰``：artists 44 claims 但更厚，
-    lingnan 60 claims 但更薄），所以主判据是 claim 数、体量只做 tie-break。
+    Ranking chooses a presentation representative after identity is established;
+    weights and body sizes are never evidence of identity. Missing identities
+    keep their pages separate. The ordinary reader supplies no resolver.
     """
+    if identity_of is None:
+        return _IDENTITY
     if is_candidate is None:
         is_candidate = is_merge_candidate
 
@@ -118,9 +91,8 @@ def build_merge_map(
         title = ""
         if isinstance(entry, dict):
             title = str(entry.get("title") or "")
-        key = normalize_title(title)
-        if not key:
-            # 无标题页面不参与归并：否则会把一堆无关页面并成一页
+        key = identity_of(path)
+        if not isinstance(key, str) or not key.strip():
             continue
         titles[path] = title
         buckets.setdefault(key, []).append(path)

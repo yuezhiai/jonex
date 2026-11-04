@@ -1,0 +1,21 @@
+{
+  "id": "artwork-catalog",
+  "version": "1.0.0",
+  "label": "艺术图录",
+  "description": "可选的原生图录版式识别，保存作者、作品和配图候选；保守规则的覆盖范围需核对。",
+  "processor": "jonex_wiki.scenarios.artwork:interpret",
+  "requires_model": false,
+  "kinds": [
+    "person",
+    "artwork"
+  ],
+  "relations": [
+    "创作",
+    "代表作"
+  ],
+  "instructions": "Native catalog compatibility, explicitly selected documents only.",
+  "kind_labels": {
+    "person": "人物",
+    "artwork": "作品"
+  }
+}

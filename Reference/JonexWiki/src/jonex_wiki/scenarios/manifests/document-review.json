@@ -1,0 +1,26 @@
+{
+  "id": "document-review",
+  "version": "1.0.0",
+  "label": "资料审阅",
+  "description": "组织资料中的规则、条件和待核实事项，独立于教育场景。",
+  "processor": "jonex_wiki.scenarios.semantic:interpret",
+  "kinds": [
+    "rule",
+    "condition",
+    "observation",
+    "open_issue"
+  ],
+  "relations": [
+    "conditions",
+    "qualifies",
+    "contradicts",
+    "continues"
+  ],
+  "instructions": "Organize document review material into explicit rules, conditions, observations and unresolved issues, retaining source and applicability. Do not invent obligations, missing rules, ownership or chronology. Do not treat examples as exhaustive. Link conditions to rules only with source evidence. This is document organization, not professional advice.",
+  "kind_labels": {
+    "rule": "规则",
+    "condition": "条件",
+    "observation": "观察",
+    "open_issue": "待核实事项"
+  }
+}

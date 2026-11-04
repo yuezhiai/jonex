@@ -13,7 +13,7 @@ from typing import Callable, Mapping
 from jonex_wiki.domain.engine.compile.source_prep.blocks import ParseBlock
 from jonex_wiki.kernel.runtime_env import current_env
 
-STRATEGY = "structure-pack-1"
+STRATEGY = "structure-pack-2"
 # prose(非表格/非记录)块的字符窗口上限。**不是 env 旋钮**:没有独立的
 # ``JONEX_WIKI_*`` 入口,只由本常量决定;生效值还要与整包字符硬上限取小
 # (见 ``PackingOptions.text_window``),所以它不可能突破 ``max_chars``。
@@ -111,30 +111,15 @@ def is_separator_row(cells) -> bool:
 
 
 def markdown_header_line_count(lines: list[str]) -> int:
-    """Recognize explicit continued headers without filling data cells.
+    """Repeat only the Markdown header and its explicit separator.
 
-    Office exports repeat leading header labels for merged heading rows. A
-    calendar export instead has two blank label columns, paired weekday/date
-    heading rows. Unknown layouts retain the ordinary one-row header.
+    Data words, repeated labels and numeric shapes do not prove another
+    header tier. Native and HTML consumers retain their own structural
+    metadata; a plain pipe grid cannot reconstruct it from cell values.
     """
-    if len(lines) < 2:
-        return len(lines)
-    first = split_table_row(lines[0])
-    count = 2
-    weekday = lambda row: any(re.fullmatch(r"星期[一二三四五六日天]", c.strip()) for c in row)
-    serial = lambda row: any(re.fullmatch(r"[345]\d{4}(?:\.0)?", c.strip()) for c in row)
-    while count < len(lines):
-        row = split_table_row(lines[count])
-        if len(row) != len(first):
-            break
-        repeated_labels = (len(first) >= 3 and all(first[:2])
-                           and row[:2] == first[:2] and row != first)
-        calendar = (len(first) >= 3 and not any(first[:2]) and not any(row[:2])
-                    and ((weekday(first) and serial(row)) or (serial(first) and weekday(row))))
-        if not (repeated_labels or calendar):
-            break
-        count += 1
-    return count
+    if len(lines) >= 2 and is_separator_row(split_table_row(lines[1])):
+        return 2
+    return 0
 
 
 @dataclass(frozen=True)

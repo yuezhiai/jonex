@@ -1,0 +1,32 @@
+{
+  "id": "education",
+  "version": "1.0.0",
+  "label": "教育",
+  "description": "理解与组织学习材料；支持自由排版、手写、图文与讲解，保留缺失及不确定状态。",
+  "processor": "jonex_wiki.scenarios.semantic:interpret",
+  "kinds": [
+    "task",
+    "explanation",
+    "learner_work",
+    "feedback",
+    "note",
+    "concept"
+  ],
+  "relations": [
+    "answers",
+    "explains",
+    "corrects",
+    "uses_concept",
+    "continues",
+    "shared_context"
+  ],
+  "instructions": "Organize learning material according to meaning, not headings or numbering. Material may be handwritten, incomplete, a lecture, a draft, annotations or a mixture. Identify tasks, explanations, learner work, feedback, notes and concepts only when grounded. Do not force everything into a question. Distinguish student work, reference answer, teacher feedback and your own interpretation. Do not infer that a learner was wrong without explicit evidence. Missing prompts or answers stay missing. Objects may span multiple non-contiguous units and pages. Identify ambiguous associations and unreadable symbols. Never infer mastery or prerequisites from co-occurrence.",
+  "kind_labels": {
+    "task": "任务与题目",
+    "explanation": "讲解",
+    "learner_work": "学习过程与作品",
+    "feedback": "反馈",
+    "note": "笔记",
+    "concept": "概念"
+  }
+}

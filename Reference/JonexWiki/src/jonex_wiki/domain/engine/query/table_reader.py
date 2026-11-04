@@ -1694,7 +1694,7 @@ def project_saved_cell_semantics(cells: List[Mapping[str, Any]],
                     cell["merge_anchor"] = merge["anchor"]
     if epoch is not None:
         for cell in projected:
-            if cell.get("date_candidate"):
+            if cell.get("date_candidate") and not str(cell.get("number_format") or "").startswith("builtin:"):
                 value = cell.get("cached_value") if cell.get("formula") else cell.get("raw_value")
                 normalized = excel_serial_iso(value, epoch)
                 if normalized is not None:
@@ -1812,16 +1812,36 @@ def _compact_grid(cells, merges, *, epoch=None):
              "| --- | " + " | ".join("---" for _ in columns) + " |"]
     lines.extend("| {} | {} |".format(row, " | ".join(values.get(c, "") for c in columns))
                  for row, values in sorted(rows.items()))
-    return "\n".join(lines) + render_intersecting_merges(merges, cells)
+    # Formatting can carry units (0.00%) or identifier padding (000000).
+    # Group contiguous coordinates so that preserving it does not require a
+    # second, verbose citation record for every cell. Raw values stay intact.
+    formats = {}
+    for cell in cells:
+        number_format = str(cell.get("number_format") or "")
+        if number_format not in {"", "General", "@"}:
+            formats.setdefault((int(cell["column_index"]), number_format), set()).add(int(cell["row_index"]))
+    notes = []
+    for (column, number_format), positions in sorted(formats.items()):
+        ordered = sorted(positions)
+        runs = []
+        for row in ordered:
+            if runs and row == runs[-1][1] + 1:
+                runs[-1][1] = row
+            else:
+                runs.append([row, row])
+        ranges = ", ".join("R{}C{}:R{}C{}".format(first, column, last, column) for first,last in runs)
+        notes.append("- {}: {}".format(ranges, json.dumps(number_format, ensure_ascii=False)))
+    format_notes = ("\n\n## 原始数值格式\n\n格式与原值共同解释；百分比、前导零和未知格式不得忽略。\n" + "\n".join(notes)) if notes else ""
+    return "\n".join(lines) + render_intersecting_merges(merges, cells) + format_notes
 
 
-def render_full_table_markdown(source_id, table, cells, merges, sheet_name=None):
+def render_full_table_markdown(source_id, table, cells, merges, sheet_name=None, epoch=None):
     title = table.get("title") or table.get("table_id") or ""
     header = "# {}\n\nsource_id=`{}` table_id=`{}`\n".format(
         title, source_id, table.get("table_id"))
     if sheet_name:
         header += "工作表：{}\n".format(sheet_name)
-    return header + "\n" + _compact_grid(cells, merges)
+    return header + "\n" + _compact_grid(cells, merges, epoch=epoch)
 
 
 def render_full_sheet_markdown(source_id, sheet, cells, merges):
@@ -1836,9 +1856,10 @@ def full_table_body(connection, source_id: str, table_id: str) -> str:
     cells = [dict(row) for row in stream_cells(connection, table)]
     merges = [dict(row) for row in read_merge_ranges(connection, table)]
     sheet_row = connection.execute(
-        "SELECT name FROM sheets WHERE sheet_id=?", (table["sheet_id"],)).fetchone()
+        "SELECT name,date_epoch FROM sheets WHERE sheet_id=?", (table["sheet_id"],)).fetchone()
     sheet_name = str(sheet_row["name"]) if sheet_row is not None else None
-    body = render_full_table_markdown(source_id, dict(table), cells, merges, sheet_name=sheet_name)
+    body = render_full_table_markdown(source_id, dict(table), cells, merges, sheet_name=sheet_name,
+        epoch=sheet_row["date_epoch"] if sheet_row is not None else None)
     exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_observations'").fetchone()
     if exists:
@@ -1849,7 +1870,10 @@ def full_table_body(connection, source_id: str, table_id: str) -> str:
             raw = json.loads(observation["raw_item_json"] or "{}")
             item = raw.get("raw_item") or raw
             html = item.get("table_body") if isinstance(item, dict) else None
-            if html:
+            if html and not cells:
+                # A usable saved grid is the compact, coordinate-bearing
+                # reading surface. Retain raw HTML as fallback for raw-only
+                # observations, without sending a second copy of every value.
                 body = "# {}\n\n{}".format(table["title"], html)
             elif not cells:
                 body = "# {}\n\n{}".format(table["title"], raw.get("text") or "")

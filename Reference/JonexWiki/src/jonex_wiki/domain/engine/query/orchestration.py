@@ -37,20 +37,9 @@ async def run_query(
     question: str,
     strategy: QueryStrategy,
     routing: Dict[str, Any],
-    route: Optional[Union[str, Route]] = None,
     cancel: CancelPort | None = None,
 ) -> QueryRunResult:
-    """Build the query corpus and run the enforced strict traversal.
-
-    LWP-RET-002: ``route`` is the per-query long-document routing override
-    (default ``None`` = auto).  An explicit override may also arrive through the
-    routing dict under ``_route_override`` (following the ``_published_*`` pop
-    precedent); otherwise the question is classified deterministically by
-    ``query_router.resolve_route``.  The resolved route lives on the corpus for
-    the traversal controller and on ``result.config``/trace afterwards — never
-    in effective-config.  The default auto->proposition path keeps the hybrid
-    trace byte-identical.
-    """
+    """Query the published corpus using the runner-selected retrieval policy."""
     routing = dict(routing)
     prepared_corpus = routing.pop("_prepared_corpus", None)
     if prepared_corpus is None:
@@ -62,23 +51,8 @@ async def run_query(
         corpus = prepared_corpus.model_copy(deep=False)
     lexical_index = routing.pop("_published_lexical_index", None)
     frozen_indexes = lexical_index is not None or routing.get("bundle_view") is not None
-    # LWP-RET-002: engine-side query-intent classification (zero API/DB
-    # changes, nothing persisted).  Explicit override flows through the routing
-    # dict pop (the same pop precedent as ``_published_lexical_index`` above)
-    # or the ``route`` argument; the default derives from the question via the
-    # pure router.
-    route_override = routing.pop("_route_override", None)
-    if route is None:
-        route = route_override
-    resolved_route = resolve_route(question, route)
-    # Raw-source fallback axis (P0 #1): an injected on-demand single-segment
-    # reader plus an explicit mode ("off" default | "production" | "matched").
-    # Nothing here re-injects the source archive into the corpus.
-    raw_fallback_mode = routing.pop("_raw_fallback_mode", "off")
-    raw_source_reader = routing.pop("_raw_source_reader", None)
+    resolved_route = resolve_route(question, explicit=routing.pop("route", None))
     corpus.route = resolved_route.value
-    corpus.raw_fallback_mode = raw_fallback_mode
-    corpus.raw_source_reader = raw_source_reader
     if frozen_indexes:
         routing["lexical_index"] = lexical_index
         routing["frozen_indexes"] = True
@@ -91,9 +65,6 @@ async def run_query(
     # never effective-config.  Proposition/auto adds no trace event, keeping
     # the default-stack trace byte-identical to the pre-route hybrid.
     result.config["route"] = resolved_route.value
-    result.config["raw_source_fallback_count"] = sum(
-        1 for entry in result.trace if entry.event == "raw_source_fallback"
-    )
     if resolved_route != Route.PROPOSITION:
         detail: Dict[str, Any] = {"route": resolved_route.value}
         result.trace.append(TraceEntry(event="route_selected", detail=detail))

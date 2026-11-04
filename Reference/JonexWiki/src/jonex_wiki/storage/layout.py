@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -152,7 +153,13 @@ class Layout:
         history = sorted((path for path in versions.iterdir()
                           if path.is_dir() and path != active),
                          key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
-        keep = {active.name, *(protected_refs or set())}
+        # A corrupt reference ledger cannot authorize deletion. Scenario jobs,
+        # retained business selections and workbench runs share this ledger.
+        try:
+            durable_pins = self.version_pins(tenant_id, kb_id)
+        except (ValueError, OSError):
+            return []
+        keep = {active.name, *(protected_refs or set()), *durable_pins.values()}
         keep.update(path.name for path in history[:max(0, keep_history)])
         removed = []
         for path in history:
@@ -160,3 +167,28 @@ class Layout:
                 shutil.rmtree(path)
                 removed.append(path.name)
         return removed
+
+    def version_pins(self, tenant_id: str, kb_id: str) -> dict[str, str]:
+        path = self.kb_dir(tenant_id, kb_id) / "compile" / "retention.json"
+        if not path.is_file():
+            return {}
+        value = json.loads(path.read_text())
+        if (not isinstance(value,dict) or value.get("schema") != "wiki.retention.v1" or not isinstance(value.get("pins"), dict)
+                or any(not isinstance(owner, str) or not isinstance(sha,str) or not re.fullmatch(r"[0-9a-f]{64}", sha)
+                       for owner, sha in value["pins"].items())):
+            raise ValueError("VERSION_PINS_INVALID")
+        return value["pins"]
+
+    def set_version_pin(self, tenant_id: str, kb_id: str, owner: str, revision: str | None) -> None:
+        """Caller holds version_lock. Releasing a pin never deletes an artifact."""
+        if not owner or len(owner) > 240:
+            raise ValueError("VERSION_PIN_OWNER_INVALID")
+        pins = self.version_pins(tenant_id, kb_id)
+        if revision is None:
+            pins.pop(owner, None)
+        else:
+            if not isinstance(revision,str) or not re.fullmatch(r"[0-9a-f]{64}", revision) or not self.versions_dir(tenant_id, kb_id, revision).is_dir():
+                raise ValueError("VERSION_PIN_REVISION_INVALID")
+            pins[owner] = revision
+        self.atomic_write(self.kb_dir(tenant_id, kb_id) / "compile" / "retention.json",
+                          json.dumps({"schema": "wiki.retention.v1", "pins": pins}, sort_keys=True).encode())

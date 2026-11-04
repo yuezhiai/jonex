@@ -60,11 +60,37 @@ class DocumentRepo:
 
 class TaskRepo:
     async def create(self, session: AsyncSession, *, tenant_id, kb_id, kind: TaskKind,
-                     document_id: str | None = None) -> TaskRow:
-        row = TaskRow(tenant_id=tenant_id, kb_id=kb_id, kind=kind.value, document_id=document_id)
+                     document_id: str | None = None, compile_model: str = "") -> TaskRow:
+        """建任务。``compile_model`` = **任务建立时**该 KB 的编译模型快照。
+
+        [jonex] P3b（方案 B）：模型不进引擎侧的 KB 表，只进任务。任务跑的时候
+        读自己这一行，所以「改配置影响之后的编译、不影响在途任务」是结构保证的，
+        不需要比对或同步。空串 = 这次调用没带模型 ⇒ 引擎走部署默认（env）。
+        """
+        summary = {"compile_model": compile_model} if compile_model else None
+        row = TaskRow(tenant_id=tenant_id, kb_id=kb_id, kind=kind.value,
+                      document_id=document_id, summary=summary)
         session.add(row)
         await session.flush()
         return row
+
+    @staticmethod
+    def restamp_compile_model(task: TaskRow | None, compile_model: str) -> None:
+        """给复用的**已排队**任务换上本次请求的模型（未开跑 ⇒ 换模型该生效）。
+
+        平台保存配置后会排一次重编；如果此时已有一条 queued 编译任务（比如刚上传
+        文档触发的），直接沿用就会用旧模型编完这次 —— 用户看到的是「改了没生效」。
+        这里只改还没开跑的任务；compiling 状态一律不动（在途任务保持自己的快照）。
+        """
+        if task is None or not compile_model:
+            return
+        if task.status != TaskStatus.queued.value:
+            return
+        summary = dict(task.summary or {})
+        if summary.get("compile_model") == compile_model:
+            return
+        summary["compile_model"] = compile_model
+        task.summary = summary
 
     async def get(self, session: AsyncSession, tenant_id, task_id) -> TaskRow | None:
         return (await session.execute(

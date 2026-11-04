@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,7 +35,20 @@ from jonex_wiki.domain.engine.compile.identity import (
 )
 from jonex_wiki.domain.engine.models.compiler_state import PageLink
 
-RELATION_RULE_VERSION = "wiki-relation-increment-v1"
+RELATION_RULE_VERSION = "wiki-relation-increment-v2"
+# Explicit directed predicates, not a general natural-language entailment rule.
+CHINESE_RELATIONS = ("负责审批", "负责执行", "移交付款材料", "隶属于", "属于", "位于", "适用于", "管理", "制定", "替代", "前身", "继任")
+ALLOWED_RELATIONS = frozenset((*RELATION_KINDS, *CHINESE_RELATIONS))
+
+
+def _allowed_relation(value: str) -> bool:
+    # Domain-specific Chinese predicates may keep their exact source wording.
+    # Admission is still the bounded directed-clause proof below, never the
+    # presence of a label or shared entities alone.
+    if re.match(r"(?:不|未|非|无|应当|应该|须|需|可|能|将|拟|欲|禁止|严禁|计划)", value):
+        return False
+    return value in ALLOWED_RELATIONS or (bool(re.fullmatch(r"[\u3400-\u9fff]{2,16}", value))
+                                           and value not in ("相关", "关联", "有关", "提及", "联系"))
 KIND_NAVIGATION = "navigation"
 KIND_SUPPORTED = "supported_relation"
 RESOLVED = "resolved"
@@ -76,6 +90,7 @@ class LinkRecord(BaseModel):
     kind: str
     evidence_refs: List[Dict[str, Any]] = Field(default_factory=list)
     relation: str = ""
+    qualifiers: List[Dict[str, str]] = Field(default_factory=list)
     resolution: str = RESOLVED
     aliases: List[str] = Field(default_factory=list)
     # Only for pending records: the mention that has no page yet.
@@ -144,7 +159,7 @@ def _relation_supported(proposal: LinkProposal, target: str,
     Unsupported paraphrases stay useful navigation without a fact assertion.
     """
     from jonex_wiki.domain.engine.models.claim import assess_claim_support
-    if not target or not proposal.relation or not _evidence_is_real(proposal.evidence_refs, contributions):
+    if not target or not _allowed_relation(proposal.relation) or not _evidence_is_real(proposal.evidence_refs, contributions):
         return False
     def title(path):
         entry = page_index.get(path)
@@ -159,11 +174,56 @@ def _relation_supported(proposal: LinkProposal, target: str,
              if record.support_status == "SUPPORTED" and not record.unresolved_evidence
              for span in record.source_spans
              if (span.passage_id, " ".join(span.text.split())) in requested]
+    if re.fullmatch(r"[\u3400-\u9fff]+", proposal.relation):
+        # Only a direct, positive, source-stated subject→predicate→object clause.
+        # Keep the *whole source statement* as a qualifier, so monetary, temporal
+        # and other restrictions are never erased by shortening the edge label.
+        names = lambda path: ([title(path)] + list(
+            (page_index[path].get("aliases", []) if isinstance(page_index[path], Mapping)
+             else getattr(page_index[path], "aliases", []))))
+        for span in spans:
+            statement = str(span.text)
+            if re.search(r"是否|能否|不属实|并非|不是|不负责|不适用|无权|不得|不能|假设|可能|拟由", statement):
+                continue
+            for clause in re.split(r"[。；;\n]", statement):
+                for source_name in names(proposal.page_path):
+                    for target_name in names(target):
+                        if not source_name or not target_name:
+                            continue
+                        pattern = (r"^\s*" + re.escape(source_name) +
+                                   r"(?:[（(][^）)]{0,40}[）)])?\s*" + re.escape(proposal.relation) +
+                                   r"(?P<conditions>[^，,。；;\n]{0,120}?)" + re.escape(target_name) + r"(?:[，,\s].*)?$")
+                        match = re.fullmatch(pattern, clause.strip())
+                        if match and not re.search(r"并|以及|同时|且|而|但|与|和|及|或", match["conditions"]) and assess_claim_support(
+                                statement, [span], has_unresolved_evidence=False)[0] == "SUPPORTED":
+                            return True
+        return False
     exact_relation = normalize_name(proposition)
     # Require the complete directed sentence, never just shared entities/verbs.
     exact = any(exact_relation in [normalize_name(part.strip()) + "."
                 for part in str(span.text).split(".") if part.strip()] for span in spans)
     return exact and assess_claim_support(proposition, spans, has_unresolved_evidence=False)[0] == "SUPPORTED"
+
+
+def _qualifiers(refs, contributions):
+    requested = {(str(r.get("passage_id", "")), " ".join(str(r.get("excerpt", "")).split())) for r in refs}
+    found = []
+    for record in getattr(contributions, "records", ()):
+        if record.support_status != "SUPPORTED" or not any(
+                (ref.passage_id, " ".join(ref.excerpt.split())) in requested for ref in record.evidence):
+            continue
+        # Preserve the actual supporting quote, not a shortened proposition or
+        # unvalidated model hints about currency/date/amount boundaries.
+        for value in [{"source_statement": ref.excerpt} for ref in record.evidence
+                      if (ref.passage_id, " ".join(ref.excerpt.split())) in requested]:
+            if value not in found:
+                found.append(value)
+    return found
+
+
+def _relation_key(record):
+    return (record.page_path, record.target_id, record.kind, record.relation,
+            json.dumps(record.qualifiers, ensure_ascii=False, sort_keys=True))
 
 
 def build_link_increment(contributions: Any, *,
@@ -175,7 +235,7 @@ def build_link_increment(contributions: Any, *,
     index = _target_index(page_index or {})
     links: List[LinkRecord] = []
     pending: List[LinkRecord] = []
-    seen: Dict[Tuple[str, str, str], LinkRecord] = {}
+    seen: Dict[Tuple[str, ...], LinkRecord] = {}
     for proposal in proposals or ():
         target = index.get(normalize_name(proposal.target_mention), "")
         relation = str(proposal.relation or "")
@@ -193,6 +253,7 @@ def build_link_increment(contributions: Any, *,
             # over: a navigation link must not smuggle unproven references.
             evidence_refs=list(proposal.evidence_refs) if supported or not target else [],
             relation=relation if supported or not target else "",
+            qualifiers=_qualifiers(proposal.evidence_refs, contributions) if supported else [],
             resolution=RESOLVED if target else PENDING,
             aliases=aliases,
             target_mention="" if target else str(proposal.target_mention),
@@ -209,7 +270,7 @@ def build_link_increment(contributions: Any, *,
             # as SELF_STRUCTURED_LINK) and no reader gains a destination.
             count_work("relation_self_links_dropped")
             continue
-        key = (record.page_path, record.target_id, record.kind)
+        key = _relation_key(record)
         existing = seen.get(key)
         if existing is None:
             seen[key] = record
@@ -227,15 +288,15 @@ def build_link_increment(contributions: Any, *,
                 continue
             if resolved and resolved != str(page_path) and resolved not in planned:
                 planned.append(resolved)
-    seen_targets = {(page, target) for page, target, kind in seen}
+    seen_targets = {(record.page_path, record.target_id) for record in seen.values()}
     for page_path, targets in legacy_pages.items():
         why = "legacy related entry"
         for target in targets:
-            key = (page_path, target, KIND_NAVIGATION)
             if (page_path, target) in seen_targets or not target:
                 continue
-            seen[key] = LinkRecord(page_path=page_path, target_id=target, why_visit=why,
-                                   kind=KIND_NAVIGATION, resolution=RESOLVED)
+            record = LinkRecord(page_path=page_path, target_id=target, why_visit=why,
+                                kind=KIND_NAVIGATION, resolution=RESOLVED)
+            seen[_relation_key(record)] = record
             seen_targets.add((page_path, target))
     links = sorted(seen.values(),
                    key=lambda item: (item.page_path,
@@ -265,6 +326,7 @@ def resolve_pending(increment: LinkIncrement, *,
             "resolution": RESOLVED, "target_mention": "",
             "kind": KIND_SUPPORTED if supported else KIND_NAVIGATION,
             "relation": record.relation if supported else "",
+            "qualifiers": _qualifiers(record.evidence_refs, contributions) if supported else [],
             "evidence_refs": record.evidence_refs if supported else []}))
     links.sort(key=lambda item: (item.page_path,
                                  0 if item.kind == KIND_NAVIGATION else 1,
@@ -287,7 +349,7 @@ def withdraw_links(increment: LinkIncrement, *, live_evidence: Any,
             continue
         if record.kind == KIND_SUPPORTED and not _evidence_is_real(
                 record.evidence_refs, live_evidence):
-            record = record.model_copy(update={"kind": KIND_NAVIGATION, "relation": "", "evidence_refs": [], "aliases": []})
+            record = record.model_copy(update={"kind": KIND_NAVIGATION, "relation": "", "evidence_refs": [], "aliases": [], "qualifiers": []})
         links.append(record)
     return LinkIncrement(
         links=links,
@@ -314,9 +376,9 @@ def merge_link_increments(current: LinkIncrement,
         merged.setdefault(record.page_path, []).append(record)
     links: List[LinkRecord] = []
     for page_path in sorted(merged):
-        seen: Dict[Tuple[str, str], LinkRecord] = {}
+        seen: Dict[Tuple[str, ...], LinkRecord] = {}
         for record in merged[page_path]:
-            key = (record.target_id, record.kind)
+            key = _relation_key(record)
             existing = seen.get(key)
             if existing is None or len(record.evidence_refs) > len(existing.evidence_refs):
                 seen[key] = record
@@ -389,16 +451,16 @@ def audit_declared_relations(declared: Sequence[Mapping[str, Any]],
                              increment: LinkIncrement,
                              contributions: Any) -> List[Dict[str, Any]]:
     """Record every published supported_relation that lost its support."""
-    supported = {(record.page_path, normalize_name(record.target_id))
+    supported = {(record.page_path, normalize_name(record.target_id), record.relation)
                  for record in increment.links if record.kind == KIND_SUPPORTED}
     out: List[Dict[str, Any]] = []
     for item in declared:
         page_path = str(item.get("page_path", ""))
         target = str(item.get("target_id", ""))
         relation = str(item.get("relation", "") or "")
-        if (page_path, normalize_name(target)) in supported:
+        if (page_path, normalize_name(target), relation) in supported:
             continue
-        reason = (DOWNGRADED_UNKNOWN_RELATION if relation not in RELATION_KINDS
+        reason = (DOWNGRADED_UNKNOWN_RELATION if not _allowed_relation(relation)
                   else DOWNGRADED_NO_EVIDENCE)
         out.append({"page_path": page_path, "target_id": target,
                     "declared_relation": relation, "reason": reason})
@@ -432,7 +494,7 @@ def proposals_from_pages(files: Mapping[str, Any]) -> Dict[str, Any]:
                 # without a reason is not a link this layer will render.
                 why_visit=str(entry.get("why_visit", "") or "linked page")[:MAX_LINK_WHY_CHARS],
                 evidence_refs=list(entry.get("evidence_refs") or ()),
-                relation=relation if relation in RELATION_KINDS else "",
+                relation=relation if _allowed_relation(relation) else "",
                 mentioned_aliases=list(entry.get("aliases") or ()),
             ))
         related = [str(item) for item in (fields.get("related") or ()) if str(item).strip()]
@@ -492,7 +554,7 @@ def load(raw: Any, *, page_index: Mapping[str, Any] | None = None) -> Optional[L
     """Rebuild the increment from published bytes; a missing file means none."""
     if raw is None:
         return None
-    if not isinstance(raw, Mapping) or raw.get("schema_version") != RELATIONS_SCHEMA_VERSION or raw.get("version") != RELATION_RULE_VERSION:
+    if not isinstance(raw, Mapping) or raw.get("schema_version") != RELATIONS_SCHEMA_VERSION or raw.get("version") not in ("wiki-relation-increment-v1", RELATION_RULE_VERSION):
         raise ValueError("RELATIONS_VERSION_UNSUPPORTED")
     if not raw.get("digest"):
         raise ValueError("RELATIONS_DIGEST_MISSING")
@@ -501,9 +563,21 @@ def load(raw: Any, *, page_index: Mapping[str, Any] | None = None) -> Optional[L
     version = str(raw.get("version") or RELATION_RULE_VERSION)
     expected = str(raw.get("digest") or "")
     if expected:
-        rebuilt = payload(LinkIncrement(links=links, pending=pending, version=version),
-                          downgraded=raw.get("downgraded") or ())
-        if rebuilt["digest"] != expected or rebuilt["related"] != raw.get("related"):
+        # Validate historical bytes as published. Adding the new optional
+        # qualifiers field must not invalidate an old immutable v1 bundle.
+        if version == "wiki-relation-increment-v1":
+            content = {key: raw.get(key, [] if key != "related" else {})
+                       for key in ("links", "pending", "related", "downgraded")}
+            content["version"] = version
+            encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+            related = {page: sorted({r.target_id for r in links if r.page_path == page})
+                       for page in sorted({r.page_path for r in links})}
+        else:
+            rebuilt = payload(LinkIncrement(links=links, pending=pending, version=version),
+                              downgraded=raw.get("downgraded") or ())
+            digest, related = rebuilt["digest"], rebuilt["related"]
+        if digest != expected or related != raw.get("related"):
             raise ValueError("published relations digest mismatch")
     return LinkIncrement(links=links, pending=pending, version=version)
 
@@ -548,7 +622,7 @@ def project_state_relations(state: Any, claims: Sequence[Any]) -> Any:
                 continue
             proposals.append(LinkProposal(page_path=path, target_mention=link.target_id,
                 why_visit=link.why_visit, evidence_refs=link.evidence_refs,
-                relation=link.relation if link.relation in RELATION_KINDS else ""))
+                relation=link.relation if _allowed_relation(link.relation) else ""))
             detailed.add(link.target_id)
         # Related entries only supplement pages that have no detailed record.
         legacy[path] = [target for target in page.related_pages if target not in detailed]

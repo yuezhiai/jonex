@@ -5,6 +5,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+# Change when deterministic source/reading projections change. This is
+# independent of the Bundle format version so historical Bundles stay readable.
+SOURCE_PROJECTION_VERSION = "source-projection-2"
+
 
 @dataclass
 class SourceDigest:
@@ -29,6 +33,7 @@ class SourceDigest:
         source can be replayed instead of recompiled.
         """
         payload = {
+            "source_projection_version": SOURCE_PROJECTION_VERSION,
             "source_id": self.source_id,
             "document_id": self.document_id,
             "content_sha256": self.content_sha256,
@@ -99,6 +104,7 @@ def source_fingerprint(
     )
     from jonex_wiki.domain.engine.compile.repair.planner import compile_output_tokens
     payload = {
+        "source_projection_version": SOURCE_PROJECTION_VERSION,
         "compile_output_tokens": compile_output_tokens(),
         "source_id": source_id,
         "prompt_checksum": prompt_checksum,

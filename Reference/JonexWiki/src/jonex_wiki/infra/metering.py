@@ -11,8 +11,7 @@ import time
 log = logging.getLogger(__name__)
 
 
-#: 调用结果三态。`degraded` 单独一档而不并入 `failed`——rerank 返回 None 是
-#: §9 明文规定的降级(BM25-only / 保留原序),把它记成失败会让告警噪音盖掉真正的故障。
+#: 调用结果兼容已有遥测记录；不再提供重排调用入口。
 OK, DEGRADED, FAILED = "ok", "degraded", "failed"
 
 
@@ -139,7 +138,7 @@ class MeteredGw:
                      content_chars=len(content) if isinstance(content, str) else 0)
         return out
 
-    # --- 转发的三个网关方法 ------------------------------------------------------------
+    # --- 聊天网关转发 ------------------------------------------------------------
 
     async def complete(self, messages, *, scene, tenant_id, kb_id, trace_id, **kwargs):
         return await self._call(self._inner.complete, scene=scene,
@@ -150,12 +149,6 @@ class MeteredGw:
                                 fallback_model=getattr(self._inner, "llm_model", None))
 
 
-    async def rerank(self, query, documents, *, scene, tenant_id, kb_id, trace_id, **kwargs):
-        return await self._call(self._inner.rerank, scene=scene,
-                                trace_id=trace_id, kb_id=kb_id,
-                                args=(query, documents),
-                                kwargs=dict(scene=scene, tenant_id=tenant_id, kb_id=kb_id,
-                                            trace_id=trace_id, **kwargs))
 
     async def aclose(self) -> None:
         inner_close = getattr(self._inner, "aclose", None)

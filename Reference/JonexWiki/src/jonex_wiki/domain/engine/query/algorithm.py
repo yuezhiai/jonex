@@ -29,13 +29,8 @@ here.  CR-TRACE-002 adds a real wall-clock measurement for span timing
 system clock, used solely to emit truthful ``started_at``/``duration_ms``
 span fields; never randomness, UUIDs, or secrets.
 
-Wave 3 P1 adds two bounded retrieval-efficiency steps.  ``P1.1`` decomposes a
-composite question once (one tool-free model call, disabled via
-``QUERY_QUERY_DECOMPOSE=off``) into self-contained sub-questions that are each
-searched before the traversal loop; single questions skip the call at zero
-cost.  ``P1.2`` runs at most one deterministic query rewrite after an empty
-search (``_rewrite_query_for_search``) and only counts the empty search toward
-the three-empty stop when the rewritten query is also empty.
+An empty search may trigger one deterministic query rewrite before the agent
+continues searching and reading.
 """
 
 from __future__ import annotations
@@ -80,23 +75,17 @@ from jonex_wiki.domain.engine.models.query_models import (
     FinalDraft,
     QueryCorpus,
     RelationCheck,
-    RerankResponse,
     SearchHit,
-    SubQuestionList,
     TraceEntry,
     VerifiedCitation,
 )
 
 from jonex_wiki.domain.engine.query.synthesis_orchestration import (
     EXTRACTION_ANSWER_LIMIT,
-    ENTITY_ANSWER_VERBOSE_LIMIT,
     _active_request_views,
     _call_clean_synthesis,
     _citation_matches,
-    _compact_entity_answer,
     _deterministic_citations_from_answer,
-    _entity_answer_verbose_limit,
-    _extractive_answer_from_evidence,
     _finish_controller_with_citations,
     _resolve_citations,
     _resolve_evidence_handles,
@@ -111,17 +100,12 @@ from jonex_wiki.domain.engine.query.numeric_consistency import (
 from jonex_wiki.domain.engine.query.table_query import build_active_request_views, computed_count_conflict
 
 from jonex_wiki.domain.engine.query.traversal_executor import (
-    EVIDENCE_STALL_LIMIT,
     MALFORMED_TOOL_CALL,
-    MAX_DECOMPOSED_QUERIES,
     MAX_TOOL_CALLS,
     QUERY_ANSWER_STYLE_ENV,
     QUERY_ANSWER_TARGET_HINT_ENV,
-    QUERY_DECOMPOSE_ENV,
     QUERY_TOOLS,
-    SEARCH_READ_FORCE_LIMIT,
     TRAVERSAL_MAX_TOKENS_ENV,
-    _DECOMPOSE_SYSTEM_INSTRUCTION,
     _QUESTION_TARGET_RE,
     _ReadOutcome,
     _STOP_ANSWERED,
@@ -144,17 +128,12 @@ from jonex_wiki.domain.engine.query.traversal_executor import (
     _answer_target_hint,
     _answer_target_hint_enabled,
     _assistant_tool_message,
-    _decompose_messages,
-    _decompose_question,
-    _decomposition_enabled,
-    _evidence_stall_limit,
     _execute_read,
     _exec_tool,
     _max_tool_calls_limit,
     _publish_control_transition,
     _publish_incomplete_terminal,
     _recompose_consumed_history,
-    _search_read_force_limit,
     _system_message,
     _tool_message,
     _trace_control_events,
@@ -188,7 +167,30 @@ from jonex_wiki.domain.engine.query.traversal_evidence import (
     _record_query_state_event,
 )
 
-from jonex_wiki.domain.engine.query.retrieval import (DIVERSITY_RERANK_ALPHA, FTS5_UNAVAILABLE, LLM_RERANK_KEEP, LLM_RERANK_POOL, MAX_SEARCH_HITS, MAX_SEARCH_HITS_ENV, PASSAGE_MAX_CHARS, QUERY_DECOMPOSE_MULTIHOP_ENV, QUERY_DIVERSITY_RERANK_ENV, QUERY_LLM_RERANK_ENV, QUERY_SNIPPET_ENV, _COMPOSITE_COMPARATIVES, _COMPOSITE_CONJUNCTIONS, _COMPOSITE_QUESTION_WORDS, _MULTIHOP_ENTITY_OF, _QUERY_STOPWORDS, _TOKEN_RE, _build_fts_index, _claim_hits, _diversity_rerank, _diversity_rerank_enabled, _env_int, _fts_query, _fts_search, _hit_tokens, _is_composite_question, _is_multihop_single_question, _llm_rerank, _llm_rerank_enabled, _make_snippet, _max_search_hits, _multihop_decomposition_enabled, _open_fts_index, _passage_hits, _rerank_messages, _rewrite_query_for_search, _search_terms, _snippet_enabled, _split_passages, build_fts_index_bytes, build_query_corpus)
+from jonex_wiki.domain.engine.query.retrieval import (
+    FTS5_UNAVAILABLE,
+    MAX_SEARCH_HITS,
+    MAX_SEARCH_HITS_ENV,
+    PASSAGE_MAX_CHARS,
+    QUERY_SNIPPET_ENV,
+    _QUERY_STOPWORDS,
+    _TOKEN_RE,
+    _build_fts_index,
+    _claim_hits,
+    _env_int,
+    _fts_query,
+    _fts_search,
+    _make_snippet,
+    _max_search_hits,
+    _open_fts_index,
+    _passage_hits,
+    _rewrite_query_for_search,
+    _search_terms,
+    _snippet_enabled,
+    _split_passages,
+    build_fts_index_bytes,
+    build_query_corpus,
+)
 
 # ──────────────────────────────────────────────
 #  Legacy patchable surface (lwp-arch-001 QA-1)
@@ -197,7 +199,6 @@ from jonex_wiki.domain.engine.query.retrieval import (DIVERSITY_RERANK_ALPHA, FT
 # through ``query_algorithm`` keep working; the moved retrieval module reads
 # them back through call-time accessors.
 # Legacy WAVE5_EMB_CACHE knob removed (§15); fixed default directory.
-LLM_RERANK_MIN_CANDIDATES = 6
 
 # Stable checksum over the query tool surface; feeds EffectiveRuntimeSnapshot.
 TOOL_CHECKSUM = hashlib.sha256(
@@ -488,8 +489,27 @@ class _BudgetedQueryModel:
         model falls back to the strict byte bound rather than borrowing a rate
         that was measured on another tokenizer.
         """
-        payload_bytes = _priced_payload_bytes(messages, schema, tools)
-        return int(math.ceil(payload_bytes * self.units_per_byte()))
+        # Base64 is a transport encoding, not text tokens. Reserve bounded
+        # visual input units for the <=1600px rendition, then reconcile with
+        # reported provider usage as usual. Text-only requests stay unchanged.
+        image_count = 0
+        priced_messages = []
+        for message in messages or []:
+            content = message.get('content')
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get('type') == 'image_url':
+                        image_count += 1
+                        parts.append({'type': 'text', 'text': '[bounded source image]'})
+                    else:
+                        parts.append(part)
+                priced_messages.append({**message, 'content': parts})
+            else:
+                priced_messages.append(message)
+        payload_bytes = _priced_payload_bytes(priced_messages, schema, tools)
+        visual_reserve = max(1024, min(32768, int(current_env().get('QUERY_IMAGE_INPUT_RESERVE', '8192')))) if image_count else 0
+        return int(math.ceil(payload_bytes * self.units_per_byte())) + image_count*visual_reserve
 
     @staticmethod
     def _part_bytes(value: Any) -> int:
@@ -572,13 +592,6 @@ class _BudgetedQueryModel:
 
     def _account(self, messages: Any, schema: Any, tools: Any, requested_output: int,
                  estimate: int) -> Dict[str, Any]:
-        dump = current_env().get("POC_BUDGET_MESSAGE_DUMP")
-        if dump:
-            # Development diagnostic: the exact messages a bounded call would
-            # have sent, so the accounting can be checked against real bytes.
-            with open(Path(dump).expanduser(), "a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"logical_call": self.calls + 1,
-                                         "messages": messages}, ensure_ascii=False) + "\n")
         input_estimate = self._estimate_input_units(messages, schema, tools)
         output_reserve = max(0, int(requested_output or 0))
         planned_output = self.planned_output_units(requested_output)
@@ -626,10 +639,6 @@ class _BudgetedQueryModel:
         title = schema.get("title", "") if isinstance(schema, dict) else ""
         if "RelationCheck" in title:
             return {"status": "insufficient", "reason": "query budget exhausted"}
-        if "SubQuestionList" in title:
-            return {"sub_questions": [], "requires_evidence_bridge": False}
-        if "Gap" in title:
-            return {"sufficient": False, "gaps": []}
         if "CitationExtraction" in title:
             return {"citations": []}
         if "Draft" in title:
@@ -734,7 +743,7 @@ class ToolCall(BaseModel):
     """
 
     id: str = Field(default="")
-    name: Literal["wiki_search", "wiki_read", "table_inspect", "table_locate", "table_read", "table_compute"]
+    name: Literal["wiki_search", "wiki_read", "table_inspect", "table_locate", "table_read", "table_compute", "image_find", "image_inspect"]
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
@@ -1335,10 +1344,10 @@ def _bridge_relation_input(current_slot: Mapping[str, Any], *, candidate: str,
     }
 
 
-def _tools_for_controller(runtime: Any) -> list:
+def _tools_for_controller(runtime: Any, state=None) -> list:
     """Ordinary tools; path selection belongs to the agent."""
-    return QUERY_TOOLS[:-1]
-
+    from jonex_wiki.domain.engine.query.image_tools import available_tools
+    return [tool for tool in QUERY_TOOLS[:-1] if not tool['function']['name'].startswith('image_')] + available_tools(state)
 
 
 # Questions whose answer must come from the deterministic table tool rather than from
@@ -1447,22 +1456,6 @@ def _completed_request_ids(state: Mapping[str, Any]) -> set:
     }
 
 
-def filter_table_registry(
-    table_registry: Optional[Dict[str, Dict[str, str]]],
-    allowed_documents: Sequence[str],
-) -> Dict[str, Dict[str, str]]:
-    """Keep only the tables whose owner is inside the allowed documents.
-
-    A grid follows the same scope as the pages it belongs to: a table outside
-    the allowed documents or sources is not inspectable, locatable or readable.
-    """
-    allowed = {str(value) for value in allowed_documents}
-    return {
-        table_id: info for table_id, info in (table_registry or {}).items()
-        if str(info.get("document_id")) in allowed or str(info.get("source_id")) in allowed
-    }
-
-
 # ──────────────────────────────────────────────
 #  Entry point
 # ──────────────────────────────────────────────
@@ -1483,9 +1476,9 @@ async def run_query_algorithm(
     frozen_indexes: bool = False,
     traversal_thinking: Optional[Dict[str, str]] = None,
     synthesis_thinking: Optional[Dict[str, str]] = None,
-    document_scope: Sequence[str] = (),
     bundle_view: Any = None,
     table_registry: Optional[Dict[str, Dict[str, str]]] = None,
+    query_context: Optional[dict] = None,
     cancel: CancelPort | None = None,
 ) -> QueryRunResult:
     """Run the enforced query traversal over the accepted corpus.
@@ -1495,8 +1488,7 @@ async def run_query_algorithm(
     unsupported strategy or an unavailable FTS5 backend.  Never exceeds the
     tool-call cap (default ``MAX_TOOL_CALLS``, overridable via
     ``QUERY_MAX_TOOL_CALLS``).  Duplicate searches/re-reads short-circuit to
-    cached results, and ``QUERY_EVIDENCE_STALL_LIMIT`` consecutive no-new-
-    evidence searches stop early with ``evidence_sufficient``.
+    cached results. The agent controls subsequent searches and reads.
 
     The result carries real ``spans`` (unique ``run:<run-id>:span:<n>`` ids)
     and aggregated ``token_usage`` from Provider usage (``{}`` when no provider
@@ -1519,46 +1511,9 @@ async def run_query_algorithm(
             synthesis_thinking = {"type": "enabled"}
     traversal_thinking = _query_thinking(traversal_thinking)
     synthesis_thinking = _query_thinking(synthesis_thinking)
-    document_scope = tuple(document_scope)
-    if len(document_scope) != len(set(document_scope)) or any(
-        not isinstance(value, str) or not value.strip() for value in document_scope
-    ):
-        raise ValueError("QUERY_DOCUMENT_SCOPE_INVALID")
-    if document_scope:
-        allowed_documents = set(document_scope)
-        allowed_pages = {
-            path for path, claims in corpus.claims.items()
-            if claims and all(
-                evidence.document_id in allowed_documents
-                for claim in claims for evidence in claim.evidence
-            )
-        }
-        allowed_sources = {
-            path for path, records in corpus.source_records.items()
-            if records and all(record.get("document_id") in allowed_documents for record in records)
-        }
-        allowed_files = allowed_pages | allowed_sources | {
-            path for path in corpus.files if path == "index.md" or path.endswith("/index.md")
-        }
-        corpus = corpus.model_copy(deep=False)
-        corpus.files = {path: corpus.files[path] for path in corpus.files if path in allowed_files}
-        corpus.page_index = {path: value for path, value in corpus.page_index.items() if path in allowed_pages}
-        corpus.page_text = {path: corpus.page_text[path] for path in corpus.page_text if path in allowed_pages}
-        corpus.claims = {path: value for path, value in corpus.claims.items() if path in allowed_pages}
-        corpus.source_records = {path: value for path, value in corpus.source_records.items() if path in allowed_sources}
-        corpus.source_locations = {path: value for path, value in corpus.source_locations.items() if path in allowed_sources}
-        table_registry = filter_table_registry(table_registry, allowed_documents)
-    if strategy == QueryStrategy.AUTO:
-        # Browse-first is the only supported default route.  Keep AUTO as a
-        # wire-compatible enum value, but never let it silently select the
-        # legacy search-first traversal.
-        resolved = QueryStrategy.BROWSE_FIRST
-    elif strategy == QueryStrategy.BROWSE_FIRST:
-        resolved = strategy
-    elif strategy == QueryStrategy.SEARCH_FIRST:
-        resolved = strategy
-    else:
+    if strategy != QueryStrategy.BROWSE_FIRST:
         raise ValueError(UNSUPPORTED_QUERY_STRATEGY)
+    resolved = QueryStrategy.BROWSE_FIRST
 
     file_index = bundle_view is not None and lexical_index is None
     if frozen_indexes and lexical_index is None and not file_index:
@@ -1577,7 +1532,6 @@ async def run_query_algorithm(
     # Wave 3 P0.2: the 15-call cap and the evidence-sufficiency stall are
     # configurable via environment overrides, keeping the frozen defaults.
     max_tool_calls = _max_tool_calls_limit()
-    stall_limit = _evidence_stall_limit()
     max_active_evidence = _max_active_evidence()
     runtime_config = {
         "agent_thinking": current_env().get("JONEX_WIKI_AGENT_THINKING", "on"),
@@ -1585,7 +1539,6 @@ async def run_query_algorithm(
         "answer_style": "natural" if _answer_style_natural() else "entity",
         "thinking_traversal": (traversal_thinking or {}).get("type", "scene_default"),
         "thinking_synthesis": (synthesis_thinking or {}).get("type", "scene_default"),
-        "thinking_decomposition": "off",
         "thinking_citation_extraction": "off",
         "traversal_max_tokens": _traversal_max_tokens(),
         "max_tool_calls": max_tool_calls,
@@ -1606,22 +1559,21 @@ async def run_query_algorithm(
             "output_reserve": "requested max_tokens, replaced by reported usage",
         },
         "max_seconds": budgeted_model.max_seconds,
-        "evidence_stall_limit": stall_limit,
-        "search_read_force_limit": None,
         "max_active_evidence": max_active_evidence,
-        "llm_rerank_enabled": _llm_rerank_enabled(),
-        "diversity_rerank_enabled": _diversity_rerank_enabled(),
         "evidence_units_max": _evidence_units_max(),
         "evidence_per_doc_max": _evidence_per_doc_max(),
-        "decompose_multihop_enabled": False,
         "force_read_no_progress": FORCE_READ_NO_PROGRESS,
         "no_progress_stop_limit": NO_PROGRESS_STOP_LIMIT,
         "answer_target_hint_enabled": _answer_target_hint_enabled(),
-        "document_scope": list(document_scope),
     }
 
     messages: List[Dict[str, Any]] = [_system_message(), _user_message(question, resolved)]
     trace: List[TraceEntry] = []
+    if query_context is not None:
+        from jonex_wiki.kernel.query_images import normalized_context, query_image_message
+        query_context = normalized_context(query_context)
+        messages.append(query_image_message(query_context))
+        trace.append(TraceEntry(event='query_images_used', detail={'count':len(query_context['images'])}))
     spans = _SpanBuilder(run_id=run_id)
     usage_acc: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
@@ -1694,18 +1646,18 @@ async def run_query_algorithm(
     controller_directions = []
     # ControllerRuntime and the delivered-evidence ledger own the query loop.
     runtime_config["controller_version"] = "agent_v1"
-    runtime_config["decomposition_requires_evidence_bridge"] = False
 
     # Force the first action in code before any model response.  This bypasses
     # model envelope parsing via a private execution path: the name/args are
     # constructed here, never parsed from a model tool-call envelope.
-    if resolved == QueryStrategy.BROWSE_FIRST:
-        trace.append(TraceEntry(event="forced_browse_first", detail={"paths": ["index.md"]}))
-        controller, started = start_controller(
-            question,
-            directions=controller_directions,
-        )
-        _publish_control_transition(state, controller, (started,), trace)
+    trace.append(TraceEntry(event="forced_browse_first" if current_env().get("QUERY_RETRIEVAL_STRATEGY", "tree") == "tree" else "retrieval_policy", detail={"paths":["index.md"]} if current_env().get("QUERY_RETRIEVAL_STRATEGY", "tree") == "tree" else {"strategy": current_env().get("QUERY_RETRIEVAL_STRATEGY")}))
+    controller, started = start_controller(
+        question,
+        directions=controller_directions,
+    )
+    _publish_control_transition(state, controller, (started,), trace)
+    strategy = current_env().get("QUERY_RETRIEVAL_STRATEGY", "tree")
+    if strategy == "tree":
         await _exec_tool(
             corpus,
             fts,
@@ -1722,29 +1674,54 @@ async def run_query_algorithm(
             origin="forced",
         )
     else:
-        trace.append(TraceEntry(event="forced_search_first", detail={"query": question}))
-        controller, started = start_controller(
-            question,
-            directions=controller_directions,
-        )
-        _publish_control_transition(state, controller, (started,), trace)
-        await _exec_tool(
-            corpus,
-            fts,
-            "wiki_search",
-            {"query": question},
-            "call_0",
-            state,
-            messages,
-            trace,
-            model=model,
-            routing=routing,
-            spans=spans,
-            usage_acc=usage_acc,
-            origin="forced",
-        )
-
+        if strategy not in {"direct", "structure", "semantic"}:
+            raise ValueError("QUERY_RETRIEVAL_STRATEGY_INVALID")
+        from jonex_wiki.domain.engine.query.retrieval_frontier import navigation_context, semantic_context
+        view = state.get("bundle_view")
+        await _exec_tool(corpus, fts, "wiki_search", {"query": question}, "call_entry_search",
+            state, messages, trace, model=model, routing=routing, spans=spans,
+            usage_acc=usage_acc, origin="forced")
+        hits = state["search_cache"].get(question, [])
+        from jonex_wiki.domain.engine.query.source_selection import named_source_paths
+        named_paths, named_ids = named_source_paths(view, question, corpus.page_index)
+        # Body-term matches can be dominated by an unrelated large table. A
+        # sealed filename identity takes precedence over those initial reads.
+        paths = named_paths[:4] if named_paths else list(dict.fromkeys(hit.path for hit in hits))[:4]
+        semantic_paths, semantic_detail = ([], {})
+        if strategy == "semantic":
+            try:
+                semantic_paths, semantic_detail = await asyncio.to_thread(semantic_context, view, question)
+            except (ValueError, OSError, KeyError) as exc:
+                semantic_detail = {"reason":"index_rejected","error":str(exc)[:300],"support":"discovery_only"}
+            semantic_paths = [path for path in semantic_paths if path in corpus.page_index]
+            paths = list(dict.fromkeys([*semantic_paths, *paths]))[:6]
+        parents = navigation_context(view, paths, limit=2) if strategy in {"structure", "semantic"} else []
+        trace.append(TraceEntry(event="retrieval_entry", detail={"strategy": strategy,
+            "paths": paths, "navigation_paths": parents, "semantic": semantic_detail,
+            "named_document_ids": named_ids, "named_source_paths": named_paths,
+            "semantic_applied_paths": semantic_paths,
+            "graph_used": bool(parents or semantic_paths)}))
+        for number, batch in enumerate([parents, paths]):
+            if batch:
+                await _exec_tool(corpus, fts, "wiki_read", {"paths": batch}, "call_entry_read_"+str(number),
+                    state, messages, trace, model=model, routing=routing, spans=spans,
+                    usage_acc=usage_acc, origin="forced")
     state["consumed_history_messages"] = 0
+    from jonex_wiki.domain.engine.query.source_selection import named_documents
+    mentioned_documents = named_documents(state.get("bundle_view"), question)
+    # A lexical mention is navigation metadata, not a proven inclusion policy.
+    state["mentioned_document_ids"] = mentioned_documents
+    state["explicit_document_ids"] = []
+    if mentioned_documents:
+        messages.append({"role": "user", "content": "Source identity hints: document_ids="
+            + json.dumps(mentioned_documents) + ". These are filename mentions only. Resolve from the original question whether each source is required, excluded or compared; a mention is not a source filter."})
+    runtime_config["constraint_policy"] = "explicit_predicates_v1"
+    runtime_config["automatic_lookup_answer_replacement"] = False
+    runtime_config["filename_mentions_are_source_constraints"] = False
+    trace.append(TraceEntry(event="query_constraint_policy", detail={
+        "policy": "explicit_predicates_v1", "automatic_answer_replacement": False,
+        "natural_language_coverage": "not_programmatically_verified",
+        "mentioned_document_ids": mentioned_documents}))
     final_draft: Optional[HandleFinalDraft] = None
     force_reason: Optional[str] = None
     empty_model_turns = 0
@@ -1862,7 +1839,7 @@ async def run_query_algorithm(
             answer_messages, evidence_count = _answer_material_messages(state, question)
             if (evidence_count and not budgeted_model.fits_retrieval_and_answer(
                     messages, TraversalResponse.model_json_schema(),
-                    None if tool_final_turn else QUERY_TOOLS[:-1],
+                    None if tool_final_turn else _tools_for_controller(None, state),
                     _traversal_max_tokens(), answer_messages,
                     answer_schema=_answer_material_schema())):
                 finalization_requested = True
@@ -1882,7 +1859,7 @@ async def run_query_algorithm(
                 TraversalResponse.model_json_schema(),
                 max_tokens=(2048 if compact_answer_retry_pending
                             else _traversal_max_tokens()),
-                tools=(None if tool_final_turn else QUERY_TOOLS[:-1]),
+                tools=(None if tool_final_turn else _tools_for_controller(None, state)),
                 thinking=({"type": "disabled"} if compact_answer_retry_pending
                           else traversal_thinking),
                 scene="jonex_wiki_query_traversal",
@@ -2433,12 +2410,9 @@ async def run_query_algorithm(
 __all__ = [
     "MAX_TOOL_CALLS",
     "EVIDENCE_EXCERPT_LIMIT",
-    "EVIDENCE_STALL_LIMIT",
     "MAX_ACTIVE_EVIDENCE",
     "MAX_ACTIVE_EVIDENCE_ENV",
-    "QUERY_DECOMPOSE_ENV",
     "QUERY_ANSWER_STYLE_ENV",
-    "MAX_DECOMPOSED_QUERIES",
     "QueryStrategy",
     "FTS5_UNAVAILABLE",
     "BLANK_QUESTION",
@@ -2453,16 +2427,13 @@ __all__ = [
     "TraversalResponse",
     "FinalDraft",
     "CitationExtraction",
-    "SubQuestionList",
     "TraceEntry",
     "QueryCorpus",
     "QueryRunResult",
     "build_query_corpus",
     "build_fts_index_bytes",
     "run_query_algorithm",
-    "_decomposition_enabled",
     "_answer_style_natural",
-    "_is_composite_question",
     "_rewrite_query_for_search",
     "_segment_for_search",
 ]

@@ -57,7 +57,7 @@ SCHEMA_VERSION = 3
 # Stable checksum identifying the production compiler surface.  Changing any
 # compile instruction changes this and forces a recompile, not a replay.
 # (Stage 8 replaces this with a KB-level derived checksum.)
-PROMPT_CHECKSUM = sha256_hex(b"llm-wiki-plus:production:structure-pack:column-support:publication-snapshot:v4")
+PROMPT_CHECKSUM = sha256_hex(b"llm-wiki-plus:production:structure-pack:column-support:publication-snapshot:knowledge-graph:v5")
 
 
 class ProductionCompileError(Exception):
@@ -422,7 +422,9 @@ def derive_revision_id(
     current schema version; the engine passes ``bundle.SCHEMA_VERSION``
     explicitly at every compile call site.
     """
+    from jonex_wiki.domain.engine.compile.digest import SOURCE_PROJECTION_VERSION
     identity = {
+        "source_projection_version": SOURCE_PROJECTION_VERSION,
         "digests": digests,
         "manifest_checksum": manifest_checksum,
         "manifest_payload_checksum": manifest_payload_checksum,

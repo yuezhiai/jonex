@@ -254,6 +254,19 @@ def blocks_from_items(
                 if key not in raw:
                     raw[key] = value
         text = _item_text(raw)
+        # A source picture is a readable resource even without OCR/description.
+        # This is a source anchor, never a fabricated description of its pixels.
+        if str(raw.get("type") or "") in {"image", "chart"}:
+            relative = raw.get("img_path") or raw.get("image_path") or raw.get("chart_path")
+            if isinstance(relative, str) and relative:
+                from jonex_wiki.domain.image_identity import image_anchor, plain
+                marker = image_anchor(source_name, position, relative)
+                raw["wiki_image_anchor"] = marker
+                caption = plain(raw.get("image_caption") or raw.get("chart_caption") or raw.get("caption"), 200)
+                alt = caption.replace('[', '').replace(']', '').replace('\n', ' ')
+                text = (text + "\n\n" if text else "") + f"![{alt}]({marker})"
+                if not _item_text(raw):
+                    raw["evidence_kind"] = "source_image_unread"
         if not text:
             opaque.append({"position": position, "raw_item": raw})
             continue
@@ -269,8 +282,28 @@ def blocks_from_items(
                           "page_number": _page_number(raw), "bbox": raw.get("bbox"),
                           "caption": raw.get("table_caption") or raw.get("caption"),
                           "footnote": raw.get("table_footnote") or raw.get("footnote"),
+                          "native_locator": raw.get("native_locator"),
+                          "evidence_kind": raw.get("evidence_kind", "parsed_table_observation"),
+                          "quality": raw.get("quality"), "parent_object": raw.get("parent_object"),
                           "raw_item": raw, "compile_table_values": False},
             ))
+            continue
+        if str(raw.get("type") or "") in {"audio", "video", "image", "chart"}:
+            # Media anchors must not be collapsed into a packed paragraph spanning
+            # unrelated scenes. Keep the original payload and its evidence kind.
+            kind = str(raw["type"])
+            table_blocks.append(ParseBlock(
+                block_id="{}-{}-{}".format(Path(source_name).stem, kind, position),
+                position=position, text=text, block_type=kind, page_number=_page_number(raw),
+                metadata={"source_name": source_name, "parser_id": parser_id,
+                    "route": route.value, "source_position": position, "raw_item": raw,
+                    "evidence_kind": raw.get("evidence_kind", "generated_description" if raw.get("description") else "observed_text"),
+                    "time_start": raw.get("time_start"), "time_end": raw.get("time_end"),
+                    "spans": raw.get("spans", []), "parent_object": raw.get("parent_object"),
+                    "native_locator": raw.get("native_locator"), "bbox": raw.get("bbox"),
+                    "source_locations": [{"position": position, "page_number": _page_number(raw),
+                        "bbox": raw.get("bbox"), "time_start": raw.get("time_start"),
+                        "time_end": raw.get("time_end"), "raw_item": raw}]}))
             continue
         piece = text + ("\n\n" if not text.endswith("\n\n") else "")
         normalized.append(piece)
@@ -314,8 +347,8 @@ def _item_text(item: Dict[str, Any]) -> str:
         kind = "table"
     aliases = {
         "table": (("table_caption", "caption"), ("table_body", "html", "text", "content"), ("table_footnote", "footnote")),
-        "image": (("image_caption", "img_caption", "caption"), ("text", "text_content", "ocr_text"), ("image_footnote", "img_footnote")),
-        "chart": (("chart_caption", "caption"), ("content", "text", "text_content", "ocr_text"), ("chart_footnote", "footnote")),
+        "image": (("image_caption", "img_caption", "caption"), ("text", "text_content", "ocr_text"), ("description",), ("image_footnote", "img_footnote")),
+        "chart": (("chart_caption", "caption"), ("content", "text", "text_content", "ocr_text"), ("description",), ("chart_footnote", "footnote")),
         "list": (("list_items", "text", "content"),),
         "equation": (("equation", "text", "content"), ("description",)),
         "interline_equation": (("equation", "text", "content"), ("description",)),

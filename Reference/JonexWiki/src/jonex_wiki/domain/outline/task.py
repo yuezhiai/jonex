@@ -35,6 +35,8 @@ def build_outline_runner(session_factory, settings, layout, gw):
 
     async def runner(row) -> None:
         tenant_id, kb_id = row.tenant_id, row.kb_id
+        # [jonex] P3b（方案 B）：目录也是编译产物，沿用编译任务带的模型快照
+        compile_model = str((row.summary or {}).get("compile_model") or "")
         service = OutlineService(
             session_factory=session_factory, gw=gw, layout=layout, settings=settings)
 
@@ -46,7 +48,8 @@ def build_outline_runner(session_factory, settings, layout, gw):
 
         if current is None:
             _set_summary(row, {"outcome": "draft", "reason": "no_outline"})
-            await _auto_draft(service, session_factory, repo, tenant_id, kb_id, pages)
+            await _auto_draft(
+                               service, session_factory, repo, tenant_id, kb_id, pages, compile_model)
             return
 
         if (current.catalog_fingerprint or "") == fingerprint:
@@ -57,7 +60,8 @@ def build_outline_runner(session_factory, settings, layout, gw):
         # fingerprint 变化
         if current.source == SOURCE_DRAFT:
             _set_summary(row, {"outcome": "draft", "reason": "catalog_changed", "source": current.source})
-            await _auto_draft(service, session_factory, repo, tenant_id, kb_id, pages)
+            await _auto_draft(
+                               service, session_factory, repo, tenant_id, kb_id, pages, compile_model)
             return
 
         # source=adjust：人工编辑保护，什么都不做；stale 由读取端算
@@ -74,10 +78,12 @@ def _set_summary(row, summary: dict) -> None:
     row.summary = {**(row.summary or {}), **summary}
 
 
-async def _auto_draft(service, session_factory, repo, tenant_id, kb_id, pages) -> None:
+async def _auto_draft(service, session_factory, repo, tenant_id, kb_id, pages,
+                      compile_model: str = "") -> None:
     """自动 draft：复用 LLM 起草路径；失败降级确定性兜底目录再上抛（task 标 failed）。"""
     try:
-        await service.draft(tenant_id, kb_id, {})
+        await service.draft(
+            tenant_id, kb_id, {"model": compile_model} if compile_model else {})
         log.info("[outline] 自动起草完成 kb=%s pages=%d", kb_id, len(pages))
     except Exception as exc:  # noqa: BLE001 — 自动触发失败不阻塞 bundle，兜底后上抛
         log.exception("[outline] 自动起草失败 kb=%s，降级确定性兜底目录", kb_id)

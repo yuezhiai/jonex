@@ -445,8 +445,7 @@ def resolve_reading_material(
                     break
         if source_id:
             catalog = load_reading_materials(context, source_id)
-            unit = (_workbook_unit(catalog, source_id)
-                    or _material_unit(catalog, kind="table", unit_id=str(table_id))
+            unit = (_material_unit(catalog, kind="table", unit_id=str(table_id))
                     or _registered_table_unit(state, source_id, str(table_id)))
         if unit is None:
             return None
@@ -467,16 +466,13 @@ def resolve_reading_material(
             return None
         catalog = load_reading_materials(context, source_id)
         if requested_path.startswith(("raw-tables/", "source-evidence/")):
-            unit = _workbook_unit(catalog, source_id)
-            if unit is None:
-                if requested_path.startswith("source-evidence/"):
-                    unit = _material_unit(catalog, kind="document", unit_id=source_id)
-                else:
-                    table_id = str(scope.get("table_id") or "")
-                    unit = (_material_unit(catalog, kind="table", unit_id=table_id)
-                            or _registered_table_unit(state, source_id, table_id))
-                    if unit is None:
-                        unit = _material_unit(catalog, kind="sheet", unit_id="")
+            if requested_path.startswith("raw-tables/"):
+                table_id = str(scope.get("table_id") or getattr(page_entry, "table_id", "") or "")
+                unit = (_material_unit(catalog, kind="table", unit_id=table_id)
+                        or _registered_table_unit(state, source_id, table_id))
+            else:
+                unit = (_material_unit(catalog, kind="document", unit_id=source_id)
+                        or _workbook_unit(catalog, source_id))
         else:
             unit = (_material_unit(catalog, kind="document", unit_id=source_id)
                     or _workbook_unit(catalog, source_id))
@@ -2078,84 +2074,8 @@ def referenced_unread_workbook(state: Dict[str, Any], corpus: Any,
             continue
         name = str(material.get('unit', {}).get('name') or '')
         aliases = [name] if name else []
-        aliases.extend(str(sheet.get('name') or '') for sheet in material.get('unit', {}).get('sheets') or []
-                       if re.fullmatch(r'\d+\.\d+\s*-\s*\d+\.\d+', str(sheet.get('name') or '')))
+        aliases.extend(str(sheet.get('name') or '') for sheet in material.get('unit', {}).get('sheets') or [] if sheet.get('name'))
         normalized_draft = re.sub(r'\s+', '', draft)
         if any(alias and re.sub(r'\s+', '', alias) in normalized_draft for alias in aliases):
             return str(path)
     return None
-
-
-def exact_subject_source_paths(state: Dict[str, Any], corpus: Any,
-                               question: str) -> List[str]:
-    """Recover original material containing an exact subject before refusing.
-
-    Only literal organization identities or both explicitly compared labels
-    qualify. This is navigation, never evidence registration or an answer.
-    The normal reader still enforces source scope and delivery admission.
-    """
-    subjects = re.findall(r'[A-Za-z\u4e00-\u9fff]{3,}?(?:有限责任公司|股份有限公司|有限公司|分公司)', question)
-    comparison = re.match(r'^(.{2,40}?)和(.{2,40}?)[，,]', question)
-    if not subjects and comparison:
-        subjects = [comparison.group(1), comparison.group(2)]
-    if not subjects:
-        return []
-    found: List[str] = []
-    sources = set(state.get('delivered_workbooks') or set())
-    for path, body in corpus.page_text.items():
-        if (not path.startswith(('source-articles/', 'source-evidence/', 'raw-tables/', 'tables/'))
-                or path in (state.get('read_pages') or set())
-                or not all(subject in body for subject in subjects)):
-            continue
-        material = resolve_reading_material(state, corpus, path)
-        source = str((material or {}).get('source_id') or path)
-        if source in sources:
-            continue
-        sources.add(source)
-        found.append(path)
-        if len(found) == 2:
-            break
-    return found
-
-
-def dated_workbook_source_paths(state: Dict[str, Any], corpus: Any,
-                                question: str) -> List[str]:
-    """Navigate dated meal lookups to saved menu workbooks before refusing.
-
-    Match only source names and saved sheet date intervals. This does not
-    establish coverage or answerability; the normal reader must deliver data.
-    """
-    target = re.search(r'(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日', question)
-    if not target or not re.search(r'早餐|午餐|晚餐|下午茶|粥品|粉面|菜品', question):
-        return []
-    year, month, day = target.groups()
-    date_key = (int(month), int(day))
-    if not (1 <= date_key[0] <= 12 and 1 <= date_key[1] <= 31):
-        return []
-    sources = set(state.get('delivered_workbooks') or set())
-    found: List[str] = []
-    for path in corpus.page_text:
-        if not path.startswith(('raw-tables/', 'tables/', 'source-articles/')):
-            continue
-        material = resolve_reading_material(state, corpus, path)
-        unit = (material or {}).get('unit', {})
-        source = str((material or {}).get('source_id') or '')
-        name = str(unit.get('name') or '')
-        if unit.get('kind') != 'workbook' or source in sources:
-            continue
-        body = corpus.page_text[path]
-        if '菜单' not in name and sum(label in body for label in ('下午茶', '粥品', '粉面', '面档', '糖水')) < 2:
-            continue
-        if year and f'{year}年' not in name:
-            continue
-        for sheet in unit.get('sheets') or []:
-            interval = re.fullmatch(r'(\d{1,2})\.(\d{1,2})\s*-\s*(\d{1,2})\.(\d{1,2})', str(sheet.get('name') or ''))
-            if interval:
-                m1, d1, m2, d2 = map(int, interval.groups())
-                if (m1, d1) <= date_key <= (m2, d2):
-                    sources.add(source)
-                    found.append(path)
-                    break
-        if len(found) == 2:
-            break
-    return found

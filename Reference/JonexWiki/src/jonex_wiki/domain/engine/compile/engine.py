@@ -1356,37 +1356,11 @@ class LLMWikiV1Engine:
             else getattr(revision, "tenant_id", "")
         )
 
-        if isinstance(request, dict):
-            question = request["question"]
-            raw_strategy = request.get("strategy", "browse-first")
-            model_override = request.get("model")
-            run_id = request.get("run_id")
-            thinking_traversal = request.get("thinking_traversal", "scene_default")
-            thinking_synthesis = request.get("thinking_synthesis", "scene_default")
-            document_scope = tuple(request.get("document_scope", ()))
-        else:
-            question = request.question
-            raw_strategy = getattr(request, "strategy", QueryStrategy.BROWSE_FIRST)
-            model_override = getattr(request, "model", None)
-            run_id = getattr(request, "run_id", None)
-            thinking_traversal = getattr(request, "thinking_traversal", "scene_default")
-            thinking_synthesis = getattr(request, "thinking_synthesis", "scene_default")
-            document_scope = tuple(getattr(request, "document_scope", ()))
-
-        def _thinking(value, field):
-            normalized = str(value or "scene_default").strip().casefold()
-            if normalized == "scene_default":
-                return None
-            if normalized in ("on", "enabled"):
-                return {"type": "enabled"}
-            if normalized in ("off", "disabled"):
-                return {"type": "disabled"}
-            raise ValueError(f"{field} must be on, off, or scene_default")
-
-        if isinstance(raw_strategy, str):
-            strategy = QueryStrategy(raw_strategy)
-        else:
-            strategy = raw_strategy or QueryStrategy.BROWSE_FIRST
+        from jonex_wiki.kernel.contracts import QueryRequest
+        query_request = QueryRequest.model_validate(request)
+        question = query_request.question
+        run_id = query_request.run_id
+        strategy = QueryStrategy.BROWSE_FIRST
 
         revision_id = (
             revision.get("id") or revision.get("revision_id")
@@ -1455,20 +1429,19 @@ class LLMWikiV1Engine:
         query_model = _resolve_query_model(
             previous.manifest.get("models", {}).get("query"))
         routing = {
-            "model_name": model_override or query_model,
+            "model_name": query_model,
             "tenant_id": tenant_id,
             "context_id": context_id,
             "trace_id": ("query:" + bundle_key)[:64],
             "run_id": run_id,
             "_published_lexical_index": getattr(previous, "lexical_index", None),
             "_prepared_corpus": previous.corpus,
-            "traversal_thinking": _thinking(thinking_traversal, "thinking_traversal"),
-            "synthesis_thinking": _thinking(thinking_synthesis, "thinking_synthesis"),
-            "document_scope": document_scope,
         }
         if directory_view is not None:
             routing["bundle_view"] = directory_view
             routing["table_registry"] = build_table_registry(directory_view)
+        if query_request.query_context is not None:
+            routing['query_context'] = query_request.query_context.model_dump(mode='json')
         return await orchestration.run_query(
             model, previous.state, previous.claims, question, strategy, routing,
             cancel=cancel,

@@ -10,7 +10,7 @@ from jonex_wiki.domain.engine.compile.pipeline import artifact_to_passage, canon
 _LOCATION_KEYS = {'content_generation', 'position', 'page_number', 'source_location',
                   'source_locations', 'snapshot_text', 'file_name', 'source_name',
                   'char_start', 'char_end', 'sha256', 'original_blob', 'original_sha256',
-                  'parse_input_signature'}
+                  'parse_input_signature', 'parse_input_components'}
 
 
 def dependency_key(p):

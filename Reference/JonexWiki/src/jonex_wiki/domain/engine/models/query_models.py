@@ -50,34 +50,11 @@ class SearchHit(BaseModel):
         return canonical_wiki_path(v)
 
 
-class RerankResponse(BaseModel):
-    """Ordered paths returned by the optional LLM reranker."""
-
-    paths: List[str] = Field(default_factory=list)
-
-    model_config = ConfigDict(extra="forbid")
 class TraceEntry(BaseModel):
     """One auditable trace event: an action, a tool result or a decision."""
 
     event: str
     detail: Dict[str, Any] = Field(default_factory=dict)
-
-    model_config = ConfigDict(extra="forbid")
-class SubQuestionList(BaseModel):
-    """A bounded list of self-contained sub-questions from query decomposition.
-
-    Each sub-question must stand alone and carry its own context entities so it
-    can be searched independently without entity drift.
-    """
-
-    sub_questions: List[str] = Field(default_factory=list)
-    requires_evidence_bridge: bool = Field(
-        default=False,
-        description=(
-            "True only for an ordered dependency chain whose next search must "
-            "be grounded by a value learned from earlier evidence."
-        ),
-    )
 
     model_config = ConfigDict(extra="forbid")
 class RawWikiPage(BaseModel):
@@ -214,7 +191,7 @@ class QueryCorpus(BaseModel):
     evidence_fallback: Dict[str, List[str]] = Field(
         default_factory=dict, exclude=True)
     # LWP-RET-002 long-document routing (per-query runtime axis, never part of
-    # effective-config).  All four fields are optional with defaults so every
+    # effective-config).  These fields are optional with defaults so every
     # existing QueryCorpus construction is unchanged; the route layer sets them
     # from ``query_orchestration.run_query`` after ``build_query_corpus``.
     #
@@ -225,16 +202,6 @@ class QueryCorpus(BaseModel):
     # D-5: page_number derived query-side from ``source_metadata`` as an
     # independent map (PageIndexEntry stays frozen).  wiki path → page number.
     page_number_map: Dict[str, int] = Field(default_factory=dict)
-    # Raw-source fallback (P0): an injected on-demand single-segment reader
-    # keyed by SourceSpan identity (source_id/document_id/chunk_id +
-    # start/end).  ``None`` (the default) disables the fallback entirely —
-    # the whole source archive is never re-injected into the corpus.
-    raw_source_reader: Optional[Any] = None
-    # "off" (default) | "production" | "matched" — raw fallback mode.  Only
-    # explicit production/matched callers enable it; the default stack is
-    # byte-identical to the pre-route hybrid.
-    raw_fallback_mode: str = "off"
-
     @field_serializer('source_records','source_locations','page_links','fact_mentions')
     def _serialize_mappings(self,value):
         return dict(value)

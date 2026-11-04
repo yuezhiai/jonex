@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator, field_validator, ConfigDict
 
+from jonex_wiki.kernel.query_images import QueryImageContext
+
 
 def default_models_from_env() -> Dict[str, str]:
     """role → 默认模型名。模型名唯一来源是环境变量。
@@ -480,10 +482,7 @@ class WikiRevision(BaseModel):
 
 
 class QueryStrategy(str, Enum):
-    DIRECT = "direct"
-    SEARCH_FIRST = "search-first"
     BROWSE_FIRST = "browse-first"
-    AUTO = "auto"
 
 
 class QueryEventType(str, Enum):
@@ -509,45 +508,12 @@ class Citation(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    """A query submitted by a user within a Session.
-
-    An Agent may pass an explicit ``workflow_id`` to select a DomainProfile
-    workflow.
-    """
+    """Query content and optional trace identity; policy is supplied by the runner."""
 
     question: str = Field(..., min_length=1, max_length=4096)
-    strategy: QueryStrategy = Field(default=QueryStrategy.BROWSE_FIRST)
-    model: Optional[str] = Field(default=None, description="Override default query model")
-    run_id: Optional[str] = Field(
-        default=None,
-        description="Owner Query Run ID — used to derive deterministic trace span ids",
-    )
-    workflow_id: Optional[str] = Field(
-        default=None,
-        description="Explicit DomainProfile workflow selection (Agent may pass it through the query request)",
-    )
-    document_scope: Tuple[str, ...] = Field(
-        default=(),
-        description=(
-            "Explicit source document IDs selected by the user/session. Gold or "
-            "reference-source metadata must never populate this field."
-        ),
-    )
-    thinking_traversal: str = Field(default="scene_default")
-    thinking_synthesis: str = Field(default="scene_default")
-
-    @field_validator("document_scope")
-    def _valid_document_scope(cls, values: Tuple[str, ...]) -> Tuple[str, ...]:
-        if len(values) != len(set(values)) or any(not value.strip() for value in values):
-            raise ValueError("QUERY_DOCUMENT_SCOPE_INVALID")
-        return values
-
-    @field_validator("thinking_traversal", "thinking_synthesis")
-    def _valid_thinking(cls, value: str) -> str:
-        normalized = value.strip().casefold()
-        if normalized not in {"scene_default", "on", "off", "enabled", "disabled"}:
-            raise ValueError("QUERY_THINKING_INVALID")
-        return normalized
+    run_id: Optional[str] = None
+    query_context: Optional[QueryImageContext] = None
+    model_config = ConfigDict(extra="forbid")
 
 
 class TraceSpanType(str, Enum):

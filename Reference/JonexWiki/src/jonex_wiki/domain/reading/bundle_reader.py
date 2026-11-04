@@ -13,13 +13,9 @@ The bundle layout may be older than the reading indexes (a bundle compiled
 before the sinkdown has no ``page_graph`` / ``indexes/links.json``); those
 fields degrade to empty values instead of failing.
 
-**同名归并（展示侧）**：本模块是*展示链路*（standalone service 与 platform
-共用），因此同名页面在这里被投影成「一个实体一页」——发布 bundle 一字不动，
-检索侧（``domain/engine/query`` 的 traversal / corpus）完全不受影响。
-归并规则见 ``page_merge``；所有读取入口都经过 ``MergeMap``：
-``list_pages`` 只列 winner，``read_page`` 把 loser 解析到 winner 并取全体成员的
-references，``get_backlinks`` 合并簇内链入，``get_claims`` /
-``list_page_documents`` 按簇取并集。
+**页面身份**：标题相同也保留各自路径、正文、关系端点与引用。
+普通读取没有权威实体归一记录，不自动合并同名页面。兼容 MergeMap 接口
+只接受调用方明确提供的已确认身份；本模块默认返回恒等映射。
 
 **claims 口径**：references / claims 一律来自 ``claims.jsonl``（编译期写出的
 **全量** claim，实测 2743 条），**不做 ``support_status`` 过滤**。SUPPORTED
@@ -38,7 +34,6 @@ from jonex_wiki.domain.engine.compile.mention_index import is_raw_page
 from jonex_wiki.domain.reading.page_merge import (
     MergeMap,
     build_merge_map,
-    is_merge_candidate,
 )
 from jonex_wiki.kernel.errors import NotFoundError
 from jonex_wiki.domain.engine.json_artifacts import load_json_artifact
@@ -71,56 +66,14 @@ def _strip_frontmatter(md: str) -> str:
     return md
 
 
-def _page_bytes(pub: Path, path: str) -> int:
-    """正文体量：选主用的「谁更厚」。只需 stat，不必解析 claims.jsonl。"""
-    try:
-        return (pub / "wiki" / path).stat().st_size
-    except OSError:
-        return 0
-
-
-@lru_cache(maxsize=_NAVIGATION_CACHE_SIZE)
-def _claim_counts_cached(pub_str: str, stamp: tuple) -> Dict[str, int]:
-    """``page_path → claim 数``（全量 claims，不做 support_status 过滤）。
-
-    选主的第一判据。按 (mtime_ns, size) 缓存，同一 revision 只解析一次
-    claims.jsonl。
-    """
-    _, grouped = _claims_by_page_cached(pub_str, stamp)
-    return {page: len(indices) for page, indices in grouped.items() if page}
-
-
-def _claim_counts(pub: Path) -> Mapping[str, int]:
-    claims_file = pub / "claims.jsonl"
-    try:
-        stat = claims_file.stat()
-    except OSError:
-        return {}
-    return _claim_counts_cached(str(pub.resolve()), (stat.st_mtime_ns, stat.st_size))
-
-
 def _merge_map(pub: Path, nav: Mapping[str, Any]) -> MergeMap:
-    """当前 bundle 的展示侧归并映射（纯函数结果；claims 计数按 revision 缓存）。
-
-    ``weight_of`` = claim 数（证据最多的一份是实体正页），``size_of`` = 正文体量
-    （只 stat，用于 tie-break）。
-    """
+    """Keep every saved page separate unless authoritative identity is supplied."""
     index = nav.get("page_index", {}) or {}
-    candidates = {
-        str(path): entry
-        for path, entry in index.items()
-        if not is_raw_page(str(path)) and is_merge_candidate(str(path))
-    }
-    counts = _claim_counts(pub)
-    return build_merge_map(
-        candidates,
-        weight_of=lambda p: counts.get(p, 0),
-        size_of=lambda p: _page_bytes(pub, p),
-    )
+    return build_merge_map(index)
 
 
 def merge_map(pub: Path) -> MergeMap:
-    """展示侧同名归并映射（供目录投影复用：目录在 DB 里，不在 bundle 内）。"""
+    """Reading projection, identity by default; stored outlines stay unchanged."""
     return _merge_map(pub, load_navigation(pub))
 
 
@@ -339,6 +292,11 @@ def read_page(pub: Path, page_id: str) -> Dict[str, Any]:
         "content": body,  # deprecated alias, kept for standalone HTTP compat
         "references": _references_for(pub, cluster),
     }
+    if result["type"] == "table":
+        from jonex_wiki.domain.reading.table_reading import read_table_data
+        table_data = read_table_data(pub, page_index[target])
+        if table_data is not None:
+            result["table_data"] = table_data
     if target != page_id:
         result["requested_path"] = page_id
         result["redirected_from"] = page_id

@@ -37,7 +37,8 @@ def create_app(settings=None, session_factory=None, executor=None):
     if settings is None:
         from jonex_wiki.infra.settings import Settings
         settings = Settings()   # 生产:factory 模式无参构造;缺必填 env 在此 fail-fast
-    app = FastAPI(title="Jonex Wiki", version="0.1.0", lifespan=lifespan)
+    from importlib.metadata import version
+    app = FastAPI(title="Jonex Wiki", version=version("jonex-wiki"), lifespan=lifespan)
     app.state.settings = settings
     app.state.session_factory = session_factory
     app.state.executor = executor
@@ -117,6 +118,8 @@ def create_app(settings=None, session_factory=None, executor=None):
     app.include_router(prompts_router.router)
     app.include_router(compile_router.router)
     app.include_router(query_router.router)
+    from jonex_wiki.api.routers.scenarios import router as scenarios_router
+    app.include_router(scenarios_router)
 
     return app
 

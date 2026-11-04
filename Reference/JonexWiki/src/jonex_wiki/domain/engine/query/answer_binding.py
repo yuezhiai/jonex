@@ -70,19 +70,6 @@ _UNIT_TOKEN = re.compile(
     r'\s*(%|％|百分点|个百分点|万|萬|千|百|亿|億|百万|千万|十亿|美元|港元|欧元|日元|元|'
     r'thousand|million|billion|dollars|USD|RMB|CNY|HKD|EUR|percent|people|employees|shares)',
     re.I)
-_METRIC_ALIASES = (
-    ('revenue', ('revenue', 'revenues', 'sales', 'turnover', '营业收入', '营收', '收入', '销售额')),
-    ('net_income', ('net income', 'net profit', 'net earnings', '净利润', '淨利潤', '净利')),
-    ('operating_income', ('operating income', 'operating profit', '营业利润', '经营利润')),
-    ('gross_profit', ('gross profit', '毛利')),
-    ('assets', ('total assets', 'assets', '资产总额', '总资产', '資產總額')),
-    ('liabilities', ('total liabilities', 'liabilities', '负债总额', '总负债', '負債總額')),
-    ('equity', ('shareholders equity', "shareholders' equity", 'total equity', 'owner equity',
-                '所有者权益', '股东权益', '股东权益合计')),
-    ('cash', ('cash and cash equivalents', 'cash', '现金', '貨幣資金', '货币资金')),
-    ('employees', ('employees', 'headcount', '员工人数', '员工总数', '雇员人数')),
-    ('eps', ('earnings per share', 'eps', '每股收益', '每股盈利')),
-)
 _UP = re.compile(r'上升|增加|增长|提高|增长至|rise|rises|rose|increase[sd]?|grew|grow(?:th)?\b', re.I)
 _DOWN = re.compile(r'下降|减少|降低|下跌|减少至|decline[sd]?|decrease[sd]?|fell|drop(?:ped)?|lower\b', re.I)
 
@@ -143,12 +130,21 @@ def _covered_by_claims(proposition: str, claims: Sequence[str]) -> bool:
     return all(_BINDING_JOIN.fullmatch(gap) for gap in gaps)
 
 
-def _metric_scope(text: str) -> set:
+def _metric_scope(text: str, labels: Sequence[str] = ()) -> set:
+    """Match only literal labels explicitly supplied from source metadata.
+
+    No built-in domain aliases: equivalence and absent labels are undetermined.
+    """
     lowered = (text or "").casefold()
     found = set()
-    for name, aliases in _METRIC_ALIASES:
-        if any(alias.casefold() in lowered for alias in aliases):
-            found.add(name)
+    for label in labels:
+        if not isinstance(label, str) or not label.strip():
+            continue
+        name = label.strip().casefold()
+        pattern = (r"(?<![a-z0-9_])" + re.escape(name) + r"(?![a-z0-9_])"
+                   if name.isascii() else re.escape(name))
+        if re.search(pattern, lowered):
+            found.add(label)
     return found
 
 
@@ -177,7 +173,8 @@ def _directions(text: str) -> set:
     return found
 
 
-def scope_conflicts(claim: str, quote_text: str) -> List[Dict[str, Any]]:
+def scope_conflicts(claim: str, quote_text: str, *,
+                    metric_labels: Sequence[str] = ()) -> List[Dict[str, Any]]:
     """Program-checkable scope disagreements between a claim and its quote.
 
     Only *determinable* dimensions are judged: a dimension is skipped when
@@ -194,7 +191,7 @@ def scope_conflicts(claim: str, quote_text: str) -> List[Dict[str, Any]]:
     if len(claimed_units) == 1 and len(quoted_units) == 1 and claimed_units != quoted_units:
         conflicts.append({"dimension": "unit", "claim": sorted(claimed_units)[0],
                           "quote": sorted(quoted_units)[0]})
-    claimed_metrics, quoted_metrics = _metric_scope(claim), _metric_scope(quote_text)
+    claimed_metrics, quoted_metrics = _metric_scope(claim, metric_labels), _metric_scope(quote_text, metric_labels)
     if len(claimed_metrics) == 1 and len(quoted_metrics) == 1 \
             and claimed_metrics != quoted_metrics:
         conflicts.append({"dimension": "metric", "claim": sorted(claimed_metrics)[0],
@@ -409,7 +406,7 @@ def verify_answer_bindings(
             # Determinable scope: period, unit base, metric and direction.  A
             # dimension either side states more than once is skipped -- the
             # comparison would be undetermined, and this check never guesses.
-            scopes = scope_conflicts(claim, quote)
+            scopes = scope_conflicts(claim, quote, metric_labels=state.get("source_metric_labels") or ())
             if scopes and matching:
                 reported.append({"reason": "binding_scope_conflict",
                                  "claim": claim, "conflicts": scopes,
@@ -440,12 +437,13 @@ def verify_answer_bindings(
         "rule_version": "answer-binding-v2",
         "reason": reported[0]["reason"],
         "conflicts": reported[:MAX_ANSWER_BINDINGS],
-        "scope_dimensions": ["period", "unit", "metric", "direction"],
-        "undetermined_dimensions": ["subject_identity", "alias_equivalence",
+        "scope_dimensions": ["period", "unit", "direction"],
+        "literal_metric_labels": list(state.get("source_metric_labels") or ()),
+        "undetermined_dimensions": ["subject_identity", "metric_semantics", "alias_equivalence",
                                     "semantic_entailment"],
         "note": ("这些绑定只做了可程序验证的事：每条已声明结论都有绑定、句柄属于本次已交付文本、"
                  "直接引用有落在该句柄内的原文（派生值对应本次程序结果）、以及可判定的"
-                 "期间/单位/指标/方向范围一致。主体同一性、别名等价与语义蕴含仍未判定："
+                 "期间/单位/方向范围；指标只比较显式提供的来源原始标签。主体同一性、指标语义、别名等价与语义蕴含仍未判定："
                  "请补齐引文或程序结果，或把该部分明确标为待核实。"),
         "message": _correction_message(reported[:MAX_ANSWER_BINDINGS], state),
     }

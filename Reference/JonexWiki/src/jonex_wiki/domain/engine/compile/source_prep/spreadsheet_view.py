@@ -159,7 +159,8 @@ def _styles(archive: zipfile.ZipFile) -> tuple[list[str], set[int]]:
     style_formats = [formats.get(int(xf.attrib.get("numFmtId", 0)), builtins.get(int(xf.attrib.get("numFmtId", 0)),
                          "builtin:" + xf.attrib.get("numFmtId", "0"))) for xf in xfs]
     date_styles = {index for index, value in enumerate(style_formats)
-                   if re.search(r"(?<!\\)[ymdhis]", re.sub(r'"[^"]*"', "", value), re.I)}
+                   if not value.startswith("builtin:")
+                   and re.search(r"(?<!\\)[ymdhis]", re.sub(r'"[^"]*"', "", value), re.I)}
     return style_formats or ["General"], date_styles
 
 
@@ -331,6 +332,10 @@ def parse_spreadsheet(path: Path, *, output_dir: Path, source_id: str,
                         status = "ambiguous"
                         header_disambiguation = None
                     title = next((value for value in first_row if value), "{} 区域 {}".format(name, ordinal))
+                    if re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", title):
+                        # A serial date/year/amount is a cell value, not a
+                        # useful standalone table title. Do not guess its type.
+                        title = "{} · 表 {}".format(name, ordinal)
                     interpretation_id = "interpretation-" + hashlib.sha256((table_id + ":v1").encode()).hexdigest()[:16]
                     connection.execute("INSERT INTO logical_tables VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (table_id, sheet_id, ordinal, title, r1, c1, r2, c2, status,

@@ -36,7 +36,14 @@ async def trigger_compile(kb_id: str, request: Request,
             raise ValidationError("该知识库没有已解析文档,无法编译")
         if len(docs) > settings.compile_max_documents:
             raise ValidationError(f"编译文档数超限: docs={len(docs)}/{settings.compile_max_documents}")
-        task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile)
+        # [jonex] P3b（方案 B）：可选 model = 本次编译要用的模型快照；缺省 = 部署默认
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — 空 body / 非 JSON 一律当没带
+            body = {}
+        compile_model = str((body or {}).get("model") or "").strip()
+        task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
+                                       kind=TaskKind.compile, compile_model=compile_model)
         await s.commit()
         executor.submit(task)
         return {"task_id": task.task_id, "status": task.status}
