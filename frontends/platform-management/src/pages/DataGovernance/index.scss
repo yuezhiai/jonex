@@ -107,3 +107,34 @@
   margin: 0;
   padding-left: 18px;
 }
+
+// ── W2.5 数据质量闭环 ──
+.yx-dg-quality-field-label {
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.yx-dg-quality-sql,
+.yx-dg-quality-detail {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.yx-dg-quality-muted {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+// W2.6 责任视图：未分配分组高亮（提示需要补责任人 / 业务域）。
+.yx-dg-resource-row-unassigned > td {
+  background: #fff7e6 !important;
+}

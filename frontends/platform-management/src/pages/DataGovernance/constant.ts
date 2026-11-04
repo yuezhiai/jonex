@@ -8,7 +8,13 @@ import type { DgAssetType } from './types';
  */
 export const DG_PERMISSION_READ = 'knowledge:read';
 
-export const DG_ASSET_TYPES: DgAssetType[] = ['document', 'data_source'];
+export const DG_ASSET_TYPES: DgAssetType[] = [
+  'document',
+  'data_source',
+  'table',
+  'column',
+  'metric',
+];
 
 export const DG_DOCUMENT_STATUSES = [
   'pending',

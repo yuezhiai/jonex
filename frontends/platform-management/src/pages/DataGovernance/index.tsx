@@ -45,8 +45,10 @@ import {
   buildCategoryOptions,
   buildLevelOptions,
   errorMeta,
+  isDerivedAssetType,
   levelColor,
   levelLabel,
+  parentLabel,
   qualityColor,
   qualityLabelKey,
   statusColor,
@@ -57,6 +59,10 @@ import ClassificationBatchModal from './components/ClassificationBatchModal';
 import ClassificationConfigModal from './components/ClassificationConfigModal';
 import RetentionPolicyModal from './components/RetentionPolicyModal';
 import StandardCatalogTab from './components/StandardCatalogTab';
+import QualityTab from './quality/QualityTab';
+import ResourceViewsTab, {
+  type ResourceDrillDownFilters,
+} from './resourceViews/ResourceViewsTab';
 import './index.scss';
 
 interface Filters {
@@ -78,7 +84,9 @@ export default function DataGovernancePage() {
   const { hasPerm } = usePermission();
   const canRead = hasPerm(DG_PERMISSION_READ);
   const isTenantAdmin = getShellContext()?.getCurrentUser?.()?.isTenantAdmin === true;
+  const currentUserId = getShellContext()?.getCurrentUser?.()?.id ?? null;
 
+  const [activeTab, setActiveTab] = useState('assets');
   const [filters, setFilters] = useState<Filters>(INITIAL_FILTERS);
   const [applied, setApplied] = useState<Filters>(INITIAL_FILTERS);
   const [page, setPage] = useState(1);
@@ -259,6 +267,22 @@ export default function DataGovernancePage() {
     setApplied({ ...INITIAL_FILTERS });
   }, []);
 
+  /**
+   * 资源视图下钻：把空间/域/责任人作为资产目录筛选条件，并切回 assets 页签。
+   * 资产类型重置为 `all`，避免上一次的文档/数据源筛选把结果挡空。
+   */
+  const handleDrillDown = useCallback((next: ResourceDrillDownFilters) => {
+    const merged: Filters = {
+      ...INITIAL_FILTERS,
+      ...next,
+      assetType: 'all',
+    };
+    setFilters(merged);
+    setApplied({ ...merged });
+    setPage(1);
+    setActiveTab('assets');
+  }, []);
+
   const statusOptions = useMemo<readonly string[]>(() => {
     if (filters.assetType === 'document') {
       // `deleted` 在目录查询里恒被 `is_deleted=0` 过滤掉，作为筛选值只会命中 0 条。
@@ -267,6 +291,15 @@ export default function DataGovernancePage() {
     if (filters.assetType === 'data_source') return DG_DATA_SOURCE_STATUSES;
     return [];
   }, [filters.assetType]);
+
+  // 派生资产（表/列/指标）没有统一的业务状态：`status` 是 compiled 同步状态
+  // 或指标 `active`，沿用文档/数据源词表会回显英文或错误语义，因此状态下拉与
+  // 状态列都按类型隐藏（`all` 混合列表里派生行渲染占位符）。
+  // 依据「已应用」类型而不是草稿值：避免用户改了类型但未点查询时，
+  // 下拉禁用状态与表格实际数据瞬时不一致。
+  const statusFilterDisabled =
+    applied.assetType === 'all' || isDerivedAssetType(applied.assetType);
+  const showStatusColumn = !isDerivedAssetType(applied.assetType);
 
   const hasActiveFilters =
     applied.assetType !== 'all' ||
@@ -286,6 +319,19 @@ export default function DataGovernancePage() {
 
   const categoryName = (code: string) =>
     classificationConfig.categories.find((category) => category.code === code)?.name ?? code;
+
+  const statusColumn: ColumnsType<DgAssetItem>[number] = {
+    title: t('dataGovernance.column.status'),
+    dataIndex: 'status',
+    width: 110,
+    render: (status: string, row) =>
+      // 混合列表里派生行的状态没有对应词表：留占位符，不展示原始编码。
+      isDerivedAssetType(row.assetType) ? (
+        <span className="yx-dg-muted">—</span>
+      ) : (
+        <Tag color={statusColor(status)}>{t(statusLabelKey(row.assetType, status))}</Tag>
+      ),
+  };
 
   const columns: ColumnsType<DgAssetItem> = [
     {
@@ -325,15 +371,22 @@ export default function DataGovernancePage() {
         </Tooltip>
       ),
     },
-    { title: t('dataGovernance.column.kb'), dataIndex: 'kbName', width: 200, ellipsis: true },
     {
-      title: t('dataGovernance.column.status'),
-      dataIndex: 'status',
-      width: 110,
-      render: (status: string, row) => (
-        <Tag color={statusColor(status)}>{t(statusLabelKey(row.assetType, status))}</Tag>
-      ),
+      title: t('dataGovernance.column.parent'),
+      dataIndex: 'parentId',
+      width: 200,
+      ellipsis: true,
+      render: (_value, row) => {
+        // 列显示所属表（parent_id）；表/指标显示来源（数据源/KB 名称）。
+        if (row.assetType === 'column') return parentLabel(row);
+        if (row.assetType === 'table' || row.assetType === 'metric') {
+          return row.sourceLabel || '—';
+        }
+        return '—';
+      },
     },
+    { title: t('dataGovernance.column.kb'), dataIndex: 'kbName', width: 200, ellipsis: true },
+    ...(showStatusColumn ? [statusColumn] : []),
     {
       title: t('dataGovernance.column.quality'),
       dataIndex: 'qualityVerdict',
@@ -417,6 +470,8 @@ export default function DataGovernancePage() {
       <PageHeader title={t('navigation.dataGovernance')} />
       <PageContent showCard={false}>
         <Tabs
+          activeKey={activeTab}
+          onChange={setActiveTab}
           items={[
             {
               key: 'assets',
@@ -499,7 +554,7 @@ export default function DataGovernancePage() {
             />
             <Select
               allowClear
-              disabled={filters.assetType === 'all'}
+              disabled={statusFilterDisabled}
               placeholder={t('dataGovernance.filter.status')}
               value={filters.status}
               options={statusOptions.map((v) => ({
@@ -615,15 +670,39 @@ export default function DataGovernancePage() {
               label: t('dataGovernance.standards.title'),
               children: <StandardCatalogTab />,
             },
+            {
+              key: 'quality',
+              label: t('dataGovernance.quality.title'),
+              children: (
+                <QualityTab
+                  canWrite={isTenantAdmin}
+                  userId={currentUserId}
+                  isAdmin={isTenantAdmin}
+                />
+              ),
+            },
+            {
+              key: 'resourceViews',
+              label: t('dataGovernance.resourceViews.title'),
+              children: (
+                <ResourceViewsTab
+                  canWrite={isTenantAdmin}
+                  onDrillDown={handleDrillDown}
+                />
+              ),
+            },
           ]}
         />
       </PageContent>
 
+      {/* 页面目前只有 `knowledge:read` 权限码，暂无细粒度写权限来源：
+          显式传 `true` 保持可编辑，后端 `assert_can_write` 做最终兜底。 */}
       <AssetDrawer
         open={Boolean(drawer)}
         assetType={drawer?.type ?? 'document'}
         assetId={drawer?.id ?? ''}
         classificationConfig={classificationConfig}
+        canWrite
         onClose={() => setDrawer(null)}
         onSaved={() => {
           void load();

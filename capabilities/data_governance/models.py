@@ -18,7 +18,7 @@ class AssetMetadata(TenantMixin, TimestampMixin, Base):
 
     id = Column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
     asset_type = Column(String(32), nullable=False)
-    asset_id = Column(String(64), nullable=False)
+    asset_id = Column(String(255), nullable=False)
     owner = Column(String(128), nullable=True)
     domain = Column(String(64), nullable=True)
     sensitivity = Column(String(32), nullable=True)

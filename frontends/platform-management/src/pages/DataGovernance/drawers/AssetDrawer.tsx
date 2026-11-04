@@ -14,8 +14,10 @@ import {
   Select,
   Skeleton,
   Space,
+  Table,
   Tag,
 } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
 import {
   DeleteOutlined,
   InboxOutlined,
@@ -44,6 +46,7 @@ import {
   classificationSourceLabelKey,
   errorMeta,
   formatFileSize,
+  isDerivedAssetType,
   levelColor,
   levelLabel,
   qualityColor,
@@ -53,6 +56,7 @@ import {
   retentionValueText,
   statusColor,
   statusLabelKey,
+  syncStatusText,
 } from '../utils';
 import type { MetadataDraft, RetentionDraft } from '../utils';
 import LineageSection from '../components/LineageSection';
@@ -62,15 +66,24 @@ interface Props {
   assetType: DgAssetType;
   assetId: string;
   classificationConfig: DgClassificationConfig;
+  /**
+   * 无写权限时禁用元数据编辑区。默认 false（安全默认），调用方必须显式授权。
+   * 页面当前暂无细粒度写权限来源，显式传 true，由后端 `assert_can_write` 兜底。
+   */
+  canWrite?: boolean;
   onClose: () => void;
   onSaved: () => void;
 }
+
+type ColumnRow = NonNullable<DgAssetDetail['columns']>[number];
+type LandingRow = NonNullable<DgAssetDetail['landings']>[number];
 
 export default function AssetDrawer({
   open,
   assetType,
   assetId,
   classificationConfig,
+  canWrite = false,
   onClose,
   onSaved,
 }: Props) {
@@ -300,12 +313,65 @@ export default function AssetDrawer({
   const isArchived = detail?.status === 'archived';
   // 统一并发闸门：元数据/策略/生命周期任一写操作进行中，其它写入口一律禁用。
   const busy = saving || retentionSaving || lifecycleAction !== null;
+  // 全局写闸：元数据 / 保留策略 / 生命周期共用；`canWrite` 默认 false（安全默认），
+  // 调用方在有写权限语义时显式传 true，后端 assert_can_write 仍做最终兜底。
+  const writeDisabled = busy || !canWrite;
 
   // 与 utils helper 共用：内置级别文案、停用项 disabled 口径一致。
   const levelOptions = buildLevelOptions(t, classificationConfig.levels);
   const categoryOptions = buildCategoryOptions(classificationConfig.categories, t);
   const categoryName = (code: string) =>
     classificationConfig.categories.find((category) => category.code === code)?.name ?? code;
+
+  // 表/列/指标是 compiled schema 的只读派生视图：详情按类型分支展示，
+  // 元数据（责任人/主题域/分级/分类）仍可写，写入能力由 canWrite 控制。
+  const derived = isDerivedAssetType(detail?.assetType);
+  const columnRows: ColumnRow[] = detail?.columns ?? [];
+  const landingRows: LandingRow[] = detail?.landings ?? [];
+
+  const columnTableColumns: ColumnsType<ColumnRow> = [
+    { title: t('dataGovernance.drawer.columnName'), dataIndex: 'name' },
+    {
+      title: t('dataGovernance.drawer.columnType'),
+      dataIndex: 'type',
+      render: (value: string | null) => value || '—',
+    },
+    {
+      title: t('dataGovernance.drawer.primaryKey'),
+      dataIndex: 'primaryKey',
+      width: 90,
+      render: (value: boolean) => t(value ? 'common.yes' : 'common.no'),
+    },
+    {
+      title: t('dataGovernance.drawer.displayName'),
+      dataIndex: 'displayName',
+      render: (value: string | null) => value || '—',
+    },
+  ];
+
+  const landingTableColumns: ColumnsType<LandingRow> = [
+    { title: t('dataGovernance.drawer.dataSource'), dataIndex: 'dataSourceId' },
+    {
+      title: t('dataGovernance.drawer.entityName'),
+      dataIndex: 'entityName',
+      render: (value: string | undefined) => value || '—',
+    },
+    {
+      title: t('dataGovernance.drawer.diMetric'),
+      dataIndex: 'diMetric',
+      render: (value: string | undefined) => value || '—',
+    },
+    {
+      title: t('dataGovernance.drawer.physicalTable'),
+      dataIndex: 'table',
+      render: (value: string | null) =>
+        value || (
+          <span className="yx-dg-muted">
+            {t('dataGovernance.landingTableUnresolved')}
+          </span>
+        ),
+    },
+  ];
 
   return (
     <Drawer
@@ -342,11 +408,63 @@ export default function AssetDrawer({
             <Descriptions.Item label={t('dataGovernance.column.kb')}>
               {detail.kbName}
             </Descriptions.Item>
-            <Descriptions.Item label={t('dataGovernance.column.status')}>
-              <Tag color={statusColor(detail.status)}>
-                {t(statusLabelKey(detail.assetType, detail.status))}
-              </Tag>
-            </Descriptions.Item>
+            {/* 派生资产没有业务状态：`status` 是 compiled 同步状态/指标 active，
+                沿用文档/数据源词表会回显英文或错误语义，故不展示。 */}
+            {!derived && (
+              <Descriptions.Item label={t('dataGovernance.column.status')}>
+                <Tag color={statusColor(detail.status)}>
+                  {t(statusLabelKey(detail.assetType, detail.status))}
+                </Tag>
+              </Descriptions.Item>
+            )}
+            {detail.assetType === 'table' && (
+              <>
+                <Descriptions.Item label={t('dataGovernance.drawer.dataSource')}>
+                  {detail.sourceLabel || detail.dataSourceId || '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.physicalTable')}>
+                  {detail.table || detail.name}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.schemaVersion')}>
+                  {detail.schemaVersion ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.syncStatus')}>
+                  {syncStatusText(t, detail.syncStatus)}
+                </Descriptions.Item>
+              </>
+            )}
+            {detail.assetType === 'column' && (
+              <>
+                <Descriptions.Item label={t('dataGovernance.columnOfTable')}>
+                  {detail.table || '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.columnType')}>
+                  {detail.columnType || '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.primaryKey')}>
+                  {detail.primaryKey ? t('common.yes') : t('common.no')}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.displayName')}>
+                  {detail.displayName || '—'}
+                </Descriptions.Item>
+              </>
+            )}
+            {detail.assetType === 'metric' && (
+              <>
+                <Descriptions.Item label={t('dataGovernance.additivity')}>
+                  {detail.additivity || '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('dataGovernance.drawer.aliases')}>
+                  {detail.aliases?.length ? detail.aliases.join(', ') : '—'}
+                </Descriptions.Item>
+                <Descriptions.Item
+                  label={t('dataGovernance.drawer.description')}
+                  span={2}
+                >
+                  {detail.description || '—'}
+                </Descriptions.Item>
+              </>
+            )}
             {detail.assetType === 'document' && (
               <>
                 <Descriptions.Item label={t('dataGovernance.column.quality')}>
@@ -382,6 +500,54 @@ export default function AssetDrawer({
               </>
             )}
           </Descriptions>
+
+          {detail.assetType === 'table' && (
+            <>
+              <Divider style={{ margin: 0 }} />
+              <div>
+                <div className="yx-dg-section-title">
+                  {t('dataGovernance.columnsOfTable')}
+                  {detail.columnCount !== null && detail.columnCount !== undefined
+                    ? ` (${detail.columnCount})`
+                    : ''}
+                </div>
+                <Table<ColumnRow>
+                  rowKey={(row) => row.name}
+                  size="small"
+                  pagination={false}
+                  columns={columnTableColumns}
+                  dataSource={columnRows}
+                  scroll={{ y: 240 }}
+                  locale={{ emptyText: t('common.noData') }}
+                />
+              </div>
+            </>
+          )}
+
+          {detail.assetType === 'metric' && (
+            <>
+              <Divider style={{ margin: 0 }} />
+              <div>
+                <div className="yx-dg-section-title">{t('dataGovernance.landings')}</div>
+                {detail.unresolved && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    title={t('dataGovernance.metricUnresolved')}
+                    style={{ marginBottom: 8 }}
+                  />
+                )}
+                <Table<LandingRow>
+                  rowKey={(row, index) => `${row.dataSourceId}:${row.table ?? ''}:${index}`}
+                  size="small"
+                  pagination={false}
+                  columns={landingTableColumns}
+                  dataSource={landingRows}
+                  locale={{ emptyText: t('common.noData') }}
+                />
+              </div>
+            </>
+          )}
 
           <Divider style={{ margin: 0 }} />
 
@@ -440,7 +606,7 @@ export default function AssetDrawer({
                 id="yx-dg-owner"
                 value={draft.owner ?? ''}
                 maxLength={128}
-                disabled={busy}
+                disabled={writeDisabled}
                 placeholder={t('dataGovernance.drawer.ownerPlaceholder')}
                 onChange={(e) => setDraft((d) => ({ ...d, owner: e.target.value || null }))}
               />
@@ -450,7 +616,7 @@ export default function AssetDrawer({
                 id="yx-dg-domain"
                 value={draft.domain ?? ''}
                 maxLength={64}
-                disabled={busy}
+                disabled={writeDisabled}
                 placeholder={t('dataGovernance.drawer.domainPlaceholder')}
                 onChange={(e) => setDraft((d) => ({ ...d, domain: e.target.value || null }))}
               />
@@ -461,7 +627,7 @@ export default function AssetDrawer({
               <Select
                 id="yx-dg-level"
                 allowClear
-                disabled={busy}
+                disabled={writeDisabled}
                 value={draft.sensitivity ?? undefined}
                 placeholder={t('dataGovernance.classification.inherit')}
                 options={levelOptions}
@@ -482,7 +648,7 @@ export default function AssetDrawer({
                   id="yx-dg-categories"
                   mode="multiple"
                   allowClear
-                  disabled={busy}
+                  disabled={writeDisabled}
                   value={draft.categories ?? undefined}
                   placeholder={t('dataGovernance.classification.inherit')}
                   options={categoryOptions}
@@ -498,7 +664,7 @@ export default function AssetDrawer({
                 <Button
                   size="small"
                   type={draft.categories?.length === 0 ? 'primary' : 'default'}
-                  disabled={busy}
+                  disabled={writeDisabled}
                   onClick={() => setDraft((d) => ({ ...d, categories: [] }))}
                 >
                   {t('dataGovernance.classification.noCategories')}
@@ -512,7 +678,7 @@ export default function AssetDrawer({
             <Button
               type="primary"
               loading={saving}
-              disabled={busy && !saving}
+              disabled={writeDisabled && !saving}
               onClick={() => void save()}
             >
               {saving ? t('dataGovernance.drawer.saving') : t('dataGovernance.drawer.save')}
@@ -521,6 +687,8 @@ export default function AssetDrawer({
 
           <Divider style={{ margin: 0 }} />
 
+          {/* 派生资产（表/列/指标）没有归档/恢复/保留策略语义，整段隐藏。 */}
+          {!derived && (
           <div className="yx-dg-lifecycle">
             <div className="yx-dg-section-title">{t('dataGovernance.lifecycle.title')}</div>
             <Descriptions column={3} size="small">
@@ -582,7 +750,7 @@ export default function AssetDrawer({
                         min={0}
                         precision={0}
                         style={{ width: '100%' }}
-                        disabled={busy}
+                        disabled={writeDisabled}
                         value={retentionDraft.retentionDays ?? undefined}
                         placeholder={t('dataGovernance.lifecycle.inherit')}
                         addonAfter={t('dataGovernance.retention.daysUnit')}
@@ -603,7 +771,7 @@ export default function AssetDrawer({
                         min={0}
                         precision={0}
                         style={{ width: '100%' }}
-                        disabled={busy}
+                        disabled={writeDisabled}
                         value={retentionDraft.graceDays ?? undefined}
                         placeholder={t('dataGovernance.lifecycle.inherit')}
                         addonAfter={t('dataGovernance.retention.daysUnit')}
@@ -623,7 +791,7 @@ export default function AssetDrawer({
                   <Button
                     type="primary"
                     loading={retentionSaving}
-                    disabled={busy && !retentionSaving}
+                    disabled={writeDisabled && !retentionSaving}
                     onClick={() => void saveRetention()}
                   >
                     {t('dataGovernance.lifecycle.saveOverride')}
@@ -642,7 +810,7 @@ export default function AssetDrawer({
                         <Button
                           icon={<UndoOutlined />}
                           loading={lifecycleAction === 'restore'}
-                          disabled={busy && lifecycleAction !== 'restore'}
+                          disabled={writeDisabled && lifecycleAction !== 'restore'}
                         >
                           {t('dataGovernance.lifecycle.restore')}
                         </Button>
@@ -662,7 +830,7 @@ export default function AssetDrawer({
                             danger
                             icon={<DeleteOutlined />}
                             loading={lifecycleAction === 'destroy'}
-                            disabled={busy && lifecycleAction !== 'destroy'}
+                            disabled={writeDisabled && lifecycleAction !== 'destroy'}
                           >
                             {t('dataGovernance.lifecycle.destroy')}
                           </Button>
@@ -682,7 +850,7 @@ export default function AssetDrawer({
                       <Button
                         icon={<InboxOutlined />}
                         loading={lifecycleAction === 'archive'}
-                        disabled={busy && lifecycleAction !== 'archive'}
+                        disabled={writeDisabled && lifecycleAction !== 'archive'}
                       >
                         {t('dataGovernance.lifecycle.archive')}
                       </Button>
@@ -692,12 +860,14 @@ export default function AssetDrawer({
               </>
             )}
           </div>
+          )}
 
-          {detail.assetType === 'document' && (
+          {(detail.assetType === 'document' || derived) && (
             <>
               <Divider style={{ margin: 0 }} />
               <LineageSection
                 key={`${detail.assetType}:${detail.assetId}`}
+                assetType={detail.assetType}
                 assetId={detail.assetId}
               />
             </>

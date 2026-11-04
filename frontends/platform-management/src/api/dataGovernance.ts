@@ -58,6 +58,15 @@ interface DgAssetItemRow {
     sensitivity?: DgClassificationSource;
     classification_categories?: DgClassificationSource;
   };
+  // ── W2.1 派生资产（表 / 列 / 指标）列表字段 ──────────────────────
+  /** 上级标识：列 → `ds:table`，表 → 数据源 id，指标 → KB id。 */
+  parent_id?: string | null;
+  /** 表/列所属数据源；指标为所在 KB；文档/数据源本身为 null。 */
+  source_id?: string | null;
+  /** 来源展示名（列表 SQL 计算列）：表/列为数据源名，指标为 KB 名。 */
+  source_label?: string | null;
+  /** per-source compiled schema / 抽象 schema 的版本号。 */
+  schema_version?: number | null;
 }
 
 interface DgAssetDetailRow extends DgAssetItemRow {
@@ -79,6 +88,39 @@ interface DgAssetDetailRow extends DgAssetItemRow {
   archived_at?: string | null;
   /** 详情接口附加：生效保留策略投影（投影失败为 null）。 */
   retention_policy?: DgRetentionPolicyRow | null;
+  // ── W2.1 派生资产（表 / 列 / 指标）详情字段 ──────────────────────
+  data_source_id?: string | null;
+  /** 物理表名（列资产为其所属表）。 */
+  table?: string | null;
+  column_type?: string | null;
+  primary_key?: boolean | null;
+  display_name?: string | null;
+  /** 表的列清单（snake_case，映射时逐项转 camelCase）。 */
+  columns?: DgColumnRow[] | null;
+  column_count?: number | null;
+  description?: string | null;
+  additivity?: string | null;
+  aliases?: string[] | null;
+  /** 指标落点（snake_case，映射时逐项转 camelCase）。 */
+  landings?: DgLandingRow[] | null;
+  unresolved?: boolean | null;
+  sync_status?: string | null;
+}
+
+/** 表详情里的列行（来自 active per-source compiled schema）。 */
+interface DgColumnRow {
+  name: string;
+  type: string | null;
+  primary_key?: boolean | null;
+  display_name?: string | null;
+}
+
+/** 指标落点行（`table` 为空 = 未解析到物理表）。 */
+interface DgLandingRow {
+  data_source_id: string;
+  entity_name?: string;
+  di_metric?: string;
+  table?: string | null;
 }
 
 /**
@@ -115,17 +157,27 @@ interface DgLineageRow {
   nodes: DgGraphNodeRow[];
   edges: DgGraphEdgeRow[];
   // counts / truncated 允许整体缺失：映射层与 nodes/edges 统一按「缺省给默认值」兜底。
+  // 派生资产（表/列/指标）的计数是 `{nodes, edges}`，文档图才是四类计数。
   counts?: {
-    chunks: number | null;
-    entities: number;
-    relations: number;
-    citations: number;
+    chunks?: number | null;
+    entities?: number;
+    relations?: number;
+    citations?: number;
+    nodes?: number;
+    edges?: number;
   };
-  truncated?: {
-    entities: boolean;
-    relations: boolean;
-    chunks: boolean;
-  };
+  // 文档图是对象；派生资产血缘直接给 `false`，两种形状都要兼容。
+  truncated?:
+    | {
+        entities?: boolean;
+        relations?: boolean;
+        chunks?: boolean;
+      }
+    | boolean;
+  /** 派生资产血缘的降级标记（文档血缘缺省 false）。 */
+  degraded?: boolean;
+  /** 指标血缘无落点（其他资产缺省 false）。 */
+  unresolved?: boolean;
 }
 
 // ── 纯函数：参数组装 ─────────────────────────────────────────────────
@@ -205,6 +257,11 @@ export function mapAssetItem(row: DgAssetItemRow): DgAssetItem {
       classificationCategories:
         row.classification_sources?.classification_categories ?? 'none',
     },
+    // 派生资产字段只在后端给出键时出现（旧响应/文档行不受影响）。
+    ...(row.parent_id !== undefined ? { parentId: row.parent_id } : {}),
+    ...(row.source_id !== undefined ? { sourceId: row.source_id } : {}),
+    ...(row.source_label !== undefined ? { sourceLabel: row.source_label } : {}),
+    ...(row.schema_version !== undefined ? { schemaVersion: row.schema_version } : {}),
   };
 }
 
@@ -264,11 +321,57 @@ export function mapAssetDetail(row: DgAssetDetailRow): DgAssetDetail {
     createdAt: row.created_at ?? null,
     archivedAt: row.archived_at ?? null,
     retentionPolicy: mapRetentionPolicy(row.retention_policy),
+    // ── W2.1 派生资产专属字段 ────────────────────────────────────
+    // 与旧响应/文档详情保持兼容：只有后端给出键时才写入，避免把
+    // 「不适用」伪造成 null 而污染既有页面断言与展示。
+    ...(row.data_source_id !== undefined ? { dataSourceId: row.data_source_id } : {}),
+    ...(row.table !== undefined ? { table: row.table } : {}),
+    ...(row.column_type !== undefined ? { columnType: row.column_type } : {}),
+    ...(row.primary_key !== undefined ? { primaryKey: row.primary_key } : {}),
+    ...(row.display_name !== undefined ? { displayName: row.display_name } : {}),
+    // 列清单的嵌套键必须逐项转换，不能整体透传 snake_case。
+    ...(row.columns !== undefined
+      ? {
+          columns: (row.columns ?? []).map((column) => ({
+            name: column.name,
+            type: column.type ?? null,
+            primaryKey: Boolean(column.primary_key),
+            displayName: column.display_name ?? null,
+          })),
+        }
+      : {}),
+    ...(row.column_count !== undefined ? { columnCount: row.column_count } : {}),
+    ...(row.description !== undefined ? { description: row.description } : {}),
+    ...(row.additivity !== undefined ? { additivity: row.additivity } : {}),
+    ...(row.aliases !== undefined ? { aliases: row.aliases ?? [] } : {}),
+    ...(row.landings !== undefined
+      ? {
+          landings: (row.landings ?? []).map((landing) => ({
+            dataSourceId: landing.data_source_id,
+            entityName: landing.entity_name,
+            diMetric: landing.di_metric,
+            table: landing.table ?? null,
+          })),
+        }
+      : {}),
+    ...(row.unresolved !== undefined ? { unresolved: Boolean(row.unresolved) } : {}),
+    ...(row.sync_status !== undefined ? { syncStatus: row.sync_status } : {}),
   };
 }
 
-/** 血缘图映射。`counts.chunks` 仅在 depth=2 时有值，其余为 null。 */
+/**
+ * 血缘图映射。
+ *
+ * - 文档图：`counts.chunks` 仅在 depth=2 时有值，其余为 null；`truncated` 是
+ *   三个布尔构成的对象。
+ * - 派生资产（表/列/指标）：`counts` 为 `{nodes, edges}`（按键透传），
+ *   `truncated` 直接是布尔值；`true` 表示整图被截断。
+ */
 export function mapLineage(row: DgLineageRow): DgLineage {
+  // 派生资产把 `truncated` 直接给布尔值；对象形状则逐键读取。
+  const truncatedAll = row.truncated === true;
+  const truncated =
+    typeof row.truncated === 'object' && row.truncated !== null ? row.truncated : {};
   return {
     asset: {
       assetType: row.asset.asset_type,
@@ -293,12 +396,19 @@ export function mapLineage(row: DgLineageRow): DgLineage {
       entities: row.counts?.entities ?? 0,
       relations: row.counts?.relations ?? 0,
       citations: row.counts?.citations ?? 0,
+      // 派生资产按 `{nodes, edges}` 给计数：仅在键存在时透传，
+      // 文档图保持原四键输出，不多出 nodes/edges。
+      ...(row.counts?.nodes !== undefined ? { nodes: row.counts.nodes } : {}),
+      ...(row.counts?.edges !== undefined ? { edges: row.counts.edges } : {}),
     },
     truncated: {
-      entities: Boolean(row.truncated?.entities),
-      relations: Boolean(row.truncated?.relations),
-      chunks: Boolean(row.truncated?.chunks),
+      entities: truncatedAll || Boolean(truncated.entities),
+      relations: truncatedAll || Boolean(truncated.relations),
+      chunks: truncatedAll || Boolean(truncated.chunks),
     },
+    // 仅派生资产响应会带这两个键；文档血缘保持原输出形状。
+    ...(row.degraded !== undefined ? { degraded: Boolean(row.degraded) } : {}),
+    ...(row.unresolved !== undefined ? { unresolved: Boolean(row.unresolved) } : {}),
   };
 }
 

@@ -1,23 +1,32 @@
 -- ============================================================
 -- 第 2 期数据治理：平台管理 → 资产目录 菜单
 -- 复用既有 knowledge:read，不新增权限码；只做加法 + 排序顺延。
--- 幂等：INSERT ON CONFLICT + 条件 UPDATE + COMMIT 前不变量自检，
---       重跑为空操作；全新库（006 已插同 id）同样通过。
+-- 幂等：NOT EXISTS 判存 + 条件 UPDATE + COMMIT 前不变量自检，
+--       重跑为空操作；菜单已存在（无论 id 是多少）则不插入。
 --
--- ⚠ id 取 31 而非 30：id 30 曾被 update/046 占用（047 随菜单合并删除）。
---   若这里用 30，全新数据卷路径会 006 先插 30 → apply.sh 再跑 046 撞主键
---   → ON_ERROR_STOP 中止，047–061 全不执行（含 060 建表）。
---   全量种子对应 migrations/006_seed_data.sql（两处 id / 排序必须一致）。
+-- ⚠ 不再硬编码 id。原写法固定 id=31，但 migrations/018 用 MAX(id)+1
+--   动态分配，全新库上会先占到 31，导致本脚本 ON CONFLICT 跳过、自检失败
+--   （2026-11-04 真机踩过）。改为与 update/069 相同的动态分配写法。
 -- ============================================================
 BEGIN;
 
 INSERT INTO platform.menus
     (id, parent_id, name, path, icon, app_id, sort_order, permission_code)
-VALUES
-    (31, 5, 'navigation.dataGovernance',
-     '/apps/platform-management/data-governance/assets',
-     'DatabaseOutlined', NULL, 2, 'knowledge:read')
-ON CONFLICT (id) DO NOTHING;
+SELECT v.new_id,
+       5,
+       'navigation.dataGovernance',
+       '/apps/platform-management/data-governance/assets',
+       'DatabaseOutlined',
+       NULL,
+       2,
+       'knowledge:read'
+  FROM (SELECT COALESCE(MAX(id), 0) + 1 AS new_id FROM platform.menus) AS v
+ WHERE NOT EXISTS (
+       SELECT 1 FROM platform.menus
+        WHERE parent_id = 5
+          AND name = 'navigation.dataGovernance'
+       -- 不限定 is_deleted：菜单被 088 软删隐藏后，重跑不得复活
+       );
 
 -- 平台管理分组原有子项顺延一位（只在仍是旧值时改）
 UPDATE platform.menus SET sort_order = 3, updated_at = NOW()
@@ -38,11 +47,11 @@ DECLARE
     bad_order int;
     missing int;
 BEGIN
+    -- 不限定 is_deleted：被 088 隐藏后（is_deleted=1）同样视为「菜单存在」
     SELECT count(*) INTO missing
     FROM platform.menus
     WHERE parent_id = 5 AND name = 'navigation.dataGovernance'
-      AND path = '/apps/platform-management/data-governance/assets'
-      AND is_deleted = 0;
+      AND path = '/apps/platform-management/data-governance/assets';
     IF missing = 0 THEN
         RAISE EXCEPTION '061: dataGovernance menu missing or path mismatch';
     END IF;

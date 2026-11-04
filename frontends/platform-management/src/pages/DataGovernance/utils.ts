@@ -100,6 +100,54 @@ export function classificationOverrideDraft(detail: DgAssetDetail): {
   };
 }
 
+/**
+ * 派生资产类型：表 / 列 / 指标的元数据来自 compiled schema（只读派生），
+ * 与文档、数据源这两类「实体资产」在用词与展示上区分。
+ */
+export function isDerivedAssetType(type: DgAssetType | string | undefined): boolean {
+  return type === 'table' || type === 'column' || type === 'metric';
+}
+
+/** compiled schema 同步状态词表（表详情用；未知值原样展示，不臆造语义）。 */
+const KNOWN_SYNC_STATUSES = ['synced', 'outdated', 'apply_failed'];
+
+/** 同步状态 → 可读文案；缺失显示占位符。 */
+export function syncStatusText(
+  t: (key: string) => string,
+  status: string | null | undefined,
+): string {
+  if (!status) return '—';
+  return KNOWN_SYNC_STATUSES.includes(status)
+    ? t(`dataGovernance.syncStatus.${status}`)
+    : status;
+}
+
+/**
+ * 派生资产图计数：优先用后端 `counts.{nodes,edges}`，缺失时回落到数组长度。
+ *
+ * 文档四列图的 `counts` 是实体/关系/引用/切片，不经过这里；只有
+ * `isDerivedAssetType(lineage.asset.assetType)` 为真时才使用。
+ */
+export function derivedLineageCounts(lineage: DgLineage): {
+  nodes: number;
+  edges: number;
+} {
+  return {
+    nodes: lineage.counts.nodes ?? lineage.nodes.length,
+    edges: lineage.counts.edges ?? lineage.edges.length,
+  };
+}
+
+/** 资产类型 → i18n key（页面统一用 `t(assetTypeLabelKey(type))`）。 */
+export function assetTypeLabelKey(type: DgAssetType | string): string {
+  return `dataGovernance.assetType.${type}`;
+}
+
+/** 上级标识展示：缺失时用占位符（列显示所属表、表显示数据源）。 */
+export function parentLabel(item: { assetType: DgAssetType; parentId?: string | null }): string {
+  return item.parentId || '—';
+}
+
 export function statusLabelKey(assetType: DgAssetType, status: string): string {
   const group = assetType === 'document' ? 'document' : 'dataSource';
   // 直接复用 constant.ts 的权威词表（那里已 `as const`），避免两处维护漂移；

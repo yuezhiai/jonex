@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
-import { Button, Empty, Space, Tag, theme } from 'antd';
+import { Alert, Button, Empty, Space, Tag, theme } from 'antd';
 import { ExpandOutlined, MinusOutlined, PlusOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { DgGraphEdge, DgGraphNode, DgLineage } from '../types';
 import { LINEAGE_LAYOUT } from '../constant';
-import { clampPan, computeFitView, layoutLineage, lineageEdgePath, zoomAt } from '../utils';
+import {
+  clampPan,
+  computeFitView,
+  derivedLineageCounts,
+  isDerivedAssetType,
+  layoutLineage,
+  lineageEdgePath,
+  zoomAt,
+} from '../utils';
 import type { LineageLayout, ViewTransform } from '../utils';
 
 /** 未知节点类型的描边色（与 chunk 同色），保证新类型也不会画丢。 */
@@ -18,6 +26,10 @@ const NODE_COLORS: Record<string, string> = {
   ontology_entity: '#13c2c2',
   search_citation: '#fa8c16',
   chunk: DEFAULT_NODE_COLOR,
+  // 派生资产一跳血缘节点（表 / 列 / 指标）。
+  table: '#2f54eb',
+  column: '#52c41a',
+  metric: '#eb2f96',
 };
 
 const ARROW_MARKER_ID = 'dg-lineage-arrow';
@@ -93,6 +105,8 @@ function truncateLabel(label: string): string {
 export default function LineageGraph({ lineage }: { lineage: DgLineage }) {
   const { t } = useTranslation();
   const { token } = theme.useToken();
+  // 表/列/指标血缘：计数、列标题、截断文案都与文档四列图不同。
+  const derived = isDerivedAssetType(lineage.asset?.assetType);
   // 布局按 lineage 记忆化：拖拽/缩放只改 transform，不重跑布局。
   const layout = useMemo(() => layoutLineage(lineage), [lineage]);
   // 边的 path 只随布局/边集合变化；拖拽与缩放每帧都只改 transform。
@@ -237,21 +251,53 @@ export default function LineageGraph({ lineage }: { lineage: DgLineage }) {
     );
   };
 
+  // 降级 / 无落点是后端显式标记，必须让用户看到，不能伪装成「没有血缘」。
+  const alerts = (
+    <>
+      {lineage.degraded && (
+        <Alert
+          type="warning"
+          showIcon
+          title={t('dataGovernance.lineageDegraded')}
+          style={{ marginBottom: 8 }}
+        />
+      )}
+      {lineage.unresolved && (
+        <Alert
+          type="warning"
+          showIcon
+          title={t('dataGovernance.metricUnresolved')}
+          style={{ marginBottom: 8 }}
+        />
+      )}
+    </>
+  );
+
   if (!hasNodes) {
-    return <Empty description={t('dataGovernance.lineage.empty')} />;
+    return (
+      <div>
+        {alerts}
+        <Empty description={t('dataGovernance.lineage.empty')} />
+      </div>
+    );
   }
 
   const edgeStroke = token.colorBorder;
-  const countsText = t('dataGovernance.lineage.counts', {
-    entities: lineage.counts.entities,
-    relations: lineage.counts.relations,
-    citations: lineage.counts.citations,
-    chunks: lineage.counts.chunks ?? '—',
-  });
+  const countsText = derived
+    ? t('dataGovernance.lineage.derivedCounts', derivedLineageCounts(lineage))
+    : t('dataGovernance.lineage.counts', {
+        entities: lineage.counts.entities,
+        relations: lineage.counts.relations,
+        citations: lineage.counts.citations,
+        chunks: lineage.counts.chunks ?? '—',
+      });
+  const truncatedAny =
+    lineage.truncated.entities || lineage.truncated.relations || lineage.truncated.chunks;
   const percent = Math.round(view.scale * 100);
 
   return (
     <div>
+      {alerts}
       <div
         ref={viewportRef}
         className={`yx-dg-lineage-viewport${dragging ? ' is-dragging' : ''}`}
@@ -336,7 +382,7 @@ export default function LineageGraph({ lineage }: { lineage: DgLineage }) {
                 背景色描边光晕仅用于文字边缘抗锯齿，它依赖「视口背景 ==
                 token.colorBgContainer」（见 index.scss 的 .yx-dg-lineage-viewport），
                 换主题或改视口背景时需同步检查。 */}
-            {columnsWithNodes.map((column) => (
+            {!derived && columnsWithNodes.map((column) => (
               <text
                 key={`column-${column}`}
                 x={LINEAGE_LAYOUT.columnX[column] + LINEAGE_LAYOUT.nodeWidth / 2}
@@ -398,27 +444,36 @@ export default function LineageGraph({ lineage }: { lineage: DgLineage }) {
 
       <Space wrap size={4} style={{ marginTop: 8 }}>
         <Tag>{countsText}</Tag>
-        {lineage.truncated.entities && (
-          <Tag color="gold">
-            {t('dataGovernance.lineage.truncatedEntities', {
-              count: LINEAGE_LAYOUT.truncatedEntities,
-            })}
-          </Tag>
-        )}
-        {lineage.truncated.relations && (
-          <Tag color="gold">
-            {t('dataGovernance.lineage.truncatedRelations', {
-              count: LINEAGE_LAYOUT.truncatedRelations,
-            })}
-          </Tag>
-        )}
-        {lineage.truncated.chunks && (
-          <Tag color="gold">
-            {t('dataGovernance.lineage.truncatedChunks', {
-              count: LINEAGE_LAYOUT.truncatedChunks,
-            })}
-          </Tag>
-        )}
+        {/* 派生资产只有一个布尔截断标记，没有实体/关系/切片分项。 */}
+        {derived
+          ? truncatedAny && (
+              <Tag color="gold">{t('dataGovernance.lineage.truncatedAll')}</Tag>
+            )
+          : (
+              <>
+                {lineage.truncated.entities && (
+                  <Tag color="gold">
+                    {t('dataGovernance.lineage.truncatedEntities', {
+                      count: LINEAGE_LAYOUT.truncatedEntities,
+                    })}
+                  </Tag>
+                )}
+                {lineage.truncated.relations && (
+                  <Tag color="gold">
+                    {t('dataGovernance.lineage.truncatedRelations', {
+                      count: LINEAGE_LAYOUT.truncatedRelations,
+                    })}
+                  </Tag>
+                )}
+                {lineage.truncated.chunks && (
+                  <Tag color="gold">
+                    {t('dataGovernance.lineage.truncatedChunks', {
+                      count: LINEAGE_LAYOUT.truncatedChunks,
+                    })}
+                  </Tag>
+                )}
+              </>
+            )}
         {layout.hiddenCount > 0 && (
           <Tag>{t('dataGovernance.lineage.collapsed', { count: layout.hiddenCount })}</Tag>
         )}

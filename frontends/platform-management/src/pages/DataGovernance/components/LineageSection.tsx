@@ -3,21 +3,23 @@ import { Alert, Button, Select, Skeleton, Space } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { getAssetLineage } from '@/api/dataGovernance';
-import type { DgDirection, DgLineage } from '../types';
-import { errorMeta } from '../utils';
+import type { DgAssetType, DgDirection, DgLineage } from '../types';
+import { errorMeta, isDerivedAssetType } from '../utils';
 import LineageGraph from './LineageGraph';
 
 interface Props {
   assetId: string;
+  /** 资产类型；文档走原四列图，表/列/指标走一跳派生图。 */
+  assetType?: DgAssetType;
 }
 
 /**
- * 资产血缘区（只处理文档，父组件已在 document 分支渲染）。
+ * 资产血缘区（文档四列图 / 派生资产一跳图）。
  *
  * 独立持有 direction/depth/graph 状态：抽屉按资产 key 重挂本组件，
  * 切换资产时状态自然归零，不会再出现「旧图残留」或同一资产重复请求。
  */
-export default function LineageSection({ assetId }: Props) {
+export default function LineageSection({ assetId, assetType = 'document' }: Props) {
   const { t } = useTranslation();
   // 异步回调里读 tRef：切换语言不应触发重新取数。
   const tRef = useRef(t);
@@ -25,6 +27,7 @@ export default function LineageSection({ assetId }: Props) {
     tRef.current = t;
   }, [t]);
 
+  const derived = isDerivedAssetType(assetType);
   const [direction, setDirection] = useState<DgDirection>('both');
   const [depth, setDepth] = useState<1 | 2>(1);
   const [graph, setGraph] = useState<DgLineage | null>(null);
@@ -40,7 +43,13 @@ export default function LineageSection({ assetId }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const next = await getAssetLineage('document', assetId, direction, depth);
+      // 派生资产只支持一跳：即使上层残留 depth=2 也固定按 1 请求。
+      const next = await getAssetLineage(
+        assetType,
+        assetId,
+        direction,
+        derived ? 1 : depth,
+      );
       if (my !== graphSeq.current) return;
       setGraph(next);
     } catch (err: unknown) {
@@ -55,7 +64,7 @@ export default function LineageSection({ assetId }: Props) {
     } finally {
       if (my === graphSeq.current) setLoading(false);
     }
-  }, [assetId, direction, depth]);
+  }, [assetId, assetType, direction, depth, derived]);
 
   useEffect(() => {
     void loadGraph();
@@ -93,16 +102,19 @@ export default function LineageSection({ assetId }: Props) {
             ]}
             onChange={(value) => setDirection(value as DgDirection)}
           />
-          <Select
-            aria-label={t('dataGovernance.lineage.depth')}
-            value={depth}
-            style={{ width: 100 }}
-            options={[
-              { value: 1, label: t('dataGovernance.lineage.depth1') },
-              { value: 2, label: t('dataGovernance.lineage.depth2') },
-            ]}
-            onChange={(value) => setDepth(value as 1 | 2)}
-          />
+          {/* 派生资产（表/列/指标）只支持一跳，隐藏深度选择避免 400。 */}
+          {!derived && (
+            <Select
+              aria-label={t('dataGovernance.lineage.depth')}
+              value={depth}
+              style={{ width: 100 }}
+              options={[
+                { value: 1, label: t('dataGovernance.lineage.depth1') },
+                { value: 2, label: t('dataGovernance.lineage.depth2') },
+              ]}
+              onChange={(value) => setDepth(value as 1 | 2)}
+            />
+          )}
           <Button
             size="small"
             icon={<ReloadOutlined />}

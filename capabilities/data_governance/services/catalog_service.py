@@ -26,6 +26,7 @@ from capabilities.knowledge_base.services.space_permission_service import (
     is_tenant_admin,
 )
 
+from ..asset_identity import DERIVED_TYPES, split_asset_id
 from ..clients.knowledge_base_client import get_knowledge_base_client
 from ..repository import asset_metadata_repository
 from ..repository.asset_metadata_repository import normalize_metadata_fields
@@ -34,14 +35,28 @@ from ..repository.catalog_read_repository import (
     count,
     fetch_detail_fields,
     fetch_page,
+    fetch_table_columns,
+    normalize_metric_landings,
+    resolve_landing_tables,
 )
 from . import classification_service
 from .permissions import assert_can_write, visible_kb_ids
 
 logger = logging.getLogger(__name__)
 
-_LIST_ASSET_TYPES = {None, "all", "document", "data_source"}
-_DETAIL_ASSET_TYPES = {"document", "data_source"}
+_LIST_ASSET_TYPES = {
+    None, "all", "document", "data_source", "table", "column", "metric",
+}
+_DETAIL_ASSET_TYPES = {"document", "data_source", "table", "column", "metric"}
+
+# 审计 resource 按资产类型映射：派生资产不能一律记成 document。
+_AUDIT_RESOURCE_BY_ASSET_TYPE = {
+    "document": ResourceType.DOCUMENT,
+    "data_source": ResourceType.DATA_SOURCE,
+    "table": ResourceType.TABLE,
+    "column": ResourceType.COLUMN,
+    "metric": ResourceType.METRIC,
+}
 
 # spec §5.1：一页最多投影 20 个不同 KB 的质量档位，超出的 KB 本页不调。
 _MAX_QUALITY_KBS = 20
@@ -57,6 +72,11 @@ _QUALITY_CONCURRENCY = 5
 
 # 批量打标单次上限（全量预检 + 单事务写入，超出直接 400）。
 _MAX_BATCH_ASSETS = 200
+
+# 审计 resource_id 列宽（`platform.audit_logs.resource_id` VARCHAR(255)）。
+# 派生资产 id（`{data_source_id}:{table}.{column}`）可能更长，超长会让
+# audit ingest 整批失败；写入端截断为有界摘要，完整值放 request_params。
+_AUDIT_RESOURCE_ID_MAX = 255
 
 
 def _audit_user_id(user_id) -> int | None:
@@ -115,12 +135,14 @@ def _source_of(asset_value, kb_value, tenant_value) -> str:
 
 
 def _apply_classification(row: dict) -> None:
-    """把仓储行的三组覆盖列解析成生效值 + 来源，并移除原始列。
+    """把仓储行的覆盖列解析成生效值 + 来源，并移除原始列。
 
     - `sensitivity` / `classification_categories` 是**生效值**（展示与筛选口径）；
     - `classification_sources` 告诉写路径审计 `before` 取哪个覆盖值
       （`_override_of` 只认 `asset`）。
     - 未分级为 `None`，无分类为 `[]`；原始列不进入响应。
+    - 列多一层继承：列覆盖 → 表覆盖 → KB → 租户（spec §5）。表级覆盖
+      只对列生效，其余资产的 `table_level/table_categories` 一律丢弃。
     """
     asset_level = row.pop("asset_level", None)
     kb_level = row.pop("kb_level", None)
@@ -130,7 +152,7 @@ def _apply_classification(row: dict) -> None:
     tenant_categories = row.pop("tenant_categories", None)
     row["sensitivity"] = row.pop("effective_level", None)
     row["classification_categories"] = row.pop("effective_categories", None) or []
-    row["classification_sources"] = {
+    sources = {
         "sensitivity": _source_of(asset_level, kb_level, tenant_level),
         "classification_categories": _source_of(
             asset_categories, kb_categories, tenant_categories,
@@ -138,6 +160,19 @@ def _apply_classification(row: dict) -> None:
     }
     # 密级上限是内部过滤字段，不进入 API 响应。
     row.pop("effective_rank", None)
+
+    table_level = row.pop("table_level", None)
+    table_categories = row.pop("table_categories", None)
+    if row.get("asset_type") == "column":
+        # 列没有自己的覆盖时，表覆盖先于 KB/租户默认（与列表 SQL 同优先级）。
+        if asset_level is None and table_level is not None:
+            row["sensitivity"] = table_level
+            sources["sensitivity"] = "table"
+        if asset_categories is None and table_categories is not None:
+            row["classification_categories"] = table_categories
+            sources["classification_categories"] = "table"
+
+    row["classification_sources"] = sources
 
 
 def _normalize_asset_type(value) -> str | None:
@@ -324,7 +359,16 @@ async def _resolve_retention_policy(
 
 
 class CatalogService:
-    async def list_assets(self, tenant_id: str, user_id: str | None, data: dict) -> dict:
+    async def list_assets(
+        self, tenant_id: str, user_id: str | None, data: dict,
+        *, include_quality: bool = True,
+    ) -> dict:
+        """资产列表。
+
+        `include_quality=False` 时整段跳过质量投影：不调 KB、行上不产生
+        `quality_verdict`。供聚合/建议等只需主数据的批量分页调用使用
+        （避免为 1 万条资产逐页触发 KB 质量查询）。
+        """
         tenant_id = require_tenant(tenant_id)
         data = data or {}
         asset_type = _normalize_asset_type(data.get("asset_type"))
@@ -370,7 +414,8 @@ class CatalogService:
             for row in rows:
                 _apply_classification(row)
 
-        await _attach_quality(tenant_id, rows)
+        if include_quality:
+            await _attach_quality(tenant_id, rows)
         return {
             "items": rows,
             "total": total,
@@ -407,6 +452,10 @@ class CatalogService:
                 message="invalid_asset_type",
                 details={"asset_type": asset_type},
             )
+        # 派生资产的 id 有格式契约：非法格式是参数错误（1001），不是「不存在」
+        # （1002）。在任何可见性/DB 查询之前挡住残缺 id。
+        if asset_type in DERIVED_TYPES:
+            split_asset_id(asset_type, asset_id)
 
         visible = await visible_kb_ids(tenant_id, user_id)
         if visible is not None and not visible:
@@ -432,9 +481,38 @@ class CatalogService:
                 session, tenant_id=tenant_id,
                 asset_type=asset_type, asset_id=asset_id,
             )
+            if asset_type == "table":
+                # 列清单是详情附加信息；标识优先取详情 SQL，回落到列表行。
+                data_source_id = _as_text(
+                    detail.get("data_source_id") or rows[0].get("source_id")
+                )
+                table = _as_text(detail.get("table") or rows[0].get("name"))
+                detail["columns"] = (
+                    await fetch_table_columns(
+                        session, tenant_id=tenant_id,
+                        data_source_id=data_source_id, table=table,
+                    )
+                    if data_source_id and table else []
+                )
+                # 计数与清单同源：去重后的列清单长度。
+                detail["column_count"] = len(detail["columns"])
+            elif asset_type == "metric":
+                landings = normalize_metric_landings(detail.get("landings"))
+                detail["landings"] = await resolve_landing_tables(
+                    session, tenant_id=tenant_id, landings=landings,
+                )
+                # `unresolved` = 无落点，或有落点但一条都没解析到物理表。
+                detail["unresolved"] = (
+                    not detail["landings"]
+                    or all(
+                        landing.get("table") is None
+                        for landing in detail["landings"]
+                    )
+                )
+                detail["aliases"] = detail.get("aliases") or []
 
         row = rows[0]
-        # 详情返回**生效**分级/分类（资产 → KB → 租户），并带来源供审计用。
+        # 详情返回**生效**分级/分类（资产 → KB → 租户；列多一层表），并带来源供审计用。
         _apply_classification(row)
         # 生效保留策略是详情附加信息：**session 关闭后**自开会话解析；
         # 只吞可预期的存储/租户错误，编程错误（AttributeError 等）照常暴露。
@@ -551,14 +629,15 @@ class CatalogService:
             "action": "asset_metadata_update",
             "outcome": "SUCCESS",
             "service_name": "data_governance",
-            "resource": (
-                ResourceType.DATA_SOURCE.value
-                if canonical_type == "data_source"
-                else ResourceType.DOCUMENT.value
-            ),
-            "resource_id": str(canonical_id),
+            "resource": _AUDIT_RESOURCE_BY_ASSET_TYPE[canonical_type].value,
+            # resource_id 只是有界摘要（列宽 255）；完整 id 始终留在 request_params。
+            "resource_id": str(canonical_id)[:_AUDIT_RESOURCE_ID_MAX],
             # after 用落库后的实际值（行上的三键），不是请求归一值。
-            "request_params": {"before": before, "after": updated},
+            "request_params": {
+                "asset_id": str(canonical_id),
+                "before": before,
+                "after": updated,
+            },
         })
         # 响应与 GET 详情逐键同形：写入/审计成功后再做一次（且仅一次）质量投影。
         # 质量投影发生在写权限通过、写入完成之后，失败路径不会触达。

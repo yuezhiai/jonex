@@ -40,9 +40,11 @@ import {
 import { DG_PAGE_SIZE, DG_PAGE_SIZE_OPTIONS } from '../constant';
 import { BindingStatusTag, DocStatsCell } from './StandardCatalogBits';
 import KbSchemaDrawer from './KbSchemaDrawer';
+import StandardAssetsTab from './StandardAssetsTab';
+import DataContractsTab from './DataContractsTab';
 import StandardScenarioDrawer from './StandardScenarioDrawer';
 
-type CatalogTab = 'template' | 'kb';
+type CatalogTab = 'template' | 'kb' | 'assets' | 'contracts';
 
 interface DomainDetail {
   domain: DgStandardDomain;
@@ -52,7 +54,8 @@ interface DomainDetail {
 /**
  * 标准目录：模板标准（领域 → 场景 → 场景抽屉）与知识库应用（KB schema → 详情抽屉）。
  *
- * 只做展示与导航，不提供写操作；权限由页面 `canRead` 在渲染前控制。
+ * 模板/知识库应用只读；标准资产子页签含写操作（仅租户管理员）。
+ * 权限由页面 `canRead` 在渲染前控制。
  * 所有请求都带序号：切领域/切 Tab/关抽屉后，旧响应一律丢弃。
  */
 export default function StandardCatalogTab(): JSX.Element {
@@ -601,6 +604,16 @@ export default function StandardCatalogTab(): JSX.Element {
             key: 'kb',
             label: t('dataGovernance.standards.kbTab'),
             children: kbContent,
+          },
+          {
+            key: 'assets',
+            label: t('dataGovernance.standardAssets.title'),
+            children: <StandardAssetsTab />,
+          },
+          {
+            key: 'contracts',
+            label: t('dataGovernance.dataContracts.title'),
+            children: <DataContractsTab />,
           },
         ]}
       />

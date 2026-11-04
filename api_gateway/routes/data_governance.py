@@ -15,11 +15,32 @@ from jonex_core.common.exceptions import InvalidParameterError
 
 from capabilities.data_governance.dtos.catalog import (
     AssetMetadataUpdateRequest,
+    BindingCreateRequest,
+    BindingUpdateRequest,
     ClassificationBatchRequest,
     ClassificationCategoryUpdateRequest,
     ClassificationDefaultUpdateRequest,
     ClassificationLevelUpdateRequest,
+    DataContractDraftRequest,
+    DataContractImportRequest,
+    DataContractPublishRequest,
+    DataContractScaffoldRequest,
+    DataContractUpdateRequest,
     RetentionPolicyUpdateRequest,
+    StandardAssetDraftRequest,
+    StandardAssetPublishRequest,
+    StandardAssetUpdateRequest,
+    QualityContractImportRequest,
+    QualityIssueAssignRequest,
+    QualityIssueCommentRequest,
+    QualityIssueStatusRequest,
+    QualityIssueVerifyRequest,
+    QualityPreviewRequest,
+    QualityRuleCreateRequest,
+    QualityRuleUpdateRequest,
+    QualityRunCreateRequest,
+    QualityRunFailRequest,
+    QualityRunSubmitRequest,
     UserClearanceUpdateRequest,
 )
 
@@ -35,7 +56,7 @@ router = APIRouter(
 @router.get("/assets", summary="资产目录列表")
 async def list_assets(
     request: Request,
-    asset_type: str = Query("all", description="all/document/data_source"),
+    asset_type: str = Query("all", description="all/document/data_source/table/column/metric"),
     domain_space_id: Optional[str] = Query(None, description="领域空间 ID"),
     kb_id: Optional[str] = Query(None, description="知识库 ID"),
     domain: Optional[str] = Query(None, description="业务域"),
@@ -139,14 +160,15 @@ async def set_retention_policy(
 
 
 @router.get(
-    "/assets/{asset_type}/{asset_id}/lineage", summary="资产血缘（文档级）",
+    "/assets/{asset_type}/{asset_id}/lineage",
+    summary="资产血缘（文档级 / 派生资产一跳）",
 )
 async def get_asset_lineage(
     request: Request,
     asset_type: str,
     asset_id: str,
     direction: str = Query("both", description="up/down/both"),
-    depth: int = Query(1, ge=1, le=2, description="展开深度"),
+    depth: int = Query(1, ge=1, le=2, description="展开深度（派生资产仅支持 1）"),
 ):
     result = await _invoke_sidecar_capability(
         request, "get_asset_lineage",
@@ -375,6 +397,665 @@ async def get_standard_references(
     result = await _invoke_sidecar_capability(
         request, "get_standard_references",
         {"scope_type": scope_type, "scope_id": scope_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+# ---------------------------------------------------------------------------
+# 标准资产（W2.2）— 术语 / 数据元 / 指标口径卡
+# ---------------------------------------------------------------------------
+# 注册顺序：静态路径（列表 / versions / drafts）必须排在 `/{asset_id}` 之前，
+# 否则 `GET /standard-assets/versions` 会被详情路由吞掉。
+
+
+@router.get("/standard-assets", summary="标准资产列表")
+async def list_standard_assets(
+    request: Request,
+    kind: Optional[str] = Query(None, description="term/data_element/metric_card"),
+    status: Optional[str] = Query(None, description="draft/published/retired"),
+    keyword: Optional[str] = Query(None, description="名称/编码关键字"),
+    include_drafts: bool = Query(False, description="仅管理员有效"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+):
+    payload = {
+        "kind": kind,
+        "status": status,
+        "keyword": keyword,
+        "include_drafts": include_drafts,
+        "page": page,
+        "page_size": page_size,
+    }
+    result = await _invoke_sidecar_capability(
+        request, "list_standard_assets", payload,
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/standard-assets/versions", summary="标准资产版本历史")
+async def list_standard_asset_versions(
+    request: Request,
+    kind: str = Query(..., description="term/data_element/metric_card"),
+    code: str = Query(..., description="资产编码"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_standard_asset_versions",
+        {"kind": kind, "code": code},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/standard-assets/drafts", summary="新建标准资产草稿")
+async def create_standard_draft(
+    request: Request, body: StandardAssetDraftRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "create_standard_draft", body.dict(),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/standard-assets/{asset_id}", summary="标准资产详情")
+async def get_standard_asset(request: Request, asset_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "get_standard_asset", {"asset_id": asset_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.put("/standard-assets/{asset_id}", summary="更新标准资产草稿")
+async def update_standard_draft(
+    request: Request, asset_id: str, body: StandardAssetUpdateRequest,
+):
+    # `exclude_unset`：未传字段不能被序列化成 null 覆盖已有内容。
+    result = await _invoke_sidecar_capability(
+        request, "update_standard_draft",
+        {"asset_id": asset_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/standard-assets/{asset_id}/publish", summary="发布标准资产")
+async def publish_standard_asset(
+    request: Request, asset_id: str, body: StandardAssetPublishRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "publish_standard_asset",
+        {"asset_id": asset_id, "expected_revision": body.expected_revision},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/standard-assets/{asset_id}/retire", summary="退役标准资产")
+async def retire_standard_asset(request: Request, asset_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "retire_standard_asset", {"asset_id": asset_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.delete("/standard-assets/{asset_id}", summary="删除标准资产草稿")
+async def delete_standard_draft(request: Request, asset_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "delete_standard_draft", {"asset_id": asset_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+# ---------------------------------------------------------------------------
+# 数据合同（W2.3）— 数据源级、版本化的 ODCS v3.x 合同
+# ---------------------------------------------------------------------------
+# 注册顺序：字面量路径（versions / scaffold-preview / drafts / import）必须排在
+# `/{contract_id}` 之前，否则 `GET /data-contracts/versions` 会被详情路由吞掉。
+
+
+@router.get("/data-contracts", summary="数据合同列表")
+async def list_data_contracts(
+    request: Request,
+    keyword: Optional[str] = Query(None, description="名称/数据源关键字"),
+    status: Optional[str] = Query(None, description="draft/published/retired"),
+    include_drafts: bool = Query(False, description="仅管理员有效"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+):
+    payload = {
+        "keyword": keyword,
+        "status": status,
+        "include_drafts": include_drafts,
+        "page": page,
+        "page_size": page_size,
+    }
+    result = await _invoke_sidecar_capability(
+        request, "list_data_contracts", payload,
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-contracts/versions", summary="数据合同版本历史")
+async def list_data_contract_versions(
+    request: Request,
+    data_source_id: str = Query(..., description="数据源 ID"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_data_contract_versions",
+        {"data_source_id": data_source_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/data-contracts/scaffold-preview", summary="预览数据合同脚手架")
+async def preview_data_contract_scaffold(
+    request: Request, body: DataContractScaffoldRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "preview_data_contract_scaffold", body.dict(),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/data-contracts/drafts", summary="新建数据合同草稿")
+async def create_data_contract_draft(
+    request: Request, body: DataContractDraftRequest,
+):
+    # `exclude_unset`：未传的 payload/name/base_version 不序列化成 null。
+    result = await _invoke_sidecar_capability(
+        request, "create_data_contract_draft", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/data-contracts/import", summary="导入 ODCS 数据合同")
+async def import_data_contract(
+    request: Request, body: DataContractImportRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "import_data_contract", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-contracts/{contract_id}/export", summary="导出 ODCS 数据合同")
+async def export_data_contract(
+    request: Request,
+    contract_id: str,
+    format: Optional[str] = Query(None, description="json/yaml"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "export_data_contract",
+        {"contract_id": contract_id, "format": format},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-contracts/{contract_id}", summary="数据合同详情")
+async def get_data_contract(request: Request, contract_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "get_data_contract", {"contract_id": contract_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.put("/data-contracts/{contract_id}", summary="更新数据合同草稿")
+async def update_data_contract_draft(
+    request: Request,
+    contract_id: str,
+    body: DataContractUpdateRequest,
+):
+    # `exclude_unset`：未传字段不能被序列化成 null 覆盖已有内容。
+    result = await _invoke_sidecar_capability(
+        request, "update_data_contract_draft",
+        {"contract_id": contract_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/data-contracts/{contract_id}/publish", summary="发布数据合同")
+async def publish_data_contract(
+    request: Request,
+    contract_id: str,
+    body: DataContractPublishRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "publish_data_contract",
+        {"contract_id": contract_id, "expected_revision": body.expected_revision},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/data-contracts/{contract_id}/retire", summary="退役数据合同")
+async def retire_data_contract(request: Request, contract_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "retire_data_contract", {"contract_id": contract_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.delete("/data-contracts/{contract_id}", summary="删除数据合同草稿")
+async def delete_data_contract_draft(request: Request, contract_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "delete_data_contract_draft", {"contract_id": contract_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════════
+# W2.5 数据质量闭环 /quality/**
+# 字面量路由必须排在动态 `/{id}` 之前。
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/quality/rules", summary="质量规则列表")
+async def list_quality_rules(
+    request: Request,
+    data_source_id: Optional[str] = Query(None),
+    asset_type: Optional[str] = Query(None, description="table/column"),
+    asset_id: Optional[str] = Query(None),
+    dimension: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    check_type: Optional[str] = Query(None),
+    enabled: Optional[int] = Query(None, ge=0, le=1),
+    keyword: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_quality_rules",
+        {
+            "data_source_id": data_source_id, "asset_type": asset_type,
+            "asset_id": asset_id, "dimension": dimension, "severity": severity,
+            "check_type": check_type, "enabled": enabled, "keyword": keyword,
+            "page": page, "page_size": page_size,
+        },
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/rules", summary="创建质量规则")
+async def create_quality_rule(request: Request, body: QualityRuleCreateRequest):
+    result = await _invoke_sidecar_capability(
+        request, "create_quality_rule", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/rules/import", summary="从数据合同导入质量规则")
+async def import_quality_rules_from_contract(
+    request: Request, body: QualityContractImportRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "import_quality_rules_from_contract", body.dict(),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/rules/{rule_id}", summary="质量规则详情")
+async def get_quality_rule(request: Request, rule_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "get_quality_rule", {"rule_id": rule_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.put("/quality/rules/{rule_id}", summary="更新质量规则")
+async def update_quality_rule(
+    request: Request, rule_id: str, body: QualityRuleUpdateRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "update_quality_rule",
+        {"rule_id": rule_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.delete("/quality/rules/{rule_id}", summary="删除质量规则")
+async def delete_quality_rule(request: Request, rule_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "delete_quality_rule", {"rule_id": rule_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/preview-sql", summary="预览质量检查 SQL")
+async def preview_quality_check_sql(
+    request: Request, body: QualityPreviewRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "preview_quality_check_sql", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/runs", summary="巡检运行列表")
+async def list_quality_runs(
+    request: Request,
+    data_source_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_quality_runs",
+        {
+            "data_source_id": data_source_id, "status": status,
+            "page": page, "page_size": page_size,
+        },
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/runs", summary="发起巡检运行")
+async def create_quality_run(request: Request, body: QualityRunCreateRequest):
+    result = await _invoke_sidecar_capability(
+        request, "create_quality_run", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/runs/{run_id}", summary="巡检运行详情")
+async def get_quality_run(request: Request, run_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "get_quality_run", {"run_id": run_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/runs/{run_id}/results", summary="回传巡检结果")
+async def submit_quality_run_results(
+    request: Request, run_id: str, body: QualityRunSubmitRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "submit_quality_run_results",
+        {"run_id": run_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/runs/{run_id}/fail", summary="巡检失败收口")
+async def fail_quality_run(
+    request: Request, run_id: str, body: QualityRunFailRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "fail_quality_run",
+        {"run_id": run_id, **body.dict()},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/issues", summary="质量问题列表")
+async def list_quality_issues(
+    request: Request,
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    assignee_id: Optional[str] = Query(None),
+    data_source_id: Optional[str] = Query(None),
+    asset_type: Optional[str] = Query(None),
+    asset_id: Optional[str] = Query(None),
+    keyword: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_quality_issues",
+        {
+            "status": status, "severity": severity, "assignee_id": assignee_id,
+            "data_source_id": data_source_id, "asset_type": asset_type,
+            "asset_id": asset_id, "keyword": keyword,
+            "page": page, "page_size": page_size,
+        },
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/issues/{issue_id}", summary="质量问题详情（含事件）")
+async def get_quality_issue(request: Request, issue_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "get_quality_issue", {"issue_id": issue_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/issues/{issue_id}/assign", summary="指派质量问题")
+async def assign_quality_issue(
+    request: Request, issue_id: str, body: QualityIssueAssignRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "assign_quality_issue",
+        {"issue_id": issue_id, **body.dict()},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/issues/{issue_id}/status", summary="流转质量问题状态")
+async def update_quality_issue_status(
+    request: Request, issue_id: str, body: QualityIssueStatusRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "update_quality_issue_status",
+        {"issue_id": issue_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/issues/{issue_id}/verify", summary="复验质量问题")
+async def verify_quality_issue(
+    request: Request, issue_id: str, body: QualityIssueVerifyRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "verify_quality_issue",
+        {"issue_id": issue_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/quality/issues/{issue_id}/comments", summary="评论质量问题")
+async def comment_quality_issue(
+    request: Request, issue_id: str, body: QualityIssueCommentRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "comment_quality_issue",
+        {"issue_id": issue_id, **body.dict()},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/quality/summary", summary="质量摘要")
+async def get_quality_summary(
+    request: Request,
+    data_source_id: Optional[str] = Query(None),
+):
+    result = await _invoke_sidecar_capability(
+        request, "get_quality_summary",
+        {"data_source_id": data_source_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════════
+# W2.6 资源视图 /resource-views/**
+# 字面量路由（coverage / suggest）必须排在动态 `/{binding_id}` 之前。
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/resource-views/domains", summary="业务域视图")
+async def get_resource_domain_view(
+    request: Request,
+    space_id: Optional[str] = Query(None, description="领域空间 ID"),
+    domain: Optional[str] = Query(None, description="业务域"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "get_resource_domain_view",
+        {"space_id": space_id, "domain": domain},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/resource-views/responsibilities", summary="责任视图")
+async def get_responsibility_view(
+    request: Request,
+    group_by: str = Query("owner", description="owner/domain"),
+    space_id: Optional[str] = Query(None, description="领域空间 ID"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "get_responsibility_view",
+        {"group_by": group_by, "space_id": space_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/resource-views/standard-bindings", summary="落标绑定列表")
+async def list_standard_bindings(
+    request: Request,
+    standard_kind: Optional[str] = Query(None, description="term/data_element/metric_card"),
+    standard_code: Optional[str] = Query(None, description="标准编码"),
+    asset_type: Optional[str] = Query(None, description="table/column/metric"),
+    asset_id: Optional[str] = Query(None, description="W2.1 资产 ID"),
+    status: Optional[str] = Query(None, description="active/disabled"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "list_standard_bindings",
+        {
+            "standard_kind": standard_kind, "standard_code": standard_code,
+            "asset_type": asset_type, "asset_id": asset_id,
+            "status": status, "page": page, "page_size": page_size,
+        },
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get(
+    "/resource-views/standard-bindings/coverage",
+    summary="落标覆盖率视图",
+)
+async def get_standard_binding_view(
+    request: Request,
+    kind: Optional[str] = Query(None, description="term/data_element/metric_card"),
+    domain: Optional[str] = Query(None, description="业务域"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "get_standard_binding_view",
+        {"kind": kind, "domain": domain, "page": page, "page_size": page_size},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/resource-views/standard-bindings/suggest",
+    summary="落标建议（只读）",
+)
+async def suggest_standard_bindings(
+    request: Request,
+    standard_kind: Optional[str] = Query(None, description="term/data_element/metric_card"),
+    standard_code: Optional[str] = Query(None, description="标准编码"),
+    asset_type: Optional[str] = Query(None, description="table/column/metric"),
+    asset_id: Optional[str] = Query(None, description="W2.1 资产 ID"),
+    limit: int = Query(20, ge=1, le=100, description="返回条数上限"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "suggest_standard_bindings",
+        {
+            "standard_kind": standard_kind, "standard_code": standard_code,
+            "asset_type": asset_type, "asset_id": asset_id, "limit": limit,
+        },
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.post("/resource-views/standard-bindings", summary="创建落标绑定")
+async def create_standard_binding(
+    request: Request, body: BindingCreateRequest,
+):
+    # `exclude_unset`：未传的 note/source 不序列化成 null。
+    result = await _invoke_sidecar_capability(
+        request, "create_standard_binding", body.dict(exclude_unset=True),
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.put(
+    "/resource-views/standard-bindings/{binding_id}",
+    summary="更新/停用落标绑定",
+)
+async def update_standard_binding(
+    request: Request, binding_id: str, body: BindingUpdateRequest,
+):
+    result = await _invoke_sidecar_capability(
+        request, "update_standard_binding",
+        {"binding_id": binding_id, **body.dict(exclude_unset=True)},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.delete(
+    "/resource-views/standard-bindings/{binding_id}",
+    summary="删除落标绑定（软删）",
+)
+async def delete_standard_binding(request: Request, binding_id: str):
+    result = await _invoke_sidecar_capability(
+        request, "delete_standard_binding", {"binding_id": binding_id},
+        capability_id=_CAPABILITY_ID,
+    )
+    return success_response(data=result)
+
+
+@router.get("/resource-views/source-anchors", summary="资产原文锚点")
+async def get_asset_source_anchors(
+    request: Request,
+    asset_type: str = Query(..., description="table/column"),
+    asset_id: str = Query(..., description="W2.1 资产 ID"),
+):
+    result = await _invoke_sidecar_capability(
+        request, "get_asset_source_anchors",
+        {"asset_type": asset_type, "asset_id": asset_id},
         capability_id=_CAPABILITY_ID,
     )
     return success_response(data=result)

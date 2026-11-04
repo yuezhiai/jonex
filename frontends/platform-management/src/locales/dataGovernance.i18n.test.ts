@@ -80,8 +80,64 @@ const DYNAMIC_KEYS: string[] = [
     (value) => `dataGovernance.retention.source.${value}`,
   ),
   // 分类字段来源：`classificationSourceLabelKey` 同为模板串。
-  ...['asset', 'kb', 'tenant', 'none'].map(
+  // `table` = 列继承表级覆盖，必须与其余来源一起校验。
+  ...['asset', 'table', 'kb', 'tenant', 'none'].map(
     (value) => `dataGovernance.classification.source.${value}`,
+  ),
+  // compiled schema 同步状态：`syncStatusText` 用模板串拼接。
+  ...['synced', 'outdated', 'apply_failed'].map(
+    (value) => `dataGovernance.syncStatus.${value}`,
+  ),
+  // 标准资产状态：`statusText` / 列表 Tag 都用模板串拼接。
+  ...['draft', 'published', 'retired'].map(
+    (value) => `dataGovernance.standardAssets.status.${value}`,
+  ),
+  // 数据合同状态：`statusLabelKey` 返回模板串、列表与抽屉 Tag 共用。
+  ...['draft', 'published', 'retired'].map(
+    (value) => `dataGovernance.dataContracts.status.${value}`,
+  ),
+  // W2.5 质量闭环：以下 key 家族全部由模板串拼接（列表 Tag / 筛选下拉 / 摘要）。
+  ...['completeness', 'uniqueness', 'validity', 'consistency', 'timeliness'].map(
+    (value) => `dataGovernance.quality.dimension.${value}`,
+  ),
+  ...['info', 'warning', 'error', 'critical'].map(
+    (value) => `dataGovernance.quality.severity.${value}`,
+  ),
+  ...['library', 'sql', 'custom'].map(
+    (value) => `dataGovernance.quality.checkType.${value}`,
+  ),
+  ...['open', 'assigned', 'fixing', 'pending_verify', 'closed'].map(
+    (value) => `dataGovernance.quality.issueStatus.${value}`,
+  ),
+  ...['running', 'completed', 'failed'].map(
+    (value) => `dataGovernance.quality.runStatus.${value}`,
+  ),
+  ...['passed', 'failed', 'error'].map(
+    (value) => `dataGovernance.quality.resultStatus.${value}`,
+  ),
+  // 内置规则指标与工单事件：`metricLabelKey` / `issueEventLabelKey` 模板串。
+  ...['rowCount', 'nullValues', 'missingValues', 'duplicateValues', 'invalidValues', 'unique'].map(
+    (value) => `dataGovernance.quality.metric.${value}`,
+  ),
+  ...['created', 'assigned', 'status_change', 'verified', 'reopened', 'comment'].map(
+    (value) => `dataGovernance.quality.issueEvent.${value}`,
+  ),
+  // W2.6 资源视图：以下 key 家族全部由模板串拼接（资产类型 / 分级 / 绑定状态 /
+  // 绑定来源 / 责任分组）。
+  ...['table', 'column', 'metric', 'document', 'dataSource'].map(
+    (value) => `dataGovernance.resourceViews.assetType.${value}`,
+  ),
+  ...['public', 'internal', 'confidential', 'secret', 'unclassified'].map(
+    (value) => `dataGovernance.resourceViews.sensitivity.${value}`,
+  ),
+  ...['active', 'disabled'].map(
+    (value) => `dataGovernance.resourceViews.bindingStatus.${value}`,
+  ),
+  ...['manual', 'suggested'].map(
+    (value) => `dataGovernance.resourceViews.bindingSource.${value}`,
+  ),
+  ...['owner', 'domain'].map(
+    (value) => `dataGovernance.resourceViews.responsibility.groupBy.${value}`,
   ),
 ];
 

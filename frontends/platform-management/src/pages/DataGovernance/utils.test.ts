@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { mapAssetDetail, mapAssetItem, mapLineage } from '@/api/dataGovernance';
 import {
   actionErrorMessage,
+  assetTypeLabelKey,
   batchDraftError,
   buildBatchPayload,
   buildCategoryOptions,
@@ -18,11 +20,13 @@ import {
   computeFitView,
   formatFileSize,
   formatRetentionValue,
+  isDerivedAssetType,
   layoutLineage,
   levelColor,
   levelLabel,
   lineageEdgePath,
   LINEAGE_PAN_MARGIN,
+  parentLabel,
   qualityColor,
   qualityLabelKey,
   retentionDaysLabelKey,
@@ -89,6 +93,245 @@ describe('展示映射', () => {
       key: 'dataGovernance.retention.days',
       params: { count: 30 },
     });
+  });
+});
+
+// ── W2.1 派生资产（表 / 列 / 指标） ───────────────────────────────────
+
+type AssetItemRow = Parameters<typeof mapAssetItem>[0];
+type AssetDetailRow = Parameters<typeof mapAssetDetail>[0];
+
+function makeItemRow(overrides: Partial<AssetItemRow> = {}): AssetItemRow {
+  return {
+    asset_type: 'document',
+    asset_id: 'doc-1',
+    name: 'a.pdf',
+    kb_id: 'kb-1',
+    kb_name: 'KB',
+    space_id: 'space-1',
+    status: 'ready',
+    updated_at: '2026-10-01T00:00:00Z',
+    owner: null,
+    domain: null,
+    sensitivity: null,
+    ...overrides,
+  };
+}
+
+/** 详情工厂：嵌套字段走类型检查，拼错 snake_case 键会编译失败。 */
+function makeDetailRow(overrides: Partial<AssetDetailRow> = {}): AssetDetailRow {
+  return {
+    ...makeItemRow(),
+    file_size: null,
+    mime_type: null,
+    data_source_type: null,
+    folder_id: null,
+    content_generation: null,
+    ontology_status: null,
+    access_type: null,
+    sync_mode: null,
+    last_sync_at: null,
+    last_sync_status: null,
+    document_count: null,
+    ...overrides,
+  };
+}
+
+type LineageRow = Parameters<typeof mapLineage>[0];
+
+function makeLineageRow(overrides: Partial<LineageRow> = {}): LineageRow {
+  return {
+    asset: { asset_type: 'document', asset_id: 'doc-1', name: 'a.pdf' },
+    nodes: [],
+    edges: [],
+    counts: { chunks: null, entities: 0, relations: 0, citations: 0 },
+    truncated: { entities: false, relations: false, chunks: false },
+    ...overrides,
+  };
+}
+
+describe('派生资产类型 helper', () => {
+  it('derived asset types are recognised', () => {
+    expect(isDerivedAssetType('table')).toBe(true);
+    expect(isDerivedAssetType('column')).toBe(true);
+    expect(isDerivedAssetType('metric')).toBe(true);
+    expect(isDerivedAssetType('document')).toBe(false);
+    expect(isDerivedAssetType('data_source')).toBe(false);
+    expect(isDerivedAssetType(undefined)).toBe(false);
+  });
+
+  it('assetTypeLabelKey 统一生成 i18n key', () => {
+    expect(assetTypeLabelKey('table')).toBe('dataGovernance.assetType.table');
+    expect(assetTypeLabelKey('column')).toBe('dataGovernance.assetType.column');
+    expect(assetTypeLabelKey('metric')).toBe('dataGovernance.assetType.metric');
+  });
+
+  it('parent label prefers table for columns', () => {
+    expect(parentLabel({ assetType: 'column', parentId: 'ds1:public.jobs' })).toBe(
+      'ds1:public.jobs',
+    );
+    expect(parentLabel({ assetType: 'document', parentId: null })).toBe('—');
+    expect(parentLabel({ assetType: 'document', parentId: undefined })).toBe('—');
+    expect(parentLabel({ assetType: 'column', parentId: '' })).toBe('—');
+  });
+});
+
+describe('派生资产字段映射', () => {
+  it('列表项映射 parentId / sourceId / sourceLabel / schemaVersion', () => {
+    const mapped = mapAssetItem(
+      makeItemRow({
+        asset_type: 'column',
+        asset_id: 'ds1:public.jobs.id',
+        parent_id: 'ds1:public.jobs',
+        source_id: 'ds1',
+        source_label: 'PG 主库',
+        schema_version: 7,
+      }),
+    );
+    expect(mapped).toMatchObject({
+      assetType: 'column',
+      parentId: 'ds1:public.jobs',
+      sourceId: 'ds1',
+      sourceLabel: 'PG 主库',
+      schemaVersion: 7,
+    });
+  });
+
+  it('旧响应缺字段时不写入键（兼容既有精确断言）', () => {
+    const mapped = mapAssetItem(makeItemRow());
+    expect(mapped.parentId).toBeUndefined();
+    expect(mapped.sourceId).toBeUndefined();
+    expect(mapped.sourceLabel).toBeUndefined();
+    expect(mapped.schemaVersion).toBeUndefined();
+  });
+
+  it('详情映射表字段与列清单（嵌套键逐项转 camelCase）', () => {
+    const row = makeDetailRow({
+      asset_type: 'table',
+      asset_id: 'ds1:public.jobs',
+      name: 'public.jobs',
+      data_source_id: 'ds1',
+      table: 'public.jobs',
+      schema_version: 4,
+      sync_status: 'active',
+      columns: [
+        { name: 'id', type: 'bigint', primary_key: true, display_name: '编号' },
+        { name: 'title', type: null, primary_key: false, display_name: null },
+      ],
+      column_count: 2,
+    });
+    const mapped = mapAssetDetail(row);
+    expect(mapped.dataSourceId).toBe('ds1');
+    expect(mapped.table).toBe('public.jobs');
+    expect(mapped.schemaVersion).toBe(4);
+    expect(mapped.syncStatus).toBe('active');
+    expect(mapped.columnCount).toBe(2);
+    expect(mapped.columns).toEqual([
+      { name: 'id', type: 'bigint', primaryKey: true, displayName: '编号' },
+      { name: 'title', type: null, primaryKey: false, displayName: null },
+    ]);
+    // 后端列行是 snake_case，不能整体透传。
+    expect(mapped.columns?.[0]).not.toHaveProperty('primary_key');
+  });
+
+  it('详情映射列字段（所属表 / 类型 / 主键 / 显示名）', () => {
+    const row = makeDetailRow({
+      asset_type: 'column',
+      asset_id: 'ds1:public.jobs.id',
+      data_source_id: 'ds1',
+      table: 'public.jobs',
+      column_type: 'bigint',
+      primary_key: true,
+      display_name: '编号',
+    });
+    const mapped = mapAssetDetail(row);
+    expect(mapped).toMatchObject({
+      dataSourceId: 'ds1',
+      table: 'public.jobs',
+      columnType: 'bigint',
+      primaryKey: true,
+      displayName: '编号',
+    });
+  });
+
+  it('详情映射指标字段（aliases:null→[]、landings / unresolved 逐项转键）', () => {
+    const row = makeDetailRow({
+      asset_type: 'metric',
+      asset_id: 'kb-1:job_count',
+      schema_version: 3,
+      description: '职位数',
+      additivity: 'additive',
+      aliases: null,
+      landings: [
+        {
+          data_source_id: 'ds1',
+          entity_name: 'Job',
+          di_metric: 'job_count',
+          table: 'public.jobs',
+        },
+        {
+          data_source_id: 'ds2',
+          entity_name: 'Job',
+          di_metric: 'job_count',
+          table: null,
+        },
+      ],
+      unresolved: false,
+    });
+    const mapped = mapAssetDetail(row);
+    expect(mapped.description).toBe('职位数');
+    expect(mapped.additivity).toBe('additive');
+    expect(mapped.aliases).toEqual([]);
+    expect(mapped.unresolved).toBe(false);
+    expect(mapped.landings).toEqual([
+      {
+        dataSourceId: 'ds1',
+        entityName: 'Job',
+        diMetric: 'job_count',
+        table: 'public.jobs',
+      },
+      { dataSourceId: 'ds2', entityName: 'Job', diMetric: 'job_count', table: null },
+    ]);
+    expect(mapped.landings?.[0]).not.toHaveProperty('data_source_id');
+  });
+});
+
+describe('mapLineage · 派生资产图契约', () => {
+  it('真实形状：counts 为 {nodes,edges}、truncated=false，透传 degraded/unresolved', () => {
+    const mapped = mapLineage(
+      makeLineageRow({
+        asset: { asset_type: 'table', asset_id: 'ds1:public.jobs', name: 'public.jobs' },
+        nodes: [{ id: 'table:ds1:public.jobs', type: 'table', label: 'public.jobs' }],
+        edges: [],
+        counts: { nodes: 1, edges: 0 },
+        truncated: false,
+        degraded: true,
+        unresolved: true,
+      }),
+    );
+    // 派生计数按后端键透传，文档图四键默认值不变。
+    expect(mapped.counts).toEqual({
+      chunks: null,
+      entities: 0,
+      relations: 0,
+      citations: 0,
+      nodes: 1,
+      edges: 0,
+    });
+    expect(mapped.truncated).toEqual({ entities: false, relations: false, chunks: false });
+    expect(mapped.degraded).toBe(true);
+    expect(mapped.unresolved).toBe(true);
+  });
+
+  it('truncated=true 时三个截断标记都为 true', () => {
+    const mapped = mapLineage(makeLineageRow({ truncated: true }));
+    expect(mapped.truncated).toEqual({ entities: true, relations: true, chunks: true });
+  });
+
+  it('文档图不额外产生 nodes/edges 键', () => {
+    const mapped = mapLineage(makeLineageRow());
+    expect(mapped.counts).not.toHaveProperty('nodes');
+    expect(mapped.counts).not.toHaveProperty('edges');
   });
 });
 
@@ -576,9 +819,13 @@ describe('levelLabel / levelColor', () => {
 });
 
 describe('classificationSourceLabelKey', () => {
-  it('四种来源各有 i18n key', () => {
+  it('五种来源各有 i18n key', () => {
     expect(classificationSourceLabelKey('asset')).toBe(
       'dataGovernance.classification.source.asset',
+    );
+    // 列继承表级覆盖。
+    expect(classificationSourceLabelKey('table')).toBe(
+      'dataGovernance.classification.source.table',
     );
     expect(classificationSourceLabelKey('kb')).toBe('dataGovernance.classification.source.kb');
     expect(classificationSourceLabelKey('tenant')).toBe(
