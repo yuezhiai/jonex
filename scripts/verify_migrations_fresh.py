@@ -5,8 +5,8 @@
 1. 起一个空的 ``postgres:16-alpine`` 容器（不挂卷，退出即删）；
 2. 把 ``deploy/postgres/migrations/*.sql`` 拷进 ``/docker-entrypoint-initdb.d/``，
    让官方 entrypoint 按文件名字母序执行（与生产首次初始化同路径）；
-3. 检查 010–014 建出的表/列/约束都在；
-4. 再把 010–014 逐个人工重跑一遍，验证幂等；
+3. 检查 010 / 012 / 019 / 020 建出的表/列/约束都在；
+4. 再把这几份逐个人工重跑一遍，验证幂等；
 5. 用该库跑 ``TEST_FILES`` 里的集成测试，
    让仓储 SQL 在真实 PostgreSQL 上执行（而非只断言 SQL 文本）。
 
@@ -33,6 +33,7 @@ TEST_FILES = (
     "tests/integration/test_kb_delete_cleanup_pg.py",
     "tests/integration/test_clearance_repository_pg.py",
     "tests/integration/test_classification_access_pg.py",
+    "tests/integration/test_similarity_repository_pg.py",
 )
 IMAGE = os.getenv("DG_MIGRATION_TEST_IMAGE", "postgres:16-alpine")
 NAME = f"jonex-mig-verify-{os.getpid()}"
@@ -40,11 +41,11 @@ DB_USER = "jonex"
 DB_PASSWORD = "change-me"
 DB_NAME = "jonex"
 IDEMPOTENT_FILES = (
+    # 2026-11-04 起数据治理 DDL 归并为两份（原 010/011/013/014/018 与 019–023）
     "010_data_governance.sql",
-    "011_lifecycle_retention.sql",
     "012_kb_type_check.sql",
-    "013_classification.sql",
-    "014_user_clearance.sql",
+    "019_data_governance_assets.sql",
+    "020_document_similarity_check.sql",
 )
 
 
@@ -217,6 +218,61 @@ def check_target_state() -> None:
         """,
         "1",
     )
+    expect_sql(
+        "knowledge_document_signatures 表",
+        "SELECT to_regclass('knowledge_base.knowledge_document_signatures') "
+        "IS NOT NULL",
+        "t",
+    )
+    expect_sql(
+        "signatures.simhash 允许 NULL（不可用哨兵）",
+        """
+        SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'knowledge_base'
+           AND table_name = 'knowledge_document_signatures'
+           AND column_name = 'simhash'
+        """,
+        "YES",
+    )
+    expect_sql(
+        "ck_kb_doc_sig_simhash CHECK 存在",
+        """
+        SELECT count(*) FROM pg_constraint
+         WHERE conrelid = 'knowledge_base.knowledge_document_signatures'::regclass
+           AND conname = 'ck_kb_doc_sig_simhash'
+        """,
+        "1",
+    )
+    expect_sql(
+        "ix_kb_doc_sig_unavailable 索引存在",
+        """
+        SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'knowledge_base'
+           AND tablename = 'knowledge_document_signatures'
+           AND indexname = 'ix_kb_doc_sig_unavailable'
+        """,
+        "1",
+    )
+    expect_sql(
+        "ix_kb_doc_sim_target 索引存在",
+        """
+        SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'knowledge_base'
+           AND tablename = 'knowledge_document_similarity_suggestions'
+           AND indexname = 'ix_kb_doc_sim_target'
+        """,
+        "1",
+    )
+    expect_sql(
+        "uq_kb_doc_sim_pair 唯一约束存在",
+        """
+        SELECT count(*) FROM pg_constraint
+         WHERE conrelid =
+               'knowledge_base.knowledge_document_similarity_suggestions'::regclass
+           AND conname = 'uq_kb_doc_sim_pair'
+        """,
+        "1",
+    )
 
 
 def rerun_incremental_migrations() -> None:
@@ -261,7 +317,7 @@ def main() -> int:
         check_target_state()
         print("[verify] 全量迁移目标态 OK")
 
-        print("[verify] 重跑 010–014 验证幂等 ...")
+        print("[verify] 重跑 010 / 012 / 019 / 020 验证幂等 ...")
         rerun_incremental_migrations()
         check_target_state()
         print("[verify] 幂等 OK")
