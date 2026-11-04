@@ -16,6 +16,7 @@ platform.mcp_key_service_mappings 预载进 ctx.service_permissions。
 """
 import asyncio
 import logging
+import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Optional
@@ -92,11 +93,20 @@ class McpAuthError(Exception):
 # ============================================================================
 
 async def find_by_key_hash(key_hash: str) -> dict | None:
-    """查找有效的统一 MCP Key 记录（未撤销/未停用/未过期/未删除）。
+    """查找有效的统一 MCP Key 记录（Key 与所属租户均处于 active 状态）。
 
-    使用参数化查询 $1，状态过滤（revoked_at/disabled_at/expires_at/is_deleted）
-    通过 WHERE 子句隐式完成，只放行 active 状态的 Key。
-    allowed_kb_ids / write_grants 为 JSONB，asyncpg 自动反序列化为 list。
+    「Key 有效」现在包含两层含义，均由 SQL 隐式判定：
+      1. Key 自身 active：未撤销/未停用/未过期/未删除
+         （revoked_at / disabled_at / expires_at / is_deleted）；
+      2. Key 所属租户 active：``platform.tenants`` 满足 ``is_deleted = 0 AND status = 1``。
+         与平台登录链路（TenantRepository.list_active_by_ids）口径一致——租户被软删
+         或停用后，其存量 Key 不能再访问残留 KB 数据。
+
+    租户状态不做额外区分：任何一条不满足都返回 None，由调用方统一抛 401
+    「认证失败」，不泄露租户是删除了还是停用了。
+
+    使用参数化查询 $1；allowed_kb_ids / write_grants 为 JSONB，asyncpg 自动
+    反序列化为 list。
 
     调用方应遍历 ``crypto.candidate_hashes()`` 的结果逐个查询，以放行盐轮换
     之前签发的存量 Key（legacy 兜底）；只查当前盐会让存量 Key 全部 401。
@@ -110,13 +120,17 @@ async def find_by_key_hash(key_hash: str) -> dict | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, tenant_id, allowed_kb_ids, space_id, write_grants
-               FROM platform.mcp_keys
-               WHERE key_hash = $1
-                 AND revoked_at IS NULL
-                 AND disabled_at IS NULL
-                 AND is_deleted = 0
-                 AND (expires_at IS NULL OR expires_at > NOW())""",
+            """SELECT k.id, k.tenant_id, k.allowed_kb_ids, k.space_id, k.write_grants
+               FROM platform.mcp_keys k
+               JOIN platform.tenants t
+                 ON t.id = k.tenant_id
+                AND t.is_deleted = 0
+                AND t.status = 1
+               WHERE k.key_hash = $1
+                 AND k.revoked_at IS NULL
+                 AND k.disabled_at IS NULL
+                 AND k.is_deleted = 0
+                 AND (k.expires_at IS NULL OR k.expires_at > NOW())""",
             key_hash,
         )
     if row is None:
@@ -183,8 +197,9 @@ class McpAuthMiddleware:
     4. 格式校验（yxm_ 前缀 + 长度检查）
     5. 计算候选哈希（当前盐优先，MCP_KEY_SECRET_LEGACY 兜底）
     6. 按候选哈希逐个单查 mcp_keys（统一 Key），任一命中即可
-    7. 状态过滤（revoked/disabled/expired/deleted，SQL WHERE 隐式完成）
-    8. tenant 状态校验
+    7. 状态过滤（Key 的 revoked/disabled/expired/deleted + 租户的 is_deleted/status，
+       SQL WHERE/JOIN 隐式完成）
+    8. tenant 格式校验（空值/默认租户；租户 active 已在 Step 6 的 JOIN 中过滤）
     9. 预载 service_permissions + 组装 ctx
     10. contextvar 注入 + fire-and-forget last_used 更新
     11. try/finally 清理 contextvar
@@ -255,7 +270,12 @@ class McpAuthMiddleware:
             # Step 12: 异常处理 → 401 JSON 响应
             await self._send_error_response(send, e)
         except Exception as e:
-            # McpToolError（参数校验、Gateway 故障等）→ re-raise 让 FastMCP 处理为 MCP JSON-RPC 错误
+            # McpToolError 正常不会冒到中间件：工具入口装饰器 ``_inject_mcp_tool``
+            # 已在 tool 调用内把它翻译成 ``CallToolResult(isError=True)``，码值放在
+            # ``structuredContent = {code, message, data}``，**不产生 JSON-RPC error
+            # 对象**（MCP 规范里 tool 执行错误走 isError，JSON-RPC error 留给协议层）。
+            # 这里保留 re-raise 只是防御性透传（未来若有路径绕过装饰器），不要据此
+            # 认为 FastMCP 会把码值还原——它只会包成 ``ToolError`` 文本。
             from tools import McpToolError
             if isinstance(e, McpToolError):
                 raise
@@ -311,7 +331,12 @@ class McpAuthMiddleware:
             raise McpAuthError(401, "认证失败")
 
     def _validate_tenant(self, tenant_id: str) -> None:
-        """租户状态校验：非空且非默认租户。"""
+        """租户格式校验：非空且非默认租户（纵深防御）。
+
+        真正的租户 active 判定（is_deleted=0 AND status=1）已在
+        ``find_by_key_hash`` 的 JOIN 中完成；此处只兜住 Key 记录本身
+        携带空值/默认租户的异常数据。
+        """
         if not tenant_id or not tenant_id.strip():
             raise McpAuthError(401, "认证失败")
         if tenant_id.strip() in _DEFAULT_TENANT_IDS:
@@ -436,6 +461,59 @@ def require_write_scope(
 # Fire-and-forget helper
 # ============================================================================
 
+# 系统写服务固定 service_id / tool 名（与 capabilities/platform/repository
+# /mcp_service_repository.py 的 SYSTEM_SERVICE_ID / SYSTEM_SERVICE_TOOL 保持一致）
+SYSTEM_SERVICE_ID = "system.knowledge_document_write"
+SYSTEM_SERVICE_TOOL = "knowledge_document_write"
+
+
+async def touch_service_call(tenant_id: str, service_id: str) -> None:
+    """更新服务目录「最近调用时间」（服务级）。
+
+    UPSERT 而非 UPDATE：系统写服务的发布行由 platform 侧懒 seed，目录页若从未
+    打开过就还没有行；领域服务被调用必然已发布，行一定存在，UPSERT 只走
+    DO UPDATE 分支。冲突时只刷新 last_call_at，不覆盖发布状态 / tool 配置。
+    """
+    if not service_id:
+        return
+    is_system = service_id == SYSTEM_SERVICE_ID
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO platform.mcp_service_publish
+                (id, tenant_id, service_id, is_published, service_type, tool,
+                 last_call_at, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            ON CONFLICT (tenant_id, service_id)
+            DO UPDATE SET last_call_at = NOW()
+            """,
+            uuid.uuid4().hex,
+            tenant_id,
+            service_id,
+            1 if is_system else 0,
+            "system" if is_system else "domain",
+            SYSTEM_SERVICE_TOOL if is_system else None,
+        )
+
+
+def touch_service_call_async(tenant_id: str, service_id: str | None) -> None:
+    """不阻塞工具主路径地记录服务调用时间（无 service_id 时静默跳过）。"""
+    if not service_id:
+        return
+    asyncio.create_task(_touch_service_call_fire(tenant_id, service_id))
+
+
+async def _touch_service_call_fire(tenant_id: str, service_id: str) -> None:
+    """Fire-and-forget 写 last_call_at；失败静默，不影响工具调用结果。"""
+    try:
+        await touch_service_call(tenant_id, service_id)
+    except Exception:
+        logging.getLogger("mcp.auth").debug(
+            "Failed to touch last_call_at for service_id=%s", service_id, exc_info=True
+        )
+
+
 async def _update_last_used_fire(key_id: str, ip: str) -> None:
     """Fire-and-forget 更新 last_used。
 
@@ -457,6 +535,10 @@ __all__ = [
     "find_by_key_hash",
     "find_service_permissions",
     "update_last_used",
+    "touch_service_call",
+    "touch_service_call_async",
+    "SYSTEM_SERVICE_ID",
+    "SYSTEM_SERVICE_TOOL",
     "require_mcp_auth",
     "require_kb_scope",
     "require_write_scope",

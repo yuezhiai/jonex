@@ -280,12 +280,14 @@ def register_routes(app: FastAPI):
     try:
         from api_gateway.routes import knowledge_base_router, tcadp_router, auth_router, platform_router, ecosystem_router
         from api_gateway.routes import knowledge_base_ingest_router, internal_router
+        from api_gateway.routes import knowledge_base_lineage_ingest_router
         from api_gateway.routes import task_center_router
         from api_gateway.routes.data_governance import router as data_governance_router
         app.include_router(auth_router, prefix="/api/v1/auth", tags=["认证"])
         app.include_router(platform_router, prefix="/api/v1/platform", tags=["平台管理"])
         app.include_router(knowledge_base_router, prefix="/api/v1/knowledge-base", tags=["知识库"])
         app.include_router(knowledge_base_ingest_router, prefix="/api/v1/knowledge-base", tags=["知识库-入站推送"])
+        app.include_router(knowledge_base_lineage_ingest_router, prefix="/api/v1/knowledge-base", tags=["知识库-血缘事件"])
         app.include_router(task_center_router, prefix="/api/v1/task-center", tags=["任务中心"])
         app.include_router(data_governance_router, prefix="/api/v1", tags=["数据治理"])
         app.include_router(ecosystem_router, tags=["生态管理"])

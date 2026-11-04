@@ -7,7 +7,8 @@ dependencies = [
     "mcp>=1.28.1,<2",
     "pydantic>=2.11.0",
     "slowapi>=0.1.9",
-    "redis>=5.2.0",
+    # 上界对齐生产 requirements.txt 的 redis 5.3.x，避免 major 跃迁（uv 重新 lock 会解析到 8.x）
+    "redis>=5.2.0,<6",
     "asyncpg>=0.29.0",
     "uvicorn>=0.27.0",
     "httpx>=0.28.1",

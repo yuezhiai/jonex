@@ -225,6 +225,59 @@ async def list_enabled_mcp_tools(request: Request):
 
 
 # ════════════════════════════════════════════════════════════
+# 工具目录管理 /api/v1/ecosystem/skill-catalog（平台管理员）
+# 单独前缀：避开 /skills/{skill_id} 通配；权限校验在能力层
+# ════════════════════════════════════════════════════════════
+
+@ecosystem_router.get("/skill-catalog", summary="工具目录列表（平台管理员，含停用与运行时）")
+async def list_skill_catalog(
+    request: Request,
+    offset: int = Query(0, ge=0, description="偏移量"),
+    limit: int = Query(20, ge=1, le=200, description="每页条数"),
+    status: str | None = Query(None, description="published / disabled"),
+    keyword: str | None = Query(None, description="搜索关键词（名称 / 工具名 / 描述）"),
+):
+    result = await _call_bd_capability(request, "list_skill_catalog", {
+        "offset": offset, "limit": limit, "status": status, "keyword": keyword,
+    })
+    return success_response(data=result)
+
+
+@ecosystem_router.post("/skill-catalog", summary="新建工具（平台管理员）")
+async def create_skill_catalog(request: Request, payload: dict = Body(...)):
+    result = await _call_bd_capability(request, "create_skill_catalog", payload)
+    return success_response(data=result)
+
+
+@ecosystem_router.get("/skill-catalog/{skill_id}", summary="工具详情（平台管理员）")
+async def get_skill_catalog(request: Request, skill_id: str):
+    result = await _call_bd_capability(request, "get_skill_catalog", {"skill_id": skill_id})
+    return success_response(data=result)
+
+
+@ecosystem_router.patch("/skill-catalog/{skill_id}", summary="编辑 / 上下架工具（平台管理员）")
+async def update_skill_catalog(request: Request, skill_id: str, payload: dict = Body(...)):
+    payload["skill_id"] = skill_id
+    result = await _call_bd_capability(request, "update_skill_catalog", payload)
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 本体动作执行 /api/v1/ecosystem/ontology-actions
+# ════════════════════════════════════════════════════════════
+
+@ecosystem_router.post("/ontology-actions/execute", summary="执行本体动作绑定的工具（最小执行器）")
+async def execute_ontology_action(request: Request, payload: dict = Body(...)):
+    """按知识库本体里该动作的契约判定后执行绑定工具。
+
+    body：`{knowledge_base_id, action_name, inputs?, confirmations?: {authorization, preconditions}, dry_run?}`。
+    判定为转人工 / 拒绝、或缺确认 / 缺入参时不执行，状态见返回的 `status`。
+    """
+    result = await _call_bd_capability(request, "execute_ontology_action", payload)
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
 # 业务领域模板 /api/v1/ecosystem/templates
 # ════════════════════════════════════════════════════════════
 

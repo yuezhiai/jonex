@@ -5,6 +5,7 @@ Jonex 平台 - API 路由模块
 from .internal import router as internal_router
 from .knowledge_base import router as knowledge_base_router
 from .knowledge_base import ingest_router as knowledge_base_ingest_router
+from .knowledge_base import lineage_ingest_router as knowledge_base_lineage_ingest_router
 from .tcadp import router as tcadp_router
 from .task_center import router as task_center_router
 from .auth import router as auth_router
@@ -15,6 +16,7 @@ __all__ = [
     "internal_router",
     "knowledge_base_router",
     "knowledge_base_ingest_router",
+    "knowledge_base_lineage_ingest_router",
     "tcadp_router",
     "task_center_router",
     "auth_router",

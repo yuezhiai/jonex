@@ -9,6 +9,7 @@ Authorization token and is forwarded to Sidecar; request bodies never accept
 
 import asyncio
 import base64
+import json
 import os
 import random
 import re
@@ -20,8 +21,10 @@ from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Body, Depends, File, Form, Header, Path, Query, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi import HTTPException, APIRouter, Body, Depends, File, Form, Header, Path, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse, Response
+
 
 from api_gateway.deps import require_auth_header, raise_from_capability_result
 # 身份解析统一在 `api_gateway/identity.py`（原先这里和 business_domain.py 各抄了一份）。
@@ -269,13 +272,19 @@ async def _call_kb_capability(
     *,
     user_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    timeout: Optional[float] = None,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> dict:
-    """知识库能力 invoke 转发(向后兼容委托,capability_id 固定 business.knowledge_base.v1)。"""
+    """知识库能力 invoke 转发(向后兼容委托,capability_id 固定 business.knowledge_base.v1)。
+
+    `timeout` 原样交给 `_invoke_sidecar_capability`：长操作（演化试跑 / 采纳）按请求
+    放宽，不走全局 `GATEWAY_SIDECAR_TIMEOUT`。缺省 `None` = 沿用全局默认。
+    """
     return await _invoke_sidecar_capability(
         request, action, payload,
         capability_id="business.knowledge_base.v1",
-        user_id=user_id, tenant_id=tenant_id, http_client=http_client,
+        user_id=user_id, tenant_id=tenant_id,
+        timeout=timeout, http_client=http_client,
     )
 
 
@@ -301,6 +310,84 @@ async def _call_rag_capability(
     )
 
 
+_MAX_METADATA_CHARS = 64 * 1024
+_MAX_SUPPRESSED_TARGETS = 50
+_MAX_SUPPRESSED_TARGET_CHARS = 64
+# 上传端点（multipart 表单）只接受这两个键；其余能力层消费的 metadata 由直连/未来端点提供。
+_ALLOWED_METADATA_KEYS = ("similarity_suppressed_targets", "modality_enrich")
+
+
+def _reject_json_constant(value: str) -> None:
+    """拒绝 NaN / Infinity / -Infinity（非法 JSON，但 Python 默认放行）。"""
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _parse_upload_metadata(raw: str | None) -> dict[str, Any]:
+    """上传 metadata 表单字段（JSON 字符串）→ dict。
+
+    能力层读的是 ``extra_metadata`` 里的结构化字段（如
+    ``similarity_suppressed_targets``），不能把原串包成 ``{"raw": ...}`` 透传。
+    仅放行已知键，且做形状校验；未知键直接拒绝。
+    """
+    if not raw:
+        return {}
+    if len(raw) > _MAX_METADATA_CHARS:
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.metadata_invalid", fallback="metadata 必须是 JSON 对象",
+            ),
+            details={"max_chars": _MAX_METADATA_CHARS},
+        )
+    try:
+        parsed = json.loads(raw, parse_constant=_reject_json_constant)
+    except (TypeError, ValueError, RecursionError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.metadata_invalid", fallback="metadata 必须是 JSON 对象",
+            )
+        )
+
+    unknown = sorted(key for key in parsed if key not in _ALLOWED_METADATA_KEYS)
+    if unknown:
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.metadata_unknown_key", fallback="metadata 包含不允许的键",
+            ),
+            details={"unknown_keys": unknown, "allowed_keys": list(_ALLOWED_METADATA_KEYS)},
+        )
+
+    suppressed = parsed.get("similarity_suppressed_targets")
+    if suppressed is not None and (
+        not isinstance(suppressed, list)
+        or len(suppressed) > _MAX_SUPPRESSED_TARGETS
+        or any(
+            not isinstance(item, str) or len(item) > _MAX_SUPPRESSED_TARGET_CHARS
+            for item in suppressed
+        )
+    ):
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.metadata_suppressed_invalid",
+                fallback="similarity_suppressed_targets 必须是字符串数组，每项 ≤ 64 个字符、最多 50 项",
+            ),
+            details={
+                "max_items": _MAX_SUPPRESSED_TARGETS,
+                "max_item_chars": _MAX_SUPPRESSED_TARGET_CHARS,
+            },
+        )
+
+    if "modality_enrich" in parsed and not isinstance(parsed["modality_enrich"], bool):
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.metadata_invalid", fallback="metadata 必须是 JSON 对象",
+            ),
+            details={"field": "modality_enrich", "expected": "boolean"},
+        )
+    return parsed
+
+
 @router.post("/documents/upload", summary="上传知识文档")
 async def upload_document(
     request: Request,
@@ -321,6 +408,9 @@ async def upload_document(
     - COS 直传：客户端先通过 generate-upload-url 上传到 COS，再传 storage_key 确认
     """
     tenant_id = extract_tenant_id(request)
+    # 先解析再落对象（仅 multipart 模式）：metadata 非法时不应该把文件写进存储留下孤儿对象。
+    # COS 直传模式下对象在本次请求前已存在，这里拒绝不会自动清理，需调用方自行处理。
+    parsed_metadata = _parse_upload_metadata(metadata)
 
     payload: dict[str, Any] = {
         "knowledge_base_id": knowledge_base_id,
@@ -368,8 +458,8 @@ async def upload_document(
         #   （local=共享卷绝对路径 / 对象存储=storage_key）
         logger.info("Gateway 上传文件: backend=%s key=%s (%d bytes)", backend, new_key, len(content))
 
-    if metadata:
-        payload["metadata"] = {"raw": metadata}
+    if parsed_metadata:
+        payload["metadata"] = parsed_metadata
 
     result = await _call_kb_capability(request, "upload_document", payload)
     return success_response(data=result)
@@ -642,6 +732,49 @@ async def reparse_document(request: Request, document_id: str, body: ReparseRequ
     return success_response(data=result)
 
 
+# ── 更新模型：文档行操作 → Ontology Builder 再解析 → 草稿 → 人工确认导入 ──
+
+
+class ModelUpdateStartRequest(BaseModel):
+    knowledge_base_id: str = Field(..., min_length=1, max_length=128)
+
+
+class ModelUpdateApplyRequest(BaseModel):
+    knowledge_base_id: str = Field(..., min_length=1, max_length=128)
+
+
+@router.post("/documents/{document_id}/model-update", summary="发起模型更新（异步）")
+async def start_model_update(
+    request: Request,
+    document_id: str,
+    body: ModelUpdateStartRequest,
+):
+    """用当前 KB schema + 该文档已解析正文，在 Ontology Builder 里重新诱导一版 schema 草稿。
+
+    只生成草稿，不写 KB；人审通过后再调 apply。返回 `job_id`，前端轮询状态。
+    """
+    result = await _call_kb_capability(
+        request,
+        "start_model_update",
+        {"knowledge_base_id": body.knowledge_base_id, "document_id": document_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/model-update/{job_id}", summary="查询模型更新任务状态")
+async def get_model_update_status(
+    request: Request,
+    job_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request,
+        "get_model_update_status",
+        {"knowledge_base_id": knowledge_base_id, "job_id": job_id},
+    )
+    return success_response(data=result)
+
+
 @router.get("/documents/{document_id}/versions", summary="文档版本历史")
 async def list_document_versions(request: Request, document_id: str):
     result = await _call_kb_capability(
@@ -660,6 +793,9 @@ async def upload_document_version(
     storage_backend: Optional[str] = Form(None),
     file_name: Optional[str] = Form(None),
     mime_type: Optional[str] = Form(None),
+    file_size: Optional[int] = Form(None),
+    confirm_similar: bool = Form(False),
+    preview: bool = Form(False),
 ):
     """上传新版本（新版生效、旧版存档）。
 
@@ -670,6 +806,8 @@ async def upload_document_version(
     payload: dict[str, Any] = {
         "document_id": document_id,
         "knowledge_base_id": knowledge_base_id,
+        "confirm_similar": confirm_similar,
+        "preview": preview,
     }
 
     if storage_key:
@@ -728,6 +866,98 @@ async def get_document_version_url(
 ):
     result = await _call_kb_capability(
         request, "get_document_version_url",
+        {"document_id": document_id, "version_no": version_no},
+    )
+    return success_response(data=result)
+
+
+@router.post("/model-update/{job_id}/apply", summary="确认导入模型草稿")
+async def apply_model_update(
+    request: Request,
+    job_id: str,
+    body: ModelUpdateApplyRequest,
+):
+    """把人审确认后的草稿写入 KB compiled schema（乐观锁 version 由能力层取）。"""
+    result = await _call_kb_capability(
+        request,
+        "apply_model_update",
+        {"knowledge_base_id": body.knowledge_base_id, "job_id": job_id},
+    )
+    return success_response(data=result)
+
+
+@router.delete(
+    "/documents/{document_id}/versions/pending",
+    summary="放弃一次待确认的新版本上传（删除临时对象）",
+)
+async def discard_document_version_upload(
+    request: Request,
+    document_id: str,
+    storage_key: str = Query(..., min_length=1),
+    storage_backend: Optional[str] = Query(None),
+):
+    result = await _call_kb_capability(
+        request, "discard_document_version_upload",
+        {
+            "document_id": document_id,
+            "storage_key": storage_key,
+            "storage_backend": storage_backend,
+        },
+    )
+    return success_response(data=result)
+
+
+@router.get(
+    "/documents/{document_id}/similarity-suggestions",
+    summary="文档相似合并建议",
+)
+async def get_document_similarity_suggestions(
+    request: Request, document_id: str,
+):
+    result = await _call_kb_capability(
+        request, "get_document_similarity_suggestions",
+        {"document_id": document_id},
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/documents/{document_id}/similarity-suggestions/{suggestion_id}/dismiss",
+    summary="忽略相似合并建议",
+)
+async def dismiss_document_similarity_suggestion(
+    request: Request, document_id: str, suggestion_id: str,
+):
+    result = await _call_kb_capability(
+        request, "dismiss_document_similarity_suggestion",
+        {"document_id": document_id, "suggestion_id": suggestion_id},
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/documents/{document_id}/similarity-suggestions/{suggestion_id}/merge",
+    summary="合并为已有文档的新版本",
+)
+async def merge_document_version(
+    request: Request, document_id: str, suggestion_id: str,
+):
+    result = await _call_kb_capability(
+        request, "merge_document_version",
+        {"document_id": document_id, "suggestion_id": suggestion_id},
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/documents/{document_id}/versions/{version_no}/activate",
+    summary="切换文档生效版本（文件级回滚）",
+)
+async def activate_document_version(
+    request: Request, document_id: str, version_no: int,
+):
+    result = await _call_kb_capability(
+        request, "activate_document_version",
         {"document_id": document_id, "version_no": version_no},
     )
     return success_response(data=result)
@@ -1152,6 +1382,28 @@ class WikiEvidenceRequest(BaseModel):
 async def wiki_evidence(request: Request, payload: WikiEvidenceRequest):
     result = await _call_kb_capability(request, "resolve_wiki_evidence",
                                       _schema_payload(payload), user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.post("/search/ontology-data", summary="本体 + 数据检索（本体答案 + NL→SQL 补充）")
+async def search_ontology_data(request: Request, payload: dict = Body(...)):
+    """先走 `/search/ontology`，再按候选补一次 ②（无 router 部署可用）。
+
+    请求体与 router 兼容；`entity_pins` 只用于数据补充段，不转给本体检索。
+    """
+    result = await _call_kb_capability(request, "search_ontology_data", payload)
+    return success_response(data=result)
+
+
+@router.post("/search/data", summary="纯数据检索（NL→SQL，不经本体）")
+async def search_data(request: Request, payload: dict = Body(...)):
+    """KB → database 源 → ② NL→SQL → `data_blocks`。
+
+    router 数据路线的进程内实现；没有 onto-router 的部署也能用。
+    请求体与 router 兼容：`query`、`knowledge_base_ids`（或 `knowledge_base_id`）、
+    可选 `entity_pins`；其余检索参数（mode/top_k/strict_*）忽略。
+    """
+    result = await _call_kb_capability(request, "search_data", payload)
     return success_response(data=result)
 
 
@@ -1726,16 +1978,24 @@ async def list_answer_feedback(
     request: Request,
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
     feedback_type: Optional[str] = Query(None, regex="^(like|dislike)?$", description="按反馈类型过滤"),
+    source: Optional[str] = Query(
+        None, regex="^(web|mcp)?$", description="按来源过滤：web=浏览器、mcp=MCP 客户端"
+    ),
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(50, ge=1, le=100, description="每页条数"),
 ):
-    """按知识库聚合查询回答反馈列表（含统计）。"""
+    """按知识库聚合查询回答反馈列表（含统计）。
+
+    source 只影响列表与总数的筛选，统计数（like_count / dislike_count）仍按
+    知识库全量聚合，不随 source 变化。
+    """
     result = await _call_kb_capability(
         request,
         "list_answer_feedback",
         {
             "knowledge_base_id": knowledge_base_id,
             "feedback_type": feedback_type,
+            "source": source,
             "page": page,
             "page_size": page_size,
         },
@@ -2042,6 +2302,93 @@ async def get_wiki_backlinks(
         payload["document_id"] = document_id
     result = await _call_kb_capability(request, "get_wiki_backlinks", payload)
     return success_response(data=result)
+
+
+@router.post("/wiki/resources/{operation}", summary="按发布版本读取题目、资源、表格记录和音视频片段")
+async def query_wiki_resources(operation: str, request: Request,
+                               knowledge_base_id: str = Query(..., min_length=1, max_length=128)):
+    options = await request.json()
+    result = await _call_kb_capability(request, "query_wiki_resources", {
+        "knowledge_base_id": knowledge_base_id, "operation": operation, "options": options})
+    return success_response(data=result)
+
+
+@router.get("/wiki/scenarios", summary="知识库可用场景与启用状态")
+async def list_wiki_scenarios(request: Request, knowledge_base_id: str = Query(..., min_length=1, max_length=128)):
+    result = await _call_kb_capability(request, "list_wiki_scenarios", {"knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.put("/wiki/scenarios/{scenario_id}", summary="启用或配置知识库场景")
+async def configure_wiki_scenario(scenario_id: str, request: Request, knowledge_base_id: str = Query(..., min_length=1, max_length=128)):
+    result = await _call_kb_capability(request, "configure_wiki_scenario", {
+        "knowledge_base_id": knowledge_base_id, "scenario_id": scenario_id, "options": await request.json()})
+    return success_response(data=result)
+
+
+@router.post("/wiki/scenarios/{scenario_id}/{operation}", summary="读取场景资源或执行场景操作")
+async def wiki_scenario_operation(scenario_id: str, operation: str, request: Request,
+                                  knowledge_base_id: str = Query(..., min_length=1, max_length=128)):
+    actions = {"resources": "read_wiki_scenario_resources", "interpret": "run_wiki_scenario", "review": "review_wiki_scenario",
+               "selection": "select_wiki_scenario_resources", "materials": "read_wiki_scenario_materials",
+               "material": "read_wiki_scenario_material", "annotate": "annotate_wiki_scenario"}
+    if operation not in actions:
+        raise HTTPException(status_code=422, detail="不支持的场景操作")
+    result = await _call_kb_capability(request, actions[operation], {
+        "knowledge_base_id": knowledge_base_id, "scenario_id": scenario_id, "options": await request.json()})
+    return success_response(data=result)
+
+
+@router.get("/wiki/graph/types", summary="Wiki 图谱节点类型与计数")
+async def get_wiki_graph_types(request: Request, knowledge_base_id: str = Query(..., min_length=1),
+                               graph_revision: str = "", document_id: str = ""):
+    result = await _call_kb_capability(request, "get_wiki_graph_types", {
+        "knowledge_base_id": knowledge_base_id, "graph_revision": graph_revision, "document_id": document_id})
+    return success_response(data=result)
+
+
+@router.get("/wiki/graph/nodes", summary="Wiki 图谱节点搜索与分页")
+async def search_wiki_nodes(request: Request, knowledge_base_id: str = Query(..., min_length=1),
+                           query: str = "", node_type: str = "", graph_revision: str = "",
+                           document_id: str = "", limit: int = Query(20, ge=1, le=100), cursor: str = ""):
+    result = await _call_kb_capability(request, "search_wiki_nodes", {
+        "knowledge_base_id": knowledge_base_id, "query": query, "node_type": node_type,
+        "graph_revision": graph_revision, "document_id": document_id, "limit": limit, "cursor": cursor})
+    return success_response(data=result)
+
+
+@router.get("/wiki/graph/node", summary="读取指定发布版本的 Wiki 节点")
+async def get_wiki_graph_node(request: Request, knowledge_base_id: str = Query(..., min_length=1),
+                             node_id: str = Query(..., min_length=1),
+                             graph_revision: str = Query(..., min_length=64, max_length=64), document_id: str = "",
+                             include_content: bool = False):
+    result = await _call_kb_capability(request, "get_wiki_node", {
+        "knowledge_base_id": knowledge_base_id, "node_id": node_id,
+        "graph_revision": graph_revision, "document_id": document_id, "include_content": include_content})
+    return success_response(data=result)
+
+
+@router.get("/wiki/graph/neighbors", summary="按方向和关系类别展开 Wiki 邻居")
+async def get_wiki_graph_neighbors(request: Request, knowledge_base_id: str = Query(..., min_length=1),
+                                  node_id: str = Query(..., min_length=1),
+                                  graph_revision: str = Query(..., min_length=64, max_length=64),
+                                  direction: str = "both", families: Optional[list[str]] = Query(None),
+                                  document_id: str = "", limit: int = Query(20, ge=1, le=100), cursor: str = ""):
+    payload = {"knowledge_base_id": knowledge_base_id, "node_id": node_id, "graph_revision": graph_revision,
+               "direction": direction, "document_id": document_id, "limit": limit, "cursor": cursor}
+    if families is not None:
+        payload["families"] = families
+    return success_response(data=await _call_kb_capability(request, "get_wiki_neighbors", payload))
+
+
+@router.get("/wiki/graph/evidence", summary="分页读取关系或节点的原文证据")
+async def get_wiki_graph_evidence(request: Request, knowledge_base_id: str = Query(..., min_length=1),
+                                 graph_revision: str = Query(..., min_length=64, max_length=64),
+                                 node_id: str = "", edge_id: str = "", evidence_id: str = "",
+                                 document_id: str = "", limit: int = Query(20, ge=1, le=100), cursor: str = ""):
+    return success_response(data=await _call_kb_capability(request, "get_wiki_graph_evidence", {
+        "knowledge_base_id": knowledge_base_id, "graph_revision": graph_revision, "node_id": node_id,
+        "edge_id": edge_id, "evidence_id": evidence_id, "document_id": document_id, "limit": limit, "cursor": cursor}))
 
 
 @router.get("/wiki/claims", summary="读取 claim 级溯源明细（列式视图·溯源审计）")
@@ -2596,9 +2943,15 @@ async def get_ontology_editor_state(
 async def get_ontology_compiled_schema(
     request: Request,
     knowledge_base_id: str = Query(..., description="知识库 ID"),
+    data_source_id: Optional[str] = Query(
+        None, description="不传 = 知识库级；传了 = 该数据源自己的那份",
+    ),
 ):
-    """查询知识库当前 compiled schema。"""
-    result = await _call_kb_capability(request, "get_compiled_schema", {"knowledge_base_id": knowledge_base_id})
+    """查询 compiled schema。粒度是「知识库 + 数据源」，不传 data_source_id 取知识库级那份。"""
+    payload = {"knowledge_base_id": knowledge_base_id}
+    if data_source_id:
+        payload["data_source_id"] = data_source_id
+    result = await _call_kb_capability(request, "get_compiled_schema", payload)
     return success_response(data=result)
 
 
@@ -2628,6 +2981,213 @@ async def recompile_ontology_compiled_schema(request: Request, payload: dict = B
     - apply_to_documents=true：编译成功后顺带触发该 KB 文档批量重抽（对账被动）。
     """
     result = await _call_kb_capability(request, "recompile_schema", payload)
+    return success_response(data=result)
+
+
+@router.get("/ontology/compiled-schema/status", summary="知识库级 schema 生命周期状态")
+async def get_compiled_schema_status(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+):
+    """KB 级 compiled schema 的新鲜度读取契约（只读，不触发自动编译）。
+
+    `freshness` ∈ missing / seeded / outdated / manual_edited / abstract_projection；
+    对齐影响面见 `alignment_impact`（`projected_maps_to` 为估算下界）。
+    """
+    result = await _call_kb_capability(
+        request, "get_kb_compiled_schema_status",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/compiled-schema/recompile/preview", summary="预览重编译差异与影响面")
+async def preview_compiled_schema_recompile(
+    request: Request,
+    knowledge_base_id: str = Body(
+        ..., embed=True, min_length=1, description="知识库 ID"),
+):
+    """预览一次 recompile 的差异与影响面（只读：不 upsert、不重置文档）。
+
+    `stale_after` 是本次重编译后**新**失效的 doc_type；`affected_alignments`
+    为受影响的对齐行（`affected_maps_to` 为估算下界）。
+    入参走类型化 Body（`embed=True`）：缺失 / 空串 / 非字符串在 FastAPI 层
+    统一按参数校验失败（1001）拒掉，不会带着 `None` 穿到能力层。
+    """
+    result = await _call_kb_capability(
+        request, "preview_kb_compiled_schema_recompile",
+        {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/data-assets", summary="结构化数据资产子图查询")
+async def list_ontology_data_assets(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str = Query(..., min_length=1, description="数据源 ID"),
+    table: Optional[str] = Query(None, description="起点表（不传 = 全部节点/边）"),
+    direction: str = Query("both", description="upstream / downstream / both"),
+    hops: int = Query(1, ge=1, le=3, description="BFS 跳数（1-3）"),
+):
+    """读取结构化数据资产子图（节点/边/列映射）。
+
+    - `table` 缺省：返回该源全部节点与边。
+    - 给了 `table`：按 `direction`（数据流方向）与 `hops` 取锚点子图。
+    - `unknown=true` 表示这张表不在该源的投影里（与「表在但没边」区分）。
+    """
+    result = await _call_kb_capability(
+        request, "list_ontology_data_assets",
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "data_source_id": data_source_id,
+            "table": table,
+            "direction": direction,
+            "hops": hops,
+        },
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/data-assets/rebuild", summary="重建结构化数据资产子图")
+async def rebuild_ontology_data_assets(request: Request, payload: dict = Body(...)):
+    """手工把知识库下 database 源的数据资产子图重建到「当前 schema + 活血缘」形态。
+
+    幂等；`data_source_id` 可选（不传 = 该 KB 下全部 database 源）。
+    投影开关关闭时返回 `{disabled: true, sources: []}`（回滚语义，不是错误）。
+    """
+    result = await _call_kb_capability(
+        request, "rebuild_ontology_data_assets", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.get("/ontology/lineage-paths", summary="血缘路径评分查询（P2b）")
+async def list_ontology_lineage_paths(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str = Query(..., min_length=1, description="数据源 ID"),
+    anchor: str = Query(..., min_length=1, description="锚点物理表名"),
+    target: Optional[str] = Query(None, description="可选目标物理表名（命中加分）"),
+    max_hops: int = Query(3, ge=1, le=3, description="最大跳数（1-3）"),
+    max_paths: int = Query(5, ge=1, le=10, description="最多返回路径数（1-10）"),
+    min_hops: int = Query(1, ge=1, le=3, description="最小跳数（1-3）"),
+):
+    """在「join 边 + 血缘边」混合图上，从 `anchor` 出发按置信度取评分路径。
+
+    与 ② NL→SQL 的路径搜索同源（同一份编译 schema 行、同一套边池与打分），
+    供血缘画布做路径高亮。`unknown=true` 表示该数据源没有 active 编译 schema
+    （与「schema 在、锚点不在图里」区分：后者 `paths=[]`、`unknown=false`）。
+    """
+    result = await _call_kb_capability(
+        request, "list_lineage_paths",
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "data_source_id": data_source_id,
+            "anchor": anchor,
+            "target": target,
+            "max_hops": max_hops,
+            "max_paths": max_paths,
+            "min_hops": min_hops,
+        },
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/lineage-impact", summary="血缘影响分析（只读）")
+async def analyze_ontology_lineage_impact(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str = Query(..., min_length=1, description="数据源 ID"),
+    table: str = Query(..., min_length=1, description="锚点物理表名"),
+    column: Optional[str] = Query(None, description="锚点列（可选，锁首跳）"),
+    direction: str = Query("downstream", description="downstream/upstream/both"),
+    hops: int = Query(3, ge=1, le=3, description="最大跳数（1-3）"),
+    min_origin: Optional[str] = Query(None, description="信任档下限"),
+):
+    """从锚点表（可选列）出发，按数据流方向展开影响面。
+
+    只使用血缘边（不含 join 边）。读边失败时 `unknown=true`——「查不到」不等于「没有」。
+    """
+    result = await _call_kb_capability(
+        request, "analyze_lineage_impact",
+        {
+            "knowledge_base_id": knowledge_base_id,
+            "data_source_id": data_source_id,
+            "table": table,
+            "column": column,
+            "direction": direction,
+            "hops": hops,
+            "min_origin": min_origin,
+        },
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/lineage-coverage", summary="血缘覆盖率（只读）")
+async def get_ontology_lineage_coverage(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str = Query(..., min_length=1, description="数据源 ID"),
+):
+    """以 active per-source compiled schema 为分母、血缘边为分子。
+
+    无 active 编译 schema ⇒ 1001；读边失败 ⇒ `unknown=true` 且比率 `null`。
+    """
+    result = await _call_kb_capability(
+        request, "get_lineage_coverage",
+        {"knowledge_base_id": knowledge_base_id, "data_source_id": data_source_id},
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 跨模态对齐（P1.5b：文档实体类型 ↔ 数据源实体，人审）
+#
+# 生成只落 `proposed`（不自动生效）；审批走 PATCH。
+# ⚠️ `knowledge_base_id` 在 PATCH / GET 上都是**必填 Query**（照血缘边的 M-8
+# 口径）：对齐行按 KB 收口，缺失时会改/列到同租户内另一个 KB 的行。
+# ════════════════════════════════════════════════════════════
+
+@router.post("/ontology/data-alignment/suggest", summary="生成跨模态对齐建议")
+async def suggest_ontology_alignments(request: Request, payload: dict = Body(...)):
+    """按同名/别名匹配生成 `proposed` 建议（幂等；已否过的不会重新提出）。
+
+    返回 `{created, existing, unresolved}`。
+    """
+    result = await _call_kb_capability(
+        request, "suggest_ontology_alignments", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.get("/ontology/data-alignment", summary="跨模态对齐列表")
+async def list_ontology_alignments(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    status: str | None = Query(None, description="状态过滤：proposed/active/rejected"),
+):
+    result = await _call_kb_capability(
+        request, "list_ontology_alignments",
+        {"knowledge_base_id": knowledge_base_id, "status": status},
+    )
+    return success_response(data=result)
+
+
+@router.patch("/ontology/data-alignment/{alignment_id}", summary="审批跨模态对齐")
+async def set_ontology_alignment_status(
+    request: Request,
+    alignment_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID（必填：对齐按 KB 收口）"),
+    payload: dict = Body(...),
+):
+    # ⚠️ 覆盖、不是默认：以 Query / 路径为准，不信任 body 里的同名值 —— 否则
+    # 「body 写 A、Query 写 B」就是一次越权审批另一个 KB 的对齐。
+    payload["alignment_id"] = alignment_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(
+        request, "set_ontology_alignment_status", payload,
+        user_id=_extract_user_id(request))
     return success_response(data=result)
 
 
@@ -2740,6 +3300,1082 @@ async def import_synonyms(request: Request, payload: dict = Body(...)):
     return success_response(data=result)
 
 
+# ════════════════════════════════════════════════════════════
+# 血缘边（KB 设置 → 血缘页签）
+#
+# 逐条 CRUD。`update` / `delete` **必须带 `knowledge_base_id`**（能力层的
+# `_REQUIRED_FIELDS` 已列为必填，审查 M-8：边按 KB 收口，避免同租户内改/删到
+# 另一个 KB 的边）—— 所以不能照抄 synonyms 的 delete（它只传 `synonym_id`）。
+# ⚠️ `knowledge_base_id` 走 Query 且带 `min_length=1`：这是「空串 = 已给」的
+# 第三道防线（网关）。`""` 在网关直接 422，不会穿到能力层/服务层（那两层各自的
+# 收口见 Task 3 的 I-1 修复）——空串曾能整条绕过「按 KB 收口」。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/lineage-edges", summary="血缘边列表")
+async def list_lineage_edges(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str | None = Query(None, description="数据源 ID（不传=该 KB 全源）"),
+):
+    """按 KB（可选按源）列出列级血缘边。"""
+    result = await _call_kb_capability(
+        request, "list_lineage_edges",
+        {"knowledge_base_id": knowledge_base_id, "data_source_id": data_source_id},
+    )
+    return success_response(data=result)
+
+
+# ── 本体实例 → 可执行工具绑定 ──
+# 固定路径（/tools）声明在带参数路径之前，避免被 /{binding_id} 截走。
+
+@router.get("/ontology/tool-bindings/tools", summary="可绑定的工具（本租户已启用）")
+async def list_bindable_tools(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "list_bindable_tools", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/lineage-edges", summary="新增血缘边")
+async def create_lineage_edge(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "create_lineage_edge", payload)
+    return success_response(data=result)
+
+
+@router.patch("/lineage-edges/{edge_id}", summary="更新血缘边")
+async def update_lineage_edge(
+    request: Request,
+    edge_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID（必填：边按 KB 收口）"),
+    payload: dict = Body(...),
+):
+    # ⚠️ 覆盖、不是默认：以 Query 为准，不信任 body 里的同名值 —— 否则
+    # 「body 写 A、Query 写 B」就是一次越权改另一个 KB 的边。`edge_id` 同理。
+    payload["edge_id"] = edge_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(request, "update_lineage_edge", payload)
+    return success_response(data=result)
+
+
+@router.delete("/lineage-edges/{edge_id}", summary="删除血缘边")
+async def delete_lineage_edge(
+    request: Request,
+    edge_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID（必填：边按 KB 收口）"),
+):
+    result = await _call_kb_capability(
+        request, "delete_lineage_edge",
+        {"edge_id": edge_id, "knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/metrics/approvals", summary="指标调用审批列表（W4.8，只读）")
+async def list_metric_call_approvals(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+    status: str | None = Query(None),
+):
+    result = await _call_kb_capability(request, "list_metric_call_approvals",
+                                       {"knowledge_base_id": knowledge_base_id,
+                                        "status": status})
+    return success_response(data=result)
+
+
+@router.post("/metrics/approvals/request", summary="申请指标调用审批（W4.8）")
+async def request_metric_call_approval(request: Request,
+                                       payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "request_metric_call_approval", payload)
+    return success_response(data=result)
+
+
+@router.post("/metrics/approvals/approve", summary="批准指标调用（W4.8，管理员）")
+async def approve_metric_call(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "approve_metric_call", payload)
+    return success_response(data=result)
+
+
+@router.post("/metrics/approvals/suspend", summary="下线指标调用（W4.8，管理员）")
+async def suspend_metric_call(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "suspend_metric_call", payload)
+    return success_response(data=result)
+
+
+@router.post("/metrics/clarify", summary="显式澄清池 ask/drop/add（W4.7，只读）")
+async def clarify_metric(request: Request, payload: dict = Body(...)):
+    """不执行 SQL：ask 重算问题池；drop/add 编辑调用方池子。"""
+    result = await _call_kb_capability(request, "clarify_metric", payload)
+    return success_response(data=result)
+
+
+@router.post("/lineage/search", summary="问题/概念 → 资产候选（W4.5 血缘检索，只读）")
+async def search_lineage_assets(request: Request, payload: dict = Body(...)):
+    """词面召回指标/实体/表/列，命中项沿血缘扩展；无 LLM、不写库。"""
+    result = await _call_kb_capability(request, "search_lineage_assets", payload)
+    return success_response(data=result)
+
+
+@router.get("/ontology/tool-bindings", summary="工具绑定列表")
+async def list_tool_bindings(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    entity_type: Optional[str] = Query(None, description="Skill / Action"),
+):
+    payload: dict[str, Any] = {
+        "knowledge_base_id": knowledge_base_id, "page": page, "page_size": page_size,
+    }
+    if entity_type:
+        payload["entity_type"] = entity_type
+    result = await _call_kb_capability(request, "list_tool_bindings", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/tool-bindings", summary="新建工具绑定")
+async def create_tool_binding(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "create_tool_binding", payload)
+    return success_response(data=result)
+
+
+@router.patch("/ontology/tool-bindings/{binding_id}", summary="更新工具绑定（启停 / 参数映射 / 工具）")
+async def update_tool_binding(request: Request, binding_id: str, payload: dict = Body(...)):
+    payload["binding_id"] = binding_id
+    result = await _call_kb_capability(request, "update_tool_binding", payload)
+    return success_response(data=result)
+
+
+@router.delete("/ontology/tool-bindings/{binding_id}", summary="删除工具绑定")
+async def delete_tool_binding(request: Request, binding_id: str):
+    result = await _call_kb_capability(request, "delete_tool_binding", {"binding_id": binding_id})
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 血缘「禁止同查」表对（roadmap #10）
+#
+# 与 lineage-edges 同款安全口径：`knowledge_base_id` 走 Query 且 `min_length=1`
+# （空串在网关直接 422）；PATCH 以 Query 覆盖 body 的同名值（防越权改别的 KB）。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/lineage-forbidden-pairs", summary="禁止同查表对列表")
+async def list_lineage_forbidden_pairs(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID"),
+    data_source_id: str | None = Query(None, description="数据源 ID（不传=该 KB 全源）"),
+    status: str | None = Query(None, description="proposed | active | disabled"),
+):
+    result = await _call_kb_capability(
+        request, "list_lineage_forbidden_pairs",
+        {"knowledge_base_id": knowledge_base_id,
+         "data_source_id": data_source_id, "status": status},
+    )
+    return success_response(data=result)
+
+
+@router.post("/lineage-forbidden-pairs", summary="新增禁止同查表对")
+async def create_lineage_forbidden_pair(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "create_lineage_forbidden_pair", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.patch("/lineage-forbidden-pairs/{pair_id}", summary="更新禁止同查表对")
+async def update_lineage_forbidden_pair(
+    request: Request,
+    pair_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID（必填：按 KB 收口）"),
+    payload: dict = Body(...),
+):
+    # 覆盖、不是默认：以 Query 为准，不信任 body 里的同名值。
+    payload["pair_id"] = pair_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(
+        request, "update_lineage_forbidden_pair", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.delete("/lineage-forbidden-pairs/{pair_id}", summary="删除禁止同查表对")
+async def delete_lineage_forbidden_pair(
+    request: Request,
+    pair_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, description="知识库 ID（必填：按 KB 收口）"),
+):
+    result = await _call_kb_capability(
+        request, "delete_lineage_forbidden_pair",
+        {"pair_id": pair_id, "knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 数据治理控制面 P1（#11）：标签 / 标签字典 / 用户密级 / 策略 / 审计 / 试算
+#
+# 与 lineage 同款安全口径：读接口的 `knowledge_base_id` 走 Query 且 min_length=1；
+# update/delete 以 Query 覆盖 body（防越权改别的 KB）。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/governance/labels", summary="治理标签列表")
+async def list_governance_labels(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+    data_source_id: str | None = Query(None),
+    table_name: str | None = Query(None),
+):
+    result = await _call_kb_capability(
+        request, "list_governance_labels",
+        {"knowledge_base_id": knowledge_base_id,
+         "data_source_id": data_source_id, "table_name": table_name})
+    return success_response(data=result)
+
+
+@router.post("/governance/labels", summary="新增治理标签")
+async def create_governance_label(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "create_governance_label", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.post("/governance/sensitive-scan", summary="敏感数据分布扫描（只读）")
+async def governance_sensitive_scan(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "governance_sensitive_scan", payload)
+    return success_response(data=result)
+
+
+@router.post("/governance/sensitive-scan/adopt", summary="采纳敏感扫描建议")
+async def governance_adopt_sensitive_scan(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "governance_adopt_sensitive_scan", payload)
+    return success_response(data=result)
+
+
+@router.patch("/governance/labels/{label_id}", summary="更新治理标签")
+async def update_governance_label(
+    request: Request,
+    label_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+    payload: dict = Body(...),
+):
+    payload["label_id"] = label_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(
+        request, "update_governance_label", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.delete("/governance/labels/{label_id}", summary="删除治理标签")
+async def delete_governance_label(
+    request: Request,
+    label_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "delete_governance_label",
+        {"label_id": label_id, "knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.get("/governance/tags", summary="治理标签字典")
+async def list_governance_tags(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "list_governance_tags",
+        {"knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.post("/governance/tags", summary="新增标签字典项")
+async def create_governance_tag(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "create_governance_tag", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.patch("/governance/tags/{tag_id}", summary="更新标签字典项")
+async def update_governance_tag(
+    request: Request,
+    tag_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+    payload: dict = Body(...),
+):
+    payload["tag_id"] = tag_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(
+        request, "update_governance_tag", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.delete("/governance/tags/{tag_id}", summary="删除标签字典项")
+async def delete_governance_tag(
+    request: Request,
+    tag_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "delete_governance_tag",
+        {"tag_id": tag_id, "knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.get("/governance/clearance", summary="用户数据密级列表")
+async def list_governance_clearance(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "list_governance_clearance",
+        {"knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.put("/governance/clearance", summary="设置用户数据密级")
+async def set_governance_clearance(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "set_governance_clearance", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.get("/governance/policies", summary="治理策略列表")
+async def list_governance_policies(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "list_governance_policies",
+        {"knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.post("/governance/policies", summary="新增治理策略")
+async def create_governance_policy(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "create_governance_policy", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.patch("/governance/policies/{policy_id}", summary="更新治理策略")
+async def update_governance_policy(
+    request: Request,
+    policy_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+    payload: dict = Body(...),
+):
+    payload["policy_id"] = policy_id
+    payload["knowledge_base_id"] = knowledge_base_id
+    result = await _call_kb_capability(
+        request, "update_governance_policy", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.delete("/governance/policies/{policy_id}", summary="删除治理策略")
+async def delete_governance_policy(
+    request: Request,
+    policy_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "delete_governance_policy",
+        {"policy_id": policy_id, "knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.get("/governance/audit", summary="治理判定审计")
+async def list_governance_audit(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+    user_id: str | None = Query(None),
+    decision: str | None = Query(None),
+    action: str | None = Query(None),
+    resource_table: str | None = Query(None),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    result = await _call_kb_capability(
+        request, "list_governance_audit",
+        {"knowledge_base_id": knowledge_base_id, "user_id": user_id,
+         "decision": decision, "action": action,
+         "resource_table": resource_table, "offset": offset, "limit": limit})
+    return success_response(data=result)
+
+
+@router.post("/governance/evaluate", summary="治理策略试算（不执行 SQL）")
+async def evaluate_governance_policy(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "evaluate_governance_policy", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 演化台服务化（②a）：runs / ledgers / corpus
+#
+# 前缀 `/api/v1/knowledge-base/evolution/**`（Task 9 起前端基址切到这边）。
+# 能力侧全部动作仅租户管理员 —— 网关不重复判权，只负责转发身份
+# （`_invoke_sidecar_capability` 默认把 `_extract_user_id(request)` 塞进 invoke 报文；
+# 漏带身份的方向是「悄悄放行」，所以这里不手工拼 body）。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/evolution/status", summary="演化台服务状态")
+async def evolution_status(request: Request):
+    result = await _call_kb_capability(request, "evolution_status", {})
+    return success_response(data=result)
+
+
+@router.get("/evolution/runs", summary="演化运行列表")
+async def evolution_list_runs(
+    request: Request,
+    kb: str | None = Query(None, description="知识库 ID（不传=本租户全部）"),
+    limit: int = Query(50, ge=1, le=200, description="返回条数上限"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_list_runs", {"kb": kb, "limit": limit})
+    return success_response(data=result)
+
+
+@router.post("/evolution/runs", summary="发起演化运行")
+async def evolution_start_run(request: Request, payload: dict = Body(...)):
+    """发起一次 alias / query_rule 演化。
+
+    `request_id` 是可选幂等键：同一次提交的重试沿用它，服务端返回
+    `{"run_id", "reused": true}` 而不是再建一条。
+    """
+    result = await _call_kb_capability(request, "evolution_start_run", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/evolution/runs/batch-adopt",
+    summary="批量采纳演化补丁（同 KB、每链一个 run、1..10）",
+)
+async def evolution_batch_adopt_run(request: Request, payload: dict = Body(...)):
+    """批量确认采纳：`{"run_ids": [...], "override_reason": "..."}`。
+
+    没有 `confirm` 参数（调用即受理，没有批量预览）。结构校验（去重 / 同 KB /
+    每链至多一个 run / 上限 10）在能力层受理前整体完成，任一条不满足 → 1001；
+    受理阶段单条失败不中断其余，逐条回 `{run_id, accepted, status, code,
+    message}`，整体 HTTP 200（`accepted`/`rejected` 是计数）。
+    """
+    result = await _call_kb_capability(
+        request, "evolution_adopt_runs", dict(payload or {}))
+    return success_response(data=result)
+
+
+@router.get("/evolution/runs/{run_id}", summary="演化运行详情（RunBundle）")
+async def evolution_get_run(request: Request, run_id: str):
+    result = await _call_kb_capability(
+        request, "evolution_get_run", {"run_id": run_id})
+    return success_response(data=result)
+
+
+@router.get("/evolution/runs/{run_id}/log", summary="演化运行日志尾部")
+async def evolution_run_log(request: Request, run_id: str):
+    result = await _call_kb_capability(
+        request, "evolution_run_log", {"run_id": run_id})
+    return success_response(data=result)
+
+
+@router.get("/evolution/versions", summary="演化语义版本列表")
+async def evolution_list_versions(
+    request: Request,
+    kb: str = Query(..., description="知识库 ID"),
+    scope: str | None = Query(
+        None, description="abstract / compiled；不传=两种 scope 合并"),
+    ds: str | None = Query(
+        None, description="数据源 ID（compiled 链）；不传=该 KB 所有 DS"),
+    include_archived: bool = Query(False, description="是否包含归档版本"),
+    limit: int = Query(50, ge=1, le=200, description="返回条数上限"),
+    offset: int = Query(0, ge=0, description="偏移量"),
+):
+    result = await _call_kb_capability(request, "evolution_list_versions", {
+        "kb": kb, "scope": scope, "ds": ds,
+        "include_archived": include_archived, "limit": limit, "offset": offset,
+    })
+    return success_response(data=result)
+
+
+# 知识库工具（KB 级工具目录）/ontology/kb-tools
+# 本库登记的 API 工具；凭据只写不读。执行入口 run_kb_tool 是内部 action，不开路由。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/ontology/kb-tools", summary="本库工具列表")
+async def list_kb_tools(
+    request: Request,
+    knowledge_base_id: str = Query(..., description="知识库 ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    keyword: Optional[str] = Query(None, description="名称 / 工具名关键词"),
+):
+    result = await _call_kb_capability(request, "list_kb_tools", {
+        "knowledge_base_id": knowledge_base_id, "page": page, "page_size": page_size,
+        "keyword": keyword,
+    })
+    return success_response(data=result)
+
+
+@router.get("/evolution/versions/{version_id}", summary="演化版本详情")
+async def evolution_get_version(
+    request: Request,
+    version_id: str,
+    include_snapshot: bool = Query(
+        False, description="是否返回完整 snapshot（默认只给摘要与 hash）"),
+    include_archived: bool = Query(
+        False, description="是否允许读取归档版本（默认 false → 归档行 1002）"),
+):
+    result = await _call_kb_capability(request, "evolution_get_version", {
+        "version_id": version_id, "include_snapshot": include_snapshot,
+        "include_archived": include_archived,
+    })
+    return success_response(data=result)
+
+
+@router.get("/evolution/ledgers", summary="演化台账（alias / query_rule / rejects）")
+async def evolution_list_ledgers(request: Request):
+    result = await _call_kb_capability(request, "evolution_list_ledgers", {})
+    return success_response(data=result)
+
+
+@router.get("/evolution/corpus-cases", summary="演化评测语料列表")
+async def evolution_list_corpus_cases(request: Request):
+    result = await _call_kb_capability(
+        request, "evolution_list_corpus_cases", {})
+    return success_response(data=result)
+
+
+@router.post("/evolution/corpus-cases", summary="新增评测语料")
+async def evolution_create_corpus_case(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "evolution_create_corpus_case", payload)
+    return success_response(data=result)
+
+
+@router.patch("/evolution/corpus-cases/{case_id}", summary="更新评测语料")
+async def evolution_update_corpus_case(
+    request: Request, case_id: str, payload: dict = Body(...),
+):
+    # 以路径参数为准、覆盖 body 同名值：否则「路径写 A、body 写 B」就是
+    # 一次越权改另一个条目（同 lineage-edges 的 PATCH 口径）。
+    payload["case_id"] = case_id
+    result = await _call_kb_capability(
+        request, "evolution_update_corpus_case", payload)
+    return success_response(data=result)
+
+
+@router.delete("/evolution/corpus-cases/{case_id}", summary="删除评测语料")
+async def evolution_delete_corpus_case(request: Request, case_id: str):
+    result = await _call_kb_capability(
+        request, "evolution_delete_corpus_case", {"case_id": case_id})
+    return success_response(data=result)
+
+
+@router.post(
+    "/evolution/runs/{run_id}/promote-adhoc",
+    summary="把 run 里已验证的 ad-hoc case 提升为语料",
+)
+async def evolution_promote_adhoc(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    """`case_ids` 缺省 = 该 run 全部 verified case；显式给出时只提升这些。
+
+    路径 `run_id` 覆盖 body 同名值（与 adopt/reject/rollback 同口径）；
+    body 可缺省。去重/冲突口径由能力层裁定（重复→skipped，冲突不覆盖）。
+    """
+    body = dict(payload or {})
+    body["run_id"] = run_id
+    result = await _call_kb_capability(request, "evolution_promote_adhoc", body)
+    return success_response(data=result)
+
+
+@router.post(
+    "/evolution/runs/{run_id}/adhoc-evidence",
+    summary="人工 ad-hoc 验真：现场跑一次问句取证据",
+)
+async def evolution_adhoc_evidence(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    """临时 apply 候选（按 `picks`）→ 跑一次问句 → 恢复快照；不改 run 状态。
+
+    路径 `run_id` 覆盖 body 同名值（与 adopt/promote-adhoc 同口径），body 可缺省。
+    """
+    body = dict(payload or {})
+    body["run_id"] = run_id
+    result = await _call_kb_capability(
+        request, "evolution_adhoc_evidence", body,
+        # 验真会临时 apply + 进程内跑一次 ②（LLM）；与 replay/adopt-alias 同档放宽，
+        # 610s 只保证网关不静默截断在前（前端预算先生效）。
+        timeout=float(os.getenv(
+            "GATEWAY_EVOLUTION_ADHOC_EVIDENCE_TIMEOUT", "610")))
+    return success_response(data=result)
+
+
+@router.post(
+    "/evolution/runs/{run_id}/adopt",
+    summary="采纳演化补丁（confirm=false 为预览）",
+    responses={202: {"description": "accepted; poll GET /evolution/runs/{run_id}"}},
+)
+async def evolution_adopt_run(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    """`confirm=false`（缺省）只做预览、不写库；`confirm=true` 是 202 受理。
+
+    信任闭环 Task 9：受理后 apply / 冒烟 / 完整语料基准在能力侧后台执行，
+    网关不再同步等结果 —— `accepted=True` 回 **202**，前端改轮询 run 状态；
+    预览（`accepted` 缺失/False）与幂等失败重放仍回 200。
+    """
+    body = dict(payload or {})
+    body["run_id"] = run_id          # 路径参数为准，body 同名值不得改别的 run
+    result = await _call_kb_capability(request, "evolution_adopt_run", body)
+    if isinstance(result, dict) and result.get("accepted") is True:
+        return success_response(data=result, status_code=202)
+    return success_response(data=result)
+
+
+@router.post("/evolution/runs/{run_id}/reject", summary="否决演化补丁")
+async def evolution_reject_run(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    body = dict(payload or {})
+    body["run_id"] = run_id
+    result = await _call_kb_capability(request, "evolution_reject_run", body)
+    return success_response(data=result)
+
+
+@router.post("/evolution/runs/{run_id}/rollback", summary="回滚演化补丁/版本")
+async def evolution_rollback_run(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    body = dict(payload or {})
+    # 路径 run_id 覆盖 body 同名值：不给越权改别的 run 的口子。
+    body["run_id"] = run_id
+    result = await _call_kb_capability(request, "evolution_rollback_run", body)
+    return success_response(data=result)
+
+
+@router.post("/evolution/runs/{run_id}/entries/adjust", summary="条目人工调整（对话一轮）")
+async def evolution_adjust_entry(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    body = dict(payload or {})
+    body["run_id"] = run_id
+    result = await _call_kb_capability(request, "evolution_adjust_entry", body)
+    return success_response(data=result)
+
+
+@router.post("/evolution/runs/{run_id}/entries/edit", summary="条目人工调整（写回补丁）")
+async def evolution_edit_entry(
+    request: Request, run_id: str, payload: dict = Body(default=None),
+):
+    body = dict(payload or {})
+    body["run_id"] = run_id
+    result = await _call_kb_capability(request, "evolution_edit_entry", body)
+    return success_response(data=result)
+
+
+# ── ②b 诊断（2026-10-18）────────────────────────────────────────────
+
+@router.get("/evolution/failures", summary="失败观测清单（窗口内 failed 行）")
+async def evolution_list_failures(
+    request: Request,
+    days: int = Query(7, ge=1, le=365, description="窗口天数"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_list_failures", {"days": days})
+    return success_response(data=result)
+
+
+@router.post("/evolution/diagnosis", summary="运行失败诊断（报告落库）")
+async def evolution_run_diagnosis(
+    request: Request, payload: dict = Body(default=None),
+):
+    # body 整体透传：`days` 由能力侧收口（默认 7 / 1..365），网关不做第二套判据。
+    result = await _call_kb_capability(
+        request, "evolution_run_diagnosis", dict(payload or {}))
+    return success_response(data=result)
+
+
+@router.get("/evolution/diagnosis/latest", summary="最近一份诊断报告")
+async def evolution_latest_diagnosis(request: Request):
+    result = await _call_kb_capability(
+        request, "evolution_latest_diagnosis", {})
+    return success_response(data=result)
+
+
+# ── ②b 点踩诊断 / 抽象层选项 / 采纳（Task 3，2026-10-18）──────────────
+#
+# 形状与旧桥接 `/dislikes`、`/dislikes/{id}/...`、`/metric-options`、
+# `/concept-options`、`/failures/adopt-metric` 逐键一致（前端零改动）。
+# 身份由 `_invoke_sidecar_capability` 默认透传（`user_id` 走 invoke 报文，
+# 不走请求头）；试跑 / 采纳是长操作，按请求放宽超时。
+
+@router.get("/evolution/dislikes", summary="用户点踩列表（反馈行 + 最近一条 ② 观测）")
+async def evolution_list_dislikes(
+    request: Request,
+    days: int = Query(30, ge=1, le=365, description="窗口天数"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_list_dislikes", {"days": days})
+    return success_response(data=result)
+
+
+@router.get("/evolution/dislikes/{feedback_id}/context",
+            summary="点踩诊断现场（反馈行 + 历史时间线 + 观测）")
+async def evolution_dislike_context(request: Request, feedback_id: str):
+    result = await _call_kb_capability(
+        request, "evolution_dislike_context", {"feedback_id": feedback_id})
+    return success_response(data=result)
+
+
+@router.post("/evolution/dislikes/{feedback_id}/replay",
+             summary="点踩诊断试跑（经 router 重走检索 + 归因）")
+async def evolution_replay_dislike(request: Request, feedback_id: str):
+    """空 body：契约只需要反馈 id + 调用者身份（身份由 invoke 报文透传）。"""
+    result = await _call_kb_capability(
+        request, "evolution_replay_dislike", {"feedback_id": feedback_id},
+        # 试跑会真实调模型；前端预算 320s 先生效，网关 610s 只保证不静默截断在前
+        timeout=float(os.getenv("GATEWAY_EVOLUTION_REPLAY_TIMEOUT", "610")))
+    return success_response(data=result)
+
+
+@router.post("/evolution/dislikes/{feedback_id}/adopt-alias",
+             summary="采纳为概念别名（写抽象 schema + 台账）")
+async def evolution_adopt_dislike_alias(
+    request: Request, feedback_id: str, payload: dict = Body(default=None),
+):
+    body = dict(payload or {})
+    body["feedback_id"] = feedback_id     # 路径参数为准，body 同名值不得改别的反馈
+    result = await _call_kb_capability(
+        request, "evolution_adopt_dislike_alias", body,
+        timeout=float(os.getenv("GATEWAY_EVOLUTION_ADOPT_TIMEOUT", "620")))
+    return success_response(data=result)
+
+
+@router.get("/evolution/metric-options", summary="抽象 schema 指标名单")
+async def evolution_metric_options(
+    request: Request, kb: str = Query("", description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_metric_options", {"kb": kb})
+    return success_response(data=result)
+
+
+@router.get("/evolution/concept-options", summary="抽象 schema 概念名单")
+async def evolution_concept_options(
+    request: Request, kb: str = Query("", description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_concept_options", {"kb": kb})
+    return success_response(data=result)
+
+
+@router.get("/evolution/tool-options", summary="多轮工具名单（代码默认 ⊕ 覆盖）")
+async def evolution_tool_options(
+    request: Request, kb: str = Query("", description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "evolution_tool_options", {"kb": kb})
+    return success_response(data=result)
+
+
+@router.post("/evolution/failures/adopt-metric",
+             summary="采纳为指标别名（写抽象 schema + 台账）")
+async def evolution_adopt_metric(
+    request: Request, payload: dict = Body(default=None),
+):
+    result = await _call_kb_capability(
+        request, "evolution_adopt_metric", dict(payload or {}),
+        timeout=float(os.getenv("GATEWAY_EVOLUTION_ADOPT_TIMEOUT", "620")))
+    return success_response(data=result)
+
+
+@router.get("/evolution/metrics", summary="采纳/基准指标（窗口 days，默认 7）")
+async def evolution_metrics(
+    request: Request,
+    days: int = Query(7, ge=1, le=90, description="窗口天数"),
+):
+    """信任闭环 Task 9：`adopt_accepted / adopted / smoke_failed / bench_failed /
+    bench_skipped / stale_conflicts / p95_adopt_seconds / active_versions /
+    avg_corpus_size`，只读且仅租户管理员（能力侧统一闸门）。"""
+    result = await _call_kb_capability(
+        request, "evolution_metrics", {"days": days})
+    return success_response(data=result)
+
+
+@router.get("/evolution/corpus-coverage", summary="语料覆盖率（按 KB/DS）")
+async def evolution_corpus_coverage(request: Request):
+    """语料治理 Task 5：每条 (kb, ds) 链的题数 / 启用数 / tier / expect 分布，
+    以及 active 版本与当前语料的一致性（fresh / drifted / missing）。只读且
+    仅租户管理员（能力侧统一闸门）。"""
+    result = await _call_kb_capability(
+        request, "evolution_corpus_coverage", {})
+    return success_response(data=result)
+
+
+@router.post("/evolution/corpus-seed", summary="按 schema / cases 播种语料")
+async def evolution_seed_corpus(request: Request, payload: dict = Body(...)):
+    """语料治理 Task 6：`{kb, ds, mode: schema|cases, cases?, dry_run?}`。
+
+    schema 模式从该源编译 schema 派生 `COUNT(*)` 题（标识符白名单，SQL 只由
+    固定模板组成）；cases 模式导入显式载荷。去重按归一化问句，同句异内容
+    **绝不覆盖**；`dry_run=true` 只算不写。仅租户管理员（能力侧统一闸门）。
+    """
+    result = await _call_kb_capability(
+        request, "evolution_seed_corpus", payload)
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 跨数据源抽象 schema（概念对齐层）
+#
+# 与 compiled-schema 的区别：那份是「某个数据源的表结构」，这份是「把各源的
+# 概念抽象起来、并记住每个概念在各源里分别叫什么」。只有人确认过（active）
+# 的那份参与检索。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/ontology/abstract-schema", summary="读取抽象 schema（含标脏）")
+async def get_abstract_schema(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """读该知识库的抽象 schema。
+
+    没生成过时**不是 404**：`data` 是**空对象 `{}`**，不是 `null` —— service 读不到
+    对齐时返回 `None`，而网关的 `_invoke_sidecar_capability` 统一归一成 `{}`
+    （这条归一服务全部网关路由，`None` 到不了这里）。这是配置页的常态之一，
+    前端据此显示空态 + 「生成候选」按钮。
+
+    ⚠️ 判空**不能**写 `if (!data)`：JS 里 `{}` 是 truthy，判假会让新建的知识库
+    走进「已有对齐」分支、渲染出零个概念。判据是**有没有 `id`**（有对齐时必带）：
+    `if (!data?.id)` 才是空态。
+
+    返回的每条源映射带 `stale` / `stale_reason`（`entity_gone` / `source_gone`），
+    是**读时现算**的派生字段 —— 源 schema 再生后对齐指向了不存在的实体就会标出来，
+    但库里的对齐**不会**被改动（决策 7：标脏 + 提示，不自动改）。
+    """
+    result = await _call_kb_capability(
+        request, "get_abstract_schema", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/abstract-schema/generate", summary="由各源 schema 生成抽象概念候选")
+async def generate_abstract_schema(request: Request, payload: dict = Body(...)):
+    """读该 KB 全部数据源级 schema 的实体类型 → LLM 提候选概念簇 → 落 `proposed`。
+
+    生成结果**未确认**（`proposed`），不参与检索。
+
+    已有 `active` 对齐时**默认 409**：直接覆盖等于把人工确认过的结果退回未确认。
+    界面应弹二次确认，确认后带 `force: true` 重试。
+
+    生成失败**不落库、不覆盖**（读 schema / 调 LLM / 解析任何一步出错都抛）。
+    """
+    result = await _call_kb_capability(request, "generate_abstract_schema", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/abstract-schema/focus-preview",
+    summary="聚焦生成·解析预览（提示词 → 种子与邻居，不落库）",
+)
+async def preview_focus_abstract_schema(request: Request, payload: dict = Body(...)):
+    """把提示词解析成「重点实体（种子）+ 双向 1 跳关联」，供界面确认/删减。
+
+    **不落库、不占生成守卫**（幂等只读 + 一次 LLM 调用）；真正的生成走
+    `POST /ontology/abstract-schema/generate` 带 `focus_seeds`（用户确认后的清单，
+    后端按它重算闭包）。
+
+    解析不出任何相关实体时回 **1001**（明确文案），**绝不**静默回退全量 ——
+    界面应留在弹窗里让用户改词重试。
+    """
+    result = await _call_kb_capability(request, "preview_focus_abstract_schema", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/abstract-schema/construct", summary="自动构造抽象 schema 草稿（补齐式）")
+async def construct_abstract_schema(request: Request, payload: dict = Body(...)):
+    """把各数据源级 schema + 证据**补齐**成完整草稿：属性合并 / 关系提升 /
+    跨源补边建议 / 枚举取样 / 属性中文名（可关）。
+
+    结果恒为 `proposed`（未确认不参与检索）；**只增不删**（重复调用幂等）。
+
+    已有 `active` 时**默认 409**（同 generate）：确认覆盖请带 `force=true` 重试。
+    同一 KB 已有构造/生成在飞时 **429**（守卫与 generate 共用）。
+    构造失败**不落库、不覆盖**。
+
+    `seed="document"`：先以**文档本体**（KB 级 compiled schema）为种子，再叠加
+    结构化数据源的只增不删补齐；缺省 `"structured"` 保持旧行为（只从数据源聚类）。
+    """
+    result = await _call_kb_capability(request, "construct_abstract_schema", payload)
+    return success_response(data=result)
+
+
+@router.put("/ontology/abstract-schema", summary="保存 / 确认抽象 schema")
+async def save_abstract_schema(request: Request, payload: dict = Body(...)):
+    """界面的改名 / 合并 / 删源 / 确认都走这一条。
+
+    `status='active'` 即「确认」——确认不是独立动作，只是同一次保存的一个字段。
+    `expected_schema_version` **必填**（乐观锁）；版本对不上回 409。
+
+    ⚠️ `status` 也必须**每次显式带**（必填，缺了回 1001）：它是整份替换语义的一部分，
+    服务端**不会**替你按 `proposed` 兜底。一次「只改名、漏带 status」若被兜成
+    `proposed`，一份已确认（active，正在参与检索）的对齐会被静默降级、
+    退出检索链路而全链路不报错 —— 宁可报错。
+    """
+    result = await _call_kb_capability(request, "save_abstract_schema", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/abstract-schema/import", summary="导入共享本体 TBox（YAML）")
+async def import_abstract_schema(request: Request, payload: dict = Body(...)):
+    """把 Ontology Builder 规划的 TBox YAML 导入为本库的抽象 schema。
+
+    **只增不删**：YAML 与现有对齐**反序合并** —— 本体标量以 YAML 为准（导入方优先，
+    含「YAML 没写 → 覆盖为空」）、别名/落点并集保留、已有独有实体保留；导入**不改已有
+    落点**、**不动 metrics**、**保留原 status**（active 仍 active）。
+
+    `dry_run: true` 只算 diff（回带 `summary` + `warnings`）不写库、不需要版本；
+    正式导入必须带 `expected_schema_version`（乐观锁；**首次导入传 0**——upsert 对
+    「行不存在」走 INSERT、不看该值，行已存在时 0 会被 CAS 判 1003）。
+    """
+    result = await _call_kb_capability(request, "import_abstract_schema", payload)
+    return success_response(data=result)
+
+
+# ── 抽象 schema 保存历史（spec 2026-10-27 §4）───────────────────
+#
+# 每次公开保存（手动保存 / 确认 / TBox 导入 / 还原）都会留一条内容快照。
+# 列表**不含 schema**（只给元数据）；详情才有内容；还原是新的一次公开保存，
+# `expected_schema_version` 必填（乐观锁）——冲突沿既有 409/1003 口径。
+
+@router.get(
+    "/ontology/abstract-schema/history",
+    summary="抽象 schema 保存历史列表（不含 schema 内容）",
+)
+async def list_abstract_schema_snapshots(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+    limit: int = Query(20, description="返回条数（服务端 clamp 1..50）"),
+):
+    """最近 N 条保存快照元数据，新→旧：`{items, total}`，每项
+    `{id, schema_version, status, saved_by, source, created_at}`。
+
+    `source` 为 `manual`（手动保存/确认/导入）或 `restore`（由快照还原产生）。
+    """
+    result = await _call_kb_capability(
+        request, "list_abstract_schema_snapshots",
+        {"knowledge_base_id": knowledge_base_id, "limit": limit},
+    )
+    return success_response(data=result)
+
+
+@router.get(
+    "/ontology/abstract-schema/history/{snapshot_id}",
+    summary="抽象 schema 保存历史详情（含 schema）",
+)
+async def get_abstract_schema_snapshot(
+    request: Request,
+    snapshot_id: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """单条快照详情（含 `schema`）。不存在 / 别的租户 / 别的 KB → 1002/404。"""
+    result = await _call_kb_capability(
+        request, "get_abstract_schema_snapshot",
+        {"snapshot_id": snapshot_id, "knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/abstract-schema/history/{snapshot_id}/restore",
+    summary="按保存历史快照还原抽象 schema（生成新版本）",
+)
+async def restore_abstract_schema_snapshot(
+    request: Request,
+    snapshot_id: str,
+    payload: dict = Body(...),
+):
+    """把快照内容当作一次**公开保存**提交：版本号推进、状态取快照里的状态，
+    并再落一条 `source='restore'` 的快照。
+
+    `expected_schema_version` **必填**（当前行版本，乐观锁）：编辑页可能开着很久，
+    不带版本就是拿旧内容盖新内容 —— 服务端按既有口径回 1003/409。
+    """
+    body = dict(payload or {})
+    # 乐观锁版本必须是整数：JSON 字符串（"3"）或 true/false 都不是版本号。
+    # ⚠️ `isinstance(True, int)` 为真 —— bool 必须单独先排除，否则 `true` 会被
+    # 当成版本 1 送下去（`False` 当 0），错误成因在后端变成「版本冲突」而非
+    # 「参数错了」。网关先拦成 1001，能力层还会按非空再收一道。
+    version = body.get("expected_schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise InvalidParameterError(message=translate(
+            "err.abstract_schema.invalid_expected_version",
+            fallback="expected_schema_version 必须是整数（当前行版本号）",
+        ))
+    # 路径参数覆盖 body 里的同名值（防 body 伪造别的 snapshot_id）。
+    body["snapshot_id"] = snapshot_id
+    result = await _call_kb_capability(
+        request, "restore_abstract_schema_snapshot", body,
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/kb-tools", summary="新建本库工具")
+async def create_kb_tool(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "create_kb_tool", payload)
+    return success_response(data=result)
+
+
+@router.patch("/ontology/kb-tools/{tool_id}", summary="编辑 / 启停本库工具")
+async def update_kb_tool(request: Request, tool_id: str, payload: dict = Body(...)):
+    payload["tool_id"] = tool_id
+    result = await _call_kb_capability(request, "update_kb_tool", payload)
+    return success_response(data=result)
+
+
+@router.delete("/ontology/kb-tools/{tool_id}", summary="删除本库工具")
+async def delete_kb_tool(request: Request, tool_id: str):
+    result = await _call_kb_capability(request, "delete_kb_tool", {"tool_id": tool_id})
+    return success_response(data=result)
+
+
+@router.post("/ontology/kb-tools/{tool_id}/test", summary="试运行本库工具（真实调用对方接口）")
+async def test_kb_tool(request: Request, tool_id: str, payload: dict = Body(default={})):
+    payload["tool_id"] = tool_id
+    result = await _call_kb_capability(request, "test_kb_tool", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/extract-tools/preview", summary="试跑抽取期工具声明（真实调用一次工具，不写图）")
+async def preview_extract_tool(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "preview_extract_tool", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/actions/resolve-execution", summary="动作执行前解析（只读，不执行）")
+async def resolve_action_execution(request: Request, payload: dict = Body(...)):
+    """返回动作的契约状态、执行判定、绑定工具与参数计划（按读口径，供执行前预览）。
+
+    真正执行走 `POST /api/v1/ecosystem/ontology-actions/execute`：执行器代调用人调
+    knowledge_base 的 `prepare_action_execution`（同一份解析，按写口径判定），这里不执行。
+    """
+    result = await _call_kb_capability(request, "resolve_action_execution", payload)
+    return success_response(data=result)
+
+
 @router.get("/ontology/statistics", summary="本体 kb 维度统计")
 async def get_ontology_statistics(
     request: Request,
@@ -2849,6 +4485,25 @@ async def get_ontology_graph(
     return success_response(data=result)
 
 
+_ONTOLOGY_NEIGHBOR_DEPTH_MAX_DEFAULT = 3
+
+
+def _ontology_neighbor_depth_max() -> int:
+    """本体邻居展开的多跳深度上限（D11）。
+
+    每次请求现读 ``ONTOLOGY_NEIGHBOR_DEPTH_MAX``，缺失 / 非整数 / 小于 1 一律
+    回落默认 3；直接读环境变量而不在导入期解析，非法值不会让服务启动失败。
+    """
+    raw = os.getenv("ONTOLOGY_NEIGHBOR_DEPTH_MAX")
+    if raw is None:
+        return _ONTOLOGY_NEIGHBOR_DEPTH_MAX_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _ONTOLOGY_NEIGHBOR_DEPTH_MAX_DEFAULT
+    return value if value >= 1 else _ONTOLOGY_NEIGHBOR_DEPTH_MAX_DEFAULT
+
+
 @router.get("/ontology/neighbors", summary="实体一跳邻居展开（nodes + edges）")
 async def expand_ontology_neighbors(
     request: Request,
@@ -2856,14 +4511,42 @@ async def expand_ontology_neighbors(
     entity_type: str = Query(..., min_length=1, max_length=128, description="实体类型"),
     canonical_name: str = Query(..., min_length=1, max_length=512, description="实体规范名"),
     limit: int = Query(50, ge=1, le=200, description="邻居数量上限"),
+    depth: int = Query(
+        1,
+        ge=1,
+        description="多跳深度（1=直接邻居；上限由 ONTOLOGY_NEIGHBOR_DEPTH_MAX 控制，默认 3）",
+    ),
     document_id: Optional[str] = Query(None, description="按来源文档过滤邻居节点"),
 ):
-    """展开指定实体的一跳邻居，返回邻居节点与连接边，用于前端双击节点增量扩展"""
+    """展开指定实体的邻居（depth=1 为一跳），返回邻居节点与连接边，用于前端双击节点增量扩展"""
+    depth_max = _ontology_neighbor_depth_max()
+    if depth > depth_max:
+        # 上限随环境变量变化，无法写进 Query(le=...)，但要用 422 与 FastAPI 参数校验同口径
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "depth"),
+                    "msg": f"ensure this value is less than or equal to {depth_max}",
+                    "input": depth,
+                    "ctx": {"limit_value": depth_max},
+                }
+            ]
+        )
+    if document_id and depth > 1:
+        raise InvalidParameterError(
+            message=translate(
+                "err.kb.ontology_neighbor_depth_document_conflict",
+                fallback="document_id 仅支持一跳邻居展开（depth=1）",
+            ),
+            details={"document_id": document_id, "depth": depth},
+        )
     payload = OntologyNeighborRequest(
         knowledge_base_id=knowledge_base_id,
         entity_type=entity_type,
         canonical_name=canonical_name,
         limit=limit,
+        depth=depth,
         document_id=document_id,
     )
     result = await _call_kb_capability(request, "expand_ontology_neighbors", _schema_payload(payload))
@@ -3090,6 +4773,205 @@ async def reset_ingest_key(request: Request, ds_id: str):
     return success_response(data=result)
 
 
+@router.post("/data-sources/{ds_id}/lineage-import", summary="导入血缘边文件（JSON/CSV）")
+async def import_lineage_file(request: Request, ds_id: str,
+                              file: UploadFile = File(...)):
+    """把 ETL 来源的 JSON/CSV 血缘文件导入 `lineage_edges`（幂等 upsert，origin=platform）。
+
+    - 只接受 `.json` / `.csv`（解析在能力层做；扩展名不认 ⇒ 1001）；
+    - 单文件上限 5MB（**网关侧先挡**，不把大文件塞进 invoke body）；
+    - 单行坏不计入失败：`errors` 最多回前 20 条，其余行照常导入。
+    """
+    # 只多读 1 字节即可判超限：`await file.read()` 无参会把整个上传读进内存
+    #（5MB 的检查形同虚设，用户传 1GB 就先 OOM 一次）。
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise_from_capability_result({"success": False, "code": 1001,
+                                      "message": "文件过大（上限 5MB）"})
+    result = await _call_kb_capability(
+        request, "import_lineage_file",
+        {"ds_id": ds_id, "filename": file.filename or "",
+         "content_b64": base64.b64encode(raw).decode()},
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.post("/data-sources/{ds_id}/lineage-forbidden-suggest",
+             summary="从 1 跳血缘生成禁止同查建议")
+async def suggest_lineage_forbidden_pairs(request: Request, ds_id: str,
+                                          payload: dict = Body(...)):
+    body = {"ds_id": ds_id,
+            "knowledge_base_id": payload.get("knowledge_base_id")}
+    result = await _call_kb_capability(
+        request, "suggest_lineage_forbidden_pairs", body,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.get("/data-sources/{ds_id}/catalog", summary="读数据库数据源的库表结构")
+async def read_data_source_catalog(request: Request, ds_id: str):
+    """读取数据库数据源的表/列/主键/外键/注释。
+
+    只查 information_schema，**不读业务数据行**。仅 access_type=database 的数据源可用。
+    """
+    result = await _call_kb_capability(request, "read_data_source_catalog", {"ds_id": ds_id})
+    return success_response(data=result)
+
+
+@router.post("/data-sources/ask", summary="按问题查数据（NL→SQL，分源：一问一源一条 SQL）")
+async def ask_data_source(request: Request, payload: dict = Body(...)):
+    """把问句落到某个数据源的某张表上，生成并执行**一条只读 SQL**。
+
+    只读边界：连接池里必须登记 `readonly_user` / `readonly_password_ref`，
+    没登记就直接回「答不了」（fail-closed，绝不回退写凭据）。
+
+    **契约（③ 照这个判）**：成功 `{ok: true, data_source_id, source_name, entity_name,
+    sql, columns, rows, row_count, truncated, not_answerable: false}`；
+    答不了 `{ok: false, not_answerable: true, reason_code, reason, …}`。**按 `ok` 判成败**，
+    要区分「数据里没有」还是「这次坏了」就看 `reason_code`：
+
+    ⚠️ **上面两种形状说的是「这个源答不答得上来」，不是「这个接口的全部返回」**：
+    **调用方用错**（租户非法 / KB 不存在 / 问题为空或过长）走**错误信封**（4xx/5xx，
+    由 `ResourceNotFoundError` / `InvalidParameterError` 经全局异常处理器产出），
+    **不**是 `ok:false`；`ok:false` 只表示「这个源这次答不了」。③ 别把「KB id 拼错」
+    当成「这个源没数据」跳过 —— 那会把调用方的错误静悄悄咽掉。
+
+    | reason_code | 含义 | 是不是「重试可能有用」 |
+    | --- | --- | --- |
+    | `no_candidate` | 没命中任何已确认的数据实体（含对齐还没确认） | 否 |
+    | `ambiguous` | 命中多个实体，需要点名 | 否（回候选列表） |
+    | `entity_gone` | 实体在源里已不存在 | 否 |
+    | `no_readonly_creds` | 该源没登记只读凭据 | 否（要去登记） |
+    | `not_a_database_source` | 源不是 database 类型 / 引擎不支持 | 否 |
+    | `source_gone` | 数据源已被删（编译 schema 行还留着） | 否 |
+    | `not_answerable` | 模型认为这些列答不了这个问题 | 否 |
+    | `rejected_unsafe_sql` | 生成的 SQL 未过安全闸（**附 `rejected_sql`，绝不执行**） | 否 |
+    | `rejected_sensitive` | 生成的 SQL 被治理策略拒（密级/标签/行过滤，**附 `rejected_sql`**） | 否 |
+    | `llm_failed` | 生成 SQL 那次调用失败（超时/传输/坏答案） | **是** |
+    | `exec_failed` | 执行失败（连不上/超时/方言/权限，**附 `sql`**） | **是** |
+
+    ⚠️ **`truncated` 的确切语义是「行数上限由我们加上或收紧过」**，不是「返回的行被截断了」：
+    模型自己写 `LIMIT 5` 时它是 `false`，我们注入了 `TOP 200` 时它是 `true`。
+    ③ 若要用它表达「答案可能不完整」，得自己按 `row_count == NL2SQL_MAX_ROWS` 另判。
+
+    多源分派与「不合成统一数字」的呈现**不在这个接口**（那是 ③ 联邦编排）。
+
+    **可选 `hints`**（2026-10-28，A2）：`str` 或 `list[str]`，公式/口径/值映射；
+    服务端 `NL2SQL_HINTS=1` 时注入 payload/提示词，默认关（忽略）。超限/类型错 → 1001。
+
+    **可选 `evolution_run_id`**：演化基准标记（演化台合成流量用）。空 / 缺省 = 普通提问，
+    行为逐字节不变。非空时仅当指向本租户 `status ∈ {running, adopting}` 的 run 且调用方
+    身份是 `evolution` 才生效：观测打 `evolution_bench` 标记并跳过审计；普通调用方照常审计。
+    """
+    result = await _call_kb_capability(request, "ask_data_source", payload)
+    return success_response(data=result)
+
+
+@router.post("/metrics/ask", summary="按已登记指标确定性问数（W4.1，不调 LLM）")
+async def ask_metric(request: Request, payload: dict = Body(...)):
+    """指标优先的确定性问数：匹配 → 编译 → 安全/治理 → 只读执行 → 基础溯源。
+
+    **不猜意图**：`group_by` / `time_grain` 由调用方显式给；同一问题命中多个
+    同等指标或落点时回 `ambiguous_*` + 候选，不自动挑一个。
+
+    契约：成功 `{ok:true, mode:"metric", metric, sql, columns, rows, row_count,
+    truncated, provenance}`；答不了 `{ok:false, not_answerable:true, reason_code,
+    reason, …}`。调用方用错（空问题/KB 不存在/参数类型错）仍走 4xx 错误信封。
+    """
+    result = await _call_kb_capability(request, "ask_metric", payload)
+    return success_response(data=result)
+
+
+@router.post("/data-sources/{ds_id}/generate-schema", summary="由库表结构生成该数据源的 schema")
+async def generate_data_source_schema(request: Request, ds_id: str):
+    """读该数据源的库表结构 → 生成 → 落成**数据源级**的一份 compiled schema。
+
+    与知识库级那份互不影响：写的是 `data_source_id = ds_id` 那一行，
+    KB 级（`data_source_id IS NULL`）原封不动。这正是「一个知识库多个数据源」的粒度。
+
+    生成过程**失败不落库**：读 catalog / 调生成器任何一步出错都会抛出，
+    不会留下半份 schema。
+
+    默认在 knowledge-base 进程内生成（`jonex_core.capability.atomic.schema_gen`）；
+    只有 `SCHEMA_GEN_BACKEND=remote` 时才需要 `ONTO_INTEL_BASE` 指向
+    onto-intelligent 的路由器 `POST {ONTO_INTEL_BASE}/schema-gen`。
+    """
+    result = await _call_kb_capability(request, "generate_ds_schema", {"ds_id": ds_id})
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 平台级数据源连接池 /api/v1/knowledge-base/data-source-connections
+#
+# 与上面 /data-sources 的区别：那些是**知识库引用**（每库一份、绑 kb_id），
+# 这些是**领域级连接**（按 space_id 隔离、同领域内可被多个知识库引用）。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/data-source-connections", summary="连接池列表（按领域空间隔离，space_id 必填）")
+async def list_ds_connections(request: Request,
+                              space_id: str = Query(..., min_length=1)):
+    result = await _call_kb_capability(request, "list_ds_connections",
+                                       {"space_id": space_id})
+    return success_response(data=result)
+
+
+@router.post("/data-source-connections", summary="创建连接（必须带 space_id，不含 knowledge_base_id）")
+async def create_ds_connection(request: Request, payload: dict = Body(...)):
+    """建一条可复用的数据库连接。
+
+    **不接收 `knowledge_base_id`**：连接挂在 `space_id` 领域的连接池里，
+    要接哪个库由该领域下的知识库「添加数据源」时选。
+    """
+    result = await _call_kb_capability(request, "create_ds_connection", payload)
+    return success_response(data=result)
+
+
+@router.get("/data-source-connections/{conn_id}", summary="连接详情")
+async def get_ds_connection(request: Request, conn_id: str,
+                            space_id: str = Query(..., min_length=1)):
+    """`config_json` 里的 `password_ref` 恒为 `***`，密文不出库。"""
+    result = await _call_kb_capability(request, "get_ds_connection",
+                                       {"conn_id": conn_id, "space_id": space_id})
+    return success_response(data=result)
+
+
+@router.patch("/data-source-connections/{conn_id}", summary="更新连接（含改密码）")
+async def update_ds_connection(request: Request, conn_id: str,
+                               payload: dict = Body(...),
+                               space_id: str = Query(..., min_length=1)):
+    """只传要改的字段。`config_json` 里不带 `password` 就保留原密码。"""
+    payload["conn_id"] = conn_id
+    payload["space_id"] = space_id
+    result = await _call_kb_capability(request, "update_ds_connection", payload)
+    return success_response(data=result)
+
+
+@router.delete("/data-source-connections/{conn_id}", summary="删除连接（有引用则 400）")
+async def delete_ds_connection(request: Request, conn_id: str,
+                               space_id: str = Query(..., min_length=1)):
+    """被知识库引用时返回 400 并列出引用的库名，**不静默级联删**。"""
+    result = await _call_kb_capability(request, "delete_ds_connection",
+                                       {"conn_id": conn_id, "space_id": space_id})
+    return success_response(data=result)
+
+
+@router.post("/data-source-connections/{conn_id}/test", summary="测试连接")
+async def test_ds_connection(request: Request, conn_id: str,
+                             space_id: str = Query(..., min_length=1)):
+    result = await _call_kb_capability(request, "test_ds_connection",
+                                       {"conn_id": conn_id, "space_id": space_id})
+    return success_response(data=result)
+
+
+@router.get("/data-source-connections/{conn_id}/catalog", summary="读库表结构（看表数）")
+async def read_ds_connection_catalog(request: Request, conn_id: str,
+                                     space_id: str = Query(..., min_length=1)):
+    """只查 information_schema，不读业务数据行。平台页用它显示「这个连接有多少张表」。"""
+    result = await _call_kb_capability(request, "read_ds_connection_catalog",
+                                       {"conn_id": conn_id, "space_id": space_id})
+    return success_response(data=result)
+
+
 # ════════════════════════════════════════════════════════════
 # 解析引擎设置 /api/v1/knowledge-base/parser-settings
 # ════════════════════════════════════════════════════════════
@@ -3119,6 +5001,29 @@ async def update_parser_setting(request: Request, setting_id: str, payload: dict
 @router.delete("/parser-settings/{setting_id}", summary="删除解析引擎设置")
 async def delete_parser_setting(request: Request, setting_id: str):
     result = await _call_kb_capability(request, "delete_parser_setting", {"setting_id": setting_id})
+    return success_response(data=result)
+
+# ════════════════════════════════════════════════════════════
+# KB 级模型配置 /api/v1/knowledge-base/model-settings
+#
+# 只覆盖解析/编译两个阶段的 3 个 scope（多模态理解 / 本体抽取 / Wiki 编译）；
+# 查询侧模型与向量化不由这里配置（见 docs/knowledge-base/kb-model-settings-design.md）。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/model-settings", summary="知识库模型配置")
+async def list_model_settings(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "list_model_settings", {"knowledge_base_id": knowledge_base_id}
+    )
+    return success_response(data=result)
+
+
+@router.put("/model-settings", summary="保存知识库模型配置（空值即清除覆盖）")
+async def save_model_settings(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "save_model_settings", payload)
     return success_response(data=result)
 
 
@@ -3213,6 +5118,98 @@ async def ingest_push(
         external_id=external_id,
     )
     return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# OpenLineage 血缘事件（ETL 来源）—— 免用户 JWT，鉴权用 X-Ingest-Key（能力侧校验）
+# ════════════════════════════════════════════════════════════
+
+lineage_ingest_router = APIRouter()
+
+# 公开端点（免 JWT）：事件体按字节上限收口。`Request.body()` 本身无上限，
+# 先把整包读进内存再判——2MB 足够容纳数千条 columnLineage 边，同时挡住打满网关内存的超大请求。
+_LINEAGE_EVENT_MAX_BYTES = 2 * 1024 * 1024
+
+
+async def _call_kb_capability_lineage_ingest(
+    ds_id: str,
+    ingest_key: str,
+    event: dict,
+) -> dict:
+    """调内部 ingest_lineage_event action。从 ingest key 解析租户传给 Sidecar。"""
+    from jonex_core.common.crypto import decode_ingest_key
+    key_info = decode_ingest_key(ingest_key) or {}
+    # 校验 key 中的 ds_id 与 URL 中的一致
+    if key_info.get("ds_id") and key_info["ds_id"] != ds_id:
+        raise InvalidApiKeyError(message=translate("err.ingest.key_mismatch", fallback="ingest key 与数据源不匹配"))
+    tenant_id = key_info.get("tenant_id")
+    if not tenant_id:
+        raise InvalidApiKeyError(message=translate("err.ingest.key_invalid", fallback="ingest key 无效"))
+    config = get_config()
+    sidecar_payload = {
+        "capability_id": "business.knowledge_base.v1",
+        "tenant_id": tenant_id,
+        "payload": {
+            "action": "ingest_lineage_event",
+            "data": {
+                "ds_id": ds_id,
+                "ingest_key": ingest_key,
+                "event": event,
+            },
+        },
+    }
+    headers = {"X-API-Key": config.GATEWAY_API_KEY}
+    transmit_locale_header(headers)
+    timeout = float(os.getenv("GATEWAY_SIDECAR_TIMEOUT", "180"))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{config.SIDECAR_URL}/invoke", json=sidecar_payload, headers=headers)
+    result = resp.json()
+    if resp.status_code != 200 or not result.get("success", False):
+        raise_from_capability_result(result)
+    return result.get("data") or {}
+
+
+@lineage_ingest_router.post("/lineage/ingest/{ds_id}", summary="OpenLineage 血缘事件入库")
+async def ingest_lineage_event(
+    request: Request,
+    ds_id: str,
+    x_ingest_key: Optional[str] = Header(None, alias="X-Ingest-Key"),
+    authorization: Optional[str] = Header(None),
+):
+    # 两种携带方式等价：`X-Ingest-Key`（平台约定）或 `Authorization: Bearer <key>`。
+    # 后者是 OpenLineage HTTP transport 的唯一鉴权形式（`OPENLINEAGE_API_KEY` 固定发
+    # Bearer），不兼容就得为 Airflow 再加一层头转换代理。两处取的都是同一个一次性
+    # ingest key，鉴权强度不变。
+    ingest_key = str(x_ingest_key or "").strip()
+    if not ingest_key and authorization:
+        scheme, _, token = str(authorization).partition(" ")
+        if scheme.lower() == "bearer":
+            ingest_key = token.strip()
+    if not ingest_key:
+        raise InvalidApiKeyError(
+            message=translate("err.ingest.key_missing", fallback="缺少 ingest key"))
+    raw = await request.body()
+    if len(raw) > _LINEAGE_EVENT_MAX_BYTES:
+        raise InvalidParameterError(
+            message=translate("err.lineage.event_too_large", fallback="事件体超过 2MB 限制")
+        )
+    try:
+        body = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 —— 请求体不是合法 JSON
+        raise InvalidParameterError(
+            message=translate("err.lineage.event_json_invalid", fallback="请求体必须是合法 JSON 对象")
+        ) from exc
+    # 合法 JSON 但不是对象（`[]` / `null` / `0` / `"x"`）同样 1001：
+    # 能力层 `d.get("event") or {}` 会把它们兜成空 dict → 静默 200 success，
+    # 调用方看不出自己发错了形状。必须在网关就挡住。
+    if not isinstance(body, dict):
+        raise InvalidParameterError(
+            message=translate("err.lineage.event_json_invalid", fallback="请求体必须是合法 JSON 对象")
+        )
+    # 与 `ingest_push` 同一口径：公开端点也必须回标准信封（success/code/message/data），
+    # 不能把能力层 `data` 裸 dict 直接当 HTTP 响应（那样调用方拿不到 success 判定）。
+    return success_response(data=await _call_kb_capability_lineage_ingest(
+        ds_id, ingest_key, body))
 
 
 @ingest_router.get("/documents/{document_id}/raw", summary="原文查看（token 或 JWT 鉴权；302 / 本地流式 / 同源代理）")
@@ -3339,13 +5336,175 @@ async def get_raw_document(
     )
 
 
+@ingest_router.get("/wiki/media/{asset_id}", summary="读取固定发布版本的 Wiki 图片")
+async def get_wiki_media(request: Request, asset_id: str,
+                         knowledge_base_id: str = Query(..., min_length=1),
+                         document_id: str = Query(..., min_length=1),
+                         graph_revision: str = Query(..., min_length=64, max_length=64),
+                         token: Optional[str] = None):
+    if token:
+        info = verify_view_token(token)
+        if not info or info.get("doc_id") != document_id:
+            raise InvalidApiKeyError(message="查看票据无效或已过期")
+        tenant_id = info["tenant_id"]
+    else:
+        if not _extract_user_id(request):
+            raise InvalidApiKeyError(message="需要登录或查看票据")
+        tenant_id = extract_tenant_id(request)
+    result = await _call_kb_capability(request, "get_wiki_media", {
+        "knowledge_base_id": knowledge_base_id, "document_id": document_id,
+        "graph_revision": graph_revision, "asset_id": asset_id, "include_content": True}, tenant_id=tenant_id)
+    import base64
+    return Response(content=base64.b64decode(result["content_base64"], validate=True),
+                    media_type=result["mime_type"], headers={"X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "private, no-store", "ETag": '"' + result["sha256"] + '"'})
+
+
+@ingest_router.get("/wiki/images/{asset_id}", summary="按图片票据流式读取 Wiki 原文图片")
+async def get_wiki_image(request: Request, asset_id: str,
+                         knowledge_base_id: str = Query(..., min_length=1),
+                         document_id: str = Query(..., min_length=1),
+                         revision: str = Query(..., min_length=64, max_length=64),
+                         variant: str = "preview", token: Optional[str] = None):
+    from jonex_core.common.wiki_images import verify_image_ticket
+    info = verify_image_ticket(token or '', knowledge_base_id, document_id, revision, asset_id, variant)
+    if not info:
+        raise InvalidApiKeyError(message="图片查看票据无效或已过期，请刷新页面")
+    # Recheck current KB access for the ticket's actor. Possessing a stale URL
+    # must not bypass permission revocation, even before the short ticket expires.
+    located = await _call_kb_capability(request, "query_wiki_resources", {
+        "knowledge_base_id": knowledge_base_id, "operation": "get_image",
+        "options": {"revision": revision, "asset_id": asset_id, "document_id": document_id}},
+        tenant_id=info['tid'], user_id=info['uid'])
+    if located['image']['document_id'] != document_id:
+        raise InvalidApiKeyError(message="图片与查看票据不匹配")
+    config = get_config()
+    client = httpx.AsyncClient(timeout=30, trust_env=False)
+    headers = {"X-API-Key": config.JONEX_WIKI_API_KEY, "X-Tenant-ID": info['tid']}
+    for key in ('range', 'if-range', 'if-none-match'):
+        if request.headers.get(key): headers[key] = request.headers[key]
+    url = config.JONEX_WIKI_URL.rstrip('/') + '/reader/images/' + quote(knowledge_base_id, safe='') + '/' + quote(asset_id, safe='')
+    try:
+        upstream = await client.send(client.build_request('GET', url, params={
+            'revision': revision, 'document_id': document_id, 'variant': variant}, headers=headers), stream=True)
+    except BaseException:
+        await client.aclose()
+        raise
+    if upstream.status_code not in {200, 206, 304, 416}:
+        status = upstream.status_code
+        await upstream.aclose(); await client.aclose()
+        return Response(status_code=status)
+    response_headers = {k: v for k, v in upstream.headers.items() if k.lower() in {
+        'content-length', 'content-range', 'accept-ranges', 'etag', 'cache-control',
+        'content-type', 'content-disposition', 'x-content-type-options'}}
+    # Ticket requests always traverse authorization again; a revoked user must
+    # not keep loading a browser-cached image. ETag still supports cheap 304s.
+    response_headers['cache-control'] = 'private, no-cache'
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes(): yield chunk
+        finally:
+            await upstream.aclose(); await client.aclose()
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=response_headers)
+
+
+@ingest_router.get("/wiki/resource-media/{object_id}", summary="按发布版本与范围读取音视频或关键帧")
+async def get_wiki_resource_media(request: Request, object_id: str,
+                                  knowledge_base_id: str = Query(..., min_length=1),
+                                  document_id: str = Query(..., min_length=1),
+                                  revision: str = Query(..., min_length=64, max_length=64),
+                                  token: Optional[str] = None):
+    if token:
+        info = verify_view_token(token)
+        if not info or info.get("doc_id") != document_id:
+            raise InvalidApiKeyError(message="查看票据无效或已过期")
+        tenant_id = info["tenant_id"]
+    else:
+        if not _extract_user_id(request):raise InvalidApiKeyError(message="需要登录或查看票据")
+        tenant_id = extract_tenant_id(request)
+    located = await _call_kb_capability(request, "query_wiki_resources", {
+        "knowledge_base_id": knowledge_base_id, "operation": "get_media_segment",
+        "options": {"revision": revision, "object_id": object_id}}, tenant_id=tenant_id)
+    if located["segment"]["document_id"] != document_id:
+        raise InvalidApiKeyError(message="资源与查看票据不匹配")
+    config = get_config()
+    client = httpx.AsyncClient(timeout=60)
+    headers = {"X-API-Key": config.JONEX_WIKI_API_KEY, "X-Tenant-ID": tenant_id}
+    for key in ("range", "if-range", "if-none-match"):
+        if request.headers.get(key):headers[key] = request.headers[key]
+    url = config.JONEX_WIKI_URL.rstrip("/") + "/reader/media/" + quote(knowledge_base_id, safe="") + "/" + quote(object_id, safe="")
+    try:
+        upstream = await client.send(client.build_request("GET", url, params={"revision": revision}, headers=headers), stream=True)
+    except BaseException:
+        await client.aclose();raise
+    if upstream.status_code not in {200, 206, 304, 416}:
+        status = upstream.status_code;await upstream.aclose();await client.aclose()
+        return Response(status_code=status)
+    response_headers = {key: value for key, value in upstream.headers.items() if key.lower() in {
+        "content-length", "content-range", "accept-ranges", "etag", "cache-control", "content-type", "content-disposition", "x-content-type-options"}}
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes():yield chunk
+        finally:
+            await upstream.aclose();await client.aclose()
+    return StreamingResponse(body(), status_code=upstream.status_code, headers=response_headers)
+
+
 @ingest_router.get("/documents/{document_id}/assets/{image_idx}", summary="图片资产查看（token 或 JWT 鉴权；302 / 本地流式）")
+async def _proxy_presigned_stream(presigned: str, request: Request, media_type: str):
+    """同源代理一个预签名 URL 的字节（Range 透传）—— 图片/资产端点共用。
+
+    与 `/documents/{id}/raw?proxy=1` 的代理同口径：`local_address="0.0.0.0"` 强制
+    IPv4（容器 DNS 可能同时给 IPv6，httpx 优先拨 IPv6 且不 fallback）。
+    """
+    range_header = request.headers.get("range")
+    upstream_headers = {"Range": range_header} if range_header else {}
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=None),
+        follow_redirects=True,
+        transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+    )
+    try:
+        upstream = await client.send(
+            client.build_request("GET", presigned, headers=upstream_headers),
+            stream=True,
+        )
+    except Exception:
+        await client.aclose()
+        raise
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    headers = {
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+    }
+    if "content-range" in upstream.headers:
+        headers["Content-Range"] = upstream.headers["content-range"]
+    if "content-length" in upstream.headers:
+        headers["Content-Length"] = upstream.headers["content-length"]
+    return StreamingResponse(
+        _stream(), status_code=upstream.status_code, media_type=media_type,
+        headers=headers,
+    )
+
+
+@ingest_router.get("/documents/{document_id}/assets/{image_idx}", summary="图片资产查看（token 或 JWT 鉴权；302 / 同源代理 / 本地流式）")
+
 async def get_raw_document_asset(
     request: Request,
     document_id: str,
     image_idx: int,
     ext: Optional[str] = Query(None, description="图片扩展名（检索侧 aext 旁路值；缺省按白名单兜底 png）"),
     token: Optional[str] = Query(None, description="短时查看 token（图片 <img> 直连用）"),
+    proxy: bool = Query(False, description="同源代理：网关流式透传对象存储字节（S3/MinIO 预签名直连地址浏览器不可达时用）"),
 ):
     """[jonex] §image-refs P2-4: 获取文档内嵌图片资产原文。
 
@@ -3373,6 +5532,11 @@ async def get_raw_document_asset(
     )
     presigned = loc.get("presigned_url")
     if presigned:
+        if proxy:
+            # 同源代理：S3/MinIO 部署下预签名地址常是**部署内域名**（如 minio:9000），
+            # 浏览器解析不了 → 图片全挂；由网关在服务端取字节后同源返回。
+            return await _proxy_presigned_stream(
+                presigned, request, _safe_inline_media_type(loc.get("mime_type")))
         # COS：浏览器直连，<img> 加载无 CORS 门槛
         return RedirectResponse(url=presigned, status_code=302)
 

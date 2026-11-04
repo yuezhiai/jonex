@@ -12,20 +12,28 @@
   - 零 import jonex_core——所有 KB 交互通过 HTTP 调 Gateway
   - Tool handler 签名不含 request、tenant_id、mcp_key_id——从 contextvar 获取
 """
+import asyncio
 import logging
 import os
 import re
+import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import wraps
+from uuid import uuid4
 
 import httpx
+from mcp.types import CallToolResult, TextContent
 
 from auth import (
+    SYSTEM_SERVICE_ID,
     McpAuthContext,
     McpAuthError,
     require_kb_scope,
     require_mcp_auth,
     require_write_scope,
+    touch_service_call_async,
 )
 from config import settings
 
@@ -53,6 +61,102 @@ class McpToolError(Exception):
         self.message = message
         self.data = data
         super().__init__(message)
+
+
+# ============================================================================
+# Block 0.5: MCP 工具名请求级上下文
+# ============================================================================
+
+# 当前正在执行的 MCP 公开工具名。工具入口装饰器负责 set/reset，
+# `call_gateway_ext()` 在出口读取并上报；handler 签名因此无需新增参数，
+# fallback / 多 KB 循环也自动继承同一个工具名。
+_current_mcp_tool: ContextVar[str | None] = ContextVar("current_mcp_tool", default=None)
+
+
+def _set_current_mcp_tool(name: str | None):
+    """写入当前工具名，返回供复位用的 token。"""
+    return _current_mcp_tool.set(name)
+
+
+def _reset_current_mcp_tool(token) -> None:
+    """按 token 复位当前工具名（成功与异常路径都必须成对调用）。"""
+    _current_mcp_tool.reset(token)
+
+
+def _mcp_error_result(code: int, message: str, data: dict | None = None) -> CallToolResult:
+    """把工具侧错误翻译成带机器可读码值的 ``CallToolResult``。
+
+    为什么不是 JSON-RPC error 对象：MCP 规范里 tool 执行错误本就该走
+    ``isError=true``，JSON-RPC error 留给协议层错误。MCP Python SDK 只有一个
+    逃生口 —— ``UrlElicitationRequiredError``（-32042）会被 lowlevel server
+    re-raise 成 JSON-RPC error，但劫持它语义错误（客户端会误触发 URL
+    elicitation 流程），所以不走。
+
+    SDK 的 ``Tool.run`` 会把未捕获异常包成 ``ToolError("Error executing tool
+    xxx: ...")`` —— 文本没了码值、还多一层前缀；lowlevel server 随后只把它
+    转成 ``CallToolResult(isError=True)``，没有 code 位置。把 tool 返回的
+    ``CallToolResult`` 原样透传（``func_metadata.convert_result`` 与 lowlevel
+    server 两条路径都认）是唯一不改 SDK 又能带上码值的出口。
+
+    ``structuredContent`` 承载 ``{code, message, data}``，``content`` 保留人类
+    可读文本以兼容只读文本的老客户端。``data`` 缺省补 ``{}``，避免客户端读
+    不到键；限流场景的 ``retry_after`` 就在 ``data`` 里。
+
+    接收通用参数而不是异常对象，是因为两类异常要共用同一出口：
+      - ``McpToolError``：码值自带（-32602 / -32000 / -32001 / -32002 / -32003），
+        ``data`` 原样透传（如 ``retry_after``）；
+      - ``McpAuthError``：只有 HTTP ``status_code``（401/403），统一映射为契约
+        约定的 ``-32002``（「认证 / 授权失败」），原始状态码放
+        ``data.status_code`` 供客户端区分「不在授权范围」(401) 与「权限级别
+        不够」(403)；不把 HTTP 码当 MCP 码用，避免两套语义混在一起。
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=message)],
+        structuredContent={"code": code, "message": message, "data": data or {}},
+        isError=True,
+    )
+
+
+def _inject_mcp_tool(name: str):
+    """装饰 MCP 工具入口：执行期间注入工具名，返回前复位；统一翻译工具错误。
+
+    ``name`` 必须与 ``app.py`` 中 ``@mcp.tool()`` 注册的公开名一致；
+    装饰器把它写入 ``__mcp_tool_name__``，供静态覆盖测试断言「新增工具漏注入」。
+
+    全部 15 个工具都罩在这层下，故工具错误的线上翻译只此一处，两类异常共用
+    ``_mcp_error_result``：
+      - ``McpToolError`` → 用它自带的码值 / data；
+      - ``McpAuthError``（handler 内 ``require_mcp_auth`` / ``require_write_scope``
+        / ``_check_service_scope`` 抛出）→ 统一 ``-32002``，原始 401/403 放
+        ``data.status_code``。
+
+    ⚠ 边界：``McpAuthMiddleware`` 在工具装饰器作用域**之外**（MCP 请求分发前），
+    它捕获 ``McpAuthError`` 后仍返回 HTTP 401 JSON，本装饰器不接触那条路径；
+    这里只翻译「工具 handler 执行期间」抛出的鉴权异常。
+
+    ``finally`` 必须留在两个 ``except`` 之后，保证异常路径也按 token 复位
+    ContextVar，不污染同请求内的后续调用。
+    """
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            token = _set_current_mcp_tool(name)
+            try:
+                return await func(*args, **kwargs)
+            except McpToolError as e:
+                return _mcp_error_result(e.code, e.message, e.data)
+            except McpAuthError as e:
+                return _mcp_error_result(
+                    _ERROR_AUTH, e.message, {"status_code": e.status_code}
+                )
+            finally:
+                _reset_current_mcp_tool(token)
+
+        wrapper.__mcp_tool_name__ = name
+        return wrapper
+
+    return decorator
 
 
 # ============================================================================
@@ -103,13 +207,19 @@ def _resp_biz_code(resp) -> int | None:
     return None
 
 
-async def call_gateway(
+async def call_gateway_ext(
     action: str,
     tenant_id: str,
     mcp_key_id: str,
     data: dict | None = None,
-) -> dict:
-    """向 Gateway /internal/kb/invoke 发送请求，返回 capability 响应 data 部分。
+    *,
+    report_tool: bool = True,
+) -> tuple[dict, str | None]:
+    """向 Gateway /internal/kb/invoke 发送请求，返回 (capability 响应 data, request_id)。
+
+    `request_id` 取自 Gateway 响应顶层，与 Sidecar 能力信封及
+    `search_request_event.request_id` 同源；检索工具把它返回给调用方，
+    作为提交该次检索反馈的锚点。旧 Gateway 响应不带顶层 request_id 时为 None。
 
     异常统一转换为 McpToolError(code=-32000, message="知识库服务暂不可用")，
     消息脱敏，不暴露 Gateway URL、堆栈、内部错误详情。
@@ -119,24 +229,38 @@ async def call_gateway(
         tenant_id: 租户 ID（从 McpAuthContext 获取）
         mcp_key_id: MCP Key ID（从 McpAuthContext 获取，用于审计）
         data: action 所需参数（可选）
+        report_tool: 是否上报当前 MCP 工具名（默认 True）。工具 handler 内部
+            的前置校验调用（如 ``get_service`` 取 kb_ids）传 False。
+            ⚠ 语义归属在 Gateway（``_INTERNAL_CHECK_ACTIONS`` 会省略
+            ``context.source="mcp"``，使其落成普通 invoke 记录）；MCP 侧这层
+            只是 belt-and-braces 双保险，任一层回归都不会让同名记录复发。
+            真实业务 action 调用保持默认 True，同一工具的多 action / 多 KB
+            循环仍归属该工具。
 
     Returns:
-        dict: capability 响应数据
+        tuple: (capability 响应数据, 能力信封 request_id 或 None)
 
     Raises:
         McpToolError(code=-32000): 知识库服务不可用（HTTP 错误 / 超时 / 传输错误 / 业务失败）
         McpToolError(code=-32003): 内容重复（409 + 业务码 1003），调用方应按「已存在」处理而非重试
     """
     client = await get_http_client()
+    body: dict = {
+        "action": action,
+        "tenant_id": tenant_id,
+        "mcp_key_id": mcp_key_id,
+        "data": data or {},
+    }
+    # 工具名只在 MCP 工具调用栈内上报；无值时完全省略该键，
+    # 兼容尚未识别该字段的旧网关（不要把 null 发出去）。``report_tool=False``
+    # 用于工具内部前置校验调用：仍走同一出口与错误映射，但不打工具标记。
+    mcp_tool = _current_mcp_tool.get() if report_tool else None
+    if mcp_tool:
+        body["mcp_tool"] = mcp_tool
     try:
         resp = await client.post(
             "/internal/kb/invoke",
-            json={
-                "action": action,
-                "tenant_id": tenant_id,
-                "mcp_key_id": mcp_key_id,
-                "data": data or {},
-            },
+            json=body,
             headers={
                 "X-Internal-API-Key": settings.INTERNAL_API_KEY,
                 "X-Tenant-ID": tenant_id,
@@ -235,9 +359,47 @@ async def call_gateway(
         mcp_code = _ERROR_INVALID_PARAMS if isinstance(biz_code, int) and 1000 <= biz_code < 2000 else _ERROR_INTERNAL
         raise McpToolError(code=mcp_code, message="知识库服务暂不可用")
 
+    request_id = result.get("request_id") if isinstance(result, dict) else None
+
     # 提取 data 字段（标准 success_response 格式），否则返回原始结果
     if isinstance(result, dict) and "data" in result:
-        return result["data"]
+        return result["data"], request_id
+    return result, request_id
+
+
+async def call_gateway(
+    action: str,
+    tenant_id: str,
+    mcp_key_id: str,
+    data: dict | None = None,
+    *,
+    report_tool: bool = True,
+) -> dict:
+    """向 Gateway /internal/kb/invoke 发送请求，只返回 capability 响应 data 部分。
+
+    需要能力信封 `request_id` 时用 `call_gateway_ext`。错误映射与
+    `call_gateway_ext` 完全一致。``report_tool`` 语义见 `call_gateway_ext`：
+    工具内部前置校验调用传 False，避免被当成一次真实 MCP 工具调用。
+    """
+    result, _ = await call_gateway_ext(
+        action, tenant_id, mcp_key_id, data, report_tool=report_tool
+    )
+    return result
+
+
+async def _call_search_gateway(action: str, auth, payload: dict) -> dict:
+    """检索类 action 的统一出口：调 Gateway 并把能力信封 request_id 附在响应顶层。
+
+    `request_id` 是本次检索在 `search_request_event` 里的锚点，调用方提交
+    检索反馈时回传它。
+    """
+    # 服务目录「最近调用时间」：所有检索类工具都带 service_id
+    touch_service_call_async(auth.tenant_id, (payload or {}).get("service_id"))
+    result, request_id = await call_gateway_ext(
+        action, auth.tenant_id, auth.key_id, payload
+    )
+    if isinstance(result, dict):
+        result["request_id"] = request_id
     return result
 
 
@@ -297,16 +459,16 @@ async def _check_service_scope(
 
 
 def _validate_file_name(file_name: str) -> str:
-    """Validate file_name for safety: non-empty, no path traversal characters.
+    """校验 file_name 安全性：非空、不含路径穿越字符。
 
     Args:
-        file_name: The uploaded file name from MCP client (untrusted).
+        file_name: MCP 客户端上传的文件名（不可信输入）。
 
     Returns:
-        str: Trimmed safe file name.
+        str: 去除首尾空格后的安全文件名。
 
     Raises:
-        McpToolError(code=-32602): file_name empty or contains path traversal chars.
+        McpToolError(code=-32602): file_name 为空或包含路径穿越字符。
     """
     name = file_name.strip()
     if not name:
@@ -330,6 +492,7 @@ def _grant_mode_for_kb(auth: McpAuthContext, kb_id: str) -> str | None:
     return None
 
 
+@_inject_mcp_tool("confirm_upload")
 async def confirm_upload(
     service_id: str,
     file_name: str,
@@ -338,9 +501,9 @@ async def confirm_upload(
     doc_id: str = "",
     mime_type: str = "",
 ) -> dict:
-    """Confirm a COS direct upload and trigger parsing/indexing via MCP.
+    """确认 COS 直传并触发解析/索引（直传闭环的确认步骤）。
 
-    直传闭环的确认步骤（真实文件上传推荐走这条链路）：
+    直传闭环（真实文件上传推荐走这条链路）：
       1) 先调 generate_upload_url 拿预签名 PUT URL + storage_key；
       2) 客户端把字节直传对象存储；
       3) 再调本工具传 storage_key 确认入库并触发解析/索引。
@@ -349,20 +512,20 @@ async def confirm_upload(
     对真实文档不适用。
 
     Args:
-        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
-        file_name: Original file name (untrusted, validated for traversal).
-        knowledge_base_id: Target knowledge base ID.
+        service_id: 领域服务 ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
+        file_name: 原始文件名（不可信输入，需做路径穿越校验）。
+        knowledge_base_id: 目标知识库 ID。
         storage_key: COS storage key（generate_upload_url 返回），直传后确认入库。
         doc_id: generate_upload_url 返回的文档 ID（可选，确认入库元数据）。
-        mime_type: Optional MIME type (default: "").
+        mime_type: 可选 MIME 类型（默认 ""）。
 
     Returns:
-        dict: Document metadata (doc_id, file_name, knowledge_base_id, status).
+        dict: 文档元数据（doc_id、file_name、knowledge_base_id、status）。
 
     Raises:
-        McpToolError(code=-32602): Parameter validation failure.
-        McpAuthError(401): Not authenticated / missing "write" permission / KB not in scope.
-        McpToolError(code=-32000): Gateway error / timeout / transport failure.
+        McpToolError(code=-32602): 参数校验失败。
+        McpAuthError(401): 未认证 / 缺少 "write" 权限 / KB 不在授权范围。
+        McpToolError(code=-32000): Gateway 错误 / 超时 / 传输失败。
     """
     # Step 1 — Parameter non-empty validation
     if not service_id or not service_id.strip():
@@ -378,6 +541,8 @@ async def confirm_upload(
     # Step 3 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
     # 写 Key 无 mcp_key_service_mappings，_check_service_scope 恒 401；写入范围由 grants 表达。
     auth = require_mcp_auth("write")  # 写授权看 write_grants
+    # 服务目录「最近调用时间」：写工具统一归因到内置「知识写入」服务
+    touch_service_call_async(auth.tenant_id, SYSTEM_SERVICE_ID)
     kb_id = knowledge_base_id.strip()
     # 方案 1：specified 目录级写入暂不支持 MCP 上传，显式拒绝而非静默 401
     if _grant_mode_for_kb(auth, kb_id) == "specified":
@@ -409,6 +574,7 @@ async def confirm_upload(
     )
 
 
+@_inject_mcp_tool("generate_upload_url")
 async def generate_upload_url(
     service_id: str,
     knowledge_base_id: str,
@@ -416,29 +582,28 @@ async def generate_upload_url(
     content_type: str = "",
     file_size: int = 0,
 ) -> dict:
-    """Generate a COS presigned upload URL for direct-to-storage upload.
+    """生成 COS 预签名上传 URL，用于文件直传对象存储。
 
-    Returns a presigned PUT URL so MCP clients can upload large files directly
-    to object storage (e.g. ``curl -X PUT --upload-file <file> <upload_url>``).
-    After the bytes are uploaded, call confirm_upload to confirm and trigger
-    parsing/indexing.
+    返回预签名 PUT URL，MCP 客户端可把大文件直接传到对象存储
+    （例如 ``curl -X PUT --upload-file <file> <upload_url>``）。
+    字节上传完成后，必须调用 confirm_upload 确认入库并触发解析/索引。
 
     Args:
-        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
-        knowledge_base_id: Target knowledge base ID.
-        file_name: Original file name (untrusted, validated for traversal).
-        content_type: Optional MIME type (default: "").
-        file_size: Optional byte size to upload (default: 0 = unknown). When > 0,
-            the size is validated against the server cap and signed into the
-            Content-Length header, locking the exact byte count of the PUT.
+        service_id: 领域服务 ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
+        knowledge_base_id: 目标知识库 ID。
+        file_name: 原始文件名（不可信输入，需做路径穿越校验）。
+        content_type: 可选 MIME 类型（默认 ""）。
+        file_size: 可选，待上传字节数（默认 0 = 未知）。大于 0 时，
+            服务端会校验上限并把 Content-Length 签入预签名，
+            锁死 PUT 的精确字节数。
 
     Returns:
-        dict: {doc_id, storage_key, upload_url, storage_backend}.
+        dict: {doc_id, storage_key, upload_url, storage_backend}。
 
     Raises:
-        McpToolError(code=-32602): Parameter validation failure.
-        McpAuthError(401): Not authenticated / missing "write" permission / KB not in scope.
-        McpToolError(code=-32000): Gateway error / timeout / transport failure.
+        McpToolError(code=-32602): 参数校验失败。
+        McpAuthError(401): 未认证 / 缺少 "write" 权限 / KB 不在授权范围。
+        McpToolError(code=-32000): Gateway 错误 / 超时 / 传输失败。
     """
     # Step 1 — Parameter non-empty validation
     if not service_id or not service_id.strip():
@@ -456,6 +621,8 @@ async def generate_upload_url(
     # Step 3 — Auth + write scope（写 Key：grants 级校验，替代 service scope）
     # 写 Key 无 mcp_key_service_mappings，_check_service_scope 恒 401；写入范围由 grants 表达。
     auth = require_mcp_auth("write")  # 写授权看 write_grants
+    # 服务目录「最近调用时间」：写工具统一归因到内置「知识写入」服务
+    touch_service_call_async(auth.tenant_id, SYSTEM_SERVICE_ID)
     kb_id = knowledge_base_id.strip()
     # 方案 1：specified 目录级写入暂不支持 MCP 直传，显式拒绝而非静默 401
     if _grant_mode_for_kb(auth, kb_id) == "specified":
@@ -483,26 +650,104 @@ async def generate_upload_url(
     )
 
 
-async def get_upload_status(service_id: str, document_id: str) -> dict:
-    """Query document processing status after upload via MCP.
+@_inject_mcp_tool("submit_search_feedback")
+async def submit_search_feedback(
+    request_id: str,
+    service_id: str,
+    feedback_type: str,
+    feedback_reason: str | None = None,
+    feedback_comment: str | None = None,
+    operation_id: str | None = None,
+    version: int = 1,
+) -> dict:
+    """提交检索反馈（点赞/点踩）——以检索工具返回的 request_id 锚定本次检索。
 
-    Returns status, ontology_status, error_message, and other metadata
-    to let MCP clients track upload progress through the async pipeline
-    (PENDING → PARSING → INGESTING → READY / FAILED).
+    Action: submit_mcp_feedback
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, required_permission="call")
+
+    MCP 检索不写搜索历史，没有 history_id / user_id，因此以 request_id
+    （检索响应顶层的反馈锚点）定位检索；归属由服务端按 MCP Key 校验。
+    不接收 tenant_id / mcp_key_id / query / answer——身份与租户取自鉴权上下文，
+    问答快照不落库。
 
     Args:
-        service_id: Domain service ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
-        document_id: Document ID (returned by confirm_upload).
+        request_id: 检索响应返回的 request_id（反馈锚点）
+        service_id: 领域服务 ID（服务端会与检索记录比对）
+        feedback_type: 反馈类型，"like" 或 "dislike"
+        feedback_reason: 点踩原因（dislike 时必填，复用现有 6 个原因码）
+        feedback_comment: 补充评论（可选，最多 300 字符）
+        operation_id: 幂等键（可选，缺省由 MCP 生成 uuid4）
+        version: 反馈版本号（默认 1；乱序提交时服务端丢弃旧版本）
 
     Returns:
-        dict: Document status fields (doc_id, status, ontology_status,
-              error_message, file_name, file_size, knowledge_base_id,
-              created_at, updated_at).
+        dict: {feedback, superseded, idempotent}
 
     Raises:
-        McpAuthError(401): Not authenticated / not a write key.
-        McpToolError(code=-32602): Parameter validation failure.
-        McpToolError(code=-32000): Gateway error / write key grants empty.
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): request_id / service_id / feedback_type 缺失
+        McpToolError(code=-32000): 知识库服务不可用
+    """
+    if not request_id or not request_id.strip():
+        raise McpToolError(code=-32602, message="request_id 为必填参数，不能为空")
+    if not service_id or not service_id.strip():
+        raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
+    if not feedback_type or not feedback_type.strip():
+        raise McpToolError(code=-32602, message="feedback_type 为必填参数，不能为空")
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="call")
+    touch_service_call_async(auth.tenant_id, service_id.strip())
+
+    payload: dict = {
+        "request_id": request_id.strip(),
+        "service_id": service_id.strip(),
+        "feedback_type": feedback_type.strip(),
+        "operation_id": operation_id or uuid4().hex,
+        "version": version,
+    }
+    if feedback_reason is not None:
+        payload["feedback_reason"] = feedback_reason
+    if feedback_comment is not None:
+        payload["feedback_comment"] = feedback_comment
+
+    return await call_gateway(
+        "submit_mcp_feedback",
+        auth.tenant_id,
+        auth.key_id,
+        payload,
+    )
+
+
+@_inject_mcp_tool("get_upload_status")
+async def get_upload_status(service_id: str, document_id: str) -> dict:
+    """查询上传后的文档处理状态。
+
+    返回 status、ontology_status、error_message 等元数据，
+    供 MCP 客户端跟踪异步处理进度（PENDING → PARSING → INGESTING → READY / FAILED）。
+
+    文档可能处于 ``status=ready`` 且 ``ontology_status=failed`` 的状态：
+    正文已解析、可问答，但知识图谱未建成。这属于**部分成功**，
+    必须显式提示降级，不能按完全成功汇报。
+
+    Args:
+        service_id: 领域服务 ID（写 Key 场景保留签名兼容，不再用于定位 KB）。
+        document_id: 文档 ID（confirm_upload 返回）。
+
+    Returns:
+        dict: 文档状态字段（doc_id、status、ontology_status、error_message、
+              file_name、file_size、knowledge_base_id、created_at、updated_at），
+              以及图谱降级提示：ontology_error、ontology_retry_count、
+              ontology_retry_limit、degraded、degraded_reason、retry_exhausted。
+
+              当 ``status=ready`` 且 ``ontology_status=failed`` 时，
+              ``degraded=true``、``degraded_reason="ontology_failed"``；
+              图谱重试次数达到 ``ontology_retry_limit`` 时
+              ``retry_exhausted=true``，``status`` 仍为 ``ready``。
+
+    Raises:
+        McpAuthError(401): 未认证 / 不是写 Key。
+        McpToolError(code=-32602): 参数校验失败。
+        McpToolError(code=-32000): Gateway 错误 / 写 Key 无可查询的授权。
     """
     # Step 1 — Parameter non-empty validation
     if not service_id or not service_id.strip():
@@ -512,6 +757,8 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
 
     # Step 2 — Auth + scope（写 Key 专属：上传生命周期，service_id 保留签名但不再用于定位）
     auth = require_mcp_auth("write")  # 写授权看 write_grants
+    # 服务目录「最近调用时间」：上传生命周期查询同样归因到「知识写入」服务
+    touch_service_call_async(auth.tenant_id, SYSTEM_SERVICE_ID)
     # 方案 1：specified 目录级不支持 MCP，仅 all 模式 kb 可查上传状态，
     # 剔除 specified 的 kb，避免平铺 grants[].kb 导致目录级隔离被突破（越权读他人文档状态）。
     kb_ids_to_check = [
@@ -536,6 +783,7 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
     )
 
 
+@_inject_mcp_tool("list_domain_services")
 async def list_domain_services() -> dict:
     """列出 MCP Key 对应租户下所有领域服务。
 
@@ -579,27 +827,26 @@ _ERROR_RATE_LIMITED = -32001  # 限流（自定义 MCP extension）
 _ERROR_AUTH = -32002  # 认证/授权失败（401/403 → 禁止管线 fallback）
 _ERROR_CONFLICT = -32003  # 资源冲突/内容重复（409 + 业务码 1003；同样禁止管线 fallback）
 
-# NOTE: SEARCH_LLMWIKI_ENABLED 是进程级状态。多 worker 场景下各 worker 独立进行
-# 健康检查，可能在不同时刻得出不同结论（部分 worker 启用、部分禁用）。
-# 当前影响较小（仅控制一个可选 search tool）；若需严格一致性，可考虑 Redis 等共享存储。
-# LLM-Wiki 检索开关（Feature Flag，默认开启）
+# LLM-Wiki 检索开关（Feature Flag，默认开启）。
+# ⚠ 只由环境变量控制，**不再由启动健康检查翻转**（同 SEARCH_JONEX_WIKI_ENABLED：
+# 依赖晚启动是部署常态，一次性探测失败永久禁用会让工具无法自愈）。
 SEARCH_LLMWIKI_ENABLED = os.getenv("SEARCH_LLMWIKI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 
 def is_search_llmwiki_enabled() -> bool:
-    """返回 search_llmwiki 是否可用（线程安全读取模块级状态）。
-
-    该标志由 lifespan 健康检查设置，多 worker 下各 worker 独立。
-    """
+    """返回 search_llmwiki 的显式开关（仅由环境变量决定，不含运行时健康状态）。"""
     return SEARCH_LLMWIKI_ENABLED
 
 
-# [jonex] jonex_wiki 检索开关（Feature Flag，默认开启；由 check_jonex_wiki_health 控制）
+# [jonex] jonex_wiki 检索开关（Feature Flag，默认开启）。
+# ⚠ 只由环境变量控制，**不再由启动健康检查翻转**：jonex-wiki 晚于 mcp-server 就绪
+# 是部署常态，一次性探测失败若永久禁用，工具会一直报「暂未开放」且无法自愈。
+# 服务真不可用时，调用会返回 -32000 并由 handler 的 fallback 回退到 search_mix。
 SEARCH_JONEX_WIKI_ENABLED = os.getenv("SEARCH_JONEX_WIKI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 
 def is_search_jonex_wiki_enabled() -> bool:
-    """返回 search_jonex_wiki 是否可用（线程安全读取模块级状态）。"""
+    """返回 search_jonex_wiki 的显式开关（仅由环境变量决定，不含运行时健康状态）。"""
     return SEARCH_JONEX_WIKI_ENABLED
 
 
@@ -614,6 +861,7 @@ _VALID_FILENAME_RE = re.compile(r'^[\w一-鿿.()\[\]（） -]+$')  # Safe filena
 _PATH_TRAVERSAL_RE = re.compile(r'\.\./|\.\.\\')  # Path traversal detection
 
 
+@_inject_mcp_tool("list_documents")
 async def list_documents(
     service_id: str,
     file_name: str = "",
@@ -631,12 +879,16 @@ async def list_documents(
         file_name: 可选的文件名关键词过滤（最多 255 字符）
 
     Returns:
-        dict: 含 items（文档列表，每项含 id、file_name、knowledge_base_id、status 等）、total 字段
+        dict: 含 items（文档列表，每项含 id、file_name、knowledge_base_id、status 等）、
+              total 字段。部分知识库不可访问时额外带 ``errors`` 数组，元素为
+              ``{knowledge_base_id, code, message}``；全部成功时没有 ``errors`` 键。
 
     Raises:
         McpAuthError(401): 未认证 / service 不在授权范围
         McpToolError(code=-32602): 参数校验失败（空 service_id / file_name 超长）
-        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库
+        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库 /
+            全部知识库均不可访问且无鉴权失败
+        McpToolError(code=-32002): 全部知识库均不可访问且至少一个为鉴权失败
     """
     if not service_id or not service_id.strip():
         raise McpToolError(code=-32602, message="service_id 为必填参数，不能为空")
@@ -645,16 +897,27 @@ async def list_documents(
         raise McpToolError(code=-32602, message="file_name 长度不能超过 255 字符")
     auth = require_mcp_auth("view")
     intersection = await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id.strip())
     if intersection:
         kb_ids_to_query = intersection
     else:
+        # 前置校验调用：get_service 不是公开 MCP 工具，不上报工具名。
+        # 语义归属在 Gateway（_INTERNAL_CHECK_ACTIONS 记成普通 invoke）；
+        # 这里 report_tool=False 是 belt-and-braces 双保险。
         service_detail = await call_gateway(
-            "get_service", auth.tenant_id, auth.key_id, {"service_id": service_id},
+            "get_service",
+            auth.tenant_id,
+            auth.key_id,
+            {"service_id": service_id},
+            report_tool=False,
         )
         kb_ids_to_query = service_detail.get("kb_ids", [])
     if not kb_ids_to_query:
         raise McpToolError(code=-32000, message="服务下无可用知识库")
     all_items: list[dict] = []
+    # 逐 KB 收集错误：不能把「不可访问」静默吞成「没有文档」，否则依赖本工具
+    # 的调用方（如等待解析完成）会把上游故障/密级拦截误判成空结果并等到超时。
+    kb_errors: list[dict] = []
     for kb_id in kb_ids_to_query:
         try:
             data: dict[str, str] = {"knowledge_base_id": kb_id}
@@ -664,9 +927,634 @@ async def list_documents(
                 "list_documents", auth.tenant_id, auth.key_id, data,
             )
             all_items.extend(result.get("items", []))
-        except McpToolError:
+        except McpToolError as exc:
+            logger.warning(
+                "list_documents 跳过不可访问的知识库: service_id=%s kb_id=%s code=%s",
+                service_id,
+                kb_id,
+                exc.code,
+            )
+            kb_errors.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    # 保留原始 code 供诊断：400/404/422 被 call_gateway 映射成
+                    # -32602，但这里多半是密级/权限问题，不是调用方参数错。
+                    "code": exc.code,
+                    # 中性文案：不把上游 404 解释成「KB 不存在」，避免泄露存在性。
+                    "message": "该知识库不可访问，已跳过",
+                }
+            )
+    if kb_errors and len(kb_errors) == len(kb_ids_to_query):
+        # 全部失败：对外统一归一为 -32002 / -32000，绝不抛 -32602（会把密级
+        # 拦截误导成「调用方参数有误」）。任一鉴权失败优先 -32002。
+        logger.error(
+            "list_documents 全部知识库不可访问: service_id=%s errors=%s",
+            service_id,
+            kb_errors,
+        )
+        if any(err["code"] == _ERROR_AUTH for err in kb_errors):
+            raise McpToolError(code=_ERROR_AUTH, message="知识库不可访问")
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+    payload: dict = {"items": all_items, "total": len(all_items)}
+    if kb_errors:
+        # 向后兼容：只在部分失败时出现，旧客户端可忽略。
+        payload["errors"] = kb_errors
+    return payload
+
+
+# ── 本体列式浏览：3 个只读工具 ───────────────────────────────────────────
+# 只调用白名单内的读 action；KB 归属唯一活路径是 get_service → kb_ids。
+
+
+def _ontology_required_str(value, field: str, max_len: int) -> str:
+    """校验必填字符串参数：非空、去首尾空格、长度上限。"""
+    if not isinstance(value, str):
+        raise McpToolError(code=_ERROR_INVALID_PARAMS, message=f"{field} 必须为字符串")
+    value = value.strip()
+    if not value:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message=f"{field} 为必填参数，不能为空"
+        )
+    if len(value) > max_len:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message=f"{field} 长度不能超过 {max_len} 字符",
+        )
+    return value
+
+
+def _ontology_optional_str(value, field: str, max_len: int) -> str:
+    """校验可选字符串参数：允许空串，去首尾空格，长度上限。"""
+    if not isinstance(value, str):
+        raise McpToolError(code=_ERROR_INVALID_PARAMS, message=f"{field} 必须为字符串")
+    value = value.strip()
+    if len(value) > max_len:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message=f"{field} 长度不能超过 {max_len} 字符",
+        )
+    return value
+
+
+def _ontology_int_param(value, field: str, minimum: int, maximum: int) -> int:
+    """校验整数参数上下界（MCP 不经 REST 的 le 约束，必须自校验）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise McpToolError(code=_ERROR_INVALID_PARAMS, message=f"{field} 必须为整数")
+    if not minimum <= value <= maximum:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message=f"{field} 必须在 {minimum}-{maximum} 之间",
+        )
+    return value
+
+
+# 单次跨库聚合的 KB 数量上限：超过则要求调用方显式收窄范围。
+_ONTOLOGY_MAX_FANOUT_KBS = settings.ONTOLOGY_MAX_FANOUT_KBS
+
+# 同 KB 多跳（D11）：深度上限与多 KB 扇出整体截止时间。
+# 上限与 Gateway / capability 读同名 env；deadline 仅 depth>1 的多 KB 扇出生效。
+_ONTOLOGY_NEIGHBOR_DEPTH_MAX = settings.ONTOLOGY_NEIGHBOR_DEPTH_MAX
+_MULTIHOP_DEADLINE_SECONDS = settings.ONTOLOGY_MULTIHOP_DEADLINE_SECONDS
+
+
+def _normalize_ontology_kb_ids(value) -> list[str]:
+    """校验并归一 ``knowledge_base_ids``：list、元素非空字符串、去重保序、≤配置上限。
+
+    ``None`` 表示未提供（返回空列表）；显式 ``[]`` 视为参数错误，避免被
+    「都不传 = 查全服务」静默放大成一次全量扇出。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="knowledge_base_ids 必须为字符串数组"
+        )
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="knowledge_base_ids 的元素必须为字符串",
+            )
+        kb_id = raw.strip()
+        if not kb_id:
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="knowledge_base_ids 不能包含空字符串",
+            )
+        if len(kb_id) > 128:
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="knowledge_base_ids 的单个 ID 长度不能超过 128 字符",
+            )
+        if kb_id in seen:
             continue
-    return {"items": all_items, "total": len(all_items)}
+        seen.add(kb_id)
+        ids.append(kb_id)
+    if not ids:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="knowledge_base_ids 不能为空列表"
+        )
+    if len(ids) > _ONTOLOGY_MAX_FANOUT_KBS:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message=f"knowledge_base_ids 最多 {_ONTOLOGY_MAX_FANOUT_KBS} 个",
+        )
+    return ids
+
+
+def _validate_ontology_kb_selection(
+    knowledge_base_id: str,
+    knowledge_base_ids,
+) -> tuple[str, list[str]]:
+    """纯参数校验（先于鉴权）：单值/列表互斥 + 列表归一。
+
+    Returns:
+        (single, explicit)：single 为空串表示未提供单值；explicit 为归一后的
+        显式列表（未提供时为空列表）。
+    """
+    explicit = _normalize_ontology_kb_ids(knowledge_base_ids)
+    single = (knowledge_base_id or "").strip()
+    if single and knowledge_base_ids is not None:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="knowledge_base_id 与 knowledge_base_ids 不能同时提供",
+        )
+    return single, explicit
+
+
+async def _resolve_ontology_kb_ids(
+    auth: McpAuthContext,
+    service_id: str,
+    knowledge_base_id: str,
+    knowledge_base_ids,
+) -> list[str]:
+    """解析本次调用要扇出的 KB 列表（唯一 ``get_service`` 调用点）。
+
+    显式单值/列表必须全部属于服务 ``kb_ids``，任一越界整单拒绝；都未提供时
+    取服务下全部可读 KB，超过上限则要求调用方显式指定。
+
+    Raises:
+        McpToolError(code=-32000): 服务下无可用知识库 / 缺省 KB 超过上限
+        McpToolError(code=-32002): 显式知识库不在该服务范围内
+    """
+    single, explicit = _validate_ontology_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    # 前置校验调用：get_service 不是公开 MCP 工具，不上报工具名。
+    service_detail = await call_gateway(
+        "get_service",
+        auth.tenant_id,
+        auth.key_id,
+        {"service_id": service_id},
+        report_tool=False,
+    )
+    kb_ids = (
+        service_detail.get("kb_ids", []) if isinstance(service_detail, dict) else []
+    )
+    if not kb_ids:
+        raise McpToolError(code=_ERROR_INTERNAL, message="服务下无可用知识库")
+
+    requested = [single] if single else explicit
+    if requested:
+        # 不区分「KB 不存在」与「KB 越界」，避免泄露存在性。
+        if any(kb_id not in kb_ids for kb_id in requested):
+            raise McpToolError(
+                code=_ERROR_AUTH, message="知识库不在该服务范围内"
+            )
+        return requested
+
+    # 缺省：服务下全部可读 KB，去重保序后受同一上限约束。
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for kb_id in kb_ids:
+        if kb_id in seen:
+            continue
+        seen.add(kb_id)
+        resolved.append(kb_id)
+    if len(resolved) > _ONTOLOGY_MAX_FANOUT_KBS:
+        raise McpToolError(
+            code=_ERROR_INTERNAL,
+            message=(
+                f"服务关联知识库超过 {_ONTOLOGY_MAX_FANOUT_KBS} 个，"
+                "请显式指定 knowledge_base_ids"
+            ),
+        )
+    return resolved
+
+
+async def _fanout_ontology_action(
+    action: str,
+    auth: McpAuthContext,
+    kb_ids: list[str],
+    build_payload,
+    *,
+    deadline_seconds: float | None = None,
+) -> list[dict]:
+    """逐 KB 串行调用目标 action，独立捕获单库失败。
+
+    ``deadline_seconds`` 非空时对整轮扇出设总预算（D11 多跳 × 多 KB）：每库只用
+    「剩余时间」等待，超时库按失败组处理，已完成库照常返回。
+
+    Returns:
+        与 ``kb_ids`` 同序的 outcomes；成功项 ``{"knowledge_base_id", "data"}``，
+        失败项 ``{"knowledge_base_id", "error": {knowledge_base_id, code,
+        message}, "retry_after"}``。``error`` 即对外暴露的中性错误元素。
+    """
+    outcomes: list[dict] = []
+    deadline = (
+        time.monotonic() + deadline_seconds if deadline_seconds else None
+    )
+    for kb_id in kb_ids:
+        try:
+            coro = call_gateway(
+                action, auth.tenant_id, auth.key_id, build_payload(kb_id)
+            )
+            if deadline is None:
+                data = await coro
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                data = await asyncio.wait_for(coro, timeout=remaining)
+            outcomes.append({"knowledge_base_id": kb_id, "data": data})
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s 多 KB 整体 deadline 到期，跳过: kb_id=%s", action, kb_id
+            )
+            outcomes.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    "error": {
+                        "knowledge_base_id": kb_id,
+                        "code": _ERROR_INTERNAL,
+                        "message": "该知识库不可访问，已跳过",
+                    },
+                }
+            )
+        except McpToolError as exc:
+            logger.warning(
+                "%s 跳过不可访问的知识库: kb_id=%s code=%s", action, kb_id, exc.code
+            )
+            retry_after = (exc.data or {}).get("retry_after")
+            outcomes.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    "error": {
+                        "knowledge_base_id": kb_id,
+                        "code": exc.code,
+                        # 中性文案：不把上游 404 解释成「KB 不存在」。
+                        "message": "该知识库不可访问，已跳过",
+                    },
+                    "retry_after": retry_after,
+                }
+            )
+    return outcomes
+
+
+def _raise_if_all_ontology_groups_failed(outcomes: list[dict]) -> None:
+    """全部 KB 失败时归一为 -32002 / -32001 / -32000；部分失败不抛。"""
+    errors = [o["error"] for o in outcomes if "error" in o]
+    if not errors or len(errors) != len(outcomes):
+        return
+    logger.error("本体浏览全部知识库不可访问: errors=%s", errors)
+    if any(err["code"] == _ERROR_AUTH for err in errors):
+        raise McpToolError(code=_ERROR_AUTH, message="知识库不可访问")
+    if all(err["code"] == _ERROR_RATE_LIMITED for err in errors):
+        retry_after = max(
+            (o.get("retry_after") or 60 for o in outcomes if "error" in o),
+            default=60,
+        )
+        raise McpToolError(
+            code=_ERROR_RATE_LIMITED,
+            message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+            data={"retry_after": retry_after},
+        )
+    # 注意：密级 404 映射来的 -32602 也落到这里 → -32000，绝不归一为参数错误。
+    raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+
+@_inject_mcp_tool("list_ontology_entity_types")
+async def list_ontology_entity_types(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids=None,
+) -> dict:
+    """浏览本体知识库的实体类型目录（本体列式浏览第一列）。
+
+    Action: list_ontology_entity_types
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB（单值/列表）全部 ∈ get_service.kb_ids
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个知识库 ID（可选，与 knowledge_base_ids 互斥）
+        knowledge_base_ids: 知识库 ID 列表（可选，去重后不超过配置上限；与单值互斥）；
+            两者都不传时查询服务下全部可读知识库（上限同配置）
+
+    Returns:
+        dict: 单个 KB 时 {"items": [...], "total": int}（旧形态）；
+              多个 KB 时 {"items": [...], "total": int, "groups": [...]}，
+              顶层 item 追加 knowledge_base_id，groups 每项含
+              knowledge_base_id + items/total，失败组只含 errors。
+              item 含 name、display_name、description、status、build_status、
+              instance_count、attributes、source_object_id。游离类型
+              status="unschematized" 且 build_status="built"。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库 /
+            缺省知识库超过配置上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    # 纯参数校验先于鉴权与任何上游调用。
+    _single, explicit = _validate_ontology_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_ontology_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+
+    def build_payload(kb_id: str) -> dict:
+        return {"knowledge_base_id": kb_id}
+
+    # 返回形态按参数形态判定：显式列表（即使 1 个元素）一律 groups；
+    # 显式单值 / 缺省且只解析出 1 个 KB 才逐字节复用旧形态。
+    if not explicit and len(kb_ids) == 1:
+        return await call_gateway(
+            "list_ontology_entity_types",
+            auth.tenant_id,
+            auth.key_id,
+            build_payload(kb_ids[0]),
+        )
+
+    outcomes = await _fanout_ontology_action(
+        "list_ontology_entity_types", auth, kb_ids, build_payload
+    )
+    _raise_if_all_ontology_groups_failed(outcomes)
+
+    all_items: list[dict] = []
+    groups: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if "error" in outcome:
+            groups.append({"knowledge_base_id": kb_id, "errors": [outcome["error"]]})
+            continue
+        data = outcome["data"] or {}
+        items = data.get("items", [])
+        all_items.extend({**item, "knowledge_base_id": kb_id} for item in items)
+        groups.append(
+            {
+                "knowledge_base_id": kb_id,
+                "items": items,
+                "total": data.get("total", len(items)),
+            }
+        )
+    return {"items": all_items, "total": len(all_items), "groups": groups}
+
+
+@_inject_mcp_tool("list_ontology_instances")
+async def list_ontology_instances(
+    service_id: str,
+    knowledge_base_id: str = "",
+    entity_type: str = "",
+    keyword: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    knowledge_base_ids=None,
+) -> dict:
+    """分页浏览某个实体类型下的本体实例（本体列式浏览第二列）。
+
+    Action: list_ontology_instances
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB（单值/列表）全部 ∈ get_service.kb_ids
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个知识库 ID（可选，与 knowledge_base_ids 互斥）
+        entity_type: 实体类型精确匹配（可选，≤ 128 字符）
+        keyword: 名称/别名子串模糊搜索（可选，≤ 255 字符）
+        page: 页码（1-1000，默认 1；多 KB 时对每个库独立生效）
+        page_size: 每页条数（1-100，默认 20；多 KB 时对每个库独立生效）
+        knowledge_base_ids: 知识库 ID 列表（可选，去重后不超过配置上限；与单值互斥）；
+            两者都不传时查询服务下全部可读知识库（上限同配置）
+
+    Returns:
+        dict: 单个 KB 时 {"items": [...], "total": int, "page": int,
+              "page_size": int}（旧形态）；多个 KB 时 {"total": int,
+              "groups": [...]}，groups 每项含 knowledge_base_id + items/total/
+              page/page_size（各库独立分页），失败组只含 errors；多 KB 时
+              **没有**顶层 items/page/page_size。顶层 total 为成功组 total 之和。
+              item 含 name、type、aliases、attributes、description、confidence、
+              doc_ids —— 没有 id。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（含上下界越界）
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库 /
+            缺省知识库超过配置上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    entity_type = _ontology_optional_str(entity_type, "entity_type", 128)
+    keyword = _ontology_optional_str(keyword, "keyword", 255)
+    page = _ontology_int_param(page, "page", 1, 1000)
+    page_size = _ontology_int_param(page_size, "page_size", 1, 100)
+    # 纯参数校验先于鉴权与任何上游调用。
+    _single, explicit = _validate_ontology_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_ontology_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+
+    def build_payload(kb_id: str) -> dict:
+        payload: dict = {
+            "knowledge_base_id": kb_id,
+            "page": page,
+            "page_size": page_size,
+        }
+        # 空串不传：后端 DTO 对这些字段按缺省处理
+        if entity_type:
+            payload["entity_type"] = entity_type
+        if keyword:
+            payload["keyword"] = keyword
+        return payload
+
+    # 返回形态按参数形态判定：显式列表（即使 1 个元素）一律 groups；
+    # 显式单值 / 缺省且只解析出 1 个 KB 才逐字节复用旧形态。
+    if not explicit and len(kb_ids) == 1:
+        return await call_gateway(
+            "list_ontology_instances",
+            auth.tenant_id,
+            auth.key_id,
+            build_payload(kb_ids[0]),
+        )
+
+    outcomes = await _fanout_ontology_action(
+        "list_ontology_instances", auth, kb_ids, build_payload
+    )
+    _raise_if_all_ontology_groups_failed(outcomes)
+
+    groups: list[dict] = []
+    total = 0
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if "error" in outcome:
+            groups.append({"knowledge_base_id": kb_id, "errors": [outcome["error"]]})
+            continue
+        data = outcome["data"] or {}
+        group_total = int(data.get("total", 0) or 0)
+        total += group_total
+        groups.append(
+            {
+                "knowledge_base_id": kb_id,
+                "items": data.get("items", []),
+                "total": group_total,
+                "page": data.get("page", page),
+                "page_size": data.get("page_size", page_size),
+            }
+        )
+    # 多 KB：不提供顶层 items / page / page_size（全局分页语义失真）。
+    return {"total": total, "groups": groups}
+
+
+@_inject_mcp_tool("expand_ontology_neighbors")
+async def expand_ontology_neighbors(
+    service_id: str,
+    knowledge_base_id: str = "",
+    entity_type: str = "",
+    canonical_name: str = "",
+    limit: int = 50,
+    knowledge_base_ids=None,
+    depth: int = 1,
+) -> dict:
+    """展开一个本体实例的邻居（本体列式浏览第三列；depth>1 时同 KB 多跳）。
+
+    Action: expand_ontology_neighbors
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB（单值/列表）全部 ∈ get_service.kb_ids
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个知识库 ID（可选，与 knowledge_base_ids 互斥）
+        entity_type: 起点实体类型（必填，≤ 128 字符）
+        canonical_name: 起点规范名称（必填，≤ 512 字符）
+        limit: 边数上限（1-200，默认 50；多 KB 时对每个库独立生效）；
+            节点按 id 去重后不超过 limit
+        knowledge_base_ids: 知识库 ID 列表（可选，去重后不超过配置上限；与单值互斥）；
+            两者都不传时查询服务下全部可读知识库（上限同配置）
+
+    Returns:
+        dict: 单个 KB 时 {"nodes": [...], "edges": [...], "degraded": bool}
+              （旧形态），降级时额外含 degraded_reason；多个 KB 时只返回
+              {"groups": [...]}，每项含 knowledge_base_id + nodes/edges/
+              degraded（+ degraded_reason），失败组只含 errors；多 KB 时
+              **没有**顶层 nodes/edges/degraded。node 含稳定 id
+              （"类型:名称"，不含知识库），edge 的 source/target 是名称不是节点 id。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（含上下界越界）
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 知识库服务不可用 / 服务下无可用知识库 /
+            缺省知识库超过配置上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    # entity_type / canonical_name 因位置参数关系给了空串默认值，
+    # 但语义仍是必填：空串一律 -32602。
+    entity_type = _ontology_required_str(entity_type, "entity_type", 128)
+    canonical_name = _ontology_required_str(canonical_name, "canonical_name", 512)
+    limit = _ontology_int_param(limit, "limit", 1, 200)
+    depth = _ontology_int_param(depth, "depth", 1, _ONTOLOGY_NEIGHBOR_DEPTH_MAX)
+    # 纯参数校验先于鉴权与任何上游调用。
+    _single, explicit = _validate_ontology_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_ontology_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+
+    def build_payload(kb_id: str) -> dict:
+        payload = {
+            "knowledge_base_id": kb_id,
+            "entity_type": entity_type,
+            "canonical_name": canonical_name,
+            "limit": limit,
+        }
+        # depth=1 不写 payload：保持单 KB 旧请求与多 KB 精确断言不变。
+        if depth > 1:
+            payload["depth"] = depth
+        return payload
+
+    # 返回形态按参数形态判定：显式列表（即使 1 个元素）一律 groups；
+    # 显式单值 / 缺省且只解析出 1 个 KB 才逐字节复用旧形态。
+    if not explicit and len(kb_ids) == 1:
+        return await call_gateway(
+            "expand_ontology_neighbors",
+            auth.tenant_id,
+            auth.key_id,
+            build_payload(kb_ids[0]),
+        )
+
+    outcomes = await _fanout_ontology_action(
+        "expand_ontology_neighbors",
+        auth,
+        kb_ids,
+        build_payload,
+        # 仅多跳 × 多 KB 设整体 deadline；depth=1 不改变既有行为。
+        deadline_seconds=_MULTIHOP_DEADLINE_SECONDS if depth > 1 else None,
+    )
+    _raise_if_all_ontology_groups_failed(outcomes)
+
+    groups: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if "error" in outcome:
+            groups.append({"knowledge_base_id": kb_id, "errors": [outcome["error"]]})
+            continue
+        data = outcome["data"] or {}
+        group: dict = {
+            "knowledge_base_id": kb_id,
+            "nodes": data.get("nodes", []),
+            "edges": data.get("edges", []),
+            "degraded": bool(data.get("degraded", False)),
+        }
+        if "degraded_reason" in data:
+            group["degraded_reason"] = data["degraded_reason"]
+        if depth > 1:
+            group["depth"] = data.get("depth", depth)
+            group["limit"] = data.get("limit", limit)
+            group["returned"] = data.get("returned", len(group["edges"]))
+            group["truncated"] = bool(data.get("truncated", False))
+        groups.append(group)
+    # 多 KB：不提供顶层 nodes / edges / degraded（节点 id 不含 kb，跨库会撞 id）。
+    return {"groups": groups}
 
 
 async def _validate_search_params(
@@ -701,8 +1589,11 @@ async def _validate_search_params(
             code=-32602,
             message=f"mode 必须为 {sorted(_VALID_SEARCH_MODES)} 之一，当前值: {mode}",
         )
-    if not 1 <= top_k <= 100:
-        raise McpToolError(code=-32602, message="top_k 必须在 1-100 之间")
+    # 与 capabilities/knowledge_base/dtos/search.py 的 le=50 对齐：
+    # 51-100 若放行会被后端 400 拒绝，再被 call_gateway 误映射成
+    # 「知识库服务请求参数有误」，调用方看不出真正的边界。
+    if not 1 <= top_k <= 50:
+        raise McpToolError(code=-32602, message="top_k 必须在 1-50 之间")
 
     auth = require_mcp_auth("view")
     kb_ids = await _check_service_scope(auth, service_id, required_permission="call")
@@ -710,6 +1601,7 @@ async def _validate_search_params(
     return query, mode, auth, kb_ids
 
 
+@_inject_mcp_tool("search_ontology")
 async def search_ontology(
     service_id: str,
     query: str,
@@ -730,7 +1622,7 @@ async def search_ontology(
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
         mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
-        top_k: 返回结果数（默认 5，1-100）
+        top_k: 返回结果数（默认 5，1-50）
         strict_mode: 是否启用严格模式多次验证（默认 False）
         with_reasoning: 是否返回推理链追踪（默认 False）
 
@@ -750,12 +1642,15 @@ async def search_ontology(
         "top_k": top_k,
         "strict_mode": strict_mode,
         "with_reasoning": with_reasoning,
+        # MCP 检索固定不写搜索历史（不提供调用方开关）
+        "save_history": False,
     }
     if kb_ids:
         payload["knowledge_base_ids"] = kb_ids
-    return await call_gateway("query_with_ontology", auth.tenant_id, auth.key_id, payload)
+    return await _call_search_gateway("query_with_ontology", auth, payload)
 
 
+@_inject_mcp_tool("search_deep")
 async def search_deep(
     service_id: str,
     query: str,
@@ -777,7 +1672,7 @@ async def search_deep(
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
         mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
-        top_k: 返回结果数（默认 5，1-100）
+        top_k: 返回结果数（默认 5，1-50）
         strict_mode: 是否启用严格模式多次验证（默认 False）
         with_reasoning: 是否返回推理链追踪（默认 False）
 
@@ -797,12 +1692,15 @@ async def search_deep(
         "top_k": top_k,
         "strict_mode": strict_mode,
         "with_reasoning": with_reasoning,
+        # MCP 检索固定不写搜索历史（不提供调用方开关）
+        "save_history": False,
     }
     if kb_ids:
         payload["knowledge_base_ids"] = kb_ids
-    return await call_gateway("deep_query", auth.tenant_id, auth.key_id, payload)
+    return await _call_search_gateway("deep_query", auth, payload)
 
 
+@_inject_mcp_tool("search_llmwiki")
 async def search_llmwiki(
     service_id: str,
     query: str,
@@ -823,7 +1721,7 @@ async def search_llmwiki(
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
         mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
-        top_k: 返回结果数（默认 5，1-100）
+        top_k: 返回结果数（默认 5，1-50）
         with_reasoning: 是否返回推理链追踪（默认 False）
 
     Returns:
@@ -843,11 +1741,13 @@ async def search_llmwiki(
         "mode": mode_norm,
         "top_k": top_k,
         "with_reasoning": with_reasoning,
+        # MCP 检索固定不写搜索历史（不提供调用方开关）
+        "save_history": False,
     }
     if kb_ids:
         payload["knowledge_base_ids"] = kb_ids
     try:
-        return await call_gateway("search_llmwiki", auth.tenant_id, auth.key_id, payload)
+        return await _call_search_gateway("search_llmwiki", auth, payload)
     except McpToolError as e:
         # 管线不匹配 (-32602，服务含 lightrag 库) 或 OpenKB 运行时不可用 (-32000)
         # → fallback 到 search_mix 统一入口（按 kb_type 分组扇出，正确处理混合库）
@@ -857,15 +1757,14 @@ async def search_llmwiki(
                 e.code,
                 service_id,
             )
-            return await call_gateway("search_mix", auth.tenant_id, auth.key_id, payload)
+            return await _call_search_gateway("search_mix", auth, payload)
         raise
 
 
+@_inject_mcp_tool("search_jonex_wiki")
 async def search_jonex_wiki(
     service_id: str,
     query: str,
-    mode: str = "hybrid",
-    top_k: int = 5,
     with_reasoning: bool = False,
 ) -> dict:
     """Jonex Wiki 检索——仅适用于 jonex_wiki 管线知识库。
@@ -880,8 +1779,6 @@ async def search_jonex_wiki(
     Args:
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
-        mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
-        top_k: 返回结果数（默认 5，1-100）
         with_reasoning: 是否返回推理链追踪（默认 False）
 
     Returns:
@@ -890,22 +1787,22 @@ async def search_jonex_wiki(
     Raises:
         McpToolError(code=-32000): jonex_wiki 检索未开放（feature flag 关闭） / 知识库服务不可用
         McpAuthError(401): 未认证 / service 不在授权范围
-        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限 / mode 不合法 / top_k 超范围）
+        McpToolError(code=-32602): 参数校验失败（空值 / 长度超限）
     """
     if not SEARCH_JONEX_WIKI_ENABLED:
         raise McpToolError(code=-32000, message="Jonex Wiki 检索暂未开放")
-    query_norm, mode_norm, auth, kb_ids = await _validate_search_params(service_id, query, mode, top_k)
+    query_norm, _, auth, kb_ids = await _validate_search_params(service_id, query, "hybrid", 5)
     payload: dict = {
         "service_id": service_id,
         "query": query_norm,
-        "mode": mode_norm,
-        "top_k": top_k,
         "with_reasoning": with_reasoning,
+        # MCP 检索固定不写搜索历史（不提供调用方开关）
+        "save_history": False,
     }
     if kb_ids:
         payload["knowledge_base_ids"] = kb_ids
     try:
-        return await call_gateway("search_jonex_wiki", auth.tenant_id, auth.key_id, payload)
+        return await _call_search_gateway("search_jonex_wiki", auth, payload)
     except McpToolError as e:
         # 管线不匹配 (-32602，服务含非 jonex_wiki 库) 或 jonex_wiki 运行时不可用 (-32000)
         # → fallback 到 search_mix 统一入口（按 kb_type 分组扇出，正确处理混合库）
@@ -915,10 +1812,11 @@ async def search_jonex_wiki(
                 e.code,
                 service_id,
             )
-            return await call_gateway("search_mix", auth.tenant_id, auth.key_id, payload)
+            return await _call_search_gateway("search_mix", auth, payload)
         raise
 
 
+@_inject_mcp_tool("search_mix")
 async def search_mix(
     service_id: str,
     query: str,
@@ -938,7 +1836,7 @@ async def search_mix(
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
         mode: 搜索模式（naive / local / global / hybrid，默认 "hybrid"）
-        top_k: 返回结果数（默认 5，1-100）
+        top_k: 返回结果数（默认 5，1-50）
         with_reasoning: 是否返回推理链追踪（默认 False）
 
     Returns:
@@ -955,12 +1853,15 @@ async def search_mix(
         "mode": mode_norm,
         "top_k": top_k,
         "with_reasoning": with_reasoning,
+        # MCP 检索固定不写搜索历史（不提供调用方开关）
+        "save_history": False,
     }
     if kb_ids:
         payload["knowledge_base_ids"] = kb_ids
-    return await call_gateway("search_mix", auth.tenant_id, auth.key_id, payload)
+    return await _call_search_gateway("search_mix", auth, payload)
 
 
+@_inject_mcp_tool("read_source")
 async def read_source(
     service_id: str,
     document_id: str,
@@ -992,16 +1893,20 @@ async def read_source(
         raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
     auth = require_mcp_auth("view")
     intersection = await _check_service_scope(auth, service_id, required_permission="call")
+    touch_service_call_async(auth.tenant_id, service_id.strip())
 
     if intersection:
         kb_ids_to_try = intersection
     else:
-        # allowed_kb_ids 为空 = 全部允许，需要获取 service 的所有 kb_ids
+        # allowed_kb_ids 为空 = 全部允许，需要获取 service 的所有 kb_ids。
+        # 前置校验调用不上报工具名（语义归属在 Gateway 的
+        # _INTERNAL_CHECK_ACTIONS；这里 report_tool=False 是双保险）。
         service_detail = await call_gateway(
             "get_service",
             auth.tenant_id,
             auth.key_id,
             {"service_id": service_id},
+            report_tool=False,
         )
         kb_ids_to_try = service_detail.get("kb_ids", [])
 
@@ -1028,6 +1933,7 @@ async def read_source(
 
 __all__ = [
     "call_gateway",
+    "call_gateway_ext",
     "get_http_client",
     "_check_service_scope",
     "_validate_file_name",
@@ -1036,7 +1942,11 @@ __all__ = [
     "get_upload_status",
     "list_documents",
     "list_domain_services",
+    "list_ontology_entity_types",
+    "list_ontology_instances",
+    "expand_ontology_neighbors",
     "read_source",
+    "submit_search_feedback",
     "search_deep",
     "search_jonex_wiki",
     "search_llmwiki",

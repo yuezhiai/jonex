@@ -15,6 +15,16 @@ _OPENKB_HEALTH_RETRIES = 3
 _OPENKB_HEALTH_RETRY_DELAY = 2  # seconds
 
 
+def _brief_error(exc: BaseException) -> str:
+    """把异常压成一行原因（**不打堆栈**）。
+
+    依赖没起来 / 网络不通是部署常态，不是代码缺陷；打完整 traceback 只会把启动日志
+    刷成几十行且淹掉真正的问题。只保留「异常类型 + 消息」这一行。
+    """
+    message = str(exc).strip() or exc.__class__.__name__
+    return f"{exc.__class__.__name__}: {message}"
+
+
 async def check_openkb_health(
     openkb_health_url: str,
     client: httpx.AsyncClient | None = None,
@@ -48,23 +58,24 @@ async def check_openkb_health(
         except httpx.InvalidURL as e:
             # 配置错误（URL 格式不合法）→ 不应重试，直接报告
             logger.error(
-                "OpenKB 健康检查 URL 配置错误: %s (url=%s)", e, openkb_health_url,
-                exc_info=True,
+                "OpenKB 健康检查 URL 配置错误（url=%s）：%s —— 禁用 search_llmwiki",
+                openkb_health_url, _brief_error(e),
             )
             return False
         except Exception as e:
             if attempt < _OPENKB_HEALTH_RETRIES - 1:
-                logger.warning(
-                    "OpenKB 健康检查失败 (attempt %d/%d)，%ds 后重试: %s",
-                    attempt + 1, _OPENKB_HEALTH_RETRIES, _OPENKB_HEALTH_RETRY_DELAY, e,
-                    exc_info=True,
+                # 逐次失败只留 debug 一行（启动竞态很常见，不该刷屏）
+                logger.debug(
+                    "OpenKB 健康检查失败 (attempt %d/%d)，%ds 后重试：%s",
+                    attempt + 1, _OPENKB_HEALTH_RETRIES,
+                    _OPENKB_HEALTH_RETRY_DELAY, _brief_error(e),
                 )
                 await asyncio.sleep(_OPENKB_HEALTH_RETRY_DELAY)
             else:
-                logger.warning(
-                    "OpenKB 不可用（已重试 %d 次），禁用 search_llmwiki: %s",
-                    _OPENKB_HEALTH_RETRIES, e,
-                    exc_info=True,
+                # 重试耗尽：整段只打这**一条**，不带 traceback
+                logger.error(
+                    "OpenKB 不可用（已重试 %d 次，url=%s）：%s —— 已禁用 search_llmwiki",
+                    _OPENKB_HEALTH_RETRIES, openkb_health_url, _brief_error(e),
                 )
     return False
 
@@ -90,22 +101,21 @@ async def check_jonex_wiki_health(
             return True
         except httpx.InvalidURL as e:
             logger.error(
-                "jonex_wiki 健康检查 URL 配置错误: %s (url=%s)", e, jonex_wiki_health_url,
-                exc_info=True,
+                "jonex_wiki 健康检查 URL 配置错误（url=%s）：%s —— 禁用 search_jonex_wiki",
+                jonex_wiki_health_url, _brief_error(e),
             )
             return False
         except Exception as e:
             if attempt < _OPENKB_HEALTH_RETRIES - 1:
-                logger.warning(
-                    "jonex_wiki 健康检查失败 (attempt %d/%d)，%ds 后重试: %s",
-                    attempt + 1, _OPENKB_HEALTH_RETRIES, _OPENKB_HEALTH_RETRY_DELAY, e,
-                    exc_info=True,
+                logger.debug(
+                    "jonex_wiki 健康检查失败 (attempt %d/%d)，%ds 后重试：%s",
+                    attempt + 1, _OPENKB_HEALTH_RETRIES,
+                    _OPENKB_HEALTH_RETRY_DELAY, _brief_error(e),
                 )
                 await asyncio.sleep(_OPENKB_HEALTH_RETRY_DELAY)
             else:
-                logger.warning(
-                    "jonex_wiki 不可用（已重试 %d 次），禁用 search_jonex_wiki: %s",
-                    _OPENKB_HEALTH_RETRIES, e,
-                    exc_info=True,
+                logger.error(
+                    "jonex_wiki 不可用（已重试 %d 次，url=%s）：%s —— 已禁用 search_jonex_wiki",
+                    _OPENKB_HEALTH_RETRIES, jonex_wiki_health_url, _brief_error(e),
                 )
     return False

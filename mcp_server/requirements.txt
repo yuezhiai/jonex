@@ -35,7 +35,9 @@ h11==0.16.0
 httpcore==1.0.9
     # via httpx
 httpx==0.28.1
-    # via mcp
+    # via
+    #   mcp
+    #   mcp-server-jonex
 httpx-sse==0.4.3
     # via mcp
 idna==3.18
@@ -64,15 +66,17 @@ pydantic-core==2.46.4
 pydantic-settings==2.14.2
     # via mcp
 pyjwt==2.13.0
-    # via mcp
+    # via
+    #   mcp
+    #   redis
 python-dotenv==1.2.2
     # via pydantic-settings
 python-multipart==0.0.32
     # via mcp
 pywin32==312 ; sys_platform == 'win32'
-redis==5.3.1
-    # via limits (redis extra)
     # via mcp
+redis==5.3.1
+    # via mcp-server-jonex
 referencing==0.37.0
     # via
     #   jsonschema
