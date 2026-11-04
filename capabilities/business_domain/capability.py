@@ -23,6 +23,8 @@ from capabilities.business_domain.services.prompt_template_service import Prompt
 from capabilities.business_domain.services.template_publish_service import TemplatePublishService
 from capabilities.business_domain.services.template_approval_service import TemplateApprovalService
 from capabilities.business_domain.services.template_rollback_service import TemplateRollbackService
+from capabilities.business_domain.services.ontology_action_executor import OntologyActionExecutor
+from capabilities.business_domain.services.skill_catalog_admin_service import SkillCatalogAdminService
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,9 @@ _ACTION_PERMISSIONS = {
     "disconnect_adapter": "adapter:write",
     "enable_skill": "skill:write",
     "disable_skill": "skill:write",
+    # execute_ontology_action 故意不在本表：执行权限只认调用人对该知识库的写权限，
+    # 由 knowledge_base 的 prepare_action_execution 判定（执行器带着调用人身份去取计划）；
+    # 在这里再叠一个平台权限码会把「有知识库写权限但没有 skill:write」的人挡在外面
     "create_template_domain": "template:write",
     "update_template_domain": "template:write",
     "delete_template_domain": "template:write",
@@ -126,6 +131,28 @@ async def _require_tenant_admin_for_publish(request) -> None:
         )
 
 
+async def _require_platform_admin(request) -> None:
+    """平台共享实体（工具目录）的读写只允许平台管理员。
+
+    无 user_id（测试 token / 系统链路）一律拒绝：工具目录对所有租户生效，
+    且管理端视图包含运行时地址，不能匿名读写。租户管理员不够。
+    """
+    msg = translate(
+        "err.skill_catalog.platform_admin_required",
+        fallback="工具目录管理需要平台管理员",
+    )
+    if not request.user_id:
+        raise PermissionDeniedError(message=msg)
+    try:
+        uid = int(request.user_id)
+    except (TypeError, ValueError):
+        raise PermissionDeniedError(message=msg)
+    from jonex_core.security.permission import has_permission
+
+    if not await has_permission(request.tenant_id, uid, "platform:admin"):
+        raise PermissionDeniedError(message=msg)
+
+
 class BusinessDomainCapability(BaseCapability):
     """业务领域 + 生态管理能力"""
 
@@ -133,6 +160,8 @@ class BusinessDomainCapability(BaseCapability):
         self._engine = EngineService()
         self._adapter = AdapterService()
         self._skill = SkillService()
+        self._executor = OntologyActionExecutor()
+        self._catalog = SkillCatalogAdminService()
         self._template = TemplateService()
         self._prompt_template = PromptTemplateService()
         self._publish = TemplatePublishService()
@@ -179,6 +208,8 @@ class BusinessDomainCapability(BaseCapability):
         e = self._engine
         a = self._adapter
         sk = self._skill
+        ex = self._executor
+        cat = self._catalog
         t = self._template
         pt = self._prompt_template
         p = self._publish
@@ -191,6 +222,13 @@ class BusinessDomainCapability(BaseCapability):
                 r.tenant_id, scenario_id,
                 published_by=r.username or r.user_id,
             )
+
+        def _platform_admin(fn):
+            """包装 handler：先校验平台管理员，再执行（工具目录管理专用）。"""
+            async def _wrapped(r, d):
+                await _require_platform_admin(r)
+                return await fn(r, d)
+            return _wrapped
 
         async def _rollback_as_admin(r, rollback, scenario_id, version):
             await _require_tenant_admin_for_publish(r)
@@ -223,6 +261,17 @@ class BusinessDomainCapability(BaseCapability):
             "enable_skill":           lambda r, d: sk.enable(r.tenant_id, d["skill_id"]),
             "disable_skill":          lambda r, d: sk.disable(r.tenant_id, d["skill_id"]),
             "list_enabled_mcp_tools": lambda r, d: sk.list_enabled_mcp_tools(r.tenant_id),
+            # ── 工具目录管理（平台共享，仅平台管理员；上下架走 update 的 status）──
+            "list_skill_catalog": _platform_admin(lambda r, d: cat.list(
+                d.get("offset", 0), d.get("limit", 20), d.get("status"), d.get("keyword"),
+            )),
+            "get_skill_catalog": _platform_admin(lambda r, d: cat.get(d["skill_id"])),
+            "create_skill_catalog": _platform_admin(lambda r, d: cat.create(d)),
+            "update_skill_catalog": _platform_admin(lambda r, d: cat.update(d["skill_id"], d)),
+            # ── 本体动作执行（最小执行器：解析 → 判定 → 确认 → 调工具 → 审计）──
+            "execute_ontology_action": lambda r, d: ex.execute(
+                r.tenant_id, d, user_id=r.user_id, username=r.username, request_id=r.request_id,
+            ),
             # ── 业务模板 ──
             "list_template_domains":    lambda r, d: t.list_domains(r.tenant_id, d.get("offset", 0), d.get("limit", 20), d.get("status")),
             "get_template_domain":      lambda r, d: t.get_domain(d["domain_id"], r.tenant_id),

@@ -1,17 +1,198 @@
+.skills-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.skills-subtitle-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-subtitle-info {
+  flex: none;
+  cursor: help;
+}
+
+/* 页面外壳：卡片去内边距，页签栏贴顶，留白只由内容区给一次 */
+.skills-panel .ant-tabs-nav {
+  margin: 0;
+  padding: 0 18px;
+}
+
+.skills-panel .ant-tabs-nav::before {
+  border-bottom-color: #eef2f7;
+}
+
+.skills-panel .ant-tabs-content-holder {
+  padding: 16px 18px 18px;
+}
+
+.skills-panel-plain {
+  padding: 16px 18px 18px;
+}
+
+.skills-filter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  flex-wrap: wrap;
+}
+
+.skills-category-scroll {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.skills-count {
+  margin-left: auto;
+  color: #94a3b8;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .skills-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
 }
 
-@media (max-width: 1200px) {
-  .skills-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
+.skill-card {
+  height: 100%;
+  cursor: pointer;
 }
 
-@media (max-width: 768px) {
-  .skills-grid {
-    grid-template-columns: 1fr;
-  }
+.skill-card-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.skill-card-icon {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  font-size: 19px;
+}
+
+.skill-card-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.skill-card-title {
+  color: #1e293b;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-card-toolname {
+  display: block;
+  margin-top: 3px;
+  color: #98a0ac;
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 固定两行高度，让同排卡片的标签区与页脚对齐 */
+.skill-card-desc {
+  display: -webkit-box;
+  height: 40px;
+  margin: 12px 0 0;
+  color: #5b6472;
+  font-size: 13px;
+  line-height: 20px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.skill-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin: 12px 0 14px;
+}
+
+.skill-card-tags .ant-tag {
+  margin-inline-end: 0;
+}
+
+.skill-card-tags .ant-tag.skill-tag-category {
+  border-color: transparent;
+  background: #eef4ff;
+  color: #2563eb;
+}
+
+.skill-tag-more {
+  color: #98a0ac;
+  font-size: 12px;
+}
+
+.skill-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid #f2f3f5;
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.skill-card-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.skill-card-detail {
+  height: auto;
+  padding: 0;
+}
+
+.catalog-subtitle {
+  margin: 0 0 16px;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.catalog-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.catalog-toolbar-create {
+  margin-left: auto;
+}
+
+.skills-empty {
+  padding: 48px 0;
+}
+
+.skills-pagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
 }

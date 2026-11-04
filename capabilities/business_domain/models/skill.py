@@ -56,7 +56,11 @@ class SkillCatalog(TimestampMixin, SoftDeleteMixin, Base):
             "input_schema": self.input_schema_json or {},
             "output_schema": self.output_schema_json or {},
             "tags": self.tags_json or [],
-            "capability": self.capability_json or {},
+            # 租户视图不暴露运行时（调用地址、鉴权方式）与加密凭据：只有平台管理员的目录管理视图能看
+            "capability": {
+                k: v for k, v in (self.capability_json or {}).items()
+                if k not in ("runtime", "runtime_secret")
+            },
         }
 
     def to_mcp_tool_definition(self) -> dict:

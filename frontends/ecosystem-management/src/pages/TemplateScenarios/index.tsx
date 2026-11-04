@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Alert, Button, ConfigProvider, Menu, message, Modal, Select, Table, Tag } from 'antd';
+import { Alert, Button, ConfigProvider, Menu, message, Modal, Select, Table, Tabs, Tag, Tooltip } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
   DeleteOutlined,
@@ -59,12 +59,12 @@ const ATTRIBUTE_TYPE_VALUES = ['字符串', '数值', '日期', '枚举', '布�
 const RELATION_TYPE_VALUES = ['一对一', '一对多', '多对一', '多对多'] as const;
 
 /**
- * 左栏每一项是三行（名称 / 创建时间 / 所属领域），而 antd inline 菜单项的高度由 token
+ * 左栏每一项是两行（名称 / 领域 · 时间），而 antd inline 菜单项的高度由 token
  * `itemHeight` 决定（默认 40px）、且 `align-items: center` + `overflow: hidden`，
- * 内容超出时会从上下两端对称裁掉 —— 露出的是中间那一行「创建时间」，名称反而看不见。
- * 所以这里按内容实际高度抬高，不要再回去压 `.ant-menu-item` 的 height。
+ * 内容超出时会从上下两端对称裁掉。所以这里按两行的实际高度抬高，
+ * 不要再回去压 `.ant-menu-item` 的 height。
  */
-const SCENE_ITEM_HEIGHT = 72;
+const SCENE_ITEM_HEIGHT = 56;
 
 // 提到模块作用域：内联的对象字面量每次渲染都是新引用，antd 会当成主题变更重新算一遍样式
 const SCENE_MENU_THEME = { components: { Menu: { itemHeight: SCENE_ITEM_HEIGHT } } };
@@ -73,6 +73,38 @@ function formatTime(value?: string | null) {
   if (!value) return '-';
   const parsed = dayjs(value);
   return parsed.isValid() ? parsed.format('YYYY-MM-DD HH:mm') : value;
+}
+
+/** 表格行操作：三张表共用同一套按钮样式（text 按钮 + 图标，删除走 danger）。 */
+function RowActions({
+  onEdit,
+  onDelete,
+  editText,
+  deleteText,
+}: {
+  onEdit: () => void;
+  onDelete: () => void;
+  editText: string;
+  deleteText: string;
+}) {
+  return (
+    <span className="ts-row-acts">
+      <Tooltip title={editText}>
+        <Button type="text" size="small" className="ts-row-act" aria-label={editText} icon={<EditOutlined />} onClick={onEdit} />
+      </Tooltip>
+      <Tooltip title={deleteText}>
+        <Button
+          type="text"
+          size="small"
+          danger
+          className="ts-row-act"
+          aria-label={deleteText}
+          icon={<DeleteOutlined />}
+          onClick={onDelete}
+        />
+      </Tooltip>
+    </span>
+  );
 }
 
 export default function TemplateScenarios() {
@@ -199,7 +231,7 @@ export default function TemplateScenarios() {
     } finally {
       setLoadingScenes(false);
     }
-  }, []);
+  }, [t]);
 
   const refreshTemplateDetails = useCallback(async (sceneId: string | null) => {
     if (!sceneId) {
@@ -226,7 +258,7 @@ export default function TemplateScenarios() {
     } finally {
       setLoadingDetails(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     setLoadingDomains(true);
@@ -237,7 +269,7 @@ export default function TemplateScenarios() {
 
     // [jonex] 进入页面时按 URL domain_id 参数自动默认选中对应领域
     void refreshScenarios(initialDomainIdRef.current);
-  }, [refreshScenarios]);
+  }, [refreshScenarios, t]);
 
   useEffect(() => {
     void refreshTemplateDetails(selectedSceneId);
@@ -271,7 +303,7 @@ export default function TemplateScenarios() {
       title: t('common.name'),
       dataIndex: 'name',
       key: 'name',
-      width: 160,
+      width: 140,
       render: (_, record) => <strong>{getTemplateObjectDisplay(record, english).name}</strong>,
     },
     {
@@ -288,7 +320,7 @@ export default function TemplateScenarios() {
       title: t('templateScenarios.attributes'),
       dataIndex: 'attributes',
       key: 'attributes',
-      width: 340,
+      width: 300,
       render: (attrs: TemplateAttribute[]) =>
         attrs.length > 0 ? (
           <Table
@@ -333,22 +365,20 @@ export default function TemplateScenarios() {
       title: t('common.createdAt'),
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 150,
+      width: 140,
       render: formatTime,
     },
     {
       title: t('common.actions'),
       key: 'action',
-      width: 170,
+      width: 96,
       render: (_, record) => (
-        <span className="template-scenarios-table-actions">
-          <a className="yx-table-action" onClick={() => objectModalRef.current?.openEdit(record)}>
-            <EditOutlined /> {t('common.edit')}
-          </a>
-          <a className="yx-table-action template-scenarios-danger-link" onClick={() => openDeleteObject(record)}>
-            <DeleteOutlined /> {t('common.delete')}
-          </a>
-        </span>
+        <RowActions
+          onEdit={() => objectModalRef.current?.openEdit(record)}
+          onDelete={() => openDeleteObject(record)}
+          editText={t('common.edit')}
+          deleteText={t('common.delete')}
+        />
       ),
     },
   ];
@@ -413,25 +443,23 @@ export default function TemplateScenarios() {
       key: 'action',
       width: 170,
       render: (_, record) => (
-        <span className="template-scenarios-table-actions">
-          <a className="yx-table-action" onClick={() => relationModalRef.current?.openEdit(record)}>
-            <EditOutlined /> {t('common.edit')}
-          </a>
-          <a className="yx-table-action template-scenarios-danger-link" onClick={() => openDeleteRelation(record)}>
-            <DeleteOutlined /> {t('common.delete')}
-          </a>
-        </span>
+        <RowActions
+          onEdit={() => relationModalRef.current?.openEdit(record)}
+          onDelete={() => openDeleteRelation(record)}
+          editText={t('common.edit')}
+          deleteText={t('common.delete')}
+        />
       ),
     },
   ];
 
   const constraintColumns: ColumnsType<TemplateConstraint> = [
-    { title: t('templateScenarios.constraintName'), dataIndex: 'name', key: 'name', width: 160 },
+    { title: t('templateScenarios.constraintName'), dataIndex: 'name', key: 'name', width: 140 },
     {
       title: t('templateScenarios.constraintTargetType'),
       dataIndex: 'target_type',
       key: 'target_type',
-      width: 120,
+      width: 110,
       render: (val: string) => {
         const label = t(`compile.constraintTargetType.${val}`);
         return <Tag>{label}</Tag>;
@@ -441,13 +469,13 @@ export default function TemplateScenarios() {
       title: t('templateScenarios.constraintTargetObject'),
       dataIndex: 'target_label',
       key: 'target_label',
-      width: 160,
+      width: 140,
     },
     {
       title: t('templateScenarios.constraintType'),
       dataIndex: 'constraint_type',
       key: 'constraint_type',
-      width: 100,
+      width: 110,
       render: (val: string) => {
         const label = t(`compile.constraintType.${val}`);
         return <Tag color="blue">{label}</Tag>;
@@ -457,7 +485,7 @@ export default function TemplateScenarios() {
       title: t('templateScenarios.constraintExpression'),
       dataIndex: 'expression',
       key: 'expression',
-      width: 160,
+      width: 120,
       render: (text) => (text ? <code style={{ fontSize: 12 }}>{text}</code> : '-'),
     },
     {
@@ -470,16 +498,14 @@ export default function TemplateScenarios() {
     {
       title: t('common.actions'),
       key: 'action',
-      width: 140,
+      width: 120,
       render: (_, record) => (
-        <span className="template-scenarios-table-actions">
-          <a className="yx-table-action" onClick={() => constraintModalRef.current?.openEdit(record)}>
-            <EditOutlined /> {t('common.edit')}
-          </a>
-          <a className="yx-table-action template-scenarios-danger-link" onClick={() => openDeleteConstraint(record)}>
-            <DeleteOutlined /> {t('common.delete')}
-          </a>
-        </span>
+        <RowActions
+          onEdit={() => constraintModalRef.current?.openEdit(record)}
+          onDelete={() => openDeleteConstraint(record)}
+          editText={t('common.edit')}
+          deleteText={t('common.delete')}
+        />
       ),
     },
   ];
@@ -647,6 +673,16 @@ export default function TemplateScenarios() {
     selectedFileRef.current = null;
   }, []);
 
+  // 页签栏右侧的「新建」入口：三个页签各建各的，动作随当前页签切换
+  const createAction: Record<typeof activeTab, { label: string; onClick: () => void }> = {
+    objects: { label: t('templateScenarios.createObject'), onClick: openCreateObject },
+    relations: { label: t('templateScenarios.createRelation'), onClick: openCreateRelation },
+    constraints: {
+      label: t('templateScenarios.createConstraint'),
+      onClick: () => constraintModalRef.current?.openCreate(),
+    },
+  };
+
   return (
     <>
       <PageHeader
@@ -664,7 +700,9 @@ export default function TemplateScenarios() {
             <aside className="template-scenarios-left">
               <div className="template-scenarios-left-title">
                 <h2>{t('templateScenarios.domainScenes')}</h2>
-                <span>{t('templateScenarios.sceneCount', { count: scenes.length })}</span>
+                <span className="ts-count" title={t('templateScenarios.sceneCount', { count: scenes.length })}>
+                  {scenes.length}
+                </span>
               </div>
 
               <Select
@@ -698,22 +736,18 @@ export default function TemplateScenarios() {
                     items={scenes.map((scene) => ({
                       key: scene.id,
                       label: (
-                        <div
-                          style={{
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            alignItems: 'flex-start',
-                            width: '100%',
-                          }}
-                        >
-                          <div className="template-scenarios-item-main">
-                            <div className="template-scenarios-item-name">
+                        <div className="ts-scene">
+                          <div className="ts-scene-main">
+                            <div className="ts-scene-name">
                               {getTemplateScenarioDisplay(scene, english, t).name}
                             </div>
-                            <div className="template-scenarios-item-meta">{formatTime(scene.created_at)}</div>
-                            <Tag className="template-scenarios-domain-tag">{getDomainName(scene.domain_id)}</Tag>
+                            <div className="ts-scene-meta">
+                              <span className="ts-scene-domain">{getDomainName(scene.domain_id)}</span>
+                              <span className="ts-scene-dot" />
+                              <span>{formatTime(scene.created_at)}</span>
+                            </div>
                           </div>
-                          <div className="template-scenarios-item-actions">
+                          <div className="ts-scene-acts">
                             <Button
                               type="text"
                               size="small"
@@ -757,9 +791,9 @@ export default function TemplateScenarios() {
             <section className="template-scenarios-right">
               {!selectedScene ? (
                 <>
-                  <div className="template-scenarios-right-header">
-                    <h2>{t('templateScenarios.selectSceneFromLeft')}</h2>
-                    <div style={{ display: 'flex', gap: 8 }}>
+                  <div className="ts-detail-head">
+                    <h2 className="ts-detail-name">{t('templateScenarios.selectSceneFromLeft')}</h2>
+                    <div className="ts-actions">
                       <Button icon={<ExportOutlined />} disabled>
                         {t('templateScenarios.exportYaml')}
                       </Button>
@@ -771,39 +805,45 @@ export default function TemplateScenarios() {
                       </Button>
                     </div>
                   </div>
-                  <div className="yx-empty-state template-scenarios-empty">
-                    {t('templateScenarios.selectSceneHint')}
+                  <div className="ts-empty">
+                    <span className="ts-empty-icon">◇</span>
+                    <span>{t('templateScenarios.selectSceneHint')}</span>
                   </div>
                 </>
               ) : (
                 <>
-                  <div className="template-scenarios-right-header">
-                    <div>
-                      <h2>{getTemplateScenarioDisplay(selectedScene, english, t).name}</h2>
-                      <p className="yx-page-subtitle">
+                  <div className="ts-detail-head">
+                    <div className="ts-detail-title">
+                      <div className="ts-detail-name-row">
+                        <h2 className="ts-detail-name">{getTemplateScenarioDisplay(selectedScene, english, t).name}</h2>
+                        <span className="ts-chip">
+                          {t('templateScenarios.objectTemplate')} {objects.length}
+                        </span>
+                        <span className="ts-chip">
+                          {t('templateScenarios.relationTemplate')} {relations.length}
+                        </span>
+                        <span className="ts-chip">
+                          {t('templateScenarios.constraintTemplate')} {constraints.length}
+                        </span>
+                      </div>
+                      <p className="ts-detail-desc">
                         {getTemplateScenarioDisplay(selectedScene, english, t).description ||
                           t('templateScenarios.noSceneDescription')}
                       </p>
                     </div>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                    <div className="ts-actions">
                       {canApprove && (
-                        <Button
-                          type="primary"
-                          onClick={() => void handleDirectPublish()}
-                          loading={publishing}
-                        >
+                        <Button onClick={() => void handleDirectPublish()} loading={publishing}>
                           {t('templateScenarios.publish.publish')}
                         </Button>
                       )}
-                      <Button
-                        onClick={() => void handleSubmitPublishRequest()}
-                        loading={requesting}
-                      >
+                      <Button onClick={() => void handleSubmitPublishRequest()} loading={requesting}>
                         {t('templateScenarios.publish.request')}
                       </Button>
                       <Button onClick={() => setApprovalOpen(true)}>
                         {t('templateScenarios.publish.openApprovals')}
                       </Button>
+                      <span className="ts-actions-divider" />
                       <Button icon={<ExportOutlined />} onClick={handleExportYaml}>
                         {t('templateScenarios.exportYaml')}
                       </Button>
@@ -820,94 +860,94 @@ export default function TemplateScenarios() {
                     </div>
                   </div>
 
-                  <div className="yx-tabs template-scenarios-tabs">
-                    <Button
-                      type={activeTab === 'objects' ? 'primary' : 'default'}
-                      icon={<ProfileOutlined />}
-                      onClick={() => setActiveTab('objects')}
-                      style={{ borderRadius: 8 }}
-                    >
-                      {t('templateScenarios.objectTemplate')}
-                    </Button>
-                    <Button
-                      type={activeTab === 'relations' ? 'primary' : 'default'}
-                      icon={<ShareAltOutlined />}
-                      onClick={() => setActiveTab('relations')}
-                      style={{ borderRadius: 8 }}
-                    >
-                      {t('templateScenarios.relationTemplate')}
-                    </Button>
-                    <Button
-                      type={activeTab === 'constraints' ? 'primary' : 'default'}
-                      icon={<SafetyOutlined />}
-                      onClick={() => setActiveTab('constraints')}
-                      style={{ borderRadius: 8 }}
-                    >
-                      {t('templateScenarios.constraintTemplate')}
-                    </Button>
-                  </div>
-
-                  <p style={{ color: '#94a3b8', fontSize: 12, marginTop: 8 }}>
-                    {activeTab === 'constraints'
-                      ? t('templateScenarios.constraintNote')
-                      : t('templateScenarios.relationNote')}
-                  </p>
-
-                  {activeTab === 'objects' && (
-                    <div className="template-scenarios-tab-body">
-                      <div className="template-scenarios-tab-toolbar">
-                        <Button type="primary" icon={<PlusOutlined />} onClick={openCreateObject}>
-                          {t('templateScenarios.createObject')}
-                        </Button>
-                      </div>
-                      <Table
-                        dataSource={objects}
-                        columns={objectColumns}
-                        rowKey="id"
-                        loading={loadingDetails}
-                        pagination={false}
-                        locale={{ emptyText: t('templateScenarios.noObjectTemplates') }}
-                      />
-                    </div>
-                  )}
-                  {activeTab === 'relations' && (
-                    <div className="template-scenarios-tab-body">
-                      <div className="template-scenarios-tab-toolbar">
-                        <Button type="primary" icon={<PlusOutlined />} onClick={openCreateRelation}>
-                          {t('templateScenarios.createRelation')}
-                        </Button>
-                      </div>
-                      <Table
-                        dataSource={relations}
-                        columns={relationColumns}
-                        rowKey="id"
-                        loading={loadingDetails}
-                        pagination={false}
-                        locale={{ emptyText: t('templateScenarios.noRelationTemplates') }}
-                      />
-                    </div>
-                  )}
-                  {activeTab === 'constraints' && (
-                    <div className="template-scenarios-tab-body">
-                      <div className="template-scenarios-tab-toolbar">
-                        <Button
-                          type="primary"
-                          icon={<PlusOutlined />}
-                          onClick={() => constraintModalRef.current?.openCreate()}
-                        >
-                          {t('templateScenarios.createConstraint')}
-                        </Button>
-                      </div>
-                      <Table
-                        dataSource={constraints}
-                        columns={constraintColumns}
-                        rowKey="id"
-                        loading={loadingDetails}
-                        pagination={false}
-                        locale={{ emptyText: t('templateScenarios.noConstraintTemplates') }}
-                      />
-                    </div>
-                  )}
+                  <Tabs
+                    className="template-scenarios-tabs"
+                    activeKey={activeTab}
+                    onChange={(key) => setActiveTab(key as typeof activeTab)}
+                    items={[
+                      {
+                        key: 'objects',
+                        icon: <ProfileOutlined />,
+                        label: (
+                          <span className="ts-tab-label">
+                            {t('templateScenarios.objectTemplate')}
+                            <span className="ts-tab-count">{objects.length}</span>
+                          </span>
+                        ),
+                        children: (
+                          <div className="template-scenarios-tab-body">
+                            <p className="ts-note">{t('templateScenarios.relationNote')}</p>
+                            <Table
+                              dataSource={objects}
+                              columns={objectColumns}
+                              rowKey="id"
+                              className="ts-table"
+                              loading={loadingDetails}
+                              pagination={false}
+                              scroll={{ x: 860 }}
+                              locale={{ emptyText: t('templateScenarios.noObjectTemplates') }}
+                            />
+                          </div>
+                        ),
+                      },
+                      {
+                        key: 'relations',
+                        icon: <ShareAltOutlined />,
+                        label: (
+                          <span className="ts-tab-label">
+                            {t('templateScenarios.relationTemplate')}
+                            <span className="ts-tab-count">{relations.length}</span>
+                          </span>
+                        ),
+                        children: (
+                          <div className="template-scenarios-tab-body">
+                            <p className="ts-note">{t('templateScenarios.relationNote')}</p>
+                            <Table
+                              dataSource={relations}
+                              columns={relationColumns}
+                              rowKey="id"
+                              className="ts-table"
+                              loading={loadingDetails}
+                              pagination={false}
+                              scroll={{ x: 860 }}
+                              locale={{ emptyText: t('templateScenarios.noRelationTemplates') }}
+                            />
+                          </div>
+                        ),
+                      },
+                      {
+                        key: 'constraints',
+                        icon: <SafetyOutlined />,
+                        label: (
+                          <span className="ts-tab-label">
+                            {t('templateScenarios.constraintTemplate')}
+                            <span className="ts-tab-count">{constraints.length}</span>
+                          </span>
+                        ),
+                        children: (
+                          <div className="template-scenarios-tab-body">
+                            <p className="ts-note">{t('templateScenarios.constraintNote')}</p>
+                            <Table
+                              dataSource={constraints}
+                              columns={constraintColumns}
+                              rowKey="id"
+                              className="ts-table"
+                              loading={loadingDetails}
+                              pagination={false}
+                              scroll={{ x: 860 }}
+                              locale={{ emptyText: t('templateScenarios.noConstraintTemplates') }}
+                            />
+                          </div>
+                        ),
+                      },
+                    ]}
+                    // 新建按钮钉在页签栏右侧：整栏不随表格滚动，也就省掉了原来每页签一条工具条
+                    tabBarExtraContent={
+                      <Button type="primary" icon={<PlusOutlined />} onClick={createAction[activeTab].onClick}>
+                        {createAction[activeTab].label}
+                      </Button>
+                    }
+                  />
                 </>
               )}
             </section>
@@ -943,13 +983,7 @@ export default function TemplateScenarios() {
         english={english}
         onSaved={handleDetailItemSaved}
       />
-      <DeleteConfirmModal
-        ref={deleteModalRef}
-        selectedSceneId={selectedSceneId}
-        domainFilter={domainFilter}
-        english={english}
-        onDeleted={handleItemDeleted}
-      />
+      <DeleteConfirmModal ref={deleteModalRef} english={english} onDeleted={handleItemDeleted} />
 
       <input
         type="file"

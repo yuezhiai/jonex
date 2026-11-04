@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { Card, Tabs } from 'antd';
+import { AppstoreOutlined, KeyOutlined } from '@ant-design/icons';
 import { useSearchParams } from 'react-router-dom';
-import { radius } from '@jonex/platform-theme/tokens';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
 import McpServicesTab from './McpServicesTab';
 import McpKeysTab from './McpKeysTab';
@@ -36,19 +36,30 @@ export default function McpServiceDirectory() {
       <PageHeader title={t('mcpServiceDirectory.title')} />
 
       <PageContent showCard={false}>
-        <Card style={{ borderRadius: radius.card }}>
+        <Card className="mcp-panel" styles={{ body: { padding: 0 } }}>
           <Tabs
+            className="mcp-tabs"
             activeKey={activeTab}
             onChange={handleTabChange}
             items={[
               {
                 key: 'catalog',
-                label: t('mcpServiceDirectory.tabCatalog'),
+                label: (
+                  <span className="mcp-tab-label">
+                    <AppstoreOutlined />
+                    {t('mcpServiceDirectory.tabCatalog')}
+                  </span>
+                ),
                 children: <McpServicesTab onGoToKeys={() => handleTabChange('keys')} />,
               },
               {
                 key: 'keys',
-                label: t('mcpServiceDirectory.tabKeys'),
+                label: (
+                  <span className="mcp-tab-label">
+                    <KeyOutlined />
+                    {t('mcpServiceDirectory.tabKeys')}
+                  </span>
+                ),
                 children: <McpKeysTab />,
               },
             ]}

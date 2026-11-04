@@ -152,3 +152,243 @@
   font-size: 12px;
   color: #94a3b8;
 }
+
+/* ── 页面外壳：Card 去掉内边距，Tab 栏贴顶、内容区统一留白 ── */
+.mcp-panel {
+  border: 1px solid #eef2f7;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.mcp-panel > .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+}
+
+.mcp-panel .ant-tabs {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.mcp-panel .ant-tabs-nav {
+  margin: 0;
+  padding: 2px 18px 0;
+}
+
+.mcp-panel .ant-tabs-nav::before {
+  border-bottom-color: #eef2f7;
+}
+
+.mcp-panel .ant-tabs-tab {
+  padding: 12px 0 10px;
+  font-size: 13.5px;
+}
+
+.mcp-panel .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+  padding: 16px 18px 18px;
+}
+
+.mcp-panel .ant-tabs-tabpane {
+  height: 100%;
+}
+
+.mcp-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mcp-tab-label .anticon {
+  color: #8a97a8;
+  font-size: 14px;
+}
+
+.mcp-panel .ant-tabs-tab-active .mcp-tab-label .anticon {
+  color: #1677ff;
+}
+
+/* ── 列表单元格：主标题 + 等宽副标题 ── */
+.mcp-cell-name.ant-btn {
+  height: auto;
+  justify-content: flex-start;
+  padding: 0;
+  color: #1c4f8a;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.mcp-cell-name.ant-btn:hover {
+  color: #1677ff;
+}
+
+.mcp-cell-sub {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: #94a3b8;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-cell-muted {
+  color: #94a3b8;
+  font-size: 12.5px;
+}
+
+.mcp-cell-date {
+  color: #5b6b7f;
+  font-size: 12.5px;
+}
+
+/* ── 标签（能力 / 写入范围 / 资源范围）：统一浅底胶囊 ── */
+.mcp-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mcp-chip {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0 7px;
+  border: 1px solid #e6ebf2;
+  border-radius: 6px;
+  background: #f7f9fc;
+  color: #5b6b7f;
+  font-size: 11.5px;
+  line-height: 19px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-chip.is-call {
+  border-color: #dbe6fb;
+  background: #eef4ff;
+  color: #2f6bd8;
+}
+
+.mcp-chip.is-view {
+  border-color: #f2e3c2;
+  background: #fdf7e8;
+  color: #8a6a1f;
+}
+
+.mcp-chip.is-write {
+  border-color: #d6ecdd;
+  background: #eef8f1;
+  color: #2f7a4e;
+}
+
+.mcp-chip.is-more {
+  border-color: #e9eef5;
+  background: #f2f5f9;
+  color: #7c8899;
+}
+
+/* ── 状态：圆点 + 文案 ── */
+.mcp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #44536b;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.mcp-status::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #8a97a8;
+  content: '';
+}
+
+.mcp-status.is-active {
+  color: #2f7a4e;
+}
+
+.mcp-status.is-active::before {
+  background: #37a06a;
+}
+
+.mcp-status.is-off {
+  color: #8a6a1f;
+}
+
+.mcp-status.is-off::before {
+  background: #d99a2b;
+}
+
+.mcp-status.is-expired {
+  color: #a4692f;
+}
+
+.mcp-status.is-expired::before {
+  background: #d98a2b;
+}
+
+.mcp-status.is-revoked {
+  color: #9c4a42;
+}
+
+.mcp-status.is-revoked::before {
+  background: #cf5a50;
+}
+
+.mcp-status.is-unpublished {
+  color: #7c8899;
+}
+
+/* ── 行内操作：图标按钮 + 更多 ── */
+.mcp-row-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.mcp-icon-btn.ant-btn,
+.mcp-more-btn.ant-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 7px;
+  color: #6b7a8d;
+}
+
+.mcp-icon-btn.ant-btn:hover,
+.mcp-more-btn.ant-btn:hover {
+  background: #f2f5f9;
+  color: #1677ff;
+}
+
+.mcp-cell-mono {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  color: #5b6b7f;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.mcp-cell-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  color: #44536b;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}

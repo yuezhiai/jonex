@@ -31,14 +31,12 @@ export interface DeleteConfirmModalHandle {
 }
 
 interface DeleteConfirmModalProps {
-  selectedSceneId: string | null;
-  domainFilter: string;
   english: boolean;
   onDeleted: (deleteType: string) => void;
 }
 
 const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, DeleteConfirmModalProps>(function DeleteConfirmModal(
-  { selectedSceneId, domainFilter, english, onDeleted },
+  { english, onDeleted },
   ref,
 ) {
   const { t } = useTranslation();

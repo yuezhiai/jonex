@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Empty, Result, Space, Tag, Tooltip } from 'antd';
+import { Button, Empty, Result, Tooltip } from 'antd';
 import type { TableColumnsType } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
+import { EyeOutlined, ReloadOutlined } from '@ant-design/icons';
 import { CommonTable, formatDateTime } from '@jonex/shared-lib';
 import type { FilterConfig, TableQueryParams } from '@jonex/shared-lib';
 import { listMcpServices } from '@/api/mcpServices';
@@ -21,6 +21,9 @@ type ServiceFilters = {
   keyword?: string;
   space_id?: string;
 };
+
+/** 资源范围标签最多直出几个，其余折叠成 +N */
+const SCOPE_TAG_LIMIT = 3;
 
 /** MCP 服务目录 — 服务列表 Tab */
 export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
@@ -102,94 +105,114 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
       });
   }, []);
 
+  /** 发布状态 + 是否可调用，压成一条带圆点的状态文案 */
+  const renderStatus = (record: McpServiceItem) => {
+    if (!record.is_published) {
+      return <span className="mcp-status is-unpublished">{t('mcpServiceDirectory.statusUnpublished')}</span>;
+    }
+    if (record.enabled === 0) {
+      return (
+        <Tooltip title={t('mcpServiceDirectory.statusUnavailableTip')}>
+          <span className="mcp-status is-off">{t('mcpServiceDirectory.statusUnavailable')}</span>
+        </Tooltip>
+      );
+    }
+    return <span className="mcp-status is-active">{t('mcpServiceDirectory.statusPublished')}</span>;
+  };
+
+  /** 默认资源范围：系统内置服务由 Key 授权决定，领域服务列出 KB（超过 3 个折叠） */
+  const renderScope = (record: McpServiceItem) => {
+    if (record.service_type === 'system') {
+      return <span className="mcp-cell-muted">{t('mcpServiceDirectory.scopeByKey')}</span>;
+    }
+    const names = record.kb_names || [];
+    if (names.length === 0) return <span className="mcp-cell-muted">-</span>;
+    const shown = names.slice(0, SCOPE_TAG_LIMIT);
+    const rest = names.slice(SCOPE_TAG_LIMIT);
+    return (
+      <div className="mcp-chip-row">
+        {shown.map((n) => (
+          <span className="mcp-chip" key={n}>
+            {n}
+          </span>
+        ))}
+        {rest.length > 0 && (
+          <Tooltip title={rest.join('、')}>
+            <span className="mcp-chip is-more">+{rest.length}</span>
+          </Tooltip>
+        )}
+      </div>
+    );
+  };
+
   const columns: TableColumnsType<McpServiceItem> = [
     {
       title: t('mcpServiceDirectory.colName'),
       dataIndex: 'name',
       key: 'name',
+      width: 200,
       render: (name: string, record: McpServiceItem) => (
-        <Space size={6}>
-          <Button
-            type="link"
-            style={{ padding: 0, height: 'auto', color: '#1C6FEA', fontWeight: 600 }}
-            onClick={() => detailDrawerRef.current?.open(record)}
-          >
-            {name}
-          </Button>
-        </Space>
+        <Button
+          type="text"
+          className="mcp-cell-name"
+          title={name}
+          onClick={() => detailDrawerRef.current?.open(record)}
+        >
+          {name}
+        </Button>
       ),
     },
     {
       title: t('mcpServiceDirectory.colCapabilityType'),
       key: 'capability_type',
-      width: 100,
-      render: (_: unknown, record: McpServiceItem) =>
-        record.service_type === 'system' ? (
-          <Tag color="blue">{t('mcpServiceDirectory.capabilityWrite')}</Tag>
-        ) : (
-          <Tag>{t('mcpServiceDirectory.capabilityDomain')}</Tag>
-        ),
+      width: 130,
+      render: (_: unknown, record: McpServiceItem) => (
+        <span className={`mcp-chip ${record.service_type === 'system' ? 'is-call' : ''}`}>
+          {record.service_type === 'system'
+            ? t('mcpServiceDirectory.capabilityWrite')
+            : t('mcpServiceDirectory.capabilityDomain')}
+        </span>
+      ),
     },
     {
       title: t('mcpServiceDirectory.colToolName'),
       key: 'tool_name',
+      width: 170,
       render: (_: unknown, record: McpServiceItem) =>
-        record.tool ? <span>{record.tool}</span> : <span style={{ color: '#94a3b8' }}>-</span>,
+        record.tool ? (
+          <span className="mcp-cell-mono" title={record.tool}>
+            {record.tool}
+          </span>
+        ) : (
+          <span className="mcp-cell-muted">-</span>
+        ),
     },
     {
       title: t('mcpServiceDirectory.colSource'),
       key: 'source',
-      width: 120,
+      width: 150,
       render: (_: unknown, record: McpServiceItem) =>
         record.service_type === 'system' ? (
-          <span>{t('mcpServiceDirectory.sourceBuiltin')}</span>
+          <span className="mcp-cell-text">{t('mcpServiceDirectory.sourceBuiltin')}</span>
+        ) : record.space_name ? (
+          <span className="mcp-cell-text" title={record.space_name}>
+            {record.space_name}
+          </span>
         ) : (
-          record.space_name || '-'
+          <span className="mcp-cell-muted">-</span>
         ),
     },
     {
       title: t('mcpServiceDirectory.colResourceScope'),
       key: 'resource_scope',
-      render: (_: unknown, record: McpServiceItem) => {
-        // 知识写入（system）无预授权知识库，资源范围由 Key 授权决定
-        if (record.service_type === 'system') {
-          return <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.scopeByKey')}</span>;
-        }
-        const names = record.kb_names || [];
-        if (names.length === 0) return <span style={{ color: '#94a3b8' }}>-</span>;
-        const shown = names.slice(0, 3);
-        const rest = names.slice(3);
-        return (
-          <Space size={8} wrap>
-            {shown.map((n) => (
-              <Tag key={n}>{n}</Tag>
-            ))}
-            {rest.length > 0 && (
-              <Tooltip title={rest.join('、')}>
-                <Tag>+{rest.length}</Tag>
-              </Tooltip>
-            )}
-          </Space>
-        );
-      },
+      width: 300,
+      render: (_: unknown, record: McpServiceItem) => renderScope(record),
     },
     {
       title: t('mcpServiceDirectory.colStatus'),
-      dataIndex: 'is_published',
       key: 'is_published',
-      render: (v: boolean, record: McpServiceItem) =>
-        v ? (
-          <Space size={4} wrap>
-            <Tag color="success">{t('mcpServiceDirectory.statusPublished')}</Tag>
-            {record.enabled === 0 && (
-              <Tooltip title={t('mcpServiceDirectory.statusUnavailableTip')}>
-                <Tag color="orange">{t('mcpServiceDirectory.statusUnavailable')}</Tag>
-              </Tooltip>
-            )}
-          </Space>
-        ) : (
-          <Tag>{t('mcpServiceDirectory.statusUnpublished')}</Tag>
-        ),
+      width: 140,
+      render: (_: unknown, record: McpServiceItem) => renderStatus(record),
     },
     {
       title: t('mcpServiceDirectory.colLastCall'),
@@ -197,16 +220,25 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
       key: 'last_call_at',
       width: 150,
       render: (v: string | null) =>
-        v ? formatDateTime(v) : <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.neverCalled')}</span>,
+        v ? (
+          <span className="mcp-cell-date">{formatDateTime(v)}</span>
+        ) : (
+          <span className="mcp-cell-muted">{t('mcpServiceDirectory.neverCalled')}</span>
+        ),
     },
     {
       title: t('mcpServiceDirectory.colActions'),
       key: 'actions',
-      width: 90,
+      width: 84,
       render: (_: unknown, record: McpServiceItem) => (
-        <Button type="link" size="small" onClick={() => detailDrawerRef.current?.open(record)}>
-          {t('mcpServiceDirectory.viewDetail')}
-        </Button>
+        <Tooltip title={t('mcpServiceDirectory.viewDetail')}>
+          <Button
+            type="text"
+            className="mcp-icon-btn"
+            icon={<EyeOutlined />}
+            onClick={() => detailDrawerRef.current?.open(record)}
+          />
+        </Tooltip>
       ),
     },
   ];
@@ -232,18 +264,19 @@ export default function McpServicesTab({ onGoToKeys }: McpServicesTabProps) {
   }
 
   return (
-    <div>
+    <div className="mcp-tab-body">
       <CommonTable<McpServiceItem, ServiceFilters>
         rowKey="id"
         filters={filters}
         columns={columns}
         fetch={fetchRows}
-        scroll={{ x: 'max-content' }}
+        size="middle"
+        scroll={{ x: 1330 }}
         emptyText={
           totalCount === 0 ? (
-            <Empty description={t('mcpServiceDirectory.emptyText')} />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('mcpServiceDirectory.emptyText')} />
           ) : (
-            <Empty description={t('mcpServiceDirectory.emptySearchText')} />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('mcpServiceDirectory.emptySearchText')} />
           )
         }
       />

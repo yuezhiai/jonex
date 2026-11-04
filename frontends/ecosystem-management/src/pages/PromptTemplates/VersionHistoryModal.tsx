@@ -1,20 +1,23 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Modal, Table, Button, Tag, Typography, message, Popconfirm } from 'antd';
+import { Modal, Table, Button, Tag, message, Popconfirm } from 'antd';
 import { EyeOutlined, RollbackOutlined, BranchesOutlined } from '@ant-design/icons';
 import { listVersions, rollbackVersion, type VersionItem, type PromptTemplateItem } from '../../api/promptTemplates';
 import { promptTemplateVersionsDisplay } from '../../utils/systemPromptTemplateDisplay';
+import { formatUpdatedAt } from './formatTime';
 
-interface VersionModalProps {
+interface VersionHistoryModalProps {
   open: boolean;
   template: PromptTemplateItem | null;
   onClose: () => void;
-  onRollback: () => void; // refresh parent after rollback
+  /** 回滚成功后通知父级刷新列表（回滚会产生新版本）。 */
+  onRollback: () => void;
   onViewDetail: (version: VersionItem) => void;
   domainSpaceId?: string | null;
 }
 
-const VersionModal: React.FC<VersionModalProps> = ({
+/** 版本历史弹窗：只承载领域模板（后端 list_versions 不接受系统模板）。 */
+const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
   open,
   template,
   onClose,
@@ -22,9 +25,9 @@ const VersionModal: React.FC<VersionModalProps> = ({
   onViewDetail,
   domainSpaceId,
 }) => {
+  const { t } = useTranslation();
   const [versions, setVersions] = useState<VersionItem[]>([]);
   const [currentVersion, setCurrentVersion] = useState('');
-  const { t } = useTranslation();
   const [loading, setLoading] = useState(false);
 
   const loadVersions = useCallback(async () => {
@@ -61,10 +64,10 @@ const VersionModal: React.FC<VersionModalProps> = ({
     {
       title: t('promptTemplate.versionColumn'),
       dataIndex: 'version',
-      width: 100,
-      render: (v: string, _: VersionItem, idx: number) => (
+      width: 112,
+      render: (version: string, _record: VersionItem, idx: number) => (
         <span>
-          <span style={{ fontWeight: 600, color: '#7c3aed' }}>v{v}</span>
+          <span style={{ fontWeight: 600, color: '#7c3aed' }}>v{version}</span>
           {idx === 0 && (
             <Tag color="green" style={{ marginLeft: 6, fontSize: 10 }}>
               {t('promptTemplate.currentTag')}
@@ -74,34 +77,24 @@ const VersionModal: React.FC<VersionModalProps> = ({
       ),
     },
     {
-      title: t('promptTemplate.contentPreview'),
-      dataIndex: 'content',
-      width: 320,
-      render: (content: string) => (
-        <Typography.Paragraph
-          type="secondary"
-          ellipsis={{ rows: 2, tooltip: content || undefined }}
-          style={{ margin: 0 }}
-        >
-          {content || ''}
-        </Typography.Paragraph>
-      ),
-    },
-    {
       title: t('promptTemplate.updateDescription'),
       dataIndex: 'remark',
-      width: 90,
       ellipsis: true,
       render: (remark: string) => <span>{remark || '—'}</span>,
     },
-    { title: t('promptTemplate.updatedBy'), dataIndex: 'updated_by', width: 120 },
-    { title: t('promptTemplate.updatedAt'), dataIndex: 'updated_at', width: 150 },
+    { title: t('promptTemplate.updatedBy'), dataIndex: 'updated_by', width: 110, ellipsis: true },
+    {
+      title: t('promptTemplate.updatedAt'),
+      dataIndex: 'updated_at',
+      width: 150,
+      render: (value: string) => formatUpdatedAt(value),
+    },
     {
       title: t('common.actions'),
       key: 'actions',
-      width: 120,
+      width: 132,
       render: (_: unknown, record: VersionItem, idx: number) => (
-        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 6 }}>
           <Button size="small" icon={<EyeOutlined />} onClick={() => onViewDetail(record)}>
             {t('promptTemplate.viewBtn')}
           </Button>
@@ -124,38 +117,39 @@ const VersionModal: React.FC<VersionModalProps> = ({
   ];
 
   return (
-    <>
-      <Modal
-        title={
-          <span>
-            <BranchesOutlined style={{ color: '#7c3aed', marginRight: 8 }} />
-            {t('promptTemplate.version')} · {template?.name}
-          </span>
-        }
-        open={open}
-        onCancel={onClose}
-        footer={<Button onClick={onClose}>{t('common.close')}</Button>}
-        width={1080}
-      >
-        <div style={{ marginBottom: 16, fontSize: 13, color: '#475569' }}>
-          <span>
-            {t('promptTemplate.currentVersion')}: <Tag color="purple">v{currentVersion}</Tag>
-          </span>
-          <span style={{ marginLeft: 16 }}>
-            {t('promptTemplate.versionCountLabel')} <strong>{versions.length}</strong>{' '}
-            {t('promptTemplate.versionCountUnit')}
-          </span>
-        </div>
-        <Table
-          dataSource={versions}
-          columns={columns}
-          rowKey="version"
-          loading={loading}
-          pagination={false}
-        />
-      </Modal>
-    </>
+    <Modal
+      title={
+        <span>
+          <BranchesOutlined style={{ color: '#7c3aed', marginRight: 8 }} />
+          {t('promptTemplate.versionHistory')} · {template?.name}
+        </span>
+      }
+      open={open}
+      onCancel={onClose}
+      footer={<Button onClick={onClose}>{t('common.close')}</Button>}
+      width={760}
+      destroyOnHidden
+    >
+      <div style={{ marginBottom: 14, fontSize: 13, color: '#475569' }}>
+        <span>
+          {t('promptTemplate.currentVersion')}: <Tag color="purple">v{currentVersion}</Tag>
+        </span>
+        <span style={{ marginLeft: 16 }}>
+          {t('promptTemplate.versionCountLabel')} <strong>{versions.length}</strong>{' '}
+          {t('promptTemplate.versionCountUnit')}
+        </span>
+      </div>
+      <Table
+        dataSource={versions}
+        columns={columns}
+        rowKey="version"
+        loading={loading}
+        pagination={false}
+        size="small"
+        scroll={{ y: 420 }}
+      />
+    </Modal>
   );
 };
 
-export default React.memo(VersionModal);
+export default React.memo(VersionHistoryModal);

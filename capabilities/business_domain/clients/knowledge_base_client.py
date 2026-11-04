@@ -24,19 +24,45 @@ class KnowledgeBaseClient:
             timeout=300,
         )
 
-    async def invoke(self, action: str, data: dict, tenant_id: str) -> dict:
+    async def invoke(
+        self,
+        action: str,
+        data: dict,
+        tenant_id: str,
+        *,
+        user_id: str | None = None,
+        username: str | None = None,
+        request_id: str | None = None,
+        extra: dict | None = None,
+    ) -> dict:
+        """调一个 knowledge_base action。
+
+        `user_id` / `username`：代真实用户调用时传 —— knowledge_base 据此做空间 / KB 权限判定；
+        不传就是「平台内部调用」（无用户身份，knowledge_base 跳过空间判定、内部 action 才放行）。
+        `extra`：并入 Sidecar `/invoke` 报文的其它身份字段（如模拟态 `impersonated` / `perms` /
+        `original_tenant_id`）。`request_id` 作 `X-Request-ID` 透传，串起两边的审计与日志。
+        """
         body = {
             "capability_id": _CAPABILITY_ID,
             "payload": {"action": action, "data": data},
             "tenant_id": tenant_id,
         }
-        resp = await post_sidecar(self._client, body, tenant_id)
+        if user_id:
+            body["user_id"] = str(user_id)
+        if username:
+            body["username"] = username
+        for k, v in (extra or {}).items():
+            if v is not None:
+                body[k] = v
+        headers = {"X-Request-ID": request_id} if request_id else None
+        resp = await post_sidecar(self._client, body, tenant_id, headers=headers)
         result = resp.json()
         if not result.get("success"):
             raise CapabilityInvokeError(
                 message=f"knowledge_base invoke failed: {result.get('message')}",
                 details={
                     "upstream_message": result.get("message"),
+                    "upstream_code": result.get("code"),
                     "error_code": (result.get("details") or {}).get("error_code"),
                 },
             )

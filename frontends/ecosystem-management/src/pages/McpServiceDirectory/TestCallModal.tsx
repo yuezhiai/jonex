@@ -12,7 +12,7 @@ export type TestCallModalHandle = {
   open: (record: McpServiceItem) => void;
 };
 
-interface TestCallModalProps {}
+type TestCallModalProps = Record<string, never>;
 
 /** 一次测试调用结果（附带递增 id 与原始 query，便于多次测试追加展示） */
 interface TestCallResultItem extends TestCallResponse {

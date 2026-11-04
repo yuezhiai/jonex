@@ -1,0 +1,140 @@
+/* 创建/编辑对象弹窗：顶部说明 + 属性表格式编辑（名称 / 说明 / 类型 / 主键 / 操作） */
+.tom-form .tom-hint {
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #5b6b7f;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.tom-basic {
+  display: flex;
+  flex-direction: column;
+}
+
+.tom-attrs {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.tom-attrs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.tom-attrs-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #0b2b5c;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.tom-attrs-count {
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: #eef4fa;
+  color: #44648a;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+.tom-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.45fr) 108px 84px 32px;
+  gap: 10px;
+  align-items: start;
+  padding: 6px 0;
+}
+
+.tom-row-head {
+  padding: 0 0 4px;
+  color: #94a3b8;
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.tom-row .ant-form-item {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.tom-row .ant-form-item-explain {
+  padding-top: 2px;
+  font-size: 11.5px;
+}
+
+.tom-row-head .tom-row-key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 主键列：与 32px 高的输入框同高并垂直居中 */
+.tom-row .ant-form-item.tom-row-key {
+  display: flex;
+  width: 100%;
+  height: 32px;
+  margin-bottom: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.tom-row .ant-form-item.tom-row-key .ant-form-item-control,
+.tom-row .ant-form-item.tom-row-key .ant-form-item-control-input,
+.tom-row .ant-form-item.tom-row-key .ant-form-item-control-input-content {
+  height: 32px;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+}
+
+.tom-row .ant-checkbox-wrapper {
+  margin-inline-start: 0;
+}
+
+/* 删除按钮：常驻红色，与主键复选框同高对齐 */
+.tom-row > .tom-remove.ant-btn {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  justify-self: end;
+  color: #d64a42;
+  font-size: 14px;
+}
+
+.tom-row > .tom-remove.ant-btn:hover {
+  background: #fdf3f2;
+  color: #b83a33;
+}
+
+.tom-empty {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 22px 16px;
+  border: 1px dashed #e2e8f0;
+  border-radius: 10px;
+  background: #fcfdff;
+  color: #94a3b8;
+  font-size: 12.5px;
+}
+
+.tom-modal .ant-modal-body {
+  padding-top: 6px;
+}

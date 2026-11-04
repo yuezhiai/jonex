@@ -25,11 +25,6 @@ interface RouteConfigItem {
   index?: boolean;
 }
 
-interface MenuItem {
-  path?: string;
-  permissionCode?: string;
-}
-
 interface AuthLoaderOptions {
   basename: string;
   mode: string;

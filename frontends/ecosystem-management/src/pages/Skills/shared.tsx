@@ -8,6 +8,7 @@ import {
   DatabaseOutlined,
   SearchOutlined as FusionSearchOutlined,
 } from '@ant-design/icons';
+import type { SkillItem } from '../../api/skills';
 
 /** 技能类别 → 类别图标 */
 export const CATEGORY_ICONS: Record<string, React.ReactNode> = {
@@ -38,6 +39,45 @@ export const BUILT_IN_SKILL_KEYS: Record<string, string> = {
   skill_multimodal_search: 'multimodalSearch',
   skill_data_extraction: 'dataExtraction',
 };
+
+/** 内置技能 id → 默认标签（标签由 i18n 翻译） */
+const BUILT_IN_SKILL_TAGS: Record<string, string[]> = {
+  imageRecognition: ['image', 'ocr', 'recognition'],
+  speechToText: ['speech', 'transcription', 'asr'],
+  documentLayout: ['document', 'layout', 'structured'],
+  videoUnderstanding: ['video', 'frameSampling', 'analysis'],
+  multimodalSearch: ['search', 'fusion', 'semantic'],
+  dataExtraction: ['extraction', 'structured', 'document'],
+};
+
+/** 类别 → 浅底 + 同色图标（比高饱和渐变安静，保留分类辨识度） */
+export const CATEGORY_TINTS: Record<string, { background: string; color: string }> = {
+  image: { background: '#e8f1ff', color: '#1d6ff2' },
+  voice: { background: '#e6f7ef', color: '#0f9d63' },
+  document: { background: '#fff2e3', color: '#d97706' },
+  video: { background: '#f1ecff', color: '#7c4dff' },
+  fusion: { background: '#fef0f0', color: '#dc2626' },
+  custom: { background: '#e6f7f8', color: '#0891b2' },
+};
+
+/** 列表卡片与详情弹窗共用的文案解析：内置技能走 i18n，自定义工具用接口原文 */
+export function getSkillCopy(skill: SkillItem, t: (key: string) => string) {
+  const key = BUILT_IN_SKILL_KEYS[skill.id];
+  if (!key) {
+    return {
+      name: skill.name,
+      description: skill.description || '',
+      instruction: skill.instruction,
+      tags: skill.tags,
+    };
+  }
+  return {
+    name: t(`skills.builtIn.${key}.name`),
+    description: t(`skills.builtIn.${key}.description`),
+    instruction: t(`skills.builtIn.${key}.instruction`),
+    tags: (BUILT_IN_SKILL_TAGS[key] || []).map((tag) => t(`skills.tags.${tag}`)),
+  };
+}
 
 /** JSON Schema 字段名 → 描述 i18n key（localizeSchemaDescriptions 按父键查找） */
 const SCHEMA_DESCRIPTION_KEYS: Record<string, string> = {

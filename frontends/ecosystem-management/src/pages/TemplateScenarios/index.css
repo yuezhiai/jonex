@@ -1,320 +1,479 @@
+/* 领域模板场景：左侧场景列表 + 右侧对象/关系/约束页签的主从布局 */
+
 .template-scenarios-card {
-  padding: 0;
-  overflow: hidden;
-  /* 卡片固定为一屏高：右栏定义表可以有几千 px，若让卡片按内容长高，
-     左栏会被一起拉到同样的高度（滚到下面时左半屏是空白）。
-     高度由视口定、不给内容长高的机会，滚动交给下面的右栏自己 */
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
+  border-radius: 14px;
 }
 
-/* 撑满卡片余量。min-height 设 0：否则会取内容的 min-content 高度（几千 px），
-   把卡片顶开后被 overflow:hidden 裁掉 —— 右栏就再也滚不到了 */
 .template-scenarios-split {
   display: flex;
   flex: 1;
   min-height: 0;
 }
 
+/* ---------- 左栏 ---------- */
+
 .template-scenarios-left {
   display: flex;
   flex-direction: column;
-  width: 260px;
-  min-width: 260px;
-  padding: 20px 16px;
-  border-right: 1px solid #e2e8f0;
-  background: #fff;
+  gap: 10px;
+  width: 280px;
+  min-width: 280px;
+  padding: 16px 14px 14px;
+  border-right: 1px solid #eef2f7;
+  background: #fcfdff;
 }
 
 .template-scenarios-left-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
+  gap: 8px;
+  padding: 0 2px;
 }
 
 .template-scenarios-left-title h2 {
   margin: 0;
+  font-size: 13px;
+  font-weight: 700;
   color: #0b2b5c;
-  font-size: 14px;
+  letter-spacing: 0.2px;
+}
+
+.ts-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid #e9eef5;
+  border-radius: 10px;
+  background: #f5f8fc;
+  color: #5b6b7f;
+  font-size: 11.5px;
   font-weight: 600;
 }
 
-.template-scenarios-left-title span {
-  color: #64748b;
-  font-size: 12px;
-}
-
-.template-scenarios-domain-filter {
+.template-scenarios-left .ant-select {
   width: 100%;
-  margin-bottom: 14px;
 }
 
 .template-scenarios-list {
-  max-height: 420px;
-  margin: 0 0 16px;
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0 2px 2px 0;
   overflow-y: auto;
-}
-
-.template-scenarios-item-main {
-  min-width: 0;
-  /* 菜单项把 line-height 设成了 itemHeight（等于一行的行高），下面三行若继承，
-     每行都会被撑到 itemHeight 那么高、再被 overflow 裁掉。这里恢复成正常行高。 */
-  line-height: normal;
-}
-
-.template-scenarios-item-name {
-  color: #0b2b5c;
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.template-scenarios-item-meta {
-  margin-top: 2px;
-  color: #94a3b8;
-  font-size: 12px;
-}
-
-.template-scenarios-domain-tag {
-  margin-top: 4px;
-  padding: 1px 8px;
-  border: 0;
-  border-radius: 4px;
-  background: #f1f5f9;
-  color: #475569;
-  font-size: 11px;
-  line-height: 18px;
-}
-
-.template-scenarios-item-actions {
-  display: flex;
-  flex-shrink: 0;
-  opacity: 0;
-  transition: opacity 0.2s;
-}
-
-.template-scenarios-no-scene {
-  justify-content: center;
-  padding: 40px 20px;
-  color: #94a3b8;
-  font-size: 13px;
-  text-align: center;
-  cursor: default;
-}
-
-.template-scenarios-no-scene:hover {
-  border-color: transparent;
+  border-inline-end: 0 !important;
   background: transparent;
 }
 
-.template-scenarios-list li:hover .template-scenarios-item-actions,
-.template-scenarios-list .ant-menu-item-selected .template-scenarios-item-actions {
-  opacity: 1;
+/* 场景条目：两行（名称 / 领域 · 时间），高度由内容决定 */
+.template-scenarios-list .ant-menu-item {
+  height: auto !important;
+  margin: 0 0 3px !important;
+  padding: 9px 10px !important;
+  border-radius: 10px;
+  line-height: normal !important;
+  overflow: visible;
 }
 
-.template-scenarios-create-scene {
+.template-scenarios-list .ant-menu-item .ant-menu-title-content {
+  width: 100%;
+  min-width: 0;
+}
+
+.template-scenarios-list .ant-menu-item:hover {
+  background: #f6f9fd;
+}
+
+.template-scenarios-list .ant-menu-item-selected {
+  background: #eef4fa !important;
+}
+
+.template-scenarios-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.template-scenarios-list::-webkit-scrollbar-thumb {
+  background: #dbe3ec;
+  border-radius: 4px;
+}
+
+.ts-scene {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
 }
 
-.template-scenarios-right {
+.ts-scene-main {
   flex: 1;
   min-width: 0;
-  padding: 20px 24px 24px;
-  /* 场景标题、标签页留在原地，只有标签内容区滚 —— 见 .template-scenarios-tab-body */
-  display: flex;
-  flex-direction: column;
+}
+
+.ts-scene-name {
   overflow: hidden;
-}
-
-/* 定义表 pagination={false}，几百行全渲染。滚的是这一层而不是整个右栏，
-   否则翻长表时标签页和「新建」按钮会一起滚出视口 */
-.template-scenarios-tab-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-
-.template-scenarios-right-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 4px;
-}
-
-.template-scenarios-right-header h2 {
-  margin: 0;
   color: #0b2b5c;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 600;
-}
-
-.template-scenarios-empty {
-  display: flex;
-  min-height: 340px;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.template-scenarios-tabs {
-  margin-bottom: 16px;
-  border-bottom: 1px solid #e2e8f0;
-}
-
-.template-scenarios-tabs .yx-tab {
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: #64748b;
-  font-family: inherit;
-  font-size: 14px;
-  padding: 10px 24px;
-}
-
-.template-scenarios-tabs .yx-tab.active {
-  border-bottom-color: #3b82f6;
-  color: #3b82f6;
-}
-
-.template-scenarios-tab-toolbar {
-  display: flex;
-  justify-content: flex-end;
-  /* 钉在滚动区顶部：翻长表时「新建」按钮留在手边。
-     用 padding 而非 margin 留白 —— sticky 会把外边距一起带上，
-     下面留一条 14px 的缝让表格从缝里透出来。底色不透明同理 */
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  padding-bottom: 14px;
-  background: #fff;
-}
-
-.template-scenarios-table-actions {
-  display: inline-flex;
-  flex-wrap: nowrap;
-  gap: 14px;
-  align-items: center;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.template-scenarios-key-mark {
-  color: #059669;
-  font-weight: 600;
-}
-
-.template-scenarios-muted {
-  color: #94a3b8;
-  font-size: 12px;
-}
-
-.template-scenarios-danger-link {
-  color: #dc2626;
-}
-
-.template-scenarios-danger-link:hover {
-  color: #b91c1c;
-}
-
-.template-scenarios-form {
-  margin-top: 8px;
-}
-
-.template-scenarios-attr-editor {
-  padding: 12px;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #f8fafc;
-}
-
-.template-scenarios-attr-editor-head {
+.ts-scene-meta {
   display: flex;
   align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  overflow: hidden;
+  color: #94a3b8;
+  font-size: 11.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.ts-scene-domain {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid #e9eef5;
+  border-radius: 5px;
+  background: #f4f7fa;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ts-scene-dot {
+  flex-shrink: 0;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #cbd5e1;
+}
+
+.ts-scene-acts {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 0;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.template-scenarios-list .ant-menu-item:hover .ts-scene-acts,
+.template-scenarios-list .ant-menu-item-selected .ts-scene-acts {
+  opacity: 1;
+}
+
+.ts-scene-acts .ant-btn {
+  color: #94a3b8;
+}
+
+.ts-scene-acts .ant-btn:hover {
+  color: #1677ff;
+}
+
+.ts-scene-acts .ant-btn-dangerous:hover {
+  color: #cf3b34;
+}
+
+.template-scenarios-create-scene {
+  flex-shrink: 0;
+  height: 32px;
+  border-radius: 9px;
+  box-shadow: 0 2px 6px rgba(46, 84, 128, 0.16);
+}
+
+/* ---------- 右栏 ---------- */
+
+.template-scenarios-right {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  padding: 18px 22px 22px;
+  overflow: hidden;
+}
+
+.ts-detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
   justify-content: space-between;
+  gap: 12px 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.ts-detail-title {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.ts-detail-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ts-detail-name {
+  margin: 0;
+  color: #0b2b5c;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.ts-chip {
+  padding: 1px 7px;
+  border: 1px solid #e9eef5;
+  border-radius: 6px;
+  background: #f5f8fc;
+  color: #5b6b7f;
+  font-size: 11.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.ts-detail-desc {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.ts-actions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  gap: 8px;
+}
+
+.ts-actions .ant-btn {
+  height: 30px;
+  padding: 0 12px;
+  border-color: #e2e8f0;
+  border-radius: 8px;
+  color: #44536b;
+  font-size: 12.5px;
+}
+
+.ts-actions .ant-btn:not(.ant-btn-primary):hover {
+  border-color: #cfe0f5;
+  color: #1677ff;
+}
+
+/* 表格行操作 */
+.ts-row-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ts-row-acts .ant-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 7px;
+  color: #5b6b7f;
+  font-size: 13px;
+}
+
+.ts-row-acts .ant-btn:hover {
+  background: #f4f7fb;
+  color: #1677ff;
+}
+
+.ts-row-acts .ant-btn.ant-btn-dangerous {
+  color: #b4554d;
+}
+
+.ts-row-acts .ant-btn.ant-btn-dangerous:hover {
+  background: #fdf4f3;
+  color: #cf3b34;
+}
+
+.ts-actions-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: #e9eef5;
+}
+
+.ts-empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 320px;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.ts-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid #e9eef5;
+  border-radius: 12px;
+  background: #f7fafd;
+  color: #b8c6d6;
+  font-size: 18px;
+}
+
+/* ---------- 页签 ---------- */
+
+.template-scenarios-right .ant-tabs {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  margin-top: 14px;
+}
+
+.template-scenarios-right .ant-tabs-nav {
+  flex-shrink: 0;
   margin-bottom: 12px;
 }
 
-.template-scenarios-attr-editor-head label {
-  color: #0f172a;
+.template-scenarios-right .ant-tabs-nav::before {
+  border-bottom-color: #eef2f7;
+}
+
+.template-scenarios-right .ant-tabs-tab {
+  padding: 8px 2px;
+}
+
+.template-scenarios-right .ant-tabs-content-holder {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.template-scenarios-right .ant-tabs-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.template-scenarios-right .ant-tabs-tabpane {
+  height: 100%;
+}
+
+.ts-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ts-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.ant-tabs-tab-active .ts-tab-count {
+  background: #eef4fa;
+  color: #1677ff;
+}
+
+.template-scenarios-tab-body {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.ts-note {
+  margin: 0 0 12px;
+  padding: 8px 11px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #7b8a9c;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 页签表格：轻表头、紧凑行 */
+.ts-table .ant-table {
+  background: transparent;
+}
+
+.ts-table .ant-table-thead > tr > th {
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 12px;
   font-weight: 600;
 }
 
-.template-scenarios-attr-row {
-  display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.2fr) 110px 96px 36px;
-  gap: 8px;
-  align-items: start;
-  margin-bottom: 8px;
+.ts-table .ant-table-tbody > tr > td {
+  font-size: 12.5px;
 }
 
-.template-scenarios-attr-row .ant-form-item {
-  margin-bottom: 0;
+.ts-table .ant-table-tbody > tr:hover > td {
+  background: #f8fafc;
 }
 
-.template-scenarios-relation-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
+.ts-table .ant-table-placeholder .ant-table-cell {
+  background: transparent;
 }
 
-.template-scenarios-delete-content {
-  padding: 12px 0;
-  color: #334155;
-  font-size: 14px;
-  line-height: 1.7;
-  text-align: center;
-}
+/* ---------- 窄屏 ---------- */
 
 @media (max-width: 960px) {
-  /* 两栏堆叠后改回整块滚（右栏再自己滚会被压成很矮一条）。
-     横向也收：表格没有 scroll.x，比面板宽时自会溢出，这一层不收就没人能滚到右边的列 */
   .template-scenarios-split {
     flex-direction: column;
-    overflow: auto;
   }
 
-  .template-scenarios-right {
-    flex: 0 0 auto;
-    overflow: visible;
-  }
-
-  .template-scenarios-tab-body {
-    flex: 0 0 auto;
-    overflow: visible;
-  }
-
-  /* 没有滚动区可钉，再 sticky 会盖在表格上 */
-  .template-scenarios-tab-toolbar {
-    position: static;
-  }
-
-  /* width 交给 stretch：本文件没有全局 border-box，
-     width:100% 会再叠上左右各 16px 内边距，比卡片宽 32px 被裁掉 */
   .template-scenarios-left {
-    width: auto;
+    width: 100%;
     min-width: 0;
     border-right: 0;
-    border-bottom: 1px solid #e2e8f0;
+    border-bottom: 1px solid #eef2f7;
   }
 
   .template-scenarios-list {
-    max-height: none;
+    flex: 0 1 auto;
+    max-height: 320px;
+  }
+
+  .template-scenarios-tab-body {
+    height: auto;
+    overflow: visible;
+  }
+
+  .ts-detail-head {
+    flex-direction: column;
+  }
+
+  .ts-actions {
+    justify-content: flex-start;
   }
 }
 
 @media (max-width: 720px) {
+  .template-scenarios-left,
   .template-scenarios-right {
-    padding: 18px 16px;
-  }
-
-  .template-scenarios-attr-row {
-    grid-template-columns: 1fr;
-  }
-
-  .template-scenarios-relation-grid {
-    grid-template-columns: 1fr;
-    gap: 0;
+    padding: 14px;
   }
 }
