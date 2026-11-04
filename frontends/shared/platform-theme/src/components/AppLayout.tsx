@@ -42,6 +42,8 @@ export interface LayoutLogo {
   alt: string;
   /** 当前语言：'en' 时显示 logo-en 资源，其余显示默认 logo；不随侧栏折叠变化 */
   locale?: string;
+  /** 传了就用这段文字替代 logo 图片（演示期临时换品牌名用；不传保持原图） */
+  text?: string;
 }
 
 /** 侧栏导航树节点：label 已由壳翻译、icon 已由壳解析为 ReactNode，组件零 i18n / 图标注册表依赖 */
@@ -379,7 +381,11 @@ export default function AppLayout({
             }}
             aria-label={logo.alt}
           >
-            <img src={logo.locale === 'en' ? '/logo-en.svg' : '/logo.svg'} alt={logo.alt} />
+            {logo.text ? (
+              <span className="yx-topbar-brand-text">{logo.text}</span>
+            ) : (
+              <img src={logo.locale === 'en' ? '/logo-en.svg' : '/logo.svg'} alt={logo.alt} />
+            )}
           </a>
         </div>
         <div className="yx-topbar-right">

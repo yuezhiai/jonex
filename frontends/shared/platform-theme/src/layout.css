@@ -518,6 +518,14 @@
   max-width: 160px;
   object-fit: contain;
 }
+/* 文字品牌名（`LayoutLogo.text`）：演示期替代 logo 图片用 */
+.yx-topbar-brand-text {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  color: var(--yx-text-primary, #0f172a);
+}
 .yx-topbar-right {
   display: flex;
   align-items: center;

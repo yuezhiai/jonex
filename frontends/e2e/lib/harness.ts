@@ -189,10 +189,20 @@ export function navigatedToLogin(urls: string[]): boolean {
  * 事件采集器（页面内）。挂在 addInitScript ⇒ 每次导航都会重新安装。
  * ⚠️ addInitScript 的函数会被序列化后送进浏览器，**外层作用域不存在** ⇒ 常量必须在函数体内重新声明。
  * 事件写入 sessionStorage ⇒ 跨 reload 累积（window 上的数组会被导航清掉）。
+ *
+ * ⚠️ addInitScript **只对之后的导航生效，不会注入当前已加载的文档**。
+ * S9 的事件（模拟态 401 → impersonation-expired）发生在安装后的**同一文档**里，还原后才 reload；
+ * 若只在 addInitScript 安装，事件会落在没有监听器的文档上 ⇒ 采集恒空（2026-10-26 实测踩坑，
+ * 且会让「不得发 token-expired」在空数组上假绿）。故安装时对当前文档再注入一次。
  */
 export async function installEventRecorder(page: Page, events: string[]): Promise<void> {
-  await page.addInitScript((names: string[]) => {
+  const install = (names: string[]) => {
     const KEY = '__jonex_e2e_events';
+    // 同一文档内 addInitScript 与「立即注入」会各装一次 ⇒ 用标记防重复注册
+    const FLAG = '__jonex_e2e_event_recorder_ready';
+    const flags = window as unknown as Record<string, unknown>;
+    if (flags[FLAG]) return;
+    flags[FLAG] = true;
     const load = (): string[] => {
       try {
         return JSON.parse(sessionStorage.getItem(KEY) || '[]') as string[];
@@ -211,7 +221,9 @@ export async function installEventRecorder(page: Page, events: string[]): Promis
         }
       });
     }
-  }, events);
+  };
+  await page.addInitScript(install, events);
+  await page.evaluate(install, events);
 }
 
 export async function readEvents(page: Page): Promise<string[]> {

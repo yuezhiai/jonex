@@ -97,7 +97,7 @@ importers:
         version: 1.100.0
       zustand:
         specifier: ^5.0.14
-        version: 5.0.14(@types/react@18.3.29)(react@18.3.1)
+        version: 5.0.14(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)(use-sync-external-store@1.7.0(react@18.3.1))
     devDependencies:
       '@originjs/vite-plugin-federation':
         specifier: ^1.4.1
@@ -153,6 +153,9 @@ importers:
       '@loadable/component':
         specifier: ^5.15.3
         version: 5.16.7(react@18.3.1)
+      '@xyflow/react':
+        specifier: 12.11.2
+        version: 12.11.2(@types/react-dom@18.3.7(@types/react@18.3.29))(@types/react@18.3.29)(immer@11.1.15)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       antd:
         specifier: ^6.4.3
         version: 6.4.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -180,6 +183,9 @@ importers:
       i18next:
         specifier: ^25.3.1
         version: 25.10.10(typescript@5.9.3)
+      immer:
+        specifier: 11.1.15
+        version: 11.1.15
       lodash:
         specifier: ^4.17.21
         version: 4.18.1
@@ -213,9 +219,12 @@ importers:
       sass:
         specifier: ^1.89.2
         version: 1.100.0
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
       zustand:
         specifier: ^5.0.14
-        version: 5.0.14(@types/react@18.3.29)(react@18.3.1)
+        version: 5.0.14(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)(use-sync-external-store@1.7.0(react@18.3.1))
     devDependencies:
       '@originjs/vite-plugin-federation':
         specifier: ^1.4.1
@@ -336,7 +345,7 @@ importers:
         version: 1.100.0
       zustand:
         specifier: ^5.0.14
-        version: 5.0.14(@types/react@18.3.29)(react@18.3.1)
+        version: 5.0.14(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)(use-sync-external-store@1.7.0(react@18.3.1))
     devDependencies:
       '@originjs/vite-plugin-federation':
         specifier: ^1.4.1
@@ -424,7 +433,7 @@ importers:
         version: 1.100.0
       zustand:
         specifier: ^5.0.14
-        version: 5.0.14(@types/react@18.3.29)(react@18.3.1)
+        version: 5.0.14(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)(use-sync-external-store@1.7.0(react@18.3.1))
     devDependencies:
       '@originjs/vite-plugin-federation':
         specifier: ^1.4.1
@@ -2065,6 +2074,9 @@ packages:
   '@types/d3-transition@3.0.9':
     resolution: {integrity: sha512-uZS5shfxzO3rGlu0cC3bjmMFKsXv+SmZZcgp0KD22ts4uGXp5EVYGzu/0YdwZeKmddhcAccYtREJKkPfXkZuCg==}
 
+  '@types/d3-zoom@3.0.8':
+    resolution: {integrity: sha512-iqMC4/YlFCSlO8+2Ii1GGGliCAY4XdeG748w5vQUbevlbDu0zSjH/+jojorQVBK/se0j6DUFNPBGSqD3YWYnDw==}
+
   '@types/d3-zoom@3.0.9':
     resolution: {integrity: sha512-0sE1406XBYJGiqD3AusTl9ZqC//2mIXix51tbom25gDCA8ri4xnSZg28CaSE8Srl6FClqABUKfsn0qghgdepMA==}
 
@@ -2212,6 +2224,22 @@ packages:
 
   '@webgpu/types@0.1.70':
     resolution: {integrity: sha512-LFiNHHKMvmAEvwVew3JLJmTdShhbdwRFSImUshGhE2mGE8ybQzIo63l5uRp+YKnNx+8Qno8Kf6gN+DKMreIJCA==}
+
+  '@xyflow/react@12.11.2':
+    resolution: {integrity: sha512-eLAlDWJfWnQEhJwGMjlWdAXO9eYllKpliUmPQlAmOLxz6mExXuzMVDUKLMquixgkrtmMFFtug3jGKmYYld12cA==}
+    peerDependencies:
+      '@types/react': '>=17'
+      '@types/react-dom': '>=17'
+      react: '>=17'
+      react-dom: '>=17'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      '@types/react-dom':
+        optional: true
+
+  '@xyflow/system@0.0.79':
+    resolution: {integrity: sha512-czLyOh91NF0hIzbNzwi8I6GlqG23BHh2435OddfI6uiaLH3xdrdygO93gqgH1Bv9mhy8XPFQJOBn1FTq4LvEWA==}
 
   acorn-jsx@5.3.2:
     resolution: {integrity: sha512-rq9s+JNhf0IChjtDXxllJ7g41oZk5SlXtp0LHwyA5cejwn7vKmKp4pPri6YEePv2PU65sAsegbXtIinmDFDXgQ==}
@@ -2408,6 +2436,9 @@ packages:
   chokidar@5.0.0:
     resolution: {integrity: sha512-TQMmc3w+5AxjpL8iIiwebF73dRDF4fBIieAqGn9RGCWaEVwQ6Fb2cGe31Yns0RRIzii5goJ1Y7xbMwo1TxMplw==}
     engines: {node: '>= 20.19.0'}
+
+  classcat@5.0.5:
+    resolution: {integrity: sha512-JhZUT7JFcQy/EzW605k/ktHtncoo9vnyW/2GspNYwFlN1C/WmjuV/xtS04e9SOkL2sTdw0VAZ2UGCcQ9lR6p6w==}
 
   classnames@2.5.1:
     resolution: {integrity: sha512-saHYOzhIQs6wy2sVxTM6bUDsQO4F50V9RQ22qBpEdCW+I+/Wmke2HOl6lS6dTpdxVhb88/I6+Hs+438c3lfUow==}
@@ -3271,6 +3302,9 @@ packages:
   ignore@7.0.6:
     resolution: {integrity: sha512-BAg6QkE8W+TuQLrrw0Ugr7HegXduRuuj8/ti2kSOc+jz1dmx8/WNcjr6XGnq5YpDWxFwwaavqD0+jIUOKelTsw==}
     engines: {node: '>= 4'}
+
+  immer@11.1.15:
+    resolution: {integrity: sha512-VrNANlmnWQnh5COXIIOQXM9oOJw7naGKlBT74ZOOR6lpVXc3gFEu9FJLDFcpCJ2j+NWr8TIwtWD//T6ZX6TKiQ==}
 
   immutable@5.1.5:
     resolution: {integrity: sha512-t7xcm2siw+hlUM68I+UEOK+z84RzmN59as9DZ7P1l0994DKUWV7UXBMQZVxaoMSRQ+PBZbHCOoBt7a2wxOMt+A==}
@@ -4447,6 +4481,11 @@ packages:
   url-parse@1.5.10:
     resolution: {integrity: sha512-WypcfiRhfeUP9vvF0j6rw0J3hrWrw6iZv3+22h6iRMJ/8z1Tj6XfLP4DsUix5MhMPnXpiHDoKyoZ/bdCkwBCiQ==}
 
+  use-sync-external-store@1.7.0:
+    resolution: {integrity: sha512-6L+EeigHMQhdaIPNIFUKwfWJSwWFQ8gJbJ2DLOs5sDIegTwR9fRxvnM3uciHKjIZhFz+KAv2emhWMRvDmMcY8A==}
+    peerDependencies:
+      react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
+
   utrie@1.0.2:
     resolution: {integrity: sha512-1MLa5ouZiOmQzUbjbu9VmjLzn1QLXBhwpUa7kdLUQK+KQ5KA9I1vk5U4YHe/X2Ch7PYnJfWuWT+VbuxbGwljhw==}
 
@@ -4672,6 +4711,21 @@ packages:
 
   zrender@6.1.0:
     resolution: {integrity: sha512-oEGMDB6pOP2S6OwRR4PdVv610zrjnA3Bh+JnSG12fYJlBKjtNAoEb5fSUoCOOINlH96I2fU38/A2UpRKs67xYQ==}
+
+  zustand@4.5.7:
+    resolution: {integrity: sha512-CHOUy7mu3lbD6o6LJLfllpjkzhHXSBlX8B9+qPddUsIfeF5S/UZ5q0kmCsnRqT1UHFQZchNFDDzMbQsuesHWlw==}
+    engines: {node: '>=12.7.0'}
+    peerDependencies:
+      '@types/react': '>=16.8'
+      immer: '>=9.0.6'
+      react: '>=16.8'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      immer:
+        optional: true
+      react:
+        optional: true
 
   zustand@5.0.14:
     resolution: {integrity: sha512-/8tAspM5LMPr28b3fwLYrtdj77ECpfZviaP75CMTnwO8ISyaE4GDIG/9rDDYq/cH9D2Xw2A2RXglLInmVBQB/g==}
@@ -6196,6 +6250,11 @@ snapshots:
     dependencies:
       '@types/d3-selection': 3.0.12
 
+  '@types/d3-zoom@3.0.8':
+    dependencies:
+      '@types/d3-interpolate': 3.0.4
+      '@types/d3-selection': 3.0.12
+
   '@types/d3-zoom@3.0.9':
     dependencies:
       '@types/d3-interpolate': 3.0.4
@@ -6424,6 +6483,31 @@ snapshots:
       pretty-format: 29.7.0
 
   '@webgpu/types@0.1.70': {}
+
+  '@xyflow/react@12.11.2(@types/react-dom@18.3.7(@types/react@18.3.29))(@types/react@18.3.29)(immer@11.1.15)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
+    dependencies:
+      '@xyflow/system': 0.0.79
+      classcat: 5.0.5
+      react: 18.3.1
+      react-dom: 18.3.1(react@18.3.1)
+      zustand: 4.5.7(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)
+    optionalDependencies:
+      '@types/react': 18.3.29
+      '@types/react-dom': 18.3.7(@types/react@18.3.29)
+    transitivePeerDependencies:
+      - immer
+
+  '@xyflow/system@0.0.79':
+    dependencies:
+      '@types/d3-drag': 3.0.7
+      '@types/d3-interpolate': 3.0.4
+      '@types/d3-selection': 3.0.12
+      '@types/d3-transition': 3.0.9
+      '@types/d3-zoom': 3.0.8
+      d3-drag: 3.0.0
+      d3-interpolate: 3.0.1
+      d3-selection: 3.0.0
+      d3-zoom: 3.0.0
 
   acorn-jsx@5.3.2(acorn@8.16.0):
     dependencies:
@@ -6694,6 +6778,8 @@ snapshots:
   chokidar@5.0.0:
     dependencies:
       readdirp: 5.0.0
+
+  classcat@5.0.5: {}
 
   classnames@2.5.1: {}
 
@@ -7794,6 +7880,8 @@ snapshots:
   ignore@5.3.2: {}
 
   ignore@7.0.6: {}
+
+  immer@11.1.15: {}
 
   immutable@5.1.5: {}
 
@@ -9336,6 +9424,10 @@ snapshots:
       querystringify: 2.2.0
       requires-port: 1.0.0
 
+  use-sync-external-store@1.7.0(react@18.3.1):
+    dependencies:
+      react: 18.3.1
+
   utrie@1.0.2:
     dependencies:
       base64-arraybuffer: 1.0.2
@@ -9547,9 +9639,19 @@ snapshots:
     dependencies:
       tslib: 2.3.0
 
-  zustand@5.0.14(@types/react@18.3.29)(react@18.3.1):
+  zustand@4.5.7(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1):
+    dependencies:
+      use-sync-external-store: 1.7.0(react@18.3.1)
     optionalDependencies:
       '@types/react': 18.3.29
+      immer: 11.1.15
       react: 18.3.1
+
+  zustand@5.0.14(@types/react@18.3.29)(immer@11.1.15)(react@18.3.1)(use-sync-external-store@1.7.0(react@18.3.1)):
+    optionalDependencies:
+      '@types/react': 18.3.29
+      immer: 11.1.15
+      react: 18.3.1
+      use-sync-external-store: 1.7.0(react@18.3.1)
 
   zwitch@2.0.4: {}

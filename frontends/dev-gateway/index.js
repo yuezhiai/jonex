@@ -72,12 +72,22 @@ function findRoute(pathname) {
     return { handler: true }
   }
 
-  // 2. Backend API
+  // 2. 演化台（服务端）：试跑/调整/采纳要走真实 ②/LLM 链（正常 30-60s，上游降级时
+  //    可能跑数分钟）——全局 60s 会贴线截断，浏览器只得 ERR_EMPTY_RESPONSE
+  //    （2026-10-13 真机实测 58s 险过、超线即误报「网络异常」）。
+  //    预算链（网关须为全长，先于任何上游放行）：试跑/调整 = 前端 TIMEOUT_REPLAY/ADJUST
+  //    320s；采纳 = 前端 TIMEOUT_ADOPT 600s。故取 610s 覆盖两者（终审 M1：330s 仍会
+  //    静默截断 600s 档的采纳）。
+  if (pathname.startsWith('/api/v1/knowledge-base/evolution')) {
+    return { target: UPSTREAMS.api, timeoutMs: 610_000 }
+  }
+
+  // 3. Backend API
   if (pathname.startsWith('/api/')) {
     return { target: UPSTREAMS.api }
   }
 
-  // 3. Remote entry (Module Federation dev server virtual module)
+  // 4. Remote entry (Module Federation dev server virtual module)
   for (const app of SUB_APPS) {
     const entryPrefix = `/remotes/${app}/assets/remoteEntry.js`
     if (pathname === entryPrefix) {
@@ -88,7 +98,7 @@ function findRoute(pathname) {
     }
   }
 
-  // 4. Remote assets (Module Federation) — strip /remotes prefix
+  // 5. Remote assets (Module Federation) — strip /remotes prefix
   for (const app of SUB_APPS) {
     const prefix = `/remotes/${app}/`
     if (pathname.startsWith(prefix)) {
@@ -97,14 +107,14 @@ function findRoute(pathname) {
     }
   }
 
-  // 5. Standalone SPA routes
+  // 6. Standalone SPA routes
   for (const app of SUB_APPS) {
     if (pathname.startsWith(`/${app}/`) || pathname === `/${app}`) {
       return { target: UPSTREAMS[app] }
     }
   }
 
-  // 6. Shell — catch-all
+  // 7. Shell — catch-all
   return { target: UPSTREAMS.shell }
 }
 
@@ -138,7 +148,14 @@ const server = createServer((req, res) => {
 
   console.log(`  → ${req.method} ${req.url} [${route.target}]`)
 
-  proxy.web(req, res, { target: route.target }, (err) => {
+  // 每路由可覆盖全局 60s 超时（如演化台 610s）；不设则沿 createProxyServer 默认。
+  const proxyOpts = { target: route.target }
+  if (route.timeoutMs) {
+    proxyOpts.proxyTimeout = route.timeoutMs
+    proxyOpts.timeout = route.timeoutMs
+  }
+
+  proxy.web(req, res, proxyOpts, (err) => {
     console.error(`[ERROR] ${req.method} ${req.url} → ${err.message}`)
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'text/plain' })

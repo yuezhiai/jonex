@@ -29,6 +29,22 @@ export type { PageHeaderProps } from './components/PageHeader';
 export { default as PageContent } from './components/PageContent';
 export type { PageContentProps } from './components/PageContent';
 
+// 可执行工具的运行时配置表单段（平台工具目录 / 知识库工具共用）
+export {
+  default as ApiRuntimeFields,
+  RUNTIME_FIELD_NAMES,
+  formValuesToRuntime,
+  runtimeToFormValues,
+} from './components/ApiRuntimeFields';
+export type {
+  ApiRuntimeFieldsProps,
+  ApiRuntimeFormValues,
+  AuthType as ToolRuntimeAuthType,
+  HttpMethod as ToolRuntimeHttpMethod,
+  RuntimeSubmitPart,
+  RuntimeType as ToolRuntimeType,
+} from './components/ApiRuntimeFields';
+
 // 列表页组件：筛选区 + 取数 + 表格 + 三态 + 分页
 export { default as CommonTable } from './components/CommonTable';
 export type { CommonTableProps, CommonTableRef } from './components/CommonTable/types';

@@ -1,9 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
-function logoSrc(lng: string) {
-  return lng === 'en' ? '/logo-en.svg' : '/logo.svg';
-}
 import { Form, Input, Button, Card, Tabs, message } from 'antd';
 import {
   ApartmentOutlined,
@@ -25,6 +22,10 @@ import { isAllowedRedirect } from '@jonex/shell-sdk';
 import { colors, radius } from '@jonex/platform-theme/tokens';
 import { userDisplayName } from '../../utils/userDisplay';
 import { markSsoNavigationInFlight, consumeSsoReturnHint } from '../../utils/ssoInflight';
+
+function logoSrc(lng: string) {
+  return lng === 'en' ? '/logo-en.svg' : '/logo.svg';
+}
 
 function getRedirectParam(): string | null {
   const params = new URLSearchParams(window.location.search);
