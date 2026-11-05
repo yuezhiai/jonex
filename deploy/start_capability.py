@@ -18,6 +18,7 @@ from fastapi import FastAPI, Depends
 from jonex_core.capability import get_capability_registry
 from jonex_core.common.exception_handler import register_exception_handlers
 from jonex_core.common.i18n import install_locale_middleware
+from jonex_core.common.monitor_collector import get_monitor_collector
 from jonex_core.discovery import get_service_registry, HeartbeatManager, ServiceInstance
 from jonex_core.security import verify_internal_service
 
@@ -56,10 +57,28 @@ async def lifespan(app: FastAPI):
     """
     服务生命周期管理
 
-    启动时：注册能力到本地注册表 + 注册到服务发现中心
-    关闭时：停止心跳，从服务发现中心注销
+    启动时：启动监控采集器 + 注册能力到本地注册表 + 注册到服务发现中心
+    关闭时：停止心跳，从服务发现中心注销；最后 flush 并停止监控采集器
+
+    ⚠️ 采集器（MonitorCollector）由本入口**统一**启动/停止，能力容器不要再各自
+    在 initialize()/shutdown() 里重复实现。它必须在 capability.initialize() 之前
+    启动 —— 部分能力（task_center / knowledge_base）会在 initialize 里就启动后台
+    循环并产生 call_attempt（物理尝试记录），晚启动会漏掉这段窗口。
+    ⚠️ 若新增的容器会产生 call_log / call_attempt，必须在 docker-compose 注入平台主库 DB_*，否则
+    采集器能启动但写库会失败（write_failed）。
     """
     global heartbeat_manager
+
+    # 调用明细采集写口（monitor.call_log / monitor.call_attempt）。
+    # 采集器是每进程一份单例；不启动时 put_* 会静默计入 unstarted_count 后丢弃。
+    # 采集是旁路：起不来只记 ERROR，绝不拖垮能力启动。
+    collector = None
+    try:
+        collector = get_monitor_collector()
+        collector.start()
+        logger.info("MonitorCollector 已启动")
+    except Exception:
+        logger.exception("MonitorCollector 启动失败（不影响能力启动）")
 
     # 注册能力到本地注册表
     registry = get_capability_registry()
@@ -105,6 +124,13 @@ async def lifespan(app: FastAPI):
         logger.info(f"能力 {CAPABILITY_KIND}.{CAPABILITY_NAME} 本地注册成功")
     except Exception as e:
         logger.exception(f"能力本地注册失败: {e}")
+        # lifespan 在 yield 之前抛异常时不会执行后面的清理段；这里先收掉采集器，
+        # 避免留下一个后台消费任务，再把异常原样抛出。
+        if collector is not None:
+            try:
+                await collector.stop()
+            except Exception:
+                logger.exception("MonitorCollector 停止失败（能力初始化失败路径）")
         raise
 
     # 注册到服务发现中心并启动心跳
@@ -140,6 +166,14 @@ async def lifespan(app: FastAPI):
             await capability.shutdown()
         except Exception as e:
             logger.exception(f"能力关闭失败: {e}")
+    # 能力后台循环已停，最后 flush 并停止采集器。stop() 是幂等的；
+    # 若某个能力仍保留了显式 stop（当前已全部删除），这里再调一次也是 no-op。
+    if collector is not None:
+        try:
+            await collector.stop()
+            logger.info("MonitorCollector 已停止并 flush")
+        except Exception:
+            logger.exception("MonitorCollector 停止失败")
     if heartbeat_manager:
         try:
             await heartbeat_manager.stop()

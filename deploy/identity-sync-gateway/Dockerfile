@@ -2,6 +2,11 @@
 # 构建上下文 = 本目录：deploy/identity-sync-gateway/
 FROM python:3.12-slim
 
+# 本镜像零第三方依赖、无构建期联网，ARG 只为与其它镜像的打标口径一致
+# （`docker inspect --format '{{json .Config.Labels}}'` 能统一查到构建配置）。
+ARG USE_OVERSEAS_MIRROR=false
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
+
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

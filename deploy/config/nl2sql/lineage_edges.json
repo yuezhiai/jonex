@@ -1,0 +1,8 @@
+{
+  "_comment": "血缘/换乘边（列级）。upstream 列 → downstream 列；origin 决定置信度档位。被 NL2SQL_JOIN_PATHS 打开时的路径搜索消费（NL2SQL_LINEAGE_EDGES_PATH 可覆盖本路径）。",
+  "_status_2026_10_16": "⚠️ **本文件当前刻意为空** —— 不是漏了。",
+  "_why_empty": "原先放在这里的 15 条边，本质是「引用关系」（FK 语义），不是设计 §4 定义的数据流。它们已改走**更对**的通道：作为 `origin=value` 的**编译 schema 关系**采纳（`tests/eval/nl2sql/join_adopt.py --add … --yes`）。理由：① 模型直接在 joins/related_tables 里看到，不依赖 NL2SQL_JOIN_PATHS 开关；② 路径搜索照样能沿这条 join 边把表带到远处锚点（于是安全闸白名单也跟着扩，走 Task 6C 那条路）⇒ **它把换乘通道在这几张表上的作用整个涵盖了**；③ 不用背换乘惩罚（0.4 → 0.4×0.9×0.5）。采纳记录见 .superpowers/sdd/nl2sql-join-adoptions.json 与 compiled-schema-join-adopt-backup-*.json。",
+  "_when_to_use_this_file": "留给**真正的数据流血缘**（dbt / ETL / OpenLineage 那种「B 由 A 加工而来」）—— 那才是换乘通道不可替代的场景，而它需要真实上游，目前没有。手工/文件导入仍是设计 §2 决策 6 认可的第一版来源。",
+  "_provenance_of_the_15": "全部经值包含验证（子表该列非空值有多少比例能在父表主键里找到，只采纳 100% 命中）。被证伪的候选已丢弃 —— 例：job_feedback.sender_id 对 company_user.id 是 6214/0（证伪），对 users.id 是 6214/6214（采纳）；M_SalaryCategory.jobuserid 对 users.id 是 16/8（半对半，有歧义，丢弃）。",
+  "edges": []
+}

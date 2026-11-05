@@ -249,7 +249,7 @@ CREATE TABLE IF NOT EXISTS platform.audit_logs (
     ip VARCHAR(64),
     action VARCHAR(64) NOT NULL,
     resource VARCHAR(128),
-    resource_id VARCHAR(64),
+    resource_id VARCHAR(255),
     status_code SMALLINT,
     duration_ms BIGINT,
     request_params JSONB,
@@ -449,11 +449,11 @@ CREATE TABLE IF NOT EXISTS platform.mcp_keys (
     UNIQUE(key_hash)
 );
 
-CREATE INDEX idx_mcp_keys_tenant_active
+CREATE INDEX IF NOT EXISTS idx_mcp_keys_tenant_active
     ON platform.mcp_keys(tenant_id)
     WHERE revoked_at IS NULL;
 
-CREATE INDEX idx_mcp_keys_space
+CREATE INDEX IF NOT EXISTS idx_mcp_keys_space
     ON platform.mcp_keys(space_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_keys_tenant_reqid
@@ -493,6 +493,8 @@ CREATE TABLE IF NOT EXISTS platform.mcp_service_publish (
     tool            VARCHAR(128),
     tool_description TEXT,
     service_type    VARCHAR(32) NOT NULL DEFAULT 'domain',
+    -- 服务级最近调用时间：MCP 工具调用时 UPSERT 写入（见 update/077）
+    last_call_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ,
     UNIQUE(tenant_id, service_id)
@@ -554,6 +556,11 @@ CREATE TABLE IF NOT EXISTS monitor.call_log (
     source              VARCHAR(128)  NULL,
     target              VARCHAR(128)  NULL,
     protocol            VARCHAR(32)   NULL,
+    -- 调用边界（external/internal/open），与 direction 正交；见 CallScope。
+    -- 允许 NULL：滚动发布期旧采集器不认识本列时仍可写入。
+    call_scope          VARCHAR(16)   NULL,
+    -- MCP 工具名（仅 protocol='mcp' 时有值）；对象标识读侧取 COALESCE(mcp_tool, target)
+    mcp_tool            VARCHAR(128)  NULL,
     trigger_type        VARCHAR(16)   NOT NULL DEFAULT 'user',
     logical_started_at  TIMESTAMPTZ   NULL,
     final_ended_at      TIMESTAMPTZ   NULL,
@@ -568,6 +575,12 @@ CREATE TABLE IF NOT EXISTS monitor.call_log (
     CONSTRAINT ck_monitor_call_log_direction  CHECK (direction IN ('outbound','inbound')),
     CONSTRAINT ck_monitor_call_log_final_status
         CHECK (final_status IN ('success','failed','cancelled','running','unknown')),
+    -- 调用边界取值集已定；允许 NULL（滚动发布期旧采集器写入的行）
+    CONSTRAINT ck_monitor_call_log_scope CHECK (
+        call_scope IS NULL
+        OR (direction = 'inbound' AND call_scope = 'open')
+        OR (direction = 'outbound' AND call_scope IN ('external', 'internal'))
+    ),
     -- 触发方取值集已定（user 用户直接发起 / system 系统后台批量）
     CONSTRAINT ck_monitor_call_log_trigger CHECK (trigger_type IN ('user','system'))
 );
@@ -580,6 +593,9 @@ CREATE INDEX IF NOT EXISTS idx_monitor_call_log_dir_status_started
     ON monitor.call_log (direction, final_status, logical_started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_monitor_call_log_target_started
     ON monitor.call_log (target, logical_started_at DESC);
+-- I11：外部依赖页按调用边界 + 时间筛
+CREATE INDEX IF NOT EXISTS idx_monitor_call_log_scope_started
+    ON monitor.call_log (call_scope, logical_started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_monitor_call_log_created
     ON monitor.call_log (created_at DESC);
 -- I9：按触发方（用户/系统后台）筛选 + 时间倒序（调用列表的筛选维度）

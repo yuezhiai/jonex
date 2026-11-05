@@ -18,6 +18,8 @@ FROM python:3.12-slim
 
 # 构建源镜像开关：false=国内源（腾讯云 pip），true=国外官方源（pypi.org）
 ARG USE_OVERSEAS_MIRROR=false
+# 溯源标签（口径同 python-base.Dockerfile）
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -49,7 +51,11 @@ RUN pip install --no-cache-dir -r /tmp/openkb-capability-requirements.txt
 # 源码层（无前端产物）
 COPY Reference/OpenKB/openkb/ ./openkb/
 COPY jonex_core/ ./jonex_core/
-COPY deploy/ ./deploy/
+# 只搬运行时真正需要的：启动脚本 + 本体 tbox 兜底配置（ONTOLOGY_SCHEMA_FALLBACK_PATH）。
+# 不再 `COPY deploy/ ./deploy/` —— 那会把 deploy/env/**（各画像的 DB 密码/JWT_SECRET/云凭据）
+# 与各种 compose/env 文件一并烤进镜像层。
+COPY deploy/start_capability.py ./deploy/
+COPY deploy/config/ ./deploy/config/
 
 # 持久化数据目录
 RUN mkdir -p /app/data/kb_storage /app/data/inputs

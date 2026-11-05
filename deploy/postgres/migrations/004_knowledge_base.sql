@@ -566,16 +566,23 @@ CREATE INDEX IF NOT EXISTS idx_kb_feedback_user_id
     ON knowledge_base.knowledge_search_feedback (user_id);
 
 -- ------------------------------------------------------------
--- 回答级反馈（answer feedback）：按问答记录 history_id 锚定
--- 主表保存最新反馈 + 上下文快照；事件表只增不改（operation_id 幂等）
--- 锚点 history_id = knowledge_base.knowledge_search_history.id
+-- 回答级反馈（answer feedback）
+--   * Web 链路：按问答记录 history_id 锚定（history_id 唯一，允许多个 NULL）；
+--   * MCP 链路：关闭检索历史后无 history_id，改按 request_id 锚定，
+--     user_id / history_id / query 均为 NULL，只保留 mcp_key_id / mcp_key_name 快照。
+-- 主表保存最新反馈 + 上下文快照；事件表只增不改（operation_id 幂等）。
+-- 锚点：history_id = knowledge_base.knowledge_search_history.id；
+--       request_id = knowledge_base.search_request_event.request_id。
+-- 存量库增量脚本：deploy/postgres/update/076_knowledge_answer_feedback_create.sql（建表，本段改动须同步）、
+--                 deploy/postgres/update/076_knowledge_answer_feedback_reuse.sql（列变更）
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback (
     id              VARCHAR(64) PRIMARY KEY,
     tenant_id       VARCHAR(64) NOT NULL,
-    user_id         VARCHAR(128) NOT NULL,
-    history_id      VARCHAR(64) NOT NULL,
-    query           TEXT NOT NULL,
+    user_id         VARCHAR(128),
+    history_id      VARCHAR(64),
+    request_id      VARCHAR(64),
+    query           TEXT,
     answer          TEXT,
     feedback_type   VARCHAR(16) NOT NULL,
     feedback_reason VARCHAR(32),
@@ -585,6 +592,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback (
     source          VARCHAR(64),
     mode            VARCHAR(32),
     source_missing_reason VARCHAR(64),
+    mcp_key_id      VARCHAR(64),
+    mcp_key_name    VARCHAR(255),
     version         INTEGER NOT NULL DEFAULT 0,
     adopted         BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -594,24 +603,32 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_answer_feedback_history
     ON knowledge_base.knowledge_answer_feedback (history_id);
+-- MCP 幂等冲突键：同一 request_id 只允许一行（NULL 行不参与唯一性）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_answer_feedback_request
+    ON knowledge_base.knowledge_answer_feedback (request_id)
+    WHERE request_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_tenant_user
     ON knowledge_base.knowledge_answer_feedback (tenant_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_tenant_time
     ON knowledge_base.knowledge_answer_feedback (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_kb_ids
     ON knowledge_base.knowledge_answer_feedback USING GIN (knowledge_base_ids);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_mcp_key
+    ON knowledge_base.knowledge_answer_feedback (mcp_key_id);
 
 CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_answer_feedback_event (
     id              VARCHAR(64) PRIMARY KEY,
     tenant_id       VARCHAR(64) NOT NULL,
-    history_id      VARCHAR(64) NOT NULL,
+    history_id      VARCHAR(64),
+    request_id      VARCHAR(64),
     feedback_id     VARCHAR(64),
-    user_id         VARCHAR(128) NOT NULL,
+    user_id         VARCHAR(128),
     operation_id    VARCHAR(64) NOT NULL,
     version         INTEGER NOT NULL,
     feedback_type   VARCHAR(16),
     feedback_reason VARCHAR(32),
     feedback_comment VARCHAR(300),
+    mcp_key_id      VARCHAR(64),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -619,8 +636,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_answer_feedback_event_operation
     ON knowledge_base.knowledge_answer_feedback_event (operation_id);
 CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_event_history
     ON knowledge_base.knowledge_answer_feedback_event (history_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_answer_feedback_event_request
+    ON knowledge_base.knowledge_answer_feedback_event (request_id);
 
-COMMENT ON TABLE knowledge_base.knowledge_answer_feedback IS '检索问答用户反馈主记录：按问答记录 history_id 唯一，保存最新反馈状态与上下文快照';
+COMMENT ON TABLE knowledge_base.knowledge_answer_feedback IS '检索问答用户反馈主记录：Web 按 history_id 唯一、MCP 按 request_id 唯一，保存最新反馈状态与上下文快照';
 COMMENT ON TABLE knowledge_base.knowledge_answer_feedback_event IS '检索问答用户反馈变更事件：只增不改，operation_id 幂等，保留每次变更';
 
 -- ------------------------------------------------------------
@@ -711,10 +730,13 @@ CREATE INDEX IF NOT EXISTS idx_llm_wiki_schema_kb
 -- 方案：原先独立成 008_search_events.sql，后并入本文件——
 --       六张表全在 knowledge_base schema 内，无独立执行时机，
 --       且 008 不在 init.sql 的 \ir 清单里（手动初始化会漏建）。
--- 存量库增量脚本：deploy/postgres/update/032_search_events.sql
+-- 存量库增量脚本：deploy/postgres/update/032_search_events.sql、
+--                 038_data_operations_events_phase2.sql、076_knowledge_answer_feedback_reuse.sql
 -- ------------------------------------------------------------
 
 -- 1. 检索请求接收事件（每次检索调用的入口记录，含失败/中断的请求）
+--    存量库注意：knowledge_base_ids 由 038 增量补齐、mcp_key_id 由 076 增量补齐；
+--    此处一并声明，保证全新初始化与 update 链最终结构一致。
 CREATE TABLE IF NOT EXISTS knowledge_base.search_request_event (
     id VARCHAR(64) PRIMARY KEY,
     tenant_id VARCHAR(64) NOT NULL,
@@ -724,6 +746,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_request_event (
     domain_space_id VARCHAR(64),
     query TEXT,
     query_hash VARCHAR(64),
+    knowledge_base_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    mcp_key_id VARCHAR(64),
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -731,6 +755,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.search_request_event (
 );
 CREATE INDEX IF NOT EXISTS idx_sre_tenant_time ON knowledge_base.search_request_event (tenant_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sre_request ON knowledge_base.search_request_event (request_id);
+CREATE INDEX IF NOT EXISTS idx_sre_kbs ON knowledge_base.search_request_event USING GIN (knowledge_base_ids);
+CREATE INDEX IF NOT EXISTS idx_sre_mcp_key ON knowledge_base.search_request_event (mcp_key_id);
 
 -- 2. 检索步骤事件（一次检索内各推理/检索步骤，stage 对齐 ReasoningStep 的 STAGE_*/STATUS_*）
 CREATE TABLE IF NOT EXISTS knowledge_base.search_step_event (

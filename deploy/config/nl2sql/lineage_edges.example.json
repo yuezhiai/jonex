@@ -1,0 +1,12 @@
+{
+  "_comment": "血缘边（列级）。upstream 列 → downstream 列。origin 决定置信度档位；未知档按最保守处理。真实来源（元数据平台）到位后本文件由适配器取代。",
+  "edges": [
+    {
+      "from_table": "dwd_order",
+      "from_column": "order_id",
+      "to_table": "public.t_order",
+      "to_column": "id",
+      "origin": "platform"
+    }
+  ]
+}

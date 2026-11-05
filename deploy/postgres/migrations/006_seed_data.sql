@@ -376,12 +376,14 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     (22, 0, 'navigation.integrationExtension', NULL, 'GlobalOutlined', NULL, 3, NULL),
     -- (18, 22, 'navigation.adapterList', '/apps/ecosystem-management/adapter-management', 'BlockOutlined', NULL, 1, 'adapter:read'), -- 适配器目录：已注释隐藏，恢复时放开本行
     (19, 22, 'navigation.mcpServiceDirectory', '/apps/ecosystem-management/mcp-service-directory', 'ClusterOutlined', NULL, 2, 'mcp:service:view'),
+    -- 工具目录：租户启用 / 停用可执行工具；平台管理员在页内另有「目录管理」页签。存量库见 update/082_ontology_skill_action_tools.sql
+    (23, 22, 'navigation.skillCatalog', '/apps/ecosystem-management/skills', 'ThunderboltOutlined', NULL, 3, 'skill:read'),
     -- 平台管理分组 → 数据运营（直接项，按需求排在「账号与权限」之前）
     (5, 0, 'navigation.platformManagement', NULL, 'SettingOutlined', NULL, 4, NULL),
     (29, 5, 'navigation.dataOperations', '/apps/platform-management/data-operations', 'BarChartOutlined', NULL, 1, 'analytics:read'),
     -- 平台管理分组 → 资产目录（第 2 期数据治理；复用 knowledge:read，不新增权限码）
     -- id 30 曾在 update/046 中使用（后被 047 删除）；这里取 31，避免全新库迁移链 046 撞主键。
-    (31, 5, 'navigation.dataGovernance', '/apps/platform-management/data-governance/assets', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
+    -- (31, 5, 'navigation.dataGovernance', '/apps/platform-management/data-governance/assets', 'DatabaseOutlined', NULL, 2, 'knowledge:read'),
     -- 平台管理分组 → 账号与权限组（可折叠）
     (25, 5, 'navigation.accountPermission', NULL, 'TeamOutlined', NULL, 3, NULL),
     (11, 25, 'navigation.tenantManagement', '/apps/platform-management/tenant-management', 'TeamOutlined', NULL, 1, 'platform:tenant:read'),
@@ -404,7 +406,9 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     -- 平台管理员天然持全部 tenant 码，所以他仍然看得到。
     (15, 26, 'navigation.operationLog', '/apps/platform-management/operation-log', 'FileTextOutlined', NULL, 2, 'audit:read'),
     -- [jonex] 平台监控：与系统配置/操作日志同属系统运维组
-    (28, 26, 'navigation.platformMonitor', '/apps/platform-management/platform-monitor', 'MonitorOutlined', NULL, 3, 'platform:monitor:read')
+    (28, 26, 'navigation.platformMonitor', '/apps/platform-management/platform-monitor', 'MonitorOutlined', NULL, 3, 'platform:monitor:read'),
+    -- [jonex] 演化台：② 自进化闭环前端（服务端 API，见 dev-guide「十、演化台」）；菜单码与操作日志同码（audit:read）
+    (30, 26, 'navigation.evolution', '/apps/platform-management/evolution', 'ExperimentOutlined', NULL, 4, 'audit:read')
     -- [jonex] 2026-10-10 合并：原有一条独立的「租户安全设置」菜单（navigation.tenantSecurity，
     -- 指向 /apps/platform-management/tenant-security，码 tenant:security:read）**已删除**。
     -- 该页并入「系统配置」/apps/platform-management/system-config：同一页按权限分段渲染

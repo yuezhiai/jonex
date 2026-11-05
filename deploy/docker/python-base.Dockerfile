@@ -22,6 +22,12 @@ WORKDIR /app
 # 构建源镜像开关：false=国内源（腾讯云 apt/pip），true=国外官方源（deb.debian.org / pypi.org）
 ARG USE_OVERSEAS_MIRROR=false
 
+# 溯源标签：镜像里烤的是哪套源、页面一看 docker inspect 就知道，不用猜。
+# 本镜像的 label 会被所有 `FROM ${PYTHON_BASE}` 的后端服务继承
+# （gateway / sidecar / llm-gateway / knowledge-base / business-domain /
+#  data-governance / task-center / platform）。
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
+
 # 环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

@@ -31,7 +31,11 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.28.0.0/16
+        # 容器网段可经 JONEX_NETWORK_SUBNET 覆盖（见 .env.example）。
+        # 目标环境若有主机安全设备（如 Dynarose / 神农盾），该网段必须加入其
+        # 「入向信任网段」，否则容器出站的新建连接会被拦截：宿主机访问正常，
+        # 容器内一律超时。换网段后需 down/up 重建网络并同步通知客户加白。
+        - subnet: ${JONEX_NETWORK_SUBNET:-172.28.0.0/16}
 
 volumes:
   jonex-postgres-data:
@@ -236,6 +240,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-knowledge-base-service
     container_name: jonex-knowledge-base
     hostname: knowledge-base
     networks:
@@ -266,6 +271,22 @@ services:
       NEO4J_USERNAME: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me}
       NEO4J_ONTOLOGY_LABEL: OntologyEntity
+      # [jonex] schema 生成后端：local（默认）= 进程内 vendored 生成器，
+      # 不依赖 router；remote = 回退到 onto-intelligent 的
+      # `POST {ONTO_INTEL_BASE}/schema-gen`（仅在需要回滚/对照时设置）。
+      SCHEMA_GEN_BACKEND: ${SCHEMA_GEN_BACKEND:-local}
+      # 仅 remote 模式使用；local 模式不看它。
+      ONTO_INTEL_BASE: ${ONTO_INTEL_BASE:-http://host.docker.internal:8010}
+      # [jonex] 演化台 ②b 点踩试跑：试跑**必须经 router :8010**（② 主答翻转 / DI
+      # 扇出 / 观测写入都在那里拦 `search/mix`），直连 Jonex 会绕过编排、落不了观测。
+      # 容器里访问宿主机走 host.docker.internal（依赖下面的 extra_hosts 映射）；
+      # **router 没起时试跑返回 5003**「router 不可达」——不是配置错，是那个进程没跑。
+      # 纯 Linux 无 host-gateway 的环境改成实际 router 地址（如 http://<ip>:8010）。
+      EVOLUTION_ROUTER_BASE: ${EVOLUTION_ROUTER_BASE:-http://host.docker.internal:8010}
+      # [jonex] 演化台完整语料基准：父本/候选两臂都经**平台网关**走
+      # `/api/v1/knowledge-base/data-sources/ask`（与用户问答同一条 invoke 链路）；
+      # 容器内固定走 gateway 服务名（不要直连 Jonex / router）。
+      EVOLUTION_GATEWAY_BASE: http://gateway:8000
       # [jonex] P5-var 退化闸门：reconcile 重写前对比本文档图中已有实体数，
       # 跌幅超阈值（0.3 = 30%）告警并拒绝覆盖（方差下沿不吞旧数据；0 关闭）
       ONTOLOGY_RECONCILE_DEGRADE_GUARD_THRESHOLD: ${ONTOLOGY_RECONCILE_DEGRADE_GUARD_THRESHOLD:-0.3}
@@ -320,6 +341,11 @@ services:
     # 「网关侧要用的」必须在 gateway 段显式列出来 —— 见下面 gateway 服务里的那段。
     env_file:
       - .env
+    extra_hosts:
+      # Linux 上 host.docker.internal 需要显式映射到宿主网关；演化台试跑
+      # （EVOLUTION_ROUTER_BASE）与 remote 模式的 schema 生成器（ONTO_INTEL_BASE）
+      # 都靠它访问宿主进程
+      - "host.docker.internal:host-gateway"
     volumes:
       - jonex-logs:/app/logs
       - jonex-rag-inputs:/app/inputs             # local 后端：读取 gateway/atomic-rag 写入的原始文件
@@ -330,6 +356,13 @@ services:
       - jonex-rag-storage:/app/rag_storage:ro
       - ./config/capability_runtime.yaml:/app/config/capability_runtime.yaml:ro
       - ./config/ontology:/app/deploy/config/ontology:ro   # 编译 yaml_default 兜底需要 default.yaml
+      # [jonex] 多跳 join 路径化（2026-10-16；2026-10-17 运行时来源已改为表）：
+      # ② 的运行时血缘读 `knowledge_base.lineage_edges`（迁移 010），**不再读这个文件**。
+      # 这个挂载只为 P1 的 `file` 摄取通道保留解析器默认路径
+      # （`lineage_source.LINEAGE_EDGES_PATH` = `deploy/config/nl2sql/lineage_edges.json`）。
+      # ⚠️ 仍要挂：Dockerfile **只 copy `deploy/start_capability.py`、不 copy
+      # `deploy/config/`** ⇒ 不挂时那条 file 通道在容器里**静默返回空**（表路径不受影响）。
+      - ./config/nl2sql:/app/deploy/config/nl2sql:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -359,6 +392,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-business-domain-service
     container_name: jonex-business-domain
     hostname: business-domain
     networks:
@@ -407,6 +441,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-data-governance-service
     container_name: jonex-data-governance
     hostname: data-governance-service
     networks:
@@ -463,6 +498,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-task-center-service
     container_name: jonex-task-center
     hostname: task-center
     networks:
@@ -522,6 +558,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-platform-service
     container_name: jonex-platform
     hostname: platform
     networks:
@@ -572,6 +609,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-sidecar
     container_name: jonex-sidecar
     hostname: sidecar
     networks:
@@ -641,6 +679,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-gateway
     container_name: jonex-gateway
     hostname: gateway
     networks:
@@ -734,6 +773,7 @@ services:
         PYTHON_BASE: python-base                            # 共享基础镜像
       additional_contexts:
         python-base: "docker-image://jonex/python-base:local"
+    image: jonex-llm-gateway
     container_name: jonex-llm-gateway
     hostname: llm-gateway
     networks:
@@ -787,6 +827,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/docker/frontend-gateway.Dockerfile
+    image: jonex-frontend-gateway
     container_name: jonex-frontend-gateway
     hostname: frontend-gateway
     environment:
@@ -842,6 +883,7 @@ services:
       dockerfile: frontends/shell/Dockerfile
       args:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-shell-frontend
     container_name: jonex-shell-frontend
     hostname: shell-frontend
     networks:
@@ -869,6 +911,7 @@ services:
       dockerfile: frontends/core-business/Dockerfile
       args:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-core-business-frontend
     container_name: jonex-core-business-frontend
     hostname: core-business-frontend
     networks:
@@ -895,6 +938,7 @@ services:
       dockerfile: frontends/platform-management/Dockerfile
       args:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-platform-management-frontend
     container_name: jonex-platform-management-frontend
     hostname: platform-management-frontend
     networks:
@@ -921,6 +965,7 @@ services:
       dockerfile: frontends/ecosystem-management/Dockerfile
       args:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-ecosystem-management-frontend
     container_name: jonex-ecosystem-management-frontend
     hostname: ecosystem-management-frontend
     networks:
@@ -994,11 +1039,18 @@ services:
       context: ..
       dockerfile: deploy/docker/atomic-rag.Dockerfile
       args:
-        MINERU_SOURCE: ${MINERU_SOURCE:-modelscope}
+        # ⚠️ 下面两项是**纯构建期**参数，故意不叫 RAG_PROFILE / MINERU_SOURCE：
+        #    compose 会自动加载本目录的 `.env`，若沿用同名键，改一个运行期配置文件
+        #    就会顺手改掉镜像内容。构建期正确入口：`make build-rag-slim` / `make build-rag-full`，
+        #    或显式 `JONEX_BUILD_RAG_PROFILE=full make build-rag`（不设时默认 slim）。
+        MINERU_SOURCE: ${JONEX_BUILD_MINERU_SOURCE:-modelscope}
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
-        # 依赖胖瘦：full（默认，三种 RAG_PARSER 都能真跑）/ slim（仅 online/selfhost，省 ~3.9GB）
-        # 打瘦身包：RAG_PROFILE=slim docker compose build atomic-rag
-        RAG_PROFILE: ${RAG_PROFILE:-full}
+        # 依赖胖瘦（默认 **slim**）：slim 仅 online/selfhost，去 torch/CUDA/mineru，省 ~3.9GB；
+        #   full 含本地 mineru CLI + 音视频依赖，三种 RAG_PARSER 都能真跑。
+        # ⚠️ 默认 slim 的代价：RAG_PARSER=mineru（本地）、GPU 加速、音视频解析都不可用，
+        #    需要它们时必须显式 `make build-rag-full`。
+        RAG_PROFILE: ${JONEX_BUILD_RAG_PROFILE:-slim}
+    image: jonex-atomic-rag
     container_name: jonex-atomic-rag
     hostname: atomic-rag
     networks:
@@ -1261,6 +1313,13 @@ services:
       - jonex-network
     expose:
       - "7566"                      # 仅容器内，adapter 通过此端口调用
+    # ⚠ 当前无调用明细埋点，故不注入平台 DB_*；将来补埋点时，必须同时注入
+    #   DB_HOST/DB_PORT/DB_USERNAME/DB_PASSWORD/DB_NAME，否则采集器写库会失败（write_failed）。
+    environment:
+      # Sidecar 用它签发内部服务 JWT，本容器用它验签；缺这项时容器落到配置默认
+      # 占位值，Sidecar 转发进来的 /invoke 一律 403 invalid token（表现为 wiki-contents 500）。
+      # `.env.openkb` 里的同名项是注释占位，不能作为来源。
+      JWT_SECRET: ${JWT_SECRET}
     env_file:
       - .env.openkb                 # OpenKB 专属环境变量
     volumes:
@@ -1302,6 +1361,10 @@ services:
     environment:
       # Short-lived query progress sessions use the same Redis as knowledge-base.
       REDIS_URL: redis://redis:6379/0
+      # Sidecar 用它签发内部服务 JWT，本容器用它验签；缺这项时容器落到配置默认
+      # 占位值，Sidecar 转发进来的 /invoke 一律 403 invalid token。
+      # `.env.jonex_wiki` 里的同名项是注释占位，不能作为来源。
+      JWT_SECRET: ${JWT_SECRET}
     env_file:
       - .env.jonex_wiki             # 引擎专属环境变量（JONEX_WIKI_* / LLM_BINDING_* / DB_*）
     volumes:
@@ -1340,7 +1403,7 @@ services:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
     container_name: ontology-compile
     hostname: ontology-compile
-    image: ontology-compile-server
+    image: jonex-ontology-compile-server
     networks:
       - jonex-network
     expose:
@@ -1357,6 +1420,16 @@ services:
       #   OperationNotSupportedError（client.py 有意不静默回落）。
       #   与 knowledge-base-service / atomic-rag 同款：值 + 挂载**成对**，缺一不可。
       CAPABILITY_RUNTIME_FILE: /app/config/capability_runtime.yaml
+      # 平台主库连接（MonitorCollector 用）：本容器经 deploy/start_capability.py 启动，
+      #   采集器会直写 monitor.call_log / monitor.call_attempt。缺这几项时采集器仍能启动，
+      #   但首批写入会连 localhost 失败并计入 write_failed（监控静默缺数）。
+      #   注意与下面的 ONTOLOGY_COMPILE_DATABASE_URL 分工：那是编译引擎自己的库连接，
+      #   这里是共享内核（jonex_core.common.database）的 DB_*。
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${DB_USERNAME:-jonex}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me}
+      DB_NAME: ${DB_NAME:-jonex}
       # DB 连接：**照房规用 compose 插值拼**（同本文件各能力容器的 `${DB_*}` 注入），
       #   而不是在 .env.ontology_compile 里写死口令 —— 口令若写死，改 `DB_PASSWORD` 时
       #   不会被 rotate_secrets 同步（它在 FILL_MISSING_EXCLUDED + ROTATE_REQUIRES_OPT_IN 里），
@@ -1364,6 +1437,15 @@ services:
       #   同类服务上已踩过（见 deploy/README.md）。
       #   compose 的 `environment:` 优先级高于 `env_file:`，故模板里那行已注释掉。
       ONTOLOGY_COMPILE_DATABASE_URL: postgresql+asyncpg://${DB_USERNAME:-jonex}:${DB_PASSWORD:-change-me}@postgres:5432/${DB_NAME:-jonex}
+      # ---- procedural 抽取子管线（Skill/Action 规程抽取）----
+      # 2026-10-17 起本体编译默认由本容器执行，总闸必须同时接到这里，否则开了 atomic-rag
+      # 那份也不作用于默认链路。与 atomic-rag 段**同一来源**（deploy/.env 插值），
+      # 一处改两边同时生效，避免两份值漂移。真正决定某个 KB 是否跑 procedural 的是
+      # 库级开关 knowledge_info.procedural_extract（总闸 AND 库级开关）。
+      ONTOLOGY_PROCEDURAL_EXTRACT_ENABLED: ${ONTOLOGY_PROCEDURAL_EXTRACT_ENABLED:-false}
+      ONTOLOGY_PROCEDURAL_CHUNK_MAX: ${ONTOLOGY_PROCEDURAL_CHUNK_MAX:-30}
+      ONTOLOGY_PROCEDURAL_MAX_ACTIONS: ${ONTOLOGY_PROCEDURAL_MAX_ACTIONS:-100}
+      ONTOLOGY_PROCEDURAL_NAME_MAXLEN: ${ONTOLOGY_PROCEDURAL_NAME_MAXLEN:-30}
     volumes:
       # ⚠️ 设计 §4.5：extract_only 要读 atomic-rag 写在共享卷上的表格上下文存档；
       # 漏了它不报错，只是 _load_table_context 读回 None → P0-b 把有表格的文档判为拒绝重抽。
@@ -1412,6 +1494,10 @@ services:
     build:
       context: ..
       dockerfile: mcp_server/Dockerfile
+      args:
+        # 与其它镜像一致的源切换开关：false=国内源（腾讯云 apt/pip），true=国外官方源
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-mcp-server
     container_name: jonex-mcp-server
     hostname: mcp-server
     networks:
@@ -1473,6 +1559,10 @@ services:
     build:
       context: ./identity-sync-gateway
       dockerfile: Dockerfile
+      args:
+        # 本镜像零第三方依赖、无构建期联网，此项只用于打 LABEL 溯源（与其它镜像口径一致）
+        USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+    image: jonex-identity-sync-gateway
     container_name: jonex-identity-sync-gateway
     hostname: identity-sync-gateway
     profiles: ["identity-sync-gateway"]

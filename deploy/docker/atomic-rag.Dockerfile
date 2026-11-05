@@ -68,9 +68,19 @@ RUN pip config set global.timeout 300 \
 # ── Build args（docker-compose 传参） ──
 ARG MINERU_SOURCE=modelscope
 # RAG_PROFILE：控制 raganything 依赖胖瘦（代码始终支持三种 RAG_PARSER，本变量只决定装不装重依赖）
-#   full（默认）：装 [all,local]，含本地 mineru CLI + 音视频/paddleocr，三种 parser 都能真跑
-#   slim        ：装 [image,text]，去掉 mineru/whisper/torch/CUDA（省 ~3.9GB），仅 online/selfhost 可用
-ARG RAG_PROFILE=full
+#   slim（默认）：装 [image,text]，去掉 mineru/whisper/torch/CUDA（省 ~3.9GB），仅 online/selfhost 可用
+#   full        ：装 [all,local]，含本地 mineru CLI + 音视频/paddleocr，三种 parser 都能真跑
+# ⚠️ 默认 slim：本地 mineru（RAG_PARSER=mineru）、GPU 加速、音视频解析都需要 full，
+#    构建入口 `make build-rag-full`（compose 侧默认值见 deploy/docker-compose.yml）。
+ARG RAG_PROFILE=slim
+
+# ── 溯源标签：三个构建期开关全部写进镜像元数据 ──
+#   docker inspect <镜像> --format '{{json .Config.Labels}}'
+# 目的：同一个 commit 因 RAG_PROFILE 不同会长出 3.9GB 差异与不同的 parser 能力，
+# 出问题时先看 label 就知道手里这个镜像到底是怎么打出来的。
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}" \
+      org.jonex.build.rag_profile="${RAG_PROFILE}" \
+      org.jonex.build.mineru_source="${MINERU_SOURCE}"
 
 # ── 环境变量（模型缓存路径 + 能力身份 + Python 路径）──
 ENV HF_ENDPOINT=https://hf-mirror.com \

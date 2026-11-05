@@ -87,6 +87,9 @@ RUN echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  /app
 # ── 运行阶段 ──
 # .venv 已从 builder 完整复制，无需再次 uv sync
 FROM python:3.12-slim
+# ARG 不跨 stage 继承：最终镜像的 label 要在本 stage 重新声明才能取到值
+ARG USE_OVERSEAS_MIRROR=false
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
 WORKDIR /app
 ENV PATH=/app/.venv/bin:$PATH
 
