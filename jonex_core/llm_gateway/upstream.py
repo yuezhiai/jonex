@@ -17,6 +17,7 @@ from fastapi import Request
 
 from jonex_core.common.config import get_config
 from jonex_core.common.monitor_collector import attempt_span
+from jonex_core.common.thinking import DEFAULT_FIELDS, apply_thinking_fields
 from jonex_core.llm_gateway.context import MeteringContext, derive_request_id
 from jonex_core.llm_gateway.rerank_profiles import get_profile
 
@@ -116,22 +117,22 @@ def upstream_headers(upstream_key: str, request: Request) -> dict[str, str]:
 
 
 def _maybe_disable_thinking(path: str, body: dict, ctx: MeteringContext) -> None:
-    """按场景为指定模型注入 body.thinking={"type":"disabled"}，加速抽取类任务。
+    """按场景为指定模型注入思考控制字段，加速抽取/短输出类任务。
 
     - 仅作用于 chat/completions（embedding 无 thinking 概念）；
     - 仅当 model 命中 LLMGW_DISABLE_THINKING_MODELS 且 scene 命中
       LLMGW_DISABLE_THINKING_SCENES 时注入（空集合表示不限制该维度）；
-    - 不覆盖调用方已显式设置的 thinking 字段；
-    - ⚠️ 仅适配腾讯 tokenhub（tencentmaas）：顶层 {"thinking": {"type": "disabled"}}
-      是其专有关思考格式。换其他上游（OpenAI/DeepSeek 官方/vLLM 等）须在此适配对应
-      参数，否则上游可能报错或忽略；不确定时把 LLMGW_DISABLE_THINKING_ENABLED 关掉。
+    - **注入什么由 ``LLMGW_THINKING_FIELDS`` 决定**（语法见
+      :mod:`jonex_core.common.thinking`）：缺省 ``thinking.type.string`` 即历史
+      TokenHub 写法；Qwen3 自建服务配 ``chat_template_kwargs.enable_thinking.bool``；
+    - 调用方已显式设置的叶子字段不覆盖。
     """
     if path.endswith("/embeddings"):
         return
     cfg = get_config()
     if not getattr(cfg, "LLMGW_DISABLE_THINKING_ENABLED", False):
         return
-    if not isinstance(body, dict) or "thinking" in body:  # 调用方显式声明优先
+    if not isinstance(body, dict):
         return
     model = body.get("model") or ""
     models = {m.strip() for m in (cfg.LLMGW_DISABLE_THINKING_MODELS or "").split(",") if m.strip()}
@@ -140,11 +141,16 @@ def _maybe_disable_thinking(path: str, body: dict, ctx: MeteringContext) -> None
     scenes = {s.strip() for s in (cfg.LLMGW_DISABLE_THINKING_SCENES or "").split(",") if s.strip()}
     if scenes and ctx.scene not in scenes:
         return
-    body["thinking"] = {"type": "disabled"}
-    logger.info(
-        "注入 thinking.disabled | req_id=%s model=%s scene=%s",
-        ctx.request_id, model, ctx.scene,
+    injected = apply_thinking_fields(
+        body,
+        getattr(cfg, "LLMGW_THINKING_FIELDS", DEFAULT_FIELDS),
+        log_prefix=f"req_id={ctx.request_id}",
     )
+    if injected:
+        logger.info(
+            "注入思考字段 | req_id=%s model=%s scene=%s fields=%s",
+            ctx.request_id, model, ctx.scene, ",".join(injected),
+        )
 
 
 # ============================================================

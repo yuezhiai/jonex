@@ -96,6 +96,7 @@ async def _openai_chat(
     scope: Optional[Dict[str, Any]] = None,
     json_mode: bool = False,
     return_meta: bool = False,
+    model: Optional[str] = None,
 ):
     """调用 OpenAI 兼容接口（经 llm-gateway 计量，上游 deepseek-v4-flash 等）。
 
@@ -103,6 +104,14 @@ async def _openai_chat(
         json_mode: 开启 response_format=json_object（开关 ONTOLOGY_EXTRACT_JSON_MODE）
         return_meta: [jonex] P2 True 时返回 (content, meta) 元组，meta 含
             finish_reason 供截断检测（§5.4）；默认 False 保持旧调用方行为不变。
+        model: [jonex] P3a 模型覆盖（KB 级配置下发）。三级优先级：
+            **显式入参 > `scope["model"]` > `ONTOLOGY_LLM_MODEL`**。
+
+            为什么也认 `scope`：本体抽取的 4 个 LLM 出口（主抽取、表格补跑、
+            表级判定、列名映射）只有前两个自带 `options`，后两个在
+            `table_object_extractor` 里、签名只有 `scope` 一个通道。把模型挂在
+            scope 上，四处共用同一个值、也免掉「给两个方法各加形参再逐层透传」
+            那种改一半就静默失效的接线。空值一律视为"没覆盖"。
     """
     import httpx
 
@@ -114,7 +123,9 @@ async def _openai_chat(
         "ONTOLOGY_LLM_BINDING_API_KEY",
         "",  # 改为网关内部 token，不持云端 key
     )
-    model = resolve_llm_model("ONTOLOGY_LLM_MODEL")
+    # [jonex] P3a：显式入参 > scope 携带 > env 默认（见 docstring 的三级优先级）
+    model = (model or "").strip() or str((scope or {}).get("model") or "").strip() \
+        or resolve_llm_model("ONTOLOGY_LLM_MODEL")
     timeout = float(os.getenv("ONTOLOGY_LLM_TIMEOUT", "60"))
 
     headers = {"Content-Type": "application/json"}
@@ -309,6 +320,192 @@ def _recover_truncated_objects(core: str) -> Optional[dict]:
                 pass
             pos = i + 1
     return out if (out["entities"] or out["relations"]) else None
+
+
+#: procedural 子管线的产出标记（native_ontology_extractor 的 procedural 解析写入）
+PROCEDURAL_EXTRACTION_METHOD = "procedural_llm"
+#: 以 procedural 结果为准的类型：procedural prompt 专门约束了这两类的契约字段与禁编造，
+#: 主抽取对这些字段没有约束
+PROCEDURAL_PRIORITY_TYPES = frozenset({"Action", "Skill"})
+#: 库级 procedural 开关在 prompt_schema（即抽取器收到的 tbox）顶层的键名。
+#: 由 kb-service 派单时按 knowledge_info.procedural_extract 写入；抽取器只认值为 True。
+#: 两个执行方（atomic-rag / ontology-compile）都把 prompt_schema 原样作为 tbox 传给
+#: NativeOntologyExtractor.extract()，故挂在这里不需要改任何派单 payload 结构。
+PROCEDURAL_GATE_KEY = "procedural_extract"
+
+
+def _non_empty_attrs(attrs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        k: v for k, v in (attrs or {}).items()
+        if v is not None and v != "" and v != [] and v != {}
+    }
+
+
+def merge_entity_attributes(kept: "ExtractedEntity", incoming: "ExtractedEntity") -> None:
+    """同名实体合并时的属性合并（原地修改 ``kept``）。
+
+    - 任一方是 procedural 产出、且该 procedural 实体属于 Action/Skill：
+      以 procedural 一方的属性为准，缺失字段用另一方补（字段级并集，同字段冲突取 procedural）。
+      procedural 一方后到时，类型与 extraction_method 也改用 procedural 的——
+      主抽取可能把同名动作判成 Concept 等泛化类型，留下它会让 Action 整个丢失。
+      双方都是 procedural 时，先到者为准、后到者补缺。
+    - 其余情况维持先到者优先：先到者属性为空时才取后到者的整份属性。
+    """
+    kept_proc = (
+        kept.extraction_method == PROCEDURAL_EXTRACTION_METHOD
+        and kept.entity_type in PROCEDURAL_PRIORITY_TYPES
+    )
+    incoming_proc = (
+        incoming.extraction_method == PROCEDURAL_EXTRACTION_METHOD
+        and incoming.entity_type in PROCEDURAL_PRIORITY_TYPES
+    )
+    if not (kept_proc or incoming_proc):
+        if incoming.attributes and not kept.attributes:
+            kept.attributes = dict(incoming.attributes)
+        return
+
+    if incoming_proc and not kept_proc:
+        primary, secondary = incoming.attributes, kept.attributes
+        kept.entity_type = incoming.entity_type
+        kept.extraction_method = incoming.extraction_method
+    else:
+        primary, secondary = kept.attributes, incoming.attributes
+    merged = _non_empty_attrs(secondary)
+    merged.update(_non_empty_attrs(primary))
+    kept.attributes = merged
+
+
+_TRUE_WORDS = frozenset({"true", "yes", "y", "1", "是", "需要", "要", "必须", "需", "有"})
+_FALSE_WORDS = frozenset({"false", "no", "n", "0", "否", "不需要", "不要", "无需", "不必", "无"})
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    """布尔属性归一：认得出是 / 否就返回 bool，认不出（含 None、空串）返回 None。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value) if value in (0, 1) else None
+    s = str(value).strip().lower()
+    if s in _TRUE_WORDS:
+        return True
+    if s in _FALSE_WORDS:
+        return False
+    return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    """整数归一（step_no 等序号）：接受 int、整数值 float、纯数字字符串，其余返回 None。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    s = str(value).strip()
+    return int(s) if s.lstrip("-").isdigit() else None
+
+
+def _coerce_number(value: Any) -> Optional[float | int]:
+    """数值归一：只认不带单位的纯数字（含小数、千分位逗号）。
+
+    带单位的值（「1.2亿元」「70%」）在抽取侧**不换算**：换算口径属于消费方
+    （审查项目的精确取值接口按 TBox 类型归一并保留原值），这里猜单位会把错数落进图。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value).strip().replace(",", "")
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return int(f) if f.is_integer() and "." not in s else f
+
+
+def coerce_attribute_types(entities: List["ExtractedEntity"], schema: Optional[dict]) -> Dict[str, int]:
+    """按 TBox 声明的属性类型归一实体属性值（原地修改），返回 {"coerced": n, "unparsed": m}。
+
+    - boolean：认得出是 / 否就转 bool；认不出**删键**——布尔字段落一个说不清的字符串，
+      下游（动作执行器 / 审查规则）会把它当成「有值」。
+    - number：纯数字字符串转 int / float；带单位等认不出的**保留原值**，由消费方按自己的
+      口径解析（删掉会丢信息，猜单位会落错数）。
+    - 其它类型不动。
+    """
+    stats = {"coerced": 0, "unparsed": 0}
+    if not schema:
+        return stats
+    types: Dict[str, Dict[str, str]] = {}
+    for et in schema.get("entity_types") or []:
+        name = et.get("name") or ""
+        types[name] = {
+            str(a.get("name")): str(a.get("type") or "string").lower()
+            for a in (et.get("attributes") or []) if a.get("name")
+        }
+    for e in entities:
+        decl = types.get(e.entity_type)
+        if not decl or not e.attributes:
+            continue
+        attrs = dict(e.attributes)
+        changed = False
+        for key, value in list(attrs.items()):
+            t = decl.get(key)
+            if t == "boolean" and not isinstance(value, bool):
+                b = _coerce_bool(value)
+                if b is None:
+                    attrs.pop(key)
+                    stats["unparsed"] += 1
+                else:
+                    attrs[key] = b
+                    stats["coerced"] += 1
+                changed = True
+            elif t == "number" and (isinstance(value, str) or isinstance(value, bool)):
+                n = _coerce_number(value)
+                if n is None:
+                    stats["unparsed"] += 1
+                else:
+                    attrs[key] = n
+                    stats["coerced"] += 1
+                    changed = True
+        if changed:
+            e.attributes = attrs
+    return stats
+
+
+def warn_cardinality_conflicts(relations: List["ExtractedRelation"], schema: Optional[dict]) -> List[str]:
+    """基数与步骤序冲突**只告警不删**，返回告警文本列表。
+
+    - cardinality=one_to_one 的关系：同一源实体出现多条出边；
+    - HAS_STEP：同一技能下多个动作共用同一 step_no。
+    图上保留全部边（LLM 抖动丢数据比冗余边更伤），查询侧按 confidence 取首条。
+    """
+    warnings: List[str] = []
+    if not schema:
+        return warnings
+    one_to_one = {
+        rt.get("name") for rt in (schema.get("relation_types") or [])
+        if (rt.get("cardinality") or "") == "one_to_one" and rt.get("name")
+    }
+    out_edges: Dict[tuple, set] = {}
+    step_slots: Dict[tuple, set] = {}
+    for r in relations:
+        if r.relation_type in one_to_one:
+            out_edges.setdefault((r.relation_type, r.source_name), set()).add(r.target_name)
+        if r.relation_type == "HAS_STEP":
+            n = _coerce_int((r.attributes or {}).get("step_no"))
+            if n is not None:
+                step_slots.setdefault((r.source_name, n), set()).add(r.target_name)
+    for (rel, src), targets in out_edges.items():
+        if len(targets) > 1:
+            warnings.append(f"{rel} 声明 one_to_one，但 {src} 有 {len(targets)} 条出边: {sorted(targets)}")
+    for (skill, n), actions in step_slots.items():
+        if len(actions) > 1:
+            warnings.append(f"技能 {skill} 的第 {n} 步对应多个动作: {sorted(actions)}")
+    for w in warnings:
+        logger.warning("ontology 基数/步骤序冲突（只告警不删）: %s", w)
+    return warnings
 
 
 def _endpoint_ok(actual: str, expected) -> bool:

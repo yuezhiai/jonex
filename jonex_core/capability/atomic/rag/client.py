@@ -57,6 +57,7 @@ class RAGClient(ABC):
         prompt_ids: Optional[list] = None,
         execution_mode: str = "full",
         kb_type: str = "",
+        kb_vlm_override: str = "",  # [jonex] KB 级多模态模型覆盖（空 = 不下发）
     ) -> dict:
         """插入文档到 RAG 索引，立即返回 task_id
 
@@ -65,6 +66,9 @@ class RAGClient(ABC):
             storage_backend: 存储后端（"local" | "cos" | "s3"），P3
             storage_key: 对象存储键（storage_backend 为 "cos"/"s3" 时使用）
             kb_type: lightrag | openkb | jonex_wiki（[jonex] llm-wiki 产物分支用）
+            kb_vlm_override: [jonex] KB 级多模态模型覆盖。**空字符串 = 不下发**，
+                引擎走自己的默认链（注册表 → VLM_MODEL_NAME）—— 与"这个库没配置"
+                完全等价。设计见 docs/knowledge-base/kb-model-settings-design.md §5.2。
 
         Returns:
             {"task_id": str, "status": "pending", "file_path": str}
@@ -287,10 +291,13 @@ class RAGClient(ABC):
         force_retry: bool = False,
         content_generation: int = 0,
         engine_chunks: Optional[list] = None,
+        ontology_model: str = "",  # [jonex] KB 级本体抽取模型覆盖（空 = 不下发）
     ) -> dict:
         """重新触发文档的本体抽取（ontology-only 模式）
 
         engine_chunks: 引擎全量 chunk（rag 链恒 None）。
+        ontology_model: [jonex] KB 级本体抽取模型覆盖。**空字符串 = 不下发**，
+            引擎走自己的默认链（`ONTOLOGY_LLM_MODEL`）—— 与「这个库没配置」等价。
         """
         pass
 
@@ -363,6 +370,9 @@ class LocalRAGClient(RAGClient):
         prompt_ids: Optional[list] = None,
         execution_mode: str = "full",
         kb_type: str = "",
+        # [jonex] KB 级 VLM 覆盖：LOCAL 模式下引擎与本进程共享同一套 env，
+        # 这个形参只为接口一致（调用方不必区分 LOCAL/REMOTE），不参与执行。
+        kb_vlm_override: str = "",
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -642,6 +652,9 @@ class LocalRAGClient(RAGClient):
         force_retry: bool = False,
         content_generation: int = 0,
         engine_chunks: Optional[list] = None,
+        # [jonex] KB 级本体抽取模型覆盖：LOCAL 面（v2 adapter）没有这个形参，
+        # 收下只为接口一致 —— 调用方不必区分 LOCAL/REMOTE。
+        ontology_model: str = "",
     ) -> dict:
         await self._ensure_initialized()
         # [jonex] v1 退役：v2 adapter 形参序为 (document_id, tenant_id, *, knowledge_base_id)，
@@ -733,6 +746,7 @@ class RemoteRAGClient(RAGClient):
         execution_mode: str = "full",
         idempotency_key: Optional[str] = None,  # [jonex] R1
         kb_type: str = "",
+        kb_vlm_override: str = "",  # [jonex] KB 级多模态模型覆盖
     ) -> dict:
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
         payload: dict = {
@@ -761,6 +775,11 @@ class RemoteRAGClient(RAGClient):
             payload["idempotency_key"] = idempotency_key
         if kb_type:
             payload["kb_type"] = kb_type
+        # [jonex] KB 级 VLM 覆盖：**只在有值时才带这个键**。空值也带的话，引擎侧
+        # 无法区分"平台说要清空"和"平台没配置"—— 这两者在引擎里必须是同一件事
+        # （都走引擎自己的默认链）。
+        if (kb_vlm_override or "").strip():
+            payload["kb_vlm_override"] = kb_vlm_override.strip()
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -785,6 +804,7 @@ class RemoteRAGClient(RAGClient):
         old_rag_doc_ids: Optional[list] = None,
         idempotency_key: Optional[str] = None,  # [jonex] R1
         kb_type: str = "",
+        kb_vlm_override: str = "",  # [jonex] KB 级多模态模型覆盖
     ) -> dict:
         """以 force_reparse=true 重新解析同一文件（atomic-rag action `retry`）。
 
@@ -821,6 +841,9 @@ class RemoteRAGClient(RAGClient):
             payload["idempotency_key"] = idempotency_key
         if kb_type:
             payload["kb_type"] = kb_type
+        # [jonex] 重解析同样吃当前配置（「保存只影响未派活的步骤」——重解析是新派活）
+        if (kb_vlm_override or "").strip():
+            payload["kb_vlm_override"] = kb_vlm_override.strip()
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -1135,6 +1158,7 @@ class RemoteRAGClient(RAGClient):
         force_retry: bool = False,
         content_generation: int = 0,
         engine_chunks: Optional[list] = None,
+        ontology_model: str = "",  # [jonex] KB 级本体抽取模型覆盖
     ) -> dict:
         payload: dict = {
             "action": "retry_ontology_extract",
@@ -1154,6 +1178,11 @@ class RemoteRAGClient(RAGClient):
         # rag 链 payload 与从前逐字一致）
         if engine_chunks:
             payload["engine_chunks"] = engine_chunks
+        # [jonex] KB 级本体抽取模型：**只在有值时才带这个键**。空值也带的话，
+        # 引擎侧分不清「平台要清空」与「平台没配置」，而这两者在引擎里必须是
+        # 同一件事（都走 `ONTOLOGY_LLM_MODEL`）。
+        if (ontology_model or "").strip():
+            payload["ontology_model"] = ontology_model.strip()
         resp = await self._invoke(payload, tenant_id)
         return resp["data"]
 
@@ -1325,6 +1354,8 @@ class MockRAGClient(RAGClient):
         preset: Optional[str] = None,
         prompt_ids: Optional[list] = None,
         execution_mode: str = "full",
+        # [jonex] KB 级 VLM 覆盖：MOCK 不真的调模型，形参只为接口一致
+        kb_vlm_override: str = "",
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         knowledge_base_id = require_knowledge_base(knowledge_base_id)
@@ -1574,6 +1605,8 @@ class MockRAGClient(RAGClient):
         force_retry: bool = False,
         content_generation: int = 0,
         engine_chunks: Optional[list] = None,
+        # [jonex] KB 级本体抽取模型覆盖：MOCK 不真的调模型，形参只为接口一致
+        ontology_model: str = "",
     ) -> dict:
         require_tenant(tenant_id)
         require_knowledge_base(knowledge_base_id)

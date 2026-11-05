@@ -12,13 +12,14 @@ from jonex_core.common.exceptions import RateLimitExceededError
 _cooldowns: dict[tuple[int, str], float] = {}
 
 
-async def post_sidecar(client, body: dict, tenant_id: str):
+async def post_sidecar(client, body: dict, tenant_id: str, headers: dict | None = None):
     key = (id(asyncio.get_running_loop()), tenant_id)
+    send_headers = {**(headers or {}), "X-Tenant-ID": tenant_id}
     for attempt in range(4):
         delay = _cooldowns.get(key, 0) - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
-        response = await client.post("/invoke", json=body, headers={"X-Tenant-ID": tenant_id})
+        response = await client.post("/invoke", json=body, headers=send_headers)
         if response.status_code != 429:
             response.raise_for_status()
             return response

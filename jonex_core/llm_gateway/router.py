@@ -14,12 +14,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from jonex_core.common.config import get_config
 from jonex_core.common.monitor_collector import (
+    attempt_span,
     classify_trigger_by_scene,
     get_monitor_collector,
 )
+from jonex_core.common.monitor_identity import format_user_identity
 from jonex_core.common.monitor_models import (
     CallDirection,
     CallFinalStatus,
+    CallScope,
     Protocol,
 )
 from jonex_core.llm_gateway.context import MeteringContext, derive_request_id, parse_ctx
@@ -200,7 +203,24 @@ async def rerank(request: Request, ctx: MeteringContext = Depends(parse_ctx)):
         len(body.get("documents") or []),
     )
 
-    data, status_code, latency_ms = await proxy_rerank(request, body, ctx)
+    # call_attempt（monitor.call_attempt）：rerank 走 proxy_rerank，内部没有 attempt_span，
+    # 原先只有 call_log ⇒ 监控降级模式（读 attempt）下 rerank 对象会消失。这里按**一次逻辑
+    # 调用 = 一次物理尝试**补一条（rerank 无重试语义，attempt_no=1 / is_final=True）。
+    # request_id 必须与下方 ``_record_usage`` 的 call_log 逐字一致 —— 两处都用同一个 body
+    # 调 ``derive_request_id``。采集是旁路：投递异常由 attempt_span 自身吞掉。
+    monitor_request_id = derive_request_id(ctx, body)
+    with attempt_span(
+        request_id=monitor_request_id,
+        tenant_id=ctx.tenant_id,
+        attempt_no=1,
+        is_final=True,
+    ) as att:
+        data, status_code, latency_ms = await proxy_rerank(request, body, ctx)
+        if status_code >= 400:
+            att.fail(
+                error_code=status_code,
+                error_message=_error_text_from_response(data),
+            )
 
     # [jonex] 2026-09-22：原「检索期 rerank 命中」的 Redis 标记已删除——它的唯一读者
     # 是 kb-service 旧链路的命中检测函数，二者随本次清理一并移除。留着只是让每次
@@ -308,14 +328,17 @@ def _collect_monitor_n1_outbound(
     error_code: Optional[str] = None,
     error_message: Optional[Any] = None,
 ) -> None:
-    """投递一条 llm-gateway **出站** N1（``monitor.call_log``），**吞掉一切异常**。
+    """投递一条 llm-gateway **出站逻辑调用记录**（``monitor.call_log``），**吞掉一切异常**。
 
     拼行范式照抄 ``sidecar/main.py`` 的 ``_monitor_n1_fields`` / ``_collect_monitor_n1``。
     两处刻意的取值：
 
     - ``direction=outbound`` —— 记录的是「网关**发出**的调用」，与 Sidecar 的
       ``inbound``（进入能力）相对。
-    - ``source`` = 用户身份，拿不到时记 ``platform``（表示平台自身发起，不是某个用户）。
+    - ``source`` = 用户身份的**稳定标识**：``ctx.user_id`` 能确认为本地用户主键
+      时写 ``user:<id>``；外部 ID（UUID 等）原样保留；都没有时记 ``platform``
+      （表示平台自身发起）。**不写用户名** —— 用户名可变，改名会让同一个人
+      分裂成两条来源，展示名统一由读侧按主键解析。
 
     ``tenant_id`` 直接取 ``ctx.tenant_id``：非法（空 / ``unknown`` 等）时整条会被
     采集侧丢弃 —— **既定行为，不造假租户兜底**。
@@ -323,14 +346,18 @@ def _collect_monitor_n1_outbound(
     try:
         ended = datetime.now(timezone.utc)
         failed = final_status == CallFinalStatus.FAILED.value
-        get_monitor_collector().put_call_log({
+        source = format_user_identity(ctx.user_id) or (ctx.user_id or "") or "platform"
+        collector = get_monitor_collector()
+        collector.put_call_log({
             "request_id": request_id,
             "trace_id": ctx.trace_id,
             "tenant_id": ctx.tenant_id,
             "direction": CallDirection.OUTBOUND.value,
-            "source": ctx.user_id or "platform",
+            "source": source,
             "target": model,
             "protocol": Protocol.OPENAI.value,
+            # 平台调外部模型 ⇒ 外部依赖（不是内部互调）。
+            "call_scope": CallScope.EXTERNAL.value,
             "trigger_type": classify_trigger_by_scene(ctx.scene),
             # DDL 是 TIMESTAMPTZ ⇒ 必须 tz-aware（朴素值会踩 asyncpg 编解码坑）
             "logical_started_at": ended - timedelta(milliseconds=latency_ms),
@@ -356,7 +383,7 @@ def _record_usage(
     final_status: Optional[str] = None,
     error_message: Optional[Any] = None,
 ):
-    """统一计量记录入口（同时投递一条出站 N1 调用明细）。"""
+    """统一计量记录入口（同时投递一条出站逻辑调用记录）。"""
     prompt_tokens = (usage or {}).get("prompt_tokens", 0) or 0
     completion_tokens = (usage or {}).get("completion_tokens", 0) or 0
     total_tokens = (usage or {}).get("total_tokens", 0) or (prompt_tokens + completion_tokens)
@@ -384,7 +411,7 @@ def _record_usage(
     recorder = get_recorder()
     asyncio.create_task(recorder.record(rec))
 
-    # 出站 N1 调用明细（旁路；投递同步非阻塞、吞异常，不影响计量与业务）
+    # 出站逻辑调用记录（旁路；投递同步非阻塞、吞异常，不影响计量与业务）
     if final_status is None:
         final_status = (
             CallFinalStatus.SUCCESS.value if status_code < 400 else CallFinalStatus.FAILED.value

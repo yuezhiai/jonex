@@ -200,6 +200,17 @@ class AuditForwarder:
     # 排除路径前缀
     _EXCLUDED_PREFIXES = ("auth/", "health")
 
+    # 读类动词：invoke 动作的**首 token 精确等于**其中之一的，一律判读类、不采集。
+    # 与 _is_key_action 文档中列的读类动词一致。防 token 内写关键字误命中
+    # 读类动作（如 preview_kb_compiled_schema_recompile 的 token recompile），
+    # 并消除既有误命中 get_editor_state（editor≈edit）、
+    # list_enabled_mcp_tools（enabled≈enable）。
+    # 约定：**新增写动作不得以读类动词开头**；确需例外（读动词开头的写动作），
+    # 改本集合，不要在调用侧绕过。
+    _READ_ACTION_VERBS = frozenset(
+        {"get", "list", "search", "query", "preview", "detail", "export", "stats", "suggest"}
+    )
+
     _BASE_BACKOFF = 1.0       # 初始退避 1 秒
     _MAX_BACKOFF = 60.0       # 最大退避 60 秒
 
@@ -221,14 +232,18 @@ class AuditForwarder:
     def _is_key_action(self, action: Optional[str]) -> bool:
         """判断 invoke 的 payload.action 是否为关键行为（创建/修改/删除等）。
 
-        按分隔符（_ - . 空格）切分为 token 后匹配关键字（精确或前缀），
+        首 token 为读类动词（get/list/search/query/preview/detail/export/stats，
+        见 _READ_ACTION_VERBS）的动作无条件判读类、不采集——即使 token 内含
+        recompile 等写关键字（如 preview_kb_compiled_schema_recompile）。
+        其余动作按分隔符（_ - . 空格）切分为 token 后匹配关键字（精确或前缀），
         兼容 batch_delete / update_status / create_xxx 等命名；
         同时避免 preview 误命中 review 这类子串假阳性。
-        读类动作（list/get/search/query/preview/detail/export/stats）不命中即被过滤。
         """
         if not action:
             return False
         tokens = re.split(r"[_\-.\s]+", action.lower())
+        if tokens[0] in self._READ_ACTION_VERBS:
+            return False
         return any(
             tok == kw or tok.startswith(kw)
             for tok in tokens

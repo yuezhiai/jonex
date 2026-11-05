@@ -47,6 +47,10 @@ class RedisPoolManager:
                 retry_on_timeout=True,
                 health_check_interval=config.REDIS_HEALTH_CHECK_INTERVAL,
                 decode_responses=config.REDIS_DECODE_RESPONSES,
+                # ⚠️ 本地 Redis 5.0 不支持 RESP3 的 HELLO 握手；redis-py 8.x 默认
+                # protocol=3 会先发 `HELLO 3`，在 Redis 5 上直接报 unknown command。
+                # 固定 RESP2：协议能力之外，所有命令语义一致。
+                protocol=2,
             )
             logger.info(f"✅ Redis 连接池已初始化 (host={config.REDIS_HOST}:{config.REDIS_PORT})")
         return cls._pool

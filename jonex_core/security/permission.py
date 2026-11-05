@@ -42,9 +42,17 @@ def _cache_key(tenant_id: str, user_id: int) -> str:
     return f"perm:{tenant_id}:{user_id}"
 
 
+# ⚠️ 必须 join platform.roles 并过滤 is_deleted：角色删除是软删，只把 roles.is_deleted
+# 置 1，既不删 user_roles / role_permissions，也没有外键级联。少这一段的话，删除角色
+# 后用户会继续持有一整套权限码——`RoleService.delete` 里的缓存失效救不回来，因为下次
+# 查库会按同一条 SQL 重新算出同一批码（不是「最多 30 秒」的缓存窗口问题）。
 _PERMISSION_SQL = """
     SELECT DISTINCT p.code
       FROM platform.user_roles ur
+      JOIN platform.roles r
+        ON r.id = ur.role_id
+       AND r.tenant_id = ur.tenant_id
+       AND r.is_deleted = 0
       JOIN platform.role_permissions rp
         ON rp.tenant_id = ur.tenant_id AND rp.role_id = ur.role_id
       JOIN platform.permissions p ON p.id = rp.permission_id

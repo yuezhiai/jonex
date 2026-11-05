@@ -35,9 +35,11 @@ from jonex_core.sidecar.hooks import (
 )
 from jonex_core.common.audit_enums import _ACTION_TO_RESOURCE, _RESOURCE_TO_ID_FIELD
 from jonex_core.common.monitor_collector import get_monitor_collector
+from jonex_core.common.monitor_identity import format_user_identity
 from jonex_core.common.monitor_models import (
     CallDirection,
     CallFinalStatus,
+    CallScope,
     CallTrigger,
     Protocol,
 )
@@ -81,12 +83,54 @@ class CapabilityInvokeRequest(BaseModel):
     original_tenant_id: Optional[str] = None
 
 
+# KB 级 compiled schema 的写动作：只有这两个动作采集审计明细
+# （request_params / response_body）。其余动作维持既有的「动作 + 资源 id」粒度。
+_COMPILED_SCHEMA_AUDIT_ACTIONS = frozenset({
+    "recompile_schema",
+    "reseed_compiled_schema",
+})
+
+
+def _compiled_schema_audit_request_params(action: str, data: dict) -> dict:
+    """recompile / reseed 的审计入参摘要（不含 schema 正文）。"""
+    params = {
+        "knowledge_base_id": data.get("knowledge_base_id"),
+        "force": bool(data.get("force", False)),
+        "apply_to_documents": bool(data.get("apply_to_documents", False)),
+    }
+    if action == "reseed_compiled_schema":
+        # reseed 的来源身份：没有这些键，审计里只剩「重置过某个 KB」，
+        # 无法回答「重置到了哪个场景/哪个来源类型」。
+        params.update({
+            "template_scenario_id": data.get("template_scenario_id"),
+            "template_domain_id": data.get("template_domain_id"),
+            "source_type": data.get("source_type"),
+        })
+    return params
+
+
+def _compiled_schema_audit_response_body(result: dict) -> dict:
+    """recompile / reseed 的审计结果摘要（含版本与文档重置计数）。"""
+    data = result.get("data") if isinstance(result, dict) else None
+    data = data if isinstance(data, dict) else {}
+    body = {
+        "schema_version": data.get("schema_version"),
+        "unchanged": data.get("unchanged"),
+        "documents_matched": data.get("documents_matched"),
+        "documents_queued": data.get("documents_queued"),
+    }
+    # 文档重置是独立失败的分步结果：有错误才带，避免每条审计都多一个 null。
+    if data.get("apply_error"):
+        body["apply_error"] = data["apply_error"]
+    return body
+
+
 class InvokeResult(BaseModel):
     """调用结果。
 
     `data` 故意是 `Any`、不是 `dict`：Sidecar 是**转发层**，不该对下游能力的
     业务数据做形状裁决。设计文档 §4.3 明确 `data` 可为**对象或列表**（`runner.list` /
-    `def.catalog_list` / `def.catalog_steps` / `task.subtask_list` 这四个不设分页的接口
+    `def.catalog_steps` / `task.subtask_list` 这三个不设分页的接口
     就是直接回裸数组，doc §4.0「不设分页的接口」）。写死成 `dict` 会让这几个 action
     经 `/invoke` 反代时被 FastAPI 的 `response_model` 校验拦下、冒出一个 500 ——
     数据本身没问题，纯粹是这张模型写窄了。形状由能力自己的契约负责。
@@ -324,9 +368,17 @@ def _resolve_platform_tenant(
     body: dict[str, Any] | None,
     auth: dict | None = None,
     require: bool = False,
+    allow_expired_subject: bool = False,
 ) -> str | None:
+    """解析 platform 透传请求的租户。
+
+    ``allow_expired_subject``：调用方已用专用依赖验明身份（目前只有
+    ``/auth/impersonate/end`` 的「模拟 token 宽限」）。此时 Authorization 里的
+    token 可能已过期，不能再走 ``_tenant_from_authorization`` 的严格解码，
+    以 ``auth`` 自带的租户为准；``X-Tenant-ID`` 与它的比对保持不变。
+    """
     canonical = _candidate_tenant(auth.get("tenant_id"), "auth") if auth else None
-    if auth is not None:
+    if auth is not None and not allow_expired_subject:
         canonical = _assert_tenant_matches(
             _tenant_from_authorization(request.headers.get("Authorization")),
             canonical,
@@ -358,7 +410,7 @@ def _resolve_invoke_tenant(
 
 # 系统级 invoke action：租户由能力侧（数据源记录）推导，允许无租户调用。
 # 这些 action 自身做强校验（如 ingest_push 校验 per-数据源 ingest key）。
-_SYSTEM_INVOKE_ACTIONS = {"ingest_push"}
+_SYSTEM_INVOKE_ACTIONS = {"ingest_push", "ingest_lineage_event"}
 
 
 def _resolve_invoke_tenant_optional(
@@ -390,7 +442,7 @@ def _error_code_to_http_status() -> dict[int, int]:
 def _derive_invoke_status_code(result: dict) -> int:
     """由能力返回体推导「记录用」状态码（审计 / 计量侧）。
 
-    能力侧 `/invoke` 端点（`deploy/start_capability.py:177`）恒以 **HTTP 200** 返回，
+    能力侧 `/invoke` 端点（`deploy/start_capability.py` 的 lifespan）恒以 **HTTP 200** 返回，
     业务成败只体现在响应体的 `success` / `code` 上 —— `CapabilityRegistry.invoke`
     会把 `JonexException` 与未捕获异常**都转成** `CapabilityResponse.error` 返回
     （`jonex_core/capability/registry.py:86-101`），因此这里 `raise_for_status()`
@@ -421,24 +473,31 @@ def _derive_invoke_status_code(result: dict) -> int:
     return 500
 
 
-def _caller_from_auth(auth: dict) -> tuple:
+def _caller_from_auth(auth: dict, user_id: Optional[str] = None) -> tuple:
     """从认证结果推导「真实调用方」与「触发方」。
 
     返回 ``(source, trigger_type)``。
 
-    ``source`` 记**真实发起方**，不记内部中转站：网关代用户发起的业务请求会带上
-    用户 JWT，此处解析出的就是用户本人。取不到用户身份时退回认证类型
-    （``apikey`` 等），表示「另一个系统在调」而非某个用户。
+    ``source`` 记**真实发起方**的稳定标识 ``user:<本地用户主键>``，不记内部中转站：
+    网关代用户发起的业务请求会带上用户 JWT，``sub`` 就是用户本人。**不写用户名** ——
+    用户名可变，写进记录后用户一改名，同一个人就会分裂成两条来源；展示名统一由
+    读侧按主键解析。取不到合法用户主键时退回认证类型（``apikey`` 等），表示
+    「另一个系统在调」而非某个用户。
+
+    ``user_id`` 优先取调用点已合并的值（``invoke_request.user_id or auth.user_id``），
+    缺省时回退 ``auth.user_id``。
 
     ``trigger_type``：带上用户身份 ⇒ ``user``；否则视为系统/后台调用 ⇒ ``system``。
     ⚠️ **已知不精确**：外部系统经 MCP 发起的调用若无用户身份，会落在 ``system``
     一侧 —— 待调用方透传显式标识后再细分。
     """
     auth_type = (auth or {}).get("auth_type") or ""
-    username = (auth or {}).get("username") or ""
-    user_id = (auth or {}).get("user_id")
-    if auth_type == "user" and (username or user_id):
-        return (username or f"user:{user_id}", CallTrigger.USER.value)
+    if auth_type == "user":
+        identity = format_user_identity(
+            user_id if user_id is not None else (auth or {}).get("user_id")
+        )
+        if identity:
+            return (identity, CallTrigger.USER.value)
     return (auth_type or "unknown", CallTrigger.SYSTEM.value)
 
 
@@ -454,6 +513,8 @@ def _monitor_n1_fields(
     error_code: Optional[Any] = None,
     error_message: Optional[Any] = None,
     final_status: Optional[str] = None,
+    mcp_tool: Optional[str] = None,
+    is_mcp: bool = False,
 ) -> dict:
     """拼一次 ``/invoke`` 的 N1（``monitor.call_log``）字段。
 
@@ -464,6 +525,12 @@ def _monitor_n1_fields(
     ``direction`` 恒 ``inbound`` —— 记录的是「进入能力」的调用；llm-gateway 腿记 ``outbound``。
     时间列走 tz-aware（DDL 是 TIMESTAMPTZ，朴素值会踩 asyncpg 编解码坑）。
     ``error_*`` 只判状态码，成功时留空。
+
+    MCP 链路由调用方按**上下文** ``invoke_request.context.source == "mcp"`` 判定后以
+    ``is_mcp=True`` 传入：协议记 ``mcp``，工具名取 ``context.mcp_tool``；``target`` 仍记
+    能力标识（读侧用 ``COALESCE(mcp_tool, target)`` 展示对象）。``source`` 始终是真实调用方
+    （如 MCP 链路经 API Key 认证为 ``apikey``），不参与 MCP 判定。其余链路协议恒
+    ``invoke``、工具名恒空。
     """
     success = status_code < 400
     # 流式端点无法在开流后改 HTTP 状态码，取消等三态必须由调用方显式指定。
@@ -477,7 +544,11 @@ def _monitor_n1_fields(
         "direction": CallDirection.INBOUND.value,
         "source": source,
         "target": capability_id,
-        "protocol": Protocol.INVOKE.value,
+        "protocol": Protocol.MCP.value if is_mcp else Protocol.INVOKE.value,
+        # 外部调用方进入平台能力 ⇒ open（direction 恒 inbound）。
+        "call_scope": CallScope.OPEN.value,
+        # 工具名只属于 MCP 链路；误传到其它链路的工具名一律不落库。
+        "mcp_tool": mcp_tool if is_mcp else None,
         "trigger_type": trigger_type,
         "logical_started_at": datetime.fromtimestamp(start_time, timezone.utc),
         "final_ended_at": datetime.now(timezone.utc),
@@ -605,8 +676,18 @@ async def _record_platform_metrics(
     )
 
 
-async def _proxy_to_platform(request: Request, path: str, auth: dict | None = None):
-    """转发请求到 platform 容器"""
+async def _proxy_to_platform(
+    request: Request,
+    path: str,
+    auth: dict | None = None,
+    *,
+    allow_expired_subject: bool = False,
+):
+    """转发请求到 platform 容器。
+
+    ``allow_expired_subject`` 见 :func:`_resolve_platform_tenant`（仅
+    ``/auth/impersonate/end`` 使用）。
+    """
     config = get_config()
     platform_url = config.PLATFORM_URL
     limiter = get_rate_limiter()
@@ -620,6 +701,7 @@ async def _proxy_to_platform(request: Request, path: str, auth: dict | None = No
         body,
         auth=auth,
         require=_platform_path_requires_tenant(path),
+        allow_expired_subject=allow_expired_subject,
     )
     metering_tenant_id = tenant_id or _build_anon_rate_limit_key(request)
 
@@ -852,6 +934,38 @@ class SidecarApp:
                 return {"auth_type": "apikey", "tenant_id": tenant_id}
             raise MissingApiKeyError()
 
+        async def verify_impersonation_end_auth(
+            api_key: Optional[str] = Depends(api_key_header),
+            authorization: Optional[str] = Header(None),
+            x_tenant_id: Optional[str] = Header(None),
+        ) -> dict:
+            """``/auth/impersonate/end`` 专用认证：模拟 token 刚过期也放行。
+
+            到期自动退出由前端定时器触发，那一刻 access token 必已失效。本依赖
+            先按 ``verify_any_auth`` 正常校验；仅在它抛 ``TokenExpiredError`` 时，
+            再用 ``UserAuth.decode_impersonation_end_token`` 判定「模拟态 +
+            过期不超过 ``IMPERSONATE_END_GRACE_SECONDS``」并放行。
+
+            ⛔ 只给这一个路由用，勿挂到任何数据端点：宽限只覆盖「写审计 +
+            清标记 cookie」，platform 侧还会再判一次。
+            """
+            try:
+                return await verify_any_auth(api_key, authorization, x_tenant_id)
+            except TokenExpiredError:
+                token = extract_bearer_token(authorization)
+                if not token:
+                    raise
+                payload, _expired = get_user_auth().decode_impersonation_end_token(token)
+                return {
+                    "auth_type": "user",
+                    "tenant_id": require_tenant(payload.get("tenant_id")),
+                    "user_id": int(payload["sub"]),
+                    "username": payload.get("username", ""),
+                    "impersonated": bool(payload.get("impersonated")),
+                    "original_tenant_id": payload.get("original_tenant_id"),
+                    "perms": payload.get("perms") or [],
+                }
+
         # ==================== 系统端点 ====================
 
         @self.app.get("/health")
@@ -935,8 +1049,14 @@ class SidecarApp:
             return await _proxy_to_platform(request, "auth/impersonate", auth)
 
         @self.app.post("/auth/impersonate/end")
-        async def auth_impersonate_end(request: Request, auth: dict = Depends(verify_any_auth)):
-            return await _proxy_to_platform(request, "auth/impersonate/end", auth)
+        async def auth_impersonate_end(
+            request: Request, auth: dict = Depends(verify_impersonation_end_auth)
+        ):
+            # 到期自动退出时 token 已过期：专用依赖放行「模拟态 + 宽限期内」，
+            # 并告知 _proxy_to_platform 不要再用严格解码复核 Authorization。
+            return await _proxy_to_platform(
+                request, "auth/impersonate/end", auth, allow_expired_subject=True
+            )
 
         # ==================== 平台管理代理 ====================
 
@@ -963,11 +1083,24 @@ class SidecarApp:
             # 从 invoke payload 的 data 中提取 resource_id
             _resource = _ACTION_TO_RESOURCE.get(_action) if _ACTION_TO_RESOURCE else None
             _resource_id = None
+            _payload_data = (invoke_request.payload or {}).get("data", {})
+            if not isinstance(_payload_data, dict):
+                _payload_data = {}
             if _resource:
                 _id_field = _RESOURCE_TO_ID_FIELD.get(_resource)
                 if _id_field:
-                    _payload_data = (invoke_request.payload or {}).get("data", {})
                     _resource_id = _payload_data.get(_id_field)
+            # compiled schema 审计明细：请求参数与成功响应摘要在转发前后各建一次。
+            # resource_id 取 knowledge_base_id —— 这两条动作的
+            # `_RESOURCE_TO_ID_FIELD["compiled_schema"]` 是 schema_id（表里不存在），
+            # 不覆盖就永远是 None，审计里只剩动作名。
+            _audit_schema_action = _action in _COMPILED_SCHEMA_AUDIT_ACTIONS
+            _audit_request_params = (
+                _compiled_schema_audit_request_params(_action, _payload_data)
+                if _audit_schema_action else None
+            )
+            if _audit_schema_action:
+                _resource_id = _payload_data.get("knowledge_base_id")
             if _action in _SYSTEM_INVOKE_ACTIONS:
                 tenant_id = invoke_request.tenant_id or _resolve_invoke_tenant_optional(invoke_request, auth, x_tenant_id)
                 if not tenant_id:
@@ -990,7 +1123,15 @@ class SidecarApp:
             trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
             # 监控采集：真实调用方 + 触发方。「来源服务」列记发起方本人，
             # 来源列记真实调用方，不记内部中转站。
-            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
+            _monitor_source, _monitor_trigger = _caller_from_auth(auth, user_id)
+            # MCP 链路：网关在 context 里写 source="mcp" 与工具名（可选）。采集侧据此
+            # 把协议记为 mcp、写入工具名；非 MCP 链路完全沿用真实调用方的历史口径。
+            _invoke_context = getattr(invoke_request, "context", None) or {}
+            # MCP 判定只看上下文来源，监控 source 列仍记真实调用方（MCP 为 apikey）。
+            _monitor_is_mcp = _invoke_context.get("source") == "mcp"
+            _monitor_mcp_tool = (
+                _invoke_context.get("mcp_tool") if _monitor_is_mcp else None
+            )
             limiter = get_rate_limiter()
             breaker = get_circuit_breaker()
             metering = get_metering()
@@ -1059,6 +1200,11 @@ class SidecarApp:
                     invoke_action=_action,
                     is_invoke=True,
                     resource_id=_resource_id,
+                    request_params=_audit_request_params,
+                    response_body=(
+                        _compiled_schema_audit_response_body(result)
+                        if _audit_schema_action else None
+                    ),
                     impersonated=impersonated,
                     original_tenant_id=original_tenant_id,
                 )
@@ -1074,6 +1220,8 @@ class SidecarApp:
                     trigger_type=_monitor_trigger,
                     error_code=result.get("code"),
                     error_message=result.get("message"),
+                    mcp_tool=_monitor_mcp_tool,
+                    is_mcp=_monitor_is_mcp,
                 )
 
                 logger.info(
@@ -1110,6 +1258,7 @@ class SidecarApp:
                     invoke_action=_action,
                     is_invoke=True,
                     resource_id=_resource_id,
+                    request_params=_audit_request_params,
                     impersonated=impersonated,
                     original_tenant_id=original_tenant_id,
                 )
@@ -1125,6 +1274,8 @@ class SidecarApp:
                     trigger_type=_monitor_trigger,
                     error_code=getattr(e, "code", None),
                     error_message=str(e),
+                    mcp_tool=_monitor_mcp_tool,
+                    is_mcp=_monitor_is_mcp,
                 )
                 msg = str(e)
                 cid = invoke_request.capability_id
@@ -1158,7 +1309,7 @@ class SidecarApp:
             import uuid as _uuid
             trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
             # 来源 / 触发方取法与 /invoke 一致：记真实调用方，不记中转站。
-            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
+            _monitor_source, _monitor_trigger = _caller_from_auth(auth, user_id)
 
             # 直接把采集生成器交给 StreamingResponse：`body_iterator` 就是它，
             # 客户端断开时 aclose/GeneratorExit 能直达采集层，记成 cancelled。
@@ -1207,7 +1358,9 @@ class SidecarApp:
 
             import uuid as _uuid2
             _trace_id = request.headers.get("X-Request-ID") or _uuid2.uuid4().hex
-            _monitor_source, _monitor_trigger = _caller_from_auth(auth)
+            _monitor_source, _monitor_trigger = _caller_from_auth(
+                auth, auth.get("user_id")
+            )
 
             return StreamingResponse(
                 _monitored_stream(

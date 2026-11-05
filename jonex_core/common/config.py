@@ -109,6 +109,11 @@ class SecuritySettings(BaseSettings):
 
     # 租户模拟配置
     IMPERSONATE_EXPIRE_MINUTES: int = 30
+    # 到期自动退出的审计宽限（秒）：模拟 token 到期那一刻前端才调
+    # `/auth/impersonate/end`，此时 access token 已失效。仅该端点接受
+    # 「签名有效 + impersonated=true + exp 已过但不超过该宽限」的 token，
+    # 用于写 `impersonate_expired` 审计；不放开任何数据接口。
+    IMPERSONATE_END_GRACE_SECONDS: int = 300
 
     class Config:
         env_file = ".env"
@@ -435,6 +440,25 @@ class AppSettings(BaseSettings):
     def supported_locales_list(self) -> list[str]:
         return [x.strip() for x in self.SUPPORTED_LOCALES.split(",") if x.strip()]
 
+    # ── 演化台（②b）──
+    # 点踩试跑的 router 入口：试跑**必须经 router :8010**（② 主答翻转 / DI 扇出 /
+    # 观测写入都在那里拦 `search/mix`），直连 Jonex 会绕过编排、试跑也就落不了观测。
+    # 默认指向宿主机（KB 能力跑在容器里）；宿主侧调试可用 env 覆盖。
+    EVOLUTION_ROUTER_BASE: str = "http://host.docker.internal:8010"
+    # 演化评测上游档位：`ask`（默认）= 进程内 ② 问答，逐字节沿用旧行为；
+    # `router` = 经 router 的 data-only 检索路径（W4）。非法值回落 `ask` 并告警，
+    # 归一化在 `services/evolution/upstream._upstream_mode()` 里做（不在配置层）。
+    EVOLUTION_UPSTREAM: str = "ask"
+    # router 档单次问答的超时（秒）。非法值回落 120（归一化在
+    # `services/evolution/upstream._router_timeout()`）。
+    EVOLUTION_ROUTER_TIMEOUT: int = 120
+    # router 档演化 JWT 的 `sub`（需要有目标 KB 空间权限的数值用户；
+    # username 仍是 `evolution`，审计/观测仍可辨识合成流量）。
+    EVOLUTION_ROUTER_USER_ID: str = "1"
+    # 基准臂的网关入口：演化基准从平台网关走完整 invoke 链路（认证 / 租户 /
+    # 观测与用户问答同一条），**不直连 router**（那是点踩试跑的入口）。
+    # 默认宿主回环；拼 URL 前统一 `rstrip("/")`。容器里部署时按实际网关地址覆盖。
+    EVOLUTION_GATEWAY_BASE: str = "http://127.0.0.1:8000"
     # ── 登录页（面向前端，经 GET /api/v1/auth/login-config 下发）──
     # 默认租户 ID：登录页租户输入框的预填值。空 = 不预填，由用户手输。
     DEFAULT_TENANT_ID: str = ""
@@ -505,6 +529,13 @@ class AppSettings(BaseSettings):
     MONITOR_RETENTION_DAYS: int = 90
     # 保留清理调度器的轮询间隔（秒）。<= 0 = 显式关闭（本地/测试可关）。
     MONITOR_RETENTION_SCHEDULER_INTERVAL_SECONDS: int = 86400
+    # attempt_count 周期对账调度器（秒）。<= 0 = 显式关闭。
+    # 背景：call_log / call_attempt 跨进程写事务重叠时互相不可见，批内补正
+    # 会双双落空；由 platform 定期把最近窗口的 attempt_count 收敛到
+    # call_attempt 行数。
+    MONITOR_ATTEMPT_RECONCILE_INTERVAL_SECONDS: int = 30
+    # 每轮对账回看窗口（分钟）。要覆盖写入慢 / 队列积压的极端情况。
+    MONITOR_ATTEMPT_RECONCILE_LOOKBACK_MINUTES: int = 10
     # 单次查询允许的最大时间跨度（天）。<= 0 = 不限制。
     # 三族读接口（调用 / 任务 / Token）共用；超限返回 4004（不属于参数格式错误）。
     MONITOR_QUERY_MAX_RANGE_DAYS: int = 30
@@ -525,7 +556,8 @@ class AppSettings(BaseSettings):
     # 读类动作（list/get/search/query/preview 等）不入库
     AUDIT_KEY_ACTION_KEYWORDS: str = (
         "create,update,delete,remove,save,publish,modify,edit,import,"
-        "review,retry,cancel,approve,reject,bind,unbind,enable,disable,reset,upload"
+        "review,retry,cancel,approve,reject,bind,unbind,enable,disable,reset,upload,"
+        "recompile,reseed"
     )
 
     # Sidecar 服务地址
@@ -624,9 +656,8 @@ class LLMGatewaySettings(BaseSettings):
     LLMGW_METERING_ENABLED: bool = True
     LLMGW_QUOTA_ENABLED: bool = False        # 预留，默认关
     # 关思考（thinking.disabled）注入：加速实体/关系抽取等分类任务
-    # 仅对命中 MODELS 且 scene 命中 SCENES 的 chat 请求注入 body.thinking={"type":"disabled"}
-    # ⚠️ 仅适配腾讯 tokenhub（tencentmaas）：该字段为其专有关思考格式；换其他上游
-    #    需改 upstream._maybe_disable_thinking 适配，否则应把 ENABLED 设为 False
+    # 仅对命中 MODELS 且 scene 命中 SCENES 的 chat 请求注入思考控制字段
+    # （具体写什么由 LLMGW_THINKING_FIELDS 决定，见 jonex_core/common/thinking.py）
     LLMGW_DISABLE_THINKING_ENABLED: bool = True
     # 逗号分隔；空=不限模型（注意：空会把 thinking.disabled 注入到**所有**模型，
     # 所以兜底取「本部署的默认模型」而不是空串）。
@@ -638,10 +669,53 @@ class LLMGatewaySettings(BaseSettings):
     # 逗号分隔；空=不限场景。分档策略见 docs/ontology-query-thinking-latency-fix-plan.md §3：
     # 抽取场景恒禁；ontology_arbitration 恒禁（二选一分类）；`_fast` 变体=严格模式快档；
     # 原始查询 scene（ontology_qa/rag_chunk_qa/rag_fusion）不在列表=精档与非严格保留思考。
+    # abstract_schema_align（概念对齐候选生成）按**抽取档**恒禁：它是同类任务 ——
+    # 一次性结构化 JSON 输出（response_format=json_object），不需要推理链，而输入可以很大
+    # （267 个实体类型 ≈ 17.5k prompt token）。漏登记时故障形态是**静默的**：网关不注入、
+    # 模型思考 token 先把输出预算占满，正文被截断成非法 JSON 或直接为空，调用侧只看到
+    # 「JSON 解析失败 / 返回空内容」。（该调用的输出预算是多少见
+    # ontology_llm.propose_concept_clusters —— 已按实体数放大，这里不复述数字。）
+    # nl2sql_generate（② NL→SQL 分源查询的 SQL 生成）同样按**抽取档**恒禁：它也是
+    # 一次性结构化输出（一段确定语法的 SQL，不需要推理链），且思考 token 会把输出
+    # 预算吃光 → 回包被截断成非法 SQL / 空内容，调用侧同样看不出根因在网关配置。
+    # nl2sql_multiturn（② 的多轮档）同理：每轮产出要么是工具调用参数、要么是与单次档
+    # 同形的终答，都是结构化输出；**不登记 = 网关静默不关思考**，思考 token 先把每轮
+    # 预算吃光（历史故障见 `ontology_llm.propose_concept_clusters`）。
+    # abstract_schema_attr_names（「自动构造」的属性中文名档）同样按**抽取档**恒禁：
+    # 它也是批量的「属性 → 中文 display_name」一次性结构化 JSON 输出，输入规模是
+    # 236 实体 × 数千属性，思考 token 会把输出预算吃光 → 回包被截断成非法 JSON /
+    # 空内容，调用侧同样看不出根因在网关配置。
+    # concept_relevance_filter（抽象概念候选的相关性筛选，v2）同属抽取档恒禁：
+    # 输入是问句 + ≤ 数十条候选，输出只是一个下标数组；不登记 = 网关静默不关思考，
+    # 思考 token 先把输出预算吃光 → 回包截断（调用侧按「筛选失败」原样放行，看不出根因）。
+    # nl2sql_alias_suggest（闭环别名候选）同属抽取档恒禁：一次性结构化 JSON，漏登记 = 静默截断。
+    # nl2sql_entry_revise（演化台「条目人工调整」的一轮修订）同属抽取档恒禁：一次性结构化
+    # JSON 输出（{"revised","rationale"}），漏登记 = 网关静默不关思考 → 思考 token 吃光输出
+    # 预算 → 回包截断成非法 JSON，弹窗只能看到「修订失败」，看不出根因在网关配置。
+    # abstract_schema_focus（聚焦生成的种子解析）与 abstract_schema_align 同档恒禁：
+    # 输入是同规模的实体清单，输出是结构化 JSON 种子组；思考 token 会吃光输出预算。
+    # nl2sql_supplement_fuse（「本体+数据」的融合 / 数据梳理）同属抽取档恒禁：一次性短抽取，
+    # 思考 token 会吃光 1200 / 400 max_tokens → 正文为空 → 静默回退（调用侧看不出根因）。
+    # nl2sql_value_synonym_suggest（值同义词候选）同属抽取档恒禁：一次性结构化 JSON，
+    # 漏登记 = 网关静默不关思考 → 回包截断 / 空正文，候选生成直接 failed。
     LLMGW_DISABLE_THINKING_SCENES: str = (
-        "lightrag_extract,ontology_extract,raganything_ingest,"
-        "ontology_arbitration,ontology_qa_fast,rag_chunk_qa_fast,rag_fusion_fast"
+        "lightrag_extract,ontology_extract,raganything_ingest,abstract_schema_align,"
+        "abstract_schema_landing_align,abstract_schema_focus,"
+        "ontology_arbitration,ontology_qa_fast,rag_chunk_qa_fast,rag_fusion_fast,"
+        "image_query_caption,"
+        "nl2sql_generate,nl2sql_multiturn,nl2sql_format,nl2sql_value_map,"
+        "nl2sql_probe_summary,nl2sql_candidate_select,"
+        "abstract_schema_attr_names,"
+        "concept_relevance_filter,nl2sql_alias_suggest,nl2sql_entry_revise,"
+        "nl2sql_value_synonym_suggest,nl2sql_supplement_fuse,ontology_qa_tools"
     )
+    # 思考字段注入写法，语法 <字段路径>.<类型>[.<取值>][,...]（见 jonex_core/common/thinking.py）：
+    #   string → enabled / disabled（省略取值 = disabled）
+    #   bool   → true / false      （省略取值 = false）
+    # 缺省 thinking.type.string = 历史 TokenHub 行为；Qwen3 自建服务用
+    # chat_template_kwargs.enable_thinking.bool。
+    # ⚠️ 本项只决定「怎么写」，是否被上游认需 curl 实测。
+    LLMGW_THINKING_FIELDS: str = "thinking.type.string"
     # PG 批量缓冲
     LLMGW_PG_FLUSH_MAX_ROWS: int = 20
     LLMGW_PG_FLUSH_MAX_SECONDS: float = 5.0
@@ -845,6 +919,365 @@ class TaskCenterSettings(BaseSettings):
         env_file = ".env"
 
 
+# ==================== NL→SQL 分源查询（②） ====================
+class NL2SqlSettings(BaseSettings):
+    """NL→SQL 分源查询（②）的全部配置。
+
+    ⚠️ 本模块所有 `NL2SQL_*` 配置**只在这个类里**，不散到别处。
+    """
+
+    #: 单次查询最多回多少行。**这是行数上限的唯一出处**：guard 按它注入 LIMIT。
+    NL2SQL_MAX_ROWS: int = 200
+    #: 连库与执行的总超时（秒）。目标库是外部系统，必须有界。
+    NL2SQL_TIMEOUT_SECONDS: int = 30
+    #: 生成 SQL 那次 LLM 调用的超时（秒）。SQL 很短，不该等太久。
+    NL2SQL_LLM_TIMEOUT: int = 60
+    #: 单次档生成 SQL 的 max_tokens。默认 1024（只出一条 SQL）；**开思考时必须放大**
+    #: （reasoning 会先吃掉预算），否则空正文/截断。
+    NL2SQL_LLM_MAX_TOKENS: int = 1024
+    #: 多轮档每轮往返的 max_tokens。默认 2048（工具调用 + 最终 SQL）。
+    NL2SQL_MULTITURN_LLM_MAX_TOKENS: int = 2048
+    #: 问句长度上限（字符）。**这是「调用方用错」与「答不了」的分界线**：超了抛
+    #: `InvalidParameterError`，不是回 `not_answerable` —— 问句本身不合法，换个源
+    #: 也答不了，混进「没有数据答案」会让 ③ 一直重试。500 足够宽，正常问句到不了。
+    NL2SQL_MAX_QUESTION_LENGTH: int = 500
+
+    #: 多轮档开关（P2-2）：**2026-10-02 第三档后默认开**（原默认关）。
+    #: 翻默认的依据（同日真机）：① 能力题 3/3 绿（2 跳，单次答不了）；② 第三档「标识符精确性行」
+    #: 修掉多轮专属拼错（同窗口 A/B 4/20→0/20）后，**同窗口双臂 26/26 ≥ 单次 25/26**（「不降」门成立）。
+    #: 代价与要求：每问句最多 5 轮往返（端到端延迟约 **+40%**、峰值 8.4s）；llm-gateway 的 scene 白名单
+    #: 必须登记 `nl2sql_multiturn`（否则思考 token 吃光每轮预算）。**置 0 即回单次档（一字不动）**。
+    NL2SQL_MULTITURN: bool = True
+    #: 多轮档的**总预算**（秒）：整个循环（最多 max_rounds+1 次往返）包一个 wait_for。
+    NL2SQL_MULTITURN_TIMEOUT: int = 120
+    #: 多轮档最多几次 LLM 往返（**全程带 tools**；预算用尽那轮若仍要调工具，
+    #: 接住它再补一次收尾 ⇒ 实际调用数上界 = 本值 + 1）。
+    #: ⚠️ 3 → 5（续档 2026-10-02 真机矩阵）：模型实测要「3 次探索 + 1 次终答」才肯收口，
+    #: 4 仍差一轮（差一轮 = 补轮也还在调 ⇒ 抛）；5 是三条硬样本全过的档。别只看成本调低。
+    NL2SQL_MULTITURN_MAX_ROUNDS: int = 5
+    #: 每回合最多执行几个工具调用（超出的回错误文本给模型）。
+    NL2SQL_MULTITURN_MAX_TOOL_CALLS_PER_ROUND: int = 3
+
+    #: 运行时观测开关（2026-10-12 运行时观测线）：`1`（默认）= 每次 ask 落一行观测
+    #: （失败现场 + 工具轨迹）供诊断/演化消费；`0` = **完全不写** —— 失败行不再有观测、
+    #: 诊断存量耗尽后**会饿**（部署纪律，见设计 §8）。回滚 = 置 0 + 重建 KB 容器。
+    NL2SQL_OBSERVE_ENABLED: bool = True
+
+    #: 语义注入档开关（2026-10-13 TBox 落点线，§5.3）：`1`（默认）= 把抽象字段落点的
+    #: 「概念 → 多列」映射按需注入 SQL 生成 payload（只在**有落点差异**时；无差异时
+    #: payload 与 prompt 逐字节不变）。`0` = 回退（不组装、不注入、不下发 4e 段）。
+    NL2SQL_CONCEPT_FIELDS: bool = True
+
+    #: 多跳 join 路径化（2026-10-16）：**额外**注入「锚点 1 跳之外」的 join 路径（`min_hops=2`），
+    #: 让模型看得到真多跳的走法（1 跳边仍由 `joins` 照发，不替代）。
+    #: ⚠️⚠️ **默认开，但增量「未证实」—— 别把这句话读成「门过了」**（2026-10-16 用户拍板保留）。
+    #: 翻档当时的测量是 off 29/35 → on 30/35（35 题 × `--repeat 3`）；**但后续用「交错 A/B」
+    #: （按时间块交替开关、让服务端跨时段漂移同等作用于两臂）重测那道据称被救回的题，
+    #: 得到 **OFF 18/18 · ON 18/18** ⇒ 那次「off 失败 / on 通过」是**漂移撞上的**，
+    #: 不是本功能的效应。**本线现在的立场是：本功能在这套语料上测不出增量。**
+    #: ⚠️ **成因不是「题不够难」，是「join 图这类题原理上就测不出」**（2026-10-16 追加实测）：
+    #: 又造了 4 道**真 3 跳**题（company→jobs→working_lifes→apply_jobs 等），**关档下仍 3/3 全过**；
+    #: 两臂中位耗时差在 ±330ms 内（基线 ~4.5s）⇒ **效率上也没测出增益**。
+    #: 机制：**模型自带的 `list_related` 工具本来就能自己走 join 图**（连 3 跳也行），
+    #: 路径注入把「模型自己走」换成「平台预先走」，**结果一样** ⇒ **任何 join 图问题都判别不出本功能**。
+    #: ⇒ 唯一能判别的形态是**血缘才能到达的表**（schema 里不参与任何 join 关系的那种）——
+    #: 那种表**任何工具都揭露不了**，只有换乘能带模型看见（真机走查已验证过一次）。
+    #: 而那需要**真实的血缘来源**。手工来源的首次验证（2026-10-16）用的是
+    #: `deploy/config/nl2sql/lineage_edges.json` 里的 15 条列级边（覆盖 5 张编译 schema 里
+    #: 孤立的表，**全部经值包含验证**、100% 命中才采纳）：默认档下真机写出过
+    #: `JOIN dbo.job_forward jf ON jf.job_id = j.id` —— 那张表是孤立的，**任何工具都揭露不了，
+    #: 只有注入的换乘路径能带它看见** ⇒ 换乘端到端成立。
+    #: ⚠️ **运行时来源已换成表**（2026-10-16 Task 5）：`knowledge_base.lineage_edges`（迁移 010），
+    #: 由 KB 设置「血缘」页签写入、② 经 `load_lineage_edges_from_db` 读取。上面那个 JSON 文件
+    #: **已清空（`edges: []`）且运行时不读它** —— 它留给 P1 的 file 摄取通道
+    #: （`load_lineage_edges()` 仍是那条通道的解析器；`NL2SQL_LINEAGE_EDGES_PATH` 只是它的默认路径）。
+    #: ⚠️ 该文件目录**仍必须被挂载进容器**（`deploy/docker-compose.yml` 里已补）：默认路径是
+    #: `deploy/config/nl2sql/…`，而 Dockerfile 不 copy `deploy/config/` —— 不挂时 file 摄取
+    #: 会在容器里**静默返回空**（表这条运行时路径不受影响）。
+    #: 保留默认开是用户的**显式选择（理由是「至少不劣」）**，不是「已证有效」。
+    #: `0` = 回退到「只发 1 跳边」。
+    #: ⚠️ 配套改动（缺任一半模型写对了也白写）：`all_join_edges` 给足边池 + 安全闸白名单
+    #: 并入注入路径上的表（Task 6B/6C）。
+    #: ⚠️ **量这个功能的任何 A/B，必须用交错块**：`--repeat` 只采样会话内抖动，
+    #: 而实测方差在**会话之间**（同一配置前后两次跑出 0/10 与 18/18）。
+    NL2SQL_JOIN_PATHS: bool = True
+    NL2SQL_JOIN_PATHS_MAX_HOPS: int = 3
+    NL2SQL_JOIN_PATHS_MAX_PATHS: int = 5
+
+    #: 投影契约（2026-10-28，P0-A1）：`1` = 提示词追加「只投影问句要的列」规则 +
+    #: 生成后 AST 检查（`nl2sql/projection.py`），标量问句多列时**最多修复一次**。
+    #: `0`（默认）= 提示词/payload/流程与引入前**逐字节相同**。
+    NL2SQL_PROJECTION_CONTRACT: bool = False
+
+    #: evidence/hints（2026-10-28，P0-A2）：`1` = `ask` 接受可选 `hints` 并注入
+    #: payload/提示词（BIRD evidence、业务口径、值映射）。`0`（默认）= 忽略 hints，
+    #: 请求/提示词/payload 与引入前逐字节相同。
+    NL2SQL_HINTS: bool = False
+    #: 生产侧 hints 自动组装（A2 第二半，2026-10-28）：`1` = 在 hints 通道开启时，
+    #: 由 Jonex 从锚点/1 跳实体的描述、枚举值、口径与指标组装 hints。**不影响**
+    #: 调用方显式传入的 hints（两者合并去重）。`0`（默认）= 只用调用方 hints，
+    #: 行为与引入前完全相同。
+    NL2SQL_AUTO_HINTS: bool = False
+    #: 列级示例值扩容（P0-1，2026-10-28）：`1` = 锚点实体给**所有**列的示例值
+    #: （每列最多 3 个、总预算 2400 字符），不再只给「像枚举」的列。`0`（默认）=
+    #: 维持 `pick_samples` 现有口径，payload 与今天逐字节相同。
+    NL2SQL_COLUMN_EXAMPLES: bool = False
+    #: 列描述注入（2026-10-30）：`1` = 锚点/1 跳列的 `description` 随列清单进 payload
+    #: （截 120 字符）。`0`（默认）= 列清单与今天逐字节相同。
+    NL2SQL_COLUMN_DESC: bool = False
+    #: 空结果修复（P0-2，2026-10-28）：`1` = 最终 SQL 执行成功但 0 行时，
+    #: 带“0 rows + 列样例”反馈重生成**一次**；`0`（默认）= 不重试，空结果照常返回。
+    #: 合法空结果存在（问“没有 X 的公司”），所以必须开关 + A/B。
+    NL2SQL_EMPTY_REPAIR: bool = False
+    #: 指标编译影子对比（W3.3 M4，2026-11-01）：`1` = 真实提问在答案产出后**旁路**
+    #: 跑一次「指标编译 SQL」，只记录不替换（`nl2sql_metric_shadow`）；
+    #: `0`（默认）= 零副作用（不调度、不读 schema、不建任务）。合成流量/observe_only
+    #: /record_evidence=False 一律不采样。开启会额外占用数据源连接，按 2–4 周窗口使用。
+    NL2SQL_METRIC_SHADOW: bool = False
+    # W4.8：指标级调用审批（默认关；关时 ask_metric 不查审批表）。
+    METRIC_CALL_APPROVAL_ENABLED: bool = False
+    # W4.3b：单元格级溯源（只描述定义/落点/SQL 快照，不抓源行）。
+    METRIC_CELL_PROVENANCE_ENABLED: bool = True
+    METRIC_CELL_PROVENANCE_MAX_CELLS: int = 200
+    # W1.6：只读查询结果缓存（默认关；键含 engine + 实际执行 SQL）。
+    NL2SQL_QUERY_CACHE_TTL_SECONDS: int = 0
+    NL2SQL_QUERY_CACHE_MAX_ENTRIES: int = 128
+
+    # ── W4.2 指标问数执行面 ──────────────────────────────────────────
+    #: 指标结果进程内缓存 TTL（秒）：`0`（默认）= 关闭。键含 schema 写代号，
+    #: 任何 schema 写入立即失效；只缓存**成功**结果。
+    METRIC_ASK_CACHE_TTL_SECONDS: int = 0
+    #: 缓存条目上限（防无界增长）。
+    METRIC_ASK_CACHE_MAX_ENTRIES: int = 128
+    #: 单次指标执行的语句级超时（秒）：`0` = 沿用 `NL2SQL_TIMEOUT_SECONDS`。
+    METRIC_ASK_TIMEOUT_SECONDS: int = 0
+    #: 空结果反馈里追加「先简化过滤条件」（S5，2026-10-30）：只在空结果修复触发时生效。
+    #: `0`（默认）= 反馈文案与引入前逐字节相同。
+    NL2SQL_EMPTY_SIMPLIFY: bool = False
+    #: 字面量值接地（P1-1，2026-10-28）：`1` = 从最终 SQL 抽字符串字面量，
+    #: 在白名单列上查真实值；仅当候选与字面量只差大小写/空白时**确定性改写**。
+    #: `0`（默认）= 不查库、不改 SQL，行为与今天逐字节相同。
+    NL2SQL_VALUE_LOOKUP: bool = False
+    #: 值查询单次超时（秒）。失败 fail-open，不影响提问。
+    NL2SQL_VALUE_LOOKUP_TIMEOUT: float = 3.0
+    #: 值接地增强（P1-1 v2，2026-10-28）：`1` = 除大小写/空白外，再做唯一 initialism /
+    #: 前缀扩展 / fuzzy（≥0.85）匹配；多个候选或低置信度不猜。`0`（默认）= v1 行为。
+    NL2SQL_VALUE_LOOKUP_FUZZY: bool = False
+    #: 值同义词注入（P1，2026-11-04）：`1` = ② 组装 payload 前按问句词面命中注入
+    #: `value_aliases`（KB 级 `ontology_synonyms` 的 `terms → canonical`）；
+    #: 同档还会在**候选召回之前**按同一份组把问句里的 variant 改写为 canonical
+    #: （2026-11-05，否则召回看到原词面、no_candidate 卡在注入之前）。
+    #: `0` = 不读表、不注入、不改写，payload / 提示词与引入前**逐字节相同**（回滚开关）。
+    NL2SQL_VALUE_ALIASES_ENABLED: bool = True
+    #: 注入上限（条数）。`0` = 不限；**只限制注入条数**，不限制读取/缓存规模。
+    #: 命中按 term 长度降序（长词优先），防止短词噪声挤掉真正的别名。
+    NL2SQL_VALUE_ALIASES_MAX_GROUPS: int = 10
+    #: 值同义词进程缓存 TTL（秒）。`0` = 关闭缓存（每次现读库）。同义词写操作经
+    #: 写代号让**本进程**缓存立即失效；TTL 只服务跨 worker / 无本进程写入的稳态流量。
+    NL2SQL_SYNONYM_CACHE_TTL_SECONDS: int = 60
+    #: evidence 改写（P1-2，2026-10-28）：`1` = 有 hints 时先调一次 LLM，把
+    #: question + hints 改写成「输出列/过滤/公式/排序限制」四段再合并。`0`（默认）
+    #: = 不改写，行为与今天逐字节相同；改写失败 fail-open 到原始 hints。
+    NL2SQL_EVIDENCE_REWRITE: bool = False
+    #: planner（P2-1，2026-10-28）：`1` = 生成 SQL 前先调一次 LLM 产出计划
+    #: （join 路径/隐藏公式/投影/单行多行/DISTINCT），随 payload 的 `plan` 键注入。
+    #: `0`（默认）= 不调用，payload/提示词与今天逐字节相同。
+    NL2SQL_PLANNER: bool = False
+    #: 选择性 planner（P2-1b，2026-10-29）：`1` = 只在本次 join 图非空（多表题）时才规划；
+    #: 单表题不调用，避免全局 planner 的 p50 翻倍。需要 `NL2SQL_PLANNER=1` 才生效。
+    NL2SQL_PLANNER_SELECTIVE: bool = False
+    #: 排名列提示（2026-10-29）：`1` = 问题里出现 "rank" 时，提示词追加规则 4l，
+    #: 要求输出 `RANK() OVER (...)` 列且只投影问题点名的列 + 该排名列。
+    #: `0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_RANK_HINT: bool = False
+    #: 平均每 Y 有多少 X 的规则（2026-10-29）：`1` = 问题出现 "average number of..." /
+    #: "on average how many..." 时追加规则 4m：先按 Y 分组 COUNT，再对计数求 AVG。
+    #: `0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_PER_GROUP_AVG_HINT: bool = False
+    #: 输出列精确性（2026-10-29）：`1` = 追加规则 4n —— 问句点名字段就只投影那些列；
+    #: 「list all X」没点名字段时只投影标识列。多选列在官方口径下直接算错。
+    #: `0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_PROJECTION_EXACT_FIELDS: bool = False
+    #: 行粒度提示（2026-11-01）：列表/计数题先判实体粒度，列表投影 DISTINCT、
+    #: 计数用 COUNT(DISTINCT key)。窄触发；`0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_GRAIN_HINT: bool = False
+    #: 否定/条件问句（Did ...? If yes / Whether / Is there）：保留反面答案，
+    #: 用 LEFT JOIN + CASE。窄触发；`0`（默认）= 提示词逐字节相同。
+    NL2SQL_LEFT_JOIN_HINT: bool = False
+    #: 百分比单位接地（2026-11-01）：问句含 `%` 且最终 0 行时，把比较谓词里的
+    #: 数字试一次 /100（或 *100），能出结果才接受。窄触发；默认关。
+    NL2SQL_UNIT_GROUNDING: bool = False
+    #: 维度标签 join（2026-11-01）：CTE 选中表里，事实→有 name/title 等标签列
+    #: 的维度表，按声明关系注入 join 提示；问句不要标签时不计算。默认关。
+    NL2SQL_DIMENSION_JOINS: bool = False
+    NL2SQL_DIMENSION_JOIN_MAX: int = 8
+    #: CHESS 式可执行断言（2026-11-01）：生成结果级断言并验证，失败重写一次。
+    #: 默认关；定向 row/value 实验用。
+    NL2SQL_UNIT_TESTER: bool = False
+    NL2SQL_UNIT_TEST_TIMEOUT: float = 15.0
+    #: hint 忠实度（2026-10-29）：`1` = 有 hints 时追加规则 4o —— hint 给的公式/值映射
+    #: 必须原样使用，不得换成同名近似列；未要求时不加 ROUND。
+    #: `0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_HINT_EXACTNESS: bool = False
+    #: 百分比分母规则（2026-10-29）：`1` = 问题含 "percentage of" / "proportion of"
+    #: 时追加 4p —— 分母是实体总量（标量子查询），不是过滤后的子集；
+    #: 只有 "among X / of those X" 才用子集。
+    #: `0`（默认）= 提示词与今天逐字节相同。
+    NL2SQL_PERCENTAGE_BASE_HINT: bool = False
+    #: 选择性 CTE 提示（2026-10-30）：`1` = join 图 ≥2 条且非 sqlserver 时追加规则 4q，
+    #: 鼓励用一层 `WITH` 算中间结果。`0`（默认）= 提示词逐字节不变。
+    NL2SQL_CTE_HINT: bool = False
+    #: 除法 NULLIF 规则（2026-10-30）：`1` = 提示词要求所有除法/百分比分母用
+    #: `NULLIF(<expr>, 0)`，避免 PG 的 division by zero。`0`（默认）= 提示词不变。
+    NL2SQL_NULLIF_HINT: bool = False
+    #: 单列投影提示（2026-10-30）：`1` = 单属性/实体列表问句（which/what/list/name/who，
+    #: 且没有 and/also 等多字段诉求）追加规则 4s，要求只投影一列。
+    #: `0`（默认）= 提示词不变。
+    NL2SQL_SINGLE_COLUMN_HINT: bool = False
+    #: 日期 cast 提示（2026-10-30）：`1` = 问句出现明确日历日期（YYYY/MM/DD 或英文月名）时
+    #: 追加规则 4t，要求时间戳列先转 date 再比较。`0`（默认）= 提示词不变。
+    NL2SQL_DATE_CAST_HINT: bool = False
+    #: 生成前格式预测（S1，2026-10-30）：`1` = 生成前调一次 LLM，只预测「应返回
+    #: 哪些列」，作为 `answer_format` 进 payload 并渲染规则 4u。`0`（默认）= 不调用，
+    #: 请求/提示词/payload 与引入前逐字节相同。
+    NL2SQL_FORMAT_PREDICT: bool = False
+    #: 格式预测单次超时（秒）；失败 fail-open 到空列表，不影响提问。
+    NL2SQL_FORMAT_TIMEOUT: float = 10.0
+    #: 语义值映射（S2，2026-10-30）：`1` = 生成前把问题里的叫法映射到列样例里
+    #: **真实存在的值**，以 hints 注入；未知值经列字典校验后丢弃。`0`（默认）=
+    #: 不调用、不追加 hint，请求与引入前逐字节相同。
+    NL2SQL_VALUE_MAPPING: bool = False
+    #: 值映射单次超时（秒）；失败 fail-open 到空映射。
+    NL2SQL_VALUE_MAPPING_TIMEOUT: float = 8.0
+    #: 探查→摘要（S4，2026-10-30）：`1` = 把列样例摘要成枚举/单位/同义词，进 hints。
+    #: `0`（默认）= 不调用、不追加 hint，请求与引入前逐字节相同。
+    NL2SQL_PROBE_SUMMARY: bool = False
+    #: 探查摘要单次超时（秒）；失败 fail-open 到空摘要。
+    NL2SQL_PROBE_SUMMARY_TIMEOUT: float = 8.0
+    #: 候选 + 成对选择（S3，2026-10-30）：`0`/`1` = 关（逐字节不变）；`2` = 对难例
+    #: （有 join 或问句 ≥14 词）多生成一条单次档候选，用一次 LLM 选择后再走现有
+    #: guard/治理/执行。选择失败回退 baseline。
+    NL2SQL_CANDIDATES: int = 0
+    #: 候选窄触发（S3 复测，2026-10-30）：`true` = 只对「问句 ≥22 词」或
+    #: 「有 join 且 ≥14 词且带最高级/比较线索」的难例多生成候选；`false`（默认）=
+    #: 旧宽触发（有 join 或 ≥14 词），与引入前逐字节相同。需 `NL2SQL_CANDIDATES>=2`。
+    NL2SQL_CANDIDATE_NARROW: bool = False
+    #: 无候选回退锚点（2026-11-01）：`1` = 词面匹配不到任何已对齐实体、且调用方
+    #: 指定了数据源时，按编译 schema 选一个确定性锚点继续生成（preview 档下有效）。
+    #: `0`（默认）= 维持 no_candidate 拒答，行为与引入前逐字节相同。
+    NL2SQL_NO_CANDIDATE_FALLBACK: bool = False
+    #: 执行结果投票（2026-11-01，OpenSearch-SQL `vote.py` 的窄移植）：`1` = 难例生成
+    #: `NL2SQL_VOTE_CANDIDATES` 条候选，各自执行后按结果集合投票选一条；空/失败弃权。
+    #: `0`（默认）= 不生成额外候选，行为与引入前逐字节相同。
+    NL2SQL_RESULT_VOTE: bool = False
+    #: 投票候选数（含基线）。仅在 `NL2SQL_RESULT_VOTE=1` 时生效。
+    NL2SQL_VOTE_CANDIDATES: int = 3
+    #: 候选选择单次超时（秒）。
+    NL2SQL_CANDIDATE_TIMEOUT: float = 15.0
+    #: 确定性歧义预检（S7，2026-10-30）：`1` = 报告「问句词命中多个列」与
+    #: 「带引号的值不在样例里」两类 hint。`0`（默认）= 不追加 hint，请求逐字节不变。
+    NL2SQL_AMBIGUITY_PRECHECK: bool = False
+    #: CTE 选中表的结构化 join 边（2026-10-31）：`1` = 把声明关系/同名列补边
+    #: 作为 `cte_joins` 注入 payload；`0`（默认）= payload 与今天逐字节相同。
+    NL2SQL_CTE_JOIN_EDGES: bool = False
+    #: CTE 大 schema join 提示（2026-10-31）：`1` = 仅当 `CTE_VIEW` 生效时追加规则 4x，
+    #: 要求跨表过滤/字段必须 join 而不是丢掉；`0`（默认）= 提示词逐字节不变。
+    NL2SQL_CTE_JOIN_HINT: bool = False
+    #: 最高级问句单行（2026-10-30）：`1` = “Which X has the highest Y” 类问句追加
+    #: 规则 4v，要求最终结果 LIMIT 1 / TOP 1。`0`（默认）= 提示词逐字节不变。
+    NL2SQL_SUPERLATIVE_LIMIT: bool = False
+    #: ORDER BY 显式 NULL 排序（2026-10-30）：`1` = 有排序意图的问句追加规则 4w，
+    #: DESC 加 NULLS LAST、ASC 加 NULLS FIRST（SQL Server 用 CASE 模拟）。
+    #: `0`（默认）= 提示词逐字节不变。
+    NL2SQL_NULLS_ORDER: bool = False
+    #: LLM 生成失败重试（2026-10-30）：`1` = 首次生成抛异常时同参重试一次（仅一次）。
+    NL2SQL_LLM_RETRY: bool = False
+    #: 同库 few-shot（2026-10-29）：`1` = 从 `NL2SQL_FEWSHOT_PATH` 里按当前表集合
+    #: 选 ≤K 条同库问答注入提示词（只作列语义/SQL 风格参考）。
+    #: `0`（默认）= 不读文件、提示词逐字节不变；生产默认无 BIRD 语料。
+    NL2SQL_FEWSHOT: bool = False
+    #: few-shot 语料路径（`{db: [{question, sql, tables}]}` JSON）。空 = 不启用。
+    NL2SQL_FEWSHOT_PATH: str = ""
+    #: 生产语料入口（2026-10-30）：`1` = 路径为空时，从演化台语料
+    #: `evolution_corpus_cases`（同租户/KB/数据源、`expect=answer` 且带 control SQL）
+    #: 读同库问答，按表重叠选。结果按 `NL2SQL_FEWSHOT_CACHE_TTL` 缓存。
+    NL2SQL_FEWSHOT_FROM_CORPUS: bool = False
+    #: 演化语料的进程内缓存秒数（0 = 不缓存）。
+    NL2SQL_FEWSHOT_CACHE_TTL: int = 300
+    #: 最多注入几条。
+    NL2SQL_FEWSHOT_K: int = 2
+    #: 小 schema 预览（P2-2，2026-10-28）：`1` = 对 ≤15 表的源，给「其他表 + 列名」
+    #: 紧凑预览（payload `schema_preview`），让模型知道可 join 的表；预览表并入安全闸白名单。
+    #: `0`（默认）= 不注入，payload/提示词与今天逐字节相同。
+    NL2SQL_SCHEMA_PREVIEW: bool = False
+    #: 大 schema 分块选择（P2-3 / P2-4c，2026-10-31）：`1` = 当该源表数 > 15 或估算
+    #: token 超 `NL2SQL_SCHEMA_CONTEXT_BUDGET` 时，不一次性注入全量 schema，而是按
+    #: 「题面 + 锚点/1 跳 + join 连通闭包」选表、按预算截断（payload 仍走 `schema_preview`
+    #: 形状，选出表并入安全闸白名单）。**与 `NL2SQL_SCHEMA_PREVIEW` 互斥**：小 schema
+    #: 仍由预览负责，BIRD 50 题不激活。`0`（默认）= 不调用，payload 与今天逐字节相同。
+    NL2SQL_CTE_VIEW: bool = False
+    #: 大 schema 上下文预算（估算 token；按 4 字符/token 折算，不引入 tokenizer 依赖）。
+    NL2SQL_SCHEMA_CONTEXT_BUDGET: int = 12000
+    #: 选择器最多保留的表数（含连通闭包补进来的桥表）。
+    NL2SQL_SCHEMA_MAX_TABLES: int = 32
+    #: 大 schema 选表时是否把**血缘边**作为弱相关信号（B2，2026-10-31）：同一条数据流
+    #: 上的表优先于完全无关的表，但排序低于 join 连通（血缘不保证可 join）。`1` = 开；
+    #: `0`（默认）= 不读血缘、选择器行为与今天逐字节相同。只在 CTE 激活时生效。
+    NL2SQL_CTE_LINEAGE: bool = False
+    #: 题面点名的实体表提升为 CTE 选择种子（2026-11-01）：修复 works_cycles 三条
+    #: 多跳题 vendor/department/person 被预算挤掉。默认关。
+    NL2SQL_CTE_ENTITY_SEEDS: bool = False
+    #: 预览列示例值（P2-4a，2026-10-29）：**依赖 `NL2SQL_SCHEMA_PREVIEW`**。`1` = 预览表
+    #: 每列再带 ≤3 个示例值（`column_examples`），数据只取编译行里**已存证据**，不查源库。
+    #: `0`（默认）= 预览形状与今天逐字节相同。
+    NL2SQL_PREVIEW_EXAMPLES: bool = False
+    #: 预览示例值的总字符预算（按表序→列序确定性截断）。
+    NL2SQL_PREVIEW_EXAMPLE_BUDGET: int = 3000
+    #: 预览每列最多几个示例值。
+    NL2SQL_PREVIEW_EXAMPLE_LIMIT: int = 3
+    #: 预览列明细（2026-10-30）：`1` = 预览表的列从「列名」升级为
+    #: `{name, type, description}`（描述截 80 字符、总预算 4000），帮模型选对同义列。
+    #: `0`（默认）= 预览形状与今天逐字节相同。
+    NL2SQL_PREVIEW_DETAILS: bool = False
+    #: 小 schema 采样行（P2-4b，2026-10-29）：**依赖 `NL2SQL_SCHEMA_PREVIEW`**。`1` = 对
+    #: 预览表各取 ≤3 行真实数据（只 SELECT 指定列、3s 超时、fail-open）挂到
+    #: `schema_preview[].sample_rows`。生产含敏感数据，生产启用前必须过治理/PII 评审；
+    #: `0`（默认）= 不查源库，payload 与今天逐字节相同。
+    NL2SQL_SAMPLE_ROWS: bool = False
+    #: 每表采样几行。
+    NL2SQL_SAMPLE_ROW_LIMIT: int = 3
+    #: 最多给几张预览表采样（按预览顺序）。
+    NL2SQL_SAMPLE_ROW_MAX_TABLES: int = 10
+    #: 采样行总字符预算（按表序→行序→列序确定性截断）。
+    NL2SQL_SAMPLE_ROW_BUDGET: int = 2000
+    #: 单表采样查询超时（秒）；失败 fail-open，不影响提问。
+    NL2SQL_SAMPLE_ROW_TIMEOUT: float = 3.0
+
+    #: 执行工具（2026-10-28，P0-A3）：`1` = 多轮档注册 `execute_sql`（只读、有界、
+    #: guard + 治理），让模型在出终答前核对行数/值格式/join。`0`（默认）= 工具清单
+    #: 与请求**逐字节不变**；没有执行器时即使打开也不注册。
+    NL2SQL_EXEC_TOOL: bool = False
+    #: 每题最多执行几次 `execute_sql`；超限回错误文本让模型收口（**不是**抛异常）。
+    NL2SQL_EXEC_TOOL_MAX_CALLS: int = 2
+    #: 探索执行返回给模型的行数上限（安全闸 LIMIT 与结果截断同一口径）。
+    NL2SQL_EXEC_TOOL_MAX_ROWS: int = 20
+    #: 单次探索执行的外层超时（秒）；卡住的是这一层，与用户看的 120s 无关。
+    NL2SQL_EXEC_TOOL_TIMEOUT: float = 10.0
+
+    #: ② 读路径的 schema 行缓存 TTL（秒；P1 版本化读取）。**默认 60**，`0` = 关闭缓存。
+    #: 键 = `(tenant, kb, scope, ds, active version_id, schema_version, schema_generation)`。
+    #: **写入立刻可见**靠的是 `schema_generation`：两个 schema 仓储的 upsert 成功后 +1
+    #: （画布保存 / 回滚写回 / 采纳 PUT 都算），下一次读取直接换键 —— 所以演化基准的
+    #: 「父臂填缓存 → 写库 → 候选臂」不会读到写前的行，TTL 不是失效机制。
+    #: TTL 只服务「没有本进程写入」的稳态流量，以及**别的 worker** 的写入
+    #: （跨进程失效最多滞后一个 TTL）。无 active 版本的旧库键里 `version_id=""`。
+    #: ⚠️ 只影响「多久读一次库」，**不影响回答内容**（行内容始终是回答来源）；
+    #: 漂移只进观测 scene（`schema_drift` / `schema_drift_scopes`），不进 HTTP 响应。
+    NL2SQL_SCHEMA_CACHE_TTL_SECONDS: int = 60
+
+    # 治理 P1（#11）：② 的标签/策略执行开关。
+    # 默认开；关闭 / 无标签 / 无策略时 ② 行为与今天**逐字节相同**（回滚 = 设 0）。
+    GOVERNANCE_ENFORCEMENT_ENABLED: bool = True
 class IdentityIntegrationSettings(BaseSettings):
     """企业身份集成「自动同步」调度器的全部配置。
 
@@ -874,6 +1307,28 @@ class IdentityIntegrationSettings(BaseSettings):
         env_file = ".env"
 
 
+# ==================== 血缘 / ETL 来源（P1） ====================
+class LineageSettings(BaseSettings):
+    """血缘 / ETL 来源（P1）。所有 ``LINEAGE_*`` 配置集中在这里。
+
+    ⚠️ 与 `NL2SqlSettings` 同款：本类只放字段，`Settings` 继承后即可用。
+    """
+    #: 本体问答的「数据来源/下游」解释块开关（A 用法）。关掉时响应与旧版一致。
+    LINEAGE_ANSWER_ENABLED: bool = True
+    #: 解释块最多跟随几跳（1 = 只看直接上下游；默认 1，控制响应体量）。
+    LINEAGE_ANSWER_MAX_HOPS: int = 1
+    #: 解释块最多展示多少个命中实体（按命中顺序取前 N）。
+    LINEAGE_ANSWER_MAX_ITEMS: int = 5
+    #: 批量导入单次最多处理的行数（防一份超大 CSV 打满请求）。
+    LINEAGE_IMPORT_MAX_ROWS: int = 5000
+    #: 结构化数据入本体投影开关（P1.5a）。关掉后所有自动触发只记日志、不写图；
+    #: 手工重建端点也返回 disabled（便于回滚）。
+    ONTOLOGY_DATA_PROJECTION_ENABLED: bool = True
+    #: 血缘失效窗口（roadmap P2 #9，天）：`origin=platform` 的边若超过该天数
+    #: 未被再次确认（导入/OpenLineage 摄入刷新 `last_seen_at`），列表/画布读时
+    #: 标 `stale=true`。只标注、不删除、不写回（与抽象 schema 的 stale 同口径）。
+    #: `0` = 关闭失效标记。
+    LINEAGE_STALE_AFTER_DAYS: int = 30
 class ImageQuerySettings(BaseSettings):
     """以图问知识（图片转查询）的全部配置。
 
@@ -943,6 +1398,32 @@ class ImageQuerySettings(BaseSettings):
         env_file = ".env"
 
 
+# ==================== 抽象 schema「自动构造」 ====================
+class AbstractConstructSettings(BaseSettings):
+    """抽象 schema「自动构造」（补齐式构造）的全部配置。
+
+    ⚠️ 本模块所有 `ABSTRACT_CONSTRUCT_*` 配置**只在这个类里**，不散到别处。
+    默认值必须让功能开箱可用（本波上线不依赖任何部署动作）。
+    """
+
+    #: 属性中文名档总开关（默认开；关 = 快档：只跑确定性骨架，中文名留人工）。
+    ABSTRACT_CONSTRUCT_NAMES_ENABLED: bool = True
+    #: 名字档总耗时预算（秒）。到点停手、剩余如实返回（再点一次续跑）。
+    #: ⚠️ 名字档**真上限 ≈ 本值 + `ABSTRACT_CONSTRUCT_NAMES_CALL_TIMEOUT_S`**（默认 100+60=**160s**，不是 100s）：
+    #: 预算只挡「发新批」，已发出的批会跑满单批超时；确定性阶段（补边探针等）另算，两项相加才是端点总耗时。
+    #: ⚠️ 端点**最坏合计 ≈ 探针 30s + 名字档 160s + 确定性 ≈ 200s**，略超网关/边车 180s —— 这条
+    #: **尾部风险已接受**：超时只会让用户侧看到 timeout，后台照写 proposal；重试会遇 429 守卫
+    #: （在飞期间不会重复构造）。实测全量 56.6s，正常路径远在 180s 内。
+    ABSTRACT_CONSTRUCT_NAMES_BUDGET_S: float = 100.0
+    #: 名字档并发批次数上限。
+    ABSTRACT_CONSTRUCT_NAMES_CONCURRENCY: int = 5
+    #: 单批名字调用超时（秒）。
+    ABSTRACT_CONSTRUCT_NAMES_CALL_TIMEOUT_S: float = 60.0
+    #: 跨源补边定向探测的时间预算（秒）与探针次数上限（够不到就记「不可测」，不硬猜）。
+    #: ⚠️ 探针阶段真上限 ≈ **本值 + ε**：每发探测的 timeout 被钳到「剩余预算」（下钳 1s），
+    #: 不再按 `probe_distinct` 默认的 60s 跑满 —— 只挡「起新探」时阶段能超到 30+60s。
+    ABSTRACT_CONSTRUCT_PROBE_BUDGET_S: float = 30.0
+    ABSTRACT_CONSTRUCT_MAX_PROBE_QUERIES: int = 40
 class DataGovernanceSettings(BaseSettings):
     """数据治理保留策略的全局默认值（第 3 期）。
 
@@ -963,6 +1444,30 @@ class DataGovernanceSettings(BaseSettings):
     # ⚠️ 仅进程内状态、不落库，见 `services/retention_scheduler.py` 的「单副本假设」。
     RETENTION_FAILURE_COOLDOWN_SECONDS: int = 3600
 
+    # 文档版本链保留最近多少版（含当前生效版）。**0 = 不自动清理**。
+    # 超出部分上传新版本时同步裁剪，旧版本对象存储 best-effort 删除。
+    DOCUMENT_VERSION_RETENTION: int = 20
+
+    # 上传新版本时的「疑似同一文件」提示阈值（0~1，0=关闭该检测）。
+    # 文本类按字符序列相似度、二进制按字节 shingle Jaccard 近似；
+    # 命中只**询问**，不阻断（用户确认后照常建新版本）。
+    DOCUMENT_VERSION_SIMILARITY_THRESHOLD: float = 0.85
+    # 相似度计算最多读取的字节数（防大文件把请求拖慢）。
+    DOCUMENT_VERSION_SIMILARITY_MAX_BYTES: int = 262144
+
+    # ── 解析后相似检测 ──
+    DOCUMENT_SIMILARITY_THRESHOLD: float = 0.85
+    DOCUMENT_SIMILARITY_CANDIDATE_THRESHOLD: float = 0.80
+    DOCUMENT_SIMILARITY_TOP_K: int = 3
+    DOCUMENT_SIMILARITY_TEXT_CAP: int = 2_000_000
+    DOCUMENT_SIMILARITY_SIGNATURE_SHINGLES: int = 200_000
+    DOCUMENT_SIMILARITY_BACKFILL_BATCH: int = 20
+    DOCUMENT_SIMILARITY_BACKFILL_INTERVAL_SECONDS: int = 600
+    # unavailable 哨兵（无可用文本）的重试 TTL（分钟）：哨兵超过该时长后，
+    # 回填会把它重新挑出来再算一次 —— 避免一次性故障被永久固化。
+    # <=0 = 关闭重试（哨兵永久保留，仅重新解析可恢复）。
+    DOCUMENT_SIMILARITY_RETRY_MINUTES: int = 60
+
     class Config:
         env_file = ".env"
 
@@ -980,6 +1485,9 @@ class Settings(
     AppSettings,
     LLMGatewaySettings,
     TaskCenterSettings,
+    NL2SqlSettings,          # ← 新增（② NL→SQL 分源查询）
+    LineageSettings,         # ← 新增（血缘 / ETL 来源）
+    AbstractConstructSettings,  # ← 新增（抽象 schema「自动构造」）
     IdentityIntegrationSettings,
     ImageQuerySettings,
     DataGovernanceSettings,

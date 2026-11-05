@@ -42,6 +42,7 @@ from openai import AsyncOpenAI
 from jonex_core.common.exceptions import ServiceTimeoutError, UpstreamServiceError
 from jonex_core.common.i18n import translate
 from jonex_core.common.model_config import resolve_llm_model
+from jonex_core.common.thinking import DEFAULT_FIELDS, apply_thinking_fields
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +279,15 @@ async def describe_query_image(
         },
     ]
 
+    # 思考控制：写法由 VLM_THINKING_FIELDS 决定（缺省 thinking.type.string）。
+    # 经 SDK 的 extra_body 传入，会被摊平合并到请求体顶层（不是包一层 extra_body）。
+    thinking_extra: dict[str, Any] = {}
+    apply_thinking_fields(
+        thinking_extra,
+        _read_env(("VLM_THINKING_FIELDS",)) or DEFAULT_FIELDS,
+        log_prefix="image_query",
+    )
+
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
@@ -287,6 +297,7 @@ async def describe_query_image(
                 max_tokens=_MAX_TOKENS,
                 response_format={"type": "json_object"},
                 extra_headers=extra_headers,
+                extra_body=thinking_extra or None,
             ),
             timeout=timeout,
         )

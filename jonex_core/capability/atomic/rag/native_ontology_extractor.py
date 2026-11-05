@@ -35,6 +35,12 @@ from jonex_core.capability.atomic.rag.ontology_extractor import (
     _openai_chat,
     _post_validate,
     _type_alias_map,
+    merge_entity_attributes,
+    PROCEDURAL_GATE_KEY,
+    _coerce_bool,
+    _coerce_int,
+    coerce_attribute_types,
+    warn_cardinality_conflicts,
 )
 
 logger = __import__("logging").getLogger(__name__)
@@ -260,7 +266,19 @@ PROCEDURAL_SYSTEM_PROMPT = """你是规程知识抽取助手，从输入的操�
 2. preconditions：执行前必须满足/核验什么。
 3. authorization：谁能执行（角色/职级/审批）。
 4. failure_policy：失败处理边界——什么失败回滚、什么失败不回滚。
-   **以上 4 字段文档未写时必须留空/空数组，禁止自行推断编造。**
+5. atomic_effects：本动作在同一事务内完成的主状态变更（失败会整体回滚的部分）。
+6. follow_ups：提交后触发的联动（通知、审计、调用其他系统等，失败不撤销主操作）。
+7. audit_required：原文**明确要求**审计、留痕、记录日志或存档时填 true，明确写不需要时填 false，
+   原文没提到时填 null。
+   **以上 7 个字段文档未写时必须留空 / 空数组 / null，禁止自行推断编造。**
+   尽量摘原文短句，不要改写成原文没有的说法。
+
+## authorization 与 performed_by 必须分开
+- authorization 只填原文**明确写出的权限要求**：如「XX级及以上可执行」「须经XX审批」
+  「权限要求：XX」「仅限XX」「XX不得自行……」「授权XX」。
+- 原文只说明「由谁来做」（如「客服专员提交申请」「风险专员执行止付」），这是执行人，
+  只填 performed_by，**authorization 留空数组**。
+- 执行人不等于有权限的人：不能因为某人执行了该动作，就推断他是权限要求。
 
 ## 挂接端点（防臆造）
 acts_on / uses_tool / performed_by / requires / results_in 的端点名**必须逐字出现在 chunk 原文**；
@@ -286,7 +304,8 @@ PROCEDURAL_USER_PROMPT = """## 原文 chunk
     {{"name": "动作名（动词+宾语）", "step_no": 1, "action_type": "operation",
       "definition": "精确业务含义，与相近动作区分",
       "part_of_skill": "所属技能名", "preconditions": [], "authorization": [],
-      "failure_policy": "", "acts_on": [], "uses_tool": [], "performed_by": [],
+      "failure_policy": "", "atomic_effects": [], "follow_ups": [], "audit_required": null,
+      "acts_on": [], "uses_tool": [], "performed_by": [],
       "requires": [], "results_in": [], "next_action": ""}}
   ]
 }}"""
@@ -335,11 +354,13 @@ def _procedural_relations_from_item(
 
     skill = str(item.get("part_of_skill") or "").strip()
     if skill and skill in skill_names:
+        step_no = _coerce_int(item.get("step_no"))
         relations.append(ExtractedRelation(
             source_name=skill, source_type="Skill",
             target_name=src, target_type="Action",
             relation_type="HAS_STEP", confidence=0.9,
-            attributes={"step_no": item.get("step_no")},
+            # 边属性是 step_no 的权威来源（D3），落整数，检索侧排序不受字符串序影响
+            attributes={"step_no": step_no} if step_no is not None else {},
         ))
     nxt = str(item.get("next_action") or "").strip()
     if nxt:
@@ -404,13 +425,21 @@ def _parse_procedural_item(
         "preconditions": _norm_contract_field(item.get("preconditions")),
         "authorization": _norm_contract_field(item.get("authorization")),
         "failure_policy": _norm_contract_field(item.get("failure_policy")),
+        "atomic_effects": _norm_contract_field(item.get("atomic_effects")),
+        "follow_ups": _norm_contract_field(item.get("follow_ups")),
     }
-    step_no = item.get("step_no")
+    # audit_required 是三态：true / false / 未提及（null 不落键）。不能走 _norm_contract_field，
+    # 否则 False 会被 str 化成 "False" 再被当成非空值保留。
+    audit = _coerce_bool(item.get("audit_required"))
+    if audit is not None:
+        attrs["audit_required"] = audit
+    step_no = _coerce_int(item.get("step_no"))
     if step_no is not None:
         attrs["step_no"] = step_no
     return ExtractedEntity(
         canonical_name=name, entity_type="Action",
-        attributes={k: v for k, v in attrs.items() if v not in ("", None) and v != []},
+        attributes={k: v for k, v in attrs.items()
+                    if v is False or (v not in ("", None) and v != [])},
         description=str(item.get("definition") or "")[:2000],
         confidence=0.9, extraction_method="procedural_llm",
     )
@@ -423,6 +452,24 @@ def _procedural_enabled(procedural_opt: Any) -> bool:
     不能用 truthiness 判定（会永远关闸）。总闸 env 由调用方另行 AND。
     """
     return procedural_opt is not None
+
+
+def _kb_procedural_gate(schema: Optional[dict]) -> bool:
+    """库级 procedural 开关：kb-service 派单时写进 prompt_schema 顶层，只认值为 True。
+
+    缺键（老任务 / 执行方自行回落 CompiledSchemaClient 取到的 schema）一律按关处理 ——
+    内置 TBox 都含 Action，没有这一道就等于总闸一开全量开。
+    """
+    return bool(schema) and schema.get(PROCEDURAL_GATE_KEY) is True
+
+
+def procedural_gate_open(procedural_opt: Any, schema: Optional[dict]) -> bool:
+    """procedural 是否真正执行 = 每文档条件（schema 含 Action）AND 库级开关 AND 进程级总闸。"""
+    return (
+        _procedural_enabled(procedural_opt)
+        and _kb_procedural_gate(schema)
+        and _env_flag("ONTOLOGY_PROCEDURAL_EXTRACT_ENABLED", False)
+    )
 
 
 def _parse_procedural_results(
@@ -441,22 +488,31 @@ def _parse_procedural_results(
         if data is None:
             errors.append(f"procedural chunk#{i} 输出非合法 JSON")
             continue
+        # procedural 每 chunk 一次调用，产出的出处就是这个 chunk：直接记上，
+        # 不等后面按名字回填（回填按名字匹配，可能挂到别的 chunk 上）
+        chunk_id = str((chunk or {}).get("chunk_id") or "")
+        origin = (
+            [{"source_id": chunk_id, "file_path": str(chunk.get("file_path") or "")}]
+            if chunk_id else []
+        )
         skill_names: set = set()
         action_names: set = set()
         for s in data.get("skills", []):
             e = _parse_procedural_item(s, "skill")
             if e is not None:
+                e.source_chunks = [dict(sc) for sc in origin]
                 entities.append(e)
                 skill_names.add(e.canonical_name)
         for a in data.get("actions", []):
             e = _parse_procedural_item(a, "action")
             if e is not None:
+                e.source_chunks = [dict(sc) for sc in origin]
                 entities.append(e)
                 action_names.add(e.canonical_name)
         for a in data.get("actions", []):
-            relations.extend(
-                _procedural_relations_from_item(a, skill_names, action_names)
-            )
+            for r in _procedural_relations_from_item(a, skill_names, action_names):
+                r.source_chunks = [dict(sc) for sc in origin]
+                relations.append(r)
     # M2 上限：每文档 Action 数截断（超出按出现顺序丢弃实体与其挂接）
     max_actions = _env_int("ONTOLOGY_PROCEDURAL_MAX_ACTIONS", 100)
     action_names_all = {
@@ -633,10 +689,10 @@ class NativeOntologyExtractor:
         # 双 AND 生效，未声明 Action 的 KB 完全不进这条路径（§5 P2-12 gate 关系）。
         # 任务层条件用「非 None」（task_manager 传空 dict 占位，空 dict falsy，
         # 用 truthiness 会永远关闸——见 _procedural_enabled）。
+        # 三道 AND：每文档条件 options.procedural（schema 含 Action）、库级开关
+        # （prompt_schema.procedural_extract，kb-service 派单写入）、进程级总闸 env
         procedural_opt = opts.get("procedural")
-        procedural_enabled = _procedural_enabled(procedural_opt) and _env_flag(
-            "ONTOLOGY_PROCEDURAL_EXTRACT_ENABLED", False,
-        )
+        procedural_enabled = procedural_gate_open(procedural_opt, schema)
         proc_entities: List[ExtractedEntity] = []
         proc_relations: List[ExtractedRelation] = []
         if procedural_enabled:
@@ -666,12 +722,23 @@ class NativeOntologyExtractor:
                             1 for e in proc_actions
                             if not (e.attributes or {}).get(key)
                         )
+                    # audit_required 是布尔：False 也是「写明了」，只有缺键才算空置
+                    audit_vacant = sum(
+                        1 for e in proc_actions
+                        if "audit_required" not in (e.attributes or {})
+                    )
+                    n_act = len(proc_actions)
                     logger.info(
                         "procedural 契约空置率: actions=%d "
-                        "authorization_vacant=%.0f%% failure_policy_vacant=%.0f%%",
-                        len(proc_actions),
-                        100 * _vacant("authorization") / len(proc_actions),
-                        100 * _vacant("failure_policy") / len(proc_actions),
+                        "authorization_vacant=%.0f%% failure_policy_vacant=%.0f%% "
+                        "atomic_effects_vacant=%.0f%% follow_ups_vacant=%.0f%% "
+                        "audit_required_vacant=%.0f%%",
+                        n_act,
+                        100 * _vacant("authorization") / n_act,
+                        100 * _vacant("failure_policy") / n_act,
+                        100 * _vacant("atomic_effects") / n_act,
+                        100 * _vacant("follow_ups") / n_act,
+                        100 * audit_vacant / n_act,
                     )
             else:
                 proc_entities, proc_relations = [], []
@@ -685,29 +752,6 @@ class NativeOntologyExtractor:
         # [jonex] P5-var 同名边合并（多次采样同一条边重复出现，不合并会翻倍）
         entities = self._merge_entities(entities)
         relations = self._merge_relations(relations)
-
-        # ⑤′ TBox 声明技能链（P7 §2.5）：声明了 extraction_skills 的类型按声明
-        # 顺序串行（refine 先于 constrain）；未声明类型走默认链 = 现有硬编码
-        # 后处理路径（行为逐字段一致）。reject 只丢单实体/挂接（D12）。
-        if procedural_enabled or any(
-            et.get("extraction_skills") for et in schema.get("entity_types", [])
-        ):
-            from jonex_core.capability.atomic.rag.ontology_extraction_skills import (
-                run_entity_skill_chains,
-            )
-
-            entities, relations, rejects, skill_logs = await run_entity_skill_chains(
-                entities, relations, schema,
-                chunk_texts=[str(c.get("content") or "") for c in usable],
-                params={"name_maxlen": _env_int("ONTOLOGY_PROCEDURAL_NAME_MAXLEN", 30)},
-            )
-            for rj in rejects:
-                logger.info(
-                    "ontology skill reject: skill=%s kind=%s name=%s reason=%s",
-                    rj.skill, rj.kind, rj.name, rj.reason,
-                )
-            for sl in skill_logs:
-                logger.debug("ontology skill log: %s", sl)
 
         # ⑥ [jonex] P3 chunk 引用确定性回填：canonical_name + aliases 归一化
         # 匹配 chunk 正文（LLM 批量抽取的 chunks 引用常失真——22 chunk 仅
@@ -767,6 +811,35 @@ class NativeOntologyExtractor:
                     len(r_entities), len(r_relations),
                 )
 
+        # ⑥″ TBox 声明技能链（§2.5）：声明了 extraction_skills 的类型按声明
+        # 顺序串行（refine 先于 constrain）；未声明类型不跑技能。reject 只丢单实体/挂接（D12）。
+        # 放在 ⑥ 回填与 ⑥′ 漏抽补跑之后：① 补跑产出的实体同样要经过约束技能；
+        # ② 此时每个实体已带 source_chunks，原文比对可限定在它自己的 chunk 内
+        #   （chunk_text_by_id），而不是整篇文档。
+        if procedural_enabled or any(
+            et.get("extraction_skills") for et in schema.get("entity_types", [])
+        ):
+            from jonex_core.capability.atomic.rag.ontology_extraction_skills import (
+                run_entity_skill_chains,
+            )
+
+            entities, relations, rejects, skill_logs = await run_entity_skill_chains(
+                entities, relations, schema,
+                chunk_texts=[str(c.get("content") or "") for c in usable],
+                params={"name_maxlen": _env_int("ONTOLOGY_PROCEDURAL_NAME_MAXLEN", 30)},
+                chunk_text_by_id={
+                    str(c.get("chunk_id")): str(c.get("content") or "")
+                    for c in usable if c.get("chunk_id")
+                },
+            )
+            for rj in rejects:
+                logger.info(
+                    "ontology skill reject: skill=%s kind=%s name=%s reason=%s",
+                    rj.skill, rj.kind, rj.name, rj.reason,
+                )
+            for sl in skill_logs:
+                logger.debug("ontology skill log: %s", sl)
+
         # ⑦ 端点兜底：关系端点缺失 → 补 entity_type="unknown" 正式实体；
         # [jonex] P4 继承来源关系 source_chunks（旧实现恒空 → 图节点
         # source_id/file_path 空串脏数据）。
@@ -795,10 +868,22 @@ class NativeOntologyExtractor:
         # [jonex] 兜底类型集合在此注入而非由 _post_validate 自行导入——本模块已
         # import ontology_extractor，反向 import 会成环。开关 ONTOLOGY_KEEP_FALLBACK_ENTITIES
         # 默认关；开时 _post_validate 放行落在这批兜底类型上的实体与关系端点。
+        # 属性按 TBox 类型归一（boolean 认不出删键、number 只转纯数字），
+        # 放在后校验之前：_post_validate 之后的观测日志看到的已是归一后的值。
+        coerce_stats = coerce_attribute_types(entities, schema)
+        if coerce_stats["coerced"] or coerce_stats["unparsed"]:
+            logger.info(
+                "ontology attrs 类型归一: coerced=%d unparsed=%d",
+                coerce_stats["coerced"], coerce_stats["unparsed"],
+            )
+
         ont_entities, ont_relations = _post_validate(
             entities, relations, schema,
             fallback_types=set(load_fallback_types()),
         )
+
+        # one_to_one 多出边、同技能 step_no 撞号：只告警不删（函数内已逐条打 warning）
+        warn_cardinality_conflicts(ont_relations, schema)
 
         # [jonex] P5-var 观测：with_attrs 比例 + TBox 属性零命中清单。
         # 区分两类零命中：语料无对应值（TBox 有定义但文档没提）与
@@ -984,6 +1069,9 @@ class NativeOntologyExtractor:
                 scope=scope,
                 json_mode=bool(opts.get("json_mode", True)),
                 return_meta=True,
+                # [jonex] P3a：KB 级本体抽取模型（None ⇒ 由 _openai_chat 再按
+                # scope / env 回落，见那里的三级优先级）
+                model=opts.get("model") or None,
             )
             return content, (meta or {}).get("finish_reason"), None
         except Exception as exc:  # noqa: BLE001 — 批级错误聚合
@@ -1446,8 +1534,8 @@ class NativeOntologyExtractor:
                 m.description = e.description
             if e.confidence > m.confidence:
                 m.confidence = e.confidence
-            if e.attributes and not m.attributes:
-                m.attributes = dict(e.attributes)
+            # Action/Skill 以 procedural 属性为准、字段级并集；其余类型先到者优先
+            merge_entity_attributes(m, e)
             for alias in e.aliases:
                 if alias and alias not in m.aliases:
                     m.aliases.append(alias)

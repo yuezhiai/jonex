@@ -49,6 +49,7 @@ class UserAuth:
         self.access_expire_hours = config.USER_JWT_EXPIRE_HOURS
         self.refresh_expire_days = config.USER_JWT_REFRESH_DAYS
         self.impersonate_expire_minutes = config.IMPERSONATE_EXPIRE_MINUTES
+        self.impersonate_end_grace_seconds = config.IMPERSONATE_END_GRACE_SECONDS
         self.bcrypt_rounds = config.BCRYPT_ROUNDS
 
     def hash_password(self, password: str) -> str:
@@ -124,6 +125,64 @@ class UserAuth:
             logger.warning(f"JWT 验签失败: {e}")
             raise TokenExpiredError()  # Token 格式无效或签名校验失败
 
+    def decode_impersonation_end_token(self, token: str) -> tuple[dict, bool]:
+        """为 ``/auth/impersonate/end`` 解码 token，返回 ``(payload, 是否已过期)``。
+
+        有效 token 与 :meth:`decode_token` 完全同口径（含类型与 claim 校验）；
+        已过期 token 仅在「``impersonated`` 为真 + 过期不超过
+        ``IMPERSONATE_END_GRACE_SECONDS``」时放行 —— 到期自动退出时前端才来
+        调 end，那一刻 access token 必然已失效，审计只能靠这条路补写。
+
+        ⛔ 只给 ``/auth/impersonate/end`` 用。任何数据接口都不得改用它：这里
+        **跳过了 exp 校验**，放行后的能力仅限「写一条审计 + 清标记 cookie」。
+        """
+        try:
+            payload, expired = self.decode_token(token), False
+        except TokenExpiredError:
+            payload = self._decode_allow_expired(token)
+            expired = True
+
+        # 本端点只接受 access token（refresh 有效期 30 天，不能当访问凭证）。
+        if payload.get("type") != "user":
+            raise TokenExpiredError(
+                message=translate("err.auth.user_token_required", fallback="需要用户访问令牌")
+            )
+        if not expired:
+            return payload, False
+        if not payload.get("impersonated"):
+            # 非模拟态的过期 token 照旧拒绝：宽限不扩大到普通会话。
+            raise TokenExpiredError()
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            # 没有可判定的 exp ⇒ 无法证明在宽限期内，fail-closed。
+            raise TokenExpiredError()
+        overdue = datetime.now(timezone.utc).timestamp() - float(exp)
+        if overdue > self.impersonate_end_grace_seconds:
+            logger.warning(
+                "模拟 token 已过期 %.0f 秒，超出审计宽限 %s 秒，拒绝 /impersonate/end",
+                overdue,
+                self.impersonate_end_grace_seconds,
+            )
+            raise TokenExpiredError()
+        return payload, True
+
+    def _decode_allow_expired(self, token: str) -> dict:
+        """解码但不校验 ``exp``（签名 / 类型 / 必需 claim 仍然校验）。"""
+        try:
+            payload = jwt.decode(
+                token,
+                self.secret,
+                algorithms=[self.algorithm],
+                options={"verify_exp": False},
+            )
+            if payload.get("type") not in ("user", "refresh"):
+                raise TokenExpiredError()  # Token 类型不合法（非 user/refresh）
+            self._validate_claims(payload)
+            return payload
+        except jwt.PyJWTError as e:
+            logger.warning(f"JWT 验签失败: {e}")
+            raise TokenExpiredError()  # Token 格式无效或签名校验失败
+
     @staticmethod
     def _validate_claims(payload: dict) -> None:
         """校验本地 HS256 token 必需 claim 的存在性与类型。
@@ -180,24 +239,9 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     （tenant 模块），仅开发环境（ENV=dev）放行，test/uat/prod 一律拒绝，
     杜绝无验签 admin 绕过（对齐 api_gateway GATEWAY_API_KEY 生产哨兵守卫模式）。
     """
-    if not authorization:
-        raise TokenExpiredError(message=translate("err.auth.missing_auth_header", fallback="缺少 Authorization 请求头"))
-    if not authorization.startswith("Bearer "):
-        raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
-    token = extract_bearer_token(authorization)
-    if not token:
-        raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
+    token = _require_bearer_token(authorization)
     if token.startswith("jonex_test_"):
-        require_test_token_allowed()
-        return {
-            "user_id": 0,
-            "tenant_id": require_tenant(token.removeprefix("jonex_test_")),
-            "username": "test_token",
-            "role": "admin",
-            "roles": ["admin"],
-            "perms": [],
-            "impersonated": False,
-        }
+        return _test_token_subject(token)
     auth = get_user_auth()
     payload = auth.decode_token(token)
     # `decode_token` 同时接受 user / refresh（续期端点要靠它解 refresh），
@@ -205,6 +249,37 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     # 用等于给了一条长效通行证（B6 终审只堵了网关 invoke 路径）。
     if payload.get("type") != "user":
         raise TokenExpiredError(message=translate("err.auth.user_token_required", fallback="需要用户访问令牌"))
+    return _user_payload_to_subject(payload)
+
+
+def _require_bearer_token(authorization: Optional[str]) -> str:
+    """取出 Bearer token；缺头 / 非 Bearer / 空 token 一律 401（3003）。"""
+    if not authorization:
+        raise TokenExpiredError(message=translate("err.auth.missing_auth_header", fallback="缺少 Authorization 请求头"))
+    if not authorization.startswith("Bearer "):
+        raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise TokenExpiredError(message=translate("err.auth.missing_bearer_token", fallback="缺少 Bearer token"))
+    return token
+
+
+def _test_token_subject(token: str) -> dict:
+    """本地调试测试 token 的兜底身份（仅 ENV=dev 放行）。"""
+    require_test_token_allowed()
+    return {
+        "user_id": 0,
+        "tenant_id": require_tenant(token.removeprefix("jonex_test_")),
+        "username": "test_token",
+        "role": "admin",
+        "roles": ["admin"],
+        "perms": [],
+        "impersonated": False,
+    }
+
+
+def _user_payload_to_subject(payload: dict) -> dict:
+    """把用户 access token 载荷映射为依赖层统一的身份字典。"""
     return {
         "user_id": int(payload["sub"]),
         "tenant_id": payload["tenant_id"],
@@ -215,6 +290,28 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
         "impersonated": bool(payload.get("impersonated")),
         "original_tenant_id": payload.get("original_tenant_id"),
     }
+
+
+async def get_current_user_for_impersonation_end(authorization: Optional[str] = Header(None)) -> dict:
+    """FastAPI 依赖：``/auth/impersonate/end`` 专用，允许模拟 token 刚过期。
+
+    与 :func:`get_current_user` 的唯一差别在 :meth:`UserAuth.decode_impersonation_end_token`：
+    模拟态 token 过期不超过 ``IMPERSONATE_END_GRACE_SECONDS`` 时仍可解析。返回字典
+    额外带 ``token_expired``，供服务层区分审计动作（``impersonate_expired`` /
+    ``impersonate_end``）。
+
+    背景：到期自动退出由前端定时器触发，那一刻 access token 必然已失效；审计
+    若依赖前端时序（提前几秒调用），页面休眠 / 标签页节流就会漏记且无人知晓。
+
+    ⛔ 不要用于任何数据端点：宽限只覆盖「写审计 + 清标记 cookie」。
+    """
+    token = _require_bearer_token(authorization)
+    if token.startswith("jonex_test_"):
+        return _test_token_subject(token)
+    payload, expired = get_user_auth().decode_impersonation_end_token(token)
+    subject = _user_payload_to_subject(payload)
+    subject["token_expired"] = expired
+    return subject
 
 
 def require_role(*roles: str):

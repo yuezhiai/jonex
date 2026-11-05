@@ -19,6 +19,20 @@ class AttributeDef:
     type: str = "string"
     required: bool = False
     description: Optional[str] = None
+    # 四个核心字段之外的键（如将来的 values / min / max / pattern 等属性约束键）原样收在这里。
+    # 旧实现 AttributeDef(**a) 直接展开，YAML 属性多一个键就 TypeError，整个 OntologyRegistry.load 崩。
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AttributeDef":
+        known = {"name", "type", "required", "description"}
+        return cls(
+            name=data["name"],
+            type=data.get("type", "string"),
+            required=bool(data.get("required", False)),
+            description=data.get("description"),
+            extra={k: v for k, v in data.items() if k not in known},
+        )
 
 
 @dataclass
@@ -37,7 +51,7 @@ class EntityTypeDef:
         return cls(
             name=data["name"],
             aliases=data.get("aliases", []),
-            attributes=[AttributeDef(**a) for a in data.get("attributes", [])],
+            attributes=[AttributeDef.from_dict(a) for a in data.get("attributes", [])],
             extraction_skills=data.get("extraction_skills"),
         )
 

@@ -222,7 +222,7 @@ class OpenkbCapability(BaseCapability):
     async def initialize(self) -> None:
         """[jonex] 启动时扫描各 KB tasks/，把 pending/running 判死（容器重启恢复）。
 
-        被 start_capability.py:105 自动调用（BaseCapability.initialize 钩子）。
+        被 start_capability.py 的 lifespan 自动调用（BaseCapability.initialize 钩子）。
         """
         from openkb.locks import atomic_write_json
 

@@ -12,8 +12,9 @@ entity_types[] 条目的 extraction_skills 声明抽取该类型时按序调用�
 - 按声明顺序串行调用，refine 先于 constrain；
 - 技能输入 = 候选实体/关系 + 当前 chunk 原文 + 类型 TBox 定义；
   输出 = 完善后的候选，或 reject（丢弃单实体/挂接 + 日志，不整批失败）；
-- 技能引用 `builtin:<name>`（一期全部内置，零跨服务依赖）/
-  `catalog:<tool_name>`（二期 MCP 打通，一期跳过并记 warning）；
+- 技能引用 `builtin:<name>`（内置，在本模块执行）/
+  `catalog:<tool_name>`（调用登记的只读工具，本模块不执行，由 knowledge-base 写图前执行，
+  格式见 jonex_core/common/catalog_skill_spec.py）；
 - 挂接关系口径：关系两端类型或端点名命中该类型实体的，视为该类型的挂接。
 
 一期内置技能全部确定性实现（无 LLM 调用）；LLM 类补全由 procedural prompt
@@ -32,6 +33,7 @@ from jonex_core.capability.atomic.rag.ontology_extractor import (
     ExtractedEntity,
     ExtractedRelation,
     _post_validate,
+    merge_entity_attributes,
 )
 
 logger = __import__("logging").getLogger(__name__)
@@ -82,6 +84,9 @@ class SkillContext:
     relations: List[ExtractedRelation]
     chunk_texts: List[str]
     tbox_entity: Dict[str, Any] = field(default_factory=dict)
+    # chunk_id → 正文。提供时，原文比对限定在实体/关系自己 source_chunks 指向的 chunk；
+    # 未提供或对不上时回落 chunk_texts（整篇）
+    chunk_text_by_id: Dict[str, str] = field(default_factory=dict)
     schema: Dict[str, Any] = field(default_factory=dict)
     params: Dict[str, Any] = field(default_factory=dict)
     rejected: List[SkillReject] = field(default_factory=list)
@@ -136,8 +141,10 @@ def parse_extraction_skills(
                 continue
             name = str(item["skill"]).strip()
             if name.startswith(_CATALOG_PREFIX):
-                # 二期 MCP 打通（D10）；一期跳过不阻塞管线
-                logger.warning("catalog 技能一期不执行，跳过声明: %s", name)
+                # 调用登记工具的技能由 knowledge-base 在写图前执行（工具定义、凭据、出站校验与
+                # 审计都在那边，见 capabilities/knowledge_base/services/extract_tool_service.py）；
+                # 抽取器不执行，声明原样留在 schema 里
+                logger.debug("catalog 技能交 knowledge-base 写图前执行，抽取期跳过: %s", name)
                 continue
             if not name.startswith(_BUILTIN_PREFIX):
                 errors.append(
@@ -230,6 +237,35 @@ def _chunk_mentions(texts: List[str], value: str) -> bool:
     return _mentions_prepared(hay, _NORM_STRIP.sub("", hay), needle)
 
 
+def _scoped_texts(ctx: SkillContext, source_chunks: List[Dict[str, Any]]) -> List[str]:
+    """按 source_chunks 取比对用原文；取不到（无映射 / 无出处 / id 对不上）回落整篇。
+
+    回落而不是返回空：空列表会让所有校验判「不在原文」，把没有出处信息的实体整批误杀。
+    """
+    if ctx.chunk_text_by_id and source_chunks:
+        ids = list(dict.fromkeys(
+            str(sc.get("source_id") or "") for sc in source_chunks
+        ))
+        texts = [ctx.chunk_text_by_id[i] for i in ids if i and i in ctx.chunk_text_by_id]
+        if texts:
+            return texts
+    return ctx.chunk_texts
+
+
+def _texts_for_entity(ctx: SkillContext, e: ExtractedEntity) -> List[str]:
+    return _scoped_texts(ctx, e.source_chunks or [])
+
+
+def _texts_for_relation(ctx: SkillContext, r: ExtractedRelation) -> List[str]:
+    """关系优先用自己的出处；没有出处时用源端实体的出处（挂接关系与源实体同 chunk 抽出）。"""
+    if r.source_chunks:
+        return _scoped_texts(ctx, r.source_chunks)
+    src = next((e for e in ctx.entities if e.canonical_name == r.source_name), None)
+    if src is not None:
+        return _texts_for_entity(ctx, src)
+    return ctx.chunk_texts
+
+
 def _skill_name_normalizer(ctx: SkillContext) -> None:
     """动作名「动词+宾语」归一：去敬语/序号前缀/句末标点；超长截断进 description。"""
     maxlen = int(ctx.params.get("name_maxlen")
@@ -267,10 +303,11 @@ def _skill_endpoint_verifier(ctx: SkillContext) -> None:
     """挂接端点必须存在于 chunk 正文，否则丢弃该挂接（防 stub 节点）。"""
     cand_names = {e.canonical_name for e in ctx.entities}
     for r in list(ctx.relations):
+        texts = _texts_for_relation(ctx, r)
         for endpoint in (r.source_name, r.target_name):
             if endpoint in cand_names:
                 continue
-            if not _chunk_mentions(ctx.chunk_texts, endpoint):
+            if not _chunk_mentions(texts, endpoint):
                 ctx.rejected.append(SkillReject(
                     "relation", f"{r.source_name}→{r.target_name}",
                     f"端点 {endpoint} 不在 chunk 正文", "builtin:endpoint_verifier",
@@ -287,16 +324,20 @@ _NO_FABRICATION_GENERATIVE = {"definition"}
 def _no_fabrication_fields(tbox_entity: Dict[str, Any]) -> List[str]:
     """no_fabrication 校验字段范围（P10 批 2.5 泛化）。
 
-    - Action 保持旧范围 authorization/failure_policy：其余契约字段
-      （parameters/preconditions/atomic_effects/follow_ups 等）由
-      procedural prompt 归纳生成、经 contract_filler 规范化，逐字
-      校验会误杀 P7 行为；
+    - Action 校验 authorization / failure_policy / preconditions / atomic_effects /
+      follow_ups 五个审查与执行边界会直接消费的契约字段；parameters 等纯归纳字段
+      逐字校验误杀率高，不纳入。比对走三级口径（逐字 → 去标点空白 → 主体过半命中），
+      容忍归纳式改写；audit_required 是布尔值，不走摘句，由 ``_clear_unstated_audit``
+      按段落措辞判断；
     - 其余类型校验 TBox 声明的全部 string/text 属性（声明即应摘句），
       排除生成式字段 definition；number/boolean/enum 非文本，摘句口径
       不适用。
     """
     if (tbox_entity or {}).get("name") == "Action":
-        return ["authorization", "failure_policy"]
+        # preconditions 是审查维度之一（「执行前必须核验什么」），编造的前置条件会直接
+        # 进审查结论，故与 authorization / failure_policy 一样要求原文支撑；
+        # atomic_effects / follow_ups 决定执行侧「什么要回滚、什么只联动」，编造同样会落错
+        return ["authorization", "failure_policy", "preconditions", "atomic_effects", "follow_ups"]
     fields = []
     for attr in tbox_entity.get("attributes") or []:
         name = str(attr.get("name", "")).strip()
@@ -321,15 +362,16 @@ def _skill_no_fabrication(ctx: SkillContext) -> None:
         return
     for e in ctx.entities:
         attrs = dict(e.attributes or {})
+        texts = _texts_for_entity(ctx, e)
         for field in fields:
             value = attrs.get(field)
             if not value:
                 continue
             if isinstance(value, str):
-                ok = _chunk_mentions(ctx.chunk_texts, value)
+                ok = _chunk_mentions(texts, value)
             elif isinstance(value, list):
                 ok = bool(value) and all(
-                    _chunk_mentions(ctx.chunk_texts, str(v)) for v in value
+                    _chunk_mentions(texts, str(v)) for v in value
                 )
             else:
                 ok = False
@@ -342,6 +384,108 @@ def _skill_no_fabrication(ctx: SkillContext) -> None:
                     f"no_fabrication: {e.canonical_name}.{field} 置空: {str(value)[:80]}"
                 )
                 attrs[field] = "" if isinstance(value, str) else []
+        e.attributes = attrs
+    # 逐字比对之外的语义兜底（只对 Action 生效）：执行人被误填成权限要求、
+    # 段落没提审计却给了 audit_required
+    _clear_unstated_authorization(ctx)
+    _clear_unstated_audit(ctx)
+
+
+# 权限类措辞：原文出现这些才算「写明了权限要求」。刻意不收裸「审批」——
+# 「止付审批通过后方可办理」是前置条件，不是本动作的权限要求。
+_AUTHORIZATION_MARKERS = re.compile(
+    r"权限|可执行|须经|需经|经[^。；\n]{0,12}审批|授权|仅限|不得|级及以上|以上人员|有权"
+)
+
+
+def _action_segment(ctx: SkillContext, e: ExtractedEntity) -> Optional[str]:
+    """本动作「自己的」原文段落：优先「第N步：<动作名>」开头的段落，否则第一个提到动作名的段落。
+
+    按换行切段。找不到（动作名经归一后与原文对不上）返回 None，由调用方按「无法判断」处理。
+    """
+    names = sorted({n for n in [e.canonical_name, *(e.aliases or [])] if n}, key=len, reverse=True)
+    if not names:
+        return None
+    paragraphs = [p for t in _texts_for_entity(ctx, e) for p in str(t).splitlines() if p.strip()]
+    step_title = re.compile(
+        r"第\s*[一二三四五六七八九十百\d]+\s*步\s*[：:]?\s*(?:" + "|".join(re.escape(n) for n in names) + ")"
+    )
+    for p in paragraphs:
+        if step_title.search(p):
+            return p
+    return next((p for p in paragraphs if any(n in p for n in names)), None)
+
+
+def _clear_unstated_authorization(ctx: SkillContext) -> None:
+    """D15：本动作自己的原文段落里没有写权限要求时，清空 authorization。
+
+    LLM 常把「由谁来做」误填成「谁有权做」（试点 e2e：5/8 个动作的 authorization 只是
+    执行人）。逐字比对拦不住——执行人的名字确实出现在原文；也不能靠「authorization
+    等于 PERFORMED_BY 端点」判断，LLM 有时只填了 authorization、不输出执行人关系。
+    判据：本动作段落（``_action_segment``）中没有任何权限类措辞（``_AUTHORIZATION_MARKERS``）。
+
+    找不到本动作段落时不动（无法判断，宁可保留也不误清）；chunk 没有换行时整块是一段，
+    只要出现过权限措辞也不动——两种情况都退化为不做这一步。
+    口径：Skill 级的权限声明（写在章节开头）不下放到各步骤，未在步骤段落内重申 = 未声明。
+    清空 = 「权限未声明」，下游按 D15 视为未知（执行侧拒绝或转人工，审查侧 unknown）。
+    """
+    for e in ctx.entities:
+        if e.entity_type != "Action":
+            continue
+        attrs = dict(e.attributes or {})
+        auth = attrs.get("authorization")
+        values = [auth] if isinstance(auth, str) else list(auth or [])
+        if not any(str(v).strip() for v in values):
+            continue
+        segment = _action_segment(ctx, e)
+        if segment is None or _AUTHORIZATION_MARKERS.search(segment):
+            continue
+        ctx.rejected.append(SkillReject(
+            "entity", e.canonical_name,
+            "authorization 在本动作段落中无权限措辞（执行人≠权限），置空（D15）",
+            "builtin:no_fabrication",
+        ))
+        ctx.logs.append(
+            f"no_fabrication: {e.canonical_name}.authorization 置空（段落未写权限）: {auth}"
+        )
+        attrs["authorization"] = "" if isinstance(auth, str) else []
+        e.attributes = attrs
+
+
+# 审计类措辞：原文出现这些才算「说到了审计留痕」（含「无需留痕」这类否定说法，
+# 否定同样是写明了，audit_required=false 也要有它撑着）。
+# 刻意不收裸「记录」：「生成挂失记录」「争议记录保留」说的是业务数据，不是审计要求，
+# 收进来会让 LLM 凭常识补的 audit_required=true 借这类句子过关。
+_AUDIT_MARKERS = re.compile(r"审计|留痕|日志|存档|归档|备案")
+
+
+def _clear_unstated_audit(ctx: SkillContext) -> None:
+    """本动作段落里没说审计留痕时，去掉 audit_required（回到「未提及」）。
+
+    audit_required 是三态：true / false / 缺键。LLM 容易按常识补一个 true（「挂失当然要留痕」）
+    或 false（没看到就填否），两种都是编造。布尔值没法逐字摘句，改按段落措辞判断：
+    本动作段落（``_action_segment``）没有审计类措辞（``_AUDIT_MARKERS``）就删键。
+    找不到本动作段落时不动（无法判断，宁可保留也不误删）。
+    """
+    for e in ctx.entities:
+        if e.entity_type != "Action":
+            continue
+        attrs = dict(e.attributes or {})
+        if "audit_required" not in attrs:
+            continue
+        segment = _action_segment(ctx, e)
+        if segment is None or _AUDIT_MARKERS.search(segment):
+            continue
+        ctx.rejected.append(SkillReject(
+            "entity", e.canonical_name,
+            "audit_required 在本动作段落中无审计措辞，置为未提及",
+            "builtin:no_fabrication",
+        ))
+        ctx.logs.append(
+            f"no_fabrication: {e.canonical_name}.audit_required 去掉（段落未提审计）: "
+            f"{attrs['audit_required']}"
+        )
+        attrs.pop("audit_required")
         e.attributes = attrs
 
 
@@ -370,8 +514,8 @@ def _skill_dedup_merger(ctx: SkillContext) -> None:
             m.description = e.description
         if e.confidence > m.confidence:
             m.confidence = e.confidence
-        if (e.attributes or {}) and not m.attributes:
-            m.attributes = dict(e.attributes)
+        # 与 NativeOntologyExtractor._merge_entities 同一合并口径（Action/Skill 以 procedural 为准）
+        merge_entity_attributes(m, e)
         for alias in e.aliases:
             if alias and alias not in m.aliases:
                 m.aliases.append(alias)
@@ -474,38 +618,52 @@ def _skill_contract_filler(ctx: SkillContext) -> None:
         attrs = dict(e.attributes or {})
         for field in ("authorization", "preconditions",
                       "atomic_effects", "follow_ups"):
-            value = attrs.get(field)
+            # 字段缺失时不写键：图上「没抽到」必须与「抽到了但为空」可区分
+            # （D15：authorization 缺失 = 未知，不能被一个空数组伪装成「已声明无约束」）
+            if field not in attrs:
+                continue
+            value = attrs[field]
             if isinstance(value, str):
-                attrs[field] = [line.strip() for line in value.splitlines()
-                                if line.strip()]
+                items = [line.strip() for line in value.splitlines() if line.strip()]
             elif isinstance(value, list):
-                attrs[field] = [str(v).strip() for v in value if str(v).strip()]
+                items = [str(v).strip() for v in value if str(v).strip()]
             else:
-                attrs[field] = []
+                items = []
+            if items:
+                attrs[field] = items
+            else:
+                attrs.pop(field)
         e.attributes = attrs
 
 
 def _skill_semantic_definition(ctx: SkillContext) -> None:
     """definition 兜底：LLM 未产出时从 chunk 找「{name}（是指/即/用于）…」句式；
     找不到留空（真实生成由 procedural prompt 承担，宁缺毋假）。"""
-    names = sorted({e.canonical_name for e in ctx.entities}, key=len, reverse=True)
-    if not names:
-        return
-    alternation = "|".join(re.escape(n) for n in names)
-    pattern = re.compile(
-        rf"[^\n。；]*?(?:所谓)?(?:{alternation})(?:，|,)?\s*(?:是指|即|用于|指)\s*([^\n。；]{{4,}})"
-    )
     for e in ctx.entities:
         attrs = dict(e.attributes or {})
-        if (attrs.get("definition") or "").strip():
+        if str(attrs.get("definition") or "").strip():
             continue
-        m = pattern.search("\n".join(ctx.chunk_texts))
-        if m:
-            attrs["definition"] = m.group(1).strip()
-            ctx.logs.append(
-                f"semantic_definition: {e.canonical_name} 兜底摘句 "
-                f"{m.group(1)[:40]}..."
-            )
+        # 每个实体只按自己的名字（及别名）匹配：共用一个 alternation 会让所有实体
+        # 拿到全文第一处匹配，把别人的定义错配给自己
+        names = sorted(
+            {n for n in [e.canonical_name, *(e.aliases or [])] if n},
+            key=len, reverse=True,
+        )
+        if not names:
+            continue
+        alternation = "|".join(re.escape(n) for n in names)
+        pattern = re.compile(
+            rf"(?:所谓)?(?:{alternation})(?:，|,)?\s*(?:是指|即|用于|指)\s*([^\n。；]{{4,}})"
+        )
+        m = pattern.search("\n".join(_texts_for_entity(ctx, e)))
+        if not m:
+            continue
+        attrs["definition"] = m.group(1).strip()
+        e.attributes = attrs
+        ctx.logs.append(
+            f"semantic_definition: {e.canonical_name} 兜底摘句 "
+            f"{m.group(1)[:40]}..."
+        )
 
 
 # 内置技能注册表（builtin:<name> → 技能函数）
@@ -589,8 +747,12 @@ async def run_entity_skill_chains(
     schema: Dict[str, Any],
     chunk_texts: List[str],
     params: Optional[Dict[str, Any]] = None,
+    chunk_text_by_id: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[ExtractedEntity], List[ExtractedRelation], List[SkillReject], List[str]]:
     """对声明了 extraction_skills 的类型逐个跑技能链（P7 接线点）。
+
+    ``chunk_text_by_id`` 提供时，原文比对限定在每个实体/关系自己 source_chunks 指向的
+    chunk（见 ``_scoped_texts``）；不提供则沿用整篇 ``chunk_texts``。
 
     未声明类型走默认链 = extractor 现有硬编码后处理路径（本函数不动它们，
     行为逐字段一致）。声明链作用于该类型实体（对象原地修改/替换）与其挂接
@@ -634,6 +796,7 @@ async def run_entity_skill_chains(
             tbox_entity=tbox_entity,
             schema=schema,
             params=params or {},
+            chunk_text_by_id=dict(chunk_text_by_id or {}),
         )
         outcome = await apply_declared_chain(ctx, refine_calls, constrain_calls)
 

@@ -49,10 +49,16 @@ class ResourceNameEnricher:
             return None
 
         schema, table, id_col, name_col = lookup
+        # ⚠️ resource_id 在 audit_logs 里是 VARCHAR，而部分资源表主键是 BIGINT
+        # （platform.*）。直接把字符串绑到 BIGINT 列上，asyncpg 会拒绝
+        # （invalid input for query argument: expected int, got str）并让整个
+        # 审计列表 500。统一按文本比较，两种主键类型都成立；代价是放弃 id 索引，
+        # 但富化只针对单页 ≤100 条记录，可接受。
         query = sa_text(
-            f"SELECT {name_col} FROM {schema}.{table} WHERE {id_col} = :rid"
+            f"SELECT {name_col} FROM {schema}.{table} "
+            f"WHERE CAST({id_col} AS TEXT) = :rid"
         )
-        result = await self.session.execute(query, {"rid": resource_id})
+        result = await self.session.execute(query, {"rid": str(resource_id)})
         row = result.scalar_one_or_none()
         if row is not None:
             return str(row)
@@ -84,9 +90,9 @@ class ResourceNameEnricher:
 
             schema, table, id_col, name_col = lookup
 
-            # 收集唯一 resource_id 集合
+            # 收集唯一 resource_id 集合（统一转文本，见 enrich() 的类型说明）
             resource_ids = list(
-                {getattr(it, "resource_id") for it in group}
+                {str(getattr(it, "resource_id")) for it in group}
             )
             if not resource_ids:
                 continue
@@ -96,10 +102,15 @@ class ResourceNameEnricher:
             params = {f"rid_{i}": rid for i, rid in enumerate(resource_ids)}
             in_query = sa_text(
                 f"SELECT {id_col}, {name_col} FROM {schema}.{table} "
-                f"WHERE {id_col} IN ({placeholders})"
+                f"WHERE CAST({id_col} AS TEXT) IN ({placeholders})"
             )
             result = await self.session.execute(in_query, params)
-            name_map = {str(row[0]): str(row[1]) for row in result}
+            # 名称为 NULL（如用户未设置 display_name）时不要写成字符串 "None"
+            name_map = {
+                str(row[0]): str(row[1])
+                for row in result
+                if row[1] is not None
+            }
 
             # 原地设置 resource_name
             for item in group:

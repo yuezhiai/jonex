@@ -28,10 +28,29 @@ class ResourceType(str, Enum):
     # ---- 文档 ----
     DOCUMENT = "document"
     DATA_SOURCE = "data_source"
+    # ---- 派生资产（数据治理目录） ----
+    TABLE = "table"
+    COLUMN = "column"
+    METRIC = "metric"
     FOLDER = "folder"
     SPACE = "space"
     TAG = "tag"
     SYNONYM = "synonym"
+    LINEAGE_EDGE = "lineage_edge"
+    LINEAGE_FORBIDDEN_PAIR = "lineage_forbidden_pair"
+    STANDARD_ASSET = "standard_asset"
+    STANDARD_BINDING = "standard_binding"
+    DATA_CONTRACT = "data_contract"
+    QUALITY_RULE = "quality_rule"
+    QUALITY_RUN = "quality_run"
+    QUALITY_ISSUE = "quality_issue"
+    GOVERNANCE_LABEL = "governance_label"
+    GOVERNANCE_TAG = "governance_tag"
+    GOVERNANCE_POLICY = "governance_policy"
+    GOVERNANCE_CLEARANCE = "governance_clearance"
+    ONTOLOGY_DATA_ALIGNMENT = "ontology_data_alignment"
+    ONTOLOGY_TOOL_BINDING = "ontology_tool_binding"
+    KB_TOOL = "kb_tool"
 
     # ---- 本体 ----
     ONTOLOGY_INSTANCE = "ontology_instance"
@@ -131,10 +150,28 @@ _RESOURCE_LABEL_ZH: dict[str, str] = {
     # ---- 文档 ----
     "document": "文档",
     "data_source": "数据源",
+    "table": "表",
+    "column": "列",
+    "metric": "指标",
     "folder": "文件夹",
     "space": "空间",
     "tag": "标签",
     "synonym": "同义词",
+    "lineage_edge": "血缘边",
+    "lineage_forbidden_pair": "禁止同查表对",
+    "standard_asset": "标准资产",
+    "standard_binding": "标准落标绑定",
+    "data_contract": "数据合同",
+    "quality_rule": "质量规则",
+    "quality_run": "质量巡检",
+    "quality_issue": "质量问题工单",
+    "governance_label": "治理标签",
+    "governance_tag": "治理标签字典",
+    "governance_policy": "治理策略",
+    "governance_clearance": "用户数据密级",
+    "ontology_data_alignment": "跨模态对齐",
+    "ontology_tool_binding": "工具绑定",
+    "kb_tool": "知识库工具",
     # ---- 本体 ----
     "ontology_instance": "本体实例",
     "ontology_relation": "本体关系",
@@ -190,10 +227,28 @@ _RESOURCE_LABEL_EN: dict[str, str] = {
     # ---- 文档 ----
     "document": "Document",
     "data_source": "Data Source",
+    "table": "Table",
+    "column": "Column",
+    "metric": "Metric",
     "folder": "Folder",
     "space": "Space",
     "tag": "Tag",
     "synonym": "Synonym",
+    "lineage_edge": "Lineage Edge",
+    "lineage_forbidden_pair": "Forbidden Lineage Pair",
+    "standard_asset": "Standard Asset",
+    "standard_binding": "Standard Asset Binding",
+    "data_contract": "Data Contract",
+    "quality_rule": "Quality Rule",
+    "quality_run": "Quality Run",
+    "quality_issue": "Quality Issue",
+    "governance_label": "Governance Label",
+    "governance_tag": "Governance Tag",
+    "governance_policy": "Governance Policy",
+    "governance_clearance": "User Data Clearance",
+    "ontology_data_alignment": "Cross-modal Alignment",
+    "ontology_tool_binding": "Tool Binding",
+    "kb_tool": "Knowledge Base Tool",
     # ---- 本体 ----
     "ontology_instance": "Ontology Instance",
     "ontology_relation": "Ontology Relation",
@@ -255,6 +310,7 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "auth.backchannel_logout": "auth",
     "impersonate_start": "auth",
     "impersonate_end": "auth",
+    "impersonate_expired": "auth",
     # ---- 文档 → document ----
     "document.upload": "document",
     "document.parse": "document",
@@ -330,6 +386,36 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "get_skill": "skill",
     "list_skills": "skill",
     "list_enabled_mcp_tools": "skill",
+    # ---- 知识库 → knowledge_info / document / folder / data_source / tag / synonym / lineage_edge / service / space / chunk / parser_setting / compiled_schema / raw_content / editor_state / ontology_* ----
+    # 工具目录管理（平台管理员）：资源仍是 skill_catalog 的行
+    "list_skill_catalog": "skill",
+    "get_skill_catalog": "skill",
+    "create_skill_catalog": "skill",
+    "update_skill_catalog": "skill",
+    # 执行器自己落审计（action 名不含审计关键字，Sidecar 不会自动采集）
+    "execute_ontology_action": "skill",
+    # ---- 本体实例 → 可执行工具绑定 ----
+    "list_tool_bindings": "ontology_tool_binding",
+    "list_bindable_tools": "ontology_tool_binding",
+    "create_tool_binding": "ontology_tool_binding",
+    "update_tool_binding": "ontology_tool_binding",
+    "delete_tool_binding": "ontology_tool_binding",
+    "resolve_action_execution": "ontology_tool_binding",
+    # 执行器代用户取执行计划（按知识库写权限判定）
+    "prepare_action_execution": "ontology_tool_binding",
+    # 知识库问答自动调用绑定工具（服务内自己落审计）
+    "ontology_call_tool": "ontology_tool_binding",
+    # 写图前调用抽取期工具（catalog: 声明；服务内自己落审计）
+    "ontology_extract_tool": "kb_tool",
+    # 编辑对象弹窗试跑抽取期工具声明（服务内自己落审计）
+    "preview_extract_tool": "kb_tool",
+    # ---- 知识库工具（KB 级工具目录）----
+    "list_kb_tools": "kb_tool",
+    "create_kb_tool": "kb_tool",
+    "update_kb_tool": "kb_tool",
+    "delete_kb_tool": "kb_tool",
+    "test_kb_tool": "kb_tool",
+    "run_kb_tool": "kb_tool",
     # ---- 知识库 → knowledge_info / document / folder / data_source / tag / synonym / service / space / chunk / parser_setting / compiled_schema / raw_content / editor_state / ontology_* ----
     "add_document_tag": "document",
     "cancel_search_feedback": "search_feedback",
@@ -337,6 +423,74 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "create_data_source": "data_source",
     "create_folder": "folder",
     "create_knowledge_info": "knowledge_info",
+    "create_lineage_edge": "lineage_edge",
+    # 血缘导入 / 读取 / OpenLineage 摄入（此前漏登记 ⇒ 审计资源列为空）
+    "import_lineage_file": "lineage_edge",
+    "list_lineage_edges": "lineage_edge",
+    "list_lineage_paths": "lineage_edge",
+    "ingest_lineage_event": "data_source",
+    # 禁止同查表对（roadmap #10）
+    "list_lineage_forbidden_pairs": "lineage_forbidden_pair",
+    "create_lineage_forbidden_pair": "lineage_forbidden_pair",
+    "update_lineage_forbidden_pair": "lineage_forbidden_pair",
+    "delete_lineage_forbidden_pair": "lineage_forbidden_pair",
+    "suggest_lineage_forbidden_pairs": "lineage_forbidden_pair",
+    # 标准资产（W2.2）：只登记写动作；读动作不产生审计
+    "create_standard_draft": "standard_asset",
+    "update_standard_draft": "standard_asset",
+    "publish_standard_asset": "standard_asset",
+    "retire_standard_asset": "standard_asset",
+    "delete_standard_draft": "standard_asset",
+    # 标准落标绑定（W2.6）：只登记写动作；读视图不产生审计
+    "standard_binding_create": "standard_binding",
+    "standard_binding_update": "standard_binding",
+    "standard_binding_delete": "standard_binding",
+    # Sidecar 用能力 action 名推导资源；两套命名都要登记。
+    "create_standard_binding": "standard_binding",
+    "update_standard_binding": "standard_binding",
+    "delete_standard_binding": "standard_binding",
+    # 数据合同（W2.3）：只登记写动作；读动作不产生审计
+    "create_data_contract_draft": "data_contract",
+    "update_data_contract_draft": "data_contract",
+    "publish_data_contract": "data_contract",
+    "retire_data_contract": "data_contract",
+    "delete_data_contract_draft": "data_contract",
+    "import_data_contract": "data_contract",
+    # 数据质量闭环（W2.5）：只登记写动作；读动作不产生审计
+    "quality_rule_create": "quality_rule",
+    "quality_rule_update": "quality_rule",
+    "quality_rule_delete": "quality_rule",
+    "quality_rule_import": "quality_rule",
+    "quality_run_create": "quality_run",
+    "quality_run_submit": "quality_run",
+    "quality_run_fail": "quality_run",
+    "quality_issue_assign": "quality_issue",
+    "quality_issue_status": "quality_issue",
+    "quality_issue_verify": "quality_issue",
+    "quality_issue_comment": "quality_issue",
+    # 数据治理控制面 P1（#11）
+    "list_governance_labels": "governance_label",
+    "create_governance_label": "governance_label",
+    "update_governance_label": "governance_label",
+    "delete_governance_label": "governance_label",
+    "list_governance_tags": "governance_tag",
+    "create_governance_tag": "governance_tag",
+    "update_governance_tag": "governance_tag",
+    "delete_governance_tag": "governance_tag",
+    "list_governance_clearance": "governance_clearance",
+    "set_governance_clearance": "governance_clearance",
+    "list_governance_policies": "governance_policy",
+    "create_governance_policy": "governance_policy",
+    "update_governance_policy": "governance_policy",
+    "delete_governance_policy": "governance_policy",
+    "list_governance_audit": "governance_label",
+    "evaluate_governance_policy": "governance_policy",
+    # 结构化数据资产投影与跨模态对齐（P1.5a/P1.5b）
+    "rebuild_ontology_data_assets": "data_source",
+    "list_ontology_data_assets": "data_source",
+    "suggest_ontology_alignments": "ontology_data_alignment",
+    "list_ontology_alignments": "ontology_data_alignment",
+    "set_ontology_alignment_status": "ontology_data_alignment",
     "create_ontology_instance": "ontology_instance",
     "create_ontology_relation": "ontology_relation",
     "create_parser_setting": "parser_setting",
@@ -349,6 +503,7 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "delete_document": "document",
     "delete_folder": "folder",
     "delete_knowledge_info": "knowledge_info",
+    "delete_lineage_edge": "lineage_edge",
     "delete_ontology_instance": "ontology_instance",
     "delete_ontology_relation": "ontology_relation",
     "delete_parser_setting": "parser_setting",
@@ -437,6 +592,7 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "toggle_search_feedback_adopted": "search_feedback",
     "update_data_source": "data_source",
     "update_knowledge_info": "knowledge_info",
+    "update_lineage_edge": "lineage_edge",
     "update_ontology_instance": "ontology_instance",
     "update_ontology_relation": "ontology_relation",
     "update_parser_setting": "parser_setting",
@@ -475,6 +631,15 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "recompile_llm_wiki_schema_outdated_documents": "compiled_schema",
     "list_wiki_contents": "compiled_schema",
     "get_wiki_page": "compiled_schema",
+    "list_wiki_scenarios": "compiled_schema",
+    "read_wiki_scenario_resources": "compiled_schema",
+    "select_wiki_scenario_resources": "compiled_schema",
+    "configure_wiki_scenario": "compiled_schema",
+    "run_wiki_scenario": "compiled_schema",
+    "review_wiki_scenario": "compiled_schema",
+    "read_wiki_scenario_materials": "compiled_schema",
+    "read_wiki_scenario_material": "compiled_schema",
+    "annotate_wiki_scenario": "compiled_schema",
     "export_compiled_schema_yaml": "compiled_schema",
     "import_compiled_schema_yaml": "compiled_schema",
     "preview_compiled_schema": "compiled_schema",
@@ -526,10 +691,28 @@ _RESOURCE_TO_ID_FIELD: dict[str, str] = {
     "document": "doc_id",
     "knowledge_info": "knowledge_base_id",
     "data_source": "ds_id",
+    "table": "asset_id",
+    "column": "asset_id",
+    "metric": "asset_id",
     "folder": "folder_id",
     "service": "service_id",
     "tag": "tag_id",
     "synonym": "synonym_id",
+    "lineage_edge": "edge_id",
+    "lineage_forbidden_pair": "pair_id",
+    "standard_asset": "asset_id",
+    "standard_binding": "binding_id",
+    "data_contract": "contract_id",
+    "quality_rule": "rule_id",
+    "quality_run": "run_id",
+    "quality_issue": "issue_id",
+    "governance_label": "label_id",
+    "governance_tag": "tag_id",
+    "governance_policy": "policy_id",
+    "governance_clearance": "user_id",
+    "ontology_data_alignment": "alignment_id",
+    "ontology_tool_binding": "binding_id",
+    "kb_tool": "tool_id",
     "prompt": "prompt_id",
     "provider": "provider_id",
     "adapter": "adapter_id",
@@ -578,6 +761,8 @@ _RESOURCE_NAME_LOOKUP: dict[str, tuple[str, str, str, str]] = {
     "folder": ("knowledge_base", "folders", "id", "name"),
     "tag": ("knowledge_base", "tags", "id", "name"),
     "synonym": ("knowledge_base", "ontology_synonyms", "id", "canonical"),
+    "ontology_tool_binding": ("knowledge_base", "ontology_tool_bindings", "id", "canonical_name"),
+    "kb_tool": ("knowledge_base", "kb_tools", "id", "name"),
     "service": ("knowledge_base", "services", "id", "name"),
     "service_api_key": ("knowledge_base", "service_api_keys", "id", "key_prefix"),
     "parser_setting": ("knowledge_base", "knowledge_parser_settings", "id", "parser_type"),

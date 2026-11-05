@@ -177,8 +177,30 @@ def _normalize_citations(raw) -> list:
             # 平台侧「引用 ↔ Wiki 页」定位依据
             "page_path": str(item.get("page_path") or ""),
             "evidence_ref": item.get("evidence_ref") or None,
+            # Keep engine-selected source attachments through B1 projection.
+            # Bytes are served separately after current permission checks.
+            "media_assets": [
+                {key: value for key, value in asset.items() if key in {
+                    "asset_id", "document_id", "bundle_sha", "path", "pdf_page", "image_idx",
+                    "author", "work_title", "caption", "label", "source_locator", "usage",
+                    "association_method", "visual_read_id", "actual_image_delivered",
+                }}
+                for asset in (item.get("media_assets") or [])[:3]
+                if isinstance(asset, dict) and asset.get("asset_id")
+                and asset.get("document_id") == doc_id
+            ],
         })
     return out
+
+
+def _compile_model(data: dict) -> str:
+    """[jonex] P3b（方案 B）：报文里的编译模型。
+
+    方案 B 只有一个事实源（平台的 `knowledge_model_settings`）：平台**发起任务时**
+    把当前配置的模型塞进报文，引擎只负责把它写进任务快照。这里不做任何兜底
+    ——空串就是"这次没指定"，编译期由 `ManifestBuilder` 回落部署 env。
+    """
+    return str((data or {}).get("model") or "").strip()
 
 
 _ACTIONS = {
@@ -191,6 +213,8 @@ _ACTIONS = {
     "get_wiki_backlinks", "get_wiki_claims",
     # [jonex] Wiki 阅读目录（读/起草/调整，目录功能下沉到引擎）
     "list_wiki_outline", "draft_wiki_outline", "adjust_wiki_outline",
+    # [jonex] 编译前预检：本库哪些产物需要重新解析（只读，供平台在派编译之前拦住）
+    "parse_status", "query_graph", "query_resources", "scenario",
 }
 
 
@@ -227,6 +251,20 @@ class JonexWikiCapability(BaseCapability):
     async def shutdown(self) -> None:
         if self._app is not None:
             await self._app.stop()
+
+    def register_routes(self, app) -> None:
+        from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse
+        from jonex_wiki.api.routers.resource_media import router
+        from jonex_wiki.kernel.errors import DomainError
+        sub = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+        sub.state.app = self._app
+        sub.state.settings = self._app.settings
+        @sub.exception_handler(DomainError)
+        async def domain_error(request: Request, exc: DomainError):
+            return JSONResponse(status_code=exc.http_status, content={"error": {"code": exc.code, "message": str(exc)}})
+        sub.include_router(router)
+        app.mount("/reader", sub)
 
     async def validate_input(self, request: CapabilityRequest) -> bool:
         action = request.payload.get("action", "")
@@ -287,17 +325,24 @@ class JonexWikiCapability(BaseCapability):
         if action == "init_kb":
             # jonex_wiki KB 隐式:首次 ingest 即建,无显式 init
             return {"initialized": True}
+        # [jonex] P3b（方案 B）：`data["model"]` = 平台在发起时给的编译模型。
+        # 引擎只在**建任务**时把它写进任务快照，不落任何 KB 级配置；缺省即空串
+        # ⇒ 编译期回落部署 env。所有会顺带排编译的动作都要带上，否则那条链路
+        # 建出来的任务就没有模型（用户看到"配了不生效"）。
         if action == "compile_parsed_documents":
-            return await app.ingest_parsed_documents(tenant_id, kb_id, data["documents"])
+            return await app.ingest_parsed_documents(tenant_id, kb_id, data["documents"],
+                                                    compile_model=_compile_model(data))
         if action == "compile_parsed_document":
             return await app.ingest_parsed_document(tenant_id, kb_id, data["source_path"],
-                                                    data["source_name"], data.get("document_id"))
+                                                    data["source_name"], data.get("document_id"),
+                                                    compile_model=_compile_model(data))
         if action == "query":
             return await self._query_sync(app, tenant_id, kb_id,
                                           str(data.get("question") or ""),
                                           bool(data.get("return_trace")),
                                           thinking_mode=data.get("thinking_mode", "fast"),
-                                          progress_session=data.get("progress_session"))
+                                          progress_session=data.get("progress_session"),
+                                          query_context=data.get('query_context'))
         if action == "resolve_evidence":
             from jonex_wiki.adapters.evidence_view import resolve_evidence
             return await resolve_evidence(app, tenant_id, kb_id, data["query_id"], data["handle"])
@@ -307,13 +352,16 @@ class JonexWikiCapability(BaseCapability):
                 raise ValueError("Query does not belong to this knowledge base")
             return await app.cancel_task(tenant_id, data["query_id"])
         if action == "remove_document":
-            return await app.remove_document(tenant_id, kb_id, data["document_id"])
+            return await app.remove_document(tenant_id, kb_id, data["document_id"],
+                                             compile_model=_compile_model(data))
         if action == "get_document_chunks":
             return await app.get_document_chunks(tenant_id, kb_id, data["document_id"])
         if action == "reparse":
-            return await app.reparse_document(tenant_id, kb_id, data["document_id"])
+            return await app.reparse_document(tenant_id, kb_id, data["document_id"],
+                                              compile_model=_compile_model(data))
         if action == "recompile":
-            return await app.recompile_document(tenant_id, kb_id, data["document_id"])
+            return await app.recompile_document(tenant_id, kb_id, data["document_id"],
+                                                compile_model=_compile_model(data))
         if action == "list_wiki_contents":
             # [jonex] view=counts：只要三类页数（编译资产 tab 的统计卡/tab 计数
             # 只用到数字，没必要把上千个页面对象搬回去）。缺省仍返回页面条目。
@@ -326,6 +374,29 @@ class JonexWikiCapability(BaseCapability):
             return await app.list_pages(tenant_id, kb_id)
         if action == "read_page":
             return await self._read_page(app, tenant_id, kb_id, str(data.get("path") or ""))
+        if action == "query_graph":
+            from jonex_wiki.domain.reading.graph_service import QUERY_FIELDS
+            operation = str(data.get("operation") or "")
+            if operation not in QUERY_FIELDS:
+                from jonex_wiki.kernel.errors import ValidationError
+                raise ValidationError("未知图查询操作")
+            return await app.query_graph(tenant_id, kb_id, operation,
+                **{key: data[key] for key in QUERY_FIELDS[operation] if key in data})
+        if action == "scenario":
+            service = app.scenario_service()
+            operation = str(data.get("operation") or "")
+            options = data.get("options", {})
+            if not isinstance(options, dict):
+                from jonex_wiki.kernel.errors import ValidationError
+                raise ValidationError("SCENARIO_OPTIONS_INVALID")
+            if operation == "list":
+                return await service.list(tenant_id, kb_id)
+            if operation == "configure":
+                return await service.configure(tenant_id, kb_id, data.get("scenario_id"), options, str(data.get("actor") or ""))
+            return await service.operation(tenant_id, kb_id, data.get("scenario_id"), operation, options, str(data.get("actor") or ""))
+        if action == "query_resources":
+            return await app.query_resources(tenant_id, kb_id, str(data.get("operation") or ""),
+                data.get("options") or {})
         if action == "list_graph":
             return await self._list_graph(app, tenant_id, kb_id,
                                           str(data.get("document_id") or ""))
@@ -355,6 +426,10 @@ class JonexWikiCapability(BaseCapability):
             return await app.cancel_task(tenant_id, data["task_id"])
         if action == "compilation_state":
             return await app.compilation_state(tenant_id, kb_id)
+        if action == "parse_status":
+            # 只读预检：每份文档 current/stale/legacy/missing/invalid，过期时还带
+            # drift（identity 里到底哪一项变了），供平台在派编译之前把话说清楚。
+            return await app.parse_status(tenant_id, kb_id)
         if action in ("pause_compilation", "resume_compilation"):
             return await app.set_compilation_paused(tenant_id, kb_id, action == "pause_compilation")
         if action == "apply_schema":
@@ -365,7 +440,8 @@ class JonexWikiCapability(BaseCapability):
 
     async def _query_sync(self, app, tenant_id: str, kb_id: str,
                           question: str, want_trace: bool,
-                          *, thinking_mode: str | None = None, progress_session: str | None = None) -> dict:
+                          *, thinking_mode: str | None = None, progress_session: str | None = None,
+                          query_context: dict | None = None) -> dict:
         """[jonex] 引擎 query 是异步任务(app.query 返回 task_id)，这里提交后同步等待完成。
 
         投影为平台契约，服务三条消费线（平台 /search/jonex_wiki）：
@@ -376,8 +452,10 @@ class JonexWikiCapability(BaseCapability):
                         已做白名单投影的检索/阅读轨迹（检索词、候选页、实读页），
                         spans 是 CR-TRACE-002 公开时间线（工具/模型/证据/合成 + 耗时）。
         """
-        task = (await app.query(tenant_id, kb_id, question) if thinking_mode is None else
-                await app.query(tenant_id, kb_id, question, thinking_mode=thinking_mode))
+        options = {'thinking_mode':thinking_mode} if thinking_mode is not None else {}
+        if query_context is not None:
+            options['query_context'] = query_context
+        task = await app.query(tenant_id, kb_id, question, **options)
         task_id = str(task.get("task_id") or "") if isinstance(task, dict) else ""
         if not task_id:
             raise RuntimeError("jonex_wiki query: missing task_id")
@@ -639,6 +717,10 @@ class JonexWikiCapability(BaseCapability):
             "limitations": [str(x) for x in (index.get("limitations") or [])][:10],
             "interpretation_status": index.get("interpretation_status"),
             "source_ids": page.get("source_ids") or [],
+            "images": res.get("images") or [],
+            "images_total": res.get("images_total") or 0,
+            "bundle_sha": res.get("bundle_sha"),
+            "image_error": res.get("image_error"),
             # 列式视图（时间轴矩阵）：表格页的列名 + 所在工作表范围
             "fields": [str(f) for f in (index.get("fields") or [])][:40],
             "scope": index.get("scope") if isinstance(index.get("scope"), dict) else {},
@@ -665,6 +747,7 @@ class JonexWikiCapability(BaseCapability):
             # ── 页面级 References（源文档溯源）──
             "references": references,
             "content": res.get("body") or "",
+            "table_data": res.get("table_data"),
         }
 
     async def _get_backlinks(self, app, tenant_id: str, kb_id: str, path: str,
@@ -754,10 +837,18 @@ class JonexWikiCapability(BaseCapability):
         prompt version(首写为 1)是两套独立版本空间。这里先读引擎当前 prompt——
         source=default(version=None)时按新建传 0,否则传实际 version。
         """
+        # [jonex] P3b（方案 B）：schema 里带来的 `config.model` 也只是**本次任务**
+        # 的模型，随 put_prompt 一起进这次重编任务，不在引擎侧存任何配置副本。
+        config = data.get("config")
+        compile_model = ""
+        if isinstance(config, dict):
+            compile_model = _compile_model(config)   # 键名对齐：config{"model": ...}
+
         schema_version = int(data.get("schema_version") or 0)
         current = await self._app.get_prompt(tenant_id, kb_id, _SCHEMA_PROMPT_KEY)
         expected_version = 0 if current["version"] is None else current["version"]
         prompt = await self._app.put_prompt(tenant_id, kb_id, _SCHEMA_PROMPT_KEY,
-                                            data["agents_md"], expected_version)
+                                            data["agents_md"], expected_version,
+                                            compile_model=compile_model)
         return {"applied": True, "schema_version": schema_version,
                 "prompt_key": _SCHEMA_PROMPT_KEY, "prompt": prompt}

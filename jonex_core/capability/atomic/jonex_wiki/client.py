@@ -17,7 +17,13 @@ class JonexWikiClient(ABC):
                                       tenant_id: str, kb_id: str) -> dict: ...
 
     async def compile_parsed_documents(self, kb_name: str, documents: list[dict],
-                                       tenant_id: str, kb_id: str) -> dict:
+                                       tenant_id: str, kb_id: str,
+                                       *, model: str = "") -> dict:
+        """[jonex] P3b（方案 B）：``model`` = **本次编译任务**要用的模型。
+
+        空串 = 本次不指定 ⇒ 引擎回落部署默认。平台只在发起任务时给值，
+        引擎不存任何 KB 级配置副本。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -36,10 +42,19 @@ class JonexWikiClient(ABC):
 
     @abstractmethod
     async def query(self, kb_name: str, question: str, tenant_id: str, kb_id: str,
-                    return_trace: bool = False, thinking_mode: str | None = None) -> dict: ...
+                    return_trace: bool = False, thinking_mode: str | None = None, query_context: dict | None = None) -> dict: ...
 
     @abstractmethod
     async def status(self, kb_name: str, tenant_id: str, kb_id: str) -> dict: ...
+
+    async def query_graph(self, tenant_id: str, kb_id: str, operation: str, **options) -> dict:
+        raise NotImplementedError
+
+    async def scenario(self, tenant_id: str, kb_id: str, operation: str, scenario_id: str = "", options: dict | None = None, *, actor: str = "") -> dict:
+        raise NotImplementedError
+
+    async def query_resources(self, tenant_id: str, kb_id: str, operation: str, options: dict) -> dict:
+        raise NotImplementedError
 
     @abstractmethod
     async def list_graph(self, kb_name: str, tenant_id: str, kb_id: str,
@@ -82,6 +97,21 @@ class JonexWikiClient(ABC):
     async def recompile(self, kb_name: str, tenant_id: str, kb_id: str,
                         doc_name=None, all_docs: bool = False) -> dict: ...
 
+    @abstractmethod
+    async def parse_status(self, kb_name: str, tenant_id: str, kb_id: str) -> dict:
+        """编译前预检（只读）：哪些文档的解析产物已过期、过期在哪一项。
+
+        返回 ``{"kb_id", "documents": [{document_id, source_name,
+        content_generation, status, needs_reparse, severity, drift, blocking,
+        warnings, refresh_method}], "needs_reparse_count", "warning_count"}``。
+
+        ``drift`` 是全部漂移项（诊断用）；``blocking`` 是其中真正阻断编译的子集
+        （产物版本 / 打包预算 / 体检策略 / 文本编码 / MinerU 版本）；``warnings``
+        是**软门**漂移（解析代码重构、注释、规则清单增删）——只告警，不算
+        ``needs_reparse``，也不触发自动重解析。``status`` 为 ``current`` 且
+        ``warnings`` 非空时 ``severity == "warn"``。
+        """
+
 
 class RemoteJonexWikiClient(JonexWikiClient):
     """通过 Sidecar /invoke 调用 jonex_wiki 适配器容器（生产用）。"""
@@ -123,7 +153,7 @@ class RemoteJonexWikiClient(JonexWikiClient):
             machine = {"engine_error_code": err_code}
             if err_code in ("not_found",):
                 raise ResourceNotFoundError(message=message, details=machine)
-            if err_code in ("conflict", "validation", "missing_tenant", "MISSING_PARAM"):
+            if err_code in ("conflict", "validation", "validation_failed", "missing_tenant", "MISSING_PARAM"):
                 raise InvalidParameterError(message=message, details=machine)
             raise RuntimeError(f"Jonex Wiki invoke failed: {message}")
         return result["data"]
@@ -131,14 +161,20 @@ class RemoteJonexWikiClient(JonexWikiClient):
     async def init_kb(self, kb_name, tenant_id, kb_id):
         return await self._invoke("init_kb", {"kb": kb_name}, tenant_id, kb_id)
 
-    async def compile_parsed_document(self, kb_name, parsed_artifact, tenant_id, kb_id):
+    async def compile_parsed_document(self, kb_name, parsed_artifact, tenant_id, kb_id,
+                                      *, model: str = ""):
         """入库平台已解析产物。parsed_artifact = {source_path, source_name, document_id}。"""
-        return await self._invoke("compile_parsed_document", {"kb": kb_name, **parsed_artifact},
-                                  tenant_id, kb_id)
+        data = {"kb": kb_name, **parsed_artifact}
+        if model:
+            data["model"] = model
+        return await self._invoke("compile_parsed_document", data, tenant_id, kb_id)
 
-    async def compile_parsed_documents(self, kb_name, documents, tenant_id, kb_id):
-        return await self._invoke("compile_parsed_documents", {"kb": kb_name, "documents": documents},
-                                  tenant_id, kb_id)
+    async def compile_parsed_documents(self, kb_name, documents, tenant_id, kb_id,
+                                       *, model: str = ""):
+        data = {"kb": kb_name, "documents": documents}
+        if model:
+            data["model"] = model
+        return await self._invoke("compile_parsed_documents", data, tenant_id, kb_id)
 
     async def apply_schema(self, kb_name, tenant_id, kb_id, *, schema_version, config, agents_md):
         return await self._invoke("apply_schema", {
@@ -157,11 +193,12 @@ class RemoteJonexWikiClient(JonexWikiClient):
         return await self._invoke("delete_kb", {"kb": kb_name}, tenant_id, kb_id)
 
     async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False,
-                    thinking_mode: str | None = None, progress_session: str | None = None):
+                    thinking_mode: str | None = None, progress_session: str | None = None, query_context: dict | None = None):
         return await self._invoke("query", {
             "kb": kb_name, "question": question, "return_trace": return_trace,
             **({"progress_session": progress_session} if progress_session else {}),
             **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
+            **({'query_context':query_context} if query_context is not None else {}),
         }, tenant_id, kb_id)
 
     async def status(self, kb_name, tenant_id, kb_id):
@@ -171,6 +208,16 @@ class RemoteJonexWikiClient(JonexWikiClient):
         action = ("compilation_state" if paused is None else
                   "pause_compilation" if paused else "resume_compilation")
         return await self._invoke(action, {}, tenant_id, kb_id)
+
+    async def query_graph(self, tenant_id, kb_id, operation, **options):
+        return await self._invoke("query_graph", {"operation": operation, **options}, tenant_id, kb_id)
+
+    async def scenario(self, tenant_id, kb_id, operation, scenario_id="", options=None, *, actor=""):
+        return await self._invoke("scenario", {"operation": operation, "scenario_id": scenario_id,
+            "options": options or {}, "actor": actor}, tenant_id, kb_id)
+
+    async def query_resources(self, tenant_id, kb_id, operation, options):
+        return await self._invoke("query_resources", {"operation": operation, "options": options}, tenant_id, kb_id)
 
     async def list_graph(self, kb_name, tenant_id, kb_id, document_id: str = ""):
         return await self._invoke("list_graph", {"kb": kb_name, "document_id": document_id},
@@ -226,6 +273,9 @@ class RemoteJonexWikiClient(JonexWikiClient):
             "kb": kb_name, "doc_name": doc_name, "all_docs": all_docs,
         }, tenant_id, kb_id)
 
+    async def parse_status(self, kb_name, tenant_id, kb_id):
+        return await self._invoke("parse_status", {"kb": kb_name}, tenant_id, kb_id)
+
 
 class MockJonexWikiClient(JonexWikiClient):
     """测试桩（与 MockOpenKBClient 对齐）。"""
@@ -257,6 +307,9 @@ class MockJonexWikiClient(JonexWikiClient):
     async def compilation_state(self, *a, **kw):
         return {"kb_id": kw.get("kb_id", ""), "paused": False,
                 "parsed_source_count": 0, "published_source_count": 0, "tasks": []}
+
+    async def parse_status(self, *a, **kw):
+        return {"kb_id": kw.get("kb_id", ""), "documents": [], "needs_reparse_count": 0}
 
 
 def get_jonex_wiki_client(capability_id: str = "atomic.jonex_wiki.v1") -> JonexWikiClient:

@@ -75,6 +75,14 @@ async def ensure_ontology_schema() -> None:
         )
         logger.info("Neo4j 本体实体名索引就绪 ont_entity_name")
 
+        # P1.5a：数据资产 schema 子图（独立 label，与 OntologyEntity 完全隔离）
+        await session.run(
+            "CREATE CONSTRAINT ds_entity_key IF NOT EXISTS "
+            "FOR (e:DataSourceEntity) "
+            "REQUIRE (e.tenant_id, e.kb_id, e.data_source_id, e.table) IS UNIQUE"
+        )
+        logger.info("Neo4j 数据资产唯一约束就绪 ds_entity_key")
+
         # 读取现有全文索引的 analyzer
         index_exists = False
         existing_analyzer: Optional[str] = None
