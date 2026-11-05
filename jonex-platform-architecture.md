@@ -1,6 +1,6 @@
 # Jonex 平台系统架构设计文档
 
-> 更新时间：2026-07-15
+> 更新时间：2026-10-27
 > 版本：0.5.0
 > 文档定位：稳定架构说明。项目议题、风险和后续演进记录见 [PROJECT_ISSUES_AND_TODO.md](PROJECT_ISSUES_AND_TODO.md)。
 
@@ -86,7 +86,7 @@ PostgreSQL / Redis / Neo4j / Milvus / etcd / MinIO / Keycloak（SSO，独立仓�
 | `api_gateway` | `8000` | 外部 API 路由聚合、CORS、request id、基础日志、协议适配。 |
 | `sidecar` | `8001` | 认证、租户上下文、内部 JWT、治理 hook、能力代理、流式代理。 |
 | `llm-gateway` | `8787` | OpenAI 兼容代理，统一 LLM/Embedding 出口、Token 计量（Redis 实时 + PG 明细）。 |
-| `knowledge-base-service` | `8003` | 知识库、文档状态机、RAG 接入、Neo4j 本体图、增强搜索、数据源接入。 |
+| `knowledge-base-service` | `8003` | 知识库、文档状态机、RAG 接入、Neo4j 本体图、增强搜索、数据源接入、血缘边（手工 / 文件 / OpenLineage）、结构化数据资产投影与跨模态对齐。 |
 | `atomic-rag` | `8004` | 多模态解析、RAG 任务、LightRAG 调用、`ontology_data` 产出。 |
 | `business-domain-service` | `8005` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
 | `task-center-service` | `8007` | 任务编排（定义 / 版本 / 发版）、触发、任务与子任务调度。**自己不监听任何 HTTP 业务端点**：只收发对内的函数调用，并出站派活给运行方。对前端唯一的入口是 Gateway 的 `/api/v1/task-center/**`（经 Sidecar `/invoke`），共八个：四个只读（任务列表 / 子任务列表 / 任务详情 / 子任务详情，两个详情与各自的列表行同形）加四个写接口（停止任务 / 停止子任务 / 重试任务 / 重试子任务，统一判 `task_center:write`）；删除 / 详情不开。 |
@@ -257,8 +257,33 @@ capabilities/{capability_name}/
 |---|---|
 | `platform` | 登录、用户、角色、权限、菜单、应用、审计、任务调度。 |
 | `business_domain` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
-| `knowledge_base` | 知识库、文档状态机、检索历史、RAG 接入、Neo4j 本体图、增强搜索、数据源接入。 |
+| `knowledge_base` | 知识库、文档状态机、检索历史、RAG 接入、Neo4j 本体图、增强搜索、数据源接入、血缘边（手工 / 文件 / OpenLineage）、结构化数据资产投影与跨模态对齐。 |
 | `task_center` | 任务编排定义与版本（草稿→发布，发布后不可变）、触发、任务 / 子任务 / 尝试记录（任务的**来源**记在 `tasks.task_source`，取值是协议层 `TASK_SOURCES` 写死枚举 —— 运行方经 `init_task` 发起时必传，平台侧自己触发的任务留空），以及后台派活与超时巡检。是**管理方**：自己不执行任何一步业务动作、自己不监听 HTTP 端点；对浏览器**只经 Gateway `/api/v1/task-center/**` 开八个口子**（四个只读 + 四个写，见上表 `task-center-service` 那一行）。 |
+
+### 4.4 服务间请求头契约（X-Jonex-*）
+
+平台内部调用 LLM / Embedding 时，调用方（能力服务、LightRAG、OpenKB 等）用 `X-Jonex-*` 请求头把计量与追踪上下文带给 llm-gateway。**本节是这些头的唯一清单**，其他文档只引用本节，不重复维护枚举。
+
+| 头名 | 可选性 | 方向 | 语义 | 生产者 | 消费者 | 校验 |
+|---|---|---|---|---|---|---|
+| `X-Jonex-Tenant-Id` | 可选；缺失按 `unknown` 解析 | 调用方 → llm-gateway | 调用归属租户 | 各 LLM/Embedding 调用点（`ontology_llm` / `ontology_embedding` / `rerank` / `vision_llm` / LightRAG、OpenKB 适配层） | llm-gateway `MeteringContext`、监控采集 | 网关只解析记录，不据此鉴权；采集侧要求合法业务租户，`unknown`、空串及 `default` / `system` 等整条丢弃（不造假租户） |
+| `X-Jonex-User-Id` | 可选 | 调用方 → llm-gateway | 发起调用的用户标识，写入计量明细；监控采集据此写稳定标识 `user:<本地用户主键>`（非本地主键则原样保留） | 知晓用户的调用点（`ontology_llm`、`rerank`、`vision_llm` 等） | llm-gateway、监控采集 | 仅计量/展示，不参与鉴权；缺失时监控 `source` 记 `platform` |
+| `X-Jonex-Username` | 可选 | 调用方 → llm-gateway（与 `X-Jonex-User-Id` 并列） | 用户名字面值，仅作展示 / 前向兼容保留；**不参与监控 `source` 生成** | 可选透传的业务调用点 | llm-gateway | trim 后 1..128 字符、仅 ASCII 可打印字符；保留字 `platform` / `anonymous` / `unknown` 无效；**仅在存在合法 `X-Jonex-User-Id` 时采纳**；不参与鉴权、租户判定或授权 |
+| `X-Jonex-Scene` | 可选；缺失按 `unknown` | 调用方 → llm-gateway | 计量场景标签（如 `ontology_qa` / `lightrag_extract` / `openkb_query`） | 各调用点 | llm-gateway、监控采集（按 `MONITOR_SYSTEM_SCENES` 判定 `trigger_type`） | 未登记场景不影响记账；缺失归 `unknown`，监控触发方兜底为 `user` |
+| `X-Jonex-Kb-Id` | 可选 | 调用方 → llm-gateway | 知识库维度 | 知识库链路调用点（`ontology_*`、LightRAG 适配层） | llm-gateway | 仅计量维度；网关不做知识库存在性/归属校验（由上游业务链负责），缺失记空 |
+| `X-Jonex-Doc-Id` | 可选 | 调用方 → llm-gateway | 文档维度 | 本体抽取、重排、文档向量化等调用点 | llm-gateway | 同上，仅计量维度 |
+| `X-Jonex-Trace-Id` | 可选；缺失兼容回落 `X-Request-ID` | 调用方 → llm-gateway | 链路追踪 ID，一次业务请求内不变，用于把该请求下的多次 LLM 调用归组 | 任务 / 问答入口生成并全链路透传 | llm-gateway（派生 `request_id`）、监控采集 | 网关只做归组；监控列宽 64，超长整条丢弃 |
+| `X-Jonex-Request-Id` | 可选 | 调用方 → llm-gateway | 计量幂等键 | 调用方需要自控幂等时显式透传 | llm-gateway（`metering.llm_usage_log` 去重） | 显式值优先、截断 64 字符；缺失由网关按 `trace_id` + 规范化请求体哈希确定性派生。调用方若显式给值，重试时必须稳定（勿每次随机） |
+
+约束与口径：
+
+- **信任级别**：`X-Jonex-*` 全部只是**计量/展示上下文**，不参与鉴权、租户判定或授权。身份与租户的权威来源仍是 Gateway / Sidecar 的认证链与内部 token。
+- **不出网关**：`upstream_headers()` 对上游 LLM 采用白名单重建，只发 `Authorization`、固定 `Content-Type` 和可选 `User-Agent`；所有 `X-Jonex-*` **不会转发给上游 LLM**。
+- **采集侧租户口径**：`tenant_id` 必填且必须是合法业务租户；空串、`default`、`default_tenant`、`system` 与兜底字面量 `unknown` 一律整条丢弃，不做假租户兜底。
+- **采集与读侧口径**：`monitor.call_log.source` 由两个采集点统一写**稳定标识** `user:<本地用户主键>`（`jonex_core/common/monitor_identity.py` 的 `format_user_identity`），非用户调用方保留 `apikey` / `platform` / `anonymous` / `unknown` 等系统标识；**不写用户名** —— 用户名可变，写进记录后改名会让同一个人分裂成两条来源。展示名只在读侧解析：按**每行自身 `tenant_id`** 查 `platform.users`（`capabilities/platform/repository/monitor_caller.py`），`user:<id>` 与裸数字等价，匹配顺序 `id` → `external_id` → `upstream_subject` → `username`（历史用户名形态兜底归并到同一用户）；`is_deleted = 0` 为有效，**已软删用户不参与解析命中**。解析不改变调用归属：租户始终取请求头，不从 `users` 反推。
+- **存量形态归一**：历史数据里的用户名与裸数字形态由 `deploy/postgres/update/083_monitor_call_log_source_to_user_identity.sql` 回刷为 `user:<id>`；回刷按行自身 `tenant_id` 匹配活跃用户，系统标识、空串与解析不到的行保持原值，已是 `user:<id>` 的行原样跳过（可重跑）。迁移须在采集端全部升级后执行，否则旧采集端会把旧形态写回来。
+
+> 观察时刻 2026-10-28：`X-Jonex-Tenant-Id` / `User-Id` / `Scene` / `Kb-Id` / `Doc-Id` / `Trace-Id` / `Request-Id` 已在 `jonex_core/llm_gateway/context.py` 解析落地；`X-Jonex-User-Id` 经 `format_user_identity` 转为监控 `source` 的稳定标识；`X-Jonex-Username` 仅解析入 `MeteringContext`，不再驱动 `source` 生成或回写。
 
 ---
 
@@ -434,6 +459,41 @@ knowledge-base 在「文件上传」之外支持多种数据源接入方式，KB
 - 凭据安全：外部 API token、S3 ak/sk 经 `jonex_core/common/crypto.py`（Fernet 对称加密）落库，列表/详情接口脱敏为 `***`。
 - 一期范围：仅「立即同步」（定时同步需调度 worker，列为后续）、存储仅 MinIO/S3、API 仅 REST+JSON。
 - 设计与逐文件执行计划见 `docs/knowledge-base-data-access-methods-plan.md`、`docs/data-access-backend-execution-plan.md`、`docs/data-access-frontend-execution-plan.md`。
+
+### 5.5 血缘、ETL 与结构化数据本体
+
+血缘与结构化数据元数据是**平台自有数据**：外部数据平台（Open Metadata / DataHub / OpenLineage）只作为事件来源适配器，内容本身落在平台 PostgreSQL（权威）并由 Neo4j 投影为派生子图。
+
+**来源与存储**
+
+| 来源 | 入口 | `origin` | 说明 |
+|---|---|---|---|
+| 手工录入 | KB 设置 → Lineage 页签（`/lineage-edges` CRUD） | `manual` | 列级强制校验，逐条编辑，重复边 1001 / 缺失 1002 |
+| 文件导入 | `POST /data-sources/{ds_id}/lineage-import`（JSON/CSV） | `platform` | 与 OpenLineage 同档（机器导入的结构性证据）；单次 `LINEAGE_IMPORT_MAX_ROWS`（默认 5000）行上限 |
+| OpenLineage 事件 | `POST /api/v1/knowledge-base/lineage/ingest/{ds_id}` + `X-Ingest-Key` 或 `Authorization: Bearer <key>` | `platform` | ETL 数据源（`access_type=etl`）的一次性 ingest key；幂等 upsert |
+| 编译 schema / join 发现 | per-source compiled schema、外键/join 发现 | 按编译产物声明（declared/comment/value/derived） | 低置信来源**不覆盖** manual/declared/comment |
+
+- 表 `knowledge_base.lineage_edges`（migration 010 + 012）：列级端点非空、`origin` 白名单、部分唯一索引保证同一四元组只有一条活边；`last_seen_at` 记录来源最后一次确认时间。
+- `origin` 置信阶梯：declared/manual 1.0 > comment 0.8 > platform 0.6 > value 0.4 > derived 0.2。
+- **失效标记**：`origin=platform` 且 `last_seen_at` 超过 `LINEAGE_STALE_AFTER_DAYS`（默认 30 天）⇒ 读取时标 `stale=true`（不删除、不写回；重复导入/OpenLineage 摄入刷新新鲜度）。本表是有向列级数据流，不做「无向边按 FQN 排序去重」。
+
+**结构化数据入本体（独立 label）**
+
+- 投影器 `services/ontology_data_projection.py` 把 per-source **active compiled schema** + 血缘边写成 Neo4j `DataSourceEntity` 子图：表=节点（复合唯一 `tenant_id,kb_id,data_source_id,table`）、列=`attributes`、血缘=表级 `DERIVED_FROM` 边 + `column_map`。
+- 使用独立 label 而非复用 `OntologyEntity`，与文档本体（ABox）在全部查询/统计/匹配面上物理隔离。
+- 触发点：编译、ETL/文件导入、OpenLineage 入库、单边 CRUD、数据源删除、文档图改写；全部 best-effort（失败只记日志）。开关 `ONTOLOGY_DATA_PROJECTION_ENABLED`；手工重建 `POST /ontology/data-assets/rebuild`，只读查询 `GET /ontology/data-assets`（全图快照或 `table` 锚点子图）。
+- **文档实体 ↔ 数据表对齐**：`knowledge_base.ontology_data_alignment`（migration 011）记录 `(doc_type, data_source_id, entity_name)` 三元组的人审状态 `proposed|active|rejected`。只有 `active` 才投影为 `MAPS_TO` 边（`OntologyEntity.canonical_name=doc_type → DataSourceEntity.table`）。文档侧 `doc_type` 必须取**存储的 KB 级 compiled schema 行**（`data_source_id IS NULL`），不能走会返回抽象投影的 `get_compiled_schema`。
+
+**消费面**
+
+- 本体问答解释块（A 用法）：命中实体经 `concept_sources → compiled schema source_object_id → walk` 装配 `data_lineage` 上下游；只在 `source == "ontology"` 且 `LINEAGE_ANSWER_ENABLED` 时出现，fail-open。
+- ② NL→SQL：join 图 / 多跳路径评分复用血缘边池。
+- 前端画布：KB 设置 Lineage 页签的 List / Graph 视图，按锚点分层展示多跳图，`truncated`（节点 ≤200 / 边 ≤400）、`unknown` 显式；路径高亮由 `GET /ontology/lineage-paths` 提供（join + lineage 同源边池，`reversed` 标注 data-flow 逆序）。
+
+**约束**
+
+- 全程不产生 1003/409：非法参数 1001、资源缺失 1002。
+- Neo4j 是派生物：硬删 PG 血缘行后必须跑一次 rebuild 收敛投影；当前无后台定时刷新。
 
 ---
 
@@ -698,7 +758,7 @@ jonex-platform/
 │   ├── docker-compose.debug.yml                   # 宿主机后端/RAG 单服务调试覆盖
 │   ├── docker-compose.mac.yml                     # macOS CPU 开发覆盖
 │   ├── docker-compose.gpu.yml                     # GPU/服务器部署覆盖
-│   ├── start_capability.py                        # capability service 通用启动入口
+│   ├── start_capability.py                        # capability service 通用启动入口（含 MonitorCollector 启停）
 │   ├── .env.example                               # 平台部署环境变量示例
 │   ├── .env.rag.example                           # RAG/LightRAG 环境变量示例
 │   ├── README.md                                  # 部署指南
@@ -841,9 +901,9 @@ jonex-platform/
 | LLM 网关上游路由 | `jonex_core/llm_gateway/upstream.py` | 上游 host/key 解析、流式/非流式转发 |
 | LLM 网关计量记录器 | `jonex_core/llm_gateway/recorder.py` | 三路落地：Redis 实时 + PG 批量 + 结构化日志 |
 | LLM 网关 usage 抽取 | `jonex_core/llm_gateway/metering.py` | 从 chat/embedding/流式响应提取 token 用量 |
-| LLM 网关上下文 | `jonex_core/llm_gateway/context.py` | 从 X-Jonex-* 请求头解析计量上下文 |
+| LLM 网关上下文 | `jonex_core/llm_gateway/context.py` | 从 X-Jonex-* 请求头解析计量上下文（契约见 §4.4）；`X-Jonex-Username` 仅解析保留，不参与监控 `source` 生成 |
 | LLM 网关认证 | `jonex_core/llm_gateway/auth.py` | Token Swap 中间件：校验内部 token → 注入上游 key |
-| 能力服务启动脚本 | `deploy/start_capability.py` | 动态加载能力类 + 服务发现注册 + 心跳 |
+| 能力服务启动脚本 | `deploy/start_capability.py` | 动态加载能力类 + 监控采集器启停 + 服务发现注册 + 心跳 |
 | 本体图仓储 | `capabilities/knowledge_base/repository/ontology_graph_repository.py` | Neo4j Cypher MERGE + 全文检索 + 邻域查询 |
 | Neo4j 客户端 | `jonex_core/common/neo4j_client.py` | Neo4j 异步驱动单例 + schema 初始化 |
 | 本体问答 LLM | `jonex_core/common/ontology_llm.py` | `answer_from_facts()` 基于图谱事实回答 |

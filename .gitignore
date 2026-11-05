@@ -319,6 +319,12 @@ certs/
 # 视频/OCR 部署栈（内部环境专用，不入库）
 /deploy/ocr-stack/
 /deploy/mineru-video/
+# 其它内部部署 / 测试栈与内部报告（不入库）
+/deploy/offline/
+/deploy/airflow-test/
+/deploy/overlays/
+/deploy/engines-sim/
+/documents/
 # frontends/ 下的误提交杂项
 /frontends/_tc.txt
 # frontends/ 内部文档（设计/i18n 计划等，不入库）

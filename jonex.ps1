@@ -692,7 +692,16 @@ switch ($Command) {
         } else {
             Write-Host "Jonex Wiki 配置已存在: deploy\.env.jonex_wiki" -ForegroundColor Yellow
         }
-        Write-Host "下一步: 按需修改 deploy\.env、deploy\.env.rag、deploy\.env.mcp、deploy\.env.openkb 和 deploy\.env.jonex_wiki" -ForegroundColor Yellow
+
+        $envOntologyCompileFile = Join-Path $DeployDir ".env.ontology_compile"
+        $envOntologyCompileExample = Join-Path $DeployDir ".env.ontology_compile.example"
+        if (-not (Test-Path $envOntologyCompileFile)) {
+            Copy-Item $envOntologyCompileExample $envOntologyCompileFile
+            Write-Host "已创建 Ontology Compile 配置: deploy\.env.ontology_compile" -ForegroundColor Green
+        } else {
+            Write-Host "Ontology Compile 配置已存在: deploy\.env.ontology_compile" -ForegroundColor Yellow
+        }
+        Write-Host "下一步: 按需修改 deploy\.env、deploy\.env.rag、deploy\.env.mcp、deploy\.env.openkb、deploy\.env.jonex_wiki 和 deploy\.env.ontology_compile" -ForegroundColor Yellow
 
         # 同时初始化前端 .env
         & $PSCommandPath "frontends-env"

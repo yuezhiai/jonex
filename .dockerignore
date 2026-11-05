@@ -68,9 +68,19 @@ env/
 # （`!` 必须写在其排除规则**之后**，否则不生效）。
 deploy/.env
 deploy/.env.*
+deploy/env/
 # 保留模板（不是机密，部署脚本与 compose 要读）
 !deploy/.env.example
 !deploy/.env.*.example
+
+# 前端子应用的 .env —— 四个前端 Dockerfile 都执行 `COPY frontends/<app>/`，
+# 而 vite build 会读 `.env` 并把 `VITE_*` 直接烤进 JS 包（实测 shell 镜像里带着
+# `VITE_ALLOWED_REDIRECT_ORIGINS=localhost:5173,...`、`VITE_LOGIN=localhost:5173`）。
+# 那是**开发机**的地址与安全策略，不该出现在生产镜像里；构建期需要的那几个键改由
+# 各 Dockerfile 的 build args 显式给（见 frontends/*/Dockerfile 的 VITE_ 段）。
+frontends/**/.env
+frontends/**/.env.*
+!frontends/**/.env.example
 
 # 日志
 logs/
@@ -90,6 +100,9 @@ data/
 
 # 本地测评数据不参与镜像构建
 financebench-eval/
+output/
+.tmp-setup/
+.venv-jw/
 
 # 文档（递归匹配各层级 README/说明文档）
 docs/

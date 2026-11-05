@@ -13,6 +13,8 @@ pydantic[dotenv]>=1.10.0,<2.0.0  # Use pydantic v1 with dotenv support (no pydan
 sqlalchemy[asyncio]>=2.0.25
 asyncpg>=0.29.0
 alembic>=1.13.0
+# 治理 P1：② 生成后 SQL 的掩码/行过滤/拒绝改写（跨 postgres/mysql/tsql）
+sqlglot>=25.0.0
 
 # Cache
 redis>=5.0.0
@@ -25,6 +27,8 @@ python-multipart>=0.0.6
 # Configuration
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
+# [jonex] schema 生成器（catalog → TBox，vendored）：简繁归一
+zhconv>=1.4.3
 
 # HTTP Client
 aiohttp>=3.9.0
@@ -55,3 +59,9 @@ python-json-logger>=2.0.7
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+
+# [jonex] 数据库数据源（只读 catalog 出 schema）：MySQL / SQL Server
+# 选 pymssql 而非 pyodbc——后者要在镜像里装 Microsoft ODBC 运行时，
+# pymssql 自带 FreeTDS，纯 pip 可装。
+aiomysql>=0.2.0
+pymssql>=2.3.0

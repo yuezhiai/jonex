@@ -5,8 +5,18 @@
 deploy/nginx/*.conf text eol=lf
 frontends/*/nginx/*.conf text eol=lf
 
+# 离线交付包（deploy/offline）—— 除 PowerShell 外一律 LF。
+# 这些文件会被 --bundle 原样带到 Linux 服务器上执行或解析：CRLF 会让
+# .env 的变量值尾带 \r、fresh-install-skip.txt 的文件名匹配失败、
+# compose 解析出带 \r 的值。根因是 core.autocrlf=true（Windows checkout
+# 默认转 CRLF），这里显式钉住，避免依赖开发者本地配置。
+deploy/offline/** text eol=lf
+
 # PowerShell scripts — always CRLF (Windows-native)
 *.ps1 text eol=crlf
+
+# 交付包内的 PowerShell 仍走上面那条（后定义优先）
+deploy/offline/**/*.ps1 text eol=crlf
 
 # Python files — auto (cross-platform compatible)
 *.py text

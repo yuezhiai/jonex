@@ -40,6 +40,10 @@ PYTHON_BASE_TAG ?= jonex/python-base:local
 # 构建源镜像开关：false=国内源（腾讯云 pip/apt、npmmirror、清华 uv），true=国外官方源
 # （pypi.org / deb.debian.org / registry.npmjs.org）。仅影响构建期下载，不影响运行。
 USE_OVERSEAS_MIRROR ?= false
+# 制品仓库前缀（推送/交付用，不带 http:// 与结尾 /）: make build TAG=v1.0.0 REGISTRY=registry.example.com
+REGISTRY ?=
+# 构建后要追打的版本 tag（留空 = 只产出 :latest）
+TAG ?=
 PERF_TAIL ?= 1000
 METERING_RETENTION_DAYS ?= 90
 
@@ -75,6 +79,16 @@ DOCKER_BASE := cd deploy && $(COMPOSE) $(COMPOSE_LOCAL_FILES)
 DOCKER_OVERRIDE := cd deploy && $(COMPOSE) $(COMPOSE_OVERRIDE_FILES)
 DOCKER_DEV := cd deploy && $(COMPOSE) $(COMPOSE_DEV_FILES)
 
+# 目标平台：留空 = 本机架构（默认）。给值则走 buildx bake 交叉构建并 --load 到本机镜像库，
+# 例：make build PLATFORM=linux/amd64  ⇒ Mac(arm64) 上产出能在 x86 服务器运行的镜像。
+# ⚠️ 交叉构建会把本机 <image>:latest 换成目标架构镜像，Mac 上无法直接运行这些镜像。
+PLATFORM ?=
+
+# 镜像离线打包（上传内网服务器用）
+DIR ?=
+INCLUDE_INFRA ?= 0
+COMPRESS ?= gzip
+
 MIDDLEWARE_SERVICES := postgres redis etcd minio milvus
 RAG_SERVICES := lightrag atomic-rag
 BACKEND_SERVICES := gateway sidecar knowledge-base-service business-domain-service task-center-service platform-service mcp-server
@@ -90,7 +104,7 @@ MAIN_FRONTEND_FILTERS := --filter $(SHELL_APP) --filter $(CORE_APP) --filter $(P
 LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(DB_USERNAME) DB_PASSWORD=$(DB_PASSWORD) DB_NAME=$(DB_NAME) REDIS_URL=redis://127.0.0.1:6379/0 MILVUS_HOST=127.0.0.1 MILVUS_PORT=19530 SIDECAR_URL=http://127.0.0.1:8001 KNOWLEDGE_BASE_URL=http://127.0.0.1:8003 BUSINESS_DOMAIN_URL=http://127.0.0.1:8005 ATOMIC_RAG_URL=http://127.0.0.1:8004 PLATFORM_URL=http://127.0.0.1:8006
 
 .PHONY: help init version \
-	build-python-base build build-local build-overseas build-gpu build-prod build-server build-infra build-rag build-backend build-frontend build-service build-sidecar build-knowledge-base build-business-domain build-platform \
+	build-python-base build build-local build-overseas build-gpu build-prod build-server build-infra build-rag build-backend build-frontend build-service build-sidecar build-knowledge-base build-business-domain build-platform build-tag build-tag-gpu build-amd64 _check-platform push-tag push-tag-gpu pull-tag pull-tag-gpu pull-tag-prod up-tag up-tag-gpu up-tag-prod save-images load-images verify-images restore-images \
 	up up-local up-detached up-gpu up-server up-prod up-backend up-frontend up-service up-sidecar up-knowledge-base up-business-domain up-platform \
 	down down-local down-gpu down-server down-prod down-v stop stop-service down-service down-gateway down-sidecar down-frontend down-knowledge-base down-business-domain down-platform \
 	restart restart-gpu restart-server restart-prod restart-service recreate-service rebuild-service \
@@ -106,6 +120,7 @@ LOCAL_BACKEND_ENV := ENV=dev DB_HOST=127.0.0.1 DB_PORT=$(DB_PORT) DB_USERNAME=$(
 	rebuild-frontend-gateway rebuild-shell-frontend rebuild-core-business-frontend rebuild-platform-management-frontend rebuild-ecosystem-management-frontend \
 	restart-gateway restart-sidecar restart-knowledge-base restart-business-domain restart-platform restart-frontend restart-frontend-gateway restart-shell-frontend restart-core-business-frontend restart-platform-management-frontend restart-ecosystem-management-frontend \
 	scale-knowledge-base up-postgres up-redis up-milvus up-lightrag pull-lightrag init-db db-migrate db-migrate-after-up test clean \
+	build-rag-slim build-rag-full \
 	exec-postgres exec-gateway exec-sidecar exec-knowledge-base exec-business-domain exec-platform exec-lightrag exec-shell-frontend \
 	shell-postgres shell-gateway shell-sidecar shell-knowledge-base shell-business-domain shell-platform shell-lightrag shell-frontend \
 	up-ontology-compile logs-ontology-compile exec-ontology-compile rebuild-ontology-compile \
@@ -139,6 +154,13 @@ help: ## 显示帮助信息
 	@echo "模式二: 本地 Docker 部署（override）"
 	@echo "  make build                        构建本地 Docker 镜像（Mac 自动叠加 docker-compose.mac.yml）"
 	@echo "  make build-overseas               构建本地 Docker 镜像（国外官方源）"
+	@echo "  make build TAG=v1.0.0             构建并追打版本 tag（可再加 REGISTRY=仓库前缀）"
+	@echo "  make build PLATFORM=linux/amd64   交叉构建 x86 镜像（Mac 上产出服务器可跑的镜像）"
+	@echo "  make push-tag TAG=.. REGISTRY=..  打仓库名并推送到制品仓库（先 docker login）"
+	@echo "  make save-images TAG=..           本地镜像打包成 tar（上传内网服务器）"
+	@echo "  make load-images DIR=..           目标机器从 tar 恢复镜像"
+	@echo "  make pull-tag TAG=.. REGISTRY=..  从制品仓库拉镜像并落成本地名（先 docker login）"
+	@echo "  make up-tag TAG=.. REGISTRY=..    拉取指定 tag 的镜像后直接启动（= pull-tag + up）"
 	@echo "  make up                           启动本地 Docker 部署（加载 docker-compose.override.yml）"
 	@echo "  make ps                           查看本地 Docker 状态"
 	@echo "  make logs                         查看本地 Docker 日志"
@@ -295,41 +317,89 @@ version: ## 显示 Docker/Compose 版本
 #   再用 COMPOSE_BAKE=1 委托 buildx bake 并行构建 deploy-* 镜像。
 #   7 个后端服务通过 docker-compose.yml 的 additional_contexts 复用 base。
 # ------------------------------------------------------------
-build-python-base: ## 构建共享基础镜像 jonex/python-base:local（被 7 个后端服务复用）
-	@echo "=== 构建共享基础镜像 $(PYTHON_BASE_TAG) ==="
+_check-platform:
+	@if [ -n "$(PLATFORM)" ]; then \
+		case "$(PLATFORM)" in \
+			*,*) echo "✗ PLATFORM 只支持单个平台，多架构请直接用 buildx bake --push 推仓库: $(PLATFORM)" >&2; exit 2 ;; \
+			linux/* | */\/*) : ;; \
+			*) echo "✗ PLATFORM 格式应为 <os>/<arch>，例: linux/amd64（当前: $(PLATFORM)）" >&2; exit 2 ;; \
+		esac; \
+	fi
+
+build-python-base: _check-platform ## 构建共享基础镜像 jonex/python-base:local（被 7 个后端服务复用）
+	@echo "=== 构建共享基础镜像 $(PYTHON_BASE_TAG)$(if $(PLATFORM), （platform=$(PLATFORM)）, ) ==="
 	cd deploy && docker buildx build --load -t $(PYTHON_BASE_TAG) -f docker/python-base.Dockerfile \
+		$(if $(PLATFORM),--platform $(PLATFORM),) \
 		--build-arg USE_OVERSEAS_MIRROR=$(USE_OVERSEAS_MIRROR) ..
 
-build: build-python-base ## 构建本地 Docker 联调镜像（共享 base + 并行 bake）
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build
+# 统一的构建命令：$(1)=compose 文件参数，$(2)=服务子集（可空）。
+# 默认走 `docker compose build`；给了 PLATFORM 就走 buildx bake + --set *.platform，
+# 因为 compose build 没有「指定目标平台」的参数，只有 bake 能整批覆盖。
+define _build_cmd
+	@if [ -n "$(PLATFORM)" ]; then \
+		echo "=== 构建（platform=$(PLATFORM)，buildx bake → docker load）==="; \
+		echo "⚠️  本机 <image>:latest 将被替换成 $(PLATFORM) 镜像，Mac 上无法直接运行，仅供推仓库/部署到同架构机器"; \
+		( cd deploy && DOCKER_BUILDKIT=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --load $(1) --set "*.platform=$(PLATFORM)" $(2) ); \
+	else \
+		( cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(1) --profile '*' build $(2) ); \
+	fi
+endef
+
+# 构建后可选追打自定义 tag（$(1)=compose 文件参数）。
+# 只做 docker tag，不重复构建；:latest 始终保留 ⇒ make up / rebuild-service 行为不变。
+# 给了 REGISTRY 时同时打仓库名：<REGISTRY>/<image>:<TAG>，便于 docker push。
+define _tag_step
+	@if [ -n "$(TAG)" ]; then REGISTRY="$(REGISTRY)" bash deploy/tag-images.sh "$(TAG)" $(1); fi
+endef
+
+build: build-python-base ## 构建本地 Docker 联调镜像（可加 TAG=v1.0.0 / PLATFORM=linux/amd64）
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),)
+	$(call _tag_step,$(COMPOSE_LOCAL_FILES))
 
 build-local: build ## 别名: 构建本地 Docker 镜像
 
 build-overseas: ## 构建本地 Docker 镜像（国外源：官方 pypi / npm / debian 源）
 	$(MAKE) build USE_OVERSEAS_MIRROR=true
 
-build-gpu: build-python-base ## 构建 GPU Docker 镜像（Windows/Linux/服务器，需 NVIDIA GPU）
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_GPU_FILES) build
+build-gpu: build-python-base ## 构建 GPU Docker 镜像（服务器，需 NVIDIA GPU；可加 TAG= / PLATFORM=）
+	$(call _build_cmd,$(COMPOSE_GPU_FILES),)
+	$(call _tag_step,$(COMPOSE_GPU_FILES))
 
-build-prod: build-python-base ## 构建生产 Docker 镜像（不含 GPU）
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build
+build-prod: build-python-base ## 构建生产 Docker 镜像（不含 GPU；可加 TAG= / PLATFORM=）
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),)
+	$(call _tag_step,$(COMPOSE_LOCAL_FILES))
 
 build-server: build-prod ## 别名: 构建生产 Docker 镜像
+
+build-amd64: ## 别名: 构建 linux/amd64 镜像（= make build PLATFORM=linux/amd64）
+	@$(MAKE) build PLATFORM=linux/amd64
 
 build-infra: ## 构建基础设施镜像（通常会直接拉取）
 	$(DOCKER_BASE) build $(MIDDLEWARE_SERVICES)
 
-build-rag: ## 构建 RAG 服务镜像（不依赖 python-base）
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build $(RAG_SERVICES)
+build-rag: _check-platform ## 构建 RAG 服务镜像（不依赖 python-base）
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),$(RAG_SERVICES))
+
+# atomic-rag 依赖胖瘦是**纯构建期**选择，不再从 deploy/.env 的 RAG_PROFILE 读取
+# （那会让「改运行期配置」顺手改掉镜像内容）。**不设时默认 slim**（见
+# deploy/docker-compose.yml 的 `${JONEX_BUILD_RAG_PROFILE:-slim}`），所以
+# `make build` / build-gpu / build-prod / build-backend / build-service SERVICE=atomic-rag
+# 打出来的都是瘦身镜像；要全量用 build-rag-full，或显式
+# `JONEX_BUILD_RAG_PROFILE=full make build-rag`。
+build-rag-slim: ## 构建 atomic-rag 瘦身镜像（slim：仅 online/selfhost，无 torch/CUDA/mineru，省 ~3.9GB；这也是默认值）
+	JONEX_BUILD_RAG_PROFILE=slim $(MAKE) build-service SERVICE=atomic-rag
+
+build-rag-full: ## 构建 atomic-rag 全量镜像（full：含本地 mineru/音视频依赖，三种 RAG_PARSER 都能真跑）
+	JONEX_BUILD_RAG_PROFILE=full $(MAKE) build-service SERVICE=atomic-rag
 
 build-backend: build-python-base ## 构建后端镜像
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build $(BACKEND_SERVICES)
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),$(BACKEND_SERVICES))
 
-build-frontend: ## 构建前端镜像（不依赖 python-base）
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build $(FRONTEND_SERVICES)
+build-frontend: _check-platform ## 构建前端镜像（不依赖 python-base）
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),$(FRONTEND_SERVICES))
 
 build-service: _require-service build-python-base ## 构建指定服务: make build-service SERVICE=gateway
-	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build $(SERVICE)
+	$(call _build_cmd,$(COMPOSE_LOCAL_FILES),$(SERVICE))
 
 build-sidecar: ## 兼容旧命令: 构建 Sidecar
 	@$(MAKE) build-service SERVICE=sidecar
@@ -342,6 +412,69 @@ build-business-domain: ## 兼容旧命令: 构建业务领域服务
 
 build-platform: ## 兼容旧命令: 构建平台管理服务
 	@$(MAKE) build-service SERVICE=platform-service
+
+# ------------------------------------------------------------
+# 给镜像打自定义 tag（默认 tag 是 latest；构建仍走 build*，之后追加 tag）
+# ------------------------------------------------------------
+# 只做 docker tag，不重复构建；:latest 保留 ⇒ `make up` 行为不变。
+# 例: make build-tag TAG=v1.0.0
+# 别名：等价于 `make build TAG=v1.0.0`（构建 + 追打 tag 都在 build 里做了）
+build-tag: _require-tag build ## 等价 make build TAG=v1.0.0
+
+build-tag-gpu: _require-tag build-gpu ## 等价 make build-gpu TAG=v1.0.0
+
+# 打仓库名（<REGISTRY>/<image>:<TAG>）并 push 到制品仓库，不重新构建。
+# 需要先登录：docker login <REGISTRY 的域名>，例: docker login registry.example.com
+# 例: make push-tag TAG=v1.0.0 REGISTRY=registry.example.com
+push-tag: _require-tag _require-registry ## 打仓库名并推送到制品仓库: make push-tag TAG=v1.0.0 REGISTRY=...
+	@REGISTRY="$(REGISTRY)" PUSH=1 bash deploy/tag-images.sh "$(TAG)" $(COMPOSE_LOCAL_FILES)
+
+push-tag-gpu: _require-tag _require-registry ## 同上（GPU 档）
+	@REGISTRY="$(REGISTRY)" PUSH=1 bash deploy/tag-images.sh "$(TAG)" $(COMPOSE_GPU_FILES)
+
+# ------------------------------------------------------------
+# 从制品仓库拉镜像（拉回后落成本地名 :TAG 和 :latest，所以 make up 直接用）
+# ------------------------------------------------------------
+# 需要先登录私有仓库：docker login registry.example.com
+# 例: make pull-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform
+pull-tag: _require-tag _require-registry ## 从制品仓库拉镜像并落成本地名: make pull-tag TAG=v1.0.0 REGISTRY=...
+	@REGISTRY="$(REGISTRY)" PULL=1 bash deploy/tag-images.sh "$(TAG)" $(COMPOSE_LOCAL_FILES)
+
+pull-tag-gpu: _require-tag _require-registry ## 同上（GPU 档）
+	@REGISTRY="$(REGISTRY)" PULL=1 bash deploy/tag-images.sh "$(TAG)" $(COMPOSE_GPU_FILES)
+
+pull-tag-prod: _require-tag _require-registry ## 同上（生产档，仅 docker-compose.yml，不带本地覆盖）
+	@REGISTRY="$(REGISTRY)" PULL=1 bash deploy/tag-images.sh "$(TAG)" $(COMPOSE_FILES)
+
+# 拉取 + 启动一条龙
+up-tag: pull-tag ## 拉取指定 tag 的镜像后启动本地部署: make up-tag TAG=v1.0.0 REGISTRY=...
+	@$(MAKE) up
+
+up-tag-gpu: pull-tag-gpu ## 拉取指定 tag 的镜像后启动 GPU 部署
+	@$(MAKE) up-gpu
+
+up-tag-prod: pull-tag-prod ## 拉取指定 tag 的镜像后启动生产部署
+	@$(MAKE) up-server
+
+# ------------------------------------------------------------
+# 镜像离线打包（内网 / 无外网服务器部署）
+# ------------------------------------------------------------
+# 本地打包 → 传到服务器 → 服务器上 load.sh 或 make load-images → make up-server
+# 例: make save-images TAG=v1.0.0
+#     make save-images TAG=v1.0.0 INCLUDE_INFRA=1     # 连 postgres/redis/milvus 等一起打
+#     make load-images DIR=dist/images-v1.0.0         # 在目标机器执行
+save-images: ## 本地镜像打包成 tar（上传内网用）: make save-images TAG=v1.0.0 [INCLUDE_INFRA=1]（x86 服务器需先 make build PLATFORM=linux/amd64）
+	@TAG="$(TAG)" INCLUDE_INFRA="$(INCLUDE_INFRA)" COMPRESS="$(COMPRESS)" ONLY="$(ONLY)" \
+		bash deploy/image-bundle.sh save "$(DIR)"
+
+load-images: _require-dir ## 目标机器从 tar 恢复镜像: make load-images DIR=dist/images-v1.0.0
+	@bash deploy/image-bundle.sh load "$(DIR)"
+
+verify-images: _require-dir ## 校验离线包（SHA256 + 包内镜像 ID vs 本地镜像 ID）: make verify-images DIR=dist/images-v1.0.0
+	@bash deploy/image-bundle.sh verify "$(DIR)"
+
+restore-images: ## 用运行中容器找回 <image>:latest 标签（误删 tag 后补救）
+	@bash deploy/image-bundle.sh restore
 
 # ------------------------------------------------------------
 # Docker 启动/停止
@@ -926,4 +1059,29 @@ _require-service:
 		echo "  make docker-local-restart-service SERVICE=gateway"; \
 		echo "  make docker-local-rebuild-service SERVICE=core-business-frontend"; \
 		exit 1; \
+	fi
+
+_require-dir:
+	@if [ -z "$(DIR)" ]; then \
+		echo "请指定 DIR（镜像包目录），例如:"; \
+		echo "  make load-images DIR=dist/images-v1.0.0"; \
+		exit 2; \
+	fi
+
+_require-tag:
+	@if [ -z "$(TAG)" ]; then \
+		echo "请指定 TAG，例如:"; \
+		echo "  make build TAG=v1.0.0"; \
+		echo "  make push-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform"; \
+		echo "  make pull-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform"; \
+		echo "  make up-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform"; \
+		exit 2; \
+	fi
+
+_require-registry:
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "请指定 REGISTRY（制品仓库前缀，不带 http:// 与结尾 /），例如:"; \
+		echo "  make push-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform"; \
+		echo "  make pull-tag TAG=v1.0.0 REGISTRY=registry.example.com/jonex-platform"; \
+		exit 2; \
 	fi

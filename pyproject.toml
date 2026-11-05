@@ -18,10 +18,12 @@ dependencies = [
     "bcrypt>=4.0.0",
     "python-dotenv>=1.0.0",
     "aiohttp>=3.9.0",
-    "httpx>=0.27.0",
+    # <0.28：starlette 0.36 的 TestClient 内部用 httpx.Client(app=...)，httpx 0.28 已移除该参数
+    "httpx>=0.27.0,<0.28.0",
     "redis>=5.0.0",
     "python-multipart>=0.0.6",
     "pyyaml>=6.0.1",
+    "zhconv>=1.4.3",
     "neo4j>=5.25.0,<6.0.0",
     "openai>=1.0.0",
     "jieba>=0.42.1",
@@ -34,6 +36,8 @@ dependencies = [
     # [jonex] §table-grid-v2 L3: xlsx 前置规范化主轨
     "openpyxl>=3.1.0,<4.0.0",
     "tencentcloud-sdk-python-sts>=3.0.1459",
+    # 治理 P1：SQL AST 解析/改写（跨 postgres/mysql/tsql）
+    "sqlglot>=25.0.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +48,7 @@ dev = [
     "black>=24.0.0",
     "isort>=5.13.0",
     "mypy>=1.8.0",
+    "tzdata>=2024.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -57,4 +62,8 @@ jonex_core = ["common/messages/*.yaml"]
 dev = [
     "aiosqlite>=0.22.1",
     "greenlet>=3.5.0",
+    # Windows 无系统 IANA 时区库：`ZoneInfo("Asia/Shanghai")`（monitor_task.py 模块级）
+    # 会抛 ZoneInfoNotFoundError。dev-guide.windows.md 用的是**裸 `uv sync`**（装的是
+    # dependency-groups，不是 extra），所以这里也必须有一份，不能只放 optional extra。
+    "tzdata>=2024.1",
 ]
