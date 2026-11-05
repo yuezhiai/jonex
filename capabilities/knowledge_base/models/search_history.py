@@ -95,6 +95,10 @@ class KnowledgeSearchHistory(Base, TenantMixin, TimestampMixin, SoftDeleteMixin)
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
         }
+        # Shared storage retains legacy columns; Wiki has no such query controls.
+        if (self.extra_metadata or {}).get("pipeline") == "jonex_wiki":
+            data["mode"] = None
+            data["top_k"] = None
         if include_snapshot:
             data["answer_preview"] = self.answer_preview
             data["answer"] = self.answer

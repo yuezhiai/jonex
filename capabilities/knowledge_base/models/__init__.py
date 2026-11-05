@@ -21,6 +21,7 @@ from .llm_wiki_schema import (
     SYNC_SYNCED,
 )
 from .data_source import KnowledgeDataSource
+from .data_source_connection import DataSourceConnection
 from .folder import Folder
 from .tag import DocumentTag, Tag
 from .domain_service import (
@@ -31,8 +32,16 @@ from .domain_service import (
 )
 from .knowledge_info import KnowledgeInfo
 from .kb_permission import KbPermission
+from .ontology_abstract_schema import AbstractSchemaSaveHistory
+from .ontology_data_alignment import OntologyDataAlignment
 from .ontology_synonym import OntologySynonym
+from .metric_call_approval import MetricCallApproval
+from .nl2sql_metric_shadow import Nl2SqlMetricShadow
+from .nl2sql_observation import Nl2SqlObservation
+from .lineage_edge import LineageEdge
+from .ontology_tool_binding import OntologyToolBinding
 from .parser_setting import KnowledgeParserSetting
+from .model_setting import KnowledgeModelSetting
 from .answer_feedback import KnowledgeAnswerFeedback, KnowledgeAnswerFeedbackEvent
 from .search_feedback import KnowledgeSearchFeedback
 from .search_history import KnowledgeSearchHistory, build_query_hash, normalize_query
@@ -44,6 +53,15 @@ from .search_event import (
     SearchHitEvent,
     SearchRequestEvent,
     SearchStepEvent,
+)
+from .similarity import (
+    STATUS_DISMISSED,
+    STATUS_INVALID,
+    STATUS_MERGED,
+    STATUS_PENDING,
+    STATUS_SUPERSEDED,
+    KnowledgeDocumentSignature,
+    KnowledgeDocumentSimilaritySuggestion,
 )
 from .space import Space, SpacePermission
 # [jonex] 任务中心接入表（接管行 + 执行登记）。按本模块 docstring 的契约，模型只有
@@ -59,7 +77,9 @@ from .task_center import (
 __all__ = [
     "ACTIVE_STATES",
     "MANAGED_STATES",
+    "AbstractSchemaSaveHistory",
     "AssetStatusEvent",
+    "DataSourceConnection",
     "DocStatus",
     "DocumentTag",
     "DomainService",
@@ -69,16 +89,25 @@ __all__ = [
     "KnowledgeAnswerFeedbackEvent",
     "KnowledgeDataSource",
     "KnowledgeDocument",
+    "KnowledgeDocumentSignature",
+    "KnowledgeDocumentSimilaritySuggestion",
     "KnowledgeInfo",
     "KnowledgeParserSetting",
+    "KnowledgeModelSetting",
     "KnowledgeSearchFeedback",
     "KnowledgeSearchHistory",
     "KnowledgeQueryImage",
     "KnowledgeDocumentVersion",
     "KnowledgeSearchHistoryImage",
     "KbPermission",
+    "LineageEdge",
+    "MetricCallApproval",
+    "Nl2SqlMetricShadow",
+    "Nl2SqlObservation",
+    "OntologyDataAlignment",
     "OntologyStatus",
     "OntologySynonym",
+    "OntologyToolBinding",
     "ProcessingTaskEvent",
     "SearchAdoptionEvent",
     "SearchHitEvent",
@@ -89,6 +118,11 @@ __all__ = [
     "ServiceKnowledgeBase",
     "Space",
     "SpacePermission",
+    "STATUS_DISMISSED",
+    "STATUS_INVALID",
+    "STATUS_MERGED",
+    "STATUS_PENDING",
+    "STATUS_SUPERSEDED",
     "TaskCenterDocState",
     "TaskCenterDocument",
     "TaskExecutionRegistry",

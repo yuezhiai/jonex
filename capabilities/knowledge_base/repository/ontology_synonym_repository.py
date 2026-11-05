@@ -30,7 +30,10 @@ class OntologySynonymRepository(BaseRepository[OntologySynonym]):
             await self.session.execute(
                 select(OntologySynonym)
                 .where(*conditions)
-                .order_by(OntologySynonym.created_at.desc())
+                # id DESC 作 tiebreaker：created_at 同值时（批量导入同秒写入）
+                # OFFSET/LIMIT 分页否则会漏行/重行。快照也对顺序敏感。
+                .order_by(OntologySynonym.created_at.desc(),
+                          OntologySynonym.id.desc())
                 .offset(offset)
                 .limit(limit)
             )

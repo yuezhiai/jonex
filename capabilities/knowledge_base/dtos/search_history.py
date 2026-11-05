@@ -75,8 +75,8 @@ class SearchHistoryResponse(BaseModel):
     query: str
     query_hash: str
     knowledge_base_id: str
-    mode: str
-    top_k: int
+    mode: Optional[str] = None
+    top_k: Optional[int] = None
     status: str
     answer_preview: Optional[str] = None
     reference_count: int = 0

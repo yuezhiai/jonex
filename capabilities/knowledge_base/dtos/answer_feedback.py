@@ -22,6 +22,23 @@ class SubmitAnswerFeedbackRequest(BaseModel):
         extra = "forbid"
 
 
+class SubmitMcpFeedbackRequest(BaseModel):
+    """提交/修改 MCP 检索反馈（request_id 锚点，不携带查询与回答快照）。"""
+
+    request_id: str = Field(..., min_length=1, max_length=64, description="MCP 检索请求 ID")
+    service_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=64, description="领域服务 ID（须与事件行一致）"
+    )
+    operation_id: str = Field(..., min_length=1, max_length=64, description="客户端操作幂等键（重试复用）")
+    version: int = Field(..., ge=1, description="客户端操作序号（单调递增）")
+    feedback_type: str = Field(..., regex="^(like|dislike)$", description="反馈类型")
+    feedback_reason: Optional[str] = Field(default=None, max_length=32, description="点踩原因 code")
+    feedback_comment: Optional[str] = Field(default=None, max_length=300, description="补充说明")
+
+    class Config:
+        extra = "forbid"
+
+
 class AnswerFeedbackQueryRequest(BaseModel):
     """按问答记录 ID 查询当前反馈状态。"""
 
@@ -63,9 +80,10 @@ class AnswerFeedbackListItemResponse(BaseModel):
 
     id: str
     tenant_id: str
-    user_id: str
-    history_id: str
-    query: str
+    # Web 反馈有 user_id / history_id / query；MCP 反馈不保存问答快照，三者均为 None
+    user_id: Optional[str] = None
+    history_id: Optional[str] = None
+    query: Optional[str] = None
     answer: Optional[str] = None
     feedback_type: str
     feedback_reason: Optional[str] = None
@@ -74,6 +92,9 @@ class AnswerFeedbackListItemResponse(BaseModel):
     source: Optional[str] = None
     mode: Optional[str] = None
     source_missing_reason: Optional[str] = None
+    # MCP 反馈归因字段；Web 反馈为 None
+    mcp_key_id: Optional[str] = None
+    mcp_key_name: Optional[str] = None
     adopted: bool = False
     version: int = 0
     created_at: Optional[str] = None

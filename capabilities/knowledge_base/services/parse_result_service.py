@@ -188,7 +188,7 @@ class ParseResultService:
         except Exception:
             return {"entities": [], "relationships": []}
 
-    async def get_wiki_page(self, tenant_id: str, kb_id: str, path: str) -> dict:
+    async def get_wiki_page(self, tenant_id: str, kb_id: str, path: str, *, actor: str = "") -> dict:
         """[jonex] llm-wiki 管线：读取 Wiki 页面内容（编译结果阅读模式）。
 
         页面级 References（溯源到源文档）由引擎适配器给出 document_id 与摘录；
@@ -198,12 +198,18 @@ class ParseResultService:
         kb_type = await self._get_kb_type(tenant_id, kb_id)
         if kb_type not in LLM_WIKI_TYPES:
             raise InvalidParameterError(message=translate("err.kb.not_openkb", fallback="仅 LLM Wiki 知识库支持 Wiki 页面读取"))
-        page = await self._wiki_compiler(kb_type).read_page(
+        compiler = self._wiki_compiler(kb_type) if kb_type != 'jonex_wiki' else None
+        if compiler is None:
+            from jonex_core.capability.atomic.jonex_wiki.client import get_jonex_wiki_client
+            compiler = get_jonex_wiki_client()
+        page = await compiler.read_page(
             kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id, path=path,
         ) or {}
         refs = page.get("references")
         if isinstance(refs, list) and refs:
             await self._attach_document_meta(tenant_id, refs)
+        from .wiki_media import attach_image_urls
+        attach_image_urls(page.get('images') or [], tenant_id, actor, kb_id, page.get('bundle_sha') or '')
         return page
 
     @staticmethod
@@ -249,6 +255,73 @@ class ParseResultService:
             info = meta.get(str(ref.get("document_id")))
             ref["file_name"] = info[0] if info else ""
             ref["mime_type"] = (info[1] if info else "") or ""
+
+    async def wiki_scenario(self, tenant_id: str, request: dict, *, operation: str, actor: str = "") -> dict:
+        tenant_id = require_tenant(tenant_id)
+        kb_id = str(request.get("knowledge_base_id") or "")
+        if await self._get_kb_type(tenant_id, kb_id) != "jonex_wiki":
+            raise InvalidParameterError(message="仅 Jonex Wiki 支持场景扩展")
+        options = request.get("options", {})
+        if not isinstance(options, dict):
+            raise InvalidParameterError(message="options 必须为对象")
+        from jonex_core.capability.atomic.jonex_wiki.client import get_jonex_wiki_client
+        return await get_jonex_wiki_client().scenario(tenant_id, kb_id, operation,
+            str(request.get("scenario_id") or ""), options, actor=actor)
+
+    async def query_wiki_resources(self, tenant_id: str, request: dict, *, actor: str = "") -> dict:
+        kb_id = str(request.get("knowledge_base_id") or "")
+        operation = str(request.get("operation") or "")
+        if operation not in {"find_resources", "get_question", "lookup_records", "get_media_segment", "get_evidence", "inspect_visual", "find_images", "get_image", "inspect_image"}:
+            raise InvalidParameterError(message="不支持的资源读取操作")
+        if await self._get_kb_type(tenant_id, kb_id) != "jonex_wiki":
+            raise InvalidParameterError(message="仅 Jonex Wiki 支持资源读取")
+        options = request.get("options") or {}
+        if not isinstance(options, dict):
+            raise InvalidParameterError(message="options 必须为对象")
+        # Resource reads use the independent Wiki port directly. Constructing
+        # JonexWikiService also eagerly builds an unrelated OpenKB DB helper.
+        from jonex_core.capability.atomic.jonex_wiki.client import get_jonex_wiki_client
+        result = await get_jonex_wiki_client().query_resources(tenant_id, kb_id, operation, options)
+        if operation in {'find_images', 'get_image'}:
+            from .wiki_media import attach_image_urls
+            images = result.get('items', []) if operation == 'find_images' else [result['image']]
+            attach_image_urls(images, tenant_id, actor, kb_id, result['revision'])
+        if operation == "get_media_segment":
+            from .wiki_media import resource_media_url
+            segment = result["segment"]
+            result["playback"]["url"] = resource_media_url(tenant_id, kb_id, segment["document_id"],
+                result["revision"], segment["object_id"])
+        return result
+
+    async def query_wiki_graph(self, tenant_id: str, operation: str, request: dict) -> dict:
+        from ..dtos.wiki_graph import GRAPH_FIELDS, WikiGraphRequest
+        req = WikiGraphRequest(**request)
+        if await self._get_kb_type(tenant_id, req.knowledge_base_id) != "jonex_wiki":
+            raise InvalidParameterError(message="仅 Jonex Wiki 知识库支持知识图谱查询")
+        if operation == "media":
+            from jonex_core.common.database import get_db_session
+            from ..repository.document_repository import KnowledgeDocumentRepository
+            async with get_db_session() as session:
+                doc = await KnowledgeDocumentRepository(session).get_required(req.document_id, tenant_id)
+                if doc.knowledge_base_id != req.knowledge_base_id:
+                    raise InvalidParameterError(message="图片不属于指定知识库")
+        payload = req.dict(exclude_none=True)
+        options = {key: payload[key] for key in GRAPH_FIELDS[operation] if key in payload}
+        result = await self._wiki_compiler("jonex_wiki").query_graph(
+            tenant_id=tenant_id, kb_id=req.knowledge_base_id, operation=operation, **options)
+        # File names belong to the platform. Enrich all returned document nodes
+        # and exact evidence locations without changing their graph identities.
+        records = list(result.get("items") or [])
+        if isinstance(result.get("node"), dict):
+            records.append(result["node"])
+        records += [item["node"] for item in list(records) if isinstance(item.get("node"), dict)]
+        refs = [record for record in records if record.get("document_id")]
+        if refs:
+            await self._attach_document_meta(tenant_id, refs)
+            for record in refs:
+                if record.get("node_type") == "document" and record.get("file_name"):
+                    record["label"] = record["file_name"]
+        return result
 
     async def get_wiki_backlinks(self, tenant_id: str, kb_id: str, path: str,
                                  document_id: str = "") -> dict:

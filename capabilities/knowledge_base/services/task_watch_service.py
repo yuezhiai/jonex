@@ -849,6 +849,27 @@ class TaskWatchService:
             )
             return "step_failed"
         # `pending` / `extracting` / 空：对账还在跑。等 —— 硬超时兜在外层。
+        #
+        # 例外（2026-10-20 现场）：对账已把下游任务的**真因**写回 `ontology_error`，
+        # 但状态刻意保持 EXTRACTING（把重抽权交给重试闸门）。任务中心拥有的文档，
+        # 对账拒绝再发起（「本体抽取新提交被拦：文档归任务中心管」），状态会永远停在
+        # EXTRACTING → 这一步永远 running（05 号文档卡了 10 分钟，用户必须手工收口）。
+        # 有真因 + 超过宽限 ⇒ 按失败收口，把「要不要重试」交回任务中心（它是发起方）。
+        if ont_status == OntologyStatus.EXTRACTING.value and str(ont_error or "").strip():
+            grace = float(os.getenv("TC_ONTOLOGY_FAILED_GRACE_SEC", "120"))
+            started = row.get("step_started_at") or row.get("updated_at")
+            if self._elapsed(started) >= grace:
+                logger.warning(
+                    "[TaskCenter] compile 步：本体任务已失败且超过宽限 %ss，收口为失败 "
+                    "（重试权交回任务中心）: doc=%s err=%s",
+                    int(grace), row["document_id"], str(ont_error)[:200],
+                )
+                await self._fail_step(
+                    row,
+                    **_compile_failure_reason(ont_error),
+                    fail_document=False,
+                )
+                return "step_failed"
         return "waiting_ontology"
 
     async def _inspect_wiki_compile(
@@ -971,6 +992,19 @@ class TaskWatchService:
                     await doc_repo.set_status(
                         doc, DocStatus.READY, rag_doc_ids=doc_ids or None,
                     )
+                    # [jonex] READY 后异步做相似检测（开关/阈值判断在扫描内部）。
+                    # best-effort：调度本身失败只记日志，不阻断本步收口。
+                    try:
+                        from .document_similarity_service import schedule_similarity_scan
+                        await schedule_similarity_scan(
+                            tenant_id=doc.tenant_id,
+                            document_id=doc.id,
+                            knowledge_base_id=doc.knowledge_base_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "触发相似检测失败 doc=%s", doc.id, exc_info=True,
+                        )
 
             await tc_repo.mark_step_handled(
                 document_id, execution_id=execution_id, release=is_last,
@@ -1089,7 +1123,7 @@ class TaskWatchService:
 
         ⚠️ **交还前还要替在途那一步报一句失败**（2026-09-30 补，与 `task_stopped` 逐字同一条
         理由）：交还之后这一行**也出了管理方的结算视野** —— 不报的话，任务中心那侧那一步
-        一直挂在 `running`，占着 `count_running_by_catalog_step` 数出来的**本目录共用名额**
+        一直挂在 `running`，占着 `count_running_by_step` 数出来的**本目录共用名额**
         （该目录的 `parse` 一共 10 个），最长到编排超时（预置 25200 秒 ≈ 7 小时）才被
         超时巡检收掉；这期间用户想「重新解析 / 重新编译」还会被管理方拒（那一步没结束）。
         走到这一支的典型成因正是「`task_stopped` 那条通知**丢了**」（单发、不重发、失败只
@@ -1199,13 +1233,49 @@ class TaskWatchService:
         下游两步的 `bind_inputs` 写的是 `@<上一步>.outputs.document_id`。漏了它，
         下一步拿到空值、最后一步查不到文档。
 
-        `compile` 步按定义它的 `output_schema` 是 `{}` —— 报空对象是**对的**，不是漏传：
-        它是链路终点，没有下游。
+        `compile` 步是链路终点，没有下游要取它的值；但它的**产物本身**要能被编排引用
+        （前端据此展示「本体」或「Wiki」入口），所以同样按 schema 带一个引用。
+
+        ## 产出里的引用（2026-10-26）
+
+        `parse` → `chunks`（切片），`compile` → `ontology`（本体，lightrag 库）或
+        `wiki`（页面树，openkb / jonex_wiki 库）。两者都是 `{kind, params}`，**不带正文**：
+
+        - `chunks` 让下游按 `bind_inputs` 接着用（运行方仍只按 `document_id` 查引擎）；
+        - `ontology` / `wiki` 是编译成果的入口，前端按哪个字段非空决定渲染哪一种。
+
+        全局步骤清单只有一条 `compile`，所以 `output_schema` 同时声明这两个可选字段，
+        运行方按库类型只填其中一个。
         """
         from jonex_core.task_runtime import get_task_runtime
 
-        outputs = {} if row["current_step"] == "compile" else {"document_id": document_id}
         refs = await self._artifact_refs(row, document_id)
+        #: 编译产物字段名 ← 引用 kind 的末段（ontology / wiki）
+        compile_fields = {
+            f"{_REF_KIND_PREFIX}.ontology": "ontology",
+            f"{_REF_KIND_PREFIX}.wiki": "wiki",
+        }
+        outputs: Dict[str, Any] = {}
+        if row["current_step"] == "compile":
+            for ref in refs:
+                field = compile_fields.get(ref.get("kind"))
+                if field:
+                    outputs[field] = {
+                        "kind": ref["kind"],
+                        "params": dict(ref.get("params") or {}),
+                    }
+        else:
+            outputs["document_id"] = document_id
+            # parse/ingest 的产出引用恰好就是切片引用；复制一份进 outputs，
+            # 让下游按 bind_inputs 拿到同一个 {kind, params}
+            chunk_ref = next(
+                (r for r in refs if r.get("kind") == f"{_REF_KIND_PREFIX}.chunks"), None
+            )
+            if chunk_ref:
+                outputs["chunks"] = {
+                    "kind": chunk_ref["kind"],
+                    "params": dict(chunk_ref.get("params") or {}),
+                }
         # 输入那份引用（2026-10-16 加）：与产出那份**同一次上报一起带** —— 用户看某一步时，
         # 「吃的是什么」和「出了什么」本来就该并排能看到。
         in_refs = await self._input_refs(row, document_id)

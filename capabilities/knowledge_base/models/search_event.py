@@ -28,6 +28,7 @@ class SearchRequestEvent(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     __table_args__ = (
         Index("idx_sre_tenant_time", "tenant_id", "received_at"),
         Index("idx_sre_request", "request_id"),
+        Index("idx_sre_mcp_key", "mcp_key_id"),
         {"schema": "knowledge_base"},
     )
 
@@ -36,6 +37,8 @@ class SearchRequestEvent(Base, TenantMixin, TimestampMixin, SoftDeleteMixin):
     request_id = Column(String(64), nullable=False)
     entry_service_id = Column(String(64), nullable=True)
     domain_space_id = Column(String(64), nullable=True)
+    # MCP 链路：行照常写（用于请求量/失败观测），query/query_hash 置空。
+    mcp_key_id = Column(String(64), nullable=True)
     query = Column(Text, nullable=True)
     query_hash = Column(String(64), nullable=True)
     # 本次检索实际覆盖的 kb 列表（capability 权限过滤后的 data 值）。

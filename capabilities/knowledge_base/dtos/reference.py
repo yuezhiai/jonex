@@ -43,6 +43,14 @@ class SourceLocation(BaseModel):
     # 供后端重新推导对象键并生成 asset_url（asset_url 是预签名、会过期，
     # 不持久化，asset_ext 才是持久标识）。
     asset_ext: Optional[str] = None
+    asset_id: Optional[str] = None
+    bundle_sha: Optional[str] = None
+    work_title: Optional[str] = None
+    author: Optional[str] = None
+    source_locator: Optional[dict] = None
+    usage: Optional[str] = None
+    association_method: Optional[str] = None
+    visual_read_id: Optional[str] = None
     text: Optional[str] = None  # 命中片段的原文文本（RAG 链路带 chunk content 时填充）
     # [jonex] S3（§3.3 #4）：统一分显式字段，消灭影子字段。
     # 口径 `score = w_r*rerank + w_e*evidence_prior + w_s*subject_prior`，见
@@ -106,6 +114,14 @@ class ParsedRef(BaseModel):
     # 推不出 asset_url）
     image_idx: Optional[int] = None
     asset_ext: Optional[str] = None
+    asset_id: Optional[str] = None
+    bundle_sha: Optional[str] = None
+    work_title: Optional[str] = None
+    author: Optional[str] = None
+    source_locator: Optional[dict] = None
+    usage: Optional[str] = None
+    association_method: Optional[str] = None
+    visual_read_id: Optional[str] = None
 
 
 class ReferenceResolveRequest(BaseModel):

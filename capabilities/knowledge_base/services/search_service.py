@@ -14,6 +14,7 @@ from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.common.model_config import resolve_llm_model
 from .openkb_service import KnowledgeCompilerService  # [jonex]
 from .jonex_wiki_service import JonexWikiService  # [jonex]
+from jonex_core.common.config import config
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import (
     InvalidParameterError,
@@ -39,6 +40,7 @@ from jonex_core.common.ontology_llm import (
     anchor_answer_to_references,  # [jonex] openkb 无标记答案 → [n] 引用锚定
     answer_from_chunks,   # [jonex] 方案 A：平台侧基于 chunk 作答
     answer_from_facts,
+    chat_with_tools,      # 本体查询工具化：单轮带 tools 的调用
     arbitrate_answers,    # [jonex] S1+S7 双向校验裁决
     fuse_rag_answers,
     normalize_citations,          # [jonex] 引用编号归一化（[ref_i] → [n]）
@@ -51,6 +53,7 @@ from ..dtos import JonexWikiSearchRequest, LlmWikiSearchRequest, MixSearchReques
 from ..dtos.reasoning import (
     STAGE_ARBITRATION,       # [jonex] S1+S7 双向校验裁决
     STAGE_CHUNK_ANSWER,      # [jonex] 方案 A：平台侧基于 chunk 作答
+    STAGE_CONCEPT_FILTER,    # [v2] 概念候选 LLM 相关性筛选
     STAGE_CONTEXT_RETRIEVE,  # [jonex] 方案 A：多 KB 只召回不生成
     STAGE_FACT_LOOKUP,
     STAGE_FUSION,
@@ -58,6 +61,7 @@ from ..dtos.reasoning import (
     STAGE_JONEX_WIKI_QUERY,  # [jonex] jonex_wiki 引擎检索链路
     STAGE_LLM_ANSWER,
     STAGE_ONTOLOGY_MATCH,
+    STAGE_ONTOLOGY_TOOLS,    # 本体查询工具化（function calling）
     STAGE_OPENKB_QUERY,
     STAGE_QUERY_PLAN,
     STAGE_REF_RETRIEVE,
@@ -71,9 +75,36 @@ from ..dtos.reasoning import (
 from ..repository import OntologyGraphRepository
 from ..repository.document_repository import KnowledgeDocumentRepository
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
+from ..repository.ontology_abstract_schema_repository import (
+    OntologyAbstractSchemaRepository,
+)
+from .concept_expansion import annotate_instances, expand_candidates, expand_metric_candidates
+from .concept_filter import filter_candidates, strip_private_keys
 from .document_service import _payload
 from .kb_type_service import LLM_WIKI_TYPES  # [jonex] llm-wiki 子集 {openkb, jonex_wiki}
+from .lineage_answer import (
+    attach_data_lineage,  # A（解释块）：响应装配 helper
+    should_attach_lineage,  # A（解释块）：只在 ontology 答案上出现
+)
 from .ontology_compiler import OntologyCompiler   # [jonex] P8（M3-a）：inverse 映射表
+from .ontology_tool_binding_service import (  # 契约工具带绑定；问答调用外部工具的总闸与上限
+    ONTOLOGY_TOOL_EXEC_MAX_CALLS,
+    ONTOLOGY_TOOL_EXEC_TIMEOUT,
+    ONTOLOGY_TOOL_EXECUTION_ENABLED,
+    OntologyToolBindingService,
+)
+from .ontology_tools import (   # 本体查询工具化（function calling）
+    OntologyToolSession,
+    outcome_fallback_reason,
+    run_tool_loop,
+)
+from .reasoning_io import (
+    ReasoningContext,
+    answer_output as io_answer_output,
+    fusion_input as io_fusion_input,
+    table as io_table,
+    text as io_text,
+)
 from .reasoning_trace import ReasoningCollector
 from .search_event_writer import write_trace_events   # [jonex] 数据运营二期：检索轨迹埋点
 from .search_history_service import SearchHistoryService
@@ -267,10 +298,11 @@ def _route_trace(
     # 旧判据文案——**保持原样**（仅把 `_route_min` 换成入参）。
     m_vscore = matched.get("vscore", 0) if matched else 0.0
     m_ftscore = matched.get("ft_score", matched.get("score", 0)) if matched else 0.0
+    # 展示用原因串统一两位小数（原始浮点如 0.8333333333333333 会直接进 UI）。
     legacy_reason = (
         f"source={matched_source}" if matched_source in ("exact", "prefix")
-        else f"vscore={m_vscore} ≥ {ONTOLOGY_VECTOR_SCORE_MIN}" if m_vscore >= ONTOLOGY_VECTOR_SCORE_MIN
-        else f"ft_score={m_ftscore} ≥ {route_min}" if m_ftscore >= route_min
+        else f"vscore={m_vscore:.2f} ≥ {ONTOLOGY_VECTOR_SCORE_MIN:.2f}" if m_vscore >= ONTOLOGY_VECTOR_SCORE_MIN
+        else f"ft_score={m_ftscore:.2f} ≥ {route_min:.2f}" if m_ftscore >= route_min
         else f"分数均不足（top-{len(top_n)} max_vscore={max_vscore:.2f} max_ftscore={max_ftscore:.2f}）"
     )
 
@@ -291,7 +323,7 @@ def _route_trace(
             reason = f"[rerank 生效] 无命中过线（top-{len(top_n)} 无候选分）"
         else:
             reason = (f"[rerank 生效] 无命中过线"
-                      f"（top-{len(top_n)} max_rerank={rr_max:.4f} < {rerank_min}）")
+                      f"（top-{len(top_n)} max_rerank={rr_max:.2f} < {rerank_min:.2f}）")
         detail.update({
             "threshold_source": "rerank",
             "rerank_score": rr_max,
@@ -470,6 +502,22 @@ ONTOLOGY_ANSWER_TIMEOUT = max(5, int(os.getenv("ONTOLOGY_ANSWER_TIMEOUT", "30"))
 # 方案④b：事实量预判阈值 — facts 数量低于此值时直接跳过本体作答进入 RAG
 ONTOLOGY_MIN_FACTS = max(0, int(os.getenv("ONTOLOGY_MIN_FACTS", "0")))
 
+# ── 本体查询工具化（function calling，PoC）──
+# 开启后，路由判定走本体时先让模型经只读工具（ontology_tools.py）查图并作答；
+# 任一环节失败（模型不支持 tools / 超轮次 / 超时 / INSUFFICIENT / 没取到事实）
+# 回落下面的正则意图路由，行为与关闭时一致。默认关。
+# 评测时可按请求覆盖：请求 dict 带私有键 `_tool_calling_override`（网关 DTO 不透传，
+# 只有服务内直调才能带上），与其它 `_*_override` 同一口径。
+ONTOLOGY_TOOL_CALLING_ENABLED = os.getenv(
+    "ONTOLOGY_TOOL_CALLING_ENABLED", "false"
+).lower() in ("1", "true", "yes", "on")
+# 最多几轮模型调用（最后一轮强制作答，不再给工具）
+ONTOLOGY_TOOL_MAX_ROUNDS = max(1, int(os.getenv("ONTOLOGY_TOOL_MAX_ROUNDS", "3")))
+# 单个工具结果送回模型的字符上限（超出部分的事实不编号、不入引用）
+ONTOLOGY_TOOL_RESULT_MAX_CHARS = max(1000, int(os.getenv("ONTOLOGY_TOOL_RESULT_MAX_CHARS", "6000")))
+# 单个工具调用（一次图查询）超时秒数；整个循环的总预算沿用本体作答超时
+ONTOLOGY_TOOL_CALL_TIMEOUT = max(1, int(os.getenv("ONTOLOGY_TOOL_CALL_TIMEOUT", "10")))
+
 # ── 方案②：融合降本 — 融合宽度上限（2a）──
 ONTOLOGY_RAG_FUSION_TOPN = max(1, int(os.getenv("ONTOLOGY_RAG_FUSION_TOPN", "3")))
 
@@ -566,6 +614,15 @@ RAG_SUBJECT_WEIGHT = float(os.getenv("RAG_SUBJECT_WEIGHT", "0.25"))
 # 语义作废 —— 失败现抛 ServiceUnavailableError，空命中返回软空结果。
 # 送 answer_from_chunks 的 chunk 文本总长上限（字符，硬截）
 RAG_ANSWER_MAX_CONTEXT_CHARS = int(os.getenv("RAG_ANSWER_MAX_CONTEXT_CHARS", "12000"))
+
+# 推理链展示用的枚举中文化（避免 "band=mid" 这类内部值直接进 UI）。
+_BAND_ZH = {"high": "高带", "mid": "中带", "low": "低带", "none": "无"}
+_CONF_ZH = {"high": "高", "mid": "中", "low": "低"}
+_INTENT_ZH = {"simple": "简单查询", "complex": "复杂查询", "unknown": "未识别"}
+_AGG_ZH = {
+    "compute": "计算", "compare": "比较", "count": "计数",
+    "reason": "推理", "convert": "换算", "none": "无",
+}
 # [jonex] S4（§3.3 #2 / §6）：统一 rerank 的载荷上限——**只防池子爆炸，不做择优**。
 #
 # 为什么不能沿用 `RAG_PRELLM_RERANK_TOPK`（默认 8）当截断值：那是「rerank 后挑
@@ -642,6 +699,14 @@ ONTOLOGY_L2_SUPPORT_T_HI = float(os.getenv("ONTOLOGY_L2_SUPPORT_T_HI", "0.65"))
 ONTOLOGY_L2_SUPPORT_T_LO = float(os.getenv("ONTOLOGY_L2_SUPPORT_T_LO", "0.15"))
 # support 取 top-K 均值（K 与 §4.4 的 `topk_mean` 一致）。
 ONTOLOGY_L2_SUPPORT_TOPK = max(1, int(os.getenv("ONTOLOGY_L2_SUPPORT_TOPK", "5")))
+#: rerank 分整体低于该值 → 视为「标度不可判」，L2 返回 `skip`（交回 LLM 裁决）。
+#: 背景：`cohere` 绑定的 Qwen3-Reranker 对「长文本答案 × chunk」打分整体塌到
+#: 1e-4 量级（2026-10-20 真机 top5=0.0003/0.0002/0.0001/0.0001/0.0），旧口径
+#: 会据此判 low 并**跳过裁决直接采纳 RAG**，把本体答案静默丢掉。reranker 失败时
+#: L2 本来就走 `skip`，这里让「分数无判别力」与「rerank 失败」同口径。
+ONTOLOGY_L2_SUPPORT_MIN_MEANINGFUL = float(
+    os.getenv("ONTOLOGY_L2_SUPPORT_MIN_MEANINGFUL", "0.001")
+)
 # ⛔ [jonex] 已删除（2026-09-24）：曾有一条「两路一致判定的 rerank 补充通道」
 # （`ONTOLOGY_ANSWER_AGREE_RERANK_ENABLED` / `_MIN` + `_answers_agree_with_rerank`，
 # 用 `rerank(onto_answer, [rag_answer])` 过线即判一致）。**标定结论是「没有可用
@@ -1106,6 +1171,16 @@ _PROCEDURAL_PATTERNS: list[re.Pattern] = [
 # [jonex] P8（M3-a）inverse 语义翻译总开关（默认 true；无 inverse_of 声明时空转零变化）
 ONTOLOGY_INVERSE_EXPAND_ENABLED = (
     os.getenv("ONTOLOGY_INVERSE_EXPAND_ENABLED", "true").lower()
+    not in ("0", "false", "no", "off")
+)
+
+# [jonex] 抽象 schema 概念扩展（概念对齐层）：查询词 → 命中概念 → 带 data_source_id
+# 的候选。关掉即回到「只有 relation inverse 参与」的既有行为。
+# 判法与相邻的 `ONTOLOGY_INVERSE_EXPAND_ENABLED` **一致**（黑名单式「关」）：两者都是
+# 回滚开关，白名单式（`in ("1","true","yes")`）会把运维最常写的 `=on` 判成**关** ——
+# 一次「照着隔壁抄」的配置就能静默停掉概念扩展，而没有任何一处报错。
+ONTOLOGY_CONCEPT_EXPAND_ENABLED = (
+    os.getenv("ONTOLOGY_CONCEPT_EXPAND_ENABLED", "true").lower()
     not in ("0", "false", "no", "off")
 )
 
@@ -1798,6 +1873,57 @@ def _first_fact_doc_id(fact: dict) -> str | None:
     return None
 
 
+# ── 推理面板：本体工具调用的逐条视图 ──
+# 工具名 → 展示名（推理面板与「可用工具」清单共用；未登记的原样显示）
+_TOOL_LABELS = {
+    "ontology_find_entities": "查找实体",
+    "ontology_get_entity": "实体详情",
+    "ontology_get_skill_steps": "技能步骤",
+    "ontology_get_next_steps": "后续步骤",
+    "ontology_get_action_contract": "动作契约",
+    "ontology_get_neighbors": "关联关系",
+    "ontology_get_entity_attribute": "实体属性",
+    "ontology_call_tool": "调用外部工具",
+}
+# 推理链整份进检索历史（JSONB）：单条结果与全部结果都设上限，超出的只留截断标记
+_TOOL_CALL_VIEW_MAX = 20
+_TOOL_RESULT_MAX_CHARS = 3000
+_TOOL_RESULTS_BUDGET_CHARS = 20000
+
+
+def _tool_call_views(records: list) -> list[dict]:
+    """调用记录 → 推理面板视图：轮次、展示名、入参（外部工具已只剩键名）、返回给模型的结果。
+
+    结果按 JSON 解析后原样展示；超过单条上限的保留文本前缀并标 `result_truncated`，
+    全部结果超过总预算后不再带结果（`result_omitted`），避免把检索历史撑大。
+    """
+    out: list[dict] = []
+    used = 0
+    for c in records[:_TOOL_CALL_VIEW_MAX]:
+        view: dict = {
+            "name": c.name, "label": _TOOL_LABELS.get(c.name, c.name), "round": c.round or None,
+            "arguments": c.arguments, "ok": c.ok, "facts_added": c.facts_added,
+            "duration_ms": c.duration_ms,
+        }
+        if c.error:
+            view["error"] = c.error
+        raw = c.result or ""
+        if raw and used < _TOOL_RESULTS_BUDGET_CHARS:
+            if len(raw) > _TOOL_RESULT_MAX_CHARS:
+                view["result"] = raw[:_TOOL_RESULT_MAX_CHARS]
+                view["result_truncated"] = True
+            else:
+                try:
+                    view["result"] = json.loads(raw)
+                except (TypeError, ValueError):
+                    view["result"] = raw
+            used += min(len(raw), _TOOL_RESULT_MAX_CHARS)
+        elif raw:
+            view["result_omitted"] = True
+        out.append(view)
+    return out
+
+
 def _facts_number_to_doc_id(facts: list[dict] | None) -> dict[str, str]:
     """从本体 facts 构建 编号 → doc_id 映射，与 answer_from_facts 的 `_no` 编号对齐。
 
@@ -1941,7 +2067,7 @@ class SearchService:
             return await self.search_jonex_wiki(
                 tenant_id, user_id,
                 JonexWikiSearchRequest(
-                    query=req.query, mode=req.mode, top_k=req.top_k,
+                    query=req.query,
                     knowledge_base_ids=[req.knowledge_base_id],
                     save_history=req.save_history,
                     domain_space_id=req.domain_space_id,
@@ -2492,6 +2618,7 @@ class SearchService:
 
     async def resolve_references(
         self, tenant_id: str, doc_ids: list[str] | None = None, refs: list[dict] | None = None,
+        *, actor: str = "",
     ) -> list[dict]:
         """引用富化端点（流式 gateway 解析出 doc_ids 后调用此方法）。
 
@@ -2500,7 +2627,50 @@ class SearchService:
         - refs：保留位置信息（流式解析出的 ParsedRef 格式）
         """
         if refs:
-            return await self._build_references(tenant_id, refs)
+            wiki = [ref for ref in refs if ref.get("asset_id")]
+            regular = [ref for ref in refs if not ref.get("asset_id")]
+            result = await self._build_references(tenant_id, regular) if regular else []
+            if wiki:
+                from .parse_result_service import ParseResultService
+                from .wiki_media import image_url, image_location, media_url
+                # Use normal document enrichment, then restore the pinned asset
+                # after the engine verifies membership in this document/version.
+                enriched = await self._build_references(tenant_id, [{k: v for k, v in ref.items()
+                    if k not in ("image_idx", "asset_id", "asset_ext")} for ref in wiki])
+                by_doc = {r["doc_id"]: r for r in enriched}
+                parse = ParseResultService()
+                for ref in wiki:
+                    if ref["doc_id"] not in by_doc:
+                        continue
+                    # Older saved references predate image usage/receipt fields.
+                    # Resolve them through their pinned legacy media contract.
+                    if not ref.get("usage"):
+                        try:
+                            asset = await parse.query_wiki_graph(tenant_id, "media", {
+                                "knowledge_base_id": ref["kb_id"], "document_id": ref["doc_id"],
+                                "graph_revision": ref.get("bundle_sha", ""), "asset_id": ref["asset_id"]})
+                            location = image_location(asset, ref["doc_id"], ref.get("bundle_sha", ""))
+                            if location is not None:
+                                location["asset_url"] = media_url(tenant_id, ref["kb_id"], ref["doc_id"], asset["bundle_sha"], asset["asset_id"])
+                                by_doc[ref["doc_id"]]["locations"].append(location)
+                        except Exception:
+                            pass
+                        continue
+                    # Missing/retired assets must not hide the text answer.
+                    try:
+                        value = await parse.query_wiki_resources(tenant_id, {
+                            "knowledge_base_id": ref["kb_id"], "operation": "get_image", "options": {
+                            "document_id": ref["doc_id"], "revision": ref.get("bundle_sha", ""), "asset_id": ref["asset_id"]}}, actor=actor)
+                        asset = value['image']
+                    except Exception:
+                        continue
+                    by_doc[ref["doc_id"]]["locations"].append({"type": "image", "image_idx": asset.get("image_idx"),
+                        "asset_id": asset["asset_id"], "bundle_sha": asset["bundle_sha"],
+                        "source_locator": asset.get('source_locator'), "usage": ref.get('usage', 'illustration'),
+                        "visual_read_id": ref.get('visual_read_id'), "text": asset.get('caption') or asset.get('label'),
+                        "asset_url": image_url(tenant_id, actor, ref["kb_id"], ref["doc_id"], asset["bundle_sha"], asset["asset_id"])})
+                result += enriched
+            return result
         if doc_ids:
             return await self._build_references_by_doc_ids(tenant_id, doc_ids)
         return []
@@ -2611,6 +2781,192 @@ class SearchService:
             return True, False
         return procedural_intent, enum_intent
 
+    # ── [jonex] 抽象 schema 概念扩展（概念对齐层）────────────────────
+
+    async def _expand_concepts(
+        self,
+        tenant_id: str,
+        kb_ids: list[str],
+        query: str,
+        collector: ReasoningCollector | None = None,
+    ) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
+        """查询词 → 命中实体（v2 `row.schema["entities"]`）→ 带 `data_source_id` 的候选。
+
+        返回 `(candidates, entities_by_kb, metric_candidates)`：`entities_by_kb` 是
+        **按 KB 分桶**的原始实体（`{kb_id: [entity, ...]}`，**不是**摊平的总池子），
+        调用方还要拿它给命中的实例**反向打源标**（`annotate_instances`）—— 按实例
+        自己的 `kb_id` 取桶，是「不跨库串源」的前提。
+
+        第三元 `metric_candidates` 来自每 KB schema 的 `metrics`
+        （`expand_metric_candidates`，响应全键形状）：识不出指标 / 指标零落点 /
+        该库没指标 / 展开出错，一律空列表，不阻塞主链路。
+
+        ⚠️ [v2] 返回的 `candidates` 是**筛后**的最终形状：跨库合并后过一次
+        `filter_candidates`（LLM 相关性筛选，失败/关开关原样放行），私有键
+        `_score` 保证已剥掉。`entities_by_kb` **不受筛选影响** —— 反向打源标
+        仍按召回的全量实体池（筛掉一个候选 ≠ 那个概念不存在）。
+
+        三处刻意的取舍：
+
+        ① **按查询的 KB 集合取，不按「命中的那个 KB」**。既有 `top_kb_id` 口径
+           （search_service.py:5236）在多 KB 查询下只读命中 KB 的 schema，会静默
+           漏掉别的库的声明 —— 那是既有缺陷，新代码不复刻它。
+        ② **独立于命中结果**，不在 `if ontology_instances:` 里面。接了库数据源的
+           库往往**没有 ABox**（实体只存在于 schema、不在 Neo4j 图里），匹配为空
+           恰恰是最需要概念扩展的场景（spec §三）。
+        ③ 开关关 / 没有 active 对齐 / 任何一步出错 → 返回 `([], {}, [])`（三个空容器，
+           与成功路径同类型），检索照常。检索链路的新增步骤一律按「降级不阻塞」写
+           （与 inverse 展开同口径）。
+        """
+        if not ONTOLOGY_CONCEPT_EXPAND_ENABLED:
+            return [], {}, []
+        try:
+            from ..repository.data_source_repository import KnowledgeDataSourceRepository
+
+            async with get_db_session() as session:
+                rows = await OntologyAbstractSchemaRepository(session).list_active_by_kbs(
+                    tenant_id, kb_ids,
+                )
+                # 候选 chip 要带数据源名（wte_a 生产库 / wte_b 生产库 / wte_dw 汇总库），
+                # 否则同一实体在 A/B 两个源上的两条候选在前端长得一模一样，无法点名。
+                # 读失败不影响候选本身（chip 只是少了源名），降级不阻塞。
+                ds_names: dict[str, str] = {}
+                try:
+                    for kb_id in kb_ids:
+                        for ds in await KnowledgeDataSourceRepository(session).list_by_kb(
+                                tenant_id, kb_id, offset=0, limit=500):
+                            ds_names[str(ds.id)] = str(ds.name or "")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[concept] 数据源名读取失败（候选 chip 无源名）: %s", exc)
+            if not rows:
+                return [], {}, []
+
+            # ⚠️ 实体**按 KB 分开存**，不要摊平成一个总池子。
+            # `annotate_instances` 只认 `entity_name`，把并集喂给全部实例会让 kbB 的实例
+            # 被贴上 kbA 的实体与 kbA 的 `data_source_id` —— 跨库串源，正是决策 6
+            # （作用域＝知识库内跨数据源，**不是**跨知识库）要挡的。
+            entities_by_kb: dict[str, list[dict]] = {}
+            candidates: list[dict] = []
+            metric_candidates: list[dict] = []
+            for row in rows:
+                entities = (row.schema or {}).get("entities") if isinstance(row.schema, dict) else []
+                entities_by_kb[row.knowledge_base_id] = entities or []
+                candidates.extend(expand_candidates(
+                    query, entities or [], knowledge_base_id=row.knowledge_base_id,
+                ))
+                # 读侧护栏与上面 entities 同款：schema 可能是 None / 非 dict / 无
+                # `metrics` 键（生成路径旧行），一律当空。
+                metrics_raw = (row.schema or {}).get("metrics") if isinstance(row.schema, dict) else []
+                try:
+                    metric_candidates.extend(
+                        expand_metric_candidates(
+                            query, metrics_raw, entities,
+                            knowledge_base_id=row.knowledge_base_id,
+                        )
+                    )
+                except Exception:  # 指标识别不阻塞主链路（沿用现有降级纪律）
+                    logger.warning("[concept] 指标候选展开失败 kb=%s",
+                                   row.knowledge_base_id, exc_info=True)
+
+            # 给候选补数据源名（前端候选 chip 用它区分 A厂/B厂/汇总库）；
+            # 读不到名字时不加键，保持既有候选形状逐字不变。
+            if ds_names:
+                for cand in [*candidates, *metric_candidates]:
+                    if isinstance(cand, dict):
+                        name = ds_names.get(str(cand.get("data_source_id") or ""))
+                        if name:
+                            cand["source_name"] = name
+
+            if collector:
+                collector.step(
+                    STAGE_ONTOLOGY_MATCH, "抽象概念扩展",
+                    status="done" if candidates else "skipped",
+                    summary=(f"命中 {len(candidates)} 条带源候选"
+                             if candidates else "无概念命中"),
+                    detail={
+                        # ⚠️ 这份 detail 随响应返回并落 search_history，而抓的是
+                        # **筛选前**的原始候选（带 `_score` / `_matches` /
+                        # `_attr_hits`）—— 必须在这里就剥掉私有键，不能只靠
+                        # `filter_candidates` 在返回边界剥：那一步发生在采集之后。
+                        "candidates": strip_private_keys(candidates[:10]),
+                        "candidate_count": len(candidates),
+                        # 指标候选同为截断预览（全键契约、无私有键可泄）。
+                        "metric_candidates": metric_candidates[:10],
+                        "metric_candidate_count": len(metric_candidates),
+                        "kb_count": len(rows),
+                        "concept_pool": sum(len(v) for v in entities_by_kb.values()),
+                    },
+                )
+            # [v2] LLM 相关性筛选（spec: concept-matching-v2 §3.4）：只筛候选集，
+            # 不改召回判定；失败/关开关 → 原样。`entities_by_kb` 不受影响。
+            candidates, filter_status = await filter_candidates(
+                query, candidates, tenant_id=tenant_id,
+                kb_id=(kb_ids[0] if len(kb_ids) == 1 else None),
+            )
+            if collector:
+                collector.step(
+                    STAGE_CONCEPT_FILTER, "概念相关性筛选",
+                    # spec §3.4 三档：filtered→done、passthrough（失败降级）→failed、
+                    # 其余（未触发/关开关）→skipped。失败与未触发在推理链上必须可分。
+                    status={"filtered": "done", "passthrough": "failed"}.get(filter_status, "skipped"),
+                    summary=f"保留 {len(candidates)} 条候选（{filter_status}）",
+                )
+            # 形状兜底：全部 `_` 前缀键（`_score` / `_matches` / `_attr_hits`）
+            # 都是私有键，绝不出这一层（`concept_candidates` 的公共形状契约见
+            # spec §五）。正常由 `filter_candidates` 剥，但它可被替换 / 未来改动
+            # 可能漏剥 —— 桩也不能让私有键泄给下游。
+            candidates = strip_private_keys(candidates)
+            logger.info(
+                "[ontology] 概念扩展 query=%r kbs=%d concepts=%d candidates=%d",
+                query, len(rows),
+                sum(len(v) for v in entities_by_kb.values()), len(candidates),
+            )
+            return candidates, entities_by_kb, metric_candidates
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ontology] 抽象概念扩展失败，跳过: %s", e)
+            return [], {}, []
+
+    async def _data_lineage(self, tenant_id: str, ontology_instances: list[dict]) -> dict | None:
+        """A：本体命中实体的「数据来源/下游」解释块（开关关 / 无内容 ⇒ None）。
+
+        命中实体经 `annotate_instances` 带 `concept_sources` 与自己的 `kb_id`；
+        多 KB 检索时按每个实体自己的 `kb_id` 分组（串库会把 A 库的源映射到 B 库的
+        schema 上）。`build_data_lineage_block` 自身 fail-open，这里只在有内容时
+        返回合并块；调用方必须「块非空才写键」，旧响应形状保持不变。
+        """
+        try:
+            if not config.LINEAGE_ANSWER_ENABLED:
+                return None
+            from .lineage_answer import build_data_lineage_block
+            from .lineage_walk import walk as walk_fn
+            compiler = OntologyCompiler()
+
+            async def get_schema(tid: str, kid: str, ds_id: str):
+                return await compiler.get_compiled_schema(tid, kid, data_source_id=ds_id)
+
+            blocks = []
+            by_kb: dict[str, list[dict]] = {}
+            for inst in ontology_instances or []:
+                if isinstance(inst, dict):
+                    by_kb.setdefault(str(inst.get("kb_id") or ""), []).append(inst)
+            for kid, insts in by_kb.items():
+                if not kid:
+                    continue
+                block = await build_data_lineage_block(
+                    tenant_id, kid, insts, get_schema=get_schema, walk_fn=walk_fn,
+                    max_items=config.LINEAGE_ANSWER_MAX_ITEMS,
+                    max_hops=config.LINEAGE_ANSWER_MAX_HOPS)
+                if block:
+                    blocks.append(block)
+            if not blocks:
+                return None
+            return {"items": [i for b in blocks for i in b["items"]],
+                    "truncated": any(b.get("truncated") for b in blocks)}
+        except Exception as exc:  # noqa: BLE001 —— 解释块是增能项，失败即缺席
+            # 懒导入、compiler 构造、config 读取都在这里兜住：任何异常都不能把检索带崩。
+            logger.warning("data_lineage 解释块装配失败，本次省略：%s", exc)
+            return None
+
     @staticmethod
     def _build_inverse_map(schema: dict | None) -> dict[str, str]:
         """[jonex] P8（M3-a）：从 compiled schema 建 relation_name → inverse_of 映射。
@@ -2710,6 +3066,174 @@ class SearchService:
                 return {"intent": intent_key, "params": params}
         # 兜底：仅有版本号但没有明确意图词 → 不匹配（让通用流程处理）
         return None
+
+    @staticmethod
+    def _tool_calling_enabled(raw: dict) -> bool:
+        """本次请求是否走工具化：请求私有键 `_tool_calling_override` 优先，否则看进程开关。"""
+        if "_tool_calling_override" in (raw or {}):
+            return bool(raw.get("_tool_calling_override"))
+        return ONTOLOGY_TOOL_CALLING_ENABLED
+
+    async def _ontology_tool_mode(
+        self, raw: dict, tenant_id: str, candidates: list[dict],
+    ) -> str | None:
+        """本次本体问答怎么用工具调用：`"all"` / `"live_data"` / None（走正则路由）。
+
+        - `all`：工具化开关打开（或请求私有键强制打开），本体问答一律走工具调用；
+        - `live_data`：工具化开关关、外部工具总闸 `ONTOLOGY_TOOL_EXECUTION_ENABLED` 开，
+          且候选实体里有「绑定启用 + 允许问答调用」的 Action —— 只为可能要取实时数据的问题进；
+        - 请求私有键 `_tool_calling_override=False` 时两种都不进。
+        """
+        if "_tool_calling_override" in (raw or {}):
+            return "all" if raw.get("_tool_calling_override") else None
+        if ONTOLOGY_TOOL_CALLING_ENABLED:
+            return "all"
+        if not ONTOLOGY_TOOL_EXECUTION_ENABLED:
+            return None
+        pairs = [(c.get("kb_id"), c.get("name")) for c in candidates or [] if c.get("type") == "Action"]
+        if not pairs:
+            return None
+        try:
+            hit = await OntologyToolBindingService().qa_callable_targets(tenant_id, pairs)
+        except Exception as exc:  # noqa: BLE001 — 粗筛失败按「不进」处理，不影响普通问答
+            logger.warning("[ontology-tools] 问答调用粗筛失败，走正则路由: %s", exc)
+            return None
+        return "live_data" if hit else None
+
+    async def _run_ontology_tool_loop(
+        self,
+        gdao: OntologyGraphRepository,
+        tenant_id: str,
+        user_id: str,
+        kb_ids: list[str],
+        top_kb_id: str,
+        query: str,
+        trace_id: str | None,
+        collector: ReasoningCollector | None,
+        budget: float,
+        candidates: list[dict] | None = None,
+        require_external_call: bool = False,
+    ) -> tuple[str, list[dict], list[dict]] | None:
+        """本体查询工具化：成功返回 `(answer, facts, tool_results)`，否则返回 None 由调用方回落正则路由。
+
+        `tool_results`：本次 ontology_call_tool 的调用摘要（总闸关时恒为空），回给前端「实时数据」区块。
+
+        `facts` 的下标与答案里 `[ref_N]` 的 N 对齐（见 ontology_tools 模块说明），
+        调用方照常走 `_ontology_refs` / `normalize_citations` / `_cross_verify`。
+        """
+        t = time.perf_counter()
+
+        async def _inverse_map(kb_id: str) -> dict:
+            return self._build_inverse_map(
+                await OntologyCompiler().get_compiled_schema(tenant_id, kb_id),
+            )
+
+        binding_svc = OntologyToolBindingService()
+
+        async def _call_tool(kb_id: str, action_name: str, inputs: dict) -> dict:
+            # 四道闸在 qa_call 里：总闸 + 绑定 qa_callable、绑定启用且工具可用、判定 allow、工具只读
+            return await binding_svc.qa_call(
+                tenant_id, kb_id, action_name, inputs, user_id=user_id, request_id=trace_id,
+            )
+
+        session = OntologyToolSession(
+            gdao=gdao, tenant_id=tenant_id, kb_ids=list(kb_ids),
+            match_fn=lambda q: self._match_ontology(gdao, tenant_id, kb_ids, q),
+            inverse_map_fn=_inverse_map if ONTOLOGY_INVERSE_EXPAND_ENABLED else None,
+            expand_inverse_fn=self._expand_inverse_relations,
+            binding_fn=binding_svc.binding_lookup(tenant_id),
+            # 总闸关时不注入：模型看不到 ontology_call_tool，提示词也不变
+            call_tool_fn=_call_tool if ONTOLOGY_TOOL_EXECUTION_ENABLED else None,
+            max_tool_calls=ONTOLOGY_TOOL_EXEC_MAX_CALLS,
+            call_tool_timeout=ONTOLOGY_TOOL_EXEC_TIMEOUT + 5,
+            result_max_chars=ONTOLOGY_TOOL_RESULT_MAX_CHARS,
+            call_timeout=ONTOLOGY_TOOL_CALL_TIMEOUT,
+        )
+        outcome = None
+        reason: str | None = None
+        try:
+            outcome = await asyncio.wait_for(
+                run_tool_loop(
+                    query, session, chat_with_tools,
+                    max_rounds=ONTOLOGY_TOOL_MAX_ROUNDS,
+                    llm_kwargs={"tenant_id": tenant_id, "kb_id": top_kb_id,
+                                "user_id": user_id, "trace_id": trace_id},
+                    # 路由阶段已算好的命中实体，让模型省掉一轮找实体
+                    candidates=candidates,
+                ),
+                timeout=budget,
+            )
+            reason = outcome_fallback_reason(outcome, session)
+            if reason is None and require_external_call and not session.tool_results:
+                # 只为取实时数据才进来的（live_data 模式），模型没调外部工具就不采纳，
+                # 回到正则路由 —— 普通本体问题的作答方式与推理过程都和以前一样
+                reason = "no_external_call"
+        except asyncio.TimeoutError:
+            reason = "timeout"
+        except Exception as exc:  # noqa: BLE001 — 任何失败都回落正则路由，不报错
+            reason = f"error:{type(exc).__name__}"
+            logger.warning("[ontology-tools] 工具循环失败，回落正则路由: %s", exc)
+
+        calls = _tool_call_views(session.calls)
+        detail = {
+            "rounds": outcome.rounds if outcome else None,
+            "tool_calls_total": len(calls),
+            "calls": calls[:_TOOL_CALL_VIEW_MAX],
+            "fact_count": len(session.facts),
+            "fallback_reason": reason,
+        }
+        step_input = [
+            io_text("检索问题", query),
+            io_text("候选实体", "、".join(
+                str(c.get("name")) for c in (candidates or [])[:5] if c.get("name")) or None),
+            io_text("可用工具", "、".join(
+                _TOOL_LABELS.get(s["function"]["name"], s["function"]["name"])
+                for s in session.tool_schemas())),
+        ]
+        step_calls_table = io_table(
+            "调用明细",
+            [{"key": "round", "label": "轮次"}, {"key": "tool", "label": "工具"},
+             {"key": "args", "label": "入参"}, {"key": "status", "label": "结果"},
+             {"key": "ms", "label": "耗时(ms)"}],
+            [{"round": c.get("round"), "tool": c.get("label"),
+              "args": json.dumps(c.get("arguments") or {}, ensure_ascii=False),
+              "status": ("失败：" + c["error"]) if not c.get("ok")
+              else ("复用缓存" if c.get("error") == "cached" else f"新增事实 {c.get('facts_added', 0)}"),
+              "ms": c.get("duration_ms")}
+             for c in calls],
+            preview_rows=10,
+        )
+        logger.info(
+            "[ontology-tools] query=%r rounds=%s calls=%s facts=%d fallback=%s",
+            query, detail["rounds"], [c["name"] for c in calls], len(session.facts), reason,
+        )
+        if reason is not None:
+            # live_data 模式下没调外部工具：不在推理过程里留这一步（外部工具调了却没被采纳的仍然显示）
+            silent = require_external_call and not session.tool_results
+            if collector and not silent:
+                collector.step(
+                    STAGE_ONTOLOGY_TOOLS, "本体工具调用", status="skipped",
+                    summary=f"工具化未采纳（{reason}），回落正则路由",
+                    detail=detail,
+                    input=step_input,
+                    output=[step_calls_table, io_text("未采纳原因", reason)],
+                    t_start=t,
+                )
+            return None
+        if collector:
+            collector.step(
+                STAGE_ONTOLOGY_TOOLS, "本体工具调用",
+                summary=(f"{detail['rounds']} 轮、{len(calls)} 次工具调用，"
+                         f"取到 {len(session.facts)} 条事实并作答"),
+                detail={**detail, "facts_preview": session.facts[:8]},
+                input=step_input,
+                output=[step_calls_table, *io_answer_output(
+                    "作答结果", outcome.answer,
+                    **{"事实数量": len(session.facts), "答案来源": "本体（工具调用）"},
+                )],
+                t_start=t,
+            )
+        return outcome.answer, session.facts, list(session.tool_results)
 
     async def _execute_graph_query(
         self,
@@ -4202,6 +4726,19 @@ class SearchService:
                 )
 
         # ── 埋点：⑤ 的 STAGE_REF_RETRIEVE 改为记本体引用构建 ──
+        # 展示用引用片段（最多 8 条）：只取 location 的短文本与分数，
+        # 不复制整份 references（detail 会随历史整份落库）。
+        _refs_preview: list[dict] = []
+        _loc_total = 0
+        for _r in all_refs:
+            for _loc in (_r.get("locations") or []):
+                _loc_total += 1
+                if len(_refs_preview) < 8:
+                    _refs_preview.append({
+                        "text": _loc.get("text"),
+                        "score": _loc.get("score", _r.get("score")),
+                        "file_name": _r.get("file_name"),
+                    })
         if collector:
             collector.step(
                 STAGE_REF_RETRIEVE, "本体引用构建",
@@ -4240,6 +4777,8 @@ class SearchService:
                     "cited_only_enabled": cited_stats["enabled"],
                     "cited_filter_kept": cited_stats["kept"],
                     "cited_filter_total": cited_stats["total"],
+                    "refs_preview": _refs_preview,
+                    "refs_preview_total": _loc_total,
                 },
                 t_start=t,
             )
@@ -4741,6 +5280,11 @@ class SearchService:
                     "answer_ms": answer_ms,
                     "scene": _scene("rag_chunk_qa", fast_mode),
                 },
+                output=io_answer_output(
+                    "作答结果", answer,
+                    **{"使用 chunk 数": len(prompt_refs),
+                       "作答耗时": f"{answer_ms}ms"},
+                ),
                 t_start=t_answer,
             )
             # 平台侧统一作答，融合阶段不触发（`fusion` 标 skipped 保留为进度可见性）
@@ -5248,14 +5792,22 @@ class SearchService:
                 "facts_summary": [],
             }
         kb_ids = await self._resolve_kb_ids(tenant_id, req)
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query, kb_ids=list(kb_ids or []),
+                mode=req.mode, top_k=req.top_k,
+            ),
+        )
 
         # ── 意图分类 ──
+        t_intent = time.perf_counter()
         intent = self._classify_intent(req.query)
         collector.step(
             STAGE_INTENT_CLASSIFY, "意图识别",
-            summary=f"intent={intent['intent']} ops={intent.get('ops', [])}",
+            summary=f"意图={_INTENT_ZH.get(str(intent['intent']), intent['intent'])}",
             detail=intent,
+            t_start=t_intent,
         )
 
         # simple → 直连现有核心
@@ -5286,7 +5838,10 @@ class SearchService:
         aggregation = plan.get("aggregation", {"op": "none", "instruction": ""})
         collector.step(
             STAGE_QUERY_PLAN, "查询分解",
-            summary=f"拆成 {len(sub_questions)} 个子查询，聚合={aggregation.get('op', 'none')}",
+            summary=(
+                f"拆成 {len(sub_questions)} 个子查询，"
+                f"聚合={_AGG_ZH.get(str(aggregation.get('op', 'none')), aggregation.get('op', 'none'))}"
+            ),
             detail={"sub_questions": sub_questions, "aggregation": aggregation},
             t_start=t_plan,
         )
@@ -5321,7 +5876,11 @@ class SearchService:
                         STAGE_SUBQUERY, f"子查询·{sq.get('id', '?')}",
                         status="done" if fact.get("value") or fact.get("answer") else "skipped",
                         summary=f"{sq.get('ask', '')} → {fact.get('value') or fact.get('answer', '')[:100]}",
-                        detail={"value": fact.get("value"), "source": fact.get("source"),
+                        detail={"ask": sq.get("ask", ""),
+                                "expect": sq.get("expect"),
+                                "value": fact.get("value"),
+                                "answer_preview": (fact.get("answer") or "")[:200],
+                                "source": fact.get("source"),
                                 "grounded": fact.get("grounded"),
                                 "ref_count": fact.get("ref_count")},
                         t_start=t_s,
@@ -5347,9 +5906,14 @@ class SearchService:
         )
         collector.step(
             STAGE_SYNTHESIS, "汇总与计算",
-            summary=f"基于 {sum(1 for f in facts if f.get('value') or f.get('answer'))}/{len(facts)} 个要素完成 {aggregation.get('op', '?')}",
+            summary=(
+                f"基于 {sum(1 for f in facts if f.get('value') or f.get('answer'))}/{len(facts)} 个要素"
+                f"完成{_AGG_ZH.get(str(aggregation.get('op')), aggregation.get('op', '?'))}"
+            ),
             detail={"facts": [{"id": f["sub_id"], "value": f.get("value")} for f in facts],
                     "aggregation_op": aggregation.get("op")},
+            output=io_answer_output("最终答案", answer,
+                                    **{"聚合方式": aggregation.get("op")}),
             t_start=t_synth,
         )
 
@@ -5465,8 +6029,19 @@ class SearchService:
         best: tuple[dict, dict] | None = None
         prior_answers: list[str] = []
 
-        # 推理链
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        # 推理链：KB 范围与普通入口同口径解析（严格模式允许只传 domain_space_id），
+        # 否则步骤里的知识库只能显示 UUID / 为空。
+        _strict_kb_ids = [k for k in (req.knowledge_base_ids or []) if k]
+        if not _strict_kb_ids:
+            _strict_kb_ids = await self._resolve_kb_ids(tenant_id, req)
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query,
+                kb_ids=list(_strict_kb_ids or []),
+                mode=req.mode, top_k=req.top_k,
+            ),
+        )
 
         for i in range(cap):
             gear = _STRICT_ESCALATION[min(i, len(_STRICT_ESCALATION) - 1)]
@@ -5529,6 +6104,8 @@ class SearchService:
                     "gear": gear,
                     "checks": chk["checks"],
                     "score": chk["score"],
+                    "passed": chk["passed"],
+                    "source": result.get("source"),
                     "answer_preview": result["answer"][:200],
                     "ref_count": len(result.get("references", [])),
                 },
@@ -5544,6 +6121,12 @@ class SearchService:
                     STAGE_STRICT_VERIFY, "严格校验通过",
                     status="done",
                     summary=f"第{i + 1}次达标（{chk['score']:.2f} ≥ {req.strict_min_score}），提前返回",
+                    detail={
+                        "attempt": i + 1,
+                        "score": chk["score"],
+                        "min_score": req.strict_min_score,
+                        "passed": True,
+                    },
                 )
                 break
 
@@ -5552,6 +6135,11 @@ class SearchService:
                     STAGE_STRICT_VERIFY, "严格校验中止",
                     status="failed",
                     summary="超总预算，返回当前最优",
+                    detail={
+                        "elapsed_s": round(time.perf_counter() - t_all, 1),
+                        "budget_s": _STRICT_TOTAL_BUDGET,
+                        "passed": False,
+                    },
                 )
                 break
 
@@ -5562,6 +6150,16 @@ class SearchService:
                 "source": "none",
                 "references": [],
                 "ontology_instances": [],
+                # [jonex] 契约字段：`query_with_ontology` 的全部返回路径（含
+                # strict 正常路径 —— 它原样 `return result`）都必须带
+                # `concept_candidates`。这条早退是**手工拼的**，不走内层
+                # `query_with_ontology`，漏掉它调用方一句 `resp["concept_candidates"]`
+                # 就是 KeyError —— 拿不到概念候选是「没命中」，不是「出错了」，
+                # 更不该让一次超时把整个响应的形状变成另一种。
+                "concept_candidates": [],
+                # 指标候选同理：每条返回路径都要有这个键（函数内 `_expand_concepts`
+                # 早退起就是 `[], {}, []`，第三元即它；空列表 = 没命中）。
+                "metric_candidates": [],
                 "rag_used": False,
                 "knowledge_base_ids": [],
                 "reasoning": collector.build("none"),
@@ -5670,7 +6268,16 @@ class SearchService:
         gdao = OntologyGraphRepository(get_neo4j_driver())
 
         # ── 编排推理链采集器（R1 双闸：请求开关 + 进程总闸）──
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query, kb_ids=list(kb_ids or []),
+                mode=req.mode, top_k=req.top_k,
+            ),
+        )
+
+        # 问答调用外部工具的摘要（总闸关 / 没走工具化时恒为空，结果里不出这个键）
+        tool_results: list[dict] = []
 
         # ── 阶段 1：多 KB 本体实体匹配（采集点①）──
         ontology_instances: list[dict] = []
@@ -5700,6 +6307,28 @@ class SearchService:
             collector.step(STAGE_ONTOLOGY_MATCH, "本体实体匹配",
                            status="failed", summary="本体检索失败，降级 OntoRAG", t_start=t)
             logger.warning("[ontology] 本体检索失败，降级 RAG: %s", e)
+
+        # ── [jonex] 抽象 schema 概念扩展（概念对齐层）──
+        # 位置在 `_match_ontology` 之后：一要拿实例做反向打源标，二要让采集器
+        # 的顺序与推理链一致。**不改召回** —— 既不往 _match_ontology 塞候选，
+        # 也不动实例集合，检索结果与改造前逐条相同；产出的候选是给下游
+        # 「分源列举」（§七 的 NL→SQL spec）用的输入。
+        concept_candidates, _entities_by_kb, metric_candidates = await self._expand_concepts(
+            tenant_id, kb_ids, req.query, collector=collector,
+        )
+        if _entities_by_kb and ontology_instances:
+            # ⚠️ **逐实例、按它自己的 KB 取实体池**，两个坑一起躲开：
+            #   ① 跨库串源：实体池是所有 queried KB 的并集，直接喂并集会让 kbB 的实例
+            #      被贴上 kbA 的实体与 kbA 的 data_source_id（决策 6：作用域是知识库内）；
+            #   ② 顺序：`ontology_instances` 是按 fused_score 排好的，路由那步要取
+            #      `_gated[:5]`。先按 KB 分组再拼回去会**重排**列表、改变路由决策，
+            #      所以这里逐条标注、原地替换，保持原序。
+            _annotated: list[dict] = []
+            for inst in ontology_instances:
+                _kb = str(inst.get("kb_id") or "")
+                _one = annotate_instances([inst], _entities_by_kb.get(_kb, []))
+                _annotated.append(_one[0] if _one else inst)
+            ontology_instances = _annotated
 
         # ── 阶段 2：路由决策（采集点②）──
         answer: str | None = None
@@ -5759,6 +6388,7 @@ class SearchService:
             return _pool_cache["pool"]
 
         if ontology_instances:
+            _t_route = time.perf_counter()
             # 路由判定：top-5 内任一命中即走本体（避免高 vscore 候选因全文 rank 落后被埋没）
             # [jonex] 多意图：收集所有过线命中（上限 ONTOLOGY_NEIGHBOR_ENTITY_MAX），
             # 供阶段 3 逐一展开邻域；matched 仍取首个（向后兼容路由展示/时间线模板）。
@@ -5825,14 +6455,17 @@ class SearchService:
                     # （不再凭硬编码 1.0 直接过线）。
                     _s = _rr_scores.get(_i)
                     _pass = _s is not None and _s >= ONTOLOGY_ROUTE_RERANK_MIN
-                    _why = (f"rerank={_s:.4f}≥{ONTOLOGY_ROUTE_RERANK_MIN}"
-                            if _s is not None else "rerank 无该候选分")
+                    _why = (f"重排分 {_s:.2f} ≥ {ONTOLOGY_ROUTE_RERANK_MIN:.2f}"
+                            if _s is not None else "重排无该候选分")
                 else:
                     # 开关关 / rerank 失败：**旧判据原样保留**（含 prefix 旁路）。
                     _pass = (src in ("exact", "prefix")
                              or vs >= ONTOLOGY_VECTOR_SCORE_MIN
                              or fs >= _route_min)
-                    _why = f"旧判据(source={src},vscore={vs},ft_score={fs})"
+                    _why = (
+                        f"旧判据(source={src}, 向量分={float(vs or 0):.2f}, "
+                        f"全文分={float(fs or 0):.2f})"
+                    )
                 if _pass:
                     hit["_route_why"] = _why
                     if len(matched_list) < ONTOLOGY_NEIGHBOR_ENTITY_MAX:
@@ -5875,6 +6508,7 @@ class SearchService:
                          if go_ontology else
                          f"降级 OntoRAG（{route_reason}）"),
                 detail=route_detail,
+                t_start=_t_route,
             )
             if go_ontology:
                 top_name = matched.get("name", "")
@@ -5885,20 +6519,56 @@ class SearchService:
                     route_detail["source"], route_detail["vscore"], route_detail["ft_score"],
                 )
 
+                # ── 本体查询工具化（开关默认关）：成功则跳过下面的正则意图路由与作答 ──
+                # 跳过方式是把各段的入口条件置否（_tool_done），不改它们的内部逻辑。
+                _tool_done = False
+                _tool_facts: list[dict] | None = None
+                # 两种进入方式：① 工具化总开关打开 → 本体问答一律走工具调用；
+                # ② 总开关关、外部工具总闸开 → 只有候选实体里有「开了问答调用」的动作才进，
+                #    且模型真的调了外部工具才采纳，否则静默回到正则路由（推理过程与改造前一致）。
+                _tool_mode = await self._ontology_tool_mode(raw, tenant_id, ontology_instances[:5])
+                if _tool_mode:
+                    _tool_out = await self._run_ontology_tool_loop(
+                        gdao, tenant_id, user_id, kb_ids, top_kb_id, req.query,
+                        trace_id, collector, budget=_answer_timeout,
+                        candidates=ontology_instances[:5],
+                        require_external_call=_tool_mode == "live_data",
+                    )
+                    if _tool_out is not None:
+                        answer, _tool_facts, tool_results = _tool_out
+                        source = "ontology"
+                        rag_used = False
+                        _tool_done = True
+
                 # ── [jonex] P1-6 时间线/枚举/计数意图 → 图查询模板 ──
                 top_type = matched.get("type", "")
-                timeline = self._detect_timeline_intent(req.query)
+                timeline = None if _tool_done else self._detect_timeline_intent(req.query)
                 graph_facts = None
                 # [jonex] S5：枚举意图 → 跳过本体取证与作答，强制走 RAG
                 # 取原始表格行（整行字段一并回传，覆盖「缺电话列」类召回不全）。
                 # 域限定：仅命中表格行实体（extraction_method=row_as_object）才处置，
                 # 非表格枚举问法（如「Skill 有哪些步骤」）正常走本体作答；
                 # M3-b：procedural 问法优先，enum 不生效。
-                enum_intent = self._enumeration_applies(req.query, matched_list)
+                # [jonex] `/search/data` 显式路线：数据路径会负责枚举，本侧必须保留
+                # 本体答案，不能再按 S5 把本体整体让给 RAG（否则「本体+数据」只剩数据）。
+                if req.skip_enum_force_rag:
+                    enum_intent = False
+                    logger.info(
+                        "[ontology] skip_enum_force_rag：跳过枚举强制 RAG query=%r",
+                        req.query,
+                    )
+                else:
+                    enum_intent = self._enumeration_applies(req.query, matched_list)
+                enum_intent = (
+                    False if _tool_done
+                    else self._enumeration_applies(req.query, matched_list)
+                )
                 # [jonex] P8（M3-b）：procedural 优先于 enum——
                 # 「配置流程的所有步骤」同时命中 enum 第 4 条（所有）与
                 # procedural（步骤），步骤类问法以步骤链模板为准。
-                procedural_intent = self._detect_procedural_intent(req.query)
+                procedural_intent = (
+                    not _tool_done and self._detect_procedural_intent(req.query)
+                )
                 procedural_intent, enum_intent = self._resolve_intent_priority(
                     procedural_intent, enum_intent,
                 )
@@ -5918,7 +6588,7 @@ class SearchService:
                         detail={"query": req.query},
                     )
                     logger.info("[ontology] 枚举意图 → 强制 RAG query=%r", req.query)
-                elif self._detect_enumeration_intent(req.query):
+                elif not _tool_done and self._detect_enumeration_intent(req.query):
                     logger.info(
                         "[ontology] 枚举词表命中但无表格行实体（procedural 优先或非 row_as_object），"
                         "不强制 RAG query=%r",
@@ -5949,7 +6619,8 @@ class SearchService:
 
                 # ── 阶段 3：邻域取证（采集点③，独立 try）──
                 t = time.perf_counter()
-                facts = graph_facts  # P1-6 图查询模板已取到 fact 则跳过 neighbors()
+                # P1-6 图查询模板已取到 fact 则跳过 neighbors()；工具化已作答时用工具取到的事实
+                facts = _tool_facts if _tool_done else graph_facts
                 if facts is None and not enum_intent:  # S5：枚举意图不取邻域，facts=None → 自然降级 RAG
                     try:
                         # [jonex] 多意图：对 matched_list 里所有过线实体并发展开邻域，
@@ -6030,9 +6701,13 @@ class SearchService:
                 # incoming 边按 inverse_of 映射翻译 relation_type（作答 LLM 看到
                 # 语义正确方向）；无声明/开关关时零变化。compiled schema 走
                 # Redis 缓存，无额外 IO。
-                if ONTOLOGY_INVERSE_EXPAND_ENABLED and facts:
+                # 工具化路径已在工具内做过 inverse 翻译，这里不重复
+                if ONTOLOGY_INVERSE_EXPAND_ENABLED and facts and not _tool_done:
                     try:
-                        _compiled = await OntologyCompiler().get_compiled_schema(
+                        # 取**合并视图**而非知识库级那一份：schema 粒度改成「按数据源」
+                        # 之后，只看知识库级会漏掉各数据源里声明的关系——映射静默变小，
+                        # 症状是「不报错、只是答得差一点」，正是最难发现的那种。
+                        _compiled = await OntologyCompiler().get_merged_schema(
                             tenant_id, top_kb_id,
                         )
                         _inverse_map = self._build_inverse_map(_compiled)
@@ -6050,11 +6725,12 @@ class SearchService:
                 # ── [jonex] S2：stub 事实过滤（desc 空且 attrs 空）──
                 # 在两个 facts 来源（图查询模板 / neighbors）之后统一执行；
                 # 全部被过滤时自然走 INSUFFICIENT → 降级 RAG。
-                if facts:
+                # 工具化路径不过滤：答案里的 [ref_N] 已按工具事实的下标编号，删事实会错位。
+                if facts and not _tool_done:
                     facts = self._filter_stub_facts(facts, collector=collector)
 
                 # ── 阶段 4：本体作答（采集点④，独立 try）──
-                if facts is not None:
+                if facts is not None and not _tool_done:
                     # 方案④b：事实量预判 — 低于阈值直接跳过本体作答
                     # [jonex] P8（M3-f）：procedural 意图 + 单 Action root 豁免
                     #（单 Action 常只有 2-3 条边，低于运维调高的阈值）
@@ -6070,7 +6746,7 @@ class SearchService:
                             len(facts), ONTOLOGY_MIN_FACTS, req.query,
                         )
                         facts = None   # 触发 RAG 降级
-                if facts is not None:
+                if facts is not None and not _tool_done:
                     t = time.perf_counter()
                     try:
                         # [jonex] P2-7: 图查询模板取到的事实 → 放宽常识边界
@@ -6097,7 +6773,16 @@ class SearchService:
                             collector.step(STAGE_LLM_ANSWER, "本体事实作答",
                                            summary="基于本体事实生成答案", t_start=t,
                                            detail={"thinking": not _fast_llm,
-                                                   "answer_timeout": _answer_timeout})
+                                                   "fact_count": len(facts),
+                                                   "answer_timeout": _answer_timeout,
+                                                   # 只带前 8 条供展示（detail 会整份落历史，
+                                                   # 不能复制全量 facts）。
+                                                   "facts_preview": facts[:8]},
+                                           output=io_answer_output(
+                                               "作答结果", answer,
+                                               **{"事实数量": len(facts),
+                                                  "答案来源": "本体"},
+                                           ))
                         else:
                             collector.step(STAGE_LLM_ANSWER, "本体事实作答", status="skipped",
                                            summary="事实不足（INSUFFICIENT），降级 OntoRAG", t_start=t)
@@ -6244,10 +6929,31 @@ class SearchService:
             "source": source,
             "references": references,
             "ontology_instances": ontology_instances,
+            # [jonex] 抽象概念扩展产出的「带源候选」。下游（分源列举 / NL→SQL）
+            # 靠它知道「用户问的这个概念，在各个源里分别对应哪张表/哪个指标」。
+            # 空列表 = 没命中概念或该库还没有已确认的对齐，不是错误。
+            "concept_candidates": concept_candidates,
+            # [jonex] 指标候选（全键形状见 `expand_metric_candidates`）：下游 NL→SQL
+            # 靠它把「用户问的指标」映射到各源上的 `di_metric` 通道。与
+            # `concept_candidates` 同纪律：空列表 = 没命中 / 零落点，不是错误。
+            "metric_candidates": metric_candidates,
             "rag_used": rag_used,
             "knowledge_base_ids": kb_ids,
             "reasoning": collector.build(source),
         }
+        # 实时数据（ontology_call_tool）：只在最终答案仍是本体答案时回传 —— 裁决改用 RAG 答案后，
+        # 工具结果不在答案依据里，展示出来会误导。键单列，不混进 references（工具结果没有文档出处）。
+        if tool_results and source == "ontology":
+            result["tool_results"] = [
+                {k: r.get(k) for k in ("seq", "action", "tool_name", "tool_label", "tool_source",
+                                       "status", "http_status", "called_at", "fact_no")}
+                for r in tool_results
+            ]
+        # A（解释块）：命中实体 → 物理表 → 上下游。fail-open；无内容不写键。
+        # 只挂在 ontology 答案上（data/clarify/rag/none 等路径不带，避免误导）。
+        if should_attach_lineage(source):
+            attach_data_lineage(
+                result, await self._data_lineage(tenant_id, ontology_instances))
         if req.save_history:
             history = await self._history.save_history(
                 tenant_id, user_id,
@@ -6866,6 +7572,14 @@ class SearchService:
                 ONTOLOGY_L2_SUPPORT_T_LO, req.query[:60],
             )
 
+        if support < ONTOLOGY_L2_SUPPORT_MIN_MEANINGFUL:
+            # 不是「证据与答案矛盾」，而是这个 reranker 对长答案×chunk 根本没有
+            # 判别力（分数整体趋近 0）。判 low 会绕过 LLM 裁决直接采纳 RAG，
+            # 而 RAG 那侧可能只是在说「资料里没有」——本体答案被静默丢掉。
+            detail["reason"] = "rerank 分整体趋近 0（标度不可判），跳过低带判定"
+            detail["band"] = "skip"
+            return "skip", support, detail
+
         band = (
             "high" if support >= ONTOLOGY_L2_SUPPORT_T_HI
             else "low" if support <= ONTOLOGY_L2_SUPPORT_T_LO
@@ -6928,6 +7642,7 @@ class SearchService:
             # 对侧完整 RAG（召回 + 作答），而 L2 用一次 rerank 就能在证据
             # 明确支持时直接放行。中/低带仍走原有对侧 + LLM 裁决路径。
             # [jonex] 2026-09-22：原总开关已删除，L2 校验固定执行。
+            _t_l2 = time.perf_counter()
             _band, _sup, _det = await self._l2_evidence_verify(
                 tenant_id, kb_ids, req, trace_id, user_id,
                 answer=answer, facts=facts,
@@ -6936,9 +7651,12 @@ class SearchService:
             if collector:
                 collector.step(
                     STAGE_ARBITRATION, "L2 证据校验",
-                    summary=(f"band={_band} support={_det.get('support', 'n/a')}"
-                             f"（{_det.get('struct_align', '')}）"),
+                    summary=(
+                        f"证据带={_BAND_ZH.get(str(_band), _band)} "
+                        f"支持度={_det.get('support', 'n/a')}"
+                    ),
                     detail=_det,
+                    t_start=_t_l2,
                 )
             if _band == "high":
                 logger.info(
@@ -7015,12 +7733,14 @@ class SearchService:
                 collector.step(
                     STAGE_ARBITRATION, "裁决触发（本体中/低置信）",
                     summary=(
-                        f"本体置信={confidence}（{conf_detail}），"
+                        f"本体置信={_CONF_ZH.get(str(confidence), confidence)}，"
                         f"RAG 对侧耗时 {time.perf_counter() - t:.1f}s"
                     ),
                     detail={"confidence": confidence, **conf_detail},
+                    t_start=t,
                 )
         else:
+            _t_cross = time.perf_counter()
             # S7 反向：RAG 作答后反查本体结构化槽位；§15.4 触发条件②——
             # RAG 侧命中 chunk 存在低质信号（S8 判据命中但未被完全剔除，
             # 旧口径下 chunk 由 LightRAG 内部作答、平台未过滤）
@@ -7081,6 +7801,7 @@ class SearchService:
                         ),
                     ),
                     detail={"slot_hit": slot_hit, "lowq_signals": lowq_signals},
+                    t_start=_t_cross,
                 )
 
         # §15.4 两路一致 → 直接返回原答案，标注 cross_verified=true
@@ -7117,6 +7838,7 @@ class SearchService:
             return None
 
         # 裁决（异常/超时 → None 回退原答案）
+        _t_arb = time.perf_counter()
         try:
             verdict = await asyncio.wait_for(
                 arbitrate_answers(
@@ -7144,7 +7866,8 @@ class SearchService:
             collector.step(
                 STAGE_ARBITRATION, "双向校验裁决",
                 summary=(
-                    f"采纳 {chosen}（confidence={verdict.get('confidence')}）："
+                    f"采纳{'本体' if chosen == 'ontology' else '知识库'}"
+                    f"（置信度 {verdict.get('confidence')}）："
                     f"{verdict.get('reason', '')[:80]}"
                 ),
                 detail={
@@ -7155,6 +7878,7 @@ class SearchService:
                     "ontology_answer": onto_answer[:200],
                     "rag_answer": rag_answer[:200],
                 },
+                t_start=_t_arb,
             )
         return {
             "answer": final_answer,
@@ -7355,6 +8079,31 @@ class SearchService:
     # ── [jonex] jonex_wiki 引擎检索链路（引擎公开 trace / span 投影）──
 
     @staticmethod
+    def _attach_jonex_wiki_trace(reasoning: dict | None, events: list[dict]) -> dict | None:
+        """[jonex] 把公开进度轨迹挂到对应 KB 的推理步骤上（历史回放与流式同一份数据）。
+
+        - 只挂 `jonex_wiki_query` 步骤，并按 `detail.kb_id` 精确匹配；
+        - 多 KB 时每个步骤只拿自己那个库的事件，避免步骤串台；
+        - 没有事件时原样返回，旧快照的形状不变（前端有 trace_events 才用它）。
+        """
+        if not reasoning or not events:
+            return reasoning
+        grouped: dict[str, list[dict]] = {}
+        for event in events:
+            if isinstance(event, dict):
+                grouped.setdefault(str(event.get("kb_id") or ""), []).append(event)
+        for step in reasoning.get("steps") or []:
+            if not isinstance(step, dict) or step.get("stage") != STAGE_JONEX_WIKI_QUERY:
+                continue
+            detail = step.get("detail")
+            if not isinstance(detail, dict):
+                continue
+            bucket = grouped.get(str(detail.get("kb_id") or ""))
+            if bucket:
+                detail["trace_events"] = bucket
+        return reasoning
+
+    @staticmethod
     def _jonex_wiki_chain_calls(trace: list[dict]) -> list[dict]:
         """[jonex] 引擎公开轨迹 → 检索链路调用序列（保序，不截断；截断由调用方做）。
 
@@ -7393,12 +8142,35 @@ class SearchService:
                     "cached": bool(detail.get("cached")),
                 })
                 continue
+            if event == 'image_tool_result':
+                calls.append({'tool':tool, 'query':detail.get('query'), 'paths':[],
+                    'count':detail.get('total'), 'status':detail.get('status'),
+                    'asset_id':detail.get('asset_id'), 'read_id':detail.get('read_id'),
+                    'actual_image_delivered':bool(detail.get('actual_image_delivered'))})
+                continue
             if event == "tool_result":
+                # 表格工具的结果计数不在 count 上：cells/has_more/matched_count 才是它的返回。
                 calls.append({
                     "tool": tool or "tool",
                     "paths": [],
                     "count": detail.get("count"),
                     "success": detail.get("success"),
+                    "table_id": detail.get("table_id"),
+                    "operation": detail.get("operation"),
+                    "status": detail.get("status"),
+                    "cells": detail.get("cells"),
+                    "has_more": detail.get("has_more"),
+                    "matched": detail.get("matched_count"),
+                })
+                continue
+            if (event in {"reading_material_delivered", "reading_material_budget_limited", "table_material_too_large"}
+                    and (detail.get("unit_kind") in {"table", "sheet", "workbook"}
+                         or event == "table_material_too_large")):
+                calls.append({
+                    "tool": "table_material", "paths": [detail["path"]] if detail.get("path") else [],
+                    "status": "complete" if event == "reading_material_delivered" and not detail.get("truncated") else "budget_limited",
+                    "unit_kind": detail.get("unit_kind"), "selected_level": detail.get("selected_level"),
+                    "body_bytes": detail.get("body_bytes"), "reason": detail.get("reason"),
                 })
                 continue
             if event == "search_rewritten":
@@ -7446,6 +8218,7 @@ class SearchService:
         self, tenant_id: str,
         per_kb_citations: list[tuple[str, list[dict]]],
         allowed_kb_ids: list[str] | None = None,
+        actor: str = "",
     ) -> list[dict]:
         """Keep each verified evidence handle distinct; document enrichment is batched."""
         from ..dtos.reference import SourceLocation, SourceReference
@@ -7478,22 +8251,44 @@ class SearchService:
                 except Exception:
                     urls[d.id] = None
             evidence = c.get("evidence_ref") or {}
+            if evidence.get("kind") == "media_segment" and evidence.get("object_id"):
+                from .wiki_media import resource_media_url
+                urls[d.id] = resource_media_url(tenant_id, kid, d.id,
+                    evidence["revision"], evidence["object_id"])
             spans = evidence.get("spans") or []
             location = SourceLocation(
-                type="char" if spans else "table_row" if evidence.get("table_id") else "chunk",
-                text=c.get("excerpt") or "", evidence_ref=evidence or None,
+                type="timestamp" if evidence.get("kind") == "media_segment" else "page" if evidence.get("kind") == "pdf_native_text" else "char" if spans else "table_row" if evidence.get("table_id") else "chunk",
+                page_no=(int(evidence["page_number"]) - 1) if evidence.get("kind") == "pdf_native_text" else None,
+                text=(f"原文图片：{d.file_name}" if evidence.get("kind") == "image_metadata"
+                      else c.get("excerpt") or ""), evidence_ref=evidence or None,
+                time_start=(evidence.get("locator") or {}).get("start_seconds") if evidence.get("kind") == "media_segment" else None,
+                time_end=(evidence.get("locator") or {}).get("end_seconds") if evidence.get("kind") == "media_segment" else None,
                 char_start=spans[0][0] if spans else None,
                 char_end=spans[0][1] if spans else None,
                 row_start=evidence.get("row_start", evidence.get("row")),
                 row_end=evidence.get("row_end"),
             )
+            from .wiki_media import image_url
+            media_locations = []
+            for asset in c.get("media_assets") or []:
+                if asset.get("document_id") != d.id or asset.get("bundle_sha") != c.get("bundle_sha"):
+                    continue
+                page_no = asset.get('pdf_page')
+                media_locations.append(SourceLocation(type="image", image_idx=asset.get("image_idx"),
+                    asset_id=asset["asset_id"], bundle_sha=asset["bundle_sha"],
+                    page_no=page_no - 1 if isinstance(page_no, int) and page_no > 0 else None,
+                    asset_ext=asset.get("path", "").rsplit(".", 1)[-1], author=asset.get("author"), work_title=asset.get("work_title"),
+                    source_locator=asset.get('source_locator'), usage=asset.get('usage', 'illustration'),
+                    association_method=asset.get('association_method'), visual_read_id=asset.get('visual_read_id'),
+                    text=asset.get('caption') or asset.get('label') or d.file_name,
+                    asset_url=image_url(tenant_id, actor, kid, d.id, asset["bundle_sha"], asset["asset_id"])))
             out.append(SourceReference(
                 doc_id=d.id, kb_id=kid, kb_name=kb_names.get(kid),
                 file_name=d.file_name or "", mime_type=d.mime_type, file_size=d.file_size,
                 media_type=classify_media(d.mime_type, d.file_name), raw_url=urls[d.id],
                 wiki_path=c.get("page_path"), query_id=c.get("query_id"),
                 evidence_handle=c.get("handle"), bundle_sha=c.get("bundle_sha"),
-                locations=[location],
+                locations=[location, *media_locations],
             ).dict())
         return out
 
@@ -7577,6 +8372,29 @@ class SearchService:
             logger.warning("KB 名批量查询失败 kb_ids=%s", kb_ids, exc_info=True)
             return {}
 
+    async def _build_reasoning_context(
+        self,
+        tenant_id: str,
+        *,
+        query: str,
+        kb_ids: list[str],
+        mode: str | None = None,
+        top_k: int | None = None,
+    ) -> ReasoningContext:
+        """每请求构造一次展示上下文：解析 KB 显示名，避免步骤里露出 UUID。
+
+        解析失败时 `_get_kb_names` 返回空映射，展示层回落 kb_id，不影响检索。
+        """
+        names = await self._get_kb_names(tenant_id, kb_ids) if kb_ids else {}
+        return ReasoningContext(
+            query=query,
+            kb_ids=list(kb_ids or []),
+            mode=mode,
+            top_k=top_k,
+            kb_names=names,
+            budget_chars=RAG_ANSWER_MAX_CONTEXT_CHARS,
+        )
+
     async def _count_llm_wiki_docs(self, tenant_id: str, kb_ids: list[str]) -> dict[str, int]:
         """[jonex] 批量统计各 KB 的有效文档数（is_deleted=0），供空库前置拦截。
 
@@ -7649,7 +8467,13 @@ class SearchService:
             )
 
         # 3. 推理链采集器
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query, kb_ids=list(kb_ids or []),
+                mode=req.mode, top_k=req.top_k,
+            ),
+        )
 
         # 4. 多 KB 并行查询 OpenKB（信号量限流）
         compiler = KnowledgeCompilerService()
@@ -7729,6 +8553,7 @@ class SearchService:
                     summary="未找到有效答案",
                     detail={
                         "kb_id": kid,
+                        "effective": False,
                         "answer_preview": (answer or "")[:200],
                         "turns": _turns,
                         "turn_count": _turn_count,
@@ -7740,6 +8565,7 @@ class SearchService:
             _trace_by_kb.append((kid, _turns))
             _detail: dict = {
                 "kb_id": kid,
+                "effective": True,
                 "answer_preview": answer[:200],
                 "turns": _turns,
                 "turn_count": _turn_count,
@@ -7797,8 +8623,11 @@ class SearchService:
             )
             source = "llm-wiki"
             rag_used = False
-            collector.step(STAGE_FUSION, "多答案融合", status="skipped",
-                           summary="仅 1 个有效答案，无需融合")
+            collector.step(
+                STAGE_FUSION, "多答案融合", status="skipped",
+                summary="仅 1 个有效答案，无需融合",
+                detail={"valid_answer_count": len(per_kb)},
+            )
         else:
             # 多 KB 融合（同 _rag_fallback_multi 的 top-N 策略）
             per_kb_fused = per_kb[:ONTOLOGY_RAG_FUSION_TOPN]
@@ -7819,9 +8648,17 @@ class SearchService:
                 tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
             )
             fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
-            collector.step(STAGE_FUSION, "多答案融合",
-                           summary=f"融合 {len(per_kb_fused)} 个知识库的 Wiki 答案",
-                           t_start=t_fuse)
+            collector.step(
+                STAGE_FUSION, "多答案融合",
+                summary=f"融合 {len(per_kb_fused)} 个知识库的 Wiki 答案",
+                input=io_fusion_input(per_kb_fused),
+                output=io_answer_output(
+                    "融合答案", answer,
+                    **{"融合侧数": len(per_kb_fused),
+                       "融合耗时": f"{fusion_ms}ms"},
+                ),
+                t_start=t_fuse,
+            )
             source = "llm-wiki"
             rag_used = False
 
@@ -7913,8 +8750,19 @@ class SearchService:
                 details={"invalid_kb_ids": invalid_ids, "expected_pipeline": "jonex_wiki"},
             )
 
+        query_context = None
+        if req.query_image_ids:
+            from .query_image_service import QueryImageService
+            query_context = await QueryImageService().search_context(
+                tenant_id, user_id, req.query_image_ids, req.image_question or '')
+
         # 3. 推理链采集器
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query, kb_ids=list(kb_ids or []),
+            ),
+        )
 
         # 4. 多 KB 并行查询 jonex_wiki（信号量限流）
         compiler = JonexWikiService()
@@ -7941,6 +8789,7 @@ class SearchService:
                         kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
                         return_trace=_want_trace,
                         thinking_mode=req.thinking_mode,
+                        **({'query_context':query_context} if query_context else {}),
                         **({"progress_session": progress_session} if progress_session else {}),
                     )
                     return (kid, _res, int((time.perf_counter() - _t0) * 1000))
@@ -7994,6 +8843,7 @@ class SearchService:
                     summary="未找到有效答案",
                     detail={
                         "kb_id": kid,
+                        "effective": False,
                         "answer_preview": (answer or "")[:200],
                         "calls": _calls,
                         "tool_calls_total": _calls_total,
@@ -8006,6 +8856,7 @@ class SearchService:
                 _citations_by_kb.append((kid, _citations))
             _detail: dict = {
                 "kb_id": kid,
+                "effective": True,
                 "answer_preview": answer[:200],
                 "calls": _calls,
                 "tool_calls_total": _calls_total,
@@ -8029,7 +8880,7 @@ class SearchService:
         #     handle 是引擎侧的 KB 内编号（每个 KB 都从 [E1] 起），跨 KB 会冲突，故按 KB
         #     分别建映射；改写只发生在融合前（单 KB 直接改 answer，多 KB 每个答案先改再融合）。
         _references = await self._build_jonex_wiki_references(
-            tenant_id, _citations_by_kb, allowed_kb_ids=kb_ids,
+            tenant_id, _citations_by_kb, allowed_kb_ids=kb_ids, actor=str(user_id or ''),
         ) if _citations_by_kb else []
 
         # 6. 无有效答案 → source="none"
@@ -8062,8 +8913,11 @@ class SearchService:
             # [jonex] 与 kb_type 同拼写（前端直接展示 final_source，别混两种写法）
             source = "jonex_wiki"
             rag_used = False
-            collector.step(STAGE_FUSION, "多答案融合", status="skipped",
-                           summary="仅 1 个有效答案，无需融合")
+            collector.step(
+                STAGE_FUSION, "多答案融合", status="skipped",
+                summary="仅 1 个有效答案，无需融合",
+                detail={"valid_answer_count": len(per_kb)},
+            )
         else:
             # 多 KB 融合（同 _rag_fallback_multi 的 top-N 策略）
             per_kb_fused = per_kb[:ONTOLOGY_RAG_FUSION_TOPN]
@@ -8081,14 +8935,34 @@ class SearchService:
                 tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
             )
             fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
-            collector.step(STAGE_FUSION, "多答案融合",
-                           summary=f"融合 {len(per_kb_fused)} 个知识库的 jonex_wiki 答案",
-                           t_start=t_fuse)
+            collector.step(
+                STAGE_FUSION, "多答案融合",
+                summary=f"融合 {len(per_kb_fused)} 个知识库的 jonex_wiki 答案",
+                input=io_fusion_input(per_kb_fused),
+                output=io_answer_output(
+                    "融合答案", answer,
+                    **{"融合侧数": len(per_kb_fused),
+                       "融合耗时": f"{fusion_ms}ms"},
+                ),
+                t_start=t_fuse,
+            )
             source = "jonex_wiki"
             rag_used = False
 
         # 7. 组装响应（references 已在 6a 构建；ontology_instances 仍空）
         total_ms = int((time.perf_counter() - t_total) * 1000)
+        # [jonex] 公开进度轨迹：流式检索把引擎 tool 进度写在 Redis（progress_session），
+        # 这里读回来挂进推理链快照。之前轨迹只活在 Redis 的 20 分钟（SESSION_TTL）里，
+        # 点开检索历史回放时早过期，展开「推理过程」只剩一条聚合步骤——看不到查了什么词、
+        # 命中哪些页、读了多少段。轨迹只做展示，读失败不影响检索结果。
+        _trace_events: list[dict] = []
+        if progress_session:
+            try:
+                from .wiki_search_session_service import collect_progress
+                _trace_events = await collect_progress(tenant_id, progress_session)
+            except Exception as exc:  # pragma: no cover - collect_progress 自身已兜底
+                logger.warning("[jonex_wiki] 读取进度轨迹失败 session=%s: %s", progress_session, exc)
+        reasoning = self._attach_jonex_wiki_trace(collector.build(source), _trace_events)
         result = {
             "answer": answer,
             "source": source,
@@ -8096,7 +8970,7 @@ class SearchService:
             "ontology_instances": [],
             "rag_used": rag_used,
             "knowledge_base_ids": kb_ids,
-            "reasoning": collector.build(source),
+            "reasoning": reasoning,
             "references_available": bool(_references),
             "ontology_instances_available": False,
         }
@@ -8108,18 +8982,19 @@ class SearchService:
                 SearchHistoryCreateRequest(
                     query=req.query,
                     knowledge_base_id="" if len(kb_ids) > 1 else kb_ids[0],
-                    mode=req.mode,
-                    top_k=req.top_k,
                     domain_space_id=req.domain_space_id,
                     answer_preview=answer[:300],
                     answer=answer,
                     references=_references,
-                    reasoning=collector.build(source),
+                    reasoning=reasoning,
                     duration_ms=total_ms,
+                    query_image_ids=req.query_image_ids,
                     metadata={
                         "knowledge_base_ids": kb_ids,
                         "source": source,
                         "pipeline": "jonex_wiki",
+                        "thinking_mode": req.thinking_mode,
+                        **({'image_question':req.image_question} if req.image_question else {}),
                     },
                 ),
             )
@@ -8149,7 +9024,6 @@ class SearchService:
         """
         tenant_id = require_tenant(tenant_id)
         req = MixSearchRequest(**_payload(request))
-        collector = ReasoningCollector(enabled=req.with_reasoning and _REASONING_ENABLED)
         t_total = time.perf_counter()
 
         # 1. 用原始 kb_ids 查管线类型（不做去重/上限/租户校验，交给下游）
@@ -8161,7 +9035,6 @@ class SearchService:
                 message=translate("err.search.kb_required",
                                   fallback="请至少指定一个知识库（knowledge_base_ids 不能为空）"),
             )
-
         # [jonex] B6 §5.1：多 KB 检索按用户可读最高等级过滤；全部被过滤 ⇒ 空结果
         # （不报错，前端已有空答案容错）。管理员/无 user/anonymous 原样放行。
         raw_ids = await _filter_kbs_by_classification(tenant_id, user_id, raw_ids)
@@ -8178,6 +9051,14 @@ class SearchService:
                 "ontology_instances_available": False,
             }
 
+        collector = ReasoningCollector(
+            enabled=req.with_reasoning and _REASONING_ENABLED,
+            context=await self._build_reasoning_context(
+                tenant_id, query=req.query, kb_ids=list(raw_ids),
+                mode=req.mode, top_k=req.top_k,
+            ),
+        )
+        _t_route = time.perf_counter()
         pipeline_map = await self._get_kb_types(tenant_id, raw_ids)
         # [jonex] 三引擎显式分桶：jonex_wiki 不兜进 lightrag 桶（Phase 5 /search/mix 三路接入）
         lightrag_ids = [k for k in raw_ids if pipeline_map.get(k) == "lightrag"]
@@ -8188,8 +9069,8 @@ class SearchService:
         collector.step(
             STAGE_ROUTE_DECISION, "分流决策",
             summary=(
-                f"OntoRAG={len(lightrag_ids)} KB, llm-wiki={len(openkb_ids)} KB, "
-                f"jonex-wiki={len(jonex_wiki_ids)} KB"
+                f"OntoRAG {len(lightrag_ids)} 个 / LLM Wiki {len(openkb_ids)} 个 / "
+                f"Jonex Wiki {len(jonex_wiki_ids)} 个知识库"
             ),
             detail={
                 "pipeline_groups": {
@@ -8201,6 +9082,7 @@ class SearchService:
                 "llm-wiki_count": len(openkb_ids),
                 "jonex-wiki_count": len(jonex_wiki_ids),
             },
+            t_start=_t_route,
         )
 
         # 3. 全 lightrag → 委托 query_with_ontology
@@ -8233,7 +9115,8 @@ class SearchService:
         # 4b. 全 jonex_wiki → 委托 search_jonex_wiki
         if not lightrag_ids and not openkb_ids:
             req_jw = JonexWikiSearchRequest(
-                query=req.query, mode=req.mode, top_k=req.top_k,
+                query=req.query,
+                query_image_ids=req.query_image_ids, image_question=req.image_question,
                 knowledge_base_ids=jonex_wiki_ids,
                 save_history=req.save_history,
                 with_reasoning=req.with_reasoning,
@@ -8293,7 +9176,8 @@ class SearchService:
 
         async def _run_jonex_wiki() -> dict:
             req_jw = JonexWikiSearchRequest(
-                query=req.query, mode=req.mode, top_k=req.top_k,
+                query=req.query,
+                query_image_ids=req.query_image_ids, image_question=req.image_question,
                 knowledge_base_ids=jonex_wiki_ids,
                 save_history=False,
                 with_reasoning=req.with_reasoning,
@@ -8354,12 +9238,31 @@ class SearchService:
                     continue
                 _sub = (_res.get("reasoning") or {}).get("steps") or []
                 for _s in _sub:
+                    _title = _s.get("title", "") or ""
+                    _stage = _s.get("stage", "")
+                    # 前缀只加在「该侧独有的过程步骤」上：wiki 侧整条链都独有；
+                    # OntoRAG 侧只标 L0/L2 细粒度步骤与平台作答——顶层本体链
+                    # 步骤（意图 / 路由 / 事实 / 作答）本身就是 mix 的主过程，
+                    # 全加前缀会让整个步骤列表变成清一色 [OntoRAG]。
+                    _needs_prefix = (
+                        _side in ("llm-wiki", "jonex-wiki")
+                        or _title.startswith(("L0 ", "L2 "))
+                        or _stage in {"context_retrieve", "chunk_answer"}
+                    )
+                    if _needs_prefix and not _title.startswith(f"[{_side}]"):
+                        _title = f"[{_side}] {_title}"
                     collector.step(
-                        _s.get("stage", ""),
-                        f"[{_side}] {_s.get('title', '')}",
+                        _stage,
+                        _title,
                         status=_s.get("status", "done"),
                         summary=_s.get("summary"),
                         detail=_s.get("detail"),
+                        # 子链路已派生好的 I/O 必须原样透传；否则会被 mix 层
+                        # 用通用模板重新派生，各侧步骤的输入输出全部丢失。
+                        input=_s.get("input"),
+                        output=_s.get("output"),
+                        # 子步骤耗时已算好；不传会因 mix 层没有 t_start 变成 None。
+                        duration_ms=_s.get("duration_ms"),
                     )
         # [jonex] Phase 5 降级标记：jonex_wiki 超时/失败在推理链显式标注，不静默
         if isinstance(jw_result, dict) and jw_result.get("degraded"):
@@ -8447,8 +9350,17 @@ class SearchService:
                 tenant_id=tenant_id, user_id=user_id, trace_id=trace_id,
             )
             fusion_ms = int((time.perf_counter() - t_fuse) * 1000)
-            collector.step(STAGE_FUSION, "多答案融合",
-                           summary=f"融合 {len(per_kb)} 侧答案", t_start=t_fuse)
+            collector.step(
+                STAGE_FUSION, "多答案融合",
+                summary=f"融合 {len(per_kb)} 侧答案",
+                input=io_fusion_input(per_kb),
+                output=io_answer_output(
+                    "融合答案", answer,
+                    **{"融合侧数": len(per_kb),
+                       "融合耗时": f"{fusion_ms}ms"},
+                ),
+                t_start=t_fuse,
+            )
             source = "mixed"
             ontology_instances = (lr_result.get("ontology_instances") or []) if lr_ok else []
             rag_used = lr_result.get("rag_used", False) if lr_ok else False
@@ -8513,6 +9425,24 @@ class SearchService:
             references_available = False
             ontology_instances_available = False
 
+        # 实际策略（与答题来源 source 区分）：多侧有效 = mixed；单侧按管线；
+        # 全失败 = none。前端「检索策略」chip 用它，避免把 source=ontology
+        # 误读成「本次只走了本体」。
+        if len(_effective) >= 2:
+            _strategy = "mixed"
+        elif len(_effective) == 1:
+            _k = _effective[0][0]
+            _strategy = (
+                _side_source[_k]
+                if _k != "lr"
+                else (_effective[0][1].get("source") or "ontology")
+            )
+        else:
+            _strategy = "none"
+        # 只 build 一次：result 与历史快照共用同一份 trace（此前分别 build，
+        # total_ms 会差几毫秒，前端展开前后对不上）。
+        _reasoning_trace = collector.build(source, strategy=_strategy)
+
         total_ms = int((time.perf_counter() - t_total) * 1000)
         result = {
             "answer": answer,
@@ -8521,10 +9451,23 @@ class SearchService:
             "ontology_instances": ontology_instances,
             "rag_used": rag_used,
             "knowledge_base_ids": raw_ids,
-            "reasoning": collector.build(source),
+            "reasoning": _reasoning_trace,
             "references_available": references_available,
             "ontology_instances_available": ontology_instances_available,
         }
+        # A（解释块）：命中实体 → 物理表 → 上下游。fail-open；无内容不写键。
+        # 只挂在 ontology 答案上（mixed/rag/none 等融合或非本体路径不带）。
+        if should_attach_lineage(source):
+            # lr 子调用（query_with_ontology）已用同一批 ontology_instances 算过同一个块，
+            # 有 lr 结果就复用（包括其中的 None = 无内容），不重复 get_schema / walk。
+            if lr_ok:
+                data_lineage = lr_result.get("data_lineage")
+            else:
+                data_lineage = (
+                    await self._data_lineage(tenant_id, ontology_instances)
+                    if ontology_instances else None
+                )
+            attach_data_lineage(result, data_lineage)
 
         # 8. 统一保存检索历史（D8.1：混合模式只写 1 条）
         if req.save_history:
@@ -8539,7 +9482,7 @@ class SearchService:
                     answer_preview=answer[:300],
                     answer=answer,
                     references=references,
-                    reasoning=collector.build(source),
+                    reasoning=_reasoning_trace,
                     duration_ms=total_ms,
                     metadata={
                         "knowledge_base_ids": raw_ids,

@@ -17,9 +17,14 @@ from .domain_service_repository import (
 )
 from .folder_repository import FolderRepository
 from .tag_repository import TagRepository
+from .ontology_abstract_schema_repository import OntologyAbstractSchemaRepository
 from .ontology_graph_repository import OntologyGraphRepository
 from .ontology_schema_repository import OntologySchemaRepository
 from .ontology_synonym_repository import OntologySynonymRepository
+from .metric_call_approval_repository import MetricCallApprovalRepository
+from .nl2sql_metric_shadow_repository import Nl2SqlMetricShadowRepository
+from .nl2sql_observation_repository import Nl2SqlObservationRepository
+from .ontology_tool_binding_repository import OntologyToolBindingRepository
 from .parser_setting_repository import KnowledgeParserSettingRepository
 from .query_image_repository import KnowledgeQueryImageRepository
 from .processing_task_repository import (
@@ -42,6 +47,7 @@ from .search_event_repository import (
 )
 from .search_feedback_repository import KnowledgeSearchFeedbackRepository
 from .search_history_repository import KnowledgeSearchHistoryRepository
+from .similarity_repository import KnowledgeSimilarityRepository
 from .space_repository import SpacePermissionRepository, SpaceRepository
 
 __all__ = [
@@ -63,12 +69,18 @@ __all__ = [
     "KnowledgeAnswerFeedbackRepository",
     "KnowledgeDataSourceRepository",
     "KnowledgeDocumentRepository",
+    "MetricCallApprovalRepository",
+    "Nl2SqlMetricShadowRepository",
+    "Nl2SqlObservationRepository",
     "KnowledgeParserSettingRepository",
     "KnowledgeQueryImageRepository",
     "KnowledgeSearchFeedbackRepository",
+    "OntologyAbstractSchemaRepository",
+    "KnowledgeSimilarityRepository",
     "OntologyGraphRepository",
     "OntologySchemaRepository",
     "OntologySynonymRepository",
+    "OntologyToolBindingRepository",
     "ServiceApiKeyRepository",
     "ServiceKnowledgeBaseRepository",
     "SpacePermissionRepository",

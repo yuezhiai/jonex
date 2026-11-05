@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from neo4j.exceptions import DriverError, TransientError
 from sqlalchemy import and_, delete, or_, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.common.audit import schedule_emit
@@ -64,6 +65,7 @@ from ..repository import (
     safe_record_asset_status_event,
 )
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
+from ..repository.similarity_repository import KnowledgeSimilarityRepository
 from ..repository.task_center_repository import TaskCenterDocumentRepository
 from ..dtos import (
     BatchMoveDocumentsRequest,
@@ -77,6 +79,30 @@ from .rag_storage_lookup import find_rag_doc_ids, find_rag_doc_ids_by_document
 from jonex_core.common.quota import classify_quota_category
 
 logger = logging.getLogger(__name__)
+
+
+async def clear_document_similarity_state(
+    session: AsyncSession,
+    tenant_id: str,
+    document_id: str,
+) -> None:
+    """文档删除/归档后清理它的签名与相关 pending 建议（规格 §7）。"""
+    repo = KnowledgeSimilarityRepository(session)
+    await repo.invalidate_for_document(tenant_id, document_id)
+    await repo.delete_signature(tenant_id, document_id)
+
+
+async def safe_clear_document_similarity_state(
+    session, tenant_id: str, document_id: str,
+) -> None:
+    try:
+        async with session.begin_nested():
+            await clear_document_similarity_state(session, tenant_id, document_id)
+    except Exception as exc:  # noqa: BLE001 —— 清理失败不影响主流程
+        logger.warning(
+            "清理相似建议/签名失败 doc=%s err=%s",
+            document_id, type(exc).__name__, exc_info=True,
+        )
 
 
 # [jonex] COS 预签名直传单文件大小上限（字节）。默认 500MB 对齐 Nginx 对外硬上限
@@ -394,6 +420,34 @@ def reset_document_for_rerun(doc: Any, *, is_llm_wiki: bool) -> Dict[str, Any]:
     return rollback
 
 
+def attach_similarity_hints(
+    items: list[dict], suggestions, target_names: dict[str, str],
+) -> list[dict]:
+    """给列表行挂 best pending 建议（每个 source 取 similarity 最大、同分按 target id 确定）。"""
+    best: dict[str, dict] = {}
+    for sug in suggestions:
+        # 目标已删/跨租户时查不到名称：不生成 hint，避免把失效文件名挂到列表上。
+        target_file_name = target_names.get(sug.target_document_id, "")
+        if sug.target_document_id not in target_names:
+            continue
+        similarity = float(sug.similarity)
+        current = best.get(sug.source_document_id)
+        if current is None or (similarity, sug.target_document_id) > (
+            current["similarity"], current["target_document_id"],
+        ):
+            best[sug.source_document_id] = {
+                "target_document_id": sug.target_document_id,
+                "target_file_name": target_file_name,
+                "similarity": similarity,
+            }
+    out: list[dict] = []
+    for row in items:
+        row = dict(row)
+        row["similarity_hint"] = best.get(row.get("id"))
+        out.append(row)
+    return out
+
+
 class DocumentService:
     """Tenant-scoped document metadata and RAG ingestion orchestration."""
 
@@ -534,7 +588,12 @@ class DocumentService:
         """[jonex] R1-c：计算解析配置指纹，用于 reparse 检测配置变更。
 
         指纹包含 preset + parser updated_at + prompt id + prompt updated_at
-        + compiled schema version。任意一项变化 → 指纹不同 → 自动放行重解析。
+        + compiled schema version + **KB 级 VLM 覆盖模型**。任意一项变化 →
+        指纹不同 → 自动放行重解析。
+
+        ⚠️ 模型必须进指纹：换了多模态模型等于换了整份解析结果，而「源文件与
+        配置都没变就跳过重解析」那条短路如果不认模型，用户改完模型再点重新解析
+        会**什么都不发生**（文档秒回 READY、内容还是旧模型的产物）。
 
         返回 (fingerprint_hash, preset_name, prompt_config_id, schema_version)。
         后三项可缓存复用，避免后续 RAG 调用阶段重复解析。
@@ -583,8 +642,14 @@ class DocumentService:
         except Exception:
             pass
 
+        # [jonex] P2b：KB 级 VLM 覆盖也进指纹（换模型 = 换解析行为）
+        vlm_override = await DocumentService._resolve_vlm_override(
+            tenant_id, kb_id
+        )
+
         fingerprint = (
             f"{preset}|{parser_ts}|{prompt_config_id or ''}|{prompt_ts}|{schema_ver}"
+            f"|{vlm_override}"
         )
         return (
             hashlib.md5(fingerprint.encode()).hexdigest(),
@@ -813,6 +878,11 @@ class DocumentService:
                     schema_version = int(schema.get("schema_version", 0) or 0)
             except Exception as exc:
                 logger.warning("Failed to ensure compiled schema for KB %s: %s", req.knowledge_base_id, exc)
+            if schema:
+                # 库级 procedural 开关随派单 schema 下发（只改副本；读失败按关处理）
+                from .procedural_gate import with_procedural_gate
+
+                schema = await with_procedural_gate(schema, tenant_id, req.knowledge_base_id)
 
         try:
             # 按文件类型解析该 KB 配置的解析器 preset。解析不到（类型不支持 / 未配置 /
@@ -884,6 +954,14 @@ class DocumentService:
             # 开关/库值翻转后，在途文档继续从它当初提交的后端取状态。
             backend = ingest_backend.resolve_backend(kb_backend)
 
+            # [jonex] KB 级 VLM 覆盖（P2b）：有覆盖才下发。全程只读一次。
+            vlm_override = await self._resolve_vlm_override(
+                tenant_id,
+                req.knowledge_base_id,
+                kb_type=kb_type,
+                ingest_backend_name=backend,
+            )
+
             rag_result = await get_rag_client().insert(
                 file_path=file_path,
                 tenant_id=tenant_id,
@@ -898,6 +976,8 @@ class DocumentService:
                 execution_mode=execution_mode,    # [jonex] OpenKB parse_only 分流
                 idempotency_key=idempotency_key,  # [jonex] R1
                 kb_type=kb_type,                  # [jonex] llm-wiki 产物分支（openkb→content.md / jonex_wiki→content_list.json）
+                # [jonex] KB 级 VLM 覆盖（空 = 不带这个键，引擎用默认模型）
+                kb_vlm_override=vlm_override,
             )
         except Exception as exc:
             logger.exception("Knowledge document ingestion failed: %s", doc_id)
@@ -2249,6 +2329,10 @@ class DocumentService:
             prompt_ids = [prompt_config_id] if prompt_config_id else []
             # [jonex] openkb：parse_only（只解析产出 markdown，不入 LightRAG、不抽本体）；
             # 相应地不需要 strict_push / old_rag_doc_ids（LightRAG 里本就没有该文档的 doc）。
+            # [jonex] KB 级 VLM 覆盖（P2b）：重解析吃**当前**配置（新派活）
+            vlm_override = await self._resolve_vlm_override(
+                tenant_id, kb_id, kb_type=kb_type
+            )
             # [jonex] R1：生成确定性幂等键（reparse 代次递增 → 天然是新键）
             idempotency_key = f"insert:{tenant_id}:{kb_id}:{document_id}:{new_generation}"
             rag_result = await get_rag_client().retry(
@@ -2268,6 +2352,8 @@ class DocumentService:
                 old_rag_doc_ids=[] if is_llm_wiki else old_rag_doc_ids,
                 idempotency_key=idempotency_key,  # [jonex] R1
                 kb_type=kb_type,                  # [jonex] llm-wiki 产物分支（openkb→content.md / jonex_wiki→content_list.json）
+                # [jonex] KB 级 VLM 覆盖（空 = 不带这个键，引擎用默认模型）
+                kb_vlm_override=vlm_override,
             )
         except Exception as exc:
             logger.exception("Knowledge document reparse failed: %s", document_id)
@@ -2371,12 +2457,34 @@ class DocumentService:
             )
             total = await repo.count(tenant_id=tenant_id, extra_conditions=conditions)
 
-        return {
-            "items": [item.to_dict() for item in items],
-            "total": total,
-            "page": req.page,
-            "page_size": req.page_size,
-        }
+            suggestions = await KnowledgeSimilarityRepository(
+                session,
+            ).list_pending_for_documents(
+                tenant_id, [item.id for item in items],
+            )
+            target_ids = {s.target_document_id for s in suggestions}
+            target_names: dict[str, str] = {}
+            if target_ids:
+                rows = (await session.execute(
+                    select(KnowledgeDocument.id, KnowledgeDocument.file_name)
+                    .where(
+                        KnowledgeDocument.id.in_(target_ids),
+                        KnowledgeDocument.tenant_id == tenant_id,
+                        KnowledgeDocument.is_deleted == 0,
+                    )
+                )).all()
+                target_names = {rid: name for rid, name in rows}
+            payload = attach_similarity_hints(
+                [item.to_dict() for item in items],
+                suggestions,
+                target_names,
+            )
+            return {
+                "items": payload,
+                "total": total,
+                "page": req.page,
+                "page_size": req.page_size,
+            }
 
     async def documents_stats(self, tenant_id: str, request: DocumentScopeRequest | dict) -> dict:
         """按线性状态口径统计某 KB 文档数（互斥四桶，设计 §5）。
@@ -2564,11 +2672,22 @@ class DocumentService:
 
         Returns:
             dict: 状态字段（doc_id、status、ontology_status、error_message、
-                  file_name、file_size、knowledge_base_id、created_at、updated_at）。
+                  file_name、file_size、knowledge_base_id、created_at、updated_at），
+                  以及图谱降级提示：degraded、degraded_reason、ontology_error、
+                  ontology_retry_count、ontology_retry_limit、retry_exhausted。
+
+                  `status=ready` 且 `ontology_status=failed` 属「部分成功」：
+                  正文仍可问答，但知识图谱未建成，`degraded=True`
+                  （`degraded_reason="ontology_failed"`）。重试计数达到
+                  `ontology_retry_limit` 时 `retry_exhausted=True`；此时文档
+                  status 仍为 ready，不改变状态机与重试逻辑。
 
         Raises:
             ResourceNotFoundError: 文档不存在或 KB 不在授权范围内。
         """
+        # 懒导入避免顶层循环依赖（document_service ↔ reconciliation_service）
+        from .reconciliation_service import MAX_ONTOLOGY_RETRIES
+
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
@@ -2581,6 +2700,11 @@ class DocumentService:
                 raise ResourceNotFoundError(
                     message=translate("err.doc.not_found", fallback="知识文档不存在"),
                 )
+            retry_count = doc.ontology_retry_count or 0
+            degraded = (
+                doc.status == DocStatus.READY.value
+                and doc.ontology_status == OntologyStatus.FAILED.value
+            )
             return {
                 "doc_id": doc.id,
                 "status": doc.status,
@@ -2591,6 +2715,12 @@ class DocumentService:
                 "knowledge_base_id": doc.knowledge_base_id,
                 "created_at": doc.created_at.isoformat(),
                 "updated_at": doc.updated_at.isoformat(),
+                "ontology_error": doc.ontology_error,
+                "ontology_retry_count": retry_count,
+                "ontology_retry_limit": MAX_ONTOLOGY_RETRIES,
+                "degraded": degraded,
+                "degraded_reason": "ontology_failed" if degraded else None,
+                "retry_exhausted": degraded and retry_count >= MAX_ONTOLOGY_RETRIES,
             }
 
     async def get_document_quality_report(
@@ -2840,6 +2970,10 @@ class DocumentService:
             doc.archived_at = None
             await repo.set_status(doc, DocStatus.DELETED)
             await repo.delete_soft(doc, tenant_id)
+            # 相似建议/签名随文档删除一并清理；savepoint 隔离，失败不影响删除主流程
+            await safe_clear_document_similarity_state(
+                session, tenant_id, document_id,
+            )
 
         audit_payload = {
             "tenant_id": tenant_id,
@@ -3020,6 +3154,12 @@ class DocumentService:
                 await gdao.delete_by_document(tenant_id, kb_id, document_id)
             except Exception:
                 logger.warning("Neo4j cleanup failed for document %s", document_id, exc_info=True)
+            # 文档实体被删后，挂在它们身上的 `MAPS_TO` 不会自己消失（对齐行
+            # 仍是 active，但文档侧节点已不在图里）。对账路径只在「图重写/
+            # 半写收回」时刷对齐投影，删除是第三条会改变文档侧图的路 —— 同款
+            # best-effort 收敛，失败不影响删除结果。
+            from .ontology_data_projection import rebuild_alignments_best_effort
+            await rebuild_alignments_best_effort(tenant_id, kb_id)
 
     async def mark_indexes_cleaned(
         self, tenant_id: str, document_id: str,
@@ -3053,16 +3193,246 @@ class DocumentService:
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
-            await KnowledgeDocumentRepository(session).get_required(
+            doc = await KnowledgeDocumentRepository(session).get_required(
                 document_id, tenant_id,
             )
             rows = await KnowledgeDocumentVersionRepository(session).list_for_document(
                 tenant_id, document_id,
             )
-        return {
-            "items": [row.to_dict() for row in rows],
-            "total": len(rows),
-        }
+        current_key = doc.storage_key
+        items = []
+        for row in rows:
+            item = row.to_dict()
+            # 当前生效版 = 文档行指向的对象；回滚会在两行间共享同一 key，
+            # 因此可能同时有多行 is_current=true（同一份内容）。
+            item["is_current"] = bool(current_key) and row.storage_key == current_key
+            items.append(item)
+        return {"items": items, "total": len(items)}
+
+    async def _trim_document_versions(
+        self, session, tenant_id: str, document_id: str,
+        version_repo: KnowledgeDocumentVersionRepository,
+        current_key: str | None,
+    ) -> list[tuple[str, str]]:
+        """保留最近 N 版；返回需要删除的 (storage_backend, storage_key) 列表。
+
+        与当前生效版共享 key 的行即使被裁掉也不删对象；同一 key 仍被其它保留行
+        引用的同样跳过。对象删除由调用方在**提交后** best-effort 执行。
+        """
+        from jonex_core.common.config import get_config
+
+        keep = int(getattr(get_config(), "DOCUMENT_VERSION_RETENTION", 20) or 0)
+        if keep <= 0:
+            return []
+        rows = await version_repo.list_for_document(tenant_id, document_id)
+        if len(rows) <= keep:
+            return []
+        kept = rows[:keep]
+        dropped = rows[keep:]
+        kept_keys = {row.storage_key for row in kept}
+        if current_key:
+            kept_keys.add(current_key)
+        to_delete = [
+            (row.storage_backend or "local", row.storage_key)
+            for row in dropped
+            if row.storage_key not in kept_keys
+        ]
+        await version_repo.delete_by_ids(
+            tenant_id, [row.id for row in dropped],
+        )
+        return to_delete
+
+    async def _delete_version_objects(
+        self, objects: list[tuple[str, str]],
+    ) -> None:
+        if not objects:
+            return
+        from jonex_core.common.object_storage import (
+            get_object_storage,
+            get_object_storage_for,
+        )
+
+        for backend, key in objects:
+            try:
+                storage = get_object_storage_for(backend) if backend else get_object_storage()
+                await storage.delete(key)
+            except Exception:
+                logger.warning(
+                    "删除历史版本对象失败（保留记录已裁掉，可人工清理）: %s",
+                    key, exc_info=True,
+                )
+
+    _TEXT_LIKE_EXTS = {
+        ".txt", ".md", ".markdown", ".json", ".jsonl", ".csv", ".tsv",
+        ".html", ".htm", ".xml", ".yaml", ".yml", ".log",
+    }
+
+    @classmethod
+    def _is_text_like(cls, file_name: str, mime_type: str | None) -> bool:
+        lowered = (file_name or "").lower()
+        if any(lowered.endswith(ext) for ext in cls._TEXT_LIKE_EXTS):
+            return True
+        mime = (mime_type or "").lower()
+        # 精确判定：OOXML 的 mime 里带 "openxmlformats" 字样（含 xml 子串），
+        # 用子串判断会把 docx/xlsx 误当纯文本，拿压缩字节去按行比。
+        return (
+            mime.startswith("text/")
+            or mime in ("application/json", "application/xml")
+            or mime.endswith("+json")
+            or mime.endswith("+xml")
+        )
+
+    _OOXML_EXTS = {".docx", ".xlsx", ".pptx"}
+
+    @staticmethod
+    def _char_grams(text: str, size: int = 8) -> set[str]:
+        if len(text) <= size:
+            return {text}
+        return {text[i:i + size] for i in range(0, len(text) - size)}
+
+    @staticmethod
+    def _ooxml_text(data: bytes, ext: str) -> str | None:
+        """从 OOXML（docx/xlsx/pptx）里抽可见文本。
+
+        docx/xlsx/pptx 是 zip 容器：直接比压缩字节时，deflate 的滑动窗口会让
+        「改几行」把后面整段字节都改掉（实测 92KB 的 docx 删几行只剩 2% 相同），
+        因此必须解压后按文本比。
+        """
+        import html
+        import io
+        import re
+        import zipfile
+
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except Exception:
+            return None
+        try:
+            names = zf.namelist()
+            if ext == ".docx":
+                targets = [n for n in names if n == "word/document.xml"]
+            elif ext == ".xlsx":
+                targets = [
+                    n for n in names
+                    if n == "xl/sharedStrings.xml"
+                    or (n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+                ]
+            else:
+                targets = [
+                    n for n in names
+                    if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+                ]
+            if not targets:
+                return None
+            chunks: list[str] = []
+            for name in sorted(targets):
+                xml = zf.read(name).decode("utf-8", "ignore")
+                # 段落 / 行 / 幻灯片节点作为换行边界，便于逐行比较
+                xml = re.sub(r"</(w:p|row|a:p|si|c)>", "\n", xml)
+                text = re.sub(r"<[^>]+>", "", xml)
+                chunks.append(html.unescape(text))
+            out = "\n".join(chunks)
+            return re.sub(r"[ \t]+", " ", out).strip() or None
+        except Exception:
+            return None
+        finally:
+            try:
+                zf.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _text_similarity(old_text: str, new_text: str) -> tuple[float, str]:
+        """文本相似度：多行按行对齐；单行/超行数退回字符 8-gram Jaccard。"""
+        import difflib
+
+        old_lines = old_text.splitlines()
+        new_lines = new_text.splitlines()
+        if (
+            len(old_lines) > 1 and len(new_lines) > 1
+            and max(len(old_lines), len(new_lines)) <= 5000
+        ):
+            return (
+                difflib.SequenceMatcher(
+                    None, old_lines, new_lines, autojunk=False,
+                ).ratio(),
+                "text_lines",
+            )
+        old_grams = DocumentService._char_grams(old_text)
+        new_grams = DocumentService._char_grams(new_text)
+        union = old_grams | new_grams
+        if not union:
+            return 0.0, "empty"
+        return len(old_grams & new_grams) / len(union), "text"
+
+    async def _content_similarity(
+        self,
+        new_backend: str,
+        new_key: str,
+        old_backend: str,
+        old_key: str,
+        file_name: str,
+        mime_type: str | None,
+    ) -> tuple[float, str]:
+        """估算新旧文件相似度（0~1）。失败返回 (0, 'error')，不阻断上传。
+
+        - 文本类：多行逐行 `SequenceMatcher`，单行大文件用字符 8-gram Jaccard；
+        - OOXML（docx/xlsx/pptx）：解压后抽文本，走同一套文本比较；
+        - 其余二进制：返回 ``unsupported`` —— **不再用压缩字节估算**。
+          对 zip/PDF/老版 Office 这类容器或压缩格式，改几行会让后续字节全变，
+          字节 Jaccard 会给出 2% 这种误导性数字；宁可只提示「无法比较」。
+        """
+        import os
+
+        from jonex_core.common.config import get_config
+        from jonex_core.common.object_storage import (
+            get_object_storage,
+            get_object_storage_for,
+        )
+
+        max_bytes = int(
+            getattr(get_config(), "DOCUMENT_VERSION_SIMILARITY_MAX_BYTES", 262144)
+            or 262144
+        )
+        ext = os.path.splitext(file_name or "")[1].lower()
+        is_office = ext in self._OOXML_EXTS
+        # OOXML 必须拿到完整 zip（截断就读不出中央目录）：放宽到 4MB
+        limit = max(max_bytes, 4 * 1024 * 1024) if is_office else max_bytes
+        try:
+            old_storage = (
+                get_object_storage_for(old_backend)
+                if old_backend else get_object_storage()
+            )
+            new_storage = (
+                get_object_storage_for(new_backend)
+                if new_backend else get_object_storage()
+            )
+            old_raw = await old_storage.get_bytes(old_key)
+            new_raw = await new_storage.get_bytes(new_key)
+        except Exception:
+            logger.warning("版本相似度读取失败（跳过询问）", exc_info=True)
+            return 0.0, "error"
+
+        if not old_raw or not new_raw:
+            return 0.0, "empty"
+
+        old_bytes, new_bytes = old_raw[:limit], new_raw[:limit]
+
+        if self._is_text_like(file_name, mime_type):
+            old_text = old_bytes.decode("utf-8", errors="ignore")
+            new_text = new_bytes.decode("utf-8", errors="ignore")
+            if old_text and new_text:
+                return self._text_similarity(old_text, new_text)
+
+        if is_office:
+            old_text = self._ooxml_text(old_bytes, ext)
+            new_text = self._ooxml_text(new_bytes, ext)
+            if old_text and new_text:
+                return self._text_similarity(old_text, new_text)
+            logger.warning("OOXML 文本抽取失败/为空，跳过相似度: %s", file_name)
+            return 0.0, "unsupported"
+
+        return 0.0, "unsupported"
 
     async def upload_document_version(
         self,
@@ -3084,6 +3454,19 @@ class DocumentService:
         file_name = str(data.get("file_name") or storage_key.rsplit("/", 1)[-1])
         mime_type = data.get("mime_type")
         file_size = int(data.get("file_size") or 0)
+
+        # 与首次上传同口径的 key 归属校验（防构造他租户/他文档 key）
+        parts = storage_key.split("/")
+        if not (
+            len(parts) >= 5
+            and parts[1] == "kb"
+            and parts[2] == tenant_id
+            and parts[3] == kb_id
+            and parts[4] == document_id
+        ):
+            raise PermissionDeniedError(
+                message="storage_key 与租户/知识库/文档不匹配",
+            )
 
         content_hash = await self._compute_source_hash(storage_backend, storage_key)
         if storage_backend == "local":
@@ -3119,6 +3502,92 @@ class DocumentService:
 
             version_repo = KnowledgeDocumentVersionRepository(session)
             existing = await version_repo.list_for_document(tenant_id, document_id)
+
+            # 同内容判定（md5；hash 取不到时 fail-open 放行）：
+            # ① 与当前生效版相同；② 与某个历史版本相同。
+            # preview 模式下**不抛错**，而是把两种命中情况回给前端展示
+            # 「内容差异」后再让用户选择；正式上传仍按原口径拒绝。
+            current_hash = doc.content_hash or ""
+            same_as_current = bool(
+                content_hash and current_hash and content_hash == current_hash
+            )
+            same_as_version_no: Optional[int] = None
+            current_version_no: Optional[int] = None
+            if content_hash and not same_as_current:
+                for row in existing:
+                    if row.storage_key == doc.storage_key:
+                        continue
+                    if row.content_hash and row.content_hash == content_hash:
+                        same_as_version_no = row.version_no
+                        break
+            for row in existing:
+                if row.storage_key == doc.storage_key:
+                    current_version_no = max(
+                        current_version_no or 0, row.version_no or 0,
+                    )
+
+            preview = bool(data.get("preview"))
+            if not preview:
+                if same_as_current:
+                    raise ResourceConflictError(
+                        message="与当前版本内容相同，未创建新版本",
+                    )
+                if same_as_version_no is not None:
+                    raise ResourceConflictError(
+                        message=(
+                            f"与历史版本 v{same_as_version_no} 内容相同；"
+                            "如需回退请使用「设为生效版」"
+                        ),
+                    )
+
+            from jonex_core.common.config import get_config as _get_config
+
+            threshold = float(
+                getattr(
+                    _get_config(),
+                    "DOCUMENT_VERSION_SIMILARITY_THRESHOLD",
+                    0.85,
+                ) or 0
+            )
+            confirm_similar = bool(data.get("confirm_similar"))
+            need_ratio = preview or not confirm_similar
+            if same_as_current:
+                ratio, method = 1.0, "hash"
+            elif need_ratio and doc.storage_key and threshold > 0:
+                ratio, method = await self._content_similarity(
+                    storage_backend, storage_key,
+                    doc.storage_backend or "local", doc.storage_key,
+                    file_name, mime_type,
+                )
+            else:
+                ratio, method = 0.0, "skipped"
+
+            base = {
+                "similarity": round(ratio, 4),
+                "method": method,
+                "threshold": threshold,
+                "same_as_current": same_as_current,
+                "same_as_version_no": same_as_version_no,
+                "current_version_no": current_version_no,
+                "current_file_size": doc.file_size or 0,
+                "storage_key": storage_key,
+                "storage_backend": storage_backend,
+                "file_name": file_name,
+                "file_size": file_size,
+                "mime_type": mime_type,
+            }
+
+            # preview：只回内容对比结果（含已落对象的 key），不写任何库、不重解析。
+            # 前端据此询问「是否作为新版本」；选新版本时复用该对象，
+            # 选新文档则调 discard 删掉临时对象。
+            if preview:
+                return {"preview": True, **base}
+
+            # 相似度询问：非完全相同、但可能是同一文件的新版本时，本次不写库，
+            # 返回 needs_confirmation；前端确认后带 storage_key +
+            # confirm_similar=true 重提（复用同一对象）。
+            if not confirm_similar and ratio >= threshold and threshold > 0:
+                return {"needs_confirmation": True, **base}
             if not existing:
                 # 防御性补 v1（迁移回填覆盖存量；此分支只针对异常缺行）
                 await version_repo.create(
@@ -3162,7 +3631,12 @@ class DocumentService:
             doc.file_path = file_path
             doc.content_hash = content_hash or None
             await session.flush()
+            trim_objects = await self._trim_document_versions(
+                session, tenant_id, document_id, version_repo, storage_key,
+            )
             await session.commit()
+
+        await self._delete_version_objects(trim_objects)
 
         schedule_emit({
             "tenant_id": tenant_id,
@@ -3206,6 +3680,189 @@ class DocumentService:
 
         return {
             "document_id": document_id,
+            "version": version_dict,
+            "reparse": reparse,
+            **({"reparse_error": reparse_error} if reparse_error else {}),
+        }
+
+    async def discard_document_version_upload(
+        self,
+        tenant_id: str,
+        document_id: str,
+        storage_key: str,
+        storage_backend: str | None = None,
+    ) -> dict:
+        """放弃一次「相似度待确认」的新版本上传：删除临时对象，不写任何记录。"""
+        tenant_id = require_tenant(tenant_id)
+        storage_key = str(storage_key or "").strip()
+        if not storage_key:
+            raise InvalidParameterError(message="storage_key 不能为空")
+        async with get_db_session() as session:
+            doc = await KnowledgeDocumentRepository(session).get_required(
+                document_id, tenant_id,
+            )
+            kb_id = doc.knowledge_base_id or ""
+        parts = storage_key.split("/")
+        if not (
+            len(parts) >= 5
+            and parts[1] == "kb"
+            and parts[2] == tenant_id
+            and parts[3] == kb_id
+            and parts[4] == document_id
+        ):
+            raise PermissionDeniedError(
+                message="storage_key 与租户/知识库/文档不匹配",
+            )
+
+        from jonex_core.common.object_storage import (
+            get_object_storage,
+            get_object_storage_for,
+        )
+
+        backend = (storage_backend or "local").strip().lower()
+        try:
+            storage = (
+                get_object_storage_for(backend) if backend else get_object_storage()
+            )
+            await storage.delete(storage_key)
+        except Exception:
+            logger.warning(
+                "放弃版本上传时删除临时对象失败: %s", storage_key, exc_info=True,
+            )
+            return {"discarded": False}
+        return {"discarded": True}
+
+    async def activate_document_version(
+        self,
+        tenant_id: str,
+        document_id: str,
+        version_no: int,
+        *,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        ip: Optional[str] = None,
+    ) -> dict:
+        """把指定历史版本重新设为生效版（文件级回滚）。
+
+        不覆盖历史：会追加一条 `source=rollback` 的新版本（共享目标版本的对象 key），
+        再把文档行切回该文件并 force reparse。对象删除由保留策略决定，这里不动。
+        """
+        tenant_id = require_tenant(tenant_id)
+        try:
+            target_no = int(version_no)
+        except (TypeError, ValueError):
+            raise InvalidParameterError(message="version_no 必须是正整数")
+        if target_no < 1:
+            raise InvalidParameterError(message="version_no 必须是正整数")
+
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            doc = await repo.get_required(document_id, tenant_id)
+            if doc.status in (
+                DocStatus.ARCHIVED.value, DocStatus.DELETED.value,
+            ):
+                raise ResourceConflictError(message="已归档或已删除的文档不能切换版本")
+            if doc.status in (
+                DocStatus.PARSING.value, DocStatus.INGESTING.value,
+                DocStatus.DELETING.value,
+            ):
+                raise ResourceConflictError(message="文档正在解析/入库/删除中，请稍后再切换版本")
+            if await TaskCenterDocumentRepository(session).exists_active(
+                document_id, tenant_id,
+            ):
+                raise ResourceConflictError(
+                    message="文档正在由任务中心处理，请等当前步骤结束后再切换版本",
+                )
+
+            version_repo = KnowledgeDocumentVersionRepository(session)
+            target = await version_repo.get_version(
+                tenant_id, document_id, target_no,
+            )
+            if target is None:
+                raise ResourceNotFoundError(message="文档版本不存在")
+
+            next_no = await version_repo.next_version_no(tenant_id, document_id)
+            version = await version_repo.create(
+                KnowledgeDocumentVersion(
+                    tenant_id=tenant_id,
+                    document_id=document_id,
+                    version_no=next_no,
+                    file_name=target.file_name,
+                    file_size=target.file_size or 0,
+                    mime_type=target.mime_type,
+                    storage_backend=target.storage_backend or "local",
+                    storage_key=target.storage_key,
+                    content_hash=target.content_hash,
+                    source="rollback",
+                    created_by=username or user_id,
+                )
+            )
+            version_dict = version.to_dict()
+
+            if (target.storage_backend or "local") == "local":
+                from jonex_core.common.object_storage import get_object_storage
+
+                file_path = (
+                    get_object_storage().fs_path(target.storage_key)
+                    or target.storage_key
+                )
+            else:
+                file_path = target.storage_key
+
+            doc.file_name = target.file_name
+            doc.file_size = target.file_size or 0
+            doc.mime_type = target.mime_type
+            doc.storage_key = target.storage_key
+            doc.storage_backend = target.storage_backend or "local"
+            doc.file_path = file_path
+            doc.content_hash = target.content_hash
+            await session.flush()
+            trim_objects = await self._trim_document_versions(
+                session, tenant_id, document_id, version_repo, target.storage_key,
+            )
+            await session.commit()
+
+        await self._delete_version_objects(trim_objects)
+
+        schedule_emit({
+            "tenant_id": tenant_id,
+            "user_id": _audit_user_id(user_id),
+            "username": username,
+            "ip": ip,
+            "log_type": "OPERATION",
+            "action": "activate_document_version",
+            "outcome": "SUCCESS",
+            "service_name": "knowledge_base",
+            "resource": ResourceType.DOCUMENT.value,
+            "resource_id": str(document_id),
+            "request_params": {
+                "version_no": target_no,
+                "activated_version_no": next_no,
+            },
+        })
+
+        reparse: dict = {}
+        reparse_error: str | None = None
+        try:
+            reparse = await self.reparse_document(
+                tenant_id,
+                document_id,
+                user_id=user_id,
+                username=username,
+                ip=ip,
+                force=True,
+                reason="version_rollback",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "切换文档版本后重新解析失败 doc=%s version=%s: %s",
+                document_id, target_no, exc, exc_info=True,
+            )
+            reparse_error = getattr(exc, "message", None) or str(exc)
+
+        return {
+            "document_id": document_id,
+            "activated_from": target_no,
             "version": version_dict,
             "reparse": reparse,
             **({"reparse_error": reparse_error} if reparse_error else {}),
@@ -3263,7 +3920,8 @@ class DocumentService:
         """归档文档：清检索索引，保留对象存储与文档行。
 
         归档是「可恢复的下线」—— 与删除的唯一区别就是**不删原始文件、不软删行**。
-        幂等：已归档直接返回成功（调度器可能重复扫到同一篇）。
+        幂等：已归档直接返回成功（调度器可能重复扫到同一篇）；该早退分支也会
+        顺带清理相似建议/签名（幂等写操作，用于自愈存量残留）。
         """
         tenant_id = require_tenant(tenant_id)
         async with get_db_session() as session:
@@ -3274,6 +3932,10 @@ class DocumentService:
                     message=translate("err.doc.not_found", fallback="知识文档不存在"),
                 )
             if doc.status == DocStatus.ARCHIVED.value:
+                # 幂等早退：顺手清理存量残留（savepoint 兜底，失败不影响返回）
+                await safe_clear_document_similarity_state(
+                    session, tenant_id, document_id,
+                )
                 return {"id": document_id, "status": "archived", "archived": True}
             if doc.status == DocStatus.DELETING.value:
                 raise ResourceConflictError(
@@ -3349,6 +4011,10 @@ class DocumentService:
                         fallback="文档状态已变化，请重试",
                     ),
                 )
+            # 归档后清理相似建议/签名；savepoint 隔离，失败不影响归档主流程
+            await safe_clear_document_similarity_state(
+                session, tenant_id, document_id,
+            )
 
         schedule_emit({
             "tenant_id": tenant_id,
@@ -3764,6 +4430,36 @@ class DocumentService:
         """[jonex] 查询 KB 的 kb_type（转调 kb_type_service）。"""
         from .kb_type_service import get_kb_type
         return await get_kb_type(tenant_id, kb_id)
+
+    @staticmethod
+    async def _resolve_vlm_override(
+        tenant_id: str,
+        kb_id: str,
+        *,
+        kb_type: str = "",
+        ingest_backend_name: str = "",
+    ) -> str:
+        """[jonex] P2b：这份文档这次派活该用的 VLM 覆盖模型名（空 = 不下发）。
+
+        判据（灰度开关 / 该库类型与链路是否适用 / 有没有值）与 fail-open **都在
+        `model_setting_service.resolve_dispatch_models` 一处** —— P3a 起它是全平台
+        唯一解析入口，本体抽取的两个写入者也走它。本方法只负责"取 VLM 那一格"。
+
+        **不做任何默认值兜底**：没有覆盖就返回空，调用方据此不带模型字段，
+        由引擎沿用自己现有的默认链。
+
+        是 `@staticmethod` 而不是实例方法：`_compute_config_fingerprint` 也是
+        staticmethod、且要用它算指纹（配置指纹必须认模型，见那里的注释）。
+        """
+        from .model_setting_service import resolve_dispatch_models
+
+        resolved = await resolve_dispatch_models(
+            tenant_id,
+            kb_id,
+            kb_type=kb_type,
+            ingest_backend=ingest_backend_name,
+        )
+        return resolved.get("parse_multimodal", "")
 
     async def _get_kb_ingest_backend(self, tenant_id: str, kb_id: str) -> str | None:
         """[jonex] 查询 KB 行的库级派单值（转调 kb_type_service，2026-10-09）。

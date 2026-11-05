@@ -233,6 +233,48 @@ async def get_kb_ontology_compile_backend(tenant_id: str, kb_id: str) -> Optiona
     return (row[0] or None) if row else None
 
 
+async def get_kb_procedural_extract(tenant_id: str, kb_id: str) -> bool:
+    """查单个 KB 是否参与 procedural（Skill/Action 规程）抽取
+    （`knowledge_info.procedural_extract`）。
+
+    只有列值**明确为 TRUE** 才返回 True；查不到 / NULL / FALSE 一律 False —— 这是增量
+    LLM 成本开关，没表态就是不开（与 `get_kb_ingest_backend` 那种「NULL = 跟随开关」
+    语义不同：这里没有可跟随的全局默认，进程级总闸只是另一道 AND 条件）。
+    """
+    if not kb_id:
+        return False
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(KnowledgeInfo.procedural_extract).where(
+                KnowledgeInfo.tenant_id == tenant_id,
+                KnowledgeInfo.id == kb_id,
+                KnowledgeInfo.is_deleted == 0,
+            )
+        )
+        row = result.first()
+    return bool(row and row[0] is True)
+
+
+async def get_kb_extract_tool_calls(tenant_id: str, kb_id: str) -> bool:
+    """查单个 KB 是否在写图前调用抽取期工具（`knowledge_info.extract_tool_calls`）。
+
+    与 `get_kb_procedural_extract` 同一口径：只有列值**明确为 TRUE** 才返回 True ——
+    这是增量外部调用成本开关，没表态就是不开。
+    """
+    if not kb_id:
+        return False
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(KnowledgeInfo.extract_tool_calls).where(
+                KnowledgeInfo.tenant_id == tenant_id,
+                KnowledgeInfo.id == kb_id,
+                KnowledgeInfo.is_deleted == 0,
+            )
+        )
+        row = result.first()
+    return bool(row and row[0] is True)
+
+
 async def get_kb_types(tenant_id: str, kb_ids: list[str]) -> dict[str, str]:
     """批量查询 KB 的 kb_type。未命中默认 'lightrag'。
 

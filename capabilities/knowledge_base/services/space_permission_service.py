@@ -30,6 +30,16 @@ SPACE_MANAGER = "space_manager"
 SPACE_MEMBER = "member"
 _SPACE_ROLE_RANK: dict[str, int] = {SPACE_MEMBER: 0, SPACE_MANAGER: 1}
 
+# [jonex] 领域空间状态（禁用态）：**可用性**维度，与空间角色（授权）正交。
+# 判定一律用正向的 `status == active` —— 存量数据里可能存在 inactive/其它历史值，
+# 反向写 `status != disabled` 会把它们误判为可用。
+# 禁用是**资源级事实**，对所有调用者成立（含租户管理员）：管理员只在「可见性」
+# 上豁免（列表/详情仍能拿到），不在「可用性」上豁免（空间内业务一律拒绝），
+# 且「管理空间本身」的动作（改状态、删除、成员权限）不受本维度约束。
+SPACE_STATUS_ACTIVE = "active"
+SPACE_STATUS_DISABLED = "disabled"
+WRITABLE_SPACE_STATUSES = frozenset({SPACE_STATUS_ACTIVE, SPACE_STATUS_DISABLED})
+
 # [jonex] 权限重构 B1：租户管理员标识码。
 # 原先是 _TENANT_WRITE = "tenant:write" —— tenant:write 语义过载（既是租户 CRUD
 # 又是"全租户知识库超级开关"），且与前端 auth_service 看 user:write 的口径不一致。
@@ -137,6 +147,83 @@ async def get_user_role(tenant_id: str, space_id: str, user_id: str | None) -> s
     return max(roles, key=lambda r: _SPACE_ROLE_RANK[r])
 
 
+async def _get_space_status(tenant_id: str, space_id: str) -> str | None:
+    """空间状态单列查询；不存在 / 软删返回 None（与「已删除」区分由调用方处理）。"""
+    tenant_id = require_tenant(tenant_id)
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(Space.status).where(
+                Space.id == space_id,
+                Space.tenant_id == tenant_id,
+                Space.is_deleted == 0,
+            )
+        )
+        row = result.first()
+    return row[0] if row else None
+
+
+async def is_space_active(tenant_id: str, space_id: str) -> bool:
+    """空间当前是否可用（`status == active`）。
+
+    正向判定：任何非 active 取值（含存量 inactive）一律视为不可用，
+    不要求先迁移历史数据。
+    """
+    return await _get_space_status(tenant_id, space_id) == SPACE_STATUS_ACTIVE
+
+
+async def require_space_active(tenant_id: str, space_id: str) -> None:
+    """空间不可用时抛错 —— **不做租户管理员豁免**。
+
+    与 require_space_visible / require_space_manage 的口径区别（刻意如此）：
+    - 可见 / 管理空间本身：租户管理员豁免（管理员要能看到并恢复禁用空间）；
+    - 使用空间（读写空间内业务数据）：所有人一律以 status 为准，管理员也一样。
+
+    错误分层：
+    - 空间不存在 / 已删除 → 404 err.space.not_found（沿用防探测口径）
+    - 存在但非 active      → 403 err.space.disabled（可识别、可展示禁用提示）
+    """
+    status = await _get_space_status(tenant_id, space_id)
+    if status is None:
+        raise ResourceNotFoundError(
+            message=translate(
+                "err.space.not_found",
+                params={"space_id": space_id},
+                fallback=f"领域空间 {space_id} 不存在",
+            )
+        )
+    if status != SPACE_STATUS_ACTIVE:
+        raise PermissionDeniedError(
+            message=translate(
+                "err.space.disabled",
+                params={"space_id": space_id},
+                fallback=f"领域空间已禁用: {space_id}",
+            )
+        )
+
+
+async def get_active_space_ids(tenant_id: str) -> set[str]:
+    """租户内所有可用空间 id（`status == active` 且未软删）。
+
+    这是**资源级可用性**口径，与调用者是不是成员、是不是管理员都无关：
+    检索多 KB 时要先剔除禁用空间下的 KB，否则「非成员但有 KB 授权」的用户
+    仍能读到禁用空间的内容（KB 授权是跨空间的）。
+
+    ⚠ 与 get_visible_space_ids 不要合并：
+    - visible：成员不可见禁用空间，租户管理员返回 None（全可见）—— 管理列表/下拉用；
+    - active ：只回答「这个空间现在开不开放」，管理员同样受限 —— 业务数据范围用。
+    """
+    tenant_id = require_tenant(tenant_id)
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(Space.id).where(
+                Space.tenant_id == tenant_id,
+                Space.is_deleted == 0,
+                Space.status == SPACE_STATUS_ACTIVE,
+            )
+        )
+        return {row[0] for row in result.all()}
+
+
 async def has_space_role(tenant_id: str, space_id: str, user_id: str | None, *roles: str) -> bool:
     """布尔判定（不抛异常）——KB 授权兜底的前置入口。
 
@@ -197,12 +284,16 @@ async def require_space_visible(tenant_id: str, space_id: str, user_id: str | No
 
     收紧口径（2026-08-19）：service:write（如领域服务管理员）不再全可见，
     按成员关系过滤。
+
+    [jonex] 禁用态：租户管理员**仍然可见**（要能恢复/清理空间），普通成员
+    对禁用空间返回 404 —— 与「成员在下拉里看不到」的产品口径一致，
+    而不是 403「存在但无权」（后者会泄露空间仍存在）。
     """
     tenant_id = require_tenant(tenant_id)
     if await is_tenant_admin(tenant_id, user_id):
         return
     role = await get_user_role(tenant_id, space_id, user_id)
-    if role is None:
+    if role is None or not await is_space_active(tenant_id, space_id):
         raise ResourceNotFoundError(
             message=translate(
                 "err.space.not_found",
@@ -247,6 +338,8 @@ async def get_visible_space_ids(tenant_id: str, user_id: str | None) -> list[str
             .where(
                 Space.tenant_id == tenant_id,
                 Space.is_deleted == 0,
+                # [jonex] 禁用空间对成员不可见（管理员在上面已返回 None=全可见）。
+                Space.status == SPACE_STATUS_ACTIVE,
             )
         )
         return [row[0] for row in result.all()]

@@ -141,6 +141,14 @@ from .image_query import (
     QueryImageRef,
 )
 from .ontology_schema import NativeOntologyExtractRequest
+from .ontology_abstract_schema import (
+    ABSTRACT_STATUSES,
+    AbstractConcept,
+    AbstractConceptSource,
+    AbstractSchemaGenerateRequest,
+    AbstractSchemaResponse,
+    AbstractSchemaSaveRequest,
+)
 
 __all__ = [
     "AbnormalAssetItem",
@@ -205,6 +213,12 @@ __all__ = [
     "LlmWikiSearchRequest",
     "MixSearchRequest",
     "NativeOntologyExtractRequest",
+    "ABSTRACT_STATUSES",
+    "AbstractConcept",
+    "AbstractConceptSource",
+    "AbstractSchemaGenerateRequest",
+    "AbstractSchemaResponse",
+    "AbstractSchemaSaveRequest",
     "OntologyEntitySearchRequest",
     "OntologyInstanceListRequest",
     "OntologyGraphRequest",

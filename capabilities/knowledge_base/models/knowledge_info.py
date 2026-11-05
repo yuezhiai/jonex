@@ -3,7 +3,8 @@
 """
 import uuid
 
-from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy import Boolean, Column, Integer, String, Text
+from sqlalchemy import Boolean, Column, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
@@ -44,6 +45,24 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     # ⚠ 刻意**不进 `to_dict`**：库级 API 暴露（前端/接口层）是设计 §5.5 的独立项，本期不做
     # （本期只有列 + env）；读取走 `kb_type_service.get_kb_ontology_compile_backend` 直查列。
     ontology_compile_backend = Column(String(32), nullable=True)
+    # [jonex] 库级 procedural（Skill/Action 规程）抽取开关：TRUE = 参与；NULL/FALSE = 不参与。
+    # 与进程级总闸 ONTOLOGY_PROCEDURAL_EXTRACT_ENABLED AND 生效。需要库级开关的原因：
+    # 内置 TBox 都含 Action，「schema 含 Action」不能再当灰度条件。派单时读、随 schema 下发
+    # （kb_type_service.get_kb_procedural_extract）。to_dict 按「明确为 TRUE」输出布尔，
+    # 与读取侧同口径；可经 update_knowledge_info 设置（知识库设计界面的动态本体开关）。
+    # 建列脚本：deploy/postgres/update/082_ontology_skill_action_tools.sql。
+    procedural_extract = Column(Boolean, nullable=True)
+    # 库级「抽取期调用工具」开关：TRUE = 写图前按 TBox 的 `catalog:` 抽取技能声明调用登记的只读工具
+    # 补充 / 校验抽取结果；NULL / FALSE = 不调用。与进程总闸 ONTOLOGY_EXTRACT_TOOL_ENABLED AND 生效
+    # （见 services/extract_tool_service.py）。建列脚本：deploy/postgres/update/090_ontology_tool_read_only_qa_callable.sql。
+    extract_tool_calls = Column(Boolean, nullable=True)
+    # [jonex] 解析后相似检测：KB 级开关 + 阈值覆盖（NULL = 跟随 env）
+    similarity_check_enabled = Column(Boolean, nullable=False, default=False)
+    similarity_check_threshold = Column(Numeric(4, 3), nullable=True)
+
+    # 结构化数据支持（数据源 / schema / 抽象 schema / 血缘 / 治理 / ETL / ②）。
+    # 新建默认关闭；存量由 015 迁移置为开启；关闭不删除任何数据。
+    structured_enabled = Column(Boolean, nullable=False, default=False)
 
     def to_dict(self, space_name: str = None):
         result = {
@@ -57,7 +76,17 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "status": self.status,
             "owner_id": self.owner_id,
             "kb_type": self.kb_type,  # [jonex]
+            "structured_enabled": bool(self.structured_enabled),
             "ingest_backend": self.ingest_backend,  # [jonex] NULL = 跟随服务端开关
+            # [jonex] 动态本体（技能 / 动作抽取）库级开关；NULL 与 FALSE 都是关
+            "procedural_extract": self.procedural_extract is True,
+            # 抽取期调用工具库级开关；NULL 与 FALSE 都是关
+            "extract_tool_calls": self.extract_tool_calls is True,
+            "similarity_check_enabled": bool(self.similarity_check_enabled),
+            "similarity_check_threshold": (
+                float(self.similarity_check_threshold)
+                if self.similarity_check_threshold is not None else None
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

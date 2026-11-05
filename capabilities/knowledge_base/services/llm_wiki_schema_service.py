@@ -376,10 +376,22 @@ class LlmWikiSchemaService:
         try:
             if kb_type == "jonex_wiki":
                 from jonex_core.capability.atomic.jonex_wiki.client import get_jonex_wiki_client
+                # [jonex] P3b：编译模型**只有一个来源** —— KB 模型配置页那张表
+                # （`knowledge_model_settings` 的 compile_wiki）。`llm_wiki_schema.model`
+                # 那个旧字段前端从来没有输入框（恒 null），保留它只会让"到底哪个算数"
+                # 说不清，所以这里改读统一入口。没配置时结果是空串 ⇒ 这次 apply_schema
+                # 建出的重编任务不带模型 ⇒ 回落 env（正是回滚想要的形状）。
+                from .model_setting_service import resolve_dispatch_models
+
+                compile_model = (
+                    await resolve_dispatch_models(
+                        tenant_id, kb_id, kb_type="jonex_wiki",
+                    )
+                ).get("compile_wiki", "")
                 result = await get_jonex_wiki_client().apply_schema(
                     kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
                     schema_version=version,
-                    config={"model": row.model, "language": row.language},
+                    config={"model": compile_model, "language": row.language},
                     agents_md=row.agents_md,
                 )
             else:

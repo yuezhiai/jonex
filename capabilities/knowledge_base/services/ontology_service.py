@@ -240,6 +240,15 @@ class OntologyService:
             # 的前置校验（它不抽本体、没有 ontology schema），这也是它必须在这里分流、
             # 不能落到下面 lightrag 那段的原因。
             if not strict:
+                # ── [jonex] 整库解析身份预检 + 自愈（只走用户这条路）──
+                # 编译是整库级：本库任何一份产物的解析身份过期，引擎就会在取源材料阶段
+                # 硬失败。不预检的话，用户点「重新编译」→ 任务中心排队 → compile 步跑
+                # 起来才失败，报错还指着**用户没点的**文档。
+                # 注意是**自愈**、不是拒绝：产物代次只在 ingest 时前进，直接拒会把唯一
+                # 的刷新路径也关掉（死锁，2026-10-21 现网复现）。strict=True 是链上回来
+                # 那一步，由 recompile_jonex_wiki 自己再查一次（同一判据），不重复做。
+                from .jonex_wiki_service import assert_kb_parsed_sources_current
+                await assert_kb_parsed_sources_current(tenant_id, real_kb_id)
                 return await self._reroute_compile_to_task_center(
                     tenant_id=tenant_id,
                     document_id=document_id,
@@ -324,6 +333,29 @@ class OntologyService:
             kb_backend=await self._get_kb_compile_backend(tenant_id, real_kb_id),
         )
 
+        # [jonex] P3a：KB 级本体抽取模型 —— 派活那一刻读（「保存只影响未派活的步骤」）。
+        # 判据（灰度开关 / 该 scope 对 lightrag 是否适用 / 有没有值）全在
+        # `resolve_dispatch_models` 一处；取不到就是空串 ⇒ 报文不带这个键 ⇒
+        # 引擎用自己的 `ONTOLOGY_LLM_MODEL`。
+        # ⚠️ 读失败按「无覆盖」处理（fail-open）：这是增强项，不该把一次配置表
+        # 抖动升级成「重抽按钮点了就报错」。
+        # 两个后端都吃这个覆盖：rag 链走 `retry_ontology_extract(ontology_model=…)`，
+        # ontology_compile 链走 `compile(ontology_model=…)`（容器再透给
+        # `NativeOntologyExtractor` 的 `options["model"]`）。
+        from .model_setting_service import resolve_dispatch_models
+
+        ontology_model = (
+            await resolve_dispatch_models(
+                tenant_id, knowledge_base_id, kb_type="lightrag",
+            )
+        ).get("compile_ontology", "")
+
+        # 库级 procedural 开关随派单 schema 下发（只改副本，不动库里的 compiled schema；
+        # 两个后端共用这一份 schema，见 procedural_gate 模块 docstring）
+        from .procedural_gate import with_procedural_gate
+
+        schema = await with_procedural_gate(schema, tenant_id, real_kb_id)
+
         # 提交 ontology-only 任务（不在此处 ++retry / 置 EXTRACTING）
         try:
             if backend == "ontology_compile":
@@ -343,6 +375,8 @@ class OntologyService:
                     mode="extract_only",
                     schema=schema,
                     content_generation=content_generation,
+                    # [jonex] KB 级本体抽取模型（空 = 不带这个键，容器用默认模型）
+                    ontology_model=ontology_model,
                 )
                 task_id = (result or {}).get("compile_id", "")
             else:
@@ -354,6 +388,8 @@ class OntologyService:
                     ontology_schema=schema,
                     schema_version=schema_version,
                     content_generation=content_generation,
+                    # [jonex] KB 级本体抽取模型（空 = 不带这个键，引擎用默认模型）
+                    ontology_model=ontology_model,
                     # [jonex] 手动重抽 = 明确要求重跑，必须传 force_retry。
                     # 否则 atomic-rag 按幂等键 `ontology:{tenant}:{kb}:{doc}:{schema_version}`
                     # 命中同版本的 completed 任务时直接 return（handler 里

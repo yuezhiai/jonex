@@ -25,6 +25,7 @@ from jonex_core.common.audit import schedule_emit
 from jonex_core.common.audit_enums import ResourceType
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import (
+    ResourceConflictError,  # [jonex] 解析身份预检「搬不动」→ 巡检跳过本轮
     ResourceNotFoundError,  # [jonex] jonex_wiki 编译任务查询：任务不存在 ≠ 查询失败
 )
 from jonex_core.common.neo4j_client import get_neo4j_driver
@@ -42,8 +43,10 @@ from ..repository.ontology_graph_repository import (
     _write_retry_base_delay,
 )
 from . import compile_backend, ingest_backend  # [jonex] P2：compile 步后端 + 粘性值判据
+from . import kb_model_config  # [jonex] P2b：KB 级模型覆盖的派活判据（SSOT）
 from .document_service import DocumentService  # [jonex] O7 残留扫描复用
 from .kb_type_service import LLM_WIKI_TYPES  # [jonex] llm-wiki 子集 {openkb, jonex_wiki}
+from .ontology_data_projection import rebuild_alignments_best_effort
 from .rag_storage_lookup import find_rag_doc_ids
 
 logger = logging.getLogger(__name__)
@@ -615,6 +618,25 @@ async def _write_graph_once_inner(gdao, doc, kb_id: str, ont_data: dict) -> list
     return ref_rels
 
 
+async def _refresh_alignments_best_effort(doc, kb_id: str) -> None:
+    """文档侧图改写/回滚后重挂该 KB 的 `MAPS_TO` 派生边（fail-open）。
+
+    对齐行（PG）是权威，`MAPS_TO` 只是派生物：本文档的实体被删除/重建后，旧的
+    对齐边会随实体消失，而投影原本只在显式「重建数据资产」时重挂。不在这里补
+    一次，先审批对齐、后入库文档（或文档实体删除后重建）就会留下「对齐已 active、
+    图上却没有边」的静默缺口，直到人工重建。
+
+    `rebuild_alignments_best_effort` 自身已做开关门控与异常吞噬；这里再兜一层，
+    保证投影的任何问题都不会改变图改写结果、不影响重试/收尾。
+    """
+    try:
+        await rebuild_alignments_best_effort(doc.tenant_id, kb_id)
+    except Exception as exc:  # noqa: BLE001 —— 投影是增能项，失败只告警
+        logger.warning(
+            "跨模态对齐投影刷新失败（不影响图改写）: kb=%s: %s", kb_id, exc,
+        )
+
+
 async def _rewrite_ontology_graph(
     gdao, doc, kb_id: str, ont_data: dict,
 ) -> tuple[bool, list, bool]:
@@ -633,6 +655,9 @@ async def _rewrite_ontology_graph(
         for attempt in range(attempts):
             try:
                 ref_rels = await _write_graph_once(gdao, doc, kb_id, ont_data)
+                # 图终态=本轮产出后重挂派生边：实体可能刚被重建，旧的 MAPS_TO
+                # 已随旧实体消失（对齐行才是权威，不能等人工重建数据资产）。
+                await _refresh_alignments_best_effort(doc, kb_id)
                 return True, ref_rels, False
             except Exception as exc:  # noqa: BLE001 — 非 transient 视为确定性失败
                 # [jonex] 整段超时（asyncio.TimeoutError）算 transient：写图卡住
@@ -662,6 +687,9 @@ async def _rewrite_ontology_graph(
         raise
 
     await _reclaim_half_written(gdao, doc, kb_id)
+    # 收回半写图后也要重算投影：投影始终以「当前图 + active 对齐行」为准，
+    # 文档实体已删时对应 MAPS_TO 一并收敛，不把半写期间的边留在图里。
+    await _refresh_alignments_best_effort(doc, kb_id)
     return False, [], last_transient
 
 
@@ -1372,6 +1400,35 @@ class ReconciliationService:
                         "Patrol schema check failed for doc %s, proceeding: %s", doc.id, exc,
                     )
                     schema = None
+                if schema:
+                    from .procedural_gate import with_procedural_gate
+
+                    schema = await with_procedural_gate(
+                        schema, doc.tenant_id, doc.knowledge_base_id,
+                    )
+
+            # [jonex] KB 级 VLM 覆盖（P2b）：对账重投是一次**新派活**，吃当前配置。
+            # 读失败按「无覆盖」处理 —— 不拦对账主流程（理由同 DocumentService 的
+            # `_resolve_vlm_override`：模型覆盖是增强项，不该让一次配置表读取故障
+            # 把一份本来还能救回来的文档卡在 FAILED）。
+            try:
+                from ..repository.model_setting_repository import (
+                    KnowledgeModelSettingRepository,
+                )
+
+                async with get_db_session() as session:
+                    _ms_rows = await KnowledgeModelSettingRepository(session).list_by_kb(
+                        doc.tenant_id, doc.knowledge_base_id
+                    )
+                vlm_override = kb_model_config.resolve_for_dispatch(
+                    {row.scope: row.model_name for row in _ms_rows},
+                    kb_type=kb_type, ingest_backend="rag",
+                ).get("parse_multimodal", "")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Patrol read KB model override failed (doc=%s): %s", doc.id, exc,
+                )
+                vlm_override = ""
 
             try:
                 rag_result = await get_rag_client().insert(
@@ -1384,6 +1441,8 @@ class ReconciliationService:
                     storage_key=doc.storage_key,
                     execution_mode="parse_only" if is_llm_wiki else "full",
                     kb_type=kb_type,
+                    # [jonex] KB 级 VLM 覆盖（空 = 不带这个键，引擎用默认模型）
+                    kb_vlm_override=vlm_override,
                 )
 
                 new_status = DocStatus.READY if not rag_result.get("task_id") else DocStatus.PARSING
@@ -1679,6 +1738,9 @@ class ReconciliationService:
         neo4j_ok = True
         neo4j_transient = False
         neo4j_write_ms = None
+        # 抽取期工具（catalog: 声明）的执行摘要；只有真正走到写图那一步才改写 extra_metadata
+        enrich_summary = None
+        enrich_ran = False
         if not schema_fenced and ont_status == "completed" and ont_data:
             _t_neo4j = time.perf_counter()
             try:
@@ -1714,6 +1776,13 @@ class ReconciliationService:
                     # 归一到 canonical 并统一 entity_type，使 MERGE 主键相同的节点自然合并。
                     # 直查 DB（强一致，正确性锚点）；失败降级不阻塞写图。
                     ont_data = await self._apply_synonyms(doc.tenant_id, kb_id, ont_data)
+                    # 抽取期工具：在同义词归一之后执行，入参用的是归一后的实体名；
+                    # 三道开关任一没开时原样返回、摘要为 None。服务内部从不抛异常。
+                    from .extract_tool_service import ExtractToolService
+                    ont_data, enrich_summary = await ExtractToolService().apply(
+                        doc.tenant_id, kb_id, doc.id, ont_data,
+                    )
+                    enrich_ran = True
                     # [jonex] 「先删后 merge」整段重试 + 耗尽清理——单条 transient
                     # 已在仓储层兜住，这里兜整段中途失败；终态只允许「完整的本轮
                     # 产出」或「零贡献」，不留会被检索召回的残缺图。
@@ -1801,6 +1870,13 @@ class ReconciliationService:
                 fm["multimodal_warnings"] = mw
             else:
                 fm.pop("multimodal_warnings", None)
+            # 抽取期工具摘要：本轮走到了写图才覆盖写；本轮没调用（开关关 / 无声明）时清掉旧摘要。
+            # 写图被拒（退化闸门）或没走到写图时保留上一轮的摘要，它仍描述图里现有的数据。
+            if enrich_ran:
+                if enrich_summary:
+                    fm["ontology_enrich"] = enrich_summary
+                else:
+                    fm.pop("ontology_enrich", None)
             # [jonex] §table-grid-v2 O7: 新旧格式 chunk 残留扫描（读操作，失败不
             # 阻塞收尾）。残留 > 0 → extra_metadata 留警告（前端文档详情可见）；
             # 无残留 → 清掉旧 key（reparse 成功后旧警告不残留）。llm-wiki 跳过。
@@ -2446,6 +2522,11 @@ class ReconciliationService:
             if schema is None:
                 return False
 
+        # 库级 procedural 开关随派单 schema 下发（只改副本；读失败按关处理）
+        from .procedural_gate import with_procedural_gate
+
+        schema = await with_procedural_gate(schema, doc.tenant_id, kb_id)
+
         # [jonex] R1：retry_count 计的是「已提交的重抽次数」。上限闸门原先放在函数入口，
         # 会把仍处于 EXTRACTING 的文档直接判死 —— 既包括在途任务的轮询收尾，也包括 R1
         # 「写图失败保持 EXTRACTING 待重写」的路径（该文档 retry_count 可能已 ≥ 上限，
@@ -2655,6 +2736,23 @@ class ReconciliationService:
 
         # Trigger new ontology retry (ontology-only, 携带 schema + 版本 + 代次)
 
+        # [jonex] P3a：对账重抽同样是**新派活**，吃当前配置。这条路只服务
+        # lightrag（本体抽取只有 Ontology 库有），所以 kb_type 直接给 lightrag。
+        # 读失败按「无覆盖」处理（fail-open）。
+        _ontology_model = ""
+        try:
+            from .model_setting_service import resolve_dispatch_models
+
+            _ontology_model = (
+                await resolve_dispatch_models(
+                    doc.tenant_id, kb_id, kb_type="lightrag",
+                )
+            ).get("compile_ontology", "")
+        except Exception as exc:  # noqa: BLE001 — 增强项，不拦对账主流程
+            logger.warning(
+                "对账重抽读取 KB 模型覆盖失败（按无覆盖处理）doc=%s: %s", doc.id, exc,
+            )
+
         try:
             result = await get_rag_client().retry_ontology_extract(
                 document_id=doc.id,
@@ -2664,6 +2762,8 @@ class ReconciliationService:
                 ontology_schema=schema,
                 schema_version=schema_version,
                 content_generation=int(getattr(doc, "content_generation", 0) or 0),
+                # [jonex] KB 级本体抽取模型（空 = 不带这个键，引擎用默认模型）
+                ontology_model=_ontology_model,
                 # [jonex] A18（N5）：无条件 force_retry —— 对账重抽 = 明确要求重跑；
                 # 不传会被同一幂等键下的 completed 任务早退复用（空转告终根因）。
                 force_retry=True,
@@ -2827,42 +2927,18 @@ class ReconciliationService:
 
         kb_id = (doc.knowledge_base_id or (doc.extra_metadata or {}).get("knowledge_base_id", ""))
 
-        suffix = os.path.splitext(doc.file_name or "")[1].lower()
-        if suffix in {".xlsx", ".xlsm"}:
-            # 原生表格:转发原始二进制到共享卷 parsed/{doc}/source{ext},
-            # 让引擎走 SPREADSHEET_NATIVE 确定性解析(工作簿级阅读材料)。
-            try:
-                source_path = await stage_jonex_wiki_ingest_source(
-                    doc.id, file_name=doc.file_name or "",
-                    storage_key=doc.storage_key or "",
-                    storage_backend=doc.storage_backend or "",
-                    file_path=doc.file_path or "",
-                )
-            except Exception as exc:
-                await self._record_openkb_status(
-                    doc, status="failed",
-                    error=f"JONEX_WIKI_NO_ORIGINAL_SOURCE: {exc}"[:1000],
-                )
-                logger.error(
-                    "[jonex] jonex_wiki compile 跳过：doc=%s 原始表格不可读", doc.id,
-                    exc_info=True,
-                )
-                return
-        else:
-            abs_md = status_info.get("parsed_markdown_path") or ""
-            source_path = self._relativize_input_path(abs_md)
-
-            if not source_path:
-                # 没有可用 parsed markdown：如实标记失败（与 openkb 同口径）
-                await self._record_openkb_status(
-                    doc, status="failed",
-                    error="JONEX_WIKI_NO_PARSED_MARKDOWN: 解析任务未提供 parsed_markdown_path"
-                          "（需解析器把 markdown 落到共享卷 inputs 并经 task status 暴露）",
-                )
-                logger.error(
-                    "[jonex] jonex_wiki compile 跳过：doc=%s 无 parsed_markdown_path", doc.id,
-                )
-                return
+        try:
+            await stage_jonex_wiki_ingest_source(
+                doc.id, file_name=doc.file_name or "", storage_key=doc.storage_key or "",
+                storage_backend=doc.storage_backend or "", file_path=doc.file_path or "",
+                tenant_id=doc.tenant_id, kb_id=kb_id,
+                content_generation=int(doc.content_generation or 0),
+                ingest_backend=ingest_backend.backend_for_document(doc))
+        except Exception as exc:
+            await self._record_openkb_status(doc, status="failed",
+                error=f"JONEX_WIKI_INPUT_NOT_READY: {exc}"[:1000])
+            logger.exception("Wiki consumer delivery rejected doc=%s", doc.id)
+            return
 
         # Parsing success is not a KB-wide batch-complete signal. Keep this
         # source durable and waiting; the patrol drains all ready sources once
@@ -3391,6 +3467,14 @@ class ReconciliationService:
                 """), {"tenant": tenant_id, "kb": kb_id,
                         "active_states": list(ACTIVE_STATES),
                         "managed_states": list(MANAGED_STATES)})).all()
+                if not documents:
+                    continue
+                # [jonex] 派发前的整库解析身份预检（与 `recompile_jonex_wiki` 同口径）：
+                # 一次 ingest 会触发整库编译，本库任一文档的解析产物硬门过期，引擎就在
+                # 「取源材料」阶段硬失败 —— 于是**别的**文档也被记成 failed，还吃一个跟
+                # 它们无关的引擎报错。所以先自愈，搬不动的回写 failed 并跳过本轮。
+                if await self._ensure_jonex_parse_identity(compiler, tenant_id, kb_id) != "ok":
+                    continue
                 artifacts, claimed = [], []
                 target = await compiler.get_active_schema_version(tenant_id, kb_id)
                 try:
@@ -3398,11 +3482,10 @@ class ReconciliationService:
                         if not await compiler.claim_compile(tenant_id, d.id, target_schema_version=target, batch=True):
                             continue
                         try:
-                            suffix = os.path.splitext(d.file_name or "")[1].lower()
-                            rel = (await stage_jonex_wiki_ingest_source(
+                            rel = await stage_jonex_wiki_ingest_source(
                                 d.id, file_name=d.file_name or "", storage_key=d.storage_key or "",
-                                storage_backend=d.storage_backend or "", file_path=d.file_path or "")
-                                if suffix in {".xlsx", ".xlsm"} else self._jonex_parsed_markdown_rel(d.id))
+                                storage_backend=d.storage_backend or "", file_path=d.file_path or "",
+                                tenant_id=tenant_id, kb_id=kb_id)
                             if not rel:
                                 raise ValueError(f"JONEX_WIKI_NO_PARSED_SOURCE: {d.id}")
                             artifacts.append({"source_path": rel, "source_name": d.file_name or d.id,
@@ -3428,6 +3511,57 @@ class ReconciliationService:
                             status="stale" if _is_jonex_wiki_compile_slot_busy(exc) else "failed", error=str(exc)[:1000])
                     logger.exception("jonex_wiki upload-window dispatch failed kb=%s", kb_id)
         return submitted
+
+    async def _ensure_jonex_parse_identity(self, compiler, tenant_id: str, kb_id: str) -> str:
+        """[jonex] 巡检派发前的整库「解析身份」预检。返回 ``ok`` / ``healed`` / ``blocked``。
+
+        ── 为什么巡检也要预检 ──
+
+        巡派的是一次 ingest，而 ingest 会触发**整库**编译：引擎在取源材料阶段逐条比对
+        解析身份，本库任何一份产物的**硬门分量**过期就整体拒绝（`source_port`），于是
+        这一批文档全被记成 failed，错误还是指着另一份文档 —— 用户看到的是「重新编译
+        失败」而不是「某文档要重新解析」。预检把这件事提前说清楚。
+
+        ── 三种结果 ──
+
+        * ``healed``：过期但平台已解析好的产物被重新 ingest 了。**本轮不再派发**：
+          自愈那次 ingest 已经让引擎按新代次重编，再派一次只是重复 ingest（每次都推进
+          `content_generation`）；下一轮巡检按新身份正常走。
+        * ``blocked``：过期且搬不动（文档不在 ready / 共享卷没有产物）。已把原因逐份
+          回写 ``failed``（带 ``JONEX_WIKI_STALE_PARSE_IDENTITY`` 前缀，供前端直接展示），
+          本轮跳过该库。用户「重新解析」会把状态改回 ``stale``，下一轮自动重试。
+        * ``ok``：没有过期文档，或预检本身不可用（引擎没实现 / 临时读不到）。预检是
+          **增强项**：不可用时按原样继续，别让一次只读调用故障把巡检整体停掉。
+        """
+        try:
+            healed = await compiler.ensure_parsed_sources_current(tenant_id, kb_id)
+        except ResourceConflictError as exc:
+            blocked = list((getattr(exc, "details", None) or {}).get("documents") or [])
+            names = "、".join(
+                str(item.get("source_name") or item.get("document_id") or "")
+                for item in blocked[:3])
+            logger.warning(
+                "[jonex] patrol 跳过 kb=%s 本轮派发：%d 份文档解析产物不可用（%s%s）",
+                kb_id, len(blocked), names, "…" if len(blocked) > 3 else "")
+            for item in blocked:
+                document_id = str(item.get("document_id") or "")
+                if not document_id:
+                    continue
+                drift = ",".join(str(value) for value in (item.get("drift") or []))
+                await self._record_openkb_status_by_id(
+                    document_id, tenant_id, status="failed",
+                    error=(f"JONEX_WIKI_STALE_PARSE_IDENTITY: 解析产物已过期"
+                           f"（{drift or 'unknown'}），请对该文档执行「重新解析」后再编译")[:1000])
+            return "blocked"
+        except Exception:   # noqa: BLE001 — 预检绝不阻断巡检
+            logger.warning("[jonex] patrol 解析身份预检不可用，按原样继续 kb=%s",
+                           kb_id, exc_info=True)
+            return "ok"
+        if healed:
+            logger.info("[jonex] patrol 解析身份自愈 %d 份 kb=%s，本轮跳过派发",
+                        healed, kb_id)
+            return "healed"
+        return "ok"
 
     async def _record_openkb_status_by_id(self, document_id: str, tenant_id: str, *,
                                           status: str, error: str = "", warnings=None,

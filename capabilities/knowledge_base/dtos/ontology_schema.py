@@ -11,6 +11,8 @@ except ImportError:
 
 import re
 
+from jonex_core.common.catalog_skill_spec import is_catalog_skill, parse_catalog_item
+
 _SKILL_REF_RE = re.compile(r"^(builtin|catalog):[A-Za-z0-9_-]+$")
 
 
@@ -75,6 +77,8 @@ class CompiledAttributeInput(BaseModel):
     required: bool = False
     is_primary_key: bool = False
     source_attribute_id: Optional[str] = Field(default=None, max_length=64)
+    # 物理列名（catalog 原名）：属性名可能是归一后的 slug，生成 SQL 用物理名。
+    physical_name: Optional[str] = Field(default=None, max_length=255)
 
 
 class CompiledEntityTypeInput(BaseModel):
@@ -114,6 +118,11 @@ class CompiledEntityTypeInput(BaseModel):
                     raise ValueError(
                         f"extraction_skills 技能名必须以 builtin: 或 catalog: 为前缀: {skill}"
                     )
+                if is_catalog_skill(skill):
+                    # catalog: 声明由 knowledge-base 写图前执行，入参 / 写入 / 拒绝条件在保存时就要合法
+                    _, errs = parse_catalog_item(group, item)
+                    if errs:
+                        raise ValueError("；".join(errs))
         return v
 
 
@@ -131,6 +140,11 @@ class CompiledRelationTypeInput(BaseModel):
     inverse_of: Optional[str] = Field(default=None, min_length=1, max_length=128)
     source_types: list[str] = Field(default_factory=list)
     target_types: list[str] = Field(default_factory=list)
+    # [jonex] P0-2：join 键。生成器填、② NL→SQL 读；编辑器保存必须原样带上，
+    # 否则一次画布保存就把 join 图洗掉了（前端 `RELATION_EXTRAS` 是另一半）。
+    source_column: Optional[str] = Field(default=None, max_length=128)
+    target_column: Optional[str] = Field(default=None, max_length=128)
+    origin: Optional[str] = Field(default=None, max_length=16)
 
 
 class CompiledConstraintInput(BaseModel):
@@ -145,6 +159,9 @@ class CompiledConstraintInput(BaseModel):
 
 class SaveCompiledSchemaRequest(BaseModel):
     knowledge_base_id: str = Field(..., min_length=1, max_length=128)
+    # 要保存哪一份：None = 知识库级；给了 id = 该数据源自己的那份。
+    # 乐观锁是**按份**的，两个槽位各有各的 schema_version。
+    data_source_id: Optional[str] = Field(default=None, max_length=64)
     entity_types: list[CompiledEntityTypeInput] = Field(default_factory=list)
     relation_types: list[CompiledRelationTypeInput] = Field(default_factory=list)
     # 三态：未传/None=保留现有约束；[]=清空；非空=替换

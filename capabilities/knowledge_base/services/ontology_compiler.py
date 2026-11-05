@@ -17,6 +17,13 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
+from ..repository.knowledge_info_repository import KnowledgeInfoRepository
+from ..repository.ontology_abstract_schema_repository import (
+    OntologyAbstractSchemaRepository,
+)
+from ..repository.ontology_data_alignment_repository import (
+    OntologyDataAlignmentRepository,
+)
 from ..repository.ontology_schema_repository import OntologySchemaRepository
 from .template_schema_provider import ObjectDef, ScenarioDef, TemplateSchemaProvider
 
@@ -44,12 +51,116 @@ CARDINALITY_MAP = {
 }
 
 
-def _compiled_key(tenant_id: str, knowledge_base_id: str) -> str:
-    return f"ontology:compiled:{tenant_id}:{knowledge_base_id}"
+def _ds_slot(data_source_id: Optional[str]) -> str:
+    """缓存键里的数据源槽位。
+
+    知识库级（None）用固定占位符而不是省略——否则 `{tenant}:{kb}` 会和
+    「某数据源」的键前缀撞上，两类 schema 互相覆盖。
+    """
+    return data_source_id or "-"
 
 
-def _hash_key(tenant_id: str, knowledge_base_id: str) -> str:
-    return f"ontology:compiled:hash:{tenant_id}:{knowledge_base_id}"
+def _compiled_key(tenant_id: str, knowledge_base_id: str, data_source_id: Optional[str] = None) -> str:
+    return f"ontology:compiled:{tenant_id}:{knowledge_base_id}:{_ds_slot(data_source_id)}"
+
+
+def _hash_key(tenant_id: str, knowledge_base_id: str, data_source_id: Optional[str] = None) -> str:
+    return f"ontology:compiled:hash:{tenant_id}:{knowledge_base_id}:{_ds_slot(data_source_id)}"
+
+
+def abstract_to_compiled_types(schema: dict) -> tuple[list[dict], list[dict]]:
+    """v2 抽象 schema → compiled 形状的 (entity_types, relation_types)。
+
+    - 实体带扩展字段 `sources`（**仅 included** 落点）与编译形状属性
+      （`primary_key` → `is_primary_key`）；
+    - 关系带扩展字段 `backings`（原样，含 join 键与 origin）；
+    - 这里**不做**标脏、不读库：纯映射，供投影与测试共用。
+    """
+    entity_types: list[dict] = []
+    for e in (schema or {}).get("entities") or []:
+        if not isinstance(e, dict) or not e.get("name"):
+            continue
+        entity: dict = {
+            "name": e["name"],
+            "description": e.get("description") or "",
+            "aliases": list(e.get("aliases") or []),
+            "attributes": [
+                {
+                    "name": a.get("name"),
+                    "type": a.get("type") or "string",
+                    "required": bool(a.get("required")),
+                    "is_primary_key": bool(a.get("primary_key")),
+                    **({"display_name": a["display_name"]} if a.get("display_name") else {}),
+                    **({"description": a["description"]} if a.get("description") else {}),
+                    **({"enum_values": list(a["enum_values"])} if a.get("enum_values") else {}),
+                }
+                for a in e.get("attributes") or []
+                if isinstance(a, dict) and a.get("name")
+            ],
+            "sources": [
+                {"data_source_id": s.get("data_source_id"), "entity_name": s.get("entity_name")}
+                for s in e.get("sources") or []
+                if isinstance(s, dict) and s.get("included") is not False
+            ],
+        }
+        if e.get("display_name"):
+            entity["display_name"] = e["display_name"]
+        entity_types.append(entity)
+
+    relation_types: list[dict] = []
+    for r in (schema or {}).get("relations") or []:
+        if not isinstance(r, dict) or not r.get("name"):
+            continue
+        relation: dict = {
+            "name": r["name"],
+            "source": r.get("source"),
+            "target": r.get("target"),
+            "description": r.get("description") or "",
+            "backings": [dict(b) for b in r.get("backings") or [] if isinstance(b, dict)],
+        }
+        if r.get("cardinality"):
+            relation["cardinality"] = r["cardinality"]
+        relation_types.append(relation)
+    return entity_types, relation_types
+
+
+def merge_schema_parts(parts: list[dict], tenant_id: str, knowledge_base_id: str) -> dict:
+    """把若干「schema 形状 dict」（抽象投影在前 + 各 ds 行）合并成一份视图。
+
+    合并规则与 `get_merged_schema` 原实现一致（按 name 去重、先到先得、
+    disambiguation 取第一份非空），本条只是把「行列表」换成「dict 列表」以便
+    投影与 ds 行同路装配、纯函数可测。
+    """
+    merged: dict = {
+        "tenant_id": tenant_id,
+        "knowledge_base_id": knowledge_base_id,
+        "data_source_id": None,
+        "schema_version": max((int(p.get("schema_version") or 1) for p in parts), default=1),
+        "source_type": "merged",
+        "entity_types": [],
+        "relation_types": [],
+        "constraints": [],
+        "disambiguation": None,
+        "sources": [
+            {"data_source_id": p.get("data_source_id"), "schema_version": p.get("schema_version")}
+            for p in parts
+        ],
+    }
+    seen: dict[str, set] = {"entity_types": set(), "relation_types": set(), "constraints": set()}
+    for part in parts:
+        for key in ("entity_types", "relation_types", "constraints"):
+            for item in part.get(key) or []:
+                name = (item or {}).get("name")
+                if name and name in seen[key]:
+                    continue
+                if name:
+                    seen[key].add(name)
+                merged[key].append(item)
+        if merged["disambiguation"] is None and part.get("disambiguation"):
+            merged["disambiguation"] = part["disambiguation"]
+    if merged["disambiguation"] is None:
+        merged["disambiguation"] = {"case_insensitive": True, "alias_merge": True}
+    return merged
 
 
 def _normalize_cardinality(raw: str) -> str:
@@ -73,6 +184,125 @@ def _dedupe_strings(items: list[str]) -> list[str]:
         seen.add(value)
         result.append(value)
     return result
+
+
+def resolve_freshness(
+    stored,
+    schema: Optional[dict],
+    expected_hash: Optional[str] = None,
+) -> str:
+    """KB 级行新鲜度（纯函数，读时计算）。
+
+    - 有存储行：manual_edited 优先，其次显式 outdated，再其次 **来源 hash 比对**
+      （`expected_hash` 非空且与 `stored.source_hash` 不等 → outdated），
+      否则 seeded；
+    - 无存储行：抽象投影 → abstract_projection；否则有可用 schema → seeded；
+      两者都没有 → missing。
+
+    `expected_hash` 是当前模板场景的 `structure_hash`（YAML 兜底没有可比对象，
+    调用方传 None ⇒ 保持 seeded）。比较口径只有这一处定义：状态页与跨模态对齐
+    必须共用，否则同一个 KB 会按读取入口给出两种新鲜度。
+    """
+    if stored is not None:
+        if (getattr(stored, "schema_mode", None) or "") == "manual_edited":
+            return "manual_edited"
+        if (getattr(stored, "sync_status", None) or "") == "outdated":
+            return "outdated"
+        if expected_hash and (getattr(stored, "source_hash", None) != expected_hash):
+            return "outdated"
+        return "seeded"
+    if schema is None:
+        return "missing"
+    if (schema.get("source_type") or "") == "abstract":
+        return "abstract_projection"
+    return "seeded"
+
+
+def stored_entity_type_names(stored) -> list[str]:
+    """存储的 KB 级行上的实体名（统一口径，Task 3 复用）。
+
+    **只认行对象自带的 `entity_types`**：抽象投影 / YAML 兜底 / 无行
+    都没有「存储的 KB 级行实体名集合」，返回空列表。
+    """
+    names: list[str] = []
+    for entity in getattr(stored, "entity_types", None) or []:
+        if isinstance(entity, dict):
+            name = str(entity.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def diff_entity_types(current: list[dict], candidate: list[dict]) -> dict:
+    """实体类型差异：优先按 `source_object_id` 识别 rename，其余按名字。"""
+    cur = [e for e in current or [] if isinstance(e, dict)]
+    cand = [e for e in candidate or [] if isinstance(e, dict)]
+    cur_by_name = {str(e.get("name") or "").strip(): e for e in cur
+                   if str(e.get("name") or "").strip()}
+    cand_by_name = {str(e.get("name") or "").strip(): e for e in cand
+                    if str(e.get("name") or "").strip()}
+    cur_by_obj = {str(e.get("source_object_id") or "").strip(): e for e in cur
+                  if str(e.get("source_object_id") or "").strip()}
+    renamed: list[dict] = []
+    consumed_cur: set[str] = set()
+    consumed_cand: set[str] = set()
+    for name, entity in cand_by_name.items():
+        obj = str(entity.get("source_object_id") or "").strip()
+        old = cur_by_obj.get(obj) if obj else None
+        old_name = str(old.get("name") or "").strip() if old else ""
+        # 同一旧实体（重复 source_object_id）只产出一次 rename：后出现的新名
+        # 不能再认领它（否则 `from` 重复、新名还会误入 added）。
+        if (
+            old_name
+            and old_name != name
+            and old_name not in cand_by_name
+            and old_name not in consumed_cur
+        ):
+            renamed.append({"from": old_name, "to": name})
+            consumed_cur.add(old_name)
+            consumed_cand.add(name)
+    return {
+        "added": sorted(n for n in cand_by_name
+                        if n not in cur_by_name and n not in consumed_cand),
+        "removed": sorted(n for n in cur_by_name
+                          if n not in cand_by_name and n not in consumed_cur),
+        "renamed": renamed,
+    }
+
+
+def _filter_mirror_constraints(
+    constraints, entity_types: list[dict], relation_types: list[dict],
+) -> list[dict]:
+    """镜像回写时保留的约束：只留目标仍存在的。
+
+    抽象 schema 不建模 constraints，镜像源的约束来自**原 KB 级行**。实体/关系
+    被抽象层改名或删除后，原约束会指空；`save_compiled_schema` 的
+    `_normalize_constraints` 会因此拒绝整次写入。这里先过滤，写回只丢失效约束。
+    """
+    attrs = {
+        str(e.get("name")): {
+            str(a.get("name")) for a in (e.get("attributes") or [])
+            if isinstance(a, dict) and a.get("name")
+        }
+        for e in entity_types if isinstance(e, dict) and e.get("name")
+    }
+    relations = {str(r.get("name")) for r in relation_types if isinstance(r, dict) and r.get("name")}
+    kept: list[dict] = []
+    for constraint in constraints or []:
+        if not isinstance(constraint, dict):
+            continue
+        kind = constraint.get("type")
+        if kind == "relation_cardinality":
+            if str(constraint.get("relation") or "") in relations:
+                kept.append(constraint)
+        elif kind in ("required_attribute", "unique_attribute", "value_range"):
+            entity = str(constraint.get("entity") or "")
+            if entity in attrs and str(constraint.get("attribute") or "") in attrs[entity]:
+                kept.append(constraint)
+        else:
+            # 未知类型交给 save 的 _normalize_constraints 判（保持原口径）。
+            kept.append(constraint)
+    return kept
 
 
 class OntologyCompiler:
@@ -237,21 +467,39 @@ class OntologyCompiler:
         self,
         tenant_id: str,
         knowledge_base_id: str,
+        data_source_id: Optional[str] = None,
         auto_compile: bool = True,
     ) -> Optional[dict]:
+        """取一份编译 schema。
+
+        `data_source_id=None` → **知识库级**（与改造前完全一致，既有调用方零改动）；
+        给了 id → 该数据源自己的那份。
+        """
         tenant_id = require_tenant(tenant_id)
 
-        cached = await self._get_cache(tenant_id, knowledge_base_id)
+        # active 抽象 schema 存在 → 知识库级就是它的投影。放在缓存之前是有意的：
+        # 遗留行写进缓存的旧值不该盖过已生效的抽象内容（投影本身不缓存）。
+        if data_source_id is None:
+            projected = await self._abstract_projection(tenant_id, knowledge_base_id)
+            if projected is not None:
+                return projected
+
+        cached = await self._get_cache(tenant_id, knowledge_base_id, data_source_id)
         if cached is not None:
             return cached
 
         async with get_db_session() as session:
             repo = OntologySchemaRepository(session)
-            schema = await repo.get_compiled_schema(tenant_id, knowledge_base_id)
+            schema = await repo.get_compiled_schema(tenant_id, knowledge_base_id, data_source_id)
             if schema is not None:
                 result = schema.to_dict()
-                await self._set_cache(tenant_id, knowledge_base_id, result)
+                await self._set_cache(tenant_id, knowledge_base_id, result, data_source_id)
                 return result
+
+        # 兜底路径（自动编译 / YAML 默认）产出的是知识库级语义，
+        # 只对「要知识库级」的调用返回；否则会把 KB 级那份错当成数据源的
+        if data_source_id is not None:
+            return None
 
         if auto_compile and ONTOLOGY_AUTO_COMPILE:
             try:
@@ -269,6 +517,251 @@ class OntologyCompiler:
                 e,
             )
             return None
+
+    async def _expected_source_hash(
+        self, session, tenant_id: str, binding,
+    ) -> Optional[str]:
+        """当前绑定的模板场景 structure_hash（只读，不编译、不落库）。
+
+        只取**模板来源**的期望 hash：无绑定 / 无 `template_scenario_id` /
+        场景不可用 → None（YAML 兜底没有可比的期望 hash）。
+        场景不可用时留 warning，便于定位「绑定还在、模板没了」。
+        """
+        if binding is None or not binding.template_scenario_id:
+            return None
+        scenario = await TemplateSchemaProvider(session).load_scenario(
+            tenant_id, binding.template_scenario_id)
+        if scenario is None:
+            logger.warning(
+                "KB schema status: template scenario unavailable tenant=%s scenario=%s",
+                tenant_id, binding.template_scenario_id,
+            )
+            return None
+        return getattr(scenario, "structure_hash", None)
+
+    async def _fallback_schema_for_status(
+        self, tenant_id: str, knowledge_base_id: str,
+    ) -> Optional[dict]:
+        projected = await self._abstract_projection(tenant_id, knowledge_base_id)
+        if projected is not None:
+            return projected
+        try:
+            return await self._compile_from_yaml_fallback()
+        except Exception as exc:  # YAML 不可用 = 没有可用 TBox
+            logger.warning(
+                "KB schema status: yaml fallback unavailable kb=%s: %s",
+                knowledge_base_id, exc,
+            )
+            return None
+
+    async def get_kb_schema_status(
+        self, tenant_id: str, knowledge_base_id: str,
+    ) -> dict:
+        """KB 级 compiled schema 的读取契约（只读，不触发自动编译）。"""
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            await KnowledgeInfoRepository(session).get_required(
+                knowledge_base_id, tenant_id)
+            repo = OntologySchemaRepository(session)
+            binding = await repo.get_binding(tenant_id, knowledge_base_id)
+            stored = await repo.get_compiled_schema(tenant_id, knowledge_base_id)
+            expected_hash = await self._expected_source_hash(
+                session, tenant_id, binding)
+            alignments = await OntologyDataAlignmentRepository(session).list_by_kb(
+                tenant_id, knowledge_base_id)
+
+            # 基于 ORM 行的读取全部落在 session 块内：退出后实例可能已过期，
+            # 不依赖懒加载 / expire_on_commit 行为。
+            has_stored = stored is not None
+            stored_values = {
+                "source_type": getattr(stored, "source_type", None),
+                "source_version": getattr(stored, "source_version", None),
+                "source_hash": getattr(stored, "source_hash", None),
+                "schema_version": getattr(stored, "schema_version", None),
+                "compiled_at": getattr(stored, "compiled_at", None),
+                "edited_at": getattr(stored, "edited_at", None),
+                "edited_by": getattr(stored, "edited_by", None),
+            } if has_stored else {}
+            template_domain_id = getattr(binding, "template_domain_id", None)
+            template_scenario_id = getattr(binding, "template_scenario_id", None)
+            active_rows = [
+                row for row in alignments
+                if (getattr(row, "status", None) or "") == "active"
+            ]
+
+            if has_stored:
+                schema = stored.to_dict()
+                # doc_types 只认**存储的 KB 级行**（不是抽象投影、不是 YAML 兜底）。
+                doc_types = set(stored_entity_type_names(stored))
+                # M-2：只对 active/proposed 行判陈旧。rejected 是人已否决的
+                # 候选，既不代表当前文档侧事实，也不应计入影响面；行本身保留
+                # （不删除、不翻状态）。
+                stale = sorted({
+                    str(row.doc_type).strip() for row in alignments
+                    if (getattr(row, "status", None) or "") in ("active", "proposed")
+                    and str(getattr(row, "doc_type", "") or "").strip()
+                    and str(row.doc_type).strip() not in doc_types
+                })
+                # 来源 hash 与当前模板不一致 ⇒ seeded 之上再判 outdated（I-3）。
+                freshness = resolve_freshness(
+                    stored, schema, expected_hash=expected_hash)
+            else:
+                # 无存储行时没有可比对的实体名集合：抽象投影 / YAML 兜底 /
+                # missing 一律不判 stale（不删除对齐行，也不虚构过期）。
+                schema = None
+                doc_types = set()
+                stale = []
+                freshness = "missing"
+
+            # `projected_maps_to` 是**估算值**（下界）：只统计 doc_type 能落到
+            # 当前存储行实体名集合里的 active 行，并按 (doc_type, data_source_id)
+            # 去重。精确值需复用对齐投影器（实例级 MAPS_TO 边数），这里不复算投影。
+            projected_maps_to = len({
+                (str(getattr(row, "doc_type", "") or "").strip(),
+                 getattr(row, "data_source_id", None))
+                for row in active_rows
+                if str(getattr(row, "doc_type", "") or "").strip() in doc_types
+            })
+
+        if not has_stored:
+            schema = await self._fallback_schema_for_status(tenant_id, knowledge_base_id)
+            freshness = resolve_freshness(None, schema)
+
+        # M-1：状态读取留一行可观测日志（只记计数，不落完整 schema）。
+        logger.info(
+            "KB schema status: kb=%s freshness=%s stored=%s stale_doc_types=%d "
+            "active_alignments=%d projected_maps_to=%d",
+            knowledge_base_id, freshness, has_stored, len(stale),
+            len(active_rows), projected_maps_to,
+        )
+
+        return {
+            "schema": schema,
+            "freshness": freshness,
+            "source_type": stored_values.get("source_type") or (schema or {}).get("source_type"),
+            "source_version": stored_values.get("source_version") or (schema or {}).get("source_version"),
+            "source_hash": stored_values.get("source_hash") or (schema or {}).get("source_hash"),
+            "schema_version": stored_values.get("schema_version") or (schema or {}).get("schema_version"),
+            "compiled_at": stored_values.get("compiled_at"),
+            "edited_at": stored_values.get("edited_at"),
+            "edited_by": stored_values.get("edited_by"),
+            "expected_source_hash": expected_hash,
+            "template_domain_id": template_domain_id,
+            "template_scenario_id": template_scenario_id,
+            "stale_doc_types": stale,
+            "alignment_impact": {
+                "active_alignments": len(active_rows),
+                "stale_doc_types": len(stale),
+                "projected_maps_to": projected_maps_to,
+            },
+        }
+
+    async def preview_recompile(
+        self, tenant_id: str, knowledge_base_id: str,
+    ) -> dict:
+        """预览一次 recompile 的差异与影响面（只读：不 upsert、不重置文档）。"""
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            await KnowledgeInfoRepository(session).get_required(
+                knowledge_base_id, tenant_id)
+            repo = OntologySchemaRepository(session)
+            binding = await repo.get_binding(tenant_id, knowledge_base_id)
+            current = await repo.get_compiled_schema(tenant_id, knowledge_base_id)
+            if binding and binding.template_scenario_id:
+                scenario = await TemplateSchemaProvider(session).load_scenario(
+                    tenant_id, binding.template_scenario_id)
+                if scenario is None:
+                    raise ResourceNotFoundError(
+                        message=translate(
+                            "err.template.scenario_not_available",
+                            params={"scenario_id": binding.template_scenario_id},
+                            fallback=f"模板场景不存在或不可用: {binding.template_scenario_id}"),
+                    )
+                candidate = self._compile_from_scenario(
+                    scenario, source_type=binding.source_type or "business_template")
+            else:
+                candidate = await self._compile_from_yaml_fallback()
+            alignments = await OntologyDataAlignmentRepository(session).list_by_kb(
+                tenant_id, knowledge_base_id)
+
+            # 基于 ORM 行的读取全部落在 session 块内（与状态页同口径）：
+            # 退出后实例可能已过期，不依赖懒加载 / expire_on_commit 行为。
+            current_entity_types = (
+                [dict(e) for e in (getattr(current, "entity_types", None) or [])
+                 if isinstance(e, dict)]
+                if current is not None else []
+            )
+            current_hash = (
+                getattr(current, "source_hash", None) if current is not None else None)
+            current_mode = (
+                (getattr(current, "schema_mode", None) or "")
+                if current is not None else "")
+            candidate_entity_types = [
+                dict(e) for e in (candidate.get("entity_types") or [])
+                if isinstance(e, dict)]
+            candidate_hash = candidate.get("source_hash")
+            alignment_pairs = [
+                (
+                    str(getattr(row, "doc_type", "") or "").strip(),
+                    (getattr(row, "status", None) or ""),
+                    getattr(row, "data_source_id", None),
+                )
+                for row in alignments
+            ]
+
+        diff = diff_entity_types(current_entity_types, candidate_entity_types)
+        # 与 `compile_for_knowledge_base(force=False)` 的短路条件同口径：只有
+        # 「有行 + 来源 hash 非空 + hash 未变 + 非人工编辑」才复用既有快照。
+        # YAML 兜底来源的 source_hash 恒为 None ⇒ 必然 upsert，预览不能显示无变化。
+        would_short_circuit = bool(
+            current is not None
+            and current_hash
+            and current_hash == candidate_hash
+            and current_mode != "manual_edited"
+        )
+        # `stale_after` 语义 = 本次重编译后**新**失效的 doc_type
+        # （removed ∪ renamed.from），不是「当前已 stale 的集合」。
+        stale_after = sorted(
+            set(diff["removed"]) | {r["from"] for r in diff["renamed"]})
+        stale_set = set(stale_after)
+        # 影响面与 M-2 同口径：rejected 行是人已否决的候选，不计入
+        # `affected_alignments` / `affected_maps_to`（行本身保留）。
+        affected = [
+            pair for pair in alignment_pairs
+            if pair[0] in stale_set and pair[1] in ("active", "proposed")
+        ]
+        # `affected_maps_to` 是估算值（下界），与状态页 `alignment_impact`
+        # 同口径：只统计 active 行，并按 (doc_type, data_source_id) 去重。
+        # 精确值需复用对齐投影器（实例级 MAPS_TO 边数）。
+        affected_maps_to = len({
+            (doc_type, data_source_id)
+            for doc_type, status, data_source_id in affected
+            if status == "active"
+        })
+        # M-1：预览只读，留一行影响面摘要（计数即可，不落完整 diff/schema）。
+        logger.info(
+            "KB schema recompile preview: kb=%s changed=%s source_changed=%s "
+            "manual_edited=%s added=%d removed=%d renamed=%d affected_alignments=%d",
+            knowledge_base_id,
+            (not would_short_circuit) or bool(
+                diff["added"] or diff["removed"] or diff["renamed"]),
+            current is None or current_hash != candidate_hash,
+            current_mode == "manual_edited",
+            len(diff["added"]), len(diff["removed"]), len(diff["renamed"]),
+            len(affected),
+        )
+        return {
+            "changed": (not would_short_circuit) or bool(
+                diff["added"] or diff["removed"] or diff["renamed"]),
+            "source_changed": current is None or current_hash != candidate_hash,
+            "manual_edited": current_mode == "manual_edited",
+            "added_entity_types": diff["added"],
+            "removed_entity_types": diff["removed"],
+            "renamed_entity_types": diff["renamed"],
+            "affected_alignments": len(affected),
+            "stale_after": stale_after,
+            "affected_maps_to": affected_maps_to,
+        }
 
     async def inject_synonyms(
         self, tenant_id: str, knowledge_base_id: str, schema: dict
@@ -342,6 +835,76 @@ class OntologyCompiler:
             "current_template": current_template,
         }
 
+    async def get_merged_schema(self, tenant_id: str, knowledge_base_id: str) -> Optional[dict]:
+        """把该知识库下的**全部** schema 合成一份视图。
+
+        检索侧（`_build_inverse_map`）要用这个。schema 粒度改成「按数据源」之后，
+        仍按知识库级取一份会漏掉各数据源里声明的关系——inverse 映射会静默变小，
+        而且是那种「不报错、只是答得差一点」的漏。
+
+        合并规则：
+          - entity_types / relation_types / constraints 按 `name` 去重求并集
+            （先出现的胜出：知识库级在前，其后按数据源 id 排序，保证结果稳定）
+          - disambiguation 取第一份非空的
+        合并视图**不缓存**：它随任一数据源变化而失效，缓存收益不抵失效逻辑的复杂度。
+
+        改造（抽象 schema v2）：KB 出现 active 抽象时，**抽象投影取代知识库级那份、
+        且遗留的知识库级行不再并入**——否则它的同名实体会在「先到先得」里去压
+        已生效的抽象内容；各数据源级行照旧并入。
+        """
+        tenant_id = require_tenant(tenant_id)
+        projected = await self._abstract_projection(tenant_id, knowledge_base_id)
+        async with get_db_session() as session:
+            rows = await OntologySchemaRepository(session).list_compiled_schemas(tenant_id, knowledge_base_id)
+
+        # 知识库级放最前，其余按数据源 id 排——顺序稳定，合并结果才可复现。
+        # 排序必须落在分支**之前**（两个分支共用）：`list_compiled_schemas` 没有
+        # ORDER BY，投影分支若不排，「先到先得」的胜者就取决于数据库的返回顺序。
+        rows.sort(key=lambda r: (r.data_source_id is not None, r.data_source_id or ""))
+
+        parts: list[dict] = []
+        if projected is not None:
+            # active 抽象存在：投影取代 KB 级行，且**遗留行不再并入**——
+            # 否则它的同名实体会在「先到先得」里去压已生效的抽象内容。
+            parts.append(projected)
+            parts.extend(r.to_dict() for r in rows if r.data_source_id is not None)
+        else:
+            parts.extend(r.to_dict() for r in rows)
+
+        if not parts:
+            return None
+        return merge_schema_parts(parts, tenant_id, knowledge_base_id)
+
+    async def _abstract_projection(self, tenant_id: str, knowledge_base_id: str) -> Optional[dict]:
+        """active 抽象 schema → compiled 形状投影；没有/未确认/空 → None。
+
+        **不缓存**：抽象行一变（保存/确认）投影就变，而 KB 级缓存键没有跟着它
+        失效的接线——现算省掉这条失效链（先例：合并视图也不缓存）。调用点有三处：
+        `get_compiled_schema(ds=None)`、`get_merged_schema`，以及
+        `save_compiled_schema` 的防洗行护栏（KB 级写入前先问一句「这个 KB 还有
+        没有可写的知识库级 schema」）——都不在热路径。
+        """
+        async with get_db_session() as session:
+            row = await OntologyAbstractSchemaRepository(session).get_by_kb(tenant_id, knowledge_base_id)
+        if row is None or row.status != "active":
+            return None
+        schema = row.schema if isinstance(row.schema, dict) else None
+        if not schema or not (schema.get("entities") or []):
+            return None
+        entity_types, relation_types = abstract_to_compiled_types(schema)
+        return {
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "data_source_id": None,
+            "schema_version": row.schema_version,
+            "source_type": "abstract",
+            "entity_types": entity_types,
+            "relation_types": relation_types,
+            "constraints": [],
+            "disambiguation": {"case_insensitive": True, "alias_merge": True},
+            "prompt_schema": self._build_prompt_schema(entity_types, relation_types),
+        }
+
     async def save_compiled_schema(
         self,
         tenant_id: str,
@@ -351,12 +914,46 @@ class OntologyCompiler:
         edited_by: Optional[str] = None,
         constraints: Optional[list[dict]] = None,
         expected_schema_version: Optional[int] = None,
+        data_source_id: Optional[str] = None,
+        _mirror_from_abstract: bool = False,
+        _carry_enabled: bool = True,
     ) -> dict:
+        """保存某一份编译 schema。
+
+        `data_source_id=None` → 存知识库级那份；但该 KB 有 active 抽象 schema
+        时直接 1003 拒绝（防洗行护栏，见下方注释）；
+        给了 id → 存该数据源自己的那份。乐观锁是**按份**的
+        （每份 schema 各有自己的 schema_version）。
+        """
         tenant_id = require_tenant(tenant_id)
 
         # 编辑器保存必须携带版本，做乐观锁；缺失直接 400（避免无版本请求绕过并发保护）
         if expected_schema_version is None:
             raise InvalidParameterError(message=translate("err.ontology.missing_schema_version", fallback="缺少 expected_schema_version")  )  # 原消息)
+
+        # ── 防洗行护栏（p12 §三.1 收口；决策 = 防洗护栏 + 15 条维持）──
+        # KB 有 active 抽象 schema 时，`data_source_id IS NULL` 的读取已被投影
+        # 接管（`get_compiled_schema(ds=None)` 返回 `source_type="abstract"` 的
+        # 投影、`get_merged_schema` 也不再并入遗留行）——此时**没有任何可编辑的
+        # 「知识库级 schema」**。但画布回落路径恰好会这么写：读到的正是投影、
+        # 保存时不带 `data_source_id`。现状仅靠乐观锁「版本不等」碰巧挡下
+        # （投影版本 = 抽象行版本，通常 ≠ 遗留行版本）；一旦两者巧合相等，
+        # CAS 放行、投影内容就**整行覆写遗留行**（assets_r2 id=7，v15，含
+        # 15 条 unique_attribute —— 对 ② 零价值但属人工数据，洗掉不可逆）。
+        # 这里把「碰巧」变成「必然」：先于乐观锁与一切写入，语义拒绝。
+        if data_source_id is None and not _mirror_from_abstract:
+            projected = await self._abstract_projection(tenant_id, knowledge_base_id)
+            if projected is not None:
+                raise ResourceConflictError(
+                    message=translate(
+                        "err.ontology.kb_level_managed_by_abstract",
+                        fallback="该知识库已启用抽象 schema，知识库级 schema 不可再直接保存；请到抽象 schema 编辑器中修改",
+                    ),
+                    details={
+                        "knowledge_base_id": knowledge_base_id,
+                        "reason": "abstract_schema_active",
+                    },
+                )
 
         normalized_entities = self._normalize_entity_types(entity_types)
         normalized_relations = self._normalize_relation_types(relation_types, normalized_entities)
@@ -366,7 +963,8 @@ class OntologyCompiler:
         async with get_db_session() as session:
             repo = OntologySchemaRepository(session)
             binding = await repo.get_binding(tenant_id, knowledge_base_id)
-            current = await repo.get_compiled_schema(tenant_id, knowledge_base_id)
+            # 乐观锁与继承字段都按**份**取——数据源级那份不该继承知识库级的模板来源
+            current = await repo.get_compiled_schema(tenant_id, knowledge_base_id, data_source_id)
 
             source_type = current.source_type if current else "manual"
             template_domain_id = current.template_domain_id if current else None
@@ -379,8 +977,20 @@ class OntologyCompiler:
             if constraints is None:
                 final_constraints = self._strip_legacy_stub(current.constraints if current else [])
             else:
+                # 跨层防护（P1-4）：旧客户端（如画布）会把约束重建成不含
+                # `enabled` 的固定 7 键对象；归一化的 fail-open 会把它当启用，
+                # 一次与约束无关的保存就静默撤销人工 disable。先按 name 从
+                # **本份**已存行补回（current 已为本函数读出，无额外读/写，
+                # 乐观锁口径不变）；显式给了 enabled 的条目永远以入参为准。
+                # `_carry_enabled=False`（内部写路径：版本恢复）关闭继承 ——
+                # 恢复载荷是**权威内容**，不得被当前行「补」出新键，否则
+                # 恢复后内容指纹与版本 snapshot_hash 对不上（SnapshotRestoreError）。
+                incoming = constraints
+                if _carry_enabled:
+                    incoming = self._carry_over_constraint_enabled(
+                        constraints, current.constraints if current else None)
                 final_constraints = self._normalize_constraints(
-                    constraints, normalized_entities, normalized_relations
+                    incoming, normalized_entities, normalized_relations
                 )
 
             if binding and binding.template_scenario_id:
@@ -394,9 +1004,17 @@ class OntologyCompiler:
                         source_version = scenario.version
                         source_hash = scenario.structure_hash
 
+            # 抽象镜像不是模板派生，也不该被当成人工编辑：
+            # - source_type 让状态页/后续维护能认出这份行的来源；
+            # - schema_mode 不能是 manual_edited（否则 freshness 会报 manual_edited，
+            #   而这份内容其实是抽象层确认后的派生结果）。
+            if _mirror_from_abstract:
+                source_type = "abstract_mirror"
+
             compiled = await repo.upsert_compiled_schema(
                 tenant_id=tenant_id,
                 knowledge_base_id=knowledge_base_id,
+                data_source_id=data_source_id,
                 template_domain_id=template_domain_id,
                 template_scenario_id=template_scenario_id,
                 source_type=source_type,
@@ -407,7 +1025,7 @@ class OntologyCompiler:
                 constraints=final_constraints,
                 disambiguation=disambiguation or {"case_insensitive": True, "alias_merge": True},
                 prompt_schema=prompt_schema,
-                schema_mode="manual_edited",
+                schema_mode=("abstract_mirror" if _mirror_from_abstract else "manual_edited"),
                 sync_status="synced",
                 edited_at=edited_at,
                 edited_by=edited_by,
@@ -415,8 +1033,77 @@ class OntologyCompiler:
             )
             await session.commit()
 
-        await self._set_cache(tenant_id, knowledge_base_id, compiled.to_dict())
+        await self._set_cache(tenant_id, knowledge_base_id, compiled.to_dict(), data_source_id)
+        # 数据源级 schema 被人工编辑后，图里的 `DataSourceEntity` 子图（表/列）
+        # 还是旧形状 —— 投影只在编译/导入等流程触发，直连本方法的编辑入口会漏。
+        # best-effort：投影失败不回滚已提交的 schema（权威是 PG）。
+        if data_source_id:
+            from .ontology_data_projection import project_source_best_effort
+            await project_source_best_effort(
+                tenant_id, knowledge_base_id, str(data_source_id))
         return compiled.to_dict()
+
+    async def mirror_from_abstract(
+        self,
+        tenant_id: str,
+        knowledge_base_id: str,
+        abstract_schema: dict,
+        *,
+        edited_by: Optional[str] = None,
+    ) -> dict:
+        """把 active 抽象 schema 镜像写回 KB 级 compiled schema（P2）。
+
+        唯一合法的「抽象 → KB 级」写入方向：防洗行护栏在
+        `_mirror_from_abstract=True` 下放行；其它 KB 级写入仍被拒绝。
+        约束沿用原 KB 级行，但只保留目标仍存在的（见 `_filter_mirror_constraints`）。
+        指标（metrics）不在 compiled schema 形状里，天然不写。
+        """
+        tenant_id = require_tenant(tenant_id)
+        entity_types, relation_types = abstract_to_compiled_types(abstract_schema or {})
+        async with get_db_session() as session:
+            current = await OntologySchemaRepository(session).get_compiled_schema(
+                tenant_id, knowledge_base_id,
+            )
+            constraints = _filter_mirror_constraints(
+                getattr(current, "constraints", None), entity_types, relation_types,
+            )
+            expected_version = int(getattr(current, "schema_version", 0) or 0)
+
+        result = await self.save_compiled_schema(
+            tenant_id,
+            knowledge_base_id,
+            entity_types,
+            relation_types,
+            edited_by=edited_by,
+            constraints=constraints,
+            expected_schema_version=expected_version,
+            data_source_id=None,
+            _mirror_from_abstract=True,
+        )
+        logger.info(
+            "抽象 schema 已镜像回 KB 级 compiled schema: kb=%s entities=%d rels=%d v=%s",
+            knowledge_base_id, len(entity_types), len(relation_types),
+            result.get("schema_version"),
+        )
+        return result
+
+    async def set_evidence(
+        self, tenant_id: str, knowledge_base_id: str, data_source_id: Optional[str], evidence: dict,
+    ) -> bool:
+        """写「生成期探测」的证据。**转发给仓储**。
+
+        ⚠️ 这层转发不是装饰：`generate_schema` 手里的 `compiler` 是**能力层传进来的 `OntologyCompiler`**
+        （`capability.py` 里 `compiler = self.service.compiler`），而 `set_evidence` 只定义在
+        `OntologySchemaRepository` 上 —— 不转发的话生产链路上会 `AttributeError`，
+        再被 `generate_schema` 那段宽 `except` 吞成一行 warning：
+        **付了探测的全部成本（真连库、逐表采样、最长 300s），一条证据都没落库**（评审查出的 Critical）。
+        （`get_db_session()` 退出时自动 commit，这里不需要显式提交。）
+        """
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            return await OntologySchemaRepository(session).set_evidence(
+                tenant_id, knowledge_base_id, data_source_id, evidence,
+            )
 
     async def export_compiled_schema_yaml(
         self,
@@ -435,6 +1122,7 @@ class OntologyCompiler:
         from jonex_core.common.ontology_yaml import (
             dump_yaml, OntologyYamlDocument, YamlAttribute,
             YamlConstraint, YamlEntity, YamlRelation, to_yaml_attr_type,
+            ONTOLOGY_YAML_FORMAT_VERSION,
         )
 
         tenant_id = require_tenant(tenant_id)
@@ -476,6 +1164,8 @@ class OntologyCompiler:
                 description=et.get("description"),
                 aliases=et.get("aliases", []),
                 attributes=attrs,
+                # TBox 构建技能声明：漏传会让「导出 → 导入」往返清空库里的技能链
+                extraction_skills=et.get("extraction_skills") or None,
             ))
 
         # [jonex] Map relation_types → YamlRelation, strip source_relation_id
@@ -489,6 +1179,9 @@ class OntologyCompiler:
                 description=rt.get("description"),
                 aliases=rt.get("aliases", []),
                 cardinality=rt.get("cardinality", "custom"),
+                inverse_of=rt.get("inverse_of") or None,
+                source_types=list(rt.get("source_types") or []),
+                target_types=list(rt.get("target_types") or []),
             ))
 
         # [jonex] Map constraints → YamlConstraint, decompose target_code.
@@ -526,7 +1219,9 @@ class OntologyCompiler:
         domain = schema.get("template_domain_id") or schema.get("source_type") or "default"
 
         doc = OntologyYamlDocument(
-            version=schema.get("schema_version", 1),
+            # YAML 格式版本固定为 1；schema["schema_version"] 是乐观锁版本（每次编辑自增），
+            # 写进 version 会让 ontology builder 等消费方按 "Schema version 1" 校验时整份拒绝。
+            version=ONTOLOGY_YAML_FORMAT_VERSION,
             domain=domain,
             entity_types=entities,
             relation_types=relations,
@@ -613,6 +1308,8 @@ class OntologyCompiler:
                 "aliases": ye.aliases,
                 "source_object_id": None,  # [jonex] strip tracking field
                 "attributes": attrs,
+                # 整份交给 save_compiled_schema 落库：不带就会把库里已有的技能链清空
+                "extraction_skills": ye.extraction_skills,
             })
 
         # 3. Convert relations
@@ -628,6 +1325,18 @@ class OntologyCompiler:
                 "target": yr.target,
                 "source_relation_id": None,  # [jonex] strip tracking field
                 "cardinality": yr.cardinality,
+                # ⚠️ 必须显式写进来。`parse_yaml` 已把 inverse_of 解析到
+                # `yr.inverse_of`，但这里若不带上，下游 `_normalize_relation_types`
+                # 的 `item.get("inverse_of")` 只会读到 None——
+                # 于是导入的 TBox 里每条关系的 inverse_of 都成 null，
+                # 检索侧 `_build_inverse_map` 建出空映射，inverse 语义翻译静默失效。
+                # （`_normalize_relation_types` 本身就带 inverse_of 的互指校验，
+                #  说明这个键是它预期收到的——只是导入这条路上漏传了。）
+                "inverse_of": yr.inverse_of,
+                # 同上：inverse_of / 多态端点不带就会在落库时被清空
+                "inverse_of": yr.inverse_of,
+                "source_types": list(yr.source_types or []),
+                "target_types": list(yr.target_types or []),
             })
 
         # 4. Convert constraints
@@ -968,6 +1677,11 @@ class OntologyCompiler:
                     "required": bool(attr.get("required")),
                     "is_primary_key": bool(attr.get("is_primary_key")),
                     "source_attribute_id": attr.get("source_attribute_id"),
+                    # 物理列名（catalog 原名，可能带空格/大写）。属性名是归一后的 slug，
+                    # ② NL→SQL 生成 SQL 时必须用物理名 —— 白名单丢了就会拿 slug 去查
+                    # 一张没有该列的表（2026-10-23 BIRD 实测）。
+                    **({"physical_name": str(attr["physical_name"])}
+                       if attr.get("physical_name") else {}),
                 })
 
             normalized.append({
@@ -1059,6 +1773,12 @@ class OntologyCompiler:
                 "inverse_of": inverse_of,
                 "source_types": source_types,
                 "target_types": target_types,
+                # join 键（P0-2）：生成器算出来的两个端点列 + 来源档。
+                # **缺省是 None** —— 存量行、YAML 导入、旧版前端保存都走这条，
+                # 不能因为它们没带就让整个保存失败。
+                "source_column": (item.get("source_column") or None),
+                "target_column": (item.get("target_column") or None),
+                "origin": (item.get("origin") or None),
             })
 
         return normalized
@@ -1074,6 +1794,45 @@ class OntologyCompiler:
             if isinstance(item, dict) and (item.get("target_code") or "").strip():
                 result.append(item)
         return result
+
+    @staticmethod
+    def _carry_over_constraint_enabled(
+        constraints: list[dict],
+        stored: list[dict] | None,
+    ) -> list[dict]:
+        """入参缺 `enabled` 时，按 name 继承**已存行**的启用状态。
+
+        P1-4 的跨层防护：画布等旧客户端把约束重建成固定 7 键对象（没有
+        `enabled`），`_normalize_constraints` 的 fail-open（缺字段 = 启用）
+        会让一次与约束无关的保存把人工 `disable` 静默翻回启用。这里在
+        归一化前按约束 `name` 从同 (kb, ds) 的已存行补回：
+
+        - 入参显式带 `enabled` → 原样保留（入参永远赢）；
+        - 存储行有该 name 且带 `enabled` → 复制其布尔语义（只有显式 False
+          是停用，与读取侧同口径）；
+        - 新 name / 存储行本身缺键 / 没有存储行 → 不带键，交由归一化默认
+          True（与今天逐字节相同的行为）。
+
+        纯函数：不读库、不改入参。
+        """
+        if not constraints:
+            return constraints
+        by_name = {
+            str(item.get("name")): item
+            for item in stored or []
+            if isinstance(item, dict) and item.get("name")
+        }
+        out: list[dict] = []
+        for item in constraints:
+            if not isinstance(item, dict) or "enabled" in item:
+                out.append(item)
+                continue
+            old = by_name.get(str(item.get("name")))
+            if isinstance(old, dict) and "enabled" in old:
+                out.append({**item, "enabled": old.get("enabled") is not False})
+            else:
+                out.append(item)
+        return out
 
     def _normalize_constraints(
         self,
@@ -1117,7 +1876,7 @@ class OntologyCompiler:
                     details={"name": name, "target_type": target_type},
                 )
 
-            normalized.append({
+            row = {
                 "name": name,
                 "target_type": target_type,
                 "target_code": target_code,
@@ -1125,7 +1884,15 @@ class OntologyCompiler:
                 "constraint_type": (item.get("constraint_type") or "custom").strip(),
                 "expression": (item.get("expression") or "").strip(),
                 "suggestion": (item.get("suggestion") or "").strip(),
-            })
+            }
+            # 停用开关（R1）：**只有显式 False 是停用**——缺字段 / "false" / 其它
+            # 一律启用（fail-open）。这里只在入参**本来带键**时才写回：存量约束
+            # 是 7 键（没有 enabled），若无条件补键，任何一次保存都会改变内容
+            # 指纹 —— 老版本快照的 hash 对不上（restore_snapshot 拒绝回滚）、
+            # P1-1 编译漂移首次保存误报。缺键的语义继续由读取侧 fail-open 承担。
+            if "enabled" in item:
+                row["enabled"] = item.get("enabled") is not False
+            normalized.append(row)
 
         return normalized
 
@@ -1172,27 +1939,41 @@ class OntologyCompiler:
             ],
         }
 
-    async def _set_cache(self, tenant_id: str, knowledge_base_id: str, data: dict) -> None:
+    async def _set_cache(
+        self, tenant_id: str, knowledge_base_id: str, data: dict, data_source_id: Optional[str] = None
+    ) -> None:
         try:
-            key = _compiled_key(tenant_id, knowledge_base_id)
+            key = _compiled_key(tenant_id, knowledge_base_id, data_source_id)
             raw = json.dumps(data, ensure_ascii=False, default=str)
             await CacheUtil.set(key, raw, expire=ONTOLOGY_COMPILED_SCHEMA_TTL)
         except Exception as e:
             logger.warning("Redis cache write failed: %s", e)
 
-    async def _get_cache(self, tenant_id: str, knowledge_base_id: str) -> Optional[dict]:
+    async def _get_cache(
+        self, tenant_id: str, knowledge_base_id: str, data_source_id: Optional[str] = None
+    ) -> Optional[dict]:
         try:
-            raw = await CacheUtil.get(_compiled_key(tenant_id, knowledge_base_id))
+            raw = await CacheUtil.get(_compiled_key(tenant_id, knowledge_base_id, data_source_id))
             if raw:
                 return json.loads(raw)
         except Exception as e:
             logger.warning("Redis cache read failed: %s", e)
         return None
 
-    async def invalidate_cache(self, tenant_id: str, knowledge_base_id: str) -> None:
+    async def invalidate_cache(
+        self, tenant_id: str, knowledge_base_id: str, data_source_id: Optional[str] = None
+    ) -> None:
+        """失效某一份 schema 的缓存。
+
+        **同时清掉合并视图**——合并结果是把 KB 级与各数据源级叠起来，
+        任何一份变了，合并视图都不再成立。只清单份会让检索侧一直读到旧合并结果。
+        """
         try:
-            await CacheUtil.delete(_compiled_key(tenant_id, knowledge_base_id))
-            await CacheUtil.delete(_hash_key(tenant_id, knowledge_base_id))
+            await CacheUtil.delete(_compiled_key(tenant_id, knowledge_base_id, data_source_id))
+            await CacheUtil.delete(_hash_key(tenant_id, knowledge_base_id, data_source_id))
+            if data_source_id is not None:
+                # 单份变更 → 合并视图必须一并失效
+                await CacheUtil.delete(_compiled_key(tenant_id, knowledge_base_id, None))
         except Exception as e:
             logger.warning("Redis cache invalidation failed: %s", e)
 
@@ -1265,6 +2046,9 @@ def _derive_constraint_name(yc, target_code: str) -> str:
 
 __all__ = [
     "OntologyCompiler",
+    "diff_entity_types",
+    "resolve_freshness",
+    "stored_entity_type_names",
     "_yaml_constraint_target",
     "_resolve_constraint_label",
     "_derive_constraint_name",

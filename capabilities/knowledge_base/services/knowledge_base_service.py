@@ -1,5 +1,6 @@
 """Knowledge Base service facade."""
 
+from .abstract_schema_service import AbstractSchemaService
 from .answer_feedback_service import AnswerFeedbackService
 from .document_service import DocumentService
 from .data_source_service import DataSourceService
@@ -10,9 +11,13 @@ from .ontology_compiler import OntologyCompiler
 from .ontology_query_service import OntologyQueryService
 from .ontology_service import OntologyService
 from .ontology_synonym_service import OntologySynonymService
+from .ontology_tool_binding_service import OntologyToolBindingService
+from .kb_tool_service import KbToolService
 from .parse_result_service import ParseResultService
 from .parser_setting_service import ParserSettingService
+from .model_setting_service import ModelSettingService
 from .llm_wiki_schema_service import LlmWikiSchemaService
+from .nl2sql import Nl2SqlService
 from .wiki_outline_service import WikiOutlineService
 from .reconciliation_service import ReconciliationService
 from .search_feedback_service import SearchFeedbackService
@@ -31,6 +36,8 @@ class KnowledgeBaseService:
         self.folders = FolderService()
         self.tags = TagService()
         self.data_sources = DataSourceService()
+        # ② NL→SQL 分源查询（spec 2026-09-28）。无状态，与其它服务同样一次构造。
+        self.nl2sql = Nl2SqlService()
         self.knowledge_infos = KnowledgeInfoService()
         self.search = SearchService()
         # [jonex] 以图问知识（两步式的第一步 + 图片生命周期）：
@@ -45,6 +52,7 @@ class KnowledgeBaseService:
         self.answer_feedback = AnswerFeedbackService()
         self.parse_results = ParseResultService()
         self.parser_settings = ParserSettingService()
+        self.model_settings = ModelSettingService()
         self.ontology_query = OntologyQueryService()
         self.ontology = OntologyService()
         self.reconciliation = ReconciliationService()
@@ -53,6 +61,12 @@ class KnowledgeBaseService:
         # [jonex] Wiki 阅读目录（LLM 起草 + LLM 调整，纯展示投影，不参与检索）
         self.wiki_outlines = WikiOutlineService()
         self.synonyms = OntologySynonymService()
+        # [jonex] 跨数据源抽象 schema（概念对齐层）：LLM 提候选 → 人工确认 → 检索期概念扩展
+        self.abstract_schemas = AbstractSchemaService()
+        # 本体 Skill/Action 实例 → 平台可执行工具的绑定 + 执行前解析（执行器唯一入口）
+        self.tool_bindings = OntologyToolBindingService()
+        # 知识库工具（KB 级工具目录）：本库登记的 API 工具，可绑定到本体实例
+        self.kb_tools = KbToolService()
         # [jonex] 任务中心接入（只服务 Ontology 库 —— kb_type == "lightrag"）。
         # `task_runner` 是**运行方**：任务中心派活时进它（经 `_build_dispatch` 里那句
         # `dispatch.update(...bind())`）；`task_watch` 是 30 秒看门狗，盯每一步的下游

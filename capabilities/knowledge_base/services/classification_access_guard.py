@@ -47,6 +47,8 @@ _DOC_ACTIONS = frozenset({
     # 文档版本链：版本列表与归档下载都属于文档读出口
     "list_document_versions",
     "get_document_version_url",
+    # 相似合并建议：源文档超密级 ⇒ 404（目标侧由 service 逐条过滤）
+    "get_document_similarity_suggestions",
 })
 
 # 批量质量报告：过滤掉超密级文档后继续返回（不报错）。
@@ -70,8 +72,14 @@ _KB_ACTIONS = frozenset({
     # Wiki 派生产物
     "get_wiki_page", "list_wiki_contents", "get_wiki_backlinks",
     "get_wiki_claims", "get_wiki_outline",
+    "get_wiki_graph_types", "search_wiki_nodes", "get_wiki_node",
+    "get_wiki_neighbors", "get_wiki_graph_evidence", "get_wiki_media",
+    "list_wiki_scenarios", "read_wiki_scenario_resources", "select_wiki_scenario_resources",
+    "configure_wiki_scenario", "run_wiki_scenario", "review_wiki_scenario",
+    "read_wiki_scenario_materials", "read_wiki_scenario_material", "annotate_wiki_scenario",
     # 本体图
     "get_ontology_graph", "list_ontology_instances",
+    "list_ontology_entity_types", "list_ontology_relation_types",
     "list_ontology_relations", "get_ontology_statistics",
     "expand_ontology_neighbors", "search_ontology_entities",
     # Wiki 证据

@@ -60,6 +60,18 @@ def _is_transient_error(exc: Exception) -> bool:
     return str(getattr(exc, "code", "") or "").startswith("Neo.TransientError")
 
 
+def _edge_sort_key(edge: dict) -> tuple:
+    """多跳边的确定性排序键：hop → 四元组（D11 契约）。"""
+    return (
+        edge.get("hop", 0),
+        edge.get("source_type") or "",
+        edge.get("source") or "",
+        edge.get("target_type") or "",
+        edge.get("target") or "",
+        edge.get("label") or "",
+    )
+
+
 async def _with_transient_retry(fn, *, what: str):
     """执行 ``fn()``（async，含结果消费）；transient 错误退避重试，其余上抛。
 
@@ -618,7 +630,14 @@ class OntologyGraphRepository:
 
     async def delete_by_document(self, tenant_id: str, kb_id: str, doc_id: str) -> None:
         """移除某文档对本体图谱的贡献：从实体/关系的 doc_ids 摘除该 doc，
-        并清理因此变为孤立（无 doc 归属且无边）的实体/关系。
+        并清理因此变为孤立（无 doc 归属且无 `ONT_REL` 边）的实体/关系。
+
+        `MAPS_TO`（P1.5b 跨模态对齐投影）是**派生物**：它从 PG 对齐行 +
+        数据源 schema 重建，不是文档贡献。保留判据因此只认文档侧的
+        `ONT_REL` —— 否则一条 `MAPS_TO` 就能让文档已删光的实体永远活着，
+        继续出现在 entity-types 计数与全文检索里（间接的零污染违规）。
+        节点用 `DETACH DELETE`：残留的 `MAPS_TO` 会让裸 `DELETE` 报
+        「仍有关系」；边随节点一起删，对齐投影重建时会按需重挂。
 
         [jonex] 批 6 根治（删光重来）：写图路径恢复全量删除——重抽/重解析
         语义统一为「先删后 merge」，图终态 = 本轮产出，实体不再跨轮累积。
@@ -657,12 +676,14 @@ class OntologyGraphRepository:
                 """,
                 {"t": tenant_id, "k": kb_id, "doc_id": doc_id},
             )
-            # 4) 实体：无 doc 归属且无边者删除
+            # 4) 实体：无 doc 归属且无文档侧关系（ONT_REL）者删除。
+            #    保留判据按边类型收窄：`MAPS_TO` 是对齐投影的派生物（可重建），
+            #    不能当作「还有文档在用这个实体」的证据。
             await session.run(
                 """
                 MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
-                WHERE size(coalesce(e.doc_ids,[]))=0 AND NOT (e)--()
-                DELETE e
+                WHERE size(coalesce(e.doc_ids,[]))=0 AND NOT (e)-[:ONT_REL]-()
+                DETACH DELETE e
                 """,
                 {"t": tenant_id, "k": kb_id},
             )
@@ -923,6 +944,66 @@ class OntologyGraphRepository:
         row = dict(record)
         self._deserialize_attrs([row])
         return row
+
+    async def get_entity_with_sources(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        entity_type: str,
+        canonical_name: str,
+    ) -> Optional[dict]:
+        """同 `get_entity` 的三元组口径，额外带 `source_chunks`（契约字段要能回指原文）。
+
+        返回 `{name, type, aliases, attributes, description, confidence, kb_id, doc_ids,
+        source_chunks, extraction_method}`，字段名与 `exact_match_entities` 的行一致。
+        """
+        tenant_id = require_tenant(tenant_id)
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$name})
+        WHERE coalesce(e.stub,false)=false
+        RETURN e.canonical_name AS name, e.entity_type AS type,
+               e.aliases AS aliases, e.attributes AS attributes,
+               e.description AS description, e.confidence AS confidence,
+               e.kb_id AS kb_id, e.doc_ids AS doc_ids,
+               e.source_chunks AS source_chunks, e.extraction_method AS extraction_method
+        """
+        async with self._driver.session() as session:
+            result = await session.run(
+                cypher, {"t": tenant_id, "k": kb_id, "et": entity_type, "name": canonical_name}
+            )
+            record = await result.single()
+        if not record:
+            return None
+        row = dict(record)
+        self._deserialize_attrs([row])
+        return row
+
+    async def existing_entities(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        pairs: list[tuple[str, str]],
+    ) -> set[tuple[str, str]]:
+        """批量判断 `(entity_type, canonical_name)` 是否存在（三元组严格口径，不认别名）。
+
+        返回存在的那部分。一个 KB 一次 UNWIND 查询；空输入不查库。
+        """
+        tenant_id = require_tenant(tenant_id)
+        rows = [{"et": et, "n": n} for et, n in dict.fromkeys(pairs) if et and n]
+        if not rows:
+            return set()
+        cypher = """
+        UNWIND $rows AS row
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:row.et, canonical_name:row.n})
+        WHERE coalesce(e.stub,false)=false
+        RETURN DISTINCT row.et AS et, row.n AS n
+        """
+        found: set[tuple[str, str]] = set()
+        async with self._driver.session() as session:
+            result = await session.run(cypher, {"t": tenant_id, "k": kb_id, "rows": rows})
+            async for record in result:
+                found.add((record["et"], record["n"]))
+        return found
 
     async def neighbors_by_entity(
         self,
@@ -2056,6 +2137,216 @@ class OntologyGraphRepository:
         self._deserialize_attrs(nodes)
         return {"nodes": nodes, "edges": edges}
 
+    async def expand_neighbors_multihop(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        entity_type: str,
+        canonical_name: str,
+        depth: int = 2,
+        limit: int = 50,
+        per_node_fanout: int = 20,
+    ) -> dict:
+        """按三元组锚定起点，逐层 BFS 展开 depth 跳邻居（D11）。
+
+        与 ``neighbors()`` 的区别：起点四元组精确、``truncated`` 用
+        ``limit + 1`` 哨兵判定、返回 ``nodes/edges + hop``（不返回 facts/path）。
+        ``depth = 1`` 不走本方法，由 service 分派到 ``expand_neighbors``。
+
+        Args:
+            tenant_id: 租户 ID
+            kb_id: 知识库 ID（Cypher 全程钉死，禁止跨库）
+            entity_type/canonical_name: 起点四元组（与单跳一致）
+            depth: 展开层数（≥ 2）
+            limit: 本次返回的**总边数**上限（≥ 1）
+            per_node_fanout: 每个节点每层最多展开的邻居数（≥ 1）
+
+        Returns:
+            ``{nodes, edges, truncated, returned_edges, returned_nodes,
+            depth_requested, depth_reached}``；节点/边均带 ``hop``，起点
+            ``hop=0``。起点不存在时返回空图（``depth_reached=0``）。
+
+        Raises:
+            InvalidParameterError: depth < 2 / limit < 1 / per_node_fanout < 1
+        """
+        tenant_id = require_tenant(tenant_id)
+        if int(depth) < 2:
+            raise InvalidParameterError("depth 必须 ≥ 2；单跳请使用 expand_neighbors")
+        if int(limit) < 1:
+            raise InvalidParameterError("limit 必须 ≥ 1")
+        if int(per_node_fanout) < 1:
+            raise InvalidParameterError("per_node_fanout 必须 ≥ 1")
+
+        start_cypher = (
+            "MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$etype, canonical_name:$name})\n"
+            "WHERE coalesce(e.stub,false)=false\n"
+            "RETURN e.entity_type AS entity_type, e.canonical_name AS canonical_name,\n"
+            "       e.aliases AS aliases, e.attributes AS attributes,\n"
+            "       e.description AS description, e.confidence AS confidence,\n"
+            "       e.doc_ids AS doc_ids\n"
+            "LIMIT 1"
+        )
+        async with self._driver.session() as session:
+            result = await session.run(
+                start_cypher,
+                {"t": tenant_id, "k": kb_id, "etype": entity_type, "name": canonical_name},
+            )
+            start = await result.single()
+
+        if not start:
+            return {
+                "nodes": [],
+                "edges": [],
+                "truncated": False,
+                "returned_edges": 0,
+                "returned_nodes": 0,
+                "depth_requested": depth,
+                "depth_reached": 0,
+            }
+
+        start = dict(start)
+        start_id = f"{start['entity_type']}:{start['canonical_name']}"
+        nodes: list[dict] = [
+            {
+                "id": start_id,
+                "name": start["canonical_name"],
+                "type": start["entity_type"],
+                "aliases": start.get("aliases"),
+                "attributes": start.get("attributes"),
+                "description": start.get("description"),
+                "confidence": start.get("confidence"),
+                "doc_ids": start.get("doc_ids"),
+                "hop": 0,
+            }
+        ]
+        visited: set[str] = {start_id}
+        frontier: list[dict] = [
+            {"type": start["entity_type"], "name": start["canonical_name"]}
+        ]
+        edges: list[dict] = []
+        edge_keys: set[tuple] = set()
+        truncated = False
+        depth_reached = 0
+
+        layer_cypher = (
+            "UNWIND $frontier AS f\n"
+            "MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:f.type, canonical_name:f.name})\n"
+            "WHERE coalesce(e.stub,false)=false\n"
+            "MATCH (e)-[r:ONT_REL]-(n:OntologyEntity {tenant_id:$t, kb_id:$k})\n"
+            "WHERE coalesce(n.stub,false)=false\n"
+            "WITH e, r, n\n"
+            "ORDER BY n.entity_type ASC, n.canonical_name ASC, type(r) ASC, r.relation_type ASC\n"
+            "WITH e, collect({\n"
+            "    nid: n.entity_type + ':' + n.canonical_name,\n"
+            "    nname: n.canonical_name, ntype: n.entity_type,\n"
+            "    naliases: n.aliases, nattributes: n.attributes,\n"
+            "    ndescription: n.description, nconfidence: n.confidence,\n"
+            "    ndoc_ids: n.doc_ids,\n"
+            "    source: startNode(r).canonical_name,\n"
+            "    source_type: startNode(r).entity_type,\n"
+            "    target: endNode(r).canonical_name,\n"
+            "    target_type: endNode(r).entity_type,\n"
+            "    label: r.relation_type, confidence: r.confidence\n"
+            "}) AS all_nb\n"
+            "WITH e, all_nb[..$fanout] AS neighbors, size(all_nb) > $fanout AS capped\n"
+            "UNWIND neighbors AS nb\n"
+            "RETURN e.entity_type AS src_type, e.canonical_name AS src_name, capped,\n"
+            "       nb.nid AS nid, nb.nname AS nname, nb.ntype AS ntype,\n"
+            "       nb.naliases AS naliases, nb.nattributes AS nattributes,\n"
+            "       nb.ndescription AS ndescription, nb.nconfidence AS nconfidence,\n"
+            "       nb.ndoc_ids AS ndoc_ids,\n"
+            "       nb.source AS source, nb.source_type AS source_type,\n"
+            "       nb.target AS target, nb.target_type AS target_type,\n"
+            "       nb.label AS label, nb.confidence AS confidence"
+        )
+
+        for hop in range(1, depth + 1):
+            if not frontier:
+                break
+            async with self._driver.session() as session:
+                result = await session.run(
+                    layer_cypher,
+                    {
+                        "t": tenant_id,
+                        "k": kb_id,
+                        "frontier": frontier,
+                        "fanout": int(per_node_fanout),
+                        "hop": hop,
+                    },
+                )
+                rows = [dict(rec) async for rec in result]
+
+            next_frontier: list[dict] = []
+            for row in rows:
+                if row.get("capped"):
+                    truncated = True
+                edge_key = (
+                    row["source_type"],
+                    row["source"],
+                    row["target_type"],
+                    row["target"],
+                    row["label"],
+                )
+                if edge_key not in edge_keys:
+                    edge_keys.add(edge_key)
+                    edges.append(
+                        {
+                            "source": row["source"],
+                            "source_type": row["source_type"],
+                            "target": row["target"],
+                            "target_type": row["target_type"],
+                            "label": row["label"],
+                            "confidence": row["confidence"],
+                            "hop": hop,
+                        }
+                    )
+                nid = row["nid"]
+                if nid not in visited:
+                    visited.add(nid)
+                    nodes.append(
+                        {
+                            "id": nid,
+                            "name": row["nname"],
+                            "type": row["ntype"],
+                            "aliases": row["naliases"],
+                            "attributes": row["nattributes"],
+                            "description": row["ndescription"],
+                            "confidence": row["nconfidence"],
+                            "doc_ids": row["ndoc_ids"],
+                            "hop": hop,
+                        }
+                    )
+                    next_frontier.append({"type": row["ntype"], "name": row["nname"]})
+
+            depth_reached = hop
+            frontier = next_frontier
+
+            if len(edges) > limit:
+                edges.sort(key=_edge_sort_key)
+                edges = edges[:limit]
+                truncated = True
+                break
+
+        edges.sort(key=_edge_sort_key)
+        nodes.sort(key=lambda n: (n["hop"], n["type"], n["name"]))
+        if truncated:
+            # 截断后只保留仍被保留边引用的节点（起点始终保留），避免孤立节点。
+            kept = {start_id}
+            for edge in edges:
+                kept.add(f"{edge['source_type']}:{edge['source']}")
+                kept.add(f"{edge['target_type']}:{edge['target']}")
+            nodes = [n for n in nodes if n["id"] in kept]
+        self._deserialize_attrs(nodes)
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "truncated": truncated,
+            "returned_edges": len(edges),
+            "returned_nodes": len(nodes),
+            "depth_requested": depth,
+            "depth_reached": depth_reached,
+        }
 
     async def _get_embedding_hash(self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str) -> Optional[str]:
         """查询单个实体的 embedding_hash（用于幂等跳过）。"""

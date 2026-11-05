@@ -87,6 +87,16 @@ class OntologySynonymService:
         """校验 KB 归属存在（不存在抛 ResourceNotFoundError）。"""
         await KnowledgeInfoRepository(session).get_required(kb_id, tenant_id)
 
+    def _bump_value_alias_generation(self, tenant_id: str, kb_id: str) -> None:
+        """同义词写入成功后推进 ② 值同义词缓存写代号（同进程写后读立即生效）。
+
+        导入放在函数内：`nl2sql.value_aliases` 依赖本 service 所在包，延迟导入避免
+        模块加载期耦合，也让单测可以 patch 源模块的 `bump_write_generation`。
+        """
+        from .nl2sql import value_aliases
+
+        value_aliases.bump_write_generation(tenant_id, kb_id)
+
     async def _invalidate_schema_cache(self, tenant_id: str, kb_id: str) -> None:
         """[jonex] 同义词变更后清 compiled schema 缓存（key 与 atomic-rag 侧共用），
         使抽取端 prompt 的同义词最终一致。异常忽略（软提示层，不影响写图强一致归并）。"""
@@ -143,6 +153,7 @@ class OntologySynonymService:
             )
             await session.commit()
             await self._invalidate_schema_cache(tenant_id, kb_id)
+            self._bump_value_alias_generation(tenant_id, kb_id)
             return obj.to_dict()
 
     async def update(self, tenant_id: str, synonym_id: str, data: dict) -> dict:
@@ -174,6 +185,7 @@ class OntologySynonymService:
 
             await session.commit()
             await self._invalidate_schema_cache(tenant_id, obj.knowledge_base_id)
+            self._bump_value_alias_generation(tenant_id, obj.knowledge_base_id)
             return obj.to_dict()
 
     async def delete(self, tenant_id: str, synonym_id: str) -> bool:
@@ -185,6 +197,7 @@ class OntologySynonymService:
             await repo.delete_soft(obj)
             await session.commit()
             await self._invalidate_schema_cache(tenant_id, kb_id)
+            self._bump_value_alias_generation(tenant_id, kb_id)
             return True
 
     async def batch_import(self, tenant_id: str, kb_id: str, groups: list) -> dict:
@@ -255,6 +268,7 @@ class OntologySynonymService:
             if to_create:
                 await session.commit()
                 await self._invalidate_schema_cache(tenant_id, kb_id)
+                self._bump_value_alias_generation(tenant_id, kb_id)
 
             return {"created": len(to_create), "skipped": skipped, "failed": []}
 

@@ -59,6 +59,11 @@ class OntologySearchRequest(BaseModel):
     top_k: int = Field(default=15, ge=1, le=50)
     knowledge_base_ids: list[str] = Field(default_factory=list)
     save_history: bool = True
+    #: [jonex] 显式「本体+数据」路线（router `/search/ontology-data`；纯数据 `/search/data`
+    #: 不再发送该字段）专用：跳过 S5 枚举意图的「强制走 RAG」处置，让本体照常取证作答。
+    #: 该路线本身就是要在本体答案上追加数据，枚举降级的理由（RAG 取原始表格行）由数据
+    #: 路径承担，不能再把本体答案丢掉。
+    skip_enum_force_rag: bool = False
     with_reasoning: bool = False          # 是否返回编排推理链（P0 非流式）
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
     # ── [jonex] §9 严格模式字段（全部可选，默认关，向后兼容）──
@@ -116,19 +121,14 @@ class LlmWikiSearchRequest(BaseModel):
 
 
 class JonexWikiSearchRequest(BaseModel):
-    """jonex_wiki 管线检索请求（只查 jonex_wiki 管线）"""
-    query: str = Field(..., min_length=1, max_length=2000)
-    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
-    mode: str = Field(default="hybrid", min_length=1, max_length=32)
+    """Only effective Wiki request controls are accepted."""
+    class Config:
+        extra = "forbid"
 
-    @validator("mode")
-    def validate_mode(cls, v):
-        v = v.lower()
-        v = _MODE_ALIASES.get(v, v)
-        if v not in _VALID_MODES:
-            raise ValueError(f"mode 必须为 {sorted(_VALID_MODES)} 之一，当前值: {v}")
-        return v
-    top_k: int = Field(default=5, ge=1, le=50)
+    query: str = Field(..., min_length=1, max_length=2000)
+    query_image_ids: list[str] = Field(default_factory=list, max_items=8)
+    image_question: Optional[str] = Field(default=None, max_length=500)
+    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
     knowledge_base_ids: list[str] = Field(default_factory=list)
     save_history: bool = True
     with_reasoning: bool = False
@@ -142,6 +142,8 @@ class MixSearchRequest(BaseModel):
     与 mode 字段的 mix 值（hybrid 的别名，`_MODE_ALIASES`）无关。
     """
     query: str = Field(..., min_length=1, max_length=2000)
+    query_image_ids: list[str] = Field(default_factory=list, max_items=8)
+    image_question: Optional[str] = Field(default=None, max_length=500)
     mode: str = Field(default="hybrid", min_length=1, max_length=32)
 
     @validator("mode")

@@ -36,6 +36,8 @@ from .kb_permission_service import KB_MANAGER, KB_MEMBER, _KB_ROLE_RANK
 # ⚠ `VALID_KB_TYPES` 不在这里 import：create() 的校验已收敛进 `resolve_creatable_kb_type()`
 # （两级校验 + 两个错误码），本文件不再直接判集合，避免又出现第二个判定点。
 from .kb_type_service import LLM_WIKI_TYPES, resolve_creatable_kb_type
+# [jonex] 软删用户可见性：绑定表不随用户软删删行，展示侧查询必须自己过滤。
+from .user_visibility import get_soft_deleted_user_ids
 
 # [jonex] 知识库名称 / 描述长度上限（2026-10-16）。**唯一判定点**，create / update 共用。
 #
@@ -170,6 +172,7 @@ class KnowledgeInfoService:
                 status=data.get("status", "synced"),
                 owner_id=data.get("owner_id"),
                 kb_type=raw_kb_type,  # [jonex]
+                structured_enabled=bool(data.get("structured_enabled", False)),
             )
 
             # ── 默认数据源：新建 KB 自动创建「文件上传」(file) 数据源 ──
@@ -334,6 +337,14 @@ class KnowledgeInfoService:
                 (write_ids is None or obj.space_id in write_ids)
                 or grant_role == KB_MANAGER
             )
+            # 动态本体总闸（进程级）：关着时库级开关存得下但不生效，界面据此提示
+            from .procedural_gate import procedural_master_switch_on
+
+            data["procedural_extract_available"] = procedural_master_switch_on()
+            # 抽取期调用工具总闸（进程级）：同上，关着时库级开关存得下但不生效
+            from .extract_tool_service import extract_tool_master_switch_on
+
+            data["extract_tool_calls_available"] = extract_tool_master_switch_on()
 
         # [jonex] 首屏提速：详情页（DomainKnowledgeBlank）只靠 kb_type + 基本信息判断渲染面板。
         # 实体/关系统计按需加载：llm-wiki 库的图谱统计是跨容器全图扫描（jonex_wiki
@@ -545,13 +556,91 @@ class KnowledgeInfoService:
         # KB 授权路径（execute 兜底打标）：editor 禁改 space_id/owner_id（防搬迁提权）；
         # 空间成员路径行为不变。
         # [jonex] 白名单与值校验都放在**碰 DB 之前**（与上面的 kb_type 闸门同一条纪律：
-        # 非法值不去读库）。`ingest_backend`（2026-10-09 库级派单值）同样是提权面 ——
+        # 非法值不去读库）。`ingest_backend`（2026-10-09 库级派单值）是提权面 ——
         # 它决定这个库的文档派去哪个后端 —— 所以只在 admin 名单里，editor 不可改。
+        # 相似检测开关/阈值则**允许 kb_manager 改本 KB**（只影响该库的检测行为，
+        # 不改变文档派发去向），因此两个名单都收。
+        # 动态本体开关 `procedural_extract` 同理：只决定本库后续抽取是否多跑一轮
+        # 技能 / 动作抽取（本库自己的 LLM 成本），不改派发去向，两个名单都收。
+        # 抽取期调用工具开关 `extract_tool_calls` 也一样：只影响本库写图前要不要调本库 / 本租户
+        # 已登记的只读工具（本库自己的外部调用成本），两个名单都收。
         kb_granted = data.pop("_kb_granted", False)
-        updatable = {"name", "description", "data_source_types", "status", "space_id", "owner_id",
-                     "ingest_backend"}
+        updatable = {
+            "name", "description", "data_source_types", "status", "space_id", "owner_id",
+            "ingest_backend", "structured_enabled", "similarity_check_enabled",
+            "similarity_check_threshold", "procedural_extract", "extract_tool_calls",
+        }
         if kb_granted:
-            updatable = {"name", "description", "data_source_types", "status"}
+            updatable = {
+                "name", "description", "data_source_types", "status",
+                "structured_enabled", "similarity_check_enabled",
+                "similarity_check_threshold", "procedural_extract", "extract_tool_calls",
+            }
+        # [jonex] 本函数下方另有局部 import，会把这两个名字绑成局部变量；须先用先绑。
+        from jonex_core.common.exceptions import InvalidParameterError
+        from jonex_core.common.i18n import translate
+
+        # 阈值：None = 清除（回到服务端默认），其余必须是 0.5~0.999。
+        # 只对「真要落的字段」校验 —— editor 的越权值静默丢弃。
+        _MISSING = object()
+        threshold_value = _MISSING
+        if "similarity_check_threshold" in updatable:
+            raw = data.get("similarity_check_threshold", _MISSING)
+            if raw is None:
+                threshold_value = None
+            elif raw is not _MISSING:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    raise InvalidParameterError(
+                        message=translate(
+                            "err.kb.similarity_threshold_invalid",
+                            fallback="相似度阈值必须是 0.5~0.999 之间的小数",
+                        ),
+                    )
+                if not (0.5 <= value <= 0.999):
+                    raise InvalidParameterError(
+                        message=translate(
+                            "err.kb.similarity_threshold_invalid",
+                            fallback="相似度阈值必须是 0.5~0.999 之间的小数",
+                        ),
+                    )
+                threshold_value = value
+        # 开关必须是真布尔：字符串 "true"/数字 0 这类会被原样写库并在读取侧
+        # 静默变成真值，所以在这里拦掉。
+        if "similarity_check_enabled" in updatable:
+            enabled = data.get("similarity_check_enabled", _MISSING)
+            if (
+                enabled is not _MISSING
+                and enabled is not None
+                and not isinstance(enabled, bool)
+            ):
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.kb.similarity_enabled_invalid",
+                        fallback="相似检测开关必须是布尔值",
+                    ),
+                )
+        # 动态本体开关：与相似检测开关同一理由，必须是真布尔（None = 不更新）。
+        procedural_value = data.get("procedural_extract") if "procedural_extract" in updatable else None
+        if procedural_value is not None and not isinstance(procedural_value, bool):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.procedural_extract_invalid",
+                    fallback="动态本体（技能 / 动作抽取）开关必须是布尔值",
+                ),
+            )
+        # 抽取期调用工具开关：同上，必须是真布尔（None = 不更新）。
+        extract_tool_value = (
+            data.get("extract_tool_calls") if "extract_tool_calls" in updatable else None
+        )
+        if extract_tool_value is not None and not isinstance(extract_tool_value, bool):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.kb.extract_tool_calls_invalid",
+                    fallback="抽取期调用工具开关必须是布尔值",
+                ),
+            )
         # [jonex] 库级派单值取值校验：None = 撤销（回到跟随服务端开关），其余必须是
         # 本代码认识的值。只对「真要落的字段」校验 —— editor 的越权值照其它字段的
         # 口径静默丢弃，不在这里炸。
@@ -586,12 +675,33 @@ class KnowledgeInfoService:
             repo = KnowledgeInfoRepository(session)
             # [jonex] 接住返回值：搬迁校验要读 obj.space_id / obj.name 作为"目标值缺省来源"。
             obj = await repo.get_required(kb_id, tenant_id)
+            # 边沿触发判据：只在「关闭 → 开启」时回填一次；已是开启态再提交 True 不重复触发。
+            was_enabled = bool(getattr(obj, "similarity_check_enabled", False))
+            # Wiki 编译型库跳过本体抽取，开了也不会生效 —— 直接拒绝，免得界面显示「已开启」误导。
+            # 关（False）照常放行：允许把历史上误设的值清掉。
+            if procedural_value is True and obj.kb_type in LLM_WIKI_TYPES:
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.kb.procedural_extract_unsupported",
+                        fallback="Wiki 编译型知识库不走本体抽取，不能开启动态本体",
+                    ),
+                )
+            if extract_tool_value is True and obj.kb_type in LLM_WIKI_TYPES:
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.kb.extract_tool_calls_unsupported",
+                        fallback="Wiki 编译型知识库不走本体抽取，不能开启抽取期调用工具",
+                    ),
+                )
             values = {k: v for k, v in data.items() if k in updatable and v is not None}
             # [jonex] `ingest_backend` 的显式 None 是**撤销**（回到跟随服务端开关）；
             # 其余字段的 None 仍是「不更新」—— 不特判的话这个设置只能设不能撤，
             # 撤销只能去改库，等于把它做成单向门。
             if "ingest_backend" in updatable and data.get("ingest_backend", "missing") is None:
                 values["ingest_backend"] = None
+            # 阈值的显式 None 是**清除**（回落服务端默认），与 ingest_backend 同一条理由。
+            if threshold_value is not _MISSING:
+                values["similarity_check_threshold"] = threshold_value
             # [jonex] 同空间重名校验（2026-10-16）：只在真的动 name / space_id 时查。
             #
             # ⚠ **必须用"目标 space_id"**：`space_id` 在本文件的 updatable 白名单里
@@ -613,9 +723,21 @@ class KnowledgeInfoService:
             if values:
                 obj = await repo.update(kb_id, tenant_id, **values)
                 await session.commit()
-                return obj.to_dict()
-            obj = await repo.get_required(kb_id, tenant_id)
-            return obj.to_dict()
+            else:
+                obj = await repo.get_required(kb_id, tenant_id)
+            result = obj.to_dict()
+            # 开关打开后立即跑一次回填（会话提交之后触发，见下方 async with 之外）。
+            enabled_now = (
+                values.get("similarity_check_enabled") is True and not was_enabled
+            )
+
+        if enabled_now:
+            try:
+                from .document_similarity_service import schedule_backfill_once
+                schedule_backfill_once()
+            except Exception:
+                logger.warning("触发相似签名回填失败", exc_info=True)
+        return result
 
     async def delete(self, kb_id: str, tenant_id: str) -> dict:
         tenant_id = require_tenant(tenant_id)
@@ -637,6 +759,13 @@ class KnowledgeInfoService:
                 ),
                 {"kb": kb_id, "t": tenant_id},
             )
+
+            # 级联：硬删该 KB 的模型覆盖（这张表本身就是硬删语义，不随主表软删）
+            from ..repository.model_setting_repository import (
+                KnowledgeModelSettingRepository,
+            )
+
+            await KnowledgeModelSettingRepository(session).delete_by_kb(tenant_id, kb_id)
 
             # 级联：同事务内软删除该 KB 的所有同义词组
             from ..repository.ontology_synonym_repository import OntologySynonymRepository
@@ -702,10 +831,13 @@ class KnowledgeInfoService:
                       FROM knowledge_base.kb_permissions kp
                       LEFT JOIN platform.users u
                         ON u.id::text = kp.user_id
-                       AND u.is_deleted = 0
                      WHERE kp.kb_id = :kb_id
                        AND kp.tenant_id = :tenant_id
                        AND kp.is_deleted = 0
+                       -- 软删谓词必须放 WHERE：写在 ON 里只会让 join 列变 NULL，
+                       -- 软删用户仍以裸 user_id 留在列表里。
+                       -- u.id IS NULL 兼容存量非数字/已不存在的 user_id（保持原展示行为）。
+                       AND (u.id IS NULL OR u.is_deleted = 0)
                 """),
                 {"kb_id": kb_id, "tenant_id": tenant_id},
             )
@@ -760,10 +892,12 @@ class KnowledgeInfoService:
                       FROM knowledge_base.space_permissions sp
                       LEFT JOIN platform.users u
                         ON u.id::text = sp.user_id
-                       AND u.is_deleted = 0
                      WHERE sp.space_id = :space_id
                        AND sp.tenant_id = :tenant_id
                        AND sp.is_deleted = 0
+                       -- 候选只展示真实活跃用户：谓词放 WHERE（等价 INNER JOIN），
+                       -- 顺带排除存量非数字/不存在 user_id 产生的空用户名行。
+                       AND u.is_deleted = 0
                        AND sp.user_id <> :user_id
                        AND NOT EXISTS (
                            SELECT 1
@@ -870,10 +1004,8 @@ class KnowledgeInfoService:
                     KbPermission.is_deleted == 0,
                 )
             )
-            for kp in existing.scalars().all():
-                await session.delete(kp)
-            # 关键：先 flush 让 DELETE 落库再插入（UoW 默认 INSERT 先于 DELETE，撞唯一索引）
-            await session.flush()
+            existing_rows = existing.scalars().all()
+            old_roles = {str(kp.user_id): kp.role for kp in existing_rows}
 
             # [jonex] B3：取值与优先级统一由 kb_permission_service._KB_ROLE_RANK 定义，
             # 不再在这里另写一份 —— 原先本地这份 {viewer:0, editor:1, kb_manager:2}
@@ -885,7 +1017,33 @@ class KnowledgeInfoService:
                 role = perm["role"]
                 if uid not in deduped or _ROLE_RANK[role] > _ROLE_RANK[deduped[uid]]:
                     deduped[uid] = role
-            for uid, role in deduped.items():
+
+            # [jonex] 软删用户绑定必须隐式保留：绑定行不随用户软删而删除（复职后恢复授权），
+            # 但 GET 已不再返回软删用户，前端「拿到什么就 PUT 什么」会把它们漏掉。
+            # 若这里直接按提交集合全量替换，管理员点一次保存就永久删掉软删用户的授权。
+            # 规则：existing 中的软删用户按**旧角色**补回（不允许借提交提权）；
+            #       existing 中没有的软删用户直接剔除，不新建授权。
+            soft_deleted = await get_soft_deleted_user_ids(
+                session, tenant_id, set(old_roles) | set(deduped),
+            )
+            active_submitted = {
+                uid: role
+                for uid, role in deduped.items()
+                if uid not in soft_deleted
+            }
+            preserved = {
+                uid: old_role
+                for uid, old_role in old_roles.items()
+                if uid in soft_deleted
+            }
+            final = {**active_submitted, **preserved}
+
+            for kp in existing_rows:
+                await session.delete(kp)
+            # 关键：先 flush 让 DELETE 落库再插入（UoW 默认 INSERT 先于 DELETE，撞唯一索引）
+            await session.flush()
+
+            for uid, role in final.items():
                 session.add(KbPermission(
                     id=uuid.uuid4().hex,
                     tenant_id=tenant_id,

@@ -141,10 +141,11 @@ from jonex_core.task_runtime import (
     require_execution_context,
 )
 
-from . import ingest_backend, task_intent
+from . import ingest_backend, kb_model_config, task_intent
 from ..models import DocStatus
 from ..models.task_center import ACTIVE_STATES, TaskCenterDocState
 from ..repository.document_repository import KnowledgeDocumentRepository
+from ..repository.model_setting_repository import KnowledgeModelSettingRepository
 from ..repository.processing_task_repository import (
     TASK_STATUS_RUNNING,
     TASK_TYPE_PARSE,
@@ -986,6 +987,21 @@ class TaskRunnerService(RunnerBase):
                     document_id=row.document_id,
                 )
 
+            # ③'' [jonex] KB 级 VLM 覆盖（P2b）：**派活那一刻**读库，与 `kb_type`
+            # 同源、同一段事务。判据全部收在 `kb_model_config.resolve_for_dispatch`：
+            #   - 该 scope 对这个库没有意义的（如只读展示 scope）不下发；
+            #   - 没有行的库不下发。
+            # 于是「没配置」与「这个库用不上」在引擎侧是同一件事 ——
+            # 都走引擎自己的默认链，平台不替它决定默认值。
+            _model_rows = await KnowledgeModelSettingRepository(session).list_by_kb(
+                tenant_id, row.knowledge_base_id
+            )
+            _vlm_override = kb_model_config.resolve_for_dispatch(
+                {r.scope: r.model_name for r in _model_rows},
+                kb_type=kb_type,
+                ingest_backend=ingest_backend.backend_for_document(doc),
+            ).get("parse_multimodal", "")
+
             # ④ 把这一步要用的东西全部拍成快照：事务一关，ORM 对象就 detached 了。
             return _StepSnapshot(
                 tenant_id=tenant_id,
@@ -1022,6 +1038,7 @@ class TaskRunnerService(RunnerBase):
                 # 动过这两列（`reparse_document` 只写代次、不清 `rag_doc_ids`）。
                 content_generation=int(getattr(doc, "content_generation", 0) or 0),
                 old_rag_doc_ids=list(doc.rag_doc_ids or []),
+                vlm_override=_vlm_override,
             )
 
     # ========================================================
@@ -1108,6 +1125,8 @@ class TaskRunnerService(RunnerBase):
             execution_mode=insert_mode_for(step_code, snapshot.kb_type),
             idempotency_key=f"task-execution:{snapshot.execution_id}",
             kb_type=snapshot.kb_type,
+            # [jonex] KB 级 VLM 覆盖（空 = 不带这个键，引擎用默认模型）
+            kb_vlm_override=snapshot.vlm_override,
         )
         return _require_task_id(result, step_code)
 
@@ -1182,6 +1201,10 @@ class TaskRunnerService(RunnerBase):
             old_rag_doc_ids=snapshot.old_rag_doc_ids,
             idempotency_key=f"task-execution:{snapshot.execution_id}",
             kb_type=_KB_TYPE_LIGHTRAG,
+            # [jonex] KB 级 VLM 覆盖：重解析同样吃当前配置（「保存只影响未派活的
+            # 步骤」—— 重新解析就是一次新派活）。这一条尤其重要：引擎那边
+            # reparse_strict 会先预检这个模型，模型不可用时在删旧数据之前就失败。
+            kb_vlm_override=snapshot.vlm_override,
         )
         return _require_task_id(result, STEP_PARSE)
 
@@ -1659,6 +1682,7 @@ class _StepSnapshot:
         "intent",
         "content_generation",
         "old_rag_doc_ids",
+        "vlm_override",
     )
 
     def __init__(
@@ -1678,6 +1702,7 @@ class _StepSnapshot:
         intent: str = task_intent.INTENT_UPLOAD,
         content_generation: int = 0,
         old_rag_doc_ids: Optional[list] = None,
+        vlm_override: str = "",
     ) -> None:
         # 前两个来自执行上下文（不是从文档行读的），其余来自接管行 + 文档行。
         # 全部在构造时定死 —— 快照就该是不可变的，不再有「事后补一个字段」这种口子。
@@ -1700,6 +1725,12 @@ class _StepSnapshot:
         self.intent = intent
         self.content_generation = content_generation
         self.old_rag_doc_ids = list(old_rag_doc_ids or [])
+        # [jonex] KB 级 VLM 覆盖（P2b）：派活那一刻从库里读到的覆盖值。
+        # **空字符串 = 这个库没配置** ⇒ 下游请求里不带 `kb_vlm_override` 键，
+        # 由引擎沿用自己现有的默认链（注册表 → VLM_MODEL_NAME）。
+        # 存在快照里而不是发请求时现读：一份文档这次派活用哪个模型，应该与它的
+        # 幂等键 / 起点时刻一致 —— 中途改配置只影响**下一次**派活。
+        self.vlm_override = vlm_override
 
 
 def _require_task_id(result: Any, step_code: str) -> str:

@@ -29,6 +29,7 @@ class OntologyNeighborRequest(BaseModel):
     entity_type: str
     canonical_name: str
     limit: int = 50
+    depth: int = 1  # 同 KB 多跳深度（1=直接邻居；>1 走多跳查询，v1 上限 3）
     document_id: Optional[str] = None  # 按来源文档过滤邻居节点；缺省 = KB 级全量
 
 

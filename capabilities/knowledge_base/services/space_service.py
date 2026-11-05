@@ -24,12 +24,15 @@ from ..repository import SpaceRepository
 from .space_permission_service import (
     SPACE_MANAGER,
     SPACE_MEMBER,
+    SPACE_STATUS_ACTIVE,
+    WRITABLE_SPACE_STATUSES,
     can_create_space,
     get_write_space_ids,
     is_tenant_admin,
     require_space_manage,
     require_space_visible,
 )
+from .user_visibility import get_soft_deleted_user_ids
 
 # [jonex] 权限重构 B2：空间角色取值与去重优先级。
 # 从 space_permission_service 引入取值常量，避免两处各写一份字面量。
@@ -241,7 +244,11 @@ class SpaceService:
                         SpacePermission.user_id == user_id,
                         SpacePermission.role.in_(tuple(_SPACE_ROLE_RANK)),
                         SpacePermission.is_deleted == 0,
-                    ))
+                    )),
+                    # [jonex] 禁用空间对成员不可见（管理员不过滤 —— 要能看到并恢复）。
+                    # 这条必须与 get_visible_space_ids 的 SQL 同步，否则
+                    # 「下拉看不到、管理页能看到」或反过来。
+                    Space.status == SPACE_STATUS_ACTIVE,
                 ]
             items = await repo.list_all(tenant_id, offset, limit, extra_conditions=conds)
             total = await repo.count(tenant_id, extra_conditions=conds)
@@ -267,6 +274,18 @@ class SpaceService:
                      user_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
         await require_space_manage(tenant_id, space_id, user_id)
+        # [jonex] 状态值域收口：只接受 active / disabled。
+        # 放在查库之前：这是**请求自身**的属性，非法值没必要先读一遍空间。
+        # 前端历史类型里还有 inactive，服务端不做静默兼容 —— 非法值直接 400，
+        # 否则库里会重新长出一批「非 active 的非标准值」，让判定无法解释。
+        if data.get("status") is not None and data["status"] not in WRITABLE_SPACE_STATUSES:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.space.invalid_status",
+                    params={"status": str(data["status"])},
+                    fallback=f"非法的空间状态: {data['status']}（仅支持 active / disabled）",
+                )
+            )
         async with get_db_session() as session:
             repo = SpaceRepository(session)
             obj = await repo.get_required(space_id, tenant_id)
@@ -358,17 +377,19 @@ class SpaceService:
             # 后端 join display_name：viewer/知识编辑者无 user:read（id=3），
             # 前端拉 /users 会 403；join 顺带避免前端拉全量用户。
             # 反向转换 u.id::text = sp.user_id：存量非数字 user_id 不会触发 CAST 报错
-            # （永不 500、无需洗数据）；排除软删用户。
+            # （永不 500、无需洗数据）。
+            # ⚠️ 软删过滤必须写在 WHERE：写在 LEFT JOIN 的 ON 里只会让 display_name
+            # 变 NULL，行本身还在 —— 软删用户会以裸 ID 出现在成员列表里。
             result = await session.execute(
                 text("""
                     SELECT sp.user_id, sp.role, u.display_name, sp.created_at
                       FROM knowledge_base.space_permissions sp
                       LEFT JOIN platform.users u
                         ON u.id::text = sp.user_id
-                       AND u.is_deleted = 0
                      WHERE sp.space_id = :space_id
                        AND sp.tenant_id = :tenant_id
                        AND sp.is_deleted = 0
+                       AND (u.id IS NULL OR u.is_deleted = 0)
                 """),
                 {"space_id": space_id, "tenant_id": tenant_id},
             )
@@ -392,10 +413,10 @@ class SpaceService:
                       FROM knowledge_base.spaces s
                       LEFT JOIN platform.users u
                         ON u.id::text = s.owner_id
-                       AND u.is_deleted = 0
                      WHERE s.id = :space_id
                        AND s.tenant_id = :tenant_id
                        AND s.is_deleted = 0
+                       AND (u.id IS NULL OR u.is_deleted = 0)
                 """),
                 {"space_id": space_id, "tenant_id": tenant_id},
             )).first()
@@ -494,17 +515,6 @@ class SpaceService:
             if uid not in deduped or _SPACE_ROLE_RANK[role] > _SPACE_ROLE_RANK[deduped[uid]]:
                 deduped[uid] = role
 
-        # [jonex] 权限重构 B5（方案 §7.1 / 执行文档 §6.3 步骤 3）：管理者不得清零。
-        # 判定**基于 deduped（提交后的最终集合）**而非单条操作 —— 这样「换管理者」
-        # （旧管理者移除 + 新管理者加入，同一次提交）能放行，只有「最终一个管理者都不剩」才拦。
-        if not any(role == SPACE_MANAGER for role in deduped.values()):
-            raise InvalidParameterError(
-                message=translate(
-                    "err.space.no_manager_left",
-                    fallback="空间至少需保留一名管理者",
-                )
-            )
-
         async with get_db_session() as session:
             # 移除已有权限（硬删）。先查旧成员集合 —— D5 级联要用它算「被移出的人」。
             existing = await session.execute(
@@ -515,7 +525,39 @@ class SpaceService:
                 )
             )
             existing_rows = existing.scalars().all()
-            old_member_ids = {str(sp.user_id) for sp in existing_rows}
+            old_roles = {str(sp.user_id): sp.role for sp in existing_rows}
+            old_member_ids = set(old_roles)
+
+            # 软删用户判定：同时看旧成员与本次提交（提交里出现的新面孔也可能是软删用户）。
+            soft_deleted = await get_soft_deleted_user_ids(
+                session, tenant_id, old_member_ids | set(deduped)
+            )
+            active_submitted = {
+                uid: role for uid, role in deduped.items() if uid not in soft_deleted
+            }
+
+            # [jonex] 权限重构 B5（方案 §7.1 / 执行文档 §6.3 步骤 3）：管理者不得清零。
+            # 判定**基于提交后的最终活跃集合**而非单条操作 —— 这样「换管理者」
+            # （旧管理者移除 + 新管理者加入，同一次提交）能放行，只有「最终一个管理者都不剩」才拦。
+            # 软删管理者**不计入**：他们不出现在 GET 里，前端提交列表自然没有他们。
+            # 校验仍在删除任何东西之前。
+            if not any(role == SPACE_MANAGER for role in active_submitted.values()):
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.space.no_manager_left",
+                        fallback="空间至少需保留一名管理者",
+                    )
+                )
+
+            # [jonex] 软删用户的绑定必须保留（复职后恢复授权）。前端是「GET 到什么
+            # 就 PUT 什么」，而 GET 已过滤软删用户；若这里不做隐式保留，管理员点一次
+            # 保存就会永久删除他们的绑定（并级联软删其 KB 授权）。保留时一律用**旧角色**，
+            # 不接受提交值 —— 防止借保存给软删用户提权。不在旧绑定里的软删用户不保留。
+            preserved = {
+                uid: role for uid, role in old_roles.items() if uid in soft_deleted
+            }
+            final = {**active_submitted, **preserved}
+
             for sp in existing_rows:
                 await session.delete(sp)
             # 关键：先 flush 让 DELETE 落库再插入——SQLAlchemy UoW 默认 flush 顺序是
@@ -529,7 +571,8 @@ class SpaceService:
             #
             # · 软删（is_deleted=1）而非硬删：保留痕迹便于事后追溯「谁曾被授权过」。
             # · 与 space_permissions 替换**同事务**：半途失败不会留下越池残留。
-            removed_ids = old_member_ids - set(deduped.keys())
+            # 用 final（含保留的软删用户）而非 deduped 计算，否则会把保留者的 KB 授权误删。
+            removed_ids = old_member_ids - set(final)
             if removed_ids:
                 await session.execute(
                     text(
@@ -544,8 +587,8 @@ class SpaceService:
                     {"t": tenant_id, "uids": list(removed_ids), "sid": space_id},
                 )
 
-            # 添加新权限
-            for uid, role in deduped.items():
+            # 添加新权限（活跃提交 + 隐式保留的软删用户）
+            for uid, role in final.items():
                 perm_obj = SpacePermission(
                     id=uuid.uuid4().hex,
                     tenant_id=tenant_id,

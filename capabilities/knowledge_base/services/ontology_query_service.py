@@ -1,10 +1,14 @@
 """Ontology query service: kb statistics, instance list, relation list."""
 
+import asyncio
 import logging
+import os
+import socket
 
 from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired, TransientError
 
 from jonex_core.common.database import get_db_session
+from jonex_core.common.exceptions import InvalidParameterError
 from jonex_core.common.neo4j_client import get_neo4j_driver
 
 from jonex_core.common.tenant import require_tenant
@@ -35,7 +39,71 @@ logger = logging.getLogger(__name__)
 
 # Neo4j 不可用类异常：触发图谱查询优雅降级（不抛 500，返回空图 + degraded 标记）
 _NEO4J_DOWN_ERRORS = (ServiceUnavailable, SessionExpired, TransientError, AuthError, OSError)
+
+
+def _is_neo4j_down(exc: BaseException) -> bool:
+    """异常（含 cause/context 链）是否表示「Neo4j 不可用」。
+
+    neo4j 驱动对不同故障形态抛的异常并不统一：
+
+    - 进程在、端口拒绝/超时 → ``ServiceUnavailable`` 等 DriverError；
+    - 容器停止、主机名从网络消失 → ``ValueError("Cannot resolve address ...")``，
+      ``__cause__`` 为 ``socket.gaierror``。
+
+    后者不在 ``_NEO4J_DOWN_ERRORS`` 里，只按最外层类型捕获会漏掉、冒成 500。
+    这里沿链判定，但只认 DNS 解析失败链，避免把真正的业务 ``ValueError`` 误降级。
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, _NEO4J_DOWN_ERRORS):
+            return True
+        if isinstance(cur, socket.gaierror):
+            return True
+        if isinstance(cur, ValueError) and "Cannot resolve address" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 _DEGRADED_REASON = "图数据库（Neo4j）暂不可用，知识图谱无法展示，基础知识库能力不受影响"
+
+# 多跳（D11）：单次执行超时与降级文案。上限复用问答链路的同名 env，
+# 但在此独立读取，避免 import search_service 把两条链路耦合起来。
+_MULTIHOP_TIMEOUT_REASON = "多跳邻居展开超时，已返回空结果（可缩小 depth 或 limit 后重试）"
+
+
+def _multihop_depth_max() -> int:
+    """同 KB 多跳深度上限；非法值回落 3。"""
+    try:
+        value = int(os.getenv("ONTOLOGY_NEIGHBOR_DEPTH_MAX", "3"))
+    except (TypeError, ValueError):
+        return 3
+    return value if value >= 1 else 3
+
+
+def _multihop_timeout() -> float:
+    """单次多跳执行超时（秒）；非法值回落 10。"""
+    try:
+        value = float(os.getenv("ONTOLOGY_COLUMN_BROWSE_TIMEOUT", "10"))
+    except (TypeError, ValueError):
+        return 10.0
+    return value if value > 0 else 10.0
+
+
+def _multihop_degraded(req: "OntologyNeighborRequest", reason: str) -> dict:
+    """多跳降级出口：空图 + 契约字段齐全（depth/limit/returned/truncated）。"""
+    return {
+        "nodes": [],
+        "edges": [],
+        "degraded": True,
+        "degraded_reason": reason,
+        "depth": req.depth,
+        "limit": req.limit,
+        "returned": 0,
+        "truncated": False,
+    }
 
 
 class OntologyQueryService:
@@ -66,7 +134,9 @@ class OntologyQueryService:
             # [jonex] 改动 52（S2）：stub 占比随统计接口暴露，KB 详情可见
             stub_stats = await gdao.stub_entity_stats(tenant_id, kb_id)
             ontology_degraded = False
-        except _NEO4J_DOWN_ERRORS as e:
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
             # Neo4j 不可用：本体计数降级为 0，仍返回 PG 侧源文件数等基础统计
             logger.warning("[ontology] 统计降级：Neo4j 不可用 kb=%s err=%s", kb_id, e)
             instance_count = 0
@@ -209,7 +279,9 @@ class OntologyQueryService:
             )
             result["degraded"] = False
             return result
-        except _NEO4J_DOWN_ERRORS as e:
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
             logger.warning("[ontology] 图谱查询降级：Neo4j 不可用 kb=%s err=%s", req.knowledge_base_id, e)
             return {
                 "nodes": [], "edges": [],
@@ -220,13 +292,62 @@ class OntologyQueryService:
             }
 
     async def expand_ontology_neighbors(self, tenant_id: str, request) -> dict:
-        """展开某实体的一跳邻居（nodes + edges），用于前端双击节点增量扩展。
+        """展开某实体的邻居（nodes + edges），用于前端双击节点增量扩展。
 
-        Neo4j 不可用时优雅降级：返回空增量 + degraded 标记，不抛 500。
+        ``depth = 1`` 走既有单跳链路，响应逐字节不变；``depth > 1`` 走三元组锚定
+        的多跳查询，独立 10s 超时，超时/Neo4j 不可用都降级为空增量（不抛 500）。
         """
         tenant_id = require_tenant(tenant_id)
         req = OntologyNeighborRequest(**_payload(request))
+        depth_max = _multihop_depth_max()
+        if req.depth < 1 or req.depth > depth_max:
+            raise InvalidParameterError(f"depth 必须在 1-{depth_max} 之间")
         gdao = OntologyGraphRepository(get_neo4j_driver())
+
+        if req.depth > 1:
+            # document_id 只对单跳有明确语义；组合会产生「过滤哪一跳」歧义。
+            if req.document_id:
+                raise InvalidParameterError("document_id 与 depth>1 不能同时使用")
+            try:
+                # 先于 _NEO4J_DOWN_ERRORS 捕获：TimeoutError 也是 OSError 子类。
+                raw = await asyncio.wait_for(
+                    gdao.expand_neighbors_multihop(
+                        tenant_id,
+                        req.knowledge_base_id,
+                        req.entity_type,
+                        req.canonical_name,
+                        depth=req.depth,
+                        limit=req.limit,
+                    ),
+                    timeout=_multihop_timeout(),
+                )
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "[ontology] 多跳邻居展开超时：kb=%s depth=%s err=%s",
+                    req.knowledge_base_id, req.depth, e,
+                )
+                return _multihop_degraded(req, _MULTIHOP_TIMEOUT_REASON)
+            except Exception as e:
+                if not _is_neo4j_down(e):
+                    raise
+                logger.warning(
+                    "[ontology] 多跳邻居展开降级：Neo4j 不可用 kb=%s err=%s",
+                    req.knowledge_base_id, e,
+                )
+                return _multihop_degraded(req, _DEGRADED_REASON)
+
+            # 仓储内部字段不外泄；对外只给契约字段（顺序固定）。
+            edges = raw.get("edges") or []
+            return {
+                "nodes": raw.get("nodes") or [],
+                "edges": edges,
+                "degraded": False,
+                "depth": req.depth,
+                "limit": req.limit,
+                "returned": raw.get("returned_edges", len(edges)),
+                "truncated": bool(raw.get("truncated", False)),
+            }
+
         try:
             result = await gdao.expand_neighbors(
                 tenant_id,
@@ -238,7 +359,9 @@ class OntologyQueryService:
             )
             result["degraded"] = False
             return result
-        except _NEO4J_DOWN_ERRORS as e:
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
             logger.warning("[ontology] 邻居展开降级：Neo4j 不可用 kb=%s err=%s", req.knowledge_base_id, e)
             return {"nodes": [], "edges": [], "degraded": True, "degraded_reason": _DEGRADED_REASON}
 

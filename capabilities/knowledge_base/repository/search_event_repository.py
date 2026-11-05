@@ -45,6 +45,7 @@ class SearchEventRepository:
         query: str | None = None,
         query_hash: str | None = None,
         knowledge_base_ids: list | None = None,
+        mcp_key_id: str | None = None,
     ) -> SearchRequestEvent:
         tenant_id = require_tenant(tenant_id)
         stmt = (
@@ -58,6 +59,7 @@ class SearchEventRepository:
                 query=query,
                 query_hash=query_hash,
                 knowledge_base_ids=knowledge_base_ids or [],
+                mcp_key_id=mcp_key_id,
                 is_deleted=0,
             )
             .returning(SearchRequestEvent)

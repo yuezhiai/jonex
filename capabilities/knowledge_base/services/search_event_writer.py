@@ -447,6 +447,7 @@ async def write_request_event(
     kb_ids: list[str] | None = None,
     entry_service_id: str | None = None,
     domain_space_id: str | None = None,
+    mcp_key_id: str | None = None,
 ) -> bool:
     """落一行检索请求事件（入口埋点）。
 
@@ -476,6 +477,7 @@ async def write_request_event(
                 query=query,
                 query_hash=hash_query(query),
                 knowledge_base_ids=list(kb_ids or []),
+                mcp_key_id=mcp_key_id,
             )
         return True
     except Exception:  # noqa: BLE001 — 埋点失败不得影响检索
