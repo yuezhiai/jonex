@@ -23,6 +23,8 @@ const KnowledgeCompileGraph = loadableComponent(() => import('@/pages/KnowledgeC
 const KnowledgeCompileVector = loadableComponent(() => import('@/pages/KnowledgeCompileVector'));
 const KnowledgeCompileCompile = loadableComponent(() => import('@/pages/KnowledgeCompileCompile'));
 const DataOperations = loadableComponent(() => import('@/pages/DataOperations'));
+const EvolutionConsole = loadableComponent(() => import('@/pages/EvolutionConsole'));
+const RunDetail = loadableComponent(() => import('@/pages/EvolutionConsole/RunDetail'));
 const DataGovernance = loadableComponent(() => import('@/pages/DataGovernance'));
 
 export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key: string) => string) {
@@ -157,6 +159,22 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           element: PlatformMonitor,
           title: T('navigation.platformMonitor'),
           menu: { icon: 'MonitorOutlined', order: 4, permissionCode: 'platform:monitor:read' },
+        },
+        {
+          // 演化台（② 自进化闭环前端化）。permissionCode 与操作日志同码（B1 重构后为 audit:read）：
+          // 能看审计的人才能看失败与采纳；桥接仅本机可达，这不是权限分级（见 spec 5.3）。
+          path: 'evolution',
+          element: EvolutionConsole,
+          title: T('navigation.evolution'),
+          // order 15：14 已被系统监控占用（dev 合并后出现的重复 order，
+          // 由 dataGovernance.menu.test 的「两两不重复」守护）。
+          menu: { icon: 'ExperimentOutlined', order: 15, permissionCode: 'audit:read' },
+        },
+        {
+          // 下钻页（无 menu 元数据）：run 详情与人审验收面。
+          path: 'evolution/:runId',
+          element: RunDetail,
+          title: T('navigation.evolution'),
         },
         { path: 'knowledge-compile', element: KnowledgeCompile, title: T('navigation.knowledgeCompile') },
         { path: 'knowledge-compile/search', element: KnowledgeCompileSearch, title: T('navigation.compileSearch') },

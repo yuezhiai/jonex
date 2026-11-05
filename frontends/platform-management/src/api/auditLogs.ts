@@ -25,6 +25,10 @@ export interface AuditLogItem {
   request_params?: unknown;
   response_body?: unknown;
   log_level?: string | null;
+  /** 日志类型：API / 任务 / 登录等来源分类（详情接口返回） */
+  log_type?: string | null;
+  /** 产生日志的服务名（详情接口返回） */
+  service_name?: string | null;
   method?: string | null;
   path?: string | null;
 }
@@ -46,6 +50,10 @@ export async function listAuditLogs(
     page_size?: number;
     user_id?: number;
     action?: string;
+    /** 执行结果筛选：SUCCESS / FAILED（后端 query 已支持） */
+    outcome?: string;
+    /** 日志类型筛选（预留：bridge.log 等投递日志用） */
+    log_type?: string;
     resource?: string;
     keyword?: string;
     start_time?: string;

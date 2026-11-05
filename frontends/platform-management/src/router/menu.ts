@@ -11,6 +11,7 @@ import {
   CloudServerOutlined,
   CodeOutlined,
   BarChartOutlined,
+  ExperimentOutlined,
   DatabaseOutlined,
   MonitorOutlined,
 } from '@ant-design/icons';
@@ -61,6 +62,7 @@ export const IconMap: Record<string, ComponentType> = {
   CloudServerOutlined,
   CodeOutlined,
   BarChartOutlined,
+  ExperimentOutlined,
   DatabaseOutlined,
   MonitorOutlined,
 };

@@ -49,6 +49,27 @@ export async function listUsers(page = 1, pageSize = 100): Promise<UserListRespo
   });
 }
 
+/**
+ * 拉取租户内全部用户（后端单页上限 500）。
+ *
+ * 角色分配弹窗需要「全部用户」才能把已绑定 id 映射成姓名；只取第一页时，排在
+ * 后面页的合法用户会因匹配不到 option 而被渲染成裸数字。
+ */
+export async function listAllTenantUsers(): Promise<UserListResponse> {
+  const pageSize = 500;
+  const items: UserItem[] = [];
+  let total: number;
+  let page = 1;
+  do {
+    const res = await listUsers(page, pageSize);
+    items.push(...res.items);
+    total = res.total;
+    if (res.items.length === 0) break;
+    page += 1;
+  } while (items.length < total);
+  return { items, total: items.length };
+}
+
 export async function createUser(data: UserCreatePayload): Promise<UserItem> {
   return apiClient.post<UserItem>('/platform/users', data);
 }

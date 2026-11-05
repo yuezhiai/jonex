@@ -37,6 +37,27 @@ export async function listRoles(page = 1, pageSize = 100, targetTenantId?: strin
   });
 }
 
+/**
+ * 拉取租户全部角色（后端单页上限 100）。
+ *
+ * 用户编辑弹窗要用角色名映射已绑定的角色 id；只取第一页时，第二页之后的合法
+ * 角色会被渲染成裸数字（保存时 ID 仍有效，但界面不可读）。
+ */
+export async function listAllRoles(targetTenantId?: string): Promise<RoleListResponse> {
+  const pageSize = 100;
+  const items: RoleItem[] = [];
+  let total: number;
+  let page = 1;
+  do {
+    const res = await listRoles(page, pageSize, targetTenantId);
+    items.push(...res.items);
+    total = res.total;
+    if (res.items.length === 0) break;
+    page += 1;
+  } while (items.length < total);
+  return { items, total: items.length };
+}
+
 export async function createRole(payload: { name: string; description?: string }): Promise<RoleItem> {
   return apiClient.post<RoleItem>('/platform/roles', payload);
 }

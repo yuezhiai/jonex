@@ -1,0 +1,80 @@
+/* 正文滚动区。
+   overflowX 必须显式 hidden：设了 overflow-y 后 overflow-x 的 visible 会计算成 auto，
+   而 Row 的 gutter 带 -4px 负外边距、正好把正文撑宽 8px，纵表就配出一条空滚 4px 的横表。
+   macOS 的滚动条不滚就隐身，底部被边缘切一半的那行看着像渲染坏了，所以这里常显一条细滚动条。 */
+.perm-body {
+  max-height: 58vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scrollbar-width: thin;
+}
+
+.perm-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.perm-body::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.perm-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 滚动区底部渐隐：sticky 让它固定在滚动视口下沿，不随内容滚走；
+   margin-top 负值让它不额外撑高内容 */
+.perm-body-fade {
+  position: sticky;
+  bottom: 0;
+  height: 28px;
+  margin-top: -28px;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), #fff);
+  pointer-events: none;
+}
+
+/* 顶部「全选 + 已选计数」条 */
+.perm-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.perm-group + .perm-group {
+  margin-top: 18px;
+}
+
+.perm-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+/* 单项：整块可点，名称换行时上下两行仍然对齐 */
+.perm-item {
+  height: 100%;
+  padding: 2px 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.perm-item:hover {
+  background: #f8fafc;
+}
+
+.perm-item-name {
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.perm-item-code {
+  color: #94a3b8;
+  font-size: 11px;
+  line-height: 16px;
+}

@@ -9,7 +9,8 @@ import {
 } from '@ant-design/icons';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Input } from 'antd';
+import { Button, Empty, Input, Spin } from 'antd';
+import dayjs from 'dayjs';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
 import { listParsers, type ParserItem } from '@/api/parsers';
 import './index.css';
@@ -19,183 +20,100 @@ interface DisplayField {
   value: string;
 }
 
-interface PrototypeParserView {
-  desc: string;
-  color: string;
+interface TypeMeta {
   icon: React.ReactNode;
-  fields: DisplayField[];
+  gradient: string;
   order: number;
 }
 
-const BUILT_IN_PARSER_NAME_KEYS: Record<string, string> = {
-  video_full_pipeline: 'parserManagement.nameVideo',
-  parser_demo_video: 'parserManagement.nameVideo',
-  audio_transcribe: 'parserManagement.nameAudio',
-  parser_demo_audio: 'parserManagement.nameAudio',
-  image_parse: 'parserManagement.nameImage',
-  parser_demo_image: 'parserManagement.nameImage',
-  document_parse: 'parserManagement.nameDocument',
-  parser_demo_document: 'parserManagement.nameDocument',
-  text_parse: 'parserManagement.nameText',
-  parser_demo_text: 'parserManagement.nameText',
-  parser_demo_web: 'parserManagement.nameWeb',
-  parser_demo_cad: 'parserManagement.nameCad',
+/** 解析器类型 → 图标与配色；顺序即卡片默认排序 */
+const TYPE_META: Record<string, TypeMeta> = {
+  video: {
+    icon: <VideoCameraOutlined />,
+    gradient: 'linear-gradient(135deg, #f87171, #dc2626)',
+    order: 0,
+  },
+  audio: {
+    icon: <AudioOutlined />,
+    gradient: 'linear-gradient(135deg, #a78bfa, #7c3aed)',
+    order: 1,
+  },
+  image: {
+    icon: <FileImageOutlined />,
+    gradient: 'linear-gradient(135deg, #fbbf24, #d97706)',
+    order: 2,
+  },
+  document: {
+    icon: <FileTextOutlined />,
+    gradient: 'linear-gradient(135deg, #60a5fa, #1d4ed8)',
+    order: 3,
+  },
+  txt: {
+    icon: <FileTextOutlined />,
+    gradient: 'linear-gradient(135deg, #60a5fa, #1d4ed8)',
+    order: 4,
+  },
+  web: {
+    icon: <GlobalOutlined />,
+    gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+    order: 5,
+  },
+  cad: {
+    icon: <PartitionOutlined />,
+    gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+    order: 6,
+  },
 };
 
-function parserDisplayName(parser: ParserItem, t: (key: string) => string): string {
-  const key = BUILT_IN_PARSER_NAME_KEYS[parser.id];
-  return key ? t(key) : parser.name;
-}
+const FALLBACK_META: TypeMeta = {
+  icon: <FileTextOutlined />,
+  gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+  order: 99,
+};
 
-function getPrototypeParsers(
-  t: (key: string, options?: Record<string, unknown>) => string,
-): Record<string, PrototypeParserView> {
+/** 内置解析器 id → i18n 名称键；库里没有的（租户自建）直接显示 name */
+const BUILT_IN_NAME_KEYS: Record<string, string> = {
+  video_full_pipeline: 'nameVideoVlm',
+  video_mps: 'nameVideoMps',
+  audio_transcribe: 'nameAudio',
+  image_parse: 'nameImage',
+  document_parse: 'nameDocument',
+  text_parse: 'nameText',
+  parser_demo_web: 'nameWeb',
+  parser_demo_cad: 'nameCad',
+};
+
+const MAX_CHIPS = 5;
+
+const readConfig = (item: ParserItem) => {
+  const config = (item.config_json ?? {}) as Record<string, unknown>;
+  const fields = Array.isArray(config.display_fields)
+    ? (config.display_fields as DisplayField[]).filter((field) => field && field.label)
+    : [];
+  const version = typeof config.version === 'string' && config.version ? config.version : '--';
+  const processCount = Number(config.process_count);
   return {
-    video: {
-      desc: t('parserManagement.videoDesc'),
-      color: '#ef4444',
-      icon: <VideoCameraOutlined />,
-      fields: [
-        { label: t('parserManagement.keyFrameExtraction'), value: t('parserManagement.smartMode') },
-        { label: t('parserManagement.resolutionLimit'), value: '1080p' },
-      ],
-      order: 0,
-    },
-    audio: {
-      desc: t('parserManagement.audioDesc'),
-      color: '#8b5cf6',
-      icon: <AudioOutlined />,
-      fields: [
-        { label: t('parserManagement.transcriptionModel'), value: t('parserManagement.generalTranscriptionModel') },
-        { label: t('parserManagement.outputFormat'), value: 'SRT' },
-      ],
-      order: 1,
-    },
-    image: {
-      desc: t('parserManagement.imageDesc'),
-      color: '#f59e0b',
-      icon: <FileImageOutlined />,
-      fields: [
-        { label: t('parserManagement.ocrEngine'), value: t('parserManagement.builtInOcr') },
-        { label: t('parserManagement.imageCompression'), value: t('parserManagement.highQuality') },
-      ],
-      order: 2,
-    },
-    document: {
-      desc: t('parserManagement.documentDesc'),
-      color: '#3b82f6',
-      icon: <FileTextOutlined />,
-      fields: [
-        { label: t('parserManagement.layoutPreservation'), value: t('parserManagement.layoutEnabled') },
-        { label: t('parserManagement.tableExtraction'), value: t('parserManagement.smartExtraction') },
-      ],
-      order: 3,
-    },
-    txt: {
-      desc: t('parserManagement.textDesc'),
-      color: '#3b82f6',
-      icon: <FileTextOutlined />,
-      fields: [
-        { label: t('parserManagement.layoutPreservation'), value: t('parserManagement.layoutEnabled') },
-        { label: t('parserManagement.tableExtraction'), value: t('parserManagement.smartExtraction') },
-      ],
-      order: 4,
-    },
-    web: {
-      desc: t('parserManagement.webDesc'),
-      color: '#94a3b8',
-      icon: <GlobalOutlined />,
-      fields: [
-        { label: t('parserManagement.renderMode'), value: t('parserManagement.staticRender') },
-        { label: t('parserManagement.scrapeDepth'), value: '--' },
-      ],
-      order: 5,
-    },
-    cad: {
-      desc: t('parserManagement.cadDesc'),
-      color: '#94a3b8',
-      icon: <PartitionOutlined />,
-      fields: [
-        { label: t('parserManagement.precisionLevel'), value: t('parserManagement.standardPrecision') },
-        { label: t('parserManagement.layerExtraction'), value: t('parserManagement.allLayers') },
-      ],
-      order: 6,
-    },
+    fields,
+    version,
+    processCount: Number.isFinite(processCount) ? processCount : 0,
   };
-}
+};
 
-function iconForType(type: string, parsers: Record<string, PrototypeParserView>): React.ReactNode {
-  return parsers[type]?.icon || <FileTextOutlined />;
-}
-
-function colorForType(type: string, active: boolean, parsers: Record<string, PrototypeParserView>): string {
-  if (!active) return '#94a3b8';
-  return parsers[type]?.color || '#3b82f6';
-}
-
-function parserDesc(
-  parser: ParserItem,
-  parsers: Record<string, PrototypeParserView>,
-  t: (key: string, options?: Record<string, unknown>) => string,
-): string {
-  return (
-    parsers[parser.parser_type]?.desc ||
-    t('parserManagement.fallbackDesc', { fileTypes: (parser.file_types || []).join('/'), name: parser.name })
-  );
-}
-
-function formatProcessCount(value: unknown, active: boolean): string {
-  if (!active) return '--';
-  if (typeof value === 'number') return value.toLocaleString();
-  if (typeof value === 'string' && value) return value;
-  return '--';
-}
-
-function displayFields(
-  parser: ParserItem,
-  parsers: Record<string, PrototypeParserView>,
-  t: (key: string, options?: Record<string, unknown>) => string,
-): DisplayField[] {
-  const prototype = parsers[parser.parser_type];
-  if (prototype) return prototype.fields;
-
-  const raw = parser.config_json?.display_fields;
-  if (Array.isArray(raw)) {
-    return raw
-      .map((item) => ({
-        label: String((item as any).label || ''),
-        value: String((item as any).value || '--'),
-      }))
-      .filter((item) => item.label);
-  }
-  return [
-    { label: t('parserManagement.supportedFormats'), value: (parser.file_types || []).slice(0, 4).join(' / ') || '--' },
-    { label: t('parserManagement.parserTypeLabel'), value: parser.parser_type || '--' },
-  ];
-}
-
-function getErrorMessage(error: unknown, t: (key: string, options?: Record<string, unknown>) => string): string {
-  if (error instanceof Error) return error.message;
-  return t('parserManagement.requestFailed');
-}
-
-export default function ParserManagement() {
+const ParserManagement: React.FC = () => {
   const { t } = useTranslation();
   const [search, setSearch] = useState('');
   const [parsers, setParsers] = useState<ParserItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const prototypeParsers = useMemo(() => getPrototypeParsers(t), [t]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const loadParsers = useCallback(async () => {
     setLoading(true);
-    setError('');
+    setError(null);
     try {
       const resp = await listParsers(0, 100);
       setParsers(resp.items || []);
     } catch (err) {
-      setError(getErrorMessage(err, t));
+      setError(err instanceof Error && err.message ? err.message : t('parserManagement.requestFailed'));
     } finally {
       setLoading(false);
     }
@@ -205,93 +123,122 @@ export default function ParserManagement() {
     void loadParsers();
   }, [loadParsers]);
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const visibleParsers = parsers
-      .filter((parser) => Boolean(prototypeParsers[parser.parser_type]))
-      .sort((a, b) => prototypeParsers[a.parser_type].order - prototypeParsers[b.parser_type].order);
+  /** 只展示已启用的解析器：未上线（status !== 'active'）的直接不出现 */
+  const visibleParsers = useMemo(() => {
+    const keyword = search.trim().toLowerCase();
+    return parsers
+      .filter((item) => item.status === 'active')
+      .filter((item) => {
+        if (!keyword) return true;
+        const haystack = [item.name, item.parser_type, ...(item.file_types ?? [])]
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(keyword);
+      })
+      .sort((a, b) => {
+        const orderA = (TYPE_META[a.parser_type] ?? FALLBACK_META).order;
+        const orderB = (TYPE_META[b.parser_type] ?? FALLBACK_META).order;
+        return orderA - orderB || a.name.localeCompare(b.name);
+      });
+  }, [parsers, search]);
 
-    if (!q) return visibleParsers;
-    return visibleParsers.filter((parser) => {
-      const fileTypes = (parser.file_types || []).join(' ').toLowerCase();
-      const displayName = parserDisplayName(parser, t).toLowerCase();
-      return (
-        parser.name.toLowerCase().includes(q) ||
-        displayName.includes(q) ||
-        parser.parser_type.toLowerCase().includes(q) ||
-        fileTypes.includes(q)
-      );
-    });
-  }, [parsers, search, prototypeParsers, t]);
+  const renderCard = (item: ParserItem) => {
+    const meta = TYPE_META[item.parser_type] ?? FALLBACK_META;
+    const { fields, version, processCount } = readConfig(item);
+    const formats = item.file_types ?? [];
+    const shown = formats.slice(0, MAX_CHIPS);
+    const hiddenCount = formats.length - shown.length;
+    const nameKey = BUILT_IN_NAME_KEYS[item.id];
+    const displayName = nameKey ? t(`parserManagement.${nameKey}`) : item.name;
+    const updatedText = item.updated_at ? dayjs(item.updated_at).format('MM-DD HH:mm') : '--';
+
+    return (
+      <div className="parser-card" key={item.id}>
+        <div className="parser-card-head">
+          <span className="parser-card-ico" style={{ background: meta.gradient }}>
+            {meta.icon}
+          </span>
+          <div className="parser-card-title">
+            <b title={displayName}>{displayName}</b>
+            <small>
+              {t('parserManagement.formatsCount', { count: formats.length })} · {version}
+            </small>
+          </div>
+        </div>
+
+        {shown.length > 0 && (
+          <div className="parser-chips">
+            {shown.map((format) => (
+              <span className="parser-chip" key={format}>
+                {format}
+              </span>
+            ))}
+            {hiddenCount > 0 && <span className="parser-chip is-more">+{hiddenCount}</span>}
+          </div>
+        )}
+
+        {fields.length > 0 && (
+          <dl className="parser-fields">
+            {fields.map((field) => (
+              <React.Fragment key={field.label}>
+                <dt>{field.label}</dt>
+                <dd title={field.value}>{field.value}</dd>
+              </React.Fragment>
+            ))}
+          </dl>
+        )}
+
+        <div className="parser-card-foot">
+          <span>{t('parserManagement.processedTimes', { count: processCount.toLocaleString() })}</span>
+          <span className="parser-card-sep">·</span>
+          <span>{t('parserManagement.updatedAt', { time: updatedText })}</span>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <>
       <PageHeader title={t('parserManagement.pageTitle')} />
       <PageContent showCard={false}>
-        <div style={{ marginBottom: 20, marginTop: 8 }}>
+        <div className="parser-toolbar">
           <Input
-            prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+            allowClear
+            prefix={<SearchOutlined />}
             placeholder={t('parserManagement.searchPlaceholder')}
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={{ width: 240 }}
+            onChange={(event) => setSearch(event.target.value)}
+            style={{ width: 264 }}
           />
+          <span className="parser-toolbar-count">
+            {t('parserManagement.totalCount', { count: visibleParsers.length })}
+          </span>
         </div>
 
-        {error && (
-          <div className="parser-page-error">
+        {error ? (
+          <div className="parser-error">
             <span>{error}</span>
-            <Button onClick={() => void loadParsers()}>{t('common.retry')}</Button>
+            <Button size="small" onClick={() => void loadParsers()}>
+              {t('common.retry')}
+            </Button>
           </div>
+        ) : loading ? (
+          <div className="parser-placeholder">
+            <Spin />
+          </div>
+        ) : visibleParsers.length === 0 ? (
+          <div className="parser-placeholder">
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description={search ? t('parserManagement.noMatch') : t('parserManagement.empty')}
+            />
+          </div>
+        ) : (
+          <div className="parser-grid">{visibleParsers.map(renderCard)}</div>
         )}
-
-        <div className="parser-grid">
-          {loading ? (
-            <div className="parser-state">{t('parserManagement.loading')}</div>
-          ) : filtered.length === 0 ? (
-            <div className="parser-state">{t('parserManagement.empty')}</div>
-          ) : (
-            filtered.map((parser) => {
-              const isActive = parser.status === 'active';
-              const version = String(parser.config_json?.version || '--');
-              const processCount = formatProcessCount(parser.config_json?.process_count, isActive);
-
-              return (
-                <div key={parser.id} className={`parser-card${isActive ? '' : ' grey'}`}>
-                  <div
-                    className="parser-icon"
-                    style={{ color: colorForType(parser.parser_type, isActive, prototypeParsers) }}
-                  >
-                    {iconForType(parser.parser_type, prototypeParsers)}
-                  </div>
-                  {!isActive && <div className="future-tag">{t('parserManagement.comingSoon')}</div>}
-                  <h3>
-                    {parser.name}{' '}
-                    <span style={{ fontSize: 12, color: isActive ? '#22c55e' : '#94a3b8', fontWeight: 400 }}>
-                      {isActive ? t('status.enabled') : t('status.disabled')}
-                    </span>
-                  </h3>
-                  <div className="parser-desc">{parserDesc(parser, prototypeParsers, t)}</div>
-                  <div className="parser-meta">
-                    <span>
-                      {t('parserManagement.version')} {version}
-                    </span>
-                    <span>
-                      {t('parserManagement.processCount')} {processCount}
-                    </span>
-                  </div>
-                  {displayFields(parser, prototypeParsers, t).map((row) => (
-                    <div key={row.label} className="form-row">
-                      <label>{row.label}</label>
-                      <div style={{ fontSize: 13, color: '#334155', padding: '2px 0' }}>{row.value}</div>
-                    </div>
-                  ))}
-                </div>
-              );
-            })
-          )}
-        </div>
       </PageContent>
     </>
   );
-}
+};
+
+export default ParserManagement;

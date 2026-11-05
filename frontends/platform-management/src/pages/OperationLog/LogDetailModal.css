@@ -1,0 +1,290 @@
+/* 日志详情弹窗（LogDetailModal）的专属样式。
+   前缀 lod-（LogOperationDetail），只影响这个弹窗，不进全局。
+   设计取舍：弹窗本身已经是一层卡片，内部不再叠卡片——分区靠「小标题 + 一条竖细标」和留白，
+   不用边框和底色块；只有代码块保留一层浅底，保证等宽文本可读。 */
+
+.lod {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding-top: 2px;
+}
+
+/* ── 头部：谁、做了什么、什么结果 ── */
+.lod-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.lod-head-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  font-size: 18px;
+}
+
+.is-ok .lod-head-icon {
+  color: #10b981;
+}
+
+.is-failed .lod-head-icon {
+  color: #ef4444;
+}
+
+.lod-head-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.lod-head-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.lod-head-action {
+  flex: none;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.lod-head-sep {
+  flex: none;
+  color: #cbd5e1;
+}
+
+.lod-head-res {
+  overflow: hidden;
+  color: #334155;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lod-head-meta {
+  margin-top: 5px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.lod-head-status {
+  flex: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.is-ok .lod-head-status {
+  color: #059669;
+}
+
+.is-failed .lod-head-status {
+  color: #dc2626;
+}
+
+/* ── 分区：小标题带一根竖细标，不用卡片容器 ── */
+.lod-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.lod-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.lod-sec-title {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  letter-spacing: 0.2px;
+}
+
+.lod-sec-title::before {
+  content: '';
+  width: 3px;
+  height: 11px;
+  margin-right: 7px;
+  border-radius: 2px;
+  background: #cbd5e1;
+}
+
+.lod-sec.is-error .lod-sec-title {
+  color: #b91c1c;
+}
+
+.lod-sec.is-error .lod-sec-title::before {
+  background: #fca5a5;
+}
+
+/* 分区右上角的「复制」：轻量文字按钮 */
+.lod-copy-text.ant-btn {
+  height: 22px;
+  padding: 0 6px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.lod-copy-text.ant-btn:hover {
+  color: #1677ff;
+  background: #f1f5f9;
+}
+
+/* ── 请求行：方法 + 路径 ── */
+.lod-req {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 12.5px;
+  color: #334155;
+}
+
+.lod-method {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #eef4ff;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #1d4ed8;
+}
+
+.lod-path {
+  word-break: break-all;
+}
+
+.lod-hint {
+  font-size: 12.5px;
+  color: #b0bac6;
+}
+
+/* ── 代码块（请求参数 / 响应体 / 堆栈共用） ── */
+.lod-pre {
+  margin: 0;
+  max-height: 320px;
+  padding: 10px 12px;
+  overflow: auto;
+  border-radius: 6px;
+  background: #f8fafc;
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 12px;
+  line-height: 1.65;
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.lod-code.is-collapsed .lod-pre {
+  max-height: 168px;
+  overflow: hidden;
+}
+
+.lod-more.ant-btn {
+  height: 22px;
+  margin-top: 4px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: #1677ff;
+}
+
+.lod-more.ant-btn:hover {
+  background: transparent;
+  color: #1c6fea;
+}
+
+/* ── 失败原因正文 ── */
+.lod-error-msg {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #334155;
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+/* ── 技术信息：标签定宽、值跟后面，两列 ── */
+.lod-rows {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 28px;
+}
+
+.lod-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.lod-row-wide {
+  grid-column: 1 / -1;
+}
+
+.lod-row-label {
+  flex: 0 0 76px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.lod-row-value {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 13px;
+  color: #334155;
+  word-break: break-all;
+}
+
+.lod-copy.ant-btn {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: #94a3b8;
+  border-radius: 6px;
+}
+
+.lod-copy.ant-btn:hover {
+  color: #1677ff;
+  background: #eef2f7;
+}
+
+.lod-mono {
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 12.5px;
+}
+
+/* 细滚动条，与列表/正文同一套 */
+.lod-pre::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.lod-pre::-webkit-scrollbar-thumb {
+  background: #dbe3ec;
+  border-radius: 4px;
+}
+
+.lod-pre::-webkit-scrollbar-thumb:hover {
+  background: #b9c6d6;
+}
+
+.lod-pre::-webkit-scrollbar-track {
+  background: transparent;
+}

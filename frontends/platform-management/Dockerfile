@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:20.18-alpine AS builder
+FROM node:24.22.1-alpine AS builder
 WORKDIR /app
 
 # 构建源镜像开关：false=国内源（npmmirror），true=国外官方源（registry.npmjs.org）
@@ -40,12 +40,25 @@ COPY frontends/tsconfig.base.json ./
 COPY frontends/vite.base.config.ts ./
 
 # 生产登录页为同源相对路径 /login；覆盖 .env 烘入的本地 dev 网关地址 localhost:8080（生产无 8080 服务，跳转会落到死地址）
+# 构建期注入的生产值：dev 的 `.env` 已从构建上下文排除（.dockerignore），
+# 这些键原先全靠 `.env` 提供，缺了会退回代码默认值（standalone 路由基址错、appId 错）。
 ARG VITE_LOGIN=/login
-ENV VITE_LOGIN=${VITE_LOGIN}
+ARG VITE_APP_ID=platform-management
+ARG VITE_STANDALONE_BASE=/platform-management/
+ARG VITE_AUTH_ME=/api/v1/auth/me
+ARG VITE_AUTH_EXCHANGE_TICKET=/api/v1/auth/exchange-ticket
+ENV VITE_LOGIN=${VITE_LOGIN} \
+    VITE_APP_ID=${VITE_APP_ID} \
+    VITE_STANDALONE_BASE=${VITE_STANDALONE_BASE} \
+    VITE_AUTH_ME=${VITE_AUTH_ME} \
+    VITE_AUTH_EXCHANGE_TICKET=${VITE_AUTH_EXCHANGE_TICKET}
 
 RUN pnpm --filter @jonex/platform-management build
 
 FROM nginx:1.27-alpine
+# ARG 不跨 stage 继承：最终镜像的 label 要在本 stage 重新声明才能取到值
+ARG USE_OVERSEAS_MIRROR=false
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
 WORKDIR /usr/share/nginx/html
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
 

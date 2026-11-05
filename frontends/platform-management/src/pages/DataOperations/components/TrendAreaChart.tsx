@@ -58,7 +58,13 @@ export default function TrendAreaChart({
     [fill],
   );
 
-  const isEmpty = !data.length;
+  const isEmpty = !data.length || data.every((point) => point.value == null);
+
+  // A 方案：空桶（接口 value=null）在**消费端**兜成 0，落到 0 基线画出来。
+  // 不用 connectNulls 跨过缺口 —— 跨过去等于把「这格无数据」画成「有数据」；
+  // 兜 0 至少位置是对的（沉到底部），一眼能看出这一段是空的。
+  // 数据源语义不变：整窗都没数据时仍走上面的空态，不会被兜成一条贴底的 0 线。
+  const chartData = data.map((point) => (point.value == null ? { ...point, value: 0 } : point));
 
   return (
     // 与 PlatformMonitor 那份同一处改动：三态共用一块高度，切指标重取时卡片不上下跳
@@ -72,7 +78,7 @@ export default function TrendAreaChart({
         </Flex>
       ) : fill && !filledHeight ? null : (
         <Area
-          data={data}
+          data={chartData}
           xField="date"
           yField="value"
           height={fill ? filledHeight : height}

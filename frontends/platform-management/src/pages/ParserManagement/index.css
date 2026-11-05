@@ -1,132 +1,184 @@
-.parser-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
-}
+/* 解析器管理：工具条 + 分类卡片。只展示已启用解析器，未上线的由页面过滤掉，样式不再处理“灰卡”。 */
 
-.parser-state,
-.parser-page-error {
-  grid-column: 1 / -1;
-  padding: 32px 16px;
-  border: 1px dashed #dbe4ef;
-  border-radius: 12px;
-  background: #fff;
-  color: #94a3b8;
-  font-size: 14px;
-  text-align: center;
-}
-
-.parser-page-error {
+.parser-toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  margin-bottom: 16px;
+  height: 56px;
+  padding: 0 14px;
+  margin-bottom: 14px;
+  background: #fff;
+  border: 1px solid #e8edf3;
+  border-radius: 12px;
+  box-shadow: 0 1px 4px rgba(15, 30, 60, 0.04);
+}
+
+.parser-toolbar-count {
+  margin-left: auto;
+  font-size: 12.5px;
+  color: #94a3b8;
+}
+
+.parser-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   padding: 12px 14px;
   border: 1px solid #fecaca;
+  border-radius: 10px;
   background: #fef2f2;
+  font-size: 13px;
   color: #dc2626;
-  text-align: left;
 }
 
-.parser-page-error button {
-  flex-shrink: 0;
-  border: 0;
-  border-radius: 6px;
-  background: #dc2626;
-  color: #fff;
-  font-size: 12px;
-  padding: 5px 10px;
-  cursor: pointer;
+.parser-error > span {
+  flex: 1;
+  min-width: 0;
 }
 
-.parser-page-error button:hover {
-  background: #b91c1c;
+.parser-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 240px;
+  background: #fff;
+  border: 1px solid #e8edf3;
+  border-radius: 12px;
+}
+
+.parser-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
 }
 
 .parser-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 16px 12px;
   background: #fff;
-  border: 1px solid #e2e8f0;
+  border: 1px solid #e8edf3;
   border-radius: 12px;
-  padding: 24px;
-  transition: box-shadow 0.2s;
+  box-shadow: 0 1px 4px rgba(15, 30, 60, 0.04);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
 }
 
 .parser-card:hover {
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  border-color: #cfe0f5;
+  box-shadow: 0 4px 14px rgba(15, 30, 60, 0.1);
 }
 
-.parser-card.grey {
-  opacity: 0.5;
+.parser-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
 }
 
-.parser-card .future-tag {
-  display: inline-block;
-  padding: 2px 10px;
+.parser-card-ico {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
   border-radius: 10px;
-  font-size: 11px;
-  background: #f1f5f9;
-  color: #94a3b8;
-  margin-bottom: 8px;
+  color: #fff;
+  font-size: 18px;
 }
 
-.parser-card .parser-icon {
-  font-size: 32px;
-  margin-bottom: 12px;
+.parser-card-title {
+  flex: 1;
+  min-width: 0;
 }
 
-.parser-card h3 {
-  margin: 0 0 4px;
-  font-size: 16px;
-}
-
-.parser-card .parser-desc {
-  font-size: 13px;
-  color: #64748b;
-  margin-bottom: 12px;
-}
-
-.parser-card .parser-meta {
-  font-size: 12px;
-  color: #94a3b8;
-  margin-bottom: 12px;
-}
-
-.parser-card .parser-meta span {
-  margin-right: 16px;
-}
-
-.parser-card .form-row {
-  margin-bottom: 10px;
-}
-
-.parser-card .form-row label {
+.parser-card-title b {
   display: block;
-  font-size: 12px;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parser-card-title small {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  font-size: 11.5px;
+  color: #94a3b8;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parser-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.parser-chip {
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: #f4f7fb;
   color: #475569;
-  margin-bottom: 2px;
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 10.5px;
+  line-height: 20px;
 }
 
-.parser-card .status-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-right: 4px;
+.parser-chip.is-more {
+  background: #eef2f7;
+  color: #64748b;
+  font-family: inherit;
 }
 
-.parser-card .status-dot.green {
-  background: #22c55e;
+.parser-fields {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.parser-fields dt {
+  color: #94a3b8;
+}
+
+.parser-fields dd {
+  margin: 0;
+  overflow: hidden;
+  color: #334155;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parser-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 9px;
+  border-top: 1px solid #f1f5f9;
+  font-size: 11.5px;
+  color: #94a3b8;
+}
+
+.parser-card-sep {
+  color: #d6dee8;
 }
 
 @media (max-width: 1200px) {
   .parser-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 768px) {
   .parser-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }

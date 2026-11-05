@@ -1,70 +1,190 @@
+/* 左列表 + 右表格：卡片内左右分栏，中间一条竖线（右侧容器的左边框画线）。
+   两侧高度都吃满卡片内容区：左列表内部滚动，右表格表体撑满剩余高度，
+   竖线因此从内容顶端一直画到底。 */
 .user-layout {
   display: flex;
-  gap: 24px;
-  align-items: flex-start;
+  align-items: stretch;
+  height: 100%;
+  /* 卡片内容区被压得很矮时留一个下限，避免列表只剩一两行 */
+  min-height: 480px;
 }
 
-.tenant-panel {
-  width: 220px;
+.user-sidebar {
+  width: 260px;
   flex-shrink: 0;
-  background: #fff;
-  border: 1px solid #e2e8f0;
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-.tenant-panel-header {
-  padding: 16px 20px;
-  font-weight: 600;
-  font-size: 15px;
-  color: #0b2b5c;
-  border-bottom: 1px solid #e8edf3;
-}
-
-.tenant-list {
-  max-height: 520px;
-  overflow-y: auto;
-}
-
-.tenant-item {
-  padding: 12px 20px;
-  cursor: pointer;
+  padding-right: 16px;
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-left: 3px solid transparent;
-  transition: all 0.15s;
-  font-size: 14px;
-  color: #334155;
-  user-select: none;
+  flex-direction: column;
+  min-height: 0;
 }
 
-.tenant-item:hover {
-  background: #f8fafc;
+/* 竖线由 .user-main 统一画；菜单自己那条默认边线会在它左侧 16px 处多出一条淡线。
+   选择器要压过 antd 的 `.ant-menu-inline`（实测两个类名不够，antd 的样式更晚注入），
+   故再带上 .ant-menu-root 并限定在侧栏内。 */
+.user-sidebar .user-tenant-menu.ant-menu-root {
+  border-inline-end: none;
+  background: transparent;
+  /* macOS 默认 overlay 滚动条常驻不可见，给一条常显的细条提示列表还能往下翻 */
+  scrollbar-width: thin;
+  scrollbar-color: #d5dde8 transparent;
 }
 
-.tenant-item.active {
-  background: #eff6ff;
-  border-left-color: #3b82f6;
-  color: #3b82f6;
+/* 列表吃掉标题与搜索框之外的全部高度，滚动发生在这里，不撑破卡片 */
+.user-tenant-menu.ant-menu {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 滚到列表尽头别把外层页面一起带着滚 */
+  overscroll-behavior: contain;
+}
+
+.user-tenant-menu.ant-menu::-webkit-scrollbar {
+  width: 6px;
+}
+
+.user-tenant-menu.ant-menu::-webkit-scrollbar-thumb {
+  background: #d5dde8;
+  border-radius: 3px;
+}
+
+.user-tenant-menu.ant-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 圆角行 + 上下留白：antd inline 菜单默认项首尾相连，二十个租户会连成一堵墙。
+   左侧间距交给 label 内的 .user-tenant-item —— Menu 的 inlineIndent 会直接改写
+   菜单项的 padding-inline-start，写在菜单项上压不住。 */
+.user-sidebar .user-tenant-menu.ant-menu .ant-menu-item {
+  height: 40px;
+  line-height: 40px;
+  margin-block: 2px;
+  border-radius: 8px;
+  padding-inline-end: 10px;
+}
+
+.user-sidebar .user-tenant-menu.ant-menu .ant-menu-item-selected {
+  background: #eef4ff;
+  color: #1d4ed8;
   font-weight: 500;
 }
 
-.tenant-item .tenant-count {
-  font-size: 12px;
-  color: #94a3b8;
-  background: #f1f5f9;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-weight: 400;
+/* 选中项左侧短竖条：让它从一列浅色块里一眼可辨 */
+.user-sidebar .user-tenant-menu.ant-menu .ant-menu-item::before {
+  content: '';
+  position: absolute;
+  inset-inline-start: 0;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 0 2px 2px 0;
+  background: #2563eb;
+  transform: translateY(-50%);
+  transition: height 0.2s ease;
 }
 
-.tenant-item.active .tenant-count {
-  background: #dbeafe;
-  color: #3b82f6;
+.user-sidebar .user-tenant-menu.ant-menu .ant-menu-item-selected::before {
+  height: 20px;
+}
+
+/* antd 的分割线是 6% 透明度的边框，卡片白底上几乎看不见 */
+.user-tenant-menu .ant-menu-item-divider {
+  margin: 6px 8px;
+  border-block-start-color: #e2e8f0;
+}
+
+.user-tenant-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  /* span 默认 content-box，width:100% 再叠加 padding 会撑出菜单，计数被裁 */
+  box-sizing: border-box;
+  /* 给选中项左侧竖条留出位置 */
+  padding-inline-start: 10px;
+  /* 菜单项继承了 40px 行高，不收住会把文字挤偏 */
+  line-height: 24px;
+}
+
+.user-tenant-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-tenant-count {
+  flex-shrink: 0;
+  min-width: 20px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #94a3b8;
+  text-align: right;
+}
+
+.user-tenant-menu .ant-menu-item-selected .user-tenant-count {
+  color: #1d4ed8;
 }
 
 .user-main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-left: 24px;
+  border-left: 1px solid #e2e8f0;
+}
+
+/* ── 右栏高度链路：CommonTable → 表 wrapper → 表体 ──
+   表头与分页固定，中间的表体吃掉剩余高度。整条链缺一级就会退回内容高度
+   （表体不滚、分页悬在半空）。表头/表体分离依赖 scroll.x，见页面里的 scroll 属性。 */
+.user-table {
+  flex: 1;
+  min-height: 0;
+}
+
+.user-table > .ant-table-wrapper {
+  flex: 1;
+  min-height: 0;
+}
+
+.user-table > .ant-table-wrapper .ant-spin,
+.user-table > .ant-table-wrapper .ant-spin-container {
+  height: 100%;
+}
+
+.user-table > .ant-table-wrapper .ant-spin-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.user-table > .ant-table-wrapper .ant-table {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.user-table > .ant-table-wrapper .ant-table-container {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.user-table > .ant-table-wrapper .ant-table-header {
+  flex-shrink: 0;
+}
+
+.user-table > .ant-table-wrapper .ant-table-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto !important;
+}
+
+.user-table > .ant-table-wrapper .ant-pagination {
+  flex-shrink: 0;
+  margin: 0 !important;
+  padding-top: 12px;
 }

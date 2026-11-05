@@ -10,7 +10,7 @@ import {
   type UserCreatePayload,
   type UserUpdatePayload,
 } from '../../api/users';
-import { listRoles, type RoleItem } from '../../api/roles';
+import { listAllRoles, type RoleItem } from '../../api/roles';
 import type { TenantItem } from '../../api/tenants';
 import { readCachedUser, isPlatformAdmin, type ShellUser } from '@jonex/shell-sdk';
 
@@ -35,7 +35,12 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
   const [editing, setEditing] = useState<UserItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [roleOptions, setRoleOptions] = useState<RoleItem[]>([]);
+  // 已绑定角色 id：用于给「不在角色列表里」的 id 补占位文案（避免裸 id）
+  const [boundRoleIds, setBoundRoleIds] = useState<number[]>([]);
   const [roleLoading, setRoleLoading] = useState(false);
+  // 角色列表或已绑定角色加载失败 ⇒ 禁止保存。否则表单里的 [] 会被当作
+  // 「用户没有任何角色」整体回写，静默清空绑定。
+  const [roleDataFailed, setRoleDataFailed] = useState(false);
   const [form] = Form.useForm();
   // 目标租户：新建 = 租户下拉（可切换）；编辑 = 隐藏字段（固定为用户所属租户）
   const targetTenantId = Form.useWatch('target_tenant_id', form);
@@ -51,6 +56,8 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
     if (!tenantId) {
       // 未选租户：角色下拉空 + 禁用
       setRoleOptions([]);
+      setBoundRoleIds([]);
+      setRoleDataFailed(false);
       return;
     }
     // 拉目标租户角色列表（RBAC roles 表）；
@@ -58,37 +65,49 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
     const cachedUser = readCachedUser<ShellUser>();
     const isPlatformAdminFlag = isPlatformAdmin(cachedUser);
     setRoleLoading(true);
+    setRoleDataFailed(false);
     try {
-      const roleList = await listRoles(1, 100, tenantId);
+      // 循环分页取全量：只取第一页会让第二页后的合法角色在已绑定列表里匹配不到
+      // 选项，界面上退化成裸数字。
+      const roleList = await listAllRoles(tenantId);
       const visibleRoles = isPlatformAdminFlag
         ? roleList.items
         : roleList.items.filter((r) => r.is_system !== 1);
 
       if (editing) {
         // 编辑：当前绑定角色若被过滤（系统角色），全部保留在选项中防误改丢失绑定
-        let boundRoleIds: number[] = [];
+        let bound: number[];
         try {
-          boundRoleIds = await getUserRoles(editing.id, tenantId);
+          bound = await getUserRoles(editing.id, tenantId);
         } catch {
-          boundRoleIds = [];
+          // ⛔ 不能吞成 []：空数组会被当成「该用户没有角色」并在保存时整体回写，
+          // 等于静默清空全部绑定。标记失败并禁止保存。
+          setRoleOptions(visibleRoles);
+          setBoundRoleIds([]);
+          setRoleDataFailed(true);
+          return;
         }
+        setBoundRoleIds(bound);
         // [jonex] 逐个补回被过滤掉的已绑定角色。此前只处理 boundRoleIds[0]，
         // 多角色用户的第 2 个及之后的系统角色会从选项里消失 → 保存时被静默解绑。
-        for (const boundId of boundRoleIds) {
+        for (const boundId of bound) {
           if (!visibleRoles.some((r) => r.id === boundId)) {
-            const bound = roleList.items.find((r) => r.id === boundId);
-            if (bound) visibleRoles.push(bound);
+            const role = roleList.items.find((r) => r.id === boundId);
+            if (role) visibleRoles.push(role);
           }
         }
         setRoleOptions(visibleRoles);
-        form.setFieldValue('role_ids', boundRoleIds);
+        form.setFieldValue('role_ids', bound);
       } else {
+        setBoundRoleIds([]);
         setRoleOptions(visibleRoles);
         // 切换租户清空已选角色，防止跨租户角色 id 残留
         form.setFieldValue('role_ids', []);
       }
     } catch {
       setRoleOptions([]);
+      setBoundRoleIds([]);
+      setRoleDataFailed(true);
     } finally {
       setRoleLoading(false);
     }
@@ -100,6 +119,8 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
       open(user) {
         const cachedUser = readCachedUser<ShellUser>();
         setEditing(user ?? null);
+        setRoleDataFailed(false);
+        setBoundRoleIds([]);
         if (user) {
           form.setFieldsValue({
             username: user.username,
@@ -134,6 +155,10 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
 
   const handleSave = async () => {
     try {
+      if (roleDataFailed) {
+        message.error(t('userManagement.roleLoadFailed'));
+        return;
+      }
       const values = await form.validateFields();
       // 用户名与姓名去除首尾空格后提交
       const username = (values.username ?? '').trim();
@@ -176,6 +201,15 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
       setSubmitting(false);
     }
   };
+
+  // 已绑定但不在角色选项里的 id（可见性过滤/分页边界）补占位文案，避免裸 id。
+  const knownRoleIds = new Set(roleOptions.map((r) => r.id));
+  const roleSelectOptions = [
+    ...roleOptions.map((role) => ({ label: role.name, value: role.id })),
+    ...boundRoleIds
+      .filter((id) => !knownRoleIds.has(id))
+      .map((id) => ({ label: t('userManagement.unknownRole', { id }), value: id })),
+  ];
 
   return (
     <Modal
@@ -259,10 +293,7 @@ const UserFormModal = forwardRef<UserFormModalHandle, Props>(({ tenants, onSaved
             placeholder={targetTenantId ? t('userManagement.requiredRole') : t('userManagement.requiredTenant')}
             loading={roleLoading}
             disabled={!targetTenantId}
-            options={roleOptions.map((role) => ({
-              label: role.name,
-              value: role.id,
-            }))}
+            options={roleSelectOptions}
           />
         </Form.Item>
         {!editing && (

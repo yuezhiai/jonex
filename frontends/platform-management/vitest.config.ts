@@ -24,6 +24,10 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // jsdom 下 antd 组件的挂载/交互（cssinjs 注入、门户、无障碍树查询）比 node
+    // 纯逻辑测试慢一个量级，默认 5s 会误伤（演化台 RunDetail / StartRunModal 已踩到）
+    // —— 与 core-business 同口径，单测放宽到 20s。
+    testTimeout: 20000,
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     server: {
       deps: {
