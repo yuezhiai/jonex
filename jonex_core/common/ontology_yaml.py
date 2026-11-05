@@ -16,6 +16,10 @@ from typing import Any, Optional
 
 import yaml
 
+# ── YAML 格式版本（跨系统契约） ────────────────────────────────────
+# 固定为 1；勿与 DB 的 schema_version（乐观锁版本，每次编辑自增）混用。
+ONTOLOGY_YAML_FORMAT_VERSION = 1
+
 # ── 属性类型 → YAML 英文类型（导出用） ──────────────────────────────
 _ATTR_TYPE_TO_YAML = {
     "string": "string",
@@ -49,6 +53,20 @@ _TEMPLATE_RELATION_TYPE_TO_CARDINALITY = {
     "一对多": "one_to_many",
     "多对多": "many_to_many",
     "多对一": "many_to_one",  # [jonex] P1：补缺，此前「多对一」静默降级 custom
+}
+
+# DB/历史导出中可能出现的非契约写法 → YAML 契约词表。
+# ontology builder（nexonto）只认 one_to_one/one_to_many/many_to_one/many_to_many/custom，
+# 其它值会被静默丢弃，故导出前必须归一化。
+_YAML_CARDINALITY_ALIASES = {
+    "1:1": "one_to_one",
+    "1:N": "one_to_many",
+    "N:1": "many_to_one",
+    "N:N": "many_to_many",
+    "一对一": "one_to_one",
+    "一对多": "one_to_many",
+    "多对多": "many_to_many",
+    "多对一": "many_to_one",
 }
 
 
@@ -383,8 +401,10 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
         if a.description:
             d["description"] = a.description
         d["type"] = to_yaml_attr_type(a.type)
-        if a.required:
-            d["required"] = True
+        # 契约要求 required 为必填布尔字段：false 也必须显式输出。
+        # 省略时 Jonex 自身能按默认 false 解析，但跨系统导入（ontology builder 的
+        # Schema v1 zod 校验）会因 "expected boolean, received undefined" 整份拒绝。
+        d["required"] = bool(a.required)
         if a.is_primary_key:
             d["is_primary_key"] = True
         return d
@@ -411,8 +431,9 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             d["description"] = r.description
         if r.aliases:
             d["aliases"] = [a for a in r.aliases]
-        if r.cardinality != "custom":
-            d["cardinality"] = r.cardinality
+        cardinality = to_yaml_cardinality(r.cardinality)
+        if cardinality != "custom":
+            d["cardinality"] = cardinality
         if r.inverse_of:
             d["inverse_of"] = r.inverse_of
         if r.source_types:
@@ -437,19 +458,18 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             d["suggestion"] = c.suggestion
         return d
 
+    # 四个集合键始终输出（即使是空数组）：ontology builder 的 Schema v1 契约
+    # 把 entity_types/relation_types/constraints 都定义为必填数组，缺键会整份导入失败。
     data: dict[str, Any] = {
         "version": doc.version,
         "domain": doc.domain,
-    }
-    if doc.entity_types:
-        data["entity_types"] = [_entity_to_dict(e) for e in doc.entity_types]
-    if doc.relation_types:
-        data["relation_types"] = [_rel_to_dict(r) for r in doc.relation_types]
-    if doc.constraints:
-        data["constraints"] = [_constraint_to_dict(c) for c in doc.constraints]
-    data["disambiguation"] = {
-        "case_insensitive": doc.disambiguation.get("case_insensitive", True),
-        "alias_merge": doc.disambiguation.get("alias_merge", True),
+        "entity_types": [_entity_to_dict(e) for e in doc.entity_types],
+        "relation_types": [_rel_to_dict(r) for r in doc.relation_types],
+        "constraints": [_constraint_to_dict(c) for c in doc.constraints],
+        "disambiguation": {
+            "case_insensitive": doc.disambiguation.get("case_insensitive", True),
+            "alias_merge": doc.disambiguation.get("alias_merge", True),
+        },
     }
 
     buf = io.StringIO()
@@ -500,6 +520,18 @@ def template_relation_type_to_card(relation_type: str) -> str:
 def to_yaml_attr_type(db_type: str) -> str:
     """DB attr_type → YAML 英文类型。未知类型返回 string 并应在调用方记 warning。"""
     return _ATTR_TYPE_TO_YAML.get(db_type.strip(), "string")
+
+
+def to_yaml_cardinality(cardinality: Optional[str]) -> str:
+    """DB/历史基线写法 → YAML 契约基数词表（未知值回落 custom）。
+
+    ontology builder 只认 one_to_one / one_to_many / many_to_one / many_to_many /
+    custom；N:1 这类写法在对方侧会被静默丢弃，因此导出前统一归一化。
+    """
+    value = (cardinality or "").strip()
+    if value in _CARDINALITY_TO_TEMPLATE_RELATION_TYPE:
+        return value
+    return _YAML_CARDINALITY_ALIASES.get(value, "custom")
 
 
 def normalize_attr_type(raw: str) -> str:
