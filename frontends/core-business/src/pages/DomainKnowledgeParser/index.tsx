@@ -28,6 +28,7 @@ import {
   type ParserSettingPayload,
   type PromptTemplateListItem,
 } from '@/api/domainKnowledge';
+import SimilarityCheckSettings from './SimilarityCheckSettings';
 import './index.css';
 
 interface ParserConfigRow {
@@ -601,6 +602,8 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
             {t('parserConfig.addSetting')}
           </Button>
         </div>
+
+        {resolvedKbId && <SimilarityCheckSettings kbId={resolvedKbId} canWrite={canWrite} />}
 
         {notice && (
           <div className="parser-config-notice">

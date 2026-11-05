@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:20.18-alpine AS builder
+FROM node:24.22.1-alpine AS builder
 WORKDIR /app
 
 # 构建源镜像开关：false=国内源（npmmirror），true=国外官方源（registry.npmjs.org）
@@ -39,13 +39,26 @@ COPY frontends/tsconfig.base.json ./
 COPY frontends/vite.base.config.ts ./
 
 # 生产登录页为同源相对路径 /login；覆盖 .env 烘入的本地 dev 网关地址 localhost:8080（生产无 8080 服务，跳转会落到死地址）
+# 构建期注入的生产值：dev 的 `.env` 已从构建上下文排除（.dockerignore），
+# 这些键原先全靠 `.env` 提供，缺了会退回代码默认值（standalone 路由基址错、appId 错）。
 ARG VITE_LOGIN=/login
-ENV VITE_LOGIN=${VITE_LOGIN}
+ARG VITE_APP_ID=core-business
+ARG VITE_STANDALONE_BASE=/core-business/
+ARG VITE_AUTH_ME=/api/v1/auth/me
+ARG VITE_AUTH_EXCHANGE_TICKET=/api/v1/auth/exchange-ticket
+ENV VITE_LOGIN=${VITE_LOGIN} \
+    VITE_APP_ID=${VITE_APP_ID} \
+    VITE_STANDALONE_BASE=${VITE_STANDALONE_BASE} \
+    VITE_AUTH_ME=${VITE_AUTH_ME} \
+    VITE_AUTH_EXCHANGE_TICKET=${VITE_AUTH_EXCHANGE_TICKET}
 
 ENV NODE_OPTIONS=--max-old-space-size=2048 GOMAXPROCS=2
 RUN pnpm --filter @jonex/core-business build
 
 FROM nginx:1.27-alpine
+# ARG 不跨 stage 继承：最终镜像的 label 要在本 stage 重新声明才能取到值
+ARG USE_OVERSEAS_MIRROR=false
+LABEL org.jonex.build.mirror="${USE_OVERSEAS_MIRROR}"
 # pdf.js 的 worker 是 .mjs；基础镜像的 mime.types 不含 mjs，默认落成
 # application/octet-stream，浏览器会拒绝把它当 ES module 加载。
 # 直接在标准类型表里补一项（不能在被 include 的 types 块里再 include

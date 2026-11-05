@@ -1,17 +1,14 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Input, Button, Table, Tag, Modal, Space, message, Result, Spin, Select, Typography } from 'antd';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Input, Button, Table, Tag, Modal, Space, message, Result, Spin, Select } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
   ReloadOutlined,
   KeyOutlined,
   DeleteOutlined,
-  CopyOutlined,
-  CheckOutlined,
   StopOutlined,
 } from '@ant-design/icons';
 import { useSearchParams } from 'react-router-dom';
-import copy from 'copy-to-clipboard';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '@/store';
 import { SPACE_URL_PARAM } from '@jonex/shell-sdk';
@@ -19,6 +16,7 @@ import { PageContent, PageHeader } from '@jonex/shared-lib';
 import type { ColumnsType } from 'antd/es/table';
 import {
   listServices,
+  createService,
   updateService,
   deleteService,
   listServiceApiKeys,
@@ -27,13 +25,15 @@ import {
 } from '../../api/domainService';
 import {
   getServiceStatusMap,
+  type DomainServiceFormData,
   type DomainServiceItem,
   type KnowledgeBaseOption,
   type ServiceApiKeyItem,
 } from '../../types/domainService';
 import { getDomainKnowledgeList } from '../../api/domainKnowledge';
-import ServiceFormModal from './ServiceFormModal';
-import type { ServiceFormModalHandle } from './ServiceFormModal';
+import ServiceConfigModal from '@/pages/DomainManagement/ServiceConfigModal';
+import ServiceFormModal from '@/pages/DomainManagement/ServiceFormModal';
+import type { ServiceFormValues } from '@/pages/DomainManagement/ServiceFormModal';
 
 const DomainManagementServices = function DomainManagementServices() {
   const { t } = useTranslation();
@@ -51,7 +51,9 @@ const DomainManagementServices = function DomainManagementServices() {
   const [typeFilter, setTypeFilter] = useState('all');
   const [submitting, setSubmitting] = useState(false);
 
-  const serviceFormRef = useRef<ServiceFormModalHandle>(null);
+  const [serviceFormOpen, setServiceFormOpen] = useState(false);
+  const [editingService, setEditingService] = useState<DomainServiceItem | null>(null);
+  const [submittingService, setSubmittingService] = useState(false);
 
   // ── Modal state ──
   const [deleteTarget, setDeleteTarget] = useState<DomainServiceItem | null>(null);
@@ -62,7 +64,6 @@ const DomainManagementServices = function DomainManagementServices() {
   const [apiKeys, setApiKeys] = useState<ServiceApiKeyItem[]>([]);
   const [apiKeysLoading, setApiKeysLoading] = useState(false);
   const [creatingKey, setCreatingKey] = useState(false);
-  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
   // Knowledge base list for form
   const [availableKbs, setAvailableKbs] = useState<KnowledgeBaseOption[]>([]);
@@ -179,10 +180,49 @@ const DomainManagementServices = function DomainManagementServices() {
     }
   };
 
+  // ── 新建 / 编辑服务弹窗 ──
+  const openCreateService = () => {
+    setEditingService(null);
+    setServiceFormOpen(true);
+  };
+
+  const openEditService = (item: DomainServiceItem) => {
+    setEditingService(item);
+    setServiceFormOpen(true);
+  };
+
+  const handleSubmitService = async (values: ServiceFormValues) => {
+    if (!global.currentSpaceId) {
+      message.warning(t('domainManagement.spaceRequired'));
+      return;
+    }
+    setSubmittingService(true);
+    try {
+      const data: DomainServiceFormData = {
+        name: values.name,
+        space_id: global.currentSpaceId,
+        domain_type: values.domain_type || undefined,
+        status: values.status ? 'active' : 'inactive',
+        kb_ids: values.kb_ids,
+      };
+      if (editingService) {
+        await updateService(editingService.id, data);
+      } else {
+        await createService(data);
+      }
+      message.success(t('common.saveSuccess'));
+      setServiceFormOpen(false);
+      await loadServices();
+    } catch (err: unknown) {
+      message.error(err instanceof Error ? err.message : t('common.saveFailed'));
+    } finally {
+      setSubmittingService(false);
+    }
+  };
+
   // ── Service Config modal ──
   const openSrvConfig = async (item: DomainServiceItem) => {
     setSrvConfigTarget(item);
-    setCopiedKeyId(null);
     setSrvConfigOpen(true);
     setApiKeysLoading(true);
     try {
@@ -193,12 +233,6 @@ const DomainManagementServices = function DomainManagementServices() {
     } finally {
       setApiKeysLoading(false);
     }
-  };
-
-  const handleCopyKey = async (keyId: string, key: string) => {
-    await copy(key);
-    setCopiedKeyId(keyId);
-    setTimeout(() => setCopiedKeyId(null), 2000);
   };
 
   const handleCreateKey = async () => {
@@ -229,15 +263,6 @@ const DomainManagementServices = function DomainManagementServices() {
         message.success(t('common.apiKeyDeleted'));
       },
     });
-  };
-
-  const formatDate = (dateStr: string | null): string => {
-    if (!dateStr) return '—';
-    try {
-      return new Date(dateStr).toISOString().slice(0, 10);
-    } catch {
-      return dateStr;
-    }
   };
 
   const typeLabel = (v: string | null): string => {
@@ -332,7 +357,7 @@ const DomainManagementServices = function DomainManagementServices() {
               className="yx-table-action"
               style={canManageServices ? undefined : { opacity: 0.4, cursor: 'not-allowed' }}
               title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
-              onClick={() => canManageServices && serviceFormRef.current?.openEdit(r)}
+              onClick={() => canManageServices && openEditService(r)}
             >
               {t('common.edit')}
             </a>
@@ -401,7 +426,7 @@ const DomainManagementServices = function DomainManagementServices() {
                 icon={<PlusOutlined />}
                 disabled={!canManageServices}
                 title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
-                onClick={() => serviceFormRef.current?.openCreate()}
+                onClick={() => openCreateService()}
               >
                 {t('domainManagementServices.createService')}
               </Button>
@@ -422,10 +447,14 @@ const DomainManagementServices = function DomainManagementServices() {
           </div>
 
           <ServiceFormModal
-            ref={serviceFormRef}
-            spaceId={global.currentSpaceId}
+            open={serviceFormOpen}
+            editing={editingService}
+            spaceName={global.currentSpace?.name}
             availableKbs={availableKbs}
-            onSaved={loadServices}
+            submitting={submittingService}
+            showType
+            onSubmit={handleSubmitService}
+            onCancel={() => setServiceFormOpen(false)}
           />
 
           {/* ===== Delete Confirm Modal ===== */}
@@ -458,112 +487,18 @@ const DomainManagementServices = function DomainManagementServices() {
             </div>
           </Modal>
 
-          {/* ===== Service Config Modal (API Keys) ===== */}
-          <Modal
-            wrapClassName="yx-domain-space-modal"
-            title={
-              <span>
-                <KeyOutlined style={{ color: '#f97316', marginRight: 8 }} />
-                {t('domainManagement.srvConfigTitle')}
-              </span>
-            }
+          {/* ===== 服务配置（API Key / MCP 接入）===== */}
+          <ServiceConfigModal
             open={srvConfigOpen}
+            canManage={canManageServices}
+            srvConfigTarget={srvConfigTarget}
+            apiKeys={apiKeys}
+            apiKeysLoading={apiKeysLoading}
+            creatingKey={creatingKey}
+            onCreateKey={handleCreateKey}
+            onDeleteKey={handleDeleteKey}
             onCancel={() => setSrvConfigOpen(false)}
-            footer={<Button onClick={() => setSrvConfigOpen(false)}>{t('common.cancel')}</Button>}
-            width={760}
-          >
-            <p style={{ fontSize: 14, color: '#475569', marginBottom: 16 }}>
-              {t('domainManagement.srvConfigDesc', { name: srvConfigTarget?.name || '' })}
-            </p>
-            <div style={{ textAlign: 'right', marginBottom: 12 }}>
-              <Button
-                type="primary"
-                size="small"
-                icon={<PlusOutlined />}
-                loading={creatingKey}
-                onClick={handleCreateKey}
-              >
-                {t('domainManagement.addApiKey')}
-              </Button>
-            </div>
-            {apiKeysLoading ? (
-              <div style={{ textAlign: 'center', padding: 24 }}>
-                <Spin />
-              </div>
-            ) : (
-              <Table<ServiceApiKeyItem>
-                columns={[
-                  {
-                    title: t('domainManagement.apiKey'),
-                    dataIndex: 'key_encrypted',
-                    key: 'key_encrypted',
-                    width: 360,
-                    render: (val: string, record: ServiceApiKeyItem) => (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <span className="yx-key-text">{val || '—'}</span>
-                        {val && (
-                          <Button
-                            type="text"
-                            className={`yx-copy-btn${copiedKeyId === record.id ? ' copied' : ''}`}
-                            title={
-                              copiedKeyId === record.id ? t('common.copySuccess') : t('domainManagement.copyApiKey')
-                            }
-                            onClick={() => handleCopyKey(record.id, val)}
-                          >
-                            {copiedKeyId === record.id ? <CheckOutlined /> : <CopyOutlined />}
-                          </Button>
-                        )}
-                      </span>
-                    ),
-                  },
-                  {
-                    title: t('domainManagement.keyPrefix'),
-                    dataIndex: 'key_prefix',
-                    key: 'key_prefix',
-                    width: 130,
-                    render: (val: string) => (val ? <Typography.Text code>{val}</Typography.Text> : '—'),
-                  },
-                  {
-                    title: t('domainManagement.expiresAt'),
-                    dataIndex: 'expires_at',
-                    key: 'expires_at',
-                    width: 120,
-                    render: (val: string | null) => formatDate(val),
-                  },
-                  {
-                    title: t('domainManagement.createdAt'),
-                    dataIndex: 'created_at',
-                    key: 'created_at',
-                    width: 120,
-                    render: (val: string | null) => formatDate(val),
-                  },
-                  {
-                    title: t('domainManagement.status'),
-                    dataIndex: 'is_active',
-                    key: 'is_active',
-                    width: 90,
-                    render: (v: number) =>
-                      v === 1 ? <Tag color="success">{t('status.active')}</Tag> : <Tag>{t('status.inactive')}</Tag>,
-                  },
-                  {
-                    title: t('domainManagement.srvConfigActions'),
-                    key: 'actions',
-                    width: 100,
-                    render: (_: unknown, record: ServiceApiKeyItem) => (
-                      <Button type="text" danger onClick={() => handleDeleteKey(record.id)}>
-                        <DeleteOutlined /> {t('common.delete')}
-                      </Button>
-                    ),
-                  },
-                ]}
-                dataSource={apiKeys}
-                rowKey="id"
-                pagination={false}
-                size="small"
-                locale={{ emptyText: t('common.noApiKey') }}
-              />
-            )}
-          </Modal>
+          />
         </div>
       </PageContent>
     </>

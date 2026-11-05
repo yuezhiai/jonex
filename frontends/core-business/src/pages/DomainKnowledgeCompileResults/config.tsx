@@ -77,8 +77,8 @@ export function buildOpenkbTabs(
   // 界面左侧目录栏信息完全重复，1-hop 关联也已由条目页的关联/反向链接承担。
   // openkb 保持原「页面树 + 实体关系图」两 tab，不受影响。
   if (isJonexWiki) {
-    // 列式图谱（对比 / 时间轴矩阵 / 溯源审计）只服务 jonex_wiki：
-    // 它需要 canonical 页面路径、claims 明细与表格 scope，openkb 产物没有这些。
+    // 版本化知识图谱：节点类型 → 节点 → 关联，使用统一图查询服务和对外接口。
+    // 仍复用本体链路的列式视觉基础件；openkb 保持原图谱视图。
     tabs.push({
       key: 'wikiColumns',
       label: t('compile.wikiColumns'),

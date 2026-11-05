@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal, Button } from 'antd';
 import type { AnswerFeedbackListItem } from '@/types/knowledgeSearch';
+import { getFeedbackSource, getMcpKeyLabel, getQuerySnapshot } from './feedbackSource';
 
 function formatTime(iso: string | null) {
   if (!iso) return '-';
@@ -33,6 +34,16 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
     >
       {item && (
         <div>
+          {getFeedbackSource(item) === 'mcp' ? (
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+                {t('tracking.mcpKey')}
+              </label>
+              <div style={{ fontSize: 14, color: '#475569', lineHeight: 1.6, wordBreak: 'break-all' }}>
+                {getMcpKeyLabel(item)}
+              </div>
+            </div>
+          ) : null}
           <div style={{ marginBottom: 16 }}>
             <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
               {t('compile.feedback.question')}
@@ -44,11 +55,12 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
                 border: '1px solid #eef2f6',
                 borderRadius: 8,
                 fontSize: 14,
-                color: '#0b2b5c',
+                color: getQuerySnapshot(item) ? '#0b2b5c' : '#94a3b8',
                 lineHeight: 1.6,
               }}
             >
-              {item.query}
+              {getQuerySnapshot(item) ??
+                (getFeedbackSource(item) === 'mcp' ? t('tracking.mcpNoQuerySnapshot') : '-')}
             </div>
           </div>
           <div style={{ marginBottom: 16 }}>
@@ -101,7 +113,11 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
               </div>
             </div>
           ) : null}
-          <div style={{ display: 'flex', gap: 20, fontSize: 13, color: '#94a3b8' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, fontSize: 13, color: '#94a3b8' }}>
+            <span>
+              {t('tracking.sourceLabel')}
+              {t(getFeedbackSource(item) === 'mcp' ? 'tracking.sourceMcp' : 'tracking.sourceWeb')}
+            </span>
             <span>
               {t('tracking.searchTime')}
               {formatTime(item.created_at)}

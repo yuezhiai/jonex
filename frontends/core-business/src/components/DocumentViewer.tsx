@@ -127,14 +127,18 @@ export function useDocumentViewer() {
         const sep = url.includes('?') ? '&' : '?';
         let finalUrl = url;
         if (kind === 'video' || kind === 'audio') {
-          // 音视频：302 直连对象存储（Range 流式最优），带时间锚点 fragment 定位。
-          // 直连来源须在 CSP media-src 白名单内（部署项 CSP_STORAGE_ORIGIN）。
+          // 音视频：同源代理（网关透传 Range，仍可流式/拖动）。预签名直连的域名是
+          // 对象存储的部署内地址（如 `minio:9000`），浏览器解析不了 → 播放白屏。
+          finalUrl = `${url}${sep}proxy=1`;
           if (timeStart != null) {
-            finalUrl = `${url}#t=${timeStart}${timeEnd != null ? `,${timeEnd}` : ''}`;
+            finalUrl = `${finalUrl}#t=${timeStart}${timeEnd != null ? `,${timeEnd}` : ''}`;
           }
-        } else if (kind === 'pdf' || kind === 'text' || kind === 'other') {
-          // iframe 内嵌：走网关同源代理，规避跨域 CSP(frame-src) / 上游 X-Frame-Options。
+        } else if (kind === 'pdf' || kind === 'text' || kind === 'other' || kind === 'image') {
+          // 网关同源代理：规避跨域 CSP / 上游 X-Frame-Options。
           // 同源 → 与后端是 cos 还是 s3 无关，无需 CSP 白名单。
+          // ⚠️ 图片也必须走代理（2026-10-22 真机）：302 直连的预签名 URL 用的是
+          // 对象存储的**部署内地址**（如 `http://minio:9000/...`），浏览器解析不了 →
+          // 「查看原文件」白屏。代理由网关在服务端取字节，图片/PDF/文本都适用。
           finalUrl = `${url}${sep}proxy=1`;
           // PDF 页码定位：#page=N 是浏览器 PDF viewer 的本地 fragment（不发送到
           // 服务器），Chrome/Firefox 均支持；N 为 1-based。
@@ -168,8 +172,7 @@ export function useDocumentViewer() {
             if (!spans || spans.length === 0) return;
             setState((s) => (s.open && s.docId === opts.docId ? { ...s, spans } : s));
           });
-        }
-      })
+        }      })
       .catch((err: any) => message.error(err?.message || t('common.openDocumentFailed')));
   }, []);
 
@@ -260,6 +263,11 @@ export function useDocumentViewer() {
       width={state.kind === 'audio' ? 520 : isFrame ? 960 : isVideo || isImage ? 1100 : 820}
       onCancel={close}
       destroyOnHidden
+      // 这一层永远在最上面：它可能从「引用详情」抽屉（1000）或「原文证据」抽屉（1100）里
+      // 打开，而打开它的同时源抽屉正在播放关闭动画 —— 只靠 portal 追加顺序会在那 300ms
+      // 里被源抽屉盖住。分层见 `WikiEvidenceDrawer` 顶部注释；1200 仍低于 antd 的
+      // message / notification（2110），轻提示不会被挡。
+      zIndex={1200}
       styles={{ body: { padding: isFrame || isVideo || isImage ? 0 : 24 } }}
     >
       {state.kind === 'video' ? (

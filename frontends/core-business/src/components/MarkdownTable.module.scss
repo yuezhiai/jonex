@@ -1,0 +1,113 @@
+.wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 12px 0 14px;
+  border: 1px solid #e6ebf4;
+  border-radius: 10px;
+  background: #fff;
+  // 可横向滚动的区域必须能聚焦，键盘用户才能滚动（WCAG 2.1.1）
+  &:focus-visible {
+    outline: 2px solid #6366f1;
+    outline-offset: 2px;
+  }
+}
+
+.table {
+  // separate 而非 collapse：collapse 下 sticky 首列会与相邻单元格的边框打架
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+
+.table th {
+  padding: 9px 14px;
+  background: #f6f8fc;
+  color: #0f172a;
+  font-weight: 600;
+  text-align: left;
+  border-bottom: 1px solid #e6ebf4;
+}
+
+.table td {
+  padding: 9px 14px;
+  color: #334155;
+  vertical-align: top;
+  border-bottom: 1px solid #f1f5f9;
+  // 长文本列（如「权限项」描述）换行，别把整张表撑到屏幕外
+  overflow-wrap: anywhere;
+  max-width: 340px;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr:nth-child(even) td {
+  background: #fbfcfe;
+}
+
+// 首列粘左：横向滚动时行头不丢。必须给 sticky 单元格自己的底色，
+// 否则滚动内容会从下面透出来。
+.table th:first-child,
+.table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+
+.table th:first-child {
+  z-index: 2;
+}
+
+.table td:first-child {
+  background: #fff;
+}
+
+.table tbody tr:nth-child(even) td:first-child {
+  background: #fbfcfe;
+}
+
+// 勾选符号格（☑/□）：方块之间留 5px，格子本身按全表统一的左对齐排版。
+// 曾经试过「符号格居中」，但表头是左对齐的 ⇒ 表头文字和下面的方块错位（表头在列左、
+// 色块在列中），看着更乱。CSS 也没法把某一列的表头单独跟着居中，所以统一左对齐最稳。
+.symbolCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.symbolBox {
+  box-sizing: border-box;
+  display: inline-block;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  line-height: 14px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.symbolOn {
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  color: #15803d;
+}
+
+.symbolOn::after {
+  content: '✓';
+}
+
+.symbolOff {
+  background: #fff;
+  border: 1px solid #cbd5e1;
+}
+
+.symbolSep {
+  color: #cbd5e1;
+  font-size: 12px;
+}

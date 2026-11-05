@@ -1,23 +1,32 @@
 import React, { useEffect, useState } from 'react';
 import { Modal, Form, Input, Select, InputNumber, Typography, message, Alert, Table } from 'antd';
 import { useTranslation } from 'react-i18next';
-import { listAccessMethods, createDataSource } from '@/api/dataSource';
-import type { AccessMethodItem, DataSourceInstance } from '@/types/dataSource';
+import { listAccessMethods, createDataSource, listConnections } from '@/api/dataSource';
+import type { AccessMethodItem, ConnectionItem, DataSourceInstance } from '@/types/dataSource';
 import { EXTENSIONS_NO_DOT } from '@/constants/upload';
 import { accessMethodDisplayName } from '@/utils/dataSourceDisplay';
 
 interface Props {
   open: boolean;
   kbId: string;
+  /** 该知识库所属领域：连接池按领域隔离，只能选同领域的连接。 */
+  spaceId?: string;
   /** 已有数据源的 access_type 集合，用于禁止重复添加同类型 */
   existingTypes: string[];
   onClose: () => void;
   onCreated: (ds: DataSourceInstance) => void;
 }
 
-export default function AddDataSourceModal({ open, kbId, existingTypes, onClose, onCreated }: Props) {
+export default function AddDataSourceModal({
+  open, kbId, spaceId, existingTypes, onClose, onCreated,
+}: Props) {
   const { t } = useTranslation();
   const [methods, setMethods] = useState<AccessMethodItem[]>([]);
+  const [connections, setConnections] = useState<ConnectionItem[]>([]);
+  /** 连接池单独一份 loading / error：它和接入方式互不牵连，但下拉里「在拉」「拉挂了」
+   *  「真的一条都没有」是三种话——只有第三种才该让用户去平台管理创建。 */
+  const [connectionsLoading, setConnectionsLoading] = useState(false);
+  const [connectionsError, setConnectionsError] = useState(false);
   const [loading, setLoading] = useState(false);
   const [showApiHelp, setShowApiHelp] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -36,7 +45,24 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
       .then(setMethods)
       .catch((e: any) => message.error(e?.message || t('dataSource.loadMethodsFailed')))
       .finally(() => setLoading(false));
-  }, [open, form, t]);
+    // 连接池并行拉，失败不挡别的接入类型；但也不能降级成「空下拉」——那会让用户看到
+    // 「还没有可用的连接，请先到平台管理创建」，而连接可能好好地在那儿。单独记错误态。
+    setConnections([]); // 重开弹窗先清掉上一轮的列表，免得旧数据闪一下
+    setConnectionsError(false);
+    if (!spaceId) {
+      // 没有领域就拉不到连接（后端按领域隔离）；这不是错误，等详情带回领域。
+      setConnectionsLoading(false);
+      return;
+    }
+    setConnectionsLoading(true);
+    listConnections(spaceId)
+      .then(setConnections)
+      .catch((e: any) => {
+        setConnectionsError(true);
+        message.error(e?.message || t('dataSource.loadConnectionsFailed'));
+      })
+      .finally(() => setConnectionsLoading(false));
+  }, [open, form, t, spaceId]);
 
   // 选择接入方式后自动填写默认名称
   useEffect(() => {
@@ -45,11 +71,25 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
     }
   }, [selected, form, t]);
 
-  // 过滤已添加的类型
+  // 过滤已添加的类型。
+  //
+  // **`database` 例外**：一个知识库本来就可以接多个数据库（每个数据源一份自己的
+  // schema，见 037 的按数据源粒度）。把它一起过滤掉会直接掐死「一库多数据源」。
+  // 其余类型仍只允许一份——重复接同一类文档来源没有意义。
   const existingSet = new Set(existingTypes);
-  const availableMethods = methods.filter((m) => !existingSet.has(m.accessType));
+  const availableMethods = methods.filter(
+    (m) => m.accessType === 'database' || !existingSet.has(m.accessType),
+  );
 
   const accessType = selected?.accessType;
+
+  // 连接下拉的三种空态：在拉 / 拉挂了 / 真的一条都没有。混成一种会把「拉挂了」说成
+  // 「还没有可用的连接，请先到平台管理创建」，用户照着去建，建完发现列表里已经有几条。
+  const connectionsEmptyText = connectionsLoading
+    ? t('common.loading')
+    : connectionsError
+      ? t('dataSource.loadConnectionsFailed')
+      : t('dataSource.noConnections');
 
   function buildConfig(v: any): Record<string, any> {
     if (accessType === 'api') {
@@ -88,6 +128,9 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
     if (accessType === 'file') {
       return {};
     }
+    // `database` 走**引用**路径，不经这里（见 handleCreate）——本函数产出的是内联
+    // config（engine/host/密码…），那是存量路径，添上 database 分支等于把凭证
+    // 在引用行再抄一份，「改一次密码、N 个库一起生效」就不成立了。
     return {};
   }
 
@@ -99,13 +142,28 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
     const v = await form.validateFields();
     setSubmitting(true);
     try {
-      const ds = await createDataSource({
-        knowledge_base_id: kbId,
-        access_method_id: selected.id,
-        access_type: selected.accessType,
-        name: v.name,
-        config_json: buildConfig(v),
-      });
+      // database 走**引用**路径：只传连接 id，config_json 留空（后端 `create_source`
+      // 见 connection_id 就不会去读 config_json）。别走 buildConfig —— 它产出的
+      // 是内联 config（engine/host/密码…），那是存量路径，会把凭证在引用行再抄一份。
+      const isReference = accessType === 'database';
+      const ds = await createDataSource(
+        isReference
+          ? {
+              knowledge_base_id: kbId,
+              access_method_id: selected.id,
+              access_type: selected.accessType,
+              name: v.name,
+              connection_id: v.connection_id,
+              config_json: {},
+            }
+          : {
+              knowledge_base_id: kbId,
+              access_method_id: selected.id,
+              access_type: selected.accessType,
+              name: v.name,
+              config_json: buildConfig(v),
+            },
+      );
       if (ds.accessType === 'api_push' && ds.ingestKey) {
         setCreated(ds); // 展示一次性 key，不立即关闭
       } else {
@@ -329,6 +387,39 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
             </>
           )}
 
+          {accessType === 'database' && (
+            <Form.Item
+              label={t('dataSource.selectConnection')}
+              name="connection_id"
+              rules={[{ required: true, message: t('dataSource.connectionRequired') }]}
+              extra={t('dataSource.connectionHint')}
+            >
+              <Select
+                placeholder={t('dataSource.selectConnectionPlaceholder')}
+                options={connections.map((c) => ({
+                  value: c.id,
+                  label: `${c.name}（${(c.config_json || {}).engine ?? ''} / ${(c.config_json || {}).database ?? ''}）`,
+                }))}
+                showSearch
+                optionFilterProp="label"
+                loading={connectionsLoading}
+                notFoundContent={connectionsEmptyText}
+                onChange={(value: string) => {
+                  // 数据库接入默认只把名称填成接入方式名（「数据库接入」），一库多源时
+                  // 会出现三条同名数据源，ETL 的目标下拉分不清是哪台库。选中连接后，
+                  // 若名称还是默认值（或为空），自动带出连接名；用户敲过的不覆盖。
+                  const picked = connections.find((c) => c.id === value);
+                  if (!picked) return;
+                  const current = String(form.getFieldValue('name') ?? '').trim();
+                  const defaultName = selected ? accessMethodDisplayName(selected, t) : '';
+                  if (!current || current === defaultName) {
+                    form.setFieldsValue({ name: picked.name });
+                  }
+                }}
+              />
+            </Form.Item>
+          )}
+
           {accessType === 'file' && (
             <Alert
               type="info"
@@ -354,7 +445,9 @@ export default function AddDataSourceModal({ open, kbId, existingTypes, onClose,
                       },
                     ]}
                     columns={[
-                      { title: t('dataSource.fileType'), dataIndex: 'type', key: 'type', width: 80 },
+                      // 表头走 common：同app 里几张文件表的「类型」列都用它
+                      // （DataSourceDocTable / DomainKnowledgeBlank），dataSource 下没有也不需要重复一份
+                      { title: t('common.fileType'), dataIndex: 'type', key: 'type', width: 80 },
                       { title: t('dataSource.extensions'), dataIndex: 'exts', key: 'exts' },
                     ]}
                     rowKey="type"

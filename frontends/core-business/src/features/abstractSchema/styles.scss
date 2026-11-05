@@ -1,0 +1,57 @@
+/** 抽象编辑器（在 ontologyCanvas/styles.scss 之外，只加落点/背书两块）。 */
+.ae-page {
+  .ae-landings { margin: 8px 0; border-top: 1px dashed #d9e2ec; padding-top: 8px; }
+  .ae-landings-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; color: #0b2b5c; }
+  .ae-landings-empty { color: #65758b; font-size: 12px; margin: 4px 0; }
+  /* 落点/来源行：允许换行——行内放不下（长列名 + role 输入 + 删除）就折行，
+     不把属性面板单列 grid 的轨道 min-content 撑宽（横向溢出的根因）。 */
+  .ae-landing { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; }
+  /* 未纳入的落点行：内容淡化，但「打开源画布」链接保持可点观感——它是查看入口，
+     整行 opacity 会让它看起来像被禁用（全波终审 Minor ③）。 */
+  .ae-landing.is-off > :not(.ae-landing-open) { opacity: 0.45; }
+  .ae-landing-src { margin: 0; }
+  /* 来源块产生方式提示（全波终审 Minor ④） */
+  .ae-sources-hint { color: #65758b; font-size: 12px; margin: 2px 0 6px; }
+  .ae-landing > code { min-width: 0; overflow-wrap: anywhere; }
+  .ae-picker-list { max-height: 320px; overflow: auto; margin-top: 8px; }
+  .ae-picker-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #f1f5f9; }
+  .ae-backings { margin: 8px 0; border-top: 1px dashed #d9e2ec; padding-top: 8px; }
+  .ae-backings-title { font-weight: 600; color: #0b2b5c; margin: 0 0 4px; }
+  .ae-attr-sources { margin: 4px 0 0; min-width: 0; }
+  .ae-attr-sources-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; color: #0b2b5c; font-size: 12px; }
+  .ae-attr-source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 0; font-size: 12px; min-width: 0; }
+  .ae-attr-source-row > code { min-width: 0; overflow-wrap: anywhere; }
+  .ae-attr-source-role { width: 120px; max-width: 100%; }
+  /* 属性名（长蛇形标识符如 resignation_instructions_description）是属性卡里
+     第二个会把单列 grid 轨道撑宽的内容源：行允许换行 + 名称可断行。
+     仅抽象编辑器页内生效（.ae-page 之外不受影响）。 */
+  .attribute-editor-top { flex-wrap: wrap; }
+  .attribute-editor-top strong { min-width: 0; overflow-wrap: anywhere; }
+}
+
+/* 多态端点契约提示（仅抽象态渲染）：复用既有提示字号（12px）。 */
+.ae-endpoint-hint {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.65;
+}
+
+.ae-suggest-group {
+  margin-bottom: 12px;
+}
+
+.ae-suggest-group-head {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-bottom: 4px;
+}
+
+.ae-suggest-hit {
+  margin-left: 6px;
+}
+
+.ae-suggest-display {
+  margin-left: 6px;
+  opacity: 0.75;
+}

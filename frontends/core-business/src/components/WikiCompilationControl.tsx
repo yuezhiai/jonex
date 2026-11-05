@@ -4,17 +4,19 @@ import { useTranslation } from 'react-i18next';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import { useWikiCompilation } from '@/hooks/useWikiCompilation';
 
-export default function WikiCompilationControl({ kbId, control, compact = false }: {
+export default function WikiCompilationControl({ kbId, control, compact = false, showToggle = true }: {
   kbId: string;
   control: ReturnType<typeof useWikiCompilation>;
   compact?: boolean;
+  /** 是否显示「暂停/恢复自动编译」按钮；jonex_wiki 知识库关闭，只保留状态提示 */
+  showToggle?: boolean;
 }) {
   const { t } = useTranslation();
   const { canWrite } = useKbPermission(kbId);
   const { state, loading, error, refresh, toggle } = control;
   const key = 'domainKnowledge.wikiCompilation';
   const status = control.status;
-  const action = error
+  const action = !showToggle ? null : error
     ? <Button icon={<ReloadOutlined />} onClick={() => void refresh()}>{t('common.retry')}</Button>
     : <Button disabled={!canWrite || !control.canToggle} loading={loading} onClick={() => void toggle()}
         icon={state?.paused ? <CaretRightOutlined /> : <PauseOutlined />}>

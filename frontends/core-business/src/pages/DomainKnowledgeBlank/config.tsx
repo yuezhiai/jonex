@@ -1,4 +1,4 @@
-import { Tag, Space, Button, Dropdown } from 'antd';
+import { Tag, Space, Button, Dropdown, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
 import {
   FileOutlined,
@@ -11,6 +11,7 @@ import {
   FolderOutlined,
   PauseOutlined,
   CaretRightOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons';
 import type { TFunction } from 'i18next';
 import type { ColumnsType } from 'antd/es/table';
@@ -20,7 +21,7 @@ import DocumentStatusBadge from '@/components/DocumentStatusBadge';
 import DocumentQualityBadge from '@/components/DocumentQualityBadge';
 import { accessMethodDisplayName } from '@/utils/dataSourceDisplay';
 
-const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFunction, canWrite: boolean, paused?: boolean, onToggleCompilation?: () => void, controlDisabled?: boolean): MenuProps['items'] => [
+const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFunction, canWrite: boolean, paused?: boolean, onToggleCompilation?: () => void, controlDisabled?: boolean, showModelUpdate = true): MenuProps['items'] => [
   ...(onToggleCompilation ? [{
     key: 'compilation-control',
     icon: paused ? <CaretRightOutlined /> : <PauseOutlined />,
@@ -55,6 +56,13 @@ const actionItems = (record: ManualDocItem, handlers: ActionHandlers, t: TFuncti
     disabled: !canWrite,
     onClick: () => canWrite && handlers.onRecompile(record),
   },
+  ...(showModelUpdate ? [{
+    key: 'update-model',
+    icon: <ExperimentOutlined />,
+    label: t('common.updateModel'),
+    disabled: !canWrite,
+    onClick: () => canWrite && handlers.onUpdateModel(record),
+  }] : []),
   {
     key: 'move',
     icon: <FolderOutlined />,
@@ -77,6 +85,7 @@ interface ActionHandlers {
   onViewResult: (record: ManualDocItem) => void;
   onReparse: (record: ManualDocItem) => void;
   onRecompile: (record: ManualDocItem) => void;
+  onUpdateModel: (record: ManualDocItem) => void;
   onMove: (record: ManualDocItem) => void;
   onDelete: (record: ManualDocItem) => void;
 }
@@ -103,24 +112,50 @@ export const createColumns = (
       key: 'name',
       ellipsis: true,
       width: 200,
-      render: (name: string, record: ManualDocItem) => (
-        <Space>
-          <FileOutlined style={{ color: '#3b82f6' }} />
-          <span
-            style={{
-              color: '#3b82f6',
-              cursor: 'pointer',
-              textDecoration: 'underline',
-            }}
-            onClick={(e) => {
-              e.stopPropagation();
-              handlers.onViewResult(record);
-            }}
-          >
-            {name}
-          </span>
-        </Space>
-      ),
+      render: (name: string, record: ManualDocItem) => {
+        const hint = record.similarityHint;
+        const tip = hint
+          ? t('domainKnowledge.similarity.badgeTip', {
+              name: hint.targetFileName,
+              percent: Math.round(hint.similarity * 100),
+            })
+          : '';
+        return (
+          <Space style={{ minWidth: 0 }}>
+            <FileOutlined style={{ color: '#3b82f6', flex: 'none' }} />
+            <span
+              style={{
+                color: '#3b82f6',
+                cursor: 'pointer',
+                textDecoration: 'underline',
+                // 长文件名先收缩并省略，给徽标保留位置
+                flex: '0 1 auto',
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+              onClick={(e) => {
+                e.stopPropagation();
+                handlers.onViewResult(record);
+              }}
+            >
+              {name}
+            </span>
+            {hint && (
+              <Tooltip title={tip}>
+                <Tag
+                  color="orange"
+                  tabIndex={0}
+                  aria-label={tip}
+                  style={{ flex: 'none', margin: 0 }}
+                >
+                  {t('domainKnowledge.similarity.badge')}
+                </Tag>
+              </Tooltip>
+            )}
+          </Space>
+        );
+      },
     },
     {
       title: t('common.fileType'),
@@ -206,7 +241,7 @@ export const createColumns = (
       width: 80,
       align: 'center',
       render: (_: unknown, record: ManualDocItem) => (
-        <Dropdown menu={{ items: actionItems(record, handlers, t, canWrite, compilationPaused, onToggleCompilation, controlDisabled) }} trigger={['click']} placement="bottomRight">
+        <Dropdown menu={{ items: actionItems(record, handlers, t, canWrite, compilationPaused, onToggleCompilation, controlDisabled, kbType !== 'openkb') }} trigger={['click']} placement="bottomRight">
           <Button type="text" icon={<MoreOutlined />} size="small" />
         </Dropdown>
       ),

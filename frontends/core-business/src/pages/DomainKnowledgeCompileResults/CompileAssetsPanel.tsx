@@ -1,7 +1,9 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import type { CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Tabs, Space, Skeleton } from 'antd';
+import { Alert, Button, Result, Tabs, Space, Skeleton } from 'antd';
+import { ReloadOutlined } from '@ant-design/icons';
+import { getErrorMessage } from '@jonex/shared-lib';
 import type {
   OntologyStatistics,
   OntologyInstanceSummary,
@@ -76,9 +78,15 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
   const [activeTab, setActiveTab] = useState('ontology');
   const [statsData, setStatsData] = useState<OntologyStatistics | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
+  // 决定性请求（statistics）失败：lightrag 的 tab 全靠它的计数构建，必须整页报错而不是留空
+  const [statsError, setStatsError] = useState<string | null>(null);
+  // 次要请求（实体类型 / 关系类型）失败：tab 仍可渲染，只降级类型标签与建实例下拉，用横幅提示
+  const [typesError, setTypesError] = useState<string | null>(null);
   const [entityTypes, setEntityTypes] = useState<OntologyInstanceSummary[] | null>(null);
   const [relationTypes, setRelationTypes] = useState<RelationInstanceSummary[] | null>(null);
   const [feedbackStats, setFeedbackStats] = useState<SearchFeedbackStats | null>(null);
+  // 重试令牌：自增即重跑下面那批请求（错误态重试按钮与次要错误横幅共用）
+  const [reloadToken, setReloadToken] = useState(0);
   // [jonex] openkb 分流：kbType 决定展示 Wiki 页面/图谱（本体数据为空）；
   // wikiCounts = 宿主页下发的全库三类页数，tab 计数用它
   const wikiCounts = wikiStats ?? EMPTY_WIKI_STATS;
@@ -99,39 +107,78 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
     }
   }, [isLlmWiki, isJonexWiki, activeTab]);
 
+  const retry = useCallback(() => setReloadToken((n) => n + 1), []);
+
   // 进入面板请求统计 + 本体实例 + 关系实例 + 反馈统计
+  // 三个失败分支分档处理（不再静默吞错）：
+  //   - statistics：决定性，失败 ⇒ statsError ⇒ lightrag 整页错误态（见下方渲染分支）；
+  //   - entity/relation-types：次要，失败 ⇒ typesError ⇒ 顶部横幅提示，tab 与表格照常；
+  //   - feedback-stats：只喂「用户赞/踩采纳」两个 tab 计数（当前未启用），失败降级为 0，
+  //     不打扰用户——但仍显式落一个零值兜底，而不是把异常丢掉。
   useEffect(() => {
     if (!kbId) return;
+    let alive = true;
     setStatsLoading(true);
+    setStatsError(null);
+    setTypesError(null);
 
     getOntologyStatistics(kbId)
-      .then(setStatsData)
-      .catch(() => {})
-      .finally(() => setStatsLoading(false));
+      .then((data) => {
+        if (alive) setStatsData(data);
+      })
+      .catch((err) => {
+        if (alive) setStatsError(getErrorMessage(err, t('compile.assets.loadErrorDesc')));
+      })
+      .finally(() => {
+        if (alive) setStatsLoading(false);
+      });
 
     getOntologyEntityTypes(kbId)
-      .then((res) => setEntityTypes(res.items.map((item) => ({ ...item, type: item.name }))))
-      .catch(() => {});
+      .then((res) => {
+        if (alive) setEntityTypes(res.items.map((item) => ({ ...item, type: item.name })));
+      })
+      .catch((err) => {
+        if (alive) setTypesError(getErrorMessage(err, t('compile.assets.partialError')));
+      });
 
     getOntologyRelationTypes(kbId)
-      .then((res) => setRelationTypes(res.items))
-      .catch(() => {});
+      .then((res) => {
+        if (alive) setRelationTypes(res.items);
+      })
+      .catch((err) => {
+        // 两个次要请求只留第一条错误文案，避免横幅内容来回跳
+        if (alive) setTypesError((prev) => prev ?? getErrorMessage(err, t('compile.assets.partialError')));
+      });
 
     getSearchFeedbackStats(kbId)
-      .then(setFeedbackStats)
-      .catch(() => {});
-  }, [kbId]);
+      .then((stats) => {
+        if (alive) setFeedbackStats(stats);
+      })
+      .catch(() => {
+        if (alive) setFeedbackStats({ total: 0, like_count: 0, dislike_count: 0 });
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [kbId, reloadToken, t]);
 
   const tabs = useMemo(() => {
+    // llm-wiki 的 tab 计数来自宿主页下发的 wikiStats，不依赖本体统计——
+    // 统计请求失败也不能把这两类库的页面清空（子视图自己会报自己的错）
+    if (isLlmWiki) return buildOpenkbTabs(t, wikiCounts, isJonexWiki);
     if (!statsData) return [];
-    return isLlmWiki
-      ? buildOpenkbTabs(t, wikiCounts, isJonexWiki)
-      : buildTabs(t, statsData, feedbackStats?.like_count, feedbackStats?.dislike_count);
+    return buildTabs(t, statsData, feedbackStats?.like_count, feedbackStats?.dislike_count);
   }, [isLlmWiki, isJonexWiki, statsData, feedbackStats, wikiCounts, t]);
   // 首次加载（tab 计数还没到位）走骨架屏，撑住布局。
   // lightrag 的 tab 计数取自 statsData，llm-wiki 取自宿主页下发的 wikiStats——
   // 后者比 statsData 晚到也不算问题：计数只是 tab 头上一行灰字，补上时不引起跳变。
   const initialLoading = statsLoading;
+  // lightrag 的 tab 构建依赖本体统计，统计 404/失败 ⇒ 整页错误态（含重试）。
+  // llm-wiki 的 tab 用 wikiStats，统计失败不影响它们，交给子视图各自报错。
+  const loadError = !isLlmWiki && !!statsError;
+  // 次要错误横幅：只在 tab 能正常渲染时出现，避免与整页错误叠加
+  const showTypesWarning = !loadError && !isLlmWiki && !!typesError;
   // 一律走「撑满」布局：子视图（表格 / 图谱 / 页面树）都要跟着容器高度自适应，
   // 内容超出时各自内部滚动。原先只有 llm-wiki 撑满、lightrag 依赖外层滚动，
   // 于是同一批子视图在文档级和知识库级两处呈现不一致——现在两边统一走这条链。
@@ -195,8 +242,42 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
             </Space>
             <Skeleton active title={false} paragraph={{ rows: 5, width: '100%' }} />
           </div>
+        ) : loadError ? (
+          // 统一错误态：此前四个请求全部静默吞错，statsData 永远为空 ⇒ tabs=[] ⇒
+          // 页面只剩一片空白（普通用户无密级时四个接口全 404 的真实表现）。
+          <Result
+            status="warning"
+            title={t('compile.assets.loadErrorTitle')}
+            subTitle={
+              <>
+                <div>{statsError}</div>
+                {/* 与知识库页整页错误态同一措辞：404 同时覆盖「不存在」与「无权访问」 */}
+                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
+                  {t('domainKnowledge.loadErrorHint')}
+                </div>
+              </>
+            }
+            extra={
+              <Button icon={<ReloadOutlined />} onClick={retry}>
+                {t('common.retry')}
+              </Button>
+            }
+          />
         ) : (
           <>
+            {showTypesWarning && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message={t('compile.assets.partialError')}
+                action={
+                  <Button size="small" onClick={retry}>
+                    {t('common.retry')}
+                  </Button>
+                }
+              />
+            )}
             {/* className 供宿主样式去掉 .ant-tabs-nav 的默认下边距；
                 不再自带左右内边距——内容直接落在宿主卡片的内边距上，少一层缩进 */}
             <Tabs

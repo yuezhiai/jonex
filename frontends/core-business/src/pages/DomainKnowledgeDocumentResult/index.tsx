@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import { Button, Space, Tag, Tabs, Spin, message } from 'antd';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
@@ -29,6 +29,7 @@ import StageDetailCard from './StageDetailCard';
 import DocumentQualityCard from '@/components/DocumentQualityCard';
 import CompileResultPanel from './CompileResultPanel';
 import DocumentVersionsTab from './DocumentVersionsTab';
+import SimilaritySuggestionsBanner from './SimilaritySuggestionsBanner';
 import { buildDocumentStageKeys } from './documentTabs';
 import type { DocumentStageKey } from './documentTabs';
 import type { ProcessingStage } from './StageDetailCard';
@@ -71,6 +72,7 @@ const DOC_STATUS_COLOR: Record<string, string> = {
 
 export default function DomainKnowledgeDocumentResult() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { id = '', docId = '' } = useParams<{ id: string; docId: string }>();
   // KB 写权限（权限矩阵）：重新解析/重新编译按钮依据
   const { canWrite } = useKbPermission(id || undefined);
@@ -364,6 +366,13 @@ export default function DomainKnowledgeDocumentResult() {
       />
 
       <PageContent>
+        {/* 解析后相似建议：有建议时才渲染；合并成功源文档即被删除，回到知识库列表 */}
+        <SimilaritySuggestionsBanner
+          docId={docId}
+          canWrite={canWrite}
+          refreshKey={doc?.updatedAt}
+          onMerged={() => navigate(`/domain-knowledge/${id}`)}
+        />
         {/* 卡片外壳由 PageContent 承担，Tabs 不再自带白底与边框。
             这层 div 只为把卡片高度递给 Tabs：中间的 Spin 会渲染 .ant-spin /
             .ant-spin-container 两层包裹，它们都是内容高度，不撑满的话

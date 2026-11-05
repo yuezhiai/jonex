@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { Form, Modal, Input, Radio, Tag, Space, Alert } from 'antd';
+import { Form, Modal, Input, Radio, Tag, Space, Alert, Switch } from 'antd';
 import { PlusOutlined, EditOutlined, LockOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { DomainKnowledgeItem, KnowledgeBaseType } from '@/types/domainKnowledge';
@@ -9,7 +9,13 @@ interface CreateEditModalProps {
   editingKb: DomainKnowledgeItem | null;
   submitting: boolean;
   /** kb_type 仅在「创建」模式下回传；编辑模式不回传（类型创建后不可变） */
-  onOk: (data: { name: string; description?: string; kb_type?: KnowledgeBaseType }) => void;
+  onOk: (data: {
+    name: string;
+    description?: string;
+    kb_type?: KnowledgeBaseType;
+    /** 结构化开关：创建默认 false；编辑回填当前值。始终为布尔（后端按布尔落库） */
+    structured_enabled: boolean;
+  }) => void;
   onCancel: () => void;
   /**
    * [jonex] 本部署**可创建**的类型（后端 env `KB_ENABLED_TYPES`，见
@@ -90,6 +96,8 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
         description: editingKb?.description ?? '',
         // 编辑模式回填以便只读展示；创建模式用后端给的默认可用类型
         kb_type: editingKb?.kbType ?? defaultType,
+        // 结构化开关：创建默认关；编辑回填当前值（缺省按关处理）
+        structured_enabled: editingKb?.structuredEnabled ?? false,
       });
     }
   }, [open, editingKb, form, defaultType]);
@@ -101,6 +109,7 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
       onOk({
         name: values.name,
         description: values.description,
+        structured_enabled: values.structured_enabled === true,
         ...(isEdit ? {} : { kb_type: values.kb_type as KnowledgeBaseType }),
       });
     } catch {
@@ -217,6 +226,17 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
             maxLength={KB_DESCRIPTION_MAX_LENGTH}
             showCount
           />
+        </Form.Item>
+
+        {/* [jonex] 结构化开关：关闭时详情页隐藏 Schema/血缘/ETL/治理等页签；
+            「数据源」页签不受它控制（接数据是基础能力），恒定展示。 */}
+        <Form.Item
+          name="structured_enabled"
+          label={t('domainKnowledge.structuredSupport')}
+          valuePropName="checked"
+          extra={t('domainKnowledge.structuredSupportDesc')}
+        >
+          <Switch />
         </Form.Item>
 
         {/* [jonex] 新建 KB 默认配置说明（仅创建模式） */}

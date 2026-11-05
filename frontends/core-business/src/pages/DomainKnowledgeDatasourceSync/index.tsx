@@ -5,6 +5,7 @@ import { Button, Card, Input, Space, message, Spin } from 'antd';
 import { ArrowLeftOutlined, CloudOutlined, SyncOutlined } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { getDataSource, listDataSourceDocuments, syncDataSource } from '@/api/dataSource';
+import { formatLocalDateTime } from '@/utils/dateTime';
 import type { DataSourceInstance } from '@/types/dataSource';
 import type { ManualDocItem } from '@/types/domainKnowledge';
 import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
@@ -67,7 +68,7 @@ export default function DomainKnowledgeDatasourceSync() {
     },
     {
       label: t('domainKnowledge.sync.lastSyncTime'),
-      value: ds?.lastSyncAt ? ds.lastSyncAt.replace('T', ' ').slice(0, 19) : '—',
+      value: formatLocalDateTime(ds?.lastSyncAt),
     },
   ];
 

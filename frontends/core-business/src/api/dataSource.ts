@@ -1,17 +1,20 @@
 import { request, getData } from './request';
 import type {
   AccessMethodItem,
+  ConnectionItem,
   CreateDataSourcePayload,
   DataSourceInstance,
   SyncResult,
   TestResult,
 } from '@/types/dataSource';
 import type { ManualDocItem } from '@/types/domainKnowledge';
+import { formatLocalDateTime } from '@/utils/dateTime';
 
 interface BackendDataSource {
   id: string;
   tenant_id: string;
   knowledge_base_id: string;
+  connection_id?: string | null;
   access_method_id?: string | null;
   access_type: string;
   name: string;
@@ -32,6 +35,7 @@ function mapDataSource(b: BackendDataSource): DataSourceInstance {
   return {
     id: b.id,
     knowledgeBaseId: b.knowledge_base_id,
+    connectionId: b.connection_id || undefined,
     accessMethodId: b.access_method_id || undefined,
     accessType: b.access_type as DataSourceInstance['accessType'],
     name: b.name,
@@ -108,6 +112,55 @@ export async function resetIngestKey(dsId: string): Promise<DataSourceInstance> 
   );
 }
 
+export interface LineageImportResult {
+  imported: number
+  skipped: number
+  errors: string[]
+  /** 全量错误计数（`errors` 只回前 20 条，计数不截断） */
+  error_count: number
+  total: number
+}
+
+export async function importLineageFile(dsId: string, file: File): Promise<LineageImportResult> {
+  const form = new FormData()
+  form.append('file', file)
+  return getData<LineageImportResult>(
+    request.post(`/knowledge-base/data-sources/${dsId}/lineage-import`, form),
+  )
+}
+
+// ── 平台级连接池：知识库这边只**读**（选一个来引用），增删改在 platform-management ──
+export async function listConnections(spaceId: string): Promise<ConnectionItem[]> {
+  const res = await getData<{ items: ConnectionItem[] }>(
+    request.get('/knowledge-base/data-source-connections', {
+      params: { space_id: spaceId },
+    }),
+  );
+  return res.items || [];
+}
+
+/**
+ * 由该数据源的库表结构生成**这个知识库自己那份** schema（别的库不受影响）。
+ *
+ * 生成失败（`SCHEMA_GEN_BACKEND=remote` 时 `ONTO_INTEL_BASE` 不可达也走这里）
+ * 后端会抛 400 并把原因写在 message 里，
+ * 调用方照原样 `message.error(err.message)` 展示即可。
+ */
+export async function generateDataSourceSchema(
+  dsId: string,
+): Promise<{ schema_version?: number; stats?: Record<string, unknown>; warnings?: string[] }> {
+  return getData(request.post(`/knowledge-base/data-sources/${dsId}/generate-schema`));
+}
+
+/** 读该数据源的库表结构统计（生成前给用户看一眼有多少表）。 */
+export async function readDataSourceCatalog(dsId: string): Promise<{
+  engine: string;
+  database: string;
+  stats: { tables: number; columns: number; columns_with_comment: number };
+}> {
+  return getData(request.get(`/knowledge-base/data-sources/${dsId}/catalog`));
+}
+
 // ── 数据源同步/接收文档（后端 /documents 暂不按 ds 过滤，前端按 metadata 过滤）──
 // 返回与手动上传页一致的 ManualDocItem，便于复用状态链渲染 / 查看 / 删除。
 export async function listDataSourceDocuments(
@@ -139,7 +192,7 @@ export async function listDataSourceDocuments(
         type: ((d.file_name || '').split('.').pop() || '').toUpperCase(),
         size: fmtSize(d.file_size),
         uploader: (meta.uploader as string) || 'system',
-        uploadTime: (d.created_at || '').replace('T', ' ').slice(0, 19),
+        uploadTime: formatLocalDateTime(d.created_at),
         status: statusText(d.status),
         docStatus: d.status,
         ontologyStatus: d.ontology_status,
@@ -147,6 +200,8 @@ export async function listDataSourceDocuments(
         ontologyError: d.ontology_error,
         knowledgeBaseId: kbId,
         dataSourceType: d.data_source_type,
+        // 数据源同步列表不展示相似提示；后端即便带出也按「无提示」处理。
+        similarityHint: null,
       };
     });
 }

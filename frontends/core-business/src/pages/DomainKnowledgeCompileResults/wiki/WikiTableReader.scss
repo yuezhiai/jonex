@@ -1,0 +1,46 @@
+.wiki-table-reader {
+  color: #16365a;
+  .ant-alert { margin: 16px 0; }
+  &__toolbar { display: flex; flex-wrap: wrap; gap: 16px; margin: 4px 0 20px;
+    label { display: flex; flex-direction: column; gap: 6px; color: #64748b; font-size: 13px; }
+    .ant-select { min-width: 160px; max-width: 280px; }
+  }
+  &__layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 28px; align-items: start; }
+  &__content { min-width: 0;
+    section { margin-bottom: 28px; }
+    h3 { margin: 12px 0 16px; font-size: 17px; }
+  }
+  &__record { display: flex; gap: 20px; align-items: center; padding: 15px 0; border-top: 1px solid #e2e8f0;
+    > button { border: 1px solid transparent; background: #f7f9fc; border-radius: 6px; color: #21364d; padding: 7px 12px; cursor: pointer; text-align: left; }
+    > button.is-selected { border-color: #3666ff; color: #265bff; background: #f0f5ff; }
+    small { display: block; }
+  }
+  &__record-context { min-width: 120px; max-width: 220px; color: #64748b; font-size: 13px; }
+  &__source { position: sticky; top: 12px; padding: 20px; background: #f7f9fc; border: 1px solid #e2e8f0; border-radius: 8px;
+    h3 { font-size: 16px; margin: 0 0 18px; }
+    dt { color: #718198; font-size: 13px; margin-top: 14px; }
+    dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+    small { color: #718198; display: block; }
+    button:not(.ant-btn) { color: #265bff; background: none; border: 0; padding: 0; cursor: pointer; }
+    .ant-btn { height: auto; white-space: normal; padding: 8px 0; display: block; text-align: left; }
+  }
+  &__hint, &__empty { color: #718198; font-size: 13px; }
+  &__hint { border-top: 1px solid #e2e8f0; padding-top: 14px; }
+  &__grid { max-height: 640px; overflow: auto; border: 1px solid #dbe3ef;
+    table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
+    td, th { border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
+    th { background: #f4f7fb; padding: 8px; position: sticky; left: 0; z-index: 1; }
+    thead th { top: 0; z-index: 2; }
+    td { min-width: 100px; max-width: 280px;
+      button { background: none; color: inherit; border: 0; cursor: pointer; padding: 8px 10px; text-align: left; width: 100%; min-height: 36px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      &.is-selected { background: #edf3ff; outline: 2px solid #3666ff; outline-offset: -2px; }
+    }
+  }
+  button:focus-visible { outline: 2px solid #3666ff; outline-offset: 2px; }
+  @media (max-width: 1000px) {
+    &__layout { grid-template-columns: minmax(0, 1fr); }
+    &__source { position: static; }
+    &__record { gap: 10px; }
+    &__record-context { min-width: 90px; }
+  }
+}

@@ -41,6 +41,7 @@ import {
   exportCompiledSchemaYaml,
   importCompiledSchemaYaml,
 } from '@/api/domainKnowledge';
+import { getAbstractSchema } from '@/api/abstractSchema';
 import OntologyObjectSection from './OntologyObjectSection';
 import OntologyRelationSection from './OntologyRelationSection';
 import OntologyConstraintSection from './OntologyConstraintSection';
@@ -52,7 +53,10 @@ import ConstraintFormModal from './ConstraintFormModal';
 import StepFormModal from './StepFormModal';
 import PromptViewModal from './PromptViewModal';
 import TemplateImportModal from './TemplateImportModal';
+import SchemaLifecyclePanel from './SchemaLifecyclePanel';
 import TemplateBindModal from './TemplateBindModal';
+import ProceduralExtractSwitch from './ProceduralExtractSwitch';
+import ExtractToolSwitch from './ExtractToolSwitch';
 
 interface Props {
   kbId: string;  canWrite?: boolean;
@@ -107,6 +111,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
 
   // compiled schema (for schema_version tracking and YAML import)
   const [compiledSchema, setCompiledSchema] = useState<CompiledSchema | null>(null);
+  // 生命周期面板的刷新触发器：页内所有写口（对象/关系/约束的增删改、YAML 导入、
+  // 模板导入）都经 reloadCompiledSchema，自增让面板重拉新鲜度（否则面板会一直
+  // 显示编辑前的旧状态）。
+  const [lifecycleRefreshKey, setLifecycleRefreshKey] = useState(0);
   const [loadingObjects, setLoadingObjects] = useState(false);
   const [loadingRelations, setLoadingRelations] = useState(false);
   const [loadingConstraints, setLoadingConstraints] = useState(false);
@@ -117,6 +125,8 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
     open: boolean;
     editing: OntologyObjectDef | null;
   }>({ open: false, editing: null });
+  // 本库「抽取期调用工具」开关：打开时编辑对象弹窗显示 catalog: 声明编辑
+  const [extractToolOn, setExtractToolOn] = useState(false);
   const [relationModal, setRelationModal] = useState<{
     open: boolean;
     editing: OntologyRelationDef | null;
@@ -152,6 +162,18 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   }>({ open: false, result: null, loading: false, error: null });
   const [yamlExporting, setYamlExporting] = useState(false);
   const [yamlImporting, setYamlImporting] = useState(false);
+
+  // ── v2 收口：抽象 schema active 探针 ──────────────────
+  // 该 KB 一旦有 active 且非空的抽象 schema，检索/编译链路读的就是它；本页编辑的
+  // 遗留 compiled 行（`data_source_id IS NULL`）此后不再生效——顶部横幅说明 +
+  // 六个写处理器 + 两个导入写口（YAML / 模板）统一拦写（见各 handler / 导入出口的 abstractActive 闸）。
+  // 探测失败按「未启用」处理：收口是保守增强，不能因一次探测失败把本来可用的编辑面弄瘫。
+  const [abstractActive, setAbstractActive] = useState(false);
+  useEffect(() => {
+    getAbstractSchema(kbId)
+      .then((s) => setAbstractActive(s?.status === 'active' && (s.schema.entities?.length ?? 0) > 0))
+      .catch(() => setAbstractActive(false));
+  }, [kbId]);
 
   const loadObjects = useCallback(() => {
     setLoadingObjects(true);
@@ -219,6 +241,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
 
   // 编译 schema 三类共用全量保存，任一保存后同步刷新三类，保证 schema_version 与目标选项一致
   const reloadCompiledSchema = useCallback(() => {
+    setLifecycleRefreshKey((k) => k + 1);
     loadObjects();
     loadRelations();
     loadConstraints();
@@ -236,6 +259,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const submitObject = async (payload: SaveOntologyObjectPayload) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     setSubmitting(true);
     try {
       if (objectModal.editing) {
@@ -255,6 +282,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const removeObject = (o: OntologyObjectDef) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     Modal.confirm({
       title: t('compile.deleteObject'),
       content: t('compile.confirmDeleteObject', { name: o.name }),
@@ -274,6 +305,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const submitRelation = async (payload: SaveOntologyRelationPayload) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     setSubmitting(true);
     try {
       if (relationModal.editing) {
@@ -293,6 +328,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const removeRelation = (r: OntologyRelationDef) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     Modal.confirm({
       title: t('compile.deleteRelation'),
       content: t('compile.confirmDeleteRelation', { name: r.name }),
@@ -312,6 +351,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const submitConstraint = async (payload: SaveOntologyConstraintPayload) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     setSubmitting(true);
     try {
       if (constraintModal.editing) {
@@ -322,7 +365,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         message.success(t('compile.constraintCreated'));
       }
       setConstraintModal({ open: false, editing: null });
-      loadConstraints();
+      reloadCompiledSchema();
     } catch (e: any) {
       handleSaveError(e, t('compile.saveConstraintFailed'));
     } finally {
@@ -331,6 +374,10 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const removeConstraint = (c: OntologyConstraint) => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     Modal.confirm({
       title: t('compile.deleteConstraint'),
       content: t('compile.confirmDeleteConstraint', { name: c.name }),
@@ -341,7 +388,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         try {
           await deleteOntologyConstraint(kbId, c.id);
           message.success(t('compile.constraintDeleted'));
-          loadConstraints();
+          reloadCompiledSchema();
         } catch (e: any) {
           handleSaveError(e, t('compile.deleteConstraintFailed'));
         }
@@ -430,6 +477,11 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
     }
 
     if (!dryRun) {
+      // v2 收口：dry-run 预览（只读）保持可用，只拦真正的写入
+      if (abstractActive) {
+        message.warning(t('compile.abstractTakesOver'));
+        return;
+      }
       setYamlImporting(true);
     }
     try {
@@ -473,8 +525,26 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
   };
 
   const handleYamlImportConfirm = async () => {
+    // 闸要判在置 loading 之前：doImport 的闸是提前 return，置过 loading 再被拦会把
+    // 弹窗永久卡在「确认导入…」（只能 Cancel 退出）。这里与 doImport 里的闸同款、双保险。
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
     setYamlImportModal((prev) => ({ ...prev, loading: true, error: null }));
     await doImport(false);
+  };
+
+  /** 打开模板导入弹窗。v2 收口：模板导入落库写的就是同一批遗留 compiled 行
+   *  （`TemplateImportModal` → PUT `/knowledge-base/ontology/compiled-schema`），
+   *  abstract schema active 时一并拦——提示与六个写处理器 + 另一个导入写口（YAML）同款。
+   *  （弹窗本身只有「选模板 → 导入」一条出口，没有纯查看用途，拦在触发处即可。） */
+  const openTemplateImport = (mode: 'object' | 'relation' | 'constraint') => {
+    if (abstractActive) {
+      message.warning(t('compile.abstractTakesOver'));
+      return;
+    }
+    setImportModal({ open: true, mode });
   };
 
   // 「新建 / 从模板导入」属于子 tab 自己的操作，随激活 tab 切换。
@@ -488,19 +558,19 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
       createLabel: t('compile.object.createBtn'),
       importLabel: t('compile.object.importBtn'),
       onCreate: () => setObjectModal({ open: true, editing: null }),
-      onImport: () => setImportModal({ open: true, mode: 'object' }),
+      onImport: () => openTemplateImport('object'),
     },
     rel: {
       createLabel: t('compile.relation.createBtn'),
       importLabel: t('compile.relation.importBtn'),
       onCreate: () => setRelationModal({ open: true, editing: null }),
-      onImport: () => setImportModal({ open: true, mode: 'relation' }),
+      onImport: () => openTemplateImport('relation'),
     },
     constraint: {
       createLabel: t('compile.constraint.createBtn'),
       importLabel: t('compile.constraint.importBtn'),
       onCreate: () => setConstraintModal({ open: true, editing: null }),
-      onImport: () => setImportModal({ open: true, mode: 'constraint' }),
+      onImport: () => openTemplateImport('constraint'),
     },
   };
   const activeActions = subTabActions[activeSubTab] ?? subTabActions.obj;
@@ -565,6 +635,27 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
 
   return (
     <div>
+      {/* KB 级 compiled schema 生命周期：新鲜度/影响面 + 预览重编译/重置 */}
+      <SchemaLifecyclePanel
+        kbId={kbId}
+        canWrite={canWrite}
+        refreshKey={lifecycleRefreshKey}
+        onChanged={reloadCompiledSchema}
+      />
+
+      {/* v2 收口横幅：抽象 schema 接管后，遗留行的编辑不再生效（本页保留查看） */}
+      {abstractActive ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={t('compile.abstractTakesOver')}
+          description={t('compile.abstractTakesOverBody')}
+        />
+      ) : null}
+
+      <ProceduralExtractSwitch kbId={kbId} canWrite={canWrite} />
+      <ExtractToolSwitch kbId={kbId} canWrite={canWrite} onEnabledChange={setExtractToolOn} />
       <Tabs
         activeKey={activeSubTab}
         onChange={setActiveSubTab}
@@ -641,6 +732,8 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         submitting={submitting}
         onCancel={() => setObjectModal({ open: false, editing: null })}
         onSubmit={submitObject}
+        kbId={kbId}
+        extractToolEnabled={extractToolOn}
       />
       <RelationFormModal
         open={relationModal.open}
@@ -691,12 +784,7 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         mode={importModal.mode}
         kbId={kbId}
         onClose={() => setImportModal((s) => ({ ...s, open: false }))}
-        onImported={() => {
-          if (importModal.mode === 'object') loadObjects();
-          else if (importModal.mode === 'relation') loadRelations();
-          else loadConstraints();
-          loadTargetOptions();
-        }}
+        onImported={() => reloadCompiledSchema()}
       />
 
       {/* YAML 导入预览/确认弹窗 */}

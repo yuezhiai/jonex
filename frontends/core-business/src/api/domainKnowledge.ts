@@ -27,6 +27,7 @@ import type {
   DocumentQualitySummary,
   ManualDocItem,
   ManualDocListParams,
+  SimilaritySuggestion,
   DocumentStatsResult,
   BackendParseResultSummary,
   BackendEntityItem,
@@ -35,6 +36,7 @@ import type {
   CompiledSchema,
   CompiledSchemaEntityType,
   CompiledSchemaRelationType,
+  ExtractionSkillsConfig,
   OntologyEditorState,
   OntologyObjectDef,
   OntologyRelationDef,
@@ -67,6 +69,11 @@ import type {
   UpdateOntologyRelationResponse,
   DeleteOntologyRelationResponse,
   YamlImportResult,
+  CompiledSchemaStatus,
+  RecompilePreview,
+  RecompileResult,
+  ModelUpdateJob,
+  ModelUpdateApplyResult,
   KnowledgeBaseType,
   WikiEntityRow,
   WikiRelationshipRow,
@@ -161,6 +168,20 @@ interface BackendKBItem {
   ontology_degraded?: boolean;
   /** [jonex] 知识库类型：lightrag / openkb（仅 get 详情返回） */
   kb_type?: string;
+  /** 结构化开关（详情/列表接口回带；缺省按关闭处理） */
+  structured_enabled?: boolean;
+  /** KB 级相似检测开关（缺省 false）。 */
+  similarity_check_enabled?: boolean;
+  /** KB 级相似阈值（0.5~0.999）；null/缺省 = 继承全局默认。 */
+  similarity_check_threshold?: number | null;
+  /** 动态本体（技能 / 动作抽取）库级开关；缺省 false。 */
+  procedural_extract?: boolean;
+  /** 动态本体进程级总闸（仅 get 详情返回）。 */
+  procedural_extract_available?: boolean;
+  /** 写图前调用抽取期工具库级开关；缺省 false。 */
+  extract_tool_calls?: boolean;
+  /** 抽取期工具进程级总闸（仅 get 详情返回）。 */
+  extract_tool_calls_available?: boolean;
 }
 
 interface BackendKBListResponse {
@@ -207,6 +228,8 @@ export async function createKnowledgeInfo(data: {
   data_source_types?: string[];
   /** [jonex] 知识库类型，创建时选定后不可变；缺省由后端落 lightrag */
   kb_type?: KnowledgeBaseType;
+  /** 结构化开关；缺省由后端决定（默认关闭） */
+  structured_enabled?: boolean;
 }): Promise<DomainKnowledgeItem> {
   const backendItem = await getData<BackendKBItem>(request.post('/knowledge-base/knowledge-info', data));
   return mapKBItem(backendItem);
@@ -220,6 +243,12 @@ export async function updateKnowledgeInfo(
     space_id?: string;
     description?: string;
     status?: string;
+    /** 结构化开关（运行时可切换；缺省不改） */
+    structured_enabled?: boolean;
+    similarity_check_enabled?: boolean;
+    similarity_check_threshold?: number | null;
+    procedural_extract?: boolean;
+    extract_tool_calls?: boolean;
   },
 ): Promise<DomainKnowledgeItem> {
   const backendItem = await getData<BackendKBItem>(request.patch(`/knowledge-base/knowledge-info/${kbId}`, data));
@@ -245,10 +274,14 @@ function mapKBItem(item: BackendKBItem): DomainKnowledgeItem {
     description: item.description || undefined,
     // [jonex] 知识库类型：列表/创建/更新响应都带，编辑弹窗与列表标签依赖它
     kbType: (item.kb_type as KnowledgeBaseType) || 'lightrag',
+    structuredEnabled: item.structured_enabled === true,
     // 权限字段（KB 权限：管理权 + 写权限 + 授权共享标识）
     can_manage_permissions: (item as unknown as Record<string, unknown>).can_manage_permissions === true,
     can_write: (item as unknown as Record<string, unknown>).can_write === true,
     grant_shared: (item as unknown as Record<string, unknown>).grant_shared === true,
+    // 相似检测设置：列表/创建/更新响应统一映射，缺省 false / null
+    similarityCheckEnabled: item.similarity_check_enabled === true,
+    similarityCheckThreshold: item.similarity_check_threshold ?? null,
   };
 }
 
@@ -334,15 +367,26 @@ export async function getDomainKnowledgeDetail(
     updatedAt: info.updated_at ? formatLocalDateTime(info.updated_at) : '—',
     ontologyDegraded: info.ontology_degraded ?? false,
     kbType: (info.kb_type as KnowledgeBaseType) || 'lightrag',
+    structuredEnabled: info.structured_enabled === true,
     can_manage_permissions: (info as unknown as Record<string, unknown>).can_manage_permissions === true,
     can_write: (info as unknown as Record<string, unknown>).can_write === true,
+    similarityCheckEnabled: info.similarity_check_enabled === true,
+    similarityCheckThreshold: info.similarity_check_threshold ?? null,
+    proceduralExtract: info.procedural_extract === true,
+    proceduralExtractAvailable: info.procedural_extract_available === true,
+    extractToolCalls: info.extract_tool_calls === true,
+    extractToolCallsAvailable: info.extract_tool_calls_available === true,
   };
 }
 
 export function getDomainKnowledgeDataSources(kbId: string, t?: (key: string) => string): Promise<DataSourceConfig[]> {
   const _t = t || ((key: string) => key);
+  // `access_type=etl` 是「ETL 集成」页签的运维对象，不是用户感知的数据源：
+  // 让它走到下面的 `file` 兜底会显示成「文件 / 手动上传」，path 还会拼成
+  // `/datasource/manual/{etlId}`（该路由不带 dsId）→ 点开是空白页。
+  // 这里直接排除；其他 accessType 的类型判定与路由一律原样保留。
   return listDataSources(kbId).then((list) =>
-    list.map((ds) => {
+    list.filter((ds) => ds.accessType !== 'etl').map((ds) => {
       const v = getDSView(_t)[ds.accessType] || getDSView(_t).file;
       return {
         id: ds.id,
@@ -405,6 +449,17 @@ function getDSView(t: (key: string) => string): Record<
       typeLabel: t('domainKnowledge.dataSourceType.file'),
       routePrefix: 'datasource/manual',
     },
+    // 数据库数据源是**结构来源**：不取文档，数据在「它自己那份 schema」里。
+    // routePrefix 用 `schema` 拼出 `/domain-knowledge/{kbId}/schema/{dsId}` —— 正是画布路由。
+    // 不写这一支会落到 `file` 兜底：错图标、错文案，而且 `datasource/manual` 那条路由
+    // **不带 :dsId**，拼出来的 path 是个死链。
+    database: {
+      iconType: 'database',
+      iconBg: '#f5f3ff',
+      iconColor: '#7c3aed',
+      typeLabel: t('domainKnowledge.dataSourceType.database'),
+      routePrefix: 'schema',
+    },
   };
 }
 
@@ -415,6 +470,14 @@ function dsDesc(ds: DataSourceInstance, t: (key: string) => string): string {
     return `${c.backend || ''} ｜ ${t('domainKnowledge.dataSourceDesc.bucket')}：${c.bucket || '-'}${c.prefix ? ' / ' + c.prefix : ''}`;
   if (ds.accessType === 'api_push')
     return `${t('domainKnowledge.dataSourceDesc.apiPush')} ｜ ${t('domainKnowledge.dataSourceDesc.allowed')}：${(c.allowed_ext || []).join('/') || '-'}`;
+  // 数据库数据源：显示连的是哪个库。密码不在 config_json 里（是 password_ref 密文），这里也不碰它
+  //
+  // 优先显示连接池里的连接名：引用行自己不带连接信息（config_json 是 `{}` 占位），
+  // 后端在 list/get 时把连接的公开配置合并了进来，`connection_name` 是其中一项。
+  if (ds.accessType === 'database') {
+    const conn = c.connection_name ? `${c.connection_name} · ` : '';
+    return `${conn}${c.engine || ''} ｜ ${c.host || '-'}:${c.port ?? '-'} / ${c.database || '-'}`;
+  }
   return t('domainKnowledge.dataSourceDesc.manualUpload');
 }
 
@@ -535,15 +598,48 @@ export function reseedOntologyCompiledSchema(
   kbId: string,
   templateScenarioId: string,
   templateDomainId?: string,
-  applyToDocuments = false,
-): Promise<CompiledSchema> {
+  applyToDocuments?: boolean,): Promise<CompiledSchema> {
   return postData<CompiledSchema>('/knowledge-base/ontology/compiled-schema/reseed', {
     knowledge_base_id: kbId,
     template_domain_id: templateDomainId,
     template_scenario_id: templateScenarioId,
     source_type: 'business_template',
-    apply_to_documents: applyToDocuments,
+    // 与 recompile 同口径：显式给出布尔值，避免后端按缺省 false 猜测意图。
+    apply_to_documents: applyToDocuments ?? false,
   });
+}
+
+/** KB 级 schema 生命周期状态（读时新鲜度 + 对齐影响面；只读，不触发自动编译）。 */
+export function getCompiledSchemaStatus(kbId: string): Promise<CompiledSchemaStatus> {
+  return getData<CompiledSchemaStatus>(
+    request.get('/knowledge-base/ontology/compiled-schema/status', {
+      params: { knowledge_base_id: kbId },
+    }),
+  );
+}
+
+/** 预览一次重编译的差异与影响面（只读：不 upsert、不重置文档）。 */
+export function previewRecompileCompiledSchema(kbId: string): Promise<RecompilePreview> {
+  return postData<RecompilePreview>(
+    '/knowledge-base/ontology/compiled-schema/recompile/preview',
+    { knowledge_base_id: kbId },
+  );
+}
+
+/**
+ * 从模板/YAML 重编译 KB 级 schema。
+ *
+ * `force` 默认 false：与预览/短路语义一致 —— 源 hash 未变就不写库（`unchanged: true`）；
+ * 用户显式要强制重生成时才传 true。
+ */
+export function recompileCompiledSchema(
+  kbId: string,
+  opts: { force?: boolean; applyToDocuments?: boolean } = {},
+): Promise<RecompileResult> {
+  return postData<RecompileResult>('/knowledge-base/ontology/compiled-schema/recompile', {
+    knowledge_base_id: kbId,
+    force: opts.force ?? false,
+    apply_to_documents: opts.applyToDocuments ?? false,  });
 }
 
 // ─── Manual Datasource APIs ─────────────────────────────
@@ -567,6 +663,12 @@ interface BackendDocItem {
   data_source_type?: string;
   mime_type?: string;
   folder_id?: string | null;
+  /** 解析完成后的相似提示（未命中 / 检测关闭时为 null 或缺省）。 */
+  similarity_hint?: {
+    target_document_id: string;
+    target_file_name: string;
+    similarity: number;
+  } | null;
 }
 
 interface BackendDocListResponse {
@@ -626,6 +728,14 @@ export function mapBackendDoc(doc: BackendDocItem, knowledgeBaseId: string, _t: 
     mimeType: doc.mime_type,
     folder_id: doc.folder_id ?? null,
     mediaType: doc.mime_type && doc.mime_type.includes('video') ? 'video' : 'document',
+    // 相似提示：后端 snake_case → camelCase；缺失/空一律 null（组件按「无提示」处理）
+    similarityHint: doc.similarity_hint?.target_document_id
+      ? {
+          targetDocumentId: doc.similarity_hint.target_document_id,
+          targetFileName: doc.similarity_hint.target_file_name,
+          similarity: doc.similarity_hint.similarity,
+        }
+      : null,
   };
 }
 
@@ -693,6 +803,16 @@ export async function getManualDocList(
 export interface UploadDocumentOptions {
   onUploadProgress?: (e: { loaded: number; total?: number }) => void;
   signal?: AbortSignal;
+  /**
+   * 版本上传：跳过「高度相似是否同一文档新版本」的二次询问。
+   * 用户在别处（如同名文档提示）已明确选择「作为新版本」时传 true。
+   */
+  confirmSimilar?: boolean;
+  /**
+   * 用户在「同名文档」提示里选择了「作为新文档」，明确拒绝了相似目标。
+   * 上传时写入 metadata.similarity_suppressed_targets，解析完成后的相似检测会跳过它。
+   */
+  suppressSimilarityTargetId?: string;
 }
 
 export async function uploadManualDocument(
@@ -711,6 +831,14 @@ export async function uploadManualDocument(
   if (folderId) {
     formData.append('folder_id', folderId);
   }
+  if (options?.suppressSimilarityTargetId) {
+    formData.append(
+      'metadata',
+      JSON.stringify({
+        similarity_suppressed_targets: [options.suppressSimilarityTargetId],
+      }),
+    );
+  }
 
   // [jonex] R7: 上传接口单独放大 timeout 到 300s，避免大文件触发全局 30s 超时
   const result = await getData<BackendDocItem>(
@@ -723,6 +851,52 @@ export async function uploadManualDocument(
   );
 
   return mapBackendDoc(result, knowledgeBaseId, _t);
+}
+
+export interface ExistingDocumentMatch {
+  id: string;
+  fileName: string;
+  updatedAt?: string;
+}
+
+/** 从列表结果里挑出**完全同名**的最近更新条目（keyword 是模糊匹配，需再精确化）。 */
+export function pickExactNameMatch(
+  rows: Array<{ id: string; file_name?: string; updated_at?: string }>,
+  fileName: string,
+): ExistingDocumentMatch | null {
+  const matches = rows.filter((d) => (d.file_name || '') === fileName);
+  if (!matches.length) return null;
+  matches.sort((a, b) =>
+    String(b.updated_at || '').localeCompare(String(a.updated_at || '')),
+  );
+  const picked = matches[0];
+  return {
+    id: picked.id,
+    fileName: picked.file_name || fileName,
+    updatedAt: picked.updated_at,
+  };
+}
+
+/**
+ * 在同知识库内按文件名精确查找未删除文档（列表接口 keyword 是 ilike 模糊匹配，
+ * 这里只保留**完全同名**的候选，取最近更新的一条）。
+ * 用于上传前提示「是否作为已有文档的新版本」。
+ */
+export async function findDocumentByName(
+  knowledgeBaseId: string,
+  fileName: string,
+): Promise<ExistingDocumentMatch | null> {
+  const result = await getData<BackendDocListResponse>(
+    request.get('/knowledge-base/documents', {
+      params: {
+        knowledge_base_id: knowledgeBaseId,
+        keyword: fileName,
+        page: 1,
+        page_size: 20,
+      },
+    }),
+  );
+  return pickExactNameMatch(result.items || [], fileName);
 }
 
 export async function getManualDocumentDetail(
@@ -798,6 +972,44 @@ export async function retryDocumentOntology(knowledgeBaseId: string, documentId:
     document_id: documentId,
     knowledge_base_id: knowledgeBaseId,
   });
+}
+
+// ── 更新模型：文档行操作 → nexonto 再解析 → 草稿 → 人工确认导入 ──
+
+/** 发起模型更新（异步）：返回 job_id，后续轮询 `getModelUpdateStatus`。 */
+export async function startModelUpdate(
+  knowledgeBaseId: string,
+  documentId: string,
+): Promise<ModelUpdateJob> {
+  return getData<ModelUpdateJob>(
+    request.post(`/knowledge-base/documents/${documentId}/model-update`, {
+      knowledge_base_id: knowledgeBaseId,
+    }),
+  );
+}
+
+/** 轮询模型更新任务；远端 done 后能力层会先做 dry-run 校验再返回 ready/invalid。 */
+export async function getModelUpdateStatus(
+  knowledgeBaseId: string,
+  jobId: string,
+): Promise<ModelUpdateJob> {
+  return getData<ModelUpdateJob>(
+    request.get(`/knowledge-base/model-update/${jobId}`, {
+      params: { knowledge_base_id: knowledgeBaseId },
+    }),
+  );
+}
+
+/** 人审确认：把草稿写入 KB compiled schema。 */
+export async function applyModelUpdate(
+  knowledgeBaseId: string,
+  jobId: string,
+): Promise<ModelUpdateApplyResult> {
+  return getData<ModelUpdateApplyResult>(
+    request.post(`/knowledge-base/model-update/${jobId}/apply`, {
+      knowledge_base_id: knowledgeBaseId,
+    }),
+  );
 }
 
 /** 重新解析文档 */
@@ -1098,12 +1310,15 @@ function mapCompiledEntityToOntology(kbId: string, entity: CompiledSchemaEntityT
     description: entity.description || '',
     requirement: entity.requirement || '',
     status: entity.status || 'active',
+    compiledName: entity.name,
+    extractionSkills: entity.extraction_skills || null,
     attributes: (entity.attributes || []).map((attr) => ({
       id: encodeUiId('attr', entity.name, attr.name, attr.source_attribute_id || ''),
       name: attr.display_name || attr.name,
       description: attr.description || '',
       type: compiledAttrToOntologyType(attr.type),
       isPrimaryKey: Boolean(attr.is_primary_key ?? attr.required),
+      compiledName: attr.name,
     })),
   };
 }
@@ -1279,6 +1494,37 @@ function buildCompiledEntityFromPayload(
 ): CompiledSchemaEntityType {
   const compiledName = existing?.name || ensureUniqueName(slugifyOntologyName(payload.name), existingNames);
   const attrNames = new Set<string>();
+  const attributes: CompiledSchemaEntityType['attributes'] = (payload.attributes || []).map((attr) => {
+    const attrMeta = decodeAttrMeta(attr.id);
+    const attrName = attrMeta.compiledName || ensureUniqueName(slugifyOntologyName(attr.name), attrNames);
+    attrNames.add(attrName);
+    return {
+      name: attrName,
+      display_name: attr.name,
+      description: attr.description || '',
+      type: ontologyAttrToCompiledType(attr.type),
+      required: Boolean(attr.isPrimaryKey),
+      is_primary_key: Boolean(attr.isPrimaryKey),
+      source_attribute_id: attrMeta.sourceAttributeId || null,
+    };
+  });
+  // 弹窗没给 extractionSkills（undefined）= 保留原值，防静默丢失
+  const extractionSkills =
+    payload.extractionSkills === undefined ? existing?.extraction_skills || null : payload.extractionSkills;
+  // 抽取期工具写入的属性若还不在定义里，按原名补进属性定义（键必须与工具写入的键一致，不能 slug 改名）
+  for (const [attr, tool] of toolWrittenAttributes(extractionSkills)) {
+    if (attrNames.has(attr)) continue;
+    attrNames.add(attr);
+    attributes.push({
+      name: attr,
+      display_name: attr,
+      description: `由抽取期工具 ${tool} 写入`,
+      type: 'string',
+      required: false,
+      is_primary_key: false,
+      source_attribute_id: null,
+    });
+  }
   return {
     name: compiledName,
     display_name: payload.name,
@@ -1287,23 +1533,22 @@ function buildCompiledEntityFromPayload(
     status: payload.status || 'active',
     aliases: existing?.aliases || [],
     source_object_id: existing?.source_object_id || null,
-    // [jonex] P1：extraction_skills 一期不做编辑器，保存时保留 existing（防静默丢失）
-    extraction_skills: existing?.extraction_skills || null,
-    attributes: (payload.attributes || []).map((attr) => {
-      const attrMeta = decodeAttrMeta(attr.id);
-      const attrName = attrMeta.compiledName || ensureUniqueName(slugifyOntologyName(attr.name), attrNames);
-      attrNames.add(attrName);
-      return {
-        name: attrName,
-        display_name: attr.name,
-        description: attr.description || '',
-        type: ontologyAttrToCompiledType(attr.type),
-        required: Boolean(attr.isPrimaryKey),
-        is_primary_key: Boolean(attr.isPrimaryKey),
-        source_attribute_id: attrMeta.sourceAttributeId || null,
-      };
-    }),
+    extraction_skills: extractionSkills,
+    attributes,
   };
+}
+
+/** refine 组 catalog: 声明会写入的属性 → 工具名（按声明顺序，同名属性取第一条）。 */
+export function toolWrittenAttributes(skills?: ExtractionSkillsConfig | null): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const item of skills?.refine || []) {
+    if (!item?.skill?.startsWith('catalog:') || !item.writes) continue;
+    const tool = item.skill.slice('catalog:'.length);
+    Object.keys(item.writes).forEach((attr) => {
+      if (!out.has(attr)) out.set(attr, tool);
+    });
+  }
+  return out;
 }
 
 function buildCompiledRelationFromPayload(
@@ -1324,6 +1569,11 @@ function buildCompiledRelationFromPayload(
     throw new Error('Referenced object does not exist. Please create the object before saving the relation.');
   }
 
+  // 端点被改到别的实体后，`existing` 上的列名属于**旧端点** —— 带到新关系上会被 ② 侧
+  // 的「对端列不存在 → 回落主键」洗成一条没人声明过的等值条件。所以端点一变，三个键一起清掉。
+  const endpointsChanged =
+    existing != null && (existing.source !== sourceCode || existing.target !== targetCode);
+
   return {
     name: existing?.name || ensureUniqueName(slugifyOntologyName(payload.name), existingNames),
     display_name: payload.name,
@@ -1340,8 +1590,17 @@ function buildCompiledRelationFromPayload(
       .map((t) => entityCodeByDisplay.get(t) || t),
     target_types: (payload.targetTypes || existing?.target_types || [])
       .map((t) => entityCodeByDisplay.get(t) || t),
+    // join 键（P0-2）：与 `inverse_of` 同一口径 —— payload 里没有（编辑器没这个输入项），
+    // 就**保留 existing**。这三行缺了，改关系名/基数/逆名都会把 join 键一起抹掉。
+    // 但端点变了（`endpointsChanged`）时不保留：旧端点的列名对新端点无意义。
+    source_column: endpointsChanged ? null : (existing?.source_column || null),
+    target_column: endpointsChanged ? null : (existing?.target_column || null),
+    origin: endpointsChanged ? null : (existing?.origin || null),
   };
 }
+
+/** 测试别名：不给测试复制第二份逻辑，只把上面这个私有构造函数露出来。 */
+export const buildCompiledRelationFromPayloadForTest = buildCompiledRelationFromPayload;
 
 export async function getOntologyObjects(kbId: string): Promise<OntologyObjectDef[]> {
   const schema = await fetchCompiledSchemaForEditing(kbId);
@@ -1604,6 +1863,60 @@ export async function getParserConfigs(offset = 0, limit = 100): Promise<{ items
   return getData<{ items: ParserConfigItem[]; total: number }>(
     request.get('/ecosystem/parser-configs', { params: { offset, limit } }),
   );
+}
+
+// ── KB 级模型配置（解析/编译阶段的模型覆盖）────────────────────────────
+// 只有 3 个可写 scope；向量化（embedding）是只读展示位，不可配置。
+export type KbModelScope = 'parse_multimodal' | 'compile_ontology' | 'compile_wiki' | 'embedding' | 'rerank';
+
+export interface KbModelSettingItem {
+  scope: KbModelScope;
+  /** 前端按 label_key 取文案，label 是后端给的中文兜底 */
+  label_key: string;
+  label: string;
+  stage: 'parse' | 'compile' | 'retrieve';
+  /** false = 只读展示（如向量化等） */
+  configurable: boolean;
+  kb_value: string | null;
+  effective: string | null;
+  source: 'kb' | 'engine_default';
+  source_text: string;
+  env_var: string;
+  /** 平台侧读到的部署默认值（该 env 变量当前的值）；null = 平台进程没注入该变量 */
+  engine_default: string | null;
+  disabled_reason?: string;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
+export interface KbModelSettingsView {
+  knowledge_base_id: string;
+  kb_type: string;
+  items: KbModelSettingItem[];
+}
+
+export interface KbModelSettingPayloadItem {
+  scope: KbModelScope;
+  /** 空字符串 = 清除该 scope 的覆盖，恢复继承 */
+  model_name: string;
+}
+
+export async function getModelSettings(knowledgeBaseId: string): Promise<KbModelSettingsView> {
+  return getData<KbModelSettingsView>(
+    request.get('/knowledge-base/model-settings', {
+      params: { knowledge_base_id: knowledgeBaseId },
+    }),
+  );
+}
+
+export async function saveModelSettings(
+  knowledgeBaseId: string,
+  items: KbModelSettingPayloadItem[],
+): Promise<KbModelSettingsView> {
+  return putData<KbModelSettingsView>('/knowledge-base/model-settings', {
+    knowledge_base_id: knowledgeBaseId,
+    items,
+  });
 }
 
 export interface ParserSettingItem {
@@ -2483,6 +2796,8 @@ export function getWikiContentsStats(
 export interface DocumentVersionItem {
   id: string;
   versionNo: number;
+  /** 文档行当前指向的版本（回滚后可能与其它版本共享同一对象）。 */
+  isCurrent: boolean;
   fileName: string;
   fileSize: number;
   mimeType: string | null;
@@ -2496,6 +2811,7 @@ export interface DocumentVersionItem {
 interface BackendDocumentVersion {
   id: string;
   version_no: number;
+  is_current?: boolean;
   file_name: string;
   file_size: number;
   mime_type?: string | null;
@@ -2510,6 +2826,7 @@ function mapDocumentVersion(row: BackendDocumentVersion): DocumentVersionItem {
   return {
     id: row.id,
     versionNo: row.version_no,
+    isCurrent: row.is_current === true,
     fileName: row.file_name,
     fileSize: row.file_size,
     mimeType: row.mime_type ?? null,
@@ -2531,19 +2848,74 @@ export async function listDocumentVersions(
   return { items, total: data.total ?? items.length };
 }
 
+export interface VersionSimilarityHint {
+  similarity: number;
+  method: string;
+  threshold: number;
+  storageKey: string;
+  storageBackend: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string | null;
+}
+
+export type UploadVersionResult =
+  | { kind: 'created'; documentId: string; version: DocumentVersionItem }
+  | { kind: 'needs_confirmation'; hint: VersionSimilarityHint };
+
+interface BackendVersionUploadResponse {
+  document_id?: string;
+  version?: BackendDocumentVersion;
+  needs_confirmation?: boolean;
+  preview?: boolean;
+  similarity?: number;
+  method?: string;
+  threshold?: number;
+  same_as_current?: boolean;
+  same_as_version_no?: number | null;
+  current_version_no?: number | null;
+  current_file_size?: number;
+  storage_key?: string;
+  storage_backend?: string;
+  file_name?: string;
+  file_size?: number;
+  mime_type?: string | null;
+}
+
+function mapUploadVersionResult(data: BackendVersionUploadResponse): UploadVersionResult {
+  if (data.needs_confirmation) {
+    return {
+      kind: 'needs_confirmation',
+      hint: {
+        similarity: data.similarity ?? 0,
+        method: data.method ?? 'bytes',
+        threshold: data.threshold ?? 0.85,
+        storageKey: data.storage_key ?? '',
+        storageBackend: data.storage_backend ?? 'local',
+        fileName: data.file_name ?? '',
+        fileSize: data.file_size ?? 0,
+        mimeType: data.mime_type ?? null,
+      },
+    };
+  }
+  return {
+    kind: 'created',
+    documentId: data.document_id ?? '',
+    version: mapDocumentVersion(data.version as BackendDocumentVersion),
+  };
+}
+
 export async function uploadDocumentVersion(
   documentId: string,
   knowledgeBaseId: string,
   file: File,
   options?: UploadDocumentOptions,
-): Promise<{ documentId: string; version: DocumentVersionItem }> {
+): Promise<UploadVersionResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('knowledge_base_id', knowledgeBaseId);
-  const data = await getData<{
-    document_id: string;
-    version: BackendDocumentVersion;
-  }>(
+  if (options?.confirmSimilar) formData.append('confirm_similar', 'true');
+  const data = await getData<BackendVersionUploadResponse>(
     request.post(`/knowledge-base/documents/${documentId}/versions`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 300000,
@@ -2551,7 +2923,89 @@ export async function uploadDocumentVersion(
       signal: options?.signal,
     }),
   );
-  return { documentId: data.document_id, version: mapDocumentVersion(data.version) };
+  return mapUploadVersionResult(data);
+}
+
+export interface VersionPreviewResult extends VersionSimilarityHint {
+  sameAsCurrent: boolean;
+  /** 与某个历史版本 MD5 完全相同时的版本号（否则 null）。 */
+  sameAsVersionNo: number | null;
+  currentVersionNo: number | null;
+  currentFileSize: number;
+}
+
+/** 仅上传对象并对比内容（不写库）：用于上传前的「同名文档内容差异」提示。 */
+export async function previewDocumentVersion(
+  documentId: string,
+  knowledgeBaseId: string,
+  file: File,
+  options?: UploadDocumentOptions,
+): Promise<VersionPreviewResult> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('knowledge_base_id', knowledgeBaseId);
+  formData.append('preview', 'true');
+  const data = await getData<BackendVersionUploadResponse>(
+    request.post(`/knowledge-base/documents/${documentId}/versions`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000,
+      onUploadProgress: options?.onUploadProgress,
+      signal: options?.signal,
+    }),
+  );
+  return {
+    sameAsCurrent: Boolean(data.same_as_current),
+    sameAsVersionNo: data.same_as_version_no ?? null,
+    currentVersionNo: data.current_version_no ?? null,
+    currentFileSize: data.current_file_size ?? 0,
+    similarity: data.similarity ?? 0,
+    method: data.method ?? 'bytes',
+    threshold: data.threshold ?? 0.85,
+    storageKey: data.storage_key ?? '',
+    storageBackend: data.storage_backend ?? 'local',
+    fileName: data.file_name ?? file.name,
+    fileSize: data.file_size ?? file.size,
+    mimeType: data.mime_type ?? null,
+  };
+}
+
+/** 相似度询问确认后复用同一临时对象建版本（不再传文件字节）。 */
+export async function confirmDocumentVersionUpload(
+  documentId: string,
+  knowledgeBaseId: string,
+  hint: VersionSimilarityHint,
+): Promise<{ documentId: string; version: DocumentVersionItem }> {
+  const formData = new FormData();
+  formData.append('knowledge_base_id', knowledgeBaseId);
+  formData.append('storage_key', hint.storageKey);
+  formData.append('storage_backend', hint.storageBackend);
+  formData.append('file_name', hint.fileName);
+  if (hint.mimeType) formData.append('mime_type', hint.mimeType);
+  formData.append('file_size', String(hint.fileSize));
+  formData.append('confirm_similar', 'true');
+  const data = await getData<BackendVersionUploadResponse>(
+    request.post(`/knowledge-base/documents/${documentId}/versions`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000,
+    }),
+  );
+  return {
+    documentId: data.document_id ?? documentId,
+    version: mapDocumentVersion(data.version as BackendDocumentVersion),
+  };
+}
+
+/** 放弃待确认上传：删除临时对象。 */
+export async function discardDocumentVersionUpload(
+  documentId: string,
+  storageKey: string,
+  storageBackend: string,
+): Promise<{ discarded: boolean }> {
+  return getData<{ discarded: boolean }>(
+    request.delete(`/knowledge-base/documents/${documentId}/versions/pending`, {
+      params: { storage_key: storageKey, storage_backend: storageBackend },
+    }),
+  );
 }
 
 export async function getDocumentVersionUrl(
@@ -2566,4 +3020,84 @@ export async function getDocumentVersionUrl(
     request.get(`/knowledge-base/documents/${documentId}/versions/${versionNo}/url`),
   );
   return { url: data.url, fileName: data.file_name, versionNo: data.version_no };
+}
+
+export async function activateDocumentVersion(
+  documentId: string,
+  versionNo: number,
+): Promise<{ documentId: string; activatedFrom: number; version: DocumentVersionItem }> {
+  const data = await getData<{
+    document_id: string;
+    activated_from: number;
+    version: BackendDocumentVersion;
+  }>(
+    request.post(
+      `/knowledge-base/documents/${documentId}/versions/${versionNo}/activate`,
+    ),
+  );
+  return {
+    documentId: data.document_id,
+    activatedFrom: data.activated_from,
+    version: mapDocumentVersion(data.version),
+  };
+}
+
+// ─── 解析后相似建议 / 合并为新版本 ─────────────────────────────
+
+interface BackendSimilaritySuggestion {
+  id: string;
+  target_document_id: string;
+  target_file_name?: string;
+  similarity: number;
+  method?: string;
+  can_merge?: boolean;
+  block_reason?: string | null;
+  source_block_reason?: string | null;
+}
+
+/** 该文档当前待处理的相似建议（dismiss 后不再返回）。 */
+export async function getSimilaritySuggestions(documentId: string): Promise<SimilaritySuggestion[]> {
+  const data = await getData<{ items: BackendSimilaritySuggestion[] }>(
+    request.get(`/knowledge-base/documents/${documentId}/similarity-suggestions`),
+  );
+  return (data.items || [])
+    // 缺 id / target 的条目是脏数据：丢弃，避免渲染出 "undefined"
+    .filter((it) => Boolean(it.id) && Boolean(it.target_document_id))
+    .map((it) => ({
+      id: it.id,
+      targetDocumentId: it.target_document_id,
+      targetFileName: it.target_file_name || '',
+      // 0 仅作异常兜底（后端契约里 similarity 必为数字）
+      similarity: Number.isFinite(it.similarity) ? it.similarity : 0,
+      // 不猜测检测方法：后端未给就留空
+      method: it.method || '',
+      canMerge: it.can_merge === true,
+      blockReason: it.block_reason ?? null,
+      sourceBlockReason: it.source_block_reason ?? null,
+    }));
+}
+
+/** 忽略一条相似建议（源文档与目标文档均保持不变）。 */
+export async function dismissSimilaritySuggestion(
+  documentId: string,
+  suggestionId: string,
+): Promise<void> {
+  await postData(`/knowledge-base/documents/${documentId}/similarity-suggestions/${suggestionId}/dismiss`, {});
+}
+
+/** 把源文档合并为目标文档的新版本（可选触发重解析）。 */
+export async function mergeSimilaritySuggestion(
+  documentId: string,
+  suggestionId: string,
+): Promise<{ targetDocumentId: string; versionNo: number; reparseError?: string }> {
+  const data = await postData<{
+    target_document_id: string;
+    version_no: number;
+    reparse_error?: string;
+  }>(`/knowledge-base/documents/${documentId}/similarity-suggestions/${suggestionId}/merge`, {});
+  return {
+    targetDocumentId: data.target_document_id,
+    versionNo: data.version_no,
+    reparseError: data.reparse_error,
+  };
 }

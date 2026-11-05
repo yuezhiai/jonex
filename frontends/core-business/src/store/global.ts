@@ -65,10 +65,11 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
 
   setSpaces: (list) => {
     set((state) => {
-      // 当前空间不在新列表中则回落
+      // 当前空间不在新列表中则回落；优先落到首个可用空间
+      // （列表里仍可能保留管理员可见的禁用空间，不能一上来就选中它）
       let currentSpaceId = state.currentSpaceId;
       if (currentSpaceId && !list.find((s) => s.id === currentSpaceId)) {
-        currentSpaceId = list[0]?.id ?? null;
+        currentSpaceId = list.find((s) => s.status === 'active')?.id ?? list[0]?.id ?? null;
       }
       return {
         spaces: list,
@@ -93,8 +94,13 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
       const { currentSpaceId } = get();
       if (!currentSpaceId) {
         const persisted = readPersistedSpaceId();
+        // [jonex] 判据是「在不在列表里」，不是「是不是 active」：禁用空间对管理员
+        // 仍可见，选中它就是为了看到禁用态说明；只有列表里没有（成员看到的禁用
+        // 空间已被后端过滤，或空间已删除）才回落到首个可用空间。
         const valid = persisted && data.find((s) => s.id === persisted);
-        const nextId = valid ? persisted : (data[0]?.id ?? null);
+        const nextId = valid
+          ? persisted
+          : (data.find((s) => s.status === 'active')?.id ?? data[0]?.id ?? null);
         persistSpaceId(nextId);
         set({ currentSpaceId: nextId });
       }

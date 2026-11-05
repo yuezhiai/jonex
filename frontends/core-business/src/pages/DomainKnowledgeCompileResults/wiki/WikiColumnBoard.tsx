@@ -1,897 +1,230 @@
-/**
- * [jonex] Wiki 列式图谱 = 「列式浏览」（Miller columns）。
- *
- * 形态与平台既有链路（领域本体 → 列式浏览）**完全一致**：点一张卡片就向右追加一列，
- * 列间用贝塞尔曲线连起来，已出现过的节点置灰去环。基础件直接复用 `columnBoard/`，
- * 不另写一套视觉。
- *
- * 列的内容按「读者在 Wiki 里怎么找东西」安排：
- *   ① 目录主题（无目录时退化为分类）→ ② 该主题的章节条目（按目录顺序编号）
- *   → ③ 这一页的关联（页间链接 / 正文提及 / 链入 / 源文档，带方向徽标）
- *   → ④+ 继续下钻：关联页 → 它自己的关联；源文档 → 它支撑的断言；
- *        表格页 → 行/品类 → 该行在各日期的取值。
- *
- * 旧的「对比表 / 时间轴矩阵 / 溯源审计」三个独立表格界面已并入这条下钻路径
- * （矩阵与审计只保留在本体链路的表格视图里，Wiki 侧不再重复造表格）。
- */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+/** Wiki graph data with the ontology chain's shared Miller-column presentation. */
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Alert, Segmented, Spin } from 'antd';
-import { getWikiBacklinks, getWikiClaims, getWikiOutline, getWikiReaderPage } from '@/api/wikiReader';
-import type {
-  WikiClaim,
-  WikiOutlineView,
-  WikiPageContent,
-  WikiReaderPage,
-} from '@/types/domainKnowledge';
+import { Alert, Button, Drawer, Select, Spin, Tag, Image } from 'antd';
+import { useDocumentViewer, inferMediaType } from '@/components/DocumentViewer';
+import MarkdownContent from '@/components/MarkdownContent';
 import {
-  ColumnEmpty,
-  ColumnError,
-  ColumnLoading,
-  ColumnShell,
-  ColumnStage,
-  EMPTY_SET,
-  NodeCard,
-  useAppearedKeys,
-  useColumnConnectors,
-  type ColumnItem,
-} from '../columnBoard/parts';
-import { buildLinkGroups } from './wikiRelations';
-import { LINK_BADGE_KEY, LINK_KIND_COLOR } from './wikiLinkStyle';
-import { analyzePageLinks } from './wikiMarkdown';
-import { ROOT_ID, buildOutlineTree, type OutlineNodeLike } from './wikiOutlineData';
-import { buildTimelineMatrix, type TimelineMatrix } from './wikiColumnar';
+  getWikiImageUrl, getWikiGraphTypes, searchWikiGraphNodes, getWikiGraphNeighbors, getWikiGraphEvidence, getWikiGraphNode,
+  type WikiGraphNode, type WikiGraphEdge, type WikiGraphEvidence, type WikiGraphFamily,
+  type WikiGraphTypes, type WikiGraphPage,
+} from '@/api/wikiGraph';
+import { ColumnEmpty, ColumnError, ColumnLoading, ColumnShell, ColumnStage, NodeCard,
+  useColumnConnectors, type ColumnItem } from '../columnBoard/parts';
 
-const FETCH_CONCURRENCY = 6;
-/** 关联列最多展示的条目数（超出的按分组截断，避免一列上百张卡） */
-const LINKS_PER_GROUP = 30;
-/** 断言列上限 */
-const CLAIM_LIMIT = 200;
-
-type WikiColumnPayload =
-  | { kind: 'topics' }
-  | { kind: 'entries'; topicId: string }
-  | { kind: 'links'; path: string }
-  | { kind: 'rows'; path: string }
-  | { kind: 'cells'; path: string; rowLabel: string }
-  | { kind: 'claims'; documentId: string };
-
-type WikiColumnDesc = WikiColumnPayload & { key: string; title: string };
-
-interface WikiColumnBoardProps {
-  kbId: string;
-  documentId?: string;
-  /** 已加载的目录视图（阅读页首屏已有，不必重复请求） */
-  view?: WikiOutlineView | null;
-  height?: string | number;
-  onOpenPage?: (path: string) => void;
-  onOpenDocument?: (documentId: string) => void;
+const PAGE_SIZE = 20;
+type Column = { key: string } & ({ kind: 'types' } | { kind: 'nodes'; nodeType: string } | { kind: 'neighbors'; node: WikiGraphNode });
+interface Props {
+  kbId: string; documentId?: string; height?: string | number;
+}
+const typeKey = (kind: string) => `domainKnowledge.wikiGraph.nodeTypes.${kind}`;
+const familyKey = (family: string) => `domainKnowledge.wikiGraph.families.${family}`;
+function conditionText(value: WikiGraphEdge['qualifiers']) {
+  const records = Array.isArray(value) ? value : [value];
+  return [...new Set(records.flatMap(record => Object.entries(record || {}).filter(([key]) => !["catalog_relation_id", "support_kind", "binding_id", "association_method"].includes(key)).map(([, value]) => value).filter(item => typeof item === 'string') as string[]))].join('；');
 }
 
-/** 目录节点 → 扁平的可下钻条目（含小节，按目录顺序） */
-function entriesOf(node: OutlineNodeLike | undefined): { path: string; title: string; role?: string; note?: string }[] {
-  if (!node) return [];
-  const out: { path: string; title: string; role?: string; note?: string }[] = [];
-  const walk = (n: OutlineNodeLike) => {
-    for (const entry of n.entries || []) {
-      out.push({
-        path: entry.path,
-        title: entry.title || entry.path,
-        role: (entry as { role?: string }).role,
-        note: (entry as { note?: string }).note,
-      });
-    }
-    for (const child of n.children || []) walk(child);
-  };
-  walk(node);
-  return out;
+export default function WikiColumnBoard(props: Props) {
+  return <GraphBoard key={`${props.kbId}:${props.documentId || ''}`} {...props} />;
 }
-
-export default function WikiColumnBoard({
-  kbId,
-  documentId = '',
-  view: viewProp,
-  height = 'calc(100vh - 400px)',
-  onOpenPage,
-  onOpenDocument,
-}: WikiColumnBoardProps) {
+function GraphBoard({ kbId, documentId = '', height = '100%' }: Props) {
   const { t } = useTranslation();
-  const seqRef = useRef(1);
-  const [innerView, setInnerView] = useState<WikiOutlineView | null>(viewProp ?? null);
-  const [loadError, setLoadError] = useState('');
-  const [columns, setColumns] = useState<WikiColumnDesc[]>([]);
-  const [colItemsMap, setColItemsMap] = useState<Record<string, Set<string>>>({});
-  const [docs, setDocs] = useState<Record<string, WikiPageContent>>({});
-
+  const sequence = useRef(1);
+  const [columns, setColumns] = useState<Column[]>([{ key: 'col-0', kind: 'types' }]);
+  const [types, setTypes] = useState<WikiGraphTypes | null>(null);
+  const [error, setError] = useState('');
+  const [reload, setReload] = useState(0);
+  const [detail, setDetail] = useState<{ node: WikiGraphNode; edge?: WikiGraphEdge } | null>(null);
   const connectors = useColumnConnectors(columns.length);
-  const scheduleConnectors = connectors.scheduleConnectors;
-
-  const view = viewProp ?? innerView;
-  const pages = useMemo(() => view?.pages || [], [view]);
-  const pagesByPath = useMemo(() => new Map(pages.map((p) => [p.path, p])), [pages]);
-
-  // 没有外部传入目录时自己取（文档级面板与知识库级共用同一个接口，document_id 决定范围）
   useEffect(() => {
-    if (viewProp) {
-      setInnerView(viewProp);
-      return;
-    }
     let alive = true;
-    getWikiOutline(kbId, documentId || undefined)
-      .then((res) => {
-        if (alive) {
-          setInnerView(res);
-          setLoadError('');
-        }
-      })
-      .catch((err) => {
-        if (alive) setLoadError((err as Error)?.message || t('common.loadFailed'));
-      });
-    return () => {
-      alive = false;
-    };
-  }, [kbId, documentId, viewProp, t]);
-
-  // 首列：目录主题（无目录时退化为分类）
-  useEffect(() => {
-    if (!view || columns.length) return;
-    setColumns([{ key: 'col-0', kind: 'topics', title: t('domainKnowledge.wikiColumns.topics') }]);
-  }, [view, columns.length, t]);
-
-  /** 批量读页面（带缓存 + 并发上限），关联列与表格列共用 */
-  const loadDocs = useCallback(
-    async (paths: string[]): Promise<void> => {
-      const todo = paths.filter((p) => p && !docs[p]);
-      for (let i = 0; i < todo.length; i += FETCH_CONCURRENCY) {
-        const chunk = todo.slice(i, i + FETCH_CONCURRENCY);
-        const results = await Promise.all(chunk.map((p) => getWikiReaderPage(kbId, p).catch(() => null)));
-        const fetched: Record<string, WikiPageContent> = {};
-        results.forEach((res, idx) => {
-          if (res) fetched[chunk[idx]] = res;
-        });
-        if (Object.keys(fetched).length) setDocs((prev) => ({ ...prev, ...fetched }));
-      }
-    },
-    [kbId, docs],
-  );
-
-  const handleDrill = useCallback((index: number, payload: WikiColumnPayload, title: string) => {
-    const key = `col-${seqRef.current++}`;
-    setColumns((prev) => [...prev.slice(0, index + 1), { ...payload, key, title }]);
+    setTypes(null); setError('');
+    getWikiGraphTypes(kbId, { document_id: documentId }).then(result => {
+      if (alive) setTypes(result);
+    }).catch(err => { if (alive) setError(err?.message || t('common.loadFailed')); });
+    return () => { alive = false; };
+  }, [kbId, documentId, reload, t]);
+  const drill = useCallback((index: number, node: WikiGraphNode) => {
+    setColumns(previous => {
+      const prefix = previous.slice(0, index + 1);
+      const existing = prefix.findIndex(c => c.kind === 'neighbors' && c.node.node_id === node.node_id);
+      if (existing >= 0) return prefix.slice(0, existing + 1);
+      return [...prefix, { key: `col-${sequence.current++}`, kind: 'neighbors', node }];
+    });
   }, []);
-
-  const handleColItems = useCallback((colKey: string, keys: Set<string>) => {
-    setColItemsMap((prev) => ({ ...prev, [colKey]: keys }));
-  }, []);
-
-  const appearedByCol = useAppearedKeys(
-    columns.map((c) => c.key),
-    colItemsMap,
-  );
-
-  // top-level 目录主题 -> 节点映射（entries 列按 topicId 取内容）
-  const topicById = useMemo(() => {
-    const map = new Map<string, OutlineNodeLike>();
-    for (const node of view?.outline?.topics || []) map.set(node.id, node as unknown as OutlineNodeLike);
-    return map;
-  }, [view]);
-
-  if (loadError) {
-    return (
-      <Alert
-        type="error"
-        showIcon
-        message={t('common.loadFailed')}
-        description={loadError}
-        style={{ margin: 24 }}
-      />
-    );
-  }
-  if (!view) {
-    return (
-      <div style={{ padding: 48, textAlign: 'center' }}>
-        <Spin />
-      </div>
-    );
-  }
-
-  return (
+  if (error) return <Alert type="error" showIcon message={t('common.loadFailed')} description={error}
+    action={<Button onClick={() => setReload(v => v + 1)}>{t('common.retry')}</Button>} />;
+  if (!types) return <div style={{ padding: 48, textAlign: 'center' }}><Spin /></div>;
+  return <>
     <ColumnStage connectors={connectors} height={height}>
-      {columns.map((col, i) => {
-        const common = {
-          kbId,
-          documentId,
-          colKey: col.key,
-          grayedKeys: appearedByCol[i] ?? EMPTY_SET,
-          onItemsChange: handleColItems,
-          onDrill: (payload: WikiColumnPayload, title: string) => handleDrill(i, payload, title),
-          onChanged: scheduleConnectors,
-        };
-        if (col.kind === 'topics') {
-          return (
-            <TopicsColumn
-              key={col.key}
-              {...common}
-              outline={view.outline}
-              pages={pages}
-            />
-          );
-        }
-        if (col.kind === 'entries') {
-          const node = topicById.get(col.topicId);
-          return (
-            <EntriesColumn
-              key={col.key}
-              {...common}
-              title={col.title}
-              entries={node ? entriesOf(node) : entriesOfFallback(pages, col.topicId)}
-              pagesByPath={pagesByPath}
-            />
-          );
-        }
-        if (col.kind === 'links') {
-          return (
-            <LinksColumn
-              key={col.key}
-              {...common}
-              path={col.path}
-              title={col.title}
-              pages={pages}
-              pagesByPath={pagesByPath}
-              docs={docs}
-              loadDocs={loadDocs}
-              onOpenPage={onOpenPage}
-              onOpenDocument={onOpenDocument}
-            />
-          );
-        }
-        if (col.kind === 'rows') {
-          return (
-            <RowsColumn
-              key={col.key}
-              {...common}
-              path={col.path}
-              title={col.title}
-              docs={docs}
-              loadDocs={loadDocs}
-            />
-          );
-        }
-        if (col.kind === 'cells') {
-          return (
-            <CellsColumn
-              key={col.key}
-              {...common}
-              path={col.path}
-              rowLabel={col.rowLabel}
-              title={col.title}
-              docs={docs}
-              loadDocs={loadDocs}
-            />
-          );
-        }
-        return (
-          <ClaimsColumn
-            key={col.key}
-            {...common}
-            documentId={col.documentId}
-            title={col.title}
-            onOpenPage={onOpenPage}
-          />
-        );
-      })}
+      {columns.map((column, index) => column.kind === 'types' ? <TypesColumn key={column.key} types={types}
+        onChanged={connectors.scheduleConnectors}
+        onChoose={nodeType => setColumns(previous => [previous[0], { key: `col-${sequence.current++}`, kind: 'nodes', nodeType }])} /> :
+        <DataColumn key={column.key} kbId={kbId} documentId={documentId} revision={types.graph_revision} column={column}
+          visited={new Set(columns.slice(0, index).flatMap(c => c.kind === 'neighbors' ? [c.node.node_id] : []))}
+          onChanged={connectors.scheduleConnectors} onChoose={node => drill(index, node)}
+          onRefresh={() => { setColumns([{ key: 'col-0', kind: 'types' }]); setDetail(null); setReload(v => v + 1); }}
+          onDetail={(node, edge) => setDetail({ node, edge })} />)}
     </ColumnStage>
-  );
+    {detail && <NodeDetail kbId={kbId} documentId={documentId} revision={types.graph_revision} detail={detail}
+      onClose={() => setDetail(null)} />}
+  </>;
 }
-
-interface ColumnCommonProps {
-  kbId: string;
-  documentId: string;
-  colKey: string;
-  grayedKeys: ReadonlySet<string>;
-  onItemsChange: (colKey: string, keys: Set<string>) => void;
-  onDrill: (payload: WikiColumnPayload, title: string) => void;
-  onChanged: () => void;
-}
-
-/** 无目录时的主题列：按分类分组（与主题地图的兜底同源，顺序也一致） */
-function entriesOfFallback(pages: WikiReaderPage[], topicId: string) {
-  const category = topicId.startsWith('cat:') ? topicId.slice(4) : topicId;
-  return pages
-    .filter((p) => (p.category || 'unclassified') === category)
-    .sort((a, b) => (a.title || '').localeCompare(b.title || '', 'zh-CN'))
-    .map((p) => ({ path: p.path, title: p.title || p.path, role: p.type }));
-}
-
-/** 渲染完成后重画连线 + 上报本列节点（置灰去环的依据） */
-function useColumnItems(
-  items: ColumnItem[],
-  colKey: string,
-  onItemsChange: ColumnCommonProps['onItemsChange'],
-  onChanged: () => void,
-  extraKey?: string,
-) {
-  useEffect(() => {
-    onItemsChange(colKey, new Set(items.map((it) => it.key)));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [colKey, items]);
-  useEffect(() => {
-    onChanged();
-  }, [items, extraKey, onChanged]);
-}
-
-// ── ① 目录主题（无目录 → 分类）─────────────────────────────
-
-function TopicsColumn({
-  outline,
-  pages,
-  colKey,
-  grayedKeys,
-  onItemsChange,
-  onDrill,
-  onChanged,
-}: ColumnCommonProps & { outline: WikiOutlineView['outline']; pages: WikiReaderPage[] }) {
+function TypesColumn({ types, onChoose, onChanged }: { types: WikiGraphTypes; onChoose: (kind: string) => void; onChanged: () => void }) {
   const { t } = useTranslation();
   const [keyword, setKeyword] = useState('');
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const items = useMemo<ColumnItem[]>(() => {
-    const tree = buildOutlineTree({
-      outline: outline ? { topics: outline.topics as unknown as OutlineNodeLike[] } : null,
-      pages,
-      expanded: new Set([ROOT_ID]),
-    });
-    return (tree.children || []).map((node) => ({
-      key: node.id,
-      label: node.label,
-      sub: t('domainKnowledge.wikiColumns.pageCount', { count: node.count ?? 0 }),
-      isType: true,
-    }));
-  }, [outline, pages, t]);
-
-  const filtered = useMemo(() => {
-    const kw = keyword.trim().toLowerCase();
-    return kw ? items.filter((it) => it.label.toLowerCase().includes(kw)) : items;
-  }, [items, keyword]);
-
-  useColumnItems(items, colKey, onItemsChange, onChanged, keyword);
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.outline')}
-      title={t('domainKnowledge.wikiColumns.topics')}
-      count={filtered.length}
-      searchable
-      search={keyword}
-      onSearch={setKeyword}
-    >
-      {filtered.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyTopics')} />
-      ) : (
-        filtered.map((it) => (
-          <NodeCard
-            key={it.key}
-            selected={selected === it.key}
-            grayed={grayedKeys.has(it.key)}
-            onClick={() => {
-              setSelected(it.key);
-              onDrill({ kind: 'entries', topicId: it.key }, it.label);
-            }}
-            item={it}
-          />
-        ))
-      )}
-    </ColumnShell>
-  );
+  const [selected, setSelected] = useState('');
+  const items = types.items.filter(item => t(typeKey(item.node_type)).toLowerCase().includes(keyword.toLowerCase()) || item.node_type.includes(keyword));
+  useEffect(() => { onChanged(); }, [keyword, selected, types, onChanged]);
+  return <ColumnShell kicker={t('domainKnowledge.wikiGraph.kicker')} title={t('domainKnowledge.wikiGraph.types')}
+    count={items.length} searchable search={keyword} onSearch={setKeyword}>
+    {items.length ? items.map(item => <NodeCard key={item.node_type} selected={selected === item.node_type}
+      item={{ key: item.node_type, label: t(typeKey(item.node_type)), sub: t('domainKnowledge.wikiGraph.nodeCount', { count: item.count }), isType: true }}
+      onClick={() => { setSelected(item.node_type); onChoose(item.node_type); }} />) : <ColumnEmpty text={t('domainKnowledge.wikiGraph.empty')} />}
+  </ColumnShell>;
 }
-
-// ── ② 章节条目（按目录顺序编号）───────────────────────────
-
-function EntriesColumn({
-  title,
-  entries,
-  pagesByPath,
-  colKey,
-  grayedKeys,
-  onItemsChange,
-  onDrill,
-  onChanged,
-}: ColumnCommonProps & {
-  title: string;
-  entries: { path: string; title: string; role?: string; note?: string }[];
-  pagesByPath: Map<string, WikiReaderPage>;
+function DataColumn({ kbId, documentId, revision, column, visited, onChoose, onDetail, onChanged, onRefresh }: {
+  kbId: string; documentId: string; revision: string; column: Exclude<Column, { kind: 'types' }>;
+  visited: Set<string>; onChoose: (node: WikiGraphNode) => void;
+  onDetail: (node: WikiGraphNode, edge?: WikiGraphEdge) => void; onChanged: () => void; onRefresh: () => void;
 }) {
   const { t } = useTranslation();
   const [keyword, setKeyword] = useState('');
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const items = useMemo<ColumnItem[]>(
-    () =>
-      entries
-        // 目录可能引用了已不存在的页面（编译产物换代）→ 这里以页面清单为准
-        .filter((entry) => pagesByPath.has(entry.path))
-        .map((entry, index) => {
-          const page = pagesByPath.get(entry.path);
-          return {
-            key: entry.path,
-            label: entry.title,
-            // 序号来自目录顺序：这是「像课本」的那条线索，列式视图也必须保留
-            sub: `${String(index + 1).padStart(2, '0')} · ${page?.type || entry.role || ''}`,
-            tag: page?.category,
-            desc: entry.note,
-          };
-        }),
-    [entries, pagesByPath],
-  );
-
-  const filtered = useMemo(() => {
-    const kw = keyword.trim().toLowerCase();
-    return kw
-      ? items.filter(
-          (it) => it.label.toLowerCase().includes(kw) || (it.tag || '').toLowerCase().includes(kw),
-        )
-      : items;
-  }, [items, keyword]);
-
-  useColumnItems(items, colKey, onItemsChange, onChanged, keyword);
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.entries')}
-      title={title}
-      count={filtered.length}
-      searchable
-      search={keyword}
-      onSearch={setKeyword}
-    >
-      {filtered.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyEntries')} />
-      ) : (
-        filtered.map((it) => (
-          <NodeCard
-            key={it.key}
-            selected={selected === it.key}
-            grayed={grayedKeys.has(it.key)}
-            onClick={() => {
-              setSelected(it.key);
-              onDrill({ kind: 'links', path: it.key }, it.label);
-            }}
-            item={it}
-          />
-        ))
-      )}
-    </ColumnShell>
-  );
-}
-
-// ── ③ 本页关联（页间链接 / 提及 / 链入 / 源文档）────────────
-
-function LinksColumn({
-  kbId,
-  path,
-  title,
-  pages,
-  pagesByPath,
-  docs,
-  loadDocs,
-  onOpenPage,
-  onOpenDocument,
-  colKey,
-  grayedKeys,
-  onItemsChange,
-  onDrill,
-  onChanged,
-}: ColumnCommonProps & {
-  path: string;
-  title: string;
-  pages: WikiReaderPage[];
-  pagesByPath: Map<string, WikiReaderPage>;
-  docs: Record<string, WikiPageContent>;
-  loadDocs: (paths: string[]) => Promise<void>;
-  onOpenPage?: (path: string) => void;
-  onOpenDocument?: (documentId: string) => void;
-}) {
-  const { t } = useTranslation();
-  const [backlinks, setBacklinks] = useState<Awaited<ReturnType<typeof getWikiBacklinks>> | null>(null);
+  const [family, setFamily] = useState<WikiGraphFamily | 'all'>('all');
+  const [items, setItems] = useState<(WikiGraphNode | WikiGraphEdge)[]>([]);
+  const [total, setTotal] = useState(0);
+  const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const page = docs[path];
-  const pageKey = path;
-
+  const [selected, setSelected] = useState('');
+  const [reload, setReload] = useState(0);
+  const requestSequence = useRef(0);
+  const load = useCallback(async (nextCursor = '') => {
+    const token = ++requestSequence.current;
+    setLoading(true); setError('');
+    try {
+      const options = { graph_revision: revision, document_id: documentId, cursor: nextCursor, limit: PAGE_SIZE };
+      const result: WikiGraphPage<WikiGraphNode | WikiGraphEdge> = column.kind === 'nodes'
+        ? await searchWikiGraphNodes(kbId, { ...options, query: keyword, node_type: column.nodeType })
+        : await getWikiGraphNeighbors(kbId, { ...options, node_id: column.node.node_id, families: family === 'all' ? undefined : [family] });
+      if (token !== requestSequence.current) return;
+      setItems(previous => nextCursor ? [...previous, ...result.items] : result.items);
+      setTotal(result.total); setCursor(result.next_cursor);
+    } catch (err) { if (token === requestSequence.current) setError((err as Error)?.message || t('common.loadFailed')); }
+    finally { if (token === requestSequence.current) setLoading(false); }
+  }, [kbId, documentId, revision, column, keyword, family, t]);
   useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    Promise.all([loadDocs([pageKey]), getWikiBacklinks(kbId, path).catch(() => null)])
-      .then(([, backs]) => {
-        if (!alive) return;
-        setBacklinks(backs);
-        setError('');
-      })
-      .catch((err) => {
-        if (alive) setError((err as Error)?.message || '');
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, kbId]);
-
-  // 关系分组：与条目页右栏、星形图共用同一模型（顺序与配色都一致）
-  const groups = useMemo(() => {
-    if (!page) return [];
-    const analysis = analyzePageLinks(page.content || '', pages, page.enginePath || page.path);
-    const siblings = pages
-      .filter((p) => p.category && p.category === pagesByPath.get(path)?.category && p.path !== path)
-      .slice(0, 6);
-    return buildLinkGroups({
-      page,
-      pagesByPath,
-      mentionPaths: analysis.mentionPaths,
-      backlinks: backlinks?.items || [],
-      seeAlso: siblings,
-    });
-  }, [page, pages, pagesByPath, backlinks, path]);
-
-  const rows = useMemo(() => {
-    const seen = new Set<string>();
-    const out: { item: ColumnItem; payload: WikiColumnPayload; open?: () => void }[] = [];
-    for (const group of groups) {
-      for (const link of group.items.slice(0, LINKS_PER_GROUP)) {
-        if (seen.has(link.path)) continue;
-        seen.add(link.path);
-        const target = pagesByPath.get(link.path);
-        const isTable = (target?.type || '') === 'table';
-        // 源文档不是页面，下钻 = 看它支撑的断言；双击 = 打开原始文档
-        const payload: WikiColumnPayload =
-          group.kind === 'source'
-            ? { kind: 'claims', documentId: link.path }
-            : isTable
-              ? { kind: 'rows', path: link.path }
-              : { kind: 'links', path: link.path };
-        const open =
-          group.kind === 'source'
-            ? () => onOpenDocument?.(link.path)
-            : () => onOpenPage?.(link.path);
-        out.push({
-          item: {
-            key: group.kind === 'source' ? `doc:${link.path}` : link.path,
-            label: link.title,
-            sub: target?.category,
-            tag: target?.type,
-            desc: link.note,
-            relation: t(LINK_BADGE_KEY[group.kind]),
-          },
-          payload,
-          open,
-        });
-      }
-    }
-    return out;
-  }, [groups, pagesByPath, t, onOpenDocument, onOpenPage]);
-
-  useColumnItems(
-    rows.map((r) => r.item),
-    colKey,
-    onItemsChange,
-    onChanged,
-  );
-
-  if (loading && !page) {
-    return (
-      <ColumnShell kicker={t('domainKnowledge.wikiColumns.relations')} title={title} count={0}>
-        <ColumnLoading />
-      </ColumnShell>
-    );
-  }
-  if (error) {
-    return (
-      <ColumnShell kicker={t('domainKnowledge.wikiColumns.relations')} title={title} count={0}>
-        <ColumnError message={error} onRetry={() => setError('')} />
-      </ColumnShell>
-    );
-  }
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.relations')}
-      title={title}
-      count={rows.length}
-    >
-      {rows.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyRelations')} />
-      ) : (
-        <>
-          {rows.map(({ item, payload, open }) => (
-            <NodeCard
-              key={item.key}
-              selected={selected === item.key}
-              grayed={grayedKeys.has(item.key)}
-              onClick={() => {
-                setSelected(item.key);
-                onDrill(payload, item.label);
-              }}
-              onOpen={open}
-              openHint={t('domainKnowledge.wikiColumns.openHint')}
-              item={item}
-            />
-          ))}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, padding: '8px 2px 0' }}>
-            {groups.map((group) => (
-              <span key={group.kind} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <span
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: '50%',
-                    background: LINK_KIND_COLOR[group.kind],
-                  }}
-                />
-                <span style={{ fontSize: 10, color: '#94a3b8' }}>
-                  {t(LINK_BADGE_KEY[group.kind])} {group.items.length}
-                </span>
-              </span>
-            ))}
-          </div>
-        </>
-      )}
-    </ColumnShell>
-  );
+    setItems([]); setCursor(null); setTotal(0); setLoading(true); setSelected('');
+    const timer = setTimeout(() => { void load(); }, keyword ? 200 : 0);
+    return () => { clearTimeout(timer); ++requestSequence.current; };
+  }, [load, reload, keyword]);
+  useEffect(() => { onChanged(); }, [items, selected, loading, onChanged]);
+  const isNodes = column.kind === 'nodes';
+  return <ColumnShell kicker={isNodes ? t(typeKey(column.nodeType)) : column.node.label}
+    title={t(isNodes ? 'domainKnowledge.wikiGraph.nodes' : 'domainKnowledge.wikiGraph.neighbors')}
+    count={total} searchable={isNodes} search={keyword} onSearch={setKeyword}
+    headerExtra={isNodes ? undefined : <Select size="small" style={{ width: '100%' }} value={family}
+      aria-label={t('domainKnowledge.wikiGraph.relationFilter')} onChange={setFamily}
+      options={['all', 'semantic', 'navigation', 'provenance'].map(value => ({ value, label: t(familyKey(value)) }))} />}>
+    {items.map(item => {
+      const edge = 'edge_id' in item ? item : undefined;
+      const node = edge ? edge.node : item as WikiGraphNode;
+      const key = edge?.edge_id || node.node_id;
+      const scopeName = ['company', 'organization', 'sheet'].map(field => node.scope?.[field]).find(value => typeof value === 'string');
+      const card: ColumnItem = { key, label: node.label, tag: t(typeKey(node.node_type)),
+        sub: edge ? [t(familyKey(edge.family)), t('domainKnowledge.wikiGraph.evidence', { count: edge.evidence_count }),
+          edge.conflict ? t('domainKnowledge.wikiGraph.conflict') : '',
+          visited.has(node.node_id) ? t('domainKnowledge.wikiGraph.visited') : ''].filter(Boolean).join(' · ')
+          : node.node_type === 'claim' ? node.support_status : (scopeName as string | undefined) || node.category,
+        desc: edge ? conditionText(edge.qualifiers) || edge.description || node.description : node.description,
+        relation: edge ? `${edge.direction === 'in' ? '←' : '→'} ${edge.predicate}` : undefined };
+      return <NodeCard key={key} item={card} selected={selected === key} grayed={visited.has(node.node_id)}
+          onClick={() => { setSelected(key); onChoose(node); }} onOpen={() => onDetail(node, edge)}
+          openHint={t('domainKnowledge.wikiGraph.detailHint')} />;
+    })}
+    {loading && <ColumnLoading />}
+    {error && <ColumnError message={error} onRetry={() => setReload(v => v + 1)} />}
+    {error && <Button size="small" onClick={onRefresh}>{t('domainKnowledge.wikiGraph.refresh')}</Button>}
+    {!loading && !error && !items.length && <ColumnEmpty text={t('domainKnowledge.wikiGraph.empty')} />}
+    {!loading && !error && cursor && <Button onClick={() => void load(cursor)}>{t('domainKnowledge.wikiGraph.loadMore', { count: items.length, total })}</Button>}
+  </ColumnShell>;
 }
-
-// ── ④ 表格页 → 行/品类 ────────────────────────────────────
-
-function RowsColumn({
-  path,
-  title,
-  docs,
-  loadDocs,
-  colKey,
-  grayedKeys,
-  onItemsChange,
-  onDrill,
-  onChanged,
-}: ColumnCommonProps & {
-  path: string;
-  title: string;
-  docs: Record<string, WikiPageContent>;
-  loadDocs: (paths: string[]) => Promise<void>;
+function NodeDetail({ kbId, documentId, revision, detail, onClose }: {
+  kbId: string; documentId: string; revision: string; detail: { node: WikiGraphNode; edge?: WikiGraphEdge };
+  onClose: () => void;
 }) {
   const { t } = useTranslation();
-  const [selected, setSelected] = useState<string | null>(null);
-  const page = docs[path];
-
-  useEffect(() => {
-    void loadDocs([path]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
-
-  const matrix = useMemo<TimelineMatrix | null>(() => {
-    if (!page) return null;
-    return buildTimelineMatrix([
-      {
-        path: page.enginePath || page.path,
-        title: page.title || '',
-        markdown: page.content || '',
-        sheet: typeof page.scope?.sheet === 'string' ? page.scope.sheet : undefined,
-      },
-    ]);
-  }, [page]);
-
-  const items = useMemo<ColumnItem[]>(
-    () =>
-      (matrix?.rows || []).map((row) => {
-        const dates = Object.keys(row.values);
-        return {
-          key: row.label,
-          label: row.label,
-          sub: t('domainKnowledge.wikiColumns.dateCount', { count: dates.length }),
-          desc: dates.length ? row.values[dates[0]] : '',
-        };
-      }),
-    [matrix, t],
-  );
-
-  useColumnItems(items, colKey, onItemsChange, onChanged);
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.tableRows')}
-      title={title}
-      count={items.length}
-    >
-      {!page || !matrix ? (
-        <ColumnLoading />
-      ) : items.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyRows')} />
-      ) : (
-        items.map((it) => (
-          <NodeCard
-            key={it.key}
-            selected={selected === it.key}
-            grayed={grayedKeys.has(it.key)}
-            onClick={() => {
-              setSelected(it.key);
-              onDrill({ kind: 'cells', path, rowLabel: it.key }, it.label);
-            }}
-            item={it}
-          />
-        ))
-      )}
-    </ColumnShell>
-  );
-}
-
-// ── ⑤ 行 → 各日期取值 ─────────────────────────────────────
-
-function CellsColumn({
-  path,
-  rowLabel,
-  title,
-  docs,
-  loadDocs,
-  colKey,
-  grayedKeys,
-  onItemsChange,
-  onChanged,
-}: ColumnCommonProps & {
-  path: string;
-  rowLabel: string;
-  title: string;
-  docs: Record<string, WikiPageContent>;
-  loadDocs: (paths: string[]) => Promise<void>;
-}) {
-  const { t } = useTranslation();
-  const page = docs[path];
-
-  useEffect(() => {
-    void loadDocs([path]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
-
-  const items = useMemo<ColumnItem[]>(() => {
-    if (!page) return [];
-    const matrix = buildTimelineMatrix([
-      {
-        path: page.enginePath || page.path,
-        title: page.title || '',
-        markdown: page.content || '',
-        sheet: typeof page.scope?.sheet === 'string' ? page.scope.sheet : undefined,
-      },
-    ]);
-    const row = matrix.rows.find((r) => r.label === rowLabel);
-    if (!row) return [];
-    return Object.entries(row.values).map(([date, value]) => ({
-      key: `${rowLabel}:${date}`,
-      label: date,
-      desc: value,
-    }));
-  }, [page, rowLabel]);
-
-  useColumnItems(items, colKey, onItemsChange, onChanged);
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.values')}
-      title={title}
-      count={items.length}
-    >
-      {!page ? (
-        <ColumnLoading />
-      ) : items.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyValues')} />
-      ) : (
-        items.map((it) => <NodeCard key={it.key} grayed={grayedKeys.has(it.key)} item={it} onClick={() => undefined} />)
-      )}
-    </ColumnShell>
-  );
-}
-
-// ── ⑥ 源文档 → 它支撑的断言 ───────────────────────────────
-
-function ClaimsColumn({
-  kbId,
-  documentId,
-  title,
-  onOpenPage,
-  colKey,
-  onItemsChange,
-  onChanged,
-}: ColumnCommonProps & {
-  documentId: string;
-  title: string;
-  onOpenPage?: (path: string) => void;
-}) {
-  const { t } = useTranslation();
-  const [claims, setClaims] = useState<WikiClaim[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { openDocument, viewer } = useDocumentViewer();
+  const [imageUrl, setImageUrl] = useState('');
+  const [content, setContent] = useState<string | null>(null);
+  const [contentError, setContentError] = useState('');
+  const [contentLoading, setContentLoading] = useState(false);
+  const [items, setItems] = useState<WikiGraphEvidence[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [groupByPage, setGroupByPage] = useState<'page' | 'claim'>('page');
-
+  const sequence = useRef(0);
+  const contentSequence = useRef(0);
+  const load = useCallback(async (next = '') => {
+    const token = ++sequence.current;
+    setLoading(true); setError('');
+    try {
+      const result = await getWikiGraphEvidence(kbId, { graph_revision: revision, document_id: documentId,
+        ...(detail.edge ? { edge_id: detail.edge.edge_id } : { node_id: detail.node.node_id }), cursor: next });
+      if (token === sequence.current) { setItems(previous => next ? [...previous, ...result.items] : result.items); setCursor(result.next_cursor); }
+    } catch (err) { if (token === sequence.current) setError((err as Error)?.message || t('common.loadFailed')); }
+    finally { if (token === sequence.current) setLoading(false); }
+  }, [kbId, documentId, revision, detail, t]);
+  useEffect(() => {
+    setItems([]); setContent(null); setContentError(''); setContentLoading(false); void load();
+    return () => { ++sequence.current; ++contentSequence.current; };
+  }, [load]);
   useEffect(() => {
     let alive = true;
-    setLoading(true);
-    getWikiClaims(kbId, { documentId, limit: CLAIM_LIMIT })
-      .then((res) => {
-        if (!alive) return;
-        setClaims(res.items);
-        setError('');
-      })
-      .catch((err) => {
-        if (alive) setError((err as Error)?.message || '');
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [kbId, documentId]);
-
-  // 一个源文档通常支撑几十条断言、但只落在几页上：默认按页面归组，读者先看「影响了哪些页」
-  const items = useMemo<ColumnItem[]>(() => {
-    if (groupByPage) {
-      const byPage = new Map<string, { count: number; sample: string }>();
-      for (const claim of claims) {
-        const entry = byPage.get(claim.pagePath) || { count: 0, sample: claim.text };
-        entry.count += 1;
-        byPage.set(claim.pagePath, entry);
-      }
-      return [...byPage.entries()].map(([pagePath, info]) => ({
-        key: pagePath,
-        label: claims.find((c) => c.pagePath === pagePath)?.pageTitle || pagePath,
-        sub: t('domainKnowledge.wikiReader.claimCount', { count: info.count }),
-        desc: info.sample,
-      }));
+    setImageUrl('');
+    if (detail.node.asset_id && detail.node.document_id) {
+      getWikiImageUrl(kbId, detail.node.document_id, revision, detail.node.asset_id)
+        .then(url => { if (alive) setImageUrl(url); })
+        .catch(err => { if (alive) setContentError((err as Error).message); });
     }
-    return claims.map((claim) => ({
-      key: claim.claimId,
-      label: (claim.text || '').slice(0, 40),
-      sub: claim.pageTitle || claim.pagePath,
-      desc: claim.excerpt,
-    }));
-  }, [claims, groupByPage, t]);
-
-  useColumnItems(items, colKey, onItemsChange, onChanged, groupByPage);
-
-  return (
-    <ColumnShell
-      kicker={t('domainKnowledge.wikiColumns.claims')}
-      title={title}
-      count={items.length}
-      headerExtra={
-        <Segmented
-          size="small"
-          value={groupByPage ? 'page' : 'claim'}
-          onChange={(value) => setGroupByPage(value as 'page' | 'claim')}
-          options={[
-            { label: t('domainKnowledge.wikiColumns.byPage'), value: 'page' },
-            { label: t('domainKnowledge.wikiColumns.byClaim'), value: 'claim' },
-          ]}
-        />
-      }
-    >
-      {loading ? (
-        <ColumnLoading />
-      ) : error ? (
-        <ColumnError message={error} onRetry={() => setError('')} />
-      ) : items.length === 0 ? (
-        <ColumnEmpty text={t('domainKnowledge.wikiColumns.emptyClaims')} />
-      ) : (
-        items.map((it) => (
-          <NodeCard
-            key={it.key}
-            item={it}
-            onClick={groupByPage ? () => onOpenPage?.(it.key) : () => undefined}
-            onOpen={groupByPage ? () => onOpenPage?.(it.key) : undefined}
-            openHint={t('domainKnowledge.wikiColumns.openHint')}
-          />
-        ))
-      )}
-    </ColumnShell>
-  );
+    return () => { alive = false; };
+  }, [kbId, revision, detail.node]);
+  const openSource = (id: string, name: string, mime = '', page?: number) => {
+    openDocument({ docId: id, fileName: name, mediaType: inferMediaType(name), page });
+  };
+  const openPage = async () => {
+    const token = ++contentSequence.current;
+    setContentLoading(true); setContentError('');
+    try { const result = await getWikiGraphNode(kbId, detail.node.node_id, revision, documentId, true); if (token === contentSequence.current) setContent(result.node.content || ''); }
+    catch (err) { if (token === contentSequence.current) setContentError((err as Error)?.message || t('common.loadFailed')); }
+    finally { if (token === contentSequence.current) setContentLoading(false); }
+  };
+  return <Drawer open title={detail.node.label} onClose={onClose} size="large">
+    <Tag>{t(typeKey(detail.node.node_type))}</Tag>
+    <div style={{ margin: '12px 0', color: '#64748b' }}>{t('domainKnowledge.wikiGraph.version')} {revision.slice(0, 12)}</div>
+    {imageUrl && <Image src={imageUrl} alt={detail.node.label} style={{ maxHeight: 520, objectFit: 'contain' }} />}
+    {detail.node.description && <MarkdownContent content={detail.node.description} />}
+    {detail.edge && <>
+      <p>{detail.edge.direction === 'in' ? '←' : '→'} {detail.edge.predicate} · {t(familyKey(detail.edge.family))}</p>
+      {detail.edge.conflict && <Tag color="error">{t('domainKnowledge.wikiGraph.conflict')}</Tag>}
+      {conditionText(detail.edge.qualifiers) && <p>{conditionText(detail.edge.qualifiers)}</p>}
+    </>}
+    {detail.node.page_path && <Button loading={contentLoading} onClick={() => void openPage()}>{t('domainKnowledge.wikiGraph.openPage')}</Button>}
+    {detail.node.document_id && detail.node.node_type === 'document' && <Button onClick={() => openSource(detail.node.document_id!, detail.node.label, detail.node.mime_type)}>{t('domainKnowledge.wikiGraph.openSource')}</Button>}
+    <h3>{t('domainKnowledge.wikiGraph.sourceEvidence')}</h3>
+    {items.map(item => <section key={item.evidence_id} style={{ borderTop: '1px solid #e2e8f0', padding: '16px 0' }}>
+      <strong>{item.file_name || item.document_id || item.passage_id}</strong> <Tag>{item.support_status}</Tag>
+      <blockquote style={{ whiteSpace: 'pre-wrap', margin: '12px 0', paddingLeft: 12, borderLeft: '3px solid #4b84eb' }}>{item.excerpt}</blockquote>
+      <div>{item.chunk_id}{item.start_char != null ? ` · ${item.start_char}–${item.end_char}` : ''}</div>
+      {item.source_sha256 && <div style={{ overflowWrap: 'anywhere' }}>{t('domainKnowledge.wikiGraph.sourceVersion')} <code>{item.source_sha256}</code></div>}
+      {item.document_id && <Button type="link" onClick={() => openSource(item.document_id, item.file_name || item.document_id, item.mime_type, item.pdf_page)}>{t('domainKnowledge.wikiGraph.openSource')}</Button>}
+    </section>)}
+    {loading && <Spin />}
+    {error && <Alert type="error" message={error} action={<Button onClick={() => void load()}>{t('common.retry')}</Button>} />}
+    {!loading && !error && !items.length && <p>{t('domainKnowledge.wikiGraph.noEvidence')}</p>}
+    {!loading && !error && cursor && <Button onClick={() => void load(cursor)}>{t('domainKnowledge.wikiGraph.moreEvidence')}</Button>}
+    {contentError && <Alert type="error" message={contentError} />}
+    {content !== null && <MarkdownContent content={content} />}
+    {viewer}
+  </Drawer>;
 }

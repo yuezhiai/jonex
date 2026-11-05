@@ -28,6 +28,13 @@ export interface DomainKnowledgeItem {
   can_manage_permissions?: boolean;
   /** KB 写权限（额外含授权 editor）——列表页编辑/操作按钮依据 */
   can_write?: boolean;
+  /** 结构化开关（创建时选定）：关闭时隐藏 schema / 血缘 / ETL / 治理等页签；
+      「数据源」页签不受它控制，恒展示（接数据是基础知识库能力） */
+  structuredEnabled?: boolean;
+  /** KB 级相似检测开关（缺省 false）。 */
+  similarityCheckEnabled: boolean;
+  /** KB 级相似阈值（0.5~0.999）；null = 继承全局默认。 */
+  similarityCheckThreshold: number | null;
 }
 
 export interface DomainKnowledgeListParams {
@@ -128,6 +135,41 @@ export interface DomainKnowledgeDetail {
   can_manage_permissions: boolean;
   /** KB 写权限（额外含授权 editor）——详情页各 tab 写操作按钮依据 */
   can_write: boolean;
+  /** 结构化开关：false 时详情页隐藏 schema / 血缘 / ETL / 治理等页签并回退 activeTab
+      （「数据源」页签恒展示，不参与隐藏） */
+  structuredEnabled: boolean;
+  /** KB 级相似检测开关（缺省 false）。 */
+  similarityCheckEnabled: boolean;
+  /** KB 级相似阈值（0.5~0.999）；null = 继承全局默认。 */
+  similarityCheckThreshold: number | null;
+  /** 动态本体（技能 / 动作抽取）库级开关；缺省 false。只对本体型（lightrag）库有意义。 */
+  proceduralExtract?: boolean;
+  /** 动态本体进程级总闸是否打开；关着时库级开关能存但不生效。 */
+  proceduralExtractAvailable?: boolean;
+  /** 写图前调用抽取期工具（TBox 里的 catalog: 声明）库级开关；缺省 false。 */
+  extractToolCalls?: boolean;
+  /** 抽取期工具进程级总闸是否打开；关着时库级开关能存但不生效。 */
+  extractToolCallsAvailable?: boolean;
+}
+
+/** 文档列表相似提示（后端 similarity_hint，解析完成后写入）。 */
+export interface SimilarityHint {
+  targetDocumentId: string;
+  targetFileName: string;
+  similarity: number;
+}
+
+/** 基于解析内容的相似建议（待用户 dismiss / merge）。 */
+export interface SimilaritySuggestion {
+  id: string;
+  targetDocumentId: string;
+  targetFileName: string;
+  similarity: number;
+  method: string;
+  canMerge: boolean;
+  blockReason: string | null;
+  /** 源文档自身不可合并的原因（如仍在解析/编译中）；独立于 blockReason。 */
+  sourceBlockReason: string | null;
 }
 
 export interface DataSourceConfig {
@@ -139,7 +181,7 @@ export interface DataSourceConfig {
   docs: number;
   status: string;
   desc: string;
-  iconType: 'api' | 'upload' | 'storage';
+  iconType: 'api' | 'upload' | 'storage' | 'database';
   iconBg: string;
   iconColor: string;
   path: string;
@@ -662,6 +704,8 @@ export interface ManualDocItem {
   qualityVerdict?: QualityVerdict | null;
   /** 档位为 bad 时的判据名（用于 tooltip）。 */
   qualityReasons?: string[];
+  /** 解析完成后命中的相似提示（列表接口带出；详情接口（get_document）当前不返回，恒为 null）。 */
+  similarityHint: SimilarityHint | null;
 }
 
 export interface ManualDocListParams {
@@ -761,6 +805,14 @@ export interface CompiledSchemaAttribute {
 export interface ExtractionSkillRef {
   skill: string;
   description?: string;
+  /** catalog: 声明专用：工具入参 ← $entity.name / $entity.type / $attr.<属性> / 字面量 */
+  inputs?: Record<string, string | number | boolean>;
+  /** catalog: refine 专用：属性 ← 工具输出路径（$.data.x） */
+  writes?: Record<string, string>;
+  /** catalog: constrain 专用：命中即剔除实体 */
+  reject_when?: { path: string; equals: string | number | boolean | null };
+  /** refine: keep | drop_attr；constrain: keep | reject */
+  on_error?: string;
 }
 
 export interface ExtractionSkillsConfig {
@@ -795,6 +847,10 @@ export interface CompiledSchemaRelationType {
   inverse_of?: string | null;
   source_types?: string[];
   target_types?: string[];
+  /** [jonex] P0-2：join 键。画布与关系编辑弹窗都**不建模**它们，保存时必须原样保留。 */
+  source_column?: string | null;
+  target_column?: string | null;
+  origin?: string | null;
 }
 
 export interface CompiledSchema {
@@ -873,6 +929,8 @@ export interface OntologyAttribute {
   description?: string;
   type: OntologyAttrType;
   isPrimaryKey: boolean;
+  /** 编译 schema 里的属性键（实体 attributes 用的就是它）；只读，新建属性时为空 */
+  compiledName?: string;
 }
 
 export interface OntologyObjectDef {
@@ -883,6 +941,13 @@ export interface OntologyObjectDef {
   attributes: OntologyAttribute[];
   requirement: string;
   status: OntologyDefStatus;
+  /** 编译 schema 里的类型名（图里实体的 entity_type）；只读，新建对象时为空 */
+  compiledName?: string;
+  /**
+   * 抽取技能声明（builtin: 与 catalog: 两类）。保存时：undefined = 保留原值；
+   * 给了值 = 整份替换（弹窗负责把 builtin: 原样带回来）。
+   */
+  extractionSkills?: ExtractionSkillsConfig | null;
 }
 
 export type OntologyRelationType = '一对一' | '一对多' | '多对一' | '多对多' | '自定义';
@@ -1020,6 +1085,95 @@ export interface SynonymImportResult {
   failed: { index: number; reason: string }[];
 }
 
+/** 本体实例 → 平台可执行工具的绑定 */
+export type ToolBindingEntityType = 'Skill' | 'Action';
+
+/** 工具来源：platform = 平台工具目录（租户已启用）/ kb = 本库工具 */
+export type ToolSource = 'platform' | 'kb';
+
+export interface ToolBinding {
+  id: string;
+  knowledgeBaseId: string;
+  entityType: ToolBindingEntityType;
+  canonicalName: string;
+  toolSource: ToolSource;
+  toolName: string;
+  /** 工具显示名；工具不可用时为 null */
+  toolLabel: string | null;
+  paramMapping: Record<string, unknown>;
+  enabled: boolean;
+  /** 允许知识库问答自动调用（另需总闸开启、判定 allow、工具声明只读） */
+  qaCallable: boolean;
+  /** 是否参与执行：只有 Action 绑定参与；存量 Skill 绑定是历史数据 */
+  executable: boolean;
+  /** 工具在本租户是否可用（已发布且已启用） */
+  toolAvailable: boolean;
+  /** 绑定的工具是否声明了只读 */
+  toolReadOnly: boolean;
+  /** 绑定目标在本体中是否存在；本体不可用时为 null（未知） */
+  targetExists: boolean | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface ToolBindingListResult {
+  items: ToolBinding[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface BindableTool {
+  source: ToolSource;
+  toolName: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, any>;
+  /** 工具是否声明了只读 */
+  readOnly: boolean;
+}
+
+/** 本库工具运行时的列表摘要 */
+export interface KbToolRuntimeBrief {
+  type: 'echo' | 'api';
+  method?: string;
+  url?: string;
+  authType?: string;
+}
+
+/** 知识库工具（KB 级工具目录）：本库登记的可执行 API 工具 */
+export interface KbTool {
+  id: string;
+  knowledgeBaseId: string;
+  toolName: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, any>;
+  outputSchema: Record<string, any>;
+  /** 完整运行时配置（编辑用）；null = 没有可调入口 */
+  runtime: Record<string, any> | null;
+  runtimeBrief: KbToolRuntimeBrief | null;
+  /** 已保存鉴权凭据（凭据本身任何接口都不回传） */
+  hasSecret: boolean;
+  enabled: boolean;
+  /** 只读声明（登记人显式勾选）；只有只读工具才可能被知识库问答自动调用 */
+  readOnly: boolean;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+/** 工具试运行结果 */
+export interface KbToolRunResult {
+  status: 'executed' | 'failed' | 'no_runtime' | 'invalid_input' | 'tool_unavailable';
+  ok: boolean;
+  httpStatus?: number | null;
+  output?: unknown;
+  outputTruncated?: boolean;
+  error?: string | null;
+  missingInputs?: string[];
+  durationMs?: number;
+}
+
 export interface YamlImportCounts {
   entities: number;
   attributes: number;
@@ -1065,6 +1219,25 @@ export interface WikiGraphData {
 // ── [jonex] Wiki 阅读模式（编译结果页）──
 
 /** Wiki 页面内容（GET parse-results/wiki-page） */
+export interface WikiSourceImage {
+  asset_id: string;
+  document_id: string;
+  bundle_sha: string;
+  source_name: string;
+  caption?: string;
+  label?: string;
+  preview_url?: string;
+  display_url?: string;
+  original_url?: string;
+  width?: number;
+  height?: number;
+  placement?: 'inline' | 'gallery';
+  association_method?: string;
+  source_locator?: { page_number?: number; source_position?: number; kind?: string; [key: string]: unknown };
+  usage?: 'illustration' | 'visual_evidence';
+  visual_read_id?: string;
+}
+
 export interface WikiPageContent {
   /** canonical 引擎路径（jonex_wiki 阅读界面用它做页面身份） */
   path: string;
@@ -1092,8 +1265,14 @@ export interface WikiPageContent {
   fields?: string[];
   /** 引擎 scope（表格页含 sheet / 行列范围：矩阵用它把表头对齐到日期） */
   scope?: Record<string, unknown>;
+  /** 与当前发布版本绑定的表格阅读数据；旧发布物可不提供。 */
+  tableData?: WikiTableData;
   /** 页面级 References：该页证据指向的源文档 */
   references?: WikiPageReference[];
+  images?: WikiSourceImage[];
+  imagesTotal?: number;
+  bundleSha?: string;
+  imageError?: string;
 }
 
 /** 页间链接明细（引擎 frontmatter links 的 kind / why_visit） */
@@ -1330,4 +1509,137 @@ export interface RecompileOutdatedResult {
   skipped: number;
   failed: number;
   schema_version: number;
+}
+
+// ─── KB 级 compiled schema 生命周期（读时新鲜度 / 重编译预览）────────
+
+/** 新鲜度判定（读时计算，不落列、不自动重编译）。 */
+export type CompiledSchemaFreshness =
+  | 'missing'
+  | 'seeded'
+  | 'outdated'
+  | 'manual_edited'
+  | 'abstract_projection';
+
+/** `GET /ontology/compiled-schema/status` 的响应。 */
+export interface CompiledSchemaStatus {
+  /**
+   * 存储行的完整快照；无存储行时为 null。
+   *
+   * 放宽为 Partial：YAML 兜底 / 抽象投影等只读视图不保证 CompiledSchema 的
+   * 全部字段（例如 source_type、schema_version），按完整类型声明会让消费方
+   * 误以为字段一定存在。
+   */
+  schema: Partial<CompiledSchema> | null;
+  freshness: CompiledSchemaFreshness;
+  source_type?: string | null;
+  source_version?: number | null;
+  source_hash?: string | null;
+  schema_version?: number | null;
+  compiled_at?: string | null;
+  edited_at?: string | null;
+  edited_by?: string | null;
+  expected_source_hash?: string | null;
+  template_domain_id?: string | null;
+  template_scenario_id?: string | null;
+  stale_doc_types: string[];
+  alignment_impact: {
+    active_alignments: number;
+    stale_doc_types: number;
+    projected_maps_to: number;
+  };
+}
+
+/** `POST /ontology/compiled-schema/recompile/preview` 的响应（只读 diff）。 */
+export interface RecompilePreview {
+  changed: boolean;
+  source_changed: boolean;
+  manual_edited: boolean;
+  added_entity_types: string[];
+  removed_entity_types: string[];
+  renamed_entity_types: { from: string; to: string }[];
+  affected_alignments: number;
+  stale_after: string[];
+  affected_maps_to: number;
+}
+
+/** `POST /ontology/compiled-schema/recompile` 的响应。 */
+export interface RecompileResult {
+  schema_saved: boolean;
+  schema_version: number;
+  unchanged: boolean;
+  documents_matched: number;
+  documents_queued: number;
+  apply_error?: string;
+}
+
+/** 「更新模型」草稿摘要（`POST /knowledge-base/documents/{id}/model-update`）。 */
+export interface ModelUpdateDraftSummary {
+  entity_types_count: number;
+  relation_types_count: number;
+  constraints_count: number;
+  schema_version: number;
+  domain: string;
+}
+
+export interface ModelUpdateDraft {
+  yaml_text: string;
+  summary: ModelUpdateDraftSummary | null;
+  warnings: string[];
+  errors: string[];
+}
+
+export type ModelUpdateStatus = 'running' | 'ready' | 'invalid' | 'failed' | 'applied';
+
+export interface ModelUpdateJob {
+  job_id: string;
+  status: ModelUpdateStatus;
+  stage: string;
+  document_id: string;
+  stats: { entities: number; relations: number; constraints: number } | null;
+  issues: unknown[];
+  draft: ModelUpdateDraft | null;
+  warnings: string[];
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelUpdateApplyResult {
+  job_id: string;
+  status: 'applied';
+  schema_version: number | null;
+  summary: ModelUpdateDraftSummary | null;
+  warnings: string[];
+}
+
+/** Table angles share one saved grid and retain each dimension's source cell. */
+export interface WikiTableField {
+  key: string; label: string; value: string; coordinate: string;
+  raw_coordinate: string; inherited: boolean;
+}
+export interface WikiTableRecord {
+  id: string; row: number; value: string; coordinate: string;
+  date: { value: string; raw_value: string; coordinate: string;
+    status: 'candidate' | 'formatted_date'; evidence: string[] } | null;
+  dimensions: WikiTableField[]; measures: WikiTableField[];
+}
+export interface WikiTableModel {
+  table_id: string; sheet_id: string; title: string; structure_status: string;
+  bounds: { row_start: number; row_end: number; column_start: number; column_end: number };
+  rows: { row: number; cells: { column: number; coordinate: string; value: string;
+    raw_value: string | null; formula?: string | null; cached_value?: string | null;
+    number_format?: string | null;
+    anchor?: string | null; hidden: boolean; empty_kind?: string | null }[] }[];
+  records: WikiTableRecord[];
+  dimensions: { key: string; label: string; values: string[] }[];
+  has_dates: boolean; date_inferred: boolean; complete: boolean; shown_row_end: number;
+  context?: string[];
+}
+export interface WikiTableData {
+  schema_version: number; revision: string; document_id: string; source_id: string;
+  selected_table_id: string; complete: boolean;
+  sheets: { sheet_id: string; name: string; visibility: string;
+    tables: WikiTableModel[]; truncated?: boolean }[];
+
 }

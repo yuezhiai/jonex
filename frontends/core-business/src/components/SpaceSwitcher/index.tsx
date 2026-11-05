@@ -70,6 +70,8 @@ const S: Record<string, React.CSSProperties> = {
   },
   activeItem: { color: '#3b82f6', fontWeight: 500 },
   addItem: { color: '#3b82f6' },
+  disabledItem: { color: '#cbd5e1' },
+  disabledTag: { marginLeft: 6, fontSize: 11, color: '#94a3b8' },
 };
 
 interface SpaceSwitcherProps {
@@ -83,6 +85,8 @@ const SpaceSwitcher = ({ collapsed }: SpaceSwitcherProps) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
 
   const currentName = global.currentSpace?.name || t('domainSpace.selectSpace');
+  // [jonex] 当前空间被禁用时触发器也标注：与页面内的禁用横幅保持同一口径。
+  const currentDisabled = !!global.currentSpace && global.currentSpace.status !== 'active';
 
   const handleSelect = (spaceId: string) => {
     global.setCurrentSpaceId(spaceId, { persist: true, broadcast: true });
@@ -111,11 +115,32 @@ const SpaceSwitcher = ({ collapsed }: SpaceSwitcherProps) => {
 
   const items = [
     ...(global.spacesLoaded
-      ? global.spaces.map((s) => ({
-          key: s.id,
-          label: <span style={s.id === global.currentSpaceId ? S.activeItem : undefined}>{s.name}</span>,
-          onClick: () => handleSelect(s.id),
-        }))
+      ? global.spaces.map((s) => {
+          // [jonex] 禁用空间：管理员可见（他能在这里看到并去管理页恢复），
+          // 但不可选中 / 不可进入。普通成员的列表里压根不会有它（后端已过滤）。
+          const spaceDisabled = s.status !== 'active';
+          return {
+            key: s.id,
+            disabled: spaceDisabled,
+            label: (
+              <span
+                style={
+                  s.id === global.currentSpaceId
+                    ? S.activeItem
+                    : spaceDisabled
+                      ? S.disabledItem
+                      : undefined
+                }
+              >
+                {s.name}
+                {spaceDisabled && <span style={S.disabledTag}>{t('status.disabled')}</span>}
+              </span>
+            ),
+            onClick: () => {
+              if (!spaceDisabled) handleSelect(s.id);
+            },
+          };
+        })
       : []),
     { type: 'divider' as const },
     // [jonex] W2（2026-10-19）：入口按后端 can_create_space 显示（判据 = 租户管理员
@@ -172,6 +197,7 @@ const SpaceSwitcher = ({ collapsed }: SpaceSwitcherProps) => {
           ) : (
             <>
               <span style={S.name}>{currentName}</span>
+              {currentDisabled && <span style={S.disabledTag}>{t('status.disabled')}</span>}
               <DownOutlined style={S.arrow} />
             </>
           )}

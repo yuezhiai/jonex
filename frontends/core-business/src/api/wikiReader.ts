@@ -102,6 +102,10 @@ interface BackendReference {
 interface BackendPageContent extends Partial<Omit<WikiPageContent, 'references' | 'linkMeta'>> {
   /** 适配器输出的 canonical 路径（与 path 一致；显式映射，避免 camelCase 漏转） */
   engine_path?: string;
+  table_data?: WikiPageContent['tableData'];
+  images_total?: number;
+  bundle_sha?: string;
+  image_error?: string;
   why_visit?: string;
   references?: BackendReference[];
   link_meta?: { path: string; kind?: string; why_visit?: string }[];
@@ -268,6 +272,11 @@ export function getWikiReaderPage(kbId: string, path: string): Promise<WikiPageC
       whyVisit: l.why_visit || '',
     })),
     references: mapReferences(res.references),
+    tableData: res.table_data,
+    images: res.images || [],
+    imagesTotal: res.images_total || 0,
+    bundleSha: res.bundle_sha,
+    imageError: res.image_error,
   }));
 }
 

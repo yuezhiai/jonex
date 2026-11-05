@@ -27,6 +27,7 @@
     "@jonex/shared-lib": "workspace:*",
     "@jonex/shell-sdk": "workspace:*",
     "@loadable/component": "^5.15.3",
+    "@xyflow/react": "12.11.2",
     "antd": "^6.4.3",
     "axios": "^1.10.0",
     "classnames": "^2.5.1",
@@ -36,6 +37,7 @@
     "echarts": "^6.1.0",
     "hast-util-sanitize": "^5.0.2",
     "i18next": "^25.3.1",
+    "immer": "11.1.15",
     "lodash": "^4.17.21",
     "pdfjs-dist": "4.10.38",
     "react": "^18.2.0",
@@ -47,6 +49,7 @@
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
     "sass": "^1.89.2",
+    "zod": "4.4.3",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

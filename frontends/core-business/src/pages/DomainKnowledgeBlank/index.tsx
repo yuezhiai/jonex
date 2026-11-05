@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Button, Skeleton, Space, Tabs } from 'antd';
+import { Button, Result, Skeleton, Space, Tabs } from 'antd';
 import {
   FileTextOutlined,
   DatabaseOutlined,
@@ -11,8 +11,9 @@ import {
   CloseCircleOutlined,
   BuildOutlined,
   SettingOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons';
-import { PageContent, PageHeader } from '@jonex/shared-lib';
+import { PageContent, PageHeader, getErrorMessage } from '@jonex/shared-lib';
 import type { DomainKnowledgeDetail, DocumentStatsResult, WikiStats } from '@/types/domainKnowledge';
 import { getDomainKnowledgeDetail, getDocumentStats, getWikiContents } from '@/api/domainKnowledge';
 import { listDataSources } from '@/api/dataSource';
@@ -38,6 +39,9 @@ export default function DomainKnowledgeBlank() {
   const { id = '' } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const [detail, setDetail] = useState<DomainKnowledgeDetail | null>(null);
+  // 详情首次加载失败（典型是密级守卫 404 / code=1002）：整页报错而不是留骨架屏。
+  // 已有 detail 时刷新失败仍走「保留旧值」，不清空页头。
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [dataSources, setDataSources] = useState<string>('—');
   const [docStats, setDocStats] = useState<DocumentStatsResult | null>(null);
   // 每次切到编译资产 tab 都 bump → 面板重挂载 → 统计数据与子表全部重新拉取。
@@ -93,21 +97,30 @@ export default function DomainKnowledgeBlank() {
       .then(setDocStats)
       .catch(() => setDocStats(null));
     getDomainKnowledgeDetail(id)
-      .then(setDetail)
+      .then((next) => {
+        setDetail(next);
+        setDetailError(null);
+      })
       // 拉失败保留旧值：页头不该因为一次刷新失败就清空成空白
-      .catch(() => {});
-  }, [id]);
+      .catch((err) => {
+        // 但「一次都没拉到」时必须报错：此前静默吞掉 404，页面只剩一个永不结束的
+        // 骨架屏（编译资产面板的 detail==null 分支），用户看到的是「一直加载」。
+        setDetailError((prev) => prev ?? getErrorMessage(err, t('domainKnowledge.loadErrorDesc')));
+      });
+  }, [id, t]);
 
   useEffect(() => {
     refreshStats();
   }, [refreshStats]);
 
   useEffect(() => {
-    if (!id) return;
+    if (!id || !detail) return;
+    // 数据源不受「结构化数据支持」开关控制（见 DomainKnowledgeDetail/tabVisibility.ts），
+    // 关闭态也要如实展示已接入的数据源，不再走「—」占位。
     listDataSources(id)
       .then((list) => setDataSources(list.map((ds) => dataSourceInstanceDisplayName(ds, t)).join(' · ') || '—'))
       .catch(() => setDataSources('—'));
-  }, [id, t]);
+  }, [id, t, detail]);
 
   // 这份 Wiki 计数上提到宿主页，是因为页头标签要用它——面板已改成经 prop 拿，不再自己拉。
   // assetsMountKey 参与依赖：切进「编译资产」tab 时会连它一起重取，编译产物变了计数跟着变。
@@ -191,6 +204,28 @@ export default function DomainKnowledgeBlank() {
       />
 
       <PageContent>
+        {detail == null && detailError ? (
+          // 详情一次都没拉到时整页报错：文档库 / 编译资产 / 追踪三个页签全部依赖它，
+          // 继续渲染只会得到空列表和一个永不结束的骨架屏。
+          <Result
+            status="warning"
+            title={t('domainKnowledge.loadErrorTitle')}
+            subTitle={
+              <>
+                <div>{detailError}</div>
+                {/* 后端 404 同时覆盖「不存在」与「无权访问」，措辞用条件句，不泄露存在性 */}
+                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
+                  {t('domainKnowledge.loadErrorHint')}
+                </div>
+              </>
+            }
+            extra={
+              <Button icon={<ReloadOutlined />} onClick={refreshStats}>
+                {t('common.retry')}
+              </Button>
+            }
+          />
+        ) : (
         <Tabs
           className="kb-detail-tabs"
           activeKey={activeTab}
@@ -276,6 +311,7 @@ export default function DomainKnowledgeBlank() {
             },
           ]}
         />
+        )}
       </PageContent>
     </>
   );

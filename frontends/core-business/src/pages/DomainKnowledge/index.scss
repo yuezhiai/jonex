@@ -23,91 +23,171 @@
   }
 }
 
-/* 工具栏 */
+/* ── 工具栏 ── */
 .yx-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  margin-bottom: 18px;
   flex-wrap: wrap;
   gap: 12px;
 }
 
-.yx-search-box {
+.kb-search.ant-input-affix-wrapper {
+  width: 300px;
+  height: 34px;
+  padding-inline: 11px;
+  border-radius: 9px;
+  border-color: #e2e8f0;
+  background: #fff;
+  transition: border-color 0.2s, box-shadow 0.2s;
+
+  .ant-input {
+    font-size: 13px;
+    background: transparent;
+  }
+
+  .ant-input-prefix {
+    margin-inline-end: 7px;
+    color: #94a3b8;
+    font-size: 14px;
+  }
+
+  &:hover {
+    border-color: #cbd5e1;
+  }
+
+  &.ant-input-affix-wrapper-focused {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  }
+}
+
+.kb-toolbar-create.ant-btn {
+  height: 34px;
+  padding-inline: 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 2px 6px rgba(59, 130, 246, 0.24);
+}
+
+/* 工具栏提示（未选空间 / 配额达限） */
+.kb-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1;
+  white-space: nowrap;
+
+  &.is-warn {
+    color: #b45309;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+  }
+
+  &.is-block {
+    margin-bottom: 14px;
+  }
+
+  /* 禁用空间的空态说明：非警告语气，用灰色中性提示 */
+  &.is-muted {
+    color: #94a3b8;
+  }
+}
+
+/* ── 加载 / 空 / 错误 ── */
+.kb-state {
+  padding: 72px 0;
+  text-align: center;
+}
+
+.kb-error {
   display: flex;
   align-items: center;
-  background: #fff;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  padding: 0 12px;
-  transition: border-color 0.2s;
-  width: 280px;
-
-  &:focus-within {
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-  }
-
-  input {
-    border: none;
-    outline: none;
-    padding: 8px 8px;
-    font-size: 13px;
-    color: #1e293b;
-    background: transparent;
-    flex: 1;
-    min-width: 180px;
-    font-family: inherit;
-
-    &::placeholder {
-      color: #94a3b8;
-    }
-  }
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 12.5px;
 }
 
 /* ── 知识库卡片网格 ── */
 .kb-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 20px;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 18px;
   margin-bottom: 24px;
 }
 
 .kb-card {
-  background: #fff;
-  border-radius: 12px;
-  border: 1px solid #e4ebf5;
-  box-shadow: 0 1px 4px rgba(11, 43, 92, 0.06);
-  transition: all 0.25s ease;
-  overflow: visible;
+  --kb-accent: #2563eb;
+  --kb-accent-soft: #eff6ff;
+  --kb-accent-line: #dbeafe;
+
+  position: relative;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #e8edf3;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
 
   &:hover {
     transform: translateY(-2px);
-    box-shadow: 0 8px 28px rgba(11, 43, 92, 0.1);
-    border-color: #b8cde8;
+    border-color: #cbd5e1;
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+  }
+
+  &:focus-within {
+    border-color: #93c5fd;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
+  }
+
+  /* 三类知识库各用一组主色，图标与类型胶囊共用同一组变量 */
+  &.kb-type-jonex_wiki {
+    --kb-accent: #0e7490;
+    --kb-accent-soft: #ecf8fb;
+    --kb-accent-line: #c9e7ef;
+  }
+
+  &.kb-type-openkb {
+    --kb-accent: #6d28d9;
+    --kb-accent-soft: #f4f0ff;
+    --kb-accent-line: #e4dbfa;
   }
 }
 
 .kb-card-top {
-  padding: 18px 20px 8px;
+  padding: 16px 18px 0;
   display: flex;
   align-items: flex-start;
   gap: 12px;
 }
 
 .kb-card-icon {
-  width: 42px;
-  height: 42px;
+  width: 40px;
+  height: 40px;
   border-radius: 10px;
-  background: linear-gradient(135deg, #eff6ff, #dbeafe);
-  color: #3b82f6;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
   flex-shrink: 0;
+  font-size: 18px;
+  color: var(--kb-accent);
+  background: var(--kb-accent-soft);
+  border: 1px solid var(--kb-accent-line);
+  transition: background 0.18s ease;
 
   img {
     width: 100%;
@@ -122,24 +202,52 @@
   min-width: 0;
 }
 
+.kb-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .kb-card-name {
   font-size: 15px;
   font-weight: 600;
+  line-height: 1.4;
   color: #0b2b5c;
   cursor: pointer;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transition: color 0.2s;
-  line-height: 1.3;
 
   &:hover {
     color: #2563eb;
   }
 }
 
+.kb-card-type {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid var(--kb-accent-line);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  white-space: nowrap;
+  color: var(--kb-accent);
+  background: var(--kb-accent-soft);
+}
+
 .kb-card-meta {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 6px;
+  align-items: center;
+  gap: 7px;
+  margin-top: 5px;
+  min-width: 0;
   font-size: 12px;
   color: #94a3b8;
 
@@ -147,52 +255,106 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
-    .anticon {
-      font-size: 12px;
-    }
+  .anticon {
+    font-size: 12px;
+  }
+
+  .kb-meta-sep {
+    flex-shrink: 0;
+    color: #cbd5e1;
+  }
+}
+
+.kb-card-menu {
+  flex-shrink: 0;
+  margin: -3px -5px 0 0;
+  padding: 4px;
+  border-radius: 7px;
+  color: #94a3b8;
+  font-size: 16px;
+  cursor: pointer;
+  opacity: 0.65;
+  transition: all 0.15s;
+
+  &:hover {
+    opacity: 1;
+    color: #475569;
+    background: #f1f5f9;
   }
 }
 
 .kb-card-body {
-  padding: 10px 20px 22px;
   flex: 1;
+  padding: 8px 18px 14px;
 }
 
 .kb-card-desc {
-  font-size: 13px;
-  color: #64748b;
-  line-height: 1.6;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  min-height: calc(2 * 1.65em);
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: #64748b;
 }
 
 /* 卡片底部标签区 */
 .kb-card-tags {
-  padding: 0 20px 16px;
+  margin-top: auto;
+  padding: 11px 18px 14px;
+  border-top: 1px solid #f1f5f9;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
   gap: 8px;
+  flex-wrap: wrap;
+
+  .ant-tag {
+    margin: 0;
+    height: 20px;
+    padding: 0 7px;
+    border: none;
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 20px;
+  }
+}
+
+/* 「已授权共享」：与主色同源的浅蓝胶囊，替代 antd 默认 purple */
+.source-tag.is-shared {
+  color: #2563eb;
+  background: #eff6ff;
+  border-color: #dbeafe;
 }
 
 .source-tags {
   display: flex;
-  gap: 4px;
+  gap: 5px;
   flex-wrap: wrap;
 }
 
 .source-tag {
   display: inline-flex;
   align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
   font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: #eff6ff;
-  color: #3b82f6;
-  border: 1px solid #bfdbfe;
   white-space: nowrap;
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+}
+
+/* 窄屏（手机/分屏）：单列铺满，避免两张卡挤成一行 */
+@media (max-width: 767px) {
+  .kb-card-grid {
+    grid-template-columns: 1fr;
+  }
 }

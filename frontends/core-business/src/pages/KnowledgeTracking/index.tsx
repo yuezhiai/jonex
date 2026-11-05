@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Card, Empty, Modal, Spin, Table, message } from 'antd';
+import { Button, Card, Empty, Modal, Select, Spin, Table, message } from 'antd';
 import {
   ArrowLeftOutlined,
   LikeOutlined,
@@ -17,9 +17,12 @@ import {
   deleteAnswerFeedback,
 } from '@/api/knowledgeSearch';
 import type { AnswerFeedbackListItem, AnswerFeedbackListResponse, AnswerFeedbackStats } from '@/types/knowledgeSearch';
+import type { AnswerFeedbackSource } from '@/api/knowledgeSearch';
 import FeedbackViewModal from './FeedbackViewModal';
+import { getFeedbackSource, getMcpKeyLabel, getQuerySnapshot } from './feedbackSource';
 
 type TabKey = 'all' | 'like' | 'dislike';
+type SourceFilter = 'all' | AnswerFeedbackSource;
 
 const TAB_CONFIG: { key: TabKey; labelKey: string; icon: React.ReactNode; color: string }[] = [
   { key: 'all', labelKey: 'domainManagementSearch.chip.all', icon: null, color: '#3b82f6' },
@@ -45,6 +48,8 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState<TabKey>('all');
+  // 来源筛选只影响列表与总数；统计卡仍是知识库全量（stats 接口无 source 参数）
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
 
   // 数据
   const [feedbackData, setFeedbackData] = useState<AnswerFeedbackListResponse | null>(null);
@@ -61,8 +66,10 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
     setError('');
     try {
       const feedbackType = activeTab === 'all' ? undefined : activeTab;
+      const source = sourceFilter === 'all' ? undefined : sourceFilter;
       const [listResult, statsResult] = await Promise.all([
-        getAnswerFeedbackList(knowledgeBaseId, { feedbackType, page: 1, pageSize: 50 }),
+        // 固定第 1 页 50 条、无分页；筛选变化时重新请求第一页
+        getAnswerFeedbackList(knowledgeBaseId, { feedbackType, source, page: 1, pageSize: 50 }),
         getAnswerFeedbackStats(knowledgeBaseId),
       ]);
       setFeedbackData(listResult);
@@ -72,7 +79,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
     } finally {
       setLoading(false);
     }
-  }, [knowledgeBaseId, activeTab]);
+  }, [knowledgeBaseId, activeTab, sourceFilter]);
 
   useEffect(() => {
     void loadData();
@@ -107,7 +114,9 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
   const handleDeleteFeedback = useCallback(async (item: AnswerFeedbackListItem) => {
     Modal.confirm({
       title: t('compile.feedback.deleteFeedback'),
-      content: t('compile.confirmDeleteFeedback', { query: item.query }),
+      content: t('compile.confirmDeleteFeedback', {
+        query: getQuerySnapshot(item) ?? t('tracking.mcpNoQuerySnapshot'),
+      }),
       okText: t('common.okText'),
       okButtonProps: { danger: true },
       cancelText: t('common.cancel'),
@@ -222,39 +231,54 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
     <div
       style={{
         display: 'flex',
-        gap: 0,
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: 12,
         borderBottom: '2px solid #eef2f6',
         marginBottom: 20,
       }}
     >
-      {TAB_CONFIG.map((tab) => {
-        const isActive = activeTab === tab.key;
-        return (
-          <Button
-            key={tab.key}
-            type="text"
-            onClick={() => setActiveTab(tab.key)}
-            style={{
-              padding: '10px 24px',
-              fontSize: 14,
-              fontWeight: 500,
-              color: isActive ? tab.color : '#94a3b8',
-              borderBottom: `2px solid ${isActive ? tab.color : 'transparent'}`,
-              marginBottom: -2,
-              borderRadius: 0,
-              transition: 'all 0.2s',
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              height: 'auto',
-              lineHeight: 'inherit',
-            }}
-          >
-            {tab.icon}
-            {t(tab.labelKey)}
-          </Button>
-        );
-      })}
+      <div style={{ display: 'flex', gap: 0 }}>
+        {TAB_CONFIG.map((tab) => {
+          const isActive = activeTab === tab.key;
+          return (
+            <Button
+              key={tab.key}
+              type="text"
+              onClick={() => setActiveTab(tab.key)}
+              style={{
+                padding: '10px 24px',
+                fontSize: 14,
+                fontWeight: 500,
+                color: isActive ? tab.color : '#94a3b8',
+                borderBottom: `2px solid ${isActive ? tab.color : 'transparent'}`,
+                marginBottom: -2,
+                borderRadius: 0,
+                transition: 'all 0.2s',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                height: 'auto',
+                lineHeight: 'inherit',
+              }}
+            >
+              {tab.icon}
+              {t(tab.labelKey)}
+            </Button>
+          );
+        })}
+      </div>
+      <Select<SourceFilter>
+        value={sourceFilter}
+        onChange={setSourceFilter}
+        aria-label={t('tracking.columnSource')}
+        style={{ width: 150, marginBottom: 8 }}
+        options={[
+          { value: 'all', label: t('tracking.sourceAll') },
+          { value: 'web', label: t('tracking.sourceWeb') },
+          { value: 'mcp', label: t('tracking.sourceMcp') },
+        ]}
+      />
     </div>
   );
 
@@ -301,30 +325,82 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         ),
       },
       {
+        title: t('tracking.columnSource'),
+        dataIndex: 'mcp_key_id',
+        key: 'source',
+        width: 150,
+        render: (_: string | null, record: AnswerFeedbackListItem) => {
+          const isMcp = getFeedbackSource(record) === 'mcp';
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  alignSelf: 'flex-start',
+                  padding: '2px 10px',
+                  borderRadius: 6,
+                  fontSize: 12,
+                  fontWeight: 500,
+                  background: isMcp ? '#f5f3ff' : '#eff6ff',
+                  color: isMcp ? '#7c3aed' : '#3b82f6',
+                }}
+              >
+                {t(isMcp ? 'tracking.sourceMcp' : 'tracking.sourceWeb')}
+              </span>
+              {isMcp ? (
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: '#94a3b8',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                  title={getMcpKeyLabel(record)}
+                >
+                  {getMcpKeyLabel(record)}
+                </span>
+              ) : null}
+            </div>
+          );
+        },
+      },
+      {
         title: t('compile.feedback.question'),
         dataIndex: 'query',
         key: 'query',
-        width: '25%',
-        render: (val: string) => (
-          <div
-            style={{
-              fontWeight: 500,
-              color: '#1e293b',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-            title={val}
-          >
-            {val}
-          </div>
-        ),
+        width: 240,
+        render: (_: string | null, record: AnswerFeedbackListItem) => {
+          const query = getQuerySnapshot(record);
+          if (!query) {
+            return (
+              <span style={{ color: '#94a3b8', fontSize: 12 }}>
+                {record.mcp_key_id ? t('tracking.mcpNoQuerySnapshot') : '-'}
+              </span>
+            );
+          }
+          return (
+            <div
+              style={{
+                fontWeight: 500,
+                color: '#1e293b',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title={query}
+            >
+              {query}
+            </div>
+          );
+        },
       },
       {
         title: t('tracking.columnAnswer'),
         dataIndex: 'answer',
         key: 'answer',
-        width: '35%',
+        width: 300,
         render: (val: string | null) => (
           <div
             style={{
@@ -345,7 +421,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         title: t('common.type'),
         dataIndex: 'feedback_type',
         key: 'type',
-        width: 160,
+        width: 150,
         render: (val: string, record: AnswerFeedbackListItem) => (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <span
@@ -377,7 +453,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         title: t('tracking.columnStatus'),
         dataIndex: 'adopted',
         key: 'status',
-        width: 120,
+        width: 110,
         render: (adopted: boolean) => (
           <span
             style={{
@@ -396,9 +472,9 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
       {
         title: t('common.actions'),
         key: 'actions',
-        width: 120,
+        width: 210,
         render: (_: unknown, record: AnswerFeedbackListItem) => (
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             <Button
               onClick={() => handleView(record)}
               style={{
@@ -463,6 +539,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         pagination={false}
         size="middle"
         rowClassName={() => 'tracking-row'}
+        scroll={{ x: 1310 }}
       />
     );
   };

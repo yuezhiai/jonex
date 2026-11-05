@@ -1,7 +1,7 @@
 import React from 'react';
 import './index.scss';
 import { useTranslation } from 'react-i18next';
-import { Table } from 'antd';
+import { Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
   EditOutlined,
@@ -84,7 +84,24 @@ export default function OntologyObjectSection({
       dataIndex: 'name',
       key: 'name',
       width: 180,
-      render: (value) => <strong>{value}</strong>,
+      render: (value, row) => {
+        // 有抽取期工具声明（catalog:）的对象标一下，便于找到在哪配置的
+        const n = [...(row.extractionSkills?.refine || []), ...(row.extractionSkills?.constrain || [])].filter(
+          (s) => typeof s?.skill === 'string' && s.skill.startsWith('catalog:'),
+        ).length;
+        return (
+          <div>
+            <strong>{value}</strong>
+            {n > 0 && (
+              <div>
+                <Tag color="purple" style={{ marginTop: 4, fontSize: 11 }}>
+                  {t('compile.extractTool.decl.listTag', { count: n })}
+                </Tag>
+              </div>
+            )}
+          </div>
+        );
+      },
     },
     {
       title: t('compile.object.description'),

@@ -12,6 +12,8 @@ const DomainSpacePermission = loadableComponent(() => import('@/pages/DomainSpac
 const DomainKnowledge = loadableComponent(() => import('@/pages/DomainKnowledge'));
 const DomainKnowledgeDetail = loadableComponent(() => import('@/pages/DomainKnowledgeDetail'));
 const DomainKnowledgeBlank = loadableComponent(() => import('@/pages/DomainKnowledgeBlank'));
+/** 本体图形编辑页（移植自 nexonto 的画布）：一个数据源一份 schema */
+const OntologyCanvas = loadableComponent(() => import('@/features/ontologyCanvas/OntologyCanvasPage'));
 const DomainKnowledgeDatasourceManual = loadableComponent(() => import('@/pages/DomainKnowledgeDatasourceManual'));
 const DomainKnowledgeDatasourceStorage = loadableComponent(() => import('@/pages/DomainKnowledgeDatasourceStorage'));
 const DomainKnowledgeDatasourceSync = loadableComponent(() => import('@/pages/DomainKnowledgeDatasourceSync'));
@@ -20,7 +22,7 @@ const DomainKnowledgeSourceData = loadableComponent(() => import('@/pages/Domain
 const DomainKnowledgeDocumentResult = loadableComponent(() => import('@/pages/DomainKnowledgeDocumentResult'));
 const DomainKnowledgeDataSource = loadableComponent(() => import('@/pages/DomainKnowledgeDataSource'));
 const DomainKnowledgeParser = loadableComponent(() => import('@/pages/DomainKnowledgeParser'));
-const DomainKnowledgeEngine = loadableComponent(() => import('@/pages/DomainKnowledgeEngine'));
+const DomainKnowledgeModelSettings = loadableComponent(() => import('@/pages/DomainKnowledgeModelSettings'));
 const DomainKnowledgeGraph = loadableComponent(() => import('@/pages/DomainKnowledgeGraph'));
 const DomainKnowledgeInstanceDetail = loadableComponent(() => import('@/pages/DomainKnowledgeInstanceDetail'));
 const DomainKnowledgeRelationDetail = loadableComponent(() => import('@/pages/DomainKnowledgeRelationDetail'));
@@ -33,8 +35,21 @@ const DomainManagementSearch = loadableComponent(() => import('@/pages/DomainMan
 export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key: string) => string) {
   // hosted (MF mount) or embed (Shell iframe embed, URL with ?embed=1) both use shell-less layout,
   // only render the content area, shell (sidebar/header) is handled by Shell.
+  //
+  // ⚠️ 三个信号之间是**或**，不是且。原先是 `isEmbedded() && inIframe`，踩过的坑：
+  // 在 iframe 里导航时 `?embed=1` 会丢（子应用自己的 createBrowserRouter 跳转不带 search），
+  // 但 `window.parent` 仍然是 shell —— 此时「且」判成假，回落到 BasicLayout，
+  // shell 外面又套了一层自己的侧栏/顶栏（双层壳），且 BasicLayout 的内容区高度链不完整，
+  // 画布 `height:100%` 撑不满、底部留白。
+  // 症状是**切语言才出现**：useMemo 依赖 `t`，只有切语言才会重算 Layout 并重新求值 isEmbedded()，
+  // 单纯导航不会（useMemo 不重跑，坏掉的判定一直没被触发）。
+  //
+  // 三个信号各自都足以说明「壳由别人提供」，任何一个成立就都该走无壳布局：
+  //   mode==='hosted' —— MF 挂载，就在 shell 里
+  //   inIframe        —— 被 iframe 嵌着，我们不是最外层（本产品里 iframe 只来自 shell 的 AppHost）
+  //   isEmbedded()    —— URL 显式要求 embed（shell 加的参数，也允许被单独使用）
   const inIframe = typeof window !== 'undefined' && window.parent !== window;
-  const Layout = mode === 'hosted' || (isEmbedded() && inIframe) ? HostedLayout : BasicLayout;
+  const Layout = mode === 'hosted' || inIframe || isEmbedded() ? HostedLayout : BasicLayout;
   const T = t || ((s: string) => s);
 
   return [
@@ -86,6 +101,13 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
         },
         { path: 'domain-knowledge/:id', element: DomainKnowledgeBlank, title: T('domainKnowledge.detail') },
         {
+          // 本体图形编辑：:dsId 为具体数据源；'-'（知识库级）自 v2 起转抽象编辑器
+          // （路由参数不能为空，而 data_source_id 为 NULL 是有意义的取值）
+          path: 'domain-knowledge/:kbId/schema/:dsId',
+          element: OntologyCanvas,
+          title: T('route.ontologyCanvas'),
+        },
+        {
           path: 'domain-knowledge/:id/detail',
           element: DomainKnowledgeDetail,
           title: T('route.domainKnowledgeSettings'),
@@ -126,7 +148,11 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           title: T('route.dataSourceConfig'),
         },
         { path: 'domain-knowledge/:id/parser', element: DomainKnowledgeParser, title: T('route.parserConfig') },
-        { path: 'domain-knowledge/:id/engine', element: DomainKnowledgeEngine, title: T('route.engineConfig') },
+        {
+          path: 'domain-knowledge/:id/models',
+          element: DomainKnowledgeModelSettings,
+          title: T('route.modelConfig'),
+        },
         {
           path: 'domain-knowledge/:id/graph',
           element: DomainKnowledgeGraph,

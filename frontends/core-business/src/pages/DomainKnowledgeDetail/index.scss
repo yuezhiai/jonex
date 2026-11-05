@@ -1,5 +1,95 @@
 /* ── DomainKnowledgeDetail 页面样式 ── */
 
+/* 统计标签：药丸形，数字加重突出，单位文字退让 */
+.yx-kb-stat-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 18px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+  color: #94a3b8;
+}
+
+.yx-kb-stat-badge b {
+  color: #334155;
+  font-weight: 600;
+}
+
+/* 三类统计按语义配色：文档=数据(蓝)、实体=知识(绿)、关系=连接(橙)。
+   底色、边框、图标与单位文字同取一个色相（color 会同时作用于图标和后面的单位文字），数字保持统一深色。 */
+.yx-kb-stat-badge-docs {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
+}
+
+.yx-kb-stat-badge-entities {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #059669;
+}
+
+.yx-kb-stat-badge-relations {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #d97706;
+}
+
+.yx-kb-stat-badge svg,
+.yx-kb-stat-badge .anticon {
+  font-size: 12px;
+}
+
+/* 「知识库级 schema」页签：内嵌本体画布（画布要一个确定高度；PageContent 的卡片 body
+   不是 flex 列，这里用视口估算）。⚠️ 数值按页头/页签栏实测调，改版式要重核。 */
+.yx-kb-schema-embed {
+  height: calc(100vh - 320px);
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 顶部一句定位说明（这份是单源血统的编译 schema，不是抽象层） */
+.yx-kb-schema-note {
+  flex: none;
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: #65758b;
+}
+
+/* 画布自带 height:100%，但有说明行这个兄弟节点后 100% 会溢出——改成吃剩余高度 */
+.yx-kb-schema-embed > .ontology-canvas-page {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+
+/* 知识库级 / 全部数据源 切换行：Segmented 在左，说明文字吃剩余宽度 */
+.yx-kb-schema-switch {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.yx-kb-schema-switch .yx-kb-schema-note {
+  flex: 1;
+  margin: 0;
+}
+
+/* 多源视图自带 height:100%，与说明行同为兄弟节点后 100% 会溢出——吃剩余高度 */
+.yx-kb-schema-embed > .ms-view {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+
 /* 状态文字：圆点跟随 currentColor，失败/处理中自动换色 */
 .yx-kb-detail-status {
   display: inline-flex;
@@ -234,4 +324,12 @@
 .yx-kb-header-updated {
   font-size: 12px;
   color: #94a3b8;
+}
+
+/* 库型未知时的页签占位：详情要等 with_stats（jonex_wiki 可达数秒），
+   这期间既不能挂错面板，也不能让内容区塌成一条边线 */
+.yx-kb-tab-loading {
+  display: flex;
+  justify-content: center;
+  padding: 64px 0;
 }

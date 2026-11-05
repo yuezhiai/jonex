@@ -5,6 +5,10 @@ import rehypeRaw from 'rehype-raw';
 import rehypeSanitize from 'rehype-sanitize';
 import { defaultSchema } from 'hast-util-sanitize';
 import { PictureOutlined } from '@ant-design/icons';
+import MarkdownTable, { markdownTableCell } from './MarkdownTable';
+import WikiSourcePicture from './WikiSourcePicture';
+import type { WikiSourceImage } from '@/types/domainKnowledge';
+
 
 interface MarkdownContentProps {
   /** Markdown / GFM / 内联 HTML 源文本 */
@@ -22,6 +26,8 @@ interface MarkdownContentProps {
    * 顺序须与正文 h2~h4 出现顺序一致（由 wikiMarkdown.extractToc 生成）。
    */
   headingIds?: string[];
+  images?: WikiSourceImage[];
+  onOpenImageSource?: (image: WikiSourceImage) => void;
 }
 
 // 安全白名单：在 react-markdown 默认 schema 基础上，额外放行 HTML 表格相关标签（table/tr/td/th/br）
@@ -114,6 +120,8 @@ const toText = (node: React.ReactNode): string =>
     .join('');
 
 interface ComponentsOptions {
+  images?: WikiSourceImage[];
+  onOpenImageSource?: (image: WikiSourceImage) => void;
   /** 是否把 ```markdown 围栏当子文档渲染。子文档内部传 false，切断递归 */
   markdownFence: boolean;
   /**
@@ -147,6 +155,8 @@ function buildComponents({
   headingIds,
   onInternalLink,
   imagePlaceholder,
+  images,
+  onOpenImageSource,
 }: ComponentsOptions): Components {
   // 每次渲染重置游标：h2~h4 渲染顺序 = 正文出现顺序，与 headingIds 一一对应。
   let headingCursor = 0;
@@ -231,7 +241,7 @@ function buildComponents({
             <div className="yx-md-embed" style={embedStyle}>
               <MarkdownBody
                 content={source}
-                components={buildComponents({ markdownFence: false, onInternalLink, imagePlaceholder })}
+                components={buildComponents({ markdownFence: false, onInternalLink, imagePlaceholder, images, onOpenImageSource })}
               />
             </div>
           );
@@ -240,38 +250,21 @@ function buildComponents({
 
       return <pre style={preStyle}>{owned ? React.cloneElement(owned, { style: blockCodeStyle }) : children}</pre>;
     },
-    table: ({ children }) => (
-      <table
-        style={{
-          borderCollapse: 'collapse',
-          margin: '0 0 12px',
-          width: '100%',
-          fontSize: 13,
-        }}
-      >
-        {children}
-      </table>
+    // 表格与答案正文共用一套渲染（`@/components/MarkdownTable`）：带边框/斑马纹、
+    // 窄容器可横向滚动，单元格是 ☑/□ 一类符号时换成可读色块
+    table: ({ children }) => <MarkdownTable>{children}</MarkdownTable>,
+    th: ({ node: _node, ...rest }) => <th {...rest} />,
+    td: ({ node: _node, children, ...rest }) => (
+      <td {...rest}>{markdownTableCell(children)}</td>
     ),
-    th: ({ node: _node, ...rest }) => (
-      <th
-        style={{
-          border: '1px solid #e2e8f0',
-          background: '#f8fafc',
-          padding: '6px 10px',
-          fontWeight: 600,
-          textAlign: 'left',
-        }}
-        {...rest}
-      />
-    ),
-    td: ({ node: _node, ...rest }) => (
-      <td style={{ border: '1px solid #e2e8f0', padding: '6px 10px' }} {...rest} />
-    ),
-    img: ({ alt }) => (
+    img: ({ alt, src }) => {
+      const id = typeof src === 'string' && src.startsWith('#wiki-image/') ? src.slice('#wiki-image/'.length) : '';
+      const image = images?.find((item) => item.asset_id === id);
+      return image ? <WikiSourcePicture image={image} onOpenSource={onOpenImageSource} /> : (
       <span style={{ color: '#94a3b8', fontSize: 12 }}>
         <PictureOutlined /> {alt || imagePlaceholder}
       </span>
-    ),
+    ); },
   };
 }
 
@@ -286,12 +279,14 @@ export default function MarkdownContent({
   imagePlaceholder = '图片',
   onInternalLink,
   headingIds,
+  images,
+  onOpenImageSource,
 }: MarkdownContentProps) {
   return (
     <div style={{ fontSize: 14, lineHeight: 1.8, color: '#334155', wordBreak: 'break-word' }}>
       <MarkdownBody
         content={content}
-        components={buildComponents({ markdownFence: true, headingIds, onInternalLink, imagePlaceholder })}
+        components={buildComponents({ markdownFence: true, headingIds, onInternalLink, imagePlaceholder, images, onOpenImageSource })}
       />
     </div>
   );

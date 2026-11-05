@@ -41,6 +41,7 @@ import UploadModal from './UploadModal';
 import FolderNameModal from './FolderNameModal';
 import MoveDocModal from './MoveDocModal';
 import TagModal from './TagModal';
+import ModelUpdateModal from './ModelUpdateModal';
 import { useWikiCompilation } from '@/hooks/useWikiCompilation';
 import WikiCompilationControl from '@/components/WikiCompilationControl';
 import './index.scss';
@@ -73,6 +74,9 @@ export default function DocumentLibrary({
   onRefreshQuota,
   onRefreshStats,
 }: DocumentLibraryProps) {
+  // jonex_wiki 的编译控制（状态文字 + 暂停/恢复按钮）暂时隐藏。
+  // 组件与调用代码都保留，恢复展示时把开关改回 true 即可。
+  const SHOW_WIKI_COMPILATION_CONTROL = false;
   const { canWrite } = useKbPermission(kbId);
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -87,6 +91,7 @@ export default function DocumentLibrary({
   const [foldersCollapsed, setFoldersCollapsed] = useState(false);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [tagDoc, setTagDoc] = useState<ManualDocItem | null>(null);
+  const [modelUpdateDoc, setModelUpdateDoc] = useState<ManualDocItem | null>(null);
   // 受控行选中（批量移动按钮可用性 + 移动目标文档集）
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
   const [moveModal, setMoveModal] = useState<{
@@ -443,6 +448,7 @@ export default function DocumentLibrary({
       onViewResult: handleViewResult,
       onReparse: handleReparse,
       onRecompile: handleRecompile,
+      onUpdateModel: setModelUpdateDoc,
       onDelete: handleDelete,
       onMove: handleMove,
     },
@@ -450,7 +456,9 @@ export default function DocumentLibrary({
     kbType,
     canWrite,
     compilation.state?.paused,
-    kbType === 'jonex_wiki' ? () => void compilation.toggle() : undefined,
+    // 行操作菜单里的「暂停/恢复自动编译」与顶部状态条共用同一个开关：
+    // 传 undefined 时 actionItems 不生成该菜单项（关闭时整个消失，而非置灰）。
+    SHOW_WIKI_COMPILATION_CONTROL && kbType === 'jonex_wiki' ? () => void compilation.toggle() : undefined,
     !compilation.canToggle,
   );
 
@@ -621,7 +629,8 @@ export default function DocumentLibrary({
             actions={{ refresh: false, reset: false }}
             toolbar={
               <>
-                {kbType === 'jonex_wiki' && <WikiCompilationControl kbId={kbId} control={compilation} compact />}
+                {SHOW_WIKI_COMPILATION_CONTROL && kbType === 'jonex_wiki'
+                  && <WikiCompilationControl kbId={kbId} control={compilation} compact showToggle={false} />}
                 <Button icon={<ReloadOutlined />} onClick={() => reload()}>
                   {t('common.refresh')}
                 </Button>
@@ -704,6 +713,14 @@ export default function DocumentLibrary({
           setTagModalOpen(false);
           setTagDoc(null);
         }}
+      />
+      <ModelUpdateModal
+        open={modelUpdateDoc !== null}
+        kbId={kbId}
+        docId={modelUpdateDoc?.id ?? ''}
+        docName={modelUpdateDoc?.name ?? ''}
+        onClose={() => setModelUpdateDoc(null)}
+        onApplied={() => reload()}
       />
       <MoveDocModal
         open={moveModal.open}

@@ -1,0 +1,333 @@
+/* ═══════════════════════════════════════════════════════════
+   ─── 服务配置弹窗（API Key / MCP 接入）────────────────────
+   颜色全部取 @jonex/platform-theme 的语义 token，与卡片页同源
+   ═══════════════════════════════════════════════════════════ */
+
+.scm-modal {
+  .ant-modal-content {
+    padding: 0;
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  .ant-modal-header {
+    margin-bottom: 0;
+    padding: 18px 22px 16px;
+    border-bottom: 1px solid #eef2f6;
+    background: #fff;
+  }
+
+  .ant-modal-title {
+    font-size: 15px;
+  }
+
+  .ant-modal-close {
+    top: 20px;
+    inset-inline-end: 18px;
+  }
+
+  .ant-modal-body {
+    padding: 18px 22px 4px;
+    max-height: calc(100vh - 260px);
+    overflow-y: auto;
+    background: #fff;
+  }
+
+  .ant-modal-footer {
+    margin-top: 0;
+    padding: 12px 22px 16px;
+    border-top: 1px solid #f1f5f9;
+  }
+}
+
+.scm-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #0b2b5c;
+}
+
+.scm-title-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: #2563eb;
+  background: #eff6ff;
+  border: 1px solid #dbeafe;
+}
+
+/* ── 服务身份条 ── */
+.scm-hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.scm-hero-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  flex-shrink: 0;
+  font-size: 17px;
+  color: #2563eb;
+  background: #eff6ff;
+  border: 1px solid #dbeafe;
+}
+
+.scm-hero-main {
+  min-width: 0;
+}
+
+.scm-hero-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.scm-hero-name-text {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #0b2b5c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-hero-sub {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 状态胶囊 ── */
+.scm-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+
+  &.is-active {
+    color: #059669;
+    background: #ecfdf5;
+    border: 1px solid #d1fae5;
+  }
+
+  &.is-testing {
+    color: #b45309;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+  }
+
+  &.is-idle {
+    color: #64748b;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+  }
+}
+
+/* ── 接入元信息 ── */
+.scm-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 116px 116px;
+  gap: 14px;
+  margin: 0 0 6px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+
+  dt {
+    margin-bottom: 5px;
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+    color: #94a3b8;
+  }
+
+  dd {
+    margin: 0;
+    font-size: 13px;
+    color: #1e293b;
+    min-width: 0;
+  }
+}
+
+.scm-meta-item.is-wide dd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-endpoint.ant-typography {
+  font-size: 12.5px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: #f1f5f9;
+  color: #475569;
+  border: none;
+}
+
+.scm-tag.ant-tag {
+  margin: 0;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 18px;
+}
+
+/* ── Tabs ── */
+.scm-tabs {
+  .ant-tabs-nav {
+    margin: 6px 0 14px;
+  }
+
+  .ant-tabs-tab {
+    font-size: 13px;
+    padding: 8px 0;
+  }
+}
+
+/* ── API Key 区 ── */
+.scm-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.scm-section-copy {
+  min-width: 0;
+
+  h4 {
+    margin: 0;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #1e293b;
+  }
+
+  p {
+    margin: 3px 0 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #64748b;
+  }
+}
+
+.scm-table {
+  .ant-table {
+    border: 1px solid #eef2f6;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .ant-table-thead > tr > th {
+    padding: 9px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #64748b;
+    background: #f8fafc;
+    border-bottom: 1px solid #eef2f6;
+
+    &::before {
+      display: none;
+    }
+  }
+
+  .ant-table-tbody > tr > td {
+    padding: 9px 12px;
+    font-size: 12.5px;
+    border-bottom: 1px solid #f1f5f9;
+  }
+
+  .ant-table-tbody > tr:last-child > td {
+    border-bottom: none;
+  }
+
+  .ant-table-tbody > tr:hover > td {
+    background: #f8fafc;
+  }
+}
+
+.scm-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.scm-key-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 12px;
+  color: #475569;
+}
+
+.scm-copy.ant-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: #94a3b8;
+
+  &:hover {
+    color: #2563eb;
+    background: #eff6ff;
+  }
+
+  &.is-copied {
+    color: #059669;
+  }
+}
+
+.scm-prefix {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
+  font-size: 11.5px;
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+}
+
+.scm-dim {
+  color: #94a3b8;
+}
+
+.scm-del.ant-btn {
+  font-size: 12px;
+  color: #dc2626;
+
+  &:hover {
+    color: #b91c1c;
+    background: #fef2f2;
+  }
+}

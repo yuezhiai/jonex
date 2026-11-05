@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Input, Button, message, Empty, Spin, Dropdown, Tag, Tooltip } from 'antd';
+import { Input, Button, message, Empty, Spin, Dropdown, Tooltip } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
@@ -74,6 +74,11 @@ const DomainKnowledge = function DomainKnowledge() {
   const kbQuota = getQuota('tenantKnowledgeBaseLimit');
   const kbReached = isReached('tenantKnowledgeBaseLimit');
 
+  // [jonex] 禁用空间：管理员可见（本页能打开），但所有人都不可用。
+  // 后端对空间内全部业务 action 返回 err.space.disabled，这里不再发无意义的请求，
+  // 直接把页面切换成禁用态（横幅 + 空列表 + 写入口禁用）。
+  const spaceDisabled = !!global.currentSpace && global.currentSpace.status !== 'active';
+
   // ── filter state ────────────────────────────────────
   const [keywordInput, setKeywordInput] = useState('');
   const [keyword, setKeyword] = useState('');
@@ -98,6 +103,7 @@ const DomainKnowledge = function DomainKnowledge() {
   const [list, setList] = useState<DomainKnowledgeItem[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
 
   // ── create modal state ────────────────────────────────
   const [createOpen, setCreateOpen] = useState(false);
@@ -154,7 +160,16 @@ const DomainKnowledge = function DomainKnowledge() {
   // ── fetch helpers ────────────────────────────────────
   const fetchList = useCallback(
     async (kw: string) => {
+      // 禁用空间不发起列表请求：后端必然 403，请求只会把「已禁用」渲染成一次报错。
+      if (global.currentSpace?.status !== 'active') {
+        setList([]);
+        setTotal(0);
+        setListError(null);
+        setLoading(false);
+        return;
+      }
       setLoading(true);
+      setListError(null);
       try {
         const result = await getDomainKnowledgeList({
           page: 1,
@@ -165,12 +180,13 @@ const DomainKnowledge = function DomainKnowledge() {
         setList(result.list);
         setTotal(result.pagination.total);
       } catch (err: any) {
-        message.error(err?.message || t('domainKnowledge.fetchListFailed'));
+        // 失败原因常驻在列表上方，比一闪而过的 toast 好读
+        setListError(err?.message || t('domainKnowledge.fetchListFailed'));
       } finally {
         setLoading(false);
       }
     },
-    [global.currentSpaceId],
+    [global.currentSpaceId, global.currentSpace?.status],
   );
 
   // ── initial load ─────────────────────────────────────
@@ -197,16 +213,22 @@ const DomainKnowledge = function DomainKnowledge() {
     if (global.spacesLoaded) {
       fetchList(keyword);
     }
-  }, [global.spacesLoaded, global.currentSpaceId, keyword]);
+  }, [global.spacesLoaded, global.currentSpaceId, global.currentSpace?.status, keyword]);
 
   // ── create handler ───────────────────────────────────
-  const handleCreate = async (values: { name: string; description?: string; kb_type?: KnowledgeBaseType }) => {
+  const handleCreate = async (values: {
+    name: string;
+    description?: string;
+    kb_type?: KnowledgeBaseType;
+    structured_enabled: boolean;
+  }) => {
     setCreateSubmitting(true);
     try {
       const data = {
         name: values.name.trim(),
         space_id: global.currentSpaceId!,
         description: values.description?.trim() || undefined,
+        structured_enabled: values.structured_enabled === true,
       };
       if (editingKb) {
         // [jonex] 编辑时绝不能带 kb_type：类型创建后不可变，后端会抛 err.kb.kb_type_immutable
@@ -293,27 +315,46 @@ const DomainKnowledge = function DomainKnowledge() {
 
       {/* Toolbar + Card Grid */}
       <PageContent showCard={false}>
+        {spaceDisabled && (
+          <div
+            role="alert"
+            style={{
+              marginBottom: 16,
+              padding: '10px 14px',
+              borderRadius: 8,
+              background: '#fff7e6',
+              border: '1px solid #ffd591',
+              color: '#ad6800',
+              fontSize: 13,
+              lineHeight: '20px',
+            }}
+          >
+            {t('domainKnowledge.spaceDisabledHint')}
+          </div>
+        )}
         <div className="yx-toolbar">
           <Input
-            prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+            className="kb-search"
+            prefix={<SearchOutlined />}
             placeholder={t('domainKnowledge.searchPlaceholder')}
             value={keywordInput}
             onChange={(e) => {
               setKeywordInput(e.target.value);
             }}
-            style={{ width: 280, lineHeight: 'normal' }}
+            allowClear
           />
           {!global.currentSpaceId ? (
-            <span style={{ color: '#f97316', fontSize: 13 }}>{t('domainKnowledge.notSelected')}</span>
+            <span className="kb-hint is-warn">{t('domainKnowledge.notSelected')}</span>
           ) : kbReached ? (
-            <span style={{ color: '#f97316', fontSize: 13 }}>
+            <span className="kb-hint is-warn">
               {t('common.quotaKbReached', { limit: kbQuota?.limit ?? 0 })}
             </span>
           ) : (
             <Button
+              className="kb-toolbar-create"
               type="primary"
               icon={<PlusOutlined />}
-              disabled={!global.currentSpace?.can_write_space}
+              disabled={!global.currentSpace?.can_write_space || spaceDisabled}
               onClick={openCreateModal}
             >
               {t('domainKnowledge.newKnowledgeBase')}
@@ -321,28 +362,48 @@ const DomainKnowledge = function DomainKnowledge() {
           )}
         </div>
 
+        {listError && (
+          <div className="kb-error">
+            <span>{listError}</span>
+            <Button size="small" onClick={() => fetchList(keyword)}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        )}
+
         {/* Loading State */}
         {loading && list.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: '80px 0' }}>
+          <div className="kb-state">
             <Spin size="large" />
           </div>
         ) : list.length === 0 ? (
           /* Empty State */
-          <div style={{ textAlign: 'center', padding: '80px 0' }}>
-            <Empty description={t('domainKnowledge.emptyDescription')}>
+          <div className="kb-state">
+            <Empty
+              description={
+                spaceDisabled
+                  ? t('domainKnowledge.spaceDisabled')
+                  : t('domainKnowledge.emptyDescription')
+              }
+            >
               {!global.currentSpaceId ? (
-                <div style={{ color: '#f97316', fontSize: 13, marginBottom: 12 }}>
+                <div className="kb-hint is-warn is-block">
                   {t('domainKnowledge.notSelected')}
                 </div>
+              ) : spaceDisabled ? (
+                <div className="kb-hint is-block is-muted">
+                  {t('domainKnowledge.spaceDisabledHint')}
+                </div>
               ) : kbReached ? (
-                <div style={{ color: '#f97316', fontSize: 13, marginBottom: 12 }}>
+                <div className="kb-hint is-warn is-block">
                   {t('common.quotaKbReached', { limit: kbQuota?.limit ?? 0 })}
                 </div>
               ) : (
                 <Button
+                  className="kb-toolbar-create"
                   type="primary"
                   icon={<PlusOutlined />}
-                  disabled={!global.currentSpace?.can_write_space}
+                  disabled={!global.currentSpace?.can_write_space || spaceDisabled}
                   onClick={openCreateModal}
                 >
                   {t('domainKnowledge.newKnowledgeBase')}
@@ -354,28 +415,25 @@ const DomainKnowledge = function DomainKnowledge() {
           /* Card Grid */
           <div className="kb-card-grid">
             {displayList.map((item) => (
-              <div className="kb-card" key={item.id}>
+              <div className={`kb-card kb-type-${item.kbType || 'lightrag'}`} key={item.id}>
                 {/* Card Top */}
                 <div className="kb-card-top">
                   <div className="kb-card-icon">
                     <DatabaseOutlined />
                   </div>
                   <div className="kb-card-info">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <div className="kb-card-title">
                       <div className="kb-card-name" onClick={() => navigate(`/domain-knowledge/${item.id}`)}>
                         {item.name}
                       </div>
-                      {/* [jonex] 知识库类型标签：三种类型行为差别大（引用溯源/编译结果页），需可一眼区分 */}
-                      <Tag
-                        color={item.kbType === 'jonex_wiki' ? 'magenta' : item.kbType === 'openkb' ? 'purple' : 'blue'}
-                        style={{ marginInlineEnd: 0, flexShrink: 0, fontSize: 12 }}
-                      >
+                      {/* [jonex] 知识库类型胶囊：三种类型行为差别大（引用溯源/编译结果页），需可一眼区分 */}
+                      <span className="kb-card-type">
                         {item.kbType === 'jonex_wiki'
                           ? t('domainKnowledge.kbTypeJonexWiki')
                           : item.kbType === 'openkb'
                             ? t('domainKnowledge.kbTypeOpenkb')
                             : t('domainKnowledge.kbTypeLightrag')}
-                      </Tag>
+                      </span>
                     </div>
                     <div className="kb-card-meta">
                       <span>
@@ -384,6 +442,7 @@ const DomainKnowledge = function DomainKnowledge() {
                           count: item.documentCount ?? 0,
                         })}
                       </span>
+                      <span className="kb-meta-sep">·</span>
                       <span>
                         <ClockCircleOutlined /> {item.updatedAt || '—'}
                       </span>
@@ -436,7 +495,7 @@ const DomainKnowledge = function DomainKnowledge() {
                     trigger={['hover']}
                     placement="bottomRight"
                   >
-                    <EllipsisOutlined style={{ cursor: 'pointer' }} />
+                    <EllipsisOutlined className="kb-card-menu" />
                   </Dropdown>
                 </div>
 
@@ -449,9 +508,9 @@ const DomainKnowledge = function DomainKnowledge() {
                 <div className="kb-card-tags">
                   <div className="source-tags">
                     {item.grant_shared && (
-                      <Tag color="purple" style={{ marginRight: 6 }}>
+                      <span className="source-tag is-shared">
                         {t('kbPermission.grantShared')}
-                      </Tag>
+                      </span>
                     )}
                     {(item.dataSourceTypes && item.dataSourceTypes.length > 0 ? item.dataSourceTypes : ['file']).map(
                       (type) => (

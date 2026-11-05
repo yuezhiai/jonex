@@ -21,6 +21,13 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // 组件测试（*.test.tsx）跑 jsdom（RTL 需要真实 DOM 与 window）；纯逻辑
+    // 测试（*.test.ts）保持 node —— 既有 50 条不复用任何 DOM 假设。
+    environmentMatchGlobs: [['src/**/*.test.tsx', 'jsdom']],
+    setupFiles: ['./src/test/setup.ts'],
+    // jsdom 下 antd 组件的挂载/交互（cssinjs 注入、门户、无障碍树查询）比 node
+    // 纯逻辑测试慢一个量级，默认 5s 会误伤 —— 单文件放宽到 20s。
+    testTimeout: 20000,
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     server: {
       deps: {

@@ -1,9 +1,16 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Modal, Form, Input, Select, Switch, Button } from 'antd';
+import { Modal, Form, Input, Select, Switch, Button, Alert, message } from 'antd';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
-import type { OntologyAttrType, OntologyObjectDef, SaveOntologyObjectPayload } from '@/types/domainKnowledge';
+import type {
+  ExtractionSkillRef,
+  OntologyAttrType,
+  OntologyObjectDef,
+  SaveOntologyObjectPayload,
+} from '@/types/domainKnowledge';
 import { ATTR_TYPE_OPTIONS } from './constants';
+import ExtractToolDeclarations, { type AttrOption } from './ExtractToolDeclarations';
+import { attributeKeyOf, mergeSkills, splitSkills, type CatalogDraft } from './extractToolDraft';
 
 interface AttrFormItem {
   id?: string;
@@ -11,6 +18,7 @@ interface AttrFormItem {
   description?: string;
   type?: OntologyAttrType;
   isPrimaryKey?: boolean;
+  compiledName?: string;
 }
 
 interface ObjectFormValues {
@@ -26,14 +34,36 @@ interface Props {
   submitting: boolean;
   onCancel: () => void;
   onSubmit: (payload: SaveOntologyObjectPayload) => void;
+  /** 知识库 id：抽取期工具一节要拉工具列表、试跑 */
+  kbId?: string;
+  /** 本库「抽取期调用工具」开关是否打开：打开才显示声明编辑 */
+  extractToolEnabled?: boolean;
 }
 
-export default function ObjectFormModal({ open, editing, submitting, onCancel, onSubmit }: Props) {
+const EMPTY_BUILTIN = { refine: [] as ExtractionSkillRef[], constrain: [] as ExtractionSkillRef[] };
+
+export default function ObjectFormModal({
+  open,
+  editing,
+  submitting,
+  onCancel,
+  onSubmit,
+  kbId,
+  extractToolEnabled = false,
+}: Props) {
   const { t } = useTranslation();
   const [form] = Form.useForm<ObjectFormValues>();
+  const [drafts, setDrafts] = useState<CatalogDraft[]>([]);
+  const [builtin, setBuiltin] = useState(EMPTY_BUILTIN);
+  const [draftsTouched, setDraftsTouched] = useState(false);
+  const watchedAttrs = Form.useWatch('attributes', form) as AttrFormItem[] | undefined;
 
   useEffect(() => {
     if (!open) return;
+    const split = splitSkills(editing?.extractionSkills);
+    setDrafts(split.drafts);
+    setBuiltin(split.builtin);
+    setDraftsTouched(false);
     if (editing) {
       form.setFieldsValue({
         name: editing.name,
@@ -45,6 +75,7 @@ export default function ObjectFormModal({ open, editing, submitting, onCancel, o
           description: attr.description,
           type: attr.type,
           isPrimaryKey: attr.isPrimaryKey,
+          compiledName: attr.compiledName,
         })),
       });
       return;
@@ -57,13 +88,59 @@ export default function ObjectFormModal({ open, editing, submitting, onCancel, o
     });
   }, [editing, form, open]);
 
+  // 写入 / 入参下拉用的属性键：已有属性用编译键，新加的属性按保存时的推导规则算
+  const attrOptions: AttrOption[] = useMemo(() => {
+    const seen = new Set<string>();
+    const out: AttrOption[] = [];
+    (watchedAttrs || []).forEach((attr) => {
+      const label = (attr?.name || '').trim();
+      const key = attr?.compiledName || attributeKeyOf(label);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      out.push({ key, label: label || key });
+    });
+    return out;
+  }, [watchedAttrs]);
+
+  // 声明写入、但还不在属性定义里的属性：保存时自动加进来，这里先告诉用户
+  const newAttrs = useMemo(() => {
+    if (!extractToolEnabled) return [];
+    const keys = new Set(attrOptions.map((a) => a.key));
+    const out: string[] = [];
+    drafts.forEach((d) => {
+      if (d.group !== 'refine') return;
+      d.writes.forEach((w) => {
+        const attr = (w.attr || '').trim();
+        if (attr && !keys.has(attr) && !out.includes(attr)) out.push(attr);
+      });
+    });
+    return out;
+  }, [attrOptions, drafts, extractToolEnabled]);
+
   async function handleOk() {
     const values = await form.validateFields();
+    // 开关关着时不显示编辑区，也不碰声明（undefined = 保存时保留原值）
+    let extractionSkills: SaveOntologyObjectPayload['extractionSkills'];
+    if (extractToolEnabled && (draftsTouched || !editing)) {
+      const merged = mergeSkills(builtin, drafts);
+      if (merged.errors.length) {
+        const first = merged.errors[0];
+        message.error(
+          t('compile.extractTool.decl.saveBlocked', {
+            index: first.index + 1,
+            reason: t(`compile.extractTool.err.${first.errors[0].code}`, first.errors[0].params || {}),
+          }),
+        );
+        return;
+      }
+      extractionSkills = merged.config;
+    }
     onSubmit({
       name: values.name.trim(),
       description: (values.description || '').trim(),
       requirement: (values.requirement || '').trim(),
       status: editing?.status || 'active',
+      extractionSkills,
       attributes: (values.attributes || [])
         .filter((item) => (item.name || '').trim())
         .map((item) => ({
@@ -76,6 +153,8 @@ export default function ObjectFormModal({ open, editing, submitting, onCancel, o
     });
   }
 
+  const catalogCount = drafts.length;
+
   return (
     <Modal
       title={editing ? t('compile.objectEdit') : t('compile.objectNew')}
@@ -85,7 +164,7 @@ export default function ObjectFormModal({ open, editing, submitting, onCancel, o
       okText={t('common.confirm')}
       cancelText={t('common.cancel')}
       confirmLoading={submitting}
-      width={860}
+      width={extractToolEnabled ? 1040 : 860}
       destroyOnHidden
     >
       <Form form={form} layout="vertical" preserve={false}>
@@ -149,6 +228,39 @@ export default function ObjectFormModal({ open, editing, submitting, onCancel, o
           )}
         </Form.List>
       </Form>
+
+      {extractToolEnabled && kbId ? (
+        <>
+          <ExtractToolDeclarations
+            kbId={kbId}
+            entityType={editing?.compiledName}
+            attributes={attrOptions}
+            builtin={builtin}
+            value={drafts}
+            onChange={(next) => {
+              setDrafts(next);
+              setDraftsTouched(true);
+            }}
+          />
+          {newAttrs.length > 0 && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginTop: 8 }}
+              title={t('compile.extractTool.decl.newAttrsHint', { attrs: newAttrs.join('、') })}
+            />
+          )}
+        </>
+      ) : (
+        catalogCount > 0 && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginTop: 12 }}
+            title={t('compile.extractTool.decl.switchOff', { count: catalogCount })}
+          />
+        )
+      )}
     </Modal>
   );
 }

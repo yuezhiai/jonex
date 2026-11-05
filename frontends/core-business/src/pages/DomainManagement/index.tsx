@@ -24,7 +24,7 @@ import {
   type ServiceApiKeyItem,
 } from '../../types/domainService';
 import { getDomainKnowledgeList } from '../../api/domainKnowledge';
-import DomainFormModal from './DomainFormModal';
+import ServiceFormModal from './ServiceFormModal';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import ServiceConfigModal from './ServiceConfigModal';
 import './index.scss';
@@ -288,7 +288,7 @@ const DomainManagement = function DomainManagement() {
       dataIndex: 'status',
       key: 'status',
       width: 90,
-      render: (v: string, r: DomainServiceItem) => {
+      render: (v: string) => {
         const cfg = getServiceStatusMap(t)[v];
         if (!cfg) return <Tag>{v}</Tag>;
         return <Tag color={v === 'active' ? 'success' : v === 'testing' ? 'warning' : 'error'}>{cfg.label}</Tag>;
@@ -422,12 +422,13 @@ const DomainManagement = function DomainManagement() {
           </div>
 
           {/* Create/Edit Modal */}
-          <DomainFormModal
+          <ServiceFormModal
             open={formOpen}
             editing={editing}
+            spaceName={global.currentSpace?.name}
             availableKbs={availableKbs}
             submitting={submitting}
-            onSave={handleSave}
+            onSubmit={handleSave}
             onCancel={() => setFormOpen(false)}
           />
 

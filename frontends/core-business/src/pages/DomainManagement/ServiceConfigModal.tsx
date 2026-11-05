@@ -1,17 +1,19 @@
 import { useState } from 'react';
-import { Modal, Button, Table, Tabs, Card, Descriptions, Tag, Typography } from 'antd';
+import { Modal, Button, Table, Tabs, Tag, Typography, Empty } from 'antd';
 import {
   ApiOutlined,
   PlusOutlined,
   CopyOutlined,
   CheckOutlined,
   DeleteOutlined,
+  KeyOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import copy from 'copy-to-clipboard';
 import type { ColumnsType } from 'antd/es/table';
 import type { DomainServiceItem, ServiceApiKeyItem } from '../../types/domainService';
 import McpKeyTab from './McpKeyTab';
+import './ServiceConfigModal.css';
 
 interface ServiceConfigModalProps {
   open: boolean;
@@ -25,6 +27,13 @@ interface ServiceConfigModalProps {
   onDeleteKey: (keyId: string) => void;
   onCancel: () => void;
 }
+
+/** 服务状态 → 胶囊样式（active / testing / 其他） */
+const statusTone = (status?: string): 'is-active' | 'is-testing' | 'is-idle' => {
+  if (status === 'active') return 'is-active';
+  if (status === 'testing') return 'is-testing';
+  return 'is-idle';
+};
 
 export default function ServiceConfigModal({
   open,
@@ -51,9 +60,7 @@ export default function ServiceConfigModal({
       : srvConfigTarget?.status === 'testing'
         ? t('domainService.status.testing')
         : t('status.inactive');
-  const apiEndpoint = srvConfigTarget
-    ? `/api/v1/knowledge-base/services/${srvConfigTarget.id}`
-    : '-';
+  const apiEndpoint = srvConfigTarget ? `/api/v1/knowledge-base/services/${srvConfigTarget.id}` : '-';
   const apiMethod = 'POST';
   const apiAuth = 'API Key';
 
@@ -77,14 +84,14 @@ export default function ServiceConfigModal({
       title: t('domainManagement.apiKey'),
       dataIndex: 'key_encrypted',
       key: 'key_encrypted',
-      width: 360,
       render: (val: string, record: ServiceApiKeyItem) => (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <span className="yx-key-text">{val || '—'}</span>
+        <span className="scm-key">
+          <span className="scm-key-text">{val || '—'}</span>
           {val && (
             <Button
               type="text"
-              className={`yx-copy-btn${copiedKeyId === record.id ? ' copied' : ''}`}
+              size="small"
+              className={`scm-copy${copiedKeyId === record.id ? ' is-copied' : ''}`}
               title={copiedKeyId === record.id ? t('common.copySuccess') : t('domainManagement.copyApiKey')}
               onClick={() => handleCopyKey(record.id, val)}
             >
@@ -98,36 +105,42 @@ export default function ServiceConfigModal({
       title: t('domainManagement.keyPrefix'),
       dataIndex: 'key_prefix',
       key: 'key_prefix',
-      width: 130,
-      render: (val: string) => (val ? <Typography.Text code>{val}</Typography.Text> : '—'),
+      width: 132,
+      render: (val: string) => (val ? <span className="scm-prefix">{val}</span> : '—'),
     },
     {
       title: t('domainManagement.expiresAt'),
       dataIndex: 'expires_at',
       key: 'expires_at',
-      width: 120,
-      render: (val: string | null) => formatDate(val),
+      width: 108,
+      render: (val: string | null) => <span className="scm-dim">{formatDate(val)}</span>,
     },
     {
       title: t('domainManagement.createdAt'),
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 120,
-      render: (val: string | null) => formatDate(val),
+      width: 108,
+      render: (val: string | null) => <span className="scm-dim">{formatDate(val)}</span>,
     },
     {
       title: t('domainManagement.status'),
       dataIndex: 'is_active',
       key: 'is_active',
-      width: 90,
-      render: (v: number) => (v === 1 ? <Tag color="success">{t('status.active')}</Tag> : <Tag>{t('status.inactive')}</Tag>),
+      width: 88,
+      render: (v: number) =>
+        v === 1 ? (
+          <span className="scm-status is-active">{t('status.active')}</span>
+        ) : (
+          <span className="scm-status is-idle">{t('status.inactive')}</span>
+        ),
     },
     {
       title: t('domainManagement.srvConfigActions'),
       key: 'actions',
-      width: 100,
+      width: 84,
+      align: 'right',
       render: (_: unknown, record: ServiceApiKeyItem) => (
-        <Button type="text" danger onClick={() => onDeleteKey(record.id)}>
+        <Button type="text" size="small" danger className="scm-del" onClick={() => onDeleteKey(record.id)}>
           <DeleteOutlined /> {t('common.delete')}
         </Button>
       ),
@@ -136,20 +149,67 @@ export default function ServiceConfigModal({
 
   return (
     <Modal
-      wrapClassName="yx-domain-space-modal"
+      wrapClassName="scm-modal"
       title={
-        <span>
-          <ApiOutlined style={{ color: '#f97316', marginRight: 8 }} />
+        <span className="scm-title">
+          <span className="scm-title-ico">
+            <ApiOutlined />
+          </span>
           {t('domainManagement.srvConfigTitle')}
         </span>
       }
       open={open}
       onCancel={onCancel}
-      footer={<Button onClick={onCancel}>{t('common.cancel')}</Button>}
-      width={760}
+      footer={
+        <Button autoInsertSpace={false} onClick={onCancel}>
+          {t('common.close')}
+        </Button>
+      }
+      width={880}
       destroyOnHidden
     >
+      {/* 服务身份：名称 + 状态，配一句用途说明 */}
+      <div className="scm-hero">
+        <span className="scm-hero-ico">
+          <KeyOutlined />
+        </span>
+        <div className="scm-hero-main">
+          <div className="scm-hero-name">
+            <span className="scm-hero-name-text">{srvConfigTarget?.name || '—'}</span>
+            <span className={`scm-status ${statusTone(srvConfigTarget?.status)}`}>{apiStatusText}</span>
+          </div>
+          <div className="scm-hero-sub">{t('domainManagement.srvConfigIntro')}</div>
+        </div>
+      </div>
+
+      {/* 接入元信息：三段平铺，弱化边框，比重层 Card 更轻 */}
+      <dl className="scm-meta">
+        <div className="scm-meta-item is-wide">
+          <dt>{t('domainManagement.apiEndpoint')}</dt>
+          <dd>
+            <Typography.Text code copyable className="scm-endpoint">
+              {apiEndpoint}
+            </Typography.Text>
+          </dd>
+        </div>
+        <div className="scm-meta-item">
+          <dt>{t('domainManagement.apiMethod')}</dt>
+          <dd>
+            <Tag color="blue" className="scm-tag">
+              {apiMethod}
+            </Tag>
+          </dd>
+        </div>
+        <div className="scm-meta-item">
+          <dt>{t('domainManagement.apiAuth')}</dt>
+          <dd>
+            <Tag className="scm-tag">{apiAuth}</Tag>
+          </dd>
+        </div>
+      </dl>
+
       <Tabs
+        className="scm-tabs"
         activeKey={activeTab}
         onChange={setActiveTab}
         items={[
@@ -157,68 +217,42 @@ export default function ServiceConfigModal({
             key: 'api',
             label: t('domainManagement.apiAccessTitle'),
             children: (
-              <>
-                <p style={{ fontSize: 14, color: '#475569', marginBottom: 12 }}>
-                  {t('domainManagement.srvConfigDesc', {
-                    name: srvConfigTarget?.name || '',
-                  })}
-                </p>
-
-                {/* API 接入元信息（暂为死数据，无边框/上下排列/一行两个，无 title） */}
-                <Card size="small" style={{ marginBottom: 16 }}>
-                  <Descriptions column={2} layout="vertical" size="small" colon={false}>
-                    <Descriptions.Item label={t('domainManagement.apiStatus')}>
-                      <Tag color={srvConfigTarget?.status === 'active' ? 'success' : 'default'}>
-                        {apiStatusText}
-                      </Tag>
-                    </Descriptions.Item>
-                    <Descriptions.Item label={t('domainManagement.apiEndpoint')}>
-                      <Typography.Text code copyable>
-                        {apiEndpoint}
-                      </Typography.Text>
-                    </Descriptions.Item>
-                    <Descriptions.Item label={t('domainManagement.apiMethod')}>
-                      <Tag color="blue">{apiMethod}</Tag>
-                    </Descriptions.Item>
-                    <Descriptions.Item label={t('domainManagement.apiAuth')}>
-                      <Tag>{apiAuth}</Tag>
-                    </Descriptions.Item>
-                  </Descriptions>
-                </Card>
-
-                {/* API Key 标题 + 描述 与 添加按钮 左右分布 */}
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    marginBottom: 12,
-                  }}
-                >
-                  <div>
-                    <h4 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
-                      {t('domainManagement.apiKeyListTitle')}
-                    </h4>
-                    <p style={{ margin: '4px 0 0', fontSize: 13, color: '#64748b' }}>
-                      {t('domainManagement.apiKeyListDesc')}
-                    </p>
+              <div className="scm-section">
+                <div className="scm-section-head">
+                  <div className="scm-section-copy">
+                    <h4>{t('domainManagement.apiKeyListTitle')}</h4>
+                    <p>{t('domainManagement.apiKeyListDesc')}</p>
                   </div>
-                  <Button type="primary" size="small" icon={<PlusOutlined />} loading={creatingKey} onClick={onCreateKey}>
+                  <Button
+                    type="primary"
+                    size="small"
+                    icon={<PlusOutlined />}
+                    loading={creatingKey}
+                    onClick={onCreateKey}
+                  >
                     {t('domainManagement.addApiKey')}
                   </Button>
                 </div>
-
-                {/* API Key 列表 */}
                 <Table<ServiceApiKeyItem>
+                  className="scm-table"
                   columns={apiKeyColumns}
                   dataSource={apiKeys}
                   rowKey="id"
                   pagination={false}
                   size="small"
                   loading={apiKeysLoading}
-                  locale={{ emptyText: t('common.noApiKey') }}
+                  scroll={{ x: 760 }}
+                  locale={{
+                    emptyText: (
+                      <Empty
+                        image={Empty.PRESENTED_IMAGE_SIMPLE}
+                        description={t('common.noApiKey')}
+                        style={{ margin: '12px 0' }}
+                      />
+                    ),
+                  }}
                 />
-              </>
+              </div>
             ),
           },
           ...(isAdmin
@@ -226,9 +260,7 @@ export default function ServiceConfigModal({
                 {
                   key: 'mcp',
                   label: t('domainManagement.mcpAccessTitle'),
-                  children: (
-                    <McpKeyTab service={srvConfigTarget} visible={activeTab === 'mcp'} />
-                  ),
+                  children: <McpKeyTab service={srvConfigTarget} visible={activeTab === 'mcp'} />,
                 },
               ]
             : []),

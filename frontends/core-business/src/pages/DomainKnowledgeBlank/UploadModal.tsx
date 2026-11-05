@@ -4,7 +4,16 @@ import type { UploadProps } from 'antd/es/upload';
 import type { UploadFile } from 'antd';
 import { PlusOutlined, CloudUploadOutlined, QuestionCircleOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import { uploadManualDocument, getFolderList } from '@/api/domainKnowledge';
+import {
+  uploadManualDocument,
+  uploadDocumentVersion,
+  confirmDocumentVersionUpload,
+  discardDocumentVersionUpload,
+  findDocumentByName,
+  previewDocumentVersion,
+  getFolderList,
+} from '@/api/domainKnowledge';
+import type { VersionPreviewResult } from '@/api/domainKnowledge';
 import { ACCEPT_EXTENSIONS } from '@/constants/upload';
 import type { FolderItem } from '@/types/domainKnowledge';
 import { useQuota, fileSizeLimitBytes, formatMiB } from '@/hooks/useQuota';
@@ -18,6 +27,8 @@ import {
   type FileUploadStatus,
   type SkipReason,
 } from '@/utils/batchUpload';
+
+type VersionChoice = 'version' | 'new' | 'cancel';
 
 export interface UploadModalProps {
   kbId: string;
@@ -51,7 +62,27 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
   const abortMapRef = useRef<Map<string, AbortController>>(new Map());
   const closedRef = useRef(false);
   const notifiedSuccessRef = useRef(0);
+  // 每个文件的去向：同名文档命中时由用户选择「作为新版本」/「作为新文档」
+  const modesRef = useRef<
+    Map<
+      string,
+      | { kind: 'new' }
+      | { kind: 'canceled' }
+      | { kind: 'version'; documentId: string; hint?: VersionPreviewResult }
+    >
+  >(new Map());
+  // 预检已落对象的临时文件（用户关闭弹窗时要删掉）
+  const previewHintsRef = useRef<Map<string, { documentId: string; hint: VersionPreviewResult }>>(new Map());
+  // 用户在「同名文档」提示里明确选了「作为新文档」的抑制目标（uid → 已有文档 id）；
+  // 解析完成后的相似检测会跳过它，避免重复提示同一条。
+  const suppressedRef = useRef<Map<string, string>>(new Map());
   const overflowNotifiedRef = useRef(false); // 同批溢出提示只报一次（onChange 可能逐次触发）
+  // 同名文档提示（三选一：新版本 / 新文档 / 取消）
+  const [versionPrompt, setVersionPrompt] = useState<{
+    fileName: string;
+    preview: VersionPreviewResult | null;
+  } | null>(null);
+  const versionPromptResolveRef = useRef<((choice: VersionChoice) => void) | null>(null);
 
   // 打开弹窗时重置所有批量状态 + 加载文件夹
   useEffect(() => {
@@ -62,6 +93,10 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
       closedRef.current = false;
       notifiedSuccessRef.current = 0;
       overflowNotifiedRef.current = false;
+      modesRef.current = new Map();
+      previewHintsRef.current = new Map();
+      suppressedRef.current = new Map();
+      setVersionPrompt(null);
       setRunning(false);
       setSelectedFolderId(defaultFolderId ?? '');
       getFolderList(kbId)
@@ -180,14 +215,47 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     [flushNow],
   );
 
-  /** 单文件执行器：吞掉所有异常，只写状态，不向上抛 */
-  const uploadOne = async (item: UploadItem): Promise<void> => {
+  /** 临时对象清理（放弃 / 关闭时）；失败只提示不阻断。 */
+  const discardHint = useCallback(
+    (documentId: string, hint: VersionPreviewResult) => {
+      void discardDocumentVersionUpload(documentId, hint.storageKey, hint.storageBackend).catch(
+        () => {
+          message.warning(t('domainKnowledge.versions.similarityDiscardFailed'));
+        },
+      );
+    },
+    [t],
+  );
+
+  /** 三选一提示的结算入口（按钮 / 关闭 X / ESC 都走这里）。 */
+  const settleVersionPrompt = useCallback((choice: VersionChoice) => {
+    versionPromptResolveRef.current?.(choice);
+  }, []);
+
+  /** 同名文档提示：展示与现有版本的内容差异，确认「作为新版本」/「作为新文档」/「取消」。 */
+  const askVersionChoice = useCallback(
+    (fileName: string, preview: VersionPreviewResult | null): Promise<VersionChoice> =>
+      new Promise((resolve) => {
+        versionPromptResolveRef.current = (choice: VersionChoice) => {
+          versionPromptResolveRef.current = null;
+          setVersionPrompt(null);
+          resolve(choice);
+        };
+        setVersionPrompt({ fileName, preview });
+      }),
+    [],
+  );
+
+  /** 预检：把文件落到临时对象并与现有版本比对内容（不写库）。 */
+  const runPreview = async (
+    item: UploadItem,
+    documentId: string,
+  ): Promise<VersionPreviewResult | null> => {
     const controller = new AbortController();
     abortMapRef.current.set(item.uid, controller);
     patchItem(item.uid, { status: 'uploading', progress: 0 }, true);
-
     try {
-      await uploadManualDocument(kbId, item.file, selectedFolderId || undefined, t, {
+      return await previewDocumentVersion(documentId, kbId, item.file, {
         signal: controller.signal,
         onUploadProgress: (e) => {
           if (e.total) {
@@ -195,10 +263,119 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
           }
         },
       });
+    } catch {
+      // 预检失败不阻断：退回「仅按文件名」的提示
+      return null;
+    } finally {
+      abortMapRef.current.delete(item.uid);
+      patchItem(item.uid, { status: 'pending', progress: 0 }, true);
+    }
+  };
+
+  /** 上传前逐个判定同名文档（串行，避免多个弹窗叠加）。 */
+  const resolveUploadModes = async (files: UploadItem[]) => {
+    for (const item of files) {
+      modesRef.current.delete(item.uid);
+      let mode:
+        | { kind: 'new' }
+        | { kind: 'canceled' }
+        | { kind: 'version'; documentId: string; hint?: VersionPreviewResult } = { kind: 'new' };
+      try {
+        const existing = await findDocumentByName(kbId, item.file.name);
+        if (existing) {
+          const preview = await runPreview(item, existing.id);
+          if (closedRef.current) return;
+          if (preview) {
+            previewHintsRef.current.set(item.uid, { documentId: existing.id, hint: preview });
+          }
+          const choice = await askVersionChoice(item.file.name, preview);
+          if (closedRef.current) return;
+          if (choice === 'version') {
+            // 改选新版本：之前若有抑制目标，已不再适用
+            suppressedRef.current.delete(item.uid);
+            mode = { kind: 'version', documentId: existing.id, hint: preview ?? undefined };
+          } else {
+            if (preview) {
+              // 选择新文档 / 取消上传：预检临时对象都不再需要
+              previewHintsRef.current.delete(item.uid);
+              discardHint(existing.id, preview);
+            }
+            mode = choice === 'cancel' ? { kind: 'canceled' } : { kind: 'new' };
+            if (choice === 'new') {
+              // 用户明确拒绝「作为新版本」：记录目标，解析后的相似检测不再提示它
+              suppressedRef.current.set(item.uid, existing.id);
+            } else {
+              suppressedRef.current.delete(item.uid);
+            }
+          }
+        }
+      } catch {
+        // 查询失败不阻断上传：按新文档处理（后端仍有重复校验）
+        mode = { kind: 'new' };
+      }
+      modesRef.current.set(item.uid, mode);
+    }
+  };
+
+  /** 单文件执行器：吞掉所有异常，只写状态，不向上抛 */
+  const uploadOne = async (item: UploadItem): Promise<void> => {
+    const mode = modesRef.current.get(item.uid) ?? { kind: 'new' as const };
+    if (mode.kind === 'canceled') {
+      // 用户在「是否作为新版本」提示里选择了取消：本次不上传
+      patchItem(item.uid, { status: 'canceled', progress: 0 }, true);
+      return;
+    }
+    const controller = new AbortController();
+    abortMapRef.current.set(item.uid, controller);
+    patchItem(item.uid, { status: 'uploading', progress: 0 }, true);
+
+    const options = {
+      signal: controller.signal,
+      onUploadProgress: (e: { loaded: number; total?: number }) => {
+        if (e.total) {
+          patchItem(item.uid, { progress: Math.round((e.loaded / e.total) * 100) });
+        }
+      },
+    };
+
+    try {
+      if (mode.kind === 'version') {
+        // 用户已明确选「作为新版本」，跳过相似度二次询问。
+        if (mode.hint) {
+          // 预检已把文件落到临时对象，直接复用（不再重传字节）
+          await confirmDocumentVersionUpload(mode.documentId, kbId, mode.hint);
+          previewHintsRef.current.delete(item.uid);
+        } else {
+          const result = await uploadDocumentVersion(mode.documentId, kbId, item.file, {
+            ...options,
+            confirmSimilar: true,
+          });
+          if (result.kind === 'needs_confirmation') {
+            await confirmDocumentVersionUpload(mode.documentId, kbId, result.hint);
+          }
+        }
+      } else {
+        await uploadManualDocument(kbId, item.file, selectedFolderId || undefined, t, {
+          ...options,
+          suppressSimilarityTargetId: suppressedRef.current.get(item.uid),
+        });
+      }
       patchItem(item.uid, { status: 'success', progress: 100 }, true);
     } catch (err: any) {
+      const mode = modesRef.current.get(item.uid);
+      if (mode?.kind === 'version' && mode.hint) {
+        // 建版本失败：临时对象没有归属，顺手清掉
+        previewHintsRef.current.delete(item.uid);
+        discardHint(mode.documentId, mode.hint);
+      }
       if (controller.signal.aborted) {
         patchItem(item.uid, { status: 'canceled', progress: 0 }, true);
+      } else if (
+        /内容相同|同一文档/.test(String(err?.message || '')) &&
+        modesRef.current.get(item.uid)?.kind === 'version'
+      ) {
+        // 版本上传的同内容拦截：保留后端更准确的文案（当前版 / 历史版 vN）
+        patchItem(item.uid, { status: 'duplicate', error: err.message }, true);
       } else if (isDuplicateError(err)) {
         patchItem(item.uid, { status: 'duplicate', error: t('common.batchUploadDupInKb') }, true);
       } else {
@@ -207,6 +384,8 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
       }
     } finally {
       abortMapRef.current.delete(item.uid);
+      // 本次去向已结算，清掉抑制项避免整批上传期间内存滞留
+      suppressedRef.current.delete(item.uid);
     }
   };
 
@@ -232,6 +411,12 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     if (running) return;
     setRunning(true);
     const toUpload = itemsRef.current.filter((it) => it.status === 'pending');
+    await resolveUploadModes(toUpload);
+    if (closedRef.current) {
+      // 询问过程中用户已关闭弹窗：别再继续上传
+      setRunning(false);
+      return;
+    }
     await runWithByteBudget(toUpload, uploadOne);
     setRunning(false);
     finishRound();
@@ -249,6 +434,12 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     flushNow();
     setRunning(true);
     const toUpload = itemsRef.current.filter((it) => it.status === 'pending');
+    await resolveUploadModes(toUpload);
+    if (closedRef.current) {
+      // 询问过程中用户已关闭弹窗：别再继续上传
+      setRunning(false);
+      return;
+    }
     await runWithByteBudget(toUpload, uploadOne);
     setRunning(false);
     finishRound();
@@ -256,7 +447,11 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
 
   const doClose = () => {
     closedRef.current = true;
+    versionPromptResolveRef.current?.('cancel');
     abortMapRef.current.forEach((c) => c.abort());
+    // 预检产生但未被采用的临时对象，关闭时删除
+    previewHintsRef.current.forEach(({ documentId, hint }) => discardHint(documentId, hint));
+    previewHintsRef.current.clear();
     notifySuccessIfNeeded();
     onClose();
   };
@@ -335,6 +530,42 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     return `${bytes} B`;
   };
 
+  // 同名提示正文：展示与现有版本的内容差异
+  const versionPromptContent = useMemo(() => {
+    if (!versionPrompt) return '';
+    const { fileName, preview } = versionPrompt;
+    if (!preview) {
+      return t('common.versionPromptBody', { name: fileName });
+    }
+    if (preview.sameAsCurrent) {
+      return t('common.versionPromptBodyIdenticalCurrent', {
+        name: fileName,
+        version: preview.currentVersionNo ?? '-',
+      });
+    }
+    if (preview.sameAsVersionNo != null) {
+      return t('common.versionPromptBodyIdenticalHistory', {
+        name: fileName,
+        version: preview.sameAsVersionNo,
+      });
+    }
+    if (preview.method === 'unsupported') {
+      // 压缩/容器格式（PDF、老版 Office 等）不做字节估算，避免误导性百分比
+      return t('common.versionPromptBodyUnsupported', { name: fileName });
+    }
+    if (preview.method === 'empty' || preview.method === 'error') {
+      // 现有文件读不到（存量缺 storage_key / 存储读取失败）时不展示百分比
+      return t('common.versionPromptBody', { name: fileName });
+    }
+    return t('common.versionPromptBodySimilar', {
+      name: fileName,
+      version: preview.currentVersionNo ?? '-',
+      percent: Math.round(preview.similarity * 100),
+      currentSize: formatSize(preview.currentFileSize),
+      newSize: formatSize(preview.fileSize),
+    });
+  }, [versionPrompt, t]);
+
   // 单文件大小摘要：只列后端下发配额的类别（「类别 ≤xxMB」用 · 连接）
   const sizeSummary = useMemo(() => {
     if (!quotas) return '';
@@ -391,6 +622,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
   const countReached = uploadFileCountLimit != null && items.length >= uploadFileCountLimit;
 
   return (
+    <>
     <Modal
       title={
         <Space>
@@ -547,6 +779,32 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
         </div>
       )}
     </Modal>
+
+      <Modal
+        open={versionPrompt !== null}
+        title={t('common.versionPromptTitle')}
+        maskClosable={false}
+        onCancel={() => settleVersionPrompt('cancel')}
+        footer={[
+          <Button key="cancel" onClick={() => settleVersionPrompt('cancel')}>
+            {t('common.versionPromptCancel')}
+          </Button>,
+          <Button key="new" onClick={() => settleVersionPrompt('new')}>
+            {t('common.versionPromptNew')}
+          </Button>,
+          <Button
+            key="version"
+            type="primary"
+            disabled={Boolean(versionPrompt?.preview?.sameAsCurrent)}
+            onClick={() => settleVersionPrompt('version')}
+          >
+            {t('common.versionPromptOk')}
+          </Button>,
+        ]}
+      >
+        <div>{versionPromptContent}</div>
+      </Modal>
+    </>
   );
 };
 

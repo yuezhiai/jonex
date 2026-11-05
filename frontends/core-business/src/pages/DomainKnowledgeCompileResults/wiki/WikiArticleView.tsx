@@ -16,9 +16,11 @@ import { useTranslation } from 'react-i18next';
 import { Tag, Tooltip, Empty } from 'antd';
 import { BookOutlined, FileTextOutlined, LinkOutlined, NumberOutlined } from '@ant-design/icons';
 import MarkdownContent from '@/components/MarkdownContent';
+import WikiSourcePicture from '@/components/WikiSourcePicture';
 import { useDocumentViewer, inferMediaType } from '@/components/DocumentViewer';
 import type { WikiBacklinkResult, WikiPageContent, WikiPageReference, WikiReaderPage } from '@/types/domainKnowledge';
 import WikiBacklinks from './WikiBacklinks';
+import WikiTableReader from './WikiTableReader';
 import WikiLinkGroups from './WikiLinkGroups';
 import { buildLinkGroups } from './wikiRelations';
 import { analyzePageLinks, isRepeatedWikiLead, roleLabelKey } from './wikiMarkdown';
@@ -127,6 +129,8 @@ export default function WikiArticleView({
   };
 
   const openPageReference = (ref: WikiPageReference) => openReference(ref.documentId, ref.fileName, ref.mimeType);
+  const openImageSource = (image: NonNullable<WikiPageContent['images']>[number]) =>
+    openReference(image.document_id, image.source_name, '');
 
   return (
     <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start' }}>
@@ -149,14 +153,14 @@ export default function WikiArticleView({
         {/* 导语 */}
         {leadMarkdown ? (
           <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.9, color: '#334155' }}>
-            <MarkdownContent content={leadMarkdown} onInternalLink={onOpenPage} />
+            <MarkdownContent content={leadMarkdown} onInternalLink={onOpenPage} images={page.images} onOpenImageSource={openImageSource} />
           </div>
         ) : (
           page.description && !isRepeatedWikiLead(page.description, bodyMarkdown) && <div style={{ marginTop: 10, fontSize: 15, color: '#475569' }}>{page.description}</div>
         )}
 
         {/* 页内目录 */}
-        {toc.length > 1 && (
+        {!page.tableData && toc.length > 1 && (
           <div
             style={{
               display: 'inline-block',
@@ -192,8 +196,19 @@ export default function WikiArticleView({
 
         {/* 正文 */}
         <div style={{ marginTop: 12 }}>
-          <MarkdownContent content={bodyMarkdown} onInternalLink={onOpenPage} headingIds={toc.map((item) => item.id)} />
+          {page.tableData ? <WikiTableReader key={`${page.tableData.revision}:${page.tableData.selected_table_id}`}
+            data={page.tableData} fileName={references.find(ref => ref.documentId === page.tableData?.document_id)?.fileName || ''}
+            onOpenSource={() => {
+              const ref = references.find(item => item.documentId === page.tableData?.document_id);
+              if (ref) openPageReference(ref);
+              else openReference(page.tableData!.document_id, page.tableData!.document_id, '');
+            }} /> : <MarkdownContent content={bodyMarkdown} onInternalLink={onOpenPage} headingIds={toc.map((item) => item.id)} images={page.images} onOpenImageSource={openImageSource} />}
         </div>
+
+        {(page.images || []).filter((image) => image.placement !== 'inline').map((image) =>
+          <WikiSourcePicture key={image.asset_id} image={image} onOpenSource={openImageSource} />)}
+        {page.imageError && <div role="status" style={{ color: '#64748b' }}>图片暂不可读，正文仍可阅读。请查看原文。</div>}
+        {(page.imagesTotal || 0) > (page.images?.length || 0) && <p style={{ color: '#64748b' }}>本页还有更多原文图片，可通过顶部「找图」分页浏览。</p>}
 
         {/* 相关页面 */}
         {seeAlso.length > 0 && (
@@ -296,7 +311,7 @@ export default function WikiArticleView({
       </div>
 
       {/* 右栏：信息框（维基百科 infobox）+ 本页关系小地图（1-hop ego） */}
-      <div style={{ width: 240, flex: '0 0 240px', display: 'grid', gap: 12 }}>
+      {!page.tableData && <div style={{ width: 240, flex: '0 0 240px', display: 'grid', gap: 12 }}>
         <div
           style={{
             border: '1px solid #e2e8f0',
@@ -343,7 +358,6 @@ export default function WikiArticleView({
               />
             )}
           </div>
-          {viewer}
         </div>
 
         {/* 本页关联：右栏是 240px 的窄栏，画图必然压叠 —— 这里用分组列表（图谱 Tab 才画图）。
@@ -357,7 +371,8 @@ export default function WikiArticleView({
             else openReference(documentId, documentId, '');
           }}
         />
-      </div>
+      </div>}
+      {viewer}
     </div>
   );
 }

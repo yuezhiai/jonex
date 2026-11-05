@@ -36,6 +36,7 @@ import WikiOutlineRail from './WikiOutlineRail';
 import WikiHomeView from './WikiHomeView';
 import WikiTopicView from './WikiTopicView';
 import WikiArticleView from './WikiArticleView';
+import WikiImageBrowser from './WikiImageBrowser';
 
 type WikiView = { kind: 'home' } | { kind: 'topic'; nodeId: string } | { kind: 'article'; path: string };
 
@@ -397,6 +398,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
             flexWrap: 'wrap',
           }}
         >
+          <WikiImageBrowser key={`${kbId}:${documentId}`} kbId={kbId} documentId={documentId} />
           <Space size={4}>
             <Tooltip title={t('domainKnowledge.wikiReader.back')}>
               <Button
