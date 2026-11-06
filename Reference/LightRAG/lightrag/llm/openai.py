@@ -222,6 +222,7 @@ async def openai_complete_if_cache(
     azure_deployment: str | None = None,
     api_version: str | None = None,
     _jonex_file_source: str | None = None,                # [jonex]
+    _jonex_scene: str | None = None,                      # [jonex] 强制场景（摘要等无 file_source 的调用）
     **kwargs: Any,
 ) -> str:
     """Complete a prompt using OpenAI's API with caching support and Chain of Thought (COT) integration.
@@ -343,8 +344,13 @@ async def openai_complete_if_cache(
     from lightrag.jonex_metering import build_metering_headers
 
     extra_headers = build_metering_headers(
-        file_source=_jonex_file_source, default_scene="lightrag_query"
+        file_source=_jonex_file_source,
+        default_scene=_jonex_scene or "lightrag_query",
     )
+    if not extra_headers:
+        # [jonex] 无 file_source 且无 contextvar 时，至少标注场景，
+        # 避免网关落成 scene=unknown；租户仍需由 file_source/contextvar 提供。
+        extra_headers = {"X-Jonex-Scene": _jonex_scene or "lightrag_query"}
     # ── [jonex] end ───────────────────────────────────────────────────
 
     try:

@@ -95,6 +95,27 @@ def parse_file_source(file_source: Optional[str]) -> dict:
     }
 
 
+def pick_file_source(paths) -> Optional[str]:
+    """从候选 file_path 中挑一个可解析出租户/知识库的 file_source。
+
+    摘要调用（实体/关系描述合并）原先不传 ``_jonex_file_source``，后台任务又
+    未必有 contextvar，导致计量头整体缺失、网关落成 tenant=unknown + scene=unknown。
+    优先返回能解析出 tenant/kb/doc 的路径；否则退回第一个非空、非占位路径。
+    """
+    candidates = []
+    for path in paths or []:
+        if not isinstance(path, str):
+            continue
+        path = path.strip()
+        if not path or path == "unknown_source" or path.startswith("..."):
+            continue
+        candidates.append(path)
+        fs = parse_file_source(path)
+        if fs.get("tenant_id") or fs.get("kb_id") or fs.get("doc_id"):
+            return path
+    return candidates[0] if candidates else None
+
+
 def build_metering_headers(
     file_source: Optional[str] = None,
     default_scene: str = "lightrag",

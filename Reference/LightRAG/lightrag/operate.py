@@ -164,6 +164,18 @@ def chunking_by_token_size(
     return results
 
 
+def _jonex_pick_file_source(paths) -> str | None:
+    """[jonex] 从候选 file_path 中挑一个可解析出租户/知识库的 file_source。
+
+    摘要调用原先不传 ``_jonex_file_source``，后台任务又未必有 contextvar，
+    导致计量头整体缺失、网关落成 tenant=unknown + scene=unknown。
+    具体挑法见 ``lightrag.jonex_metering.pick_file_source``。
+    """
+    from lightrag.jonex_metering import pick_file_source
+
+    return pick_file_source(paths)
+
+
 async def _handle_entity_relation_summary(
     description_type: str,
     entity_or_relation_name: str,
@@ -171,6 +183,7 @@ async def _handle_entity_relation_summary(
     separator: str,
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    file_source: str | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
 
@@ -237,6 +250,7 @@ async def _handle_entity_relation_summary(
                     current_list,
                     global_config,
                     llm_response_cache,
+                    file_source=file_source,          # [jonex]
                 )
                 return final_summary, True  # LLM was used for final summarization
 
@@ -293,6 +307,7 @@ async def _handle_entity_relation_summary(
                     chunk,
                     global_config,
                     llm_response_cache,
+                    file_source=file_source,          # [jonex]
                 )
                 new_summaries.append(summary)
                 llm_was_used = True  # Mark that LLM was used in reduce phase
@@ -307,6 +322,7 @@ async def _summarize_descriptions(
     description_list: list[str],
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    file_source: str | None = None,
 ) -> str:
     """Helper function to summarize a list of descriptions using LLM.
 
@@ -365,6 +381,8 @@ async def _summarize_descriptions(
         use_llm_func,
         llm_response_cache=llm_response_cache,
         cache_type="summary",
+        _jonex_file_source=file_source,          # [jonex] 计量维度透传
+        _jonex_scene="lightrag_extract",         # [jonex] 摘要是入库抽取的一部分
     )
 
     # Check summary token length against embedding limit
@@ -1246,6 +1264,7 @@ async def _rebuild_single_entity(
                 GRAPH_FIELD_SEP,
                 global_config,
                 llm_response_cache=llm_response_cache,
+                file_source=_jonex_pick_file_source(file_paths),  # [jonex]
             )
         else:
             final_description = current_entity.get("description", "")
@@ -1319,6 +1338,7 @@ async def _rebuild_single_entity(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache=llm_response_cache,
+            file_source=_jonex_pick_file_source(file_paths_list),  # [jonex]
         )
     else:
         final_description = current_entity.get("description", "")
@@ -1479,6 +1499,7 @@ async def _rebuild_single_relationship(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache=llm_response_cache,
+            file_source=_jonex_pick_file_source(file_paths_list),  # [jonex]
         )
     else:
         # fallback to keep current(unchanged)
@@ -1822,6 +1843,9 @@ async def _merge_nodes_then_upsert(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache,
+            file_source=_jonex_pick_file_source(
+                already_file_paths + [dp.get("file_path") for dp in nodes_data]
+            ),  # [jonex]
         )
 
         # 9. Build file_path within MAX_FILE_PATHS
@@ -2172,6 +2196,9 @@ async def _merge_edges_then_upsert(
             GRAPH_FIELD_SEP,
             global_config,
             llm_response_cache,
+            file_source=_jonex_pick_file_source(
+                already_file_paths + [dp.get("file_path") for dp in edges_data]
+            ),  # [jonex]
         )
 
         # 9. Build file_path within MAX_FILE_PATHS limit

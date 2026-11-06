@@ -2078,6 +2078,7 @@ async def use_llm_func_with_cache(
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
     _jonex_file_source: str | None = None,           # [jonex]
+    _jonex_scene: str | None = None,                 # [jonex]
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -2162,6 +2163,8 @@ async def use_llm_func_with_cache(
             kwargs["max_tokens"] = max_tokens
         if _jonex_file_source:                              # [jonex]
             kwargs["_jonex_file_source"] = _jonex_file_source
+        if _jonex_scene:                                    # [jonex]
+            kwargs["_jonex_scene"] = _jonex_scene
 
         res: str = await use_llm_func(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
@@ -2198,6 +2201,8 @@ async def use_llm_func_with_cache(
         kwargs["max_tokens"] = max_tokens
     if _jonex_file_source:                              # [jonex]
         kwargs["_jonex_file_source"] = _jonex_file_source
+    if _jonex_scene:                                    # [jonex]
+        kwargs["_jonex_scene"] = _jonex_scene
 
     try:
         res = await use_llm_func(
