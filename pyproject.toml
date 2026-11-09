@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# W1.6：查询结果契约的 Arrow IPC 输出（惰性 import；不装则 output=arrow 回 400）。
+arrow = [
+    "pyarrow>=14.0.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
