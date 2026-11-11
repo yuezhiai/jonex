@@ -42,7 +42,7 @@ REQUIRED_SECRETS = [
 ]
 # 必须显式存在的键（缺了会静默降级到别的东西）
 REQUIRED_PRESENT = {
-    "MCP_KEY_SECRET": "缺 ⇒ HMAC 盐回退 JWT_SECRET，轮换 JWT_SECRET 会连带作废全部 ingest/MCP key",
+    "MCP_KEY_SECRET": "缺 ⇒ HMAC 盐回退 JWT_SECRET，轮换 JWT_SECRET 会连带作废全部 ingest/MCP key（mcp-server 只读 .env.mcp，主 .env 配了这里也必须同值，见下方盐一致性检查）",
     "DATA_SOURCE_SECRET_KEY": "缺 ⇒ Fernet 主密钥从 JWT_SECRET 派生，轮换 JWT_SECRET 会让库里已加密凭据全部解不开",
 }
 # 跨文件必须同值的键（GROUPS 之外还要查的派生/对齐项）
@@ -173,6 +173,38 @@ def run(paths: list[Path], *, dev: bool, verbose: bool) -> int:
                              f"必须同值（否则其中一方连不上）| {who}"))
         else:
             findings.append((OK, f"{' = '.join(group)} 同值", f"{len(present)} 个键取值一致"))
+
+    # ── 5c. MCP Key 盐：校验侧只读 .env.mcp，解析后必须与写入侧同值 ──
+    # 两侧的取值规则都是「MCP_KEY_SECRET 非空 ? 它 : JWT_SECRET」。因此单查
+    # 「键是否存在 / 值是否不同」都抓不到下面这个组合：主 .env 配了独立盐，
+    # .env.mcp 没配 —— 此时 mcp-server 回退自己文件里的 JWT_SECRET，与写入侧
+    # 不是同一个盐，表现为所有 yxm_ Key 401，而两个容器都 healthy。
+    mcp_file = next(
+        (p for p in files if p.name == ".env.mcp" or p.name.startswith(".env.mcp.")),
+        None,
+    )
+    if main and mcp_file and mcp_file != main:
+        def _resolved_salt(path: Path) -> str:
+            lines, idx = data[path]
+            for key in ("MCP_KEY_SECRET", "JWT_SECRET"):
+                if key in idx:
+                    value = R._value_of(lines[idx[key]])
+                    if value:
+                        return value
+            return ""
+
+        salt_main = _resolved_salt(main)
+        salt_mcp = _resolved_salt(mcp_file)
+        if not salt_main and not salt_mcp:
+            findings.append((WARN, "MCP Key 盐",
+                             f"{main.name} 与 {mcp_file.name} 均无 MCP_KEY_SECRET/JWT_SECRET ⇒ mcp-server 启动守卫拒绝启动"))
+        elif salt_main != salt_mcp:
+            findings.append((BAD, "MCP Key 盐跨文件不一致",
+                             f"{main.name} 与 {mcp_file.name} **解析后**盐值不同 ⇒ 写入侧与校验侧对不上，"
+                             f"所有 yxm_ Key 401（典型成因：主 .env 配了 MCP_KEY_SECRET，.env.mcp 未配、回退了自己的 JWT_SECRET）"))
+        else:
+            findings.append((OK, "MCP Key 盐",
+                             f"{main.name} 与 {mcp_file.name} 解析后同值，MCP Key 校验可用"))
 
     # ── 6. Redis：口令与 URL 必须自洽（本轮实际踩到）────────────────
     rp = {v for vs in _all_values(data, "REDIS_PASSWORD").values() for v in vs}
