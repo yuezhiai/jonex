@@ -23,8 +23,11 @@ export async function consumeWikiSearchStream(response: Response, handlers: Know
     if (event === 'error') throw new Error(payload.message || 'Wiki search failed');
     if (event === 'complete') {
       completed = true;
+      // ⚠️ 白名单显式搬运：new field 不加进来会被静默丢弃。
+      // total_tokens 与 rag_used / history_id 同层由 complete 事件下发。
       const meta = { source: payload.source, references: payload.references ?? [],
-        reasoning: payload.reasoning ?? null, rag_used: payload.rag_used, history_id: payload.history_id };
+        reasoning: payload.reasoning ?? null, rag_used: payload.rag_used, history_id: payload.history_id,
+        total_tokens: payload.total_tokens };
       // Deliver the verified answer immediately; no synthetic typing delay.
       handlers.onDelta(payload.answer ?? '', meta);
       handlers.onDone?.(meta);

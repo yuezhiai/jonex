@@ -34,7 +34,7 @@ class KnowledgeQueryImage(Base, TenantMixin, SoftDeleteMixin):
     __tablename__ = "knowledge_query_images"
     __table_args__ = (
         # 同用户同图只存一份；带 is_deleted=0 的部分索引让软删过的旧图不挡新图落盘
-        # （与 update/045 + migrations/004 里的同名索引一致）
+        # （与 update/045 + migrations/003_knowledge_base.sql 里的同名索引一致）
         Index(
             "uq_kb_qimg_tenant_user_sha",
             "tenant_id", "user_id", "sha256",

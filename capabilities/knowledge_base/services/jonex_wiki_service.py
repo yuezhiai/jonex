@@ -387,8 +387,14 @@ class JonexWikiService:
         thinking_mode: str | None = None,
         query_context: dict | None = None,
         progress_session: str | None = None,
+        trace_id: str | None = None,  # [jonex] 平台检索 trace（缺省不改行为）
     ) -> dict:
-        """搜索已编译的 Wiki 知识。"""
+        """搜索已编译的 Wiki 知识。
+
+        ``trace_id`` 非空时作为 ``X-Request-ID`` 传给 Sidecar，经 capability 的
+        ``request.request_id`` 进入引擎，成为本次查询每次模型调用的
+        ``X-Jonex-Trace-Id``。
+        """
         options = {"thinking_mode": thinking_mode} if thinking_mode is not None else {}
         if query_context is not None:
             options['query_context'] = query_context
@@ -396,7 +402,7 @@ class JonexWikiService:
             options["progress_session"] = progress_session
         return await self._client.query(
             kb_name=kb_name, question=question, tenant_id=tenant_id, kb_id=kb_id,
-            return_trace=return_trace,
+            return_trace=return_trace, trace_id=trace_id,
             **options,
         )
 
@@ -429,6 +435,17 @@ class JonexWikiService:
         return await self._client.list_graph(
             kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
             document_id=document_id,
+        )
+
+    async def list_page_graph(self, kb_name: str, tenant_id: str, kb_id: str) -> dict:
+        """带语义的全库图（action list_page_graph，供 MCP 列式浏览）。
+
+        与 ``get_graph`` 的差别：保留 ``kind`` / ``why_visit`` 与 source 页，
+        source/target 都是 canonical 引擎路径；图源上限已由 atomic 适配器截断，
+        这里只做透传。
+        """
+        return await self._client.list_page_graph(
+            kb_name=kb_name, tenant_id=tenant_id, kb_id=kb_id,
         )
 
     async def read_page(self, kb_name: str, tenant_id: str, kb_id: str, path: str) -> dict:
