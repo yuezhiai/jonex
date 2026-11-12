@@ -988,6 +988,8 @@ async def _understand_attempt(
         trace_id=routing.get("trace_id", ""),
         thinking={"type": "disabled"},
         scene=UNDERSTANDING_SCENE,
+        # 逐 passage 调用，passage 自带来源文档 —— 带上它，入库计量才能按文档归集。
+        doc_id=str(getattr(passage, "document_id", "") or ""),
     )
     payload, dropped_identity = strip_model_identity(raw)
     if dropped_identity:

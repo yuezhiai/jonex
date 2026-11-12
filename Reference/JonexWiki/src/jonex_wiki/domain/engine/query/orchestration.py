@@ -9,6 +9,7 @@ old import path stays available through the re-export shim.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Union
 
 from jonex_wiki.kernel.contracts import QueryStrategy
@@ -41,6 +42,13 @@ async def run_query(
 ) -> QueryRunResult:
     """Query the published corpus using the runner-selected retrieval policy."""
     routing = dict(routing)
+    # [jonex] bundle 级 trace 是诊断锚点，不是模型调用头：取出来只记录，别继续
+    # 往 run_query_algorithm（显式关键字签名）里传。
+    bundle_trace_id = routing.pop("bundle_trace_id", None)
+    if bundle_trace_id and bundle_trace_id != routing.get("trace_id"):
+        logging.getLogger(__name__).debug(
+            "query trace | trace_id=%s bundle_trace_id=%s",
+            routing.get("trace_id"), bundle_trace_id)
     prepared_corpus = routing.pop("_prepared_corpus", None)
     if prepared_corpus is None:
         with telemetry_stage(current_runtime_telemetry(), "render"):

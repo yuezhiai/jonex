@@ -1325,13 +1325,19 @@ class LLMWikiV1Engine:
 
     # ── Phase C ───────────────────────────────────────────────────────
 
-    async def query(self, request, revision, ports, *, cancel: CancelPort | None = None) -> QueryRunResult:
+    async def query(self, request, revision, ports, *, cancel: CancelPort | None = None,
+                    trace_id: str | None = None) -> QueryRunResult:
         """Query a published revision via the accepted strict query algorithm.
 
         ``request`` is a ``QueryRequest`` (or dict) with ``question``,
         ``strategy`` and an optional ``model`` override; ``revision`` is a
         ``WikiRevision`` (or dict) exposing ``bundle_key``/``context_id``/
         ``tenant_id``; ``ports`` exposes the ``ArtifactStore`` and ``ModelPort``.
+
+        ``trace_id`` (optional) is the **per-query** metering trace supplied by
+        the embedding platform (one search request → one trace); every model
+        call of this run carries it as ``X-Jonex-Trace-Id``. ``None`` keeps the
+        legacy bundle-level identity (``query:<bundle_key>``).
         """
         if cancel:
             cancel.raise_if_cancelled()
@@ -1428,11 +1434,20 @@ class LLMWikiV1Engine:
         # fallback for deployments that configure no model in the env at all.
         query_model = _resolve_query_model(
             previous.manifest.get("models", {}).get("query"))
+        # [jonex] trace 归属：``trace_id`` = **本次查询**的计量 trace（平台一次检索
+        # 的 request_id，经适配器传入），同一次检索里的所有模型调用因此归到同一条
+        # trace。未传时保持旧的 bundle 级标识（``query:<bundle_key>``）——既有部署/直
+        # 连引擎调用行为不变。
+        # bundle 级标识**保留**（不删）：它仍是「这次查询读的是哪一版已发布 bundle」
+        # 的诊断锚点，经 routing 交给 run_query 记录（不会进模型调用头）。
+        bundle_trace_id = ("query:" + bundle_key)[:64]
+        query_trace_id = (trace_id or bundle_trace_id)[:64]
         routing = {
             "model_name": query_model,
             "tenant_id": tenant_id,
             "context_id": context_id,
-            "trace_id": ("query:" + bundle_key)[:64],
+            "trace_id": query_trace_id,
+            "bundle_trace_id": bundle_trace_id,
             "run_id": run_id,
             "_published_lexical_index": getattr(previous, "lexical_index", None),
             "_prepared_corpus": previous.corpus,

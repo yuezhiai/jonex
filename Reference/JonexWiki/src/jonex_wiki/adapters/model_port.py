@@ -231,6 +231,7 @@ class ModelPortAdapter(ModelPort):
         trace_id: str = "",
         thinking: Dict[str, Any] | None = None,
         scene: str | None = None,
+        doc_id: str = "",
     ) -> Dict[str, Any]:
         if self._before_call is not None:
             await self._before_call()
@@ -245,6 +246,9 @@ class ModelPortAdapter(ModelPort):
             "schema": schema,
             "max_tokens": max_tokens,
             "model": model,
+            # 文档级归因（2026-11-12）：不传时网关不写 doc_id，入库计量就归不到
+            # 任何文档行，任务中心的 Token 对 wiki 文档恒为「-」。
+            "doc_id": doc_id,
         }
         if tools is not None:
             gw_kwargs["tools"] = tools

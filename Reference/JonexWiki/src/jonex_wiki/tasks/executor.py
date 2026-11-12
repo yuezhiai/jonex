@@ -49,11 +49,15 @@ class TaskExecutor:
         self._cancel_flags[row.task_id] = asyncio.Event()
         self._running_tasks[row.task_id] = asyncio.create_task(self._run(row))
 
-    def submit_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None) -> None:
-        """提交后台查询任务（独立 query_tasks 表,不复用 tasks 生命周期）。"""
+    def submit_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None,
+                     trace_id: str | None = None) -> None:
+        """提交后台查询任务（独立 query_tasks 表,不复用 tasks 生命周期）。
+
+        ``trace_id``：本次查询的计量 trace（平台检索 trace）；None = 引擎用 bundle 级标识。
+        """
         self._cancel_flags[row.query_id] = asyncio.Event()
         self._running_tasks[row.query_id] = asyncio.create_task(
-            self._run_query(row, thinking_mode=thinking_mode))
+            self._run_query(row, thinking_mode=thinking_mode, trace_id=trace_id))
 
     def _dispatch(self, row: TaskRow) -> tuple:
         """kind → (runner, semaphore, 运行中状态)。outline 用独立 sem（不占编译槽）。"""
@@ -169,10 +173,13 @@ class TaskExecutor:
         return {"kb_id": kb_id, "paused": paused,
                 "task_ids": [row.task_id for row in rows]}
 
-    async def _run_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None) -> None:
+    async def _run_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None,
+                         trace_id: str | None = None) -> None:
         """后台查询生命周期(§6.3/§6.4):queued→running→done/failed/cancelled。
 
         query_tasks 只读高频、无 stage 恢复重放;不落 tasks 表。
+        ``trace_id`` 只在**本次进程内**随调用链传递（不落库）：重启后仍在队列里的
+        查询本来就依赖内存态 runner，语义一致。
         """
         try:
             if self.query_runner is None:
@@ -187,8 +194,14 @@ class TaskExecutor:
                                                  TaskStatus.running.value)
                     await s.commit()
                 try:
-                    result = (await self.query_runner(row) if thinking_mode is None else
-                              await self.query_runner(row, thinking_mode=thinking_mode))
+                    # 只在有值时追加 kwarg：无 trace 的调用形状与旧版完全一致
+                    # （runner 可被替换成只认 thinking_mode 的实现）。
+                    runner_kwargs: dict = {}
+                    if thinking_mode is not None:
+                        runner_kwargs["thinking_mode"] = thinking_mode
+                    if trace_id:
+                        runner_kwargs["trace_id"] = trace_id
+                    result = await self.query_runner(row, **runner_kwargs)
                 except asyncio.CancelledError:
                     async with self.session_factory() as s:
                         await self._transition_query(s, row.tenant_id, row.query_id,

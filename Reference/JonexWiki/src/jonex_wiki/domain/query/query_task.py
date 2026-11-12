@@ -129,7 +129,8 @@ def _dump_spans(spans) -> list:
 def create_query_runner(session_factory, settings, layout: Layout, gw, executor=None):
     engine = LLMWikiV1Engine()
 
-    async def runner(row: QueryTaskRow, *, thinking_mode: str | None = None) -> dict:
+    async def runner(row: QueryTaskRow, *, thinking_mode: str | None = None,
+                     trace_id: str | None = None) -> dict:
         start = time.monotonic()
         tenant_id, kb_id = row.tenant_id, row.kb_id
         cancel = CancelPortAdapter(executor, row.query_id) if executor else None
@@ -189,7 +190,8 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
         async with QueryProgressAdapter(session_factory, tenant_id, row.query_id) as progress:
             with runtime_environment(environment), query_progress(progress.record):
                 result = await engine.query(
-                    request, revision, {"store": store, "model": model}, cancel=cancel
+                    request, revision, {"store": store, "model": model}, cancel=cancel,
+                    trace_id=trace_id,
                 )
         if thinking_mode is not None:
             result.config["thinking_mode"] = thinking_mode

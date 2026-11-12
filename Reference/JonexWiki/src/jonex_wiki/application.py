@@ -753,8 +753,13 @@ class WikiApplication:
 
     async def query(self, tenant_id: str, kb_id: str, question: str,
                     *, thinking_mode: str | None = None, retrieval_strategy: str | None = None,
-                    query_context: dict | None = None) -> dict:
-        """提交查询任务(异步,返回 task_id)。"""
+                    query_context: dict | None = None,
+                    trace_id: str | None = None) -> dict:
+        """提交查询任务(异步,返回 task_id)。
+
+        ``trace_id`` 是**本次查询**的计量 trace（平台检索 trace，经适配器传入）；
+        None/空 = 引擎用 bundle 级标识（``query:<bundle_key>``），与旧行为一致。
+        """
         question = (question or "").strip()
         from jonex_wiki.kernel.query_images import normalized_context
         query_context = normalized_context(query_context)
@@ -781,9 +786,9 @@ class WikiApplication:
                             **({'query_context':query_context} if query_context else {})}, ensure_ascii=False).encode())
                 await s.commit()
         if thinking_mode is None:
-            self.executor.submit_query(row)
+            self.executor.submit_query(row, trace_id=trace_id)
         else:
-            self.executor.submit_query(row, thinking_mode=thinking_mode)
+            self.executor.submit_query(row, thinking_mode=thinking_mode, trace_id=trace_id)
         return {"task_id": query_id, "kind": "query"}
 
     async def get_task(self, tenant_id: str, task_id: str) -> dict:
