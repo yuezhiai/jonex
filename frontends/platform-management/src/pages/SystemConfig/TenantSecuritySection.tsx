@@ -159,7 +159,7 @@ export default function TenantSecuritySection() {
 
   const heading = (
     <h3 style={HEADING_STYLE}>
-      <SafetyOutlined style={{ color: '#3b82f6' }} /> {t('tenantSecurity.title')}
+      <SafetyOutlined style={{ color: 'var(--yx-accent)' }} /> {t('tenantSecurity.title')}
       <Button
         icon={<ReloadOutlined />}
         size="small"
