@@ -63,26 +63,14 @@ export interface McpServiceListResponse {
   total: number;
 }
 
-export interface TestCallRequest {
-  query: string; // 1-2000 字符
-}
-
-export interface TestCallResponse {
-  answer: string; // 模拟回答，前缀 [模拟回答]
-  kb_names: string[]; // 关联知识库名称
-  relevance: number; // 相关度（0-1）
-  latency_ms: number; // 模拟延迟（ms）
-  request_id: string; // 请求追踪 ID
-}
-
 export interface AuthorizedKeyItem {
   key_id: string; // Key ID
   key_name: string; // Key 名称
-  key_prefix: string; // Key 前缀（脱敏）
+  key_prefix: string; // Key 前缀（脱敏，不含 yxm_ 前缀）
   permission_level: string; // 服务级权限等级（'call' | 'view'）
-  key_status: string; // Key 状态（'active' | 'revoked' 等）
-  /** TODO: 待确认点 #1 —— 后端 AuthorizedKeyResponse 是否透出 expires_at（服务侧授权表有效期列） */
-  expires_at?: string | null;
+  key_status: string; // Key 状态（'active' | 'revoked' | 'expired' | 'disabled'）
+  expires_at?: string | null; // 有效期（null = 永久有效）
+  created_at?: string | null; // 创建时间
 }
 
 export interface AuthorizedKeyListResponse {
@@ -124,9 +112,25 @@ export async function unpublishService(serviceId: string): Promise<McpServiceIte
   return apiClient.post<McpServiceItem>(`/platform/mcp-services/${serviceId}/unpublish`);
 }
 
-/** 测试调用已发布的服务（一期返回模拟回答） */
-export async function testCallService(serviceId: string, query: string): Promise<TestCallResponse> {
-  return apiClient.post<TestCallResponse>(`/platform/mcp-services/${serviceId}/test-call`, { query });
+/** 服务状态变更响应（publish / unpublish / stop / start 共用的最小返回结构） */
+export interface ServiceStatusMutationResponse {
+  service_id: string;
+  is_published: boolean;
+  stopped?: boolean;
+  stopped_at?: string | null;
+  stopped_by?: string | null;
+  published_at?: string | null;
+  published_by?: string | null;
+}
+
+/** 停用已发布服务（仅 published 态可用；未发布/已停用后端返回 409） */
+export async function stopService(serviceId: string): Promise<ServiceStatusMutationResponse> {
+  return apiClient.post<ServiceStatusMutationResponse>(`/platform/mcp-services/${serviceId}/stop`);
+}
+
+/** 启用已停用服务（仅 stopped 态可用；未停用/未发布后端返回 409） */
+export async function startService(serviceId: string): Promise<ServiceStatusMutationResponse> {
+  return apiClient.post<ServiceStatusMutationResponse>(`/platform/mcp-services/${serviceId}/start`);
 }
 
 /** 查看已授权 MCP Key 列表 */

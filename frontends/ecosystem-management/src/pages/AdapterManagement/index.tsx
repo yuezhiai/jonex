@@ -18,15 +18,15 @@ const ADAPTER_DISPLAY: {
   icon: React.ReactNode;
   color: string;
 }[] = [
-  { type: 'dingtalk', icon: <ThunderboltOutlined />, color: '#3b82f6' },
+  { type: 'dingtalk', icon: <ThunderboltOutlined />, color: 'var(--yx-accent)' },
   { type: 'wechat_work', icon: <ApiOutlined />, color: '#8b5cf6' },
-  { type: 'feishu', icon: <CloudOutlined />, color: '#94a3b8' },
+  { type: 'feishu', icon: <CloudOutlined />, color: 'var(--yx-text-muted)' },
 ];
 
 const FALLBACK_ICONS: { icon: React.ReactNode; color: string }[] = [
-  { icon: <SketchOutlined />, color: '#94a3b8' },
-  { icon: <CarryOutOutlined />, color: '#94a3b8' },
-  { icon: <BugOutlined />, color: '#94a3b8' },
+  { icon: <SketchOutlined />, color: 'var(--yx-text-muted)' },
+  { icon: <CarryOutOutlined />, color: 'var(--yx-text-muted)' },
+  { icon: <BugOutlined />, color: 'var(--yx-text-muted)' },
 ];
 
 const BUILT_IN_ADAPTER_KEYS: Record<string, string> = {
@@ -128,7 +128,7 @@ export default function AdapterManagement() {
             return (
               <div key={adapter.id} className={`adapter-card${isGrey ? ' grey' : ''}`}>
                 {isGrey && <span className="future-tag">{t('ecosystem.comingSoon')}</span>}
-                <div className="adapter-icon" style={{ background: isGrey ? '#94a3b8' : display.color }}>
+                <div className="adapter-icon" style={{ background: isGrey ? 'var(--yx-text-muted)' : display.color }}>
                   {display.icon}
                 </div>
                 <h3>{copy.name}</h3>

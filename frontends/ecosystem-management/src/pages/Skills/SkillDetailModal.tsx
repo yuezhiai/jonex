@@ -69,7 +69,7 @@ export default function SkillDetailModal({ open, skill, onClose }: SkillDetailMo
           <Text strong style={{ display: 'block', marginBottom: 8 }}>
             {t('skills.instruction')}
           </Text>
-          <Paragraph style={{ background: '#f8fafc', padding: 12, borderRadius: 8, fontSize: 13, lineHeight: 1.7 }}>
+          <Paragraph style={{ background: 'var(--yx-bg-subtle)', padding: 12, borderRadius: 8, fontSize: 13, lineHeight: 1.7 }}>
             {detail.instruction}
           </Paragraph>
 
@@ -79,7 +79,7 @@ export default function SkillDetailModal({ open, skill, onClose }: SkillDetailMo
           <pre
             style={{
               background: '#1e293b',
-              color: '#e2e8f0',
+              color: 'var(--yx-border)',
               padding: 12,
               borderRadius: 8,
               fontSize: 12,
@@ -100,7 +100,7 @@ export default function SkillDetailModal({ open, skill, onClose }: SkillDetailMo
           <pre
             style={{
               background: '#1e293b',
-              color: '#e2e8f0',
+              color: 'var(--yx-border)',
               padding: 12,
               borderRadius: 8,
               fontSize: 12,
@@ -116,7 +116,7 @@ export default function SkillDetailModal({ open, skill, onClose }: SkillDetailMo
           </Text>
           <pre
             style={{
-              background: '#f8fafc',
+              background: 'var(--yx-bg-subtle)',
               padding: 12,
               borderRadius: 8,
               fontSize: 12,

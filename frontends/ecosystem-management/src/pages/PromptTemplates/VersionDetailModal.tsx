@@ -37,35 +37,39 @@ export default function VersionDetailModal({ open, version, onClose }: VersionDe
         </Button>,
       ]}
       width={700}
+      // 从「版本历史」弹窗里打开，必须压在上面：antd 的顶层容器 z-index 是平的
+      // （zIndexPopupBase + 100），谁在上面只由 portal 在 body 里的先后决定。
+      // 分层见 VersionHistoryModal 的注释；1200 仍低于 antd message / notification（2110）。
+      zIndex={1200}
     >
       {version && (
         <>
           <div style={{ display: 'flex', gap: 24, marginBottom: 14, fontSize: 13 }}>
             <div>
-              <span style={{ color: '#94a3b8' }}>{t('promptTemplate.versionDetailLabel')}: </span>
+              <span style={{ color: 'var(--yx-text-muted)' }}>{t('promptTemplate.versionDetailLabel')}: </span>
               <Tag color="purple">v{version.version}</Tag>
             </div>
             <div>
-              <span style={{ color: '#94a3b8' }}>{t('promptTemplate.updateInfo')}: </span>
+              <span style={{ color: 'var(--yx-text-muted)' }}>{t('promptTemplate.updateInfo')}: </span>
               {version.updated_at} · {version.updated_by}
             </div>
           </div>
           <div style={{ marginBottom: 14 }}>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+            <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginBottom: 4 }}>
               {t('promptTemplate.updateDescription')}
             </div>
             <div
-              style={{ fontSize: 13, color: '#475569', padding: '8px 12px', background: '#f8fafc', borderRadius: 6 }}
+              style={{ fontSize: 13, color: '#475569', padding: '8px 12px', background: 'var(--yx-bg-subtle)', borderRadius: 6 }}
             >
               {version.remark || '—'}
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('promptTemplate.content')}</div>
+            <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginBottom: 4 }}>{t('promptTemplate.content')}</div>
             <Paragraph
               copyable
               style={{
-                background: '#f8fafc',
+                background: 'var(--yx-bg-subtle)',
                 border: '1px solid #e8edf3',
                 borderRadius: 8,
                 padding: 14,

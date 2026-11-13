@@ -12,6 +12,7 @@ import type { CommonTableRef, FilterConfig, TableQueryParams } from '@jonex/shar
 import { McpKeyDrawer, type McpKeyDrawerHandle } from './McpKeyDrawer';
 import { RecreateKeyModal, type RecreateKeyModalHandle } from './RecreateKeyModal';
 import McpKeyDetailDrawer, { type McpKeyDetailDrawerHandle } from './McpKeyDetailDrawer';
+import { useFilledTableHeight } from './useFilledTableHeight';
 import './index.css';
 
 /** 必须是 type 别名而不是 interface：CommonTable 的 F 要求隐式索引签名 */
@@ -44,6 +45,8 @@ export default function McpKeysTab() {
   // 权限（shell 下发）：由共享 hook usePermission 提供，按钮级判断交给 PermButton
   const { permissions: userPermissions } = usePermission();
   const tableRef = useRef<CommonTableRef>(null);
+  /** 表体宿主：高度固定，Key 多时只有表体滚动（表头、筛选区、按钮都钉住） */
+  const [tableHostRef, tableBodyHeight] = useFilledTableHeight();
   const [error, setError] = useState<string | null>(null);
   /** 接口返回的全量条数：区分「一个 Key 都没有」与「筛选没命中」 */
   const [totalCount, setTotalCount] = useState<number | null>(null);
@@ -154,16 +157,11 @@ export default function McpKeysTab() {
     return <div className="mcp-chip-row">{parts}</div>;
   };
 
-  /** 写入范围聚合：KB名(全部) / KB名(N 目录)，多 KB 折叠（复用写 Key 渲染逻辑） */
+  /** 写入范围聚合：按知识库展示（整库授权，不再区分目录级），多 KB 折叠 */
   const renderWriteScope = (record: McpKeyItem) => {
     const grants = record.write_grants || [];
     if (grants.length === 0) return <span className="mcp-cell-muted">-</span>;
-    const renderOne = (g: WriteGrant) => {
-      const kbName = kbNameMap.get(g.kb) ?? g.kb;
-      return g.mode === 'all'
-        ? `${kbName}(${t('mcpKeyManagement.writeAll')})`
-        : `${kbName}(${g.directories?.length ?? 0} ${t('mcpKeyManagement.directoryUnit')})`;
-    };
+    const renderOne = (g: WriteGrant) => kbNameMap.get(g.kb) ?? g.kb;
     const shown = grants.slice(0, 2);
     const rest = grants.slice(2);
     return (
@@ -338,7 +336,7 @@ export default function McpKeysTab() {
       dataIndex: 'name',
       key: 'name',
       width: 160,
-      render: (v: string) => v || <span style={{ color: '#94a3b8' }}>-</span>,
+      render: (v: string) => v || <span style={{ color: 'var(--yx-text-muted)' }}>-</span>,
     },
     {
       title: t('mcpKeyManagement.keyPrefix'),
@@ -378,7 +376,7 @@ export default function McpKeysTab() {
       key: 'note',
       width: 160,
       ellipsis: true,
-      render: (v: string | null) => (v ? v : <span style={{ color: '#94a3b8' }}>-</span>),
+      render: (v: string | null) => (v ? v : <span style={{ color: 'var(--yx-text-muted)' }}>-</span>),
     },
     {
       title: t('mcpKeyManagement.actions'),
@@ -405,9 +403,11 @@ export default function McpKeysTab() {
   }
 
   return (
-    <div className="mcp-tab-body">
+    <div className="mcp-tab-body" ref={tableHostRef}>
       <CommonTable<McpKeyItem, KeyFilters>
         ref={tableRef}
+        // .yx-table-fill 由 platform-theme 提供：表头固定、表体 flex:1 滚动
+        className="yx-table-fill"
         rowKey="id"
         filters={filters}
         columns={columns}
@@ -415,7 +415,7 @@ export default function McpKeysTab() {
         size="middle"
         // 迁移前即不分页：一次性取全量、全部铺开（列表长也不加翻页）；列宽合计 1138，容器不足时左右滑动
         pagination={false}
-        scroll={{ x: 1180 }}
+        scroll={{ x: 1180, y: tableBodyHeight }}
         // 「一个 Key 都没有」才给创建引导；筛选没命中只给一句提示
         emptyText={
           totalCount === 0 ? (

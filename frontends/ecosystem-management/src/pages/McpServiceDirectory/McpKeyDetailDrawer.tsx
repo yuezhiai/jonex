@@ -1,7 +1,9 @@
 import { forwardRef, useImperativeHandle, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Drawer, Descriptions, Tag, Space, Typography } from 'antd';
+import { Button, Drawer, Typography } from 'antd';
+import { KeyOutlined } from '@ant-design/icons';
 import type { McpKeyItem, WriteGrant } from '@/api/mcpKeys';
+import './index.css';
 
 export type McpKeyDetailDrawerHandle = {
   open: (record: McpKeyItem) => void;
@@ -11,6 +13,14 @@ interface McpKeyDetailDrawerProps {
   /** KB id → 名称（写入范围展示） */
   kbNameMap: Map<string, string>;
 }
+
+/** 4 态 → 文案 key / 圆点样式（与 McpKeysTab 列表一列对齐） */
+const STATUS_META: Record<string, { labelKey: string; cls: string }> = {
+  active: { labelKey: 'mcpKeyManagement.activeStatus', cls: 'is-active' },
+  disabled: { labelKey: 'mcpKeyManagement.disabledStatus', cls: 'is-off' },
+  expired: { labelKey: 'mcpKeyManagement.expiredStatus', cls: 'is-expired' },
+  revoked: { labelKey: 'mcpKeyManagement.revokedStatus', cls: 'is-revoked' },
+};
 
 const McpKeyDetailDrawer = forwardRef<McpKeyDetailDrawerHandle, McpKeyDetailDrawerProps>(
   ({ kbNameMap }, ref) => {
@@ -34,86 +44,133 @@ const McpKeyDetailDrawer = forwardRef<McpKeyDetailDrawerHandle, McpKeyDetailDraw
       return 'active';
     };
 
-    const statusTag = (r: McpKeyItem) => {
-      const map: Record<string, React.ReactNode> = {
-        revoked: <Tag color="error">{t('mcpKeyManagement.revokedStatus')}</Tag>,
-        expired: <Tag color="orange">{t('mcpKeyManagement.expiredStatus')}</Tag>,
-        disabled: <Tag>{t('mcpKeyManagement.disabledStatus')}</Tag>,
-        active: <Tag color="success">{t('mcpKeyManagement.activeStatus')}</Tag>,
-      };
-      return map[deriveStatus(r)] || map.active;
-    };
+    /** 写入范围：按知识库展示（整库授权，不再区分目录级） */
+    const grantText = (g: WriteGrant) => kbNameMap.get(g.kb) ?? g.kb;
 
-    const grantText = (g: WriteGrant) => {
-      const kbName = kbNameMap.get(g.kb) ?? g.kb;
-      return g.mode === 'all'
-        ? `${kbName}(${t('mcpKeyManagement.writeAll')})`
-        : `${kbName}(${g.directories?.length ?? 0} ${t('mcpKeyManagement.directoryUnit')})`;
-    };
+    const statusMeta = record ? (STATUS_META[deriveStatus(record)] ?? STATUS_META.active) : STATUS_META.active;
+    const grants = record?.write_grants ?? [];
+    /** Key 级知识库白名单（上界）：空数组 = 不限（全部知识库） */
+    const allowedKbIds = record?.allowed_kb_ids ?? [];
+    const servicePermissions = record?.service_permissions ?? [];
+    const callCount = servicePermissions.filter((s) => s.permission_level === 'call').length;
+    const viewCount = servicePermissions.filter((s) => s.permission_level === 'view').length;
+    // 旧写 Key 并入统一 mcp-keys 后可能带 write/* 级权限，与列表口径一致：视同知识写入
+    const legacyWriteCount = servicePermissions.filter(
+      (s) => s.permission_level !== 'call' && s.permission_level !== 'view',
+    ).length;
+    const writeCount = grants.length + legacyWriteCount;
+    const hasAuth = callCount + viewCount + writeCount > 0;
 
     return (
       <Drawer
-        title={t('mcpKeyManagement.detailTitle')}
+        className="mcp-key-detail"
         placement="right"
-        width={520}
+        size={560}
         open={open}
         onClose={() => setOpen(false)}
+        title={
+          <div className="mcp-drawer-title">
+            <span className="mcp-drawer-title-icon">
+              <KeyOutlined />
+            </span>
+            <span className="mcp-drawer-title-text">{t('mcpKeyManagement.detailTitle')}</span>
+          </div>
+        }
+        footer={
+          <div className="mcp-drawer-footer">
+            <Button onClick={() => setOpen(false)}>{t('common.close')}</Button>
+          </div>
+        }
       >
         {record && (
-          <Descriptions column={1} size="small" colon={false} layout="vertical">
-            <Descriptions.Item label={t('mcpKeyManagement.nameLabel')}>
-              {record.name || '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.keyPrefix')}>
-              {record.key_prefix ? <Typography.Text code>{record.key_prefix}</Typography.Text> : '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.status')}>
-              {statusTag(record)}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.colCapability')}>
-              {(record.service_permissions || []).length > 0 || (record.write_grants || []).length > 0 ? (
-                <Space size={4} wrap>
-                  {(record.service_permissions || []).map((s) => (
-                    <Tag
-                      key={s.service_id}
-                      color={s.permission_level === 'call' ? 'blue' : s.permission_level === 'view' ? 'gold' : 'green'}
-                    >
-                      {s.permission_level === 'call'
-                        ? t('mcpKeyManagement.permissionCall')
-                        : s.permission_level === 'view'
-                          ? t('mcpKeyManagement.permissionView')
-                          : t('mcpKeyManagement.writeCapability')}
-                    </Tag>
-                  ))}
-                  {(record.write_grants || []).length > 0 && (
-                    <Tag color="green">{t('mcpKeyManagement.writeCapability')}</Tag>
+          <div className="mcp-kd">
+            {/* 头部：名称 + 状态 + 前缀，只用一条分隔线，不做卡片 */}
+            <div className="mcp-kd-head">
+              <div className="mcp-kd-name">{record.name || '-'}</div>
+              <div className="mcp-kd-meta">
+                <span className={`mcp-status ${statusMeta.cls}`}>{t(statusMeta.labelKey)}</span>
+                {record.key_prefix && (
+                  <Typography.Text code copyable={{ text: record.key_prefix }}>
+                    mcp_{record.key_prefix}
+                  </Typography.Text>
+                )}
+              </div>
+            </div>
+
+            {/* 基础信息：两列事实行，无边框底板 */}
+            <section className="mcp-kd-section">
+              <div className="mcp-kd-section-title">{t('mcpKeyManagement.detailSectionBasic')}</div>
+              <div className="mcp-kd-facts">
+                <div className="mcp-kd-fact">
+                  <span className="k">{t('mcpKeyManagement.expiryLabel')}</span>
+                  <span className="v">
+                    {record.expires_at ? record.expires_at.slice(0, 10) : t('mcpKeyManagement.expiryForever')}
+                  </span>
+                </div>
+                <div className="mcp-kd-fact">
+                  <span className="k">{t('mcpKeyManagement.colCreatedAt')}</span>
+                  <span className="v">{record.created_at ? record.created_at.slice(0, 10) : '-'}</span>
+                </div>
+              </div>
+            </section>
+
+            {/* 授权能力：胶囊横排，写入范围单独一行 */}
+            <section className="mcp-kd-section">
+              <div className="mcp-kd-section-title">{t('mcpKeyManagement.colCapability')}</div>
+              {hasAuth ? (
+                <>
+                  <div className="mcp-kd-chips">
+                    {callCount > 0 && (
+                      <span className="mcp-chip is-call">{t('mcpKeyManagement.callCount', { n: callCount })}</span>
+                    )}
+                    {viewCount > 0 && (
+                      <span className="mcp-chip is-view">{t('mcpKeyManagement.viewCount', { n: viewCount })}</span>
+                    )}
+                    {writeCount > 0 && (
+                      <span className="mcp-chip is-write">
+                        {t('mcpKeyManagement.writeCapability')} · {writeCount}
+                      </span>
+                    )}
+                  </div>
+                  {grants.length > 0 && (
+                    <div className="mcp-kd-line">
+                      <span className="mcp-kd-line-label">{t('mcpKeyManagement.colWriteScope')}</span>
+                      <div className="mcp-kd-chips">
+                        {grants.map((g, i) => (
+                          <span className="mcp-chip" key={`${g.kb}-${i}`}>
+                            {grantText(g)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   )}
-                </Space>
+                </>
               ) : (
-                '-'
+                <span className="mcp-kd-empty">-</span>
               )}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.colWriteScope')}>
-              {(record.write_grants || []).length > 0 ? (
-                <Space size={4} wrap>
-                  {(record.write_grants || []).map((g, i) => (
-                    <Tag key={i}>{grantText(g)}</Tag>
-                  ))}
-                </Space>
-              ) : (
-                '-'
-              )}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.expiryLabel')}>
-              {record.expires_at ? record.expires_at.slice(0, 10) : t('mcpKeyManagement.expiryForever')}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.noteLabel')}>
-              {record.note || '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label={t('mcpKeyManagement.colCreatedAt')}>
-              {record.created_at ? record.created_at.slice(0, 10) : '-'}
-            </Descriptions.Item>
-          </Descriptions>
+              {/* 知识库范围（上界）：空 = 不限；有值 = 只能访问这些库 */}
+              <div className="mcp-kd-line">
+                <span className="mcp-kd-line-label">{t('mcpKeyManagement.kbScopeLabel')}</span>
+                <div className="mcp-kd-chips">
+                  {allowedKbIds.length === 0 ? (
+                    <span className="mcp-chip is-more">{t('mcpKeyManagement.kbScopeAllTag')}</span>
+                  ) : (
+                    allowedKbIds.map((id) => (
+                      <span className="mcp-chip" key={id}>
+                        {kbNameMap.get(id) ?? id}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* 备注：纯文本，不加底框 */}
+            <section className="mcp-kd-section">
+              <div className="mcp-kd-section-title">{t('mcpKeyManagement.noteLabel')}</div>
+              <p className="mcp-kd-text">{record.note || '-'}</p>
+            </section>
+          </div>
         )}
       </Drawer>
     );

@@ -1,6 +1,6 @@
 import React, { useState, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Modal, message } from 'antd';
+import { message } from 'antd';
 import {
   deleteTemplateConstraint,
   deleteTemplateObject,
@@ -18,7 +18,7 @@ import {
   getTemplateRelationDisplay,
   getTemplateScenarioDisplay,
 } from '../../utils/builtInTemplateDisplay';
-import { getErrorMessage } from '@jonex/shared-lib';
+import { DangerConfirmModal, getErrorMessage } from '@jonex/shared-lib';
 
 type DeletingItem =
   | { type: 'scene'; item: TemplateScenario }
@@ -91,14 +91,6 @@ const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, DeleteConfirmMod
     }
   }, [deletingItem, onDeleted, t]);
 
-  const deleteTitle =
-    deletingItem?.type === 'scene'
-      ? t('templateScenarios.deleteScene')
-      : deletingItem?.type === 'object'
-        ? t('templateScenarios.deleteObject')
-        : deletingItem?.type === 'constraint'
-          ? t('templateScenarios.deleteConstraint')
-          : t('templateScenarios.deleteRelation');
 
   const deleteName =
     deletingItem?.type === 'scene'
@@ -110,21 +102,15 @@ const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, DeleteConfirmMod
           : deletingItem?.item.name;
 
   return (
-    <Modal
-      title={deleteTitle}
+    <DangerConfirmModal
       open={modalOpen}
-      onCancel={() => setModalOpen(false)}
-      onOk={handleConfirm}
+      title={t('templateScenarios.deleteConfirmContent', { name: deleteName })}
       okText={t('templateScenarios.confirmDelete')}
       cancelText={t('common.cancel')}
       confirmLoading={submitting}
-      okButtonProps={{ danger: true }}
-      width={420}
-    >
-      <div className="template-scenarios-delete-content">
-        {t('templateScenarios.deleteConfirmContent', { name: deleteName })}
-      </div>
-    </Modal>
+      onOk={handleConfirm}
+      onCancel={() => setModalOpen(false)}
+    />
   );
 });
 

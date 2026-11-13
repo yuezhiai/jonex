@@ -56,12 +56,8 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone') {
           title: 'navigation.templateDomains',
           menu: { icon: 'CopyOutlined', order: 6, permissionCode: 'template:read' },
         },
-        {
-          path: 'template-scenarios',
-          element: TemplateScenarios,
-          title: 'navigation.templateScenarios',
-          menu: { icon: 'CopyOutlined', order: 5, permissionCode: 'template:read' },
-        },
+        // 领域模板场景不进侧栏（改由「领域模板」卡片进入）；路由保留，路由级 403 守卫随之取消
+        { path: 'template-scenarios', element: TemplateScenarios, title: 'navigation.templateScenarios' },
         { path: 'template-objects', element: TemplateObjects, title: 'navigation.templateObjects' },
         { path: 'template-relations', element: TemplateRelations, title: 'navigation.templateRelations' },
         {

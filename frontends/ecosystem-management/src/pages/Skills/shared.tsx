@@ -56,7 +56,7 @@ export const CATEGORY_TINTS: Record<string, { background: string; color: string 
   voice: { background: '#e6f7ef', color: '#0f9d63' },
   document: { background: '#fff2e3', color: '#d97706' },
   video: { background: '#f1ecff', color: '#7c4dff' },
-  fusion: { background: '#fef0f0', color: '#dc2626' },
+  fusion: { background: '#fef0f0', color: 'var(--yx-error-text)' },
   custom: { background: '#e6f7f8', color: '#0891b2' },
 };
 

@@ -4,7 +4,7 @@
   padding: 8px 12px;
   border: 1px solid #eef2f7;
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   color: #5b6b7f;
   font-size: 12.5px;
   line-height: 1.7;
@@ -18,7 +18,7 @@
 .tom-attrs {
   margin-top: 16px;
   padding-top: 14px;
-  border-top: 1px solid #f1f5f9;
+  border-top: 1px solid var(--yx-bg-muted);
 }
 
 .tom-attrs-head {
@@ -32,7 +32,7 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 13.5px;
   font-weight: 600;
 }
@@ -60,7 +60,7 @@
 
 .tom-row-head {
   padding: 0 0 4px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 11.5px;
   font-weight: 500;
 }
@@ -128,10 +128,10 @@
   justify-content: center;
   gap: 6px;
   padding: 22px 16px;
-  border: 1px dashed #e2e8f0;
+  border: 1px dashed var(--yx-border);
   border-radius: 10px;
   background: #fcfdff;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12.5px;
 }
 

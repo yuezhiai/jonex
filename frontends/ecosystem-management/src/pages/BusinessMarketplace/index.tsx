@@ -1,7 +1,9 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Tag } from 'antd';
-import { ShopOutlined, BlockOutlined, InboxOutlined, CodepenOutlined, NodeIndexOutlined } from '@ant-design/icons';
+import { BlockOutlined, InboxOutlined, CodepenOutlined, NodeIndexOutlined } from '@ant-design/icons';
+import { PageContent, PageHeader } from '@jonex/shared-lib';
+import './index.css';
 
 const previewCards = [
   {
@@ -29,36 +31,25 @@ const previewCards = [
 export default function BusinessMarketplace() {
   const { t } = useTranslation();
   return (
-    <div>
-      <div style={{ textAlign: 'center', padding: '60px 20px' }}>
-        <ShopOutlined style={{ fontSize: 72, color: '#3b82f6', opacity: 0.3, marginBottom: 20, display: 'block' }} />
-        <h2 style={{ fontSize: 28, color: '#1e293b', margin: '0 0 8px' }}>
-          {t('ecosystem.businessDomainMarketplace')}
-        </h2>
-        <p style={{ color: '#94a3b8', fontSize: 15, margin: '0 0 40px' }}>{t('ecosystem.marketplaceComingSoonDesc')}</p>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 20 }}>
-          {previewCards.map((c, i) => (
-            <div
-              key={i}
-              style={{
-                background: '#fff',
-                border: '1px solid #e2e8f0',
-                borderRadius: 12,
-                padding: 24,
-                textAlign: 'center',
-                opacity: 0.5,
-              }}
-            >
-              <div style={{ fontSize: 36, color: '#94a3b8', marginBottom: 12 }}>{c.icon}</div>
-              <h4 style={{ margin: '0 0 6px', fontSize: 15, color: '#64748b' }}>{t(c.title)}</h4>
-              <p style={{ margin: 0, fontSize: 13, color: '#94a3b8' }}>{t(c.desc)}</p>
-              <Tag style={{ marginTop: 10, background: '#f1f5f9', color: '#94a3b8', border: 'none' }}>
-                {t('ecosystem.comingSoon')}
-              </Tag>
+    <>
+      <PageHeader
+        title={t('ecosystem.businessDomainMarketplace')}
+        subtitle={t('ecosystem.marketplaceComingSoonDesc')}
+      />
+      <PageContent showCard={false} height="content">
+        <div className="marketplace-grid">
+          {previewCards.map((card) => (
+            <div className="yx-card marketplace-card" key={card.title}>
+              <span className="marketplace-card-icon" aria-hidden>
+                {card.icon}
+              </span>
+              <h3 className="marketplace-card-title">{t(card.title)}</h3>
+              <p className="marketplace-card-desc">{t(card.desc)}</p>
+              <Tag className="marketplace-card-tag">{t('ecosystem.comingSoon')}</Tag>
             </div>
           ))}
         </div>
-      </div>
-    </div>
+      </PageContent>
+    </>
   );
 }

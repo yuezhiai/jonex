@@ -47,6 +47,7 @@ from jonex_core.common.exceptions import (
     InvalidParameterError,
     JonexException,
     PermissionDeniedError,
+    ResourceConflictError,
     UpstreamServiceError,
 )
 from jonex_core.common.i18n import translate
@@ -167,6 +168,7 @@ class OntologyActionExecutor:
     async def _prepare(
         self, tenant_id: str, kb_id: str, action_name: str, *,
         user_id: str, username: Optional[str], request_id: Optional[str],
+        qa_pending_id: Optional[str] = None,
     ) -> dict:
         """代调用人取执行计划：knowledge_base 按调用人的知识库写权限判定（空间管理者 /
         租户管理员 / kb_manager），没有写权限直接拒绝 —— 执行权限只认这一处。"""
@@ -176,18 +178,27 @@ class OntologyActionExecutor:
              "original_tenant_id": ctx.get("original_tenant_id")}
             if ctx.get("impersonated") else None
         )
+        payload = {"knowledge_base_id": kb_id, "action_name": action_name}
+        if qa_pending_id:
+            payload["qa_pending_id"] = qa_pending_id
         try:
             return await self._kb().invoke(
                 "prepare_action_execution",
-                {"knowledge_base_id": kb_id, "action_name": action_name},
+                payload,
                 tenant_id,
                 user_id=user_id, username=username, request_id=request_id, extra=extra,
             ) or {}
         except CapabilityInvokeError as exc:
-            # 知识库侧的权限拒绝原样还给调用方（否则前端只看到一个笼统的调用失败）
-            if (exc.details or {}).get("upstream_code") == PermissionDeniedError.code:
+            # 知识库侧的权限拒绝 / 待办冲突原样还给调用方（否则前端只看到一个笼统的调用失败）
+            upstream = (exc.details or {}).get("upstream_code")
+            if upstream == PermissionDeniedError.code:
                 raise PermissionDeniedError(
                     message=(exc.details or {}).get("upstream_message") or None,
+                )
+            if upstream == ResourceConflictError.code:
+                raise ResourceConflictError(
+                    message=(exc.details or {}).get("upstream_message")
+                    or "该卡片已执行、已失效或结果未知，请先到业务系统核实；需要重办请重新提问",
                 )
             raise
         except JonexException:
@@ -245,6 +256,7 @@ class OntologyActionExecutor:
         inputs = data.get("inputs") or {}
         confirmations = data.get("confirmations") or {}
         dry_run = bool(data.get("dry_run", False))
+        qa_pending_id = str(data.get("qa_pending_id") or "").strip() or None
         if not kb_id or not action_name:
             raise InvalidParameterError(message="knowledge_base_id 与 action_name 必填")
         if not isinstance(inputs, dict) or not isinstance(confirmations, dict):
@@ -260,6 +272,7 @@ class OntologyActionExecutor:
         plan = await self._prepare(
             tenant_id, kb_id, action_name,
             user_id=str(user_id), username=username, request_id=request_id,
+            qa_pending_id=qa_pending_id,
         )
         decision = plan.get("decision") or {}
         binding = plan.get("binding") or {}
@@ -292,6 +305,13 @@ class OntologyActionExecutor:
             return _finish(STATUS_BLOCKED)
         if verdict == "manual":
             return _finish(STATUS_MANUAL)
+        if decision.get("contract_changed"):
+            # 文档契约在提问后变过：要求按新 checklist 重新确认，不认领卡片
+            return _finish(
+                STATUS_NEEDS_CONFIRMATION,
+                pending_confirmations=decision.get("checklist") or [],
+                contract_changed=True,
+            )
         pending = check_confirmations(decision.get("checklist") or [], confirmations)
         if pending:
             return _finish(STATUS_NEEDS_CONFIRMATION, pending_confirmations=pending)
@@ -316,35 +336,98 @@ class OntologyActionExecutor:
         if missing:
             return _finish(STATUS_INVALID_INPUT, missing_inputs=missing)
         result["arguments"] = arguments
+        result["arguments_view"] = self._arguments_view(plan, arguments, inputs)
         if dry_run:
             return _finish(STATUS_PLANNED)
+
+        # 认领放在所有前置检查之后、真正调用工具之前：
+        # 缺参 / 未确认 / manual / 工具不可用 / 契约变化 / 权限被拒都不消耗卡片。
+        if qa_pending_id:
+            try:
+                await self._kb().invoke(
+                    "claim_qa_pending_action", {"qa_pending_id": qa_pending_id}, tenant_id,
+                )
+            except CapabilityInvokeError as exc:
+                if (exc.details or {}).get("upstream_code") == ResourceConflictError.code:
+                    _finish(STATUS_BLOCKED, error="qa_pending_conflict")
+                    raise ResourceConflictError(message="该卡片已执行或已失效，请重新提问获取新卡片")
+                raise
 
         context = {
             "tenant_id": tenant_id, "knowledge_base_id": kb_id, "action_name": action_name,
             "tool_name": tool_name, "tool_source": source, "request_id": request_id,
         }
-        if source == TOOL_SOURCE_KB:
-            outcome = await self._run_kb_tool(tenant_id, kb_id, tool_name, arguments, context)
-            if outcome.get("status") == STATUS_TOOL_UNAVAILABLE:
-                return _finish(STATUS_BLOCKED, error=STATUS_TOOL_UNAVAILABLE)
-        else:
-            cap = skill.capability_json or {}
-            runtime = cap.get("runtime") or {}
-            runner = self._runners.get(str(runtime.get("type") or ""))
-            # 入参必填已由 build_arguments 校验，这里不再按 schema 复查
-            outcome = await invoke_tool(
-                runtime if runner is not None else None,
-                cap.get("runtime_secret"),
-                None,
-                arguments,
-                context,
-                runner=(
-                    (lambda rt, a, s, c: runner(rt, a, {**c, "secret": s}))
-                    if runner is not None else None
-                ),
-            )
+        try:
+            if source == TOOL_SOURCE_KB:
+                outcome = await self._run_kb_tool(tenant_id, kb_id, tool_name, arguments, context)
+                if outcome.get("status") == STATUS_TOOL_UNAVAILABLE:
+                    final = _finish(STATUS_BLOCKED, error=STATUS_TOOL_UNAVAILABLE)
+                    await self._record_qa_result(tenant_id, qa_pending_id, final)
+                    return final
+            else:
+                cap = skill.capability_json or {}
+                runtime = cap.get("runtime") or {}
+                runner = self._runners.get(str(runtime.get("type") or ""))
+                # 入参必填已由 build_arguments 校验，这里不再按 schema 复查
+                outcome = await invoke_tool(
+                    runtime if runner is not None else None,
+                    cap.get("runtime_secret"),
+                    None,
+                    arguments,
+                    context,
+                    runner=(
+                        (lambda rt, a, s, c: runner(rt, a, {**c, "secret": s}))
+                        if runner is not None else None
+                    ),
+                )
+        except Exception as exc:
+            if not qa_pending_id:
+                raise
+            final = _finish(STATUS_FAILED, error=type(exc).__name__)
+            await self._record_qa_result(tenant_id, qa_pending_id, final)
+            return final
         status, extra = _outcome_fields(outcome)
-        return _finish(status, **extra)
+        final = _finish(status, **extra)
+        await self._record_qa_result(tenant_id, qa_pending_id, final)
+        return final
+
+    @staticmethod
+    def _arguments_view(plan: dict, arguments: dict, inputs: dict) -> list[dict]:
+        """给卡片展示最终入参及来源：ontology / ai / literal / user。"""
+        parameters = plan.get("parameters") or {}
+        resolved = parameters.get("resolved") or {}
+        input_refs = parameters.get("input_refs") or {}
+        provenance = parameters.get("provenance") or {}
+        view: list[dict] = []
+        for key, value in arguments.items():
+            if key in resolved:
+                source = provenance.get(key, "ontology")
+            elif key in input_refs or key in inputs:
+                source = "user"
+            else:
+                source = "literal"
+            view.append({"key": key, "value": value, "source": source})
+        return view
+
+    async def _record_qa_result(self, tenant_id: str, qa_pending_id: Optional[str], result: dict) -> None:
+        """执行结果由服务端写回（历史 + 待办终态）；失败只记日志，不影响执行结果。"""
+        if not qa_pending_id:
+            return
+        try:
+            await self._kb().invoke(
+                "record_qa_action_result",
+                {
+                    "qa_pending_id": qa_pending_id,
+                    "status": result.get("status"),
+                    "output": result.get("output"),
+                    "output_truncated": result.get("output_truncated"),
+                    "http_status": result.get("http_status"),
+                    "error": result.get("error"),
+                },
+                tenant_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — 结果回写是附属动作
+            logger.warning("问答动作结果回写失败 pending=%s: %s", qa_pending_id, exc)
 
     def _emit_audit(
         self, tenant_id: str, user_id: Optional[str], username: Optional[str],

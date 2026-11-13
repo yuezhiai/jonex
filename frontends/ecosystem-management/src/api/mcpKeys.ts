@@ -5,13 +5,17 @@ import apiClient from './request';
 /** 服务级授权级别：view=仅查看、call=可调用（Phase 16 收敛为 call/view） */
 export type McpServicePermissionLevel = 'view' | 'call';
 
-/** 单个知识库写入授权（grants[] 列表项） */
+/** 单个知识库写入授权（grants[] 列表项）
+ *
+ * UI 已收敛为知识库级授权（整库可写）：新建/编辑恒按 mode='all'、directories=[] 提交；
+ * 后端仍保留 specified 语义，历史 Key 的详情数据可能是 specified。
+ */
 export interface WriteGrant {
   /** 知识库 ID（uuid） */
   kb: string;
-  /** "all"=全目录可写（directories 必须为空）| "specified"=仅指定目录可写（directories 必须非空） */
+  /** "all"=整库可写（directories 为空）| "specified"=仅指定目录可写（历史数据，UI 不再产生） */
   mode: 'all' | 'specified';
-  /** 平铺 folder_id 列表；仅 mode=specified 时非空 */
+  /** 平铺 folder_id 列表；仅历史 mode=specified 数据非空 */
   directories: string[];
 }
 
@@ -35,6 +39,8 @@ export interface McpKeyCreatePayload {
   expires_at?: string | null;
   /** 知识写入授权（可选；null/不传 = 不开写入；非空数组 = 开启写入，空数组会报错） */
   write_grants?: WriteGrant[] | null;
+  /** Key 级知识库白名单（上界）：[] = 不限；非空 = 服务关联库 ∩ 白名单 */
+  allowed_kb_ids?: string[];
 }
 
 export interface McpKeyUpdatePayload {
@@ -48,6 +54,8 @@ export interface McpKeyUpdatePayload {
   expires_at?: string | null;
   /** 知识写入授权（可选；不传 = 保留原值；null = 关闭写入；非空数组 = 覆盖，空数组会报错） */
   write_grants?: WriteGrant[] | null;
+  /** Key 级知识库白名单（上界）：不传 = 保留原值；[] = 放开全部；非空 = 覆盖 */
+  allowed_kb_ids?: string[];
 }
 
 export interface McpKeyRecreatePayload {
@@ -69,6 +77,8 @@ export interface McpKeyItem {
   service_permissions?: Array<{ service_id: string; permission_level: string }>;
   /** 知识写入授权（统一 Key；空数组 = 纯服务访问 Key） */
   write_grants?: WriteGrant[];
+  /** Key 级知识库白名单（上界）：空数组 = 不限 */
+  allowed_kb_ids?: string[];
   /** 授权摘要（可调用 N · 仅查看 N · 写入开关） */
   auth_summary?: string;
   /** 写入范围摘要（可写知识库 N · 指定目录 N） */
@@ -94,6 +104,8 @@ export interface McpKeyCreateResult {
   space_id: string | null;
   service_permissions?: Array<{ service_id: string; permission_level: string }>;
   write_grants?: WriteGrant[];
+  /** Key 级知识库白名单（上界）：空数组 = 不限 */
+  allowed_kb_ids?: string[];
   status: string;
   auth_summary?: string;
   write_scope_summary?: string;

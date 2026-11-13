@@ -4,7 +4,7 @@
   gap: 6px;
   margin: 0 0 16px;
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .skills-subtitle-text {
@@ -52,7 +52,7 @@
 
 .skills-count {
   margin-left: auto;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 13px;
   white-space: nowrap;
 }
@@ -171,7 +171,7 @@
 
 .catalog-subtitle {
   margin: 0 0 16px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 13px;
 }
 

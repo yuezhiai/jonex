@@ -46,7 +46,7 @@ const TemplateReader: React.FC<TemplateReaderProps> = ({
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={
               <div style={{ lineHeight: 1.9 }}>
-                <div style={{ fontSize: 13.5, color: '#64748b' }}>{t('promptTemplate.selectHint')}</div>
+                <div style={{ fontSize: 13.5, color: 'var(--yx-text-secondary)' }}>{t('promptTemplate.selectHint')}</div>
                 <div style={{ fontSize: 12 }}>{t('promptTemplate.selectHintSub')}</div>
               </div>
             }
@@ -120,18 +120,14 @@ const TemplateReader: React.FC<TemplateReaderProps> = ({
                 {t('promptTemplate.copyFullText')}
               </Button>
             </Tooltip>
-            <Tooltip
-              title={canCopyToSpace ? t('promptTemplate.copyToTenant') : t('promptTemplate.noDomainSpaceHint')}
+            <Button
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={() => onCopyTemplate(display.id)}
+              disabled={!canCopyToSpace}
             >
-              <Button
-                size="small"
-                icon={<CopyOutlined />}
-                onClick={() => onCopyTemplate(display.id)}
-                disabled={!canCopyToSpace}
-              >
-                {t('promptTemplate.copyToSpace')}
-              </Button>
-            </Tooltip>
+              {t('promptTemplate.copyToSpace')}
+            </Button>
             {!isSystem && (
               <Button size="small" icon={<BranchesOutlined />} onClick={() => onVersionHistory(display.id)}>
                 {t('promptTemplate.version')}

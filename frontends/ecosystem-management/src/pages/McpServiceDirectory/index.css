@@ -3,8 +3,8 @@
 
 /* 测试调用结果块 */
 .mcp-svc-test-result {
-  background: #f8fafc;
-  border: 1px solid #eef2f6;
+  background: var(--yx-bg-subtle);
+  border: 1px solid var(--yx-border-light);
   border-radius: 8px;
   padding: 12px;
 }
@@ -27,13 +27,13 @@
 .mcp-svc-card-head h2 {
   font-size: 20px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   margin: 0 0 4px;
 }
 
 .mcp-svc-card-head p {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   margin: 0;
 }
 
@@ -41,7 +41,7 @@
 .mcp-svc-detail-section {
   font-size: 15px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   margin: 0 0 14px;
   padding-left: 10px;
   border-left: 3px solid #1c6fea;
@@ -50,17 +50,22 @@
 
 /* 详情抽屉服务信息：label 弱化、值留白 */
 .mcp-svc-detail .ant-descriptions-item-label {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-weight: 500;
+}
+
+/* 详情抽屉：超长服务名/值在抽屉内换行，不撑破 680px 宽度 */
+.mcp-svc-detail .ant-descriptions-item-content {
+  word-break: break-word;
 }
 
 /* 关联知识库：矩形按钮感标签 */
 .mcp-svc-kb-tag {
   padding: 2px 12px;
   border-radius: 6px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   background: #fff;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
 }
 
 /* 详情抽屉：分区间距 */
@@ -81,31 +86,31 @@
 .mcp-svc-tab-head h2 {
   font-size: 16px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   margin: 0 0 4px;
 }
 
 .mcp-svc-tab-head p {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   margin: 0;
 }
 
 .mcp-key-plaintext-copy {
   font-size: 16px;
-  color: #3b82f6;
+  color: var(--yx-accent);
   cursor: pointer;
   padding: 4px 10px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   display: inline-flex;
   align-items: center;
   flex-shrink: 0;
 }
 
 .mcp-key-plaintext-copy:hover {
-  border-color: #3b82f6;
+  border-color: var(--yx-accent);
   color: #1d4ed8;
 }
 
@@ -115,12 +120,12 @@
   justify-content: space-between;
   align-items: center;
   font-size: 13px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   margin-top: 12px;
 }
 
 .mcp-key-info-line strong {
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
 }
 
 
@@ -131,12 +136,12 @@
 
 /* 引导卡片内的 JSON 配置代码块 */
 .mcp-key-workbuddy-guide pre {
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   border-radius: 8px;
   padding: 16px;
   font-size: 13px;
   line-height: 1.6;
-  border: 1px solid #eef2f6;
+  border: 1px solid var(--yx-border-light);
   overflow: auto;
 }
 
@@ -144,17 +149,31 @@
 .mcp-write-hero-stat-value {
   font-size: 18px;
   font-weight: 700;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   line-height: 1.4;
 }
 
 .mcp-write-hero-stat-label {
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 /* ── 页面外壳：Card 去掉内边距，Tab 栏贴顶、内容区统一留白 ── */
+/*
+ * 卡片在 .yx-content 里是 flex item（PageContent fill 模式）：内容比可视区高时会被压回
+ * 可视高度，而卡片是 overflow:hidden —— 必须让卡片内部真正「吃掉」这个高度，否则超出
+ * 部分直接被裁掉：既看不见也滚不到（20 条/页时第 11 行往后全部消失）。
+ * 所以这里卡片自己要成为列向 flex 容器，卡片体 flex:1 + min-height:0 才有确定高度，
+ * 再配合 .ant-tabs / .ant-tabs-content-holder 的 flex:1 把高度一路传到表格，
+ * 最后由表体自己滚（表头与分页固定），而不是整块内容区一起滚。
+ */
 .mcp-panel {
+  display: flex;
+  /* 撑满页头之下的剩余高度：不撑满时卡片高度会跟着内容走，而表体高度又由卡片高度
+     反推（scroll.y 的上限），两者互相喂数据，换页/改条数时会来回抖。 */
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
   border: 1px solid #eef2f7;
   border-radius: 12px;
   overflow: hidden;
@@ -162,6 +181,7 @@
 
 .mcp-panel > .ant-card-body {
   display: flex;
+  flex: 1;
   flex-direction: column;
   min-height: 0;
   padding: 0;
@@ -188,14 +208,57 @@
   font-size: 13.5px;
 }
 
+/*
+ * 内容区自己不是滚动容器（滚动在表体内部，见下方 .mcp-tab-body 与 .yx-table-fill）：
+ * 这里只负责把卡片的高度一路传下去。antd 的 DOM 是
+ * holder > .ant-tabs-content > .ant-tabs-tabpane，三层都得是有确定高度的 flex 容器，
+ * 里面的 .mcp-tab-body 才拿得到可用高度；漏任何一层，表体就塌回内容高度。
+ */
 .mcp-panel .ant-tabs-content-holder {
+  display: flex;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   padding: 16px 18px 18px;
 }
 
-.mcp-panel .ant-tabs-tabpane {
+.mcp-panel .ant-tabs-content {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-panel .ant-tabs-tabpane-active {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   height: 100%;
+  min-height: 0;
+  /* flex item 默认 min-width:auto，表格 1330 的横向最小宽度会把它顶宽，
+     分页器直接被推到卡片右侧外面（选择器点不到） */
+  min-width: 0;
+}
+
+/*
+ * 切走的页签只靠 antd 的 `.ant-tabs-tabpane-hidden { display: none }` 藏起来，
+ * 上面那条选择器比它更具体 —— 如果写成 `.ant-tabs-tabpane`，隐藏页签会被重新撑成
+ * flex，两个列表就同时出现在页面上。
+ */
+.mcp-panel .ant-tabs-tabpane-hidden {
+  display: none;
+}
+
+/*
+ * 表格宿主：固定高度 + 列向 flex。表体滚动交给 platform-theme 的 `.yx-table-fill`
+ * （页面上给 CommonTable 挂这个类即可由它负责表头/分页固定、表体 flex:1 滚动），
+ * 所以这里切不可再写 overflow —— 两层都滚会出现双滚动条。
+ */
+.mcp-tab-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
 }
 
 .mcp-tab-label {
@@ -214,13 +277,26 @@
 }
 
 /* ── 列表单元格：主标题 + 等宽副标题 ── */
+/* 名称列宽固定（200）：按钮最大不超过单元格，超长名由内部 span 单行省略 */
 .mcp-cell-name.ant-btn {
+  max-width: 100%;
   height: auto;
   justify-content: flex-start;
+  overflow: hidden;
   padding: 0;
   color: #1c4f8a;
   font-size: 13.5px;
   font-weight: 600;
+}
+
+/* 省略必须落在 span 上：.ant-btn 自身是 inline-flex，直接对按钮做 text-overflow 不会出省略号 */
+.mcp-cell-name-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mcp-cell-name.ant-btn:hover {
@@ -231,7 +307,7 @@
   display: block;
   margin-top: 2px;
   overflow: hidden;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 11.5px;
   text-overflow: ellipsis;
@@ -239,7 +315,7 @@
 }
 
 .mcp-cell-muted {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12.5px;
 }
 
@@ -370,6 +446,13 @@
   color: #1677ff;
 }
 
+/* 行内状态操作：文字链接按钮，与查看图标同排且保持紧凑 */
+.mcp-act-link.ant-btn {
+  height: 26px;
+  padding: 0 4px;
+  font-size: 12.5px;
+}
+
 .mcp-cell-mono {
   display: inline-block;
   max-width: 100%;
@@ -391,4 +474,246 @@
   text-overflow: ellipsis;
   vertical-align: middle;
   white-space: nowrap;
+}
+
+
+/* ══ Key 管理抽屉：标题区 / 分组卡片 / 详情概览（创建编辑与详情共用同一套设计语言） ══ */
+
+/* 抽屉标题：图标 + 主标题 + 辅助说明 */
+.mcp-drawer-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mcp-drawer-title-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--yx-info-bg);
+  color: var(--yx-accent);
+  font-size: 15px;
+}
+
+.mcp-drawer-title-text {
+  min-width: 0;
+}
+
+.mcp-drawer-title-main {
+  color: var(--yx-brand-dark);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.mcp-drawer-title-sub {
+  margin-top: 1px;
+  color: var(--yx-text-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.mcp-drawer-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ── Key 详情抽屉：无卡片，靠分隔线与留白分区 ── */
+.mcp-kd-head {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--yx-border-light);
+}
+
+.mcp-kd-name {
+  color: var(--yx-brand-dark);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.mcp-kd-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.mcp-kd-section {
+  margin-top: 22px;
+}
+
+.mcp-kd-section-title {
+  margin-bottom: 10px;
+  color: var(--yx-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 基础信息：两列事实行（label 在上、值在下），不用 Descriptions 边框 */
+.mcp-kd-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 24px;
+}
+
+.mcp-kd-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mcp-kd-fact .k {
+  color: var(--yx-text-muted);
+  font-size: 12px;
+}
+
+.mcp-kd-fact .v {
+  color: var(--yx-text-primary);
+  font-size: 13.5px;
+}
+
+.mcp-kd-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 写入范围：左侧小标签 + 右侧知识库胶囊 */
+.mcp-kd-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.mcp-kd-line-label {
+  flex: 0 0 64px;
+  padding-top: 2px;
+  color: var(--yx-text-muted);
+  font-size: 12px;
+}
+
+.mcp-kd-empty {
+  color: var(--yx-text-muted);
+}
+
+.mcp-kd-text {
+  margin: 0;
+  color: var(--yx-text-body);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── 创建 / 编辑 Key 抽屉 ── */
+.mcp-key-steps {
+  margin-bottom: 16px;
+  padding: 14px 16px 4px;
+  border: 1px solid var(--yx-border-light);
+  border-radius: 12px;
+  background: #fbfdff;
+}
+
+.mcp-key-card {
+  margin-bottom: 16px;
+  padding: 14px 16px 6px;
+  border: 1px solid var(--yx-border-light);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.mcp-key-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 22px;
+  margin-bottom: 12px;
+}
+
+.mcp-key-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--yx-brand-dark);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mcp-key-card-title::before {
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--yx-accent);
+  content: '';
+}
+
+.mcp-key-count-chip {
+  padding: 0 10px;
+  border: 1px solid #dbe6fb;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #2f6bd8;
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.mcp-key-form .ant-form-item {
+  margin-bottom: 18px;
+}
+
+.mcp-key-form .ant-form-item:last-child {
+  margin-bottom: 10px;
+}
+
+/* 有效期提示：与单选组同屏，弱化成辅助信息 */
+.mcp-key-expiry-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 5px 10px;
+  border: 1px dashed var(--yx-border-accent);
+  border-radius: 8px;
+  background: var(--yx-info-bg);
+  color: #2f6bd8;
+  font-size: 12px;
+}
+
+.mcp-key-hint {
+  margin: 0 0 8px;
+  color: var(--yx-text-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* 明文 Key 与配置：等宽字体，便于逐字符核对 */
+.mcp-svc-auth-plaintext .ant-input {
+  font-family: var(--yx-font-mono);
+}
+
+/* ── 写入授权：行式卡片（嵌在写入授权卡片内，避免卡片套卡片） ── */
+.mcp-grant-item {
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--yx-border-light);
+  border-radius: 10px;
+  background: var(--yx-bg-subtle);
+}
+
+.mcp-grant-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
 }

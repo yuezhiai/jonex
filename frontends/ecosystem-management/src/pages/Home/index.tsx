@@ -1,81 +1,40 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { Row, Col } from 'antd';
 import { ApiOutlined, ShopOutlined } from '@ant-design/icons';
-import { PageContent, PageHeader } from '@jonex/shared-lib';
-
-const actions = [
-  {
-    label: 'ecosystem.adapterList',
-    desc: 'ecosystem.adapterDesc',
-    path: '/adapter-management',
-    icon: <ApiOutlined />,
-    color: '#3b82f6',
-  },
-  {
-    label: 'ecosystem.businessDomainMarketplace',
-    desc: 'ecosystem.marketplaceDesc',
-    path: '/business-marketplace',
-    icon: <ShopOutlined />,
-    color: '#10b981',
-    future: true,
-  },
-];
+import { EntryGrid, PageContent, PageHeader } from '@jonex/shared-lib';
+import type { EntryGridItem } from '@jonex/shared-lib';
 
 export default function Home() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const actions: EntryGridItem[] = [
+    {
+      key: '/adapter-management',
+      label: t('ecosystem.adapterList'),
+      description: t('ecosystem.adapterDesc'),
+      path: '/adapter-management',
+      icon: <ApiOutlined />,
+      color: 'var(--yx-accent)',
+    },
+    {
+      key: '/business-marketplace',
+      label: t('ecosystem.businessDomainMarketplace'),
+      description: t('ecosystem.marketplaceDesc'),
+      path: '/business-marketplace',
+      icon: <ShopOutlined />,
+      color: '#10b981',
+      upcoming: true,
+    },
+  ];
   return (
     <>
-      <PageHeader title={t('navigation.ecosystemManagement')} style={{ marginBottom: 4 }} />
-      <p style={{ color: '#64748b', margin: '0 0 16px', fontSize: 14 }}>{t('ecosystem.ecosystemManagementDesc')}</p>
+      <PageHeader
+        title={t('navigation.ecosystemManagement')}
+        subtitle={t('ecosystem.ecosystemManagementDesc')}
+      />
       <PageContent>
-        <Row gutter={[16, 16]}>
-          {actions.map((a) => (
-            <Col xs={24} sm={12} key={a.label}>
-              <a
-                onClick={() => navigate(a.path)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 14,
-                  padding: '18px 20px',
-                  background: '#fff',
-                  borderRadius: 12,
-                  border: '1px solid #e2e8f0',
-                  textDecoration: 'none',
-                  cursor: 'pointer',
-                  transition: 'all 0.2s',
-                  opacity: a.future ? 0.6 : 1,
-                }}
-              >
-                <span
-                  style={{
-                    fontSize: 22,
-                    color: a.color,
-                    background: `${a.color}15`,
-                    width: 44,
-                    height: 44,
-                    borderRadius: 10,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  {a.icon}
-                </span>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: '#1e293b' }}>
-                    {t(a.label)}
-                    {a.future ? t('ecosystem.futureTag') : ''}
-                  </div>
-                  <div style={{ fontSize: 12, color: '#94a3b8' }}>{t(a.desc)}</div>
-                </div>
-              </a>
-            </Col>
-          ))}
-        </Row>
+        <EntryGrid items={actions} onNavigate={navigate} upcomingText={t('ecosystem.futureTag')} />
       </PageContent>
     </>
   );

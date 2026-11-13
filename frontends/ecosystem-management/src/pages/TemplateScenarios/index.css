@@ -21,8 +21,9 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  width: 280px;
-  min-width: 280px;
+  /* 300：条目里「领域标签 + 时间」要在同一行放下（280 时常见领域名会被压成省略号） */
+  width: 300px;
+  min-width: 300px;
   padding: 16px 14px 14px;
   border-right: 1px solid #eef2f7;
   background: #fcfdff;
@@ -40,7 +41,7 @@
   margin: 0;
   font-size: 13px;
   font-weight: 700;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   letter-spacing: 0.2px;
 }
 
@@ -117,44 +118,53 @@
   min-width: 0;
 }
 
+/* 名称独占一行：长名称在这里自己省略（title 有全文），不跟时间抢宽度 */
 .ts-scene-name {
   overflow: hidden;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 13px;
   font-weight: 600;
+  line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* 元信息行：领域靠左、时间靠右（margin-left: auto）。领域是唯一可伸缩项，
+   超长时自己省略，时间 flex: none 永远完整可见 —— 原来领域与时间同一行且领域 flex-shrink: 0，
+   领域名一长就把时间顶出可视区 */
 .ts-scene-meta {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-top: 4px;
+  margin-top: 3px;
+  min-width: 0;
   overflow: hidden;
-  color: #94a3b8;
-  font-size: 11.5px;
-  line-height: 16px;
   white-space: nowrap;
 }
 
 .ts-scene-domain {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   padding: 0 5px;
   border: 1px solid #e9eef5;
   border-radius: 5px;
   background: #f4f7fa;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 11px;
   line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.ts-scene-dot {
-  flex-shrink: 0;
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: #cbd5e1;
+.ts-scene-time {
+  flex: none;
+  margin-left: auto;
+  color: var(--yx-text-muted);
+  font-size: 11.5px;
+  line-height: 16px;
+  white-space: nowrap;
 }
 
 .ts-scene-acts {
@@ -171,7 +181,7 @@
 }
 
 .ts-scene-acts .ant-btn {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .ts-scene-acts .ant-btn:hover {
@@ -207,7 +217,7 @@
   justify-content: space-between;
   gap: 12px 18px;
   padding-bottom: 14px;
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--yx-bg-muted);
 }
 
 .ts-detail-title {
@@ -224,7 +234,7 @@
 
 .ts-detail-name {
   margin: 0;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 17px;
   font-weight: 650;
   letter-spacing: 0.2px;
@@ -243,7 +253,7 @@
 
 .ts-detail-desc {
   margin: 6px 0 0;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 12.5px;
   line-height: 1.6;
 }
@@ -261,7 +271,7 @@
 .ts-actions .ant-btn {
   height: 30px;
   padding: 0 12px;
-  border-color: #e2e8f0;
+  border-color: var(--yx-border);
   border-radius: 8px;
   color: #44536b;
   font-size: 12.5px;
@@ -317,7 +327,7 @@
   justify-content: center;
   gap: 10px;
   min-height: 320px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 13px;
 }
 
@@ -386,8 +396,8 @@
   height: 18px;
   padding: 0 5px;
   border-radius: 9px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--yx-bg-muted);
+  color: var(--yx-text-secondary);
   font-size: 11px;
   line-height: 1;
 }
@@ -408,7 +418,7 @@
   padding: 8px 11px;
   border: 1px solid #eef2f7;
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   color: #7b8a9c;
   font-size: 12px;
   line-height: 1.6;
@@ -420,8 +430,8 @@
 }
 
 .ts-table .ant-table-thead > tr > th {
-  background: #f8fafc;
-  color: #64748b;
+  background: var(--yx-bg-subtle);
+  color: var(--yx-text-secondary);
   font-size: 12px;
   font-weight: 600;
 }
@@ -431,7 +441,7 @@
 }
 
 .ts-table .ant-table-tbody > tr:hover > td {
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
 }
 
 .ts-table .ant-table-placeholder .ant-table-cell {

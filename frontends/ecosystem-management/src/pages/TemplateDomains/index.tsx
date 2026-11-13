@@ -14,7 +14,7 @@ import './index.css';
 const PAGE_SIZE = 12;
 
 const DOMAIN_ICONS: Array<{ icon: string; bg: string; color: string }> = [
-  { icon: '💰', bg: '#eff6ff', color: '#3b82f6' },
+  { icon: '💰', bg: 'var(--yx-info-bg)', color: 'var(--yx-accent)' },
   { icon: '🏥', bg: '#f0fdf4', color: '#10b981' },
   { icon: '⚖️', bg: '#fff7ed', color: '#f97316' },
   { icon: '🏭', bg: '#fef2f2', color: '#ef4444' },
@@ -22,7 +22,7 @@ const DOMAIN_ICONS: Array<{ icon: string; bg: string; color: string }> = [
   { icon: '🛒', bg: '#fdf2f8', color: '#ec4899' },
   { icon: '🎓', bg: '#ecfeff', color: '#06b6d4' },
   { icon: '🚚', bg: '#fffbeb', color: '#d97706' },
-  { icon: '🏗️', bg: '#f1f5f9', color: '#475569' },
+  { icon: '🏗️', bg: 'var(--yx-bg-muted)', color: '#475569' },
   { icon: '📊', bg: '#f0f9ff', color: '#0284c7' },
 ];
 
@@ -105,7 +105,7 @@ export default function TemplateDomains() {
                 setPage(1);
               }}
               allowClear
-              style={{ width: 260 }}
+              style={{ width: 240 }}
             />
             <Select
               placeholder={t('status.allStatus')}

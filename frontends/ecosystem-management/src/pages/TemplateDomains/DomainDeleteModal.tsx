@@ -61,7 +61,7 @@ const DomainDeleteModal = forwardRef<DomainDeleteModalHandle, DomainDeleteModalP
             height: 48,
             borderRadius: 12,
             background: '#fef2f2',
-            color: '#dc2626',
+            color: 'var(--yx-error-text)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -73,7 +73,7 @@ const DomainDeleteModal = forwardRef<DomainDeleteModalHandle, DomainDeleteModalP
         </div>
         <div>
           <strong style={{ fontSize: 16 }}>{deletingDomain?.name}</strong>
-          <p style={{ fontSize: 14, color: '#64748b', margin: '4px 0 0' }}>
+          <p style={{ fontSize: 14, color: 'var(--yx-text-secondary)', margin: '4px 0 0' }}>
             {t('templateDomains.confirmDeleteContent')}
           </p>
         </div>

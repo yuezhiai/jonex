@@ -6,7 +6,7 @@
 
 .adapter-card {
   background: #fff;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   border-radius: 12px;
   padding: 24px;
   text-align: center;
@@ -40,7 +40,7 @@
 
 .adapter-card .adapter-desc {
   font-size: 13px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   margin-bottom: 12px;
 }
 
@@ -53,8 +53,8 @@
   padding: 2px 10px;
   border-radius: 10px;
   font-size: 11px;
-  background: #f1f5f9;
-  color: #94a3b8;
+  background: var(--yx-bg-muted);
+  color: var(--yx-text-muted);
   margin-bottom: 8px;
 }
 

@@ -128,6 +128,10 @@ const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
       onCancel={onClose}
       footer={<Button onClick={onClose}>{t('common.close')}</Button>}
       width={760}
+      // 显式分层，别靠 portal 的增删顺序：这里带 destroyOnHidden，每次打开都会重建 portal
+      // 并追加到 body 末尾，而「版本详情」的 portal 一直留着 —— 关掉两层再重开时，
+      // 历史会反压到详情之上（现象就是详情弹窗被挡住）。分层：历史 1100 → 详情 1200。
+      zIndex={1100}
       destroyOnHidden
     >
       <div style={{ marginBottom: 14, fontSize: 13, color: '#475569' }}>

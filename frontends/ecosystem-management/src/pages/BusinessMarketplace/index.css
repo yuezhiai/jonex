@@ -1,0 +1,49 @@
+/* 业务市场：占位页，只展示即将上线的品类，不含任何可用能力。
+   色值/圆角/字号一律取 theme.css 的 --yx-* 变量，不在此处新增设计值。 */
+.marketplace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.marketplace-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.marketplace-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin-bottom: 12px;
+  border-radius: var(--yx-btn-radius);
+  background: var(--yx-info-bg);
+  color: var(--yx-accent);
+  font-size: 18px;
+}
+
+.marketplace-card-title {
+  margin: 0;
+  font-size: var(--yx-font-size-card-title);
+  font-weight: var(--yx-font-weight-card-title);
+  color: var(--yx-text-primary);
+}
+
+.marketplace-card-desc {
+  margin: 6px 0 0;
+  font-size: var(--yx-font-size-small);
+  line-height: 1.6;
+  color: var(--yx-text-muted);
+}
+
+.marketplace-card-tag {
+  margin-top: 12px;
+  margin-inline-end: 0;
+  border: none;
+  border-radius: var(--yx-tag-radius);
+  background: var(--yx-icon-btn-bg);
+  color: var(--yx-text-secondary);
+}

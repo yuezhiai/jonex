@@ -205,6 +205,12 @@ export default function TemplateScenarios() {
     [english, objects],
   );
 
+  /** 左栏场景项里名称要出现两次（文本 + title 兜底），抽出来免得两次算同一串。 */
+  const getScenarioName = useCallback(
+    (scene: TemplateScenario) => getTemplateScenarioDisplay(scene, english, t).name,
+    [english, t],
+  );
+
   const refreshScenarios = useCallback(async (nextDomainId = '', preferredSceneId?: string | null) => {
     setLoadingScenes(true);
     try {
@@ -716,11 +722,11 @@ export default function TemplateScenarios() {
               />
 
               {loadingScenes ? (
-                <div style={{ textAlign: 'center', padding: '40px 20px', color: '#94a3b8' }}>
+                <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--yx-text-muted)' }}>
                   {t('templateScenarios.loadingScenes')}
                 </div>
               ) : scenes.length === 0 ? (
-                <div style={{ textAlign: 'center', padding: '40px 20px', color: '#94a3b8' }}>
+                <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--yx-text-muted)' }}>
                   {t('templateScenarios.noMatchScene')}
                 </div>
               ) : (
@@ -738,13 +744,16 @@ export default function TemplateScenarios() {
                       label: (
                         <div className="ts-scene">
                           <div className="ts-scene-main">
-                            <div className="ts-scene-name">
-                              {getTemplateScenarioDisplay(scene, english, t).name}
+                            {/* 第一行只放名称，占满整行宽度，超长自己省略（title 里有全文） */}
+                            <div className="ts-scene-name" title={getScenarioName(scene)}>
+                              {getScenarioName(scene)}
                             </div>
+                            {/* 第二行：领域标签靠左（超长自己省略），时间靠右固定，谁长都不影响时间 */}
                             <div className="ts-scene-meta">
-                              <span className="ts-scene-domain">{getDomainName(scene.domain_id)}</span>
-                              <span className="ts-scene-dot" />
-                              <span>{formatTime(scene.created_at)}</span>
+                              <span className="ts-scene-domain" title={getDomainName(scene.domain_id)}>
+                                {getDomainName(scene.domain_id)}
+                              </span>
+                              <span className="ts-scene-time">{formatTime(scene.created_at)}</span>
                             </div>
                           </div>
                           <div className="ts-scene-acts">

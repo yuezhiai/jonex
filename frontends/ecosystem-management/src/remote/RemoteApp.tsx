@@ -5,7 +5,7 @@ import { ConfigProvider } from 'antd';
 import { StyleProvider } from '@ant-design/cssinjs';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
-import { antdTheme, sharedCache } from '@jonex/platform-theme';
+import { sharedCache, withCssVarKey } from '@jonex/platform-theme';
 import i18n from '@/locales/i18n';
 import '@/styles/index.scss';
 import '@jonex/platform-theme/theme.css';
@@ -24,10 +24,10 @@ interface ShellContext {
 function AntdLocaleGate({ children }: { children: React.ReactNode }) {
   const { i18n: appI18n } = useTranslation();
   const antdLocale = appI18n.language === 'en' ? enUS : zhCN;
-  // cssVar 关闭：见 App.tsx 说明（MF 共享单例下所有应用需一致关闭）。
+  // cssVar key 固定为本应用的 app key，避免与 shell 的 cssVar 作用域串号（原因见 withCssVarKey 注释）。
   return (
     <StyleProvider cache={sharedCache}>
-      <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+      <ConfigProvider locale={antdLocale} theme={withCssVarKey('jonex-ecosystem-management')}>
         {children}
       </ConfigProvider>
     </StyleProvider>

@@ -17,7 +17,7 @@
 .domain-card {
   background: #fff;
   border-radius: 12px;
-  border: 1px solid #eef2f6;
+  border: 1px solid var(--yx-border-light);
   padding: 20px;
   cursor: pointer;
   transition: box-shadow 0.2s, transform 0.15s;
@@ -51,7 +51,7 @@
 .card-title {
   font-size: 15px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -60,7 +60,7 @@
 
 .card-desc {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -74,12 +74,12 @@
   justify-content: space-between;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid #f1f5f9;
+  border-top: 1px solid var(--yx-bg-muted);
 }
 
 .card-time {
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .card-status {
@@ -88,8 +88,8 @@
   border-radius: 10px;
   font-weight: 500;
 }
-.card-status.active { background: #ecfdf5; color: #10b981; }
-.card-status.inactive { background: #f1f5f9; color: #94a3b8; }
+.card-status.active { background: var(--yx-success-bg); color: #10b981; }
+.card-status.inactive { background: var(--yx-bg-muted); color: var(--yx-text-muted); }
 
 .card-footer {
   display: flex;
@@ -100,7 +100,7 @@
 
 .card-scenario-count {
   font-size: 13px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 .card-actions {

@@ -14,9 +14,10 @@ import {
   Steps,
   Radio,
   DatePicker,
+  Modal,
   message,
 } from 'antd';
-import { CopyOutlined } from '@ant-design/icons';
+import { CopyOutlined, KeyOutlined, ClockCircleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import copy from 'copy-to-clipboard';
 import dayjs, { type Dayjs } from 'dayjs';
@@ -113,6 +114,9 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
     // 知识写入授权开关 + 授权范围（grants[]）
     const [writeEnabled, setWriteEnabled] = useState(false);
     const [writeGrants, setWriteGrants] = useState<WriteGrant[]>([]);
+    // Key 级知识库白名单（上界）：'specified' = 选定知识库；'all' = 不限（allowed_kb_ids=[]）
+    const [kbScopeMode, setKbScopeMode] = useState<'specified' | 'all'>('specified');
+    const [allowedKbIds, setAllowedKbIds] = useState<string[]>([]);
 
     // 知识库列表 + 空间名称映射（一次性加载，数据量小）
     useEffect(() => {
@@ -154,6 +158,9 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         // 对称重置知识写入授权：避免切换空间后残留旧空间 KB，提交被后端按空间校验 400
         setWriteEnabled(false);
         setWriteGrants([]);
+        // 白名单同样按空间收敛：切换空间后旧空间的库不可再选
+        setKbScopeMode('specified');
+        setAllowedKbIds([]);
       });
     }, [editRecord]);
 
@@ -187,6 +194,9 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
           // 创建模式：知识写入授权重置为关闭
           setWriteEnabled(false);
           setWriteGrants([]);
+          // 创建模式：白名单恢复默认引导（先指定知识库，而非直接放开全部）
+          setKbScopeMode('specified');
+          setAllowedKbIds([]);
           // 锁定当前全局空间（创建态）
           setCurrentSpaceId(sid);
           setOpen(true);
@@ -210,6 +220,10 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
           // 知识写入授权回填（开关 + 授权范围）
           setWriteEnabled(!!(record.write_grants || []).length);
           setWriteGrants(record.write_grants || []);
+          // 白名单回填：有值 → 指定知识库；空数组 → 不限（全部）
+          const recordAllowedKbIds = record.allowed_kb_ids || [];
+          setKbScopeMode(recordAllowedKbIds.length ? 'specified' : 'all');
+          setAllowedKbIds(recordAllowedKbIds);
           // 编辑态锁定原 Key 空间（服务列表按此加载，不跟随全局切换）
           setCurrentSpaceId(record.space_id || null);
           // M5：历史 Key 未关联领域空间时提示（服务授权仅原样保留，表格不展示）
@@ -250,6 +264,20 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
       }
     };
 
+    /** 「全部知识库」二次确认：放开全部库属高风险操作，只有明确确认才提交空数组 */
+    const confirmOpenAllKbs = () =>
+      new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: t('mcpKeyManagement.kbScopeAllConfirmTitle'),
+          content: t('mcpKeyManagement.kbScopeAllConfirm'),
+          okText: t('common.confirm'),
+          cancelText: t('common.cancel'),
+          okButtonProps: { danger: true },
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        });
+      });
+
     /** 第 2 步创建/编辑提交 */
     const handleCreate = async () => {
       const values = basicInfo || form.getFieldsValue();
@@ -258,21 +286,31 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         permission_level,
       }));
       // 知识写入：开关开启且至少一项授权才提交，否则显式置空数组
-      const effectiveGrants = writeEnabled ? writeGrants.filter((g) => g.kb) : [];
+      // 写入授权已收敛为知识库级（整库可写）：统一按 mode='all'、directories=[] 提交，
+      // 历史 specified 授权在被编辑保存后自然收敛为整库
+      const effectiveGrants = writeEnabled
+        ? writeGrants.filter((g) => g.kb).map((g) => ({ kb: g.kb, mode: 'all' as const, directories: [] }))
+        : [];
       // 至少一项授权：领域服务授权 或 有效写入授权，二者至少要有其一
       // （校验实际生效的 grants 而非开关：开关开着但没选任何知识库也算零授权）
       if (servicePermissions.length === 0 && effectiveGrants.length === 0) {
         message.error(t('mcpKeyManagement.atLeastOneAuth'));
         return;
       }
-      // 提交前轻量校验（与 WriteGrantsEditor 约束一致）：specified 必选目录、all 目录必须为空，
-      // 避免提交后才被后端 400 拒绝而只弹通用「操作失败」
-      if (effectiveGrants.some((g) => g.mode === 'specified' && !(g.directories || []).length)) {
-        message.error(t('mcpKeyManagement.directoriesRequired'));
+      // 知识库白名单：有空间才可配置（历史无空间 Key 不可选库，原样保留后端值）
+      const canConfigKbScope = !!currentSpaceId;
+      if (canConfigKbScope && kbScopeMode === 'specified' && allowedKbIds.length === 0) {
+        message.error(t('mcpKeyManagement.kbScopeRequired'));
         return;
       }
-      if (effectiveGrants.some((g) => g.mode === 'all' && (g.directories || []).length > 0)) {
-        message.error(t('mcpKeyManagement.allNoDirectories'));
+      // 原本就是「放开全部」的 Key 再次保存（改名/改有效期）不重复弹确认，避免骚扰
+      const alreadyOpenAll = !!editRecord && !(editRecord.allowed_kb_ids || []).length;
+      if (
+        canConfigKbScope &&
+        kbScopeMode === 'all' &&
+        !alreadyOpenAll &&
+        !(await confirmOpenAllKbs())
+      ) {
         return;
       }
       const common = {
@@ -281,6 +319,10 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         expires_at: calcExpiry(values.expiry_type || '12m', values.expiry_custom),
         // 空数组会触发后端「写入已开启但未指定知识库」报错；未开启写入必须传 null
         write_grants: effectiveGrants.length ? effectiveGrants : null,
+        // 白名单上界：全部 → []（不限）；指定 → 选中的库
+        ...(canConfigKbScope
+          ? { allowed_kb_ids: kbScopeMode === 'all' ? [] : allowedKbIds }
+          : {}),
       };
       setSaving(true);
       try {
@@ -347,6 +389,21 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
       return typeof url === 'string' ? url : '';
     })();
 
+    /**
+     * 服务是否可授权（UI-KEY-16）：已发布且未停用。
+     * 不能只看 is_published —— stopped 态 is_published 仍为 true，但服务已不可调用。
+     */
+    const isServiceSelectable = (r: McpServiceItem) => r.is_published && r.status !== 'stopped';
+
+    /** 第 2 步可见服务（已发布且未停用）：与表格数据源同源，用于「已选 N」计数 */
+    const selectableServices = services.filter(isServiceSelectable);
+    const selectedVisibleCount = selectableServices.filter((s) => !!selected[s.id]).length;
+
+    /** 白名单候选项：仅当前领域空间下的知识库（切换空间时上面已清空选择） */
+    const spaceKbOptions = kbList
+      .filter((k) => !currentSpaceId || k.space_id === currentSpaceId)
+      .map((k) => ({ value: k.id, label: k.name }));
+
     // 第 2 步：授权领域服务表格列（勾选 + 服务级权限 call/view）
     const serviceColumns: ColumnsType<McpServiceItem> = [
       {
@@ -356,7 +413,6 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         render: (_: unknown, record: McpServiceItem) => (
           <Checkbox
             checked={!!selected[record.id]}
-            disabled={!record.is_published}
             onChange={(e) => {
               const next = { ...selected };
               if (e.target.checked) next[record.id] = 'view';
@@ -370,14 +426,7 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
         title: t('mcpKeyManagement.serviceNameColumn'),
         dataIndex: 'name',
         key: 'name',
-        render: (_: unknown, record: McpServiceItem) => (
-          <div>
-            <div>{record.name}</div>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              {record.space_name || '-'}·MCP{record.is_published ? t('mcpKeyManagement.publishedStatus') : t('mcpKeyManagement.unpublishedStatus')}
-            </Typography.Text>
-          </div>
-        ),
+        render: (_: unknown, record: McpServiceItem) => <div>{record.name}</div>,
       },
       {
         title: t('mcpKeyManagement.mcpToolColumn'),
@@ -394,7 +443,7 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
             size="small"
             style={{ width: 110 }}
             value={selected[record.id]}
-            disabled={!selected[record.id] || !record.is_published}
+            disabled={!selected[record.id]}
             onChange={(v) => setSelected((prev) => ({ ...prev, [record.id]: v }))}
             options={SERVICE_PERMISSIONS.map((p) => ({ value: p, label: permissionLabel(p) }))}
           />
@@ -435,97 +484,166 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
 
     return (
       <Drawer
-        title={editRecord ? t('mcpKeyManagement.editTitle') : t('mcpKeyManagement.createTitle')}
+        className="mcp-key-drawer"
+        title={
+          <div className="mcp-drawer-title">
+            <span className="mcp-drawer-title-icon">
+              <KeyOutlined />
+            </span>
+            <div className="mcp-drawer-title-text">
+              <div className="mcp-drawer-title-main">
+                {editRecord ? t('mcpKeyManagement.editTitle') : t('mcpKeyManagement.createTitle')}
+              </div>
+              <div className="mcp-drawer-title-sub">
+                {editRecord
+                  ? t('mcpKeyManagement.drawerEditSubtitle')
+                  : t('mcpKeyManagement.drawerCreateSubtitle')}
+              </div>
+            </div>
+          </div>
+        }
         placement="right"
-        width={680}
+        size={700}
         open={open}
         onClose={() => close(step === 3)}
         footer={footer}
         destroyOnHidden
       >
-        {/* 步骤指示 */}
-        <Steps
-          size="small"
-          current={step - 1}
-          items={
-            editRecord
-              ? [
-                  { title: t('mcpKeyManagement.createStep1') },
-                  { title: t('mcpKeyManagement.createStep2') },
-                ]
-              : [
-                  { title: t('mcpKeyManagement.createStep1') },
-                  { title: t('mcpKeyManagement.createStep2') },
-                  { title: t('mcpKeyManagement.createStep3') },
-                ]
-          }
-          style={
-            editRecord
-              ? { maxWidth: 380, margin: '0 auto 24px' }
-              : { marginBottom: 24 }
-          }
-        />
+        {/* 步骤指示：浅色底板，与下方表单卡片分层 */}
+        <div className="mcp-key-steps">
+          <Steps
+            size="small"
+            current={step - 1}
+            items={
+              editRecord
+                ? [
+                    { title: t('mcpKeyManagement.createStep1') },
+                    { title: t('mcpKeyManagement.createStep2') },
+                  ]
+                : [
+                    { title: t('mcpKeyManagement.createStep1') },
+                    { title: t('mcpKeyManagement.createStep2') },
+                    { title: t('mcpKeyManagement.createStep3') },
+                  ]
+            }
+          />
+        </div>
 
         {/* Form 始终挂载（step 2/3 时隐藏），避免卸载导致已填字段值丢失 */}
         <div style={{ display: step === 1 ? undefined : 'none' }}>
-          <Form form={form} layout="vertical">
-            <Form.Item
-              name="name"
-              label={t('mcpKeyManagement.keyNameLabel')}
-              rules={[{ required: true, whitespace: true, message: t('mcpKeyManagement.keyNameRequired') }]}
-            >
-              <Input placeholder={t('mcpKeyManagement.keyNamePlaceholder')} maxLength={255} />
-            </Form.Item>
-            <Form.Item name="note" label={t('mcpKeyManagement.noteLabel')}>
-              <Input.TextArea
-                placeholder={t('mcpKeyManagement.notePlaceholder')}
-                rows={2}
-                maxLength={500}
-              />
-            </Form.Item>
-            <Form.Item name="expiry_type" label={t('mcpKeyManagement.expiryLabel')} initialValue="12m">
-              <Radio.Group>
-                <Space direction="vertical">
-                  {EXPIRY_OPTIONS.map((o) => (
-                    <Radio key={o.value} value={o.value}>
-                      {t(`mcpKeyManagement.${o.labelKey}`)}
-                    </Radio>
-                  ))}
-                  <Radio value="forever">{t('mcpKeyManagement.expiryForever')}</Radio>
-                  <Radio value="custom">{t('mcpKeyManagement.expiryCustom')}</Radio>
-                </Space>
-              </Radio.Group>
-            </Form.Item>
-            {expiryType === 'custom' && (
-              <Form.Item name="expiry_custom" label={t('mcpKeyManagement.expiryLabel')}>
-                <DatePicker style={{ width: '100%' }} />
+          <div className="mcp-key-card">
+            <div className="mcp-key-card-head">
+              <span className="mcp-key-card-title">{t('mcpKeyManagement.createStep1')}</span>
+            </div>
+            <Form form={form} layout="vertical" className="mcp-key-form">
+              <Form.Item
+                name="name"
+                label={t('mcpKeyManagement.keyNameLabel')}
+                rules={[{ required: true, whitespace: true, message: t('mcpKeyManagement.keyNameRequired') }]}
+              >
+                <Input placeholder={t('mcpKeyManagement.keyNamePlaceholder')} maxLength={255} />
               </Form.Item>
-            )}
-            {expiryTo && (
-              <Typography.Text type="secondary">
-                {t('mcpKeyManagement.expiryTo', { date: expiryTo })}
-              </Typography.Text>
-            )}
-          </Form>
+              <Form.Item name="note" label={t('mcpKeyManagement.noteLabel')}>
+                <Input.TextArea
+                  placeholder={t('mcpKeyManagement.notePlaceholder')}
+                  rows={2}
+                  maxLength={500}
+                />
+              </Form.Item>
+              <Form.Item name="expiry_type" label={t('mcpKeyManagement.expiryLabel')} initialValue="12m">
+                <Radio.Group>
+                  {EXPIRY_OPTIONS.map((o) => (
+                    <Radio.Button key={o.value} value={o.value}>
+                      {t(`mcpKeyManagement.${o.labelKey}`)}
+                    </Radio.Button>
+                  ))}
+                  <Radio.Button value="forever">{t('mcpKeyManagement.expiryForever')}</Radio.Button>
+                  <Radio.Button value="custom">{t('mcpKeyManagement.expiryCustom')}</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+              {expiryType === 'custom' && (
+                <Form.Item name="expiry_custom" label={t('mcpKeyManagement.expiryLabel')}>
+                  <DatePicker style={{ width: '100%' }} />
+                </Form.Item>
+              )}
+              {expiryTo && (
+                <div className="mcp-key-expiry-hint">
+                  <ClockCircleOutlined />
+                  {t('mcpKeyManagement.expiryTo', { date: expiryTo })}
+                </div>
+              )}
+            </Form>
+          </div>
         </div>
 
         {step === 2 && (
-          <Table<McpServiceItem>
-            rowKey="id"
-            columns={serviceColumns}
-            dataSource={services}
-            pagination={false}
-            bordered
-            locale={{
-              emptyText: <Typography.Text type="secondary">{t('mcpKeyManagement.emptyServices')}</Typography.Text>,
-            }}
-          />
+          <div className="mcp-key-card">
+            <div className="mcp-key-card-head">
+              <span className="mcp-key-card-title">{t('mcpKeyManagement.createStep2')}</span>
+              <span className="mcp-key-count-chip">
+                {t('mcpKeyManagement.selectedServiceCount', { count: selectedVisibleCount })}
+              </span>
+            </div>
+            <Table<McpServiceItem>
+              rowKey="id"
+              columns={serviceColumns}
+              // 只展示可选（已发布且未停用）服务：不可授权的数据不进入授权列表
+              dataSource={selectableServices}
+              pagination={false}
+              size="small"
+              // 限制表格最大高度，服务多时表内滚动，不把下方「知识写入授权」挤出视口
+              scroll={{ y: 320 }}
+              locale={{
+                emptyText: <Typography.Text type="secondary">{t('mcpKeyManagement.emptyServices')}</Typography.Text>,
+              }}
+            />
+          </div>
+        )}
+
+        {step === 2 && currentSpaceId && (
+          <div className="mcp-key-card">
+            <div className="mcp-key-card-head">
+              <span className="mcp-key-card-title">{t('mcpKeyManagement.kbScopeLabel')}</span>
+              <span className="mcp-key-count-chip">
+                {kbScopeMode === 'all'
+                  ? t('mcpKeyManagement.kbScopeAllTag')
+                  : t('mcpKeyManagement.kbScopeSelectedCount', { count: allowedKbIds.length })}
+              </span>
+            </div>
+            <Radio.Group
+              value={kbScopeMode}
+              onChange={(e) => {
+                setKbScopeMode(e.target.value);
+                if (e.target.value === 'all') setAllowedKbIds([]);
+              }}
+              style={{ marginBottom: 12 }}
+            >
+              <Radio.Button value="specified">{t('mcpKeyManagement.kbScopeSpecified')}</Radio.Button>
+              <Radio.Button value="all">{t('mcpKeyManagement.kbScopeAll')}</Radio.Button>
+            </Radio.Group>
+            {kbScopeMode === 'specified' ? (
+              <Select
+                mode="multiple"
+                allowClear
+                style={{ width: '100%' }}
+                value={allowedKbIds}
+                onChange={setAllowedKbIds}
+                options={spaceKbOptions}
+                placeholder={t('mcpKeyManagement.kbScopePlaceholder')}
+                notFoundContent={t('mcpKeyManagement.kbScopeNoKb')}
+                optionFilterProp="label"
+              />
+            ) : (
+              <p className="mcp-key-hint">{t('mcpKeyManagement.kbScopeAllHint')}</p>
+            )}
+            <p className="mcp-key-hint">{t('mcpKeyManagement.kbScopeHint')}</p>
+          </div>
         )}
 
         {step === 2 && (
-          <div style={{ marginTop: 16 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <Typography.Text strong>{t('mcpKeyManagement.writeAuthLabel')}</Typography.Text>
+          <div className="mcp-key-card">
+            <div className="mcp-key-card-head">
+              <span className="mcp-key-card-title">{t('mcpKeyManagement.writeAuthLabel')}</span>
               <Radio.Group
                 value={writeEnabled}
                 onChange={(e) => {
@@ -537,7 +655,7 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
                 <Radio.Button value={true}>{t('mcpKeyManagement.writeAuthOn')}</Radio.Button>
               </Radio.Group>
             </div>
-            {writeEnabled && (
+            {writeEnabled ? (
               <WriteGrantsEditor
                 value={writeGrants}
                 onChange={setWriteGrants}
@@ -545,6 +663,8 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
                 spaceNameMap={spaceNameMap}
                 spaceId={currentSpaceId}
               />
+            ) : (
+              <p className="mcp-key-hint">{t('mcpKeyManagement.writeAuthOffHint')}</p>
             )}
           </div>
         )}
@@ -563,7 +683,7 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
               <Alert
                 type="warning"
                 showIcon
-                message={t('mcpKeyManagement.idempotentHitWarning')}
+                title={t('mcpKeyManagement.idempotentHitWarning')}
                 style={{ marginBottom: 16 }}
               />
             ) : (
@@ -572,14 +692,14 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
                   <Alert
                     type="info"
                     showIcon
-                    message={t('mcpKeyManagement.writeAuthIncluded', { count: effectiveWriteGrants.length })}
+                    title={t('mcpKeyManagement.writeAuthIncluded', { count: effectiveWriteGrants.length })}
                     style={{ marginBottom: 16 }}
                   />
                 )}
                 <Alert
                   type="warning"
                   showIcon
-                  message={t('mcpKeyManagement.keyPlaintextWarning')}
+                  title={t('mcpKeyManagement.keyPlaintextWarning')}
                   style={{ marginBottom: 16 }}
                 />
                 {/* MCP Key 模块 */}
@@ -600,13 +720,13 @@ export const McpKeyDrawer = forwardRef<McpKeyDrawerHandle, McpKeyDrawerProps>(
                 {t('mcpKeyManagement.workbuddyBlock')}
               </Typography.Title>
               {!mcpConfigUrl ? (
-                <Alert type="warning" showIcon message={t('mcpKeyManagement.mcpConfigMissing')} />
+                <Alert type="warning" showIcon title={t('mcpKeyManagement.mcpConfigMissing')} />
               ) : (
                 <>
                   <pre
                     style={{
-                      background: '#f8fafc',
-                      border: '1px solid #eef2f6',
+                      background: 'var(--yx-bg-subtle)',
+                      border: '1px solid var(--yx-border-light)',
                       borderRadius: 8,
                       padding: 12,
                       fontSize: 12,

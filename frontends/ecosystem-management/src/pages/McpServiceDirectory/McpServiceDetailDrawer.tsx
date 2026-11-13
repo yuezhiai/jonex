@@ -1,4 +1,4 @@
-import React, { useState, useImperativeHandle, forwardRef } from 'react';
+import React, { useState, useImperativeHandle, forwardRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Drawer,
@@ -11,11 +11,19 @@ import {
   Empty,
   Button,
   Typography,
+  Form,
+  Input,
+  message,
 } from 'antd';
 import type { TableProps } from 'antd';
-import { getAuthorizedKeys, getMcpServiceDetail } from '@/api/mcpServices';
+import {
+  getAuthorizedKeys,
+  getMcpServiceDetail,
+  saveToolConfig,
+  type SaveToolConfigParams,
+} from '@/api/mcpServices';
 import type { McpServiceItem, AuthorizedKeyItem, ServiceAccessInfo } from '@/api/mcpServices';
-import { formatDateTime } from '@jonex/shared-lib';
+import { formatDateTime, usePermission } from '@jonex/shared-lib';
 import './index.css';
 
 /** 服务详情抽屉对外暴露的句柄 */
@@ -27,20 +35,57 @@ export type McpServiceDetailDrawerHandle = {
 interface McpServiceDetailDrawerProps {
   /** 点击「前往 MCP Key 管理」时回调（切换到服务访问Key 视图） */
   onGoToKeys?: () => void;
+  /** 保存 Tool 配置成功后回调（父级刷新列表，发布可用性依赖已保存的 Tool） */
+  onSaved?: () => void;
 }
 
 const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServiceDetailDrawerProps>(
-  ({ onGoToKeys }, ref) => {
+  ({ onGoToKeys, onSaved }, ref) => {
     const { t } = useTranslation();
+    // 权限（shell 下发）：与列表页同一套 usePermission，写操作要求 mcp:service:manage
+    const { permissions: userPermissions } = usePermission();
+    const canManage = userPermissions.includes('mcp:service:manage');
     const [open, setOpen] = useState(false);
     const [record, setRecord] = useState<McpServiceItem | null>(null);
     const [keys, setKeys] = useState<AuthorizedKeyItem[]>([]);
     const [loadingKeys, setLoadingKeys] = useState(false);
     const [access, setAccess] = useState<ServiceAccessInfo | null>(null);
+    const [savingTool, setSavingTool] = useState(false);
+    const [toolForm] = Form.useForm<SaveToolConfigParams>();
 
-    /** 服务三态：disabled（停用）> published / unpublished（由 is_published 决定） */
-    const serviceStatus = (r: McpServiceItem) =>
-      r.enabled === 0 ? 'disabled' : r.is_published ? 'published' : 'unpublished';
+    /** 发布态：与后端 status 一致（published / stopped / unpublished），缺省按 is_published 回退 */
+    const serviceStatus = (r: McpServiceItem): 'published' | 'stopped' | 'unpublished' => {
+      if (r.status === 'stopped') return 'stopped';
+      if (r.status === 'unpublished' || !r.is_published) return 'unpublished';
+      return 'published';
+    };
+
+    /** 详情数据变化时回填 Tool 表单（列表项 / 详情接口覆盖 / 保存成功刷新均走这里） */
+    useEffect(() => {
+      toolForm.setFieldsValue({
+        tool: record?.tool || '',
+        tool_description: record?.tool_description || '',
+      });
+    }, [record?.id, record?.tool, record?.tool_description, toolForm]);
+
+    /** 保存 Tool 配置：成功后重新拉详情并通知父级刷新列表 */
+    const handleSaveTool = async (values: SaveToolConfigParams) => {
+      if (!record) return;
+      setSavingTool(true);
+      try {
+        await saveToolConfig(record.id, {
+          tool: values.tool.trim(),
+          tool_description: values.tool_description?.trim() || null,
+        });
+        message.success(t('mcpServiceDirectory.toolSaveSuccess'));
+        await loadAccess(record.id);
+        onSaved?.();
+      } catch (err: unknown) {
+        message.error(err instanceof Error ? err.message : t('mcpServiceDirectory.operationFailed'));
+      } finally {
+        setSavingTool(false);
+      }
+    };
 
     /** 加载指定服务的授权 Key 列表（失败静默降级为空，不阻塞抽屉） */
     const loadAuthorizedKeys = async (serviceId: string) => {
@@ -96,24 +141,29 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
         title: t('mcpServiceDirectory.keyColumnPrefix'),
         dataIndex: 'key_prefix',
         key: 'key_prefix',
-        render: (v: string) => (v ? <Typography.Text code>mcp_{v}</Typography.Text> : '-'),
+        // 统一 Key 前缀是 yxm_（mcp_key_service.py: plaintext[4:12]），
+        // 这里补前缀只为可读，不能写成 mcp_ 以免与真实 Key 对不上。
+        render: (v: string) => (v ? <Typography.Text code>yxm_{v}</Typography.Text> : '-'),
       },
       {
         title: t('mcpServiceDirectory.keyColumnStatus'),
         dataIndex: 'key_status',
         key: 'key_status',
-        render: (v: string) =>
-          v === 'active' ? (
-            <Tag color="success">{t('mcpServiceDirectory.keyStatusActive')}</Tag>
-          ) : (
-            <Tag color="error">{t('mcpServiceDirectory.keyStatusRevoked')}</Tag>
-          ),
+        render: (v: string) => {
+          const statusMeta: Record<string, { color: string; label: string }> = {
+            active: { color: 'success', label: t('mcpServiceDirectory.keyStatusActive') },
+            revoked: { color: 'error', label: t('mcpServiceDirectory.keyStatusRevoked') },
+            expired: { color: 'warning', label: t('mcpServiceDirectory.keyStatusExpired') },
+            disabled: { color: 'default', label: t('mcpServiceDirectory.keyStatusDisabled') },
+          };
+          const meta = statusMeta[v] ?? { color: 'default', label: v };
+          return <Tag color={meta.color}>{meta.label}</Tag>;
+        },
       },
       {
         title: t('mcpServiceDirectory.keyColumnExpiry'),
         dataIndex: 'expires_at',
         key: 'expires_at',
-        // TODO: 后端 authorized-keys 暂未返回 expires_at，当前统一按「永久有效」展示，待后端补充后接入
         render: (_: unknown, item: AuthorizedKeyItem) =>
           item.expires_at ? formatDateTime(item.expires_at) : t('mcpServiceDirectory.expiryForever'),
       },
@@ -122,7 +172,8 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
     // 接入信息派生：API 接入（系统写服务 access.api=null → 仅 MCP 接入）/ MCP 接入（server_url 由后端 access.mcp.server_url 下发）
     const api = access?.api;
     const mcp = access?.mcp;
-    const isSystem = record?.service_type === 'system';
+    // 系统写服务（固定合成 ID）Tool 固定、不可编辑
+    const isSystem = record?.service_type === 'system' || record?.id === 'system.knowledge_document_write';
 
     return (
       <Drawer
@@ -145,7 +196,7 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
             <Descriptions column={2} size="small" colon={false} layout="vertical">
               <Descriptions.Item label={t('mcpServiceDirectory.colName')}>{record.name}</Descriptions.Item>
               <Descriptions.Item label={t('mcpServiceDirectory.colToolName')}>
-                {record.tool || <span style={{ color: '#94a3b8' }}>-</span>}
+                {record.tool || <span style={{ color: 'var(--yx-text-muted)' }}>-</span>}
               </Descriptions.Item>
               <Descriptions.Item label={t('mcpServiceDirectory.colToolDesc')} span={2}>
                 {record.tool_description || t('mcpServiceDirectory.noDescription')}
@@ -161,20 +212,22 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
               <Descriptions.Item label={t('mcpServiceDirectory.colSpace')}>
                 {record.space_name || '-'}
               </Descriptions.Item>
-              {/* MCP 状态三态：disabled（停用）> published / unpublished（由 is_published 决定） */}
+              {/* MCP 发布态三态：stopped / unpublished / published；服务本体停用（enabled=0）另标「当前不可调用」 */}
               <Descriptions.Item label={t('mcpServiceDirectory.colStatus')}>
-                {serviceStatus(record) === 'disabled' ? (
-                  <Tag>{t('mcpServiceDirectory.statusDisabled')}</Tag>
-                ) : record.is_published ? (
-                  <Tag color="success">{t('mcpServiceDirectory.statusPublished')}</Tag>
-                ) : (
+                {serviceStatus(record) === 'stopped' ? (
+                  <Tag color="warning">{t('mcpServiceDirectory.statusStopped')}</Tag>
+                ) : serviceStatus(record) === 'unpublished' ? (
                   <Tag>{t('mcpServiceDirectory.statusUnpublished')}</Tag>
+                ) : record.enabled === 0 ? (
+                  <Tag>{t('mcpServiceDirectory.statusUnavailable')}</Tag>
+                ) : (
+                  <Tag color="success">{t('mcpServiceDirectory.statusPublished')}</Tag>
                 )}
               </Descriptions.Item>
               <Descriptions.Item label={t('mcpServiceDirectory.detailKbNames')} span={2}>
                 {record.service_type === 'system' ? (
                   // 知识写入服务无预授权知识库，资源范围由 Key 授权决定
-                  <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.scopeByKey')}</span>
+                  t('mcpServiceDirectory.scopeByKey')
                 ) : record.kb_names && record.kb_names.length > 0 ? (
                   <Space size={8} wrap>
                     {record.kb_names.map((n) => (
@@ -184,10 +237,48 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
                     ))}
                   </Space>
                 ) : (
-                  <span style={{ color: '#94a3b8' }}>{t('mcpServiceDirectory.noKb')}</span>
+                  t('mcpServiceDirectory.noKb')
                 )}
               </Descriptions.Item>
             </Descriptions>
+
+            {/* Tool 配置（仅领域服务 + 有管理权限时可见；系统写服务 Tool 固定不可改） */}
+            {!isSystem && canManage && (
+              <>
+                <Divider />
+                <h3 className="mcp-svc-detail-section">{t('mcpServiceDirectory.detailSectionTool')}</h3>
+                <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                  {t('mcpServiceDirectory.toolConfigHint')}
+                </Typography.Text>
+                <Form form={toolForm} layout="vertical" onFinish={handleSaveTool}>
+                  <Form.Item
+                    name="tool"
+                    label={t('mcpServiceDirectory.toolNameLabel')}
+                    rules={[
+                      { required: true, whitespace: true, message: t('mcpServiceDirectory.toolNameRequired') },
+                      { pattern: /^[A-Za-z0-9_]+$/, message: t('mcpServiceDirectory.toolNamePattern') },
+                      { max: 128, message: t('mcpServiceDirectory.toolNameMax') },
+                    ]}
+                  >
+                    <Input
+                      placeholder={t('mcpServiceDirectory.toolNamePlaceholder')}
+                      maxLength={128}
+                      allowClear
+                    />
+                  </Form.Item>
+                  <Form.Item name="tool_description" label={t('mcpServiceDirectory.toolDescriptionLabel')}>
+                    <Input.TextArea
+                      placeholder={t('mcpServiceDirectory.toolDescriptionPlaceholder')}
+                      rows={2}
+                      maxLength={255}
+                    />
+                  </Form.Item>
+                  <Button type="primary" htmlType="submit" loading={savingTool}>
+                    {t('mcpServiceDirectory.toolSaveBtn')}
+                  </Button>
+                </Form>
+              </>
+            )}
 
             {/* API 接入（详情接口 access.api；系统写服务无 REST query 语义 → 提示仅 MCP 接入） */}
             <Divider />
@@ -242,7 +333,7 @@ const McpServiceDetailDrawer = forwardRef<McpServiceDetailDrawerHandle, McpServi
                   <Tag color="geekblue">{t('mcpServiceDirectory.accessAuthBearer')}</Tag>
                 </Descriptions.Item>
                 <Descriptions.Item label={t('mcpServiceDirectory.accessMcpServerUrl')}>
-                  {mcp?.server_url || <span style={{ color: '#94a3b8' }}>-</span>}
+                  {mcp?.server_url || <span style={{ color: 'var(--yx-text-muted)' }}>-</span>}
                 </Descriptions.Item>
               </Descriptions>
             )}

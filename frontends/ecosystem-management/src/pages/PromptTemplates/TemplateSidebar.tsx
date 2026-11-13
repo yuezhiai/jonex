@@ -107,7 +107,7 @@ const TemplateSidebar: React.FC<TemplateSidebarProps> = ({
           ]}
         />
         <Input
-          prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+          prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
           placeholder={t('promptTemplate.searchPlaceholder')}
           value={keywordInput}
           onChange={(e) => onKeywordChange(e.target.value)}
