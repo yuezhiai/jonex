@@ -45,6 +45,12 @@ export interface EntityLanding {
   entityName: string;
   included: boolean;
   sourceName?: string | null;
+  /** provenance（landing-agent 线）：谁定的（name|agent|manual）、多确信
+   *  （high|medium|low）、为什么（≤200 字）。**有值才带**——缺键 = 未知，
+   *  不物化空串（与后端 normalize 同口径）。 */
+  origin?: string;
+  confidence?: string;
+  rationale?: string;
   stale?: boolean;
   staleReason?: string | null;
 }

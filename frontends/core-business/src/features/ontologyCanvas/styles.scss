@@ -11,13 +11,13 @@
  */
 
 .ontology-canvas-page {
-  --navy: #0b2b5c;
-  --blue: #3b82f6;
+  --navy: var(--yx-brand-dark);
+  --blue: var(--yx-accent);
   --blue-dark: #2563eb;
   --border: #d9e2ec;
   --muted: #65758b;
   --surface: #fff;
-  --danger: #dc2626;
+  --danger: var(--yx-error-text);
   --shadow: 0 5px 18px rgba(18, 49, 86, .08);
 
   display: flex;
@@ -78,7 +78,46 @@
   grid-template-columns: 240px 1fr 340px;
   min-height: 0;
   flex: 1;
+  position: relative;
+  transition: grid-template-columns .18s ease;
 }
+
+/* 左右栏折叠：列宽归零（画布吃满），内容隐藏但保留 DOM（画布实例不能重挂）。 */
+.ontology-canvas-body.is-left-collapsed { grid-template-columns: 0 1fr 340px; }
+.ontology-canvas-body.is-right-collapsed { grid-template-columns: 240px 1fr 0; }
+.ontology-canvas-body.is-left-collapsed.is-right-collapsed { grid-template-columns: 0 1fr 0; }
+
+.ontology-canvas-body.is-left-collapsed > .ontology-canvas-list,
+.ontology-canvas-body.is-right-collapsed > .properties-panel {
+  visibility: hidden;
+  overflow: hidden;
+  padding: 0;
+  border: none;
+}
+
+/* 边缘把手：贴在两栏的接缝上，画布不被挡（z-index 高于 canvas 但只占 16px）。 */
+.canvas-panel-toggle {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 6;
+  width: 16px;
+  height: 48px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.canvas-panel-toggle:hover { color: var(--blue); border-color: var(--blue); }
+.canvas-panel-toggle:disabled { cursor: not-allowed; opacity: .45; }
+.canvas-panel-toggle--left { left: 0; border-left: none; border-radius: 0 6px 6px 0; }
+.canvas-panel-toggle--right { right: 0; border-right: none; border-radius: 6px 0 0 6px; }
 
 .ontology-canvas-list {
   background: var(--surface);
@@ -218,7 +257,7 @@
 }
 .entity-node-attributes > div  {
 
- display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eef2f6; font-size: 11px;
+ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--yx-border-light); font-size: 11px;
 
 }
 .entity-node-attributes > div span  {
@@ -251,7 +290,7 @@
 /* 展开态:节点底角改方、底边与投影让位给下方浮层,两块拼成一个整体(不再是「节点 + 独立面板」) */
 .entity-node-expanded { border-bottom-left-radius: 0; border-bottom-right-radius: 0; border-bottom-color: transparent; box-shadow: none; }
 .entity-attr-panel { position: fixed; z-index: 40; overflow-y: auto; padding-bottom: 4px; background: #fff; border: 1px solid #b9c9dc; border-top: none; border-radius: 0 0 9px 9px; box-shadow: 0 5px 16px rgba(15,46,82,.12); }
-.entity-attr-panel > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 10px; border-bottom: 1px solid #eef2f6; font-size: 11px; }
+.entity-attr-panel > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 10px; border-bottom: 1px solid var(--yx-border-light); font-size: 11px; }
 .entity-attr-panel > div:last-child { border-bottom: none; }
 .entity-attr-panel > div span { display: flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; }
 .entity-attr-panel > div.entity-attr-added { color: #047857; font-weight: 600; }
@@ -348,7 +387,7 @@
 }
 .rule-list-target {
 
- font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #0b2b5c;
+ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--yx-brand-dark);
 
 }
 .rule-expression {
@@ -373,7 +412,7 @@
 }
 .relation-mode-hint  {
 
- position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 4; padding: 8px 12px; border-radius: 7px; background: #0b2b5c; color: #fff; box-shadow: var(--shadow); font-size: 12px; font-weight: 650; pointer-events: none;
+ position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 4; padding: 8px 12px; border-radius: 7px; background: var(--yx-brand-dark); color: #fff; box-shadow: var(--shadow); font-size: 12px; font-weight: 650; pointer-events: none;
 
 }
 .induction-panel-heading  {
@@ -485,7 +524,7 @@
 .type-picker-item  {
 
  display: flex; align-items: baseline; gap: 8px; width: 100%; border: 0; background: transparent; border-radius: 7px;
- padding: 6px 8px; text-align: left; font-size: 12.5px; color: #334155;
+ padding: 6px 8px; text-align: left; font-size: 12.5px; color: var(--yx-text-body);
 
 }
 .type-picker-item:hover  {

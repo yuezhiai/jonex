@@ -25,7 +25,7 @@
 .ms-side-block h4 {
   margin: 0 0 6px;
   font-size: 13px;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
 }
 
 .ms-side-empty {
@@ -171,7 +171,7 @@
 .ms-node-header strong {
   flex: 1;
   font-size: 13px;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -199,7 +199,7 @@
 .ms-node-attributes {
   padding: 4px 10px 8px;
   font-size: 12px;
-  color: #334155;
+  color: var(--yx-text-body);
 }
 
 .ms-node-attributes > div {
@@ -209,13 +209,13 @@
 }
 
 .ms-node-attributes small {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .ms-node-more {
   padding: 0 10px 6px;
   font-size: 11px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .ms-node-concepts {

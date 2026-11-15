@@ -40,6 +40,11 @@ export const EntityLandingSchema = z.object({
   entityName: z.string(),
   included: z.boolean(),
   sourceName: z.string().nullable().optional(),
+  // provenance（landing-agent 线）：同 P1-5 语义槽——不在这里登记，
+  // `DomainDocumentSchema.parse` 会静默剥掉，保存一次就把标记抹平。
+  origin: z.string().optional(),
+  confidence: z.string().optional(),
+  rationale: z.string().optional(),
   stale: z.boolean().optional(),
   staleReason: z.string().nullable().optional(),
 });
