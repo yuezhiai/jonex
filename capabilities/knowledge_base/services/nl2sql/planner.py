@@ -61,7 +61,7 @@ async def plan_sql(question: str, *, table_name: str, columns: list[dict],
                    constraints: list[dict] | None = None,
                    hints: list[str] | None = None, today: str | None = None,
                    tenant_id: str = "", kb_id: str = "",
-                   user_id: str = "") -> str:
+                   user_id: str = "", trace_id: str | None = None) -> str:
     """一次 planner 调用 → 计划文本；任何失败返回 `""`。"""
     prompt = build_plan_text(
         question, table_name=table_name, columns=columns, joins=joins,
@@ -73,7 +73,7 @@ async def plan_sql(question: str, *, table_name: str, columns: list[dict],
              {"role": "user", "content": prompt}],
             tools=None, model=None, scene="nl2sql_generate", max_tokens=512,
             tenant_id=tenant_id or "unknown", kb_id=kb_id or None,
-            user_id=user_id or None)
+            user_id=user_id or None, trace_id=trace_id)
     except Exception:  # noqa: BLE001 —— planner 是增能，失败退空
         return ""
     content = str((reply or {}).get("content") or "").strip()

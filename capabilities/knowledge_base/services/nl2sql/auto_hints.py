@@ -22,7 +22,12 @@ from __future__ import annotations
 
 import re
 
-from .hints import MAX_HINT_CHARS, MAX_HINTS, MAX_HINTS_TOTAL_CHARS
+from .hints import (
+    MAX_HINT_CHARS,
+    MAX_HINTS,
+    MAX_HINTS_TOTAL_CHARS,
+    build_metric_hint_text,
+)
 
 #: 锚点实体之外最多再带几个 1 跳邻居的属性说明。
 MAX_RELATED_ENTITIES = 2
@@ -161,13 +166,29 @@ def _attribute_hints(question: str, entity: dict, abstract: dict | None,
     return out
 
 
-def _metric_hints(question: str, metrics: list, abstract_entities: list) -> list[tuple[int, int, str]]:
+def _metric_hints(question: str, metrics: list, abstract_entities: list,
+                  *, exclude: set[str] | None = None) -> list[tuple[int, int, str]]:
+    """命中问句的指标定义。
+
+    `exclude` 是**按名字精确压制**的集合（已 `strip`，不比对 aliases）：请求级
+    指标 hints 已经带了同名指标的**新**定义时，库里的旧定义不再注入 —— 否则
+    模型会同时看到两条「指标 X」的自相矛盾指令（与 `apply_metric_entries` 的
+    upsert 口径一致：同名覆盖）。
+    """
     out: list[tuple[int, int, str]] = []
     for idx, metric in enumerate(metrics or []):
         if not isinstance(metric, dict):
             continue
         name = _as_text(metric.get("name") or metric.get("code"))
         if not name:
+            continue
+        # disable 采纳写 `enabled=false`（不物删）；不在这里挡掉的话，指标照旧
+        # 注入 = disable 等于没生效。
+        # 仅认显式布尔 False，与 `_normalize_metric` 落库归一一致（缺键 = 启用、
+        # 怪值也不当停用）；**不要改成 truthiness**（`"false"` / `0` 会误伤）。
+        if metric.get("enabled") is False:
+            continue
+        if exclude and name in exclude:
             continue
         aliases = [_as_text(a) for a in (metric.get("aliases") or []) if _as_text(a)]
         definition = _clean_description(
@@ -178,14 +199,11 @@ def _metric_hints(question: str, metrics: list, abstract_entities: list) -> list
         priority = 4 if _matches(question, name, *aliases) else 0
         if priority == 0:
             continue  # 指标不命中就不带（避免把整库指标灌进去）
-        text = f"指标 {name}"
-        if aliases:
-            text += f"（{'、'.join(aliases[:5])}）"
-        if definition:
-            text += f"：{definition}"
-        if formula:
-            text += f"；公式：{formula}"
-        out.append((priority, idx, text[:MAX_ATTRIBUTE_HINT_CHARS]))
+        # 与演化台验真卡共用构造器（M-3）：公式优先保完整，definition 用剩余预算，
+        # 避免长定义把公式截掉、两边看到的口径不一致。
+        out.append((priority, idx, build_metric_hint_text(
+            name=name, definition=definition, formula=formula,
+            aliases=aliases)))
     return out
 
 
@@ -193,16 +211,25 @@ def build_auto_hints(*, question: str, entity_name: str,
                      entity_types: list, abstract_entities: list,
                      constraints: list | None = None,
                      metrics: list | None = None,
-                     related: list[tuple[dict, dict | None]] | None = None) -> list[str]:
+                     related: list[tuple[dict, dict | None]] | None = None,
+                     exclude_metric_names: list[str] | None = None) -> list[str]:
     """组装本次提问的 hints（无可用材料 → `[]`，行为与没有 hints 相同）。
 
     `related` 是 1 跳邻居的 `(compiled_entity, abstract_entity)` 对，由调用方挑好
     （最多 `MAX_RELATED_ENTITIES` 个）；`constraints` 是已按锚点过滤过的口径约束。
+
+    `exclude_metric_names`：这些名字的指标定义**本次请求已由调用方覆盖**（请求级
+    指标 hints），自动 hints 不再注入同名旧定义。名字按 `str(...).strip()` **精确**
+    匹配（不模糊、不比对 aliases —— 同名才覆盖）；`None` / 空 ⇒ 行为逐字节不变。
     """
     question = _as_text(question)
     entity_name = _as_text(entity_name)
     if not entity_name:
         return []
+    if isinstance(exclude_metric_names, str):
+        exclude_metric_names = [exclude_metric_names]
+    exclude = {_as_text(name) for name in (exclude_metric_names or [])
+               if _as_text(name)}
     anchor = _find_entity(entity_types, entity_name)
     if anchor is None:
         return []
@@ -220,8 +247,9 @@ def build_auto_hints(*, question: str, entity_name: str,
         text = f"口径 {name}：{expression}" if name else f"口径：{expression}"
         candidates.append((6, idx, text[:MAX_ATTRIBUTE_HINT_CHARS]))
 
-    # 2. 指标（只带命中问句的）。
-    candidates.extend(_metric_hints(question, metrics or [], abstract_entities))
+    # 2. 指标（只带命中问句的；请求级覆盖的同名指标不再注入旧定义）。
+    candidates.extend(_metric_hints(question, metrics or [], abstract_entities,
+                                    exclude=exclude))
 
     # 3. 实体别名 / 抽象实体描述。
     aliases = _entity_aliases(abstract, entity_name)

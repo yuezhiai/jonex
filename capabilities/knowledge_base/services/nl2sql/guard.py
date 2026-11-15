@@ -28,6 +28,7 @@ from sqlglot import exp
 # 改那边等于改这里，改一处要改两处。
 from ..schema_source import normalize_engine
 from .forbidden import hit_forbidden
+from .table_ref import ref_matches, table_ref
 
 #: SQLite 风格布尔聚合 → PostgreSQL 原生函数。模型偶尔会写出
 #: `logical_and(...)`/`logical_or(...)`（SQLite 函数名），在 Postgres 上直接
@@ -94,26 +95,35 @@ _UNPARSEABLE_TABLE = "<无法解析的表名>"
 _TABLE_SOURCE_NODES = (exp.Table, exp.Subquery, exp.Paren, exp.Lateral, exp.Values)
 
 
-def _table_key(name: str) -> str:
-    """把表名归一成「最后一段的小写」：`dbo.Jobs` / `[dbo].[jobs]` / `` `jobs` `` → `jobs`。
+def _clean_ref(name) -> str:
+    """模型写的表名 → 小写点分名（**保留限定段**）；末尾孤点 → 空串。
 
-    **只比最后一段**是刻意的：清单里给的是限定名（`dbo.jobs`），而模型完全可能写不带 schema 的
-    `jobs` —— 在默认 schema 下那是同一张表，判越权属误伤。
+    保留限定段是白名单与「禁止同查」共用的口径（`table_ref`）：清单给 `sales.orders` 时，
+    模型写裸名 `orders` 仍命中（后缀匹配），而写 `archive.orders` **不**命中 ——
+    「同名的另一张表」正是表作用域校验要拦的东西。
 
-    ⚠️ 空段必须滤掉：`dbo.`（点后带空格被正则截断）归一成空串的话，会被下游的 `if t` 静默丢掉，
-    于是**整条校验对这句 SQL 失效**（实测过：`FROM dbo. apply_jobs` 曾整个绕过）。
-
-    滤空段只对**中间**那些段成立（`db..table` 是合法 T-SQL、空的是库名那段）：**末尾那个点**
-    是另一回事 —— `dbo.` 后面那张表压根没被正则收进来，它一个表名段都没给出。这时回空串，
-    交给 `_referenced_tables` 的哨兵兜住（回 `dbo` 会把 schema 名当表名，理由也说不清）。
+    滤空段只对**中间**那些段成立（`db..table` 是合法 T-SQL、空的是 schema 那段）：
+    **末尾那个点**是另一回事 —— `dbo.` 后面那张表压根没被正则收进来，它一个表名段都没给出。
+    这时回空串，交给 `_referenced_tables` 的哨兵兜住（回 `dbo` 会把 schema 名当表名）。
     """
-    cleaned = name.strip()
-    for ch in "[]`\"":
-        cleaned = cleaned.replace(ch, "")
-    if cleaned.endswith("."):
-        return ""
-    parts = [p for p in cleaned.split(".") if p]
-    return (parts[-1] if parts else "").strip().lower()
+    return ".".join(table_ref(name))
+
+
+def _original_spelling(normalized: str, body: str) -> str:
+    """在 SQL 原文里找回归一表名的模型原始写法（**只影响报错文案**）。
+
+    `_clean_ref` 会把表名压成小写；报错时显示模型原本写的 `dbo.Orders` /
+    `[dbo].[Orders]` 更容易对上用户的查询。匹配语义不变（比较仍用小写），
+    找不到就回归一后的写法 —— 不编一个原文里没有的名字。
+    """
+    parts = [part for part in str(normalized or "").split(".") if part]
+    if not parts:
+        return normalized
+    sep = r"\s*\.\s*"
+    edge = r'[\[\]`"]*\s*'
+    pattern = sep.join(f"{edge}{re.escape(part)}{edge}" for part in parts)
+    match = re.search(rf"(?<![\w$.]){pattern}", body, re.IGNORECASE)
+    return match.group(0).strip() if match else normalized
 
 
 def _ast_referenced_tables(body: str, engine: str) -> set[str] | None:
@@ -151,11 +161,15 @@ def _ast_referenced_tables(body: str, engine: str) -> set[str] | None:
         # CTE 名不能被 schema 限定：`public.apply_jobs` 里的 `apply_jobs` 是真表，
         # 不能因为同名的 CTE 存在就被剔掉（否则那句 SQL 的越权表会被静默放过）。
         qualified = bool((table.db or "").strip() or (table.catalog or "").strip())
-        key = _table_key(name)
-        if not qualified and key in cte_names:
+        if not qualified and name.lower() in cte_names:
             continue
+        # 保留限定段（`catalog.db.schema.table`，按非空段拼接）：白名单按后缀匹配逐条判。
+        # ⚠️ 必须用 `table.parts`（列出全部标识符）：四段名 `srv.db.schema.table` 在
+        # sqlglot 里 `schema.table` 落在 `this`（Dot）里 —— 按 `(catalog, db, name)`
+        # 拼会丢掉 `schema` 一段，与正则兜底口径不一致。
+        parts = [str(p).strip() for p in table.parts if str(p or "").strip()]
         # 归一后是空串（如带引号但内容只有点号的畸形名）不能被静默丢掉 —— 丢了 = 这条 SQL 免检。
-        found.add(key or _UNPARSEABLE_TABLE)
+        found.add(_clean_ref(".".join(parts)) or _UNPARSEABLE_TABLE)
     return found
 
 
@@ -168,10 +182,10 @@ def _regex_referenced_tables(body: str) -> set[str]:
     found: set[str] = set()
     for m in _TABLE_RE.finditer(body):
         raw = m.group(1)
-        if "." not in raw and _table_key(raw) in cte_names:
+        if "." not in raw and str(raw).strip().lower() in cte_names:
             continue
-        key = _table_key(raw)
-        found.add(key or _UNPARSEABLE_TABLE)
+        # 与 AST 路径同一口径：保留限定段，白名单按后缀逐条匹配。
+        found.add(_clean_ref(raw) or _UNPARSEABLE_TABLE)
     return found
 
 
@@ -326,7 +340,8 @@ def guard_sql(sql: str, *, engine: str, max_rows: int,
               forbidden_pairs=None, offset: int = 0) -> GuardResult:
     """校验并给 SQL 加上行数上限。
 
-    `allowed_tables` 是**这次允许碰的表名集合**（可含限定名，比对时归一成最后一段）；
+    `allowed_tables` 是**这次允许碰的表名集合**（可含限定名，按段序列后缀匹配：
+    裸名 `orders` 命中 `sales.orders`，而 `archive.orders` 不命中 —— 见 `table_ref`）；
     `None` = 不做表作用域校验 —— 既有调用点与既有用例走的就是这一档，行为与加这个参数
     之前**逐字节相同**。
 
@@ -386,16 +401,19 @@ def guard_sql(sql: str, *, engine: str, max_rows: int,
                 kind="forbidden_pair",
             )
     if allowed_tables is not None:
-        allowed = {_table_key(t) for t in allowed_tables if t}
+        allowed = [str(t).strip() for t in allowed_tables if str(t or "").strip()]
         # 兜底（**仅正则路径**）：带 FROM/JOIN 却有认不出来的表引用 → 拒。正常语句不可能是这个形状；
         # 出现它只说明提取器没认出这句（`FROM .db.dbo.apply_jobs` 这种前导点号、或别的畸形写法），
         # 而「认不出」绝不能等于「放行」—— 那正是这道校验存在的意义。
         # AST 解析成功时不跑这道：它本身就是正则实现，会把 `EXTRACT(... FROM 列)` 误报成漏认。
         if not ast_parsed and _has_unparsed_table_reference(body):
             return _reject(sql, "语句里的表名解析不出来，无法确认它只查了给定的表")
-        outside = sorted(referenced - allowed)
+        # 逐条后缀匹配（`table_ref` 唯一口径）：裸名 ⊑ 限定名，另一 schema 的同名表不命中。
+        outside = sorted(r for r in (referenced or ()) if not ref_matches(r, allowed))
         if outside:
-            return _reject(sql, "只允许查询给定的表，语句里出现了清单外的表：" + "、".join(outside))
+            # 报错保留模型原始大小写/引号写法（比较仍走小写归一）。
+            shown = [_original_spelling(r, body) for r in outside]
+            return _reject(sql, "只允许查询给定的表，语句里出现了清单外的表：" + "、".join(shown))
     if offset not in (0, None):
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             return _reject(sql, "offset 必须是非负整数", kind="pagination")

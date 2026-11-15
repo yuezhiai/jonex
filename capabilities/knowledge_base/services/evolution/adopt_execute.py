@@ -219,19 +219,19 @@ class AdoptExecuteMixin:
             scope = common.scope_for_kind(kind)
         except ValueError as exc:
             raise InvalidParameterError(message=str(exc)) from exc
-        # alias / synonym 批省略 `adhoc_verdicts` 且 picks 已排除全部待验真
-        # case：等价于「本次无需验真」，不能回落到 verify_adhoc 自动 judge
-        # （未被 apply 的 case 本来就没有候选数据可判）。与 `_preflight` 的
-        # 兼容分支同口径。
-        if (verdicts is None and kind in ("alias", "synonym")
+        # alias / synonym / metric 批省略 `adhoc_verdicts` 且 picks 已排除全部
+        # 待验真 case：等价于「本次无需验真」，不能回落到 verify_adhoc 自动
+        # judge（未被 apply 的 case 本来就没有候选数据可判）。与 `_preflight`
+        # 的兼容分支同口径。
+        if (verdicts is None and kind in ("alias", "synonym", "metric")
                 and common._unverified_adhoc_cases(run)
                 and not common.picked_adhoc_cases(run, picks)):
             verdicts = []
         # `execute` 是公开后台入口（accept 之后、恢复/另一个 worker 都可能直接
         # 调用）：人工判定与 accept 同口径，kind / 覆盖 / fail 在任何写库之前
-        # 校验。人工验真本期做 alias 与 synonym（spec §5）。
+        # 校验。人工验真本期做 alias / synonym / metric（spec §5）。
         if verdicts is not None:
-            if kind not in ("alias", "synonym"):
+            if kind not in ("alias", "synonym", "metric"):
                 raise InvalidParameterError(
                     message="该演化类型暂不支持人工验真")
             common._require_verdict_coverage(
@@ -1255,6 +1255,36 @@ class AdoptExecuteMixin:
                     }
                     await ledger.append(
                         tenant_id, ledger_type_for_kind("synonym"), entry,
+                        run_id=run_id)
+                elif kind == "metric":
+                    # 统一指标口径线：写抽象 schema 的 metrics，落 alias 那本
+                    # 账，用 `entry.kind="metric"` 区分。`source_entry` 按 name
+                    # 匹配（`entry_key` 对 metric 就是 name）；apply 的 added
+                    # 已带 `before` / `after`，台账只带出 `before`（回滚依据），
+                    # `after` 是回读核对用的批内目标态，不落账。
+                    source_entry = next(
+                        (x for x in entries
+                         if isinstance(x, dict)
+                         and common.entry_key(x, "metric")
+                         == common.entry_key(item, "metric")), {})
+                    entry = {
+                        "kind": "metric",
+                        "op": item.get("op") or source_entry.get("op"),
+                        "name": item.get("name") or source_entry.get("name"),
+                        "before": (item.get("before")
+                                   if "before" in item
+                                   else source_entry.get("before")),
+                        "kb": kb,
+                        "version_before": version_before,
+                        "version_after": version_after,
+                        "verified": True,
+                        "from_file": common._patch_hint(run_id),
+                        "backup": backup_hint,
+                        "at": at,
+                        "note": note,
+                    }
+                    await ledger.append(
+                        tenant_id, ledger_type_for_kind("metric"), entry,
                         run_id=run_id)
                 elif kind == "constraint":
                     # R4：仍写 query_rule 那本账，用 `entry.kind="constraint"` 区分；

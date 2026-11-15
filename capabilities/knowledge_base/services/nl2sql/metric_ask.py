@@ -477,6 +477,10 @@ class MetricAskMixin:
                 "metric_type": metric_type,
                 "additivity": metric.get("additivity") or "unknown",
                 "definition": metric.get("description") or "",
+                # 匹配档位（exact/alias/partial/description）：调用方据此决定
+                # 「要不要优先走指标」——partial 只说明沾边，不该抢 ② 的活。
+                "match_kind": hit.get("match_kind") or "",
+                "matched_term": hit.get("matched_term") or "",
             },
             "sql": exec_sql,
             "columns": columns,

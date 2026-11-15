@@ -64,6 +64,8 @@ from ..abstract_schema_canonical import canonical_abstract_snapshot_hash
 from ..evolution.schema_io import snapshot_from_row
 from ..evolution.version_store import canonical_snapshot_hash
 
+from . import semantics
+
 logger = logging.getLogger(__name__)
 
 #: active 版本查询：**一次索引查找**，只取 id 与 snapshot_hash（不搬 snapshot JSONB）。
@@ -352,6 +354,9 @@ async def _read_compiled_row(tenant_id: str, kb_id: str,
             # `evidence` 不是语义内容（不进快照），但多轮档的读料需要原样带上。
             "evidence": dict(r.evidence or {}),
             "schema_version": int(r.schema_version or 1),
+            # N1-5：语义 digest 随行缓存（同一份行只算一次）；语义变了但结构没变时
+            # payload 指纹/评测 series 仍能区分。
+            "semantic_digest": semantics.row_digest(r.entity_types or []),
         }
     return None
 

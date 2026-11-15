@@ -175,6 +175,7 @@ def entry_key(entry: dict, kind: str | None = None) -> str:
       被 update / disable 多次，人审 --pick 按 name 整组选中）
     - `synonym` → `词1/词2:canonical`（同批 term 不重复；canonical 进键让
       「同词换名」的候选与旧组可区分）
+    - `metric` → 指标 name（同批不同指标不能共用缺省空键互相串选）
 
     `kind` 缺省时保留旧调用口径（concept → alias，target_code → query_rule；
     relation 需要**四个端点字段齐全**才认，避免把普通条目的 source/target
@@ -186,7 +187,7 @@ def entry_key(entry: dict, kind: str | None = None) -> str:
         return f"{entry.get('concept')}:{entry.get('alias')}"
     if kind == "query_rule":
         return str(entry.get("target_code") or entry.get("expression") or "")
-    if kind in ("relation", "constraint", "tool_schema"):
+    if kind in ("relation", "constraint", "tool_schema", "metric"):
         return str(entry.get("name") or "")
     if kind == "mapping":
         # 同一抽象属性可以有多个落点（不同源/实体/列），只按 target_code 取键会

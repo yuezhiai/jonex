@@ -764,7 +764,11 @@ async def metric_options(tenant_id: str, kb_id: str) -> dict:
     schema, _status = _schema_body(data)
     out = []
     for metric in schema.get("metrics") or []:
-        if isinstance(metric, dict) and (metric.get("name") or "").strip():
+        # 停用指标不进候选：生产 `auto_hints._metric_hints` 对显式 `False` 一律
+        # 不注入 —— 列出来只会让用户选到一个永远不会生效的「候选」。只认布尔
+        # `False`（缺键 / `True` / 怪值都算启用，与归一化同口径）。
+        if isinstance(metric, dict) and metric.get("enabled") is not False \
+                and (metric.get("name") or "").strip():
             out.append({"name": metric["name"].strip(),
                         "additivity": metric.get("additivity") or "unknown"})
     return {"metrics": out}

@@ -33,11 +33,12 @@ logger = logging.getLogger(__name__)
 #: `relation` / `constraint` 与 `query_rule` **共用** compiled 链（P1-3 R1 /
 #: P1-4 R5）：同 scope、同锁、同 active 唯一键，不新增 scope / 迁移。
 #: `mapping` 与 `alias` 共用 abstract 链（P1-5：KB 级抽象 schema 的落点）；
-#: `tool_schema`（Tool-Schema 线）写抽象 schema 的 `tools` 覆盖块，同样属
-#: abstract 家族（同链、同锁、`ds=None`）。`synonym`（值同义词线）是**自己的
-#: 版本链 / 自己的锁**（`ds=None`）：不写抽象 schema，不能与 alias 等互斥。
+#: `tool_schema`（Tool-Schema 线）写抽象 schema 的 `tools` 覆盖块，`metric`
+#: （指标线）写抽象 schema 的 `metrics` 块，同样属 abstract 家族（同链、同锁、
+#: `ds=None`）。`synonym`（值同义词线）是**自己的版本链 / 自己的锁**
+#: （`ds=None`）：不写抽象 schema，不能与 alias 等互斥。
 _KIND_TO_SCOPE = {"alias": "abstract", "mapping": "abstract",
-                  "tool_schema": "abstract",
+                  "tool_schema": "abstract", "metric": "abstract",
                   "synonym": "synonym",
                   "query_rule": "compiled", "relation": "compiled",
                   "constraint": "compiled"}
@@ -47,23 +48,23 @@ _KIND_TO_SCOPE = {"alias": "abstract", "mapping": "abstract",
 _SCOPE_TO_KIND = {"abstract": "alias", "compiled": "query_rule",
                   "synonym": "synonym"}
 #: scope → 该链上的全部 kind（同链并发判定用；三条链各自互斥）。
-_KINDS_BY_SCOPE = {"abstract": ("alias", "mapping", "tool_schema"),
+_KINDS_BY_SCOPE = {"abstract": ("alias", "mapping", "tool_schema", "metric"),
                    "compiled": ("query_rule", "relation", "constraint"),
                    "synonym": ("synonym",)}
 
 #: compiled 家族的 kind（存储分支共用；schema_io / adopt_common 从这里导入）。
 COMPILED_KINDS = frozenset(_KINDS_BY_SCOPE["compiled"])
-#: abstract 家族的 kind（`alias` / `mapping` / `tool_schema`：KB 级同一
-#: 存储分支/版本链）。
+#: abstract 家族的 kind（`alias` / `mapping` / `tool_schema` / `metric`：
+#: KB 级同一存储分支/版本链）。
 ABSTRACT_KINDS = frozenset(_KINDS_BY_SCOPE["abstract"])
 #: synonym 家族的 kind（值同义词线；KB 级、独立版本链）。
 SYNONYM_KINDS = frozenset(_KINDS_BY_SCOPE["synonym"])
 
 
 def scope_for_kind(kind: str) -> str:
-    """`alias` / `mapping` / `tool_schema` → `abstract`（KB 级），`synonym`
-    → `synonym`（KB 级、独立链），`query_rule` / `relation` / `constraint`
-    → `compiled`（DS 级）。"""
+    """`alias` / `mapping` / `tool_schema` / `metric` → `abstract`（KB 级），
+    `synonym` → `synonym`（KB 级、独立链），`query_rule` / `relation` /
+    `constraint` → `compiled`（DS 级）。"""
     try:
         return _KIND_TO_SCOPE[str(kind)]
     except KeyError:
@@ -80,9 +81,9 @@ def kind_for_scope(scope: str) -> str:
 
 
 def kinds_for_scope(scope: str) -> tuple[str, ...]:
-    """该版本链上的全部 kind（abstract 链 = alias / mapping / tool_schema；
-    compiled 链 = `query_rule` + `relation` + `constraint`；synonym 链 =
-    `synonym`）。"""
+    """该版本链上的全部 kind（abstract 链 = alias / mapping / tool_schema /
+    metric；compiled 链 = `query_rule` + `relation` + `constraint`；synonym
+    链 = `synonym`）。"""
     try:
         return _KINDS_BY_SCOPE[str(scope)]
     except KeyError:
@@ -95,7 +96,8 @@ def is_compiled_kind(kind: str) -> bool:
 
 
 def is_abstract_kind(kind: str) -> bool:
-    """kind 是否落在 abstract 家族（`alias` / `mapping` / `tool_schema`）。"""
+    """kind 是否落在 abstract 家族（`alias` / `mapping` / `tool_schema` /
+    `metric`）。"""
     return str(kind) in ABSTRACT_KINDS
 
 

@@ -45,6 +45,7 @@ from .locking import (
     scope_for_kind,
     try_chain_lock,
 )
+from .metric_ops import apply_metric_entries
 from .run_store import RunStore
 from .smoke import adhoc_cases, run_smoke, verify_adhoc
 from .version_store import VersionStore, canonical_snapshot_hash
@@ -60,7 +61,13 @@ _PREVIEW_STATUSES = frozenset({"evaluated", "adopted"})
 #: `rolled-back` 也在内：重复回滚必须是幂等成功（`rollback.added` 已空 → 0 条），
 #: 不能因为「已经回滚过」报 409。
 _ROLLBACK_STATUSES = frozenset({"evaluated", "adopted", "rejected",
-                                "rolled-back"})
+                                "rolled-back",
+                                # `smoke-failed`：`_restore_after_failure` 已按
+                                # 台账把内容恢复回去了，此时回滚是一次幂等 no-op
+                                # （逆操作内容不变 → 不写库，只清账）。允许它是
+                                # 为了给出人话，而不是让用户对着「终态」干瞪眼
+                                # （2026-11-05 run_776a2e913c92 实测）。
+                                "smoke-failed"})
 #: `failed` 运行只在这些 stage 上允许回滚：`applied` / `candidate-ran` 是「PUT
 #: 已成功过」的证据（schema 里可能真的留着本批条目）；`created`/`drafted` 等
 #: 阶段的 failed 从未写过 schema，没有可逆操作，仍按状态冲突拒绝。
@@ -1226,6 +1233,12 @@ async def _trial(tenant_id: str, patch: dict,
         groups = (row.get("synonyms")
                   if isinstance(row.get("synonyms"), list) else [])
         planned, skipped = _plan_synonym_entries(groups, entries)
+    elif kind == "metric":
+        # 指标存在抽象 schema 的 `metrics` 块：必须走 metric_ops 的三 op 分支，
+        # 否则会落进 query_rule 的 add-only else，预览显示 planned=[] +
+        # skipped「expression 为空」的假计划。
+        schema = row.get("schema") if isinstance(row.get("schema"), dict) else {}
+        _, planned, skipped = apply_metric_entries(schema, entries)
     else:
         _, planned, skipped = apply_constraint_entries(row, entries)
     return planned, skipped

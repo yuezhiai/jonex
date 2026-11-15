@@ -17,6 +17,7 @@ import os
 
 from .forbidden import ForbiddenPair
 from .paths import EDGE_LINEAGE, Edge, confidence_of
+from .table_ref import is_same_table
 
 logger = logging.getLogger(__name__)
 
@@ -179,8 +180,17 @@ async def load_forbidden_pairs_from_db(session, tenant_id: str, kb_id: str,
             LineageForbiddenPair.is_deleted == 0,
         )
         rows = list((await session.execute(stmt)).scalars().all())
-        return [ForbiddenPair(table_a=str(r.table_a), table_b=str(r.table_b))
-                for r in rows]
+        pairs: list[ForbiddenPair] = []
+        for r in rows:
+            table_a, table_b = str(r.table_a), str(r.table_b)
+            # 历史遗留的同表对（`orders` / `dbo.orders`）会让 `_pair_hit` 用**一个**
+            # 引用同时命中两端 —— 任何单表查询都会被判「同现」而拒。读路径直接跳过。
+            if is_same_table(table_a, table_b):
+                logger.warning(
+                    "禁止同查表对两端是同一张表，已跳过：%s / %s", table_a, table_b)
+                continue
+            pairs.append(ForbiddenPair(table_a=table_a, table_b=table_b))
+        return pairs
     except (AssertionError, NameError, AttributeError, TypeError, KeyError):
         raise
     except Exception as exc:  # noqa: BLE001 —— 增能项，坏了一律退空

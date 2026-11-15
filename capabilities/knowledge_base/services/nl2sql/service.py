@@ -76,7 +76,10 @@ from ..evolution.tokens import EVOLUTION_USERNAME
 from . import multiturn
 from . import observe
 from . import schema_read
+from . import semantics
+from . import schema_retrieval
 from . import value_aliases
+from . import verified
 from .auto_hints import MAX_RELATED_ENTITIES, build_auto_hints
 from .ambiguity import find_ambiguities
 from .anchor_fallback import choose_anchor
@@ -85,7 +88,7 @@ from .constraints import filter_constraints
 from .cte_joins import selected_join_edges
 from .dimension_joins import build_dimension_joins
 from .evidence import pick_examples, pick_samples
-from .exec_errors import is_fixable_exec_error
+from .exec_errors import classify_exec_error, is_fixable_exec_error
 from .fewshot import (load_corpus_examples, load_examples, select_examples)
 from .format_predict import predict_format
 from .grain_hint import wants_entity_grain
@@ -105,6 +108,21 @@ from .schema_preview import build_schema_preview
 from .schema_select import select_schema, should_select_schema
 from .sample_rows import SAMPLE_CELL_CHARS, build_sample_sql, normalize_rows
 from .projection import ProjectionViolation, check_projection
+from .precompile import build_schema_map, check_precompile, format_precompile_note
+from .scope import (
+    Nl2SqlScope,
+    build_scope,
+    exec_allowed_tables as _exec_allowed_tables,
+    filter_secret_columns as _filter_secret_columns,
+    filter_secret_joins as _filter_secret_joins,
+    governance_decide as _governance_decide,
+    governance_level as _governance_level,
+    governance_tags as _governance_tags,
+    governance_tables as _governance_tables,
+    load_forbidden_pairs as _load_forbidden_pairs,
+    load_governance as _load_governance,
+)
+from .table_ref import ref_matches
 from .value_mapping import map_question_values
 from .value_grounding import (build_lookup_sql, extract_literals, pick_case_match,
                               pick_value_match, replace_literals)
@@ -134,6 +152,215 @@ def _on_shadow_done(task: asyncio.Task) -> None:
 _RETRY_MAX = 1
 
 
+# ---------------------------------------------------------------------------
+# N1-2 检索式 schema 选择的接线段（纯 helper，无 I/O，便于单测）
+# ---------------------------------------------------------------------------
+
+def merge_schema_candidates(base: list[dict], extra: list[dict]) -> list[dict]:
+    """把检索候选并进词面候选：按 `(data_source_id, entity_name)` 去重。
+
+    **base 优先**：同键的检索候选不覆盖词面候选（词面命中带 `_score`，是既有
+    打分的来源）；只追加 base 里没有的键。返回新列表 + 浅拷贝，不改入参。
+    """
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in list(base or []) + list(extra or []):
+        if not isinstance(candidate, dict):
+            continue
+        key = (str(candidate.get("data_source_id") or ""),
+               str(candidate.get("entity_name") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(candidate))
+    return merged
+
+
+def pick_anchor_candidate(candidates: list[dict],
+                          baseline_keys: set[tuple[str, str]],
+                          score_map: dict[tuple[str, str], float]
+                          ) -> tuple[dict | None, str]:
+    """N1-2 v1：检索是**召回增强**，不是锚点排序器。
+
+    基线（词面展开）候选保持锚点优先：只要候选键（`(ds, entity)`）在
+    `baseline_keys` 里，就取该候选（按原候选序，即词面排序）。基线一个候选都没有
+    时才退回「检索分最高」的候选（`score_map` 降序）。
+
+    返回 `(候选, anchor_choice)`；`anchor_choice` 落在 scene 里：
+    `schema_retrieval_baseline_first` / `schema_retrieval_top1` / `""`（无候选）。
+    """
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        key = (str(candidate.get("data_source_id") or ""),
+               str(candidate.get("entity_name") or ""))
+        if key in baseline_keys:
+            return candidate, "schema_retrieval_baseline_first"
+    ranked = sort_candidates_by_score(candidates, score_map)
+    if ranked:
+        return ranked[0], "schema_retrieval_top1"
+    return None, ""
+
+
+def build_filter_input_candidates(candidates: list[dict]) -> list[dict]:
+    """给 `filter_candidates` 的**只读副本**：剥掉检索候选的 `_score`。
+
+    检索分是 0–1000 的 `float`，词面展开分是 1–10 的 `int` —— 混量纲进筛选提示，
+    模型会把检索候选当强证据压过基线候选，逼回「检索 top1」锚点（本波要消除的
+    退化）。只剥 `match_kind == "schema_retrieval"` 的 `_score`，基线分数原样保留；
+    `_matches`/`_attr_hits` 等其余键与顺序不变。返回新列表 + 浅拷贝，不改入参
+    （`pre_filter` / `score_map` 仍依赖原分数）。
+    """
+    prepared: list[dict] = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            prepared.append(candidate)
+            continue
+        copy = dict(candidate)
+        if copy.get("match_kind") == "schema_retrieval":
+            copy.pop("_score", None)
+        prepared.append(copy)
+    return prepared
+
+
+def sort_candidates_by_score(candidates: list[dict],
+                             scores: dict[tuple[str, str], float]) -> list[dict]:
+    """按 `scores[(ds, entity)]` 降序排；同分按 `entity_name` 升序（确定性）。
+
+    `filter_candidates` 会剥掉 `_score`，所以分数表必须在筛选**前**从候选上抓，
+    筛选后再按 `(ds, entity)` 键回查。缺分的候选按 0 处理。
+    """
+    return sorted(
+        [dict(c) for c in (candidates or []) if isinstance(c, dict)],
+        key=lambda candidate: (
+            -float(scores.get((candidate.get("data_source_id"),
+                               candidate.get("entity_name")), 0.0) or 0.0),
+            str(candidate.get("entity_name") or "")))
+
+
+async def match_verified_query(tenant_id: str, kb_id: str, ds_id: str,
+                               question: str, *, engine: str, floor: float
+                               ) -> tuple[dict | None, dict | None, str | None,
+                                          float, str]:
+    """N1-1：匹配 active 模板 → 抽参 → 渲染 → stale 校验。
+
+    返回 `(row, values, sql, score, reason)`；未命中返回 `(None, None, None, 0, "")`。
+    `reason` 只在**命中但不可用**时非空（`params` / `render` / `parse` /
+    `stale_table` / `unknown_column` / `ambiguous_column`），供观测落 `verified_stale`。
+    compiled schema 行缺失时**只做方言解析**（fail-open：运行时由 guard 与数据库兜底）。
+    """
+    from ...repository.nl2sql_verified_query_repository import (
+        Nl2SqlVerifiedQueryRepository,
+    )
+
+    async with get_db_session() as session:
+        rows = await Nl2SqlVerifiedQueryRepository(session).list_active(
+            tenant_id, kb_id, ds_id)
+    if not rows:
+        return None, None, None, 0.0, ""
+    ranked = verified.rank_query(
+        question, [r.to_dict() for r in rows], floor=floor)
+    if ranked is None:
+        return None, None, None, 0.0, ""
+    row, score = ranked
+
+    values = verified.extract_params(question, row.get("params") or [])
+    if values is None:
+        return None, None, None, score, "params"
+    try:
+        sql = verified.render_template(
+            row.get("sql_template") or "", row.get("params") or [], values)
+    except ValueError:
+        return None, None, None, score, "render"
+
+    compiled = await schema_read.load_compiled_row(tenant_id, kb_id, ds_id)
+    if compiled:
+        schema_map = build_schema_map(compiled.get("entity_types") or [])
+        tables = verified.template_tables(sql, engine)
+        if tables is None:
+            return None, None, None, score, "parse"
+        known = {str(key).casefold() for key in schema_map}
+        missing = [
+            t for t in tables
+            if str(t).split(".")[-1].strip().strip('"[]`').casefold() not in known
+        ]
+        if missing:
+            return None, None, None, score, "stale_table"
+        violation = check_precompile(sql, engine=engine, schema_map=schema_map)
+        if violation is not None:
+            return None, None, None, score, violation.code
+    return row, values, sql, score, ""
+
+
+def inject_retrieved_columns(preview: list[dict],
+                             columns_by_table: dict[str, list[str]], *,
+                             max_extra: int = 10, max_chars: int = 3000) -> int:
+    """把检索命中的**物理列**前缀注入预览同名表；返回实际新增列数。
+
+    - 每表最多 `max_extra` 列；全局预算 `max_chars` 是**总预算**：先扣掉预览
+      已用的 `len(table)+Σlen(column)`，只剩差额可注入（不是每张表重给 3000）；
+    - 已在预览里的列（按 casefold 判重）不重复加；
+    - 就地改 `preview[i]["columns"]`（预览是本次请求的临时结构，无共享）。
+    """
+    if not preview or not columns_by_table:
+        return 0
+    per_table = max(0, int(max_extra))
+    if per_table <= 0:
+        return 0
+
+    def _preview_name(column) -> str:
+        raw = column.get("name") if isinstance(column, dict) else column
+        return str(raw or "").strip()
+
+    used = 0
+    for entry in preview:
+        if not isinstance(entry, dict):
+            continue
+        used += len(str(entry.get("table") or ""))
+        columns = entry.get("columns")
+        if isinstance(columns, list):
+            used += sum(len(_preview_name(column)) for column in columns)
+    remaining = max(0, int(max_chars) - used)
+    if remaining <= 0:
+        return 0
+    added_total = 0
+    for entry in preview:
+        if not isinstance(entry, dict) or remaining <= 0:
+            break
+        table = str(entry.get("table") or "")
+        columns = entry.get("columns")
+        retrieved = columns_by_table.get(table) if table else None
+        if not retrieved or not isinstance(columns, list):
+            continue
+        # 列可能是裸字符串（`schema_preview` 默认）或 `{"name": ...}`（
+        # `NL2SQL_PREVIEW_DETAILS` 开）—— 注入必须**保持原形状**，否则 payload 混型。
+        detailed = any(isinstance(column, dict) for column in columns)
+        seen = {
+            str((column.get("name") if isinstance(column, dict) else column)
+                or "").strip().casefold()
+            for column in columns
+        }
+        seen.discard("")
+        prepend: list[str] = []
+        for raw in retrieved:
+            if len(prepend) >= per_table:
+                break
+            name = str(raw or "").strip()
+            if not name or name.casefold() in seen:
+                continue
+            cost = len(name) + 1
+            if cost > remaining:
+                continue
+            seen.add(name.casefold())
+            prepend.append(name)
+            remaining -= cost
+        if prepend:
+            entry["columns"] = ([{"name": name} for name in prepend] if detailed
+                                else prepend) + columns
+            added_total += len(prepend)
+    return added_total
+
+
 async def _load_lineage_edges(tenant_id: str, kb_id: str, ds_id: str) -> list:
     """运行时血缘边：开一个短会话读表（`Nl2SqlService` 无状态，没有常驻 session）。
 
@@ -154,18 +381,6 @@ async def _load_lineage_edges(tenant_id: str, kb_id: str, ds_id: str) -> list:
         raise
     except Exception as exc:  # noqa: BLE001 —— 增能项：会话进入/退出与行映射的残余失败也退空图
         logger.warning("血缘边读表会话失败，本次退空图：%s", exc)
-        return []
-
-
-async def _load_forbidden_pairs(tenant_id: str, kb_id: str, ds_id: str) -> list:
-    """运行时禁止对；**始终加载**（安全闸必须生效，不受 `NL2SQL_JOIN_PATHS` 开关影响）。"""
-    try:
-        async with get_db_session() as session:
-            return await load_forbidden_pairs_from_db(session, tenant_id, kb_id, ds_id)
-    except (AssertionError, NameError, AttributeError, TypeError, KeyError):
-        raise
-    except Exception as exc:  # noqa: BLE001 —— 增能约束，会话层失败也退空
-        logger.warning("禁止同查表对读表会话失败，本次退空：%s", exc)
         return []
 
 
@@ -200,104 +415,19 @@ def _filter_join_plan(plan: JoinPlan, forbidden_pairs: list) -> JoinPlan:
     return JoinPlan(joins=kept, related_tables=related, truncated=plan.truncated)
 
 
-async def _load_governance(tenant_id: str, kb_id: str, ds_id: str,
-                           user_id: str | None) -> dict:
-    """读取本次提问的标签/策略/密级 + 编译 schema；失败 fail-open 到「无治理」。"""
-    try:
-        async with get_db_session() as session:
-            from ..governance.label_service import GovernanceLabelService
-            from ..governance.policy_service import GovernancePolicyService
-            from ..governance.clearance_service import GovernanceClearanceService
-            from ..governance.levels import effective_level, level_rank
-            labels = (await GovernanceLabelService(session).list(
-                tenant_id, kb_id, ds_id))["items"]
-            policies = (await GovernancePolicyService(session).list(
-                tenant_id, kb_id))["items"]
-            clearance = await GovernanceClearanceService(session).get(
-                tenant_id, user_id)
-        # 编译 schema **必须走版本化读口**（P1）：否则同一次提问会混用「缓存的
-        # schema 视图」与「现读的治理视图」—— 列集合不一致会产出假的
-        # `rejected_sensitive` / guard 拒绝，最长持续一个 TTL。放在治理会话**之外**
-        # 读：别占着连接池的一条连接再开第二个会话。
-        # 行不存在时 `tables_from_compiled_row` 抛 `InvalidParameterError`
-        # （与旧 `schema_tables` 同型）→ 下面同一条 fail-open 接住。
-        schema = schema_read.tables_from_compiled_row(
-            await schema_read.load_compiled_row(tenant_id, kb_id, ds_id))
-    except (AssertionError, NameError, AttributeError, TypeError, KeyError):
-        raise
-    except Exception as exc:  # noqa: BLE001 —— 治理是增能约束，读失败退空
-        # kb/ds 一并记：行缺失那条的异常文案不再带 ds（投影函数签名里没有它）。
-        logger.warning("治理数据读取失败，本次退空：kb=%s ds=%s err=%s",
-                       kb_id, ds_id, exc)
-        return {"active": False, "policies": [], "clearance": "public", "schema": {}}
+def _coerce_metric_hints(value) -> list[str]:
+    """`extra_metric_hints` 的**容器**归一：`str` → `[str]`，list/tuple 原样。
 
-    grouped: dict[tuple[str, str | None], list[dict]] = {}
-    for r in labels:
-        grouped.setdefault((r["table_name"], r["column_name"]), []).append(r)
-    col_levels: dict[tuple[str, str], str] = {}
-    table_levels: dict[str, str] = {}
-    tags: dict[tuple[str, str | None], set[str]] = {}
-    for (table, col), rows in grouped.items():
-        level = effective_level(rows)
-        if col is None:
-            table_levels[table] = level
-        else:
-            col_levels[(table, col)] = level
-        bucket: set[str] = set()
-        for r in rows:
-            bucket.update(str(t) for t in (r.get("tags") or ()) if str(t).strip())
-        tags[(table, col)] = bucket
-    # 表级是列级的下限
-    for (table, col), level in list(col_levels.items()):
-        floor = table_levels.get(table)
-        if floor and level_rank(floor) > level_rank(level):
-            col_levels[(table, col)] = floor
-    return {
-        "active": bool(labels or policies),
-        "col_levels": col_levels, "table_levels": table_levels,
-        "tags": tags, "policies": policies,
-        "clearance": clearance, "schema": schema,
-    }
-
-
-def _governance_tables(gov: dict, table: str) -> list[str]:
-    """SQL 表名 → 标签表名候选（精确优先，否则末段匹配）。"""
-    names = set(gov.get("table_levels") or {})
-    names |= {t for t, _ in (gov.get("col_levels") or {})}
-    if table in names:
-        return [table]
-    last = table.split(".")[-1].lower()
-    hits = [n for n in names if n.split(".")[-1].lower() == last]
-    return hits or [table]
-
-
-def _governance_level(gov: dict, table: str, column: str | None) -> str | None:
-    from ..governance.levels import max_level
-    levels: list[str | None] = []
-    for t in _governance_tables(gov, table):
-        if column is not None:
-            levels.append((gov.get("col_levels") or {}).get((t, column)))
-        levels.append((gov.get("table_levels") or {}).get(t))
-    found = [lv for lv in levels if lv]
-    return max_level(*found) if found else None
-
-
-def _governance_tags(gov: dict, table: str, column: str | None) -> list[str]:
-    out: set[str] = set()
-    for t in _governance_tables(gov, table):
-        out |= set((gov.get("tags") or {}).get((t, column)) or ())
-        out |= set((gov.get("tags") or {}).get((t, None)) or ())
-    return sorted(out)
-
-
-def _governance_decide(gov: dict, table: str, column: str | None, action: str):
-    from ..governance.pdp import decide
-    return decide(
-        clearance=str(gov.get("clearance") or "public"),
-        level=_governance_level(gov, table, column),
-        tags=_governance_tags(gov, table, column),
-        policies=list(gov.get("policies") or []),
-        action=action, table=table, column=column)
+    条数/长度预算**不在这里**管 —— 交给 `merge_hints` 的「超预算丢弃、不抛」
+    语义（验真不能因提示变长而 1001）。其它容器类型是调用方用错，抛。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise InvalidParameterError("extra_metric_hints 必须是字符串或字符串数组")
 
 
 def _hints_meta(texts: list[str]) -> dict:
@@ -314,60 +444,10 @@ def _sql_hash(sql: str) -> str:
     return hashlib.sha256(str(sql or "").encode("utf-8")).hexdigest()[:12]
 
 
-def _edge_ends(edge) -> tuple[str, str]:
-    if isinstance(edge, dict):
-        return (str(edge.get("from_table") or "").strip(),
-                str(edge.get("to_table") or "").strip())
-    return (str(getattr(edge, "from_table", "") or "").strip(),
-            str(getattr(edge, "to_table", "") or "").strip())
-
-
-def _exec_allowed_tables(*, anchor_entity: str, anchor_table: str,
-                         related_tables, known_tables, lineage_edges,
-                         join_edges=(), max_hops: int = 3) -> set[str]:
-    """执行工具的表白名单（A3）：与最终答案**同源**的那几张表。
-
-    - 锚点（实体名 + 物理表）+ 这次注入的 1 跳 related；
-    - 多跳路径表：从锚点出发、沿「join 边 ∪ 血缘边」在 `max_hops` 内**可达**、
-      且属于编译 schema 已知表的血缘端点。可达性过滤是必要的——只按「血缘端点 ∩
-      已知表」取交会把**与本题无关**的远端表也放进来（审查 #1），而最终答案的白名单
-      只含**实际注入的路径表**。
-    """
-    tables = {str(anchor_entity or "").strip(), str(anchor_table or "").strip()}
-    for t in related_tables or []:
-        tables.add(str((t or {}).get("table") or "").strip())
-    known = {str(t).strip() for t in known_tables or () if str(t).strip()}
-    adj: dict[str, set[str]] = {}
-    for edge in list(join_edges or []) + list(lineage_edges or []):
-        a, b = _edge_ends(edge)
-        if not a or not b:
-            continue
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-    # 锚点与 1 跳 related 是**已经交给模型**的表，本身就是可达起点（不一定在边池里）；
-    # 三者都为空时无从展开，白名单只剩空集（不能凭空造一个起点）。
-    reachable = {t for t in tables if t}
-    frontier = set(reachable)
-    for _ in range(max(0, int(max_hops))):
-        nxt: set[str] = set()
-        for t in frontier:
-            nxt |= adj.get(t, set())
-        nxt -= reachable
-        if not nxt:
-            break
-        reachable |= nxt
-        frontier = nxt
-    for edge in lineage_edges or []:
-        for t in _edge_ends(edge):
-            if t and t in known and t in reachable:
-                tables.add(t)
-    tables.discard("")
-    return tables
-
-
 def _build_exec_tool(*, source, cfg: dict, engine: str, allowed_tables: set[str],
-                     forbidden_pairs, gov: dict, gov_active: bool,
-                     stats: dict, max_rows: int | None = None
+                     scope: Nl2SqlScope,
+                     stats: dict, max_rows: int | None = None,
+                     schema_map: dict[str, set[str]] | None = None
                      ) -> Callable[[str], Awaitable[dict]]:
     """构造 `execute_sql` 的异步执行闭包（A3）：normalize → guard → 治理 → 只读执行。
 
@@ -383,21 +463,24 @@ def _build_exec_tool(*, source, cfg: dict, engine: str, allowed_tables: set[str]
         stats["calls"] += 1
         try:
             norm = normalize_dialect_sql(str(sql or "").strip(), engine)
-            guarded = guard_sql(norm, engine=engine, max_rows=max_rows,
-                                allowed_tables=allowed_tables,
-                                forbidden_pairs=forbidden_pairs)
+            guarded = scope.guard(norm, engine=engine, max_rows=max_rows,
+                                  allowed_tables=allowed_tables)
             if not guarded.ok:
                 stats["errors"] += 1
                 logger.info("NL→SQL 探索执行被安全闸拒绝: engine=%s reason=%s sql_hash=%s",
                             engine, guarded.reason, _sql_hash(norm))
                 return {"error": f"rejected: {guarded.reason}"}
+            # A1b：探索与最终答案同一套 schema 校验；未知列只回错误文本，不执行。
+            if config.NL2SQL_PRECOMPILE_CHECK and schema_map:
+                violation = check_precompile(
+                    guarded.sql, engine=engine, schema_map=schema_map)
+                if violation is not None:
+                    stats["errors"] += 1
+                    return {"error": "schema: " + violation.detail +
+                                     ". Use only the listed tables and columns."}
             exec_sql = guarded.sql
-            if gov_active:
-                from ..governance.sql_rewrite import apply_governance
-                gov_result = apply_governance(
-                    exec_sql, engine=engine,
-                    decide_fn=lambda t, c, a: _governance_decide(gov, t, c, a),
-                    schema=gov.get("schema") or {})
+            if scope.gov_active:
+                gov_result = scope.rewrite(exec_sql, engine=engine)
                 if not gov_result.ok:
                     stats["errors"] += 1
                     logger.info("NL→SQL 探索执行被治理拒绝: engine=%s reason=%s sql_hash=%s",
@@ -439,6 +522,14 @@ def _prompt_columns(columns: list[dict]) -> list[dict]:
             desc = str(column.get("description") or "").strip()[:120]
             if desc:
                 item["description"] = desc
+        if config.NL2SQL_COLUMN_SEMANTICS:
+            for key in ("role", "unit", "grain"):
+                value = str(column.get(key) or "").strip()
+                if value:
+                    item[key] = value[:64]
+            values = [str(v)[:64] for v in (column.get("values") or [])][:20]
+            if values:
+                item["values"] = values
         out.append(item)
     return out
 
@@ -517,41 +608,6 @@ def _want_cte_hint(joins, engine: str) -> bool:
     return str(engine or "").strip().lower() not in ("sqlserver", "mssql")
 
 
-def _filter_secret_columns(columns: list[dict], gov: dict, table: str) -> list[dict]:
-    from ..governance.levels import level_rank
-    clearance = str(gov.get("clearance") or "public")
-    out = []
-    for c in columns or ():
-        # 治理标签按**本体属性名**登记（logical）；列清单的 `name` 可能是物理名。
-        level = _governance_level(
-            gov, table, str(c.get("logical_name") or c.get("name") or ""))
-        if level == "secret" and level_rank(clearance) < level_rank("secret"):
-            continue
-        out.append(c)
-    return out
-
-
-def _filter_secret_joins(plan: JoinPlan, gov: dict, anchor_table: str) -> JoinPlan:
-    from ..governance.levels import level_rank
-    clearance = str(gov.get("clearance") or "public")
-    if level_rank(clearance) >= level_rank("secret"):
-        return plan
-    kept = []
-    for j in plan.joins:
-        if (_governance_level(gov, str(j.get("from_table") or ""),
-                              str(j.get("from_column") or "")) == "secret"
-                or _governance_level(gov, str(j.get("to_table") or ""),
-                                     str(j.get("to_column") or "")) == "secret"):
-            continue
-        kept.append(j)
-    if len(kept) == len(plan.joins):
-        return plan
-    tables = {str(j.get("to_table") or "") for j in kept}
-    related = [r for r in (plan.related_tables or [])
-               if str(r.get("table") or "") in tables]
-    return JoinPlan(joins=kept, related_tables=related, truncated=plan.truncated)
-
-
 async def _record_governance_audit(tenant_id: str, kb_id: str, ds_id: str,
                                    user_id: str | None, decisions: tuple,
                                    sql: str) -> None:
@@ -618,9 +674,17 @@ def _build_projection_note(violation: ProjectionViolation) -> str:
 
 
 
-def _table_key(name: str) -> str:
-    """表名归一（最后一段、小写）——与 guard 的白名单同口径。"""
-    return str(name or "").strip().split(".")[-1].strip('"`[]').casefold()
+def _anchor_tables(source_object_id: str, ent: str) -> set[str]:
+    """锚点的白名单项：**有物理表名就只用物理表名**。
+
+    实体名与表名同形时（`Orders` ↔ `public.orders`），把裸实体名也放进白名单会让
+    `archive.orders` 被后缀命中 —— 等于把跨 schema 收紧抵消掉。物理表名缺失时才回退实体名。
+    """
+    table = str(source_object_id or "").strip()
+    if table:
+        return {table}
+    name = str(ent or "").strip()
+    return {name} if name else set()
 
 
 def _build_empty_retry_note(sql: str, columns: list[dict]) -> str:
@@ -643,6 +707,15 @@ def _build_empty_retry_note(sql: str, columns: list[dict]) -> str:
     )
 
 
+def _is_numeric_score(score) -> bool:
+    """可排序/可回传的分数：`int`/`float`，**排除 `bool`**（bool 是 int 子类，会冒充 0/1）。
+
+    N1-2 检索分是 `float`（0–1000，三位小数），只认 `int` 会把它当「无分」，近失
+    排序与回传同时退化。
+    """
+    return isinstance(score, (int, float)) and not isinstance(score, bool)
+
+
 def _near_miss_rows(pre: list[dict], post: list[dict], filter_status: str) -> list[dict]:
     """候选近失池（≤5 条，`{entity_name, data_source_id, score}`）—— 设计 §5.3b。
 
@@ -656,7 +729,7 @@ def _near_miss_rows(pre: list[dict], post: list[dict], filter_status: str) -> li
     def _row(c: dict, score) -> dict:
         return {"entity_name": str(c.get("entity_name") or ""),
                 "data_source_id": str(c.get("data_source_id") or ""),
-                "score": score if isinstance(score, int) else None}
+                "score": score if _is_numeric_score(score) else None}
 
     if filter_status == "filtered" and post:
         scores = {(str(c.get("data_source_id") or ""), str(c.get("entity_name") or "")):
@@ -666,8 +739,11 @@ def _near_miss_rows(pre: list[dict], post: list[dict], filter_status: str) -> li
                                 str(c.get("entity_name") or ""))))
             for c in post[:observe.MAX_NEAR_MISS]
         ]
-    ranked = sorted(pre, key=lambda c: c.get("_score") if isinstance(c.get("_score"), int) else -1,
-                    reverse=True)
+    ranked = sorted(
+        pre,
+        key=lambda c: (c.get("_score") if _is_numeric_score(c.get("_score")) else -1),
+        reverse=True,
+    )
     return [_row(c, c.get("_score")) for c in ranked[:observe.MAX_NEAR_MISS]]
 
 
@@ -798,8 +874,11 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         user_id: str = "", username: str = "", ip: str = "",
         record_evidence: bool = True, observe_only: bool = False,
         evolution_run_id: str = "", hints: list[str] | str | None = None,
-            offset: int = 0,
-            extra_value_aliases: list[dict] | None = None,
+        offset: int = 0,
+        extra_value_aliases: list[dict] | None = None,
+        extra_metric_hints: list[str] | str | None = None,
+        extra_metric_names: list[str] | None = None,
+        trace_id: str | None = None,
     ) -> dict:
         """进程内问答（router 与演化评测共用同一条链路）。
 
@@ -830,6 +909,27 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         **候选召回前的问句改写**与 SQL 生成 payload 注入 —— 验真候选在召回阶段
         就能生效（否则零候选题仍会在改写前失败）。开关
         `NL2SQL_VALUE_ALIASES_ENABLED` 关闭时整个字段被忽略 —— 与不传逐字节相同。
+
+        `extra_metric_hints`（请求级指标 hints，演化台 metric 验真用）：字符串或
+        字符串列表（传 `str` 时整体作为一条），与调用方 `hints` 合并去重后只作用于
+        **本次请求**、不写库。与 `hints` 不同，它**不受 `NL2SQL_HINTS` 开关门控**
+        —— 验真必须能在生产开关关闭时看到候选指标的效果（`NL2SQL_HINTS` 只决定
+        库/调用方的普通 hints 是否进 payload）。边界与自动 hints 同一套预算：
+        单条超 500 字符**截断**；合计超 10 条 / 2000 字符时**丢弃超出的部分**
+        （extra 先入列，所以被丢的是其后的自动 hints / 值映射等——宁可少一条也不抛）。
+        `None` / 空列表 ⇒ 行为与引入前逐字节相同。
+
+        `extra_metric_names`（与 `extra_metric_hints` 并列）：这些名字的指标定义
+        **由本次请求覆盖**，自动 hints 不再注入库里的同名旧定义 —— 否则验证一个
+        「已存在指标的 update 候选」时，payload 会同时出现旧/新两条「指标 X」的
+        自相矛盾指令。名字按 `str(...).strip()` **精确**匹配（不模糊、不比对
+        aliases —— 同名才覆盖，与 `apply_metric_entries` 的 upsert 口径一致）。
+        `None` / 空 ⇒ 行为逐字节不变。
+
+        `trace_id`：本次检索链路的 trace。非空时原样透传给本链路所有模型 /
+        embedding 调用（`generate_sql`、`generate_sql_multiturn`、evidence 改写、
+        值映射、探查摘要、格式预测、schema 检索 embedding），使它们能归到同一次
+        检索 trace；`None` ⇒ 各 helper 自造 trace，行为与引入前逐字节相同。
         """
         tenant_id = require_tenant(tenant_id)
         # 版本化读取（P1）：每次提问从**空账本**开始 —— 之后 `_load_concepts` /
@@ -866,10 +966,11 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         # 任一条件不满足 ⇒ 普通提问，审计照写（观测标记不变）。绑定 `fail` 让 11 个
         # 失败出口不必各自传参（纯机械替换）。
         synthetic = bool(evolution_run_id) and username == EVOLUTION_USERNAME
-        # 失败出口的 `fail` 一次性绑定采样条件：11 个调用点不必各自传，
-        # 也不会把 evolution_run_id/observe_only 漏进 `**extra` 响应体。
+        # 端到端耗时起点（观测 `total_ms`）：`elapsed_ms` 只覆盖 SQL 执行那一段，
+        # 这里从进入问答链路起算。绑定进 `fail`，11 个失败出口才能同样带总耗时。
+        started_total = time.monotonic()
         fail = functools.partial(
-            self._fail, synthetic=synthetic,
+            self._fail, synthetic=synthetic, t0=started_total,
             evolution_run_id=evolution_run_id, observe_only=observe_only,
         )
         # W1.6 分页：offset 只影响执行 SQL（guard 追加 OFFSET），不改变默认行为。
@@ -877,8 +978,18 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 0 <= offset <= 1_000_000):
             raise InvalidParameterError(
                 message="offset 必须是 0..1000000 的整数")
+        # N1-1：verified 命中但 stale/不可用时的原因码（未触发时为空串 ⇒ 键不出现）。
+        verified_stale_code = ""
         # hints（A2）：开关关时**完全忽略**（请求形状不变）；开时 fail-closed 归一化。
         hint_texts = normalize_hints(hints) if config.NL2SQL_HINTS else []
+        # 请求级指标 hints（演化台 metric 验真）：**不受 `NL2SQL_HINTS` 门控** ——
+        # 验真必须在生产开关关闭时也能看到候选指标的效果。走 `merge_hints`：
+        # 与既有 hints 去重、超预算宁可少一条也不抛（验真不能因提示变长而 1001）。
+        # 容器先归一（`str` 整体作一条，不得被逐字符拆开）。
+        # `None` / 空 ⇒ 一次都不碰 `hint_texts`，payload 与引入前逐字节相同。
+        extra_metric_texts = _coerce_metric_hints(extra_metric_hints)
+        if extra_metric_texts:
+            hint_texts = merge_hints(hint_texts, extra_metric_texts)
         hints_meta = _hints_meta(hint_texts)
         # KB 存在性**必须在这里硬校验**：解析不到 KB 时下游只会回 `no_candidate`
         # （文案说「没命中任何已对齐的数据实体」），而真因可能是**这个库压根不存在** ——
@@ -899,7 +1010,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             # （`scene=None` ⇒ `{}`，与改动前逐字节相同）。
             bench_scene = (
                 observe.build_scene(multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
-                                    evolution_run=evolution_run_id,
+                                    evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                     mapping_slots=mapping_slots)
                 if evolution_run_id else None)
             return fail(
@@ -935,13 +1046,53 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 tenant_id, user_id, username, ip, q, "", "no_candidate",
                 "没有命中任何已对齐的数据实体",
                 scene=observe.build_scene(
-                    evolution_run=evolution_run_id,
+                    evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                     multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
                     value_alias_rewrite=alias_rewrites or None,
                     filter_status="skipped",
                     mapping_slots=mapping_slots),
                 kb_id=kb_id, record_evidence=record_evidence,
             )
+        # N1-2 检索式 schema 选择：在**观测补齐早退之后**、相关性筛选之前接线。
+        # 没有指定源时整段跳过（表块按源切，无源 = 无从检索，也不该多打一次嵌入）。
+        # `score_map` 必须在 `filter_candidates` 剥掉 `_score` **之前**抓；筛选后按
+        # `(data_source_id, entity_name)` 回查（见 `sort_candidates_by_score`）。
+        schema_retrieval_stats: dict = {}
+        schema_retrieval_scene: dict | None = None
+        retrieval_columns: dict[str, list[str]] = {}
+        score_map: dict[tuple[str, str], float] = {}
+        baseline_keys: set[tuple[str, str]] = set()
+        if config.NL2SQL_SCHEMA_RETRIEVAL and data_source_id:
+            (schema_retrieval_stats, retrieval_columns,
+             extra_candidates) = await self._schema_retrieval(
+                tenant_id, kb_id, data_source_id, q_retrieval, entities,
+                trace_id=trace_id)
+            # 合并前抓基线键：检索只补缺，基线候选的锚点优先权不能因合并而丢失。
+            baseline_keys = {
+                (str(c.get("data_source_id") or ""),
+                 str(c.get("entity_name") or ""))
+                for c in candidates if isinstance(c, dict)}
+            baseline_count = len(candidates)
+            if extra_candidates:
+                candidates = merge_schema_candidates(candidates, extra_candidates)
+            # 真正并进候选池的条数（去重后）：`len(extra_candidates)` 会把与基线
+            # 同键的检索候选也算进去，scene 与真实召回增量对不上。
+            merged_count = len(candidates) - baseline_count
+            score_map = {
+                (c.get("data_source_id"), c.get("entity_name")):
+                    float(c.get("_score") or 0)
+                for c in candidates}
+            if schema_retrieval_stats:
+                schema_retrieval_scene = {
+                    "candidates": merged_count,
+                    "unmapped_count": int(
+                        schema_retrieval_stats.get("unmapped_count") or 0),
+                    "unmapped_top": list(
+                        schema_retrieval_stats.get("unmapped_top") or []),
+                    "embed_degraded": bool(
+                        schema_retrieval_stats.get("embed_degraded")),
+                    "anchor_choice": "",
+                }
         # 近失池（运行时观测，设计 §5.3b）：筛前留一份 —— `filter_candidates` 的各返回
         # 路径恒过 `strip_private_keys`（`_score` 被剥），score 回填只能从这份拿。
         pre_filter = list(candidates)
@@ -961,10 +1112,36 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             # 请求已指定 data_source_id 时，先按源收窄再送筛：多源 KB 里同一问题
             # 可能命中别的源的实体，筛选模型会把目标源的候选一起筛掉（切库场景的
             # 真机问题）。收窄后为空仍走原路径，由 `_pick` 给 no_candidate。
-            filter_candidates_in = self._scope_candidates(candidates, data_source_id)
+            filter_candidates_in = build_filter_input_candidates(
+                self._scope_candidates(candidates, data_source_id))
             candidates, filter_status = await filter_candidates(
                 q_retrieval, filter_candidates_in, tenant_id=tenant_id, kb_id=kb_id)
-        picked, failure = self._pick(candidates, data_source_id, entity_name)
+        # N1-2 v1：检索是召回增强，不是锚点排序器。基线（词面）候选仍拿锚点，
+        # 检索只补基线没有的实体；只有基线**完全没有**候选时才允许检索 top1 当锚点。
+        # 点名 = 调用方已经选好了锚点，检索只富化候选、**不覆盖**；
+        # 关档 / 没跑检索 / 候选唯一 → 原 `_pick` 一字不动。
+        anchor_choice = ""
+        if schema_retrieval_stats and not entity_name and len(candidates) > 1:
+            picked, anchor_choice = pick_anchor_candidate(
+                candidates, baseline_keys, score_map)
+            failure = None
+            if picked is None:
+                picked, failure = self._pick(
+                    candidates, data_source_id, entity_name)
+        else:
+            picked, failure = self._pick(candidates, data_source_id, entity_name)
+        # 单候选（基线为空 / 检索只补进一个）时 `_pick` 直接取它 —— 这个锚点
+        # 实际来自检索，也必须记成 `schema_retrieval_top1`，否则 scene 看不出
+        # 「没有基线候选、答案是检索给的」。
+        if (picked is not None and not anchor_choice and schema_retrieval_stats
+                and not entity_name):
+            picked_key = (str(picked.get("data_source_id") or ""),
+                          str(picked.get("entity_name") or ""))
+            if picked_key not in baseline_keys:
+                anchor_choice = "schema_retrieval_top1"
+        if schema_retrieval_scene is not None and anchor_choice:
+            schema_retrieval_scene["anchor_choice"] = anchor_choice
+        # 无候选兜底（dev 线 W?）：候选为空且允许回退时，按源选一个锚点再试。
         if (picked is None and config.NL2SQL_NO_CANDIDATE_FALLBACK
                 and not entity_name and data_source_id
                 and failure is not None
@@ -983,13 +1160,14 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             return fail(tenant_id, user_id, username, ip, q,
                         data_source_id or "", code, reason,
                         scene=observe.build_scene(
-                            evolution_run=evolution_run_id,
+                            evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                             multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
                             value_alias_rewrite=alias_rewrites or None,
                             filter_status=filter_status,
                             near_miss=_near_miss_rows(pre_filter, candidates, filter_status),
                             recorder=recorder,
-                            mapping_slots=mapping_slots),
+                            mapping_slots=mapping_slots,
+                            schema_retrieval=schema_retrieval_scene),
                         kb_id=kb_id, record_evidence=record_evidence,
                         **extra)
 
@@ -1000,21 +1178,25 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 tenant_id, user_id, username, ip, q, ds_id, "entity_gone",
                 f"数据源里已经没有实体 {ent}（schema 可能重生成过）",
                 scene=observe.build_scene(multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
-                                          evolution_run=evolution_run_id,
+                                          evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                           value_alias_rewrite=alias_rewrites or None,
                                           anchor=ent, recorder=recorder,
-                                          mapping_slots=mapping_slots),
+                                          mapping_slots=mapping_slots,
+                                          schema_retrieval=schema_retrieval_scene),
                 kb_id=kb_id, entity_name=ent,
                 record_evidence=record_evidence)
         source_object_id, columns, join_plan, samples_by_column, raw_constraints = resolved
-        forbidden_pairs = await _load_forbidden_pairs(tenant_id, kb_id, ds_id)
+        # N1-3：一次提问构建一个 run 级 Scope —— 禁止对 / 治理快照 / 密级 / 表
+        # 白名单都从这里出；后续 guard / 治理改写 / 生成前过滤不再各自传参。
+        scope = await build_scope(tenant_id, kb_id, ds_id, user_id)
+        forbidden_pairs = list(scope.forbidden_pairs)
         join_plan = _filter_join_plan(join_plan, forbidden_pairs)
-        gov = await _load_governance(tenant_id, kb_id, ds_id, user_id)
-        gov_active = bool(config.GOVERNANCE_ENFORCEMENT_ENABLED and gov.get("active"))
+        gov = scope.gov
+        gov_active = scope.gov_active
         if gov_active:
             # 生成前预防：无权限看的 secret 列不进注入面（生成后仍有安全闸兜底）。
-            columns = _filter_secret_columns(columns, gov, source_object_id or ent)
-            join_plan = _filter_secret_joins(join_plan, gov, source_object_id or ent)
+            columns = scope.filter_columns(columns, source_object_id or ent)
+            join_plan = scope.filter_joins(join_plan, source_object_id or ent)
         # 证据按需注入：只给「像枚举」的列；没有证据时一个键都不加（payload 与今天逐字节相同）
         columns = [{**c, **({"samples": samples_by_column[c.get("logical_name") or c["name"]]}
                             if (c.get("logical_name") or c["name"]) in samples_by_column else {})}
@@ -1028,7 +1210,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         if config.NL2SQL_HINTS and config.NL2SQL_AUTO_HINTS:
             auto = await self._auto_hints(
                 tenant_id=tenant_id, kb_id=kb_id, ds_id=ds_id, question=q_retrieval, ent=ent,
-                join_plan=join_plan, constraints=constraints, abstract_entities=entities)
+                join_plan=join_plan, constraints=constraints, abstract_entities=entities,
+                exclude_metric_names=extra_metric_names)
             if auto:
                 hint_texts = merge_hints(hint_texts, auto)
                 hints_meta = _hints_meta(hint_texts)
@@ -1036,7 +1219,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         if config.NL2SQL_HINTS and config.NL2SQL_EVIDENCE_REWRITE and hint_texts:
             rewritten = await rewrite_evidence_hints(
                 q_retrieval, hint_texts, tenant_id=tenant_id, kb_id=kb_id,
-                user_id=user_id or "")
+                user_id=user_id or "", trace_id=trace_id)
             if rewritten:
                 hint_texts = merge_hints(hint_texts, rewritten)
                 hints_meta = {**_hints_meta(hint_texts), "rewritten": True}
@@ -1062,7 +1245,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 try:
                     mapped = await map_question_values(
                         q_retrieval, values_by_column, hints=hint_texts or None,
-                        tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "")
+                        tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "",
+                        trace_id=trace_id)
                 except Exception as exc:  # noqa: BLE001 —— 值映射是增能，失败跳过
                     logger.warning("值映射失败（跳过）: %s", exc)
                     mapped = {}
@@ -1081,7 +1265,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             try:
                 summaries = await summarize_columns(
                     q_retrieval, summaries_by_column, tenant_id=tenant_id, kb_id=kb_id,
-                    user_id=user_id or "")
+                    user_id=user_id or "", trace_id=trace_id)
             except Exception as exc:  # noqa: BLE001 —— 摘要是增能，失败跳过
                 logger.warning("探查摘要失败（跳过）: %s", exc)
                 summaries = {}
@@ -1165,6 +1349,15 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                         preview_kwargs.update(include_details=True)
                     schema_preview, preview_tables = build_schema_preview(
                         entity_types, **preview_kwargs)
+        # N1-2：把检索命中的**物理列**前缀注入预览同名表（只加列、不加表 ——
+        # `preview_tables`/安全闸白名单因此不受影响）。开关关 / 无检索列 → 不调用，
+        # 预览与今天逐字节相同。
+        retrieval_columns_added = 0
+        if (config.NL2SQL_SCHEMA_RETRIEVAL and retrieval_columns
+                and schema_preview):
+            retrieval_columns_added = inject_retrieved_columns(
+                schema_preview, retrieval_columns,
+                max_extra=config.NL2SQL_SCHEMA_RETRIEVAL_MAX_EXTRA_COLUMNS)
         # 同库 few-shot（2026-10-29）：按当前表集合从语料里挑 ≤K 条；读不到就跳过。
         # 生产入口（2026-10-30）：路径为空且开 FROM_CORPUS 时，从演化台同库语料读。
         few_shots: list[dict] = []
@@ -1216,6 +1409,9 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             # 诊断用：把选择器实际选中的**表**（只表名、不含列）写进观测，
             # 用于区分「CTE 漏选」与「模型没写 join」。截 64 个，杜绝大 schema 撑大 scene。
             preview_stats["cte_tables"] = sorted(str(t) for t in preview_tables)[:64]
+        # N1-2：检索列注入计数（开关关 ⇒ 键不出现，preview_stats 与今天逐字节相同）。
+        if config.NL2SQL_SCHEMA_RETRIEVAL:
+            preview_stats["retrieval_columns_added"] = retrieval_columns_added
 
         try:
             target = await self._ds.query_config(tenant_id, ds_id)
@@ -1229,12 +1425,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             return fail(tenant_id, user_id, username, ip, q, ds_id, code,
                         f"{type(exc).__name__}: {str(exc)[:200]}",
                         scene=observe.build_scene(multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
-                                                  evolution_run=evolution_run_id,
+                                                  evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                                   value_alias_rewrite=alias_rewrites or None,
                                                   anchor=ent, recorder=recorder,
                                                   concept_fields=len(concept_fields),
                                                   concept_columns=n_concept_cols,
-                                                  mapping_slots=mapping_slots),
+                                                  mapping_slots=mapping_slots,
+                                                  schema_retrieval=schema_retrieval_scene),
                         kb_id=kb_id, entity_name=ent,
                         record_evidence=record_evidence)
         if target is None:
@@ -1242,16 +1439,136 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 tenant_id, user_id, username, ip, q, ds_id, "no_readonly_creds",
                 "该数据源未登记只读凭据，不能执行查询（请在连接池里补只读账号）",
                 scene=observe.build_scene(multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta,
-                                          evolution_run=evolution_run_id,
+                                          evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                           value_alias_rewrite=alias_rewrites or None,
                                           anchor=ent, recorder=recorder,
                                           concept_fields=len(concept_fields),
                                           concept_columns=n_concept_cols,
-                                          mapping_slots=mapping_slots),
+                                          mapping_slots=mapping_slots,
+                                          schema_retrieval=schema_retrieval_scene),
                 kb_id=kb_id, entity_name=ent,
                 record_evidence=record_evidence)
         source, cfg = target
         engine = str(cfg.get("engine") or "")
+        # ── N1-1 已验证查询快路径 ───────────────────────────────────────────
+        # 命中 KB 级带参模板 ⇒ 渲染后走**同一条** guard → 治理 → 执行链，不调 LLM。
+        # 开关关 / 演化基准流量 / 未命中 / stale 都直接落到下面的正常链路；
+        # 关档时连仓储都不读（响应/观测与引入前逐字节相同）。
+        if config.NL2SQL_VERIFIED_QUERY and not evolution_run_id:
+            (_vq_row, _vq_values, _vq_sql, _vq_score, _vq_reason,
+             ) = await match_verified_query(
+                tenant_id, kb_id, ds_id, q, engine=engine,
+                floor=float(config.NL2SQL_VERIFIED_MATCH_FLOOR))
+            verified_stale_code = _vq_reason if _vq_row is None else ""
+            _vq_scene = observe.build_scene(
+                multiturn=config.NL2SQL_MULTITURN, anchor=ent,
+                evolution_run=evolution_run_id, verified_stale=verified_stale_code,
+                value_alias_rewrite=alias_rewrites or None,
+                recorder=recorder,
+                concept_fields=len(concept_fields),
+                concept_columns=n_concept_cols,
+                mapping_slots=mapping_slots,
+                schema_retrieval=schema_retrieval_scene,
+                verified=({"id": _vq_row["id"], "name": _vq_row["name"],
+                           "score": _vq_score,
+                           "params": sorted(_vq_values or {})}
+                          if _vq_row is not None else None))
+            if _vq_row is not None:
+                _vq_tables = verified.template_tables(_vq_sql, engine) or set()
+                _vq_guarded = scope.guard(
+                    _vq_sql, engine=engine,
+                    max_rows=config.NL2SQL_MAX_ROWS, allowed_tables=_vq_tables)
+                if not _vq_guarded.ok:
+                    return fail(
+                        tenant_id, user_id, username, ip, q, ds_id,
+                        "rejected_unsafe_sql", _vq_guarded.reason,
+                        rejected_sql=_vq_guarded.sql,
+                        rejection_kind=_vq_guarded.kind or "guard",
+                        audit_extra={"verified_query_id": _vq_row["id"]},
+                        scene=_vq_scene, kb_id=kb_id, entity_name=ent,
+                        record_evidence=record_evidence)
+                _vq_exec_sql = _vq_guarded.sql
+                if gov_active:
+                    from ..governance.sql_rewrite import apply_governance
+                    _vq_gov = scope.rewrite(_vq_guarded.sql, engine=engine)
+                    if not _vq_gov.ok:
+                        return fail(
+                            tenant_id, user_id, username, ip, q, ds_id,
+                            "rejected_sensitive", _vq_gov.reason,
+                            rejected_sql=_vq_guarded.sql,
+                            rejection_kind=_vq_gov.kind or "deny",
+                            audit_extra={"verified_query_id": _vq_row["id"]},
+                            scene=_vq_scene, kb_id=kb_id, entity_name=ent,
+                            record_evidence=record_evidence)
+                    _vq_exec_sql = _vq_gov.sql
+                    if not synthetic:
+                        await _record_governance_audit(
+                            tenant_id, kb_id, ds_id, user_id, _vq_gov.decisions,
+                            _vq_guarded.sql)
+                _vq_started = time.monotonic()
+                try:
+                    _vq_result = await run_readonly(source, cfg, _vq_exec_sql)
+                except Exception as exc:  # noqa: BLE001 —— 与正常链路同口径归类
+                    _vq_info = classify_exec_error(exc)
+                    logger.warning(
+                        "NL→SQL verified 执行失败: ds=%s engine=%s category=%s err=%s",
+                        ds_id, engine, _vq_info.category, exc)
+                    return fail(
+                        tenant_id, user_id, username, ip, q, ds_id, "exec_failed",
+                        _vq_info.safe_message, sql=_vq_exec_sql,
+                        audit_extra={
+                            "verified_query_id": _vq_row["id"],
+                            "exec_error_category": _vq_info.category,
+                            "exec_error_detail": _vq_info.detail,
+                        },
+                        scene={**_vq_scene,
+                               "exec_error": {"category": _vq_info.category,
+                                              "detail": _vq_info.detail}},
+                        kb_id=kb_id, entity_name=ent,
+                        record_evidence=record_evidence)
+                _vq_elapsed_ms = int((time.monotonic() - _vq_started) * 1000)
+                if record_evidence:
+                    if not synthetic:
+                        self._audit(tenant_id, user_id, username, ip, ds_id, q,
+                                    _vq_exec_sql, _vq_result["row_count"],
+                                    _vq_elapsed_ms,
+                                    extra={"verified_query_id": _vq_row["id"]})
+                    self._observe(
+                        tenant_id=tenant_id, kb_id=kb_id, data_source_id=ds_id,
+                        question=q, outcome="success", entity_name=ent,
+                        sql=_vq_exec_sql, row_count=_vq_result["row_count"],
+                        elapsed_ms=_vq_elapsed_ms,
+                        total_ms=int((time.monotonic() - started_total) * 1000),
+                        scene=_vq_scene)
+                logger.info(
+                    "NL→SQL verified 命中: ds=%s vq=%s rows=%d elapsed_ms=%d",
+                    ds_id, _vq_row["id"], _vq_result["row_count"], _vq_elapsed_ms)
+                return {
+                    "ok": True,
+                    "not_answerable": False,
+                    "data_source_id": ds_id,
+                    "source_name": ds_names.get(ds_id, ""),
+                    "entity_name": ent,
+                    "sql": _vq_exec_sql,
+                    "columns": _vq_result["columns"],
+                    "rows": [[_jsonable(v) for v in row]
+                             for row in _vq_result["rows"]],
+                    "row_count": _vq_result["row_count"],
+                    "truncated": _vq_guarded.limit_applied,
+                    "source": "verified",
+                    "verified_query_id": _vq_row["id"],
+                    "verified_query_name": _vq_row["name"],
+                }
+        # A1b：执行前 schema 级校验用的表→列索引。优先用编译行（缓存命中零会话）；
+        # 行缺失时用本次已加载的锚点/1 跳/预览拼一份（缺表会让校验 fail-open）。
+        precompile_schema: dict[str, set[str]] = {}
+        if config.NL2SQL_PRECOMPILE_CHECK:
+            _pc_row = await schema_read.load_compiled_row(tenant_id, kb_id, ds_id)
+            if _pc_row:
+                precompile_schema = build_schema_map(_pc_row.get("entity_types") or [])
+        # 行缺失（并发重生成/行被删）时留空 map ⇒ check_precompile fail-open；
+        # 不再用锚点/预览拼兜底（预览列的 shape 在关闭 DETAILS 时是字符串，
+        # 拼接分支既是死代码、又会在竞态下抛 AttributeError —— 复审 Minor #7）。
         # P2-4b 采样行：只对预览表、只 SELECT 指定列；失败 fail-open。
         if config.NL2SQL_SAMPLE_ROWS and schema_preview and not gov_active:
             preview_stats.update(await self._attach_sample_rows(
@@ -1288,7 +1605,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     q_retrieval, engine=engine, table_name=source_object_id or ent,
                     columns=_prompt_columns(columns), joins=join_plan.joins,
                     hints=hint_texts or None, tenant_id=tenant_id,
-                    kb_id=kb_id, user_id=user_id or "")
+                    kb_id=kb_id, user_id=user_id or "", trace_id=trace_id)
             except Exception as exc:  # noqa: BLE001 —— 预测是增能，失败不影响生成
                 logger.warning("格式预测失败（跳过）: %s", exc)
         format_stats = {"cols": len(answer_format)}
@@ -1307,7 +1624,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 q_retrieval, table_name=source_object_id or ent, columns=_prompt_columns(columns),
                 joins=join_plan.joins, related_tables=join_plan.related_tables,
                 constraints=constraints, hints=hint_texts or None, today=today_text,
-                tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "")
+                tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "",
+                trace_id=trace_id)
             plan_stats = {"chars": len(plan_text)}
         # 值同义词（P1，2026-11-04）：**只在真要生成 SQL 时**按问句词面命中 KB 级
         # `ontology_synonyms`，只挑相关的组（`extra_value_aliases` 同 term 覆盖库值、
@@ -1333,6 +1651,11 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         retried, first_error = False, None
         # 投影契约（A1）：每题最多修复一次；第二次仍违规就按现状返回。
         projection_retried, projection_code = False, ""
+        # A1b：执行前 schema 校验，每题最多重写一次；独立预算。
+        precompile_retried, precompile_code = False, ""
+        precompile_fallback: dict | None = None
+        precompile_fallback_meta: dict | None = None
+        precompile_fallback_payload = ""
         # 投影重写失败时的兜底：第一次生成的 SQL 虽然违反投影契约，但通常是**可执行**的
         # ——重写那一轮回 not_answerable / 生成崩了时，不能把已有答案丢掉（A1 审查 #4）。
         # 空结果修复（P0-2）：独立预算，最多一次；不占 B/投影的额度。
@@ -1351,12 +1674,17 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         # payload 版本指纹（Task 4）：每次成功生成后从结果里取出（只送观测 scene）。
         # 循环外初始化：llm_failed 那一档拿不到当次指纹（生成没成），键不落。
         payload_version = ""
+        # N1-5：语义条目 digest（只在开关开时算；关档不传 ⇒ payload 逐字节不变）。
+        # 同一问句、同一结构下语义（role/unit/grain/values/description）变了 ⇒ 指纹变。
+        semantic_digest = (semantics.columns_digest(_prompt_columns(columns))
+                           if config.NL2SQL_COLUMN_SEMANTICS else "")
         # A3 执行工具的每问统计（跨尝试共享，只进观测 scene；开关关时恒 0）。
         exec_stats = {"calls": 0, "rows": 0, "errors": 0}
         value_stats = {"calls": 0, "hits": 0}
         candidate_stats = {"count": 1, "choice": 1}
         max_attempts = (_RETRY_MAX + 1
                         + (1 if config.NL2SQL_PROJECTION_CONTRACT else 0)
+                        + (1 if config.NL2SQL_PRECOMPILE_CHECK else 0)
                         + (1 if config.NL2SQL_EMPTY_REPAIR else 0)
                         + (1 if config.NL2SQL_LLM_RETRY else 0)
                         + (1 if config.NL2SQL_UNIT_TESTER else 0))
@@ -1398,7 +1726,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                         exec_tool = _build_exec_tool(
                             source=source, cfg=cfg, engine=engine,
                             allowed_tables=_exec_allowed_tables(
-                                anchor_entity=ent, anchor_table=source_object_id or ent,
+                                # 物理名优先的回退只在 `exec_allowed_tables` 里实现一次。
+                                anchor_entity=ent, anchor_table=source_object_id,
                                 related_tables=join_plan.related_tables,
                                 known_tables=known_tables,
                                 lineage_edges=lineage_edges,
@@ -1406,8 +1735,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                     row["relation_types"], row["entity_types"],
                                     forbidden_pairs=forbidden_pairs),
                                 max_hops=config.NL2SQL_JOIN_PATHS_MAX_HOPS),
-                            forbidden_pairs=forbidden_pairs,
-                            gov=gov, gov_active=gov_active, stats=exec_stats)
+                            scope=scope, stats=exec_stats,
+                            schema_map=precompile_schema)
                     generated = await asyncio.wait_for(
                         multiturn.generate_sql_multiturn(
                             q_retrieval,
@@ -1435,12 +1764,14 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             max_rounds=config.NL2SQL_MULTITURN_MAX_ROUNDS,
                             max_tool_calls_per_round=config.NL2SQL_MULTITURN_MAX_TOOL_CALLS_PER_ROUND,
                             tenant_id=tenant_id, kb_id=kb_id, user_id=user_id,
+                            trace_id=trace_id,
                             retry_note=retry_note,
                             concept_fields=concept_fields or None,
                             projection_contract=config.NL2SQL_PROJECTION_CONTRACT,
                             hints=hint_texts or None,
                             # 值同义词（P1）：多轮首发同样按需注入（零命中/开关关 ⇒ None）。
                             value_aliases=aliases or None,
+                            semantics_digest=semantic_digest,
                             plan_text=plan_text or None,
                             schema_preview=schema_preview or None,
                             preview_details=preview_details,
@@ -1491,6 +1822,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             concept_fields=concept_fields or None,
                             # 值同义词（P1）：零命中 / 开关关 ⇒ None（payload 键不出现）。
                             value_aliases=aliases or None,
+                            semantics_digest=semantic_digest,
                             projection_contract=config.NL2SQL_PROJECTION_CONTRACT,
                             hints=hint_texts or None, plan=plan_text or None,
                             schema_preview=schema_preview or None,
@@ -1519,6 +1851,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 | {str(t.get("table") or "")
                                    for t in (join_plan.related_tables or [])}),
                             tenant_id=tenant_id, kb_id=kb_id, user_id=user_id,
+                            trace_id=trace_id,
                             retry_note=retry_note, today=today_text,
                         ),
                         timeout=float(config.NL2SQL_LLM_TIMEOUT),
@@ -1548,7 +1881,17 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 # 答不了」而不是让传输层错误逃成 500。**不静默**：有 warning、有原文。
                 # （`asyncio.CancelledError` 是 `BaseException`，不受这里影响，照旧上抛。）
                 logger.warning("NL→SQL 生成失败: kb=%s ds=%s err=%s", kb_id, ds_id, exc)
-                if projection_fallback is not None:
+                if precompile_fallback is not None:
+                    # schema 校验重写那轮崩了：回退到首发 SQL，继续走 guard/执行。
+                    # A1b 是质量门，不能把「有答案」降级成 llm_failed。
+                    logger.warning(
+                        "NL→SQL schema 校验重写失败，回退首发 SQL: kb=%s ds=%s",
+                        kb_id, ds_id)
+                    generated = precompile_fallback
+                    payload_version = precompile_fallback_payload
+                    precompile_fallback = None
+                    llm_extra = precompile_fallback_meta
+                elif projection_fallback is not None:
                     # 投影重写那轮崩了：回退到第一次生成（它已过 guard/治理的**前置**面，
                     # 只是投影形状不理想）。不把「有答案」降级成 llm_failed。
                     logger.warning("NL→SQL 投影重写失败，回退首发 SQL: kb=%s ds=%s", kb_id, ds_id)
@@ -1574,7 +1917,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             # 异常档**无 rounds**（设计 §4.2：取不到当次 meta）——
                             # 但 recorder 里的轨迹照带（观测相对审计的增值点）。
                             scene=observe.build_scene(
-                                evolution_run=evolution_run_id,
+                                evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                 value_alias_rewrite=alias_rewrites or None,
                                 multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                                 recorder=recorder, retried=retried,
@@ -1582,10 +1925,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 concept_fields=len(concept_fields),
                                 concept_columns=n_concept_cols,
                                 mapping_slots=mapping_slots,
+                                precompile_violation=precompile_code,
+                                precompile_retried=precompile_retried,
                                 exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats),
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene),
                             kb_id=kb_id, entity_name=ent,
                             record_evidence=record_evidence)
             if hints_meta:
@@ -1641,6 +1987,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 | {str(t.get("table") or "")
                                    for t in (join_plan.related_tables or [])}),
                             tenant_id=tenant_id, kb_id=kb_id, user_id=user_id,
+                            trace_id=trace_id,
                             retry_note=note, today=today_text),
                         timeout=float(config.NL2SQL_LLM_TIMEOUT),
                     )
@@ -1668,7 +2015,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     path_t = {str(t).strip()
                               for t in ((generated.get("meta") or {}).get("path_tables") or ())}
                     path_t.discard("")
-                    vote_allowed = ({source_object_id or ent, ent}
+                    vote_allowed = (_anchor_tables(source_object_id, ent)
                                     | {str(t.get("table") or "")
                                        for t in (join_plan.related_tables or [])}
                                     | (path_t & known)
@@ -1722,6 +2069,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             concept_fields=concept_fields or None,
                             # 值同义词（P1）：零命中 / 开关关 ⇒ None（payload 键不出现）。
                             value_aliases=aliases or None,
+                            semantics_digest=semantic_digest,
                             projection_contract=config.NL2SQL_PROJECTION_CONTRACT,
                             hints=hint_texts or None, plan=plan_text or None,
                             schema_preview=schema_preview or None,
@@ -1745,6 +2093,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 | {str(t.get("table") or "")
                                    for t in (join_plan.related_tables or [])}),
                             tenant_id=tenant_id, kb_id=kb_id, user_id=user_id,
+                            trace_id=trace_id,
                             retry_note=alt_note, today=today_text),
                         timeout=float(config.NL2SQL_LLM_TIMEOUT),
                     )
@@ -1761,7 +2110,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     else:
                         picked = await select_candidate(
                             q_retrieval, [{"sql": generated["sql"]}, {"sql": alt["sql"]}],
-                            tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "")
+                            tenant_id=tenant_id, kb_id=kb_id, user_id=user_id or "",
+                            trace_id=trace_id)
                         candidate_stats["choice"] = int(picked.get("index", 0)) + 1
                         if candidate_stats["choice"] == 2:
                             generated = {"sql": alt["sql"]}
@@ -1775,12 +2125,20 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                 projection_code = projection_fallback_code
                 projection_fallback = None
                 llm_extra = projection_fallback_meta
+            if generated.get("not_answerable") and precompile_fallback is not None:
+                logger.info(
+                    "NL→SQL schema 校验重写回 not_answerable，回退首发 SQL: kb=%s ds=%s",
+                    kb_id, ds_id)
+                generated = precompile_fallback
+                payload_version = precompile_fallback_payload
+                precompile_fallback = None
+                llm_extra = precompile_fallback_meta
             if generated.get("not_answerable"):
                 return fail(tenant_id, user_id, username, ip, q, ds_id, "not_answerable",
                             generated.get("reason") or "用该实体的列答不了",
                             audit_extra=_audit_extra(llm_extra, retried, first_error),
                             scene=observe.build_scene(
-                                evolution_run=evolution_run_id,
+                                evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                 value_alias_rewrite=alias_rewrites or None,
                                 multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                                 recorder=recorder, retried=retried,
@@ -1792,14 +2150,18 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 payload_version=payload_version,
                                 projection_violation=projection_code,
                                 projection_retried=projection_retried,
+                                precompile_violation=precompile_code,
+                                precompile_retried=precompile_retried,
                                 exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats),
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene),
                             kb_id=kb_id, entity_name=ent,
                             record_evidence=record_evidence)
 
-            # 给 guard 一份「这次允许碰哪些表」的清单：锚点表 + 实体名 + 这次实际注入给模型的
+            # 给 guard 一份「这次允许碰哪些表」的清单：锚点（有物理表名就只用物理表名，
+            # 缺失才回退实体名）+ 这次实际注入给模型的
             # 那几张 join 表（1 跳），**再加多跳路径上的表**。
             # ⚠️ **路径表必须再与编译 schema 求交**（Task 6C，2026-10-16）：血缘边现在来自
             # **表**（服务层写入时已回校编译 schema），但表行可能在 schema 重生成后**过期**
@@ -1818,7 +2180,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             path_tables = {str(t).strip()
                            for t in ((generated.get("meta") or {}).get("path_tables") or ())}
             path_tables.discard("")
-            allowed_tables = ({source_object_id or ent, ent}
+            allowed_tables = (_anchor_tables(source_object_id, ent)
                               | {t["table"] for t in (join_plan.related_tables or [])}
                               | (path_tables & known_tables)
                               | preview_tables)
@@ -1832,16 +2194,16 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     allowed_tables=allowed_tables)
                 if candidate_sql != generated_sql:
                     # 确定性改写也可能让 SQL 变形；先过一次安全闸，不通过就用原文。
-                    probe = guard_sql(candidate_sql, engine=engine,
-                                      max_rows=config.NL2SQL_MAX_ROWS,
-                                      allowed_tables=allowed_tables,
-                                      forbidden_pairs=forbidden_pairs)
+                    probe = scope.guard(
+                        candidate_sql, engine=engine,
+                        max_rows=config.NL2SQL_MAX_ROWS,
+                        allowed_tables=allowed_tables)
                     if probe.ok:
                         generated_sql = candidate_sql
-            guarded = guard_sql(generated_sql, engine=engine, max_rows=config.NL2SQL_MAX_ROWS,
-                                allowed_tables=allowed_tables,
-                                forbidden_pairs=forbidden_pairs,
-                                offset=offset)
+            guarded = scope.guard(generated_sql, engine=engine,
+                                  max_rows=config.NL2SQL_MAX_ROWS,
+                                  allowed_tables=allowed_tables,
+                                  offset=offset)
             if not guarded.ok:
                 if empty_fallback is not None:
                     logger.warning("NL→SQL 空结果重写被安全闸拒绝，回退原始空结果: kb=%s ds=%s",
@@ -1868,7 +2230,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             rejection_kind=rejection_kind,
                             audit_extra=_audit_extra(llm_extra, retried, first_error),
                             scene=observe.build_scene(
-                                evolution_run=evolution_run_id,
+                                evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                 value_alias_rewrite=alias_rewrites or None,
                                 multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                                 recorder=recorder, retried=retried,
@@ -1882,12 +2244,59 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 payload_version=payload_version,
                                 projection_violation=projection_code,
                                 projection_retried=projection_retried,
+                                precompile_violation=precompile_code,
+                                precompile_retried=precompile_retried,
                                 exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats),
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene),
                             kb_id=kb_id, entity_name=ent,
                             record_evidence=record_evidence)
+
+            # A1b：执行前可构建性校验（列/别名）。只在 guard 通过后做；违规回一次
+            # retry_note 再生成。它**不是安全闸**：解析失败/缺表一律 fail-open。
+            if config.NL2SQL_PRECOMPILE_CHECK:
+                _pc_v = check_precompile(
+                    guarded.sql, engine=engine, schema_map=precompile_schema)
+                if _pc_v is not None and precompile_retried:
+                    # 第二次仍违规（Review Focus #5）：回退首发 SQL，不让第二条坏 SQL
+                    # 覆盖它。两条都坏时，至少执行模型看过提示前的那条。
+                    _pc_second_sql = generated_sql
+                    if precompile_fallback is not None:
+                        generated = precompile_fallback
+                        payload_version = precompile_fallback_payload
+                        llm_extra = precompile_fallback_meta
+                        precompile_fallback = None
+                        generated_sql = normalize_dialect_sql(generated["sql"], engine)
+                        guarded = scope.guard(
+                            generated_sql, engine=engine,
+                            max_rows=config.NL2SQL_MAX_ROWS,
+                            allowed_tables=allowed_tables)
+                        if not guarded.ok:
+                            # 首发 SQL 反而不安全（理论不可达：它此前已过 guard）：
+                            # 退回第二条，别把安全闸的拒绝变成新出口。
+                            generated = {"sql": _pc_second_sql}
+                            generated_sql = _pc_second_sql
+                            guarded = scope.guard(
+                                generated_sql, engine=engine,
+                                max_rows=config.NL2SQL_MAX_ROWS,
+                                allowed_tables=allowed_tables)
+                    precompile_code = _pc_v.code
+                elif _pc_v is not None:
+                    precompile_code = _pc_v.code
+                    precompile_retried = True
+                    precompile_fallback = dict(generated)
+                    precompile_fallback_meta = llm_extra
+                    precompile_fallback_payload = payload_version
+                    retry_note = format_precompile_note(_pc_v, precompile_schema)
+                    logger.info(
+                        "NL→SQL schema 校验违规，重写一次: kb=%s ds=%s code=%s detail=%s",
+                        kb_id, ds_id, _pc_v.code, _pc_v.detail)
+                    continue
+                else:
+                    # 新 SQL 通过：上一轮的兜底不再相关（它只服务「这一轮生成失败」）。
+                    precompile_fallback = None
 
             # 投影契约（A1）：标量问句多列 / SELECT * → 一次重写（不自动删列）。
             # ⚠️ 放在 guard **之后**（设计 §2.1）：先确认这条 SQL 本身可执行，再谈投影形状；
@@ -1910,11 +2319,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
 
             exec_sql = guarded.sql
             if gov_active:
-                from ..governance.sql_rewrite import apply_governance
-                gov_result = apply_governance(
-                    guarded.sql, engine=engine,
-                    decide_fn=lambda t, c, a: _governance_decide(gov, t, c, a),
-                    schema=gov.get("schema") or {})
+                gov_result = scope.rewrite(guarded.sql, engine=engine)
                 if not gov_result.ok:
                     if empty_fallback is not None:
                         logger.warning("NL→SQL 空结果重写被治理拒绝，回退原始空结果: kb=%s ds=%s",
@@ -1938,7 +2343,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                         rejection_kind=rejection_kind,
                         audit_extra=_audit_extra(llm_extra, retried, first_error),
                         scene=observe.build_scene(
-                            evolution_run=evolution_run_id,
+                            evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                             value_alias_rewrite=alias_rewrites or None,
                             multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                             recorder=recorder, retried=retried,
@@ -1952,10 +2357,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                             payload_version=payload_version,
                                 projection_violation=projection_code,
                                 projection_retried=projection_retried,
+                                precompile_violation=precompile_code,
+                                precompile_retried=precompile_retried,
                                 exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats),
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene),
                         kb_id=kb_id, entity_name=ent,
                         record_evidence=record_evidence)
                 exec_sql = gov_result.sql
@@ -1981,12 +2389,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     llm_extra = empty_fallback["llm_extra"]
                     empty_fallback = None
                     break
+                info = classify_exec_error(exc)
                 err = f"{type(exc).__name__}: {str(exc)[:200]}"
-                # ⚠️ 归类**不要按异常类型**：asyncpg 的建连超时本身就是 `asyncio.TimeoutError`，
-                # 与 pymssql/aiomysql 抛的驱动错误不同名（Task 7 的评审提的）。这里一律
-                # `exec_failed` + 原文，由人看日志定位 —— 按类型猜只会猜错。
-                logger.warning("NL→SQL 执行失败: ds=%s engine=%s err=%s", ds_id, engine, exc)
-                if b_retries < _RETRY_MAX and is_fixable_exec_error(exc):
+                # 对外只给 `safe_message`；原文（含 SQL/库报错）进审计与 scene 的
+                # `exec_error.detail`，不把驱动错误直接回给调用方。
+                logger.warning("NL→SQL 执行失败: ds=%s engine=%s category=%s err=%s",
+                               ds_id, engine, info.category, exc)
+                if b_retries < _RETRY_MAX and info.retryable:
                     # B（锚错兜底）：名字/语法类错误的正确名字在模型已得的上下文里
                     # （列清单 / joins 图 / 工具），把执行错误原样反馈回去再给它一次机会。
                     retried, first_error = True, err
@@ -1996,14 +2405,20 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     logger.warning("NL→SQL 执行失败(可修复)，将重试一次: ds=%s err=%s", ds_id, err)
                     continue
                 return fail(tenant_id, user_id, username, ip, q, ds_id, "exec_failed",
-                            err, sql=exec_sql,
-                            audit_extra=_audit_extra(llm_extra, retried, first_error),
+                            info.safe_message, sql=exec_sql,
+                            audit_extra={
+                                **(_audit_extra(llm_extra, retried, first_error) or {}),
+                                "exec_error_category": info.category,
+                                "exec_error_detail": info.detail,
+                            },
                             scene=observe.build_scene(
-                                evolution_run=evolution_run_id,
+                                evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                                 value_alias_rewrite=alias_rewrites or None,
                                 multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                                 recorder=recorder, retried=retried,
                                 first_error=first_error or "",
+                                exec_error={"category": info.category,
+                                            "detail": info.detail},
                                 rounds=(llm_extra or {}).get("rounds"),
                                 concept_fields=len(concept_fields),
                                 concept_columns=n_concept_cols,
@@ -2011,10 +2426,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                                 payload_version=payload_version,
                                 projection_violation=projection_code,
                                 projection_retried=projection_retried,
+                                precompile_violation=precompile_code,
+                                precompile_retried=precompile_retried,
                                 exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats),
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene),
                             kb_id=kb_id, entity_name=ent,
                             record_evidence=record_evidence)
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -2048,13 +2466,13 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                     and unit_retries < 1 and attempt + 1 < max_attempts):
                 assertions = await generate_assertions(
                     q, columns, tenant_id=tenant_id, kb_id=kb_id,
-                    user_id=user_id or "")
+                    user_id=user_id or "", trace_id=trace_id)
                 logger.info("NL→SQL 单元断言生成: ds=%s n=%s", ds_id, len(assertions))
                 if assertions:
                     evaluation = await evaluate_assertions(
                         q, assertions, exec_sql, result.get("rows") or [],
                         columns, tenant_id=tenant_id, kb_id=kb_id,
-                        user_id=user_id or "")
+                        user_id=user_id or "", trace_id=trace_id)
                     failed = failed_assertions(assertions, evaluation)
                     logger.info("NL→SQL 单元断言判定: ds=%s failed=%s", ds_id, len(failed))
                     if failed:
@@ -2093,8 +2511,11 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                           question=q, outcome="success", entity_name=ent,
                           sql=exec_sql, row_count=result["row_count"],
                           elapsed_ms=elapsed_ms,
+                          total_ms=int((time.monotonic() - started_total) * 1000),
+                          precompile_violation=precompile_code,
+                          precompile_retried=precompile_retried,
                           scene=observe.build_scene(
-                              evolution_run=evolution_run_id,
+                              evolution_run=evolution_run_id, verified_stale=verified_stale_code,
                               value_alias_rewrite=alias_rewrites or None,
                               multiturn=config.NL2SQL_MULTITURN, hints_meta=hints_meta, anchor=ent,
                               recorder=recorder, retried=retried,
@@ -2105,10 +2526,14 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                               mapping_slots=mapping_slots,
                               payload_version=payload_version,
                               projection_violation=projection_code,
-                              projection_retried=projection_retried, exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
+                              projection_retried=projection_retried,
+                              precompile_violation=precompile_code,
+                              precompile_retried=precompile_retried,
+                              exec_stats=exec_stats, empty_retried=empty_retried, value_stats=value_stats,
                                 plan_stats=plan_stats, preview_stats=preview_stats,
                                 format_stats=format_stats,
-                                candidate_stats=candidate_stats))
+                                candidate_stats=candidate_stats,
+                                schema_retrieval=schema_retrieval_scene))
         # W3.3 M4：成功档影子对比（只记录不替换；开关默认关）。
         self._schedule_metric_shadow(
             tenant_id=tenant_id, kb_id=kb_id, data_source_id=ds_id,
@@ -2304,10 +2729,11 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                              allowed_tables: set[str]) -> tuple[str, dict]:
         """v1 值接地：只做大小写/空白归一（不改拼写/缩写）。返回 (sql, stats)。"""
         stats = {"calls": 0, "hits": 0}
-        allowed = {_table_key(t) for t in allowed_tables or ()}
+        allowed = [str(t).strip() for t in allowed_tables or ()
+                   if str(t or "").strip()]
         replacements: dict[str, str] = {}
         for predicate in extract_literals(sql, engine):
-            if _table_key(predicate.table) not in allowed:
+            if not ref_matches(predicate.table, allowed):
                 continue
             candidates = await self._lookup_value_candidates(
                 source, cfg, predicate, engine=engine)
@@ -2329,11 +2755,15 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
 
     async def _auto_hints(self, *, tenant_id: str, kb_id: str, ds_id: str,
                           question: str, ent: str, join_plan, constraints: list,
-                          abstract_entities: list) -> list[str]:
+                          abstract_entities: list,
+                          exclude_metric_names: list[str] | None = None) -> list[str]:
         """组装生产侧 hints（A2）：编译 schema 的属性语义 + 抽象层的别名/枚举/指标。
 
         读口与 `_entity_columns` / `_load_concepts` 相同（版本化缓存，零额外会话）；
         任何一步缺失都只是「少几条 hint」，绝不抛 —— hints 是增能项，不能拖垮提问。
+
+        `exclude_metric_names` 透传给 `build_auto_hints`：这些名字的指标定义已由
+        请求级 hints 覆盖（验真 update 候选），不再注入库里的同名旧定义。
         """
         compiled = await schema_read.load_compiled_row(tenant_id, kb_id, ds_id)
         if not compiled:
@@ -2356,7 +2786,8 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             return build_auto_hints(
                 question=question, entity_name=ent, entity_types=entity_types,
                 abstract_entities=abstract_entities, constraints=constraints,
-                metrics=list(abstract_schema.get("metrics") or []), related=related)
+                metrics=list(abstract_schema.get("metrics") or []), related=related,
+                exclude_metric_names=exclude_metric_names)
         except Exception as exc:  # noqa: BLE001 —— hints 是增能，组装失败退空
             logger.warning("自动 hints 组装失败（本次退空）：kb=%s ds=%s err=%s",
                            kb_id, ds_id, exc)
@@ -2383,6 +2814,35 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             return [], ds_names
         schema = row["schema"] if isinstance(row["schema"], dict) else {}
         return list(schema.get("entities") or []), ds_names
+
+    async def _schema_retrieval(self, tenant_id: str, kb_id: str, ds_id: str,
+                                question: str, entities: list[dict], *,
+                                trace_id: str | None = None,
+                                ) -> tuple[dict, dict[str, list[str]], list[dict]]:
+        """N1-2 检索式 schema 选择 → `(stats, columns_by_table, extra_candidates)`。
+
+        只在该源**编译行**上做（表块/证据值都来自它）；抽象实体进块做别名增强。
+        **整体 fail-open**：schema 检索是增能项，读行或检索抛任何异常都退
+        `({}, {}, [])` —— 提问继续走原来的词面候选，与开关关逐字节相同。
+        """
+        try:
+            row = await schema_read.load_compiled_row(tenant_id, kb_id, ds_id)
+            result = await schema_retrieval.retrieve_candidates(
+                question,
+                tenant_id=tenant_id, kb_id=kb_id, ds_id=ds_id,
+                compiled=row if isinstance(row, dict) else {},
+                abstract_entities=entities,
+                top_k=config.NL2SQL_SCHEMA_RETRIEVAL_TOP_K,
+                embed_topn=config.NL2SQL_SCHEMA_RETRIEVAL_EMBED_TOPN,
+                mmr_lambda=config.NL2SQL_SCHEMA_RETRIEVAL_MMR_LAMBDA,
+                timeout=config.NL2SQL_SCHEMA_RETRIEVAL_TIMEOUT,
+                trace_id=trace_id)
+        except Exception as exc:  # noqa: BLE001 —— 检索是增能，失败回退词面候选
+            logger.warning("schema 检索失败（回退词面候选）: kb=%s ds=%s err=%s",
+                           kb_id, ds_id, exc)
+            return {}, {}, []
+        return (result.get("stats") or {}, result.get("columns") or {},
+                result.get("candidates") or [])
 
     async def _entity_columns(self, tenant_id: str, kb_id: str, ds_id: str, entity: str):
         """该实体的 `(物理表标识, 列清单, join 图, 列样本, 口径约束（整行原样，调用方按实体挑）)`。取不到（源已删/实体已消失）返回 None。
@@ -2431,11 +2891,27 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                         if not logical:
                             continue
                         physical = str(a.get("physical_name") or "").strip() or logical
+                        # N1-5：语义字段经 provenance 结算（manual > annotated >
+                        # derived）；旧行没有 `semantic_sources` ⇒ 按 derived 生效。
+                        resolved = semantics.resolve_attribute(a)
+
+                        def _val(field):
+                            item = resolved.get(field)
+                            return item["value"] if item else None
+
+                        role = str(_val("role") or "").strip()[:32]
+                        unit = str(_val("unit") or "").strip()[:64]
+                        grain = str(_val("grain") or "").strip()[:64]
+                        values = list(_val("values") or [])
                         attrs.append({
                             "name": physical,
                             "logical_name": logical,
                             "type": str(a.get("type") or ""),
-                            "description": str(a.get("description") or "").strip(),
+                            "description": str(_val("description") or "").strip(),
+                            **({"role": role} if role else {}),
+                            **({"unit": unit} if unit else {}),
+                            **({"grain": grain} if grain else {}),
+                            **({"values": values[:50]} if values else {}),
                         })
                     return (
                         str(e.get("source_object_id") or "").strip() or None,
@@ -2752,7 +3228,7 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
               kb_id: str = "", entity_name: str = "",
               record_evidence: bool = True, synthetic: bool = False,
               evolution_run_id: str = "", observe_only: bool = False,
-              **extra) -> dict:
+              t0: float | None = None, **extra) -> dict:
         """**失败出口唯一收口**：落一条失败审计 + 一条观测行，再返回 `_no_answer(...)` 同一形状。
 
         `extra` 原样透传给 `_no_answer`（`sql` / `rejected_sql` / `candidates` 等）；
@@ -2762,7 +3238,10 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
         **跳过失败审计**，观测照写（诊断仍要看见基准样本）。由 `ask_data_source`
         用 `partial` 统一绑定；普通提问恒为 False、行为逐字节不变。
 
-        ⚠️ `audit_extra` / `scene` / `kb_id` / `entity_name` / `synthetic` 必须是
+        `t0` 是 `ask_data_source` 入口的 `time.monotonic()`：观测 `total_ms`
+        走端到端耗时；`None`（直接调用 / 旧调用方）则退成空列。
+
+        ⚠️ `audit_extra` / `scene` / `kb_id` / `entity_name` / `synthetic` / `t0` 必须是
         **显式具名参数**、不能落进 `**extra` —— 那会把它一并传进 `_no_answer(**extra)`、
         把内部键泄漏进响应体。
 
@@ -2785,6 +3264,9 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                           reason=reason, entity_name=entity_name,
                           sql=extra.get("sql"),
                           rejected_sql=extra.get("rejected_sql"),
+                          total_ms=(int((time.monotonic() - t0) * 1000) if t0 else None),
+                          precompile_violation=str((scene or {}).get("precompile_violation") or ""),
+                          precompile_retried=bool((scene or {}).get("precompile_retried")),
                           scene=scene or {})
             # W3.3 M4：失败档影子对比（失败样本最有价值；开关默认关）。
             self._schedule_metric_shadow(
@@ -2802,7 +3284,9 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
                  outcome: str, reason_code: str = "", reason: str = "",
                  entity_name: str = "", sql: str | None = None,
                  rejected_sql: str | None = None, row_count: int | None = None,
-                 elapsed_ms: int | None = None, scene: dict | None = None) -> None:
+                 elapsed_ms: int | None = None, total_ms: int | None = None,
+                 precompile_violation: str = "", precompile_retried: bool = False,
+                 scene: dict | None = None) -> None:
         """装配一条观测行 → `observe.schedule_record`（**测试打桩点 = `observe.schedule_record`**）。
 
         截断口径（设计 §3.1，**有意比审计宽**）：question 500 / reason 500 / sql·rejected_sql 1000。
@@ -2822,6 +3306,9 @@ class Nl2SqlService(MetricAskMixin, LineageSearchMixin):
             "rejected_sql": (str(rejected_sql or "")[:observe.MAX_SQL_CHARS]) or None,
             "row_count": row_count,
             "elapsed_ms": elapsed_ms,
+            "total_ms": total_ms,
+            "precompile_violation": precompile_violation[:32] or None,
+            "precompile_retried": bool(precompile_retried),
             "scene": scene or {},
         })
 

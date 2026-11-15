@@ -43,14 +43,19 @@ from .engine import (
 # 版本链 scope 映射只在 locking 定义一次；这里转出供 adopt/rollback 共用。
 from .locking import (
     COMPILED_KINDS, is_abstract_kind, kind_for_scope, scope_for_kind)
+from .metric_ops import (
+    apply_metric_entries,
+    metric_added_verified,
+    rollback_metric_entries,
+)
 from .version_store import canonical_snapshot_hash
 
 logger = logging.getLogger(__name__)
 
 #: 演化类型白名单。写错 kind 会静默落到 compiled 分支（`else`），故入口处显式校验。
-#: `mapping` / `tool_schema` 属 abstract 家族（与 `alias` 同链），读/写都走
-#: `kind not in _COMPILED_KINDS` 的抽象分支，内层再按 kind 分派变换函数。
-_VALID_KINDS = frozenset({"alias", "mapping", "tool_schema", "synonym",
+#: `mapping` / `tool_schema` / `metric` 属 abstract 家族（与 `alias` 同链），
+#: 读/写都走 `kind not in _COMPILED_KINDS` 的抽象分支，内层再按 kind 分派变换函数。
+_VALID_KINDS = frozenset({"alias", "mapping", "tool_schema", "metric", "synonym",
                           "query_rule", "relation", "constraint"})
 #: compiled 家族（`query_rule` / `relation` / `constraint`）共用同一存储分支/版本链。
 _COMPILED_KINDS = COMPILED_KINDS
@@ -550,6 +555,11 @@ async def apply_patch(tenant_id: str, patch: dict, *, before_write=None) -> dict
             # 的 else（那会把每条都按 mapping 规则跳过 → 零条生效）。
             new_schema, added, skipped = apply_tool_schema_entries(
                 row.get("schema") or {}, patch["entries"])
+        elif kind == "metric":
+            # 显式分派：指标按 name 合并到 `schema.metrics`，条目没有 mapping
+            # 的 target_code / 落点三元组 —— 落进 else 会被逐条跳过。
+            new_schema, added, skipped = apply_metric_entries(
+                row.get("schema") or {}, patch["entries"])
         else:
             entries = patch.get("entries") or []
             ds_ids = {str(e.get("data_source_id") or "").strip()
@@ -589,6 +599,10 @@ async def apply_patch(tenant_id: str, patch: dict, *, before_write=None) -> dict
             # update 比 description / disable 比 enabled=False / enable 比缺键；
             # 同一 name 一个批次里被多次操作时只看最后一条（终态）。
             ok = tool_schema_state_matches(verify.get("schema") or {}, added)
+        elif patch["kind"] == "metric":
+            # add/update 比本次写过的槽、disable 比 enabled=False、enable 比
+            # 非 False；同一 name 只看最后一条（终态）。
+            ok = metric_added_verified(verify.get("schema") or {}, added)
         else:
             # 按落点分组的**终态**核对：同一落点在一批里被多次操作时，中间
             # 记录的 after 是当时那一步的投影，只能拿每组最后一条去比。
@@ -829,6 +843,12 @@ async def rollback_patch(tenant_id: str, patch: dict) -> bool:
         elif kind == "tool_schema":
             new_schema = rollback_tool_schema_entries(current_schema, added)
             # 同上：逐键比较（覆盖项早已不在时不留一个空版本）。
+            unchanged = new_schema == current_schema
+        elif kind == "metric":
+            # 显式分派：`schema.metrics` 不是落点三元组，落进 mapping 的
+            # `else` 是**静默 no-op**（回滚报成功、实际没恢复）。
+            new_schema = rollback_metric_entries(current_schema, added)
+            # 同上：逐键比较（指标早已不在时不留一个空版本）。
             unchanged = new_schema == current_schema
         else:
             new_schema = rollback_mapping_ops(current_schema, added)

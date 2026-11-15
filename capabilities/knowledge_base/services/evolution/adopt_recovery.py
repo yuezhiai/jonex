@@ -33,6 +33,8 @@ def rollback_ledger_identity(kind: str | None, scope: str,
       数据源（`corpus_ds`，即 `request.bench_ds`）；
     - `tool_schema`（Tool-Schema 线）：`kind="tool_schema"`（写 alias 那本）
       同样带 `op="rollback"`；KB 级变更，`ds_id=None`；
+    - `metric`（统一指标口径线）：与 `tool_schema` 同形，`kind="metric"`
+      （写 alias 那本）+ `op="rollback"`；KB 级变更，`ds_id=None`；
     - 其余（`alias` / `query_rule`）：沿用旧口径 `kind="rollback"`、无 op。
 
     `kind` 为空时回落 `kind_for_scope(scope)` 的兼容标签（旧 run 行）；
@@ -41,6 +43,10 @@ def rollback_ledger_identity(kind: str | None, scope: str,
     resolved = str(kind or kind_for_scope(scope))
     if resolved == "tool_schema":
         return {"entry_kind": "tool_schema", "op": "rollback", "ds_id": None}
+    if resolved == "metric":
+        # 指标口径线：与采纳行同 kind（写 alias 那本），`op="rollback"` 作为
+        # 回滚判据；KB 级变更，`ds_id=None`（与 tool_schema 同形）。
+        return {"entry_kind": "metric", "op": "rollback", "ds_id": None}
     if resolved == "synonym":
         # 值同义词线：与采纳行同 kind（写 alias 那本），`op="rollback"` 作为
         # 回滚判据；KB 级变更，`ds_id=None`。

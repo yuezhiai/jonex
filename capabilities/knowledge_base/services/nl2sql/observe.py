@@ -134,13 +134,19 @@ def build_scene(*, multiturn: bool, anchor: str = "", filter_status: str = "",
                 mapping_slots: int = 0,
                 projection_violation: str = "",
                 projection_retried: bool = False,
+                precompile_violation: str = "",
+                precompile_retried: bool = False,
                 exec_stats: dict | None = None,
+                exec_error: dict | None = None,
                 empty_retried: bool = False,
                 value_stats: dict | None = None,
                 plan_stats: dict | None = None,
                 preview_stats: dict | None = None,
                 format_stats: dict | None = None,
                 candidate_stats: dict | None = None,
+                schema_retrieval: dict | None = None,
+                verified: dict | None = None,
+                verified_stale: str = "",
                 value_alias_rewrite: list[dict] | None = None,
                 hints_meta: dict | None = None,
                 evolution_run: str = "",
@@ -205,6 +211,23 @@ def build_scene(*, multiturn: bool, anchor: str = "", filter_status: str = "",
         scene["projection_violation"] = str(projection_violation)[:32]
     if projection_retried:
         scene["projection_retried"] = True
+    # A1b（执行前 schema 校验）：违规码与「是否已重写过一次」。
+    # 空串 / False = 未触发，键不出现（按档出现纪律）。
+    if precompile_violation:
+        scene["precompile_violation"] = str(precompile_violation)[:32]
+    if precompile_retried:
+        scene["precompile_retried"] = True
+    # 已验证查询（N1-1）：命中时落模板标识与打分；stale 跳过时只落违规码。
+    # 两者都只在开关开且真的发生时出现（按档出现纪律）。
+    if verified:
+        scene["verified"] = {
+            "id": str(verified.get("id") or "")[:64],
+            "name": str(verified.get("name") or "")[:128],
+            "score": round(float(verified.get("score") or 0.0), 4),
+            "params": list(verified.get("params") or []),
+        }
+    if verified_stale:
+        scene["verified_stale"] = str(verified_stale)[:32]
     # 执行工具计数（A3）：次数 / 回给模型的总行数 / 错误次数。0 = 这一问没探索，
     # 键不出现（按档出现纪律；开关关时恒 0 ⇒ scene 与今天逐字节相同）。
     # hints 摘要（A2）：计数 / 总字符 / 内容 hash —— **不记原文**（设计 §6）。
@@ -254,6 +277,22 @@ def build_scene(*, multiturn: bool, anchor: str = "", filter_status: str = "",
         scene["candidate_count"] = int(candidate_stats["count"])
         if candidate_stats.get("choice"):
             scene["candidate_choice"] = int(candidate_stats["choice"])
+    # N1-2 检索式 schema 选择：本次检索额外并进的候选数 / 嵌入是否降级 / 锚点来源。
+    # 只在开关开且**本次真跑过检索**（stats 非空）时传参 —— 关档 scene 逐字节不变。
+    if schema_retrieval:
+        scene["schema_retrieval"] = {
+            "candidates": int(schema_retrieval.get("candidates") or 0),
+            "embed_degraded": bool(schema_retrieval.get("embed_degraded")),
+            "anchor_choice": str(schema_retrieval.get("anchor_choice") or ""),
+        }
+        # unmapped 只在真有时落键（scene 按档出现纪律）：全映射的库不多出空键。
+        unmapped_count = int(schema_retrieval.get("unmapped_count") or 0)
+        if unmapped_count:
+            scene["schema_retrieval"]["unmapped_count"] = unmapped_count
+            unmapped_top = [str(item) for item in
+                            (schema_retrieval.get("unmapped_top") or [])]
+            if unmapped_top:
+                scene["schema_retrieval"]["unmapped_top"] = unmapped_top
     # 值同义词改写（2026-11-05）：候选召回前把问句里的 variant 换成 canonical。
     # 只在**真发生过替换**时落键（空 = 键不出现，观测与引入前逐字节相同）；
     # 原问句仍由审计 / 观测的 `question` 字段保留。
@@ -271,6 +310,13 @@ def build_scene(*, multiturn: bool, anchor: str = "", filter_status: str = "",
             scene["exec_tool_rows"] = int(exec_stats["rows"])
         if exec_stats.get("errors"):
             scene["exec_tool_errors"] = int(exec_stats["errors"])
+    # N0-2：执行失败的分类与原文。对外响应只给 safe_message；原文留在这里，
+    # 只有真的执行失败才落键（成功/早退路径 scene 逐字节不变）。
+    if exec_error:
+        scene["exec_error"] = {
+            "category": str(exec_error.get("category") or "unknown"),
+            "detail": str(exec_error.get("detail") or "")[:500],
+        }
     # 演化基准标记（Task 4）：诊断/点踩读取器按 `scene->>'evolution_bench'` 整类排除。
     # run id 截 64 字符（有界性；完整 id 由 `evolution_runs` 表持有）。
     if evolution_run:

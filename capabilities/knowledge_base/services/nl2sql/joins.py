@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .forbidden import pair_key
+from .forbidden import pair_hits
 
 #: 注入给模型的上限。实测 jinpin 的 join 图平均度 2.1、最高 30 —— 绝大多数实体碰不到上限。
 MAX_JOINS = 20
@@ -89,7 +89,8 @@ def eligible_joins(
     if anchor_entity is None:
         return JoinPlan()
 
-    forbidden_keys = {p.key for p in (forbidden_pairs or ())}
+    # 禁止对逐条判（段序列后缀匹配）：存限定名、关系端点写裸名时也必须丢边。
+    forbidden = list(forbidden_pairs or ())
 
     candidates: list[dict] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -130,7 +131,7 @@ def eligible_joins(
         elif to_column not in other_columns:
             continue
 
-        if pair_key(from_table, to_table) in forbidden_keys:
+        if pair_hits(forbidden, [from_table, to_table]):
             # 禁止同查：这对表不允许在同一个查询里同时出现 —— 连边都不给，
             # 让模型没有「直连」这个选项（安全闸是最后的兜底，不是第一道）。
             continue

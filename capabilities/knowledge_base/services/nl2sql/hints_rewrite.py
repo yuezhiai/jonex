@@ -62,8 +62,12 @@ def _parse_content(content: str) -> list[str]:
 
 
 async def rewrite_evidence_hints(question: str, hints: list[str], *, tenant_id: str,
-                                 kb_id: str = "", user_id: str = "") -> list[str]:
-    """一次 LLM 调用 → 四段式 hints；任何失败返回 `[]`（fail-open）。"""
+                                 kb_id: str = "", user_id: str = "",
+                                 trace_id: str | None = None) -> list[str]:
+    """一次 LLM 调用 → 四段式 hints；任何失败返回 `[]`（fail-open）。
+
+    `trace_id` 原样进网关头 `X-Jonex-Trace-Id`；`None` ⇒ helper 自造 trace。
+    """
     hints = [str(h).strip() for h in (hints or []) if str(h).strip()]
     if not hints:
         return []
@@ -77,7 +81,8 @@ async def rewrite_evidence_hints(question: str, hints: list[str], *, tenant_id: 
             [{"role": "system", "content": _SYSTEM},
              {"role": "user", "content": user}],
             tools=None, model=None, scene="nl2sql_generate", max_tokens=512,
-            tenant_id=tenant_id, kb_id=kb_id or None, user_id=user_id or None)
+            tenant_id=tenant_id, kb_id=kb_id or None, user_id=user_id or None,
+            trace_id=trace_id)
     except Exception:  # noqa: BLE001 —— 改写是增能，失败退回原 hints
         return []
     return _parse_content((reply or {}).get("content") or "")

@@ -106,6 +106,12 @@ def validate_batch(runs: list[dict]) -> dict:
     if len(items) > MAX_BATCH_RUNS:
         raise InvalidParameterError(
             message=f"批量采纳一次最多 {MAX_BATCH_RUNS} 条")
+    # 指标口径的采纳必须逐条验真（验真卡取决于该指标在问句里的命中情况），
+    # 没有「批量确认」的人审语义 —— 在受理前整体拒绝，一条都不动。
+    # 前端会隐藏 metric 的选择，但 API 侧也必须挡（前端不是安全边界）。
+    if any(str(run.get("kind") or "").strip() == "metric" for run in items):
+        raise InvalidParameterError(
+            message="指标口径暂不支持批量采纳，请在详情页逐条验真")
 
     kbs = {str(r.get("kb") or "").strip() for r in items}
     if "" in kbs:

@@ -207,9 +207,92 @@ def _case_entries(run: dict, corpus_cases: list[dict],
     return entries
 
 
+def _adhoc_ds_map(run: dict) -> dict[str, str]:
+    """`question → data_source_id`（来自本批候选条目）。
+
+    同一问句可能对应多条条目（synonym 一批），取第一条带源的即可：验真也是
+    按条目逐个取源，问题相同就是同一个答案面。
+    """
+    patch = run.get("patch") if isinstance(run, dict) else {}
+    patch = patch if isinstance(patch, dict) else {}
+    out: dict[str, str] = {}
+    for entry in patch.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get("question") or "").strip()
+        ds_id = str(entry.get("data_source_id") or "").strip()
+        if question and ds_id:
+            out.setdefault(question, ds_id)
+    return out
+
+
+def _adhoc_asker_resolver(default_asker, factory, eval_ds: str | None,
+                          ds_by_question: dict[str, str]):
+    """返回 `ask(case, question)`：ad-hoc 题按「能答的源」链式求值。
+
+    背景（2026-11-05 `run_776a2e913c92` / `run_9659f8958330` 实测）：KB 级
+    alias/synonym 的候选条目挂的是**观测源**，而问题实体的落点可能根本不在那个
+    源里——「华东环保垃圾发电量」在 42b09462 上没有 `GroupMaster`（恒
+    `no_candidate`），`#3炉…达标吗` 却只在 42b09462 上答得出。把 ad-hoc 题钉在
+    任何单一源上都会把正确的改动判成 `expected-change-mismatch`。
+
+    求值顺序（只在上一跳 `no_candidate` 时继续，避免无谓的 LLM 调用）：
+    条目声明的源 → 语料基准源 `eval_ds` → 不指定源（自动选）；自动选返回
+    `ambiguous` 时再用它带回的候选源（第一个）问一次。
+
+    调用方没给 `factory`（单测注入 asker 的老路径）时退化成默认 asker，行为与
+    引入前逐字节相同。
+    """
+    cache: dict[str, object] = {}
+    eval_key = str(eval_ds or "").strip()
+
+    def asker_for_ds(ds_id: str | None):
+        key = str(ds_id or "").strip()
+        if factory is None:
+            return default_asker
+        if key not in cache:
+            cache[key] = factory(ds_id or None)
+        return cache[key]
+
+    async def ask(case: dict, question: str) -> dict:
+        entry_ds = (str((case or {}).get("data_source_id") or "").strip()
+                    or ds_by_question.get(str(question or "").strip(), ""))
+        order: list[str | None] = []
+        seen: set[str] = set()
+        for ds_id in (entry_ds, eval_key, None):
+            key = str(ds_id or "").strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            order.append(ds_id or None)
+
+        outcome: dict = {}
+        for ds_id in order:
+            outcome = await asker_for_ds(ds_id)(question)
+            if (outcome or {}).get("ok"):
+                return outcome
+            if (outcome or {}).get("reason_code") != "no_candidate":
+                break
+        # `ambiguous` 带回候选（含 `data_source_id`）：用第一个候选源再问一次。
+        if (outcome or {}).get("reason_code") == "ambiguous":
+            candidates = outcome.get("candidates") or []
+            picked = (candidates[0] if candidates else None) or {}
+            ds_id = str(picked.get("data_source_id") or "").strip()
+            if ds_id and ds_id not in seen:
+                outcome = await asker_for_ds(ds_id)(question)
+        return outcome
+
+    return ask
+
+
 async def _execute_cases(tenant_id, corpus, corpus_cases, graded,
-                         signature_only, asker, truth_runner) -> dict[str, dict]:
-    """执行题集，返回 `{case_name: 结果}`。失败的执行异常由调用方收口。"""
+                         signature_only, asker, truth_runner,
+                         adhoc_asker=None) -> dict[str, dict]:
+    """执行题集，返回 `{case_name: 结果}`。失败的执行异常由调用方收口。
+
+    `adhoc_asker(case)` 只作用于仅签名检查的 ad-hoc 题；语料题与带 truth 的
+    ad-hoc 仍走 `asker`（它们的对照 SQL 绑在语料源上）。
+    """
     results: dict[str, dict] = {}
     if corpus_cases:
         report = await run_eval(
@@ -229,8 +312,10 @@ async def _execute_cases(tenant_id, corpus, corpus_cases, graded,
             results[str(result.get("name"))] = result
     for case in signature_only:
         case_id = str(case["case_id"])
+        question = str(case.get("question") or "")
         try:
-            outcome = await asker(str(case.get("question") or ""))
+            outcome = (await adhoc_asker(case, question) if adhoc_asker
+                       else await asker(question))
         except Exception as exc:  # noqa: BLE001 —— 单题传输失败记 error
             outcome = {"ok": False, "reason_code": "llm_failed",
                        "why": str(exc)[:200]}
@@ -305,13 +390,17 @@ def _collect_reasons(entries: list[dict], results: dict[str, dict],
 async def run_smoke(tenant_id: str, run: dict, version: dict | None,
                     adhoc_truths: list[dict] | None, *,
                     session=None, asker=None, truth_runner=None,
-                    report=None,
+                    report=None, asker_factory=None,
                     timeout: float = SMOKE_TIMEOUT_SECONDS) -> dict:
     """采纳后 smoke（spec §6）。返回结果同时用于写 `run.smoke`。
 
     `status`: `passed` / `failed` / `skipped`；`mode`: `enforce` / `warn`。
     `skipped`（无语料/执行器异常）默认阻止采纳，由调用方按 override 放行。
     整批超过 `timeout` 秒 → `failed`（超时按失败）。
+
+    `asker_factory(ds_id) -> asker`：**ad-hoc 题按条目自己的源**求值（见
+    `_adhoc_asker_resolver`）。语料题仍固定走 `asker`（= corpus_ds），保证与
+    基准臂同尺。
     """
     started = time.monotonic()
     mode = smoke_mode()
@@ -358,18 +447,32 @@ async def run_smoke(tenant_id: str, run: dict, version: dict | None,
         return result("skipped", [], [{"case_id": None, "reason": NO_CASES}],
                       planned=0, executed=0)
 
+    eval_ds = ds or (corpus.get("target") or {}).get("data_source_id")
     if asker is None or truth_runner is None:
         from .upstream import asker_for, truth_runner_for
-        eval_ds = ds or (corpus.get("target") or {}).get("data_source_id")
-        asker = asker or asker_for(
-            tenant_id, kb, eval_ds,
-            evolution_run_id=str((run or {}).get("run_id") or ""))
+        if asker is None:
+            asker = asker_for(
+                tenant_id, kb, eval_ds,
+                evolution_run_id=str((run or {}).get("run_id") or ""))
+            if asker_factory is None:
+                run_id = str((run or {}).get("run_id") or "")
+
+                def asker_factory(ds_id, _run_id=run_id):
+                    return asker_for(tenant_id, kb, ds_id,
+                                     evolution_run_id=_run_id)
         truth_runner = truth_runner or truth_runner_for(tenant_id, eval_ds)
+
+    # ad-hoc 题按**条目自己的源**求值：人工验真用的是条目 ds，若冒烟一律压
+    # corpus_ds，多源 KB 上会把「验真通过」判成 no_candidate（2026-11-05
+    # run_776a2e913c92：条目源 ffe50153 有 GroupMaster，语料源 42b09462 没有）。
+    adhoc_asker = _adhoc_asker_resolver(
+        asker, asker_factory, eval_ds, _adhoc_ds_map(run or {}))
 
     try:
         results = await asyncio.wait_for(
             _execute_cases(tenant_id, corpus, corpus_cases, graded,
-                           signature_only, asker, truth_runner),
+                           signature_only, asker, truth_runner,
+                           adhoc_asker),
             timeout=timeout)
     except asyncio.TimeoutError:
         return result("failed", entries,

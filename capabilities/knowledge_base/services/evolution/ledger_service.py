@@ -22,10 +22,12 @@ _GROUPS = (
 #: 演化 kind → 表内 ledger_type（R2/R4：`relation` / `constraint` 不新增账本，
 #: 都落 query_rule 那本；由 entry.kind 区分）。账本分组仍只由 ledger_type 决定。
 #: `mapping` / `tool_schema` 写抽象 schema，与 `alias` 同落 alias 那本
-#: （P1-5 / Tool-Schema 线）。`synonym`（值同义词线）同样落 alias 那本，
+#: （P1-5 / Tool-Schema 线）；`metric` 写抽象 schema 的 `metrics` 块，同样落
+#: alias 那本。`synonym`（值同义词线）同样落 alias 那本，
 #: 用 `entry.kind="synonym"` 区分（不新增 ledger_type / 迁移）。
 _KIND_TO_LEDGER_TYPE = {"alias": "alias", "mapping": "alias",
-                        "tool_schema": "alias", "synonym": "alias",
+                        "tool_schema": "alias", "metric": "alias",
+                        "synonym": "alias",
                         "query_rule": "query_rule",
                         "relation": "query_rule", "constraint": "query_rule"}
 

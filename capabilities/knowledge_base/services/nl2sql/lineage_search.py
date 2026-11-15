@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import logging
 
+from jonex_core.common.config import config
 from jonex_core.common.exceptions import InvalidParameterError
 from jonex_core.common.tenant import require_tenant
 
 from ..concept_expansion import match_entities, match_metrics
-from . import schema_read
+from . import lineage_semantic, schema_read
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ class LineageSearchMixin:
     async def search_lineage_assets(
         self, tenant_id: str, kb_id: str, query: str, *,
         data_source_id: str = "", limit: int = 20, max_hops: int = 1,
-        user_id: str = "",
+        user_id: str = "", trace_id: str | None = None,
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         q = str(query or "").strip()
@@ -145,8 +146,10 @@ class LineageSearchMixin:
         # 表 / 列（编译 schema，逐源）
         degraded: list[str] = []
         table_maps: dict[str, dict[str, str]] = {}
+        rows_by_ds: dict[str, dict] = {}
         q_cf = q.casefold()
-        for ds in _data_source_ids(abstract, data_source_id):
+        data_source_ids = _data_source_ids(abstract, data_source_id)
+        for ds in data_source_ids:
             try:
                 row = await schema_read.load_compiled_row(tenant_id, kb_id, ds)
             except Exception as exc:  # noqa: BLE001 —— 单源失败只降级
@@ -156,6 +159,7 @@ class LineageSearchMixin:
                 continue
             if not row:
                 continue
+            rows_by_ds[ds] = row
             mapping: dict[str, str] = {}
             table_maps[ds] = mapping
             for entity in row.get("entity_types") or []:
@@ -186,18 +190,39 @@ class LineageSearchMixin:
                                       "match:column_name")
                     pool[asset_id] = _merge(pool.get(asset_id), item)
 
+        # W4.5 语义召回（默认关）：词面通道的补漏，失败只降级本通道。
+        semantic_enabled = bool(config.NL2SQL_LINEAGE_SEMANTIC)
+        semantic_degraded = False
+        if semantic_enabled:
+            assets = lineage_semantic.build_assets(
+                kb_id, schema, rows_by_ds, data_source_ids)
+            semantic_scores, semantic_degraded =                 await lineage_semantic.semantic_scores(
+                    assets, q, tenant_id=tenant_id, kb_id=kb_id, trace_id=trace_id)
+            by_id = {asset.asset_id: asset for asset in assets}
+            for asset_id, score in semantic_scores.items():
+                asset = by_id[asset_id]
+                item = _candidate(
+                    asset.asset_type, asset_id, asset.label, score,
+                    "match:semantic",
+                    # 实体仍是抽象层派生物：可召回、不可导航（目录里没有资产 ID）。
+                    **({"navigable": False} if asset.asset_type == "entity" else {}))
+                pool[asset_id] = _merge(pool.get(asset_id), item)
+
         if max_hops:
             await self._expand_lineage(pool, tenant_id, list(pool.values()),
                                        max_hops=max_hops,
                                        table_maps=table_maps)
 
         ranked = rank_candidates(list(pool.values()))
-        return {
+        out = {
             "query": q,
             "candidates": ranked[:limit],
             "truncated": len(ranked) > limit,
             "degraded_data_sources": degraded,
         }
+        if semantic_enabled:
+            out["semantic_degraded"] = semantic_degraded
+        return out
 
     async def _expand_lineage(self, pool: dict[str, dict], tenant_id: str,
                               seeds: list[dict], *, max_hops: int,

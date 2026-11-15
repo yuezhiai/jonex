@@ -24,7 +24,7 @@ from typing import Awaitable, Callable
 # 且同包的 `service.py` 早就顶层 import 了它的 `generate_sql`（同一层里已有先例）。
 from jonex_core.common.ontology_llm import (
     build_sql_payload, build_sql_system_prompt, call_llm_with_tools,
-    has_mapping_slots, payload_fingerprint, preview_has_rows)
+    has_column_semantics, has_mapping_slots, payload_fingerprint, preview_has_rows)
 
 # ⚠️ 必须用 `from jonex_core.common.config import config`（拿到 Settings **实例**），
 # **不是** `from jonex_core.common import config` —— 后者拿到的是 `config` **子模块**，
@@ -352,10 +352,12 @@ async def generate_sql_multiturn(
     question: str, *, ctx: MultiturnContext, engine: str, table_name: str,
     columns: list[dict], max_rounds: int = 3, max_tool_calls_per_round: int = 3,
     tenant_id: str | None = None, kb_id: str | None = None, user_id: str | None = None,
+    trace_id: str | None = None,
     concept_fields: list[dict] | None = None,
     projection_contract: bool = False,
     hints: list[str] | None = None,
     value_aliases: list[dict] | None = None,
+    semantics_digest: str = "",
     plan_text: str | None = None,
     schema_preview: list[dict] | None = None,
     preview_details: bool = False,
@@ -509,6 +511,7 @@ async def generate_sql_multiturn(
         joins_truncated=plan.truncated, constraints=constraints,
         concept_fields=concept_fields, hints=hints, plan=plan_text,
             value_aliases=value_aliases,
+            semantics_digest=semantics_digest,
             schema_preview=schema_preview, cte_joins=cte_joins,
             dimension_joins=dimension_joins,
             answer_format=answer_format, **payload_kwargs)
@@ -548,6 +551,10 @@ async def generate_sql_multiturn(
             # 判据 = **归一后 payload 里真有该键**（与 `build_sql_payload` 共用一次归一，
             # 全脏条目时不会出现「提示词说有条目、payload 却没有」）。
             with_value_aliases="value_aliases" in payload,
+            # 列级语义（N0-3）同理按 payload 判：`columns` 里真带 `role/unit/grain/values`
+            # 才渲染 4y —— 多轮档与单次档同一判据（同一份 `_prompt_columns` 产品）。
+            with_column_semantics=bool(config.NL2SQL_COLUMN_SEMANTICS
+                                       and has_column_semantics(columns)),
             few_shots=few_shots,
             with_exec_tool=exec_offered,
             tool_specs=tool_specs)},
@@ -604,7 +611,7 @@ async def generate_sql_multiturn(
         reply = await call_llm_with_tools(
             messages, tools=effective_tools, tool_choice="auto",
             max_tokens=int(config.NL2SQL_MULTITURN_LLM_MAX_TOKENS),
-            tenant_id=tenant_id, kb_id=kb_id, user_id=user_id)
+            tenant_id=tenant_id, kb_id=kb_id, user_id=user_id, trace_id=trace_id)
         if not reply["tool_calls"]:
             out = _parse_final(reply["content"])
             out["meta"] = {"rounds": rounds, "tool_calls": tool_calls, "tools_used": tools_used,
@@ -626,7 +633,7 @@ async def generate_sql_multiturn(
             reply = await call_llm_with_tools(
                 messages, tools=effective_tools, tool_choice="auto",
                 max_tokens=int(config.NL2SQL_MULTITURN_LLM_MAX_TOKENS),
-                tenant_id=tenant_id, kb_id=kb_id, user_id=user_id)
+                tenant_id=tenant_id, kb_id=kb_id, user_id=user_id, trace_id=trace_id)
             if not reply["tool_calls"]:
                 out = _parse_final(reply["content"])
                 out["meta"] = {"rounds": rounds, "tool_calls": tool_calls,

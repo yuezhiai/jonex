@@ -29,10 +29,12 @@ from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import InvalidParameterError
 from jonex_core.common.ontology_llm import (
     suggest_concept_aliases,
+    suggest_metric_definitions,
     suggest_value_synonyms,
 )
 
 from ...dtos.ontology_synonym import MAX_TERM_LENGTH, MAX_TERMS_PER_GROUP
+from ...repository.ontology_schema_repository import OntologySchemaRepository
 from ..abstract_schema_service import AbstractSchemaService
 from ..nl2sql.diagnosis import diagnose
 from .candidates import build_candidates, extract_codes
@@ -66,6 +68,19 @@ _SYNONYM_REASON_CODES = frozenset({"no_candidate", "not_answerable"})
 
 #: 一批 synonym 候选的条目上限；超出部分记 skipped（不静默截断丢证据）。
 SYNONYM_MAX_ENTRIES = 20
+
+#: 一批 metric 候选的条目上限；超出部分记 skipped（同 synonym，不静默丢证据）。
+METRIC_MAX_ENTRIES = 20
+
+#: 指标名长度上限（spec §4；名字说不清就没法按词面命中）。
+METRIC_NAME_MAX_LENGTH = 64
+
+#: 指标定义长度上限（spec §4；超出视为坏候选，不静默截断成半句话）。
+METRIC_DEFINITION_MAX_LENGTH = 500
+
+#: 单条别名长度上限与每组别名条数上限（spec §4）。
+METRIC_ALIAS_MAX_LENGTH = 32
+METRIC_MAX_ALIASES = 10
 
 #: 一次诊断最多读多少条失败观测（与旧 CLI 的 LIMIT 5000 同口径）。
 _OBSERVATION_LIMIT = 5000
@@ -435,6 +450,22 @@ def build_candidate_record(patch: dict, run: dict, corpus: dict,
             f"{'/'.join(str(t) for t in e.get('terms') or [])}→{e.get('canonical')}"
             for e in entries if isinstance(e, dict))
         rationale = f"为 {len(entries)} 条值同义词候选生成草稿：{pairs}"
+    elif kind == "metric":
+        # 指标口径（metric kind）：abstract 家族、内容层。**同一批允许混合 op**
+        # （apply 的 add 对同名天然降级 update，语义正确）：只有全部条目都是
+        # update 才标 metric.update，其余（纯 add 或混合）标 metric.add。
+        edit_type = ("metric.update"
+                     if entries and all(e.get("op") == "update" for e in entries)
+                     else "metric.add")
+        target = [{"op": e.get("op") or "add", "name": e.get("name")}
+                  for e in entries]
+        expected_changes = _alias_expected_changes(entries, corpus)
+        evidence_observations, adhoc_cases = _alias_evidence(
+            entries, observations, expected_changes)
+        source = "builder:metric_llm"
+        names = "、".join(str(e.get("name")) for e in entries
+                         if isinstance(e, dict))
+        rationale = f"为 {len(entries)} 条指标口径候选生成草稿：{names}"
     elif kind == "alias":
         edit_type = "alias.add"
         target = [{"concept": e.get("concept"), "alias": e.get("alias"),
@@ -799,6 +830,308 @@ async def _build_synonym_patch(tenant_id: str, kb: str, request: dict,
     }, relevant
 
 
+# ------------------------------------------------------------ metric 候选（Task 3）
+
+
+def _row_value(row, key: str):
+    """兼容 ORM 行与 dict 行（仓储读口在测试里会被替换成 dict）。"""
+    if isinstance(row, dict):
+        return row.get(key)
+    return getattr(row, key, None)
+
+
+async def load_compiled_entities(tenant_id: str, kb: str) -> list[dict]:
+    """该 KB 全部 active 编译 schema 的实体清单 `[{data_source_id, entity_name}]`。
+
+    指标落点（`landings`）必须指向**真实存在**的实体/源：LLM 看不到库，
+    只让它给实体名，源 id 在这里按编译 schema 反查/校验。只取数据源级行
+    （`data_source_id` 非空）；同一 `(源, 实体)` 去重保序。
+    """
+    async with get_db_session() as session:
+        rows = await OntologySchemaRepository(session).list_compiled_schemas(
+            tenant_id, kb)
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows or []:
+        ds = str(_row_value(row, "data_source_id") or "").strip()
+        if not ds:
+            continue
+        for entity in _row_value(row, "entity_types") or []:
+            if not isinstance(entity, dict):
+                continue
+            name = str(entity.get("name") or "").strip()
+            if not name:
+                continue
+            key = (ds, name.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"data_source_id": ds, "entity_name": name})
+    return out
+
+
+def _metric_landing_index(compiled_entities: list[dict]) -> tuple[
+        dict[tuple[str, str], str], dict[str, list[tuple[str, str]]], set[str]]:
+    """编译实体 → 落点校验索引。
+
+    返回 `(按 (源, 实体) 查规范名, 按实体名反查 [(源, 规范名)], 已知源集合)`。
+    """
+    pairs: dict[tuple[str, str], str] = {}
+    by_entity: dict[str, list[tuple[str, str]]] = {}
+    sources: set[str] = set()
+    for item in compiled_entities or []:
+        if not isinstance(item, dict):
+            continue
+        ds = str(item.get("data_source_id") or "").strip()
+        name = str(item.get("entity_name") or "").strip()
+        if not ds or not name:
+            continue
+        key = name.casefold()
+        sources.add(ds)
+        pairs.setdefault((ds, key), name)
+        by_entity.setdefault(key, []).append((ds, name))
+    return pairs, by_entity, sources
+
+
+def _metric_landings(raw_landings, compiled_entities: list[dict]) -> list[dict]:
+    """LLM 落点 → 可落库的落点（只保留能在编译 schema 里对上的）。
+
+    - 同时给了 `data_source_id` + `entity_name`：两键必须都在编译 schema 里存在
+      且**互相对应**（源存在但没这个实体 = 错配，丢弃）；
+    - 只给 `entity_name`：按编译 schema 反查源，多源 KB 逐源展开（同一实体在
+      多个源上都有落点时才写多条）；
+    - 只给 `data_source_id` + `di_metric`：源存在即可（DI 指标落点的常态形态）；
+    - 其余（源/实体都不认识、只有源没有指标）→ 丢弃。
+
+    全部无效时返回 `[]`，调用方据此**省略 landings 键**（绝不能写空列表：
+    update 场景会清空既有落点）。
+    """
+    pairs, by_entity, sources = _metric_landing_index(compiled_entities)
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_landings or []:
+        if not isinstance(item, dict):
+            continue
+        ds = str(item.get("data_source_id") or "").strip()
+        entity = str(item.get("entity_name") or "").strip()
+        di_metric = str(item.get("di_metric") or "").strip()
+        resolved: list[tuple[str, str]] = []
+        if entity:
+            key = entity.casefold()
+            if ds:
+                canonical = pairs.get((ds, key))
+                if canonical:
+                    resolved.append((ds, canonical))
+            else:
+                resolved.extend(by_entity.get(key) or [])
+        elif di_metric and ds in sources:
+            resolved.append((ds, ""))
+        for source, canonical in resolved:
+            dedupe = (source, di_metric, canonical)
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            landing: dict = {"data_source_id": source}
+            if di_metric:
+                landing["di_metric"] = di_metric
+            if canonical:
+                landing["entity_name"] = canonical
+            out.append(landing)
+    return out
+
+
+def _metric_concept_names(schema: dict,
+                          compiled_entities: list[dict]) -> list[str]:
+    """LLM 概念清单 = **编译 schema 实体名在前** + 抽象 schema 实体/属性名（去重保序）。
+
+    编译实体的顺序是刻意的：LLM 提示词的 `concepts` 截到 200 条，而落点
+    （`landings[].entity_name`）只能从编译实体里挑——把它们排在后面会被大库的
+    抽象属性名挤掉，导致候选永远产不出合法落点。模型挑了清单外的实体，会在
+    清洗阶段被丢掉。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in compiled_entities or []:
+        name = str((item or {}).get("entity_name") or "").strip()
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            out.append(name)
+    for name in _synonym_concept_names(schema):
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def metric_entries_from_suggestions(
+        suggestions: list[dict], questions: list[str],
+        compiled_entities: list[dict],
+        existing_metric_names: set[str] | None = None,
+) -> tuple[list, list]:
+    """LLM 指标候选 → `(entries, skipped)`（纯函数，不查库不出网）。
+
+    清洗口径（spec §4）：
+    - `q` 必须是合法问句下标（候选必须带 `question` 供 ad-hoc 验真）；
+    - `name` 非空且 ≤ `METRIC_NAME_MAX_LENGTH`；
+    - `definition` 非空且 ≤ `METRIC_DEFINITION_MAX_LENGTH`；
+    - `aliases` 逐项 trim、丢空/超 `METRIC_ALIAS_MAX_LENGTH`，去重保序，
+      最多 `METRIC_MAX_ALIASES` 条；**没有别名时省键**——update 候选若带
+      空 `aliases` 会抹掉既有别名；
+    - `formula` 可选（非字符串/空 → 省键）；
+    - `landings` 按编译 schema 校验（见 `_metric_landings`），全部无效时**省键**
+      并保留指标（不是整条跳过）；
+    - 批内同名去重（先到者胜），每批 ≤ `METRIC_MAX_ENTRIES` 条；
+    - `op` 按是否已存在同名指标给 `add` / `update`（apply 阶段直接可用）。
+    """
+    existing = {str(name).strip() for name in (existing_metric_names or set())
+                if str(name).strip()}
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    seen_names: set[str] = set()
+    for item in suggestions or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        q = item.get("q")
+        if isinstance(q, bool) or not isinstance(q, int) or not 0 <= q < len(questions or []):
+            skipped.append({"name": name, "why": "问句下标非法"})
+            continue
+        if not name:
+            skipped.append({"name": name, "why": "指标名为空"})
+            continue
+        if len(name) > METRIC_NAME_MAX_LENGTH:
+            skipped.append({
+                "name": name,
+                "why": f"name 超过长度上限({METRIC_NAME_MAX_LENGTH})",
+            })
+            continue
+        if name in seen_names:
+            skipped.append({"name": name, "why": "批内指标名重复"})
+            continue
+        raw_definition = item.get("definition")
+        definition = (raw_definition.strip()
+                      if isinstance(raw_definition, str) else "")
+        if not definition:
+            skipped.append({"name": name, "why": "指标定义为空"})
+            continue
+        if len(definition) > METRIC_DEFINITION_MAX_LENGTH:
+            skipped.append({
+                "name": name,
+                "why": f"definition 超过长度上限({METRIC_DEFINITION_MAX_LENGTH})",
+            })
+            continue
+        if len(entries) >= METRIC_MAX_ENTRIES:
+            skipped.append({
+                "name": name,
+                "why": f"超过单批条目上限 {METRIC_MAX_ENTRIES} 条",
+            })
+            continue
+        aliases: list[str] = []
+        alias_seen: set[str] = set()
+        raw_aliases = item.get("aliases")
+        if isinstance(raw_aliases, list):
+            for raw in raw_aliases:
+                if not isinstance(raw, str):
+                    continue
+                alias = raw.strip()
+                if not alias or len(alias) > METRIC_ALIAS_MAX_LENGTH:
+                    continue
+                key = alias.casefold()
+                if key in alias_seen:
+                    continue
+                alias_seen.add(key)
+                aliases.append(alias)
+                if len(aliases) >= METRIC_MAX_ALIASES:
+                    break
+        formula = item.get("formula")
+        formula = formula.strip() if isinstance(formula, str) else ""
+        landings = _metric_landings(item.get("landings"), compiled_entities)
+
+        seen_names.add(name)
+        entry: dict = {
+            "name": name,
+            "definition": definition,
+            "question": questions[q],
+            # 同名已存在 → update；否则 add（apply 阶段会再按实际行判一次）。
+            "op": "update" if name in existing else "add",
+        }
+        if aliases:
+            entry["aliases"] = aliases
+        if formula:
+            entry["formula"] = formula
+        if landings:
+            entry["landings"] = landings
+        entries.append(entry)
+    return entries, skipped
+
+
+async def _build_metric_patch(tenant_id: str, kb: str, request: dict,
+                              corpus: dict) -> tuple[dict, list]:
+    """指标口径草稿：窗口内指标口径类失败的问句 → LLM 提
+    `{name, aliases, definition, formula, landings}`（spec §4）。
+
+    KB 级（`ds=None`，与 alias / synonym 同姿态）：没有失败观测 / 没有相关
+    失败 / LLM 回空都不抛，返回空 `entries` 由 `run_pipeline` 收口
+    `empty-draft`。LLM 的**坏回包**抛（`suggest_metric_definitions` 与
+    alias / synonym 同口径），由运行入口记 failed。
+
+    落点校验读**编译 schema**（`load_compiled_entities`）：指标属于抽象层，
+    但 `landings` 指向物理实体，模型看不到库，所以只信编译 schema 里真实存在
+    的 `(data_source_id, entity_name)`。
+    """
+    until = datetime.datetime.now()
+    window_days = int(request.get("window_days") or DEFAULT_WINDOW_DAYS)
+    since = until - datetime.timedelta(days=window_days)
+    observations = await load_failed_observations(tenant_id, kb, since, until)
+    relevant = [obs for obs in observations or []
+                if isinstance(obs, dict)
+                and obs.get("outcome") == "failed"
+                and str(obs.get("reason_code") or "") in _SYNONYM_REASON_CODES]
+    questions = _synonym_questions(relevant)
+
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    note = ""
+    if not observations:
+        note = f"近 {window_days} 天窗口内没有失败观测"
+    elif not questions:
+        note = ("失败观测里没有指标口径类失败样本"
+                "（reason_code ∈ {no_candidate, not_answerable}）")
+    else:
+        data = await AbstractSchemaService().get(tenant_id, kb) or {}
+        compiled_entities = await load_compiled_entities(tenant_id, kb)
+        suggestions = await suggest_metric_definitions(
+            questions, _metric_concept_names(data, compiled_entities),
+            tenant_id=tenant_id, kb_id=kb)
+        schema = data.get("schema") or {}
+        existing_names = {
+            str(m.get("name") or "").strip()
+            for m in schema.get("metrics") or [] if isinstance(m, dict)}
+        entries, skipped = metric_entries_from_suggestions(
+            suggestions, questions, compiled_entities, existing_names)
+        # 验真必须落回「产生该失败」的数据源（与 synonym 同口径）：观测 SQL
+        # 把 `data_source_id` 别名成 `resource_id`；没有源时写空串，验真再按
+        # 唯一落点/空串回退。
+        for entry in entries:
+            entry["data_source_id"] = _synonym_observation_source(
+                str(entry.get("question") or ""), relevant)
+        if not entries:
+            note = ("LLM 未给出指标口径候选" if not suggestions
+                    else "指标口径候选全部被清洗（见 skipped 的 why）")
+
+    return {
+        "patch_id": f"met-batch-{until.strftime('%Y%m%d-%H%M%S')}",
+        "kind": "metric", "kb": kb, "ds": None,
+        "entries": entries, "skipped": skipped,
+        "target_cases": _target_cases(entries, corpus, request),
+        "source": "metric_suggest",
+        "rollback": {"added": []},
+        "note": note,
+    }, relevant
+
+
 async def _build_query_rule_patch(tenant_id: str, kb: str, ds: str | None,
                                   request: dict, corpus: dict) -> tuple[dict, list]:
     """编译 schema 码表 → 约束草稿；`request.picks` 指定子集，缺省全取。"""
@@ -1054,6 +1387,9 @@ async def build_patch(tenant_id: str, kind: str, kb: str, ds: str | None,
             tenant_id, kb, request, corpus)
     elif kind == "synonym":
         patch, observations = await _build_synonym_patch(
+            tenant_id, kb, request, corpus)
+    elif kind == "metric":
+        patch, observations = await _build_metric_patch(
             tenant_id, kb, request, corpus)
     elif kind == "query_rule":
         patch, observations = await _build_query_rule_patch(

@@ -127,6 +127,25 @@ def _entry_for_case(entries: list[dict], case_id: str) -> dict | None:
     return None
 
 
+def _metric_hint_text(entry: dict) -> str:
+    """一条指标 hint：`指标 {name}（aliases）：{definition}；公式：{formula}`。
+
+    构造器与**生产自动 hints 共用**（`nl2sql.hints.build_metric_hint_text`）：
+    单条 ≤500 字符，`formula[:200]` 优先保完整，definition 用剩余预算 ——
+    验真卡与生产注入的提示必须逐字同口径，否则评估的就不是线上行为。
+    返回空串表示条目不参与（name 为空）。
+    """
+    from ..nl2sql.hints import build_metric_hint_text
+
+    raw_aliases = entry.get("aliases")
+    return build_metric_hint_text(
+        name=entry.get("name"),
+        definition=str(entry.get("definition") or ""),
+        formula=str(entry.get("formula") or ""),
+        aliases=raw_aliases if isinstance(raw_aliases, list) else [],
+    )
+
+
 def _concept_aliases_of(pre: dict | None, concept: str) -> list[str]:
     """`pre` 快照里该概念**已有**的别名（不含本批候选别名）。
 
@@ -189,13 +208,14 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
             "gate_effective": effective,
             "override_required": override_required,
             "adhoc_veto": adhoc_veto,
-            # alias / synonym 批只列**本次 picks 影响到的** case：采纳校验
+            # alias / synonym / metric 批只列**本次 picks 影响到的** case：采纳校验
             # （`_preflight`）与执行阶段都按 picks 过滤，预览必须同口径；否则
             # 取消勾选相关条目后验真卡仍列出该 case，用户既取不到证据（1001）
             # 也无法确认采纳（Critical 1）。其它 kind 走旧 truths 通道，保持
             # 全量口径不变。
             "adhoc_cases": (common.picked_adhoc_cases(run, picks)
-                            if patch.get("kind") in ("alias", "synonym")
+                            if patch.get("kind") in ("alias", "synonym",
+                                                     "metric")
                             else common._unverified_adhoc_cases(run)),
             "smoke_plan": plan_smoke(run, await self._load_corpus_safe(
                 tenant_id, run)),
@@ -259,10 +279,10 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
         # truths 覆盖校验（那会拿全量 unverified 把采纳 1001 卡死）。
         skip_adhoc_coverage = False
         if verdicts is not None:
-            # 人工验真本期做 alias 与 synonym（spec §5）：其它 kind 仍走旧
-            # truths 表单，拿 verdicts 进来必须显式 1001，不能静默当成
+            # 人工验真本期做 alias / synonym / metric（spec §5）：其它 kind 仍走
+            # 旧 truths 表单，拿 verdicts 进来必须显式 1001，不能静默当成
             # alias 口径处理。
-            if kind not in ("alias", "synonym"):
+            if kind not in ("alias", "synonym", "metric"):
                 raise InvalidParameterError(
                     message="该演化类型暂不支持人工验真")
             picked_unverified = common.picked_adhoc_cases(run, picks)
@@ -296,11 +316,12 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
                         run.get("run_id"), exc)
                 raise ResourceConflictError(
                     message="人工验真不通过，不能采纳")
-        elif (kind in ("alias", "synonym")
+        elif (kind in ("alias", "synonym", "metric")
               and common._unverified_adhoc_cases(run)
               and not common.picked_adhoc_cases(run, picks)):
-            # 兼容整键省略 `adhoc_verdicts` 的 alias / synonym 调用方：run 确实有未验真
-            # 的 case，但 picks 已把它们全部排除 ⇒ 本次没有需要验真的对象。
+            # 兼容整键省略 `adhoc_verdicts` 的 alias / synonym / metric 调用方：
+            # run 确实有未验真的 case，但 picks 已把它们全部排除 ⇒ 本次没有
+            # 需要验真的对象。
             # `unverified` 按空集处理，门禁也不能凭空把 uncertain 升成
             # accept（没有「投票」可言）。
             # 注意：run 本来就没有 unverified case 时仍走旧 truths 覆盖校验
@@ -406,19 +427,31 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
 
     async def adhoc_evidence(self, tenant_id: str, run_id: str, case_id: str,
                              picks: list[str] | None = None) -> dict:
-        """现场验真证据：临时 apply 候选（按 picks）→ 跑一次问句 → 恢复快照。
+        """现场验真证据：按 picks 让候选生效 → 跑一次问句 → 还原状态。
 
         只读接口（不改运行状态、不写台账），用来让用户在点「通过/不通过」前
         真的看到数据与概念全名。返回值的 `evidence_id` 绑定「选中的 entries +
         case_id + 签发时间」：改 picks / 换候选都会让旧票据失效（Task 3 校验）。
 
+        三种 kind 的生效方式不同，别混为一谈：
+
+        - **alias**：schema 行上的概念别名 → 临时 apply 候选 → 跑问句 →
+          恢复快照（下面「恢复是条件式的」一条只适用于本形态）；
+        - **synonym**：值同义词存在 `ontology_synonyms` 行、不在 schema 上 →
+          走请求级 `extra_value_aliases`，**零写入、不取链锁、不碰快照**；
+        - **metric**：指标定义/公式走请求级 `extra_metric_hints` /
+          `extra_metric_names`，同样**零写入、不取链锁**（临时 apply 既改线上
+          schema，`NL2SQL_HINTS` 关闭时又根本不生效）。
+
+        共同约束：
+
         - **必须走进程内 ②**（`in_process_asker_for`，`record_evidence=False`）：
           这是人工验真辅助，不是评测，不能污染观测/审计或受 `EVOLUTION_UPSTREAM`
           开关影响；
-        - **恢复是条件式的**：apply 成功、或 apply 可能已写库（回读核对失败等
-          `_apply_may_have_written` 为真）才恢复；apply 在写库前就失败（零条
-          生效 / JonexException）绝不恢复 —— 否则会覆盖并发采纳赢家的写入。
-          执行异常时保留 `run.backup` 的 pre 快照（唯一人工恢复源）；
+        - **恢复是条件式的**（仅 alias）：apply 成功、或 apply 可能已写库（回读
+          核对失败等 `_apply_may_have_written` 为真）才恢复；apply 在写库前就
+          失败（零条生效 / JonexException）绝不恢复 —— 否则会覆盖并发采纳赢家
+          的写入。执行异常时保留 `run.backup` 的 pre 快照（唯一人工恢复源）；
           恢复失败升级成 run `failed` + 审计，绝不把半应用状态留在线上；
         - 执行异常（apply / ask）→ `ok=false` + `error`，**不签发票据**；正常
           返回（有结果、空结果或合规拒答）→ 发票据，用户仍可据此判「不通过」。
@@ -426,11 +459,12 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
         store = common.RunStore(self.session)
         run = await store.get(tenant_id, run_id)
         common._require_status(run, frozenset({"evaluated"}), "ad-hoc 验真")
-        # 人工验真本期做 alias 与 synonym（spec §5；值同义词线的验真卡只显示
-        # term/canonical + 真实结果）：其它 kind 的验真卡形态未实现，直接拒绝
-        # 而不是拿它们去临时 apply（apply 后的数据也解释不了）。
+        # 人工验真本期做 alias / synonym / metric（spec §5；值同义词线只显示
+        # term/canonical + 真实结果，metric 线显示指标名/定义/公式 + 真实结果）：
+        # 其它 kind 的验真卡形态未实现，直接拒绝而不是拿它们去临时 apply
+        # （apply 后的数据也解释不了）。
         run_kind = str(run.get("kind") or "")
-        if run_kind not in ("alias", "synonym"):
+        if run_kind not in ("alias", "synonym", "metric"):
             raise InvalidParameterError(message="该演化类型暂不支持人工验真")
 
         cid = str(case_id or "").strip()
@@ -475,6 +509,13 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
         question = str(case.get("question") or "")
         all_entries = [item for item in patch.get("entries") or []
                        if isinstance(item, dict)]
+        # metric 指标定义/公式不走「临时 apply → 恢复」：② 的注入路径受
+        # `NL2SQL_HINTS`/`NL2SQL_AUTO_HINTS` 开关控制，临时 apply 既改线上
+        # schema，开关关闭时又根本不生效。改用请求级 `extra_metric_hints`
+        # （不受开关门控、零写入）。
+        if run_kind == "metric":
+            return await self._metric_adhoc_evidence(
+                tenant_id, cid, question, entries, all_entries, run)
         # synonym 同义词不在 schema 行上：没有「临时 apply → 恢复」这回事，
         # 只把本次选中条目的 term→canonical 作为请求级值同义词交给 ②。
         if run_kind == "synonym":
@@ -731,6 +772,166 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
             "term": term,
             "terms": list(terms),
             "canonical": canonical,
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "rows_hash": common.rows_hash(rows),
+            "ok": False,
+            "error": None,
+            "evidence_id": None,
+        }
+        if exec_error is None:
+            if rows:
+                out["ok"] = True
+            else:
+                out["error"] = (table.get("reason_code")
+                                or table.get("answer")
+                                or table.get("reason")
+                                or "查询没有返回数据")
+            # 正常返回（含空结果/合规拒答）才签发票据：用户仍可据此判「不通过」。
+            out["evidence_id"] = common.make_evidence_id(
+                entries, case_id, int(time.time()))
+        else:
+            out["error"] = str(exec_error)
+        return out
+
+    async def _metric_adhoc_evidence(self, tenant_id: str, case_id: str,
+                                     question: str, entries: list[dict],
+                                     all_entries: list[dict],
+                                     run: dict) -> dict:
+        """metric 验真：**不 apply schema**，只带请求级指标 hints 跑一次 ②。
+
+        指标定义/公式存在抽象 schema 的 `metrics` 块上，但 ② 的注入路径
+        （`auto_hints._metric_hints`）受 `NL2SQL_HINTS` + `NL2SQL_AUTO_HINTS`
+        开关控制：临时 apply + 恢复既改了线上抽象 schema，开关关闭时又根本
+        不会生效，验真结果会误导用户。请求级 `extra_metric_hints` 绕过开关
+        且零写入，只回答一件事——带上这批候选口径后问句能否答上。
+
+        验真**不写库**：不碰 `run.backup`、不取链锁、不写快照/台账。返回形状
+        与 alias / synonym 证据卡同构，另带 `metric` / `definition` /
+        `formula` 与三个可观测警告：`production_hit`（生产只按词面命中注入，
+        与验真的无条件注入不同源）、`hint_dropped`（本次 hint 因合并预算被丢）、
+        `metric_disabled`（候选对应库里一个停用的既有指标）；票据仍绑定
+        「本次选中的 entries + case_id」。
+        """
+        entry = (_entry_for_case(entries, case_id)
+                 or _entry_for_case(all_entries, case_id) or {})
+        metric = str(entry.get("name") or "").strip()
+        definition = str(entry.get("definition") or "").strip()
+        formula = str(entry.get("formula") or "").strip()
+        # 选中条目的**全部**指标都注入：apply 后整批生效，验真只看第一条会
+        # 对「问句命中的是第二条」给出假阴性（与 synonym 整组 term 同理）。
+        # 单条 hint 走 500 字动态预算（`_metric_hint_text`），公式优先保完整。
+        hints: list[str] = []
+        metric_names: list[str] = []
+        for item in entries or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            hint = _metric_hint_text(item)
+            if not hint:
+                continue
+            hints.append(hint)
+            if name not in metric_names:
+                # 请求级覆盖：自动 hints 不再注入库里的同名旧定义，否则
+                # 「update 已有指标」的验真会同时看到新旧两条自相矛盾的口径。
+                metric_names.append(name)
+
+        # 可观测警告（I-2）：验真与生产的注入口径不同，卡片必须把差异说出来。
+        #
+        # `production_hit`：生产 `auto_hints._metric_hints` **只在问句词面命中
+        # name/aliases 时**注入；验真无条件注入。这里复用**同一个**匹配函数
+        # （不重新实现），对本次选中条目的 name + aliases 逐个判，任一命中即真。
+        from ..nl2sql.auto_hints import _matches
+
+        picked = [item for item in (entries or []) if isinstance(item, dict)]
+        production_hit = any(
+            _matches(
+                question,
+                str(item.get("name") or "").strip(),
+                *[str(alias).strip() for alias in (
+                    item.get("aliases")
+                    if isinstance(item.get("aliases"), list) else [])
+                  if str(alias or "").strip()])
+            for item in picked
+        )
+        # `hint_dropped`：请求级 hint 走 ② 的 `merge_hints`；超条数/总长预算时
+        # 宁可少一条也不抛（验真不能因提示变长而 1001），但卡片要标出来 —— 否则
+        # 「验真没效果」会被误读成口径错。验真入口不传 base hints（`hints=[]`），
+        # 所以这里的合并基线就是空列表，与服务端 line `merge_hints(hint_texts, …)`
+        # 在 `hint_texts=[]` 时逐字同口径。
+        from ..nl2sql.hints import merge_hints
+
+        hint_dropped = len(merge_hints([], hints)) < len(hints)
+        # `metric_disabled`：候选在库里已有同名指标且是 `enabled is False`
+        # （disable 采纳的产物）—— 该指标当前不会进生产 hints。读失败 fail-open
+        # 成 False（旁路观测，不该把验真变成 500）。
+        metric_disabled = False
+        try:
+            row = await common.schema_io.get_row(
+                tenant_id, "metric", run.get("kb"), None) or {}
+            stored_metrics = ((row.get("schema") or {}).get("metrics")
+                              if isinstance(row.get("schema"), dict) else None)
+            disabled_names = {
+                str(item.get("name") or "").strip()
+                for item in (stored_metrics if isinstance(stored_metrics, list) else [])
+                if isinstance(item, dict) and item.get("enabled") is False}
+            metric_disabled = any(name in disabled_names for name in metric_names)
+        except Exception as exc:  # noqa: BLE001 —— 旁路观测不阻断验真
+            logger.warning("metric 验真读取抽象 schema 失败 run=%s: %s",
+                           run.get("run_id"), exc)
+
+        # 取源顺序：条目自带的观测源 → 落点里**唯一**的 data_source_id →
+        # 空串（② 自行选择）。落点跨多个不同源时回退空串：猜第一个会在多源
+        # KB 上跑到错误的源，给出 no_candidate 假阴性。
+        # **不复用** `_synonym_corpus_ds`：语料 target 是评测口径，metric 的
+        # 落点是候选自己声明的源。
+        data_source_id = str(entry.get("data_source_id") or "").strip()
+        if not data_source_id:
+            landings = entry.get("landings")
+            landing_sources = {
+                str(item.get("data_source_id") or "").strip()
+                for item in (landings if isinstance(landings, list) else [])
+                if isinstance(item, dict)}
+            landing_sources.discard("")
+            if len(landing_sources) == 1:
+                data_source_id = landing_sources.pop()
+
+        outcome = None
+        exec_error: Exception | None = None
+        try:
+            # 函数内 import：测试可 monkeypatch 源模块；也避免把 ② 依赖拖进
+            # 只做纯计算/受理的路径。
+            from ..nl2sql.service import Nl2SqlService
+            from .upstream import EVOLUTION_USER_ID, EVOLUTION_USERNAME
+
+            outcome = await Nl2SqlService().ask_data_source(
+                tenant_id, run.get("kb"), question,
+                data_source_id=data_source_id,
+                user_id=EVOLUTION_USER_ID, username=EVOLUTION_USERNAME,
+                record_evidence=False,
+                extra_metric_hints=hints,
+                extra_metric_names=metric_names,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 证据查询失败不 500
+            exec_error = exc
+
+        data = outcome if isinstance(outcome, dict) else {}
+        nested = data.get("table")
+        table = nested if isinstance(nested, dict) else data
+        rows = list(table.get("rows") or [])
+        columns = list(table.get("columns") or [])
+        out = {
+            "case_id": case_id,
+            "question": question,
+            "metric": metric,
+            "definition": definition,
+            "formula": formula,
+            # 可观测警告：验真无条件注入 vs 生产的词面命中门槛 / 预算丢弃 /
+            # 既有指标停用。前端据此展示，不改变验真本身的结果。
+            "production_hit": production_hit,
+            "hint_dropped": hint_dropped,
+            "metric_disabled": metric_disabled,
             "columns": columns,
             "rows": rows,
             "row_count": len(rows),
@@ -1123,6 +1324,11 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
         if _run_kind in ("mapping", "tool_schema", "synonym"):
             raise InvalidParameterError(
                 message=f"{_run_kind} 条目不支持修订/调整")
+        # metric 的靶点是「名称 + 定义 + 公式 + 落点」，没有 alias/expression
+        # 文本靶点：LLM 改写会落进 query_rule 的 expression 口径，文案误导。
+        if _run_kind == "metric":
+            raise InvalidParameterError(
+                message="指标口径暂不支持在线修订")
         patch = common._patch_of(run)
         entry = common._find_entry(patch, entry_key)
         # disable/enable 只翻转启用状态，没有可改写的文本靶点：带 target_code
@@ -1160,6 +1366,9 @@ class AdoptService(AdoptExecuteMixin, AdoptRecoveryMixin):
         if _run_kind in ("mapping", "tool_schema"):
             raise InvalidParameterError(
                 message=f"{_run_kind} 条目不支持修订/调整")
+        if _run_kind == "metric":
+            raise InvalidParameterError(
+                message="指标口径暂不支持在线修订")
         patch = common._patch_of(run)
         entry = common._find_entry(patch, entry_key)
         # disable/enable 没有可修订的口径（同上；target_code 只是身份，不是可改文本）。

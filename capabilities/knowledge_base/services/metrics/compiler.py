@@ -159,16 +159,17 @@ def _select_for(
     """返回 `(select, tables)`；select 的值列别名恒为 `v`，不含 LIMIT。"""
     if depth > _MAX_DEPTH:
         raise MetricCompileError("metric_invalid", "指标依赖层级过深")
+    # 时间窗对所有类型都成立：SIMPLE/CUMULATIVE 直接过滤，RATIO/DERIVED 把窗口
+    # **下推到每个输入**（它们必然是 simple）—— 否则「7月份的良率」这种问法
+    # 只能对整期算，用户看到的数字与问题对不上（2026-11-15 实测）。
     if time_from or time_to:
-        if executable["metric_type"] not in ("simple", "cumulative"):
-            raise MetricCompileError(
-                "time_filter_unsupported",
-                "时间窗目前只支持 SIMPLE/CUMULATIVE 指标")
+        validate_time_bounds(time_from, time_to)
     metric_type = executable["metric_type"]
     if metric_type == "simple":
         return _compile_simple(definition, executable, compiled_row,
                                data_source_id, group_by,
                                input_filter=input_filter,
+                               time_grain=time_grain,
                                time_from=time_from, time_to=time_to)
     if metric_type == "cumulative":
         return _compile_cumulative(
@@ -179,7 +180,9 @@ def _select_for(
     return _compile_multi(definition, executable, scope=scope,
                           compiled_row=compiled_row,
                           data_source_id=data_source_id, group_by=group_by,
-                          visiting=visiting, depth=depth, key=key)
+                          visiting=visiting, depth=depth, key=key,
+                          time_grain=time_grain,
+                          time_from=time_from, time_to=time_to)
 
 
 def _compile_simple(
@@ -190,6 +193,7 @@ def _compile_simple(
     group_by: list[str],
     *,
     input_filter: str | None = None,
+    time_grain: str | None = None,
     time_from: str | None = None,
     time_to: str | None = None,
 ):
@@ -204,8 +208,15 @@ def _compile_simple(
             "半可加（non_additive_dim）编译在 M5 提供",
         )
 
-    dim_columns = [_dim_column(dim, columns, f"{definition.get('name') or 'metric'}")
-                   for dim in group_by]
+    grain = _check_grain(time_grain)
+    timed = _time_dim_names(measure, columns, group_by)
+    label = f"{definition.get('name') or 'metric'}"
+    dim_columns = []
+    for dim in group_by:
+        column = _dim_column(dim, columns, label)
+        if grain and dim in timed:
+            column = _date_trunc(grain, column)
+        dim_columns.append(column)
     select = exp.select(
         *[column.as_(dim, quoted=True) for column, dim in zip(dim_columns, group_by)],
         _aggregate(measure, columns).as_(_VALUE),
@@ -329,6 +340,15 @@ def _compile_cumulative(
     return outer, {table_id}
 
 
+def validate_time_bounds(time_from: str | None, time_to: str | None) -> None:
+    """时间窗边界的 ISO 校验；非法时抛 `time_filter_unsupported`（既有原因码）。"""
+    try:
+        _parse_time_bound(time_from, "time_from")
+        _parse_time_bound(time_to, "time_to")
+    except MetricCompileError as exc:
+        raise MetricCompileError("time_filter_unsupported", str(exc)) from exc
+
+
 def _parse_time_bound(value: str | None, field: str) -> str | None:
     """ISO 日期/时间窗边界；只接受明确格式（不做自然语言）。"""
     if value is None:
@@ -435,6 +455,9 @@ def _compile_multi(
     visiting: tuple[str, ...],
     depth: int,
     key: str | None = None,
+    time_grain: str | None = None,
+    time_from: str | None = None,
+    time_to: str | None = None,
 ):
     metric_type = executable["metric_type"]
     ordered = _ordered_inputs(metric_type, executable)
@@ -447,6 +470,7 @@ def _compile_multi(
 
     ctes: list[tuple[str, exp.Expression]] = []
     tables: set[str] = set()
+    grain_sets: list[set[str]] = []
     for index, item in enumerate(ordered):
         input_name = item["name"]
         target = scope.get(input_name)
@@ -479,10 +503,22 @@ def _compile_multi(
             target, sub_executable, scope=scope, compiled_row=compiled_row,
             data_source_id=data_source_id, group_by=group_by,
             visiting=visiting, depth=depth + 1, input_filter=input_filter,
-            key=input_name,
+            key=input_name, time_grain=time_grain,
+            time_from=time_from, time_to=time_to,
         )
+        if time_grain:
+            grain_sets.append(_timed_dims_for(
+                target, sub_executable, compiled_row, data_source_id, group_by))
         ctes.append((f"m{index}", sub_select))
         tables |= sub_tables
+    if time_grain and grain_sets and any(
+            item != grain_sets[0] for item in grain_sets):
+        # 一边按天截断、另一边按原始时间戳分组 → 两个 CTE 的键不同，
+        # LEFT JOIN 会把同一批数据拆成两行（静默错位），必须硬拒。
+        raise MetricCompileError(
+            "time_filter_unsupported",
+            "时间粒度在各输入指标间不一致："
+            + "；".join(sorted(str(sorted(item)) for item in grain_sets)))
 
     if metric_type == "ratio":
         value = sqlglot.parse_one(
@@ -767,6 +803,47 @@ def _metric_column(index: int, dim: str):
 def _keys_column(dim: str):
     """分组键 CTE（`keys`）的列。"""
     return exp.Column(this=_q(dim), table=exp.to_identifier("keys"))
+
+
+def _check_grain(time_grain: str | None) -> str | None:
+    """归一并校验时间粒度；None/空串表示「不截断」。"""
+    if not time_grain:
+        return None
+    grain = str(time_grain).strip().lower()
+    if grain not in GRANULARITIES:
+        raise MetricCompileError(
+            "metric_invalid",
+            f"time_grain 非法：{grain}（允许 " + "/".join(GRANULARITIES) + "）")
+    return grain
+
+
+def _time_dim_names(measure: dict, columns: dict[str, str | None],
+                    group_by: list[str]) -> set[str]:
+    """`group_by` 里哪些维度是**该指标自己声明过**的时间列。
+
+    只认 `measure.time_column`，不按列名或类型猜：猜错的表现是「按天」其实
+    按秒分组，编译成功、数全错，比直接报错难查得多。
+    """
+    time_column = str((measure or {}).get("time_column") or "").strip()
+    if not time_column:
+        return set()
+    physical = columns.get(time_column)
+    if not physical:
+        return set()
+    return {dim for dim in group_by if columns.get(dim) == physical}
+
+
+def _timed_dims_for(definition: dict, executable: dict,
+                    compiled_row: dict | None, data_source_id: str,
+                    group_by: list[str]) -> set[str]:
+    """某个输入指标会截断的分组维度（解析不出实体时按「不截断」算）。"""
+    try:
+        entity = _entity(compiled_row,
+                         _landing_entity(definition, data_source_id))
+    except MetricCompileError:
+        return set()
+    return _time_dim_names(executable.get("measure") or {},
+                           _columns(entity), group_by)
 
 
 def _dim_column(dim: str, columns: dict[str, str | None], metric_name: str):

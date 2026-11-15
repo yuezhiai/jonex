@@ -157,7 +157,8 @@ def build_repair_note(failed: list[str]) -> str:
 async def generate_assertions(question: str, columns: list[dict] | None, *,
                               tenant_id: str | None = None,
                               kb_id: str | None = None,
-                              user_id: str | None = None) -> list[str]:
+                              user_id: str | None = None,
+                              trace_id: str | None = None) -> list[str]:
     timeout = float(getattr(config, "NL2SQL_UNIT_TEST_TIMEOUT", 15.0) or 15.0)
     if timeout <= 0:
         return []
@@ -169,6 +170,7 @@ async def generate_assertions(question: str, columns: list[dict] | None, *,
                 tools=None, model=None, scene="nl2sql_unit_test",
                 max_tokens=512, tenant_id=tenant_id or "unknown",
                 kb_id=kb_id or None, user_id=user_id or None,
+                trace_id=trace_id,
             ),
             timeout=timeout,
         )
@@ -181,7 +183,8 @@ async def evaluate_assertions(question: str, assertions: list[str], sql: str,
                               rows: list[list] | None, columns: list[dict] | None, *,
                               tenant_id: str | None = None,
                               kb_id: str | None = None,
-                              user_id: str | None = None) -> list[dict]:
+                              user_id: str | None = None,
+                              trace_id: str | None = None) -> list[dict]:
     if not assertions:
         return []
     timeout = float(getattr(config, "NL2SQL_UNIT_TEST_TIMEOUT", 15.0) or 15.0)
@@ -196,6 +199,7 @@ async def evaluate_assertions(question: str, assertions: list[str], sql: str,
                 tools=None, model=None, scene="nl2sql_unit_test",
                 max_tokens=512, tenant_id=tenant_id or "unknown",
                 kb_id=kb_id or None, user_id=user_id or None,
+                trace_id=trace_id,
             ),
             timeout=timeout,
         )

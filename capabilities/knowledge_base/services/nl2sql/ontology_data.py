@@ -147,6 +147,7 @@ async def run_ontology_data_search(
     user_id: str = "",
     username: str = "",
     ip: str = "",
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """执行「本体 + 数据」。`ontology_call` 是无参异步函数，返回本体检索的 data dict。"""
     ontology_data = await ontology_call()
@@ -160,6 +161,7 @@ async def run_ontology_data_search(
             user_id=user_id,
             username=username,
             ip=ip,
+            trace_id=trace_id,
         )
         return _merge(ontology_data, fallback)
 
@@ -184,6 +186,7 @@ async def run_ontology_data_search(
         user_id=user_id,
         username=username,
         ip=ip,
+        trace_id=trace_id,
     )
     successes = [b for b in blocks if b.get("kind") == "answer"]
     failures = [b for b in blocks if b.get("kind") != "answer"]
