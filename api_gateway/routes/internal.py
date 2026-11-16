@@ -41,10 +41,28 @@ logger = get_logger("api_internal")
 router = APIRouter()
 
 # ── Action 白名单 ─────────────────────────────────────────────────
-_ALLOWED_ACTIONS = frozenset({"deep_query", "expand_ontology_neighbors", "generate_upload_url", "get_document_status", "get_raw_url", "get_service", "list_documents", "list_ontology_entity_types", "list_ontology_instances", "list_services", "query_with_ontology", "search_jonex_wiki", "search_llmwiki", "search_mix", "submit_mcp_feedback", "upload_document"})
-_ALLOWED_ACTIONS = _ALLOWED_ACTIONS | frozenset({
+_ALLOWED_ACTIONS = frozenset({
+    "deep_query", "expand_ontology_neighbors", "generate_upload_url",
+    "get_document_status", "get_raw_url", "get_service",
+    # MCP 列式浏览：页面图源 / 目录 / 断言
+    "get_wiki_page_graph", "get_wiki_outline", "get_wiki_claims",
+    # 版本化图与图浏览
     "get_wiki_graph_types", "search_wiki_nodes", "get_wiki_node",
     "get_wiki_neighbors", "get_wiki_graph_evidence", "get_wiki_media",
+    "list_documents", "list_ontology_entity_types", "list_ontology_instances",
+    "list_services", "query_with_ontology", "search_jonex_wiki",
+    "search_llmwiki", "search_mix", "submit_mcp_feedback", "upload_document",
+})
+# 问数（结构化数据）只读 action —— MCP「问数」工具的前置放行。
+# 只读边界：五个 action 都不写业务数据，也都不写检索历史（`ask_data_source` /
+# `ask_metric` 落 NL→SQL 观测与审计，`list_data_sources` / `get_compiled_schema`
+# 纯读，`search_data` 是纯数据 NL→SQL 扇出，见 services/nl2sql/data_search.py），
+# 因此**不登记**到下面的 `_MCP_SEARCH_ACTIONS`。
+# ⚠ 白名单只决定「MCP 能不能调这个 action」，不放宽任何业务前置：结构化能力仍受
+# 每 KB 的 `structured_enabled` 开关与数据源权限约束（能力层 `_STRUCTURED_ACTIONS`）。
+_ALLOWED_ACTIONS = _ALLOWED_ACTIONS | frozenset({
+    "ask_data_source", "search_data", "list_data_sources",
+    "get_compiled_schema", "ask_metric",
 })
 
 # MCP 工具名：仅作监控展示元数据，不参与租户/授权判定。
@@ -456,10 +474,11 @@ async def mcp_kb_invoke(
 
 @router.get("/kb/download/{token}", summary="Token 化文档下载（一次性）")
 async def kb_download_token(token: str):
-    """消费一次性下载 token，302 重定向到 COS 预签名 URL。
+    """消费一次性下载 token，302 重定向到对象存储预签名 URL（遗留端点）。
 
-    Token 由 mcp_kb_invoke 在处理 get_raw_url action 时生成并存储在 Redis 中，
-    TTL 300s，一次性消费后立即删除。
+    ⚠️ 2026-11-12 核查：全仓**没有生产写入方**——`get_raw_url` 已直接返回
+    对象存储预签名 URL，只有本端点在 ``getdel`` 消费 ``download_token:{token}``。
+    保留仅为兼容存量链路，下线需另立变更。
     """
     redis = await _get_redis()
     token_key = f"download_token:{token}"

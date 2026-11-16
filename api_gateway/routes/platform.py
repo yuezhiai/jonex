@@ -593,7 +593,7 @@ async def get_identity_sync_record(record_id: int, request: Request):
 # ==================== 平台监控 · 调用监控（C1–C9 + M1）+ Token 监控（K1–K4）====================
 #
 # ⚠ 网关对 platform 是**逐条登记**的（不像 sidecar 有 /platform/{path:path} 兜底）
-# ⇒ platform 侧 14 条监控端点必须在**同一批**登记在这里：只加 platform 不登记
+# ⇒ platform 侧 19 条监控端点必须在**同一批**登记在这里：只加 platform 不登记
 # 网关 = 浏览器侧 404；只登记网关不加 platform = `test_gateway_has_no_stale_routes` 红。
 # tests/unit/test_hide_task_center.py 的正反双向断言盯着这件事。
 
@@ -626,6 +626,16 @@ async def monitor_call_trend(request: Request):
 @router.get("/monitor/calls/records", summary="调用记录列表")
 async def monitor_call_records(request: Request):
     return await _proxy_platform(request, "monitor/calls/records")
+
+
+@router.get("/monitor/calls/token-usage", summary="调用记录 Token 补值")
+async def monitor_call_token_usage(request: Request):
+    """调用记录「首屏 - 后自动补值」的轻量轮询入口。
+
+    必须声明在 ``/monitor/calls/{request_id}/detail`` 之前（静态段在前），
+    否则 ``token-usage`` 会被参数路由的段匹配吞掉。
+    """
+    return await _proxy_platform(request, "monitor/calls/token-usage")
 
 
 @router.get("/monitor/calls/objects/{object_id}/detail", summary="对象 / 能力详情")
@@ -670,6 +680,15 @@ async def monitor_token_models_top(request: Request):
 @router.get("/monitor/tokens/usage", summary="Token 用量明细列表")
 async def monitor_token_usage(request: Request):
     return await _proxy_platform(request, "monitor/tokens/usage")
+
+
+# ---------------------------------------------------------------- 未归因调用汇总
+# 上游路径串 = platform 侧路径去掉 `/platform` 前缀，逐字符对齐。
+
+
+@router.get("/monitor/unattributed/summary", summary="未归因调用汇总")
+async def monitor_unattributed_summary(request: Request):
+    return await _proxy_platform(request, "monitor/unattributed/summary")
 
 
 # ---------------------------------------------------------------- 任务监控族（T1–T4）

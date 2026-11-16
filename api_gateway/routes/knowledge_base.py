@@ -2639,9 +2639,12 @@ async def list_spaces(
     request: Request,
     offset: int = Query(0, ge=0, description="偏移量"),
     limit: int = Query(20, ge=1, le=100, description="每页条数"),
+    scope: Optional[str] = Query("manage", description="manage=管理视角 | search=检索视角"),
 ):
     """获取领域空间分页列表"""
-    result = await _call_kb_capability(request, "list_spaces", {"offset": offset, "limit": limit})
+    result = await _call_kb_capability(
+        request, "list_spaces", {"offset": offset, "limit": limit, "scope": scope}
+    )
     return success_response(data=result)
 
 
@@ -3339,6 +3342,60 @@ async def list_bindable_tools(
     return success_response(data=result)
 
 
+@router.post(
+    "/ontology/tool-bindings/preview-mapping",
+    summary="预览工具绑定参数映射（只读，不执行）",
+)
+async def preview_tool_binding_mapping(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "preview_tool_binding_mapping", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/tool-bindings/recommend-mapping",
+    summary="AI 推荐工具绑定参数映射（只返回建议，不写库）",
+)
+async def propose_tool_binding_mapping(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "propose_tool_binding_mapping", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/tool-bindings/refine-mapping",
+    summary="AI 续推工具绑定参数映射（带用户补充答案）",
+)
+async def refine_tool_binding_mapping(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "refine_tool_binding_mapping", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/extract-tool-declarations/recommend",
+    summary="AI 生成抽取期工具声明（只返回建议，不保存）",
+)
+async def propose_extract_tool_declaration(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "propose_extract_tool_declaration", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/extract-tool-declarations/refine",
+    summary="AI 按试跑结果修正抽取期工具声明",
+)
+async def refine_extract_tool_declaration(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "refine_extract_tool_declaration", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/kb-tools/ai-draft",
+    summary="AI 生成知识库工具草稿（只返回建议，不写库）",
+)
+async def propose_kb_tool_draft(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "propose_kb_tool_draft", payload)
+    return success_response(data=result)
+
+
 @router.post("/lineage-edges", summary="新增血缘边")
 async def create_lineage_edge(request: Request, payload: dict = Body(...)):
     result = await _call_kb_capability(request, "create_lineage_edge", payload)
@@ -3692,6 +3749,104 @@ async def delete_governance_policy(
     result = await _call_kb_capability(
         request, "delete_governance_policy",
         {"policy_id": policy_id, "knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.get("/verified-queries", summary="已验证查询列表")
+async def list_verified_queries(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1),
+    data_source_id: str = Query(""),
+):
+    result = await _call_kb_capability(
+        request, "list_verified_queries",
+        {"knowledge_base_id": knowledge_base_id,
+         "data_source_id": data_source_id})
+    return success_response(data=result)
+
+
+@router.post("/verified-queries", summary="登记已验证查询（草稿）")
+async def save_verified_query(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "save_verified_query", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.get("/verified-queries/{verified_query_id}", summary="已验证查询详情")
+async def get_verified_query(
+    request: Request,
+    verified_query_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+):
+    result = await _call_kb_capability(
+        request, "get_verified_query",
+        {"verified_query_id": verified_query_id,
+         "knowledge_base_id": knowledge_base_id})
+    return success_response(data=result)
+
+
+@router.patch("/verified-queries/{verified_query_id}", summary="更新已验证查询")
+async def update_verified_query(
+    request: Request,
+    verified_query_id: str,
+    payload: dict = Body(...),
+):
+    payload["verified_query_id"] = verified_query_id
+    result = await _call_kb_capability(
+        request, "save_verified_query", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.post("/verified-queries/{verified_query_id}/activate",
+             summary="激活已验证查询")
+async def activate_verified_query(
+    request: Request,
+    verified_query_id: str,
+    payload: dict = Body(...),
+):
+    payload["verified_query_id"] = verified_query_id
+    result = await _call_kb_capability(
+        request, "activate_verified_query", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.post("/verified-queries/{verified_query_id}/retire",
+             summary="退役已验证查询")
+async def retire_verified_query(
+    request: Request,
+    verified_query_id: str,
+    payload: dict = Body(...),
+):
+    payload["verified_query_id"] = verified_query_id
+    result = await _call_kb_capability(
+        request, "retire_verified_query", payload,
+        user_id=_extract_user_id(request))
+    return success_response(data=result)
+
+
+@router.delete("/verified-queries/{verified_query_id}", summary="删除已验证查询")
+async def delete_verified_query(
+    request: Request,
+    verified_query_id: str,
+    knowledge_base_id: str = Query(..., min_length=1),
+    expected_version: int = Query(..., ge=1),
+):
+    result = await _call_kb_capability(
+        request, "delete_verified_query",
+        {"verified_query_id": verified_query_id,
+         "knowledge_base_id": knowledge_base_id,
+         "expected_version": expected_version})
+    return success_response(data=result)
+
+
+@router.post("/verified-queries/preview-match", summary="预览已验证查询匹配")
+async def preview_verified_query_match(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(
+        request, "preview_verified_query_match", payload,
+        user_id=_extract_user_id(request))
     return success_response(data=result)
 
 
@@ -4220,6 +4375,136 @@ async def construct_abstract_schema(request: Request, payload: dict = Body(...))
     结构化数据源的只增不删补齐；缺省 `"structured"` 保持旧行为（只从数据源聚类）。
     """
     result = await _call_kb_capability(request, "construct_abstract_schema", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/abstract-schema/landing-runs",
+    summary="受理抽象 schema 落点 / 构造的后台生成",
+)
+async def start_abstract_landing_run(request: Request, payload: dict = Body(...)):
+    """建一条后台 run 并立即返回 `{run_id, status}`（毫秒级，不等 LLM）。
+
+    `run_mode`：`landings` = 只补落点（保留现有草稿，提交时读一次版本做乐观锁）；
+    `full` = 全量重来（`mode=replace`，并透传 `force`）。已有 active 的抽象 schema
+    且 `force` 非 true 时回 **1003**（前端确认后带 force 重试）。
+
+    `alias_hints`：业务词表，只有 `full` 生效；`landings` 会忽略并在 run summary
+    里补一条「仅在全部重来时生效」的 warning。
+
+    同一 KB 已有 queued/running 的 run 时回 **429**（与 construct 的守卫同口径）；
+    开关关闭 / `run_mode` 非法回 **1001**，前端据此回退到同步 generate。
+    """
+    result = await _call_kb_capability(request, "start_abstract_landing_run", payload)
+    return success_response(data=result)
+
+
+@router.get(
+    "/ontology/abstract-schema/landing-runs/{run_id}",
+    summary="轮询抽象 schema 后台 run 的状态与进度",
+)
+async def get_abstract_landing_run(
+    request: Request,
+    run_id: str = Path(..., min_length=1, max_length=128, description="运行 ID"),
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    """只读一行运行状态（status / phase / progress / summary / error），**不带 schema 正文**。
+
+    `knowledge_base_id` 是归属校验：run 不属于该 KB 时按不存在（1002）处理，
+    不泄漏存在性。
+    """
+    result = await _call_kb_capability(request, "get_abstract_landing_run", {
+        "knowledge_base_id": knowledge_base_id,
+        "run_id": run_id,
+    })
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/metric-proposals",
+    summary="用指标 agent 生成一份指标提案（同步，等人确认）",
+)
+async def build_metric_proposal(request: Request, payload: dict = Body(...)):
+    """一次有界循环：召回 → 看证据 → 验 join → 预览公式 → 提交提案。
+
+    产出**只落提案表**（`pending`），不改抽象 schema、不影响检索/问数。
+    耗时通常 30–120 秒（受 `METRIC_AGENT_TIMEOUT_S` 约束），超时按软失败返回，
+    不会挂住请求也不会留下半成品。
+    """
+    result = await _call_kb_capability(request, "build_metric_proposal", payload)
+    return success_response(data=result)
+
+
+@router.get("/ontology/metric-proposals", summary="列出指标提案")
+async def list_metric_proposals(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128),
+    status: str = Query("", description="pending / confirmed / rejected，空=全部"),
+):
+    result = await _call_kb_capability(request, "list_metric_proposals", {
+        "knowledge_base_id": knowledge_base_id,
+        "status": status,
+    })
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/metric-proposals/{proposal_id}/decision",
+    summary="确认 / 驳回一份指标提案",
+)
+async def decide_metric_proposal(
+    request: Request,
+    proposal_id: str = Path(..., min_length=1, max_length=64),
+    payload: dict = Body(...),
+):
+    """`decision` 只能是 `confirmed` / `rejected`；已决定的提案**不会再被改**。
+
+    返回 `{changed, proposal}`：`changed=false` 表示这条提案早已被决定（重复点击）。
+    """
+    body = dict(payload or {})
+    body["proposal_id"] = proposal_id
+    result = await _call_kb_capability(request, "decide_metric_proposal", body)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/join-proposals/run",
+    summary="跑一轮 join 边复核（确定性发现 + agent 复核，产出提案）",
+)
+async def run_join_agent(request: Request, payload: dict = Body(...)):
+    """候选来自确定性发现器（命名短名单 + 值包含采样），agent 只做复核与定夺。
+
+    只落提案（`pending`），不写关系边、不影响检索。耗时通常 30–120 秒。
+    """
+    result = await _call_kb_capability(request, "run_join_agent", payload)
+    return success_response(data=result)
+
+
+@router.get("/ontology/join-proposals", summary="列出 join 边提案")
+async def list_join_proposals(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128),
+    status: str = Query("", description="pending / confirmed / rejected，空=全部"),
+):
+    result = await _call_kb_capability(request, "list_join_proposals", {
+        "knowledge_base_id": knowledge_base_id,
+        "status": status,
+    })
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/join-proposals/{proposal_id}/decision",
+    summary="确认 / 驳回一条 join 边提案",
+)
+async def decide_join_proposal(
+    request: Request,
+    proposal_id: str = Path(..., min_length=1, max_length=64),
+    payload: dict = Body(...),
+):
+    body = dict(payload or {})
+    body["proposal_id"] = proposal_id
+    result = await _call_kb_capability(request, "decide_join_proposal", body)
     return success_response(data=result)
 
 
@@ -4797,7 +5082,7 @@ async def import_lineage_file(request: Request, ds_id: str,
 
 
 @router.post("/data-sources/{ds_id}/lineage-forbidden-suggest",
-             summary="从 1 跳血缘生成禁止同查建议")
+             summary="从 1–2 跳血缘生成禁止同查建议")
 async def suggest_lineage_forbidden_pairs(request: Request, ds_id: str,
                                           payload: dict = Body(...)):
     body = {"ds_id": ds_id,
@@ -5927,6 +6212,183 @@ async def get_data_service_detail(
             "days": days,
             "start_date": start_date.isoformat() if start_date else None,
             "end_date": end_date.isoformat() if end_date else None,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+# ── 数据运营 ·「数据问答」观测面（设计 §4）──
+#
+# 四页与其余数据运营页签**同一套范围/窗口口径**：`domain_space_id` / `kb_id` 只能
+# 收窄，窗口用 `days` 或 `start_date`+`end_date` 成对（`_parse_trend_range` 复用）。
+# 参数的 1..365 / 100..60000 边界在网关直接 422 —— 面向客户端的非法入参立刻拒掉，
+# 能力层 `_parse_nl2sql_scope` 只做保守夹取（它还会被内部调用方经 invoke 打进来）。
+# ⚠️ 前端翻页/切排序时必须把同一组窗口参数原样带上：不传不会报错，只会按默认
+# `days=7` 算 —— 列表数字与总览对不上且没有任何提示（与抽屉 A/B/C 同款坑）。
+
+
+@router.get("/data-operations/nl2sql-overview", summary="数据问答总览")
+async def get_nl2sql_overview(
+    request: Request,
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（空表示空间/租户全量）"),
+    data_source_id: Optional[str] = Query(
+        None, max_length=64,
+        description="数据源 ID（空表示全部；__unassigned__ 表示未识别源）",
+    ),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+    slow_ms: int = Query(5000, ge=100, le=60000, description="慢查询阈值（毫秒）"),
+    include_synthetic: bool = Query(
+        False, description="是否包含演化基准流量（scene.evolution_bench=true）",
+    ),
+):
+    """数据问答总览：量/成功率、SQL 与端到端延迟分位、慢查询、A1b 重试、趋势与按源分布。
+
+    `include_synthetic=false`（默认）时所有聚合统一剔除 `scene.evolution_bench=true`
+    的行 —— 评测/演化流量不计入运营口径；勾选后才一并统计。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_nl2sql_overview",
+        {
+            "domain_space_id": domain_space_id,
+            "kb_id": kb_id,
+            "data_source_id": data_source_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+            "slow_ms": slow_ms,
+            "include_synthetic": include_synthetic,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/nl2sql-slow", summary="数据问答慢查询列表")
+async def get_nl2sql_slow(
+    request: Request,
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（空表示空间/租户全量）"),
+    data_source_id: Optional[str] = Query(
+        None, max_length=64,
+        description="数据源 ID（空表示全部；__unassigned__ 表示未识别源）",
+    ),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+    slow_ms: int = Query(5000, ge=100, le=60000, description="慢查询阈值（毫秒）；min_ms 缺省时作为其默认值"),
+    min_ms: Optional[int] = Query(
+        None, ge=100, le=60000, description="列表过滤门槛（毫秒）；空表示跟随 slow_ms",
+    ),
+    sort: str = Query("sql", pattern="^(sql|total)$", description="排序字段：sql=SQL 执行耗时，total=端到端耗时"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    include_synthetic: bool = Query(
+        False, description="是否包含演化基准流量（scene.evolution_bench=true）",
+    ),
+):
+    """慢查询列表：`sort=sql` 按 `elapsed_ms` 倒序，`sort=total` 按 `total_ms` 倒序。
+
+    `min_ms` 不给时由能力层回落到 `slow_ms`（设计 §4.2）—— 网关不替用户拍数，
+    否则同一组参数下总览的「慢 SQL 数」与列表条数会因默认值分裂。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_nl2sql_slow",
+        {
+            "domain_space_id": domain_space_id,
+            "kb_id": kb_id,
+            "data_source_id": data_source_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+            "slow_ms": slow_ms,
+            "min_ms": min_ms,
+            "sort": sort,
+            "page": page,
+            "page_size": page_size,
+            "include_synthetic": include_synthetic,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/nl2sql-failures", summary="数据问答失败复盘列表")
+async def get_nl2sql_failures(
+    request: Request,
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（空表示租户级全量）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（空表示空间/租户全量）"),
+    data_source_id: Optional[str] = Query(
+        None, max_length=64,
+        description="数据源 ID（空表示全部；__unassigned__ 表示未识别源）",
+    ),
+    days: int = Query(7, ge=1, le=365, description="统计窗口天数"),
+    start_date: Optional[date] = Query(None, description="自定义起始日期（含），与 end_date 成对；成对给出时覆盖 days"),
+    end_date: Optional[date] = Query(None, description="自定义结束日期（含），与 start_date 成对"),
+    reason_code: Optional[str] = Query(
+        None, max_length=64,
+        description="失败码过滤（空表示全部；__unclassified__ 表示空码桶「未分类」）",
+    ),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    include_synthetic: bool = Query(
+        False, description="是否包含演化基准流量（scene.evolution_bench=true）",
+    ),
+):
+    """失败复盘列表：只含 `outcome='failed'`，按 `created_at DESC`。
+
+    行内带截断到 500 字的 `reason`；完整现场（含 `rejected_sql` / `scene`）走
+    `nl2sql-detail`（设计 §4.3/§4.4）。
+    """
+    start_date, end_date = _parse_trend_range(start_date, end_date)
+    result = await _call_kb_capability(
+        request,
+        "get_nl2sql_failures",
+        {
+            "domain_space_id": domain_space_id,
+            "kb_id": kb_id,
+            "data_source_id": data_source_id,
+            "days": days,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+            "reason_code": reason_code,
+            "page": page,
+            "page_size": page_size,
+            "include_synthetic": include_synthetic,
+        },
+        user_id=_extract_user_id(request),
+    )
+    return success_response(data=result)
+
+
+@router.get("/data-operations/nl2sql-detail", summary="数据问答记录详情（抽屉）")
+async def get_nl2sql_detail(
+    request: Request,
+    id: str = Query(..., min_length=1, max_length=64, description="观测行 ID（列表里的 id）"),
+    domain_space_id: Optional[str] = Query(None, max_length=64, description="领域空间 ID（与列表同 scope）"),
+    kb_id: Optional[str] = Query(None, max_length=64, description="知识库 ID（与列表同 scope）"),
+):
+    """单条数据问答记录完整现场：比列表多 `rejected_sql` 与完整 `scene`。
+
+    ⚠️ `domain_space_id` / `kb_id` 必须与打开列表时那组参数一致：能力层先按
+    `_kb_scope` 解析本次范围内的库，再校验该行 `knowledge_base_id ∈ kb_ids`。
+    不在范围内统一 **404**（与抽屉 A/B 的防探测口径一致）—— 前端不要提示成
+    「无权限」或「已删除」，二者返回同一个结果。
+    """
+    result = await _call_kb_capability(
+        request,
+        "get_nl2sql_detail",
+        {
+            "id": id,
+            "domain_space_id": domain_space_id,
+            "kb_id": kb_id,
         },
         user_id=_extract_user_id(request),
     )

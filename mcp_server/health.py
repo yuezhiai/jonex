@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
-"""OpenKB 健康检查模块——独立于 MCP 框架，可单独测试。
+"""OpenKB / jonex_wiki 健康检查模块——独立于 MCP 框架，可单独测试。
 
-控制 SEARCH_LLMWIKI_ENABLED 运行时开关 (D-08)
+启动时观测上游可用性；探测失败只告警，不翻转 SEARCH_* 工具开关。
 """
 import asyncio
 import logging
@@ -58,7 +58,7 @@ async def check_openkb_health(
         except httpx.InvalidURL as e:
             # 配置错误（URL 格式不合法）→ 不应重试，直接报告
             logger.error(
-                "OpenKB 健康检查 URL 配置错误（url=%s）：%s —— 禁用 search_llmwiki",
+                "OpenKB 健康检查 URL 配置错误（url=%s）：%s —— 仅告警，不翻转 search_llmwiki 开关",
                 openkb_health_url, _brief_error(e),
             )
             return False
@@ -74,7 +74,7 @@ async def check_openkb_health(
             else:
                 # 重试耗尽：整段只打这**一条**，不带 traceback
                 logger.error(
-                    "OpenKB 不可用（已重试 %d 次，url=%s）：%s —— 已禁用 search_llmwiki",
+                    "OpenKB 不可用（已重试 %d 次，url=%s）：%s —— 仅告警，不翻转 search_llmwiki 开关",
                     _OPENKB_HEALTH_RETRIES, openkb_health_url, _brief_error(e),
                 )
     return False
@@ -101,7 +101,7 @@ async def check_jonex_wiki_health(
             return True
         except httpx.InvalidURL as e:
             logger.error(
-                "jonex_wiki 健康检查 URL 配置错误（url=%s）：%s —— 禁用 search_jonex_wiki",
+                "jonex_wiki 健康检查 URL 配置错误（url=%s）：%s —— 仅告警，不翻转 search_jonex_wiki 开关",
                 jonex_wiki_health_url, _brief_error(e),
             )
             return False
@@ -115,7 +115,7 @@ async def check_jonex_wiki_health(
                 await asyncio.sleep(_OPENKB_HEALTH_RETRY_DELAY)
             else:
                 logger.error(
-                    "jonex_wiki 不可用（已重试 %d 次，url=%s）：%s —— 已禁用 search_jonex_wiki",
+                    "jonex_wiki 不可用（已重试 %d 次，url=%s）：%s —— 仅告警，不翻转 search_jonex_wiki 开关",
                     _OPENKB_HEALTH_RETRIES, jonex_wiki_health_url, _brief_error(e),
                 )
     return False

@@ -2110,13 +2110,17 @@ class TestSubmitSearchFeedback:
 # TestMcpToolNameReport — 工具名请求级上报
 # ============================================================================
 
-# app.py 中 15 个 @mcp.tool() 的公开名，必须与 tools.py 注入的 __mcp_tool_name__ 一致。
+# app.py 中 19 个 @mcp.tool() 的公开名，必须与 tools.py 注入的 __mcp_tool_name__ 一致。
 _MCP_PUBLIC_TOOLS = [
     "list_domain_services",
     "list_documents",
     "list_ontology_entity_types",
     "list_ontology_instances",
     "expand_ontology_neighbors",
+    "list_wiki_topics",
+    "list_wiki_pages",
+    "expand_wiki_links",
+    "list_wiki_claims",
     "search_ontology",
     "search_deep",
     "search_llmwiki",
@@ -2127,6 +2131,12 @@ _MCP_PUBLIC_TOOLS = [
     "get_upload_status",
     "generate_upload_url",
     "submit_search_feedback",
+    # 问数（结构化数据只读，2026-11-05）
+    "ask_data",
+    "ask_data_multi",
+    "ask_metric",
+    "list_data_sources",
+    "get_schema",
 ]
 
 
@@ -2199,7 +2209,7 @@ class TestMcpToolNameReport:
     async def test_all_public_tools_send_their_name(
         self, tool_name, args, response_datas, auth_kind
     ):
-        """15 个公开工具经装饰后，真实业务请求都带本工具名。
+        """19 个公开工具经装饰后，真实业务请求都带本工具名。
 
         工具内部的前置校验 ``get_service`` 不是公开 MCP 工具，必须不带工具名：
         否则一次工具调用会在 ``monitor.call_log`` 落两条同名记录。
@@ -2503,21 +2513,23 @@ class TestTopKUpperBound:
             "search_ontology",
             "search_deep",
             "search_llmwiki",
-            "search_jonex_wiki",
             "search_mix",
         ],
     )
     async def test_top_k_50_is_accepted(self, tool_name):
-        """边界值 50 应通过校验并原样透传给上游。"""
+        """边界值 50 应通过校验并原样透传给上游。
+
+        ``search_jonex_wiki`` 不在此列：其签名固定 ``hybrid`` + ``top_k=5``，
+        不暴露 ``top_k`` 参数（见 ``tools.search_jonex_wiki``）。
+        """
         import mcp_server.tools as tools
 
         auth = _feedback_auth()
         mock_call = AsyncMock(return_value=({"answer": "ok"}, "req-1"))
         with patch("mcp_server.tools.require_mcp_auth", return_value=auth):
             with patch.object(tools, "SEARCH_LLMWIKI_ENABLED", True):
-                with patch.object(tools, "SEARCH_JONEX_WIKI_ENABLED", True):
-                    with patch("mcp_server.tools._call_search_gateway", mock_call):
-                        await getattr(tools, tool_name)("svc-1", "q", top_k=50)
+                with patch("mcp_server.tools._call_search_gateway", mock_call):
+                    await getattr(tools, tool_name)("svc-1", "q", top_k=50)
 
         assert mock_call.call_args[0][2]["top_k"] == 50
 

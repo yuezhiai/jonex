@@ -38,6 +38,14 @@ mcp = FastMCP("jonex-knowledge-base", stateless_http=True, host="0.0.0.0")
 # 结构化 -32602；WithJsonSchema 保证 tools/list 中仍是 integer。
 _DEPTH_SCHEMA = {"type": "integer", "default": 1, "title": "Depth"}
 
+# Jonex Wiki 列式浏览的整数参数同样用 Any + WithJsonSchema 接收原始值：
+# FastMCP lax 模式会把 "2" / true / 2.0 静默转成 int，契约要求这些一律 -32602。
+_WIKI_DEPTH_SCHEMA = {"type": "integer", "default": 1, "title": "Depth"}
+_WIKI_LINKS_LIMIT_SCHEMA = {"type": "integer", "default": 50, "title": "Limit"}
+_WIKI_PAGE_SCHEMA = {"type": "integer", "default": 1, "title": "Page"}
+_WIKI_PAGE_SIZE_SCHEMA = {"type": "integer", "default": 20, "title": "Page size"}
+_WIKI_CLAIMS_LIMIT_SCHEMA = {"type": "integer", "default": 200, "title": "Limit"}
+
 
 @mcp.tool()
 async def list_domain_services() -> dict:
@@ -70,7 +78,7 @@ async def list_ontology_entity_types(
 
     何时用：需要先了解知识库抽取出了哪些实体类型、每类有多少实例时，作为后续 list_ontology_instances 的入口。
 
-    何时不用：已知具体实例、想沿关系探索时用 expand_ontology_neighbors；想检索文档内容时用 search_ontology。只有本体类（lightrag）知识库有数据，其他类型知识库返回空列表。
+    何时不用：已知具体实例、想沿关系探索时用 expand_ontology_neighbors；想检索文档内容时用 search_ontology。只有本体类（lightrag）知识库有数据，其他类型知识库返回空列表；想浏览 Jonex Wiki 知识库请用 list_wiki_topics / list_wiki_pages，OpenKB 暂无浏览工具。
 
     注意：不同知识库中的同名类型是不同类型，请按 groups[].knowledge_base_id 区分；不提供跨知识库关系边，也不做同名合并。"""
     return await tools.list_ontology_entity_types(
@@ -100,7 +108,7 @@ async def list_ontology_instances(
 
     何时用：已知实体类型，想列出或搜索该类下的具体实例时。
 
-    何时不用：还不知道有哪些类型时先用 list_ontology_entity_types；想沿关系展开某个实例的邻居时用 expand_ontology_neighbors。
+    何时不用：还不知道有哪些类型时先用 list_ontology_entity_types；想沿关系展开某个实例的邻居时用 expand_ontology_neighbors；Jonex Wiki 知识库请用 list_wiki_pages（本体工具对非 lightrag 库返回空列表）。
 
     注意：多个知识库时 page / page_size 对每个知识库独立生效（不是全局第 N 页），顶层 total 为各库 total 之和，且不返回顶层 items；不跨库合并同名实例。"""
     return await tools.list_ontology_instances(
@@ -122,7 +130,7 @@ async def expand_ontology_neighbors(
     """展开一个本体实例的邻居：默认一跳；传入 depth=2 或 3 可在一次调用里展开多跳。传入实体类型 + 规范名称定位起点，返回与之相连的节点和边。
 
     何时用：已知一个具体实例，想看看它直接连着哪些实体；或需要在一次调用里看清 2–3 跳范围时用 depth。
-    何时不用：还没有具体实例名时，先用 list_ontology_instances；想看类型全貌时用 list_ontology_entity_types。depth>1 会按分支因子放大返回体量，仅在确有多跳需要时使用（局部属性查询、hub 节点、上下文紧张时不要用）。
+    何时不用：还没有具体实例名时，先用 list_ontology_instances；想看类型全貌时用 list_ontology_entity_types；Jonex Wiki 知识库请用 expand_wiki_links（本体工具对非 lightrag 库返回空列表）。depth>1 会按分支因子放大返回体量，仅在确有多跳需要时使用（局部属性查询、hub 节点、上下文紧张时不要用）。
 
     知识库选择（二选一）：
     - knowledge_base_id：指定单个知识库（旧用法）。
@@ -136,6 +144,139 @@ async def expand_ontology_neighbors(
     return await tools.expand_ontology_neighbors(
         service_id, knowledge_base_id, entity_type, canonical_name, limit,
         knowledge_base_ids, depth,
+    )
+
+
+@mcp.tool()
+async def list_wiki_topics(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids: Any = None,
+) -> dict:
+    """浏览 Jonex Wiki 知识库的目录/主题树，是 Jonex Wiki 列式浏览的第一列。
+
+    仅支持 Jonex Wiki（jonex_wiki 管线）知识库；LightRAG / OpenKB 库会返回 -32602。
+    想浏览本体（lightrag）知识库请用 list_ontology_entity_types / list_ontology_instances。
+    知识库选择（二选一）：
+    - knowledge_base_id：指定单个知识库。
+    - knowledge_base_ids：字符串数组，指定多个知识库，单次聚合并按库分组。
+    - 两者都不传：查询该服务下全部 Jonex Wiki 知识库（超过 20 个时要求显式指定）。
+    knowledge_base_id 与 knowledge_base_ids 不能同时提供；显式列表（即使 1 个元素）返回 groups。
+
+    返回：topics（语义主题树）、page_count、outline_available、outline_version、stale、wiki_degraded。
+    未生成目录时 outline_available=false 且 topics=[]；stale=true 表示目录可能过期。
+
+    何时用：想先了解这个 Wiki 有哪些语义主题、再按主题浏览页面时。
+    何时不用：已知页面路径想看链接关系时用 expand_wiki_links；想直接检索内容时用 search_jonex_wiki / search_mix。
+
+    注意：不提供跨知识库连边，也不做同名合并；source/table/concept 仅作为页面过滤条件，不是第一列。"""
+    return await tools.list_wiki_topics(
+        service_id, knowledge_base_id, knowledge_base_ids
+    )
+
+
+@mcp.tool()
+async def list_wiki_pages(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids: Any = None,
+    topic: str = "",
+    type: str = "",
+    page: Annotated[Any, WithJsonSchema(_WIKI_PAGE_SCHEMA)] = 1,
+    page_size: Annotated[Any, WithJsonSchema(_WIKI_PAGE_SIZE_SCHEMA)] = 20,
+) -> dict:
+    """分页浏览 Jonex Wiki 知识库的页面列表，是 Jonex Wiki 列式浏览的第二列。
+
+    仅支持 Jonex Wiki 知识库。可按 list_wiki_topics 返回的主题 id 过滤（含其子节点），
+    也可用 type 做内部过滤（source / table / concept，仅作过滤、不作为第一列暴露）。
+    想浏览本体（lightrag）知识库请用 list_ontology_entity_types / list_ontology_instances。
+    知识库选择（二选一）：
+    - knowledge_base_id：指定单个知识库。
+    - knowledge_base_ids：字符串数组，指定多个知识库，单次聚合并按库分组。
+    - 两者都不传：查询该服务下全部 Jonex Wiki 知识库。
+    knowledge_base_id 与 knowledge_base_ids 不能同时提供；显式列表（即使 1 个元素）返回 groups。
+
+    返回：单库 items/total/page/page_size/outline_available/stale/wiki_degraded；
+    多库只返回 {total, groups}，没有顶层 items/page/page_size。topic 不存在或该库未生成目录 → -32602。
+
+    何时用：已确定主题，想列出该主题下的页面时。
+    何时不用：还不知道主题时先用 list_wiki_topics；已知具体页面想沿链接展开时用 expand_wiki_links。
+
+    注意：多库时 page/page_size 对每个库独立生效；不跨库合并同名页面。"""
+    return await tools.list_wiki_pages(
+        service_id, knowledge_base_id, knowledge_base_ids,
+        topic, type, page, page_size,
+    )
+
+
+@mcp.tool()
+async def expand_wiki_links(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids: Any = None,
+    path: str = "",
+    depth: Annotated[Any, WithJsonSchema(_WIKI_DEPTH_SCHEMA)] = 1,
+    limit: Annotated[Any, WithJsonSchema(_WIKI_LINKS_LIMIT_SCHEMA)] = 50,
+) -> dict:
+    """沿 Jonex Wiki 页面的出链做多跳展开，并附一跳链入，是 Jonex Wiki 列式浏览的第三列。
+
+    仅支持 Jonex Wiki 知识库。path 是起点页面 canonical path（兼容旧口径
+    summaries/、entities/、concepts/ 前缀，会自动补 .md）。
+    想浏览本体（lightrag）知识库的邻域请用 expand_ontology_neighbors。
+    知识库选择（二选一）：
+    - knowledge_base_id：指定单个知识库。
+    - knowledge_base_ids：字符串数组，指定多个知识库，单次聚合并按库分组。
+    - 两者都不传：查询该服务下全部 Jonex Wiki 知识库。
+    knowledge_base_id 与 knowledge_base_ids 不能同时提供；显式列表（即使 1 个元素）返回 groups。
+
+    返回：pages（含 hop，起点 hop=0）、links（含 hop）、start_found、depth、limit、returned、
+    truncated、truncated_reason、wiki_degraded。每个返回页附 backlinks / backlink_total /
+    backlinks_truncated。depth=1 不含起点，只返回一跳目标页。
+    链入只来自同一张语义图的反向边，**可能被截断**（最多 30 条），不能当成「全部链入」；
+    正文提及型链入请用既有 get_wiki_backlinks 能力。source 页也在这张语义图里。
+
+    何时用：已知一个页面，想看清它的出链 1–3 跳范围，或需要引用它的链入页面时。
+    何时不用：还没有具体页面路径时先用 list_wiki_pages；只想检索内容时用 search_jonex_wiki。
+
+    注意：BFS 只沿出链；每节点每层最多 20 条、总边数受 limit 限制，被截断时 truncated=true
+    （truncated_reason 含 limit / fanout / source_pages / source_links）。多库时每组独立展开，
+    不提供跨库连边，也没有顶层 pages/links。"""
+    return await tools.expand_wiki_links(
+        service_id, knowledge_base_id, knowledge_base_ids, path, depth, limit
+    )
+
+
+@mcp.tool()
+async def list_wiki_claims(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids: Any = None,
+    path: str = "",
+    document_id: str = "",
+    limit: Annotated[Any, WithJsonSchema(_WIKI_CLAIMS_LIMIT_SCHEMA)] = 200,
+) -> dict:
+    """读取 Jonex Wiki 页面/文档的 claim 级溯源明细，是 Jonex Wiki 列式浏览的第四列。
+
+    仅支持 Jonex Wiki 知识库。想浏览本体（lightrag）知识库请用 list_ontology_entity_types / list_ontology_instances。
+    path 与 document_id 至少提供一个：
+    - path：页面 canonical path；
+    - document_id：来源文档 id。
+    知识库选择（二选一）：
+    - knowledge_base_id：指定单个知识库。
+    - knowledge_base_ids：字符串数组，指定多个知识库，单次聚合并按库分组。
+    - 两者都不传：查询该服务下全部 Jonex Wiki 知识库。
+    knowledge_base_id 与 knowledge_base_ids 不能同时提供；显式列表（即使 1 个元素）返回 groups。
+
+    返回：items（每条 text 已截断 400）、total（截断前总数）、returned、limit、
+    truncated（total > returned）、text_limit=400、wiki_degraded。多库只返回 groups。
+
+    何时用：需要核对某页/某文档里的断言原文与来源 chunk 时。
+    何时不用：想浏览页面结构时用 list_wiki_topics / list_wiki_pages；想沿链接探索时用 expand_wiki_links。
+
+    注意：不提供跨知识库连边；limit 上限 500。"""
+    return await tools.list_wiki_claims(
+        service_id, knowledge_base_id, knowledge_base_ids,
+        path, document_id, limit,
     )
 
 
@@ -186,16 +327,17 @@ async def search_llmwiki(
 
 @mcp.tool()
 async def search_jonex_wiki(
-    service_id: str, query: str, mode: str = "hybrid", top_k: int = 5,
-    with_reasoning: bool = False,
+    service_id: str, query: str, with_reasoning: bool = False,
+    thinking_mode: str = "fast",
 ) -> dict:
     """Jonex Wiki 知识检索——从 jonex_wiki 编译的 Wiki 知识库中检索。
     仅适用于 jonex_wiki 管线知识库；不确定管线类型时用 search_mix。
-    搜索模式：naive / local / global / hybrid（默认 hybrid）。
+    检索模式固定为 hybrid、top_k=5，不提供 mode / top_k 参数。
+    thinking_mode：fast（默认，检索决策与最终回答都不思考）/ standard（检索决策允许思考、最终回答不思考）/ deep（两阶段都允许思考）。不改变命中数、工具调用数、时间预算，且取决于上游模型能力。
     不支持严格模式（jonex_wiki 编译产物无严格模式语义）。
     支持 with_reasoning 推理链追踪（默认 False），返回 wiki 浏览轨迹。
     响应顶层含 request_id（本次检索的反馈锚点，回退时取最终成功那次）；MCP 检索不写入搜索历史。"""
-    return await tools.search_jonex_wiki(service_id, query, mode, top_k, with_reasoning)
+    return await tools.search_jonex_wiki(service_id, query, with_reasoning, thinking_mode)
 
 
 @mcp.tool()
@@ -299,6 +441,141 @@ async def submit_search_feedback(
         feedback_comment or None,
         operation_id or None,
         version,
+    )
+
+
+@mcp.tool()
+async def list_data_sources(service_id: str, knowledge_base_id: str = "") -> dict:
+    """列出服务下各知识库的数据源，并标出哪些能被 ask_data 查询。
+
+    结构化数据（数据库）问数前的第一步：只有 access_type == "database"
+    的源（is_queryable=true）能被 ask_data 查询，其余是文件/推送/对象存储源。
+    返回 {items: [{knowledge_base_id, id, name, access_type, status,
+    document_count, is_queryable}], total}；个别知识库失败时附 kb_errors，
+    不整体失败。knowledge_base_id 可选（必须属于该服务）。"""
+    return await tools.list_data_sources(service_id, knowledge_base_id)
+
+
+@mcp.tool()
+async def ask_data(
+    service_id: str,
+    question: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    entity_name: str = "",
+    offset: int = 0,
+) -> dict:
+    """按问题查结构化数据（NL→SQL）：把一个自然语言问题落到某个数据库数据源
+    的某张表上，生成并执行一条只读 SQL，返回表格结果。
+
+    适用场景：问题要的是「精确的数字/清单/统计」（有多少、有哪些、求和、
+    分组计数），而不是文档里的描述性答案。先用 list_data_sources 看哪些源
+    可查（is_queryable=true），必要时用 get_schema 确认表名列名。
+
+    成功返回：{ok: true, sql, columns, rows, row_count, truncated, offset,
+    next_offset, contract_version, blocks, data_source_id, source_name,
+    entity_name, knowledge_base_id}。blocks 是表格块，可直接展示。
+
+    ⚠ ok=false 是正常结果（这个源这次答不了），不是工具错误：reason_code
+    取值 no_candidate / ambiguous / entity_gone / no_readonly_creds /
+    not_a_database_source / source_gone / not_answerable /
+    rejected_unsafe_sql / rejected_sensitive —— 这些重试没有意义；
+    只有 llm_failed / exec_failed 值得重试。
+    truncated=true 表示行数上限被平台加上或收紧过（不是结果被截断）。
+    data_source_id / entity_name 可选，用于点名；缺省由候选匹配决定。"""
+    return await tools.ask_data(
+        service_id, question,
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+        entity_name=entity_name,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+async def get_schema(
+    service_id: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    detail: str = "names",
+) -> dict:
+    """读取编译 schema（表 / 列 / 关系 / 库口径），用于选择 ask_data 的目标。
+
+    detail="names"（默认）只给实体名 + 物理表名 + 列名 + 关系端点，体量小；
+    detail="full" 另带类型、描述、样例与 constraints（库口径，例如软删标记
+    取值约定），问数结果不符合预期时可据此确认口径。
+
+    ⚠ 两种粒度：带 data_source_id 才是 ask_data 实际使用的那份 schema；
+    不带则是知识库级（若该 KB 有抽象 schema，返回的是抽象投影）。返回项用
+    is_data_source_level 标明，source_type 也会一并给出，两者不要混用。
+    返回 {items: [schema...], total, detail}；个别知识库失败附 kb_errors。"""
+    return await tools.get_schema(
+        service_id,
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+        detail=detail,
+    )
+
+
+@mcp.tool()
+async def ask_data_multi(
+    service_id: str,
+    query: str,
+    knowledge_base_ids: list[str] | None = None,
+) -> dict:
+    """跨数据源问数：一次调用把问题扇出到多个库/源，返回**并列**的数据块。
+
+    与 ask_data 的差别：ask_data 是「一问一源出一条 SQL」，本工具是「一问多源
+    各出一块」，上游按源并行（每源都有 data_source_id / source_name / text /
+    table / sql / row_count）。**不做跨源汇总**——不同源口径不同，合成一个数
+    会把口径差异抹成确定的错，聚合由调用方按块自行判断。
+
+    knowledge_base_ids 可选（必须都属于该服务；缺省 = 该服务下全部知识库）。
+    返回原样透传上游 data_blocks，并补 knowledge_base_ids / block_count /
+    answered_count / error_count。全部块都失败也仍是成功返回。"""
+    return await tools.ask_data_multi(
+        service_id, query, knowledge_base_ids=knowledge_base_ids
+    )
+
+
+@mcp.tool()
+async def ask_metric(
+    service_id: str,
+    question: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    group_by: list[str] | None = None,
+    time_grain: str = "",
+    time_from: str = "",
+    time_to: str = "",
+    limit: int = 0,
+    offset: int = 0,
+) -> dict:
+    """按**已登记指标**确定性问数（不猜意图、不调 LLM），结果可溯源到表/列。
+
+    只认知识库里登记过、且有可执行定义与实体落点的指标；命中即用指标自带的
+    确定性 SQL。group_by / time_grain 必须由调用方显式给——上游不猜，猜错比
+    不说更糟。指标在多个数据源有落点时用 data_source_id 点名（否则回
+    ambiguous_source）。
+
+    成功返回 {ok: true, mode: "metric", metric, sql, columns, rows, row_count,
+    truncated, offset, provenance, knowledge_base_id}。
+
+    ⚠ ok=false 是正常业务答复，不是工具错误：reason_code 常见
+    no_metric（该库没登记指标，先去登记，重试无用）/ ambiguous_metric /
+    ambiguous_source / ambiguous_landing（需点名，可能带 candidates、clarifications）/
+    no_landing / metric_not_approved / compile_error / rejected_unsafe_sql /
+    rejected_sensitive / exec_failed（后两类值得重试）。"""
+    return await tools.ask_metric(
+        service_id, question,
+        knowledge_base_id=knowledge_base_id,
+        data_source_id=data_source_id,
+        group_by=group_by,
+        time_grain=time_grain,
+        time_from=time_from,
+        time_to=time_to,
+        limit=limit,
+        offset=offset,
     )
 
 

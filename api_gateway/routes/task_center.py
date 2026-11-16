@@ -26,7 +26,7 @@
 import asyncio
 import os
 import random
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
@@ -240,6 +240,31 @@ async def list_tasks(
     if task_source:
         payload["task_source"] = task_source
     result = await _call_tc_capability(request, "task.console_page", payload)
+    return success_response(data=result)
+
+
+@router.get("/tasks/token-usage", summary="任务 Token 消耗补值")
+async def get_task_token_usage(
+    request: Request,
+    task_ids: Optional[List[str]] = Query(
+        None,
+        description=(
+            "任务 ID 列表（重复参数：?task_ids=a&task_ids=b）；"
+            "一次最多 100 条，超出由能力侧当场拒（1001）"
+        ),
+    ),
+):
+    """任务 Token 消耗补值（2026-11-11 加，按文档归集）。
+
+    ⚠️ **静态段必须声明在 `/tasks/{task_id}` 之前** —— FastAPI 按注册顺序匹配，
+    反过来 `token-usage` 会被当成任务 ID 吞掉（同文件顶部那条顺序注释）。
+
+    返回 `{items: [{task_id, document_id, document_name, total_tokens}]}`：
+    `total_tokens = null` 表示没有精确计量（前端渲染「-」），**不是 0**；
+    不可见 / 不存在 / 别的租户的任务**静默不出现**（不做存在性探针）。
+    """
+    payload: dict[str, Any] = {"task_ids": task_ids or []}
+    result = await _call_tc_capability(request, "task.console_token_usage", payload)
     return success_response(data=result)
 
 

@@ -448,6 +448,11 @@ def require_write_scope(
     Raises:
         McpAuthError(401): 不在写入授权范围内
     """
+    # Key 级 KB 白名单（allowed_kb_ids）是总上界：白名单非空时，即使
+    # write_grants 里有该库，未列进白名单也一律拒绝。空列表 = 不限制，
+    # 与读路径 ``_apply_kb_whitelist`` 的口径一致。
+    if auth.allowed_kb_ids and knowledge_base_id not in auth.allowed_kb_ids:
+        raise McpAuthError(401, "不在写入授权范围内")
     for g in auth.write_grants:
         if g.get("kb") == knowledge_base_id:
             if g.get("mode") == "all":
@@ -470,31 +475,263 @@ SYSTEM_SERVICE_TOOL = "knowledge_document_write"
 async def touch_service_call(tenant_id: str, service_id: str) -> None:
     """更新服务目录「最近调用时间」（服务级）。
 
-    UPSERT 而非 UPDATE：系统写服务的发布行由 platform 侧懒 seed，目录页若从未
-    打开过就还没有行；领域服务被调用必然已发布，行一定存在，UPSERT 只走
-    DO UPDATE 分支。冲突时只刷新 last_call_at，不覆盖发布状态 / tool 配置。
+    领域服务只 UPDATE、不 INSERT：调用能走到这里说明 ``_check_service_scope``
+    已放行，发布行必然存在。若此前用 UPSERT 并插入 ``is_published=0``，而该列
+    现在也参与可用性判定，就会把「首次调用成功 → 插入未发布行 → 第二次被拒」
+    锁死自己。
+
+    系统写服务仍 UPSERT：它的发布行由 platform 侧懒 seed，目录页若从未打开过
+    就还没有行；插入时固定 ``is_published=1`` / ``service_type='system'``。
+    冲突时一律只刷新 last_call_at，不覆盖发布状态与 tool 配置。
     """
     if not service_id:
         return
-    is_system = service_id == SYSTEM_SERVICE_ID
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        if service_id == SYSTEM_SERVICE_ID:
+            await conn.execute(
+                """
+                INSERT INTO platform.mcp_service_publish
+                    (id, tenant_id, service_id, is_published, service_type, tool,
+                     last_call_at, created_at)
+                VALUES ($1, $2, $3, 1, 'system', $4, NOW(), NOW())
+                ON CONFLICT (tenant_id, service_id)
+                DO UPDATE SET last_call_at = NOW()
+                """,
+                uuid.uuid4().hex,
+                tenant_id,
+                service_id,
+                SYSTEM_SERVICE_TOOL,
+            )
+            return
+        result = await conn.execute(
             """
-            INSERT INTO platform.mcp_service_publish
-                (id, tenant_id, service_id, is_published, service_type, tool,
-                 last_call_at, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-            ON CONFLICT (tenant_id, service_id)
-            DO UPDATE SET last_call_at = NOW()
+            UPDATE platform.mcp_service_publish
+               SET last_call_at = NOW()
+             WHERE tenant_id = $1
+               AND service_id = $2
             """,
-            uuid.uuid4().hex,
             tenant_id,
             service_id,
-            1 if is_system else 0,
-            "system" if is_system else "domain",
-            SYSTEM_SERVICE_TOOL if is_system else None,
         )
+        # 影响 0 行说明「服务被成功调用却没有发布记录」——数据面异常（发布行
+        # 丢失、迁移遗漏、绕过发布直连调用）。打点不补假数据，只把它暴露出来。
+        if result == "UPDATE 0":
+            logger.warning(
+                "Touch skipped: no publish row for service_id=%s tenant=%s",
+                service_id,
+                tenant_id,
+            )
+
+
+# 服务不可调用原因（``service_block_reason`` 的返回值；None 表示可调用）
+SERVICE_BLOCK_STOPPED = "stopped"
+SERVICE_BLOCK_UNPUBLISHED = "unpublished"
+# 领域服务自身停用（``knowledge_base.services`` 的 status/enabled）
+SERVICE_BLOCK_DISABLED = "disabled"
+
+
+def _service_row_disabled(row) -> bool:
+    """``knowledge_base.services`` 行是否处于停用态。
+
+    停用口径：``status != 'active'`` 或 ``COALESCE(enabled, 1) = 0``。
+    ``enabled`` 可空，NULL 按默认启用处理（``enabled is not None and == 0``
+    才算停用）；``status`` 为 NULL 不等于 ``'active'``，按异常数据判停用。
+    """
+    if row["status"] != "active":
+        return True
+    enabled = row["enabled"]
+    return enabled is not None and enabled == 0
+
+
+async def service_block_reason(tenant_id: str, service_id: str) -> str | None:
+    """返回服务不可调用的原因；可调用时返回 ``None``。
+
+    判定分两层，**先查领域服务自身状态、再查 MCP 发布表**：
+
+    ① ``knowledge_base.services``（领域服务是否还活着）
+      - 查不到行（服务被删/租户不符/软删）→ ``"disabled"``。服务被删不该
+        退化成「无主可查」：授权表里残留的映射不能让已删除服务继续响应。
+      - ``status != 'active'`` 或 ``COALESCE(enabled, 1) = 0`` → ``"disabled"``。
+        领域服务停用/禁用不会联动发布表（实测：``status=inactive``
+        后发布行 ``stopped_at`` 仍为空，已授权 Key 仍能检索），所以必须在这里
+        独立判定。
+
+    ② ``platform.mcp_service_publish``（可调用条件与平台侧
+      ``_derive_publish_status`` 的 published 一致：``is_published=1`` 且
+      ``stopped_at`` 为空）
+      - ``stopped_at`` 非空 → ``"stopped"``（运营点「停用」）；
+      - 有发布行且 ``is_published=0`` → ``"unpublished"``（运营点「取消发布」，
+        该动作会把服务从 MCP 目录下架，已授权 Key 也必须同步失效）；
+      - 无发布行 → ``None``。从未发布过的服务不会有 Key 授权（授权时校验
+        已发布），无记录更可能是目录页从未打开、stub 未补，属数据面问题；
+        此处放行避免异常数据把全部工具打成不可用。
+
+    放行范围：系统写服务 → ``None``（发布表里可能没有行，语义上恒为 published）。
+
+    失败口径（软治理，不 fail-closed）：
+      - 查询异常（连接池未初始化、表缺失、瞬时抖动）→ 记 warning 并**跳过该层
+        的判定**，继续走下一层；两层都异常时最终 ``None``（放行）。鉴权本身已
+        依赖同一数据库，DB 不可用时请求根本走不到这里；若在此 fail-closed，
+        一次抖动会让全部工具不可用。
+      - 唯一的 fail-closed 是「``services`` 表能查通但查不到该服务行」——那是
+        确定性结论（服务不存在），不是查询失败。
+    """
+    if not service_id or service_id == SYSTEM_SERVICE_ID:
+        return None
+    try:
+        pool = await get_pool()
+    except Exception:
+        logger.warning(
+            "Failed to check availability for service_id=%s, allow by default",
+            service_id,
+            exc_info=True,
+        )
+        return None
+
+    # ① 领域服务自身状态。查询异常 → 跳过本层，继续查发布表（fail-open）。
+    try:
+        async with pool.acquire() as conn:
+            service_row = await conn.fetchrow(
+                """
+                SELECT status, enabled
+                  FROM knowledge_base.services
+                 WHERE tenant_id = $1
+                   AND id = $2
+                   AND is_deleted = 0
+                 LIMIT 1
+                """,
+                tenant_id,
+                service_id,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to check domain service status for service_id=%s, "
+            "fall back to publish table",
+            service_id,
+            exc_info=True,
+        )
+    else:
+        if service_row is None or _service_row_disabled(service_row):
+            return SERVICE_BLOCK_DISABLED
+
+    # ② MCP 发布表。查询异常 → 放行（与既有口径一致）。
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT is_published, stopped_at
+                  FROM platform.mcp_service_publish
+                 WHERE tenant_id = $1
+                   AND service_id = $2
+                 LIMIT 1
+                """,
+                tenant_id,
+                service_id,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to check publish status for service_id=%s, allow by default",
+            service_id,
+            exc_info=True,
+        )
+        return None
+    if row is None:
+        return None
+    if row["stopped_at"] is not None:
+        return SERVICE_BLOCK_STOPPED
+    if not row["is_published"]:
+        return SERVICE_BLOCK_UNPUBLISHED
+    return None
+
+
+async def block_reasons_for_services(
+    tenant_id: str, service_ids: list[str]
+) -> dict[str, str]:
+    """批量版 ``service_block_reason``：一次查出多个服务的不可用原因。
+
+    返回 ``{service_id: "disabled" | "stopped" | "unpublished"}``，**只含不可用
+    服务**；可用服务、无发布行、系统写服务都不出现在结果里。投放目录时据此
+    隐藏，避免「列得出来但调不通」——领域服务停用/禁用、运营停用与取消发布
+    都隐藏。
+
+    判定顺序与单条实现一致：先批量查 ``knowledge_base.services``（无行或
+    status/enabled 停用 → ``"disabled"``），再叠加发布表结果（``"disabled"``
+    优先，不被他层覆盖）。
+
+    失败口径同样按层 fail-open：某层查询异常只跳过该层，已确定的另一层结论
+    保留；两层都异常时返回空 dict（全部可用）。
+    """
+    ids = [sid for sid in service_ids if sid and sid != SYSTEM_SERVICE_ID]
+    if not ids:
+        return {}
+    try:
+        pool = await get_pool()
+    except Exception:
+        logger.warning(
+            "Failed to batch check availability for tenant=%s, allow by default",
+            tenant_id,
+            exc_info=True,
+        )
+        return {}
+
+    blocked: dict[str, str] = {}
+
+    # ① 领域服务自身状态。查询异常 → 跳过本层。
+    try:
+        async with pool.acquire() as conn:
+            service_rows = await conn.fetch(
+                """
+                SELECT id, status, enabled
+                  FROM knowledge_base.services
+                 WHERE tenant_id = $1
+                   AND id = ANY($2::text[])
+                   AND is_deleted = 0
+                """,
+                tenant_id,
+                ids,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to batch check domain service status for tenant=%s, "
+            "fall back to publish table",
+            tenant_id,
+            exc_info=True,
+        )
+    else:
+        found = {row["id"]: row for row in service_rows}
+        for sid in ids:
+            row = found.get(sid)
+            if row is None or _service_row_disabled(row):
+                blocked[sid] = SERVICE_BLOCK_DISABLED
+
+    # ② MCP 发布表。查询异常 → 跳过本层（已确定的服务停用结论仍保留）。
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT service_id, is_published, stopped_at
+                  FROM platform.mcp_service_publish
+                 WHERE tenant_id = $1
+                   AND service_id = ANY($2::text[])
+                """,
+                tenant_id,
+                ids,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to batch check publish status for tenant=%s, "
+            "keep domain-service verdicts only",
+            tenant_id,
+            exc_info=True,
+        )
+        return blocked
+    for row in rows:
+        if row["stopped_at"] is not None:
+            blocked.setdefault(row["service_id"], SERVICE_BLOCK_STOPPED)
+        elif not row["is_published"]:
+            blocked.setdefault(row["service_id"], SERVICE_BLOCK_UNPUBLISHED)
+    return blocked
 
 
 def touch_service_call_async(tenant_id: str, service_id: str | None) -> None:
@@ -534,6 +771,11 @@ __all__ = [
     "McpAuthMiddleware",
     "find_by_key_hash",
     "find_service_permissions",
+    "service_block_reason",
+    "block_reasons_for_services",
+    "SERVICE_BLOCK_STOPPED",
+    "SERVICE_BLOCK_UNPUBLISHED",
+    "SERVICE_BLOCK_DISABLED",
     "update_last_used",
     "touch_service_call",
     "touch_service_call_async",

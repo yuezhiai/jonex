@@ -12,6 +12,23 @@ import os
 logger = logging.getLogger("mcp.config")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔型环境变量；缺失、非法时回落默认值并告警。
+
+    接受 1/true/yes/on 与 0/false/no/off（大小写不敏感）。MCP 是入口服务，
+    配置错误应降级而不是拒绝启动。
+    """
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    logger.warning("%s=%r 不是布尔值，回落默认值 %s", name, raw, default)
+    return default
+
+
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     """读取整数型环境变量；缺失、非法或越界时回落默认值并告警。
 
@@ -65,15 +82,30 @@ class Settings:
         "ONTOLOGY_MULTIHOP_DEADLINE_SECONDS", 25, minimum=1, maximum=120
     )
 
+    # Jonex Wiki 列式浏览（4 个只读工具）
+    # 开关只控制 MCP 暴露面：关闭后工具仍注册、参数校验/鉴权照常，但不调上游。
+    WIKI_BROWSE_ENABLED: bool = _env_bool("WIKI_BROWSE_ENABLED", True)
+    # 深度上限是**独立变量**，不回落 ONTOLOGY_NEIGHBOR_DEPTH_MAX。
+    WIKI_BROWSE_DEPTH_MAX: int = _env_int(
+        "WIKI_BROWSE_DEPTH_MAX", 3, minimum=1, maximum=20
+    )
+    # 单库上游调用超时；超时组进 errors。多库整体另有 deadline。
+    WIKI_BROWSE_REQUEST_TIMEOUT_SECONDS: int = _env_int(
+        "WIKI_BROWSE_REQUEST_TIMEOUT_SECONDS", 30, minimum=1, maximum=120
+    )
+    WIKI_BROWSE_DEADLINE_SECONDS: int = _env_int(
+        "WIKI_BROWSE_DEADLINE_SECONDS", 60, minimum=1, maximum=180
+    )
+
     # 限流配置
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
     # OpenKB 健康检查（Phase 11）
     OPENKB_HEALTH_URL: str = os.getenv("OPENKB_HEALTH_URL", "http://openkb:7566/health")
-    # jonex_wiki 健康检查（经 /health 控制 search_jonex_wiki 开关）
+    # jonex_wiki 健康检查（启动时探测；仅观测，不翻转 search_jonex_wiki 开关）
     # ⚠️ 目标是 B1 单容器 `jonex-wiki:8007`（引擎 + 能力同进程，见 deploy/docker-compose.yml）。
     #    旧默认值 `jonex-wiki-adapter:7567` 属已废弃的独立 adapter 架构，Docker DNS 里
-    #    没有该别名 —— 用旧值启动必然 3 次重试全失败，`search_jonex_wiki` 被永久禁用。
+    #    没有该别名 —— 用旧值启动必然 3 次重试全失败并持续告警（工具本身不会被禁用）。
     JONEX_WIKI_HEALTH_URL: str = os.getenv(
         "JONEX_WIKI_HEALTH_URL", "http://jonex-wiki:8007/health"
     )

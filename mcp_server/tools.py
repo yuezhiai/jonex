@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -27,10 +28,12 @@ import httpx
 from mcp.types import CallToolResult, TextContent
 
 from auth import (
+    SERVICE_BLOCK_UNPUBLISHED,
     SYSTEM_SERVICE_ID,
     McpAuthContext,
     McpAuthError,
-    require_kb_scope,
+    block_reasons_for_services,
+    service_block_reason,
     require_mcp_auth,
     require_write_scope,
     touch_service_call_async,
@@ -123,7 +126,7 @@ def _inject_mcp_tool(name: str):
     ``name`` 必须与 ``app.py`` 中 ``@mcp.tool()`` 注册的公开名一致；
     装饰器把它写入 ``__mcp_tool_name__``，供静态覆盖测试断言「新增工具漏注入」。
 
-    全部 15 个工具都罩在这层下，故工具错误的线上翻译只此一处，两类异常共用
+    全部 19 个工具都罩在这层下，故工具错误的线上翻译只此一处，两类异常共用
     ``_mcp_error_result``：
       - ``McpToolError`` → 用它自带的码值 / data；
       - ``McpAuthError``（handler 内 ``require_mcp_auth`` / ``require_write_scope``
@@ -309,6 +312,14 @@ async def call_gateway_ext(
                     code=_ERROR_CONFLICT,
                     message="知识库中已存在相同内容的文档，请勿重复上传",
                 )
+            # 反馈工具：404 只表示 request_id 对应的检索事件不存在（未写成或
+            # 已过期），不是参数格式问题。单独分档，避免调用方反复改参重试；
+            # 搜索链路的 404→-32602 保持不变，多引擎 fallback 依赖该映射。
+            if action == "submit_mcp_feedback" and e.response.status_code == 404:
+                raise McpToolError(
+                    code=_ERROR_INTERNAL,
+                    message="检索记录不存在或已失效，请重新检索后使用新的 request_id",
+                )
             # 其他客户端错误（400/404/422）→ 参数或管线问题，允许上游 safe-fallback
             raise McpToolError(
                 code=_ERROR_INVALID_PARAMS,
@@ -429,13 +440,24 @@ async def _check_service_scope(
     遗留值降级迁移：write→call、read→view、*→call（写权限已移交写 Key，
     * 不再全通配）。未知值落到 rank -1 → 403（安全默认拒绝）。
 
-    统一 Key 重构后，KB 范围不再由 allowed_kb_ids 表达——空间隔离已在授权期
-    由 mcp_key_service 强制（create/update 只允许把 Key 空间内的服务写进映射），
-    故此处只做服务级权限检查，恒返回 []（空 = 全部 KB 允许），调用方自行获取
-    service 的 kb_ids。
+    本函数**只做**服务级权限 + 服务可用性判定，不返回 KB 范围：KB 范围统一由
+    ``_service_kb_ids`` 解析（已应用 Key 级 KB 白名单），调用方不要自己
+    ``get_service`` 取 ``kb_ids``，否则绕过白名单。返回值恒为 ``[]`` 仅为
+    向后兼容保留（旧调用方按「空 = 全部允许」处理，现已无生产使用）。
+
+    服务可用性拦截（领域服务自身停用/禁用、运营停用或取消发布后，已建 Key 也不得
+    再调）：权限校验通过后先查 ``knowledge_base.services``（无行、``status`` 非
+    active 或 ``enabled=0`` → ``"disabled"``），再查发布表（``stopped_at`` 非空 →
+    ``"stopped"``、``is_published=0`` → ``"unpublished"``）。放在这里而不是鉴权
+    中间件，是为了保持「逐服务」语义——同一 Key 授权的其他服务不受影响；发布表
+    无记录（如系统写服务）按可用放行（见 ``auth.service_block_reason``）。
+
+    Raises:
+        McpAuthError(401/403): 服务不在授权范围 / 权限级别不够。
+        McpToolError(-32004): 领域服务已停用/禁用、运营已停用或未发布。
 
     Returns:
-        list[str]: 恒为 []（表示「全部 KB 允许」，调用方自行获取 service 的 kb_ids）
+        list[str]: 恒为 []（向后兼容保留；KB 范围请用 ``_service_kb_ids``）
     """
     perm_level = auth.service_permissions.get(service_id)
 
@@ -453,6 +475,27 @@ async def _check_service_scope(
             403,
             f"需要'{_LABELS.get(required_permission, required_permission)}'权限，"
             f"当前为'{_LABELS.get(perm_level, perm_level)}'权限",
+        )
+
+    # 不可用即阻断：领域服务自身停用/禁用（disabled）、运营停用（stopped）与取消
+    # 发布（unpublished）都拒绝，且只拒该服务，同 Key 的其他服务照常可用。
+    # 用 McpToolError 而非 McpAuthError——这是运营治理状态，不是 Key 失效；
+    # 若用 401，客户端会误判 Key 过期并触发重复换 Key。
+    #
+    # 文案映射：只有 unpublished 说「服务未发布」；stopped 与 disabled 对用户是
+    # 同一现象（服务不可用），统一说「服务已停用」；data.reason 保留原值便于诊断。
+    # 用「非 unpublished 即已停用」而非白名单，未来新增原因也不会漏判成可调用。
+    block_reason = await service_block_reason(auth.tenant_id, service_id)
+    if block_reason is not None:
+        message = (
+            "服务未发布"
+            if block_reason == SERVICE_BLOCK_UNPUBLISHED
+            else "服务已停用"
+        )
+        raise McpToolError(
+            code=_ERROR_SERVICE_UNAVAILABLE,
+            message=message,
+            data={"service_id": service_id, "reason": block_reason},
         )
 
     return []
@@ -764,6 +807,10 @@ async def get_upload_status(service_id: str, document_id: str) -> dict:
     kb_ids_to_check = [
         g["kb"] for g in auth.write_grants if g.get("mode") == "all" and g.get("kb")
     ]
+    # Key 级 KB 白名单是总上界，写授权也受其约束（白名单为空 = 不限制）。
+    if auth.allowed_kb_ids:
+        allowed = set(auth.allowed_kb_ids)
+        kb_ids_to_check = [kb_id for kb_id in kb_ids_to_check if kb_id in allowed]
 
     if not kb_ids_to_check:
         raise McpToolError(
@@ -793,6 +840,9 @@ async def list_domain_services() -> dict:
     只返回该 Key 可访问（service_permissions 授权范围内）的服务及其库，
     避免目录枚举平铺未授权库、agent 一问即 403。
 
+    两层收窄：① 已停用 / 已取消发布的服务不再列出；② Key 级 KB 白名单非空时，
+    只列白名单内的库，交集为空的服务整条隐藏。
+
     Returns:
         dict: 含 items（领域服务列表，已按授权过滤）、total（过滤后总数）字段
     """
@@ -814,6 +864,32 @@ async def list_domain_services() -> dict:
             for item in result["items"]
             if isinstance(item, dict) and item.get("id") in authorized_ids
         ]
+        # 停用 / 取消发布的服务从 MCP 目录下架：目录不再列出调不通的服务；
+        # 调用侧保留 -32004，兜住「列完到调用之间被停用」的竞态。
+        blocked = await block_reasons_for_services(
+            auth.tenant_id, [item["id"] for item in items]
+        )
+        if blocked:
+            items = [item for item in items if item["id"] not in blocked]
+        # Key 级 KB 白名单是上界：目录里只保留白名单内的库，交集为空的服务对
+        # 该 Key 实际不可用，一并隐藏（与停用/未发布同口径，避免列了又调不通）。
+        if auth.allowed_kb_ids:
+            allowed = set(auth.allowed_kb_ids)
+            clipped: list[dict] = []
+            for item in items:
+                kb_ids = item.get("kb_ids")
+                if not isinstance(kb_ids, list):
+                    # 形状意外时 fail-closed：无法证明库在白名单内，不列该服务。
+                    logger.warning(
+                        "list_domain_services 跳过无 kb_ids 的服务: service_id=%s",
+                        item.get("id"),
+                    )
+                    continue
+                kept = [kb_id for kb_id in kb_ids if kb_id in allowed]
+                if not kept:
+                    continue
+                clipped.append({**item, "kb_ids": kept})
+            items = clipped
         return {"items": items, "total": len(items)}
     # 格式意外 → 记录并报错
     logger.error("list_services 返回意外格式: %s", type(result).__name__)
@@ -826,6 +902,7 @@ _ERROR_INTERNAL = -32000  # 内部服务错误
 _ERROR_RATE_LIMITED = -32001  # 限流（自定义 MCP extension）
 _ERROR_AUTH = -32002  # 认证/授权失败（401/403 → 禁止管线 fallback）
 _ERROR_CONFLICT = -32003  # 资源冲突/内容重复（409 + 业务码 1003；同样禁止管线 fallback）
+_ERROR_SERVICE_UNAVAILABLE = -32004  # 服务不可用：已停用/未发布（自定义 MCP extension；不在 -32602/-32000 的检索 fallback 判据内）
 
 # LLM-Wiki 检索开关（Feature Flag，默认开启）。
 # ⚠ 只由环境变量控制，**不再由启动健康检查翻转**（同 SEARCH_JONEX_WIKI_ENABLED：
@@ -896,24 +973,10 @@ async def list_documents(
     if len(file_name) > 255:
         raise McpToolError(code=-32602, message="file_name 长度不能超过 255 字符")
     auth = require_mcp_auth("view")
-    intersection = await _check_service_scope(auth, service_id, required_permission="view")
+    await _check_service_scope(auth, service_id, required_permission="view")
     touch_service_call_async(auth.tenant_id, service_id.strip())
-    if intersection:
-        kb_ids_to_query = intersection
-    else:
-        # 前置校验调用：get_service 不是公开 MCP 工具，不上报工具名。
-        # 语义归属在 Gateway（_INTERNAL_CHECK_ACTIONS 记成普通 invoke）；
-        # 这里 report_tool=False 是 belt-and-braces 双保险。
-        service_detail = await call_gateway(
-            "get_service",
-            auth.tenant_id,
-            auth.key_id,
-            {"service_id": service_id},
-            report_tool=False,
-        )
-        kb_ids_to_query = service_detail.get("kb_ids", [])
-    if not kb_ids_to_query:
-        raise McpToolError(code=-32000, message="服务下无可用知识库")
+    # 唯一解析点：已应用 Key 级 KB 白名单；空服务 / 与白名单无交集在此抛错。
+    kb_ids_to_query = await _service_kb_ids(auth, service_id)
     all_items: list[dict] = []
     # 逐 KB 收集错误：不能把「不可访问」静默吞成「没有文档」，否则依赖本工具
     # 的调用方（如等待解析完成）会把上游故障/密级拦截误判成空结果并等到超时。
@@ -1084,6 +1147,32 @@ def _validate_ontology_kb_selection(
     return single, explicit
 
 
+async def _apply_kb_whitelist(
+    auth: McpAuthContext, service_kb_ids: list[str]
+) -> list[str]:
+    """把 Key 级 KB 白名单（``allowed_kb_ids``）作为**上界**应用到服务库范围。
+
+    语义（统一 Key 重构暂停后重新启用）：
+
+    - 白名单为空 = 不限制，原样返回（存量 Key 行为不变）；
+    - 白名单非空 = 返回 ``服务关联库 ∩ 白名单``，顺序沿用服务侧；
+    - 交集为空 = 该 Key 对这个服务没有可用库，显式抛 -32002。
+
+    最后一条是必须的：若返回空列表，调用方会按「空 = 全部允许」的旧约定退化，
+    等于白名单失效——安全能力不能靠调用方各自判断，必须在这里硬失败。
+    """
+    if not auth.allowed_kb_ids:
+        return list(service_kb_ids)
+    allowed = set(auth.allowed_kb_ids)
+    effective = [kb_id for kb_id in service_kb_ids if kb_id in allowed]
+    if not effective:
+        raise McpToolError(
+            code=_ERROR_AUTH,
+            message="该 Key 未授权此服务的任何知识库",
+        )
+    return effective
+
+
 async def _resolve_ontology_kb_ids(
     auth: McpAuthContext,
     service_id: str,
@@ -1116,6 +1205,9 @@ async def _resolve_ontology_kb_ids(
     )
     if not kb_ids:
         raise McpToolError(code=_ERROR_INTERNAL, message="服务下无可用知识库")
+
+    # Key 级 KB 白名单在这里收窄，显式传参也一样受限（越界按「不在服务范围内」拒绝）。
+    kb_ids = await _apply_kb_whitelist(auth, kb_ids)
 
     requested = [single] if single else explicit
     if requested:
@@ -1557,6 +1649,1411 @@ async def expand_ontology_neighbors(
     return {"groups": groups}
 
 
+# ── Jonex Wiki 列式浏览：4 个只读工具 ─────────────────────────────────────
+# 契约：docs/ai-mcp/jonex-wiki-column-browse-mcp-tool-contract.md
+# 只调用 get_wiki_outline / get_wiki_page_graph / get_wiki_claims 三个读 action；
+# KB 归属与类型唯一入口是 get_service 的 kb_ids + kb_types（同序）。
+
+_WIKI_KB_TYPE = "jonex_wiki"
+_WIKI_BROWSE_ENABLED = settings.WIKI_BROWSE_ENABLED
+_WIKI_DEPTH_MAX = settings.WIKI_BROWSE_DEPTH_MAX
+_WIKI_REQUEST_TIMEOUT_SECONDS = settings.WIKI_BROWSE_REQUEST_TIMEOUT_SECONDS
+_WIKI_DEADLINE_SECONDS = settings.WIKI_BROWSE_DEADLINE_SECONDS
+_WIKI_MAX_FANOUT_KBS = settings.ONTOLOGY_MAX_FANOUT_KBS
+_WIKI_FANOUT_PER_NODE = 20
+_WIKI_BACKLINK_LIMIT = 30
+_WIKI_CLAIM_TEXT_LIMIT = 400
+_WIKI_TRUNCATION_ORDER = ("limit", "fanout", "source_pages", "source_links")
+
+
+def _validate_wiki_kb_selection(
+    knowledge_base_id: str,
+    knowledge_base_ids,
+) -> tuple[str, list[str]]:
+    """纯参数校验（先于鉴权）：单值/列表互斥 + 列表归一。
+
+    归一复用本体侧 ``_normalize_ontology_kb_ids``（同一扇出上限变量，
+    契约 §4.2 明确复用 ``ONTOLOGY_MAX_FANOUT_KBS``）。
+    """
+    explicit = _normalize_ontology_kb_ids(knowledge_base_ids)
+    single = (knowledge_base_id or "").strip()
+    if single and knowledge_base_ids is not None:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="knowledge_base_id 与 knowledge_base_ids 不能同时提供",
+        )
+    return single, explicit
+
+
+async def _resolve_wiki_kb_ids(
+    auth: McpAuthContext,
+    service_id: str,
+    knowledge_base_id: str,
+    knowledge_base_ids,
+) -> list[str]:
+    """解析本次调用要扇出的 Jonex Wiki KB 列表（唯一 ``get_service`` 调用点）。
+
+    显式 KB 必须属于服务且类型为 ``jonex_wiki``；缺省选择只筛
+    ``kb_type == "jonex_wiki"``。``kb_types`` 缺失/形状不符一律 -32602，
+    不做「猜测放行」（契约 §4.2 / §7.8）。
+
+    Raises:
+        McpToolError(code=-32602): ``kb_types`` 无法判定 / 显式 KB 类型不符
+        McpToolError(code=-32002): 显式知识库不在该服务范围内
+        McpToolError(code=-32000): 服务下无 Jonex Wiki KB / 缺省 KB 超过上限
+    """
+    single, explicit = _validate_wiki_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    # 前置校验调用：get_service 不是公开 MCP 工具，不上报工具名。
+    service_detail = await call_gateway(
+        "get_service",
+        auth.tenant_id,
+        auth.key_id,
+        {"service_id": service_id},
+        report_tool=False,
+    )
+    if not isinstance(service_detail, dict):
+        service_detail = {}
+    kb_ids = service_detail.get("kb_ids")
+    kb_types = service_detail.get("kb_types")
+    if not isinstance(kb_ids, list):
+        kb_ids = []
+    if not isinstance(kb_types, list) or len(kb_types) != len(kb_ids):
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="无法判定知识库类型"
+        )
+
+    # Key 级 KB 白名单是上界：kb_ids 与 kb_types 必须成对过滤，否则类型判定错位。
+    if auth.allowed_kb_ids:
+        allowed = set(auth.allowed_kb_ids)
+        pairs = [
+            (kb_id, kb_type)
+            for kb_id, kb_type in zip(kb_ids, kb_types)
+            if kb_id in allowed
+        ]
+        if not pairs:
+            raise McpToolError(
+                code=_ERROR_AUTH, message="该 Key 未授权此服务的任何知识库"
+            )
+        kb_ids = [kb_id for kb_id, _ in pairs]
+        kb_types = [kb_type for _, kb_type in pairs]
+
+    type_by_id: dict[str, str] = {}
+    for kb_id, kb_type in zip(kb_ids, kb_types):
+        if isinstance(kb_id, str) and kb_id:
+            type_by_id.setdefault(kb_id, kb_type)
+
+    requested = [single] if single else explicit
+    if requested:
+        # 不区分「KB 不存在」与「KB 越界」，避免泄露存在性。
+        if any(kb_id not in type_by_id for kb_id in requested):
+            raise McpToolError(
+                code=_ERROR_AUTH, message="知识库不在该服务范围内"
+            )
+        # 类型不符是调用方参数错误，不是「不可访问」。
+        if any(type_by_id[kb_id] != _WIKI_KB_TYPE for kb_id in requested):
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="该工具仅支持 Jonex Wiki 知识库",
+            )
+        return requested
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for kb_id, kb_type in zip(kb_ids, kb_types):
+        if kb_type != _WIKI_KB_TYPE or not isinstance(kb_id, str) or not kb_id:
+            continue
+        if kb_id in seen:
+            continue
+        seen.add(kb_id)
+        resolved.append(kb_id)
+    if not resolved:
+        raise McpToolError(
+            code=_ERROR_INTERNAL, message="服务下无可用 Jonex Wiki 知识库"
+        )
+    if len(resolved) > _WIKI_MAX_FANOUT_KBS:
+        raise McpToolError(
+            code=_ERROR_INTERNAL,
+            message=(
+                f"服务关联 Jonex Wiki 知识库超过 {_WIKI_MAX_FANOUT_KBS} 个，"
+                "请显式指定 knowledge_base_ids"
+            ),
+        )
+    return resolved
+
+
+async def _fanout_wiki_action(
+    action: str,
+    auth: McpAuthContext,
+    kb_ids: list[str],
+    build_payload,
+    *,
+    deadline_seconds: float | None = None,
+    request_timeout_seconds: float | None = None,
+) -> list[dict]:
+    """逐 KB 串行调用目标 action，独立捕获单库失败（形态同本体扇出）。
+
+    每次调用都套 ``asyncio.wait_for``（全库图是一次性大响应，不能沿用本体
+    多跳的短超时）；``deadline_seconds`` 非空时对整轮扇出设总预算，每库只用
+    「剩余时间」等待，超时库按失败组处理，已完成库照常返回。
+
+    Returns:
+        与 ``kb_ids`` 同序的 outcomes；成功项 ``{"knowledge_base_id", "data"}``，
+        失败项 ``{"knowledge_base_id", "error": {knowledge_base_id, code,
+        message}, "retry_after", "timed_out"}``。``error`` 即对外暴露的中性
+        错误元素。
+    """
+    outcomes: list[dict] = []
+    per_timeout = (
+        request_timeout_seconds
+        if request_timeout_seconds is not None
+        else _WIKI_REQUEST_TIMEOUT_SECONDS
+    )
+    deadline = (
+        time.monotonic() + deadline_seconds if deadline_seconds else None
+    )
+    for kb_id in kb_ids:
+        try:
+            timeout = per_timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                timeout = min(timeout, remaining) if timeout else remaining
+            coro = call_gateway(
+                action, auth.tenant_id, auth.key_id, build_payload(kb_id)
+            )
+            data = await asyncio.wait_for(coro, timeout=timeout)
+            outcomes.append({"knowledge_base_id": kb_id, "data": data})
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s 调用超时，跳过: kb_id=%s", action, kb_id
+            )
+            outcomes.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    "error": {
+                        "knowledge_base_id": kb_id,
+                        "code": _ERROR_INTERNAL,
+                        "message": "该知识库不可访问，已跳过",
+                    },
+                    "timed_out": True,
+                }
+            )
+        except McpToolError as exc:
+            logger.warning(
+                "%s 跳过不可访问的知识库: kb_id=%s code=%s", action, kb_id, exc.code
+            )
+            retry_after = (exc.data or {}).get("retry_after")
+            outcomes.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    "error": {
+                        "knowledge_base_id": kb_id,
+                        "code": exc.code,
+                        # 中性文案：不把上游 404 解释成「KB 不存在」。
+                        "message": "该知识库不可访问，已跳过",
+                    },
+                    "retry_after": retry_after,
+                    "timed_out": False,
+                }
+            )
+    return outcomes
+
+
+def _raise_if_all_wiki_groups_failed(outcomes: list[dict]) -> None:
+    """全部 KB 失败时归一为 -32002 / -32001 / -32000；部分失败不抛。
+
+    契约 §4.10：任一失败组为鉴权/授权 → -32002；全部为限流 → -32001；
+    其余 → -32000；**绝不归一为 -32602**（密级 404 映射来的 -32602 也落到
+    -32000）。
+    """
+    errors = [o["error"] for o in outcomes if "error" in o]
+    if not errors or len(errors) != len(outcomes):
+        return
+    logger.error("Jonex Wiki 浏览全部知识库不可访问: errors=%s", errors)
+    if any(err["code"] == _ERROR_AUTH for err in errors):
+        raise McpToolError(code=_ERROR_AUTH, message="知识库不可访问")
+    if all(err["code"] == _ERROR_RATE_LIMITED for err in errors):
+        retry_after = max(
+            (o.get("retry_after") or 60 for o in outcomes if "error" in o),
+            default=60,
+        )
+        raise McpToolError(
+            code=_ERROR_RATE_LIMITED,
+            message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+            data={"retry_after": retry_after},
+        )
+    raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+
+def _degrade_wiki_internal_outcomes(outcomes: list[dict]) -> list[dict]:
+    """把上游 -32000（非超时）失败组转成降级组。
+
+    目录/页面工具的数据源是 ``get_wiki_outline``：契约 §4.5 要求上游内部
+    错误表现为 ``wiki_degraded=true`` + 空增量，而不是工具错误。超时仍按
+    「该组 errors」处理（§4.12）。
+    """
+    normalized: list[dict] = []
+    for outcome in outcomes:
+        error = outcome.get("error")
+        if (
+            isinstance(error, dict)
+            and error.get("code") == _ERROR_INTERNAL
+            and not outcome.get("timed_out")
+        ):
+            normalized.append(
+                {
+                    "knowledge_base_id": outcome["knowledge_base_id"],
+                    "degraded": True,
+                }
+            )
+            continue
+        normalized.append(outcome)
+    return normalized
+
+
+def _wiki_error_outcome(kb_id: str, exc: McpToolError) -> dict:
+    """把 per-KB 投影阶段抛出的 ``McpToolError`` 收成中性失败组。"""
+    return {
+        "knowledge_base_id": kb_id,
+        "error": {
+            "knowledge_base_id": kb_id,
+            "code": exc.code,
+            "message": "该知识库不可访问，已跳过",
+        },
+    }
+
+
+async def _call_wiki_action_single(
+    action: str, auth: McpAuthContext, kb_id: str, payload: dict
+) -> dict:
+    """单库上游调用（带 ``WIKI_BROWSE_REQUEST_TIMEOUT_SECONDS`` 超时）。"""
+    try:
+        return await asyncio.wait_for(
+            call_gateway(action, auth.tenant_id, auth.key_id, payload),
+            timeout=_WIKI_REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("%s 单库调用超时: kb_id=%s", action, kb_id)
+        raise McpToolError(
+            code=_ERROR_INTERNAL, message="知识库服务暂不可用"
+        )
+
+
+def _wiki_truncation_reasons(reasons: set[str]) -> list[str]:
+    return [reason for reason in _WIKI_TRUNCATION_ORDER if reason in reasons]
+
+
+def _wiki_page_stem(path: str) -> str:
+    name = path.rsplit("/", 1)[-1]
+    return name[:-3] if name.endswith(".md") else name
+
+
+def _resolve_wiki_page_path(raw_path: str, page_paths) -> str | None:
+    """canonical 精确匹配；未命中时兼容旧口径 ``{section}/{stem}``。"""
+    raw_path = (raw_path or "").strip()
+    available = set(page_paths)
+    if raw_path in available:
+        return raw_path
+
+    section, sep, rest = raw_path.partition("/")
+    if sep:
+        mapped = {"summaries": "sources", "entities": "tables", "concepts": ""}
+        if section in mapped:
+            prefix = mapped[section]
+            candidate = f"{prefix}/{rest}" if prefix else rest
+        else:
+            candidate = raw_path
+    else:
+        candidate = raw_path
+    if not candidate.endswith(".md"):
+        candidate += ".md"
+    if candidate in available:
+        return candidate
+    return None
+
+
+def _collect_topic_entry_paths(outline, topic_id: str) -> set[str] | None:
+    """递归查找目录节点，返回该节点及其 children 的 entries[].path 集合。
+
+    找不到节点返回 None；节点存在但没有任何 entry 返回空集合。
+    """
+
+    def _find(nodes):
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            if node.get("id") == topic_id:
+                return node
+            found = _find(node.get("children") or [])
+            if found is not None:
+                return found
+        return None
+
+    topics = outline.get("topics") if isinstance(outline, dict) else None
+    node = _find(topics or [])
+    if node is None:
+        return None
+
+    paths: set[str] = set()
+
+    def _collect(current):
+        for entry in current.get("entries") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                if entry["path"]:
+                    paths.add(entry["path"])
+        for child in current.get("children") or []:
+            if isinstance(child, dict):
+                _collect(child)
+
+    _collect(node)
+    return paths
+
+
+def _project_wiki_page_item(page: dict) -> dict:
+    return {
+        "path": page.get("path", ""),
+        "title": page.get("title", ""),
+        "type": page.get("type", ""),
+        "category": page.get("category", ""),
+        "description": page.get("description", ""),
+        "aliases": page.get("aliases") or [],
+        "tags": page.get("tags") or [],
+        "why_visit": page.get("why_visit", ""),
+        "reference_count": page.get("reference_count", 0),
+    }
+
+
+def _bfs_wiki_links(
+    data: dict, raw_path: str, depth: int, limit: int
+) -> tuple[bool, list[dict], list[dict], bool, list[str]]:
+    """按契约 §4.7 第 3–12 条执行 BFS，返回 (start_found, pages, links, ...)。
+
+    - 邻接表只用出链；同一 ``(source, target)`` 只保留一条；
+    - 每节点每层按 target 升序取前 20（超 20 → ``fanout``）；
+    - 全局边预算 ``limit``（``limit+1`` 哨兵）；超了丢弃多余边并停止扩展；
+    - ``depth>1`` 含起点（hop=0）；``depth==1`` 不含起点；
+    - 每个返回页附「完整语义图」反算的链入（前 30，可感知截断）。
+    """
+    raw_pages = data.get("pages") or []
+    raw_links = data.get("links") or []
+
+    page_map: dict[str, dict] = {}
+    for page in raw_pages:
+        if isinstance(page, dict) and isinstance(page.get("path"), str):
+            if page["path"]:
+                page_map[page["path"]] = page
+
+    reasons: set[str] = set()
+    for reason in data.get("truncated_reason") or []:
+        if isinstance(reason, str) and reason:
+            reasons.add(reason)
+    source_truncated = bool(data.get("truncated"))
+
+    start_path = _resolve_wiki_page_path(raw_path, page_map.keys())
+    if start_path is None:
+        return (
+            False,
+            [],
+            [],
+            source_truncated or bool(reasons),
+            _wiki_truncation_reasons(reasons),
+        )
+
+    # 同一 (source, target) 只保留一条；优先保留 why_visit 非空者。
+    edge_map: dict[tuple[str, str], dict] = {}
+    for link in raw_links:
+        if not isinstance(link, dict):
+            continue
+        source = link.get("source")
+        target = link.get("target")
+        if (
+            not isinstance(source, str)
+            or not isinstance(target, str)
+            or not source
+            or not target
+        ):
+            continue
+        if source not in page_map or target not in page_map:
+            continue
+        key = (source, target)
+        existing = edge_map.get(key)
+        if existing is None or (
+            not existing.get("why_visit") and link.get("why_visit")
+        ):
+            edge_map[key] = link
+
+    adjacency: dict[str, list[str]] = {}
+    reverse: dict[str, list[tuple[str, dict]]] = {}
+    for (source, target), link in edge_map.items():
+        adjacency.setdefault(source, []).append(target)
+        reverse.setdefault(target, []).append((source, link))
+    for targets in adjacency.values():
+        targets.sort()
+
+    visited: dict[str, int] = {start_path: 0}
+    queue = deque([(start_path, 0)])
+    collected: list[dict] = []
+    seen_edges: set[tuple[str, str]] = set()
+    stop = False
+    while queue and not stop:
+        node, hop = queue.popleft()
+        if hop >= depth:
+            continue
+        targets = adjacency.get(node, [])
+        if len(targets) > _WIKI_FANOUT_PER_NODE:
+            reasons.add("fanout")
+        for target in targets[:_WIKI_FANOUT_PER_NODE]:
+            key = (node, target)
+            if key in seen_edges:
+                continue
+            if len(collected) >= limit:
+                reasons.add("limit")
+                stop = True
+                break
+            seen_edges.add(key)
+            target_hop = visited.get(target)
+            if target_hop is None:
+                target_hop = hop + 1
+                visited[target] = target_hop
+                queue.append((target, target_hop))
+            link = edge_map[key]
+            collected.append(
+                {
+                    "source": node,
+                    "target": target,
+                    "kind": link.get("kind") or "link",
+                    "why_visit": link.get("why_visit") or "",
+                    "hop": target_hop,
+                }
+            )
+
+    if depth > 1:
+        page_hops = dict(visited)
+    else:
+        # 本体口径：depth=1 不含起点，只含一跳目标页。
+        page_hops = {
+            path: hop
+            for path, hop in visited.items()
+            if path != start_path and hop == 1
+        }
+
+    connected: set[str] = set()
+    for edge in collected:
+        connected.add(edge["source"])
+        connected.add(edge["target"])
+    page_hops = {
+        path: hop
+        for path, hop in page_hops.items()
+        if path == start_path or path in connected
+    }
+
+    pages_out: list[dict] = []
+    for path, hop in sorted(page_hops.items(), key=lambda item: (item[1], item[0])):
+        page = page_map[path]
+        backlinks: list[dict] = []
+        for source, link in reverse.get(path, []):
+            source_page = page_map.get(source) or {}
+            backlinks.append(
+                {
+                    "path": source,
+                    "title": source_page.get("title") or _wiki_page_stem(source),
+                    "kind": str(link.get("kind") or "link"),
+                }
+            )
+        backlinks.sort(
+            key=lambda item: (
+                0 if "link" in item["kind"] else 1,
+                item["title"],
+            )
+        )
+        backlink_total = len(backlinks)
+        pages_out.append(
+            {
+                "path": path,
+                "title": page.get("title") or _wiki_page_stem(path),
+                "type": page.get("type", ""),
+                "aliases": page.get("aliases") or [],
+                "description": page.get("description", ""),
+                "hop": hop,
+                "backlink_total": backlink_total,
+                "backlinks": backlinks[:_WIKI_BACKLINK_LIMIT],
+                "backlinks_truncated": backlink_total > _WIKI_BACKLINK_LIMIT,
+            }
+        )
+
+    links_out = sorted(
+        collected,
+        key=lambda edge: (edge["hop"], edge["source"], edge["target"]),
+    )
+    truncated = source_truncated or bool(reasons)
+    return (
+        True,
+        pages_out,
+        links_out,
+        truncated,
+        _wiki_truncation_reasons(reasons),
+    )
+
+
+def _wiki_topics_payload(
+    kb_id: str,
+    *,
+    topics: list,
+    page_count: int,
+    outline_available: bool,
+    outline_version: int,
+    stale: bool,
+    degraded: bool,
+    disabled: bool = False,
+) -> dict:
+    payload = {
+        "knowledge_base_id": kb_id,
+        "topics": topics,
+        "page_count": page_count,
+        "outline_available": outline_available,
+        "outline_version": outline_version,
+        "stale": stale,
+        "wiki_degraded": degraded,
+    }
+    if disabled:
+        payload["wiki_browse_disabled"] = True
+    return payload
+
+
+def _project_wiki_topics(kb_id: str, data: dict) -> dict:
+    if bool(data.get("degraded")):
+        return _degraded_wiki_topics(kb_id)
+    outline = data.get("outline")
+    topics = outline.get("topics") if isinstance(outline, dict) else None
+    return _wiki_topics_payload(
+        kb_id,
+        topics=topics or [],
+        page_count=int(data.get("page_count") or 0),
+        outline_available=outline is not None,
+        outline_version=int(data.get("outline_version") or 0),
+        stale=bool(data.get("stale")),
+        degraded=False,
+    )
+
+
+def _degraded_wiki_topics(kb_id: str) -> dict:
+    return _wiki_topics_payload(
+        kb_id,
+        topics=[],
+        page_count=0,
+        outline_available=False,
+        outline_version=0,
+        stale=False,
+        degraded=True,
+    )
+
+
+def _wiki_pages_payload(
+    kb_id: str,
+    *,
+    items: list,
+    total: int,
+    page: int,
+    page_size: int,
+    outline_available: bool,
+    stale: bool,
+    degraded: bool,
+    disabled: bool = False,
+) -> dict:
+    payload = {
+        "knowledge_base_id": kb_id,
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "outline_available": outline_available,
+        "stale": stale,
+        "wiki_degraded": degraded,
+    }
+    if disabled:
+        payload["wiki_browse_disabled"] = True
+    return payload
+
+
+def _project_wiki_pages(
+    kb_id: str,
+    data: dict,
+    *,
+    topic: str,
+    page_type: str,
+    page: int,
+    page_size: int,
+) -> dict:
+    if bool(data.get("degraded")):
+        return _degraded_wiki_pages(kb_id, page, page_size)
+    outline = data.get("outline")
+    pages = data.get("pages") or []
+    if topic:
+        if not isinstance(outline, dict):
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="该知识库未生成目录，无法按 topic 过滤",
+            )
+        entry_paths = _collect_topic_entry_paths(outline, topic)
+        if entry_paths is None:
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message="目录中不存在该主题",
+            )
+        pages = [
+            item
+            for item in pages
+            if isinstance(item, dict) and item.get("path") in entry_paths
+        ]
+    if page_type:
+        pages = [
+            item
+            for item in pages
+            if isinstance(item, dict) and item.get("type") == page_type
+        ]
+    total = len(pages)
+    start = (page - 1) * page_size
+    items = [
+        _project_wiki_page_item(item)
+        for item in pages[start:start + page_size]
+        if isinstance(item, dict)
+    ]
+    return _wiki_pages_payload(
+        kb_id,
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        outline_available=isinstance(outline, dict),
+        stale=bool(data.get("stale")),
+        degraded=False,
+    )
+
+
+def _degraded_wiki_pages(kb_id: str, page: int, page_size: int) -> dict:
+    return _wiki_pages_payload(
+        kb_id,
+        items=[],
+        total=0,
+        page=page,
+        page_size=page_size,
+        outline_available=False,
+        stale=False,
+        degraded=True,
+    )
+
+
+def _wiki_links_payload(
+    kb_id: str,
+    *,
+    path: str,
+    start_found: bool,
+    pages: list,
+    links: list,
+    depth: int,
+    limit: int,
+    truncated: bool,
+    truncated_reason: list[str],
+    degraded: bool,
+    disabled: bool = False,
+) -> dict:
+    payload = {
+        "knowledge_base_id": kb_id,
+        "path": path,
+        "start_found": start_found,
+        "pages": pages,
+        "links": links,
+        "depth": depth,
+        "limit": limit,
+        "returned": len(links),
+        "truncated": truncated,
+        "truncated_reason": truncated_reason,
+        "wiki_degraded": degraded,
+    }
+    if disabled:
+        payload["wiki_browse_disabled"] = True
+    return payload
+
+
+def _project_wiki_links(
+    kb_id: str, data: dict, *, path: str, depth: int, limit: int
+) -> dict:
+    if bool(data.get("degraded")):
+        return _wiki_links_payload(
+            kb_id,
+            path=path,
+            start_found=False,
+            pages=[],
+            links=[],
+            depth=depth,
+            limit=limit,
+            truncated=False,
+            truncated_reason=[],
+            degraded=True,
+        )
+    start_found, pages, links, truncated, reasons = _bfs_wiki_links(
+        data, path, depth, limit
+    )
+    return _wiki_links_payload(
+        kb_id,
+        path=path,
+        start_found=start_found,
+        pages=pages,
+        links=links,
+        depth=depth,
+        limit=limit,
+        truncated=truncated,
+        truncated_reason=reasons,
+        degraded=False,
+    )
+
+
+def _degraded_wiki_links(kb_id: str, path: str, depth: int, limit: int) -> dict:
+    return _wiki_links_payload(
+        kb_id,
+        path=path,
+        start_found=False,
+        pages=[],
+        links=[],
+        depth=depth,
+        limit=limit,
+        truncated=False,
+        truncated_reason=[],
+        degraded=True,
+    )
+
+
+def _wiki_claims_payload(
+    kb_id: str,
+    *,
+    path: str,
+    document_id: str,
+    items: list,
+    total: int,
+    limit: int,
+    degraded: bool,
+    disabled: bool = False,
+) -> dict:
+    returned = len(items)
+    payload = {
+        "knowledge_base_id": kb_id,
+        "path": path,
+        "document_id": document_id,
+        "items": items,
+        "total": total,
+        "returned": returned,
+        "limit": limit,
+        "truncated": total > returned,
+        "text_limit": _WIKI_CLAIM_TEXT_LIMIT,
+        "wiki_degraded": degraded,
+    }
+    if disabled:
+        payload["wiki_browse_disabled"] = True
+    return payload
+
+
+def _project_wiki_claims(
+    kb_id: str, data: dict, *, path: str, document_id: str, limit: int
+) -> dict:
+    degraded = bool(data.get("degraded"))
+    items = [] if degraded else (data.get("items") or [])
+    if not isinstance(items, list):
+        items = []
+    total = int(data.get("total") or 0) if data.get("total") is not None else len(items)
+    return _wiki_claims_payload(
+        kb_id,
+        path=str(data.get("path") or path),
+        document_id=str(data.get("document_id") or document_id),
+        items=items,
+        total=total,
+        limit=limit,
+        degraded=degraded,
+    )
+
+
+def _degraded_wiki_claims(
+    kb_id: str, path: str, document_id: str, limit: int
+) -> dict:
+    return _wiki_claims_payload(
+        kb_id,
+        path=path,
+        document_id=document_id,
+        items=[],
+        total=0,
+        limit=limit,
+        degraded=True,
+    )
+
+
+@_inject_mcp_tool("list_wiki_topics")
+async def list_wiki_topics(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids=None,
+) -> dict:
+    """浏览 Jonex Wiki 知识库的目录/主题树（列式浏览第一列）。
+
+    Action: get_wiki_outline
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB 必须属于服务且类型为 jonex_wiki
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个 Jonex Wiki 知识库 ID（与 knowledge_base_ids 互斥）
+        knowledge_base_ids: Jonex Wiki 知识库 ID 列表（显式列表一律返回 groups）；
+            两者都不传时取服务下全部 Jonex Wiki 知识库
+
+    Returns:
+        dict: 单库 {knowledge_base_id, topics, page_count, outline_available,
+              outline_version, stale, wiki_degraded}；多库 {groups:[...]}。
+              上游内部错误 → wiki_degraded=true + topics=[]，不抛错。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败 / KB 类型不是 jonex_wiki /
+            kb_types 无法判定
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 服务下无 Jonex Wiki KB / 缺省 KB 超过上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    _single, explicit = _validate_wiki_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_wiki_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+    single_form = not explicit and len(kb_ids) == 1
+
+    if not _WIKI_BROWSE_ENABLED:
+        if single_form:
+            return _wiki_topics_payload(
+                kb_ids[0],
+                topics=[],
+                page_count=0,
+                outline_available=False,
+                outline_version=0,
+                stale=False,
+                degraded=False,
+                disabled=True,
+            )
+        return {
+            "groups": [
+                _wiki_topics_payload(
+                    kb_id,
+                    topics=[],
+                    page_count=0,
+                    outline_available=False,
+                    outline_version=0,
+                    stale=False,
+                    degraded=False,
+                    disabled=True,
+                )
+                for kb_id in kb_ids
+            ]
+        }
+
+    def build_payload(kb_id: str) -> dict:
+        return {"knowledge_base_id": kb_id}
+
+    if single_form:
+        try:
+            data = await _call_wiki_action_single(
+                "get_wiki_outline", auth, kb_ids[0], build_payload(kb_ids[0])
+            )
+        except McpToolError as exc:
+            if exc.code == _ERROR_INTERNAL:
+                return _degraded_wiki_topics(kb_ids[0])
+            raise
+        return _project_wiki_topics(kb_ids[0], data or {})
+
+    outcomes = await _fanout_wiki_action(
+        "get_wiki_outline",
+        auth,
+        kb_ids,
+        build_payload,
+        deadline_seconds=_WIKI_DEADLINE_SECONDS,
+        request_timeout_seconds=_WIKI_REQUEST_TIMEOUT_SECONDS,
+    )
+    outcomes = _degrade_wiki_internal_outcomes(outcomes)
+    _raise_if_all_wiki_groups_failed(outcomes)
+
+    groups: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if outcome.get("degraded"):
+            groups.append(_degraded_wiki_topics(kb_id))
+            continue
+        if "error" in outcome:
+            groups.append(
+                {"knowledge_base_id": kb_id, "errors": [outcome["error"]]}
+            )
+            continue
+        groups.append(_project_wiki_topics(kb_id, outcome.get("data") or {}))
+    return {"groups": groups}
+
+
+@_inject_mcp_tool("list_wiki_pages")
+async def list_wiki_pages(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids=None,
+    topic: str = "",
+    type: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict:
+    """浏览 Jonex Wiki 知识库的页面列表（列式浏览第二列）。
+
+    Action: get_wiki_outline
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB 必须属于服务且类型为 jonex_wiki
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个 Jonex Wiki 知识库 ID（与 knowledge_base_ids 互斥）
+        knowledge_base_ids: Jonex Wiki 知识库 ID 列表（显式列表一律返回 groups）
+        topic: 目录节点 id（来自 list_wiki_topics，含其子节点）
+        type: 内部过滤 source / table / concept；空 = 不限
+        page: 页码（1-1000，默认 1；多库时每库独立）
+        page_size: 每页条数（1-100，默认 20；多库时每库独立）
+
+    Returns:
+        dict: 单库 {knowledge_base_id, items, total, page, page_size,
+              outline_available, stale, wiki_degraded}；多库 {total, groups:[...]}，
+              无顶层 items/page/page_size。topic 不存在 → -32602。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败 / topic 不存在 / 目录未生成
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 服务下无 Jonex Wiki KB / 缺省 KB 超过上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    topic = _ontology_optional_str(topic, "topic", 128)
+    page_type = _ontology_optional_str(type, "type", 16)
+    if page_type not in ("", "source", "table", "concept"):
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="type 必须为 source / table / concept 之一",
+        )
+    page = _ontology_int_param(page, "page", 1, 1000)
+    page_size = _ontology_int_param(page_size, "page_size", 1, 100)
+    _single, explicit = _validate_wiki_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_wiki_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+    single_form = not explicit and len(kb_ids) == 1
+
+    if not _WIKI_BROWSE_ENABLED:
+        if single_form:
+            return _wiki_pages_payload(
+                kb_ids[0],
+                items=[],
+                total=0,
+                page=page,
+                page_size=page_size,
+                outline_available=False,
+                stale=False,
+                degraded=False,
+                disabled=True,
+            )
+        return {
+            "groups": [
+                _wiki_pages_payload(
+                    kb_id,
+                    items=[],
+                    total=0,
+                    page=page,
+                    page_size=page_size,
+                    outline_available=False,
+                    stale=False,
+                    degraded=False,
+                    disabled=True,
+                )
+                for kb_id in kb_ids
+            ]
+        }
+
+    def build_payload(kb_id: str) -> dict:
+        return {"knowledge_base_id": kb_id}
+
+    if single_form:
+        try:
+            data = await _call_wiki_action_single(
+                "get_wiki_outline", auth, kb_ids[0], build_payload(kb_ids[0])
+            )
+        except McpToolError as exc:
+            if exc.code == _ERROR_INTERNAL:
+                return _degraded_wiki_pages(kb_ids[0], page, page_size)
+            raise
+        return _project_wiki_pages(
+            kb_ids[0],
+            data or {},
+            topic=topic,
+            page_type=page_type,
+            page=page,
+            page_size=page_size,
+        )
+
+    outcomes = await _fanout_wiki_action(
+        "get_wiki_outline",
+        auth,
+        kb_ids,
+        build_payload,
+        deadline_seconds=_WIKI_DEADLINE_SECONDS,
+        request_timeout_seconds=_WIKI_REQUEST_TIMEOUT_SECONDS,
+    )
+    outcomes = _degrade_wiki_internal_outcomes(outcomes)
+
+    # topic 过滤等 per-KB 投影错误（如某库没有目录）在多库下进该组 errors。
+    normalized: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if outcome.get("degraded") or "error" in outcome:
+            normalized.append(outcome)
+            continue
+        try:
+            _project_wiki_pages(
+                kb_id,
+                outcome.get("data") or {},
+                topic=topic,
+                page_type=page_type,
+                page=page,
+                page_size=page_size,
+            )
+        except McpToolError as exc:
+            normalized.append(_wiki_error_outcome(kb_id, exc))
+        else:
+            normalized.append(outcome)
+    _raise_if_all_wiki_groups_failed(normalized)
+
+    groups: list[dict] = []
+    for outcome in normalized:
+        kb_id = outcome["knowledge_base_id"]
+        if outcome.get("degraded"):
+            groups.append(_degraded_wiki_pages(kb_id, page, page_size))
+            continue
+        if "error" in outcome:
+            groups.append(
+                {"knowledge_base_id": kb_id, "errors": [outcome["error"]]}
+            )
+            continue
+        groups.append(
+            _project_wiki_pages(
+                kb_id,
+                outcome.get("data") or {},
+                topic=topic,
+                page_type=page_type,
+                page=page,
+                page_size=page_size,
+            )
+        )
+    total = sum(group.get("total", 0) for group in groups)
+    # 多 KB：不提供顶层 items / page / page_size（全局分页语义失真）。
+    return {"total": total, "groups": groups}
+
+
+@_inject_mcp_tool("expand_wiki_links")
+async def expand_wiki_links(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids=None,
+    path: str = "",
+    depth: int = 1,
+    limit: int = 50,
+) -> dict:
+    """沿 Jonex Wiki 页面出链做多跳展开，并附一跳链入（列式浏览第三列）。
+
+    Action: get_wiki_page_graph
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB 必须属于服务且类型为 jonex_wiki
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个 Jonex Wiki 知识库 ID（与 knowledge_base_ids 互斥）
+        knowledge_base_ids: Jonex Wiki 知识库 ID 列表（显式列表一律返回 groups）
+        path: 起点页面 canonical path（必填，≤ 512 字符；兼容旧口径
+            summaries/、entities/、concepts/ 前缀）
+        depth: 跳数（1..WIKI_BROWSE_DEPTH_MAX，默认 1）
+        limit: 本次返回的总边数（1-200，默认 50）
+
+    Returns:
+        dict: 单库 {knowledge_base_id, path, start_found, pages, links, depth,
+              limit, returned, truncated, truncated_reason, wiki_degraded}；
+              多库 {groups:[...]}，无顶层 pages/links。depth=1 不含起点。
+              每个返回页附 backlinks/backlink_total/backlinks_truncated。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): 参数校验失败（含 depth/limit 越界）
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 服务下无 Jonex Wiki KB / 缺省 KB 超过上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    path = _ontology_required_str(path, "path", 512)
+    depth = _ontology_int_param(depth, "depth", 1, _WIKI_DEPTH_MAX)
+    limit = _ontology_int_param(limit, "limit", 1, 200)
+    _single, explicit = _validate_wiki_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_wiki_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+    single_form = not explicit and len(kb_ids) == 1
+
+    if not _WIKI_BROWSE_ENABLED:
+        if single_form:
+            return _wiki_links_payload(
+                kb_ids[0],
+                path=path,
+                start_found=False,
+                pages=[],
+                links=[],
+                depth=depth,
+                limit=limit,
+                truncated=False,
+                truncated_reason=[],
+                degraded=False,
+                disabled=True,
+            )
+        return {
+            "groups": [
+                _wiki_links_payload(
+                    kb_id,
+                    path=path,
+                    start_found=False,
+                    pages=[],
+                    links=[],
+                    depth=depth,
+                    limit=limit,
+                    truncated=False,
+                    truncated_reason=[],
+                    degraded=False,
+                    disabled=True,
+                )
+                for kb_id in kb_ids
+            ]
+        }
+
+    def build_payload(kb_id: str) -> dict:
+        return {"knowledge_base_id": kb_id}
+
+    if single_form:
+        data = await _call_wiki_action_single(
+            "get_wiki_page_graph", auth, kb_ids[0], build_payload(kb_ids[0])
+        )
+        return _project_wiki_links(
+            kb_ids[0], data or {}, path=path, depth=depth, limit=limit
+        )
+
+    outcomes = await _fanout_wiki_action(
+        "get_wiki_page_graph",
+        auth,
+        kb_ids,
+        build_payload,
+        deadline_seconds=_WIKI_DEADLINE_SECONDS,
+        request_timeout_seconds=_WIKI_REQUEST_TIMEOUT_SECONDS,
+    )
+    _raise_if_all_wiki_groups_failed(outcomes)
+
+    groups: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if "error" in outcome:
+            groups.append(
+                {"knowledge_base_id": kb_id, "errors": [outcome["error"]]}
+            )
+            continue
+        groups.append(
+            _project_wiki_links(
+                kb_id,
+                outcome.get("data") or {},
+                path=path,
+                depth=depth,
+                limit=limit,
+            )
+        )
+    return {"groups": groups}
+
+
+@_inject_mcp_tool("list_wiki_claims")
+async def list_wiki_claims(
+    service_id: str,
+    knowledge_base_id: str = "",
+    knowledge_base_ids=None,
+    path: str = "",
+    document_id: str = "",
+    limit: int = 200,
+) -> dict:
+    """读取 Jonex Wiki 页面/文档的 claim 级溯源明细（列式浏览第四列）。
+
+    Action: get_wiki_claims
+    Guard: require_mcp_auth("view") + _check_service_scope(auth, service_id, "view")
+           + 显式 KB 必须属于服务且类型为 jonex_wiki
+
+    Args:
+        service_id: 领域服务 ID
+        knowledge_base_id: 单个 Jonex Wiki 知识库 ID（与 knowledge_base_ids 互斥）
+        knowledge_base_ids: Jonex Wiki 知识库 ID 列表（显式列表一律返回 groups）
+        path: 页面 canonical path（与 document_id 至少给一个，≤ 512 字符）
+        document_id: 来源文档 id（与 path 至少给一个，≤ 128 字符）
+        limit: claim 条数上限（1-500，默认 200）
+
+    Returns:
+        dict: 单库 {knowledge_base_id, path, document_id, items, total,
+              returned, limit, truncated, text_limit, wiki_degraded}；
+              多库 {groups:[...]}。每条 claim 的 text 已在 adapter 截断 400。
+              上游内部错误（-32000）→ items=[]、total=0、wiki_degraded=true，
+              不把错误抛给调用方（与 topics/pages 同口径，契约 §4.12）。
+
+    Raises:
+        McpAuthError(401): 未认证 / service 不在授权范围
+        McpToolError(code=-32602): path/document_id 全空 / limit 越界
+        McpToolError(code=-32002): 知识库不在该服务范围内
+        McpToolError(code=-32000): 服务下无 Jonex Wiki KB / 缺省 KB 超过上限
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    knowledge_base_id = _ontology_optional_str(
+        knowledge_base_id, "knowledge_base_id", 128
+    )
+    path = _ontology_optional_str(path, "path", 512)
+    document_id = _ontology_optional_str(document_id, "document_id", 128)
+    if not path and not document_id:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="path 与 document_id 至少提供一个",
+        )
+    limit = _ontology_int_param(limit, "limit", 1, 500)
+    _single, explicit = _validate_wiki_kb_selection(
+        knowledge_base_id, knowledge_base_ids
+    )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    touch_service_call_async(auth.tenant_id, service_id)
+    kb_ids = await _resolve_wiki_kb_ids(
+        auth, service_id, knowledge_base_id, knowledge_base_ids
+    )
+    single_form = not explicit and len(kb_ids) == 1
+
+    if not _WIKI_BROWSE_ENABLED:
+        if single_form:
+            return _wiki_claims_payload(
+                kb_ids[0],
+                path=path,
+                document_id=document_id,
+                items=[],
+                total=0,
+                limit=limit,
+                degraded=False,
+                disabled=True,
+            )
+        return {
+            "groups": [
+                _wiki_claims_payload(
+                    kb_id,
+                    path=path,
+                    document_id=document_id,
+                    items=[],
+                    total=0,
+                    limit=limit,
+                    degraded=False,
+                    disabled=True,
+                )
+                for kb_id in kb_ids
+            ]
+        }
+
+    def build_payload(kb_id: str) -> dict:
+        payload: dict = {"knowledge_base_id": kb_id, "limit": limit}
+        if path:
+            payload["path"] = path
+        if document_id:
+            payload["document_id"] = document_id
+        return payload
+
+    if single_form:
+        try:
+            data = await _call_wiki_action_single(
+                "get_wiki_claims", auth, kb_ids[0], build_payload(kb_ids[0])
+            )
+        except McpToolError as exc:
+            if exc.code == _ERROR_INTERNAL:
+                return _degraded_wiki_claims(
+                    kb_ids[0], path, document_id, limit
+                )
+            raise
+        return _project_wiki_claims(
+            kb_ids[0],
+            data or {},
+            path=path,
+            document_id=document_id,
+            limit=limit,
+        )
+
+    outcomes = await _fanout_wiki_action(
+        "get_wiki_claims",
+        auth,
+        kb_ids,
+        build_payload,
+        deadline_seconds=_WIKI_DEADLINE_SECONDS,
+        request_timeout_seconds=_WIKI_REQUEST_TIMEOUT_SECONDS,
+    )
+    outcomes = _degrade_wiki_internal_outcomes(outcomes)
+    _raise_if_all_wiki_groups_failed(outcomes)
+
+    groups: list[dict] = []
+    for outcome in outcomes:
+        kb_id = outcome["knowledge_base_id"]
+        if outcome.get("degraded"):
+            groups.append(
+                _degraded_wiki_claims(kb_id, path, document_id, limit)
+            )
+            continue
+        if "error" in outcome:
+            groups.append(
+                {"knowledge_base_id": kb_id, "errors": [outcome["error"]]}
+            )
+            continue
+        groups.append(
+            _project_wiki_claims(
+                kb_id,
+                outcome.get("data") or {},
+                path=path,
+                document_id=document_id,
+                limit=limit,
+            )
+        )
+    return {"groups": groups}
+
+
 async def _validate_search_params(
     service_id: str,
     query: str,
@@ -1568,10 +3065,13 @@ async def _validate_search_params(
     校验顺序：mode 规范化 → service_id/query 非空 → query 长度 → mode 白名单 → top_k 范围 → 鉴权。
 
     Returns:
-        (normalized_query, normalized_mode, auth, kb_ids): 规范化后的 query、mode、鉴权上下文和授权的 kb_ids 交集（空列表 = 全部允许）
+        (normalized_query, normalized_mode, auth, kb_ids): 规范化后的 query、mode、
+            鉴权上下文和 Key 级 KB 白名单收窄后的 kb_ids（空列表 = 不限制，
+            请求不带 ``knowledge_base_ids``）
 
     Raises:
         McpToolError(code=-32602): 参数校验失败
+        McpToolError(code=-32002): 白名单非空但与服务库无交集
         McpAuthError(401): 未认证 / service 不在授权范围
     """
     mode = mode.lower()
@@ -1596,7 +3096,9 @@ async def _validate_search_params(
         raise McpToolError(code=-32602, message="top_k 必须在 1-50 之间")
 
     auth = require_mcp_auth("view")
-    kb_ids = await _check_service_scope(auth, service_id, required_permission="call")
+    await _check_service_scope(auth, service_id, required_permission="call")
+    # 白名单为空时不带 knowledge_base_ids（保持既有请求形状）；非空时收窄到交集。
+    kb_ids = await _service_kb_ids(auth, service_id) if auth.allowed_kb_ids else []
 
     return query, mode, auth, kb_ids
 
@@ -1766,6 +3268,7 @@ async def search_jonex_wiki(
     service_id: str,
     query: str,
     with_reasoning: bool = False,
+    thinking_mode: str = "fast",
 ) -> dict:
     """Jonex Wiki 检索——仅适用于 jonex_wiki 管线知识库。
 
@@ -1780,6 +3283,7 @@ async def search_jonex_wiki(
         service_id: 领域服务 ID
         query: 搜索查询（最多 2000 字符）
         with_reasoning: 是否返回推理链追踪（默认 False）
+        thinking_mode: 检索决策 / 最终回答的思考预设（fast/standard/deep，默认 fast）
 
     Returns:
         dict: 搜索结果，含 answer、references、reasoning 字段
@@ -1791,11 +3295,17 @@ async def search_jonex_wiki(
     """
     if not SEARCH_JONEX_WIKI_ENABLED:
         raise McpToolError(code=-32000, message="Jonex Wiki 检索暂未开放")
+    if thinking_mode not in ("fast", "standard", "deep"):
+        raise McpToolError(
+            code=-32602,
+            message="thinking_mode 必须为 fast / standard / deep 之一",
+        )
     query_norm, _, auth, kb_ids = await _validate_search_params(service_id, query, "hybrid", 5)
     payload: dict = {
         "service_id": service_id,
         "query": query_norm,
         "with_reasoning": with_reasoning,
+        "thinking_mode": thinking_mode,
         # MCP 检索固定不写搜索历史（不提供调用方开关）
         "save_history": False,
     }
@@ -1892,23 +3402,11 @@ async def read_source(
     if not document_id or not document_id.strip():
         raise McpToolError(code=-32602, message="document_id 为必填参数，不能为空")
     auth = require_mcp_auth("view")
-    intersection = await _check_service_scope(auth, service_id, required_permission="call")
+    await _check_service_scope(auth, service_id, required_permission="call")
     touch_service_call_async(auth.tenant_id, service_id.strip())
 
-    if intersection:
-        kb_ids_to_try = intersection
-    else:
-        # allowed_kb_ids 为空 = 全部允许，需要获取 service 的所有 kb_ids。
-        # 前置校验调用不上报工具名（语义归属在 Gateway 的
-        # _INTERNAL_CHECK_ACTIONS；这里 report_tool=False 是双保险）。
-        service_detail = await call_gateway(
-            "get_service",
-            auth.tenant_id,
-            auth.key_id,
-            {"service_id": service_id},
-            report_tool=False,
-        )
-        kb_ids_to_try = service_detail.get("kb_ids", [])
+    # 唯一解析点：已应用 Key 级 KB 白名单，文档只在白名单内的库里查找。
+    kb_ids_to_try = await _service_kb_ids(auth, service_id)
 
     for kb_id in kb_ids_to_try:
         try:
@@ -1925,6 +3423,647 @@ async def read_source(
             continue
 
     raise McpToolError(code=-32000, message="文档不属于该服务下的任何知识库")
+
+
+# ============================================================================
+# Block 3.5: 问数工具（结构化数据只读）
+#   - list_data_sources：服务下各 KB 的数据源清单（标出哪些能被问数）
+#   - ask_data：单源 NL→SQL 一问一答（表格结果原样透传）
+#   - get_schema：编译 schema（数据源级 / KB 级两种粒度，names / full 两档）
+#
+# 契约与上游接口见 docs/ai-mcp/ask-data-mcp-interface-inventory.md §2/§3。
+# 只读边界：三者都不写业务数据；对应 action 已登记 Gateway 内部 invoke 白名单
+# （api_gateway/routes/internal.py::_ALLOWED_ACTIONS）。
+# ============================================================================
+
+#: ② 只吃 database 类型的数据源（api / storage / api_push / file 都不能问数）
+_QUERYABLE_ACCESS_TYPE = "database"
+
+#: get_schema 的两个详细档位
+_SCHEMA_DETAIL_LEVELS = ("names", "full")
+
+#: 这几种工具层错误不再向后续 KB 重试（授权/参数/限流重试只会放大问题）
+_ASK_ABORT_CODES = frozenset(
+    {_ERROR_AUTH, _ERROR_INVALID_PARAMS, _ERROR_RATE_LIMITED}
+)
+
+
+def _require_service_id(service_id: str) -> str:
+    """问数工具的 service_id 必填校验（其余工具同款：去空格后判空）。"""
+    sid = (service_id or "").strip()
+    if not sid:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="service_id 为必填参数，不能为空"
+        )
+    return sid
+
+
+async def _service_kb_ids(auth: McpAuthContext, service_id: str) -> list[str]:
+    """取本 Key 在该服务下的**有效** kb_ids（唯一 ``get_service`` 调用点）。
+
+    返回值已应用 Key 级 KB 白名单（``_apply_kb_whitelist``）：白名单为空时即
+    服务全部库，非空时为交集，交集为空直接 -32002。所有按库扇出的工具都必须
+    走这里，不要自己 ``get_service`` 后再取 ``kb_ids``，否则绕过白名单。
+    """
+    service_detail = await call_gateway(
+        "get_service",
+        auth.tenant_id,
+        auth.key_id,
+        {"service_id": service_id},
+        report_tool=False,
+    )
+    kb_ids = (
+        service_detail.get("kb_ids", []) if isinstance(service_detail, dict) else []
+    )
+    if not kb_ids:
+        raise McpToolError(code=_ERROR_INTERNAL, message="服务下无可用知识库")
+    return await _apply_kb_whitelist(auth, list(kb_ids))
+
+
+async def _resolve_data_kb_ids(
+    auth: McpAuthContext, service_id: str, knowledge_base_id: str
+) -> list[str]:
+    """解析问数目标 KB 列表。
+
+    显式给了 ``knowledge_base_id`` 就必须属于该服务（不区分「不存在」与「越界」，
+    避免泄露存在性）；未给则取服务下全部 KB（保序去重）。
+    """
+    explicit = (knowledge_base_id or "").strip()
+    kb_ids = await _service_kb_ids(auth, service_id)
+    if explicit:
+        if explicit not in kb_ids:
+            raise McpToolError(code=_ERROR_AUTH, message="知识库不在该服务范围内")
+        return [explicit]
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for kb_id in kb_ids:
+        if kb_id in seen:
+            continue
+        seen.add(kb_id)
+        resolved.append(kb_id)
+    return resolved
+
+
+@_inject_mcp_tool("list_data_sources")
+async def list_data_sources(service_id: str, knowledge_base_id: str = "") -> dict:
+    """列出服务下各知识库的数据源，并标出哪些能被 ``ask_data`` 查询。
+
+    Action: list_data_sources（按 KB 取，工具内按服务的 kb_ids 循环）
+    Guard: require_mcp_auth("view") + _check_service_scope(..., "call")
+
+    Args:
+        service_id: 领域服务 ID（必填）
+        knowledge_base_id: 只查指定知识库（可选；必须属于该服务）
+
+    Returns:
+        dict: ``{items: [{knowledge_base_id, id, name, access_type, status,
+        document_count, is_queryable}], total}``。``is_queryable`` 为 True
+        表示 access_type == "database"，即 ``ask_data`` 能问的那类源。
+        个别库失败时附 ``kb_errors``（不吞错、不整体失败）。
+    """
+    sid = _require_service_id(service_id)
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, sid, required_permission="call")
+    touch_service_call_async(auth.tenant_id, sid)
+
+    kb_ids = await _resolve_data_kb_ids(auth, sid, knowledge_base_id)
+
+    items: list[dict] = []
+    errors: list[dict] = []
+    for kb_id in kb_ids:
+        try:
+            data = await call_gateway(
+                "list_data_sources",
+                auth.tenant_id,
+                auth.key_id,
+                {"knowledge_base_id": kb_id},
+            )
+        except McpToolError as exc:
+            if exc.code in _ASK_ABORT_CODES:
+                raise
+            errors.append(
+                {"knowledge_base_id": kb_id, "code": exc.code, "message": exc.message}
+            )
+            continue
+        rows = data.get("items") if isinstance(data, dict) else None
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            access_type = row.get("access_type") or ""
+            items.append(
+                {
+                    "knowledge_base_id": kb_id,
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "access_type": access_type,
+                    "status": row.get("status"),
+                    "document_count": row.get("document_count") or 0,
+                    "is_queryable": access_type == _QUERYABLE_ACCESS_TYPE,
+                }
+            )
+
+    result: dict = {"items": items, "total": len(items)}
+    if errors:
+        result["kb_errors"] = errors
+    return result
+
+
+@_inject_mcp_tool("ask_data")
+async def ask_data(
+    service_id: str,
+    question: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    entity_name: str = "",
+    offset: int = 0,
+) -> dict:
+    """按问题查结构化数据（NL→SQL，一问一源一条只读 SQL），返回表格结果。
+
+    Action: ask_data_source
+    Guard: require_mcp_auth("view") + _check_service_scope(..., "call")
+
+    ⚠ ``ok=false`` 是**正常结果**（这个源这次答不了，附 ``reason_code``），
+    不是工具异常：``no_candidate`` / ``ambiguous`` 等重试无意义，只有
+    ``llm_failed`` / ``exec_failed`` 值得重试。
+
+    Args:
+        service_id: 领域服务 ID（必填）
+        question: 自然语言问题（必填）
+        knowledge_base_id: 只在该知识库内问（可选；缺省按服务下 KB 顺序尝试）
+        data_source_id: 点名数据源（可选）
+        entity_name: 点名实体/表（可选）
+        offset: 结果分页偏移（默认 0）
+
+    Returns:
+        dict: 成功时原样透传上游 14 个字段（``ok`` / ``sql`` / ``columns`` /
+        ``rows`` / ``row_count`` / ``truncated`` / ``offset`` / ``next_offset`` /
+        ``contract_version`` / ``blocks`` / ``data_source_id`` / ``source_name`` /
+        ``entity_name`` / ``not_answerable``），并补 ``knowledge_base_id``；
+        多 KB 时附 ``attempts``。全部答不了时返回
+        ``{ok: false, not_answerable: true, reason_code, reason, attempts}``。
+    """
+    sid = _require_service_id(service_id)
+    q = (question or "").strip()
+    if not q:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="question 为必填参数，不能为空"
+        )
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="offset 必须是非负整数"
+        )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, sid, required_permission="call")
+    touch_service_call_async(auth.tenant_id, sid)
+
+    kb_ids = await _resolve_data_kb_ids(auth, sid, knowledge_base_id)
+    ds_id = (data_source_id or "").strip()
+    ent = (entity_name or "").strip()
+
+    attempts: list[dict] = []
+    for kb_id in kb_ids:
+        payload: dict = {"knowledge_base_id": kb_id, "question": q}
+        if ds_id:
+            payload["data_source_id"] = ds_id
+        if ent:
+            payload["entity_name"] = ent
+        if offset:
+            payload["offset"] = offset
+        try:
+            data = await call_gateway(
+                "ask_data_source", auth.tenant_id, auth.key_id, payload
+            )
+        except McpToolError as exc:
+            if exc.code in _ASK_ABORT_CODES:
+                raise
+            attempts.append(
+                {"knowledge_base_id": kb_id, "code": exc.code, "message": exc.message}
+            )
+            continue
+
+        if isinstance(data, dict) and data.get("ok"):
+            # 复制后再补标注：不要就地改上游返回（同一 dict 可能被复用/复用方共享）
+            answered = dict(data)
+            answered.setdefault("knowledge_base_id", kb_id)
+            if attempts:
+                answered["attempts"] = attempts
+            return answered
+        attempts.append(
+            {
+                "knowledge_base_id": kb_id,
+                "ok": False,
+                "reason_code": data.get("reason_code") if isinstance(data, dict) else None,
+                "reason": data.get("reason") if isinstance(data, dict) else None,
+            }
+        )
+
+    return {
+        "ok": False,
+        "not_answerable": True,
+        "reason_code": next(
+            (a.get("reason_code") for a in attempts if a.get("reason_code")),
+            "no_candidate",
+        ),
+        "reason": "该服务下各知识库都未能回答这个问题（详见 attempts）",
+        "attempts": attempts,
+    }
+
+
+def _require_str_list(value, name: str) -> list[str]:
+    """校验「字符串数组」入参（缺失/None 返回空列表），非法即 -32602。"""
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message=f"{name} 必须是字符串数组"
+        )
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS,
+                message=f"{name} 的每一项都必须是非空字符串",
+            )
+        text = item.strip()
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _optional_str(value, name: str) -> str:
+    """可选的字符串入参：None → ''，非字符串 → -32602。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message=f"{name} 必须是字符串"
+        )
+    return value.strip()
+
+
+def _optional_non_negative_int(value, name: str) -> int:
+    """可选的非负整数入参：None → 0，bool/负数/非整数 → -32602。"""
+    if value is None:
+        return 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message=f"{name} 必须是非负整数"
+        )
+    return value
+
+
+@_inject_mcp_tool("ask_data_multi")
+async def ask_data_multi(
+    service_id: str,
+    query: str,
+    knowledge_base_ids: list[str] | None = None,
+) -> dict:
+    """跨数据源问数（一次调用扇出到多个库/源），返回**并列**的数据块。
+
+    Action: search_data（上游自己按源并行扇出，MCP 侧不再自建循环）
+    Guard: require_mcp_auth("view") + _check_service_scope(..., "call")
+
+    ⚠ 这里**不合并、不汇总**多个源的数字：不同源口径不同，强行合成一个数
+    会把「口径差异」抹成「确定的错」。聚合交给调用方按 ``data_blocks`` 里
+    各自的 ``source_name`` / ``data_source_id`` 判断。
+
+    Args:
+        service_id: 领域服务 ID（必填）
+        query: 自然语言问题（必填）
+        knowledge_base_ids: 只在这些知识库内问（可选；必须都属于该服务，
+            缺省 = 该服务下全部知识库）
+
+    Returns:
+        dict: 原样透传上游（``answer`` / ``data_blocks`` / ``timings`` …），
+        并补 ``knowledge_base_ids``（实际查询范围）、``block_count``、
+        ``answered_count``（kind == "answer" 的块数）、``error_count``。
+        每个块含 ``data_source_id`` / ``source_name`` / ``kind`` / ``text`` /
+        ``table``（``columns`` / ``rows``）/ ``sql`` / ``row_count`` /
+        ``truncated``；失败块带 ``reason_code`` 与 ``reason``。
+        没有任何块能回答时仍然是成功返回（``answered_count == 0``）。
+    """
+    sid = _require_service_id(service_id)
+    q = (query or "").strip()
+    if not q:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="query 为必填参数，不能为空"
+        )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, sid, required_permission="call")
+    touch_service_call_async(auth.tenant_id, sid)
+
+    service_kbs = await _service_kb_ids(auth, sid)
+    requested = _require_str_list(knowledge_base_ids, "knowledge_base_ids")
+    if knowledge_base_ids is not None and not requested:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="knowledge_base_ids 不能是空数组（不传 = 该服务下全部知识库）",
+        )
+    if requested:
+        unknown = [kb for kb in requested if kb not in service_kbs]
+        if unknown:
+            # 与其它浏览工具同口径：不区分「不存在」与「越界」，避免泄露存在性
+            raise McpToolError(
+                code=_ERROR_AUTH, message="知识库不在该服务范围内"
+            )
+        kb_ids = requested
+    else:
+        if not service_kbs:
+            raise McpToolError(
+                code=_ERROR_INVALID_PARAMS, message="该服务下没有可用知识库"
+            )
+        kb_ids = list(service_kbs)
+
+    data = await call_gateway(
+        "search_data",
+        auth.tenant_id,
+        auth.key_id,
+        {"query": q, "knowledge_base_ids": kb_ids},
+    )
+
+    result: dict = dict(data) if isinstance(data, dict) else {"data_blocks": []}
+    blocks = [b for b in (result.get("data_blocks") or []) if isinstance(b, dict)]
+    result["knowledge_base_ids"] = kb_ids
+    result["block_count"] = len(blocks)
+    result["answered_count"] = sum(1 for b in blocks if b.get("kind") == "answer")
+    result["error_count"] = sum(1 for b in blocks if b.get("kind") == "error")
+    return result
+
+
+@_inject_mcp_tool("ask_metric")
+async def ask_metric(
+    service_id: str,
+    question: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    group_by: list[str] | None = None,
+    time_grain: str = "",
+    time_from: str = "",
+    time_to: str = "",
+    limit: int = 0,
+    offset: int = 0,
+) -> dict:
+    """按**已登记指标**确定性问数（不猜意图、不调 LLM），返回可溯源的结果。
+
+    Action: ask_metric
+    Guard: require_mcp_auth("view") + _check_service_scope(..., "call")
+
+    ⚠ 与 ``ask_data`` 的分工：``ask_data`` 靠 NL→SQL 猜落点，适合「有哪些 /
+    清单」；本工具只认知识库里**登记过**的指标（含可执行定义与实体落点），
+    命中即用指标的确定性 SQL，结果带 ``metric`` 与 ``provenance``（表/列溯源）。
+    指标没登记时恒回 ``ok=false / reason_code=no_metric`` —— 这是正常业务答复，
+    不是工具故障，别重试（先去登记指标）。
+
+    Args:
+        service_id: 领域服务 ID（必填）
+        question: 自然语言问题（必填）
+        knowledge_base_id: 只在该知识库内问（可选；缺省按服务下 KB 顺序尝试）
+        data_source_id: 点名数据源（可选；指标在多个源有落点时必须点名，
+            否则回 ``ambiguous_source``）
+        group_by: 分组维度列名（可选；**不猜**，需要分组时由调用方显式给）
+        time_grain: 时间粒度（可选，如 day/week/month；同样不猜）
+        time_from / time_to: 时间范围（可选，ISO 日期字符串）
+        limit: 行数上限（可选，0 = 平台默认）
+        offset: 分页偏移（可选，默认 0）
+
+    Returns:
+        dict: 成功时原样透传上游（``ok`` / ``mode: "metric"`` / ``metric`` /
+        ``sql`` / ``columns`` / ``rows`` / ``row_count`` / ``truncated`` /
+        ``offset`` / ``provenance`` …），并补 ``knowledge_base_id``；多 KB 时附
+        ``attempts``。答不了时返回上游的 ``{ok: false, not_answerable: true,
+        reason_code, reason, …}``（可能带 ``candidates`` / ``clarifications``
+        供澄清），同样附 ``attempts``。
+    """
+    sid = _require_service_id(service_id)
+    q = (question or "").strip()
+    if not q:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS, message="question 为必填参数，不能为空"
+        )
+    dims = _require_str_list(group_by, "group_by")
+    grain = _optional_str(time_grain, "time_grain")
+    t_from = _optional_str(time_from, "time_from")
+    t_to = _optional_str(time_to, "time_to")
+    row_limit = _optional_non_negative_int(limit, "limit")
+    page_offset = _optional_non_negative_int(offset, "offset")
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, sid, required_permission="call")
+    touch_service_call_async(auth.tenant_id, sid)
+
+    kb_ids = await _resolve_data_kb_ids(auth, sid, knowledge_base_id)
+    ds_id = (data_source_id or "").strip()
+
+    attempts: list[dict] = []
+    bodies: list[dict] = []
+    for kb_id in kb_ids:
+        payload: dict = {"knowledge_base_id": kb_id, "question": q}
+        if ds_id:
+            payload["data_source_id"] = ds_id
+        if dims:
+            payload["group_by"] = dims
+        if grain:
+            payload["time_grain"] = grain
+        if t_from:
+            payload["time_from"] = t_from
+        if t_to:
+            payload["time_to"] = t_to
+        if row_limit:
+            payload["limit"] = row_limit
+        if page_offset:
+            payload["offset"] = page_offset
+
+        try:
+            data = await call_gateway(
+                "ask_metric", auth.tenant_id, auth.key_id, payload
+            )
+        except McpToolError as exc:
+            if exc.code in _ASK_ABORT_CODES:
+                raise
+            attempts.append(
+                {"knowledge_base_id": kb_id, "code": exc.code, "message": exc.message}
+            )
+            continue
+
+        if isinstance(data, dict) and data.get("ok"):
+            answered = dict(data)
+            answered.setdefault("knowledge_base_id", kb_id)
+            if attempts:
+                answered["attempts"] = attempts
+            return answered
+
+        body = data if isinstance(data, dict) else {}
+        bodies.append(body)
+        attempts.append(
+            {
+                "knowledge_base_id": kb_id,
+                "ok": False,
+                "reason_code": body.get("reason_code"),
+                "reason": body.get("reason"),
+            }
+        )
+
+    # 全部答不了：保留上游的 reason_code / candidates / clarifications 等细节，
+    # 只把 ok / not_answerable / attempts 补齐（别丢澄清信息，模型要靠它收敛）。
+    result: dict = dict(bodies[0]) if bodies else {}
+    result["ok"] = False
+    result["not_answerable"] = True
+    result.setdefault(
+        "reason_code",
+        next((a.get("reason_code") for a in attempts if a.get("reason_code")), "no_metric"),
+    )
+    result["attempts"] = attempts
+    return result
+
+
+def _project_schema(
+    knowledge_base_id: str,
+    data,
+    data_source_id: str,
+    detail: str,
+) -> dict:
+    """把编译 schema 压成 MCP 友好的形状（names 档只给名字，防上下文爆炸）。"""
+    payload = data if isinstance(data, dict) else {}
+    entities = payload.get("entity_types") or []
+    relations = payload.get("relation_types") or []
+
+    entity_out: list[dict] = []
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        attrs_out: list = []
+        for attr in ent.get("attributes") or []:
+            if not isinstance(attr, dict):
+                continue
+            if detail == "full":
+                attrs_out.append(
+                    {
+                        "name": attr.get("name"),
+                        "type": attr.get("type"),
+                        "required": attr.get("required"),
+                        "description": attr.get("description"),
+                        "physical_name": attr.get("physical_name"),
+                        "is_primary_key": attr.get("is_primary_key"),
+                    }
+                )
+            else:
+                attrs_out.append(attr.get("name"))
+        row: dict = {
+            "name": ent.get("name"),
+            "source_object_id": ent.get("source_object_id"),
+        }
+        if detail == "full":
+            row["description"] = ent.get("description")
+            row["status"] = ent.get("status")
+        row["attributes"] = attrs_out
+        entity_out.append(row)
+
+    relation_out: list[dict] = []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        item = {
+            "name": rel.get("name"),
+            "source": rel.get("source"),
+            "target": rel.get("target"),
+        }
+        if detail == "full":
+            item.update(
+                {
+                    "source_column": rel.get("source_column"),
+                    "target_column": rel.get("target_column"),
+                    "cardinality": rel.get("cardinality"),
+                    "description": rel.get("description"),
+                }
+            )
+        relation_out.append(item)
+
+    out: dict = {
+        "knowledge_base_id": knowledge_base_id,
+        # 只有带了 data_source_id 才是 ② 实际读的那份；否则是 KB 级（可能是抽象投影）
+        "is_data_source_level": bool(data_source_id),
+        "data_source_id": data_source_id or None,
+        "schema_version": payload.get("schema_version"),
+        "source_type": payload.get("source_type"),
+        "entity_types": entity_out,
+        "relations": relation_out,
+    }
+    if detail == "full":
+        out["constraints"] = payload.get("constraints") or []
+    return out
+
+
+@_inject_mcp_tool("get_schema")
+async def get_schema(
+    service_id: str,
+    knowledge_base_id: str = "",
+    data_source_id: str = "",
+    detail: str = "names",
+) -> dict:
+    """读取编译 schema（表/列/关系/库口径），供选择和校验 ``ask_data`` 的目标。
+
+    Action: get_compiled_schema
+    Guard: require_mcp_auth("view") + _check_service_scope(..., "call")
+
+    ⚠ 两种粒度：带 ``data_source_id`` 才是 ② NL→SQL 实际使用的那份（含
+    ``constraints`` 库口径）；不带则是 KB 级，若该 KB 有 active 抽象 schema，
+    返回的是 ``source_type="abstract"`` 的**投影**。返回体用
+    ``is_data_source_level`` 标明是哪一种，别混用。
+
+    Args:
+        service_id: 领域服务 ID（必填）
+        knowledge_base_id: 只看该知识库（可选）
+        data_source_id: 精确到数据源那份 schema（可选；强烈建议问数前带）
+        detail: "names"（默认，只给实体名/物理表/列名/关系端点）或
+            "full"（附类型、描述、样例、约束）
+
+    Returns:
+        dict: ``{items: [schema...], total, detail}``；每项含
+        ``knowledge_base_id`` / ``is_data_source_level`` / ``data_source_id`` /
+        ``schema_version`` / ``source_type`` / ``entity_types`` / ``relations``
+        （full 档另带 ``constraints``）。个别库失败时附 ``kb_errors``。
+    """
+    sid = _require_service_id(service_id)
+    detail_level = (detail or "names").strip().lower()
+    if detail_level not in _SCHEMA_DETAIL_LEVELS:
+        raise McpToolError(
+            code=_ERROR_INVALID_PARAMS,
+            message="detail 必须是 names 或 full",
+        )
+
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, sid, required_permission="call")
+    touch_service_call_async(auth.tenant_id, sid)
+
+    kb_ids = await _resolve_data_kb_ids(auth, sid, knowledge_base_id)
+    ds_id = (data_source_id or "").strip()
+
+    items: list[dict] = []
+    errors: list[dict] = []
+    for kb_id in kb_ids:
+        payload: dict = {"knowledge_base_id": kb_id}
+        if ds_id:
+            payload["data_source_id"] = ds_id
+        try:
+            data = await call_gateway(
+                "get_compiled_schema", auth.tenant_id, auth.key_id, payload
+            )
+        except McpToolError as exc:
+            if exc.code in _ASK_ABORT_CODES:
+                raise
+            errors.append(
+                {"knowledge_base_id": kb_id, "code": exc.code, "message": exc.message}
+            )
+            continue
+        items.append(_project_schema(kb_id, data, ds_id, detail_level))
+
+    result: dict = {"items": items, "total": len(items), "detail": detail_level}
+    if errors:
+        result["kb_errors"] = errors
+    return result
 
 
 # ============================================================================
@@ -1945,8 +4084,17 @@ __all__ = [
     "list_ontology_entity_types",
     "list_ontology_instances",
     "expand_ontology_neighbors",
+    "list_wiki_topics",
+    "list_wiki_pages",
+    "expand_wiki_links",
+    "list_wiki_claims",
     "read_source",
     "submit_search_feedback",
+    "ask_data",
+    "ask_data_multi",
+    "ask_metric",
+    "list_data_sources",
+    "get_schema",
     "search_deep",
     "search_jonex_wiki",
     "search_llmwiki",
