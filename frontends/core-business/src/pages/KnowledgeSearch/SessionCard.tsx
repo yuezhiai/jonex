@@ -40,6 +40,7 @@ import AnswerMarkdown from './AnswerMarkdown';
 import DataBlocksView from './DataBlocksView';
 import DataLineageView from './DataLineageView';
 import ToolResultsView from './ToolResultsView';
+import PendingActionCard from './PendingActionCard';
 import OntologyToolCallsView, { type OntologyToolCallView } from './OntologyToolCallsView';
 import { stripDataReference } from './dataAnswerText';import {
   formatTimestamp,
@@ -55,6 +56,7 @@ import { buildWikiTrace, type WikiChainCall } from './wikiTraceModel';
 import WikiAnswerContent from './WikiAnswerContent';
 import ThoughtSteps from './ThoughtSteps';
 import { searchModeLabelKey } from './sessionModeLabel';
+import TokenUsage from './TokenUsage';
 // ── Helper: 媒体类型标签 ──
 function getMediaLabel(type: string, t: (key: string) => string): string {
   const map: Record<string, string> = {
@@ -189,7 +191,7 @@ function ImageAssetThumb({
         {/* [jonex] 预览走 antd 灯箱（内部就是 <img>），不走 window.open：
             asset_url 是对象存储直链，浏览器可能按 Content-Type 判成下载 */}
         {failed ? (
-          <div style={{ fontSize: 11, color: '#94a3b8', textAlign: 'center', padding: '0 6px', lineHeight: 1.5 }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', textAlign: 'center', padding: '0 6px', lineHeight: 1.5 }}>
             {t('knowledgeSearch.imageLoadFailed')}
           </div>
         ) : (
@@ -250,9 +252,9 @@ function ReasoningChip({
   tone?: 'default' | 'primary' | 'success' | 'danger';
 }) {
   const tones = {
-    default: { bg: '#f1f5f9', color: '#64748b' },
+    default: { bg: 'var(--yx-bg-muted)', color: 'var(--yx-text-secondary)' },
     primary: { bg: '#f5f3ff', color: '#7c3aed' },
-    success: { bg: '#ecfdf5', color: '#10b981' },
+    success: { bg: 'var(--yx-success-bg)', color: '#10b981' },
     danger: { bg: '#fef2f2', color: '#ef4444' },
   } as const;
   const t = tones[tone];
@@ -305,7 +307,7 @@ function StepDetail({
       if (hits.length === 0) return null;
       return wrap(
         <>
-          <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>
             {t('knowledgeSearch.hitEntities', {
               count: hits.length,
               total: d.total_hits ?? hits.length,
@@ -445,7 +447,7 @@ function StepDetail({
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {ok.length > 0 && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('knowledgeSearch.hitKbs')}</span>
+              <span style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t('knowledgeSearch.hitKbs')}</span>
               {ok.map((k) => (
                 <ReasoningChip key={k} tone="success">
                   {kbName(k)}
@@ -455,7 +457,7 @@ function StepDetail({
           )}
           {failed.length > 0 && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('knowledgeSearch.failedKbs')}</span>
+              <span style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t('knowledgeSearch.failedKbs')}</span>
               {failed.map((k) => (
                 <ReasoningChip key={k} tone="danger">
                   {kbName(k)}
@@ -465,7 +467,7 @@ function StepDetail({
           )}
           {recalls.length > 0 && (
             <div>
-              <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>{t('knowledgeSearch.recallChunks')}</div>
+              <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>{t('knowledgeSearch.recallChunks')}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 {shownRecalls.map((item, idx) => {
                   const rank = idx + 1;
@@ -565,7 +567,7 @@ function StepDetail({
         if (flat.length === 0) return null;
         return wrap(
           <>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>
               {t('knowledgeSearch.wikiBrowsed', { count: flat.length })}
             </div>
             <div
@@ -574,7 +576,7 @@ function StepDetail({
               {flat.map((c, idx) => renderCall(c, idx))}
             </div>
             {d.tool_calls_truncated && (
-              <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+              <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 4 }}>
                 {t('knowledgeSearch.wikiTruncated', { shown: flat.length, total: d.tool_calls_total })}
               </div>
             )}
@@ -583,7 +585,7 @@ function StepDetail({
       }
       return wrap(
         <>
-          <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>
             {t('knowledgeSearch.wikiTurns', { turns: turns.length, calls: d.tool_calls_total })}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 320, overflowY: 'auto' as const }}>
@@ -608,7 +610,7 @@ function StepDetail({
                   <div
                     style={{
                       fontSize: 11,
-                      color: '#64748b',
+                      color: 'var(--yx-text-secondary)',
                       marginBottom: turn.calls?.length ? 4 : 0,
                       lineHeight: 1.5,
                     }}
@@ -622,7 +624,7 @@ function StepDetail({
             ))}
           </div>
           {d.tool_calls_truncated && (
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 4 }}>
               {t('knowledgeSearch.wikiTruncated', {
                 shown: turns.reduce((s: number, t: any) => s + (t.calls?.length || 0), 0),
                 total: d.tool_calls_total,
@@ -662,7 +664,7 @@ function StepDetail({
       );
       return wrap(
         <>
-          <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>
             {t('knowledgeSearch.jonexChain', {
               count: d.tool_calls_total ?? calls.length,
               citations: d.citation_count ?? 0,
@@ -686,7 +688,7 @@ function StepDetail({
                     <span style={{ color: '#4c1d95', wordBreak: 'break-all' as const }}>{queryText}</span>
                   )}
                   {shown.length > 0 && (
-                    <span style={{ color: '#64748b', wordBreak: 'break-all' as const }}>
+                    <span style={{ color: 'var(--yx-text-secondary)', wordBreak: 'break-all' as const }}>
                       {shown.map((p: string, pi: number) => {
                         const ref = refByPath[p];
                         return (
@@ -712,7 +714,7 @@ function StepDetail({
                       {paths.length > shown.length ? ' +' + (paths.length - shown.length) : ''}
                     </span>
                   )}
-                  {tool === 'table_material' && <span style={{ color: '#64748b' }}>
+                  {tool === 'table_material' && <span style={{ color: 'var(--yx-text-secondary)' }}>
                     {c.status === 'budget_limited' ? t('wikiTableReading.budgetExceeded') :
                       t(`wikiTableReading.${c.selected_level || 'full_table'}`)}
                   </span>}
@@ -726,7 +728,7 @@ function StepDetail({
             })}
           </div>
           {d.tool_calls_truncated && (
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 4 }}>
               {t('knowledgeSearch.wikiTruncated', { shown: calls.length, total: d.tool_calls_total })}
             </div>
           )}
@@ -765,6 +767,7 @@ function FeedbackButtons({
   onVoteReasonChange,
   onVoteCommentChange,
   onDislikeConfirm,
+  totalTokens,
 }: {
   activeVote: SearchFeedbackType | null;
   loading: SearchFeedbackType | null;
@@ -776,6 +779,8 @@ function FeedbackButtons({
   onVoteReasonChange: (reason: FeedbackReason) => void;
   onVoteCommentChange: (comment: string) => void;
   onDislikeConfirm: () => void;
+  /** 本次检索 Token 用量；与按钮同一行展示，无值时不渲染 */
+  totalTokens?: number | null;
 }) {
   const { t } = useTranslation();
   const isLikeLoading = loading === 'like';
@@ -793,29 +798,30 @@ function FeedbackButtons({
         alignItems: 'center',
         gap: 10,
         fontSize: 13,
-        color: '#94a3b8',
+        color: 'var(--yx-text-muted)',
       }}
     >
-      <span style={{ color: '#94a3b8' }}>{t('knowledgeSearch.helpfulQuestion')}</span>
-
-      {/* 有帮助 */}
+      {/* 有帮助：只保留图标，文案交给 title / aria-label */}
       <Button
         disabled={!!loading}
         onClick={() => onVote('like')}
+        title={t('knowledgeSearch.helpful')}
+        aria-label={t('knowledgeSearch.helpful')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 5,
+          justifyContent: 'center',
           border: 'none',
-          height: 'auto',
+          width: 28,
+          height: 28,
           fontSize: 13,
-          borderRadius: 16,
-          padding: '3px 14px',
+          borderRadius: '50%',
+          padding: 0,
           cursor: loading ? 'default' : 'pointer',
           lineHeight: '22px',
           fontWeight: isLikeSelected ? 600 : 400,
-          color: isLikeSelected ? '#fff' : '#94a3b8',
-          background: isLikeLoading ? '#bbf7d0' : isLikeSelected ? '#22c55e' : '#f1f5f9',
+          color: isLikeSelected ? '#fff' : 'var(--yx-text-muted)',
+          background: isLikeLoading ? '#bbf7d0' : isLikeSelected ? '#22c55e' : 'var(--yx-bg-muted)',
           boxShadow: isLikeSelected ? '0 1px 4px rgba(34,197,94,0.35)' : 'none',
           transition: 'all 0.25s ease',
           opacity: loading && !isLikeLoading ? 0.5 : 1,
@@ -828,8 +834,8 @@ function FeedbackButtons({
         }}
         onMouseLeave={(e) => {
           if (!loading && !isLikeSelected) {
-            e.currentTarget.style.background = '#f1f5f9';
-            e.currentTarget.style.color = '#94a3b8';
+            e.currentTarget.style.background = 'var(--yx-bg-muted)';
+            e.currentTarget.style.color = 'var(--yx-text-muted)';
           }
         }}
       >
@@ -840,7 +846,6 @@ function FeedbackButtons({
         ) : (
           <LikeOutlined style={{ fontSize: 14 }} />
         )}
-        {isLikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.helpful')}
       </Button>
 
       {/* 无帮助：点踩原因 + 备注走 Popconfirm（按钮下方弹出） */}
@@ -852,7 +857,7 @@ function FeedbackButtons({
         title={t('knowledgeSearch.feedbackReasonTitle')}
         description={
           <div style={{ width: 300 }}>
-            <div style={{ marginBottom: 8, fontSize: 13, fontWeight: 600, color: '#334155' }}>
+            <div style={{ marginBottom: 8, fontSize: 13, fontWeight: 600, color: 'var(--yx-text-body)' }}>
               {t('knowledgeSearch.feedbackReasonLabel')}
             </div>
             <Radio.Group
@@ -866,7 +871,7 @@ function FeedbackButtons({
                 </Radio>
               ))}
             </Radio.Group>
-            <div style={{ marginTop: 14, marginBottom: 6, fontSize: 13, fontWeight: 600, color: '#334155' }}>
+            <div style={{ marginTop: 14, marginBottom: 6, fontSize: 13, fontWeight: 600, color: 'var(--yx-text-body)' }}>
               {t('knowledgeSearch.feedbackCommentLabel')}
             </div>
             <Input.TextArea
@@ -885,20 +890,23 @@ function FeedbackButtons({
       >
         <Button
           disabled={!!loading}
+          title={t('knowledgeSearch.unhelpful')}
+          aria-label={t('knowledgeSearch.unhelpful')}
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 5,
+            justifyContent: 'center',
             border: 'none',
-            height: 'auto',
+            width: 28,
+            height: 28,
             fontSize: 13,
-            borderRadius: 16,
-            padding: '3px 14px',
+            borderRadius: '50%',
+            padding: 0,
             cursor: loading ? 'default' : 'pointer',
             lineHeight: '22px',
             fontWeight: isDislikeSelected ? 600 : 400,
-            color: isDislikeSelected ? '#fff' : '#94a3b8',
-            background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : '#f1f5f9',
+            color: isDislikeSelected ? '#fff' : 'var(--yx-text-muted)',
+            background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : 'var(--yx-bg-muted)',
             boxShadow: isDislikeSelected ? '0 1px 4px rgba(239,68,68,0.35)' : 'none',
             transition: 'all 0.25s ease',
             opacity: loading && !isDislikeLoading ? 0.5 : 1,
@@ -911,8 +919,8 @@ function FeedbackButtons({
           }}
           onMouseLeave={(e) => {
             if (!loading && !isDislikeSelected) {
-              e.currentTarget.style.background = '#f1f5f9';
-              e.currentTarget.style.color = '#94a3b8';
+              e.currentTarget.style.background = 'var(--yx-bg-muted)';
+              e.currentTarget.style.color = 'var(--yx-text-muted)';
             }
           }}
         >
@@ -923,9 +931,10 @@ function FeedbackButtons({
           ) : (
             <DislikeOutlined style={{ fontSize: 14 }} />
           )}
-          {isDislikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.unhelpful')}
         </Button>
       </Popconfirm>
+      {/* 本次检索 Token 用量：与有帮助 / 无帮助并列同一行；无值时不渲染 */}
+      <TokenUsage totalTokens={totalTokens} />
     </div>
   );
 }
@@ -1227,10 +1236,10 @@ export default function SessionCard({
             gap: 8,
             fontSize: 16,
             fontWeight: 600,
-            color: '#0b2b5c',
+            color: 'var(--yx-brand-dark)',
           }}
         >
-          <SearchOutlined style={{ color: '#3b82f6', flexShrink: 0 }} />
+          <SearchOutlined style={{ color: 'var(--yx-accent)', flexShrink: 0 }} />
           {/*
             [jonex] 以图问知识：有图时标题优先显示**用户原话**（他认得出自己问的是什么），
             没原话就标「以图检索（n 张）」；`session.query` 存的是识别产出，
@@ -1261,9 +1270,9 @@ export default function SessionCard({
           <span
             style={{
               fontSize: 12,
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               fontWeight: 400,
-              background: '#f1f5f9',
+              background: 'var(--yx-bg-muted)',
               borderRadius: 999,
               padding: '2px 8px',
               flexShrink: 0,
@@ -1272,7 +1281,7 @@ export default function SessionCard({
             {domainName}
           </span>
           {running && (
-            <span style={{ fontSize: 12, color: '#94a3b8', fontWeight: 400, marginLeft: 8, flexShrink: 0 }}>
+            <span style={{ fontSize: 12, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8, flexShrink: 0 }}>
               <Spin size="small" style={{ marginRight: 4 }} />
               {/* 两段式：识别和检索是两次往返回合，用户得知道这会儿在等哪一段 */}
               {session.status === 'recognizing'
@@ -1353,7 +1362,7 @@ export default function SessionCard({
                         style={{
                           objectFit: 'cover',
                           borderRadius: 8,
-                          border: '1px solid #e2e8f0',
+                          border: '1px solid var(--yx-border)',
                           // 识别失败的张置灰：它**没有参与检索**，不能看着像生效了
                           opacity: failed ? 0.45 : 1,
                           filter: failed ? 'grayscale(1)' : undefined,
@@ -1370,13 +1379,13 @@ export default function SessionCard({
                           width: 72,
                           height: 72,
                           borderRadius: 8,
-                          border: '1px dashed #e2e8f0',
-                          background: '#f8fafc',
+                          border: '1px dashed var(--yx-border)',
+                          background: 'var(--yx-bg-subtle)',
                         }}
                       />
                     )}
                     {failed && (
-                      <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
+                      <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 2 }}>
                         {t('knowledgeSearch.imageNotUsed')}
                       </div>
                     )}
@@ -1393,8 +1402,8 @@ export default function SessionCard({
         <div
           style={{
             padding: '10px 14px',
-            background: '#f8fafc',
-            border: '1px solid #e2e8f0',
+            background: 'var(--yx-bg-subtle)',
+            border: '1px solid var(--yx-border)',
             borderRadius: 10,
             marginBottom: 14,
             fontSize: 13,
@@ -1402,10 +1411,10 @@ export default function SessionCard({
             lineHeight: 1.7,
           }}
         >
-          <span style={{ color: '#94a3b8', marginRight: 6 }}>{t('knowledgeSearch.recognizedAs')}:</span>
+          <span style={{ color: 'var(--yx-text-muted)', marginRight: 6 }}>{t('knowledgeSearch.recognizedAs')}:</span>
           <span>{session.recognized.query}</span>
           {session.recognized.images.some((image) => image.ocrText) && (
-            <div style={{ marginTop: 6, fontSize: 12, color: '#94a3b8' }}>
+            <div style={{ marginTop: 6, fontSize: 12, color: 'var(--yx-text-muted)' }}>
               {session.recognized.images
                 .filter((image) => image.ocrText)
                 .map((image) => image.ocrText.slice(0, 120))
@@ -1423,7 +1432,7 @@ export default function SessionCard({
             background: '#fef2f2',
             border: '1px solid #fecaca',
             borderRadius: 10,
-            color: '#dc2626',
+            color: 'var(--yx-error-text)',
             fontSize: 13,
             marginBottom: 16,
             lineHeight: 1.7,
@@ -1457,8 +1466,8 @@ export default function SessionCard({
         <div
           style={{
             padding: '12px 14px',
-            background: '#f8fafc',
-            border: '1px solid #e2e8f0',
+            background: 'var(--yx-bg-subtle)',
+            border: '1px solid var(--yx-border)',
             borderRadius: 10,
             marginBottom: 12,
           }}
@@ -1474,7 +1483,7 @@ export default function SessionCard({
               alignItems: 'center',
               justifyContent: 'flex-start',
               gap: 8,
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               textAlign: 'left',
               height: 'auto',
               lineHeight: 'inherit',
@@ -1489,12 +1498,12 @@ export default function SessionCard({
               {t('knowledgeSearch.thinkingProcess')}
             </span>
             {thinkGenerating ? (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#94a3b8' }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--yx-text-muted)' }}>
                 <Spin size="small" />
                 {t('knowledgeSearch.generating')}
               </span>
             ) : (
-              <span style={{ fontSize: 12, color: '#94a3b8' }}>
+              <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
                 {thinkExpanded ? t('knowledgeSearch.clickCollapse') : t('knowledgeSearch.collapsed')}
               </span>
             )}
@@ -1507,7 +1516,7 @@ export default function SessionCard({
                 background: '#ffffff',
                 borderRadius: 8,
                 fontSize: 13,
-                color: '#64748b',
+                color: 'var(--yx-text-secondary)',
                 lineHeight: 1.75,
                 whiteSpace: 'pre-wrap',
               }}
@@ -1522,7 +1531,7 @@ export default function SessionCard({
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
                 fontSize: 12,
-                color: '#94a3b8',
+                color: 'var(--yx-text-muted)',
               }}
             >
               {parsedAnswer.think.split('\n').find(Boolean) || t('knowledgeSearch.reasoningComplete')}
@@ -1580,13 +1589,13 @@ export default function SessionCard({
                   {t('knowledgeSearch.dataBadge')}
                 </span>
               )}
-              <span style={isWiki ? undefined : { fontWeight: 400, fontSize: 12, color: '#94a3b8' }}>
+              <span style={isWiki ? undefined : { fontWeight: 400, fontSize: 12, color: 'var(--yx-text-muted)' }}>
                 {isWiki ? wikiKbNames : t('knowledgeSearch.knowledgeAnalysis', { domain: domainName })}
               </span>
             </div>
             {isWiki ? <WikiAnswerContent content={responseBody} referenceCount={referenceCount}
               activeIndex={activeCitationIndex} onCitation={setActiveCitationIndex} />
-            : <div style={{ fontSize: 15, color: '#334155', lineHeight: 1.85 }}>
+            : <div style={{ fontSize: 15, color: 'var(--yx-text-body)', lineHeight: 1.85 }}>
               <AnswerMarkdown
                 content={responseBody || (running ? t('knowledgeSearch.analyzing') : '')}
                 referenceCount={referenceCount}
@@ -1655,6 +1664,7 @@ export default function SessionCard({
                 onVoteReasonChange={onVoteReasonChange}
                 onVoteCommentChange={onVoteCommentChange}
                 onDislikeConfirm={onDislikeConfirm}
+                totalTokens={session.totalTokens}
               />
             </div>
           )}
@@ -1693,12 +1703,12 @@ export default function SessionCard({
                 style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center', maxWidth: 96 }}
               >
                 <ImageAssetThumb asset={a} t={t} />
-                <span style={{ fontSize: 11, color: '#64748b' }}>{t(a.usage === 'visual_evidence' && a.visualReadId ? 'knowledgeSearch.sourceImageRead' : 'knowledgeSearch.sourceImageIllustration')}</span>
+                <span style={{ fontSize: 11, color: 'var(--yx-text-secondary)' }}>{t(a.usage === 'visual_evidence' && a.visualReadId ? 'knowledgeSearch.sourceImageRead' : 'knowledgeSearch.sourceImageIllustration')}</span>
                 {a.description && (
                   <div
                     style={{
                       fontSize: 11,
-                      color: '#64748b',
+                      color: 'var(--yx-text-secondary)',
                       textAlign: 'center',
                       lineHeight: 1.4,
                       maxWidth: 96,
@@ -1721,8 +1731,8 @@ export default function SessionCard({
       {!isWiki && (session.references?.length ?? 0) > 0 && (
         <div
           style={{
-            background: '#f8fafc',
-            borderLeft: '3px solid #3b82f6',
+            background: 'var(--yx-bg-subtle)',
+            borderLeft: '3px solid var(--yx-accent)',
             borderRadius: 8,
             padding: '14px 18px',
             marginBottom: 16,
@@ -1740,7 +1750,7 @@ export default function SessionCard({
               gap: 6,
               justifyContent: 'flex-start',
               fontSize: 12,
-              color: '#3b82f6',
+              color: 'var(--yx-accent)',
               fontWeight: 600,
               height: 'auto',
               lineHeight: 'inherit',
@@ -1800,8 +1810,8 @@ export default function SessionCard({
                       <span
                         style={{
                           fontSize: 11,
-                          color: '#64748b',
-                          background: '#f1f5f9',
+                          color: 'var(--yx-text-secondary)',
+                          background: 'var(--yx-bg-muted)',
                           borderRadius: 4,
                           padding: '1px 7px',
                           flexShrink: 0,
@@ -1813,7 +1823,7 @@ export default function SessionCard({
                         style={{
                           fontSize: 13,
                           fontWeight: 600,
-                          color: '#0b2b5c',
+                          color: 'var(--yx-brand-dark)',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',
@@ -1824,7 +1834,7 @@ export default function SessionCard({
                         {ref.file_name}
                       </span>
                       {(ref.kb_name || ref.kb_id) && (
-                        <span style={{ fontSize: 12, color: '#64748b', flexShrink: 0 }}>
+                        <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)', flexShrink: 0 }}>
                           {t('knowledgeSearch.sourceKb', { name: ref.kb_name || ref.kb_id })}
                         </span>
                       )}
@@ -1835,7 +1845,7 @@ export default function SessionCard({
                         </span>
                       )}
                       {pageLoc && (
-                        <span style={{ fontSize: 12, color: '#64748b', flexShrink: 0 }}>
+                        <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)', flexShrink: 0 }}>
                           {t('knowledgeSearch.docPage', { page: (pageLoc.page_no ?? 0) + 1 })}
                         </span>
                       )}
@@ -1920,7 +1930,7 @@ export default function SessionCard({
       {session.dataReferences && session.dataReferences.length > 0 && (
         <div
           style={{
-            background: '#f8fafc',
+            background: 'var(--yx-bg-subtle)',
             borderLeft: '3px solid #0ea5e9',
             borderRadius: '0 8px 8px 0',
             padding: '14px 18px',
@@ -1975,11 +1985,20 @@ export default function SessionCard({
       {/* 实时数据：问答调用了动作绑定的外部工具（无调用时不渲染） */}
       <ToolResultsView results={session.toolResults} />
 
+      {/* 动作提案卡片：写操作/需确认动作，用户确认后由真实登录身份执行 */}
+      {(session.pendingActions || []).map((item, index) => (
+        <PendingActionCard
+          key={item.pending_id || `pending-${index}-${item.action || ''}`}
+          item={item}
+          actionResults={session.actionResults}
+        />
+      ))}
+
       {/* Searching spinner */}
       {running && !hasContent && !isWiki && (
         <div style={{ textAlign: 'center', padding: '30px 0' }}>
           <Spin size="default" />
-          <div style={{ marginTop: 10, color: '#94a3b8', fontSize: 13 }}>{t('knowledgeSearch.searchingKnowledge')}</div>
+          <div style={{ marginTop: 10, color: 'var(--yx-text-muted)', fontSize: 13 }}>{t('knowledgeSearch.searchingKnowledge')}</div>
         </div>
       )}
 

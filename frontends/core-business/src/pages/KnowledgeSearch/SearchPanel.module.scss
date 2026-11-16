@@ -21,7 +21,7 @@
   }
 
   &Active {
-    background: #eff6ff;
+    background: var(--yx-info-bg);
 
     &:hover {
       background: #e6f0ff;
@@ -178,7 +178,7 @@
   width: 1px;
   height: 12px;
   margin: 0 2px;
-  background: #e2e8f0;
+  background: var(--yx-border);
 }
 
 .toolbarHint {

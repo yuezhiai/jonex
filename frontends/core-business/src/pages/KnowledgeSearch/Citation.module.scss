@@ -28,18 +28,18 @@
   transition: color 0.15s ease;
 
   &:hover {
-    color: #3b82f6;
+    color: var(--yx-accent);
   }
 
   &:focus-visible {
-    outline: 2px solid #3b82f6;
+    outline: 2px solid var(--yx-accent);
     outline-offset: 1px;
   }
 }
 
 .badgeActive,
 .badgeActive:hover {
-  background: #3b82f6;
+  background: var(--yx-accent);
   color: #fff;
 }
 
@@ -171,8 +171,8 @@
     // antd text 变体的 hover 选择器更深，这里保住本来的白底描边样式
     &:hover:not(:disabled) {
       background: #fff !important;
-      border-color: #3b82f6 !important;
-      color: #3b82f6 !important;
+      border-color: var(--yx-accent) !important;
+      color: var(--yx-accent) !important;
     }
 
     &:disabled {
@@ -194,12 +194,12 @@
 
 // ── 命中内容区 ──────────────────────────────────────────
 .snippet {
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   border: 1px solid #eef2f7;
   border-radius: 10px;
   padding: 14px 16px;
   font-size: 14px;
-  color: #334155;
+  color: var(--yx-text-body);
   line-height: 1.85;
 }
 
@@ -209,7 +209,7 @@
   align-items: center;
   gap: 8px;
   margin-bottom: 10px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 12px;
   font-weight: 600;
 
@@ -218,7 +218,7 @@
     width: 3px;
     height: 12px;
     border-radius: 2px;
-    background: #3b82f6;
+    background: var(--yx-accent);
   }
 }
 
@@ -259,7 +259,7 @@
   min-height: 120px;
   border: 1px dashed #dfe5ec;
   border-radius: 8px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
 }
 
@@ -286,7 +286,7 @@
   }
 
   &:focus-visible {
-    outline: 2px solid #3b82f6;
+    outline: 2px solid var(--yx-accent);
     outline-offset: 2px;
   }
 }
@@ -311,7 +311,7 @@
   width: 48px;
   height: 48px;
   border-radius: 50%;
-  background: #3b82f6;
+  background: var(--yx-accent);
   color: #fff;
   font-size: 20px;
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.22);
@@ -332,7 +332,7 @@
   padding: 18px 12px;
   border: 1px solid #e8edf5;
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   text-align: center;
 
   strong {
@@ -364,7 +364,7 @@
 }
 
 .metaIcon {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
 }
 
@@ -391,7 +391,7 @@
   padding: 2px 6px;
   border-radius: 9px;
   background: #edf5ff;
-  color: #3b82f6;
+  color: var(--yx-accent);
   font-size: 9px;
   line-height: 15px;
 }
@@ -409,7 +409,7 @@
   display: inline-block;
   padding: 1px 8px;
   border-radius: 6px;
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
   color: #475569;
   line-height: 18px;
 }
@@ -450,8 +450,8 @@
     span {
       padding: 2px 9px;
       border-radius: 999px;
-      background: #f1f5f9;
-      color: #64748b;
+      background: var(--yx-bg-muted);
+      color: var(--yx-text-secondary);
       font-size: 11px;
       line-height: 16px;
     }
@@ -462,7 +462,7 @@
     height: 30px;
     border-radius: 8px;
     border-color: #e6ecf5;
-    color: #64748b;
+    color: var(--yx-text-secondary);
     transition:
       border-color 0.18s ease,
       background 0.18s ease,
@@ -470,7 +470,7 @@
 
     &:hover:not(:disabled) {
       border-color: #bfdbfe;
-      background: #eff6ff;
+      background: var(--yx-info-bg);
       color: #2563eb;
     }
   }
@@ -510,7 +510,7 @@
     display: block;
     padding: 12px 0;
     font-size: 13px;
-    border-bottom: 1px solid #f1f5f9;
+    border-bottom: 1px solid var(--yx-bg-muted);
 
     > dt {
       width: auto;
@@ -533,7 +533,7 @@
   }
 
   .metaIcon {
-    color: #64748b;
+    color: var(--yx-text-secondary);
     font-size: 13px;
   }
 

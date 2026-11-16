@@ -26,7 +26,7 @@ function SectionHeader({ title }: { title: string }) {
         style={{
           width: 4,
           height: 16,
-          background: '#3b82f6',
+          background: 'var(--yx-accent)',
           borderRadius: 2,
         }}
       />

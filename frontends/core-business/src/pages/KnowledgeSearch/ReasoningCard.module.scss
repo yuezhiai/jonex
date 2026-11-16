@@ -9,7 +9,7 @@ $purple: #7c3aed;
 $purpleDeep: #6d28d9;
 $purpleSoft: #f5f3ff;
 $line: #ece9fb;
-$muted: #64748b;
+$muted: var(--yx-text-secondary);
 $ink2: #475569;
 
 // 正文两列的几何（标签列宽 + 列间距）。片段、路径、展开按钮都按这个缩进，
@@ -80,7 +80,7 @@ $ioIndent: $ioLabel + $ioGap;
   line-height: 18px;
   color: $muted;
   white-space: nowrap;
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
   border-radius: 4px;
 
   &.chipPrimary {
@@ -90,7 +90,7 @@ $ioIndent: $ioLabel + $ioGap;
 
   &.chipSuccess {
     color: #059669;
-    background: #ecfdf5;
+    background: var(--yx-success-bg);
   }
 
   &.chipWarn {
@@ -99,7 +99,7 @@ $ioIndent: $ioLabel + $ioGap;
   }
 
   &.chipDanger {
-    color: #dc2626;
+    color: var(--yx-error-text);
     background: #fef2f2;
   }
 }
@@ -188,7 +188,7 @@ $ioIndent: $ioLabel + $ioGap;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   font-weight: 700;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   background: #f4f2fb;
   border-radius: 7px;
 }
@@ -231,7 +231,7 @@ $ioIndent: $ioLabel + $ioGap;
 
 .kIntent {
   color: #2563eb;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
 }
 
 .kMatch {
@@ -251,7 +251,7 @@ $ioIndent: $ioLabel + $ioGap;
 
 .kRead {
   color: #059669;
-  background: #ecfdf5;
+  background: var(--yx-success-bg);
 }
 
 .kTable {
@@ -261,7 +261,7 @@ $ioIndent: $ioLabel + $ioGap;
 
 .kPlan {
   color: $ink2;
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
 }
 
 .kSynth {
@@ -272,7 +272,7 @@ $ioIndent: $ioLabel + $ioGap;
 .cardTitle {
   font-size: 13px;
   font-weight: 600;
-  color: #334155;
+  color: var(--yx-text-body);
 }
 
 .summary {
@@ -411,7 +411,7 @@ $ioIndent: $ioLabel + $ioGap;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.5;
-  color: #334155;
+  color: var(--yx-text-body);
   overflow-wrap: anywhere;
 
   i {

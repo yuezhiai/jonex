@@ -19,7 +19,7 @@
   gap: 8px;
   flex-shrink: 0;
   padding: 14px 16px 12px;
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--yx-bg-muted);
 }
 
 .headerIcon {
@@ -30,7 +30,7 @@
   height: 26px;
   border-radius: 8px;
   background: #eef4ff;
-  color: #3b82f6;
+  color: var(--yx-accent);
   font-size: 14px;
   flex-shrink: 0;
 }
@@ -38,15 +38,15 @@
 .title {
   font-size: 14px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   white-space: nowrap;
 }
 
 .count {
   font-size: 11px;
   font-weight: 500;
-  color: #64748b;
-  background: #f1f5f9;
+  color: var(--yx-text-secondary);
+  background: var(--yx-bg-muted);
   border-radius: 999px;
   padding: 1px 7px;
   line-height: 16px;
@@ -54,13 +54,13 @@
 
 .clearBtn {
   margin-left: auto;
-  color: #94a3b8 !important;
+  color: var(--yx-text-muted) !important;
   font-size: 12px;
   padding: 0 4px;
   height: 22px;
 
   &:hover {
-    color: #3b82f6 !important;
+    color: var(--yx-accent) !important;
   }
 }
 
@@ -114,7 +114,7 @@
 }
 
 .itemActive {
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   box-shadow: inset 0 0 0 1px #dbeafe;
 
   &:hover {
@@ -160,8 +160,8 @@
   width: 40px;
   height: 40px;
   border-radius: 8px;
-  border: 1px dashed #e2e8f0;
-  background: #f8fafc;
+  border: 1px dashed var(--yx-border);
+  background: var(--yx-bg-subtle);
 }
 
 .thumbBadge {
@@ -186,7 +186,7 @@
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   white-space: nowrap;
 }
 
@@ -246,7 +246,7 @@
 .emptyText {
   font-size: 12px;
   line-height: 1.6;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .loadMore {

@@ -1,5 +1,6 @@
 import { consumeWikiSearchStream } from './wikiSearchStream';
 import { readAccessToken } from '@jonex/shell-sdk';
+import { getLangHeader } from '@jonex/shared-lib';
 import { request, getData } from './request';
 import { getDomainKnowledgeSpaces, getDomainKnowledgeList } from './domainKnowledge';
 import type { DomainServiceItem } from '../types/domainService';
@@ -32,13 +33,32 @@ import type {
   AnswerFeedbackListResponse,
   AnswerFeedbackStats,
   ImageQueryResult,
+  PendingActionView,
+  ActionExecutionRecord,
+  ToolCallResult,
 } from '../types/knowledgeSearch';
+
+/**
+ * 裸 `fetch` 的公共请求头（Authorization + X-Lang）。
+ *
+ * 本文件的检索/反馈请求都手写 `fetch`（SSE 流式、keepalive 取消），**不经过
+ * axios 拦截器**，所以 `X-Lang` 必须显式带上 —— 否则后端按 `DEFAULT_LOCALE`
+ * (en-US) 出文案，中英文界面都会错位。
+ */
+function fetchHeaders(token: string | null | undefined): Record<string, string> {
+  return {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    'X-Lang': getLangHeader(),
+  };
+}
 
 type NormalizedSearchParams = {
   query: string;
   mode: KnowledgeSearchMode;
   topK: number;
   domainId: string;
+  serviceId?: string;
+  domainSpaceId?: string;
   kbIds: string[];
   kbTypes: KnowledgeBaseType[];
   strictConfig?: KnowledgeSearchStrictConfig;
@@ -78,6 +98,10 @@ interface RawKnowledgeSearchHistoryItem {
     strict_config?: KnowledgeSearchStrictConfig | null;
     /** [jonex] 以图问知识：用户原话（`query` 存的是识别产出的检索文本） */
     image_question?: string;
+    /** 动作提案卡片 / 工具摘要 / 服务端回写的执行结果 */
+    pending_actions?: PendingActionView[];
+    action_results?: ActionExecutionRecord[];
+    tool_results?: ToolCallResult[];
   };
   /** [jonex] 以图问知识：这条历史附带的查询图片（后端已按顺序返回） */
   query_images?: RawQueryImageRef[];
@@ -124,6 +148,8 @@ function normalizeSearchParams(params: KnowledgeSearchStreamParams): NormalizedS
     mode: params.mode ?? 'mix',
     topK: params.topK ?? 5,
     domainId: params.domainId ?? '',
+    serviceId: params.serviceId,
+    domainSpaceId: params.domainSpaceId,
     kbIds: params.kbIds ?? [],
     kbTypes: params.kbTypes ?? [],
     strictConfig: params.strictConfig,
@@ -158,6 +184,9 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
       viewUrl: image.viewUrl ?? image.view_url ?? null,
     })),
     imageQuestion: metadata.image_question,
+    toolResults: metadata.tool_results ?? [],
+    pendingActions: metadata.pending_actions ?? [],
+    actionResults: metadata.action_results ?? [],
   };
 }
 
@@ -207,7 +236,8 @@ export async function getKnowledgeSearchDomains(spaceId?: string): Promise<Knowl
   //    若用默认的列表口径（我管的空间 ∪ 授权 KB），纯 space member 会拿到 0 个 KB，
   //    空间维度随之变空、快速检索直接 return 发不出请求。**不要**把它改回默认。
   const [spaces, kbResult, servicesResult] = await Promise.all([
-    getDomainKnowledgeSpaces(),
+    // 检索面要 scope="search"：空间项自带 has_enabled_service（与后端 3029 判定同源）
+    getDomainKnowledgeSpaces('search'),
     getDomainKnowledgeList({ page: 1, pageSize: 100, scope: 'search' }),
     getData<{ items: DomainServiceItem[] }>(
       request.get('/knowledge-base/services', { params: { limit: 100, scope: 'search' } }),
@@ -239,6 +269,9 @@ export async function getKnowledgeSearchDomains(spaceId?: string): Promise<Knowl
         space_id: currentSpace.id,
         kb_ids: kbs.map((k) => k.id),
         kb_names: kbs.map((k) => k.name),
+        // 只透传，不自行推导：服务候选已被后端过滤过停用服务，拿它反推空间可用性
+        // 会在「空间有启用服务、但该用户没有可见 KB」时误标「暂无启用服务」。
+        has_enabled_service: currentSpace.has_enabled_service,
         // 空间下的 KB 类型可能缺失（列表项 kbType 是可选的）：只收已知的，
         // 长度不等即视为「类型不全」，端点选择回落 /search/mix
         kb_types: kbs.map((k) => k.kbType).filter((x): x is KnowledgeBaseType => !!x),
@@ -277,7 +310,11 @@ export async function getKnowledgeSearchHistory(
   const params: Record<string, string | number> = { knowledge_base_id: knowledgeBaseId, page, page_size: pageSize };
   if (domainSpaceId) params.domain_space_id = domainSpaceId;
   const result = await getData<{ items: RawKnowledgeSearchHistoryItem[]; total: number }>(
-    request.get('/knowledge-base/search/history', { params }),
+    // 历史会随执行结果回写变化：禁止浏览器用旧快照
+    request.get('/knowledge-base/search/history', {
+      params,
+      headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+    }),
   );
   return { items: (result.items ?? []).map(normalizeHistoryItem), total: result.total ?? 0 };
 }
@@ -297,6 +334,8 @@ export async function getKnowledgeSearchHistorySnapshot(
   const result = await getData<{ items: RawKnowledgeSearchHistoryItem[] }>(
     request.get('/knowledge-base/search/history', {
       params: { history_id: historyId, page: 1, page_size: 1 },
+      // 执行结果由服务端回写历史；打开历史必须拿最新快照
+      headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
     }),
   );
   const item = result.items?.[0];
@@ -396,7 +435,11 @@ export async function saveKnowledgeSearchHistory(
   //   return updated[0]
   // }
   const result = await getData<RawKnowledgeSearchHistoryItem | { item: RawKnowledgeSearchHistoryItem }>(
-    request.post('/knowledge-base/search/history', { ...payload, knowledge_base_id: knowledgeBaseId }),
+    request.post('/knowledge-base/search/history', {
+      ...payload,
+      knowledge_base_id: knowledgeBaseId,
+      ...(payload.historyId ? { history_id: payload.historyId } : {}),
+    }),
   );
   return normalizeHistoryItem(('item' in result ? result.item : result) as RawKnowledgeSearchHistoryItem);
 }
@@ -571,6 +614,10 @@ export async function streamKnowledgeSearch(
   if (normalized.kbIds.length > 0) {
     body.knowledge_base_ids = normalized.kbIds;
   }
+  // [jonex] 检索维度：用户选的是服务还是空间（二选一），供后端做领域服务可用性判定。
+  // 历史回放时若选中项已不在候选里，调用方不传这两个字段，后端按 kb_ids 的空间兜底。
+  if (normalized.serviceId) body.service_id = normalized.serviceId;
+  if (normalized.domainSpaceId) body.domain_space_id = normalized.domainSpaceId;
   // [①②] 点名 pin（可选）：给路由层用（钉死 ② 的 entity_name）；路由转发 Jonex 前会剥掉。
   // ⚠️ 走 `params`（`normalize` 是新构造对象、不会带上这个可选键）。
   if (params.pins && Object.keys(params.pins).length > 0) {
@@ -580,7 +627,7 @@ export async function streamKnowledgeSearch(
   const response = await fetch(url.toString(), {
     method: 'POST',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -606,7 +653,7 @@ export async function streamKnowledgeSearch(
         if (!sessionId) return;
         cancellation ??= fetch(new URL(`${baseUrl}${endpoint}/cancel`, window.location.origin).toString(), {
           method: 'POST', keepalive: true,
-          headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), 'Content-Type': 'application/json' },
+          headers: { ...fetchHeaders(token), 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: sessionId }),
         }).catch(() => undefined);
         return cancellation;
@@ -638,6 +685,8 @@ export async function streamKnowledgeSearch(
       rag_used: result.data.rag_used,
       // [jonex] answer-feedback 锚点：后端检索响应下发检索历史记录 id
       history_id: result.data.history_id,
+      // 本次检索 Token 总量；后端未就绪时**无键**（保持 undefined，不补 0）
+      total_tokens: result.data.total_tokens,
       // [①②] 数据路径结构化块（router 下发；不存在的后端/开关关 ⇒ null，渲染零回归）
       data_blocks: result.data.data_blocks ?? null,
       // [①②] 文档答案 + 数据补充的并置标记（router 补充路径下发）
@@ -648,6 +697,8 @@ export async function streamKnowledgeSearch(
       data_lineage: result.data.data_lineage ?? null,
       // 实时数据：问答调用了动作绑定的外部工具（总闸关 / 未调用时无键 ⇒ null）
       tool_results: result.data.tool_results ?? null,
+      // 动作提案卡片：写操作/需确认动作不直接执行，由用户确认后执行
+      pending_actions: result.data.pending_actions ?? null,
     };
 
     // [①②] 数据路径跳过模拟打字：正文与结构化块是 router 纯 Python 一次性渲染的产物
@@ -683,7 +734,7 @@ export async function submitSearchFeedback(params: SubmitSearchFeedbackParams): 
   const response = await fetch('/api/v1/knowledge-base/search/feedback', {
     method: 'POST',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -708,7 +759,7 @@ export async function cancelSearchFeedback(params: CancelSearchFeedbackParams): 
   const response = await fetch('/api/v1/knowledge-base/search/feedback', {
     method: 'DELETE',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -732,7 +783,7 @@ export async function submitAnswerFeedback(params: SubmitAnswerFeedbackParams): 
   const response = await fetch('/api/v1/knowledge-base/search/answer-feedback', {
     method: 'POST',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -769,7 +820,7 @@ export async function getAnswerFeedback(historyId: string): Promise<AnswerFeedba
   const token = readAccessToken();
   const searchParams = new URLSearchParams({ history_id: historyId });
   const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback?${searchParams}`, {
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { ...fetchHeaders(token) },
   });
   if (!response.ok) throw new Error('Failed to fetch feedback');
   const result = await response.json();
@@ -797,7 +848,7 @@ export async function getAnswerFeedbackList(
   if (params?.pageSize) searchParams.set('page_size', String(params.pageSize));
 
   const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback/list?${searchParams}`, {
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { ...fetchHeaders(token) },
   });
   if (!response.ok) throw new Error('Failed to fetch answer feedback list');
   const result = await response.json();
@@ -810,7 +861,7 @@ export async function toggleAnswerFeedbackAdopted(feedbackId: string): Promise<v
   const response = await fetch('/api/v1/knowledge-base/search/answer-feedback/toggle-adopt', {
     method: 'POST',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ feedback_id: feedbackId }),
@@ -823,7 +874,7 @@ export async function getAnswerFeedbackStats(knowledgeBaseId: string): Promise<A
   const token = readAccessToken();
   const response = await fetch(
     `/api/v1/knowledge-base/search/answer-feedback/stats?knowledge_base_id=${knowledgeBaseId}`,
-    { headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) } },
+    { headers: { ...fetchHeaders(token) } },
   );
   if (!response.ok) throw new Error('Failed to fetch answer feedback statistics');
   const result = await response.json();
@@ -835,7 +886,7 @@ export async function deleteAnswerFeedback(feedbackId: string): Promise<void> {
   const token = readAccessToken();
   const response = await fetch(`/api/v1/knowledge-base/search/answer-feedback/${feedbackId}`, {
     method: 'DELETE',
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { ...fetchHeaders(token) },
   });
   if (!response.ok) throw new Error('Failed to delete answer feedback');
 }
@@ -854,7 +905,7 @@ export async function getSearchFeedbackList(
   if (params?.pageSize) searchParams.set('page_size', String(params.pageSize));
 
   const response = await fetch(`/api/v1/knowledge-base/search/feedback?${searchParams}`, {
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { ...fetchHeaders(token) },
   });
   if (!response.ok) throw new Error('Failed to fetch feedback list');
   const result = await response.json();
@@ -867,7 +918,7 @@ export async function toggleSearchFeedbackAdopted(feedbackId: string): Promise<v
   const response = await fetch('/api/v1/knowledge-base/search/feedback/toggle-adopt', {
     method: 'POST',
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...fetchHeaders(token),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ feedback_id: feedbackId }),
@@ -881,7 +932,7 @@ export async function getSearchFeedbackStats(
 ): Promise<import('../types/knowledgeSearch').SearchFeedbackStats> {
   const token = readAccessToken();
   const response = await fetch(`/api/v1/knowledge-base/search/feedback/stats?knowledge_base_id=${knowledgeBaseId}`, {
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { ...fetchHeaders(token) },
   });
   if (!response.ok) throw new Error('Failed to fetch feedback statistics');
   const result = await response.json();

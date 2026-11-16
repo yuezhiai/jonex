@@ -40,7 +40,7 @@ function argsBrief(args?: Record<string, unknown>): string {
 const preStyle: React.CSSProperties = {
   margin: 0,
   padding: '6px 8px',
-  background: '#f8fafc',
+  background: 'var(--yx-bg-subtle)',
   border: '1px solid #ece9fb',
   borderRadius: 6,
   fontSize: 11,
@@ -61,7 +61,7 @@ function CallRow({ call, index }: { call: OntologyToolCallView; index: number })
     : cached
       ? t(`${NS}.cached`)
       : t(`${NS}.factsAdded`, { count: call.facts_added ?? 0 });
-  const statusColor = !call.ok ? '#ef4444' : cached ? '#94a3b8' : '#10b981';
+  const statusColor = !call.ok ? '#ef4444' : cached ? 'var(--yx-text-muted)' : '#10b981';
   return (
     <div style={{ borderBottom: '1px dashed #efeafc', padding: '4px 0' }}>
       <button
@@ -79,8 +79,8 @@ function CallRow({ call, index }: { call: OntologyToolCallView; index: number })
           width: '100%',
         }}
       >
-        <span style={{ color: '#94a3b8' }}>{open ? <CaretDownOutlined /> : <CaretRightOutlined />}</span>
-        <span style={{ color: '#94a3b8', minWidth: 18 }}>{index}.</span>
+        <span style={{ color: 'var(--yx-text-muted)' }}>{open ? <CaretDownOutlined /> : <CaretRightOutlined />}</span>
+        <span style={{ color: 'var(--yx-text-muted)', minWidth: 18 }}>{index}.</span>
         <span
           style={{
             fontSize: 11,
@@ -101,25 +101,25 @@ function CallRow({ call, index }: { call: OntologyToolCallView; index: number })
       </button>
       {open && (
         <div style={{ margin: '6px 0 4px 24px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={{ fontSize: 11, color: '#94a3b8' }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>
             {t(`${NS}.toolName`)}：<code>{call.name}</code>
           </div>
           <div>
             <div style={{ fontSize: 12, fontWeight: 600, color: '#6d28d9', marginBottom: 2 }}>{t(`${NS}.input`)}</div>
             <pre style={preStyle}>{pretty(call.arguments ?? {})}</pre>
-            {external && <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{t(`${NS}.inputRedacted`)}</div>}
+            {external && <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 2 }}>{t(`${NS}.inputRedacted`)}</div>}
           </div>
           <div>
             <div style={{ fontSize: 12, fontWeight: 600, color: '#6d28d9', marginBottom: 2 }}>{t(`${NS}.output`)}</div>
             {call.result_omitted ? (
-              <div style={{ fontSize: 11, color: '#94a3b8' }}>{t(`${NS}.resultOmitted`)}</div>
+              <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t(`${NS}.resultOmitted`)}</div>
             ) : call.result === undefined ? (
-              <div style={{ fontSize: 11, color: '#94a3b8' }}>—</div>
+              <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>—</div>
             ) : (
               <>
                 <pre style={preStyle}>{pretty(call.result)}</pre>
                 {call.result_truncated && (
-                  <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{t(`${NS}.resultTruncated`)}</div>
+                  <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 2 }}>{t(`${NS}.resultTruncated`)}</div>
                 )}
               </>
             )}
@@ -152,7 +152,7 @@ export default function OntologyToolCallsView({
   });
   return (
     <div>
-      <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6 }}>
+      <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginBottom: 6 }}>
         {t(`${NS}.summary`, { rounds: rounds ?? '—', count: total ?? calls.length })}
       </div>
       {groups.map((g, gi) => (
@@ -168,7 +168,7 @@ export default function OntologyToolCallsView({
         </div>
       ))}
       {total != null && total > calls.length && (
-        <div style={{ fontSize: 11, color: '#94a3b8' }}>{t(`${NS}.truncated`, { shown: calls.length, total })}</div>
+        <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t(`${NS}.truncated`, { shown: calls.length, total })}</div>
       )}
     </div>
   );

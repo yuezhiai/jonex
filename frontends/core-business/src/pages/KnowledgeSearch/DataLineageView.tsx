@@ -46,11 +46,11 @@ export default function DataLineageView({ block }: { block?: DataLineageBlock | 
 
   const renderEndpoints = (label: string, endpoints: DataLineageEndpoint[]) => (
     <div style={{ minWidth: 180 }}>
-      <div style={{ fontSize: 12, color: '#64748b' }}>{label}</div>
+      <div style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{label}</div>
       {endpoints.length === 0 ? (
-        <div style={{ fontSize: 12, color: '#94a3b8' }}>—</div>
+        <div style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>—</div>
       ) : (
-        <ul style={{ margin: '4px 0 0', paddingLeft: 16, fontSize: 13, color: '#334155' }}>
+        <ul style={{ margin: '4px 0 0', paddingLeft: 16, fontSize: 13, color: 'var(--yx-text-body)' }}>
           {endpoints.map((e, i) => {
             const originKey = e.origin ? ORIGIN_KEYS[e.origin] : undefined;
             return (
@@ -60,7 +60,7 @@ export default function DataLineageView({ block }: { block?: DataLineageBlock | 
                   <span style={originTagStyle}>{originKey ? t(originKey) : e.origin}</span>
                 )}
                 {typeof e.confidence === 'number' && (
-                  <span style={{ marginLeft: 6, fontSize: 11, color: '#94a3b8' }}>
+                  <span style={{ marginLeft: 6, fontSize: 11, color: 'var(--yx-text-muted)' }}>
                     {e.confidence.toFixed(2)}
                   </span>
                 )}
@@ -75,7 +75,7 @@ export default function DataLineageView({ block }: { block?: DataLineageBlock | 
   return (
     <div
       style={{
-        background: '#f8fafc',
+        background: 'var(--yx-bg-subtle)',
         borderLeft: '3px solid #0ea5e9',
         borderRadius: '0 8px 8px 0',
         padding: '14px 18px',
@@ -115,7 +115,7 @@ export default function DataLineageView({ block }: { block?: DataLineageBlock | 
         return (
           <div
             key={`${item.dataSourceId}-${item.table}-${i}`}
-            style={{ marginTop: 8, borderTop: i === 0 ? 'none' : '1px dashed #e2e8f0', paddingTop: i === 0 ? 0 : 8 }}
+            style={{ marginTop: 8, borderTop: i === 0 ? 'none' : '1px dashed var(--yx-border)', paddingTop: i === 0 ? 0 : 8 }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span style={{ fontWeight: 600, color: '#0f172a', fontSize: 13 }}>{item.table}</span>
@@ -135,7 +135,7 @@ export default function DataLineageView({ block }: { block?: DataLineageBlock | 
                 </span>
               )}
               {item.dataSourceId && (
-                <span style={{ fontSize: 12, color: '#64748b' }}>{item.dataSourceId}</span>
+                <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{item.dataSourceId}</span>
               )}
             </div>
             {item.unknown && (

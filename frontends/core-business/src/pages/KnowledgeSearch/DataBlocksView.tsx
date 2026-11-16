@@ -100,7 +100,7 @@ const chipTagStyle = (tag: string): React.CSSProperties => {
   if (tag === '指标') {
     return { ...base, color: '#0e7490', background: '#ecfeff', border: '1px solid #a5f3fc' };
   }
-  return { ...base, color: '#475569', background: '#f1f5f9', border: '1px solid #e2e8f0' };
+  return { ...base, color: '#475569', background: 'var(--yx-bg-muted)', border: '1px solid var(--yx-border)' };
 };
 
 /** 候选 chip 列表：多选（跨源）→「用所选重问」一次提交多个 pin。 */
@@ -112,7 +112,7 @@ function CandidateChips({ candidates, onPick }: {
   const count = Object.keys(selected).length;
   return (
     <div>
-      <div style={{ marginTop: 6, fontSize: 12, color: '#64748b' }}>
+      <div style={{ marginTop: 6, fontSize: 12, color: 'var(--yx-text-secondary)' }}>
         {onPick
           ? '候选（可多选；同一数据源选一个，点「用所选重问」）：'
           : '候选（在提问里点名其中之一再问）：'}
@@ -125,7 +125,7 @@ function CandidateChips({ candidates, onPick }: {
             fontSize: 12,
             lineHeight: '20px',
             background: isSelected ? '#dbeafe' : '#eef2ff',
-            border: `1px solid ${isSelected ? '#3b82f6' : '#c7d2fe'}`,
+            border: `1px solid ${isSelected ? 'var(--yx-accent)' : '#c7d2fe'}`,
             color: isSelected ? '#1d4ed8' : '#3730a3',
             borderRadius: 999,
             padding: '1px 10px',
@@ -170,7 +170,7 @@ function CandidateChips({ candidates, onPick }: {
           </button>
           <button
             type="button"
-            style={{ fontSize: 12, padding: '2px 8px', border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' }}
+            style={{ fontSize: 12, padding: '2px 8px', border: 'none', background: 'transparent', color: 'var(--yx-text-secondary)', cursor: 'pointer' }}
             onClick={() => setSelected({})}
           >
             清空
@@ -200,11 +200,11 @@ export default function DataBlocksView({ blocks, onPick }: {
         <div
           key={`${b.data_source_id}-${i}`}
           style={{
-            border: '1px solid #e2e8f0',
+            border: '1px solid var(--yx-border)',
             borderRadius: 8,
             padding: '8px 12px',
             marginTop: 8,
-            background: '#f8fafc',
+            background: 'var(--yx-bg-subtle)',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
@@ -218,7 +218,7 @@ export default function DataBlocksView({ blocks, onPick }: {
                 ? t('knowledgeSearch.dataSourceFallback')
                 : b.source_name}
             </span>
-            {b.engine === 'nl2sql' && (
+            {(b.engine === 'nl2sql' || b.engine === 'metric') && (
               <span
                 style={{
                   fontSize: 12,
@@ -230,7 +230,23 @@ export default function DataBlocksView({ blocks, onPick }: {
                   padding: '0 6px',
                 }}
               >
-                引擎：NL→SQL（②）
+                {b.engine === 'metric' ? '引擎：指标（确定性口径）' : '引擎：NL→SQL（②）'}
+              </span>
+            )}
+            {b.source === 'verified' && (
+              <span
+                style={{
+                  fontSize: 12,
+                  lineHeight: '18px',
+                  color: '#166534',
+                  border: '1px solid #bbf7d0',
+                  background: '#f0fdf4',
+                  borderRadius: 4,
+                  padding: '0 6px',
+                }}
+                title={b.verified_query_name || ''}
+              >
+                {t('knowledgeSearch.verifiedBadge')}
               </span>
             )}
             {b.truncated && <span style={{ fontSize: 12, color: '#b45309' }}>（结果已截断）</span>}
@@ -238,7 +254,7 @@ export default function DataBlocksView({ blocks, onPick }: {
           {b.blocks && b.blocks.some((block) =>
             block.type === 'table' || block.type === 'chart') ? (
             <ResultBlocksView blocks={b.blocks} includeText={false} />
-          ) : b.engine === 'nl2sql' && b.table && b.table.columns.length > 0 ? (
+          ) : (b.engine === 'nl2sql' || b.engine === 'metric') && b.table && b.table.columns.length > 0 ? (
             <div style={{ overflowX: 'auto' }}>
               <table style={{ borderCollapse: 'collapse', fontSize: 13, color: '#0f172a' }}>
                 <thead>
@@ -247,8 +263,8 @@ export default function DataBlocksView({ blocks, onPick }: {
                       <th
                         key={ci}
                         style={{
-                          border: '1px solid #e2e8f0',
-                          background: '#f1f5f9',
+                          border: '1px solid var(--yx-border)',
+                          background: 'var(--yx-bg-muted)',
                           padding: '4px 10px',
                           textAlign: 'left',
                           fontWeight: 600,
@@ -264,7 +280,7 @@ export default function DataBlocksView({ blocks, onPick }: {
                     <tr>
                       <td
                         colSpan={b.table.columns.length}
-                        style={{ border: '1px solid #e2e8f0', padding: '4px 10px', color: '#94a3b8' }}
+                        style={{ border: '1px solid var(--yx-border)', padding: '4px 10px', color: 'var(--yx-text-muted)' }}
                       >
                         （0 行）
                       </td>
@@ -273,7 +289,7 @@ export default function DataBlocksView({ blocks, onPick }: {
                   {b.table.rows.map((r, ri) => (
                     <tr key={ri}>
                       {r.map((v, vi) => (
-                        <td key={vi} style={{ border: '1px solid #e2e8f0', padding: '4px 10px' }}>
+                        <td key={vi} style={{ border: '1px solid var(--yx-border)', padding: '4px 10px' }}>
                           {v === null || v === undefined ? '' : String(v)}
                         </td>
                       ))}
@@ -284,26 +300,26 @@ export default function DataBlocksView({ blocks, onPick }: {
             </div>
           ) : b.candidates && b.candidates.length > 0 ? (
             <div>
-              <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: '#334155', lineHeight: 1.7 }}>
+              <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: 'var(--yx-text-body)', lineHeight: 1.7 }}>
                 {splitCandidates(b.text)}
               </div>
               <CandidateChips candidates={b.candidates} onPick={onPick} />
             </div>
           ) : (
-            <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: '#334155', lineHeight: 1.7 }}>
+            <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: 'var(--yx-text-body)', lineHeight: 1.7 }}>
               {b.text}
             </div>
           )}
           {b.sql && (
             <details style={{ marginTop: 6 }}>
-              <summary style={{ cursor: 'pointer', fontSize: 12, color: '#64748b' }}>查看 SQL</summary>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--yx-text-secondary)' }}>查看 SQL</summary>
               <pre
                 style={{
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-all',
                   fontSize: 12,
-                  color: '#334155',
-                  background: '#f1f5f9',
+                  color: 'var(--yx-text-body)',
+                  background: 'var(--yx-bg-muted)',
                   borderRadius: 6,
                   padding: 8,
                   marginTop: 4,

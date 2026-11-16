@@ -105,7 +105,7 @@ function PdfPage({ box, spans, primary, pulse, onError }: PdfPageProps) {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: '#94a3b8',
+            color: 'var(--yx-text-muted)',
             fontSize: 12,
           }}
         >
@@ -303,7 +303,7 @@ export function PdfBboxViewer({ url, spans, targetPage, onError }: PdfBboxViewer
       {error ? (
         <div style={ERROR_OVERLAY}>{error}</div>
       ) : pages.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '60px 0', color: '#64748b' }}>
+        <div style={{ textAlign: 'center', padding: '60px 0', color: 'var(--yx-text-secondary)' }}>
           PDF 加载中…
         </div>
       ) : (

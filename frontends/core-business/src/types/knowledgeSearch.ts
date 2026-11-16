@@ -38,6 +38,12 @@ export interface KnowledgeSearchDomain {
   kb_ids?: string[];
   kb_names?: string[];
   /**
+   * 该检索范围下是否有启用的领域服务（仅 `kind==='space'` 有意义，
+   * 由后端 `scope=search` 的空间接口下发）。
+   * undefined = 后端未提供（老后端 / 非检索口径），此时**不**标注「暂无启用服务」。
+   */
+  has_enabled_service?: boolean;
+  /**
    * [jonex] kb_ids 各自的知识库类型（kb_type），与 kb_ids 顺序/下标一一对应。
    * 仅当每个 kb_id 的类型都已知时才等长；前端据此决定「只选了一条引擎链路」
    * 时打哪条专用检索端点（/search/jonex_wiki、/search/llmwiki），否则回落 /search/mix。
@@ -77,9 +83,52 @@ export interface KnowledgeSearchHistoryItem {
   queryImages?: QueryImageRef[];
   /** [jonex] 以图问知识：用户当时输入的原话（可为空；`query` 存的是识别产出的检索文本） */
   imageQuestion?: string;
+  /** 实时数据摘要（历史回放；后端只在调用过工具时保存） */
+  toolResults?: ToolCallResult[];
+  /** 问答动作提案卡片（历史回放；不含入参值，只含键名） */
+  pendingActions?: PendingActionView[];
+  /** 服务端回写的动作执行结果（历史回放） */
+  actionResults?: ActionExecutionRecord[];
+}
+
+/** 问答动作提案卡片（服务端待办脱敏视图）。 */
+export interface PendingActionView {
+  pending_id?: string | null;
+  kb_id?: string | null;
+  action?: string | null;
+  tool_label?: string | null;
+  tool_source?: 'platform' | 'kb' | null;
+  verdict?: string | null;
+  /** 契约判定是否可执行（不含待办 / 写权限） */
+  contract_executable?: boolean;
+  executable?: boolean;
+  can_execute?: boolean;
+  reasons?: string[];
+  checklist?: { kind: string; items: string[] }[];
+  required_inputs?: { name: string; type?: string; description?: string; required?: boolean }[];
+  provided_input_keys?: string[];
+  /** 仅当次问答响应带值；历史回放只有键名 */
+  inputs?: Record<string, unknown>;
+  status?: string | null;
+  seq?: number;
+}
+
+/** 动作执行结果（服务端回写历史，前端不可上报）。 */
+export interface ActionExecutionRecord {
+  pending_id?: string | null;
+  action?: string | null;
+  tool_name?: string | null;
+  status?: string | null;
+  executed_at?: string | null;
+  output?: string | null;
+  output_truncated?: boolean;
+  http_status?: number | null;
+  error?: string | null;
 }
 
 export interface SaveKnowledgeSearchHistoryPayload {
+  /** 后端搜索响应已落的 history_id：补存时更新同一条，避免重复历史 */
+  historyId?: string;
   query: string;
   resultCount: number;
   domain?: string;
@@ -190,6 +239,10 @@ export interface KnowledgeSearchStreamParams {
   mode?: KnowledgeSearchMode;
   topK?: number;
   domainId?: string;
+  /** 检索维度：选中的领域服务 id（与 domainSpaceId 二选一） */
+  serviceId?: string;
+  /** 检索维度：选中的领域空间 id（与 serviceId 二选一） */
+  domainSpaceId?: string;
   /** 知识库 ID 列表，至少一个 */
   kbIds?: string[];
   /**
@@ -348,7 +401,7 @@ export interface DataBlockCandidate {
 export interface DataBlock {
   data_source_id: string;
   source_name: string;
-  engine: 'di' | 'nl2sql';
+  engine: 'di' | 'nl2sql' | 'metric';
   kind: 'answer' | 'clarify' | 'error' | 'not_wired';
   text: string;
   table?: { columns: string[]; rows: unknown[][] } | null;
@@ -360,6 +413,9 @@ export interface DataBlock {
   candidates?: DataBlockCandidate[] | null;
   /** W4.6 结果契约；老后端/无契约 → null 或键缺席，前端走旧渲染。 */
   blocks?: ResultBlock[] | null;
+  /** N1-1：② 命中已验证查询时由后端下发；老后端不带 ⇒ 前端不渲染标记。 */
+  source?: 'verified' | null;
+  verified_query_name?: string | null;
 }
 
 /** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示，不混进正文）。 */
@@ -404,6 +460,11 @@ export interface KnowledgeSearchStreamMeta {
   rag_used?: boolean;
   /** [jonex] answer-feedback 锚点：后端检索响应下发的检索历史记录 id（回放历史用 history item id） */
   history_id?: string;
+  /**
+   * 本次检索消耗的 Token 总量（后端按 trace 合计精确值）。
+   * 数据未就绪时**整个键缺席**（不是 0），前端据此整块不渲染。
+   */
+  total_tokens?: number;
   /** [①②] 数据路径结构化块（router 扇出路径的下发；不存在即无此数据路径）。 */
   data_blocks?: DataBlock[] | null;
   /** [①②] 文档答案 + 数据补充的并置标记；为 true 时保留打字、表格在下方渲染。 */
@@ -414,6 +475,8 @@ export interface KnowledgeSearchStreamMeta {
   data_lineage?: DataLineageBlock | null;
   /** 实时数据：本次问答调用动作绑定外部工具的摘要（后端只在调用过时下发）。 */
   tool_results?: ToolCallResult[] | null;
+  /** 动作提案卡片：写操作/需确认动作不直接执行，由用户在卡片上确认后执行。 */
+  pending_actions?: PendingActionView[] | null;
 }
 
 /** 问答调用外部工具的一条摘要（不含入参与输出原文；输出已作为答案依据）。 */
@@ -428,6 +491,8 @@ export interface ToolCallResult {
   http_status?: number | null;
   called_at?: string | null;
   fact_no?: number | null;
+  /** 动作提案卡片对应的服务端待办 id（status=pending_confirmation 时有值） */
+  pending_id?: string | null;
 }
 
 export interface WikiProgressEvent {

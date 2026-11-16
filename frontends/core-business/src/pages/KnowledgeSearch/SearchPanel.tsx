@@ -194,7 +194,7 @@ export default function SearchPanel({
           {attachedImages.map((image, index) => (
             <div
               key={`${image.objectUrl}-${index}`}
-              style={{ position: 'relative', width: 56, height: 56, borderRadius: 8, overflow: 'hidden', border: '1px solid #e2e8f0' }}
+              style={{ position: 'relative', width: 56, height: 56, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--yx-border)' }}
             >
               <img src={image.objectUrl} alt={image.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
               <Button
@@ -207,7 +207,7 @@ export default function SearchPanel({
               />
             </div>
           ))}
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
             {t('knowledgeSearch.attachedCount', { count: attachedImages.length, total: maxImages })}
           </span>
         </div>
@@ -231,7 +231,7 @@ export default function SearchPanel({
         // 外层的 .composer 已经是卡片本体，Sender 再画一层边框就成了「框里套框」
         styles={{
           root: { border: 'none', boxShadow: 'none', background: 'transparent' },
-          footer: { borderTop: '1px solid #f1f5f9', marginTop: 6, paddingTop: 8 },
+          footer: { borderTop: '1px solid var(--yx-bg-muted)', marginTop: 6, paddingTop: 8 },
         }}
         // 剪贴板里同时有图片和文字时（从 Word 复制），文字照常进输入框、图片顺手追加（F3）
         onPasteFile={isSearching ? undefined : (files) => onAttachImages?.(Array.from(files))}
@@ -256,8 +256,15 @@ export default function SearchPanel({
               popupMatchSelectWidth={220}
               options={visibleDomains.map((d) => ({
                 value: d.id,
-                // 当前领域空间（kind=space）为返回首项，label 固定显示「当前领域空间」
-                label: d.kind === 'space' ? t('knowledgeSearch.currentSpace') : d.name,
+                // 当前领域空间（kind=space）为返回首项，label 固定显示「当前领域空间」；
+                // 空间下没有启用服务时追加标注（仍可选，提交由后端 3029 兜底）。
+                // ⚠️ 判据必须是 === false：undefined = 后端未提供该字段，不得误标。
+                label:
+                  d.kind === 'space'
+                    ? d.has_enabled_service === false
+                      ? `${t('knowledgeSearch.currentSpace')} · ${t('knowledgeSearch.noEnabledService')}`
+                      : t('knowledgeSearch.currentSpace')
+                    : d.name,
               }))}
             />
             <span className={styles.toolbarDivider} />
@@ -302,7 +309,7 @@ export default function SearchPanel({
               <Button
                 type="text"
                 size="small"
-                icon={<PictureOutlined style={{ fontSize: 16, color: imagesFull || isSearching ? '#cbd5e1' : '#64748b' }} />}
+                icon={<PictureOutlined style={{ fontSize: 16, color: imagesFull || isSearching ? '#cbd5e1' : 'var(--yx-text-secondary)' }} />}
                 disabled={imagesFull || isSearching}
                 aria-label={t('knowledgeSearch.uploadImage')}
               />

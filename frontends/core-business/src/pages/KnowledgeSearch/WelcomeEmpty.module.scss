@@ -28,20 +28,20 @@
   font-weight: 700;
   line-height: 1.35;
   letter-spacing: 0.2px;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
 }
 
 .subtitle {
   margin: 12px 0 0;
   font-size: 18px;
   line-height: 1.6;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .suggestLabel {
   margin: 40px 0 20px;
   font-size: 16px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .suggestions {
@@ -77,5 +77,5 @@
 .suggestionPrompt {
   font-size: 15px;
   line-height: 1.55;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }

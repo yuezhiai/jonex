@@ -39,8 +39,8 @@ function IOKv({ item }: { item: ReasoningIOItem }) {
     <dl style={{ margin: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
       {entries.map(([k, v]) => (
         <div key={k} style={{ display: 'flex', gap: 6, fontSize: 12, lineHeight: 1.7 }}>
-          <dt style={{ color: '#94a3b8', flexShrink: 0 }}>{k}：</dt>
-          <dd style={{ margin: 0, color: '#334155', wordBreak: 'break-word' }}>{cellText(v)}</dd>
+          <dt style={{ color: 'var(--yx-text-muted)', flexShrink: 0 }}>{k}：</dt>
+          <dd style={{ margin: 0, color: 'var(--yx-text-body)', wordBreak: 'break-word' }}>{cellText(v)}</dd>
         </div>
       ))}
     </dl>
@@ -153,7 +153,7 @@ function IOJson({ item }: { item: ReasoningIOItem }) {
       style={{
         margin: 0,
         padding: '6px 8px',
-        background: '#f8fafc',
+        background: 'var(--yx-bg-subtle)',
         border: '1px solid #ece9fb',
         borderRadius: 6,
         fontSize: 11,
@@ -207,11 +207,11 @@ function IOBlock({ title, items }: { title: string; items?: ReasoningIOItem[] | 
             key={`${item.label}-${idx}`}
             style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12 }}
           >
-            <dt style={{ width: 96, flexShrink: 0, color: '#94a3b8' }}>{item.label}</dt>
-            <dd style={{ flex: 1, minWidth: 0, margin: 0, color: '#334155' }}>
+            <dt style={{ width: 96, flexShrink: 0, color: 'var(--yx-text-muted)' }}>{item.label}</dt>
+            <dd style={{ flex: 1, minWidth: 0, margin: 0, color: 'var(--yx-text-body)' }}>
               <IOValue item={item} />
               {item.note && (
-                <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{item.note}</div>
+                <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 2 }}>{item.note}</div>
               )}
             </dd>
           </div>
@@ -287,7 +287,7 @@ export function ReasoningRawJson({ step }: { step: ReasoningStep }) {
             style={{
               margin: 0,
               padding: '8px 10px',
-              background: '#f8fafc',
+              background: 'var(--yx-bg-subtle)',
               border: '1px solid #ece9fb',
               borderRadius: 6,
               fontSize: 11,
@@ -301,7 +301,7 @@ export function ReasoningRawJson({ step }: { step: ReasoningStep }) {
             {shown}
           </pre>
           {truncated && (
-            <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', marginTop: 2 }}>
               {t('knowledgeSearch.ioJsonTruncated')}
             </div>
           )}

@@ -14,6 +14,7 @@ const STATUS_COLOR: Record<string, string> = {
   not_callable: 'default',
   rate_limited: 'orange',
   invalid_input: 'gold',
+  pending_confirmation: 'blue',
   no_runtime: 'default',
   tool_unavailable: 'default',
 };
@@ -25,11 +26,13 @@ const STATUS_COLOR: Record<string, string> = {
  */
 export default function ToolResultsView({ results }: { results?: ToolCallResult[] | null }) {
   const { t } = useTranslation();
-  if (!results || results.length === 0) return null;
+  // 待确认卡片单独渲染（PendingActionCard）；这里只列真正查过/被拦下的实时数据
+  const visible = (results || []).filter((r) => r.status !== 'pending_confirmation');
+  if (visible.length === 0) return null;
   return (
     <div
       style={{
-        background: '#f8fafc',
+        background: 'var(--yx-bg-subtle)',
         borderLeft: '3px solid #14b8a6',
         borderRadius: '0 8px 8px 0',
         padding: '10px 14px',
@@ -39,26 +42,26 @@ export default function ToolResultsView({ results }: { results?: ToolCallResult[
       <div style={{ fontSize: 13, fontWeight: 600, color: '#0f766e', marginBottom: 6 }}>
         <ApiOutlined /> {t(`${NS}.title`)}
       </div>
-      <div style={{ fontSize: 12, color: '#64748b', marginBottom: 6 }}>{t(`${NS}.hint`)}</div>
+      <div style={{ fontSize: 12, color: 'var(--yx-text-secondary)', marginBottom: 6 }}>{t(`${NS}.hint`)}</div>
       <ul style={{ margin: 0, paddingLeft: 16 }}>
-        {results.map((r) => {
+        {visible.map((r) => {
           const status = r.status || 'failed';
           const label = t(`${NS}.status.${status}`, { defaultValue: status });
           const time = r.called_at ? new Date(r.called_at).toLocaleTimeString() : '';
           return (
-            <li key={r.seq} style={{ fontSize: 13, color: '#334155', lineHeight: 1.9 }}>
+            <li key={r.seq} style={{ fontSize: 13, color: 'var(--yx-text-body)', lineHeight: 1.9 }}>
               <span>{r.action}</span>
-              <span style={{ color: '#94a3b8' }}> → </span>
+              <span style={{ color: 'var(--yx-text-muted)' }}> → </span>
               <span style={{ fontFamily: 'monospace' }}>{r.tool_label || r.tool_name || '—'}</span>
               <Tag color={STATUS_COLOR[status] || 'default'} style={{ marginLeft: 8 }}>
                 {label}
               </Tag>
               {r.http_status != null && (
                 <Tooltip title={t(`${NS}.httpStatus`)}>
-                  <span style={{ fontSize: 12, color: '#64748b' }}>HTTP {r.http_status}</span>
+                  <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>HTTP {r.http_status}</span>
                 </Tooltip>
               )}
-              {time && <span style={{ marginLeft: 8, fontSize: 12, color: '#94a3b8' }}>{time}</span>}
+              {time && <span style={{ marginLeft: 8, fontSize: 12, color: 'var(--yx-text-muted)' }}>{time}</span>}
             </li>
           );
         })}

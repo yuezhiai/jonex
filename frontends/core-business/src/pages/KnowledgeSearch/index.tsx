@@ -60,10 +60,13 @@ import type {
   DataReference,
   DataLineageBlock,
   ToolCallResult,
+  PendingActionView,
+  ActionExecutionRecord,
 } from '@/types/knowledgeSearch';
 import { PageContent } from '@jonex/shared-lib';
 import SearchPanel from './SearchPanel';
 import SearchHistorySidebar from './SearchHistorySidebar';
+import { resolveDomainWarning } from './searchDomainAvailability';
 import { useStickyScroll } from './useStickyScroll';
 import SessionCard from './SessionCard';
 import WelcomeEmpty from './WelcomeEmpty';
@@ -81,14 +84,14 @@ const STAT_CARD_CONFIG: {
     key: 'totalDomains',
     labelKey: 'knowledgeSearch.knowledgeDomain',
     Icon: BlockOutlined,
-    bg: '#eff6ff',
-    color: '#3b82f6',
+    bg: 'var(--yx-info-bg)',
+    color: 'var(--yx-accent)',
   },
   {
     key: 'totalEntities',
     labelKey: 'knowledgeSearch.knowledgeEntity',
     Icon: NodeIndexOutlined,
-    bg: '#ecfdf5',
+    bg: 'var(--yx-success-bg)',
     color: '#10b981',
   },
   { key: 'sourceFiles', labelKey: 'common.sourceFiles', Icon: FileTextOutlined, bg: '#f5f3ff', color: '#8b5cf6' },
@@ -151,6 +154,15 @@ export interface SearchSession {
   dataLineage?: DataLineageBlock | null;
   /** 实时数据：问答调用外部工具的摘要（调用过才下发；历史回放不带，无则 null）。 */
   toolResults?: ToolCallResult[] | null;
+  /** 问答动作提案卡片（写操作/需确认动作，需用户确认后执行） */
+  pendingActions?: PendingActionView[] | null;
+  /** 动作执行结果（历史回放；由服务端回写） */
+  actionResults?: ActionExecutionRecord[] | null;
+  /**
+   * 本次检索消耗的 Token 总量。
+   * 只有新发起的检索会写入（历史回放不带、也不回填）；缺省 / 0 / 非有限值 ⇒ 不渲染。
+   */
+  totalTokens?: number;
 }
 
 export interface SessionQueryImage {
@@ -322,28 +334,30 @@ function FeedbackButtons({
         alignItems: 'center',
         gap: 10,
         fontSize: 13,
-        color: '#94a3b8',
+        color: 'var(--yx-text-muted)',
       }}
     >
-      <span style={{ color: '#94a3b8' }}>{t('knowledgeSearch.helpfulQuestion')}</span>
-
-      {/* 有帮助 */}
+      {/* 有帮助：只保留图标，文案交给 title / aria-label */}
       <Button
         disabled={!!loading}
         onClick={() => onVote('like')}
+        title={t('knowledgeSearch.helpful')}
+        aria-label={t('knowledgeSearch.helpful')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 5,
+          justifyContent: 'center',
           border: 'none',
+          width: 28,
+          height: 28,
           fontSize: 13,
-          borderRadius: 16,
-          padding: '3px 14px',
+          borderRadius: '50%',
+          padding: 0,
           cursor: loading ? 'default' : 'pointer',
           lineHeight: '22px',
           fontWeight: isLikeSelected ? 600 : 400,
-          color: isLikeSelected ? '#fff' : '#94a3b8',
-          background: isLikeLoading ? '#bbf7d0' : isLikeSelected ? '#22c55e' : '#f1f5f9',
+          color: isLikeSelected ? '#fff' : 'var(--yx-text-muted)',
+          background: isLikeLoading ? '#bbf7d0' : isLikeSelected ? '#22c55e' : 'var(--yx-bg-muted)',
           boxShadow: isLikeSelected ? '0 1px 4px rgba(34,197,94,0.35)' : 'none',
           transition: 'all 0.25s ease',
           opacity: loading && !isLikeLoading ? 0.5 : 1,
@@ -356,8 +370,8 @@ function FeedbackButtons({
         }}
         onMouseLeave={(e) => {
           if (!loading && !isLikeSelected) {
-            e.currentTarget.style.background = '#f1f5f9';
-            e.currentTarget.style.color = '#94a3b8';
+            e.currentTarget.style.background = 'var(--yx-bg-muted)';
+            e.currentTarget.style.color = 'var(--yx-text-muted)';
           }
         }}
       >
@@ -368,26 +382,29 @@ function FeedbackButtons({
         ) : (
           <LikeOutlined style={{ fontSize: 14 }} />
         )}
-        {isLikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.helpful')}
       </Button>
 
       {/* 无帮助 */}
       <Button
         disabled={!!loading}
         onClick={() => onVote('dislike')}
+        title={t('knowledgeSearch.unhelpful')}
+        aria-label={t('knowledgeSearch.unhelpful')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 5,
+          justifyContent: 'center',
           border: 'none',
+          width: 28,
+          height: 28,
           fontSize: 13,
-          borderRadius: 16,
-          padding: '3px 14px',
+          borderRadius: '50%',
+          padding: 0,
           cursor: loading ? 'default' : 'pointer',
           lineHeight: '22px',
           fontWeight: isDislikeSelected ? 600 : 400,
-          color: isDislikeSelected ? '#fff' : '#94a3b8',
-          background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : '#f1f5f9',
+          color: isDislikeSelected ? '#fff' : 'var(--yx-text-muted)',
+          background: isDislikeLoading ? '#fecaca' : isDislikeSelected ? '#ef4444' : 'var(--yx-bg-muted)',
           boxShadow: isDislikeSelected ? '0 1px 4px rgba(239,68,68,0.35)' : 'none',
           transition: 'all 0.25s ease',
           opacity: loading && !isDislikeLoading ? 0.5 : 1,
@@ -400,8 +417,8 @@ function FeedbackButtons({
         }}
         onMouseLeave={(e) => {
           if (!loading && !isDislikeSelected) {
-            e.currentTarget.style.background = '#f1f5f9';
-            e.currentTarget.style.color = '#94a3b8';
+            e.currentTarget.style.background = 'var(--yx-bg-muted)';
+            e.currentTarget.style.color = 'var(--yx-text-muted)';
           }
         }}
       >
@@ -412,7 +429,6 @@ function FeedbackButtons({
         ) : (
           <DislikeOutlined style={{ fontSize: 14 }} />
         )}
-        {isDislikeLoading ? t('knowledgeSearch.submitting') : t('knowledgeSearch.unhelpful')}
       </Button>
     </div>
   );
@@ -961,11 +977,24 @@ const KnowledgeSearch = function KnowledgeSearch() {
       const domainId = options?.domainId ?? selectedDomain;
       // [jonex] 复用历史检索条件：优先用历史快照的 strictConfig，否则用当前面板配置
       const effectiveStrictConfig = options?.strictConfig ?? strictConfig;
+      // [jonex] 告警分流：历史 / 已选范围里的服务可能已停用而不在候选中（候选已由
+      // 后端过滤），此时不能笼统说「没有可查询的知识库」，要提示范围已不可用。
+      const domainWarning = resolveDomainWarning(domainId, visibleDomains);
+      if (domainWarning === 'unavailable') {
+        message.warning(t('knowledgeSearch.domainUnavailable'));
+        return;
+      }
       const kbIds = getSelectedKbIds(domainId);
-      if (kbIds.length === 0) {
+      if (domainWarning === 'noKb' || kbIds.length === 0) {
         message.warning(t('knowledgeSearch.noKbWarning'));
         return;
       }
+      // [jonex] 检索维度：下拉里选中的是领域服务还是领域空间，二者只能下发其一。
+      // 取不到选中项（如历史回放时该服务已停用、不再出现在候选里）时两个都不传，
+      // 后端按 kb_ids 所属空间兜底。
+      const pickedDomain = visibleDomains.find((d) => d.id === domainId);
+      const serviceId = pickedDomain?.kind === 'service' ? pickedDomain.id : undefined;
+      const domainSpaceId = pickedDomain?.kind === 'space' ? pickedDomain.id : undefined;
       // [jonex] 选中范围里每个库的 kb_type（与 kbIds 同序）。API 层据此判断是否「只落在
       // 同一条引擎链路」以选择专用检索端点；为空/不等长时回落 /search/mix。
       const domainKbTypes = visibleDomains.find((dm) => dm.id === domainId)?.kb_types ?? [];
@@ -1039,6 +1068,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         dataReferences: null,
         dataLineage: null,
         toolResults: null,
+        pendingActions: null,
+        actionResults: null,
       });
 
       // 最终交给检索接口的文本：有图时是识别产出，无图时就是用户输入
@@ -1081,6 +1112,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
           mode: 'mix' as const,
           topK: 5,
           domainId,
+          serviceId,
+          domainSpaceId,
           kbIds: scopedKbIds,
           kbTypes,
           deep: searchMode === 'deep',
@@ -1097,6 +1130,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         let streamError: Error | null = null;
         let accumulatedAnswer = '';
         let finalReferences: KnowledgeReference[] = [];
+        // 后端搜索已写历史时返回的 id：前端补存用它更新同一条，避免重复历史
+        let backendHistoryId: string | undefined;
         const startTime = Date.now();
 
         await streamKnowledgeSearch(
@@ -1107,6 +1142,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
             },
             onDelta: (delta, meta?: any) => {
               accumulatedAnswer += delta;
+              if (meta?.history_id) backendHistoryId = meta.history_id;
               setThinkExpandedMap((prev) => {
                 if (!delta.includes('<think>')) return prev;
                 return { ...prev, [sessionId]: true };
@@ -1154,6 +1190,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
               reasoningRef.current = (meta?.reasoning as any) ?? null;
               // [jonex] answer-feedback 锚点：检索响应下发检索历史 id
               const historyId = meta?.history_id;
+              if (historyId) backendHistoryId = historyId;
 
               // 无答案检测：如果回答内容表示"无法回答"，清空引用
               const noAnswerPatterns = [
@@ -1187,6 +1224,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
                       dataLineage: meta?.data_lineage ?? null,
                       // 实时数据（问答调用了外部工具才下发）
                       toolResults: meta?.tool_results ?? null,
+                      // 动作提案卡片（写操作/需确认动作，用户确认后执行）
+                      pendingActions: meta?.pending_actions ?? null,
+                      // 本次检索 Token 总量；无键 / 非法值 ⇒ undefined，卡片整块不渲染
+                      totalTokens:
+                        typeof meta?.total_tokens === 'number' && Number.isFinite(meta.total_tokens)
+                          ? meta.total_tokens
+                          : undefined,
                     }
                   : prev,
               );
@@ -1214,6 +1258,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
         setThinkExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
 
         saveKnowledgeSearchHistory('', {
+          // 后端已经写过这条历史时更新同一条，避免重复行丢掉卡片元数据
+          historyId: backendHistoryId,
           // 历史按空间过滤：空间项取自身，服务项取其所属空间
           domainSpaceId: visibleDomains.find((d) => d.id === domainId)?.space_id,
           // ⚠️ 存的是**实际用于检索的文本**（有图时是识别产出），不是用户原话 ——
@@ -1385,6 +1431,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
             status: 'ok' as const,
           })),
           imageQuestion: item.imageQuestion,
+          toolResults: item.toolResults ?? null,
+          pendingActions: item.pendingActions ?? null,
+          actionResults: item.actionResults ?? null,
         });
         // 回显该历史的反馈状态（异步覆盖本地缓存与选中态）
         void fetchAnswerFeedback(item.id, sessionId);
@@ -1575,10 +1624,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
               <cfg.Icon />
             </div>
             <div>
-              <div style={{ fontSize: 22, fontWeight: 700, color: '#0b2b5c', lineHeight: 1.2 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--yx-brand-dark)', lineHeight: 1.2 }}>
                 {pageLoading ? '-' : displayValue}
               </div>
-              <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 2 }}>{t(cfg.labelKey)}</div>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginTop: 2 }}>{t(cfg.labelKey)}</div>
             </div>
           </Card>
         );
@@ -1708,7 +1757,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
                   border: '1px solid #e2e8f5',
                   background: scrollHasNew ? '#ffffff' : 'rgba(255,255,255,.92)',
                   boxShadow: '0 6px 18px rgba(11,43,92,.12)',
-                  color: scrollHasNew ? '#4c1d95' : '#64748b',
+                  color: scrollHasNew ? '#4c1d95' : 'var(--yx-text-secondary)',
                   fontSize: 12,
                   cursor: 'pointer',
                 }}

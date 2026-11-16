@@ -36,7 +36,7 @@ function SectionHeader({ title }: { title: string }) {
         style={{
           width: 4,
           height: 16,
-          background: '#3b82f6',
+          background: 'var(--yx-accent)',
           borderRadius: 2,
         }}
       />
@@ -94,8 +94,8 @@ export default function RagRecallDrawer({ open, loading, item, rank, score, onCl
                   maxHeight: 420,
                   overflow: 'auto',
                   padding: 16,
-                  background: '#f8fafc',
-                  border: '1px solid #e2e8f0',
+                  background: 'var(--yx-bg-subtle)',
+                  border: '1px solid var(--yx-border)',
                   borderRadius: 12,
                 },
               }}
@@ -104,7 +104,7 @@ export default function RagRecallDrawer({ open, loading, item, rank, score, onCl
                 style={{
                   fontSize: 14,
                   lineHeight: 1.8,
-                  color: '#334155',
+                  color: 'var(--yx-text-body)',
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                 }}

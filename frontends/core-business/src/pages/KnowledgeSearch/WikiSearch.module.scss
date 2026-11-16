@@ -13,7 +13,7 @@
   font-weight: 600;
   margin-bottom: 10px;
   :global(.anticon) { color: #6366f1; }
-  span { color: #94a3b8; font-size: 12px; font-weight: 400; margin-left: 2px; }
+  span { color: var(--yx-text-muted); font-size: 12px; font-weight: 400; margin-left: 2px; }
 }
 .answerSplit {
   display: grid;
@@ -26,7 +26,7 @@
 .answerText {
   font-size: 15px;
   line-height: 1.85;
-  color: #334155;
+  color: var(--yx-text-body);
   overflow-wrap: break-word;
   line-break: strict;
   > :first-child { margin-top: 0; }
@@ -37,39 +37,39 @@
   :global(h3) { font-size: 17px; }
   :global(ul), :global(ol) { padding-left: 22px; margin: 0 0 16px; }
   :global(li) { margin: 4px 0; }
-  :global(strong) { color: #0b2b5c; }
-  :global(blockquote) { margin: 16px 0; padding: 6px 16px; border-left: 3px solid #3b82f6; color: #475569; background: #f8fafc; }
-  :global(pre) { overflow: auto; padding: 12px 16px; background: #f8fafc; border-radius: 6px; font-size: 13px; }
+  :global(strong) { color: var(--yx-brand-dark); }
+  :global(blockquote) { margin: 16px 0; padding: 6px 16px; border-left: 3px solid var(--yx-accent); color: #475569; background: var(--yx-bg-subtle); }
+  :global(pre) { overflow: auto; padding: 12px 16px; background: var(--yx-bg-subtle); border-radius: 6px; font-size: 13px; }
 }
-.sources { background: #f8fafc; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 18px 0; }
+.sources { background: var(--yx-bg-subtle); border-left: 3px solid var(--yx-accent); border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 18px 0; }
 .sourcesSummary {
   border: 0; background: transparent; padding: 0; cursor: pointer;
   display: flex; align-items: center; gap: 7px;
-  color: #3b82f6; font-size: 13px; font-weight: 600;
+  color: var(--yx-accent); font-size: 13px; font-weight: 600;
 }
 .sourceList { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
-.sourceCard { background: #fff; border: 1px solid #e2e8f0; border-radius: 9px; padding: 12px 14px; min-width: 0; }
+.sourceCard { background: #fff; border: 1px solid var(--yx-border); border-radius: 9px; padding: 12px 14px; min-width: 0; }
 .sourceHeader {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  strong { font-size: 13px; color: #0b2b5c; max-width: 100%; overflow-wrap: anywhere; }
+  strong { font-size: 13px; color: var(--yx-brand-dark); max-width: 100%; overflow-wrap: anywhere; }
 }
-.fileFormat { color: #64748b; background: #f1f5f9; border-radius: 4px; padding: 2px 7px; font-size: 11px; }
+.fileFormat { color: var(--yx-text-secondary); background: var(--yx-bg-muted); border-radius: 4px; padding: 2px 7px; font-size: 11px; }
 .sourceKb { color: #8492a6; font-size: 12px; }
-.openSource { margin-left: auto; flex-shrink: 0; color: #3b82f6; background: none; border: 0; padding: 2px 0; font-size: 12px; cursor: pointer; }
+.openSource { margin-left: auto; flex-shrink: 0; color: var(--yx-accent); background: none; border: 0; padding: 2px 0; font-size: 12px; cursor: pointer; }
 .sourceCitations {
   display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0;
-  button { border: 1px solid #e2e8f0; color: #64748b; border-radius: 5px; padding: 3px 8px; background: #fff; font-size: 11px; cursor: pointer; }
-  button.selectedCitation { border-color: #bfd8ff; color: #2563eb; background: #eff6ff; }
+  button { border: 1px solid var(--yx-border); color: var(--yx-text-secondary); border-radius: 5px; padding: 3px 8px; background: #fff; font-size: 11px; cursor: pointer; }
+  button.selectedCitation { border-color: #bfd8ff; color: #2563eb; background: var(--yx-info-bg); }
 }
 .sourceExcerpt { background: #fafcff; border-radius: 6px; padding: 12px 14px; max-height: 240px; overflow: auto; font-size: 13px; line-height: 1.8; }
 .plainExcerpt { white-space: pre-wrap; overflow-wrap: anywhere; color: #475569; }
-.evidenceHeader { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 20px; strong { overflow-wrap: anywhere; } span { color: #64748b; } }
+.evidenceHeader { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 20px; strong { overflow-wrap: anywhere; } span { color: var(--yx-text-secondary); } }
 .sourceText { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; font-size: 14px; mark { background: #fff0b3; color: inherit; padding: 2px 0; } }
-.note { color: #64748b; font-size: 12px; }
+.note { color: var(--yx-text-secondary); font-size: 12px; }
 .tableViewport { overflow: auto; max-height: 55vh; margin: 16px 0; }
-.sourceTable { border-collapse: collapse; font-size: 13px; th, td { border: 1px solid #e2e8f0; padding: 7px 10px; min-width: 68px; white-space: pre-wrap; } th { background: #f8fafc; } }
+.sourceTable { border-collapse: collapse; font-size: 13px; th, td { border: 1px solid var(--yx-border); padding: 7px 10px; min-width: 68px; white-space: pre-wrap; } th { background: var(--yx-bg-subtle); } }
 .hitCell { background: #fff0b3; outline: 2px solid #e5ac27; outline-offset: -2px; }
-.progressSummary:focus-visible, .sourcesSummary:focus-visible, .openSource:focus-visible, .sourceCitations button:focus-visible { outline: 2px solid #3b82f6; outline-offset: 3px; }
+.progressSummary:focus-visible, .sourcesSummary:focus-visible, .openSource:focus-visible, .sourceCitations button:focus-visible { outline: 2px solid var(--yx-accent); outline-offset: 3px; }
 @media (max-width: 600px) {
   .answer { padding: 16px; }
   .answerHeading { flex-wrap: wrap; span { width: 100%; margin-left: 22px; } }
@@ -80,13 +80,13 @@
 .cellSnippet {
   display: flex; flex-direction: column; gap: 8px;
   > span { color: #8492a6; font-size: 12px; }
-  > strong { color: #0b2b5c; font-size: 16px; }
-  details { color: #64748b; font-size: 12px; }
+  > strong { color: var(--yx-brand-dark); font-size: 16px; }
+  details { color: var(--yx-text-secondary); font-size: 12px; }
   summary { cursor: pointer; }
   pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; margin-bottom: 0; }
 }
 
 .sourcePassage { margin-top: 18px; font-size: 14px; line-height: 1.9; overflow-wrap: anywhere; }
 .highlightedPassage { background: #fffbeb; border-left: 3px solid #e5ac27; border-radius: 0 6px 6px 0; padding: 16px 18px; margin: 12px 0; overflow: auto; }
-.passageContext { color: #64748b; padding: 12px 18px; }
+.passageContext { color: var(--yx-text-secondary); padding: 12px 18px; }
 .sourceText { margin-top: 18px; }
