@@ -23,6 +23,7 @@ import {
   getCallRecords,
   getCallStats,
   getCallTargets,
+  getCallTokenUsage,
   getCallTrend,
   getCapabilityStats,
   getMetaFilters,
@@ -35,6 +36,7 @@ const ENDPOINT_EXTERNAL_OBJECTS = '/platform/monitor/calls/external/objects';
 const ENDPOINT_OPEN_OBJECTS = '/platform/monitor/calls/open/objects';
 const ENDPOINT_TREND = '/platform/monitor/calls/trend';
 const ENDPOINT_RECORDS = '/platform/monitor/calls/records';
+const ENDPOINT_TOKEN_USAGE = '/platform/monitor/calls/token-usage';
 const ENDPOINT_DETAIL = '/platform/monitor/calls/req-1/detail';
 const ENDPOINT_ATTEMPTS = '/platform/monitor/calls/req-1/attempts';
 const ENDPOINT_OBJECT_DETAIL = '/platform/monitor/calls/objects/model.qwen/detail';
@@ -555,6 +557,48 @@ describe('调用监控取数层契约与映射', () => {
       // 后端解析不到时 callerName 为 null，页面回退 caller（认证类型 / platform 等既有语义）
       expect(page.items[1].callerName).toBeNull();
       expect(page.items[2].callerName).toBeNull();
+    });
+
+    it('total_tokens 映射为 totalTokens；缺失 / null 保持 null（前端走补值）', async () => {
+      routes[ENDPOINT_RECORDS] = () => ({
+        items: [
+          recordDto({ request_id: 'req-1', total_tokens: 2941 }),
+          recordDto({ request_id: 'req-2', total_tokens: null }),
+          recordDto({ request_id: 'req-3' }),
+        ],
+        total: 3,
+      });
+
+      const page = await getCallRecords('24h', baseQuery);
+
+      expect(page.items[0].totalTokens).toBe(2941);
+      expect(page.items[1].totalTokens).toBeNull();
+      // 老后端不返回该键时同样是 null，不能让页面显示 undefined
+      expect(page.items[2].totalTokens).toBeNull();
+    });
+
+    it('补值接口：request_ids 以重复 query 参数下发，null 值原样返回', async () => {
+      routes[ENDPOINT_TOKEN_USAGE] = () => ({
+        items: [
+          { request_id: 'req-1', total_tokens: 1234 },
+          { request_id: 'req-2', total_tokens: null },
+        ],
+      });
+
+      const items = await getCallTokenUsage(['req-1', 'req-2']);
+
+      expect(hits[0].url).toBe(ENDPOINT_TOKEN_USAGE);
+      const serialized = hits[0].paramsSerializer?.serialize?.(hits[0].params) ?? '';
+      expect(new URLSearchParams(serialized).getAll('request_ids')).toEqual(['req-1', 'req-2']);
+      expect(items).toEqual([
+        { requestId: 'req-1', totalTokens: 1234 },
+        { requestId: 'req-2', totalTokens: null },
+      ]);
+    });
+
+    it('补值接口：空列表不发请求', async () => {
+      expect(await getCallTokenUsage([])).toEqual([]);
+      expect(hits).toHaveLength(0);
     });
 
     it('target_any 以数组下发，并序列化为重复 query 参数', async () => {

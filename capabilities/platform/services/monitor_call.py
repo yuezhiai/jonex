@@ -16,8 +16,11 @@
 
 租户
 ----
-**不按租户过滤**（显式例外）：可见性只凭权限码
-``platform:monitor:read``。本层同样不调 ``require_tenant``。
+**一律按生效租户过滤**（2026-11-06 产品口径变更，原「不按租户过滤」例外已撤销）。
+生效租户由 route 从认证上下文（用户 JWT / 模拟 token）取出后传入 constructor，
+本层统一经 :func:`require_monitor_tenant` 校验一次，再交给仓储落成 SQL 条件。
+⛔ 不接收 body / query / 自定义 Header 指定的租户；平台管理员跨租户走既有
+impersonation（换目标租户 token），因此生效租户本身就是目标租户。
 
 已知缺口（不虚构数据，缺就返 null / 空串）
 ------------------------------------------
@@ -39,6 +42,7 @@ from capabilities.platform.dtos.monitor import (
     CallObjectItem,
     CallRecordItem,
     CallSummary,
+    CallTokenUsageItem,
     MetaFilters,
     MonitorFlags,
     TrendPoint,
@@ -55,19 +59,24 @@ from capabilities.platform.repository.monitor_caller import (
 from capabilities.platform.repository.monitor_detail import MonitorDetailRepository
 from capabilities.platform.services.monitor_buckets import FIVE_MINUTES, bucket_starts
 from capabilities.platform.services.monitor_range import enforce_max_range
+from capabilities.platform.services.monitor_scope import require_monitor_tenant
 from capabilities.platform.services.monitor_resilience import (
     MODULE_ERROR,
     resilient as _resilient,
 )
 from jonex_core.common.exceptions import (
     InvalidParameterError,
+    JonexException,
     ResourceNotFoundError,
 )
+from jonex_core.common.logger import get_logger
 from jonex_core.common.monitor_identity import (
     format_user_identity,
     is_user_identity,
 )
 from jonex_core.common.monitor_models import CallAttempt, CallLog, CallScope
+
+logger = get_logger(__name__)
 
 #: 降级态 ``module_error`` 取值（脱敏：只标「本模块暂不可用」，不带底层异常内容）。
 _MODULE_ERROR = MODULE_ERROR
@@ -89,7 +98,21 @@ _CALL_SCOPE_EXTERNAL = CallScope.EXTERNAL.value
 #: 这里与前端 ``pmFailureDrillParams`` 的下钻口径须同步扩展。
 _EXTERNAL_PROTOCOLS = frozenset({"openai"})
 
+#: 开放能力页与调用记录页统一隐藏的协议（2026-11-16 起的展示口径）。
+#: ``protocol='invoke'`` 的调用不再展示 —— 它既含浏览器发起的业务能力调用，
+#: 也含内部服务对 ``atomic.*`` 的互调，按产品要求整类隐藏，页面上只剩
+#: ``mcp`` / ``openai``。隐藏只发生在**读侧**：采集、历史数据、表结构一律不动，
+#: ``invoke`` 仍照常入库。
+_HIDDEN_CALL_PROTOCOL = "invoke"
+
 _MODE_DEGRADED = "degraded"
+
+#: 补值接口单次最多接受的 ``request_id`` 数（对齐 records 的 page_size 上限）。
+_TOKEN_BACKFILL_MAX_IDS = 100
+
+#: llm-gateway 出站行的协议值：一行 = 一次模型调用，Token 只认**自身**精确值，
+#: 不得回落 trace 合计（见 ``_token_resolver`` 的第 3 条）。
+_PROTOCOL_OPENAI = "openai"
 
 #: C5 桶粒度 → 桶宽（用于判断 ``closed``）。``5m`` 只有本 service 会补空桶。
 _BUCKET_SPANS = {
@@ -188,6 +211,11 @@ def _empty_triple(*_args, **_kwargs) -> Tuple[list, int, int]:
     return [], 0, 0
 
 
+def _empty_items(*_args, **_kwargs) -> List[Any]:
+    """补值接口降级空壳：空列表（前端据此保持 ``-``）。"""
+    return []
+
+
 def _empty_call_detail(request_id: str, *, attempt_id: Optional[str] = None) -> CallDetail:
     """C7 降级空壳（薄壳：无落点的字段一律 ``None``）。"""
     return CallDetail(
@@ -233,13 +261,16 @@ def _empty_meta_filters(*_args, **_kwargs) -> MetaFilters:
 class MonitorCallService:
     """调用监控读接口编排层。
 
-    ``session`` 由路由经 ``get_db`` 注入；本服务**不**做租户过滤（见模块 docstring）。
+    ``session`` 由路由经 ``get_db`` 注入；``tenant_id`` 是本次请求的生效租户
+    （来自认证上下文），构造时校验一次，随后交给两个读仓储落成 SQL 条件。
+    ``MonitorCallerRepository`` 按**每行记录的租户**解析用户名，不接收此参数。
     """
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, *, tenant_id: str):
         self.session = session
-        self.agg = MonitorAggregateRepository(session)
-        self.det = MonitorDetailRepository(session)
+        self.tenant_id = require_monitor_tenant(tenant_id)
+        self.agg = MonitorAggregateRepository(session, tenant_id=self.tenant_id)
+        self.det = MonitorDetailRepository(session, tenant_id=self.tenant_id)
         self.caller = MonitorCallerRepository(session)
 
     # ------------------------------------------------------------------
@@ -301,12 +332,21 @@ class MonitorCallService:
 
     @_resilient(_empty_summary)
     async def summary(
-        self, frm: str, to: str, *, direction: str, call_scope: Optional[str] = None
+        self,
+        frm: str,
+        to: str,
+        *,
+        direction: str,
+        call_scope: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
     ) -> CallSummary:
         """统计卡取数（C1 ``direction='outbound'`` / C3 ``direction='inbound'``）。
 
         ``call_scope`` 可选：外部依赖页传 ``external``，把平台内部互调排除在外；
         开放能力页不传（``direction=inbound`` 本身即外部调用方进入平台）。
+
+        ``exclude_protocol`` 只由开放能力页传 ``invoke``：KPI 必须与对象列表、
+        趋势同口径，否则会出现「统计卡含 invoke、列表不含」的自相矛盾。
         """
         start, end = self._parse_range(frm, to)
         mode = await self.agg.resolve_metric_mode(start, end)
@@ -315,6 +355,7 @@ class MonitorCallService:
             end,
             direction=direction,
             call_scope=call_scope,
+            exclude_protocol=exclude_protocol,
             degraded=(mode == _MODE_DEGRADED),
         )
         return CallSummary(
@@ -334,8 +375,10 @@ class MonitorCallService:
         )
 
     async def open_summary(self, frm: str, to: str) -> CallSummary:
-        """C3 开放能力统计卡。"""
-        return await self.summary(frm, to, direction=_DIRECTION_OPEN)
+        """开放能力统计卡：``direction=inbound`` 且排除 ``invoke``。"""
+        return await self.summary(
+            frm, to, direction=_DIRECTION_OPEN, exclude_protocol=_HIDDEN_CALL_PROTOCOL
+        )
 
     # ------------------------------------------------------------------
     # C2 / C4 · 对象列表
@@ -351,6 +394,7 @@ class MonitorCallService:
         call_scope: Optional[str] = None,
         object_type: Optional[str] = None,
         protocol: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[CallObjectItem], int, Optional[CallModeMeta]]:
@@ -364,6 +408,9 @@ class MonitorCallService:
         ``call_scope=external`` 时还会校验推导出的 ``protocol`` 是否属于外部集合
         （当前只有 ``openai``）：``object_type=能力`` 推导出 ``invoke`` 属平台内部
         互调，与外部依赖互斥，直接返空而不发查询。
+
+        ``exclude_protocol`` 同样参与推导校验：被隐藏的协议不会被任何
+        ``object_type`` 重新引回来（开放能力页的「能力」对象类型由此恒空）。
         """
         start, end = self._parse_range(frm, to)
         if object_type is not None:
@@ -371,6 +418,8 @@ class MonitorCallService:
             if derived is None or (protocol is not None and protocol != derived):
                 return [], 0, None
             if call_scope == _CALL_SCOPE_EXTERNAL and derived not in _EXTERNAL_PROTOCOLS:
+                return [], 0, None
+            if exclude_protocol is not None and derived == exclude_protocol:
                 return [], 0, None
             protocol = derived
         mode = await self.agg.resolve_metric_mode(start, end)
@@ -380,6 +429,7 @@ class MonitorCallService:
             direction=direction,
             call_scope=call_scope,
             protocol=protocol,
+            exclude_protocol=exclude_protocol,
             degraded=(mode == _MODE_DEGRADED),
             offset=self._offset(page, page_size),
             limit=page_size,
@@ -424,10 +474,12 @@ class MonitorCallService:
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[CallObjectItem], int, Optional[CallModeMeta]]:
-        """C4 开放能力对象列表（补 ``protocol`` 四值枚举筛选）。"""
+        """开放能力对象列表（补 ``protocol`` 枚举筛选，恒排除 ``invoke``）。"""
         return await self.object_list(
             frm, to, direction=_DIRECTION_OPEN,
-            object_type=object_type, protocol=protocol, page=page, page_size=page_size,
+            object_type=object_type, protocol=protocol,
+            exclude_protocol=_HIDDEN_CALL_PROTOCOL,
+            page=page, page_size=page_size,
         )
 
     # ------------------------------------------------------------------
@@ -451,8 +503,14 @@ class MonitorCallService:
         ``direction`` 切两个页签口径（outbound 外部依赖 / inbound 开放能力）；
         ``call_scope`` 进一步排除平台内部互调（外部依赖页传 ``external``）；
         不传 = 全量（与原有行为一致）。
+
+        ``direction=inbound`` 即开放能力页，趋势与统计卡、对象列表同口径排除
+        ``invoke`` —— 三个数字必须能对上，否则页面上「KPI 含 invoke、曲线不含」。
         """
         start, end = self._parse_range(frm, to)
+        exclude_protocol = (
+            _HIDDEN_CALL_PROTOCOL if direction == _DIRECTION_OPEN else None
+        )
         mode = await self.agg.resolve_metric_mode(start, end)
         rows = await self.agg.trend(
             start,
@@ -462,6 +520,7 @@ class MonitorCallService:
             target=object_id,
             direction=direction,
             call_scope=call_scope,
+            exclude_protocol=exclude_protocol,
             degraded=(mode == _MODE_DEGRADED),
         )
         now = datetime.now(timezone.utc)
@@ -510,8 +569,60 @@ class MonitorCallService:
         return points, self._mode_meta(mode, start, end)
 
     # ------------------------------------------------------------------
-    # 调用方展示名解析（读侧兜底历史数字 ID）
+    # 调用方展示名 / Token 归属解析（读侧批量兜底，均禁 N+1）
     # ------------------------------------------------------------------
+
+    async def _token_resolver(self, pairs: Sequence[Tuple[str, Optional[str]]]):
+        """构造「本行 Token 合计」解析器。
+
+        ``pairs`` 是 ``(request_id, trace_id)``。取值优先级（口径见
+        :meth:`MonitorDetailRepository.sum_token_usage`）：
+
+        1. 该行 ``request_id`` 直接命中计量行 ⇒ 取自身（模型单次调用行）；
+        2. 否则**只有链路根行（``request_id == trace_id``）**按 ``trace_id`` 汇总 ——
+           一次用户请求横跨多次模型调用，合计挂在根行上；
+        3. **链内嵌套行（``request_id != trace_id``）不做第 2 步**：它已经是独立的
+           一条调用，拿整条链路的合计冒充会让同一链路上的多行显示同一个数、纵向
+           相加成倍虚高。有自己的精确值就显示，没有就 ``-``。``protocol='openai'``
+           的行同此（单次模型调用，不该借链路合计）。
+
+        两路都是一次批量 ``IN`` 查询，与行数无关 —— 禁 N+1。所有行都没有精确计量时
+        解析器返回 ``None``（前端渲染 ``-``），⛔ 不兜 0。
+
+        **失败只降级这一列**：Token 富化出错（``metering`` schema 不可用、权限、超时）
+        时返回「全 None」解析器，列表主体照常返回 —— 不能让一个附加列把整页打成空表。
+        业务异常（``JonexException``）仍原样上抛，与 ``_resilient`` 的约定一致。
+        """
+        try:
+            by_request, by_trace = await self.det.sum_token_usage(
+                request_ids=[request_id for request_id, _ in pairs],
+                trace_ids=[trace_id for _, trace_id in pairs if trace_id],
+            )
+        except JonexException:
+            raise
+        except Exception:  # noqa: BLE001 — 附加列失败不得影响列表主体
+            logger.warning(
+                "[jonex] 调用记录 Token 富化失败，本页该列降级为 '-'", exc_info=True
+            )
+            return lambda _request_id, _trace_id, _protocol=None: None
+
+        def resolve(
+            request_id: str,
+            trace_id: Optional[str],
+            protocol: Optional[str] = None,
+        ) -> Optional[int]:
+            value = by_request.get(request_id)
+            if value is not None:
+                return value
+            # 只给链路根行挂整链路合计：嵌套行已是独立调用，回落会让同一 trace 下
+            # 多行显示同一个数，纵向相加虚高。openai 行同理，不借链路合计。
+            if protocol == _PROTOCOL_OPENAI or not trace_id:
+                return None
+            if trace_id != request_id:
+                return None
+            return by_trace.get(trace_id)
+
+        return resolve
 
     async def _resolve_callers(self, pairs: set[SourceKey]) -> dict:
         """批量解析 ``(tenant_id, source)`` → 用户名；非用户形态不进入解析集合。
@@ -628,7 +739,12 @@ class MonitorCallService:
         page: int = 1,
         page_size: int = 20,
     ) -> Tuple[List[CallRecordItem], int, Optional[CallModeMeta]]:
-        """调用记录列表（正常模式 = 逻辑调用 / 降级模式 = 物理 Attempt）。
+        """调用记录列表（正常模式 = 逻辑调用 / 降级模式 = 物理尝试 ∪ 无尝试的逻辑调用）。
+
+        降级模式的行来自 ``call_log FULL OUTER JOIN call_attempt``：有 attempt 的
+        调用按 attempt 展开，没有 attempt 的 call_log 行各计 1 行（``attempt_id``
+        为 ``None``），孤儿 attempt 也保留。两类行都由
+        :meth:`_record_from_merged` 统一组装。
 
         ``target`` 是**精确匹配**（对象详情下钻用）：同一个对象标识可能互为前缀
         （如 ``svc-a`` / ``svc-ab``），模糊匹配会把别的对象一并带进来。
@@ -687,42 +803,46 @@ class MonitorCallService:
             mapping = await self._resolve_callers(
                 self._caller_pairs((row.tenant_id, row.source) for row in rows)
             )
+            tokens = await self._token_resolver(
+                [(row.request_id, row.trace_id) for row in rows]
+            )
             return [
                 self._record_from_log(
                     row,
                     caller_name=mapping.get((row.tenant_id, row.source)),
+                    total_tokens=tokens(row.request_id, row.trace_id, row.protocol),
                 )
                 for row in rows
             ], total, mode_meta
 
-        # 降级模式的行是 N2（call_attempt），缺 direction/trigger_type/target/source/trace_id
-        # 五个 N1 列。按 request_id 批量回查 N1 补上（一页至多 page_size 行，一次 IN 查询）；
-        # 补不到的（N2 先于 N1 落库的孤儿 attempt）留 None → 组装时空串兜底。
-        n1 = await self.det.get_call_logs_by_request_ids([row.request_id for row in rows])
-        # 降级模式下 source 借用 N1 字段，租户也取该 N1 行的 tenant_id。
+        # 降级模式的行是 ``call_log FULL OUTER JOIN call_attempt`` 的合并行：
+        # call_log 列（direction / trigger_type / target / source / trace_id）已随行带出，
+        # 不需要再按 request_id 批量回查 call_log（那是旧「只读 attempt」实现的补列动作）。
         mapping = await self._resolve_callers(
-            self._caller_pairs(
-                (log.tenant_id, log.source)
-                for log in (n1.get(row.request_id) for row in rows)
-                if log is not None
-            )
+            self._caller_pairs((row.tenant_id, row.source) for row in rows)
         )
-        items = []
-        for row in rows:
-            log = n1.get(row.request_id)
-            key = None if log is None else (log.tenant_id, log.source)
-            items.append(
-                self._record_from_attempt(
-                    row,
-                    log,
-                    caller_name=None if key is None else mapping.get(key),
-                )
+        # Token 归属**逻辑调用**（call_log）：同一 request_id 的多条 attempt 行展示同一个合计
+        # （2026-11-10 需求方确认）。无 attempt 的 call_log 行取自身；孤儿 attempt
+        # 没有对应的 call_log 行 ⇒ 没有 trace，退化为自身 request_id 查询。
+        tokens = await self._token_resolver(
+            [(row.request_id, row.trace_id) for row in rows]
+        )
+        items = [
+            self._record_from_merged(
+                row,
+                caller_name=mapping.get((row.tenant_id, row.source)),
+                total_tokens=tokens(row.request_id, row.trace_id, row.protocol),
             )
+            for row in rows
+        ]
         return items, total, mode_meta
 
     @staticmethod
     def _record_from_log(
-        row: CallLog, *, caller_name: Optional[str] = None
+        row: CallLog,
+        *,
+        caller_name: Optional[str] = None,
+        total_tokens: Optional[int] = None,
     ) -> CallRecordItem:
         """N1 行 → ``CallRecordItem``。
 
@@ -750,47 +870,91 @@ class MonitorCallService:
             attempt_count=attempt_count,
             retry_count=max(attempt_count - 1, 0),
             caller_name=caller_name,
+            total_tokens=total_tokens,
         )
 
     @staticmethod
-    def _record_from_attempt(
-        row: CallAttempt,
-        log: Optional[CallLog],
+    def _record_from_merged(
+        row: Any,
         *,
         caller_name: Optional[str] = None,
+        total_tokens: Optional[int] = None,
     ) -> CallRecordItem:
-        """N2 行 → ``CallRecordItem``（``log`` 为该 attempt 的 N1 行，可能为 ``None``）。
+        """降级模式的合并行 → ``CallRecordItem``。
 
-        目标列输出**对外对象标识** ``COALESCE(mcp_tool, target)``，工具名经 N1 借出
-        （N2 本身没有该列）。
+        行来自 ``call_log FULL OUTER JOIN call_attempt``（见
+        :meth:`MonitorDetailRepository.list_records`），列已在 SQL 里统一
+        ``COALESCE(attempt, call_log)``。``row.attempt_id is None`` 表示「没有
+        attempt 的逻辑调用行」——此时状态 / 起止 / 错误码都回落 call_log 的值，
+        ``attempt_count`` 取 call_log 声明值；孤儿 attempt（有 call_attempt 无 call_log）的 call_log 列全为
+        NULL，按空串 / None 输出，``attempt_count`` 退用 ``attempt_no``。
+        「查不到就编一个」是这里最危险的写法，⛔ 不虚构 call_log 字段。
         """
-        # 降级模式下 `attempt_count` 恰恰是与实际行数对不上的那一列，
-        # 此处单行拿不到「本 request_id 的总行数」，退用 N1 值；N1 缺失时退用 attempt_no。
-        attempt_count = int(getattr(log, "attempt_count", None) or row.attempt_no or 0)
+        # 降级模式下 `attempt_count` 恰恰是与实际行数对不上的那一列，单行拿不到
+        # 「本 request_id 的总行数」，退用 call_log 声明值；call_log 缺失（孤儿 attempt）时退用 attempt_no。
+        attempt_count = int(row.logical_attempt_count or row.attempt_no or 0)
         return CallRecordItem(
             request_id=row.request_id,
-            attempt_id=row.attempt_id,  # N2 自身主键：降级模式下 C7 靠它消歧
-            trace_id=getattr(log, "trace_id", None),
-            direction=getattr(log, "direction", None) or "",
-            trigger_type=getattr(log, "trigger_type", None) or "",
-            caller=getattr(log, "source", None),
-            target=(
-                getattr(log, "mcp_tool", None)
-                or getattr(log, "target", None)
-                or ""
-            ),
-            protocol=getattr(log, "protocol", None),
+            attempt_id=row.attempt_id,  # None = 无 attempt 的逻辑调用行
+            trace_id=row.trace_id,
+            direction=row.direction or "",
+            trigger_type=row.trigger_type or "",
+            caller=row.source,
+            target=row.mcp_tool or row.target or "",
+            protocol=row.protocol,
             method=None,
             path=None,
             status=row.status,
             error_code=row.error_code,
-            duration_ms=_duration_ms(row.attempt_started_at, row.attempt_ended_at),
-            logical_started_at=_iso(row.attempt_started_at) or "",
-            final_ended_at=_iso(row.attempt_ended_at),
+            duration_ms=_duration_ms(row.started, row.ended),
+            logical_started_at=_iso(row.started) or "",
+            final_ended_at=_iso(row.ended),
             attempt_count=attempt_count,
             retry_count=max(attempt_count - 1, 0),
             caller_name=caller_name,
+            total_tokens=total_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # 调用记录 Token 补值（首屏 ``-`` 后自动补值）
+    # ------------------------------------------------------------------
+
+    @_resilient(_empty_items)
+    async def token_usage(self, request_ids: Sequence[str]) -> List[CallTokenUsageItem]:
+        """按 ``request_id`` 批量取精确 Token 合计（前端补值用轻量接口）。
+
+        与 :meth:`records` 逐行取值的口径**完全相同**（同一解析器），区别只在入口：
+        列表首屏会带 ``total_tokens``；仍为 ``None`` 的行由前端在这个接口上短轮询，
+        拿到值后原地补上。数据源仍是 ``metering.llm_usage_log``，**不重跑列表查询**
+        （筛选展开、降级判定、计数都不必再做一遍）。
+
+        顺序按入参去重后保序，便于前端逐条对照；租户由仓储条件保证，跨租户的
+        ``request_id`` 自然查不到（返回 ``total_tokens=None``，不暴露存在性）。
+        """
+        ids = list(dict.fromkeys(rid for rid in request_ids if rid))
+        if not ids:
+            return []
+        if len(ids) > _TOKEN_BACKFILL_MAX_IDS:
+            raise InvalidParameterError(
+                message=f"一次最多查询 {_TOKEN_BACKFILL_MAX_IDS} 条调用记录的 Token",
+                details={"count": len(ids), "max": _TOKEN_BACKFILL_MAX_IDS},
+            )
+        # 先补 trace：能力 / MCP 行的 Token 挂在 trace 上（只有 call_log 行有该列）。
+        logs = await self.det.get_call_logs_by_request_ids(ids)
+        resolve = await self._token_resolver(
+            [(rid, getattr(logs.get(rid), "trace_id", None)) for rid in ids]
+        )
+        return [
+            CallTokenUsageItem(
+                request_id=rid,
+                total_tokens=resolve(
+                    rid,
+                    getattr(logs.get(rid), "trace_id", None),
+                    getattr(logs.get(rid), "protocol", None),
+                ),
+            )
+            for rid in ids
+        ]
 
     # ------------------------------------------------------------------
     # C7 · 单次调用详情
@@ -800,29 +964,32 @@ class MonitorCallService:
     async def call_detail(
         self, request_id: str, *, attempt_id: Optional[str] = None
     ) -> CallDetail:
-        """C7 单次调用详情。
+        """单次调用详情 单次调用详情（``attempt_id`` 是**行选择器**，不是降级必填项）。
 
-        模式判定收窄到**单条**（``count_unlinkable_for_request``）—— C7 没有
-        ``from``/``to``，套不上区间判据。降级模式必须带 ``attempt_id``，
-        缺失抛 ``1001``（路径不变，attempt_id 作可选查询参数）。
+        - 传 ``attempt_id`` ⇒ 返回该物理尝试行，``mode_meta.metric_mode='degraded'``；
+          必须同时校验 ``tenant_id`` / ``request_id`` / ``attempt_id``（见
+          :meth:`MonitorDetailRepository.get_attempt_for_request`），
+          不属于该 request 的 attempt 按不存在处理。
+        - 不传 ⇒ 返回该 request 的逻辑调用行（``call_log``），
+          ``mode_meta.metric_mode='logical'``。
+
+        两种情况都取不到 ⇒ 404（错误码 1002）。2026-11-11 起删除「降级模式必须
+        提供 attempt_id，否则 1001」整个分支，也不再调用
+        ``count_unlinkable_for_request`` —— 没有 attempt 的逻辑调用行同样能看详情。
         """
-        degraded = await self.det.count_unlinkable_for_request(request_id) > 0
-        if degraded:
-            if not attempt_id:
-                raise InvalidParameterError(
-                    message="降级模式下查询调用详情必须提供 attempt_id",
-                    details={"request_id": request_id},
-                )
-            row: Optional[Any] = await self.det.get_attempt_by_attempt_id(attempt_id)
+        if attempt_id:
+            row: Optional[Any] = await self.det.get_attempt_for_request(
+                request_id, attempt_id
+            )
+            metric_mode = _MODE_DEGRADED
         else:
             row = await self.det.get_call_log_by_request_id(request_id)
+            metric_mode = "logical"
         if row is None:
             raise ResourceNotFoundError(
                 message=f"调用记录不存在: {request_id}",
             )
-        return self._detail_from_row(
-            request_id, row, _MODE_DEGRADED if degraded else "logical"
-        )
+        return self._detail_from_row(request_id, row, metric_mode)
 
     @staticmethod
     def _detail_from_row(request_id: str, row: Any, metric_mode: str) -> CallDetail:

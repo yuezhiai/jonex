@@ -78,6 +78,9 @@ export default function TrendAreaChart({
   detailFields,
 }: Props) {
   const { t } = useTranslation();
+  // ⚠ 图表由 G2 画在 canvas 上，canvas 解析不了 CSS 变量：`var(--yx-accent)` 经 d3-color 解析得 null，
+  // 描边落成 rgba(0,0,0,0)（透明）、面积渐变还会直接抛错 —— 曲线就整条消失。
+  // 所以颜色只能是字面量（与 theme.css 的 --yx-accent 同值），色值收敛时跳过这两张趋势图。
   const color = '#3b82f6';
 
   // plots 的 height 只吃 number，百分比进不去，所以 fill 模式下量出容器实际高度再喂给它。
@@ -158,6 +161,7 @@ export default function TrendAreaChart({
               tick: false,
               line: true,
               grid: true,
+              // 同上：canvas 里 `var(--yx-border)` 解析成透明，网格线会整片消失，用字面量
               gridStroke: '#e2e8f0',
               labelFontSize: 12,
               gridStrokeOpacity: 1,

@@ -37,10 +37,11 @@ const TREND_METRICS: { value: PmTrendMetric; labelKey: string }[] = [
 /**
  * 协议下拉的静态兜底候选（M1 元数据拿不到时使用）。
  *
- * `invoke` = 普通开放能力调用，`mcp` = MCP 工具调用（对象标识为工具名），
- * `openai` = 外部依赖。`http` 后端仍无写入方，不提供。
+ * `mcp` = MCP 工具调用（对象标识为工具名），`openai` = 模型服务。
+ * `invoke` 已被产品口径隐藏（2026-11-16，开放能力页 KPI/趋势/列表都不再含它），
+ * 不能留在候选里；`http` 后端仍无写入方，不提供。
  */
-export const PROTOCOLS: PmCallProtocol[] = ['invoke', 'mcp', 'openai'];
+export const PROTOCOLS: PmCallProtocol[] = ['mcp', 'openai'];
 
 interface Props extends PmPaneProps {
   scope: PmCallScope;
@@ -244,17 +245,33 @@ export default function CallScopeView({
     if (!allObjects.some((row) => row.name === trendTarget)) setTrendTarget(PM_ALL);
   }, [allObjects, trendTarget]);
 
-  /** 协议候选优先走 M1（后端补包后自动生效），拿不到就用枚举兜底 */
+  /**
+   * 协议候选优先走筛选元数据接口（后端补包后自动生效），拿不到就用枚举兜底。
+   *
+   * 开放能力页的列表与 KPI 都已排除 `invoke`（后端 `_HIDDEN_CALL_PROTOCOL`），
+   * 下拉里就不能留一个选中后必然为空的选项 —— 元数据里的候选要过滤，枚举兜底
+   * （`PROTOCOLS`）本身已不含 invoke。外部依赖页（isTarget）不隐藏任何协议，
+   * 保持原样。
+   */
   const protocolOptions = useMemo(() => {
+    // 元数据的 `protocol` 是 `string | null`（契约里未收窄），隐藏集合也按 string 比对
+    const hidden: readonly string[] = isTarget ? [] : ['invoke'];
     const fromMeta = (meta?.objects ?? [])
       .map((item) => item.protocol)
-      .filter((item): item is PmCallProtocol => item !== null && (PROTOCOLS as string[]).includes(item));
-    const values = fromMeta.length ? [...new Set(fromMeta)] : PROTOCOLS;
+      .filter(
+        (item): item is PmCallProtocol =>
+          item !== null &&
+          (PROTOCOLS as string[]).includes(item) &&
+          !hidden.includes(item),
+      );
+    const values = fromMeta.length
+      ? [...new Set(fromMeta)]
+      : PROTOCOLS.filter((item) => !hidden.includes(item));
     return [
       { value: PM_ALL, label: t('platformMonitor.records.allProtocols') },
       ...values.map((item) => ({ value: item, label: t(`platformMonitor.callProtocol.${item}`) })),
     ];
-  }, [meta, t]);
+  }, [meta, t, isTarget]);
 
   const columns = useMemo<TableColumnsType<PmCallScopeRow>>(() => {
     /**

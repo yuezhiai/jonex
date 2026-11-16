@@ -12,8 +12,10 @@
 
 租户
 ----
-**不按租户 / 空间过滤**（显式例外）：可见性只凭权限码
-``platform:monitor:read``。本层不调 ``require_tenant``，route 层先判权后查询。
+**一律按生效租户过滤**（2026-11-06 产品口径变更，原「不按租户 / 空间过滤」例外已撤销）。
+生效租户由 route 从认证上下文（用户 JWT / 模拟 token）取出后传入 constructor，
+本层经 :func:`require_monitor_tenant` 校验一次，再交给仓储落成 SQL 条件。
+⛔ 不新增空间（``space_id``）过滤（需求明确非目标）。
 """
 
 from datetime import datetime, timedelta
@@ -33,6 +35,7 @@ from capabilities.platform.dtos.monitor import (
 from capabilities.platform.repository.monitor_task import MonitorTaskRepository
 from capabilities.platform.services.monitor_buckets import bucket_starts
 from capabilities.platform.services.monitor_range import enforce_max_range
+from capabilities.platform.services.monitor_scope import require_monitor_tenant
 from capabilities.platform.services.monitor_resilience import (
     MODULE_ERROR,
     resilient as _resilient,
@@ -214,11 +217,16 @@ def _empty_pair(*_args, **_kwargs) -> Tuple[list, int]:
 
 
 class MonitorTaskService:
-    """任务监控读接口（T1–T4）编排层。"""
+    """任务监控读接口（T1–T4）编排层。
 
-    def __init__(self, session: AsyncSession):
+    ``tenant_id`` 是本次请求的生效租户（来自认证上下文），构造时校验一次，
+    随后交给仓储落成裸 SQL 的 ``tenant_id`` 条件。
+    """
+
+    def __init__(self, session: AsyncSession, *, tenant_id: str):
         self.session = session
-        self.repo = MonitorTaskRepository(session)
+        self.tenant_id = require_monitor_tenant(tenant_id)
+        self.repo = MonitorTaskRepository(session, tenant_id=self.tenant_id)
 
     # ------------------------------------------------------------------
     # 编排内部工具

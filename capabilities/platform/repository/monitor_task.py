@@ -9,6 +9,8 @@
 
 取数口径：
 
+- **一律按生效租户过滤**（2026-11-06 产品口径变更）：``tenant_id`` 由 service 构造时传入，
+  T1–T4 的每条 SQL（含 ``waiting_now`` 子查询）都带 ``t.tenant_id = :tenant_id``。
 - 区间**左闭右开** ``col >= :start AND col < :end``，**禁 ``BETWEEN``**；区间锚点统一
   ``tasks.created_at``（T1–T4 同一锚点 ⇒ 同一任务集合）。
 - **时间口径**：``created_at`` / ``started_at`` / ``finished_at`` 都是
@@ -53,10 +55,15 @@ _STEP_IN = "(" + ", ".join(f"'{c}'" for c in _STEP_CODES) + ")"
 
 
 class MonitorTaskRepository(BaseRepository):
-    """任务监控取数（T1–T4），全部裸 SQL、不 import task_center。"""
+    """任务监控取数（T1–T4），全部裸 SQL、不 import task_center。
 
-    def __init__(self, session: AsyncSession):
+    租户：一律按生效租户过滤（``tenant_id`` 由 service 构造时传入），
+    包括 T1 的 ``waiting_now`` 实时快照子查询 —— 否则实时快照会泄露他租户的排队量。
+    """
+
+    def __init__(self, session: AsyncSession, *, tenant_id: str):
         super().__init__(session)
+        self.tenant_id = tenant_id
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -106,13 +113,19 @@ class MonitorTaskRepository(BaseRepository):
                 (
                     SELECT count(*) FROM task_center.tasks
                     WHERE status = 'pending' AND is_deleted = 0
+                      AND tenant_id = :tenant_id
                 )                                                                AS waiting_now
             FROM task_center.tasks
             WHERE created_at >= :start AND created_at < :end
               AND is_deleted = 0
+              AND tenant_id = :tenant_id
             """
         )
-        row = (await self.session.execute(sql, {"start": start, "end": end})).mappings().one()
+        row = (
+            await self.session.execute(
+                sql, {"tenant_id": self.tenant_id, "start": start, "end": end}
+            )
+        ).mappings().one()
         return dict(row)
 
     # ------------------------------------------------------------------
@@ -151,11 +164,12 @@ class MonitorTaskRepository(BaseRepository):
                 count(*) FILTER (WHERE t.status = 'failed')                      AS failed_count
             FROM task_center.tasks t
             WHERE t.created_at >= :start AND t.created_at < :end
-              AND t.is_deleted = 0{type_sql}
+              AND t.is_deleted = 0
+              AND t.tenant_id = :tenant_id{type_sql}
             GROUP BY 1 ORDER BY 1
             """
         )
-        params = {"start": start, "end": end, **type_params}
+        params = {"tenant_id": self.tenant_id, "start": start, "end": end, **type_params}
         rows = (await self.session.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows]
 
@@ -175,7 +189,8 @@ class MonitorTaskRepository(BaseRepository):
         type_sql, type_params = self._type_filter(task_type)
         base_where = (
             "t.status = 'failed' AND t.created_at >= :start AND t.created_at < :end "
-            f"AND t.is_deleted = 0{type_sql}"
+            "AND t.is_deleted = 0 AND t.tenant_id = :tenant_id"
+            f"{type_sql}"
         )
         count_sql = sa_text(f"SELECT count(*) AS total FROM task_center.tasks t WHERE {base_where}")
         # t.finished_at：北京 naive，输出由 service 补 +08:00
@@ -198,7 +213,7 @@ class MonitorTaskRepository(BaseRepository):
             LIMIT :limit OFFSET :offset
             """
         )
-        params = {"start": start, "end": end, **type_params}
+        params = {"tenant_id": self.tenant_id, "start": start, "end": end, **type_params}
         total = int((await self.session.execute(count_sql, params)).scalar() or 0)
         rows = (
             await self.session.execute(list_sql, {**params, "limit": limit, "offset": offset})
@@ -234,11 +249,12 @@ class MonitorTaskRepository(BaseRepository):
                 )::int                                                           AS avg_duration_ms
             FROM task_center.tasks t
             WHERE t.created_at >= :start AND t.created_at < :end
-              AND t.is_deleted = 0{type_sql}
+              AND t.is_deleted = 0
+              AND t.tenant_id = :tenant_id{type_sql}
             GROUP BY 1
             """
         )
-        params = {"start": start, "end": end, **type_params}
+        params = {"tenant_id": self.tenant_id, "start": start, "end": end, **type_params}
         rows = (await self.session.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows]
 
@@ -287,13 +303,14 @@ class MonitorTaskRepository(BaseRepository):
              AND a.attempt = t.current_attempt
             WHERE t.created_at >= :start AND t.created_at < :end
               AND t.is_deleted = 0
+              AND t.tenant_id = :tenant_id
               AND s.is_deleted = 0
               AND s.step_code IN {_STEP_IN}{type_sql}
             GROUP BY 1, 2
             ORDER BY 2
             """
         )
-        params = {"start": start, "end": end, **type_params}
+        params = {"tenant_id": self.tenant_id, "start": start, "end": end, **type_params}
         rows = (await self.session.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows]
 

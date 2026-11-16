@@ -115,7 +115,7 @@
 .yx-pm-count-badge {
   font-size: 12px;
   font-weight: 600;
-  color: #dc2626;
+  color: var(--yx-error-text);
   background: #fef2f2;
   border-radius: 4px;
   padding: 0 6px;
@@ -349,7 +349,8 @@
 
 .yx-pm-bar-percent {
   display: inline-block;
-  width: 40px;
+  /* 两位小数（100.00%）比原来的整数宽，40px 会被挤成换行前的挤压 */
+  width: 56px;
   margin-left: 10px;
   text-align: right;
   font-style: normal;
@@ -446,67 +447,8 @@
   min-height: 0;
 }
 
-/* 表格内部的高度分配。antd 的 DOM 是
-   .ant-table-wrapper > .ant-spin > .ant-spin-container > (.ant-table + .ant-pagination)，
-   分页在 spin 容器里，所以那一层要是纵向 flex —— 表体 flex:1、表头与分页 flex-shrink:0。
-   `y` 的 inline max-height 只是上限，真正的高度由这条链给出。 */
-.yx-pm-records-table {
-  height: 100%;
-}
-
-.yx-pm-records-table > .ant-form {
-  flex-shrink: 0;
-}
-
-.yx-pm-records-table > .ant-table-wrapper {
-  flex: 1;
-  min-height: 0;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-spin {
-  height: 100%;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-spin-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-table {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-table-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-table-header {
-  flex-shrink: 0;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-table-body {
-  flex: 1;
-  overflow-y: auto !important;
-  overflow-x: auto !important;
-}
-
-.yx-pm-records-table > .ant-table-wrapper .ant-pagination {
-  flex-shrink: 0;
-  padding-top: 12px;
-  margin: 0 !important;
-}
-
-/* CommonTable 的筛选区是 antd Row/Col，Row 自带 -8px 左右外边距（gutter 16 的一半，本该由
-   Col 的 8px 内边距抵消）。上一版套着卡片，内边距替它兜住了；现在列表满宽，这 8px 直接顶出
-   容器，在外层 PageContent 上多出一条横向滚动条。补等量内边距抵消 —— 首列可见位置不变，
-   被抵消掉的 8px 正好对上表格单元格自身的内边距。 */
-.yx-pm-records-table > .ant-form {
+/* 表格高度分配由 layout.css 的 .yx-table-fill 负责，这里只补筛选区的 gutter 补偿 */
+.yx-table-fill > .ant-form {
   padding-inline: 8px;
 }
 
@@ -637,7 +579,7 @@
   padding: 10px 12px;
   max-height: 260px;
   overflow: auto;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   border: 1px solid var(--yx-border-light);
   border-radius: 6px;
   font-family: var(--yx-font-mono);

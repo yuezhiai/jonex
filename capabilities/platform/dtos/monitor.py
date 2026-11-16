@@ -57,8 +57,8 @@ class CallObjectItem(BaseModel):
 class CallRecordItem(BaseModel):
     """调用记录项（C6）"""
 
-    request_id: str  # 逻辑调用唯一键（去重键，**`call_log` 内唯一**；降级模式改取 call_attempt，同一 request_id 可重复属预期）
-    attempt_id: Optional[str] = None  # 本行对应的 attempt；降级模式下同 request_id 可重复，C7 寻址必须带上它（正常模式无 attempt 概念 ⇒ None）
+    request_id: str  # 逻辑调用唯一键（**`call_log` 内唯一**；降级模式按尝试展开，同一 request_id 可重复属预期）
+    attempt_id: Optional[str] = None  # 本行对应的物理尝试；None 表示该行是逻辑调用（无尝试记录）。单次调用详情 按它选择行：传了取该尝试，不传取逻辑行
     trace_id: Optional[str]  # 链路关联 ID
     direction: str
     trigger_type: str  # 触发方 → 物理列 `monitor.call_log.trigger_type`；值域 `user`（用户直接发起）/ `system`（系统后台批量，如入库向量化），见 `jonex_core/common/monitor_models.py:92-102`
@@ -77,6 +77,25 @@ class CallRecordItem(BaseModel):
     # 纯增量：解析出的调用方展示名（users.username）。
     # ``caller`` 始终保留原始 source —— 筛选 / 下钻仍用原值。
     caller_name: Optional[str] = None
+    # 本行所属**逻辑调用**消耗的精确 Token 合计。
+    # 数据源恒为 ``metering.llm_usage_log``（``call_log`` 无 Token 物理列），口径：
+    # 1) 该行 ``request_id`` 能直接命中计量行（模型单次调用，如 ``openai`` 行）⇒ 取自身合计；
+    # 2) 否则按 ``trace_id`` 汇总（能力调用 / MCP 调用行，一次逻辑调用含多次模型调用）；
+    # 3) ``protocol='openai'`` 的行不做第 2 步（自身没有精确值就是 ``-``，不得拿 trace 合计冒充）。
+    # ``None`` = 没有精确计量（未产生模型调用 / 只有估算值 / 计量尚未落库），前端渲染 ``-``。
+    total_tokens: Optional[int] = None
+
+
+class CallTokenUsageItem(BaseModel):
+    """单条调用记录的精确 Token 合计，供首屏后补值轮询使用。
+
+    只服务前端「首屏 ``-`` 后自动补值」的轻量轮询，口径与
+    :attr:`CallRecordItem.total_tokens` 完全一致 —— 同一个 request_id 两处取值必须相同。
+    """
+
+    request_id: str
+    # ``None`` = 仍然没有精确计量（含「本来就没调模型」与「还没落库」两种，调用方无法区分）
+    total_tokens: Optional[int] = None
 
 
 class AttemptItem(BaseModel):
@@ -207,6 +226,38 @@ class TokenUsageItem(BaseModel):
     avg_tokens_per_call: Optional[float]  # 分母只算「有用量回传」的调用；分母 0 ⇒ null
     last_called_at: Optional[str]  # 最近调用时间（UTC ISO8601）
     unmetered_count: int = 0  # 未计量调用数 = SUM(call_count) FILTER (WHERE total_tokens = 0)
+
+
+# ==================== 未归因调用（tenant_id='unknown'）====================
+# 不是「某个租户」的数据，而是**归因失败**的调用：调用方没带 ``X-Jonex-Tenant-Id``
+# （或链式网关把上下文头剥掉了），网关按兜底值 ``unknown`` 记量。租户维度的读接口
+# 一律排除它们（见 ``services/monitor_scope.py``），本族只做平台级完整性汇总。
+
+
+class UnattributedSceneItem(BaseModel):
+    """未归因调用按 scene 的分布项（scene 可能保留、tenant 丢失）"""
+
+    scene: str  # 缺失时为 unknown
+    call_count: int  # = SUM(call_count)，⛔ 不是行数（embedding 是聚合行）
+    total_tokens: int
+
+
+class UnattributedSummary(BaseModel):
+    """未归因调用汇总（平台级，不按租户过滤）
+
+    ⚠️ ``share_of_*`` 只对平台管理员返回（见 service 的 ``include_share``）：
+    占比分母是全平台总量，租户管理员拿到它即可反推平台规模，故对非平台管理员
+    一律返 ``null``（绝对量仍返回 —— 这些行本就不属于任何租户）。
+    """
+
+    call_count: int  # = SUM(call_count)
+    total_tokens: int
+    first_seen_at: Optional[str]  # 窗口内最早一条（UTC ISO8601）；空窗 ⇒ null
+    last_seen_at: Optional[str]  # 窗口内最晚一条（UTC ISO8601）；空窗 ⇒ null
+    scenes: List[UnattributedSceneItem]  # 按 total_tokens 降序的前 5 个 scene
+    share_of_calls: Optional[float]  # 未归因调用 ÷ 同窗口全平台调用；分母 0 或无权 ⇒ null
+    share_of_tokens: Optional[float]  # 未归因 Token ÷ 同窗口全平台 Token；同上
+    flags: Optional[MonitorFlags]
 
 
 # ==================== 任务监控族（T1–T4）====================

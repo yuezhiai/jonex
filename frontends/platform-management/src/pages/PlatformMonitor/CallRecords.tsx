@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Form, Typography } from 'antd';
+import { Alert, Form, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
@@ -13,9 +13,10 @@ import {
   PM_RECORD_PAGE_SIZE,
   PM_RECORD_REQUEST_ID_WIDTH,
   PM_RECORD_SCROLL_X,
+  PM_RECORD_TOKEN_WIDTH,
   PM_RECORD_TRACE_ID_WIDTH,
 } from '../../constants/platformMonitor';
-import { fmtLatencyOrDash } from './format';
+import { fmtCount, fmtLatencyOrDash } from './format';
 import { enumLabel } from './labels';
 import { capabilityLabel, expandKeywordTargets } from './capabilityLabels';
 import { buildCallTargetOptions, buildSourceOptions } from './identifierOptions';
@@ -25,8 +26,10 @@ import ModuleError from './components/ModuleError';
 import MetaHint from './components/MetaHint';
 import TargetObjectFilter from './components/TargetObjectFilter';
 import CallDetailDrawer from './components/CallDetailDrawer';
+import { useCallTokenBackfill } from './useCallTokenBackfill';
 import type {
   PmCallDirection,
+  PmCallMetricMode,
   PmCallProtocol,
   PmCallRecord,
   PmCallRecordFilters,
@@ -38,12 +41,15 @@ import type {
 const DIRECTIONS: PmCallDirection[] = ['inbound', 'outbound'];
 const STATUSES: PmCallStatus[] = ['success', 'failed', 'cancelled', 'running', 'unknown'];
 const TRIGGERS: PmCallRecord['triggerType'][] = ['user', 'system'];
-// 协议下拉候选：invoke / mcp / openai 均有写入方（mcp 来自 MCP 工具调用）；
+// 协议下拉候选：invoke 已被产品口径隐藏（2026-11-16），mcp / openai 仍有写入方；
 // http 仍无写入方，不提供选项。
-export const PROTOCOLS: PmCallProtocol[] = ['invoke', 'mcp', 'openai'];
+export const PROTOCOLS: PmCallProtocol[] = ['mcp', 'openai'];
 // 下钻链接里的 protocol 仍按接口的全量枚举校验（含暂未出现在下拉里的 http）：
 // 将来出现新的写入方时，记录页不会因为入口没列进下拉就把它当成脏链接丢掉。
 const PROTOCOL_PARAM_VALUES: PmCallProtocol[] = ['invoke', 'mcp', 'http', 'openai'];
+// 后端已隐藏、链接里仍然可能出现的协议：读到时忽略（按「全部协议」展示），
+// 不清 URL —— 分享链接刷新后不至于突然变成空表。
+const HIDDEN_PROTOCOLS: readonly PmCallProtocol[] = ['invoke'];
 
 /** 读 URL 里的枚举筛选：不在候选里的值一律忽略，脏链接不该把列表筛成空 */
 function readEnumFilter<T extends string>(
@@ -89,7 +95,8 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
     // 校验用接口的全量枚举（PROTOCOL_PARAM_VALUES）而不是下拉候选：
     // 将来出现 mcp / http 写入方时，记录页不会把入口给的链接当成脏链接丢掉
     const protocol = readEnumFilter(searchParams, PM_RECORD_FILTER_PARAMS.protocol, PROTOCOL_PARAM_VALUES);
-    if (protocol) next.protocol = protocol;
+    // 已被隐藏的协议（invoke）不参与筛选：链接保留、结果按全部可见记录展示
+    if (protocol && !HIDDEN_PROTOCOLS.includes(protocol)) next.protocol = protocol;
     const source = searchParams.get(PM_RECORD_FILTER_PARAMS.source)?.trim();
     if (source) next.source = source;
     const target = searchParams.get(PM_RECORD_FILTER_PARAMS.target)?.trim();
@@ -125,6 +132,17 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
   const [error, setError] = useState<unknown>(null);
   /** 详情抽屉的定位键。降级模式下同一 requestId 有多行，必须连 attemptId 一起带过去 */
   const [detailTarget, setDetailTarget] = useState<{ requestId: string; attemptId: string | null } | null>(null);
+  /**
+   * 本次列表响应的统计口径（整次查询统一）。降级 = 行按物理 attempt 展开，
+   * 没有尝试记录的调用各计 1 行。取数失败时保留上一次的值 —— 一次抖动不该把口径提示闪没。
+   */
+  const [metricMode, setMetricMode] = useState<PmCallMetricMode | null>(null);
+
+  /**
+   * Token 用量补值。首屏缺值的行先渲染 `-`，由这个 hook 在后台短轮询
+   * 轻量接口补上；不重跑列表查询，也不阻塞首屏。
+   */
+  const { tokens: backfillTokens, schedule: scheduleTokenBackfill } = useCallTokenBackfill();
 
   // 表体高度。这个值只是 antd 的 `max-height` 上限，实际高度由 `.yx-pm-records-table` 那条
   // flex 链分配，所以取容器全高即可、不必自己扣表头与分页。取容器而不用 `calc(100vh - N)`：
@@ -260,9 +278,17 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
         page,
         pageSize,
       });
+      // 口径随每次成功响应更新（切换时间窗 / 手动刷新 / 轮询都会重新取数）；
+      // 失败走 catch，上面这次赋值不会执行，上一次的口径因此得以保留
+      setMetricMode(data.metricMode);
+      // 首屏已带 Token 的行不必再问；缺值的行交给后台补值（10 秒内到账即原地填空）。
+      // 传空数组 = 取消上一页的轮询，避免翻页后还在补旧 page 的值。
+      scheduleTokenBackfill(
+        data.items.filter((row) => row.totalTokens == null).map((row) => row.requestId),
+      );
       return { list: data.items, total: data.total };
     },
-    [window, meta, t],
+    [window, meta, t, scheduleTokenBackfill],
   );
 
   /**
@@ -350,6 +376,18 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
         render: fmtLatencyOrDash,
       },
       {
+        // 本行所属逻辑调用的精确 Token 合计（多次模型调用取合计、估算值不计）。
+        // 首屏缺值渲染 `-`，随后台短轮询原地补值 —— 不新增排序 / 筛选 / 明细入口。
+        title: t('platformMonitor.records.column.tokens'),
+        dataIndex: 'totalTokens',
+        align: 'right',
+        width: PM_RECORD_TOKEN_WIDTH,
+        render: (value: number | null, row: PmCallRecord) => {
+          const total = backfillTokens[row.requestId] ?? value;
+          return total == null ? '-' : fmtCount(total);
+        },
+      },
+      {
         title: t('platformMonitor.records.column.errorCode'),
         dataIndex: 'errorCode',
         width: 110,
@@ -386,7 +424,8 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
           ),
       },
     ],
-    [t],
+    // `backfillTokens` 进依赖：补值到账后列定义重建，表格原地重渲染把 `-` 换成数字
+    [t, backfillTokens],
   );
 
   if (error) {
@@ -404,7 +443,7 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
       <div className="yx-pm-records-host" ref={hostRef}>
         <CommonTable<PmCallRecord, PmCallRecordFilters>
           ref={tableRef}
-          className="yx-pm-records-table"
+          className="yx-pm-records-table yx-table-fill"
           filters={filters}
           initialFilters={initialFilters}
           /**
@@ -434,11 +473,28 @@ export default function CallRecords({ window, refreshKey, manualRefreshKey }: Pm
               />
             </Form.Item>
           )}
+          /**
+           * 降级提示借这个「筛选行之下、表格之上」的整行扩展位：筛选区由 CommonTable 内部渲染，
+           * 共享组件没有开放表格上方的插槽。只在降级时挂上，非降级不白占那 12px 间距。
+           * 文案解释「为什么条数会比逻辑调用多」，不遮挡表头。
+           */
+          filterExtraRow={
+            metricMode === 'degraded'
+              ? () => (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message={t('platformMonitor.records.degradedMode.title')}
+                    description={t('platformMonitor.records.degradedMode.description')}
+                  />
+                )
+              : undefined
+          }
           columns={columns}
-          // 降级模式下 requestId 会重复，只有 attemptId 唯一；正常模式（attemptId 为 null）回落
-          // requestId + direction —— 同一次能力派发可能同时落 inbound/outbound 两条 N1，
-          // 只认 requestId 会在这种情况下撞 key
-          rowKey={(row) => `${row.requestId}:${row.attemptId ?? row.direction}`}
+          // 降级模式下 requestId 会重复，只有 attemptId 唯一，靠它区分；但也存在 attemptId 为 null
+          // 的行 —— 表示该调用没有物理尝试记录（各计 1 行），回落到固定标记 `log` 表示「逻辑行」。
+          // call_log.request_id 本表内唯一，所以同一 requestId 至多一条逻辑行，不会撞 key。
+          rowKey={(row) => `${row.requestId}:${row.attemptId ?? 'log'}`}
           size="small"
           scroll={{ x: PM_RECORD_SCROLL_X, y: bodyHeight }}
           defaultPageSize={PM_RECORD_PAGE_SIZE}

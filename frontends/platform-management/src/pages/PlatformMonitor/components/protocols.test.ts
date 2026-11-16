@@ -4,7 +4,9 @@
  * 两个页签（开放能力 / 调用记录）的协议下拉都有两层候选：
  *  1. 静态白名单 —— M1 元数据拿不到时的兜底；
  *  2. M1 对象清单 —— 后端放行 mcp 后自动出现。
- * 这里钉住第 1 层：MCP 调用必须能在下拉里选到，且既有 invoke / openai 不回归。
+ * 这里钉住第 1 层：MCP 调用必须能在下拉里选到，且 openai 不回归；
+ * `invoke` 自 2026-11-16 起被产品口径隐藏（KPI / 趋势 / 列表都不再含它），
+ * 下拉里不能留一个选中后必然为空的选项。
  *
  * 下拉文案走 `platformMonitor.callProtocol.<value>`；白名单里的每个取值都必须在
  * zh/en 两套语言里有对应键，否则下拉会出现裸 key。
@@ -28,12 +30,12 @@ function resolveKey(node: unknown, path: string): unknown {
 }
 
 describe.each(PROTOCOL_WHITELISTS)('%s', (_label, protocols) => {
-  it('包含 mcp，且既有 invoke / openai 不回归', () => {
+  it('包含 mcp / openai，且 hidden 的 invoke 不出现在候选里', () => {
     expect(protocols).toContain('mcp');
-    expect(protocols).toContain('invoke');
     expect(protocols).toContain('openai');
-    // 顺序即下拉顺序：invoke 在最前保持不变，mcp 紧随其后，openai 仍在末位
-    expect(protocols).toEqual(['invoke', 'mcp', 'openai']);
+    expect(protocols).not.toContain('invoke');
+    // 顺序即下拉顺序：mcp 在前，openai 在末位
+    expect(protocols).toEqual(['mcp', 'openai']);
   });
 
   it('每个协议在 zh / en 都有下拉文案', () => {

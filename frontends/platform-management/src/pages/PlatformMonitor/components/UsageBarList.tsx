@@ -1,10 +1,10 @@
 import { Empty, Flex, Skeleton } from 'antd';
 import { useTranslation } from 'react-i18next';
-import { fmtCompact } from '../format';
+import { fmtCompact, fmtPercent } from '../format';
 import type { PmModelShareItem } from '../types';
 
 /** 用同一色系的深浅区分条目，不引入第二组语义色（这一块讲的是「谁占得多」，不是好坏） */
-const PALETTE = ['#1248a0', '#2563eb', '#3b82f6', '#60a5fa', '#93c5fd'];
+const PALETTE = ['#1248a0', '#2563eb', 'var(--yx-accent)', '#60a5fa', '#93c5fd'];
 
 interface Props {
   items: PmModelShareItem[];
@@ -15,7 +15,8 @@ interface Props {
  * 横向占比条列表（模型使用分布）。
  *
  * 百分比由 `count` 与同组总量算出，**不取数据里的写死值** —— 否则改一个 count
- * 就要同步改百分比，两处迟早对不上。设计稿里百分比是整数，这里也按整数渲染。
+ * 就要同步改百分比，两处迟早对不上。展示保留两位小数（`12.34%`）：条目一多，
+ * 整数会把小占比压成 0%，看不出谁在末尾。
  *
  * 三态（骨架 / 空态 / 列表）共用 `.yx-pm-bar-slot` 一块高度下限，理由见 index.scss。
  */
@@ -46,7 +47,7 @@ export default function UsageBarList({ items, loading }: Props) {
                   </span>
                   <span className="yx-pm-bar-value">
                     {fmtCompact(item.count)}
-                    <em className="yx-pm-bar-percent">{Math.round(share)}%</em>
+                    <em className="yx-pm-bar-percent">{fmtPercent(share)}</em>
                   </span>
                 </div>
                 <div className="yx-pm-bar-track">

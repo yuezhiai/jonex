@@ -16,14 +16,15 @@
   ``unlinkable_rows > 0`` ⇒ 整次查询走降级公式。落在 :meth:`count_unlinkable_rows`
   与 :meth:`resolve_metric_mode`。
 
-硬约束
-------
-**查询一律不过滤 ``tenant_id``**（显式例外）—— 监控可见性只凭权限码
-``platform:monitor:read``，谁拿到码谁看全平台。因此本仓储：
+租户
+----
+**一律按生效租户过滤**（2026-11-06 产品口径变更，原「显式不过滤」例外已撤销）：
 
-* 不调用 ``require_tenant()``、不读 ``TenantContext``；
-* 不调用 ``BaseRepository`` 里任何自带租户 / 软删过滤的通用方法
-  （``list_all`` / ``count`` / ``get_by_id`` 等），只借用它持有的 ``self.session``。
+* 生效租户由 service 构造时传入（``tenant_id``），本仓只把它落成 SQL 条件；
+* 降级模式的孤儿 attempt（有 ``call_attempt`` 无 ``call_log``）用
+  ``COALESCE(call_log.tenant_id, call_attempt.tenant_id)`` 判租户，否则会漏；
+* 不读 ``TenantContext``，不调用 ``BaseRepository`` 里自带租户 / 软删过滤的
+  通用方法（``list_all`` / ``count`` / ``get_by_id`` 等），只借用 ``self.session``。
 
 继承 ``BaseRepository`` 仅是为对齐平台仓储写法（``model`` / ``session``）。
 
@@ -59,7 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from capabilities.platform.repository.base import BaseRepository
 from jonex_core.common.exceptions import InvalidParameterError
-from jonex_core.common.monitor_models import CallAttempt, CallLog
+from jonex_core.common.monitor_models import CallAttempt, CallFinalStatus, CallLog
 
 #: 成功率分母取值集：cancelled / running / unknown 不进分母。
 _DENOMINATOR_STATUSES = ("success", "failed")
@@ -93,6 +94,11 @@ _METRICS = ("call_count", "success_rate", "avg_latency", "failed_count")
 _MODE_LOGICAL = "logical"
 _MODE_DEGRADED = "degraded"
 
+#: 读侧隐藏的协议（2026-11-16 起的展示口径，与明细族同名常量一致）。
+#: 开放能力页排除它，筛选元数据的对象候选也一并排除，避免下拉里出现
+#: 选中后必然为空的对象。
+_HIDDEN_CALL_PROTOCOL = "invoke"
+
 
 def _rate(success: Optional[int], failed: Optional[int]) -> Optional[float]:
     """成功率 = success ÷ (success + failed)，分母为 0 返 ``None``。"""
@@ -111,13 +117,29 @@ def _to_int(value: Any) -> Optional[int]:
 class MonitorAggregateRepository(BaseRepository[CallLog]):
     """调用监控聚合族取数仓储。
 
-    ``session`` 由 ``BaseRepository`` 提供；本类**不**复用其租户 / 软删语义（见模块 docstring）。
+    ``session`` 由 ``BaseRepository`` 提供；租户条件由 ``tenant_id`` 显式承载
+    （不读 ``TenantContext``，见模块 docstring）。
     """
 
     model = CallLog
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, *, tenant_id: str):
         super().__init__(session)
+        self.tenant_id = tenant_id
+
+    def _tenant_condition(self, degraded: bool) -> Any:
+        """生效租户条件。
+
+        降级模式是 ``call_log FULL OUTER JOIN call_attempt``，孤儿 attempt
+        没有 N1 行 ⇒ 用 ``COALESCE`` 取两表的租户，保证「物理尝试 ∪ 无尝试的
+        逻辑调用」都在本租户内，而不是被 NULL 意外排除。
+        """
+        if degraded:
+            return (
+                func.coalesce(CallLog.tenant_id, CallAttempt.tenant_id)
+                == self.tenant_id
+            )
+        return CallLog.tenant_id == self.tenant_id
 
     # ------------------------------------------------------------------
     # 取数源：正常模式 = call_log；降级模式 = call_log FULL JOIN call_attempt
@@ -164,6 +186,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
 
         有效行集 = 物理尝试 ∪ 无尝试的逻辑调用：每个 attempt 一行，没有 attempt 的
         call_log 行各计 1 行，孤儿 attempt（有 call_attempt 无 call_log）也保留。
+
+        明细族 调用记录有**同款**实现：
+        ``monitor_detail.MonitorDetailRepository._apply_from``。两处刻意各写一份
+        （取的列不同，抽公共模块会把明细与聚合绑死），改口径时两处需同步。
         """
         if degraded:
             return stmt.select_from(CallLog).join(
@@ -183,6 +209,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
         source: Optional[str] = None,
         exclude_null_target: bool = False,
     ) -> list[Any]:
@@ -198,9 +225,17 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         ``call_scope`` 同取 ``CallLog.call_scope``（调用边界 external / internal /
         open）。降级模式经同一个 FULL JOIN 可达，孤儿 attempt 该列为 NULL，自然
         不命中任何取值 —— 与「NULL 不计入外部依赖」的口径一致。
+
+        ``exclude_protocol`` 是「排除某协议」的口径（目前只有开放能力页排除
+        ``invoke``）。用 ``IS DISTINCT FROM`` 而不是 ``!=``：``protocol`` 可空，
+        三值逻辑下 ``NULL != 'invoke'`` 是 UNKNOWN，会把整批无协议行一起误删。
         """
         _, started, _, object_id_col, protocol_col, source_col = self._metric_columns(degraded)
-        conditions: list[Any] = [started >= start, started < to]
+        conditions: list[Any] = [
+            self._tenant_condition(degraded),
+            started >= start,
+            started < to,
+        ]
         if direction is not None:
             conditions.append(CallLog.direction == direction)
         if call_scope is not None:
@@ -209,6 +244,8 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             conditions.append(object_id_col == target)
         if protocol is not None:
             conditions.append(protocol_col == protocol)
+        if exclude_protocol is not None:
+            conditions.append(protocol_col.is_distinct_from(exclude_protocol))
         if source is not None:
             conditions.append(source_col == source)
         if exclude_null_target:
@@ -232,6 +269,12 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """对账 ``call_log.attempt_count`` 与 ``call_attempt`` 实际行数，返回不一致行数。
 
         返回 ``> 0`` ⇒ 重试不可关联 ⇒ 整次查询走降级公式。
+
+        **在途调用不参与对账**：``call_log`` 在调用开始时已落库（``attempt_count``
+        先记 1），``call_attempt`` 要等调用结束才写。若不排除
+        ``final_status='running'``，任何时刻只要有调用在跑，就会被判成「不可关联」
+        并把整页翻成降级 —— 测试环境实测这会让人工刷新时列表条数在数千与个位数
+        之间抖动。
         """
         subquery = (
             select(func.count())
@@ -243,8 +286,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             select(func.count())
             .select_from(CallLog)
             .where(
+                CallLog.tenant_id == self.tenant_id,
                 CallLog.logical_started_at >= start,
                 CallLog.logical_started_at < to,
+                CallLog.final_status != CallFinalStatus.RUNNING.value,
                 CallLog.attempt_count != subquery,
             )
         )
@@ -272,6 +317,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
         degraded: bool = False,
     ) -> dict:
         """外部依赖 / 开放能力统计卡取数。
@@ -307,6 +353,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
                 call_scope=call_scope,
                 target=target,
                 protocol=protocol,
+                exclude_protocol=exclude_protocol,
             )
         )
         row = (await self.session.execute(stmt)).one()
@@ -321,8 +368,15 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         }
 
     async def latest_ingest_at(self) -> Optional[datetime]:
-        """模块 as-of = ``MAX(monitor.call_log.created_at)``（反映落库时刻）。"""
-        result = await self.session.execute(select(func.max(CallLog.created_at)))
+        """模块 as-of = 本租户 ``MAX(monitor.call_log.created_at)``（反映落库时刻）。
+
+        必须带租户：否则会把他租户的落库时刻当成本租户的「最近更新」。
+        """
+        result = await self.session.execute(
+            select(func.max(CallLog.created_at)).where(
+                CallLog.tenant_id == self.tenant_id
+            )
+        )
         return result.scalar()
 
     # ------------------------------------------------------------------
@@ -338,6 +392,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         call_scope: Optional[str] = None,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
         degraded: bool = False,
         offset: int = 0,
         limit: int = 20,
@@ -372,6 +427,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
             call_scope=call_scope,
             target=target,
             protocol=protocol,
+            exclude_protocol=exclude_protocol,
             exclude_null_target=True,
         )
 
@@ -426,6 +482,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         bucket: str,
         target: Optional[str] = None,
         protocol: Optional[str] = None,
+        exclude_protocol: Optional[str] = None,
         direction: Optional[str] = None,
         call_scope: Optional[str] = None,
         tz: str = _TZ,
@@ -481,6 +538,7 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
                     to,
                     target=target,
                     protocol=protocol,
+                    exclude_protocol=exclude_protocol,
                     direction=direction,
                     call_scope=call_scope,
                 )
@@ -675,7 +733,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """``monitor.call_log.source`` 的 distinct 值（M1 ``call_sources``，跳过 NULL）。"""
         stmt = (
             select(CallLog.source)
-            .where(CallLog.source.isnot(None))
+            .where(
+                CallLog.tenant_id == self.tenant_id,
+                CallLog.source.isnot(None),
+            )
             .distinct()
             .order_by(CallLog.source.asc())
             .limit(limit)
@@ -695,7 +756,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
                 CallLog.source.label("source"),
                 func.array_agg(func.distinct(CallLog.tenant_id)).label("tenant_ids"),
             )
-            .where(CallLog.source.isnot(None))
+            .where(
+                CallLog.tenant_id == self.tenant_id,
+                CallLog.source.isnot(None),
+            )
             .group_by(CallLog.source)
             .order_by(CallLog.source.asc())
             .limit(limit)
@@ -712,11 +776,19 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
 
         口径与记录页目标列一致：``COALESCE(mcp_tool, target)``（MCP 工具名与
         能力 ID / 模型名的并集），排除 NULL。
+
+        同时排除 ``protocol='invoke'``：调用记录页已不展示该协议的记录，
+        候选里若留着这些对象，选中后必然得到空列表。条件用 ``IS DISTINCT FROM``
+        处理 ``protocol`` 为空的历史行（与记录页的排除口径同一写法）。
         """
         object_id_col = func.coalesce(CallLog.mcp_tool, CallLog.target)
         stmt = (
             select(object_id_col)
-            .where(object_id_col.isnot(None))
+            .where(
+                CallLog.tenant_id == self.tenant_id,
+                object_id_col.isnot(None),
+                CallLog.protocol.is_distinct_from(_HIDDEN_CALL_PROTOCOL),
+            )
             .distinct()
             .order_by(object_id_col.asc())
             .limit(limit)
@@ -744,16 +816,21 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         ``deploy/docker/capability.Dockerfile``），禁止 import task_center ORM 模型
         ——容器内必抛 ``ModuleNotFoundError``。故同 ``mcp_service_repository.py`` 先例，
         跨能力只读一律用 ``sqlalchemy.text()`` 原始 SQL。
+
+        ⚠️ 租户范围：保留**系统级定义**（``scope='system'``，``tenant_id IS NULL``）
+        与当前租户的租户级 / 空间级定义。系统级定义是平台共享元数据，不含租户数据；
+        租户级 / 空间级定义只在所属租户内可见。
         """
         result = await self.session.execute(
             sa_text("""
                 SELECT id AS code, name
                 FROM task_center.task_definitions
                 WHERE is_deleted = 0
+                  AND (scope = 'system' OR tenant_id = :tenant_id)
                 ORDER BY name
                 LIMIT :limit
             """),
-            {"limit": limit},
+            {"tenant_id": self.tenant_id, "limit": limit},
         )
         return [{"code": row[0], "name": row[1]} for row in result.all() if row[0]]
 
@@ -769,7 +846,10 @@ class MonitorAggregateRepository(BaseRepository[CallLog]):
         """
         stmt = (
             select(CallLog.protocol.label("protocol"))
-            .where(CallLog.protocol.in_(tuple(OBJECT_TYPE_BY_PROTOCOL)))
+            .where(
+                CallLog.tenant_id == self.tenant_id,
+                CallLog.protocol.in_(tuple(OBJECT_TYPE_BY_PROTOCOL)),
+            )
             .distinct()
             .order_by(CallLog.protocol.asc())
             .limit(limit)

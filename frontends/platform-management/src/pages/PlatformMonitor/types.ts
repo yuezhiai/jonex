@@ -203,6 +203,9 @@ export type PmCallTrigger = 'user' | 'system';
 /**
  * 统计口径。`degraded` 表示后端按**物理 attempt**（重试各算一次）取数，
  * 不是逻辑调用 —— 调用量与耗时会显著高于直觉，页面必须把这个口径讲出来。
+ *
+ * 降级模式下记录行按物理 attempt 展开；**没有尝试记录的调用各计 1 行**，
+ * 这类行的 `attemptId` 为 null —— 不能假设降级行一定有 attemptId。
  */
 export type PmCallMetricMode = 'logical' | 'degraded';
 
@@ -272,7 +275,11 @@ export interface PmCallRecord {
   direction: PmCallDirection;
   /**
    * 本行对应 attempt 的 id。降级模式下同一个 `requestId` 会出现多行，靠它区分 ——
-   * 表格 `rowKey` 与 C7 寻址都用它（正常模式为 null，回落到 `requestId`；C8 不收这个参数）。
+   * 表格 `rowKey` 与 单次调用详情 寻址都用它。
+   *
+   * **可能为 null**：正常模式一行 = 一次逻辑调用；降级模式下「没有物理尝试记录」的调用
+   * 各计 1 行，这类行没有 attemptId（表示该调用无物理尝试记录），
+   * 行键回落到 `requestId` + 固定标记 `log`（见页面 `rowKey`）。
    */
   attemptId: string | null;
   triggerType: PmCallTrigger;
@@ -297,6 +304,20 @@ export interface PmCallRecord {
   requestId: string;
   /** 链路关联 ID。后端可能不给（老数据 / 采集链路未打通），此时为 null */
   traceId: string | null;
+  /**
+   * 本行所属**逻辑调用**的精确 Token 合计（一次逻辑调用含多次模型调用时取合计，
+   * 估算值一律不计）。
+   * null = 首屏还没有精确计量（没调模型，或计量还没落库）—— 页面渲染 `-`，
+   * 并随后台短轮询自动补值（见 `useCallTokenBackfill`）。
+   */
+  totalTokens: number | null;
+}
+
+/** 补值接口的一行：只按 requestId 取 Token，不改其它列 */
+export interface PmCallTokenUsage {
+  requestId: string;
+  /** null = 仍没有精确计量（「本来没调模型」与「还没落库」不可区分） */
+  totalTokens: number | null;
 }
 
 /* ────────── C7 / C8 / C9 下钻 ────────── */
@@ -435,4 +456,28 @@ export interface PmModelShareItem {
   key: string;
   label: string;
   count: number;
+}
+
+/**
+ * 未归因调用（后端 `tenant_id='unknown'`）的汇总。
+ *
+ * 这些调用**不属于任何租户**（调用方没带租户标识），所以不在任何一族的页面数字里；
+ * 但它们确实消耗了 Token。这段汇总只用来解释「页面上少掉的那部分是什么」，
+ * 不参与任何 KPI 计算，也不和租户数字相加。
+ */
+export interface PmUnattributedSummary {
+  /** = SUM(call_count)，不是行数（embedding 一行代表多次调用） */
+  callCount: number;
+  totalTokens: number;
+  /** 窗口内最早 / 最晚一条；空窗为 null（不得兜当前时刻） */
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  /** 按 Token 降序的前 5 个 scene：能说明「漏的是哪类调用」（scene 可能保留、租户才丢了） */
+  scenes: { scene: string; callCount: number; totalTokens: number }[];
+  /**
+   * 占同窗口全平台调用 / Token 的比例（0–1 小数）。
+   * 只有平台管理员拿得到，其余角色后端返 null —— 分母是全平台总量，不给租户管理员看。
+   */
+  shareOfCalls: number | null;
+  shareOfTokens: number | null;
 }

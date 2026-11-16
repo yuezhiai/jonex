@@ -33,6 +33,7 @@ import type {
   PmCallScopeRow,
   PmCallStats,
   PmCallStatus,
+  PmCallTokenUsage,
   PmCallTrigger,
   PmFailureReason,
   PmMetaFilters,
@@ -46,6 +47,7 @@ import type {
   PmTokenStats,
   PmTrendMetric,
   PmTrendPoint,
+  PmUnattributedSummary,
   PmWindow,
   PmWindowPreset,
 } from '../pages/PlatformMonitor/types';
@@ -283,7 +285,10 @@ interface MonitorFlagsDto {
   module_error?: string | null;
 }
 
-/** 统计口径元数据：`metric_mode='degraded'` 时数字按物理 attempt 计（无 attempt 的调用各计 1） */
+/**
+ * 统计口径元数据：`metric_mode='degraded'` 时数字按物理 attempt 计 ——
+ * 没有 attempt 记录的调用各计 1 行（这类行 `attempt_id` 为 null），不是按逻辑调用计。
+ */
 interface CallModeMetaDto {
   metric_mode?: string | null;
 }
@@ -311,7 +316,10 @@ interface CallTrendDto {
   mode_meta?: CallModeMetaDto | null;
 }
 
-/** 调用记录分页出参：`mode_meta` 由后端按整次查询统一判定（降级 = 行来自物理 attempt） */
+/**
+ * 调用记录分页出参：`mode_meta` 由后端按整次查询统一判定。
+ * 降级下行按物理 attempt 展开，另有「没有尝试记录的调用」各计 1 行（`attempt_id` 为 null）。
+ */
 interface CallRecordPageDto {
   items: CallRecordDto[];
   total: number;
@@ -321,7 +329,10 @@ interface CallRecordPageDto {
 interface CallObjectDto {
   /** 对象标识：模型名 / 能力 ID（物理列 `monitor.call_log.target`），表格与筛选都用它 */
   object_id: string | null;
-  /** 对象类型：由 protocol 推导，只有 `openai` / `invoke` 两类 —— **不是对象名** */
+  /**
+   * 对象类型：由 protocol 推导（`openai` / `invoke` / `mcp`）—— **不是对象名**。
+   * 开放能力页自 2026-11-16 起不再返回 `invoke`（后端 `_HIDDEN_CALL_PROTOCOL`）。
+   */
   object_type: string;
   protocol: string | null;
   call_count: number;
@@ -334,8 +345,9 @@ interface CallObjectDto {
 interface CallRecordDto {
   request_id: string;
   /**
-   * 本行对应 attempt 的 id。降级模式下同一个 `request_id` 会出现多行，只有它能区分；
-   * 正常模式后端给 `null`（那时 `request_id` 自身即唯一）。
+   * 本行对应 attempt 的 id。降级模式下同一个 `request_id` 会出现多行，靠它区分；
+   * 但降级模式里「没有尝试记录的调用」各计 1 行，这类行同样是 `null`
+   * —— 不能假设降级行必有 attempt_id。正常模式后端一律给 `null`。
    */
   attempt_id: string | null;
   /** 链路关联 ID；老数据 / 采集链路未打通时为 null */
@@ -351,6 +363,8 @@ interface CallRecordDto {
   error_code: string | null;
   duration_ms: number | null;
   logical_started_at: string;
+  /** 本行所属逻辑调用的精确 Token 合计；没有精确计量时缺省 / null */
+  total_tokens?: number | null;
 }
 
 interface TrendPointDto {
@@ -466,6 +480,7 @@ const mapRecord = (dto: CallRecordDto): PmCallRecord => ({
   errorCode: dto.error_code,
   requestId: dto.request_id,
   traceId: dto.trace_id ?? null,
+  totalTokens: dto.total_tokens ?? null,
 });
 
 const mapAttempt = (dto: AttemptDto): PmCallAttempt => ({
@@ -748,7 +763,11 @@ export interface PmCallRecordQuery extends PmCallRecordFilters {
 export interface PmCallRecordPage {
   items: PmCallRecord[];
   total: number;
-  /** 整次查询统一的口径；旧后端不返回时由 `attemptId` 推断（见页面） */
+  /**
+   * 整次查询统一的口径；null = 后端未声明。
+   * `degraded` 下行按物理 attempt 展开，没有尝试记录的调用各计 1 行 ——
+   * 这类行的 `attemptId` 为 null，页面不能假设降级行必有 attemptId。
+   */
   metricMode: PmCallMetricMode | null;
 }
 
@@ -789,6 +808,34 @@ export const getCallRecords = async (window: PmWindow, query: PmCallRecordQuery)
     total: data.total ?? 0,
     metricMode: toMetricMode(data.mode_meta?.metric_mode),
   };
+};
+
+interface CallTokenUsagePageDto {
+  items: Array<{ request_id: string; total_tokens: number | null }>;
+}
+
+/**
+ * 调用记录 Token 补值（「首屏 `-` 后自动补值」）。
+ *
+ * 只回 `requestId → totalTokens`，不重跑列表查询 —— 首屏缺值的行由页面短轮询这个接口，
+ * 拿到值后原地补进表格。后端口径与列表的 `total_tokens` 完全一致（同一解析器）。
+ *
+ * `requestIds` 一次最多 100 条（= 分页上限），空数组不发请求。
+ */
+export const getCallTokenUsage = async (requestIds: string[]): Promise<PmCallTokenUsage[]> => {
+  const ids = requestIds.filter(Boolean);
+  if (!ids.length) return [];
+  const data = await apiClient.get<CallTokenUsagePageDto>('/platform/monitor/calls/token-usage', {
+    params: { request_ids: ids },
+    // 重复参数：`request_ids=a&request_ids=b`，与 records 的 target_any 同一套序列化
+    paramsSerializer: {
+      serialize: (params: unknown) => serializePmQueryParams(params as Record<string, unknown>),
+    },
+  });
+  return (data.items ?? []).map((item) => ({
+    requestId: item.request_id,
+    totalTokens: item.total_tokens ?? null,
+  }));
 };
 
 /**
@@ -1016,16 +1063,58 @@ export const getTokenTrend = async (window: PmWindow, kind: PmTokenTrendKind): P
 /**
  * K3 模型使用分布。
  *
- * 接口按 token 总量取 TOP N，零用量的模型也会占一个名次；分布图里它们只会画出一条 0% 的空条，
- * 故在映射层剔掉。
+ * 接口按 token 总量倒序取前 N 个，`limit` 上限是 100。这张卡要把接口返回的模型**全部**列出来，
+ * 所以直接要后端上限，不再固定 TOP 5（旧值会让第 6 名之后的模型在页面上完全看不到）。
+ * 时间窗内用量为 0 的模型同样保留：它们在接口里占一个名次，说明这段时间调过这个模型，
+ * 只是没回传 token（与「用量回传完整率」讲的是同一件事），剔掉反而看不出缺口。
  */
 export const getModelShare = async (window: PmWindow): Promise<PmModelShareItem[]> => {
   const data = await apiClient.get<{ items: TokenModelTopDto[] }>('/platform/monitor/tokens/models/top', {
-    params: { ...pmRange(window), limit: 5 },
+    // 100 = 接口 `limit` 的 le 上限（capabilities/platform/api/monitor.py:555）
+    params: { ...pmRange(window), limit: 100 },
   });
-  return (data.items ?? [])
-    .filter((item) => item.total_tokens > 0)
-    .map((item) => ({ key: item.model_id, label: item.model_id, count: item.total_tokens }));
+  return (data.items ?? []).map((item) => ({
+    key: item.model_id,
+    label: item.model_id,
+    count: item.total_tokens ?? 0,
+  }));
+};
+
+interface UnattributedSummaryDto {
+  call_count: number;
+  total_tokens: number;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  scenes: { scene: string; call_count: number; total_tokens: number }[];
+  share_of_calls: number | null;
+  share_of_tokens: number | null;
+}
+
+/**
+ * 未归因调用汇总（`tenant_id='unknown'`）。
+ *
+ * 与三族的取数函数不同，这一条**不按当前租户过滤** —— 那些调用不属于任何租户，
+ * 也就不在任何一族的页面里。它只服务于「页面少掉的那部分是什么」这条说明，
+ * 不并入任何 KPI。`share_of_*` 只有平台管理员拿得到，其余角色为 null。
+ */
+export const getUnattributedSummary = async (window: PmWindow): Promise<PmUnattributedSummary> => {
+  const dto = await apiClient.get<UnattributedSummaryDto>('/platform/monitor/unattributed/summary', {
+    params: pmRange(window),
+  });
+  return {
+    callCount: dto.call_count ?? 0,
+    totalTokens: dto.total_tokens ?? 0,
+    firstSeenAt: dto.first_seen_at ?? null,
+    lastSeenAt: dto.last_seen_at ?? null,
+    scenes: (dto.scenes ?? []).map((item) => ({
+      scene: item.scene,
+      callCount: item.call_count,
+      totalTokens: item.total_tokens,
+    })),
+    // 0–1 小数 → 百分数；null 原样透传（不兜 0）
+    shareOfCalls: toPercent(dto.share_of_calls),
+    shareOfTokens: toPercent(dto.share_of_tokens),
+  };
 };
 
 export interface PmModelUsagePage {

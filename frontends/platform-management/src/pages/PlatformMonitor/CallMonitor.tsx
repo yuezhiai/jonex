@@ -10,6 +10,7 @@ import type { PmCallScope } from '../../api/platformMonitor';
 import type { PmCallProtocol, PmPaneProps } from './types';
 import CallScopeView from './components/CallScopeView';
 import CallRecords from './CallRecords';
+import UnattributedNotice from './components/UnattributedNotice';
 
 /**
  * 调用监控：三个二级页签。
@@ -41,42 +42,51 @@ export default function CallMonitor(props: PmPaneProps) {
   };
 
   return (
-    <Tabs
-      className="yx-pm-subtabs"
-      activeKey={sub}
-      onChange={handleChange}
-      destroyOnHidden
-      items={[
-        {
-          key: 'external',
-          label: t('platformMonitor.call.sub.external'),
-          children: (
-            <CallScopeView
-              scope="target"
-              {...props}
-              onDrillFailures={() => drillToFailures('target')}
-              onDrillObjectCalls={drillToObjectCalls}
-            />
-          ),
-        },
-        {
-          key: 'capability',
-          label: t('platformMonitor.call.sub.capability'),
-          children: (
-            <CallScopeView
-              scope="capability"
-              {...props}
-              onDrillFailures={() => drillToFailures('capability')}
-              onDrillObjectCalls={drillToObjectCalls}
-            />
-          ),
-        },
-        {
-          key: 'records',
-          label: t('platformMonitor.call.sub.records'),
-          children: <CallRecords {...props} />,
-        },
-      ]}
-    />
+    <>
+      {/* 未归因调用不在任何租户口径里，三个子页签缺的是同一批 —— 提示放页签之上统一说明 */}
+      <UnattributedNotice
+        window={props.window}
+        refreshKey={props.refreshKey}
+        manualRefreshKey={props.manualRefreshKey}
+      />
+
+      <Tabs
+        className="yx-pm-subtabs"
+        activeKey={sub}
+        onChange={handleChange}
+        destroyOnHidden
+        items={[
+          {
+            key: 'external',
+            label: t('platformMonitor.call.sub.external'),
+            children: (
+              <CallScopeView
+                scope="target"
+                {...props}
+                onDrillFailures={() => drillToFailures('target')}
+                onDrillObjectCalls={drillToObjectCalls}
+              />
+            ),
+          },
+          {
+            key: 'capability',
+            label: t('platformMonitor.call.sub.capability'),
+            children: (
+              <CallScopeView
+                scope="capability"
+                {...props}
+                onDrillFailures={() => drillToFailures('capability')}
+                onDrillObjectCalls={drillToObjectCalls}
+              />
+            ),
+          },
+          {
+            key: 'records',
+            label: t('platformMonitor.call.sub.records'),
+            children: <CallRecords {...props} />,
+          },
+        ]}
+      />
+    </>
   );
 }

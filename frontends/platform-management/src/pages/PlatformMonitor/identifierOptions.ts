@@ -49,6 +49,16 @@ export function buildCallTargetOptions(
 }
 
 /**
+ * 匹配用的归一化：只去首尾空白 + 统一小写。
+ *
+ * 内部空格属于对象名本身（模型名 / MCP 工具名里确实有空格），压缩掉就再也匹配不上，
+ * 所以这里只动首尾；大小写不敏感是因为用户不该为了筛一个对象去猜它的原始大小写。
+ */
+export function normalizeTargetText(text: string): string {
+  return text.trim().toLowerCase();
+}
+
+/**
  * 目标对象选择器的回显文本：原始标识 → 选项 label。
  *
  * 输入框不能直接回显原始标识（选中「本体编译」后显示 `atomic.ontology_compile.v1`
@@ -60,7 +70,8 @@ export function targetDisplayText(
   value: string | null | undefined,
 ): string {
   if (!value) return '';
-  return options.find((option) => option.value === value)?.label ?? value;
+  const needle = normalizeTargetText(value);
+  return options.find((option) => normalizeTargetText(option.value) === needle)?.label ?? value;
 }
 
 /**
@@ -68,15 +79,30 @@ export function targetDisplayText(
  *
  * 选中选项时 AutoComplete 给的是 option.value，直接可用；但用户也可能敲出
  * 选项的展示名，或自由输入模型名 / MCP 工具名。命中 label / value 时统一收敛成
- * 原始标识，未命中才原样下发（保持自由输入能力）。
+ * 原始标识，未命中才原样下发（保持自由输入能力）。命中判定大小写不敏感。
  */
 export function resolveTargetInput(options: readonly PmSelectOption[], text: string): string {
   const needle = text.trim();
   if (!needle) return '';
+  const normalized = normalizeTargetText(needle);
   return (
-    options.find((option) => option.value === needle)?.value ??
-    options.find((option) => option.label === needle)?.value ??
+    options.find((option) => normalizeTargetText(option.value) === normalized)?.value ??
+    options.find((option) => normalizeTargetText(option.label) === normalized)?.value ??
     needle
+  );
+}
+
+/**
+ * 候选是否命中当前输入（AutoComplete 的 filterOption 用）。
+ *
+ * label 与 value 任一包含即命中——用户既可能按释义搜（「知识」），也可能按原始标识搜
+ * （`knowledge_base`）。空输入视为全部命中：没在搜索时展开就该列全部候选。
+ */
+export function matchesTargetQuery(option: PmSelectOption, query: string): boolean {
+  const needle = normalizeTargetText(query);
+  if (!needle) return true;
+  return (
+    normalizeTargetText(option.label).includes(needle) || normalizeTargetText(option.value).includes(needle)
   );
 }
 

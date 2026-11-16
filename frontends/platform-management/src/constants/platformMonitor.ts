@@ -48,13 +48,16 @@ export const PM_RECORD_REQUEST_ID_WIDTH = 320;
 /** 调用记录表 Trace ID 列宽。长度与 request_id 同量级，但它是**可选**列，给得略窄 */
 export const PM_RECORD_TRACE_ID_WIDTH = 240;
 
+/** 调用记录表 Token 用量列宽。与「耗时」同宽（都是右对齐的数量列） */
+export const PM_RECORD_TOKEN_WIDTH = 110;
+
 /**
  * 调用记录表的横向最小宽度，**必须等于各列 width 之和**（含留给 target 的 220）。
  *
  * 固定表头是「表头、表体两张独立表格 + 同步滚动」，两边的可滚距离都由自己的内容宽度算；
  * 这个值小于列宽之和时，两张表内容宽度不一致，横滚行程就对不上，列会错位。
  */
-export const PM_RECORD_SCROLL_X = 1780;
+export const PM_RECORD_SCROLL_X = 1890;
 
 /** 一级页签顺序即 tab 栏顺序 */
 export const PM_TAB_KEYS: readonly PmTabKey[] = ['task', 'call', 'token'];
@@ -182,6 +185,8 @@ export function pmFailureDrillParams(scope: 'target' | 'capability', current: UR
  *
  * 开放能力侧同一个对象名可能挂在多个协议下，点进来的那一行带 `protocol` 时一并预填，
  * 让记录页与对象详情是同一口径；外部依赖侧没有协议概念（`null`），不传。
+ * `invoke` 已被产品口径隐藏（列表里不会出现该协议的行，记录页也不再展示），
+ * 即便调用方仍传进来也不预填 —— 否则下钻后记录页是空的。
  * 失败下钻留下的 `status` 不属于这次跳转，先清掉。
  */
 export function pmObjectCallsDrillParams(
@@ -195,7 +200,7 @@ export function pmObjectCallsDrillParams(
   next.delete('status');
   next.delete('direction');
   next.delete('protocol');
-  if (protocol) next.set('protocol', protocol);
+  if (protocol && protocol !== 'invoke') next.set('protocol', protocol);
   return next;
 }
 

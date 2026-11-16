@@ -16,7 +16,7 @@ import {
 import useAsyncData from '@/hooks/useAsyncData';
 import { PM_PAGE_SIZE } from '../../constants/platformMonitor';
 import { resolveUsageSortChange } from './modelUsageSort';
-import { fmtCompact, fmtCount, fmtPercent1OrDash } from './format';
+import { fmtCompact, fmtCount, fmtPercentOrDash } from './format';
 import SectionCard from './components/SectionCard';
 import FilterBar from './components/FilterBar';
 import StatCards from './components/StatCards';
@@ -24,6 +24,7 @@ import SegmentedFilter from './components/SegmentedFilter';
 import TrendAreaChart from './components/TrendAreaChart';
 import UsageBarList from './components/UsageBarList';
 import ModuleError from './components/ModuleError';
+import UnattributedNotice from './components/UnattributedNotice';
 import type { PmKpiCard, PmModelUsageRow, PmPaneProps } from './types';
 
 const TREND_KINDS: { value: PmTokenTrendKind; labelKey: string }[] = [
@@ -181,7 +182,8 @@ export default function TokenMonitor({ window, refreshKey, manualRefreshKey }: P
         // 没回传用量的调用压根没有 token 数。放同一排、文案带小字说明
         key: 'completeness',
         label: t('platformMonitor.token.kpi.completeness'),
-        value: fmtPercent1OrDash(stats.completenessRate),
+        // 两位小数：完整率经常在 99.x% 附近，1 位小数会让不同时间窗看起来一样
+        value: fmtPercentOrDash(stats.completenessRate),
       },
     ];
   }, [stats, t]);
@@ -275,6 +277,9 @@ export default function TokenMonitor({ window, refreshKey, manualRefreshKey }: P
 
   return (
     <div className="yx-pm-pane">
+      {/* 解释了「这些数字为什么小于账单」：未归因调用不属于任何租户，故不在本页任何一格 */}
+      <UnattributedNotice window={window} refreshKey={refreshKey} manualRefreshKey={manualRefreshKey} />
+
       {/* 降级不是「没数据」：统计卡会照常出空壳，挂提示而不是走错误态 */}
       {stats?.moduleError ? (
         <Alert

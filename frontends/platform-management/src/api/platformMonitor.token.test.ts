@@ -203,7 +203,7 @@ describe('Token 监控取数层契约与映射', () => {
 
       expect(hits[0].params.bucket).toBe('5m');
       expect(points[0].value).toBeNull();
-      expect(points[0].detail).toEqual({ input: null, output: null, calls: null });
+      expect(points[0].detail).toEqual({ input: null, output: null, calls: null, total: null });
       expect(points[1].value).toBe(12);
       // 5m 档横轴固定 HH:mm（UTC 12:05 = 北京 20:05）
       expect(points.map((p) => p.date)).toEqual(['20:05', '20:10']);
@@ -229,19 +229,19 @@ describe('Token 监控取数层契约与映射', () => {
       expect(total[0].value).toBe(30);
       expect(input[0].value).toBe(20);
       expect(output[0].value).toBe(10);
-      expect(total[0].detail).toEqual({ input: 20, output: 10, calls: 2 });
+      expect(total[0].detail).toEqual({ input: 20, output: 10, calls: 2, total: 30 });
       // UTC 12:00 = 北京 20:00；7d 是 day 桶
       expect(total[0].date).toBe('10-18');
     });
   });
 
   describe('模型使用分布', () => {
-    it('limit=5，count 取 total_tokens；零用量模型不进分布', async () => {
+    it('limit 取后端上限 100（模型要全展示），count 取 total_tokens；零用量模型也保留', async () => {
       routes[ENDPOINT_TOP] = () => ({
         items: [
           { model_id: 'deepseek/deepseek-flash', total_tokens: 80, ratio: 0.8 },
           { model_id: 'Qwen3-Embedding-8B', total_tokens: 20, ratio: 0.2 },
-          // 时间窗内没有用量也照样出现在 TOP N 里（后端按 model 分组、不筛 0）
+          // 时间窗内没有用量也照样出现在 TOP N 里（后端按 model 分组、不筛 0），页面上保留成 0.00%
           { model_id: 'deepseek-v4-flash-202605', total_tokens: 0, ratio: 0 },
         ],
       });
@@ -249,10 +249,11 @@ describe('Token 监控取数层契约与映射', () => {
       const share = await getModelShare('7d');
 
       expect(hits[0].url).toBe(ENDPOINT_TOP);
-      expect(hits[0].params.limit).toBe(5);
+      expect(hits[0].params.limit).toBe(100);
       expect(share).toEqual([
         { key: 'deepseek/deepseek-flash', label: 'deepseek/deepseek-flash', count: 80 },
         { key: 'Qwen3-Embedding-8B', label: 'Qwen3-Embedding-8B', count: 20 },
+        { key: 'deepseek-v4-flash-202605', label: 'deepseek-v4-flash-202605', count: 0 },
       ]);
     });
   });

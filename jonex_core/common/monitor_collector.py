@@ -3,7 +3,8 @@
 采集链路的**写口**：把调用明细异步落到 ``monitor.call_log``（N1）/ ``monitor.call_attempt``（N2）。
 
 ⚠️ **本文件住在共享内核（`jonex_core/common/`），三个采集方各自实例化**：Sidecar
-（N1 主记录）、llm-gateway（N1 出站）、各 capability（N2 Attempt）。每个进程**各拿一份
+（``call_log`` 主记录 + 嵌套调用的入站 ``call_attempt``）、llm-gateway
+（``call_log`` 出站）、各 capability（``call_attempt``）。每个进程**各拿一份
 单例 + 独立队列 + 独立连接**，直写同一个 PG 的 monitor schema；队列刻意不与审计队列共享
 maxsize —— 一个卡住不牵另一个。
 
@@ -929,10 +930,12 @@ def get_monitor_collector() -> MonitorCollector:
 class AttemptSpan:
     """一次物理 Attempt 的采集句柄（由 :func:`attempt_span` 产出）。
 
-    **为什么要有这层**：N2 的采集点散在十几个重试循环里（api_gateway 四个路由、
-    llm-gateway 上游 429 两处、任务派活重试、task_runtime 四方向）。若各处自己
-    「掐表 + 拼 dict + 兜异常」，字段含义会随人漂移。这里把那段**只写一份**，
-    各采集点只负责「告诉它这次成没成」。
+    **为什么要有这层**：``call_attempt`` 的采集点散在十几个重试循环里
+    （api_gateway 四个路由、llm-gateway 上游 429 两处、任务派活重试、
+    task_runtime 四方向），外加 Sidecar ``/invoke`` 的入站侧 —— 嵌套调用
+    没人重试、也没人记账，由 Sidecar 补一条 ``attempt_no=1`` 的入站记录。
+    若各处自己「掐表 + 拼 dict + 兜异常」，字段含义会随人漂移。
+    这里把那段**只写一份**，各采集点只负责「告诉它这次成没成」。
 
     用法（**默认成功**，失败由调用方显式标注）::
 
@@ -1109,7 +1112,9 @@ def emit_logical_call(
         get_monitor_collector().put_call_log(
             {
                 "request_id": request_id,
-                "trace_id": request_id,  # 现与 request_id 同源，是否分离待定（同 Sidecar 侧）
+                # 本点位（任务运行时 / llm 链路）没有独立的 trace 来源，仍与
+                # request_id 同源；Sidecar 侧已拆分（见 sidecar.main._resolve_call_ids）。
+                "trace_id": request_id,
                 "tenant_id": tenant_id,
                 "direction": direction,
                 "source": source,

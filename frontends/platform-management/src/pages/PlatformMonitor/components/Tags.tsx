@@ -4,7 +4,7 @@ import { enumLabel } from '../labels';
 import type { PmCallStatus, PmFailureReason } from '../types';
 
 /** 未收录的码用中性灰：它既不是成功也不是失败，染色会暗示一个并不存在的语义 */
-const NEUTRAL_COLORS: [string, string] = ['#64748b', '#f1f5f9'];
+const NEUTRAL_COLORS: [string, string] = ['var(--yx-text-secondary)', 'var(--yx-bg-muted)'];
 
 /** 浅底 + 深字的配色。用 antd Tag 承载，只把颜色写进 style，不为它另起一套 scss 类 */
 const tagStyle = (color: string, background: string) => ({
@@ -25,11 +25,11 @@ const tagStyle = (color: string, background: string) => ({
  * 若一并染红，表格里红标的条数会明显多于统计卡报的失败数，读起来像对不上账。
  */
 const STATUS_COLORS: Record<PmCallStatus, [string, string]> = {
-  success: ['#059669', '#ecfdf5'],
-  failed: ['#dc2626', '#fef2f2'],
-  cancelled: ['#64748b', '#f1f5f9'],
-  running: ['#2563eb', '#eff6ff'],
-  unknown: ['#64748b', '#f1f5f9'],
+  success: ['#059669', 'var(--yx-success-bg)'],
+  failed: ['var(--yx-error-text)', '#fef2f2'],
+  cancelled: ['var(--yx-text-secondary)', 'var(--yx-bg-muted)'],
+  running: ['#2563eb', 'var(--yx-info-bg)'],
+  unknown: ['var(--yx-text-secondary)', 'var(--yx-bg-muted)'],
 };
 
 /** 调用记录 / attempt 表的状态列 */
@@ -49,7 +49,7 @@ export function CallStatusTag({ status }: { status: PmCallStatus }) {
  * 是同一种失败，把它染得更红会暗示一个并不存在的优先级。
  */
 const REASON_COLORS: Record<PmFailureReason, [string, string]> = {
-  ontology: ['#dc2626', '#fef2f2'],
+  ontology: ['var(--yx-error-text)', '#fef2f2'],
   compile: ['#db2777', '#fdf2f8'],
   format: ['#d97706', '#fff7ed'],
   parse: ['#ea580c', '#fff7ed'],

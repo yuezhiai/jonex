@@ -226,7 +226,7 @@ class CallAttempt(TenantMixin, Base):
 class LlmUsageLog(TenantMixin, Base):
     """LLM 网关计量明细表（``metering.llm_usage_log``）只读映射。
 
-    列定义逐条对齐 ``deploy/postgres/migrations/002_platform.sql:377-402`` 的基线 DDL：
+    列定义逐条对齐 ``deploy/postgres/migrations/002_platform.sql`` 的基线 DDL：
 
     * ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` / ``is_stream`` /
       ``is_estimated`` / ``created_at`` 在 DDL 里**都没有 NOT NULL**，故 ORM 侧
@@ -236,9 +236,10 @@ class LlmUsageLog(TenantMixin, Base):
     写入方是 **llm-gateway 进程**（``jonex_core/llm_gateway/recorder.py``，走原生 SQL），
     本类只服务 platform 监控侧的**只读**聚合查询 —— 因此本类不做任何写路径适配。
 
-    租户：``metering`` 表带 ``tenant_id``，但监控族**刻意不按租户过滤**（可见性只凭权限码
-    ``platform:monitor:read``）。查询侧只选聚合列 / ``model`` 列，绝不 ``select(LlmUsageLog)``
-    整表选列，避免把 ``tenant_id`` 带进 SQL。
+    租户：``metering`` 表带 ``tenant_id``。2026-11-06 起监控族**按生效租户过滤**
+    （``MonitorTokenRepository`` 在 ``_time_filter`` 统一落 ``tenant_id = :tenant_id``；
+    ``unknown`` 不能作为生效租户，见 ``services/monitor_scope.py``）。查询侧仍只选
+    聚合列 / ``model`` 列，绝不 ``select(LlmUsageLog)`` 整表选列。
     """
 
     __tablename__ = "llm_usage_log"

@@ -14,6 +14,7 @@ import {
   buildCallTargetOptions,
   buildScopeObjectOptions,
   buildSourceOptions,
+  matchesTargetQuery,
   resolveTargetInput,
   targetDisplayText,
 } from './identifierOptions';
@@ -99,6 +100,35 @@ describe('目标对象选择器', () => {
     expect(resolveTargetInput(options, '  custom_tool  ')).toBe('custom_tool');
     // 清空 = 不筛
     expect(resolveTargetInput(options, '')).toBe('');
+  });
+
+  it('命中判定大小写不敏感，对象名内部空格原样保留', () => {
+    const options = buildCallTargetOptions(makeT('zh'), {
+      callTargets: ['atomic.ontology_compile.v1', 'DeepSeek V4 Flash'],
+    });
+
+    // 大小写不同的完整值 / 展示名都要收敛回接口认的原始值
+    expect(resolveTargetInput(options, 'deepseek v4 flash')).toBe('DeepSeek V4 Flash');
+    expect(resolveTargetInput(options, 'DEEPSEEK V4 FLASH')).toBe('DeepSeek V4 Flash');
+    expect(targetDisplayText(options, 'ATOMIC.ONTOLOGY_COMPILE.V1')).toBe('本体编译');
+    // 只去首尾空白：内部空格是对象名的一部分，不能压掉
+    expect(resolveTargetInput(options, '  deepseek  v4  ')).toBe('deepseek  v4');
+  });
+});
+
+describe('候选包含匹配', () => {
+  const option = { value: 'business.knowledge_base.v1', label: '知识库' };
+
+  it('label / value 任一包含即命中，大小写不敏感', () => {
+    expect(matchesTargetQuery(option, '知识')).toBe(true);
+    expect(matchesTargetQuery(option, 'KNOWLEDGE')).toBe(true);
+    expect(matchesTargetQuery(option, 'knowledge_base')).toBe(true);
+    expect(matchesTargetQuery(option, '任务')).toBe(false);
+  });
+
+  it('空查询视为全部命中（没在搜索时展开即列全部候选）', () => {
+    expect(matchesTargetQuery(option, '')).toBe(true);
+    expect(matchesTargetQuery(option, '   ')).toBe(true);
   });
 });
 

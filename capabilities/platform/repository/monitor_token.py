@@ -9,9 +9,11 @@
    embedding 聚合行的 ``request_id`` 是合成键 ``emb-agg:{sha1(...)}``（一行代表 N 次请求），
    去重计数会系统性低估（实测 -84.5%）⇒ 本仓 SQL 里**不出现** ``request_id``。
 2. 时间过滤左闭右开 ``[start, to)``：``created_at >= start AND created_at < to``，禁 ``BETWEEN``。
-3. **绝不过滤 ``tenant_id``** —— 监控族可见性只凭权限码 ``platform:monitor:read``
-   （2026-10-10 需求方拍板，显式例外）。⇒ 本仓只选**聚合列 / ``model`` 列**，
-   ⛔ 不 ``select(LlmUsageLog)`` 整表选列（那会把 ``tenant_id`` 带进 SQL 被验收判红）。
+3. **一律按生效租户过滤**（2026-11-06 产品口径变更，原「绝不过滤 tenant_id」的
+   例外已撤销）。生效租户由 service 构造时传入（``tenant_id``），本仓把它落成
+   ``WHERE tenant_id = :tenant_id``；K1–K4 共用 :meth:`_time_filter`，一次改全族。
+   ``tenant_id='unknown'`` 的行由 service 层拒绝以 ``unknown`` 作为生效租户而自然排除。
+   本仓仍只选**聚合列 / ``model`` 列**，不 ``select(LlmUsageLog)`` 整表选列。
 
 口径（2026-10-12 需求方拍板；近似口径连同已知偏差一并留痕）
 -------------------------------------------------------------
@@ -116,23 +118,30 @@ def _cell(row: Any, name: str) -> Any:
 class MonitorTokenRepository(BaseRepository[LlmUsageLog]):
     """Token 监控族（K1–K4）取数仓储。
 
-    ``session`` 由 ``BaseRepository`` 提供；本类**不**复用其租户 / 软删语义
-    （监控族不做租户过滤，见模块 docstring）。
+    ``session`` 由 ``BaseRepository`` 提供；租户条件由 ``tenant_id`` 显式承载
+    （不读 ``TenantContext``，见模块 docstring）。
     """
 
     model = LlmUsageLog
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, *, tenant_id: str):
         super().__init__(session)
+        self.tenant_id = tenant_id
 
     # ------------------------------------------------------------------
     # 口径件（本仓统一遵守，勿逐方法各写一套）
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _time_filter(start: datetime, to: datetime) -> list:
-        """左闭右开 ``[start, to)`` 的时间条件（禁 ``BETWEEN``）。"""
-        return [LlmUsageLog.created_at >= start, LlmUsageLog.created_at < to]
+    def _time_filter(self, start: datetime, to: datetime) -> list:
+        """生效租户 + 左闭右开 ``[start, to)`` 的公共条件（禁 ``BETWEEN``）。
+
+        K1–K4 全部查询都从这里取条件，租户过滤只维护一处。
+        """
+        return [
+            LlmUsageLog.tenant_id == self.tenant_id,
+            LlmUsageLog.created_at >= start,
+            LlmUsageLog.created_at < to,
+        ]
 
     @staticmethod
     def _metered_calls() -> Any:

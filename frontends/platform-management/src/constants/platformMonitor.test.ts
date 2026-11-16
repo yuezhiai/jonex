@@ -55,12 +55,23 @@ describe('pmObjectCallsDrillParams', () => {
   it('开放能力侧带上点进来那一行的协议，保证与对象详情同口径', () => {
     const next = pmObjectCallsDrillParams(
       'business.knowledge_base.v1',
+      'mcp',
+      new URLSearchParams('tab=call&sub=capability'),
+    );
+
+    expect(next.get('target')).toBe('business.knowledge_base.v1');
+    expect(next.get('protocol')).toBe('mcp');
+  });
+
+  it('invoke 已被隐藏：即便传进来也不预填，避免下钻后记录页恒空', () => {
+    const next = pmObjectCallsDrillParams(
+      'business.knowledge_base.v1',
       'invoke',
       new URLSearchParams('tab=call&sub=capability'),
     );
 
     expect(next.get('target')).toBe('business.knowledge_base.v1');
-    expect(next.get('protocol')).toBe('invoke');
+    expect(next.has('protocol')).toBe(false);
   });
 
   it('不修改调用方传入的 URLSearchParams', () => {
