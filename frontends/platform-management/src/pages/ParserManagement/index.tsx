@@ -30,7 +30,7 @@ interface TypeMeta {
 const TYPE_META: Record<string, TypeMeta> = {
   video: {
     icon: <VideoCameraOutlined />,
-    gradient: 'linear-gradient(135deg, #f87171, #dc2626)',
+    gradient: 'linear-gradient(135deg, #f87171, var(--yx-error-text))',
     order: 0,
   },
   audio: {
@@ -55,19 +55,19 @@ const TYPE_META: Record<string, TypeMeta> = {
   },
   web: {
     icon: <GlobalOutlined />,
-    gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+    gradient: 'linear-gradient(135deg, var(--yx-text-muted), var(--yx-text-secondary))',
     order: 5,
   },
   cad: {
     icon: <PartitionOutlined />,
-    gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+    gradient: 'linear-gradient(135deg, var(--yx-text-muted), var(--yx-text-secondary))',
     order: 6,
   },
 };
 
 const FALLBACK_META: TypeMeta = {
   icon: <FileTextOutlined />,
-  gradient: 'linear-gradient(135deg, #94a3b8, #64748b)',
+  gradient: 'linear-gradient(135deg, var(--yx-text-muted), var(--yx-text-secondary))',
   order: 99,
 };
 

@@ -1,16 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert, Button, Checkbox, Collapse, Descriptions, Empty, Input, Modal, Select,
-  Space, Spin, Steps, Table, Tabs, Tag, Tooltip, message,
+  Space, Spin, Steps, Tabs, Tag, Tooltip, message,
 } from 'antd';
-import type { ColumnsType } from 'antd/es/table';
 import { CheckCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
+import { PageHeader } from '@jonex/shared-lib';
 import {
   confirmAdopt, getRunBundle, getRunLog, listVersions, previewAdopt, promoteAdhoc, rejectRun,
   rollbackRun,
-  type AdoptPreview, type AdoptResult, type AdhocTruth, type AdhocVerdict, type Artifact,
+  type AdoptPreview, type AdoptResult, type AdhocTruth, type AdhocVerdict,
   type CandidateAdhocCase,
   type CandidateItem, type CliResult, type PatchEntry, type PromoteAdhocConflict,
   type RollbackResult, type RunBundle, type SemanticVersion, type SmokeResult,
@@ -89,16 +89,32 @@ const synonymKeyOf = (e: PatchEntry) =>
 const synonymLabelOf = (e: { terms?: unknown; canonical?: unknown }) =>
   `${synonymTermsOf(e).join(' / ')} → ${String(e.canonical ?? '').trim()}`;
 
+/** metric 条目展示：`name → formula`（无 formula 用 definition），过长截断到
+ * 120 字符（勾选行是单行摘要；完整定义在验真卡/落库条目里看）。 */
+const METRIC_LABEL_MAX = 120;
+const metricLabelOf = (e: { name?: unknown; formula?: unknown; definition?: unknown }) => {
+  const name = String(e.name ?? '').trim();
+  const raw = `${String(e.formula ?? '').trim() || String(e.definition ?? '').trim()}`;
+  if (!raw) return name;
+  const detail = raw.length > METRIC_LABEL_MAX
+    ? `${raw.slice(0, METRIC_LABEL_MAX - 1)}…`
+    : raw;
+  return `${name} → ${detail}`;
+};
+
 /** 与后端 `engine.entry_key` **逐字同口径**（人审 picks 要能对上，别加本地花样）：
  * alias → `Concept:别名`；relation（有 source+target）→ 边名 `name`（可能为空串）；
  * constraint（add/update/disable/enable）→ `name`（add 的 name 由后端生成，
  * planned 里已带；用 target_code 会与 `_pick_entries` 对不上 → 1001）；
  * mapping → `target_code|ds|entity|column`（同一抽象属性的多个落点不能互相串选）；
  * synonym → `词1/词2:canonical`（同批 term 不重复；canonical 进键让「同词换名」可区分）；
+ * metric → 指标 `name`（与后端 `entry_key(e, "metric")` 逐字对齐；后端
+ * `str(entry.get("name") or "")` **不 trim**，这里也不能 trim，否则 picks 对不上）；
  * 其它 → `target_code`。 */
 const entryKeyOf = (e: PatchEntry, kind?: string | null) => {
   if (kind === 'mapping') return mappingKeyOf(e);
   if (kind === 'synonym') return synonymKeyOf(e);
+  if (kind === 'metric') return String(e.name ?? '');
   if (e.concept !== undefined) return `${e.concept}:${e.alias}`;
   if (e.op) return String(e.name ?? e.target_code ?? '');
   if ('source' in e && 'target' in e) return String(e.name ?? '');
@@ -107,13 +123,14 @@ const entryKeyOf = (e: PatchEntry, kind?: string | null) => {
 
 /** 条目展示名（勾选行左侧的 code）：relation 用两端而不是内部边名；
  * mapping 用物理 `entity.column`（target_code 另外展示）；synonym 用
- * `词1 / 词2 → canonical`；constraint add 展示 target_code（与 query_rule 同形），
- * 其它 constraint op 用 name。 */
+ * `词1 / 词2 → canonical`；metric 用 `name → formula/definition`；constraint add
+ * 展示 target_code（与 query_rule 同形），其它 constraint op 用 name。 */
 const entryLabelOf = (e: PatchEntry, kind?: string | null) => {
   if (kind === 'mapping') {
     return [e.entity_name, e.attribute_name].filter(Boolean).join('.');
   }
   if (kind === 'synonym') return synonymLabelOf(e);
+  if (kind === 'metric') return metricLabelOf(e);
   return relationEdgeOf(e)
     ?? (e.op === 'add' ? String(e.target_code ?? e.name ?? '') : entryKeyOf(e, kind));
 };
@@ -146,7 +163,7 @@ const mappingSlotPairs = (
 /** 预览 planned 行：alias → `Concept:别名`；relation 的 `added[]` 带两端
  * （`{name, source, source_column, target, target_column}`）→ 展示边；constraint →
  * `op name[: 新表达式]`；mapping → `op target_code[: 槽=新值,…]`；synonym →
- * `op 词1 / 词2 → canonical`；其余回退到 name / target_code。 */
+ * `op 词1 / 词2 → canonical`；metric → `op 指标名`；其余回退到 name / target_code。 */
 const plannedLabel = (p: Record<string, unknown>, kind?: string | null) => {
   if (kind === 'mapping') {
     const head = [String(p.op ?? ''), String(p.target_code ?? '')].filter(Boolean).join(' ');
@@ -161,6 +178,10 @@ const plannedLabel = (p: Record<string, unknown>, kind?: string | null) => {
   if (kind === 'synonym') {
     const op = typeof p.op === 'string' && p.op ? `${p.op} ` : '';
     return `${op}${synonymLabelOf(p)}`;
+  }
+  if (kind === 'metric') {
+    const op = typeof p.op === 'string' && p.op ? `${p.op} ` : '';
+    return `${op}${String(p.name ?? '').trim()}`;
   }
   if (p.concept !== undefined) return `${p.concept}:${p.alias}`;
   const edge = relationEdgeOf(p);
@@ -181,7 +202,6 @@ const plannedLabel = (p: Record<string, unknown>, kind?: string | null) => {
 export default function RunDetail() {
   const { runId = '' } = useParams();
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const [bundle, setBundle] = useState<RunBundle | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -335,9 +355,11 @@ export default function RunDetail() {
   const runDs = typeof bundle?.run.ds === 'string' ? bundle.run.ds : null;
   const runKind = typeof bundle?.run.kind === 'string' ? bundle.run.kind : null;
   // relation / constraint 与 query_rule 共用 compiled 版本链（scope=compiled，见 P1-3 R1 / P1-4 R5）；
-  // mapping / tool_schema 与 alias 同链（KB 级 abstract，见 P1-5 / Tool-Schema 线）；
-  // synonym 是**独立**的 KB 级版本链（scope=synonym，不与 abstract 互斥）。
-  const chainScope = runKind === 'alias' || runKind === 'mapping' || runKind === 'tool_schema'
+  // mapping / tool_schema / metric 与 alias 同链（KB 级 abstract，见 P1-5 /
+  // Tool-Schema 线 / 指标口径线）；synonym 是**独立**的 KB 级版本链
+  // （scope=synonym，不与 abstract 互斥）。
+  const chainScope = runKind === 'alias' || runKind === 'mapping'
+    || runKind === 'tool_schema' || runKind === 'metric'
     ? 'abstract'
     : runKind === 'synonym'
       ? 'synonym'
@@ -359,7 +381,7 @@ export default function RunDetail() {
     }
     if (prevSelectedKeyRef.current === selectedKey) return;
     prevSelectedKeyRef.current = selectedKey;
-    if (runKind === 'alias' || runKind === 'synonym') {
+    if (runKind === 'alias' || runKind === 'synonym' || runKind === 'metric') {
       setAdhocVerdicts({});
       setAdhocOpen(false);
     }
@@ -466,9 +488,9 @@ export default function RunDetail() {
   };
 
   const adhocCases = preview?.adhoc_cases ?? [];
-  // alias / synonym 走「验真」（后端只对这两个 kind 提供 adhoc-evidence），
+  // alias / synonym / metric 走「验真」（后端对这三个 kind 提供 adhoc-evidence），
   // 其它 kind 走「补 truth」：文案分叉，避免验真用户看到补 truth。
-  const verifyRun = runKind === 'alias' || runKind === 'synonym';
+  const verifyRun = runKind === 'alias' || runKind === 'synonym' || runKind === 'metric';
   const adhocCopy = verifyRun
     ? {
       cases: t('evolutionConsole.previewAdhocCasesVerify', { n: adhocCases.length }),
@@ -494,8 +516,8 @@ export default function RunDetail() {
     || overrideMissing || adhocMissing.length > 0 || adhocFailed.length > 0;
   // 幂等键作用域：勾选 + override 理由 + 本批已填的 ad-hoc 结论
   // （只算当前预览的 case，避免上一轮残留让同一次意图换新 id）。
-  // alias / synonym 用 verdict 的 case_id + evidence_id（票据变化也是不同意图），
-  // 其它 kind 用 truth。
+  // alias / synonym / metric 用 verdict 的 case_id + evidence_id（票据变化也是
+  // 不同意图），其它 kind 用 truth。
   const adhocKeyIds = verifyRun
     ? adhocCases
       .map((item) => adhocVerdicts[item.case_id])
@@ -533,8 +555,8 @@ export default function RunDetail() {
         picks: selected,
         request_id: requestId,
         override_reason: overrideReason.trim() || undefined,
-        // alias / synonym 批与其它 kind 互斥：前两者只送人工验真结论，其余只送
-        // control truth。alias / synonym **总是**带 `adhoc_verdicts`（哪怕空数组）：
+        // alias / synonym / metric 批与其它 kind 互斥：前三者只送人工验真结论，
+        // 其余只送 control truth。三者**总是**带 `adhoc_verdicts`（哪怕空数组）：
         // picks 排除了全部待验真 case 时，空数组明确表示「本次无需验真」；整键缺席
         // 会让后端回落到旧 truths 覆盖校验，拿全量 unverified 把采纳 1001 卡死（Critical 1）。
         ...(verifyRun
@@ -864,9 +886,11 @@ export default function RunDetail() {
                 // constraint 的 add/update 有可改写的 expression（P1-4 收尾放开）；
                 // disable/enable 只翻转启用状态，仍不给调整口。其余带 op 的
                 // （relation / mapping / tool_schema）没有 alias/表达式语义，保持隐藏。
-                // synonym 条目没有 alias/表达式（改词 = 改候选语料），同样不给调整口。
+                // synonym 条目没有 alias/表达式（改词 = 改候选语料），metric 条目
+                // 没有 alias/表达式（改口径 = 改候选语料），同样不给调整口。
                 const canAdjust = !toolEntry && edge === null
                   && run.kind !== 'synonym'
+                  && run.kind !== 'metric'
                   && (e.op === undefined
                     || (run.kind === 'constraint' && (cOp === 'add' || cOp === 'update')));
                 const key = entryKeyOf(e, run.kind);
@@ -878,6 +902,9 @@ export default function RunDetail() {
                   <div key={rowKey} style={{ marginBottom: 6 }}>
                     <Checkbox value={key}>
                       <code>{entryLabelOf(e, run.kind)}</code>
+                      {run.kind === 'metric' && e.op && (
+                        <Tag style={{ marginLeft: 8 }}>{String(e.op)}</Tag>
+                      )}
                       {mappingEntry && (
                         <>
                           <Tag style={{ marginLeft: 8 }}>{String(e.op ?? '')}</Tag>
@@ -962,8 +989,9 @@ export default function RunDetail() {
                         <div style={{ color: '#8c8c8c', fontSize: 12, marginLeft: 24 }}>{e.expression}</div>
                       )
                     )}
-                    {/* relation / constraint / mapping 条目没有 alias 语义（mapping 条目也带 op），
-                        人工调整口（改别名/表达式）不适用 — 例外：constraint add/update 可改口径 */}
+                    {/* relation / constraint / mapping / synonym / metric 条目没有 alias 语义
+                        （mapping / metric 条目也带 op），人工调整口（改别名/表达式）不适用
+                        — 例外：constraint add/update 可改口径 */}
                     {canAdjust && (
                       <Tooltip title={run.status !== 'evaluated'
                         ? t('evolutionConsole.adjustDisabledHint') : ''}>
@@ -1183,12 +1211,11 @@ export default function RunDetail() {
 
   return (
     <div>
-      <div className="yx-page-title">
-        <Space>
-          <Button onClick={() => navigate('/evolution')}>{t('evolutionConsole.backToList')}</Button>
-          <h1 style={{ margin: 0 }}>{t('evolutionConsole.detailTitle', { runId })}</h1>
-        </Space>
-      </div>
+      <PageHeader
+        title={t('evolutionConsole.detailTitle', { runId })}
+        backTo="/evolution"
+        backText={t('evolutionConsole.backToList')}
+      />
 
       <Tabs
         activeKey={activeTab}
@@ -1417,8 +1444,8 @@ export default function RunDetail() {
         )}
       </Modal>
 
-      {run.kind === 'alias' || run.kind === 'synonym' ? (
-        // alias / synonym 批人工验真：先看候选生效后的真实返回，再判 pass/fail。
+      {run.kind === 'alias' || run.kind === 'synonym' || run.kind === 'metric' ? (
+        // alias / synonym / metric 批人工验真：先看候选生效后的真实返回，再判 pass/fail。
         <AdhocVerifyModal
           open={adhocOpen}
           runId={runId}

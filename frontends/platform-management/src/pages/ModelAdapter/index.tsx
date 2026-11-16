@@ -31,7 +31,7 @@ const BUILT_IN_MODEL_TYPE_KEYS: Record<string, string> = {
 const ICON_CONFIG: { icon: React.ReactNode; color: string }[] = [
   { icon: <RobotOutlined />, color: '#10b981' },
   { icon: <CodepenOutlined />, color: '#8b5cf6' },
-  { icon: <BlockOutlined />, color: '#3b82f6' },
+  { icon: <BlockOutlined />, color: 'var(--yx-accent)' },
   { icon: <SortDescendingOutlined />, color: '#f59e0b' },
 ];
 
@@ -130,7 +130,7 @@ export default function ModelAdapterPage() {
             style={{ width: 240 }}
           />
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <span style={{ fontSize: 13, color: '#64748b' }}>
+            <span style={{ fontSize: 13, color: 'var(--yx-text-secondary)' }}>
               {t('modelAdapter.totalModels', { count: filtered.length })}
             </span>
             <Button type="primary" icon={<PlusOutlined />} onClick={() => modalRef.current?.open()}>
@@ -155,7 +155,7 @@ export default function ModelAdapterPage() {
               return (
                 <div
                   key={p.id}
-                  style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 24 }}
+                  style={{ background: '#fff', border: '1px solid var(--yx-border)', borderRadius: 12, padding: 24 }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
                     <div
@@ -175,7 +175,7 @@ export default function ModelAdapterPage() {
                     </div>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontWeight: 600, fontSize: 16 }}>{p.name}</div>
-                      <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                      <div style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
                         {PROVIDER_TYPE_LABELS[p.provider_type] || p.provider_type} · {modelTypeLabel}
                       </div>
                     </div>
@@ -185,11 +185,11 @@ export default function ModelAdapterPage() {
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 16 }}>
                     <div style={{ fontSize: 13 }}>
-                      <span style={{ color: '#94a3b8' }}>{t('modelAdapter.latency')}: </span>
+                      <span style={{ color: 'var(--yx-text-muted)' }}>{t('modelAdapter.latency')}: </span>
                       {fmtLatency(p.latency_ms)}
                     </div>
                     <div style={{ fontSize: 13 }}>
-                      <span style={{ color: '#94a3b8' }}>
+                      <span style={{ color: 'var(--yx-text-muted)' }}>
                         {p.token_limit
                           ? t('modelAdapter.tokenLimit') + ': '
                           : p.vector_dimension
@@ -202,11 +202,11 @@ export default function ModelAdapterPage() {
                         '-'}
                     </div>
                     <div style={{ fontSize: 13 }}>
-                      <span style={{ color: '#94a3b8' }}>{t('modelAdapter.callCount')}: </span>
+                      <span style={{ color: 'var(--yx-text-muted)' }}>{t('modelAdapter.callCount')}: </span>
                       {fmtCount(p.call_count)}
                     </div>
                     <div style={{ fontSize: 13 }}>
-                      <span style={{ color: '#94a3b8' }}>{t('modelAdapter.successRate')}: </span>
+                      <span style={{ color: 'var(--yx-text-muted)' }}>{t('modelAdapter.successRate')}: </span>
                       {p.success_rate !== null ? `${p.success_rate}%` : '-'}
                     </div>
                   </div>

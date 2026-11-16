@@ -42,7 +42,7 @@
   margin-bottom: 16px;
   padding: 8px 12px;
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
 }
 
 .perm-group + .perm-group {
@@ -65,7 +65,7 @@
 }
 
 .perm-item:hover {
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
 }
 
 .perm-item-name {
@@ -74,7 +74,7 @@
 }
 
 .perm-item-code {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 11px;
   line-height: 16px;
 }

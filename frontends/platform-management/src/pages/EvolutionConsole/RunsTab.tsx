@@ -136,6 +136,14 @@ export default function RunsTab({ status, onChanged }: RunsTabProps) {
   /** 勾选框禁用与原因：已选行本身永远可点（否则无法取消选择）。 */
   const checkboxPropsFor = (row: EvolutionRunSummary) => {
     if (selectedSet.has(row.run_id)) return {};
+    // 指标口径暂不支持批量采纳（服务端 `validate_batch` 同样拒绝 metric）：
+    // 链键仍由 SCOPE_BY_KIND.metric 推导（判重/详情页逻辑复用），这里只挡选择。
+    if (row.kind === 'metric') {
+      return {
+        disabled: true,
+        title: t('evolutionConsole.batchSelectMetricUnsupported'),
+      };
+    }
     const chain = chainKeyOf(row);
     if (!chain) {
       return { disabled: true, title: t('evolutionConsole.batchSelectUnavailable') };
@@ -169,6 +177,11 @@ export default function RunsTab({ status, onChanged }: RunsTabProps) {
     const chains = new Set<string>();
     runs.forEach((row) => {
       if (!wanted.has(row.run_id)) return;
+      // 表头全选的 keys 可能绕过禁用态（同一事件里的渲染快照），这里再挡一次。
+      if (row.kind === 'metric') {
+        dropped.push(row.run_id);
+        return;
+      }
       const chain = chainKeyOf(row);
       if (!chain) {
         dropped.push(row.run_id);

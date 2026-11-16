@@ -269,14 +269,14 @@ export interface AdhocTruth {
  * 都会让旧票据失效，所以**没有它不能判 pass**。空结果 / 拒答仍会签发票据（`ok=false`
  * 但 `error` 给出原因），只有 apply / ask 执行异常才没有票据。
  *
- * alias 批给 `alias` / `concept`；synonym 批（值同义词）给 `term` / `canonical`
- * —— 两组键按 kind 二选一，**不是**都有。 */
+ * alias 批给 `alias` / `concept`；synonym 批（值同义词）给 `term` / `canonical`；
+ * metric 批给 `metric` / `definition` / `formula` —— 三组键按 kind 三选一，**不是**都有。 */
 export interface AdhocEvidence {
   case_id: string;
   question: string;
-  /** alias 批：候选别名（synonym 批没有该键）。 */
+  /** alias 批：候选别名（synonym / metric 批没有该键）。 */
   alias?: string;
-  /** alias 批：抽象概念名（synonym 批没有该键）。 */
+  /** alias 批：抽象概念名（synonym / metric 批没有该键）。 */
   concept?: string;
   /** synonym 批：显示用的候选值同义词（优先取非 canonical 的第一个词）。 */
   term?: string;
@@ -284,6 +284,18 @@ export interface AdhocEvidence {
   terms?: string[];
   /** synonym 批：标准值（归一目标）。 */
   canonical?: string;
+  /** metric 批：候选指标名（`entry_key(..., "metric")` 的同一字段）。 */
+  metric?: string;
+  /** metric 批：指标定义（口径说明）。 */
+  definition?: string;
+  /** metric 批：计算公式（可选，不是所有指标都有）。 */
+  formula?: string;
+  /** metric 批：候选名/别名是否在问句中命中（生产注入的前提；老后端不返回）。 */
+  production_hit?: boolean;
+  /** metric 批：本次指标提示因长度预算被丢弃（老后端不返回）。 */
+  hint_dropped?: boolean;
+  /** metric 批：候选对应的既有指标当前处于停用状态（老后端不返回）。 */
+  metric_disabled?: boolean;
   /** 抽象 schema 里该概念的其它别名（人工核对全名用）。 */
   concept_aliases?: string[];
   columns: string[];
@@ -346,10 +358,11 @@ export interface EvalArm {
  * `relation` = join 边批；`constraint` = 约束批（relation/constraint 与 query_rule
  * 共用 compiled 版本链，scope=compiled，同链同锁）；`mapping` = 落点语义槽批、
  * `tool_schema` = 多轮工具口径批（二者与 alias 共用 abstract 版本链，KB 级 run，
- * 不接受 ds）；`synonym` = 值同义词批（KB 级、**独立** synonym 版本链，不接受 ds）。 */
+ * 不接受 ds）；`synonym` = 值同义词批（KB 级、**独立** synonym 版本链，不接受 ds）；
+ * `metric` = 指标口径批（KB 级、与 alias/tool_schema 共用 abstract 版本链，不接受 ds）。 */
 export type EvolutionKind =
   | 'alias' | 'query_rule' | 'relation' | 'constraint' | 'mapping' | 'tool_schema'
-  | 'synonym';
+  | 'synonym' | 'metric';
 
 /** constraint 批的请求条目（P1-4）。四种 op 互斥：
  * - `add`：新增查询规则（只允许 constraint_type=query_rule）
@@ -425,6 +438,14 @@ export interface PatchEntry {
   terms?: string[];
   /** synonym 条目：这组词归一到的标准值（`approved`）。 */
   canonical?: string;
+  /** metric 条目：指标别名（与 `name` 同源，供词面命中）。 */
+  aliases?: string[];
+  /** metric 条目：指标定义（口径说明）。 */
+  definition?: string;
+  /** metric 条目：计算公式（可选）。 */
+  formula?: string;
+  /** metric 条目：物理落点声明（`{data_source_id, entity_name?, attribute_name?, di_metric?}`）。 */
+  landings?: unknown[];
   proposal_id?: string;
   question?: string;
   target_code?: string;
@@ -475,6 +496,8 @@ export interface SkipItem {
   target?: string;
   target_column?: string;
   name?: string;
+  /** metric / synonym 跳过条目带操作类型（add/update/disable/enable/delete）。 */
+  op?: string;
   /** 条目在请求 entries 里的下标（跳过条目必带；用于没有其它可展示字段时兜底）。 */
   index?: number;
   why?: string;
@@ -827,8 +850,8 @@ export interface ConfirmAdoptBody {
   request_id?: string;
   override_reason?: string;
   adhoc_truths?: AdhocTruth[];
-  /** 人工 ad-hoc 判定（alias 批）：与 `adhoc_truths` **互斥** —— alias run 送
-   * verdicts、其余 kind 继续送 truths，两者同时出现服务端 1001。 */
+  /** 人工 ad-hoc 判定（alias / synonym / metric 批）：与 `adhoc_truths` **互斥** ——
+   * 这三类 run 送 verdicts、其余 kind 继续送 truths，两者同时出现服务端 1001。 */
   adhoc_verdicts?: AdhocVerdict[];
 }
 

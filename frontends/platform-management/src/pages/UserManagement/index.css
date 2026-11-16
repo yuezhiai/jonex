@@ -90,7 +90,7 @@
 /* antd 的分割线是 6% 透明度的边框，卡片白底上几乎看不见 */
 .user-tenant-menu .ant-menu-item-divider {
   margin: 6px 8px;
-  border-block-start-color: #e2e8f0;
+  border-block-start-color: var(--yx-border);
 }
 
 .user-tenant-item {
@@ -119,7 +119,7 @@
   min-width: 20px;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   text-align: right;
 }
 
@@ -134,57 +134,9 @@
   display: flex;
   flex-direction: column;
   padding-left: 24px;
-  border-left: 1px solid #e2e8f0;
+  border-left: 1px solid var(--yx-border);
 }
 
 /* ── 右栏高度链路：CommonTable → 表 wrapper → 表体 ──
    表头与分页固定，中间的表体吃掉剩余高度。整条链缺一级就会退回内容高度
    （表体不滚、分页悬在半空）。表头/表体分离依赖 scroll.x，见页面里的 scroll 属性。 */
-.user-table {
-  flex: 1;
-  min-height: 0;
-}
-
-.user-table > .ant-table-wrapper {
-  flex: 1;
-  min-height: 0;
-}
-
-.user-table > .ant-table-wrapper .ant-spin,
-.user-table > .ant-table-wrapper .ant-spin-container {
-  height: 100%;
-}
-
-.user-table > .ant-table-wrapper .ant-spin-container {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.user-table > .ant-table-wrapper .ant-table {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.user-table > .ant-table-wrapper .ant-table-container {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-}
-
-.user-table > .ant-table-wrapper .ant-table-header {
-  flex-shrink: 0;
-}
-
-.user-table > .ant-table-wrapper .ant-table-body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto !important;
-}
-
-.user-table > .ant-table-wrapper .ant-pagination {
-  flex-shrink: 0;
-  margin: 0 !important;
-  padding-top: 12px;
-}

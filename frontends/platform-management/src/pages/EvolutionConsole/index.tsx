@@ -3,6 +3,7 @@ import { Alert, Spin, Tabs } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { getEvolutionStatus, type EvolutionStatus } from '../../api/evolution';
+import { PageHeader } from '@jonex/shared-lib';
 import FailuresTab from './FailuresTab';
 import RunsTab from './RunsTab';
 import LedgersTab from './LedgersTab';
@@ -43,8 +44,11 @@ export default function EvolutionConsole() {
 
   if (loading && !status && !statusError) {
     return (
-      <div className="yx-card" style={{ textAlign: 'center', padding: 64 }}>
-        <Spin />
+      <div>
+        <PageHeader title={t('evolutionConsole.title')} subtitle={t('evolutionConsole.subtitle')} />
+        <div className="yx-card" style={{ textAlign: 'center', padding: 64 }}>
+          <Spin />
+        </div>
       </div>
     );
   }
@@ -54,12 +58,7 @@ export default function EvolutionConsole() {
 
   return (
     <div>
-      <div className="yx-page-title">
-        <h1>{t('evolutionConsole.title')}</h1>
-        <p style={{ color: '#64748b', margin: '4px 0 0', fontSize: 14 }}>
-          {t('evolutionConsole.subtitle')}
-        </p>
-      </div>
+      <PageHeader title={t('evolutionConsole.title')} subtitle={t('evolutionConsole.subtitle')} />
       <div className="yx-card">
         {statusError && (
           <Alert

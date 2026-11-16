@@ -460,6 +460,38 @@ describe('StartRunModal · synonym kind', () => {
   });
 });
 
+describe('StartRunModal · metric kind', () => {
+  const metricOption = () =>
+    screen.getByRole('radio', { name: 'evolutionConsole.kind.metric' })
+      .closest('label') as HTMLElement;
+
+  it('kind 选项里列出 metric；切过去后不显示 ds，但保留窗口天数', async () => {
+    const user = await setup();
+
+    expect(metricOption()).toBeTruthy();
+    await user.click(metricOption());
+
+    expect(screen.queryByText('evolutionConsole.formDs')).toBeNull();
+    expect(screen.getByText('evolutionConsole.formWindowDays')).toBeTruthy();
+  });
+
+  it('提交 metric 时只发 kb + window_days（KB 级 run，不发 ds / entries）', async () => {
+    startEvolutionRun.mockResolvedValue({ run_id: 'run_metric_1' });
+    const user = await setup();
+
+    await user.click(metricOption());
+    await user.click(submitButton());
+
+    await waitFor(() => expect(startEvolutionRun).toHaveBeenCalledTimes(1));
+    const body = startEvolutionRun.mock.calls[0][0];
+    expect(body.kind).toBe('metric');
+    expect(body.kb).toBe(DEFAULT_KB);
+    expect(body.ds).toBeUndefined();
+    expect(body.entries).toBeUndefined();
+    expect(body.window_days).toBe(7);
+  });
+});
+
 describe('StartRunModal · mapping kind', () => {
   /** mapping 的 ds 池复用 queryRuleKbs.sources；默认 ds 不在池里时会被对账清空，
    * 所以这里显式给出 ds_1 并走真实的选择交互。 */

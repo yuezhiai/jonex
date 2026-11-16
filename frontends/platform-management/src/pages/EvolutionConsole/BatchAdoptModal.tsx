@@ -14,13 +14,14 @@ export const MAX_BATCH_RUNS = 10;
 export type ChainScope = 'abstract' | 'synonym' | 'compiled';
 
 /** kind → 版本链 scope：与后端 `locking._KIND_TO_SCOPE` 逐字对齐。
- * `alias` / `mapping` / `tool_schema` 共用 abstract（KB 级）链；`synonym`
+ * `alias` / `mapping` / `tool_schema` / `metric` 共用 abstract（KB 级）链；`synonym`
  * （值同义词）是**独立**的 KB 级链（不与 abstract 互斥）；`query_rule` /
  * `relation` / `constraint` 共用 compiled（按 ds）链。 */
 const SCOPE_BY_KIND: Record<string, ChainScope> = {
   alias: 'abstract',
   mapping: 'abstract',
   tool_schema: 'abstract',
+  metric: 'abstract',
   synonym: 'synonym',
   query_rule: 'compiled',
   relation: 'compiled',

@@ -382,3 +382,146 @@ export interface DoServiceDetail {
   requestCount: number;
   lastRequestAt: string | null;
 }
+
+/* ══════════════════════ 页 4：数据问答（NL→SQL 观测） ══════════════════════ */
+
+/**
+ * 空源哨兵：后端把 `data_source_id=''`（还没选到源的失败，如 no_candidate）
+ * 统一归到 `__unassigned__` 桶。筛选时也必须传这个哨兵，**不能传空串** ——
+ * 空串在服务层表示「未传」，会被当成不按源过滤。
+ */
+export const DO_NL2SQL_UNASSIGNED_SOURCE = '__unassigned__';
+
+/** 后端按日补零后的趋势点。样本数只数非空延迟，不是 requests */
+export interface DoNl2SqlTrendPoint {
+  /** YYYY-MM-DD */
+  date: string;
+  requests: number;
+  failed: number;
+  /** SQL 执行耗时 P95；样本不足或当天无成功执行时为 null */
+  sql_p95_ms: number | null;
+  sql_samples: number;
+  /** 端到端耗时 P95；旧行 total_ms 为 NULL 时样本不足 */
+  total_p95_ms: number | null;
+  total_samples: number;
+}
+
+/** 慢查询/失败列表与详情共用的一行。字段名与后端 snake_case 一致 */
+export interface DoNl2SqlRow {
+  id: string;
+  /** 后端 naive 时间（应用本地墙钟），列表展示前由页面格式化 */
+  created_at: string | null;
+  knowledge_base_id: string | null;
+  kb_name: string | null;
+  /** 空源输出为 `__unassigned__`，展示走 i18n「未识别源」；降级空壳为 null */
+  data_source_id: string | null;
+  source_name: string;
+  entity_name: string | null;
+  /** 降级空壳为 null —— 组件与抽屉都不得假设非空 */
+  question: string | null;
+  sql: string | null;
+  /** SQL 执行耗时（run_readonly 前后），不是端到端耗时 */
+  elapsed_ms: number | null;
+  /** 端到端耗时；旧行 / 失败早期出口可能为 null */
+  total_ms: number | null;
+  row_count: number | null;
+  /** 降级空壳为 null；未知取值按原始码展示 */
+  outcome: 'success' | 'failed' | string | null;
+  reason_code: string | null;
+  /** A1b 预编译违规码；未触发 A1b 时为 null */
+  precompile_violation: string | null;
+  precompile_retried: boolean;
+  /** 演化基准流量 */
+  synthetic: boolean;
+  /** 失败原因（截断 500）；非失败行为 null */
+  reason?: string | null;
+}
+
+/** 详情接口的 item：在列表行基础上补完整现场 */
+export interface DoNl2SqlDetail extends DoNl2SqlRow {
+  /** 被预编译校验拦下的 SQL（A1b）；没拦下时为 null */
+  rejected_sql: string | null;
+  /** 完整 scene（A1b / near_miss / 工具轨迹等）；降级或旧行可能为 null */
+  scene: Record<string, unknown> | null;
+}
+
+/** 延迟分布。P* 可能为 null（样本不足），样本数只数非空值 */
+export interface DoNl2SqlLatency {
+  sql_p50_ms: number | null;
+  sql_p95_ms: number | null;
+  sql_p99_ms: number | null;
+  sql_samples: number;
+  total_p50_ms: number | null;
+  total_p95_ms: number | null;
+  total_p99_ms: number | null;
+  total_samples: number;
+}
+
+/** 慢查询/慢回答计数与占比。边界是 `>=`，分母只数非空延迟 */
+export interface DoNl2SqlSlowStats {
+  threshold_ms: number;
+  sql_count: number;
+  sql_rate: number;
+  total_count: number;
+  total_rate: number;
+}
+
+/** A1b 预编译重试汇总 */
+export interface DoNl2SqlPrecompile {
+  retried: number;
+  retry_rate: number;
+  by_code: { code: string; count: number }[];
+}
+
+/** 按源分布。空源 = `data_source_id === DO_NL2SQL_UNASSIGNED_SOURCE` */
+export interface DoNl2SqlSourceStats {
+  data_source_id: string;
+  source_name: string;
+  requests: number;
+  failed: number;
+  sql_p95_ms: number | null;
+  sql_samples: number;
+  slow_count: number;
+}
+
+/** 失败码分布。空码归 null，前端显示「未分类」 */
+export interface DoNl2SqlReasonCode {
+  reason_code: string | null;
+  count: number;
+}
+
+/**
+ * `GET /data-operations/nl2sql-overview` 的响应。
+ *
+ * `success_rate` 在分母为 0 时为 null（设计 §5）；趋势/按源上的 P95 都随行带样本数，
+ * 前端按 `<20` 显示「—（样本不足）」。
+ */
+export interface DoNl2SqlOverview {
+  window: { start: string; end: string };
+  totals: {
+    requests: number;
+    success: number;
+    failed: number;
+    /** 0~1 小数；分母 0 → null */
+    success_rate: number | null;
+    synthetic: number;
+  };
+  latency: DoNl2SqlLatency;
+  slow: DoNl2SqlSlowStats;
+  precompile: DoNl2SqlPrecompile;
+  trend: DoNl2SqlTrendPoint[];
+  by_source: DoNl2SqlSourceStats[];
+  reason_codes: DoNl2SqlReasonCode[];
+  /** 与 nl2sql-slow 的 item 同形，最多 10 条 */
+  top_slow: DoNl2SqlRow[];
+  /** 与 nl2sql-failures 的 item 同形，最多 10 条 */
+  top_failures: DoNl2SqlRow[];
+}
+
+/** 列表分页响应。`page` / `page_size` 原样回显请求值 */
+export interface DoNl2SqlList {
+  items: DoNl2SqlRow[];
+  total: number;
+  page: number;
+  page_size: number;
+}

@@ -363,7 +363,8 @@
       "source": "任务来源",
       "startedAt": "开始时间",
       "finishedAt": "结束时间",
-      "duration": "耗时"
+      "duration": "耗时",
+      "tokens": "Token 消耗"
     },
     "action": {
       "detail": "查看详情",
@@ -391,7 +392,18 @@
       "subtaskId": "子任务 ID",
       "totalDuration": "总耗时",
       "result": "处理结果",
-      "failureReason": "失败原因"
+      "failureReason": "失败原因",
+      "tokenUsage": "Token 消耗",
+      "documentName": "来源文档",
+      "tokens": "Token",
+      "tokenNotApplicable": "该任务不是知识库文档任务",
+      "tokenBreakdown": "阶段拆分",
+      "stageParse": "解析",
+      "stageOntology": "本体",
+      "stageWiki": "Wiki 编译",
+      "stageKbCompile": "整库编译",
+      "kbCompileShared": "本批 {{count}} 份共享",
+      "stageBreakdownHint": "本体抽取与 Wiki 编译在任务收口后才跑完；整库编译一次服务整个库，按本批文档数平摊。单独列出以免被合计漏掉"
     },
     "result": {
       "pending": "{{name}}等待执行",
@@ -651,6 +663,11 @@
     "host": "主机",
     "port": "端口",
     "database": "数据库",
+    "url": "地址",
+    "urlHint": "InfluxDB v3 的 HTTP 地址，如 http://127.0.0.1:8181（不要带 /api）",
+    "influxDatabase": "数据库 / Bucket",
+    "token": "API Token",
+    "tokenHint": "提交后加密保存；编辑时留空表示不修改",
     "schema": "Schema",
     "schemaHint": "不填用默认（PostgreSQL 为 public，SQL Server 为 dbo）",
     "user": "用户名",
@@ -752,7 +769,8 @@
       "constraint": "约束批",
       "mapping": "落点批",
       "tool_schema": "工具口径批",
-      "synonym": "值同义词"
+      "synonym": "值同义词",
+      "metric": "指标口径批"
     },
     "kindRelation": "关系批",
     "relationEntryHint": "join 边：source 列 → target 列（采纳后写入 compiled schema 的 relation_types）",
@@ -880,6 +898,7 @@
     "batchSelectUnavailable": "缺少类型或知识库归属，无法推导版本链，不能批量采纳",
     "batchSelectOtherKb": "一次只能采纳同一知识库（已选 {{kb}}）",
     "batchSelectSameChain": "与已选 {{runId}} 同属一条版本链（每链只能一个）",
+    "batchSelectMetricUnsupported": "指标口径暂不支持批量采纳，请在详情页逐条验真",
     "batchSelectLimit": "一次最多 {{n}} 条",
     "batchSelectDropped": "已按「同 KB、每链一个」调整选择，未选：{{runIds}}",
     "formKind": "类型",
@@ -899,7 +918,9 @@
       "tool_schema": "调整工具说明",
       "toolSchemaDesc": "多轮问数里某个工具的说明或启停。",
       "synonym": "统一值叫法（同义词）",
-      "synonymDesc": "让「华东环保」这类值对应到数据里的标准值（如「华东环保集团」），问数时能筛对。"
+      "synonymDesc": "让「华东环保」这类值对应到数据里的标准值（如「华东环保集团」），问数时能筛对。",
+      "metric": "统一指标口径",
+      "metricDesc": "某个指标算错了（如漏了分母），把定义、公式与落点一并校正。"
     },
     "advanced": "高级选项",
     "formTargetCasesCount": "当前知识库 {{count}} 条",
@@ -1089,6 +1110,11 @@
     "skipWhyAliasTaken": "别名已被概念「{{by}}」占用（为避免歧义不加）",
     "skipWhyBadArgs": "概念名或别名为空，无效",
     "skipWhyToolsFull": "工具覆盖已达 20 条上限，该工具没有覆盖项可改",
+    "skipWhyMetricEmptyName": "指标名为空，无效",
+    "skipWhyMetricNameTooLong": "指标名过长（超过 128 字符），无效",
+    "skipWhyMetricNotFound": "库里没有这个指标，无法修改",
+    "skipWhyMetricMaxMetrics": "指标数量已达 500 条上限，未新增",
+    "skipWhyMetricInvalidLandings": "指标落点无效（数据源 / 实体 / 字段不合法），未写入",
     "skipWhyExprEmpty": "约束表达式为空，无效",
     "skipWhyTargetFormat": "目标要写成「实体.字段」格式：{{code}}",
     "skipWhyTargetMissingFile": "候选文件里没有这个目标",
@@ -1347,6 +1373,12 @@
     "adhocVerifyConcept": "概念",
     "adhocVerifyTerm": "值同义词",
     "adhocVerifyCanonical": "标准值",
+    "adhocVerifyMetric": "指标",
+    "adhocVerifyDefinition": "定义",
+    "adhocVerifyFormula": "公式",
+    "adhocVerifyProductionMiss": "该指标名/别名未在问句中命中，采纳后自动注入不会生效，建议在候选里补充问句使用的说法",
+    "adhocVerifyHintDropped": "本次指标提示超出长度预算未生效，验真结果可能不代表实际效果",
+    "adhocVerifyMetricDisabled": "该指标当前处于停用状态，采纳后仍需重新启用才会生效",
     "adhocVerifyRowCount": "共 {{n}} 行",
     "adhocVerifyNoRows": "查询没有返回数据",
     "adhocVerifyPass": "通过",
@@ -1660,6 +1692,10 @@
       "sourcePlaceholder": "筛选来源服务",
       "targetPlaceholder": "搜索或选择对象 / 能力",
       "searchPlaceholder": "搜索来源、目标或 Request ID",
+      "degradedMode": {
+        "title": "当前为降级口径",
+        "description": "每条记录按物理尝试展开，没有尝试记录的调用各计 1 行，因此条数可能多于逻辑调用数。"
+      },
       "column": {
         "time": "调用时间",
         "direction": "调用方向",
@@ -1669,6 +1705,7 @@
         "method": "调用方式",
         "status": "状态",
         "latency": "响应时间",
+        "tokens": "Token 用量",
         "errorCode": "错误码",
         "requestId": "Request ID",
         "traceId": "Trace ID"
@@ -1677,7 +1714,7 @@
     "callDetail": {
       "title": "调用详情",
       "thinShellTitle": "本期仅采集部分字段",
-      "thinShellDescription": "调用明细目前只落库 Request ID 与错误信息，方法、路径、状态码、请求/响应报文与 Token 字段暂未采集。",
+      "thinShellDescription": "调用明细目前只落库 Request ID、错误信息与 Token 用量；方法、路径、状态码与请求/响应报文暂未采集。",
       "method": "HTTP 方法",
       "statusCode": "响应状态码",
       "path": "请求路径",
@@ -1753,6 +1790,11 @@
     "degraded": {
       "title": "数据降级",
       "description": "部分数据源不可用，以下指标可能不完整。"
+    },
+    "unattributed": {
+      "title": "另有未归因调用，未计入本页统计",
+      "description": "{{calls}} 次调用、{{tokens}} Token 没有携带租户标识，无法归入任何租户；最近一次出现于 {{last}}。",
+      "share": "占同窗口全平台调用 {{shareCalls}}、Token {{shareTokens}}。"
     },
     "metaUnavailable": {
       "title": "筛选候选加载失败",
@@ -2064,7 +2106,8 @@
     "tabs": {
       "assets": "数据资产",
       "knowledge": "知识资产",
-      "search": "检索分析"
+      "search": "检索分析",
+      "nl2sql": "数据问答"
     },
     "common": {
       "totalItems": "共 {{total}} 条",
@@ -2345,6 +2388,92 @@
       "callCount": "调用次数",
       "lastCallAt": "最近调用时间",
       "relatedKbs": "关联知识库"
+    },
+    "nl2sql": {
+      "kpi": {
+        "requests": "问答量",
+        "successRate": "成功率",
+        "sqlP95": "SQL P95",
+        "totalP95": "端到端 P95",
+        "slowQueries": "慢查询",
+        "retryRate": "A1b 重试率",
+        "insufficientSamples": "—（样本不足）"
+      },
+      "section": {
+        "volumeTrendTitle": "问答量与失败趋势",
+        "p95TrendTitle": "P95 耗时趋势",
+        "p95TrendDesc": "虚线为当日样本少于 20 条的 P95，仅供参考",
+        "slowTitle": "慢查询（按 SQL 执行耗时）",
+        "failureTitle": "失败复盘",
+        "sourceTitle": "数据源分布"
+      },
+      "empty": {
+        "noObservations": "窗口内没有数据问答记录",
+        "noLatencySamples": "窗口内没有可用的耗时样本",
+        "noSlowQueries": "没有达到阈值的慢查询",
+        "noFailures": "窗口内没有失败记录"
+      },
+      "filter": {
+        "allSource": "全部数据源",
+        "unassignedSource": "未识别源",
+        "slowThreshold": "慢阈值",
+        "slowOption": "{{seconds}} 秒",
+        "includeSynthetic": "包含演化基准流量"
+      },
+      "trend": {
+        "requests": "问答量",
+        "failed": "失败数",
+        "sqlP95": "SQL P95",
+        "totalP95": "端到端 P95",
+        "lowSample": "（样本不足）"
+      },
+      "column": {
+        "time": "时间",
+        "source": "数据源",
+        "kb": "知识库",
+        "question": "问句",
+        "sqlDuration": "SQL 耗时",
+        "totalDuration": "端到端耗时",
+        "rowCount": "行数",
+        "outcome": "结果",
+        "a1b": "A1b",
+        "reasonCode": "失败码",
+        "reason": "原因",
+        "requests": "问答量",
+        "failRate": "失败率",
+        "slowCount": "慢查询",
+        "sqlP95": "SQL P95"
+      },
+      "outcome": {
+        "success": "成功",
+        "failed": "失败"
+      },
+      "reasonCode": {
+        "unclassified": "未分类"
+      },
+      "a1b": {
+        "retried": "已重试"
+      },
+      "drawer": {
+        "title": "问答现场",
+        "notFound": "该记录不存在或无权访问",
+        "basic": "基本信息",
+        "timing": "耗时",
+        "question": "问句",
+        "sql": "SQL",
+        "rejectedSql": "被拦截的 SQL",
+        "reason": "失败原因",
+        "scene": "场景摘要",
+        "emptySql": "无 SQL",
+        "questionMissing": "（问句缺失）",
+        "id": "观测 ID",
+        "degraded": "该记录为降级空壳，部分现场信息不可用",
+        "nearMiss": "近似命中",
+        "noNearMiss": "无近似命中",
+        "trajectory": "工具轨迹",
+        "truncated": "已截断",
+        "noTrajectory": "无工具轨迹"
+      }
     }
   },
   "dataGovernance": {

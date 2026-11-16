@@ -260,6 +260,44 @@ describe('RunsTab 批量采纳', () => {
     expect(enScopeCopy.synonym).toBeTruthy();
   });
 
+  it('metric run 的复选框禁用并提示逐条验真', async () => {
+    listEvolutionRuns.mockResolvedValue({
+      runs: [
+        runSummary('run_a', 'evaluated', { kind: 'alias', kb: 'kb_1' }),
+        runSummary('run_m', 'evaluated', { kind: 'metric', kb: 'kb_1' }),
+      ],
+    });
+
+    render(<RunsTab status={noActiveRun} onChanged={() => {}} />);
+    await screen.findByText('run_a');
+
+    expect(rowCheckbox('run_m').disabled).toBe(true);
+    expect(rowCheckboxTitle('run_m')).toContain('batchSelectMetricUnsupported');
+    // 其它 kind 不受影响。
+    expect(rowCheckbox('run_a').disabled).toBe(false);
+  });
+
+  it('表头全选也不会把 metric run 纳入批量选择', async () => {
+    listEvolutionRuns.mockResolvedValue({
+      runs: [
+        runSummary('run_a', 'evaluated', { kind: 'alias', kb: 'kb_1' }),
+        runSummary('run_m', 'evaluated', { kind: 'metric', kb: 'kb_1' }),
+      ],
+    });
+
+    render(<RunsTab status={noActiveRun} onChanged={() => {}} />);
+    await screen.findByText('run_a');
+
+    const headerCheckbox = document.querySelector(
+      '.ant-table-thead input[type="checkbox"]',
+    ) as HTMLInputElement | null;
+    expect(headerCheckbox).toBeTruthy();
+    fireEvent.click(headerCheckbox!);
+
+    await waitFor(() => expect(rowCheckbox('run_a').checked).toBe(true));
+    expect(rowCheckbox('run_m').checked).toBe(false);
+  });
+
   it('submits batch adopt with selected run ids and shows per-run results', async () => {
     listEvolutionRuns.mockResolvedValue({
       runs: [

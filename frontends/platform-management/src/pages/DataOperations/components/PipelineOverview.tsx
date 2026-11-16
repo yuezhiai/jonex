@@ -12,8 +12,8 @@ interface Props {
 }
 
 const STAGES: { key: keyof DoPipelineOverview; labelKey: string; accent: string }[] = [
-  { key: 'total', labelKey: 'dataOperations.pipeline.total', accent: '#64748b' },
-  { key: 'parsed', labelKey: 'dataOperations.pipeline.parsed', accent: '#3b82f6' },
+  { key: 'total', labelKey: 'dataOperations.pipeline.total', accent: 'var(--yx-text-secondary)' },
+  { key: 'parsed', labelKey: 'dataOperations.pipeline.parsed', accent: 'var(--yx-accent)' },
   { key: 'extracted', labelKey: 'dataOperations.pipeline.extracted', accent: '#8b5cf6' },
   { key: 'compiled', labelKey: 'dataOperations.pipeline.compiled', accent: '#10b981' },
 ];

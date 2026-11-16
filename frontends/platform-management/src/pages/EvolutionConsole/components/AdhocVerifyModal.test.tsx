@@ -279,6 +279,90 @@ describe('AdhocVerifyModal', () => {
     ]);
   });
 
+  it('metric 验真卡显示指标名 / 定义 / 公式 + 数据表，且能判通过', async () => {
+    vi.mocked(fetchAdhocEvidence).mockResolvedValue({
+      ...evidence,
+      alias: undefined,
+      concept: undefined,
+      concept_aliases: undefined,
+      metric: '客单价',
+      definition: '销售额除以订单数',
+      formula: 'SUM(amount) / COUNT(DISTINCT order_id)',
+      columns: ['avg_order_value'],
+      rows: [[88.5]],
+    });
+    const onSubmit = vi.fn();
+    renderModal({ cases: [cases[0]], onSubmit });
+
+    fireEvent.click(viewButtons()[0]);
+    await screen.findByText('客单价');
+
+    expect(screen.getByText('evolutionConsole.adhocVerifyMetric')).toBeTruthy();
+    expect(screen.getByText('evolutionConsole.adhocVerifyDefinition')).toBeTruthy();
+    expect(screen.getByText('evolutionConsole.adhocVerifyFormula')).toBeTruthy();
+    expect(screen.getByText('销售额除以订单数')).toBeTruthy();
+    expect(screen.getByText('SUM(amount) / COUNT(DISTINCT order_id)')).toBeTruthy();
+    // 数据表与普通证据同一套
+    expect(screen.getByText('avg_order_value')).toBeTruthy();
+    expect(screen.getByText('88.5')).toBeTruthy();
+    // metric 不是 synonym/alias 卡，不出现它们的标签
+    expect(screen.queryByText('evolutionConsole.adhocVerifyTerm')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyAlias')).toBeNull();
+    expect(passRadio().disabled).toBe(false);
+
+    fireEvent.click(passRadio());
+    fireEvent.click(submitButton());
+
+    expect(onSubmit).toHaveBeenCalledWith([
+      {
+        case_id: 'c1', verdict: 'pass', evidence_id: 'ev-1',
+        row_count: 1, rows_hash: 'hash-1',
+      },
+    ]);
+  });
+
+  it('metric 字段全空但键存在时仍走 metric 卡（不退化成 alias 卡）', async () => {
+    // 字段值可能为空（执行失败/未填），但键存在就说明是 metric 批：
+    // 不能按真值判断，否则会退化显示 `Alias - → Concept -`。
+    vi.mocked(fetchAdhocEvidence).mockResolvedValue({
+      ...evidence,
+      metric: '',
+      definition: '',
+      formula: '',
+    });
+    renderModal({ cases: [cases[0]] });
+
+    fireEvent.click(viewButtons()[0]);
+    await screen.findByText('evolutionConsole.adhocVerifyMetric');
+
+    expect(screen.queryByText('evolutionConsole.adhocVerifyAlias')).toBeNull();
+  });
+
+  it('metric 证据无票据（执行失败）时 pass/fail/submit 全禁用', async () => {
+    vi.mocked(fetchAdhocEvidence).mockResolvedValue({
+      ...evidence,
+      alias: undefined,
+      concept: undefined,
+      metric: '客单价',
+      definition: '销售额除以订单数',
+      formula: 'SUM(amount) / COUNT(DISTINCT order_id)',
+      columns: [],
+      rows: [],
+      row_count: 0,
+      ok: false,
+      error: '执行失败',
+      evidence_id: null,
+    });
+    renderModal({ cases: [cases[0]] });
+
+    fireEvent.click(viewButtons()[0]);
+    await screen.findByText('执行失败');
+
+    expect(passRadio().disabled).toBe(true);
+    expect(failRadio().disabled).toBe(true);
+    expect(submitButton().disabled).toBe(true);
+  });
+
   it('synonym 证据没有 terms 时回退显示 term', async () => {
     // 旧后端只回 `term`（没有 `terms`），卡片仍要能显示，不能整块空白。
     vi.mocked(fetchAdhocEvidence).mockResolvedValue({
@@ -293,5 +377,58 @@ describe('AdhocVerifyModal', () => {
     await screen.findByText('销量');
 
     expect(screen.getByText('sales')).toBeTruthy();
+  });
+
+  // ── metric 验真警告（I-2 / M-4 / M-5）──
+  const metricEvidence = (overrides: Partial<AdhocEvidence> = {}): AdhocEvidence => ({
+    ...evidence,
+    alias: undefined,
+    concept: undefined,
+    concept_aliases: undefined,
+    metric: '客单价',
+    definition: '销售额除以订单数',
+    columns: [],
+    rows: [],
+    row_count: 0,
+    ...overrides,
+  });
+
+  const renderMetricCard = async (overrides: Partial<AdhocEvidence> = {}) => {
+    vi.mocked(fetchAdhocEvidence).mockResolvedValue(metricEvidence(overrides));
+    renderModal({ cases: [cases[0]] });
+    fireEvent.click(viewButtons()[0]);
+    await screen.findByText('客单价');
+  };
+
+  it('production_hit === false 时展示「未命中问句」警告', async () => {
+    await renderMetricCard({ production_hit: false });
+
+    expect(screen.getByText('evolutionConsole.adhocVerifyProductionMiss')).toBeTruthy();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyHintDropped')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyMetricDisabled')).toBeNull();
+  });
+
+  it('hint_dropped === true 时展示「提示超预算」警告', async () => {
+    await renderMetricCard({ hint_dropped: true });
+
+    expect(screen.getByText('evolutionConsole.adhocVerifyHintDropped')).toBeTruthy();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyProductionMiss')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyMetricDisabled')).toBeNull();
+  });
+
+  it('metric_disabled === true 时展示「指标停用」警告', async () => {
+    await renderMetricCard({ metric_disabled: true });
+
+    expect(screen.getByText('evolutionConsole.adhocVerifyMetricDisabled')).toBeTruthy();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyProductionMiss')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyHintDropped')).toBeNull();
+  });
+
+  it('老后端缺三字段时不渲染任何 metric 警告', async () => {
+    await renderMetricCard();
+
+    expect(screen.queryByText('evolutionConsole.adhocVerifyProductionMiss')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyHintDropped')).toBeNull();
+    expect(screen.queryByText('evolutionConsole.adhocVerifyMetricDisabled')).toBeNull();
   });
 });

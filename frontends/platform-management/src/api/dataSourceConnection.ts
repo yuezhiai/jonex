@@ -23,14 +23,24 @@ export interface ConnectionItem {
   updated_at?: string | null;
 }
 
-/** 创建/更新的载荷。`password` 走明文，后端 `encrypt_config` 会换成 `password_ref`。 */
+/**
+ * 创建/更新的载荷。`password` 走明文，后端 `encrypt_config` 会换成 `password_ref`。
+ *
+ * `url` / `token` 只给 InfluxDB v3 用；`host` / `port` / `user` 对它是空的。
+ * token 也走 `password` 字段落库（Influx 适配器按 `token`/`password` 读），
+ * 不发明文 `token` 键——那不在后端 `encrypt_config` 的白名单里，会明文落库。
+ */
 export interface ConnectionPayload {
   name: string;
   engine: string;
-  host: string;
-  port: number;
+  host?: string;
+  port?: number;
   database: string;
-  user: string;
+  user?: string;
+  /** InfluxDB v3 的 HTTP 地址，如 `http://127.0.0.1:8181` */
+  url?: string;
+  /** InfluxDB v3 的 API token（提交时映射为 `password`） */
+  token?: string;
   password?: string;
   /** PostgreSQL / SQL Server 用；MySQL 拿 database 当 schema，传了也没用 */
   schema?: string;
@@ -88,6 +98,19 @@ export interface CatalogResult {
  *     而不是「把密码清空」。
  */
 function toConfigJson(payload: ConnectionPayload): Record<string, unknown> {
+  // InfluxDB v3 不是「host:port 的 SQL 库」：它用 HTTP URL + token。token 必须
+  // 借 `password` 字段落库，让后端 `encrypt_config` 铸 `password_ref` —— 后端
+  // 只会加密 `password`，写成明文 `token` 键会**原样落库并回显**。
+  if (payload.engine === 'influx_v3') {
+    const config: Record<string, unknown> = {
+      engine: payload.engine,
+      url: payload.url ?? '',
+      database: payload.database,
+    };
+    if (payload.token) config.password = payload.token;
+    // 只读凭据是 ② NL→SQL 的写库凭据口径，时序源不适用：一律不写。
+    return config;
+  }
   const config: Record<string, unknown> = {
     engine: payload.engine,
     host: payload.host,
@@ -138,17 +161,27 @@ export async function createConnection(
  *
  * **不传 password 时后端保留原密码** —— 所以编辑弹窗里密码留空是「不改密码」，
  * 而不是「把密码清空」。`toConfigJson` 把空密码整个键都剔掉，正是为了走那条分支。
+ *
+ * `space_id` 必须**同时**放进 query：网关的 PATCH 端点是 `space_id: str = Query(...)`
+ * 必填（`api_gateway/routes/knowledge_base.py` 的 `update_ds_connection`），只放 body
+ * 会在进函数前就回 1001 / `loc=["query","space_id"]`（2026-11-05 真机踩过，编辑连接
+ * 100% 失败）。body 里那份照旧保留：网关拿到 query 后会覆盖它，且与新建端点的 body
+ * 口径一致，脚本/老客户端按 body 读也不会错位。
  */
 export async function updateConnection(
   id: string,
   payload: ConnectionPayload,
   spaceId: string,
 ): Promise<ConnectionItem> {
-  return apiClient.patch<ConnectionItem>(`/knowledge-base/data-source-connections/${id}`, {
-    space_id: spaceId,
-    name: payload.name,
-    config_json: toConfigJson(payload),
-  });
+  return apiClient.patch<ConnectionItem>(
+    `/knowledge-base/data-source-connections/${id}`,
+    {
+      space_id: spaceId,
+      name: payload.name,
+      config_json: toConfigJson(payload),
+    },
+    { params: { space_id: spaceId } },
+  );
 }
 
 export async function deleteConnection(id: string, spaceId: string): Promise<void> {

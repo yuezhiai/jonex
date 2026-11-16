@@ -39,6 +39,7 @@ import { relationEdgeOf } from './skipReasons';
 const GOALS: Array<{ kind: EvolutionKind; titleKey: string; descKey: string }> = [
   { kind: 'alias', titleKey: 'evolutionConsole.goal.alias', descKey: 'evolutionConsole.goal.aliasDesc' },
   { kind: 'synonym', titleKey: 'evolutionConsole.goal.synonym', descKey: 'evolutionConsole.goal.synonymDesc' },
+  { kind: 'metric', titleKey: 'evolutionConsole.goal.metric', descKey: 'evolutionConsole.goal.metricDesc' },
   { kind: 'query_rule', titleKey: 'evolutionConsole.goal.query_rule', descKey: 'evolutionConsole.goal.queryRuleDesc' },
   { kind: 'relation', titleKey: 'evolutionConsole.goal.relation', descKey: 'evolutionConsole.goal.relationDesc' },
   { kind: 'constraint', titleKey: 'evolutionConsole.goal.constraint', descKey: 'evolutionConsole.goal.constraintDesc' },
@@ -359,11 +360,11 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
    * 抽象 schema 的 tools 块）；query_rule/relation/constraint 用 compiled 行那族
    * （后三者判据同源）。
    *
-   * synonym 不需要抽象 schema（候选来自失败观测、验真走编译 schema），只有抽象
-   * schema 的 KB 不够用：取两族的**去重并集** —— 有数据源/编译 schema 但没有抽象
-   * schema 的 KB 也必须能选。 */
+   * synonym / metric 不需要抽象 schema（候选来自失败观测、验真走编译 schema），
+   * 只有抽象 schema 的 KB 不够用：取两族的**去重并集** —— 有数据源/编译 schema
+   * 但没有抽象 schema 的 KB 也必须能选。 */
   const kbPool = useMemo(() => {
-    if (kind === 'synonym') {
+    if (kind === 'synonym' || kind === 'metric') {
       const byId = new Map(options.aliasKbs.map((kb) => [kb.id, kb]));
       for (const item of options.queryRuleKbs) byId.set(item.kb.id, item.kb);
       return Array.from(byId.values());
@@ -374,9 +375,10 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
   }, [kind, options]);
 
   /** 需要 ds 的 kind 的选项池（由已选 kb 决定；复用同一份已拉数据，零二次请求）。
-   * alias / tool_schema / synonym 是 KB 级，没有 ds 概念。 */
+   * alias / tool_schema / synonym / metric 是 KB 级，没有 ds 概念。 */
   const dsPool = useMemo(() => {
-    if (kind === 'alias' || kind === 'tool_schema' || kind === 'synonym' || !kbSelected) {
+    if (kind === 'alias' || kind === 'tool_schema' || kind === 'synonym'
+        || kind === 'metric' || !kbSelected) {
       return [];
     }
     return options.queryRuleKbs.find((x) => x.kb.id === kbSelected)?.sources ?? [];
@@ -396,6 +398,7 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
       return;
     }
     if (kind !== 'alias' && kind !== 'tool_schema' && kind !== 'synonym'
+        && kind !== 'metric'
         && dsSelected && !dsPool.some((s) => s.id === dsSelected)) {
       form.setFieldsValue({ ds: undefined });
     }
@@ -768,12 +771,13 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
     // relation 是可选的：勾了现有边 = 按边名删除；零勾选 = 交给后端发现器（不送 entries）。
     const relationEntries = values.kind === 'relation' ? buildRelationEntries() : [];
     // relation / query_rule / constraint 需要 ds（都锚在某个库的 compiled 行上）；
-    // alias / mapping / tool_schema / synonym 是 KB 级 run（后三者各有独立或共享的
-    // KB 级版本链），后端明确拒 ds。
+    // alias / mapping / tool_schema / synonym / metric 是 KB 级 run（后几者各有
+    // 独立或共享的 KB 级版本链），后端明确拒 ds。
     const needsDs = values.kind !== 'alias'
       && values.kind !== 'mapping'
       && values.kind !== 'tool_schema'
-      && values.kind !== 'synonym';
+      && values.kind !== 'synonym'
+      && values.kind !== 'metric';
     const body: StartRunBody = {
       request_id: requestIdRef.current || undefined, // T3-1：重试沿用同一键，桥接幂等复用
       kind: values.kind,
@@ -791,8 +795,9 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
       repeat: values.repeat,
       dry_run: !!values.dry_run,
       target_cases: values.target_cases?.length ? values.target_cases : undefined,
-      // alias / synonym 都从「窗口内的失败观测」提候选（synonym 的 builder 读同一字段）。
+      // alias / synonym / metric 都从「窗口内的失败观测」提候选（三者 builder 读同一字段）。
       window_days: values.kind === 'alias' || values.kind === 'synonym'
+        || values.kind === 'metric'
         ? values.window_days
         : undefined,
       // picks 只属于 query_rule；relation 零勾选时才由后端发现器自动产出条目。
@@ -1251,7 +1256,8 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
             options={kbPool.map((k) => ({ value: k.id, label: `${k.name}（${k.id}）` }))}
           />
         </Form.Item>
-        {kind !== 'alias' && kind !== 'tool_schema' && kind !== 'synonym' && (
+        {kind !== 'alias' && kind !== 'tool_schema' && kind !== 'synonym'
+          && kind !== 'metric' && (
           <Form.Item
             name="ds"
             label={t('evolutionConsole.formDs')}
@@ -1397,7 +1403,7 @@ export default function StartRunModal({ open, onClose, onStarted, onFailed }: St
               }))}
           />
         </Form.Item>
-        {(kind === 'alias' || kind === 'synonym') && (
+        {(kind === 'alias' || kind === 'synonym' || kind === 'metric') && (
           <Form.Item name="window_days" label={t('evolutionConsole.formWindowDays')} normalize={(v) => v ?? undefined}>
             <InputNumber min={1} max={90} />
           </Form.Item>

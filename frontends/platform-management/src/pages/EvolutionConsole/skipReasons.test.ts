@@ -30,6 +30,26 @@ describe('humanizeSkipReason · 已知码', () => {
       .toBe('some_raw_code');
   });
 
+  it('metric 落库跳过码 → 专属文案', () => {
+    expect(humanizeSkipReason(t, { name: '', op: 'add', why: 'empty_name' }, []))
+      .toBe('evolutionConsole.skipWhyMetricEmptyName');
+    expect(humanizeSkipReason(t, { name: '客单价', op: 'add', why: 'name_too_long' }, []))
+      .toBe('evolutionConsole.skipWhyMetricNameTooLong');
+    expect(humanizeSkipReason(t, { name: '客单价', op: 'update', why: 'not_found' }, []))
+      .toBe('evolutionConsole.skipWhyMetricNotFound');
+    expect(humanizeSkipReason(t, { op: 'add', name: '客单价', why: 'max_metrics' }, []))
+      .toBe('evolutionConsole.skipWhyMetricMaxMetrics');
+    expect(humanizeSkipReason(t, { name: '客单价', op: 'add', why: 'invalid_landings' }, []))
+      .toBe('evolutionConsole.skipWhyMetricInvalidLandings');
+  });
+
+  it('metric 的 not_found 不抢 synonym 的 not_found 分支', () => {
+    // synonym 跳过项带 terms 数组；metric 跳过项是 `{name, op, why}`。
+    expect(humanizeSkipReason(t, {
+      terms: ['甲'], canonical: '乙', op: 'delete', why: 'not_found',
+    }, [])).toBe('evolutionConsole.skipWhySynonymNotFound');
+  });
+
   it('synonym 跨组重复词 / 未知 op → 专属文案', () => {
     expect(humanizeSkipReason(t, {
       index: 0, why: 'cross_group_duplicate', term: '甲',

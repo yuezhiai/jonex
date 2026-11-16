@@ -7,7 +7,7 @@
 
 .access-card {
   background: #fff;
-  border: 2px solid #e2e8f0;
+  border: 2px solid var(--yx-border);
   border-radius: 12px;
   padding: 24px;
   text-align: center;
@@ -16,13 +16,13 @@
 }
 
 .access-card:hover {
-  border-color: #3b82f6;
+  border-color: var(--yx-accent);
   box-shadow: 0 2px 12px rgba(59, 130, 246, 0.1);
 }
 
 .access-card.active {
-  border-color: #3b82f6;
-  background: #eff6ff;
+  border-color: var(--yx-accent);
+  background: var(--yx-info-bg);
 }
 
 .access-card.grey {
@@ -32,12 +32,12 @@
 
 .access-card .icon-big {
   font-size: 36px;
-  color: #3b82f6;
+  color: var(--yx-accent);
   margin-bottom: 12px;
 }
 
 .access-card.grey .icon-big {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .access-card h3 {
@@ -48,7 +48,7 @@
 .access-card p {
   margin: 0;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .access-card .status-tag {
@@ -62,8 +62,8 @@
 }
 
 .access-card.grey .status-tag {
-  background: #f1f5f9;
-  color: #94a3b8;
+  background: var(--yx-bg-muted);
+  color: var(--yx-text-muted);
 }
 
 .access-card .dot-green {

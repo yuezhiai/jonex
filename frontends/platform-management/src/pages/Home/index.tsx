@@ -1,6 +1,5 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Row, Col } from 'antd';
 import { useTranslation } from 'react-i18next';
 import {
   RobotOutlined,
@@ -11,55 +10,63 @@ import {
   FileTextOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
-import { PageContent, PageHeader } from '@jonex/shared-lib';
+import { EntryGrid, PageContent, PageHeader } from '@jonex/shared-lib';
+import type { EntryGridItem } from '@jonex/shared-lib';
 
-function getActions(t: (key: string) => string) {
+function getActions(t: (key: string) => string): EntryGridItem[] {
   return [
     {
+      key: '/model-adapter',
       label: t('navigation.modelAdapter'),
-      desc: t('platform.homeCardModelAdapterDesc'),
+      description: t('platform.homeCardModelAdapterDesc'),
       path: '/model-adapter',
       icon: <RobotOutlined />,
       color: '#10b981',
     },
     {
+      key: '/tenant-management',
       label: t('navigation.tenantManagement'),
-      desc: t('platform.homeCardTenantManagementDesc'),
+      description: t('platform.homeCardTenantManagementDesc'),
       path: '/tenant-management',
       icon: <TeamOutlined />,
-      color: '#3b82f6',
+      color: 'var(--yx-accent)',
     },
     {
+      key: '/user-management',
       label: t('navigation.userManagement'),
-      desc: t('platform.homeCardUserManagementDesc'),
+      description: t('platform.homeCardUserManagementDesc'),
       path: '/user-management',
       icon: <UserOutlined />,
       color: '#8b5cf6',
     },
     {
+      key: '/role-permission',
       label: t('navigation.rolePermission'),
-      desc: t('platform.homeCardRolePermissionDesc'),
+      description: t('platform.homeCardRolePermissionDesc'),
       path: '/role-permission',
       icon: <SafetyOutlined />,
       color: '#f59e0b',
     },
     {
+      key: '/task-schedule',
       label: t('navigation.taskSchedule'),
-      desc: t('platform.homeCardTaskScheduleDesc'),
+      description: t('platform.homeCardTaskScheduleDesc'),
       path: '/task-schedule',
       icon: <ScheduleOutlined />,
       color: '#ec4899',
     },
     {
+      key: '/system-config',
       label: t('navigation.systemConfig'),
-      desc: t('platform.homeCardSystemConfigDesc'),
+      description: t('platform.homeCardSystemConfigDesc'),
       path: '/system-config',
       icon: <SettingOutlined />,
-      color: '#64748b',
+      color: 'var(--yx-text-secondary)',
     },
     {
+      key: '/operation-log',
       label: t('navigation.operationLog'),
-      desc: t('platform.homeCardOperationLogDesc'),
+      description: t('platform.homeCardOperationLogDesc'),
       path: '/operation-log',
       icon: <FileTextOutlined />,
       color: '#ef4444',
@@ -70,53 +77,11 @@ function getActions(t: (key: string) => string) {
 export default function Home() {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const actions = getActions(t);
   return (
     <>
-      <PageHeader title={t('platform.homeTitle')} style={{ marginBottom: 4 }} />
-      <p style={{ color: '#64748b', margin: '0 0 16px', fontSize: 14 }}>{t('platform.homeSubtitle')}</p>
+      <PageHeader title={t('platform.homeTitle')} subtitle={t('platform.homeSubtitle')} />
       <PageContent>
-        <Row gutter={[16, 16]}>
-          {actions.map((a) => (
-            <Col xs={24} sm={12} md={8} key={a.label}>
-              <a
-                onClick={() => navigate(a.path)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 14,
-                  padding: '18px 20px',
-                  background: '#fff',
-                  borderRadius: 12,
-                  border: '1px solid #e2e8f0',
-                  textDecoration: 'none',
-                  cursor: 'pointer',
-                  transition: 'all 0.2s',
-                }}
-              >
-                <span
-                  style={{
-                    fontSize: 22,
-                    color: a.color,
-                    background: `${a.color}15`,
-                    width: 44,
-                    height: 44,
-                    borderRadius: 10,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  {a.icon}
-                </span>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: '#1e293b' }}>{a.label}</div>
-                  <div style={{ fontSize: 12, color: '#94a3b8' }}>{a.desc}</div>
-                </div>
-              </a>
-            </Col>
-          ))}
-        </Row>
+        <EntryGrid items={getActions(t)} onNavigate={navigate} />
       </PageContent>
     </>
   );

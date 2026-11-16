@@ -63,10 +63,11 @@ const cellStyle: React.CSSProperties = {
   whiteSpace: 'nowrap',
 };
 
-/** alias / synonym 批的人工验真卡：每个 case 先用本次勾选的候选跑一次问句
- * （alias 是临时 apply schema，synonym 是请求级值同义词），看到数据后再判
- * 「通过 / 不通过」。`pass` 必须拿到 `evidence_id` 才能选（票据绑定本次
- * picks 的条目，勾选变化后旧证据失效）；`fail` 可填理由。全部 case 判定后才能提交。 */
+/** alias / synonym / metric 批的人工验真卡：每个 case 先用本次勾选的候选跑一次
+ * 问句（alias 是临时 apply schema，synonym 是请求级值同义词，metric 是请求级
+ * 指标 hints），看到数据后再判「通过 / 不通过」。`pass` 必须拿到 `evidence_id`
+ * 才能选（票据绑定本次 picks 的条目，勾选变化后旧证据失效）；`fail` 可填理由。
+ * 全部 case 判定后才能提交。 */
 export default function AdhocVerifyModal({
   open, runId, cases, picks, submitting, onCancel, onSubmit,
 }: AdhocVerifyModalProps) {
@@ -221,9 +222,16 @@ export default function AdhocVerifyModal({
           const draft = drafts[item.case_id];
           const verdict = draft?.verdict;
           const judgeable = isJudgeable(item.case_id);
-          // synonym 批的证据带 `term` / `canonical`（值同义词），alias 批带
-          // `alias` / `concept`（概念别名）。两组键按 kind 二选一，优先认 synonym。
-          const synonymCard = Boolean(data?.term || data?.canonical);
+          // metric 批的证据带 `metric` / `definition` / `formula`（指标口径）；
+          // synonym 批带 `term` / `canonical`（值同义词）；alias 批带 `alias` /
+          // `concept`（概念别名）。三组键按 kind 三选一：metric 显式判断并放在
+          // synonym 之前（它没有 term/canonical，不能靠 fallthrough）。
+          // 按**键存在**判断：执行失败/未填时字段可能全空，不能因真值全空退化成
+          // alias 卡（会显示 `Alias - → Concept -`）。
+          const metricCard = Boolean(
+            data && ('metric' in data || 'definition' in data || 'formula' in data),
+          );
+          const synonymCard = !metricCard && Boolean(data?.term || data?.canonical);
           return (
             <div key={item.case_id} style={{ borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
               <Space size={6} wrap style={{ marginBottom: 8 }}>
@@ -250,6 +258,56 @@ export default function AdhocVerifyModal({
 
               {data && (
                 <div style={{ marginBottom: 8 }}>
+                  {metricCard ? (
+                    <div style={{ marginBottom: 6 }}>
+                      <div>
+                        <span style={{ color: '#8c8c8c', fontSize: 12 }}>
+                          {t('evolutionConsole.adhocVerifyMetric')}
+                        </span>{' '}
+                        <b>{data.metric || '-'}</b>
+                      </div>
+                      <div>
+                        <span style={{ color: '#8c8c8c', fontSize: 12 }}>
+                          {t('evolutionConsole.adhocVerifyDefinition')}
+                        </span>{' '}
+                        {data.definition || '-'}
+                      </div>
+                      {data.formula && (
+                        <div>
+                          <span style={{ color: '#8c8c8c', fontSize: 12 }}>
+                            {t('evolutionConsole.adhocVerifyFormula')}
+                          </span>{' '}
+                          <code>{data.formula}</code>
+                        </div>
+                      )}
+                      {/* 三条警告都按「字段存在且为预期值」判断：老后端不返回这些键，
+                          不能把 undefined 当成 false 误报。 */}
+                      {data.production_hit === false && (
+                        <Alert
+                          type="warning"
+                          showIcon
+                          style={{ marginTop: 6 }}
+                          message={t('evolutionConsole.adhocVerifyProductionMiss')}
+                        />
+                      )}
+                      {data.hint_dropped === true && (
+                        <Alert
+                          type="warning"
+                          showIcon
+                          style={{ marginTop: 6 }}
+                          message={t('evolutionConsole.adhocVerifyHintDropped')}
+                        />
+                      )}
+                      {data.metric_disabled === true && (
+                        <Alert
+                          type="warning"
+                          showIcon
+                          style={{ marginTop: 6 }}
+                          message={t('evolutionConsole.adhocVerifyMetricDisabled')}
+                        />
+                      )}
+                    </div>
+                  ) : (
                   <Space size={6} wrap style={{ marginBottom: 6 }}>
                     {synonymCard ? (
                       <>
@@ -284,6 +342,7 @@ export default function AdhocVerifyModal({
                       </>
                     )}
                   </Space>
+                  )}
                   {data.error && (
                     <Alert
                       type={data.ok ? 'info' : 'warning'}

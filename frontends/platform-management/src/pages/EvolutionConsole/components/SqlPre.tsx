@@ -5,7 +5,7 @@ export default function SqlPre({ text, maxHeight = 240 }: { text: string; maxHei
     <pre
       style={{
         margin: 0,
-        background: '#f8fafc',
+        background: 'var(--yx-bg-subtle)',
         padding: 12,
         borderRadius: 8,
         fontSize: 12,

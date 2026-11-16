@@ -718,6 +718,163 @@ describe('RunDetail · 条目渲染（synonym）', () => {
   }, 60000);
 });
 
+describe('RunDetail · metric kind', () => {
+  const metricEntry: PatchEntry = {
+    name: '客单价',
+    aliases: ['平均订单金额'],
+    definition: '销售额除以订单数',
+    formula: 'SUM(amount) / COUNT(DISTINCT order_id)',
+    landings: [{ data_source_id: 'ds_1', di_metric: 'avg_order_value' }],
+    question: '客单价是多少',
+  };
+
+  it('metric 条目渲染 name → formula，勾选键与后端 entry_key 同口径', async () => {
+    await renderBundle(bundleWithEntries('metric', [metricEntry]));
+
+    expect(screen.getByText(
+      '客单价 → SUM(amount) / COUNT(DISTINCT order_id)',
+    )).toBeTruthy();
+    // 后端 `entry_key(..., "metric")` = 指标 name（人审 picks 必须逐字对上）
+    expect((screen.getByRole('checkbox') as HTMLInputElement).value).toBe('客单价');
+    // 指标条目没有 alias/表达式语义，不提供人工调整口
+    expect(screen.queryByRole('button', { name: 'evolutionConsole.adjustAction' })).toBeNull();
+  });
+
+  it('metric 勾选键保留 name 的原始空白（后端 entry_key 不 strip）', async () => {
+    // 后端 `entry_key(e, "metric")` = `str(entry.get("name") or "")`，**不 trim**；
+    // 前端若 trim 会让 picks 与 `_pick_entries` 对不上（1001）。
+    confirmAdopt.mockResolvedValue({ ok: true, adopted: true, rc: 0 });
+    previewAdopt.mockResolvedValue({
+      planned: [],
+      skipped: [],
+      backup_hint: 'db://evolution_ledgers/x',
+      already_adopted: false,
+      adhoc_cases: [],
+    });
+    await renderBundle(bundleWithEntries('metric', [{ ...metricEntry, name: ' 客单价 ' }]));
+
+    expect((screen.getByRole('checkbox') as HTMLInputElement).value).toBe(' 客单价 ');
+
+    fireEvent.click(screen.getByRole('button', { name: 'evolutionConsole.preview' }));
+    const confirm = await screen.findByRole(
+      'button', { name: 'evolutionConsole.confirmWrite' }, { timeout: 15000 },
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(confirm.disabled).toBe(false), { timeout: 15000 });
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(confirmAdopt).toHaveBeenCalled(), { timeout: 15000 });
+    expect(confirmAdopt.mock.calls[0][1].picks).toEqual([' 客单价 ']);
+  }, 60000);
+
+  it('metric 同批混 add/update 时勾选行显示 op', async () => {
+    await renderBundle(bundleWithEntries('metric', [
+      { ...metricEntry, name: '客单价', op: 'add' },
+      { ...metricEntry, name: '订单量', op: 'update' },
+    ]));
+
+    expect(screen.getByText('add')).toBeTruthy();
+    expect(screen.getByText('update')).toBeTruthy();
+  });
+
+  it('metric 没有 formula 时回退到 definition（截断展示）', async () => {
+    await renderBundle(bundleWithEntries('metric', [{
+      name: '订单量',
+      definition: '已支付订单的笔数',
+      question: '订单量是多少',
+    }]));
+
+    expect(screen.getByText('订单量 → 已支付订单的笔数')).toBeTruthy();
+  });
+
+  it('metric 走 abstract 版本链（与 alias/tool_schema 同链）', async () => {
+    const bundle = bundleWithEntries('metric', []);
+    await renderBundle({ ...bundle, run: { ...bundle.run, kb: 'kb_demo' } });
+
+    await waitFor(() => expect(listVersions).toHaveBeenCalledWith({
+      kb: 'kb_demo',
+      scope: 'abstract',
+      ds: undefined,
+      include_archived: true,
+      limit: 200,
+    }));
+  });
+
+  it('metric 没有待验真 case 时采纳仍带空 adhoc_verdicts', async () => {
+    // 与 alias/synonym 同口径：metric **总是**带 `adhoc_verdicts`（哪怕空数组）；
+    // 整键缺席会让后端回落到 truths 覆盖校验。
+    confirmAdopt.mockResolvedValue({ ok: true, adopted: true, rc: 0 });
+    previewAdopt.mockResolvedValue({
+      planned: [],
+      skipped: [],
+      backup_hint: 'db://evolution_ledgers/x',
+      already_adopted: false,
+      adhoc_cases: [],
+    });
+    await renderBundle(bundleWithEntries('metric', [metricEntry]));
+
+    fireEvent.click(screen.getByRole('button', { name: 'evolutionConsole.preview' }));
+    const confirm = await screen.findByRole(
+      'button', { name: 'evolutionConsole.confirmWrite' }, { timeout: 15000 },
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(confirm.disabled).toBe(false), { timeout: 15000 });
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(confirmAdopt).toHaveBeenCalled(), { timeout: 15000 });
+    const body = confirmAdopt.mock.calls[0][1];
+    expect(body.picks).toEqual(['客单价']);
+    expect(body.adhoc_verdicts).toEqual([]);
+    expect(body).not.toHaveProperty('adhoc_truths');
+  }, 60000);
+
+  it('metric 走验真卡并提交 metric 证据判定', async () => {
+    confirmAdopt.mockResolvedValue({ ok: true, adopted: true, rc: 0 });
+    fetchAdhocEvidence.mockResolvedValue({
+      case_id: 'c1',
+      question: '客单价是多少',
+      metric: '客单价',
+      definition: '销售额除以订单数',
+      formula: 'SUM(amount) / COUNT(DISTINCT order_id)',
+      columns: ['avg_order_value'],
+      rows: [[88.5]],
+      row_count: 1,
+      rows_hash: 'hash-metric',
+      ok: true,
+      error: null,
+      evidence_id: 'ev-metric',
+    });
+    previewAdopt.mockResolvedValue({
+      planned: [],
+      skipped: [],
+      backup_hint: 'db://evolution_ledgers/x',
+      already_adopted: false,
+      adhoc_cases: [{ case_id: 'c1', question: '客单价是多少' }],
+    });
+    await renderBundle(bundleWithEntries('metric', [metricEntry]));
+
+    fireEvent.click(screen.getByRole('button', { name: 'evolutionConsole.preview' }));
+
+    // metric 也走验真卡（不是补 truth）
+    fireEvent.click(await screen.findByRole(
+      'button', { name: 'evolutionConsole.adhocVerifyViewData' }, { timeout: 15000 },
+    ));
+    await screen.findByText('88.5', undefined, { timeout: 15000 });
+    fireEvent.click(screen.getByRole('radio', { name: 'evolutionConsole.adhocVerifyPass' }));
+    fireEvent.click(screen.getByRole('button', { name: 'evolutionConsole.adhocVerifySubmit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'evolutionConsole.confirmWrite' }));
+
+    await waitFor(() => expect(confirmAdopt).toHaveBeenCalled(), { timeout: 15000 });
+    const body = confirmAdopt.mock.calls[0][1];
+    expect(body.adhoc_verdicts).toEqual([
+      {
+        case_id: 'c1', verdict: 'pass', evidence_id: 'ev-metric',
+        row_count: 1, rows_hash: 'hash-metric',
+      },
+    ]);
+    expect(body).not.toHaveProperty('adhoc_truths');
+    expect(fetchAdhocEvidence).toHaveBeenCalledWith('run_1', 'c1', ['客单价']);
+  }, 60000);
+});
+
 describe('RunDetail · ad-hoc 验真（alias）与 truth（其它 kind）', () => {
   const previewWithAdhoc = {
     planned: [],

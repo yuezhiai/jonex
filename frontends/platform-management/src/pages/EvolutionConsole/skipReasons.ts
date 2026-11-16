@@ -74,6 +74,14 @@ export function humanizeSkipReason(
   if (why === 'not_found' && Array.isArray(s.terms)) {
     return t('evolutionConsole.skipWhySynonymNotFound');
   }
+  // metric 批的落库期跳过码（metric_ops.apply_metric_entries）。metric 跳过项是
+  // `{name, op, why}`（没有 terms）—— `not_found` 留在 synonym 守卫之后，
+  // 不会抢 synonym 的删除失败分支。
+  if (why === 'empty_name') return t('evolutionConsole.skipWhyMetricEmptyName');
+  if (why === 'name_too_long') return t('evolutionConsole.skipWhyMetricNameTooLong');
+  if (why === 'not_found') return t('evolutionConsole.skipWhyMetricNotFound');
+  if (why === 'max_metrics') return t('evolutionConsole.skipWhyMetricMaxMetrics');
+  if (why === 'invalid_landings') return t('evolutionConsole.skipWhyMetricInvalidLandings');
   if (why === 'cross_group_duplicate' && Array.isArray(s.terms)) {
     return t('evolutionConsole.skipWhySynonymCrossGroupDuplicate', {
       term: String(s.term ?? '').trim() || '-',

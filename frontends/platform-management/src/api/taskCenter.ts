@@ -1,7 +1,7 @@
 import apiClient from './request';
 
 /**
- * 任务中心的六个接口（设计文档 §4.4，后端唯一开给前端的口子）：两个只读 + 四个写。
+ * 任务中心的七个接口（设计文档 §4.4，后端唯一开给前端的口子）：三个只读 + 四个写。
  *
  * 字段口径的权威定义在 `capabilities/task_center/dtos/console.py`，此处逐字对齐。
  * **没有删除 / 详情接口** —— 再加之前先回设计文档确认边界。
@@ -152,6 +152,52 @@ export async function listTasks(params: TaskListParams): Promise<TaskConsolePage
     params: query,
     paramsSerializer: { indexes: null },
   });
+}
+
+/**
+ * 任务 Token 消耗的一行（2026-11-11 加，**按文档归集**）。
+ *
+ * 口径：任务 ↔ 文档 1:1，Token 汇总该任务所有尝试窗口内、这份文档的精确计量行；
+ * 不看 trace（异步解析任务的 trace 与任务中心的 execution_id 无关）。
+ */
+export interface TaskTokenUsageItem {
+  task_id: string;
+  /** null = 非知识库文档任务 / 没有接管行 */
+  document_id: string | null;
+  /** 文档名；文档行缺失时为空 */
+  document_name: string | null;
+  /** null = 算不出来 / 没有精确计量，**不是 0**（渲染成「-」） */
+  total_tokens: number | null;
+  /** 解析阶段消耗；`total_tokens` 为 null 时同为 null */
+  parse_tokens?: number | null;
+  /** 本体阶段消耗（抽取 + 本体向量化） */
+  ontology_tokens?: number | null;
+  /** Wiki 编译阶段中归到本文档的消耗 */
+  wiki_tokens?: number | null;
+  /** Wiki 整库编译段平摊给本文档的一份（已计入 total_tokens） */
+  kb_compile_tokens?: number | null;
+  /** 这一整库编译批次覆盖的文档数（「本批 N 份共享」） */
+  batch_size?: number | null;
+}
+
+export interface TaskTokenUsagePage {
+  items: TaskTokenUsageItem[];
+}
+
+/**
+ * 批量取任务 Token（补值用；任务行的列表接口不带 Token，先出列表后补）。
+ *
+ * `task_ids` 是可重复参数，与 `listTasks` 的 `status` 同理必须 `indexes: null`，
+ * 否则会序列化成 `task_ids[]=`，后端 `List[str]` 不认。空数组直接返回，不发请求。
+ */
+export async function getTaskTokenUsage(taskIds: string[]): Promise<TaskTokenUsageItem[]> {
+  const ids = Array.from(new Set(taskIds.filter(Boolean)));
+  if (!ids.length) return [];
+  const data = await apiClient.get<TaskTokenUsagePage>('/task-center/tasks/token-usage', {
+    params: { task_ids: ids },
+    paramsSerializer: { indexes: null },
+  });
+  return data.items ?? [];
 }
 
 /** 子任务列表。**不分页、回裸数组**（设计文档 §4.0 点名的「不设分页」接口）。 */

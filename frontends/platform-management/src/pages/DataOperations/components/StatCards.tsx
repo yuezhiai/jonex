@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Skeleton } from 'antd';
+import { KpiCards } from '@jonex/shared-lib';
 import {
   ApartmentOutlined,
   AppstoreOutlined,
@@ -51,35 +51,23 @@ interface Props {
   skeletonCount?: number;
 }
 
+/**
+ * 数据运营的 KPI 卡组：带图标的一版。
+ * 卡片样式与骨架屏统一在 shared-lib 的 KpiCards，这里只负责图标映射。
+ */
 export default function StatCards({ items, loading, skeletonCount = 4 }: Props) {
-  if (loading) {
-    return (
-      <div className="yx-do-kpi-grid">
-        {Array.from({ length: skeletonCount }, (_, i) => (
-          <div className="yx-card yx-do-kpi" key={i}>
-            <Skeleton active paragraph={{ rows: 2 }} title={false} />
-          </div>
-        ))}
-      </div>
-    );
-  }
-
   return (
-    <div className="yx-do-kpi-grid">
-      {items.map((item) => (
-        <div className="yx-card yx-do-kpi" key={item.key}>
-          <span className="yx-do-kpi-icon" style={{ color: item.accent, background: `${item.accent}14` }}>
-            {ICONS[item.iconKey]}
-          </span>
-          <div className="yx-do-kpi-main">
-            <div className="yx-do-kpi-label">{item.label}</div>
-            <div className="yx-do-kpi-value-row">
-              <span className="yx-do-kpi-value">{item.value}</span>
-              {item.delta && <span className="yx-do-kpi-delta">{item.delta}</span>}
-            </div>
-          </div>
-        </div>
-      ))}
-    </div>
+    <KpiCards
+      loading={loading}
+      skeletonCount={skeletonCount}
+      items={items.map((item) => ({
+        key: item.key,
+        label: item.label,
+        value: item.value,
+        delta: item.delta,
+        icon: ICONS[item.iconKey],
+        iconColor: item.accent,
+      }))}
+    />
   );
 }

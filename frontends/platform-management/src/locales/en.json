@@ -363,7 +363,8 @@
       "source": "Task source",
       "startedAt": "Started at",
       "finishedAt": "Finished at",
-      "duration": "Duration"
+      "duration": "Duration",
+      "tokens": "Tokens"
     },
     "action": {
       "detail": "View details",
@@ -391,7 +392,18 @@
       "subtaskId": "Subtask ID",
       "totalDuration": "Total duration",
       "result": "Result",
-      "failureReason": "Failure reason"
+      "failureReason": "Failure reason",
+      "tokenUsage": "Token usage",
+      "documentName": "Source document",
+      "tokens": "Tokens",
+      "tokenNotApplicable": "This task is not a knowledge-base document task",
+      "tokenBreakdown": "Breakdown",
+      "stageParse": "Parsing",
+      "stageOntology": "Ontology",
+      "stageWiki": "Wiki compile",
+      "stageKbCompile": "KB compile",
+      "kbCompileShared": "shared by {{count}} docs in this batch",
+      "stageBreakdownHint": "Ontology extraction and Wiki compile finish after the task closes; a KB compile serves the whole library and is split across this batch. Listed separately so they are not dropped from the total"
     },
     "result": {
       "pending": "{{name}} waiting to run",
@@ -651,6 +663,11 @@
     "host": "Host",
     "port": "Port",
     "database": "Database",
+    "url": "URL",
+    "urlHint": "InfluxDB v3 HTTP address, e.g. http://127.0.0.1:8181 (without /api)",
+    "influxDatabase": "Database / bucket",
+    "token": "API token",
+    "tokenHint": "Stored encrypted; leave blank when editing to keep the current token",
     "schema": "Schema",
     "schemaHint": "Leave blank for the default (public for PostgreSQL, dbo for SQL Server)",
     "user": "Username",
@@ -752,7 +769,8 @@
       "constraint": "Constraint batch",
       "mapping": "Mapping batch",
       "tool_schema": "Tool-schema batch",
-      "synonym": "Value synonyms"
+      "synonym": "Value synonyms",
+      "metric": "Metric batch"
     },
     "kindRelation": "Relation batch",
     "relationEntryHint": "Join edge: source column → target column (written into the compiled schema's relation_types on adoption)",
@@ -880,6 +898,7 @@
     "batchSelectUnavailable": "Missing kind or KB ownership: cannot derive the version chain, so batch adopt is unavailable",
     "batchSelectOtherKb": "Only one knowledge base per batch (already selected {{kb}})",
     "batchSelectSameChain": "Same version chain as selected {{runId}} (one run per chain)",
+    "batchSelectMetricUnsupported": "Metric definitions cannot be batch adopted; verify them one by one on the detail page",
     "batchSelectLimit": "At most {{n}} runs per batch",
     "batchSelectDropped": "Selection adjusted to one run per chain in one KB; dropped: {{runIds}}",
     "formKind": "Kind",
@@ -899,7 +918,9 @@
       "tool_schema": "Adjust a tool description",
       "toolSchemaDesc": "Change a multi-turn tool's description or enable/disable it.",
       "synonym": "Unify value names (synonyms)",
-      "synonymDesc": "Map a spoken value like \"华东环保\" to the canonical value in the data (e.g. \"华东环保集团\") so filters match."
+      "synonymDesc": "Map a spoken value like \"华东环保\" to the canonical value in the data (e.g. \"华东环保集团\") so filters match.",
+      "metric": "Unify metric definitions",
+      "metricDesc": "A metric is computed wrongly (e.g. a missing denominator); fix its definition, formula and landing."
     },
     "advanced": "Advanced options",
     "formTargetCasesCount": "{{count}} in this KB",
@@ -1089,6 +1110,11 @@
     "skipWhyAliasTaken": "Alias already taken by concept \"{{by}}\" (skipped to avoid ambiguity)",
     "skipWhyBadArgs": "Empty concept or alias; invalid",
     "skipWhyToolsFull": "Tool overrides are at the 20-entry limit; this tool has no override to edit",
+    "skipWhyMetricEmptyName": "Metric name is empty; invalid",
+    "skipWhyMetricNameTooLong": "Metric name is too long (over 128 characters); invalid",
+    "skipWhyMetricNotFound": "This metric does not exist; cannot update it",
+    "skipWhyMetricMaxMetrics": "Metric limit reached (500); not added",
+    "skipWhyMetricInvalidLandings": "Metric landings are invalid (data source / entity / column); not written",
     "skipWhyExprEmpty": "Constraint expression is empty; invalid",
     "skipWhyTargetFormat": "Target must look like Entity.field: {{code}}",
     "skipWhyTargetMissingFile": "This target is not in the candidates file",
@@ -1347,6 +1373,12 @@
     "adhocVerifyConcept": "Concept",
     "adhocVerifyTerm": "Value synonym",
     "adhocVerifyCanonical": "Canonical value",
+    "adhocVerifyMetric": "Metric",
+    "adhocVerifyDefinition": "Definition",
+    "adhocVerifyFormula": "Formula",
+    "adhocVerifyProductionMiss": "The metric name/alias was not matched in the question; automatic injection will not take effect after adoption. Consider adding the wording used in the question to the candidates.",
+    "adhocVerifyHintDropped": "The metric hint was dropped due to the length budget; this verification result may not reflect actual behavior.",
+    "adhocVerifyMetricDisabled": "This metric is currently disabled; it must be re-enabled after adoption to take effect.",
     "adhocVerifyRowCount": "{{n}} row(s)",
     "adhocVerifyNoRows": "The query returned no rows",
     "adhocVerifyPass": "Pass",
@@ -1660,6 +1692,10 @@
       "sourcePlaceholder": "Filter by caller",
       "targetPlaceholder": "Search or select an object / capability",
       "searchPlaceholder": "Search caller, target or Request ID",
+      "degradedMode": {
+        "title": "Degraded counting",
+        "description": "Each row is a physical attempt. Calls without attempt records count as one row each, so the total may exceed the number of logical calls."
+      },
       "column": {
         "time": "Time",
         "direction": "Direction",
@@ -1669,6 +1705,7 @@
         "method": "Method",
         "status": "Status",
         "latency": "Response time",
+        "tokens": "Tokens",
         "errorCode": "Error code",
         "requestId": "Request ID",
         "traceId": "Trace ID"
@@ -1677,7 +1714,7 @@
     "callDetail": {
       "title": "Call detail",
       "thinShellTitle": "Only part of the fields are collected",
-      "thinShellDescription": "Call details currently store only the request ID and error message. Method, path, status code, payloads and token fields are not collected yet.",
+      "thinShellDescription": "Call details currently store only the request ID, error message and token usage. Method, path, status code and payloads are not collected yet.",
       "method": "HTTP method",
       "statusCode": "Status code",
       "path": "Path",
@@ -1753,6 +1790,11 @@
     "degraded": {
       "title": "Degraded data",
       "description": "Some data sources are unavailable; the metrics below may be incomplete."
+    },
+    "unattributed": {
+      "title": "Unattributed calls are excluded from these figures",
+      "description": "{{calls}} calls and {{tokens}} tokens carried no tenant identifier, so they cannot be attributed to any tenant. Last seen {{last}}.",
+      "share": "That is {{shareCalls}} of all platform calls and {{shareTokens}} of all tokens in this window."
     },
     "metaUnavailable": {
       "title": "Filter options unavailable",
@@ -2064,7 +2106,8 @@
     "tabs": {
       "assets": "Data Assets",
       "knowledge": "Knowledge Assets",
-      "search": "Search Analytics"
+      "search": "Search Analytics",
+      "nl2sql": "Data Q&A"
     },
     "common": {
       "totalItems": "{{total}} items",
@@ -2345,6 +2388,92 @@
       "callCount": "Calls",
       "lastCallAt": "Last called",
       "relatedKbs": "Related knowledge bases"
+    },
+    "nl2sql": {
+      "kpi": {
+        "requests": "Q&A Requests",
+        "successRate": "Success Rate",
+        "sqlP95": "SQL P95",
+        "totalP95": "End-to-End P95",
+        "slowQueries": "Slow Queries",
+        "retryRate": "A1b Retry Rate",
+        "insufficientSamples": "— (insufficient samples)"
+      },
+      "section": {
+        "volumeTrendTitle": "Request & Failure Trend",
+        "p95TrendTitle": "P95 Latency Trend",
+        "p95TrendDesc": "Dashed segments mark P95 values based on fewer than 20 samples",
+        "slowTitle": "Slow Queries (by SQL Duration)",
+        "failureTitle": "Failure Review",
+        "sourceTitle": "By Data Source"
+      },
+      "empty": {
+        "noObservations": "No data Q&A records in this window",
+        "noLatencySamples": "No latency samples in this window",
+        "noSlowQueries": "No slow queries above the threshold",
+        "noFailures": "No failures in this window"
+      },
+      "filter": {
+        "allSource": "All data sources",
+        "unassignedSource": "Unidentified source",
+        "slowThreshold": "Slow threshold",
+        "slowOption": "{{seconds}} s",
+        "includeSynthetic": "Include evolution baseline traffic"
+      },
+      "trend": {
+        "requests": "Requests",
+        "failed": "Failures",
+        "sqlP95": "SQL P95",
+        "totalP95": "End-to-End P95",
+        "lowSample": " (insufficient samples)"
+      },
+      "column": {
+        "time": "Time",
+        "source": "Data Source",
+        "kb": "Knowledge Base",
+        "question": "Question",
+        "sqlDuration": "SQL Duration",
+        "totalDuration": "End-to-End Duration",
+        "rowCount": "Rows",
+        "outcome": "Outcome",
+        "a1b": "A1b",
+        "reasonCode": "Failure Code",
+        "reason": "Reason",
+        "requests": "Requests",
+        "failRate": "Failure Rate",
+        "slowCount": "Slow Queries",
+        "sqlP95": "SQL P95"
+      },
+      "outcome": {
+        "success": "Success",
+        "failed": "Failed"
+      },
+      "reasonCode": {
+        "unclassified": "Unclassified"
+      },
+      "a1b": {
+        "retried": "Retried"
+      },
+      "drawer": {
+        "title": "Q&A Trace",
+        "notFound": "This record does not exist or you have no access to it",
+        "basic": "Basic information",
+        "timing": "Timing",
+        "question": "Question",
+        "sql": "SQL",
+        "rejectedSql": "Rejected SQL",
+        "reason": "Failure reason",
+        "scene": "Scene summary",
+        "emptySql": "No SQL",
+        "questionMissing": "(question missing)",
+        "id": "Observation ID",
+        "degraded": "This record is a degraded shell; some trace details are unavailable.",
+        "nearMiss": "Near misses",
+        "noNearMiss": "No near misses",
+        "trajectory": "Tool trajectory",
+        "truncated": "truncated",
+        "noTrajectory": "No tool calls"
+      }
     }
   },
   "dataGovernance": {

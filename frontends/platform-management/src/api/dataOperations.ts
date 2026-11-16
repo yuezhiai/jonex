@@ -47,6 +47,9 @@ import type {
   DoKbOption,
   DoKnowledgeKpi,
   DoKpiCard,
+  DoNl2SqlDetail,
+  DoNl2SqlList,
+  DoNl2SqlOverview,
   DoPipelineOverview,
   DoPipelineStats,
   DoProportionItem,
@@ -977,4 +980,143 @@ export async function getServiceDetail(
     requestCount: data.request_count,
     lastRequestAt: data.last_request_at ? formatDateTime(data.last_request_at) : null,
   };
+}
+
+/* ══════════════════════ 页 4：数据问答（NL→SQL 观测） ══════════════════════ */
+
+/** 四个 nl2sql 观测端点的公共筛选参数 */
+export interface DoNl2SqlQuery {
+  /** 「全部知识库」哨兵由 `narrowKbId` 收敛成不下发 */
+  kbId?: string;
+  /** `__unassigned__` 表示未识别源（后端空串桶），空串 = 不按源过滤 */
+  dataSourceId?: string;
+  /** 慢阈值，后端默认 5000 */
+  slowMs?: number;
+  /** 是否包含演化基准流量（默认 false） */
+  includeSynthetic?: boolean;
+}
+
+/** 慢查询/失败列表额外参数 */
+export interface DoNl2SqlListQuery extends DoNl2SqlQuery {
+  page?: number;
+  pageSize?: number;
+  /** 慢查询过滤门槛；后端缺省回落 `slowMs` */
+  minMs?: number;
+  /** 慢查询排序口径：SQL 执行耗时（默认）或端到端耗时 */
+  sort?: 'sql' | 'total';
+  /** 失败列表按失败码过滤 */
+  reasonCode?: string;
+}
+
+/**
+ * 附加参数 → query。`include_synthetic` 显式下发 false 也安全：后端默认即 false，
+ * 两端都写死「默认排除演化流量」比依赖服务端默认更不容易漂。
+ */
+const nl2sqlParams = (
+  spaceId: string | null | undefined,
+  window: DoWindow,
+  opts: DoNl2SqlQuery,
+  extra: Record<string, unknown> = {},
+) => {
+  const kbId = narrowKbId(opts.kbId);
+  return scopeParams(spaceId, window, {
+    ...(kbId ? { kb_id: kbId } : {}),
+    ...(opts.dataSourceId ? { data_source_id: opts.dataSourceId } : {}),
+    ...(opts.slowMs != null ? { slow_ms: opts.slowMs } : {}),
+    ...(opts.includeSynthetic != null ? { include_synthetic: opts.includeSynthetic } : {}),
+    ...extra,
+  });
+};
+
+/**
+ * 观测端点的 coalesce key。除空间/窗口外，把知识库、数据源、慢阈值、合成流量开关
+ * 全部纳入 —— 任一项变化都必须重新取数，否则切筛选会看着没生效。
+ */
+const nl2sqlKey = (prefix: string, spaceId: string | null | undefined, window: DoWindow, opts: DoNl2SqlQuery) =>
+  `${prefix}|${spaceId ?? ''}|${windowKey(window)}|${narrowKbId(opts.kbId) ?? ''}|${opts.dataSourceId ?? ''}|${
+    opts.slowMs ?? ''
+  }|${opts.includeSynthetic ? '1' : '0'}`;
+
+/**
+ * 总览：KPI + 延迟分布 + 慢查询计数 + A1b + 趋势 + 按源分布。
+ *
+ * 首屏只取这一个端点即可渲染页壳；`top_slow` / `top_failures` 也随它返回（各 ≤10 条），
+ * 慢查询表与失败复盘仍走各自的列表端点做分页/筛选（Task 7）。
+ */
+export async function getNl2SqlOverview(
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+  opts: DoNl2SqlQuery = {},
+): Promise<DoNl2SqlOverview> {
+  return coalesce(nl2sqlKey('nl2sql-overview', spaceId, window, opts), () =>
+    apiClient.get<DoNl2SqlOverview>('/knowledge-base/data-operations/nl2sql-overview', {
+      params: nl2sqlParams(spaceId, window, opts),
+    }),
+  );
+}
+
+/** 慢查询列表（按 SQL 执行耗时或端到端耗时倒序，服务端分页） */
+export async function listNl2SqlSlow(
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+  opts: DoNl2SqlListQuery = {},
+): Promise<DoNl2SqlList> {
+  const page = opts.page ?? 1;
+  const pageSize = opts.pageSize ?? 20;
+  const extra = {
+    page,
+    page_size: pageSize,
+    ...(opts.sort ? { sort: opts.sort } : {}),
+    ...(opts.minMs != null ? { min_ms: opts.minMs } : {}),
+  };
+  return coalesce(`${nl2sqlKey('nl2sql-slow', spaceId, window, opts)}|${page}|${pageSize}|${opts.sort ?? 'sql'}|${opts.minMs ?? ''}`, () =>
+    apiClient.get<DoNl2SqlList>('/knowledge-base/data-operations/nl2sql-slow', {
+      params: nl2sqlParams(spaceId, window, opts, extra),
+    }),
+  );
+}
+
+/** 失败列表（按失败码过滤，服务端分页） */
+export async function listNl2SqlFailures(
+  spaceId: string | null | undefined,
+  window: DoWindow = DO_DEFAULT_WINDOW,
+  opts: DoNl2SqlListQuery = {},
+): Promise<DoNl2SqlList> {
+  const page = opts.page ?? 1;
+  const pageSize = opts.pageSize ?? 20;
+  const extra = {
+    page,
+    page_size: pageSize,
+    ...(opts.reasonCode ? { reason_code: opts.reasonCode } : {}),
+  };
+  return coalesce(`${nl2sqlKey('nl2sql-failures', spaceId, window, opts)}|${page}|${pageSize}|${opts.reasonCode ?? ''}`, () =>
+    apiClient.get<DoNl2SqlList>('/knowledge-base/data-operations/nl2sql-failures', {
+      params: nl2sqlParams(spaceId, window, opts, extra),
+    }),
+  );
+}
+
+/**
+ * 问答现场详情。响应是 `{item}`，这里解包成行对象。
+ *
+ * 与列表同 scope：`kbId`（可选）用于把行定位钉在成员库内；不存在 / 越租户 / 越空间
+ * 一律 404（防探测，与抽屉 A/B/C 同口径）。窗口对按 id 精确取行无意义，故不携带。
+ */
+export async function getNl2SqlDetail(
+  id: string,
+  spaceId?: string | null,
+  kbId?: string | null,
+): Promise<DoNl2SqlDetail> {
+  const narrowed = narrowKbId(kbId ?? undefined);
+  const data = await apiClient.get<{ item: DoNl2SqlDetail }>(
+    '/knowledge-base/data-operations/nl2sql-detail',
+    {
+      params: {
+        id,
+        ...(spaceId ? { domain_space_id: spaceId } : {}),
+        ...(narrowed ? { kb_id: narrowed } : {}),
+      },
+    },
+  );
+  return data.item;
 }

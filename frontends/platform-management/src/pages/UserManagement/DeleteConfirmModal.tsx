@@ -1,7 +1,7 @@
 import React, { useState, forwardRef, useImperativeHandle } from 'react';
-import { Modal, message } from 'antd';
-import { ExclamationCircleOutlined } from '@ant-design/icons';
+import { message } from 'antd';
 import { useTranslation } from 'react-i18next';
+import { DangerConfirmModal } from '@jonex/shared-lib';
 import { deleteUser, type UserItem } from '../../api/users';
 
 export interface DeleteConfirmModalHandle {
@@ -45,25 +45,15 @@ const DeleteConfirmModal = forwardRef<DeleteConfirmModalHandle, Props>(({ getUse
   };
 
   return (
-    <Modal
+    <DangerConfirmModal
       open={!!target}
-      onCancel={() => setTarget(null)}
-      onOk={handleDelete}
+      title={target ? getUserDisplayName(target) || target.username : ''}
+      description={t('userManagement.confirmDeleteDesc')}
       okText={t('userManagement.confirmDelete')}
       cancelText={t('common.cancel')}
-      okButtonProps={{ danger: true }}
-      width={380}
-    >
-      <div style={{ textAlign: 'center', padding: '8px 0' }}>
-        <div style={{ fontSize: 40, marginBottom: 12, color: '#dc2626' }}>
-          <ExclamationCircleOutlined />
-        </div>
-        <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>
-          {target ? getUserDisplayName(target) || target.username : ''}
-        </div>
-        <p style={{ color: '#64748b', margin: 0 }}>{t('userManagement.confirmDeleteDesc')}</p>
-      </div>
-    </Modal>
+      onOk={handleDelete}
+      onCancel={() => setTarget(null)}
+    />
   );
 });
 

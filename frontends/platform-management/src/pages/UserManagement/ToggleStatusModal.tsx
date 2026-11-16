@@ -63,7 +63,7 @@ const ToggleStatusModal = forwardRef<ToggleStatusModalHandle, Props>(({ getUserD
         <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>
           {target ? getUserDisplayName(target) || target.username : ''}
         </div>
-        <p style={{ color: '#64748b', margin: 0 }}>
+        <p style={{ color: 'var(--yx-text-secondary)', margin: 0 }}>
           {target?.status === 1 ? t('userManagement.confirmDisableDesc') : t('userManagement.confirmEnableDesc')}
         </p>
       </div>

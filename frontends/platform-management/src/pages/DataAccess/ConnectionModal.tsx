@@ -36,11 +36,25 @@ interface Props {
   onSaved: () => void;
 }
 
-/** 引擎默认端口 —— 三个都被这个 POC 的库表结构实测过。 */
-const ENGINE_PORTS: Record<string, number> = { postgresql: 5432, mysql: 3306, sqlserver: 1433 };
+/** 引擎默认端口；InfluxDB v3 用 URL，不走 host:port。 */
+const ENGINE_PORTS: Record<string, number> = {
+  postgresql: 5432, mysql: 3306, sqlserver: 1433, clickhouse: 8123,
+};
 
 /** 后端 `schema_source` 白名单，顺序与 `supported_engines()` 一致。 */
-const ENGINES = ['postgresql', 'mysql', 'sqlserver'] as const;
+const ENGINES = ['postgresql', 'mysql', 'sqlserver', 'clickhouse', 'influx_v3'] as const;
+
+/** 下拉展示名（值仍是后端认识的引擎键）。 */
+const ENGINE_LABELS: Record<string, string> = {
+  postgresql: 'PostgreSQL',
+  mysql: 'MySQL',
+  sqlserver: 'SQL Server',
+  clickhouse: 'ClickHouse',
+  influx_v3: 'InfluxDB v3',
+};
+
+/** InfluxDB v3 的连接形状是 URL + token，不是 host:port + user/password。 */
+const isInfluxEngine = (engine: string | undefined): boolean => engine === 'influx_v3';
 
 const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
   spaceId, onSaved,
@@ -55,6 +69,7 @@ const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
   const [testResult, setTestResult] = useState<TestConnectionResult | null>(null);
 
   const engine = Form.useWatch('engine', form) as string | undefined;
+  const isInflux = isInfluxEngine(engine);
   /** 勾选「该账号即只读账号」时，显式只读凭据不展示、也不提交 */
   const readonlyUseMain = Form.useWatch('readonly_use_main', form) as boolean | undefined;
 
@@ -76,6 +91,7 @@ const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
       host: cfg.host,
       port: cfg.port,
       database: cfg.database,
+      url: cfg.url,
       user: cfg.user,
       schema: cfg.schema,
       password: undefined,
@@ -119,7 +135,15 @@ const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
     const hadUseMain = Boolean(
       ((editing?.config_json || {}) as Record<string, unknown>).readonly_use_main,
     );
-    const payload = {
+    // InfluxDB v3：URL + database + token。token 借 `password` 字段提交，
+    // 后端 `encrypt_config` 会换成 `password_ref`（明文 token 键不落库）。
+    const payload = isInflux ? {
+      name: String(values.name),
+      engine: String(values.engine),
+      database: String(values.database),
+      url: String(values.url || ''),
+      token: values.password ? String(values.password) : undefined,
+    } : {
       name: String(values.name),
       engine: String(values.engine),
       host: String(values.host),
@@ -233,49 +257,82 @@ const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
 
         <Form.Item name="engine" label={t('dataSource.engine')} rules={[{ required: true }]}>
           <Select
-            onChange={(value: string) => form.setFieldsValue({ port: ENGINE_PORTS[value] })}
-            options={ENGINES.map((e) => ({ value: e, label: e }))}
+            onChange={(value: string) => {
+              form.setFieldsValue({
+                port: ENGINE_PORTS[value],
+                // 换引擎时清掉不属于该形状的字段：Influx 不吃 host/user/schema，
+                // 留着只会在 submit 时把旧值当新配置发出去。
+                host: value === 'influx_v3' ? undefined : form.getFieldValue('host'),
+                user: value === 'influx_v3' ? undefined : form.getFieldValue('user'),
+                schema: value === 'influx_v3' ? undefined : form.getFieldValue('schema'),
+                url: value === 'influx_v3' ? form.getFieldValue('url') : undefined,
+              });
+            }}
+            options={ENGINES.map((e) => ({ value: e, label: ENGINE_LABELS[e] ?? e }))}
           />
         </Form.Item>
 
-        <Space.Compact style={{ width: '100%' }}>
-          <Form.Item name="host" label={t('dataSource.host')} rules={[{ required: true }]} style={{ flex: 3 }}>
-            {/* 容器里连宿主机的库要走 host.docker.internal —— 这个 POC 的库就在宿主机上 */}
-            <Input placeholder="host.docker.internal" />
+        {isInflux ? (
+          <Form.Item
+            name="url"
+            label={t('dataSource.url')}
+            extra={t('dataSource.urlHint')}
+            rules={[{ required: true }]}
+          >
+            <Input placeholder="http://127.0.0.1:8181" />
           </Form.Item>
-          <Form.Item name="port" label={t('dataSource.port')} rules={[{ required: true }]} style={{ flex: 2 }}>
-            <InputNumber min={1} max={65535} style={{ width: '100%' }} />
-          </Form.Item>
-        </Space.Compact>
+        ) : (
+          <Space.Compact style={{ width: '100%' }}>
+            <Form.Item name="host" label={t('dataSource.host')} rules={[{ required: true }]} style={{ flex: 3 }}>
+              {/* 容器里连宿主机的库要走 host.docker.internal —— 这个 POC 的库就在宿主机上 */}
+              <Input placeholder="host.docker.internal" />
+            </Form.Item>
+            <Form.Item name="port" label={t('dataSource.port')} rules={[{ required: true }]} style={{ flex: 2 }}>
+              <InputNumber min={1} max={65535} style={{ width: '100%' }} />
+            </Form.Item>
+          </Space.Compact>
+        )}
 
-        <Form.Item name="database" label={t('dataSource.database')} rules={[{ required: true }]}>
+        <Form.Item
+          name="database"
+          label={isInflux ? t('dataSource.influxDatabase') : t('dataSource.database')}
+          rules={[{ required: true }]}
+        >
           <Input />
         </Form.Item>
 
-        {/* schema 只有 pg / sqlserver 用得上；MySQL 拿 database 当 schema，填了也没用 */}
-        {engine !== 'mysql' ? (
+        {/* schema 只有 pg / sqlserver 用得上；MySQL 拿 database 当 schema，Influx 没有 schema */}
+        {!isInflux && engine !== 'mysql' ? (
           <Form.Item name="schema" label={t('dataSource.schema')} extra={t('dataSource.schemaHint')}>
             <Input placeholder={engine === 'sqlserver' ? 'dbo' : 'public'} />
           </Form.Item>
         ) : null}
 
-        <Form.Item name="user" label={t('dataSource.user')} rules={[{ required: true }]}>
-          <Input autoComplete="off" />
-        </Form.Item>
+        {!isInflux ? (
+          <Form.Item name="user" label={t('dataSource.user')} rules={[{ required: true }]}>
+            <Input autoComplete="off" />
+          </Form.Item>
+        ) : null}
 
         <Form.Item
           name="password"
-          label={t('dataSource.password')}
-          extra={editing ? t('dataSource.passwordKeepHint') : undefined}
+          label={isInflux ? t('dataSource.token') : t('dataSource.password')}
+          extra={isInflux
+            ? t('dataSource.tokenHint')
+            : (editing ? t('dataSource.passwordKeepHint') : undefined)}
+          rules={isInflux && !editing ? [{ required: true }] : undefined}
         >
           {/* 只写不回显：后端 to_dict 把 password_ref 脱敏成 ***，本来也读不回来。
-              编辑时留空 = 不改密码（后端「不传即保留」）。 */}
+              编辑时留空 = 不改密码（后端「不传即保留」）。Influx 的 token 也走这个字段。 */}
           <Input.Password autoComplete="new-password" placeholder={editing ? '••••••' : undefined} />
         </Form.Item>
 
         {/* ── 只读凭据：② NL→SQL 专用（不是写账号的替代） ──
             后端解析只认 readonly_user / readonly_password_ref，**绝不回退**到上面的
-            写账号；没登记 ⇒ 数据问答直接回 no_readonly_creds，fail-closed。 */}
+            写账号；没登记 ⇒ 数据问答直接回 no_readonly_creds，fail-closed。
+            Influx 是时序源，② 不执行它的写库 SQL，这组字段不出现。 */}
+        {!isInflux ? (
+          <>
         <Divider style={{ margin: '8px 0 16px' }}>{t('dataSource.readonlyTitle')}</Divider>
 
         <Form.Item
@@ -314,6 +371,8 @@ const ConnectionModal = forwardRef<ConnectionModalHandle, Props>(({
             </Form.Item>
           </>
         )}
+          </>
+        ) : null}
       </Form>
 
       {testResult ? (

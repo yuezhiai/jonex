@@ -138,6 +138,65 @@ describe('LedgersTab · relation 台账行', () => {
     expect(screen.getByText(/ds_1 · Circuits\.circuitid/)).toBeTruthy();
   });
 
+  it('metric 行渲染 op + 指标名与 before 旧定义（不是 -）', async () => {
+    getLedgers.mockResolvedValue({
+      alias: ledger([
+        {
+          kind: 'metric',
+          op: 'update',
+          name: '客单价',
+          before: { definition: '旧定义', formula: 'SUM(amount)' },
+          kb: 'kb_demo',
+          version_before: 1, version_after: 2, verified: true,
+          at: '2026-10-25T10:00:00',
+        },
+        {
+          kind: 'metric',
+          op: 'add',
+          name: '订单量',
+          kb: 'kb_demo',
+          version_before: 2, version_after: 3, verified: true,
+          at: '2026-10-25T10:00:01',
+        },
+      ]),
+      query_rule: ledger([]),
+      rejects: ledger([]),
+    });
+
+    render(<LedgersTab />);
+
+    expect(await screen.findByText('客单价')).toBeTruthy();
+    expect(screen.getByText('订单量')).toBeTruthy();
+    expect(screen.getByText('update')).toBeTruthy();
+    expect(screen.getByText('add')).toBeTruthy();
+    // before 的旧值与新值（无 before 时只显示指标名，不渲染成 '-'）
+    expect(screen.getByText(/旧定义/)).toBeTruthy();
+    expect(screen.getByText(/SUM\(amount\)/)).toBeTruthy();
+  });
+
+  it('metric 行 before 旧值优先读 description（指标用 description 存定义）', async () => {
+    getLedgers.mockResolvedValue({
+      alias: ledger([
+        {
+          kind: 'metric',
+          op: 'update',
+          name: '客单价',
+          before: { description: '旧口径描述', formula: 'SUM(amount)' },
+          kb: 'kb_demo',
+          version_before: 1, version_after: 2, verified: true,
+          at: '2026-10-25T10:00:00',
+        },
+      ]),
+      query_rule: ledger([]),
+      rejects: ledger([]),
+    });
+
+    render(<LedgersTab />);
+
+    expect(await screen.findByText(/旧口径描述/)).toBeTruthy();
+    expect(screen.getByText(/SUM\(amount\)/)).toBeTruthy();
+  });
+
   it('tool_schema 行渲染工具名与描述变化（不是 -）', async () => {
     getLedgers.mockResolvedValue({
       alias: ledger([

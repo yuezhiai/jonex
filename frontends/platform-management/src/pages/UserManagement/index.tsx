@@ -248,7 +248,7 @@ export default function UserManagement() {
                 <Button
                   type="link"
                   size="small"
-                  style={{ marginLeft: 8, color: '#dc2626' }}
+                  style={{ marginLeft: 8, color: 'var(--yx-error-text)' }}
                   onClick={() => deleteConfirmModalRef.current?.open(row)}
                 >
                   {t('common.delete')}
@@ -345,7 +345,7 @@ export default function UserManagement() {
           <div className="user-main">
             <CommonTable<UserItem, UserFilters>
               ref={tableRef}
-              className="user-table"
+              className="user-table yx-table-fill"
               // y 让 antd 把表头/表体拆成两块（表头固定、表体滚动），高度由 CSS 的
               // flex 链给出；不传 y 时表头表体是同一张 table，行多了一定会被裁
               scroll={{ x: 'max-content', y: '100%' }}

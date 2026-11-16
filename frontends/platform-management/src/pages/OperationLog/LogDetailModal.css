@@ -16,7 +16,7 @@
   align-items: flex-start;
   gap: 10px;
   padding-bottom: 16px;
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--yx-bg-muted);
 }
 
 .lod-head-icon {
@@ -65,7 +65,7 @@
 
 .lod-head-res {
   overflow: hidden;
-  color: #334155;
+  color: var(--yx-text-body);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -73,7 +73,7 @@
 .lod-head-meta {
   margin-top: 5px;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .lod-head-status {
@@ -88,7 +88,7 @@
 }
 
 .is-failed .lod-head-status {
-  color: #dc2626;
+  color: var(--yx-error-text);
 }
 
 /* ── 分区：小标题带一根竖细标，不用卡片容器 ── */
@@ -111,7 +111,7 @@
   align-items: center;
   font-size: 12px;
   font-weight: 600;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   letter-spacing: 0.2px;
 }
 
@@ -137,12 +137,12 @@
   height: 22px;
   padding: 0 6px;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .lod-copy-text.ant-btn:hover {
   color: #1677ff;
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
 }
 
 /* ── 请求行：方法 + 路径 ── */
@@ -152,7 +152,7 @@
   gap: 8px;
   font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
   font-size: 12.5px;
-  color: #334155;
+  color: var(--yx-text-body);
 }
 
 .lod-method {
@@ -181,11 +181,11 @@
   padding: 10px 12px;
   overflow: auto;
   border-radius: 6px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
   font-size: 12px;
   line-height: 1.65;
-  color: #334155;
+  color: var(--yx-text-body);
   white-space: pre-wrap;
   word-break: break-all;
 }
@@ -212,7 +212,7 @@
 .lod-error-msg {
   font-size: 13px;
   line-height: 1.7;
-  color: #334155;
+  color: var(--yx-text-body);
   white-space: pre-line;
   word-break: break-word;
 }
@@ -238,7 +238,7 @@
 .lod-row-label {
   flex: 0 0 76px;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .lod-row-value {
@@ -247,7 +247,7 @@
   gap: 4px;
   min-width: 0;
   font-size: 13px;
-  color: #334155;
+  color: var(--yx-text-body);
   word-break: break-all;
 }
 
@@ -256,7 +256,7 @@
   width: 20px;
   height: 20px;
   padding: 0;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   border-radius: 6px;
 }
 

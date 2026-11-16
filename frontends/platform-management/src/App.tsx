@@ -3,18 +3,16 @@ import { I18nextProvider, useTranslation } from 'react-i18next';
 import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
-import { antdTheme } from '@jonex/platform-theme';
+import { withCssVarKey } from '@jonex/platform-theme';
 import i18n from '@/locales/i18n';
 import AppRoute from '@/router';
 
 function AntdGate({ children }: { children: React.ReactNode }) {
   const { i18n: appI18n } = useTranslation();
   const antdLocale = appI18n.language === 'zh' ? zhCN : enUS;
-  // cssVar 关闭：antd v6 cssVar 从根 ConfigProvider 继承，且 popup 的 z-index 走
-  // 会被 cssinjs 回收的 CSS 变量下发；MF 共享单例后必须所有应用一致关闭，否则
-  // 任一应用的 cssVar:true 会为共享 antd 注册全局变量，导致 popup z-index 丢失。
+  // cssVar key 固定为本应用的 app key，避免与 shell 的 cssVar 作用域串号（原因见 withCssVarKey 注释）。
   return (
-    <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+    <ConfigProvider locale={antdLocale} theme={withCssVarKey('jonex-platform-management')}>
       {children}
     </ConfigProvider>
   );

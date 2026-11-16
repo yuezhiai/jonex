@@ -14,11 +14,12 @@ const code = (v: unknown) => (v ? <code>{String(v)}</code> : '-');
 
 const aliasColumns = (t: TFunction): ColumnsType<Row> => [
   { title: <Tooltip title="id">{t('evolutionConsole.ledgerColId')}</Tooltip>, dataIndex: 'id', width: 110, render: code },
-  // mapping 与 alias 同落这本账（`entry.kind="mapping"`）：把 concept/alias 两列
-  // 分派成 op + target_code + 物理三元组，别让它们渲染成空白。
+  // mapping / tool_schema / metric 与 alias 同落这本账（`entry.kind` 区分）：把
+  // concept/alias 两列分派成 op + 身份（target_code / 工具名 / 指标名），
+  // 别让它们渲染成空白。
   { title: <Tooltip title="concept / mapping target">{t('evolutionConsole.ledgerColConcept')}</Tooltip>,
     dataIndex: 'concept', width: 200,
-    render: (v: unknown, r: Row) => (isToolSchemaRow(r)
+    render: (v: unknown, r: Row) => (isToolSchemaRow(r) || isMetricRow(r)
       ? (
         <span>
           <Tag style={{ marginRight: 4 }}>{String(r.op ?? '-')}</Tag>
@@ -42,6 +43,22 @@ const aliasColumns = (t: TFunction): ColumnsType<Row> => [
         return beforeDescription
           ? `${String(beforeDescription)} → ${description ? String(description) : '-'}`
           : (description ? String(description) : '-');
+      }
+      if (isMetricRow(r)) {
+        // update/disable/enable 的旧值（description（旧数据 definition）/ formula）；没有 before 的
+        // add 行留空（指标名已在上一列）。次要文本 + Tooltip，不撑坏表格。
+        const before = metricBeforeOf(r);
+        return before ? (
+          <Tooltip title={before}>
+            <span style={{
+              display: 'inline-block', maxWidth: 180, overflow: 'hidden',
+              textOverflow: 'ellipsis', whiteSpace: 'nowrap', verticalAlign: 'bottom',
+              color: '#8c8c8c', fontSize: 12,
+            }}>
+              {before}
+            </span>
+          </Tooltip>
+        ) : '-';
       }
       return isMappingRow(r) ? mappingTripleOf(r) : (v ? String(v) : '-');
     } },
@@ -67,6 +84,21 @@ const isMappingRow = (r: Row) => r.kind === 'mapping';
 /** tool_schema 台账行（写 alias 那本账，`entry.kind="tool_schema"`）：
  * 身份是工具 name，改的是 description；回滚行的 kind 同为 tool_schema + op=rollback。 */
 const isToolSchemaRow = (r: Row) => r.kind === 'tool_schema';
+/** metric 台账行（写 alias 那本账，`entry.kind="metric"`）：身份是指标 name，
+ * update/disable/enable 的旧值在 `before.description`（指标用 description 存定义；
+ * 老行可能是 `definition`）/ `before.formula`。 */
+const isMetricRow = (r: Row) => r.kind === 'metric';
+const metricBeforeOf = (r: Row) => {
+  const before = r.before;
+  if (!before || typeof before !== 'object') return '';
+  const { description, definition, formula } = before as {
+    description?: unknown; definition?: unknown; formula?: unknown;
+  };
+  // 落库槽是 description；definition 只作旧数据兜底（`??` 保证空串不回落）。
+  return [description ?? definition, formula]
+    .filter((value): value is string => typeof value === 'string' && Boolean(value))
+    .join(' · ');
+};
 const toolBeforeDescOf = (r: Row) => {
   const before = r.before;
   if (before && typeof before === 'object' && 'description' in before) {
@@ -97,7 +129,7 @@ const beforeExpressionOf = (r: Row) => {
 /** relation / constraint 台账行（都写 query_rule 那本账）没有完整 target_code，
  * 这两列按 kind 分派，别让它们渲染成空白。 */
 const queryRuleColumns = (t: TFunction): ColumnsType<Row> => [
-  { title: <Tooltip title="target_code / relation edge / constraint op+name">{t('evolutionConsole.ledgerColTarget')}</Tooltip>,
+  { title: <Tooltip title="entry key">{t('evolutionConsole.ledgerColTarget')}</Tooltip>,
     key: 'target', width: 240, ellipsis: true,
     render: (_, r) => {
       if (isRelationRow(r)) {
@@ -135,7 +167,7 @@ const queryRuleColumns = (t: TFunction): ColumnsType<Row> => [
       }
       return code(r.target_code);
     } },
-  { title: <Tooltip title="expression / relation description / mapping slots">{t('evolutionConsole.ledgerColExpression')}</Tooltip>,
+  { title: <Tooltip title="before / details">{t('evolutionConsole.ledgerColExpression')}</Tooltip>,
     key: 'expression', ellipsis: true,
     render: (_, r) => {
       if (isRelationRow(r)) return String(r.description ?? r.cardinality ?? '');

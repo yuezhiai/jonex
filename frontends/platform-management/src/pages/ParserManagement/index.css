@@ -16,7 +16,7 @@
 .parser-toolbar-count {
   margin-left: auto;
   font-size: 12.5px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .parser-error {
@@ -28,7 +28,7 @@
   border-radius: 10px;
   background: #fef2f2;
   font-size: 13px;
-  color: #dc2626;
+  color: var(--yx-error-text);
 }
 
 .parser-error > span {
@@ -108,7 +108,7 @@
   margin-top: 3px;
   overflow: hidden;
   font-size: 11.5px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -132,7 +132,7 @@
 
 .parser-chip.is-more {
   background: #eef2f7;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-family: inherit;
 }
 
@@ -145,13 +145,13 @@
 }
 
 .parser-fields dt {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .parser-fields dd {
   margin: 0;
   overflow: hidden;
-  color: #334155;
+  color: var(--yx-text-body);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -162,9 +162,9 @@
   gap: 6px;
   margin-top: 2px;
   padding-top: 9px;
-  border-top: 1px solid #f1f5f9;
+  border-top: 1px solid var(--yx-bg-muted);
   font-size: 11.5px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .parser-card-sep {

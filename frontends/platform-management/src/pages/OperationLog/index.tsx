@@ -197,7 +197,7 @@ export default function OperationLog() {
             <span>
               {label}
               {r.resource_name && (
-                <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.4 }}>{r.resource_name}</div>
+                <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', lineHeight: 1.4 }}>{r.resource_name}</div>
               )}
             </span>
           );
@@ -226,7 +226,7 @@ export default function OperationLog() {
           // 只认 outcome：业务失败 status_code=None（HTTP 200），不可用状态码推导
           if (v === 'FAILED') return <Tag color="red">{t('operationLog.failed')}</Tag>;
           if (v === 'SUCCESS') return <Tag color="green">{t('operationLog.success')}</Tag>;
-          return <span style={{ color: '#94a3b8' }}>-</span>;
+          return <span style={{ color: 'var(--yx-text-muted)' }}>-</span>;
         },
       },
       {

@@ -46,7 +46,7 @@ export default function MarkdownLite({ text }: { text: string }) {
         code = [];
       } else {
         out.push(
-          <pre key={`pre-${i}`} style={{ background: '#f8fafc', padding: 12, borderRadius: 8, fontSize: 12, overflow: 'auto' }}>
+          <pre key={`pre-${i}`} style={{ background: 'var(--yx-bg-subtle)', padding: 12, borderRadius: 8, fontSize: 12, overflow: 'auto' }}>
             {code.join('\n')}
           </pre>,
         );
@@ -94,7 +94,7 @@ export default function MarkdownLite({ text }: { text: string }) {
   flushList(lines.length);
   if (code !== null) {
     out.push(
-      <pre key="pre-open" style={{ background: '#f8fafc', padding: 12, borderRadius: 8, fontSize: 12 }}>
+      <pre key="pre-open" style={{ background: 'var(--yx-bg-subtle)', padding: 12, borderRadius: 8, fontSize: 12 }}>
         {(code as string[]).join('\n')}
       </pre>,
     );

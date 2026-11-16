@@ -9,7 +9,7 @@ import type { DoProportionItem } from '../types';
  * ⚠️ 这份色板由几张占比图共用，**不要为了某一页调换顺序**：资产构成图只展示五类，
  * 需要自己的配色时在条目上写 `color`（见 `DoProportionItem.color`）。
  */
-const PALETTE = ['#3b82f6', '#10b981', '#8b5cf6', '#0ea5e9', '#f97316', '#ec4899', '#6b7280'];
+const PALETTE = ['var(--yx-accent)', '#10b981', '#8b5cf6', '#0ea5e9', '#f97316', '#ec4899', '#6b7280'];
 
 interface Props {
   items: DoProportionItem[];
@@ -29,6 +29,10 @@ interface Props {
    * 必须仍留在分母里，否则百分比会被重新归一（「文档」会从 42.9% 涨到 66.7%）。
    */
   total?: number;
+  /** 点击某一行（如失败码分布 → 按码过滤）；不传则整列只读 */
+  onItemClick?: (item: DoProportionItem) => void;
+  /** 当前生效的行 key，用于高亮筛选中的那一行 */
+  activeKey?: string;
 }
 
 /**
@@ -36,7 +40,16 @@ interface Props {
  * 不用 antd Progress：它自带的内外边距与截图里的紧凑列表不符。
  * 百分比一律由 count 与同组总量算出，不取常量里的写死值，保证与数字自洽。
  */
-export default function ProportionList({ items, loading, renderValue, percentOf, colorOf, total: totalProp }: Props) {
+export default function ProportionList({
+  items,
+  loading,
+  renderValue,
+  percentOf,
+  colorOf,
+  total: totalProp,
+  onItemClick,
+  activeKey,
+}: Props) {
   const { t } = useTranslation();
 
   if (loading) return <Skeleton active paragraph={{ rows: 5 }} />;
@@ -51,8 +64,16 @@ export default function ProportionList({ items, loading, renderValue, percentOf,
         const percent = percentOf ? percentOf(item, share) : share;
         const color = item.color ?? (colorOf ? colorOf(item, index) : PALETTE[index % PALETTE.length]);
 
+        const clickable = onItemClick != null;
+        const active = activeKey != null && activeKey === item.key;
+
         return (
-          <li key={item.key} className="yx-do-proportion-item">
+          <li
+            key={item.key}
+            className={`yx-do-proportion-item${clickable ? ' is-clickable' : ''}${active ? ' is-active' : ''}`}
+            onClick={clickable ? () => onItemClick(item) : undefined}
+            style={clickable ? { cursor: 'pointer' } : undefined}
+          >
             <div className="yx-do-proportion-head">
               <span className="yx-do-proportion-label">{item.labelKey ? t(item.labelKey) : item.label}</span>
               <span className="yx-do-proportion-value">

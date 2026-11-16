@@ -39,10 +39,18 @@ function adapterSlot(): AdapterSlot {
 /** 抓最近一次请求的 body（axios 在进 adapter 前已把 data 序列化成字符串） */
 let bodies: Array<Record<string, unknown>> = [];
 
+/** 抓最近一次请求的 query 参数（axios 已把 `config.params` 原样带进 adapter）。 */
+let queries: Array<Record<string, unknown>> = [];
+
+/** 抓最近一次请求的 method + url。 */
+let requests: Array<{ method: string; url: string }> = [];
+
 function stubWriteAdapter(): void {
   const adapter: AxiosAdapter = async (config) => {
     const raw = config.data;
     bodies.push(typeof raw === 'string' ? JSON.parse(raw) : ((raw ?? {}) as Record<string, unknown>));
+    queries.push((config.params ?? {}) as Record<string, unknown>);
+    requests.push({ method: String(config.method ?? '').toLowerCase(), url: String(config.url ?? '') });
     return makeResponse(config, { success: true, code: 0, data: { id: 'conn_1', name: 'x' } });
   };
   adapterSlot().adapter = adapter;
@@ -66,6 +74,8 @@ describe('dataSourceConnection · 只读凭据', () => {
   beforeEach(() => {
     installLocalStorage();
     bodies = [];
+    queries = [];
+    requests = [];
     stubWriteAdapter();
   });
 
@@ -111,12 +121,29 @@ describe('dataSourceConnection · 只读凭据', () => {
     expect(cfg.readonly_user).toBe('demo_wte_ro');
     expect('readonly_password' in cfg).toBe(false);
   });
+
+  // 网关 PATCH 端点是 `space_id: str = Query(...)` 必填：只放 body 会 422 / code 1001
+  // （`api_gateway/routes/knowledge_base.py` update_ds_connection）。UI 编辑连接曾因此
+  // 100% 失败，这条断言把「query 里必须有 space_id」钉死。
+  it('编辑连接的 space_id 走 query（缺了后端回 1001）', async () => {
+    await updateConnection('conn_1', basePayload(), 'space_demo');
+
+    expect(requests[0]).toEqual({
+      method: 'patch',
+      url: '/knowledge-base/data-source-connections/conn_1',
+    });
+    // body 里那份保留（与新建口径一致），query 里那份才是网关校验用的
+    expect(bodies[0].space_id).toBe('space_demo');
+    expect(queries[0]).toMatchObject({ space_id: 'space_demo' });
+  });
 });
 
 describe('dataSourceConnection · 该账号即只读账号', () => {
   beforeEach(() => {
     installLocalStorage();
     bodies = [];
+    queries = [];
+    requests = [];
     stubWriteAdapter();
   });
 
@@ -150,5 +177,82 @@ describe('dataSourceConnection · 该账号即只读账号', () => {
 
     const cfg = bodies[0].config_json as Record<string, unknown>;
     expect('readonly_use_main' in cfg).toBe(false);
+  });
+});
+
+describe('dataSourceConnection · W1 新引擎', () => {
+  beforeEach(() => {
+    installLocalStorage();
+    bodies = [];
+    queries = [];
+    requests = [];
+    stubWriteAdapter();
+  });
+
+  afterEach(() => {
+    adapterSlot().adapter = originalAdapter as AxiosAdapter;
+    vi.unstubAllGlobals();
+  });
+
+  it('InfluxDB v3 ⇒ url + database，token 走 password（不写明文 token 键）', async () => {
+    await createConnection(basePayload({
+      engine: 'influx_v3',
+      host: undefined,
+      port: undefined,
+      user: undefined,
+      url: 'http://127.0.0.1:8181',
+      database: 'demo_metrics',
+      token: 'apiv3_tok',
+    }), 'space_demo');
+
+    const cfg = bodies[0].config_json as Record<string, unknown>;
+    expect(cfg).toEqual({
+      engine: 'influx_v3',
+      url: 'http://127.0.0.1:8181',
+      database: 'demo_metrics',
+      password: 'apiv3_tok',
+    });
+    expect('token' in cfg).toBe(false);
+    expect('host' in cfg).toBe(false);
+  });
+
+  it('InfluxDB v3 忽略只读凭据（时序源不走 ② 写库口径）', async () => {
+    await createConnection(basePayload({
+      engine: 'influx_v3',
+      url: 'http://127.0.0.1:8181',
+      readonlyUser: 'ro',
+      readonlyPassword: 'ro_pwd',
+      readonlyUseMain: true,
+    }), 'space_demo');
+
+    const cfg = bodies[0].config_json as Record<string, unknown>;
+    expect('readonly_user' in cfg).toBe(false);
+    expect('readonly_password' in cfg).toBe(false);
+    expect('readonly_use_main' in cfg).toBe(false);
+  });
+
+  it('ClickHouse ⇒ 保留 host/port/database/user/password 与只读凭据', async () => {
+    await createConnection(basePayload({
+      engine: 'clickhouse',
+      host: 'clickhouse',
+      port: 8123,
+      database: 'demo',
+      user: 'default',
+      password: 'ch_pwd',
+      readonlyUser: 'demo_ro',
+      readonlyPassword: 'ro_pwd',
+    }), 'space_demo');
+
+    const cfg = bodies[0].config_json as Record<string, unknown>;
+    expect(cfg).toEqual({
+      engine: 'clickhouse',
+      host: 'clickhouse',
+      port: 8123,
+      database: 'demo',
+      user: 'default',
+      password: 'ch_pwd',
+      readonly_user: 'demo_ro',
+      readonly_password: 'ro_pwd',
+    });
   });
 });

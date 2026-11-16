@@ -36,6 +36,8 @@ export default function TrendAreaChart({
   loading,
   height = 260,
   fill = false,
+  // ⚠ 缺省必须是字面量：canvas 解析不了 `var(--yx-accent)`（d3-color 得 null → 描边透明、面积渐变抛错）。
+  // 与 theme.css 的 --yx-accent 同值；改主题色时这里要同步。
   color = '#3b82f6',
   valueName,
 }: Props) {
@@ -92,6 +94,7 @@ export default function TrendAreaChart({
             // 不强制隐藏标签：14 个点在窄列里挤不下时交给 G2 自动抽稀，
             // 但必须禁用旋转，否则日期会被竖排
             x: { labelAutoRotate: false, tick: false, line: true, labelFontSize: 12 },
+            // gridStroke 同样只能是字面量（canvas 里 var() 会解析成透明）
             y: { tick: false, line: true, grid: true, gridStroke: '#e2e8f0', labelFontSize: 12, gridStrokeOpacity: 1 },
           }}
           tooltip={{ title: 'date', items: [{ channel: 'y', name: valueName ?? t('dataOperations.column.count') }] }}

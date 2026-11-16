@@ -185,7 +185,7 @@ export default function SystemConfig() {
       >
         <Card style={CARD_STYLE} styles={{ body: CARD_BODY_STYLE }}>
           <h3 style={HEADING_STYLE}>
-            <InfoCircleOutlined style={{ color: '#3b82f6' }} /> {t('systemConfig.basicSettings')}
+            <InfoCircleOutlined style={{ color: 'var(--yx-accent)' }} /> {t('systemConfig.basicSettings')}
           </h3>
           <div style={GRID_STYLE}>
             <Form.Item name="platform_name" label={t('systemConfig.platformName')}>
@@ -221,7 +221,7 @@ export default function SystemConfig() {
 
         <Card style={CARD_STYLE} styles={{ body: CARD_BODY_STYLE }}>
           <h3 style={HEADING_STYLE}>
-            <SafetyOutlined style={{ color: '#3b82f6' }} /> {t('systemConfig.securitySettings')}
+            <SafetyOutlined style={{ color: 'var(--yx-accent)' }} /> {t('systemConfig.securitySettings')}
           </h3>
           {!canPlatformWrite && <p style={READONLY_HINT_STYLE}>{t('common.readOnlyHint')}</p>}
           <div style={GRID_STYLE}>

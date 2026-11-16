@@ -39,7 +39,7 @@ export default function KnowledgeCompile() {
       value: MOCK_COMPILE_TASKS.reduce((s, t) => s + t.entityCount, 0).toLocaleString(),
       icon: <NodeIndexOutlined />,
       color: '#10b981',
-      bg: '#ecfdf5',
+      bg: 'var(--yx-success-bg)',
     },
     {
       title: t('knowledgeCompile.totalRelations'),
@@ -63,7 +63,7 @@ export default function KnowledgeCompile() {
       desc: t('knowledgeCompile.cardSearchDesc'),
       path: '/knowledge-compile/search',
       icon: <SearchOutlined />,
-      color: '#3b82f6',
+      color: 'var(--yx-accent)',
     },
     {
       title: t('knowledgeCompile.cardGraph'),
