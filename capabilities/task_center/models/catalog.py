@@ -27,7 +27,7 @@ class TaskCatalogStep(Base):
 
     __tablename__ = "task_catalog_steps"
     __table_args__ = (
-        # 索引名 / 列 / 唯一性逐条对齐 DDL（`deploy/postgres/migrations/008_task_center.sql`）。
+        # 索引名 / 列 / 唯一性逐条对齐 DDL（`deploy/postgres/migrations/005_task_center.sql`）。
         # 2026-10-23 起 `step_code` 全局唯一（以前是 `(task_catalog_code, step_code)`）。
         Index("uq_tc_cs_step_code", "step_code", unique=True),
         {"schema": "task_center"},

@@ -18,6 +18,18 @@ export const fmtDuration = (seconds: number | null | undefined): string => {
 };
 
 /**
+ * Token 数格式化（2026-11-11 加，按文档归集）。
+ *
+ * `null` → `-`：口径是「算不出来 / 没有精确计量」，**不是 0**，绝不兜成 0；
+ * 真有 `0` 就如实显示 `0`。千分位用 `toLocaleString('en-US')` —— 与调用记录那边
+ * 同一视觉口径，不受浏览器 locale 影响（否则中文环境下可能被格式化成别的分隔符）。
+ */
+export const fmtTokenCount = (tokens: number | null | undefined): string => {
+  if (tokens === null || tokens === undefined) return '-';
+  return tokens.toLocaleString('en-US');
+};
+
+/**
  * ISO 8601 → 'YYYY-MM-DD HH:mm:ss'（本地时区）。
  *
  * 统一走 dayjs 而不是自己拼字符串：接口返回的时刻是否带时区尚未确认，而 dayjs 对

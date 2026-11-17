@@ -24,6 +24,7 @@ from .execution_repository import (
 from .report_repository import SubtaskReportRepository
 from .runner_repository import RunnerDefinitionRepository
 from .space_repository import SpaceRepository
+from .token_usage_repository import TaskTokenUsageRepository
 from .trigger_repository import TaskTriggerRepository
 
 __all__ = [
@@ -37,5 +38,6 @@ __all__ = [
     "TaskDefinitionRepository",
     "TaskDefinitionVersionRepository",
     "TaskRepository",
+    "TaskTokenUsageRepository",
     "TaskTriggerRepository",
 ]

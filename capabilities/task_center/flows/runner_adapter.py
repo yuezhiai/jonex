@@ -391,6 +391,9 @@ class RunnerAdapter:
             RUNNER_EXECUTE_ACTION,
             execution.dict(),
             identity=f"task={execution.task_id}",
+            # 追踪号用**本次派活自己的** `execution_id`（不是 `task_id`）：重试会换新的
+            # execution_id，Token 才能按「这一次尝试」分别归集。
+            trace_id=execution.execution_id,
         )
 
     async def remove_task(
@@ -420,6 +423,9 @@ class RunnerAdapter:
             RUNNER_REMOVE_TASK_ACTION,
             execution.dict(),
             identity=f"task={execution.task_id}",
+            # 删除没有 execution_id（`RemoveTaskDispatch` 只有 task_id）—— 用 task_id
+            # 当追踪号，与 `call_with_retry` 的采集口径一致。
+            trace_id=execution.task_id,
         )
 
     async def notify_stopped(
@@ -448,6 +454,8 @@ class RunnerAdapter:
             RUNNER_TASK_STOPPED_ACTION,
             execution.dict(),
             identity=f"task={execution.task_id}",
+            # 同 `remove_task`：停止通知也没有 execution_id，用 task_id 当追踪号。
+            trace_id=execution.task_id,
             timeout=get_config().TASK_CENTER_NOTIFY_TIMEOUT,
         )
 
@@ -583,6 +591,7 @@ class RunnerAdapter:
         data: Dict[str, Any],
         *,
         identity: str,
+        trace_id: str = "",
         timeout: Optional[float] = None,
     ) -> DispatchResult:
         """把一次出站调用发给运行方：`action` 决定是哪个动作，通道完全一样。
@@ -590,6 +599,10 @@ class RunnerAdapter:
         `timeout` 给 `None` = 用适配器自己的那个（`TASK_CENTER_RUNNER_TIMEOUT`）；
         传值 = **这一次调用**用它（给「停止通知」那种不该让用户干等的动作留的口子，
         见 `notify_stopped`）。
+
+        `trace_id` 是本条链路的追踪号，只对 **REMOTE 通道**生效（`X-Jonex-Trace-Id`，
+        见 `_dispatch_remote`）—— LOCAL 是进程内直连、不经过 Sidecar，透传不成立，
+        本方法收下但不使用（这类部署下 Token 归集只能显示「-」）。空串 = 不带这个头。
         """
         tenant_id = require_tenant(data.get("tenant_id"))
         spec = get_locator().get_spec(capability_id)
@@ -614,6 +627,7 @@ class RunnerAdapter:
         if spec.mode == CapabilityMode.REMOTE:
             return await self._dispatch_remote(
                 capability_id, spec.endpoint, action, data, tenant_id, identity,
+                trace_id=trace_id,
                 timeout=timeout,
             )
 
@@ -667,6 +681,7 @@ class RunnerAdapter:
         tenant_id: str,
         identity: str,
         *,
+        trace_id: str = "",
         timeout: Optional[float] = None,
     ) -> DispatchResult:
         """经 Sidecar 反代到独立部署的运行方进程。
@@ -681,11 +696,22 @@ class RunnerAdapter:
             "payload": {"action": action, "data": data},
             "tenant_id": tenant_id,
         }
+        headers = {"X-Tenant-ID": tenant_id}
+        if trace_id:
+            # ⚠️ **只带 `X-Jonex-Trace-Id`，刻意不带 `X-Request-ID`** —— 两者在 Sidecar
+            # 里是**不同的东西**（`sidecar/main.py::_resolve_call_ids`）：`X-Request-ID`
+            # 是本次调用的身份（`monitor.call_log` 的唯一键），`X-Jonex-Trace-Id` 只是
+            # 全链路追踪号。带上前者会让 Sidecar 入站行与任务中心自己的派发采集行
+            # （`emit_logical_call`，`request_id=execution_id`）撞 `UNIQUE(request_id)`。
+            # 只带追踪号时：Sidecar 入站行拿到新的 request_id、trace_id 取到这里传的值，
+            # 于是派发行成了「链路根行」（`request_id == trace_id`），监控按 trace 汇总时
+            # 正好命中；能力侧经 `proxy.invoke_capability(request_id=trace_id)` 继续往下传。
+            headers["X-Jonex-Trace-Id"] = trace_id
         try:
             resp = await client.post(
                 "/invoke",
                 json=body,
-                headers={"X-Tenant-ID": tenant_id},
+                headers=headers,
                 timeout=(
                     timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT
                 ),

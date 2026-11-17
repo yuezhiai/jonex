@@ -44,7 +44,8 @@ import type { SubtaskActionHandler } from './TaskSubtasks';
 import SubtaskResult from './SubtaskResult';
 import useSubtasks from './useSubtasks';
 import useSilentPolling from './useSilentPolling';
-import { fmtDateTime, fmtDuration } from './format';
+import useTaskTokenBackfill from './useTaskTokenBackfill';
+import { fmtDateTime, fmtDuration, fmtTokenCount } from './format';
 import {
   SUBTASK_STATUS_COLORS,
   SUBTASK_STATUS_LABEL_KEY,
@@ -151,6 +152,14 @@ export default function TaskCenter() {
    * 跨应用取值走 shell-sdk 的统一通道（localStorage + 事件），hosted 的 iframe 与
    * standalone 的跨标签页两种形态都覆盖 —— 这里是本页唯一的跨应用取值。
    */
+  /**
+   * 列表的 Token 消耗（2026-11-11 加，**按文档归集**）。
+   *
+   * 列表接口不带 Token（算一次要跨库扫计量表），所以首屏先出 `-`，再对当前页的任务
+   * 轻量补值：`schedule` 每轮只查还没结论的那些，运行中的每轮刷新、终态拿到值即固定。
+   * 抽屉读的是同一份 `usage`（打开详情的那行就在当前页里），不另发一次请求。
+   */
+  const { usage: tokenUsage, schedule: scheduleTokenBackfill } = useTaskTokenBackfill();
   const [spaceId, setSpaceId] = useState<string | null>(() => readPersistedSpaceId());
 
   useEffect(() => onSpaceChanged(setSpaceId), []);
@@ -191,12 +200,19 @@ export default function TaskCenter() {
       });
       setStatusCounts(res.status_counts ?? {});
       const items = res.items ?? [];
-      setHasActiveTasks(items.some((row) => !isTaskTerminal(row.status)));
+      const runningIds = new Set(items.filter((row) => !isTaskTerminal(row.status)).map((row) => row.id));
+      setHasActiveTasks(runningIds.size > 0);
       // 请求通了，轮询节奏退回基准值（失败退避是它推远的）
       setTaskPollInterval(TASK_POLL_INTERVAL_MS);
+      // 每次取到新的一页就重新盯一遍 Token（含 5 秒静默轮询）：翻页 / 改筛选取到的
+      // 是另一批任务，运行中的那几行还要靠后续轮次把数字刷新上去
+      scheduleTokenBackfill(
+        items.map((row) => row.id),
+        runningIds,
+      );
       return { list: items, total: res.total ?? 0 };
     },
-    [spaceId],
+    [spaceId, scheduleTokenBackfill],
   );
 
   /**
@@ -337,6 +353,49 @@ export default function TaskCenter() {
   }, []);
 
   /**
+   * 抽屉里那条任务的 Token。
+   *
+   * 打开详情的那一行就在当前页里，直接读列表补值那一份 —— 抽屉不另发请求，
+   * 数字与列表那一列必然一致（两处各查一次迟早不一致）。
+   * `undefined` = 还没补到（2 秒后到位），不是「没有 Token」。
+   */
+  const detailTokenUsage = detail ? tokenUsage[detail.id] : undefined;
+
+  /**
+   * 抽屉里的阶段拆分文案（2026-11-12）。
+   *
+   * 合计已经**包含**本体、Wiki 文档级与整库编译三段（后端去掉了时间窗、
+   * 整库段按批平摊），这里只是把它们单独摆出来，让「解析花了多少、
+   * 本体/编译花了多少」可见。
+   *
+   * 为 0 的段不占位置：普通 lightrag 文档没有本体抽取，非 wiki 库没有整库段。
+   * 整库段带「本批 N 份共享」的标注 —— 不平摊说明会让用户以为单份文档就这么贵。
+   */
+  const detailTokenBreakdown = (() => {
+    const usage = detailTokenUsage;
+    if (!usage || usage.totalTokens == null) return null;
+    const parts = [
+      `${t('taskCenter.detail.stageParse')} ${fmtTokenCount(usage.parseTokens ?? 0)}`,
+    ];
+    if (usage.ontologyTokens) {
+      parts.push(`${t('taskCenter.detail.stageOntology')} ${fmtTokenCount(usage.ontologyTokens)}`);
+    }
+    if (usage.wikiTokens) {
+      parts.push(`${t('taskCenter.detail.stageWiki')} ${fmtTokenCount(usage.wikiTokens)}`);
+    }
+    if (usage.kbCompileTokens) {
+      const shared =
+        usage.batchSize && usage.batchSize > 1
+          ? `（${t('taskCenter.detail.kbCompileShared', { count: usage.batchSize })}）`
+          : '';
+      parts.push(
+        `${t('taskCenter.detail.stageKbCompile')} ${fmtTokenCount(usage.kbCompileTokens)}${shared}`,
+      );
+    }
+    return parts.join(' · ');
+  })();
+
+  /**
    * 把写操作的返回值同步给抽屉 —— **只取 `status`**（理由见 `detailStatus` 的注释）。
    * 抽屉开着的可能是别的任务，按 id 对上才写。
    */
@@ -467,6 +526,13 @@ export default function TaskCenter() {
         render: (_, row) => fmtDuration(row.duration_seconds),
       },
       {
+        // 列表接口不带 Token，值来自 `useTaskTokenBackfill` 的补值；还没补到 / 算不出来
+        // 都是 `-`（**不兜 0**），真有 0 就显示 0
+        title: t('taskCenter.column.tokens'),
+        key: 'tokens',
+        render: (_, row) => fmtTokenCount(tokenUsage[row.id]?.totalTokens),
+      },
+      {
         title: t('common.actions'),
         key: 'actions',
         render: (_, row) => (
@@ -487,7 +553,7 @@ export default function TaskCenter() {
         ),
       },
     ],
-    [t, token, openDetail, handleStop, handleRetry, canWrite],
+    [t, token, tokenUsage, openDetail, handleStop, handleRetry, canWrite],
   );
 
   // 路由守卫在两个壳里不等价（standalone 的 basename 带尾斜杠，拦不住），页面自己兜一道
@@ -555,6 +621,41 @@ export default function TaskCenter() {
                 {taskSourceLabel(t, detail.task_source ?? null)}
               </Descriptions.Item>
             </Descriptions>
+
+            <Divider style={{ margin: 0 }} />
+
+            {/* Token 消耗（2026-11-11，按文档归集）。任务 ↔ 文档 1:1，数字是该任务所有
+                运行窗口内这份文档的精确计量之和；运行中会随轮询增长。
+                `documentId === null` 是**非知识库文档任务**，没有可归集的东西 ——
+                用一句说明代替「-」，免得被读成「查不到」。 */}
+            <div>
+              <Typography.Title level={5} style={{ marginTop: 0 }}>
+                {t('taskCenter.detail.tokenUsage')}
+              </Typography.Title>
+              {detailTokenUsage && detailTokenUsage.documentId === null ? (
+                <Typography.Text type="secondary">{t('taskCenter.detail.tokenNotApplicable')}</Typography.Text>
+              ) : (
+                <Descriptions column={2} layout="vertical" size="small">
+                  <Descriptions.Item label={t('taskCenter.detail.documentName')}>
+                    {detailTokenUsage?.documentName || '-'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('taskCenter.detail.tokens')}>
+                    {fmtTokenCount(detailTokenUsage?.totalTokens)}
+                  </Descriptions.Item>
+                  {detailTokenBreakdown ? (
+                    <Descriptions.Item
+                      label={t('taskCenter.detail.tokenBreakdown')}
+                      span={2}
+                    >
+                      {detailTokenBreakdown}
+                      <Typography.Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                        {t('taskCenter.detail.stageBreakdownHint')}
+                      </Typography.Text>
+                    </Descriptions.Item>
+                  ) : null}
+                </Descriptions>
+              )}
+            </div>
 
             <Divider style={{ margin: 0 }} />
 

@@ -96,7 +96,8 @@ from .services import TaskDefinitionService, TaskService, TaskTriggerService
 logger = logging.getLogger(__name__)
 
 
-#: `action` → 需要的权限码。**§4.4 开给前端的八个口全部登记**（2026-10-08 定、2026-10-13 补两个详情）：
+#: `action` → 需要的权限码。**§4.4 开给前端的所有口全部登记**（2026-10-08 定、
+#: 2026-10-13 补两个详情、2026-11-11 补 token 用量、2026-11-17 补两个删除）：
 #: 四个只读接口用 `:read`、四个写接口用 `:write`（写的就 write、只读的就 read）——
 #: 与前端一致：`shell/src/utils/taskCenterEntry.ts` 的菜单码是 `task_center:read`，
 #: `pages/TaskCenter/index.tsx` 的 `canRead` / `canStop` 分别按这两个码收敛。
@@ -114,6 +115,8 @@ _ACTION_PERMISSIONS: Dict[str, str] = {
     # 详情两个（2026-10-13 加）：返回体与各自的**列表行完全一致**，所以同样只需读码。
     "task.console_detail": "task_center:read",
     "task.console_subtask_detail": "task_center:read",
+    # Token 补值（2026-11-11 加）：只读，与两个列表同一个读码。
+    "task.console_token_usage": "task_center:read",
     # 四个写接口共用同一个写码：粒度到「能不能改任务中心」为止，不再往下分
     # 「停止」与「重试」两档 —— 分开只会多出一批授权行，而实际授权口径是一样的
     # （见 `deploy/postgres/update/043_task_center_permission.sql`）。
@@ -121,7 +124,45 @@ _ACTION_PERMISSIONS: Dict[str, str] = {
     "task.console_subtask_stop": "task_center:write",
     "task.console_task_retry": "task_center:write",
     "task.console_subtask_retry": "task_center:write",
+    # 删除（2026-11-17 加）：外部用户可调，必须是写码；内部级联调用没有
+    # `user_id`，按既有口径放行（同 `task.stop`）。`force=True` 另有一道
+    # 「只允许内部调用」的闸，见 `_force_param`。
+    "task.delete": "task_center:write",
+    "task.delete_batch": "task_center:write",
 }
+
+
+def _strict_bool(value, name: str) -> bool:
+    """只接受真正的 `bool`（`None` = 没传 = False）。
+
+    ⚠️ **不要用 `bool()` 宽松转换**：JSON 里传 `"false"` / `1` / `{}` 都会得到
+    `True`，一个类型传错的请求会静默从「严格删除」升级成「跳过 K1、连 running
+    一起删」。对破坏性开关，类型不对必须显式拒。
+    """
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise InvalidParameterError(
+            message=f"参数 {name} 必须是布尔值",
+            details={"param": name, "value": repr(value)},
+        )
+    return value
+
+
+def _force_param(request, data) -> bool:
+    """解析 `force` 并加一道「只允许内部调用」的闸。
+
+    外部 JWT 调用方（`user_id` 非空）不能 force —— 他们走的是「用户手动删任务」，
+    语义是严格删除；`force` 专供知识库在「源头（文档 / 知识库）已删」时级联使用，
+    那条链路没有 `user_id`。
+    """
+    force = _strict_bool(data.get("force"), "force")
+    if force and request.user_id:
+        raise PermissionDeniedError(
+            message="强制删除只允许内部级联调用（源头已删除时）",
+            details={"action": request.payload.get("action")},
+        )
+    return force
 
 
 async def _check_action_permission(request) -> None:
@@ -230,6 +271,8 @@ class TaskCenterCapability(BaseCapability):
         "task.subtask_retry_batch": ("space_id", "task_id", "node_ids"),
         "task.stop": ("task_id",),
         "task.delete": ("task_id",),
+        # 批量删：`force` 是可选键（默认 false），不放进必填表。
+        "task.delete_batch": ("task_ids",),
         # `task_source` **必传**（2026-10-13 加）：这条路的语义就是「运行方发起」，
         # 来源是它的身份信息之一。⚠️ 这里只查「键在不在」；**取值对不对由 service 的
         # `_check_task_source` 判**（协议层那份判据，非法值 1001）—— 与这张表的分工一致。
@@ -246,6 +289,9 @@ class TaskCenterCapability(BaseCapability):
         # `node_id`（节点名，如 `parse_1`）—— **不是**子任务行的主键 `id`。
         "task.console_detail": ("task_id",),
         "task.console_subtask_detail": ("task_id", "node_id"),
+        # Token 补值（2026-11-11 加）：批量入参，只查「键在不在」，
+        # 类型 / 条数上限（100）由 service 判。
+        "task.console_token_usage": ("task_ids",),
         # 三个写接口（2026-09-29 新增，2026-09-29 起前端可调）：
         #   · `node_id` 寻址（同一个 `step_code` 允许在编排里出现多次，唯一的是 `node_id`）；
         #   · **不需要 `space_id`** —— 那是 `task.subtask_retry` 给运行方的一致性核对，
@@ -655,7 +701,21 @@ class TaskCenterCapability(BaseCapability):
                 )
             ),
             "task.delete": lambda r, d: self._execute(
-                lambda s: self._task_service(s).delete_task(d["task_id"], r.tenant_id)
+                lambda s: self._task_service(s).delete_task(
+                    d["task_id"], r.tenant_id,
+                    # 严格 bool + 外部用户不许 force（见 `_force_param`）。
+                    force=_force_param(r, d),
+                    user_id=r.user_id,
+                )
+            ),
+            # 批量删（2026-11-17 加）：级联场景专用。`force` 让「源头已删」的
+            # 任务不再被 K1 挡住，详见 `TaskService.delete_tasks_batch`。
+            "task.delete_batch": lambda r, d: self._execute(
+                lambda s: self._task_service(s).delete_tasks_batch(
+                    d["task_ids"], r.tenant_id,
+                    force=_force_param(r, d),
+                    user_id=r.user_id,
+                )
             ),
             # ── 发起任务 init_task（§4.2 ②，运行方调的口子）──
             # `operator_id` 取 `r.user_id`：运行方是把请求上下文里的
@@ -734,6 +794,13 @@ class TaskCenterCapability(BaseCapability):
                 lambda s: self._task_service(s).get_subtask_console(
                     d["task_id"], d["node_id"], tenant_id=r.tenant_id,
                     user_id=r.user_id,
+                )
+            ),
+            # Token 补值（2026-11-11 加，§4.4 破例开给前端）：按文档归集，
+            # 口径见 `repository/token_usage_repository.py`（不走 trace）。
+            "task.console_token_usage": lambda r, d: self._execute(
+                lambda s: self._task_service(s).get_token_usage(
+                    r.tenant_id, d.get("task_ids"), user_id=r.user_id
                 )
             ),
             # ── 管理端写（§4.4，2026-09-29 新增的三个）──

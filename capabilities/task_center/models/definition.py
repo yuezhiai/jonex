@@ -42,7 +42,7 @@ class TaskDefinition(Base, TimestampMixin):
     __table_args__ = (
         # 按租户查定义（def.list）用；索引名与 DDL 一致
         Index("idx_tc_def_tenant", "tenant_id"),
-        # 下面两条 CHECK 的出处是 DDL（`deploy/postgres/migrations/008_task_center.sql`）：
+        # 下面两条 CHECK 的出处是 DDL（`deploy/postgres/migrations/005_task_center.sql`）：
         # 这里重复声明一遍，是为了 `Base.metadata.create_all` 建出来的表**跟 DDL 一样**
         # （本模块的规矩，见 `catalog.py` 里"唯一约束必须跟着走"那句）。生产建表只走 DDL，
         # 这两条不参与；但少了它们，本地 `create_all` 出的库会**少一道生产有的闸**，

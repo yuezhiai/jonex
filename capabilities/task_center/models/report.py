@@ -3,7 +3,7 @@
 """上报收件箱 ORM：运行方上报的落库暂存（§4.2 ①）。
 
 设计出处：`docs/superpowers/specs/2026-09-09-task-center-design.md` §4.2 ①、§7.5。
-建表 DDL 见 `deploy/postgres/migrations/008_task_center.sql`。
+建表 DDL 见 `deploy/postgres/migrations/005_task_center.sql`。
 
 运行方调 `report_status` 时，管理方**先把这条上报存下来就回「受理」**（同步阶段做两件事：
 报文级校验 —— `status` 取值、条件必填项；以及**身份一致性核对** —— 报文里的任务 / 空间 /

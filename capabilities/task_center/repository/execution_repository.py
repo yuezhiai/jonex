@@ -588,6 +588,63 @@ class TaskRepository(BaseRepository[Task]):
         await self.session.flush()
         return result.rowcount > 0
 
+    async def list_by_ids(self, tenant_id: str, task_ids: list[str]) -> list[Task]:
+        """按 id 批量取任务（`task.delete_batch` 用），**一条 SQL**。
+
+        与 `get_task_fresh` 同口径：只取未假删行、绕过会话身份映射。返回顺序不保证
+        —— 调用方按 `id` 建索引再用，别按下标对齐。
+        """
+        if not task_ids:
+            return []
+        stmt = (
+            select(Task)
+            .where(
+                Task.id.in_(task_ids),
+                Task.tenant_id == tenant_id,
+                Task.is_deleted == 0,
+            )
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def mark_deleted_batch(self, tenant_id: str, task_ids: list[str]) -> list[str]:
+        """批量假删任务（`task.delete_batch` 的强制级联），**一条 UPDATE + RETURNING**。
+
+        与 `mark_deleted` 的区别：**不做 `state_version` CAS**。批量调用方是「源头
+        （知识库 / 文档）已经删了」的级联，任务行在这期间被 `retry_task` 拉回去重跑
+        也没有意义 —— 源头都没了，重跑出来的结果没人能看。仍保留 `is_deleted=0`，
+        重复调用只是 0 行，天然幂等。
+
+        **返回真正被假删的 id**：调用方要按它回填「删掉了哪些」，不能再拿
+        `list_by_ids` 读到的清单当结果 —— 两批重叠时第二批命中 0 行，却会被
+        报成「已删除」。
+
+        **不拿任务锁**：整条语句是一把行级锁 + 一次提交。**但它挡不住已经走到
+        `claim_pending` 的派活**——派活的 CAS 条件里原本没有父任务 `is_deleted`，
+        所以新增了 `require_task_alive`（见 `transition_cas`），否则「任务已删、
+        子任务还没级联删」的窗口里，另一个副本仍能把活派出去。
+        """
+        if not task_ids:
+            return []
+        stmt = (
+            update(Task)
+            .where(
+                Task.id.in_(task_ids),
+                Task.tenant_id == tenant_id,
+                Task.is_deleted == 0,
+            )
+            .values(
+                is_deleted=1,
+                state_version=Task.state_version + 1,
+                updated_at=datetime.now(),
+            )
+            .returning(Task.id)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return list(result.scalars().all())
+
     async def list_tasks_needing_settle(
         self, stale_before: datetime, limit: int | None = None
     ) -> list[Tuple[str, str]]:
@@ -803,8 +860,16 @@ class TaskAttemptRepository(BaseRepository[TaskAttempt]):
             .where(
                 TaskAttempt.id == task_attempt_id,
                 TaskAttempt.tenant_id == tenant_id,
+                # **`stopped` 也必须算在册**：`task.stop` 把当次运行写成 stopped，
+                # 之后用户对某个被停的步骤点「重试」时，运行行不拉回 running 的话，
+                # 重试收尾那一步 `finish_attempt_cas` 只认 pending/running 前驱，
+                # 会命中 0 行 —— 任务永远停在 running，且每轮被补收口扫成候选。
                 TaskAttempt.status.in_(
-                    [AttemptStatus.COMPLETED.value, AttemptStatus.FAILED.value]
+                    [
+                        AttemptStatus.COMPLETED.value,
+                        AttemptStatus.FAILED.value,
+                        AttemptStatus.STOPPED.value,
+                    ]
                 ),
             )
             .values(
@@ -978,6 +1043,7 @@ class SubtaskRepository(BaseRepository[Subtask]):
         next_status: str,
         expect_version: int | None = None,
         expect_execution_id: str | None = None,
+        require_task_alive: bool = False,
         **values,
     ) -> bool:
         """子任务状态推进的唯一落库口（§7.2）。
@@ -1006,6 +1072,18 @@ class SubtaskRepository(BaseRepository[Subtask]):
             conditions.append(Subtask.state_version == expect_version)
         if expect_execution_id is not None:
             conditions.append(Subtask.execution_id == expect_execution_id)
+        if require_task_alive:
+            # **派活专用**：任务已假删、但它的子任务还没被级联置删的窗口里，
+            # `Subtask.is_deleted == 0` 挡不住（子任务行还是干净的）。另一个副本
+            # 会把它抢成 `running` 并真的派给运行方 —— 源头已删，结果没人收。
+            # 只给 `claim_pending` 用：上报/判死不需要它（那些行本来就会因
+            # 「找不到任务」被丢弃，加子查询只是徒增成本）。
+            conditions.append(
+                exists().where(
+                    Task.id == Subtask.task_id,
+                    Task.is_deleted == 0,
+                )
+            )
 
         stmt = (
             update(Subtask)
@@ -1047,6 +1125,8 @@ class SubtaskRepository(BaseRepository[Subtask]):
             expect_version=expect_version,
             execution_id=execution_id,
             started_at=started_at or datetime.now(),
+            # 父任务已假删时不许再派活（见 `transition_cas` 里那段）。
+            require_task_alive=True,
         )
 
     async def reset_for_retry(
@@ -1577,6 +1657,33 @@ class SubtaskRepository(BaseRepository[Subtask]):
                 # **一并推版本号**：让任何「拿假删前那个版本号」的 CAS 都落空。主防御是
                 # `transition_cas` 条件里的 `is_deleted == 0`，这一条防的是别的还没带上
                 # 那道闸的 CAS 路径（不改版本号的话，假删对乐观锁是完全隐形的）。
+                state_version=Subtask.state_version + 1,
+                updated_at=datetime.now(),
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount
+
+
+    async def mark_deleted_by_tasks(self, tenant_id: str, task_ids: list[str]) -> int:
+        """批量把多个任务下的子任务一次置假删（`task.delete_batch` 用），**一条 UPDATE**。
+
+        与 `mark_deleted_by_task` 同口径（连 `state_version + 1` 的理由都一样），只是
+        把 `task_id = :id` 换成 `IN (...)`。这才是「文档/整库被删」那条路的真实量级：
+        一次清几十条任务，逐条 UPDATE 会把删除请求拖成十几秒。
+        """
+        if not task_ids:
+            return 0
+        stmt = (
+            update(Subtask)
+            .where(
+                Subtask.tenant_id == tenant_id,
+                Subtask.task_id.in_(task_ids),
+                Subtask.is_deleted == 0,
+            )
+            .values(
+                is_deleted=1,
                 state_version=Subtask.state_version + 1,
                 updated_at=datetime.now(),
             )

@@ -39,6 +39,7 @@
   都是终态，没有「代跑 `retry_subtask`」这一层。手动重试仍在。
 """
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jonex_core.common.config import get_config
 from jonex_core.common.exceptions import (
     InvalidParameterError,
+    JonexException,
     ResourceAlreadyExistsError,
     ResourceConflictError,
     ResourceNotFoundError,
@@ -81,7 +83,13 @@ from jonex_core.task_protocol.results import (
     DispatchResult,
 )
 
-from ..dtos.console import SubtaskConsoleItem, TaskConsoleItem, TaskConsolePage
+from ..dtos.console import (
+    SubtaskConsoleItem,
+    TaskConsoleItem,
+    TaskConsolePage,
+    TaskTokenUsageItem,
+    TaskTokenUsagePage,
+)
 from ..dtos.execution import (
     SubtaskAttemptItem,
     SubtaskAttemptList,
@@ -129,6 +137,7 @@ from ..repository.execution_repository import (
     TaskRepository,
 )
 from ..repository.report_repository import SubtaskReportRepository
+from ..repository.token_usage_repository import TaskTokenUsageRepository
 from .flow_validator import _detect_cycles, evaluate_bindings, normalize_by_schema
 from .error_reason import (
     TASK_AGGREGATE_FAILED,
@@ -156,6 +165,20 @@ TASK_TERMINAL_STATUSES = (
     TaskStatus.FAILED.value,
     TaskStatus.STOPPED.value,
 )
+
+# ── 批量删任务的规模约束（`task.delete_batch`，2026-11-17 加）──
+#
+# 上限只管「一次请求」：级联场景（删库）可能有几百个文档，调用方按批切片重发即可。
+# **不设成无上限**是因为一条 IN 列表过长会撑坏 SQL 参数与出站扇出 —— 后者才是大头：
+# 每条任务都要请运行方清一次残留，200 条并发 8 路已是分钟级。
+_MAX_BATCH_DELETE = 200
+# 出站清理的并发度：运行方（knowledge_base）就在同一个调用链里，串行 200 条会把
+# 删库请求拖成十几分钟；开太高又会把运行方的 remove_task 打成雪崩。
+_BATCH_DELETE_CONCURRENCY = 8
+
+#: Token 补值接口单次最多接受的任务数（与平台监控 `token-usage` 的 100 对齐；
+#: 前端列表每页通常 20，留足一次拉整页的余量）。
+_MAX_TOKEN_TASK_IDS = 100
 
 
 def _duration_seconds(
@@ -628,6 +651,7 @@ class TaskService:
         self._versions = TaskDefinitionVersionRepository(session)
         self._catalog_steps = TaskCatalogStepRepository(session)
         self._runners = RunnerRegistry(session)
+        self._token_usage = TaskTokenUsageRepository(session)
         self._adapter = runner_adapter or RunnerAdapter()
 
     # ========================================================
@@ -1665,6 +1689,105 @@ class TaskService:
         return TaskConsoleItem(
             **_localized_console_row(row),
             duration_seconds=_duration_seconds(row.started_at, row.finished_at),
+        )
+
+    async def get_token_usage(
+        self,
+        tenant_id: str,
+        task_ids: Optional[List[str]],
+        *,
+        user_id: Optional[str] = None,
+    ) -> TaskTokenUsagePage:
+        """前端**任务 Token 消耗补值**（2026-11-11 加，按文档归集）。
+
+        口径见 `repository/token_usage_repository.py`：任务 ↔ 文档 1:1，Token 按
+        `doc_id` + 该任务全部 attempt 的合并窗口汇总，**不看 trace**（异步 RAG 任务
+        的 trace 与 `execution_id` 无关，实测 0 行命中）。
+
+        闸门与 `page_tasks` 同一条口径：
+
+        - 租户由入口 `require_tenant` 收敛，SQL 里三张表都显式带 `tenant_id`；
+        - **空间可见范围**用 `visible_space_ids_for` 收敛 —— 不可见 / 别的租户 /
+          不存在的 `task_id` **静默不出现在结果里**，不报「找不到」（批量补值接口
+          不该变成存在性探针）。
+
+        `task_ids` 为空 = 直接返回空壳，不发 SQL；超过 `_MAX_TASK_IDS` 条当场拒（1001）。
+        返回顺序与请求去重后的顺序一致，方便前端逐条对照。
+        """
+        tenant_id = require_tenant(tenant_id)
+
+        if task_ids is None:
+            task_ids = []
+        if not isinstance(task_ids, (list, tuple)):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.invalid",
+                    params={"errors": "task_ids 必须是数组"},
+                    fallback="参数没通过校验：task_ids 必须是数组",
+                ),
+                details={"type": type(task_ids).__name__},
+            )
+
+        normalized: List[str] = []
+        seen = set()
+        for raw in task_ids:
+            if not isinstance(raw, str):
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.task_center.param.invalid",
+                        params={"errors": "task_ids 里只能是字符串"},
+                        fallback="参数没通过校验：task_ids 里只能是字符串",
+                    ),
+                    details={"type": type(raw).__name__},
+                )
+            tid = raw.strip()
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            normalized.append(tid)
+
+        if len(normalized) > _MAX_TOKEN_TASK_IDS:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.invalid",
+                    params={
+                        "errors": (
+                            f"一次最多查 {_MAX_TOKEN_TASK_IDS} 条，收到 {len(normalized)} 条"
+                        )
+                    },
+                    fallback=(
+                        f"参数没通过校验：一次最多查 {_MAX_TOKEN_TASK_IDS} 条，"
+                        f"收到 {len(normalized)} 条"
+                    ),
+                ),
+                details={"count": len(normalized), "max": _MAX_TOKEN_TASK_IDS},
+            )
+        if not normalized:
+            return TaskTokenUsagePage(items=[])
+
+        allowed_space_ids = await visible_space_ids_for(
+            self.session, tenant_id, user_id
+        )
+        rows = await self._token_usage.summarize_by_task(
+            tenant_id, normalized, allowed_space_ids=allowed_space_ids
+        )
+        by_task = {row.task_id: row for row in rows}
+        return TaskTokenUsagePage(
+            items=[
+                TaskTokenUsageItem(
+                    task_id=tid,
+                    document_id=by_task[tid].document_id,
+                    document_name=by_task[tid].document_name,
+                    total_tokens=by_task[tid].total_tokens,
+                    parse_tokens=by_task[tid].parse_tokens,
+                    ontology_tokens=by_task[tid].ontology_tokens,
+                    wiki_tokens=by_task[tid].wiki_tokens,
+                    kb_compile_tokens=by_task[tid].kb_compile_tokens,
+                    batch_size=by_task[tid].batch_size,
+                )
+                for tid in normalized
+                if tid in by_task
+            ]
         )
 
     async def get_subtask_console(
@@ -3176,7 +3299,14 @@ class TaskService:
         fresh = await self._tasks.get_task_fresh(tenant_id, task_id)
         return TaskItemResponse(**(fresh if fresh is not None else ctx.task).to_dict())
 
-    async def delete_task(self, task_id: str, tenant_id: Optional[str] = None) -> None:
+    async def delete_task(
+        self,
+        task_id: str,
+        tenant_id: Optional[str] = None,
+        *,
+        force: bool = False,
+        user_id: Optional[str] = None,
+    ) -> None:
         """删实例：**先请运行方清掉它侧的残留，成功后才把任务与子任务置假删**（§4.3）。
 
         五步（顺序不能反，§4.3、A.11）：
@@ -3208,13 +3338,37 @@ class TaskService:
 
         **拿不到锁不清空跳过**：这是「调用方主动发起的写操作」，`patient=True` **有心等**（有界窗口 ≈3.15 秒，**不是死等** —— 窗口内拿不到照样抛 3007），
         仍拿不到就回可重试码让调用方自己重试（§7.2 ①）。
+
+        ── `force`（2026-11-17 加）：**源头已死的级联删除** ──
+
+        默认 `False` = 上面五步的严格语义，用户手动删任务走这一档。
+
+        `True` = 跳过 K1（步骤 ① 与 ③ 的「没有活会再动」复查）、且出站清理失败
+        **不再 fail-fast**。它**只给一类调用方**：源头（文档 / 知识库 / 数据源）已经
+        被删除或重置，任务的存在已经没有意义。再严格的 K1 只会把孤儿任务永远钉在
+        库里，并让它的 `running` 子任务永久吃满并发名额 —— 2026-11-17 生产事故正是
+        这样堵死的：文档已删、任务还在，`compile` 的 10 个名额被死 `running` 占满，
+        所有新文档卡在「编译中」。
+
+        ⚠️ 这些代价是**有意的**，排障时不要把现象当新 bug：
+        - 运行中的子任务会被一并假删，运行方却可能还在跑；它随后上报的结果会因
+          「凭证定位不到」被丢弃（收件箱消化那条路）。**源头已删，丢弃是正确结局**；
+        - 运行方清理失败只记 `warning`：**宁可在对方侧留残留，也不能让已删源头的
+          任务记录永远挂在任务中心**；
+        - 它不是幂等成功（重复调用仍按「找不到」处理）。
         """
         tenant_id = require_tenant(tenant_id)
 
         # ① 无锁预检：权限 + 「没有活会再动」（K1，判据在**子任务**上，不是任务快照的状态
-        #    —— 理由见 `_require_deletable`）。
+        #    —— 理由见 `_require_deletable`）。`force` 跳过 K1：源头已删，这里再拦就把
+        #    孤儿任务钉死了（见 docstring 的 force 段）。
         task = await self._require_task(tenant_id, task_id)
-        await self._require_deletable(tenant_id, task)
+        # 与 `stop_task` 同一道空间可见性：没有这道闸，同租户里任何一个拿到
+        # `task_id` 的调用方都能删掉别的空间的任务。内部链路（知识库级联）
+        # 没有 `user_id`，守卫按既有口径放行。
+        await require_space_visible(self.session, tenant_id, task.space_id, user_id)
+        if not force:
+            await self._require_deletable(tenant_id, task)
 
         # ⚠️ **出站之前先把这次只读事务结束掉**（2026-10-09 补）：上面两次 SELECT 已经在
         # `self.session` 上开了一个事务，而下面那次出站**自带传送层重发、最坏约 97 秒**
@@ -3259,6 +3413,17 @@ class TaskService:
                 target=capability_id,
             )
             if result.disposition is not DispatchDisposition.ACCEPTED:
+                if force:
+                    # 源头已删：运行方清不掉只是「对方侧多了残留」，不能让这条任务
+                    # 记录因此永远挂在任务中心（下一轮还得有人再来删它）。
+                    logger.warning(
+                        "[TaskCenter] 强制删除：运行方 %s 没清掉自己侧的残留"
+                        " task=%s（继续删任务中心侧）: %s",
+                        capability_id,
+                        task_id,
+                        result.message,
+                    )
+                    continue
                 raise UpstreamServiceError(
                     message=translate(
                         "err.task_center.task.runner_delete_failed",
@@ -3288,7 +3453,10 @@ class TaskService:
             # 有人 `retry_task` 把它拉回去、或者有子任务刚被抢占成 `running`，都得在这里
             # 拦下。检查与更新在**同一把锁**里，中间没有窗口，所以 `mark_deleted` 只需要
             # 比版本号。
-            await self._require_deletable(tenant_id, fresh)
+            # `force` 下跳过同在 K1 里的第二道复查：源头已删，出站期间新派出的活
+            # 也已经没有意义（它上报回来会被当「任务已删」丢弃）。
+            if not force:
+                await self._require_deletable(tenant_id, fresh)
             marked = await self._tasks.mark_deleted(
                 tenant_id, task_id, expect_version=fresh.state_version
             )
@@ -3320,6 +3488,242 @@ class TaskService:
             await self._commit_locked_write()
 
         logger.info("[TaskCenter] 删除任务 task=%s", task_id)
+
+    async def delete_tasks_batch(
+        self,
+        task_ids: List[str],
+        tenant_id: Optional[str] = None,
+        *,
+        force: bool = False,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """批量删任务（`task.delete_batch`，2026-11-17 加）。
+
+        **为什么必须有批量接口**：这条路的真实调用场景是「源头（知识库 / 文档）已被
+        批量删除」，一次几十到几百条。逐条调 `task.delete` 的代价不是循环本身，而是
+        每条都要独立拿任务锁、开一次事务、再串行出站请运行方清残留 —— 200 条能把
+        删库请求拖到十几分钟。所以 `force` 路径不走逐条，而是：
+
+        1. 一条 SQL 读出全部任务行（`list_by_ids`）；
+        2. 运行方名单**先串行算好**（回落路径要查步骤清单，同一 session 不能并发），
+           出站清理再按任务并发（`_BATCH_DELETE_CONCURRENCY` 路）；每条任务仍按
+           `task_id` 调一次 `remove_task` —— 运行方的清理协议就是单任务粒度，
+           这里不对它做批量改造；
+        3. 写库**只用两条 UPDATE**：`tasks` 与 `subtasks` 各一条 IN 批量假删，
+           同一事务提交。
+
+        **部分失败不阻断**：一条任务清不掉只记录、其余照删。级联删除的目标是「把
+        孤儿清干净」，不是「要么全删要么全不删」—— 后者会把 199 条能清的和 1 条
+        清不掉的一起留在库里，继续吃并发名额。
+
+        `force=False` 时**逐条复用 `delete_task`**：严格语义（K1 预检 + 锁内 CAS）
+        本来就低频，且需要精确的「哪条能删、哪条不能」，不值得为它再写一套批量
+        重实现。
+
+        ⚠️ 已删 / 不存在的 id 进 `skipped`，**不算失败**（幂等友好：调用方重发一批
+        里夹着上次已删的 id 是正常现象）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        # **先判形状**：传进来一个字符串时，下面的列表推导会把它迭代成单个字符，
+        # 于是「删一条」变成「删一堆不存在的 id」且不报错。
+        if not isinstance(task_ids, (list, tuple)):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.required",
+                    params={"action": "task.delete_batch", "names": "task_ids"},
+                    fallback="操作 task.delete_batch 的参数 task_ids 必须是数组",
+                ),
+                details={"action": "task.delete_batch", "invalid": "task_ids"},
+            )
+        ids = [str(t).strip() for t in task_ids]
+        if not ids or any(not t for t in ids):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.required",
+                    params={"action": "task.delete_batch", "names": "task_ids"},
+                    fallback="操作 task.delete_batch 缺必填参数：task_ids",
+                ),
+                details={"action": "task.delete_batch", "missing": ["task_ids"]},
+            )
+        if len(set(ids)) != len(ids):
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.duplicate",
+                    params={"action": "task.delete_batch", "names": "task_ids"},
+                    fallback="操作 task.delete_batch 的 task_ids 有重复项",
+                ),
+                details={"action": "task.delete_batch", "duplicated": True},
+            )
+        if len(ids) > _MAX_BATCH_DELETE:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.task_center.param.batch_too_large",
+                    params={
+                        "action": "task.delete_batch",
+                        "limit": _MAX_BATCH_DELETE,
+                    },
+                    fallback=(
+                        f"操作 task.delete_batch 单次最多 {_MAX_BATCH_DELETE} 条，"
+                        "请分批调用"
+                    ),
+                ),
+                details={
+                    "action": "task.delete_batch",
+                    "limit": _MAX_BATCH_DELETE,
+                    "count": len(ids),
+                },
+            )
+
+        deleted: List[str] = []
+        failed: List[Dict[str, Any]] = []
+        skipped: List[str] = []
+
+        if not force:
+            # 严格档：逐条走完整语义。这里串行是**正确性**要求，不是偷懒 ——
+            # 每条都要拿自己的任务锁、按自己的版本号 CAS，并发只会把失败原因搅乱。
+            #
+            # **先算「哪些 id 真有行」**：调用方重发一批、里面夹着上次已删的 id 是
+            # 正常现象，那些必须进 `skipped` 而不是 `failed`（与 force 档同一口径，
+            # 也是本方法的文档承诺）。读完先提交，把只读事务关掉再逐条删。
+            existing = await self._tasks.list_by_ids(tenant_id, ids)
+            existing_ids = {t.id for t in existing}
+            skipped.extend(i for i in ids if i not in existing_ids)
+            await self.session.commit()
+            for task_id in [i for i in ids if i in existing_ids]:
+                try:
+                    await self.delete_task(task_id, tenant_id, user_id=user_id)
+                    deleted.append(task_id)
+                except JonexException as exc:
+                    # 读与删之间被别人删掉了 → 幂等成功，不算失败。
+                    if exc.code == ResourceNotFoundError.code:
+                        skipped.append(task_id)
+                        continue
+                    failed.append(
+                        {"task_id": task_id, "code": exc.code, "message": exc.message}
+                    )
+            logger.info(
+                "[TaskCenter] 批量删除任务（严格）：请求 %d 条，成功 %d，"
+                "跳过 %d，失败 %d",
+                len(ids),
+                len(deleted),
+                len(skipped),
+                len(failed),
+            )
+            return {
+                "deleted": deleted,
+                "skipped": skipped,
+                "failed": failed,
+                "cleanup_failed": [],
+            }
+
+        # ── force：批量快路径 ──
+        tasks = await self._tasks.list_by_ids(tenant_id, ids)
+        found_ids = {t.id for t in tasks}
+        skipped.extend(i for i in ids if i not in found_ids)
+
+        # 空间可见性：外部用户（有 `user_id`）只能删自己有权访问的空间；
+        # 内部级联（知识库，无 `user_id`）按既有口径放行。
+        if user_id:
+            for task in tasks:
+                await require_space_visible(
+                    self.session, tenant_id, task.space_id, user_id
+                )
+
+        # 运行方名单**先串行算好**：`_runner_capabilities_for_task` 的回落路径要查
+        # 步骤清单（`map_by_step_code`），而同一个 `AsyncSession` 不能被 `gather`
+        # 并发使用。查询很轻（清单是全局只读小表），出站才是要并发的部分。
+        plans = [
+            (task, await self._runner_capabilities_for_task(tenant_id, task))
+            for task in tasks
+        ]
+        # **名单算完再提交**：那几次查询会重新开事务；不在这里提交的话，
+        # 下面出站 `gather`（单条最坏 97 秒）期间连接会一直 `idle in transaction`。
+        await self.session.commit()
+
+        semaphore = asyncio.Semaphore(_BATCH_DELETE_CONCURRENCY)
+        cleanup_failed: List[Dict[str, Any]] = []
+
+        async def _cleanup(task: Task, capabilities: List[str]) -> None:
+            """请运行方清掉一条任务的残留。失败只记录，不抛。"""
+            try:
+                if not capabilities:
+                    return
+                dispatch = RemoveTaskDispatch(
+                    tenant_id=tenant_id,
+                    space_id=task.space_id,
+                    task_id=task.id,
+                )
+                async with semaphore:
+                    for capability_id in capabilities:
+                        result = await call_with_retry(
+                            lambda cid=capability_id: self._adapter.remove_task(
+                                cid, dispatch
+                            ),
+                            what=f"批量删除任务 task={task.id} capability={capability_id}",
+                            request_id=task.id,
+                            tenant_id=tenant_id,
+                            target=capability_id,
+                        )
+                        if result.disposition is not DispatchDisposition.ACCEPTED:
+                            cleanup_failed.append(
+                                {
+                                    "task_id": task.id,
+                                    "capability_id": capability_id,
+                                    "message": result.message,
+                                }
+                            )
+                            logger.warning(
+                                "[TaskCenter] 批量强制删除：运行方 %s 没清掉残留"
+                                " task=%s（继续删任务中心侧）: %s",
+                                capability_id,
+                                task.id,
+                                result.message,
+                            )
+            except Exception as exc:  # noqa: BLE001 —— 尽力而为：一条炸了不能带走整批
+                cleanup_failed.append(
+                    {"task_id": task.id, "capability_id": "", "message": str(exc)}
+                )
+                logger.warning(
+                    "[TaskCenter] 批量强制删除：清理运行方残留出错 task=%s：%s",
+                    task.id,
+                    exc,
+                )
+
+        await asyncio.gather(*(_cleanup(task, caps) for task, caps in plans))
+
+        # 两条 IN UPDATE、一次提交：任务与子任务同时假删。子任务先删也不影响
+        # 「任务已删就不吃并发名额」—— 名额查询 join 的是 tasks.is_deleted。
+        if tasks:
+            # **以 RETURNING 的结果为准**：两批级联重叠时，第二批 `list_by_ids`
+            # 仍能看到未提交前的那批行，但这里命中 0 行 —— 拿 `tasks` 直接当
+            # `deleted` 会把「没删掉」报成「已删」，调用方的问题记录被抹平。
+            marked_ids = await self._tasks.mark_deleted_batch(
+                tenant_id, [t.id for t in tasks]
+            )
+            await self._subtasks.mark_deleted_by_tasks(
+                tenant_id, [t.id for t in tasks]
+            )
+            await self.session.commit()
+            deleted = marked_ids
+            marked_set = set(marked_ids)
+            skipped.extend(
+                t.id for t in tasks if t.id not in marked_set
+            )
+            logger.info(
+                "[TaskCenter] 批量强制删除任务：请求 %d 条，跳过 %d，假删 %d 行，"
+                "运行方清理失败 %d 条",
+                len(ids),
+                len(skipped),
+                len(marked_ids),
+                len(cleanup_failed),
+            )
+
+        return {
+            "deleted": deleted,
+            "skipped": skipped,
+            "failed": failed,
+            "cleanup_failed": cleanup_failed,
+        }
 
     # ========================================================
     # 后台循环用的单步动作（§7.4、§7.5 ①）

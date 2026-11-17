@@ -6,7 +6,7 @@
 任一模型导入或注册失败时，模块级 import 抛出的异常会直接向上传播，
 终止整个 models 包的加载并指示失败的模型，从而不会注册部分模型。
 
-建表 DDL 见 `deploy/postgres/migrations/008_task_center.sql`。
+建表 DDL 见 `deploy/postgres/migrations/005_task_center.sql`。
 
 **ORM 与 DDL 的一处已知差异**（有意保留的，**别当 bug 去「修」**）：
 

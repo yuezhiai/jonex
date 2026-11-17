@@ -52,7 +52,7 @@ class TaskTrigger(Base, TimestampMixin):
             "next_fire_at",
             postgresql_where=text("status = 'active'"),
         ),
-        # 下面两条 CHECK 的出处是 DDL（`deploy/postgres/migrations/008_task_center.sql`）：
+        # 下面两条 CHECK 的出处是 DDL（`deploy/postgres/migrations/005_task_center.sql`）：
         # 这里重复声明一遍，是为了 `Base.metadata.create_all` 建出来的表**跟 DDL 一样**
         # （本模块的规矩，见 `TaskDefinition.__table_args__` 里那段）。生产建表只走 DDL，
         # 这两条不参与；但少了它们，本地 `create_all` 出的库会**少两道生产有的闸**，

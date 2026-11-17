@@ -8,7 +8,13 @@ DTO 是接口参数、以及响应里 `data` 字段的类型外壳，也是「�
 """
 
 from .catalog import TaskCatalogStepItem
-from .console import SubtaskConsoleItem, TaskConsoleItem, TaskConsolePage
+from .console import (
+    SubtaskConsoleItem,
+    TaskConsoleItem,
+    TaskConsolePage,
+    TaskTokenUsageItem,
+    TaskTokenUsagePage,
+)
 from .definition import (
     FieldSpec,
     FlowConfig,
@@ -57,6 +63,8 @@ __all__ = [
     "TaskCatalogStepItem",
     "TaskConsoleItem",
     "TaskConsolePage",
+    "TaskTokenUsageItem",
+    "TaskTokenUsagePage",
     "TaskDefinitionDetail",
     "TaskDefinitionItem",
     "TaskDefinitionList",

@@ -153,4 +153,76 @@ class SubtaskConsoleItem(BaseModel):
         extra = "ignore"
 
 
-__all__ = ["SubtaskConsoleItem", "TaskConsoleItem", "TaskConsolePage"]
+class TaskTokenUsageItem(BaseModel):
+    """任务 Token 消耗的一行（2026-11-11 加，按文档归集）。
+
+    口径与边界见 `repository/token_usage_repository.py` 的模块 docstring：
+    任务 ↔ 文档 1:1；没有精确计量时 `total_tokens` 是 `None`（前端渲染「-」），**不是 0**。
+    """
+
+    task_id: str = Field(description="任务 ID")
+    document_id: Optional[str] = Field(
+        default=None,
+        description="这条任务映射到的知识库文档；null = 非知识库文档任务 / 没有接管行",
+    )
+    document_name: Optional[str] = Field(
+        default=None,
+        description="文档名（`knowledge_documents.file_name`）；文档行缺失时为空",
+    )
+    total_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "精确计量合计（`is_estimated=false` 的 `SUM(total_tokens)`）。"
+            "null = 算不出来 / 没有精确计量，**不是 0**"
+        ),
+    )
+    parse_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "解析阶段消耗（合计减去本体与 wiki 两段）。"
+            "`total_tokens` 为 null 时本字段同为 null"
+        ),
+    )
+    ontology_tokens: Optional[int] = Field(
+        default=None,
+        description="本体阶段消耗（抽取 + 本体向量化，`ONTOLOGY_STAGE_SCENES`）",
+    )
+    wiki_tokens: Optional[int] = Field(
+        default=None,
+        description="Wiki 编译阶段中归到本文档的消耗（`WIKI_STAGE_SCENES`）",
+    )
+    kb_compile_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Wiki **整库编译**段平摊给本文档的一份（`WIKI_KB_STAGE_SCENES` 桶 ÷ 批内文档数）。"
+            "已计入 `total_tokens`；非 wiki 库 / 编译未完成时为 null"
+        ),
+    )
+    batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "这一整库编译批次覆盖的文档数（前端渲染「本批 N 份共享」）。"
+            "`kb_compile_tokens` 为 null 时本字段同为 null"
+        ),
+    )
+
+    class Config:
+        extra = "ignore"
+
+
+class TaskTokenUsagePage(BaseModel):
+    """Token 补值接口的返回壳（形状与平台监控 `token-usage` 的 `items` 一致）。"""
+
+    items: List[TaskTokenUsageItem] = Field(default_factory=list)
+
+    class Config:
+        extra = "ignore"
+
+
+__all__ = [
+    "SubtaskConsoleItem",
+    "TaskConsoleItem",
+    "TaskConsolePage",
+    "TaskTokenUsageItem",
+    "TaskTokenUsagePage",
+]
