@@ -21,9 +21,10 @@ Jonex 的 `_db_catalog_source()` 在自己进程里解密密码、自己连库�
 
 ## 已知限制
 
-`typemap.py` 是按 **PostgreSQL 类型名**写的，而 Jonex 的 catalog 刻意保留引擎原始类型串
-（`base.py` 注释：「不做归一化——类型映射是下游的事」）。postgres 已实测验证；
-**mysql / sqlserver 未验证**，本模块会在响应的 `warnings` 里如实标出，不假装能用。
+`typemap.py` 的主体按 **PostgreSQL 类型名**写；W1 起 ClickHouse / InfluxDB v3 的原始
+类型串先经 `normalize_engine_type()` 翻成规范名再进同一张表。postgres / clickhouse /
+influx_v3 已校准；**mysql / sqlserver 未验证**，本模块会在响应的 `warnings` 里如实标出，
+不假装能用。
 """
 
 from __future__ import annotations
@@ -38,27 +39,36 @@ from .to_nexonto import generate
 from .to_tbox import convert
 
 #: 类型映射被校准过的引擎。其余引擎会在 warnings 里提示未验证。
-_VERIFIED_ENGINES = {"postgres", "postgresql", "pg"}
+_VERIFIED_ENGINES = {
+    "postgres", "postgresql", "pg",
+    "clickhouse", "ch",
+    "influx_v3", "influxdb", "influx",
+}
 
 
 def _to_ir(catalog: dict[str, Any]) -> Schema:
     """Jonex `SchemaCatalog` 的 dict → 本仓 `ir.Schema`。
 
-    字段名两边本来就对齐，这里只做搬运，外加补两个 Jonex 侧没有的派生量：
+    字段名两边本来就对齐，这里只做搬运，外加补三个 Jonex 侧没有的派生量：
 
-    - `base_type`：由 `typemap.base_of()` 从引擎原始类型串推
+    - `pg_type`：先经 `typemap.normalize_engine_type()` 翻译成规范类型名；
+      `raw_type` 保留引擎原始串（有损清单里给人看的是原串）
+    - `base_type`：由 `typemap.base_of()` 从规范名推
     - `is_unique`：Jonex 的 catalog 不读唯一约束（本 POC 也不用它生成别的东西）
     """
+    engine = str(catalog.get("engine") or "")
     tables: list[Table] = []
     for raw_table in catalog.get("tables") or []:
         columns: list[Column] = []
         for raw_col in raw_table.get("columns") or []:
             engine_type = str(raw_col.get("type") or "")
+            normalized = typemap.normalize_engine_type(engine, engine_type)
             columns.append(
                 Column(
                     name=str(raw_col["name"]),
-                    pg_type=engine_type,
-                    base_type=typemap.base_of(engine_type),
+                    pg_type=normalized,
+                    raw_type=engine_type,
+                    base_type=typemap.base_of(normalized),
                     nullable=bool(raw_col.get("nullable", True)),
                     default=raw_col.get("default"),
                     comment=raw_col.get("comment"),

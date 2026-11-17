@@ -66,6 +66,13 @@ _STATUS_FALLBACK_MAP: dict[int, type[JonexException]] = {
     401: AuthError,
     403: AuthError,
     404: ResourceNotFoundError,
+    # 引擎的业务码「任务不存在」（`get_compile_status` 对已清理 / 不存在的
+    # compile_id 回的就是它，见 atomic-rag-server-v2.py 的同款 handler）。
+    # **必须映射成 ResourceNotFoundError**：对账只认这个异常来区分
+    # 「任务没了（not_found，可查证/可收口）」与「状态取不到（None，下一轮再问）」。
+    # 不映射时它会落进 `CapabilityInvokeError`，对账每轮静默跳过，文档永远停在
+    # EXTRACTING、且没有任何失败原因（2026-11-17 排查中定位）。
+    40401: ResourceNotFoundError,
     429: RateLimitExceededError,
     502: UpstreamServiceError,
     503: UpstreamServiceError,

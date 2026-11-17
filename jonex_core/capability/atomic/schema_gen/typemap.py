@@ -87,6 +87,96 @@ def base_of(pg_type: str) -> str:
     return _WS.sub(" ", s).strip()
 
 
+# ── 引擎类型归一（W1）────────────────────────────────────────────────────
+#: 引擎别名 → 归一键。postgres 家族直接原样透传（既有口径不变）。
+_ENGINE_ALIASES = {
+    "postgres": "postgres", "postgresql": "postgres", "pg": "postgres",
+    "mysql": "mysql", "mariadb": "mysql",
+    "sqlserver": "sqlserver", "mssql": "sqlserver",
+    "clickhouse": "clickhouse", "ch": "clickhouse",
+    "influx_v3": "influx_v3", "influxdb": "influx_v3", "influx": "influx_v3",
+}
+
+_WRAPPER = re.compile(
+    r"^(nullable|lowcardinality)\s*\((.*)\)$", re.IGNORECASE | re.DOTALL)
+
+
+def _unwrap_wrappers(type_name: str) -> str:
+    """剥 `Nullable(T)` / `LowCardinality(T)` 外壳（可嵌套）。"""
+    text = str(type_name or "").strip()
+    while True:
+        match = _WRAPPER.match(text)
+        if not match:
+            return text
+        text = match.group(2).strip()
+
+
+def _normalize_clickhouse(type_name: str) -> str:
+    text = _unwrap_wrappers(type_name)
+    lowered = text.lower()
+    if lowered.startswith("array("):
+        return "text[]"
+    if (lowered.startswith("map(") or lowered.startswith("tuple(")
+            or lowered.startswith("nested(")):
+        return "json"
+    if lowered.startswith("enum"):
+        return "text"
+    base = _PAREN.sub("", lowered).strip()
+    mapping = {
+        "string": "varchar", "fixedstring": "varchar",
+        "int8": "integer", "int16": "integer", "int32": "integer",
+        "uint8": "integer", "uint16": "integer", "uint32": "integer",
+        "int64": "bigint", "uint64": "bigint",
+        "int128": "bigint", "uint128": "bigint",
+        "int256": "bigint", "uint256": "bigint",
+        "float32": "real", "float64": "double precision",
+        "decimal": "numeric", "decimal32": "numeric",
+        "decimal64": "numeric", "decimal128": "numeric",
+        "decimal256": "numeric",
+        "bool": "boolean", "boolean": "boolean",
+        "date": "date", "date32": "date",
+        "datetime": "timestamp without time zone",
+        "datetime64": "timestamp without time zone",
+        "uuid": "uuid", "ipv4": "inet", "ipv6": "inet",
+        "json": "json", "object": "json",
+    }
+    return mapping.get(base, text)
+
+
+def _normalize_influx(type_name: str) -> str:
+    text = _unwrap_wrappers(type_name)
+    lowered = text.lower()
+    if lowered.startswith("dictionary("):
+        return "text"
+    base = _PAREN.sub("", lowered).strip()
+    mapping = {
+        "utf8": "varchar", "string": "varchar",
+        "int64": "bigint", "uint64": "bigint",
+        "int32": "integer", "uint32": "integer",
+        "float64": "double precision", "float32": "real",
+        "boolean": "boolean", "bool": "boolean",
+        "date": "date", "timestamp": "timestamp without time zone",
+        "datetime": "timestamp without time zone",
+    }
+    if lowered.startswith("timestamp"):
+        return "timestamp without time zone"
+    return mapping.get(base, text)
+
+
+def normalize_engine_type(engine: str, type_name: str) -> str:
+    """把引擎原始类型串翻成 `_TYPE_MAP` 认识的规范名。
+
+    只对 ClickHouse / InfluxDB v3 做翻译；postgres / mysql / sqlserver 原样返回
+    （既有行为逐字节不变）。不认识的类型原样返回，由 `map_type` 落 text + 有损。
+    """
+    key = _ENGINE_ALIASES.get(str(engine or "").strip().lower(), "")
+    if key == "clickhouse":
+        return _normalize_clickhouse(type_name)
+    if key == "influx_v3":
+        return _normalize_influx(type_name)
+    return str(type_name or "")
+
+
 def map_type(pg_type: str) -> tuple[str, bool]:
     """返回 (nexonto 类型, 是否有损)。"""
     if pg_type.strip().endswith("[]"):

@@ -47,8 +47,10 @@ class RefHint:
 @dataclass
 class Column:
     name: str
-    # 原始 PG 类型，如 "character varying(128)"
+    # 规范类型名，如 "character varying(128)"；引擎原始串见 `raw_type`
     pg_type: str
+    # 引擎原始类型串（ClickHouse / InfluxDB 等）；空串 = 与 `pg_type` 相同
+    raw_type: str = ""
     # 归一化后的基础类型，由 typemap 填充
     base_type: str = "text"
     nullable: bool = True

@@ -133,7 +133,9 @@ def generate(schema: Schema, domain_id: str, domain_name: str | None = None) -> 
 
             base_type, lossy = map_type(c.pg_type)
             if lossy:
-                losses.append(Loss("类型降级", f"{t.name}.{c.name}", f"{c.pg_type} → {base_type}"))
+                losses.append(Loss(
+                    "类型降级", f"{t.name}.{c.name}",
+                    f"{c.raw_type or c.pg_type} → {base_type}"))
 
             attr: dict[str, Any] = {
                 "name": aname,

@@ -323,6 +323,10 @@ async def run_ontology_extraction(deps: CompileDeps, task, ctx, doc_id: str) -> 
         # ⑤ custom-kg 回写：两档全集回写 LightRAG 图（§5.7）。
         # 失败重试 1 次，仍失败本体链路照常成功（本体存储已落），
         # 由 retry_ontology_extract 重抽时再次回写。
+        #
+        # ⚠️ 这个条件与下面的 `result.ok` **同源**（`_is_extraction_ok` 只看
+        # entities/relations 是否为空）。写图成功、状态却标 failed 的组合会让
+        # 「图里已有内容」和「任务失败」同时成立，用户重试白烧一轮 LLM。
         if result.entities or result.relations:
             await deps.hooks.writeback_custom_kg(
                 task, kb_id, result, compiled_schema or {},
@@ -340,8 +344,11 @@ async def run_ontology_extraction(deps: CompileDeps, task, ctx, doc_id: str) -> 
                 for r in result.ontology_relations
             ],
         }
+        # **成功时不写 error**：部分主批失败但其余来源有产出时，`result.errors`
+        # 里仍会留一句「批#N 调用失败」，写进 `ontology_error` 会让一份**成功**的
+        # 编译带着失败原因，下游看门狗和 UI 都会误读。失败时才落首条原因。
         task.ontology_error = (
-            str(result.errors[:1]) if result.errors else ""
+            str(result.errors[:1]) if (not result.ok and result.errors) else ""
         )
 
         logger.info(
