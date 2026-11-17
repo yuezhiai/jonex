@@ -11,7 +11,7 @@ from jonex_core.common.exceptions import (
 )
 from jonex_core.common.tenant import require_tenant
 
-from capabilities.knowledge_base.services.space_permission_service import is_tenant_admin
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..repository import classification_repository
 from ..repository import clearance_repository as repo

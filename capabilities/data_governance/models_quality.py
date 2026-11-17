@@ -1,6 +1,6 @@
 """W2.5 数据质量闭环：规则 / 巡检 / 结果 / 问题工单 / 工单事件。
 
-迁移见 ``deploy/postgres/migrations/019_data_governance_assets.sql``（2026-11-04 起
+迁移见 ``deploy/postgres/migrations/008_data_governance.sql``（2026-11-04 起
 原 ``022_data_quality.sql`` 已并入；``update/`` 下为逐字节同名镜像）。
 时间列必须显式 ``DateTime(timezone=True)``：迁移落的是 ``TIMESTAMPTZ``，沿用
 ``TimestampMixin`` 的 naive 列会让 asyncpg 按 ``TIMESTAMP WITHOUT TIME ZONE``

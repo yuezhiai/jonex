@@ -5,7 +5,8 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Alert, Button, Empty, Input, Modal, Segmented, Space, Spin, Table, Tag, message,
+  Alert, Button, Empty, Input, InputNumber, Modal, Segmented, Space, Spin,
+  Table, Tag, message,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useTranslation } from 'react-i18next';
@@ -19,7 +20,7 @@ import {
 } from '../../../api/governance';
 
 const STATUS_COLOR: Record<string, string> = {
-  pending: 'orange', approved: 'green', suspended: 'red',
+  pending: 'orange', approved: 'green', suspended: 'red', expired: 'volcano',
 };
 
 type StatusFilter = 'all' | MetricCallApprovalStatus;
@@ -49,6 +50,8 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
   const [requesting, setRequesting] = useState(false);
   const [action, setAction] = useState<{ type: ActionType; row: MetricCallApproval } | null>(null);
   const [actionReason, setActionReason] = useState('');
+  /** 批准有效期（天）；留空 = 服务端默认（0 = 不过期） */
+  const [actionDays, setActionDays] = useState<number | null>(null);
   const [acting, setActing] = useState(false);
 
   const load = useCallback(async () => {
@@ -96,7 +99,9 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
     setActing(true);
     try {
       if (action.type === 'approve') {
-        await approveMetricCall(kbId, action.row.metric_name, actionReason.trim());
+        await approveMetricCall(
+          kbId, action.row.metric_name, actionReason.trim(),
+          actionDays ?? undefined);
         message.success(t('domainKnowledge.governance.approvalApproved'));
       } else {
         await suspendMetricCall(kbId, action.row.metric_name, actionReason.trim());
@@ -104,6 +109,7 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
       }
       setAction(null);
       setActionReason('');
+      setActionDays(null);
       await load();
     } catch (e: unknown) {
       message.error(e instanceof Error ? e.message : t('common.error'));
@@ -123,9 +129,17 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
       title: t('domainKnowledge.governance.approvalColStatus'),
       dataIndex: 'status',
       width: 110,
-      render: (v: string) => (
-        <Tag color={STATUS_COLOR[v] ?? 'default'}>{statusLabel(t, v)}</Tag>
-      ),
+      // 到期是**读时计算**：存储 status 仍是 approved，展示要用 effective_status。
+      render: (_v: string, row) => {
+        const shown = row.effective_status ?? row.status;
+        return <Tag color={STATUS_COLOR[shown] ?? 'default'}>{statusLabel(t, shown)}</Tag>;
+      },
+    },
+    {
+      title: t('domainKnowledge.governance.approvalColExpiresAt'),
+      dataIndex: 'expires_at',
+      width: 180,
+      render: (v?: string | null) => (v ? v.replace('T', ' ').slice(0, 19) : '-'),
     },
     {
       title: t('domainKnowledge.governance.approvalColRequestedBy'),
@@ -159,7 +173,7 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
         <Space size={4}>
           {row.status !== 'approved' && (
             <Button size="small" type="link" disabled={!canWrite}
-                    onClick={() => { setAction({ type: 'approve', row }); setActionReason(''); }}>
+                    onClick={() => { setAction({ type: 'approve', row }); setActionReason(''); setActionDays(null); }}>
               {t('domainKnowledge.governance.approvalApprove')}
             </Button>
           )}
@@ -262,6 +276,19 @@ export default function ApprovalsView({ kbId, canWrite = false }: Props) {
             metric: action?.row.metric_name || '',
           })}
         </p>
+        {action?.type === 'approve' && (
+          <Space direction="vertical" style={{ width: '100%', marginBottom: 12 }}>
+            <span>{t('domainKnowledge.governance.approvalExpiresInDays')}</span>
+            <InputNumber
+              min={1}
+              max={3650}
+              style={{ width: '100%' }}
+              value={actionDays}
+              onChange={(v) => setActionDays(typeof v === 'number' ? v : null)}
+              placeholder={t('domainKnowledge.governance.approvalExpiresPlaceholder')}
+            />
+          </Space>
+        )}
         <Input.TextArea
           placeholder={t('domainKnowledge.governance.approvalReasonPlaceholder')}
           value={actionReason}

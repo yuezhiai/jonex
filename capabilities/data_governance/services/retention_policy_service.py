@@ -25,9 +25,7 @@ from jonex_core.common.exceptions import (
 )
 from jonex_core.common.tenant import require_tenant
 
-from capabilities.knowledge_base.services.space_permission_service import (
-    is_tenant_admin,
-)
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..repository import retention_policy_repository
 from ..repository.retention_policy_repository import (

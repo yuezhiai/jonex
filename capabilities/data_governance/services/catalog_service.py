@@ -22,9 +22,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.tenant import require_tenant
 from jonex_core.security import classification_access as policy
 
-from capabilities.knowledge_base.services.space_permission_service import (
-    is_tenant_admin,
-)
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..asset_identity import DERIVED_TYPES, split_asset_id
 from ..clients.knowledge_base_client import get_knowledge_base_client

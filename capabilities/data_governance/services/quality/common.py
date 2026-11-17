@@ -4,9 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from capabilities.knowledge_base.services.space_permission_service import (
-    is_tenant_admin,
-)
+from jonex_core.common.tenant_admin import is_tenant_admin
 from jonex_core.common.audit import schedule_emit
 from jonex_core.common.exceptions import InvalidParameterError, PermissionDeniedError
 

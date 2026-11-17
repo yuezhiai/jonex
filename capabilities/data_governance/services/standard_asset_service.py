@@ -29,9 +29,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.tenant import require_tenant
 
 from capabilities.knowledge_base.services.metrics.validation import validate_metric
-from capabilities.knowledge_base.services.space_permission_service import (
-    is_tenant_admin,
-)
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..repository import standard_asset_repository as repo
 from .standards.validation import KINDS, validate_asset_fields, validate_payload

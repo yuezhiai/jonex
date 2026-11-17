@@ -1,6 +1,6 @@
 """W2.6 标准资产 ↔ 数据资产落标绑定。
 
-迁移见 ``deploy/postgres/migrations/019_data_governance_assets.sql``
+迁移见 ``deploy/postgres/migrations/008_data_governance.sql``
 （2026-11-04 起原 ``023_standard_asset_bindings.sql`` 已并入；``update/`` 下为逐字节同名镜像）。时间列必须显式 ``DateTime(timezone=True)``：
 迁移落的是 ``TIMESTAMPTZ``，沿用 ``TimestampMixin`` 的 naive 列会让
 asyncpg 按 ``TIMESTAMP WITHOUT TIME ZONE`` 发参数（见 ``models_contract.py``

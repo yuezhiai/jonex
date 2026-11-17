@@ -122,15 +122,15 @@
   margin: 0;
   padding: 10px 12px;
   border-radius: 6px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: var(--yx-bg-subtle);
+  border: 1px solid var(--yx-border);
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .yx-dg-quality-muted {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
 }
 

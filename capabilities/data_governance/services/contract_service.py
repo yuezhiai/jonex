@@ -32,9 +32,7 @@ from jonex_core.common.exceptions import (
 )
 from jonex_core.common.tenant import require_tenant
 
-from capabilities.knowledge_base.services.space_permission_service import (
-    is_tenant_admin,
-)
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..repository import contract_repository as repo
 from .contracts import scaffold

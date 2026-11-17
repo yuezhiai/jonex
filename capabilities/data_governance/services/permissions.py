@@ -17,8 +17,8 @@ from capabilities.knowledge_base.services.space_permission_service import (
     SPACE_MANAGER,
     get_visible_space_ids,
     has_space_role,
-    is_tenant_admin,
 )
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 
 async def visible_kb_ids(tenant_id: str, user_id: str | None) -> list[str] | None:
