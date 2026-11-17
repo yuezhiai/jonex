@@ -1,14 +1,19 @@
--- ============================================================
--- Jonex 平台数据库初始化 - 独立数据库 + Schema 创建
--- 版本: 001（initdb.d 按字母序最先执行，仅新数据卷首次初始化生效）
--- ============================================================
+-- ============================================================================
+-- 建库：全部 schema
+-- ============================================================================
 
--- ------------------------------------------------------------
--- 2. 业务库 Schema 创建
--- ------------------------------------------------------------
-CREATE SCHEMA IF NOT EXISTS platform;
-CREATE SCHEMA IF NOT EXISTS knowledge_base;
 CREATE SCHEMA IF NOT EXISTS business_domain;
+
+CREATE SCHEMA IF NOT EXISTS data_governance;
+
+CREATE SCHEMA IF NOT EXISTS knowledge_base;
+
 CREATE SCHEMA IF NOT EXISTS metering;
-CREATE SCHEMA IF NOT EXISTS task_center;
+
 CREATE SCHEMA IF NOT EXISTS monitor;
+
+CREATE SCHEMA IF NOT EXISTS ontology_compile;
+
+CREATE SCHEMA IF NOT EXISTS platform;
+
+CREATE SCHEMA IF NOT EXISTS task_center;

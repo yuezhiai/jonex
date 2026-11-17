@@ -712,7 +712,13 @@ services:
       GATEWAY_SIDECAR_TIMEOUT: ${GATEWAY_SIDECAR_TIMEOUT:-300}
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      # 本地开发显式豁免默认 JWT_SECRET 的启动拦截；生产不要设置（见 security_guards.py）
+      ALLOW_INSECURE_JWT_SECRET: ${ALLOW_INSECURE_JWT_SECRET:-}
       KB_INPUT_DIR: /app/inputs               # 与 atomic-rag 容器共享路径
+      # 本体多跳邻域深度硬上限：与 knowledge-base-service（deploy/.env）/
+      # mcp-server（deploy/.env.mcp）同名同值。gateway 无 env_file，必须在此显式透传，
+      # 否则调大深度只对能力侧生效、网关仍按默认 3 拒绝。
+      ONTOLOGY_NEIGHBOR_DEPTH_MAX: ${ONTOLOGY_NEIGHBOR_DEPTH_MAX:-3}
       AUTH_CORS_ORIGINS: ${AUTH_CORS_ORIGINS:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
       # 对象存储（local / 腾讯云 COS / S3 兼容），仅网关上传用，默认 local
@@ -805,6 +811,7 @@ services:
       LLMGW_INTERNAL_TOKENS: ${LLMGW_INTERNAL_TOKENS:-${LLM_BINDING_API_KEY:-}}
       LLMGW_METERING_ENABLED: ${LLMGW_METERING_ENABLED:-true}
       LLMGW_PG_FLUSH_MAX_ROWS: ${LLMGW_PG_FLUSH_MAX_ROWS:-20}
+      LLMGW_PG_FLUSH_MAX_SECONDS: ${LLMGW_PG_FLUSH_MAX_SECONDS:-5.0}
     env_file:
       - .env
     extra_hosts:
@@ -1412,6 +1419,8 @@ services:
       - .env.ontology_compile
     # ⚠ 必须与 atomic-rag **逐值同口径**，否则两边算出的存档目录不同（静默读空，见下）
     environment:
+      # Sidecar 用它签发内部服务 JWT，本容器用它验签（与其它能力容器同口径）。
+      JWT_SECRET: ${JWT_SECRET}
       KB_INPUT_DIR: /app/inputs
       WORKING_DIR: /app/rag_storage
       # ⚠ 能力清单：locator 找清单的顺序是 CAPABILITY_RUNTIME_FILE → cwd/capability_runtime.yaml

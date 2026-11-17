@@ -1,5 +1,26 @@
 -- ============================================================
--- Jonex 平台数据库初始化 - 种子数据
+-- 090 种子数据（跨库，必须在 001–010 全部 DDL 之后执行）
+--
+-- 内容 = 原 006_seed_data.sql 的种子 + 原本排在种子之后执行的「数据修正」DML
+-- （structured_enabled 置真、模板场景菜单、任务中心预置层修正、data_access_methods
+-- 的 dam_database 等）。这些 DML 依赖种子行，必须排在种子 INSERT 之后 —— 顺序即语义。
+--
+-- 本文件是**手写维护**的（不像 001–010/091 由生产库终态 dump 生成）：种子是产品口径，
+-- 不是生产库数据快照。新增「种子之后」的数据修正时：写成幂等语句（ON CONFLICT DO NOTHING
+-- / 带 WHERE 的 UPDATE / `WHERE NOT EXISTS`），id 用 COALESCE(MAX(id),0)+1 动态取，
+-- 不要写死 —— 写死 id 会抢走种子里已占用的号（2026-11-12 踩过：菜单抢 id=2）。
+--
+-- 固定停泊在 090：011–089 留给以后的库文件。
+-- 幂等：ON CONFLICT DO NOTHING / 带 WHERE 的 UPDATE。
+-- ============================================================
+
+
+
+-- >>> 并入 006_seed_data.sql
+
+-- 来源：migrations/006_seed_data.sql
+-- ============================================================
+-- Jonex平台数据库初始化 - 种子数据
 -- 版本: 006
 -- 包含：开发租户、管理员用户、基础角色/权限、基础菜单、基础应用
 -- ============================================================
@@ -9,6 +30,7 @@ INSERT INTO platform.tenants (id, name, description, plan_type)
 VALUES ('tenant_jonex_demo', 'Jonex默认租户', '默认租户', 'free')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 多租户登录测试租户
 INSERT INTO platform.tenants (id, name, description, plan_type)
 VALUES
@@ -16,16 +38,19 @@ VALUES
     ('tenant_jonex_beta', 'Jonex Beta 租户', '用于多租户登录选择流程', 'free')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 测试 API Key
 INSERT INTO platform.api_keys (tenant_id, api_key, name, rate_limit)
 VALUES ('tenant_jonex_demo', 'jonex_test_key', '示例 API Key', 1000)
 ON CONFLICT (api_key) DO NOTHING;
+
 
 -- 管理员用户 (password: admin123)
 INSERT INTO platform.users (tenant_id, username, password_hash, display_name, role)
 VALUES ('tenant_jonex_demo', 'admin',
         '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
         '平台管理员', 'admin');
+
 
 
 -- 多租户登录测试用户
@@ -41,6 +66,7 @@ VALUES
      '同名同密用户 - Alpha 租户', 'admin');
 
 
+
 -- multi_one_match/admin123：同名用户存在于多个租户，但只有演示租户密码匹配，预期直接登录演示租户。
 -- multi_one_match/other123：只有 Alpha 租户密码匹配，预期直接登录 Alpha 租户。
 INSERT INTO platform.users (tenant_id, username, password_hash, display_name, role)
@@ -53,12 +79,14 @@ VALUES
      '单租户密码匹配用户 - Alpha 租户', 'admin');
 
 
+
 -- tenant_header_user/admin123：用于测试携带 X-Tenant-ID 的指定租户登录。
 INSERT INTO platform.users (tenant_id, username, password_hash, display_name, role)
 VALUES
     ('tenant_jonex_beta', 'tenant_header_user',
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
      '指定租户登录用户 - Beta 租户', 'admin');
+
 
 
 -- 空间权限演示账号（设计 2026-08-19-space-permission-design：默认空间成员演示）
@@ -72,6 +100,7 @@ VALUES
      '$2b$12$IRcfNr1RSXcVINY.tBvnGefCYSiMdQLI/BaUk/ARNpVFzr0BVQhCG',
      '演示观察者', 'user')
 ON CONFLICT DO NOTHING;
+
 
 -- 旧 platform:* 权限种子已废弃移除（RBAC 系统前遗留；无 id 分配曾占用序列 id 1-13，
 -- 导致 RBAC 显式 id 1-14 基础码块被 ON CONFLICT 跳过；无端点消费、无映射引用）。
@@ -106,8 +135,10 @@ INSERT INTO platform.permissions (id, code, name, resource, action, description)
     (12, 'model:write', '管理模型', 'model', 'write', '模型适配页编辑（平台级）')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 显式 id 插入不推进序列：立即对齐，防后续无 id 的 INSERT 撞主键
 SELECT setval('platform.permissions_id_seq', (SELECT MAX(id) FROM platform.permissions), true);
+
 
 -- 预设角色 —— [jonex] 权限重构 B1（D6）：账号角色由 5 个收为 3 个。
 --
@@ -126,8 +157,10 @@ INSERT INTO platform.roles (id, tenant_id, name, description, is_system) VALUES
     (6, 'tenant_jonex_demo', '普通用户', '账号角色兜底态：只持业务菜单码；实际业务能力完全由领域/知识库资源身份决定', 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 显式 id 插入不推进序列：立即对齐，防后续无 id 的角色播种撞主键
 SELECT setval('platform.roles_id_seq', (SELECT MAX(id) FROM platform.roles), true);
+
 
 -- RBAC 权限系统：平台面权限码（scope='platform'；其中 7 个 code 与上方旧 platform:* 种子重名，
 -- 依赖 ON CONFLICT DO UPDATE 把 scope 收敛为 platform）
@@ -150,10 +183,12 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('platform:monitor:read', '查看平台监控', 'monitor', 'read', '平台级：全平台服务/任务/组件运行状态', 'platform')
 ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
 
+
 -- 兜底：旧种子 6 条废弃 platform:* 码（platform:user/role/app:*）无同名新码覆盖，
 -- scope 会停在 DEFAULT 'tenant'——显式收敛，防非特权租户枚举/绑定
 UPDATE platform.permissions SET scope = 'platform'
 WHERE code LIKE 'platform:%' AND scope <> 'platform';
+
 
 -- [jonex] 权限重构 B1：新增的系统级码（scope='platform'）
 INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
@@ -163,6 +198,7 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('datasource:read', '查看数据源', 'datasource', 'read', '平台级：统一数据源目录', 'platform'),
     ('datasource:write', '管理数据源', 'datasource', 'write', '平台级：数据源与连接配置', 'platform')
 ON CONFLICT (code) DO UPDATE SET scope = EXCLUDED.scope;
+
 
 -- [jonex] 权限重构 B1：新增的租户级码（scope='tenant'）
 INSERT INTO platform.permissions (code, name, resource, action, description, scope) VALUES
@@ -201,6 +237,7 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('tenant:security:write', '管理安全配置', 'tenant_security', 'write', '租户级：设置本租户安全配置覆盖值、恢复平台默认', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
+
 -- RBAC 权限系统：租户业务权限码（scope='tenant'）
 -- [jonex] B1（D7）：engine:* / adapter:* 由 tenant 迁到 platform —— 解析器与适配器是
 -- **系统级**能力，两个功能页只有平台管理员在用。scope 见下方统一 UPDATE。
@@ -221,6 +258,7 @@ INSERT INTO platform.permissions (code, name, resource, action, description, sco
     ('mcp:key:manage', '管理 MCP Key', 'key', 'manage', '本租户 MCP Key 创建/停用/启用/撤销/重新创建/删除', 'tenant')
 ON CONFLICT (code) DO NOTHING;
 
+
 -- [jonex] 权限重构 B1：scope 迁移收敛（幂等）。
 -- 上面几个 INSERT 用的是 ON CONFLICT DO NOTHING，对**已存在**的码不会改 scope，
 -- 所以这里显式 UPDATE 一次 —— 存量库里这 6 个码是 tenant scope，必须落到 platform。
@@ -230,6 +268,7 @@ ON CONFLICT (code) DO NOTHING;
 UPDATE platform.permissions SET scope = 'platform'
 WHERE code IN ('engine:read','engine:write','adapter:read','adapter:write','model:read','model:write')
   AND scope <> 'platform';
+
 
 -- 角色-权限关联
 --
@@ -249,6 +288,7 @@ JOIN platform.permissions p ON p.scope = 'platform'
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '平台管理员' AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
+
 -- 平台管理员 + 租户管理员补全部租户业务码（兜底幂等）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT r.tenant_id, r.id, p.id
@@ -256,6 +296,24 @@ FROM platform.roles r
 JOIN platform.permissions p ON p.scope = 'tenant'
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name IN ('平台管理员', '租户管理员') AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
+
+
+-- 「平台监控」查看码（scope='platform'）除平台管理员外，**租户管理员也要持有**。
+-- 依据：`misc_services.seed_tenant_roles` 给新租户复制角色权限时，按
+-- `_TENANT_ADMIN_PLATFORM_CODES = {"platform:monitor:read"}` 白名单放行这一个平台码
+-- （capabilities/platform/services/misc_services.py:334），前提是 demo 模板里的
+-- 「租户管理员」自己持有它。历史增量 107_grant_monitor_read_to_tenant_admin.sql 做过
+-- 这件事，该文件已随 91 份历史脚本删除（2026-11-12），所以在这里补进种子 ——
+-- 否则全新库、以及新租户的租户管理员，都看不到 platform-monitor 菜单（菜单行 28 绑的
+-- 就是 permission_code = 'platform:monitor:read'），而接口侧准入只看 platform:admin /
+-- tenant:admin，不会挡他。
+INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
+SELECT r.tenant_id, r.id, p.id
+FROM platform.roles r
+JOIN platform.permissions p ON p.code = 'platform:monitor:read'
+WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '租户管理员' AND r.is_deleted = 0
+ON CONFLICT DO NOTHING;
+
 
 -- [jonex] 权限重构 B1：「普通用户」只持 3 个业务菜单码（方案 §3.2-D / §11.4）。
 --
@@ -276,6 +334,7 @@ JOIN platform.permissions p ON p.code IN ('knowledge:read', 'service:read', 'spa
 WHERE r.tenant_id = 'tenant_jonex_demo' AND r.name = '普通用户' AND r.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
+
 -- 每租户预设角色播种（demo 已显式插入 id 1/2/6；其他租户按 demo 模板复制，is_system=0）
 -- [jonex] B1（D6）：模板由 4 个角色收为 2 个 —— 「租户管理员」+「普通用户」。
 -- 「平台管理员」刻意不复制：D3 已确认平台管理员绑定在运营租户（demo），非缺陷。
@@ -288,6 +347,7 @@ CROSS JOIN (SELECT name, description FROM platform.roles
 WHERE t.id <> 'tenant_jonex_demo' AND t.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
+
 -- 每租户角色-权限映射播种（按角色 name 对齐 demo 模板；仅 scope='tenant' 码）
 INSERT INTO platform.role_permissions (tenant_id, role_id, permission_id)
 SELECT t.id, nr.id, rp.permission_id
@@ -299,6 +359,7 @@ JOIN platform.permissions p ON p.id = rp.permission_id
 WHERE t.id <> 'tenant_jonex_demo' AND p.scope = 'tenant'
 ON CONFLICT DO NOTHING;
 
+
 -- 用户-角色绑定种子（语义：平台级仅 demo 租户的 admin 账号；其余 role='admin' 为租户内管理员）
 -- 6a. 平台级：仅 demo 租户 username='admin' → 「平台管理员」
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
@@ -309,6 +370,7 @@ WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin' AND u.is_delete
   AND r.name = '平台管理员'
 ON CONFLICT DO NOTHING;
 
+
 -- 6b. 租户内管理员：其余 role='admin' 用户 → 各自租户「租户管理员」（无平台码）
 INSERT INTO platform.user_roles (tenant_id, user_id, role_id)
 SELECT u.tenant_id, u.id, r.id
@@ -317,6 +379,7 @@ JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
 WHERE u.role = 'admin' AND u.is_deleted = 0 AND r.name = '租户管理员'
   AND NOT (u.tenant_id = 'tenant_jonex_demo' AND u.username = 'admin')
 ON CONFLICT DO NOTHING;
+
 
 -- 6c. role='user' → 「普通用户」
 -- [jonex] B1（D6）：原先绑到「观察者」。该角色已取消，其"查看"能力现由资源身份
@@ -327,6 +390,7 @@ FROM platform.users u
 JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
 WHERE u.role = 'user' AND u.is_deleted = 0 AND r.name = '普通用户'
 ON CONFLICT DO NOTHING;
+
 
 -- 6d. 空间权限演示：editor_demo → 「普通用户」
 -- [jonex] B1（D6）：原先绑到「知识编辑者」。该角色已取消 —— 「编辑知识」不再是账号角色，
@@ -339,6 +403,7 @@ JOIN platform.roles r ON r.tenant_id = u.tenant_id AND r.is_deleted = 0
 WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'editor_demo' AND u.is_deleted = 0
   AND r.name = '普通用户'
 ON CONFLICT DO NOTHING;
+
 
 -- 6e. 兜底：任何没有角色绑定的用户 → 「普通用户」
 -- [jonex] B1（D6）：三个降级角色取消后，若某用户的 role 字段既不是 'admin' 也不是 'user'
@@ -354,6 +419,7 @@ WHERE u.is_deleted = 0
     WHERE ur.tenant_id = u.tenant_id AND ur.user_id = u.id
   )
 ON CONFLICT DO NOTHING;
+
 
 -- 默认菜单（四大板块：领域本体/数据接入/集成扩展/平台管理；path 为前端 hosted 路由；分组 permission_code=NULL 靠子项裁剪）
 INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order, permission_code) VALUES
@@ -417,10 +483,12 @@ INSERT INTO platform.menus (id, parent_id, name, path, icon, app_id, sort_order,
     -- 存量库删这一行见 update/047_merge_tenant_security_menu.sql。
 ON CONFLICT DO NOTHING;
 
+
 -- 隐藏「模型适配」菜单（软删除；恢复时改回 0）
 UPDATE platform.menus
 SET is_deleted = 1
 WHERE name = 'navigation.modelAdapter';
+
 
 
 -- 默认应用注册
@@ -430,6 +498,7 @@ INSERT INTO platform.applications (app_code, name, entry_path, description, sort
     ('platform-management', '平台管理', '/apps/platform-management', '平台管理', 3),
     ('ecosystem-management', '生态管理', '/apps/ecosystem-management', '生态管理', 4)
 ON CONFLICT (app_code) DO NOTHING;
+
 
 -- ============================================================
 -- AI Skill 种子数据（skill_catalog + tenant_skills）
@@ -457,6 +526,7 @@ INSERT INTO business_domain.skill_catalog (
     '{"requires_file":true,"supports_batch":true}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO business_domain.skill_catalog (
     id, name, description, category, icon, status,
     tool_name, instruction, input_schema_json, output_schema_json,
@@ -478,6 +548,7 @@ INSERT INTO business_domain.skill_catalog (
     '["语音","转录","ASR"]'::jsonb,
     '{"requires_file":true,"supports_batch":true}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
+
 
 INSERT INTO business_domain.skill_catalog (
     id, name, description, category, icon, status,
@@ -501,6 +572,7 @@ INSERT INTO business_domain.skill_catalog (
     '{"requires_file":true,"supports_batch":false}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO business_domain.skill_catalog (
     id, name, description, category, icon, status,
     tool_name, instruction, input_schema_json, output_schema_json,
@@ -522,6 +594,7 @@ INSERT INTO business_domain.skill_catalog (
     '["视频","抽帧","分析"]'::jsonb,
     '{"requires_file":true,"supports_batch":false}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
+
 
 INSERT INTO business_domain.skill_catalog (
     id, name, description, category, icon, status,
@@ -545,6 +618,7 @@ INSERT INTO business_domain.skill_catalog (
     '{"requires_file":false,"supports_batch":true}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO business_domain.skill_catalog (
     id, name, description, category, icon, status,
     tool_name, instruction, input_schema_json, output_schema_json,
@@ -567,21 +641,25 @@ INSERT INTO business_domain.skill_catalog (
     '{"requires_file":true,"supports_batch":true}'::jsonb
 ) ON CONFLICT (id) DO NOTHING;
 
+
 -- 演示租户启用示例 Skill
 INSERT INTO business_domain.tenant_skills (id, tenant_id, skill_id, status)
 VALUES ('tenant_skill_demo_image', 'tenant_jonex_demo', 'skill_image_recognition', 'enabled')
 ON CONFLICT (tenant_id, skill_id) DO UPDATE
 SET status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, is_deleted = 0;
 
+
 INSERT INTO business_domain.tenant_skills (id, tenant_id, skill_id, status)
 VALUES ('tenant_skill_demo_speech', 'tenant_jonex_demo', 'skill_speech_to_text', 'enabled')
 ON CONFLICT (tenant_id, skill_id) DO UPDATE
 SET status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, is_deleted = 0;
 
+
 INSERT INTO business_domain.tenant_skills (id, tenant_id, skill_id, status)
 VALUES ('tenant_skill_demo_layout', 'tenant_jonex_demo', 'skill_document_layout', 'enabled')
 ON CONFLICT (tenant_id, skill_id) DO UPDATE
 SET status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP, is_deleted = 0;
+
 
 -- ============================================================
 -- 生态适配器种子数据
@@ -603,6 +681,7 @@ VALUES
      '{"description":"Claw 数据抓取平台集成"}'::jsonb, 'disconnected')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 模型供应商种子数据
 -- ============================================================
@@ -614,6 +693,7 @@ VALUES
     ('provider_demo_text2vec', 'text2vec-large', 'embedding', '向量模型', 'text2vec-large-chinese', 300, NULL, 768, 56892, 100, 'active', '{"vendor":"本地部署"}'::jsonb),
     ('provider_demo_reranker', 'bge-reranker', 'reranker', '重排序模型', 'bge-reranker-v2-m3', 500, NULL, NULL, 23456, 99, 'active', '{"vendor":"本地部署","batch_size":64}'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- ============================================================
 -- 解析器种子数据
@@ -655,6 +735,7 @@ VALUES
      '{"version":"--","process_count":0,"display_fields":[{"label":"精度等级","value":"标准"},{"label":"图层提取","value":"全部"}]}'::jsonb, 'inactive')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 数据接入方式种子数据（原型 4 个 + API 开放推送）
 -- ============================================================
@@ -667,6 +748,7 @@ INSERT INTO business_domain.data_access_methods (id, name, access_type, config_j
     ('dam_demo_mqtt', 'MQTT 接入', 'mqtt', '{"description":"物联网消息队列接入"}'::jsonb, 'inactive')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 模板领域场景联调数据，互联网领域
 -- ============================================================
@@ -678,12 +760,14 @@ VALUES ('tpl_domain_internet', 'tenant_jonex_demo', '互联网', 'Internet Techn
         'b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0abc1de')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES ('tpl_scenario_internet_general', 'tenant_jonex_demo', 'tpl_domain_internet', '通用', '互联网通用实体/关系抽取场景', '{}'::jsonb, 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         'b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0abc1de')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 3. 模板对象（8 个互联网核心本体实体）
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
@@ -697,6 +781,7 @@ VALUES
  ('tpl_obj_inet_market','tenant_jonex_demo','tpl_domain_internet','tpl_scenario_internet_general','市场','用户群体/赛道','active','Market','["市场","用户群体","赛道","领域"]'::jsonb),
  ('tpl_obj_inet_investor','tenant_jonex_demo','tpl_domain_internet','tpl_scenario_internet_general','投资机构','VC/资本/投资方','active','Investor','["投资机构","资本","VC","投资方"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性（每个对象至少一个主键属性）
 INSERT INTO business_domain.template_attributes
@@ -743,6 +828,7 @@ VALUES
     ('tpl_attr_inet_inv_desc','tenant_jonex_demo','tpl_obj_inet_investor','机构简介','投资风格、赛道偏好与代表案例','文本',0,'{}'::jsonb,4,'investor_description',0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系（9 条核心关系）
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -758,6 +844,7 @@ VALUES
  ('tpl_rel_inet_participates','tenant_jonex_demo','tpl_domain_internet','tpl_scenario_internet_general','参与','公司参与/组织事件','tpl_obj_inet_company','tpl_obj_inet_event','多对多','active','PARTICIPATES','["参与","出席"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 模板领域场景联调数据，金融行业
 -- ============================================================
@@ -769,6 +856,7 @@ VALUES ('tpl_domain_finance', 'tenant_jonex_demo', '金融行业', 'Financial Se
         '0476f5786a7e292d7a2aaaed06a06b6787b96a746da8818e3869cf2cd71f9777')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES
@@ -778,6 +866,7 @@ VALUES
      '2026-06-01T00:00:00+00'::timestamptz, '6140449c1d747a2622f6c4d8dbc1542c07c26a250a7b9735c670dbbfd0ca62c1')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 3. 模板对象
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
 VALUES
@@ -785,6 +874,7 @@ VALUES
     ('tpl_object_financial_statement', 'tenant_jonex_demo', 'tpl_domain_finance', 'tpl_scenario_credit_risk', '财务报表', '企业财务报表数据', 'active', 'financial_statement', '["财报","财务报告"]'::jsonb),
     ('tpl_object_guarantee_company', 'tenant_jonex_demo', 'tpl_domain_finance', 'tpl_scenario_credit_risk', '担保企业', '为贷款申请提供担保的企业主体', 'active', 'guarantee_company', '["担保方","保证企业"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性
 INSERT INTO business_domain.template_attributes
@@ -807,6 +897,7 @@ VALUES
     ('tpl_attr_guarantee_amount', 'tenant_jonex_demo', 'tpl_object_guarantee_company', '担保金额', '为本笔贷款提供的担保金额（万元）', '数值', 0, '{}'::jsonb, 3, 'guarantee_amount', 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -814,6 +905,7 @@ VALUES
     ('tpl_relation_customer_statement', 'tenant_jonex_demo', 'tpl_domain_finance', 'tpl_scenario_credit_risk', '持有', '企业客户持有财务报表的关系', 'tpl_object_enterprise_customer', 'tpl_object_financial_statement', '一对多', 'active', 'owns_financial_statement', '["持有","拥有"]'::jsonb),
     ('tpl_relation_customer_guarantee', 'tenant_jonex_demo', 'tpl_domain_finance', 'tpl_scenario_credit_risk', '担保', '企业间担保关系', 'tpl_object_enterprise_customer', 'tpl_object_guarantee_company', '多对多', 'active', 'guaranteed_by', '["担保","保证"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- ============================================================
 -- 模板领域场景联调数据，医疗健康
@@ -826,12 +918,14 @@ VALUES ('tpl_domain_medical', 'tenant_jonex_demo', '医疗健康', 'Healthcare',
         '6b518c74048be883c991406f509f03b1921f062a5ed0a7c1167e85e1886f38ba')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES ('tpl_scenario_medical_record', 'tenant_jonex_demo', 'tpl_domain_medical', '病历智能解析', '电子病历文本的结构化解析场景', '{}'::jsonb, 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         '6b518c74048be883c991406f509f03b1921f062a5ed0a7c1167e85e1886f38ba')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 3. 模板对象
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
@@ -840,6 +934,7 @@ VALUES
     ('tpl_object_visit_record', 'tenant_jonex_demo', 'tpl_domain_medical', 'tpl_scenario_medical_record', '就诊记录', '患者单次就诊记录', 'active', 'visit_record', '["就诊","门诊记录"]'::jsonb),
     ('tpl_object_diagnosis_result', 'tenant_jonex_demo', 'tpl_domain_medical', 'tpl_scenario_medical_record', '诊断结果', '医生给出的诊断结论', 'active', 'diagnosis_result', '["诊断","诊断结论"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性
 INSERT INTO business_domain.template_attributes
@@ -862,6 +957,7 @@ VALUES
     ('tpl_attr_diag_conclusion', 'tenant_jonex_demo', 'tpl_object_diagnosis_result', '诊断结论', '医生最终诊断意见和建议', '文本', 0, '{}'::jsonb, 3, 'diagnosis_conclusion', 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -869,6 +965,7 @@ VALUES
     ('tpl_relation_record_visit', 'tenant_jonex_demo', 'tpl_domain_medical', 'tpl_scenario_medical_record', '就诊', '患者病历与就诊记录的关系', 'tpl_object_patient_record', 'tpl_object_visit_record', '一对多', 'active', 'has_visit_record', '["就诊","就医"]'::jsonb),
     ('tpl_relation_visit_diagnosis', 'tenant_jonex_demo', 'tpl_domain_medical', 'tpl_scenario_medical_record', '诊断', '就诊记录与诊断结果的关联', 'tpl_object_visit_record', 'tpl_object_diagnosis_result', '一对一', 'active', 'resulted_in_diagnosis', '["诊断","得出诊断"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- ============================================================
 -- 模板领域场景联调数据，制造业
@@ -881,12 +978,14 @@ VALUES ('tpl_domain_manufacturing', 'tenant_jonex_demo', '制造业', 'Manufactu
         'cb568b75836751b97660df5f6ff1f07c50ea57dcc428f12ef438ffcba8e02456')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES ('tpl_scenario_quality_inspection', 'tenant_jonex_demo', 'tpl_domain_manufacturing', '生产质检分析', '生产环节质量检测数据分析场景', '{}'::jsonb, 1,
         '2026-06-01T00:00:00+00'::timestamptz,
         'cb568b75836751b97660df5f6ff1f07c50ea57dcc428f12ef438ffcba8e02456')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 3. 模板对象
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
@@ -896,6 +995,7 @@ VALUES
     ('tpl_obj_mfg_defect', 'tenant_jonex_demo', 'tpl_domain_manufacturing', 'tpl_scenario_quality_inspection', '质量缺陷', '质检过程中发现的缺陷记录', 'active', 'QualityDefect', '["缺陷","质量问题","不合格项"]'::jsonb),
     ('tpl_obj_mfg_inspection', 'tenant_jonex_demo', 'tpl_domain_manufacturing', 'tpl_scenario_quality_inspection', '质检报告', '产品质量检测报告', 'active', 'InspectionReport', '["质检报告","检测报告","检验单"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性
 INSERT INTO business_domain.template_attributes
@@ -922,6 +1022,7 @@ VALUES
     ('tpl_attr_mfg_insp_conclusion', 'tenant_jonex_demo', 'tpl_obj_mfg_inspection', '检验结论', '质检综合结论和建议', '文本', 0, '{}'::jsonb, 4, 'inspection_conclusion', 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -932,12 +1033,14 @@ VALUES
     ('tpl_rel_mfg_insp_defect', 'tenant_jonex_demo', 'tpl_domain_manufacturing', 'tpl_scenario_quality_inspection', '记录缺陷', '质检报告中记录的缺陷', 'tpl_obj_mfg_inspection', 'tpl_obj_mfg_defect', '一对多', 'active', 'RECORDS_DEFECT', '["记录缺陷","发现"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 领域空间种子数据
 -- ============================================================
 INSERT INTO knowledge_base.spaces (id, tenant_id, name, description, status, knowledge_base_count, service_count, owner_id) VALUES
     ('space_demo_test', 'tenant_jonex_demo', '默认空间', '默认空间', 'active', 0, 0, '1')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 默认空间成员种子（演示空间权限：owner 不落 space_permissions，见设计 §2）
 INSERT INTO knowledge_base.space_permissions (id, tenant_id, space_id, user_id, role, created_at, updated_at)
@@ -950,6 +1053,7 @@ SELECT 'spp_demo_viewer', u.tenant_id, 'space_demo_test', CAST(u.id AS VARCHAR),
  WHERE u.tenant_id = 'tenant_jonex_demo' AND u.username = 'viewer_demo' AND u.is_deleted = 0
 ON CONFLICT DO NOTHING;
 
+
 -- ============================================================
 -- 知识库种子数据
 -- ============================================================
@@ -959,6 +1063,7 @@ INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, descri
     ('kb_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗知识库', '医疗病历智能解析本体抽取', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 内置「文件上传」数据源（每个知识库默认拥有一条 file 类型数据源实例，
 -- 与 knowledge_info.data_source_types 的 "file" 标签保持一致）
 INSERT INTO knowledge_base.knowledge_data_sources
@@ -967,7 +1072,8 @@ VALUES
     ('ds_demo_internet_file', 'tenant_jonex_demo', 'kb_demo_internet', 'dam_demo_file', 'file', '文件上传', '{}'::jsonb, 'manual', 'active'),
     ('ds_demo_credit_file', 'tenant_jonex_demo', 'kb_demo_credit_risk', 'dam_demo_file', 'file', '文件上传', '{}'::jsonb, 'manual', 'active'),
     ('ds_demo_medical_file', 'tenant_jonex_demo', 'kb_demo_medical', 'dam_demo_file', 'file', '文件上传', '{}'::jsonb, 'manual', 'active')
-ON CONFLICT (id) DO NOTHING; 
+ON CONFLICT (id) DO NOTHING;
+
 
 -- ============================================================
 -- 领域服务种子数据
@@ -980,6 +1086,7 @@ VALUES
     ('svc_demo_medical', 'tenant_jonex_demo', 'space_demo_test', '医疗领域服务', '医疗病历解析领域服务', '医疗', 'active', 'sk-medical-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 领域服务和知识库关联关系
 INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
@@ -987,6 +1094,7 @@ VALUES
     ('skb_demo_credit', 'tenant_jonex_demo', 'svc_demo_credit', 'kb_demo_credit_risk'),
     ('skb_demo_medical', 'tenant_jonex_demo', 'svc_demo_medical', 'kb_demo_medical')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- [jonex] OpenKB 知识库种子数据
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id, kb_type)
@@ -996,6 +1104,7 @@ VALUES
      '["file"]'::jsonb, 0, 'synced', 'user_demo_admin', 'openkb')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO knowledge_base.knowledge_data_sources
     (id, tenant_id, knowledge_base_id, access_method_id, access_type, name, config_json, sync_mode, status)
 VALUES
@@ -1004,6 +1113,7 @@ VALUES
      '{}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
     ('svc_demo_openkb', 'tenant_jonex_demo', 'space_demo_test', 'llm-wiki 编译服务',
@@ -1011,15 +1121,18 @@ VALUES
      'knowledge_compiler', 'active', '')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
     ('skb_demo_openkb', 'tenant_jonex_demo', 'svc_demo_openkb', 'kb_demo_openkb')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
 VALUES
     ('sak_openkb_main', 'tenant_jonex_demo', 'svc_demo_openkb', 'sk', 'sk-openkb-0123456789abcdef0123456789abcdef', '2027-12-31'::timestamp, 1)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 测试用 API Key
 INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
@@ -1039,6 +1152,7 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 
+
 -- ============================================================
 -- 本体模板编译 — 种子数据（发布模板、KB 绑定、预编译 schema）
 -- ============================================================
@@ -1050,7 +1164,8 @@ VALUES
     ('tenant_jonex_demo','kb_demo_internet','tpl_domain_internet','tpl_scenario_internet_general','business_template','active'),
     ('tenant_jonex_demo','kb_demo_credit_risk','tpl_domain_finance','tpl_scenario_credit_risk','business_template','active'),
     ('tenant_jonex_demo','kb_demo_medical','tpl_domain_medical','tpl_scenario_medical_record','business_template','active')
-ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- 7. 预编译本体 schema（互联网通用场景）
 INSERT INTO knowledge_base.ontology_compiled_schemas
@@ -1187,7 +1302,8 @@ VALUES (
         ]
     }'::jsonb,
     'active', '2026-06-09T00:00:00+00'::timestamptz
-) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+) ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- 8. 预编译本体 schema（信贷风控场景）
 INSERT INTO knowledge_base.ontology_compiled_schemas
@@ -1252,7 +1368,8 @@ VALUES (
         ]
     }'::jsonb,
     'active', '2026-06-09T00:00:00+00'::timestamptz
-) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+) ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- 9. 预编译本体 schema（病历智能解析场景）
 INSERT INTO knowledge_base.ontology_compiled_schemas
@@ -1317,7 +1434,8 @@ VALUES (
         ]
     }'::jsonb,
     'active', '2026-06-09T00:00:00+00'::timestamptz
-) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+) ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- ============================================================
 -- 模板领域场景联调数据，硬件互联网（财报分析场景）
@@ -1333,12 +1451,14 @@ VALUES ('tpl_domain_hardware_internet', 'tenant_jonex_demo', '硬件互联网', 
         'd5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES ('tpl_scenario_hw_inet_finance', 'tenant_jonex_demo', 'tpl_domain_hardware_internet', '财报分析', '硬件互联网上市公司年度/季度财报结构化抽取场景（基于小米2025年报）', '{}'::jsonb, 3,
         '2026-06-24T00:00:00+00'::timestamptz,
         'd5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 3. 模板对象（19 个财报核心本体实体）
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
@@ -1363,6 +1483,7 @@ VALUES
  ('tpl_obj_hwfin_legal','tenant_jonex_demo','tpl_domain_hardware_internet','tpl_scenario_hw_inet_finance','法律诉讼','诉讼/监管调查/或然负债事项（如小米印度调查与资产冻结）','active','legal_proceeding','["法律诉讼","诉讼","监管调查","或然负债","Legal Proceeding"]'::jsonb),
  ('tpl_obj_hwfin_esginit','tenant_jonex_demo','tpl_domain_hardware_internet','tpl_scenario_hw_inet_finance','可持续举措','ESG/可持续发展举措与行动（如物流低碳、绿电采购、以旧换新、碳减排）','active','sustainability_initiative','["可持续举措","ESG举措","可持续发展","Sustainability Initiative"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性
 INSERT INTO business_domain.template_attributes
@@ -1535,6 +1656,7 @@ VALUES
     ('tpl_attr_hwfin_si_desc','tenant_jonex_demo','tpl_obj_hwfin_esginit','举措描述','举措内容与方法说明','文本',0,'{}'::jsonb,5,'initiative_description',0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系（26 条核心关系）
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -1567,12 +1689,14 @@ VALUES
  ('tpl_rel_hwfin_si_esg','tenant_jonex_demo','tpl_domain_hardware_internet','tpl_scenario_hw_inet_finance','改善指标','可持续举措改善的ESG指标','tpl_obj_hwfin_esginit','tpl_obj_hwfin_esg','多对多','active','INITIATIVE_IMPROVES_ESG','["改善指标","支撑ESG"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 硬件互联网财报知识库种子数据
 -- ============================================================
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id) VALUES
     ('kb_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报知识库', '硬件互联网上市公司财报结构化抽（基于小米集团2025年度报告）', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 内置「文件上传」数据源
 INSERT INTO knowledge_base.knowledge_data_sources
@@ -1581,17 +1705,20 @@ VALUES
     ('ds_demo_hwfin_file', 'tenant_jonex_demo', 'kb_demo_hw_inet_finance', 'dam_demo_file', 'file', '文件上传', '{}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 领域服务
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
     ('svc_demo_hw_inet_finance', 'tenant_jonex_demo', 'space_demo_test', '硬件互联网财报领域服务', '硬件互联网财报解析领域服务', '硬件互联网', 'active', 'sk-hwfin-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 领域服务和知识库关联关系
 INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
     ('skb_demo_hwfin', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'kb_demo_hw_inet_finance')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 测试用 API Key
 INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
@@ -1601,12 +1728,14 @@ VALUES
     ('sak_hwfin_expired', 'tenant_jonex_demo', 'svc_demo_hw_inet_finance', 'sk', 'sk-expired-hwfin-00000000000000000000000000', '2026-01-01'::timestamp, 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 本体模板绑定（KB -> 模板场景）
 INSERT INTO knowledge_base.ontology_template_bindings
     (tenant_id, knowledge_base_id, template_domain_id, template_scenario_id, source_type, status)
 VALUES
     ('tenant_jonex_demo','kb_demo_hw_inet_finance','tpl_domain_hardware_internet','tpl_scenario_hw_inet_finance','business_template','active')
-ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- 10. 预编译本体 schema（硬件互联网财报分析场景）
 -- 基于小米集团 2025 年度报告（股份代号：1810/81810）逆向定义，v3 在原 13 类实体/16 类关系
@@ -2058,7 +2187,8 @@ VALUES (
         ]
     }'::jsonb,
     'active', '2026-06-24T00:00:00+00'::timestamptz
-) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+) ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 
 -- ============================================================
@@ -2076,12 +2206,14 @@ VALUES ('tpl_domain_ai_tech_report', 'tenant_jonex_demo', 'AI大模型技术报�
         'c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 2. 模板场景
 INSERT INTO business_domain.template_scenarios (id, tenant_id, domain_id, name, description, config_json, version, published_at, structure_hash)
 VALUES ('tpl_scenario_llm_tech_report', 'tenant_jonex_demo', 'tpl_domain_ai_tech_report', 'LLM技术报告', '大语言模型技术报告结构化抽取场景（基于小米MiMo-V2-Flash技术报告）', '{}'::jsonb, 2,
         '2026-06-24T00:00:00+00'::timestamptz,
         'c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 3. 模板对象（18 个 LLM 技术报告核心本体实体）
 INSERT INTO business_domain.template_objects (id, tenant_id, domain_id, scenario_id, name, description, status, ontology_code, aliases)
@@ -2105,6 +2237,7 @@ VALUES
  ('tpl_obj_llm_perf','tenant_jonex_demo','tpl_domain_ai_tech_report','tpl_scenario_llm_tech_report','性能指标','模型/架构的性能与效率指标（如 KV缓存缩减、推理加速、吞吐）','active','performance_metric','["性能指标","效率指标","Performance Metric"]'::jsonb),
  ('tpl_obj_llm_env','tenant_jonex_demo','tpl_domain_ai_tech_report','tpl_scenario_llm_tech_report','训练环境','RL/智能体训练环境与数据（如 GitHub issue 任务、K8s 集群、多模态验证器）','active','training_environment','["训练环境","训练数据","环境","Environment"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 4. 模板属性
 INSERT INTO business_domain.template_attributes
@@ -2220,6 +2353,7 @@ VALUES
     ('tpl_attr_llm_ev_desc','tenant_jonex_demo','tpl_obj_llm_env','描述','环境说明','文本',0,'{}'::jsonb,4,'description',0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 5. 模板关系（20 条核心关系）
 INSERT INTO business_domain.template_relations
     (id, tenant_id, domain_id, scenario_id, name, description, source_object_id, target_object_id, relation_type, status, ontology_code, aliases)
@@ -2246,12 +2380,14 @@ VALUES
  ('tpl_rel_llm_pt_ev','tenant_jonex_demo','tpl_domain_ai_tech_report','tpl_scenario_llm_tech_report','使用环境','后训练技术使用的训练环境/数据','tpl_obj_llm_pt','tpl_obj_llm_env','多对多','active','TECHNIQUE_USES_ENVIRONMENT','["使用环境","依赖环境"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- AI大模型技术报告知识库种子数据
 -- ============================================================
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, name, description, data_source_types, document_count, status, owner_id) VALUES
     ('kb_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告知识库', 'AI大模型技术报告结构化抽取（基于小米MiMo-V2-Flash技术报告）', '["file"]'::jsonb, 0, 'synced', '1')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 内置「文件上传」数据源
 INSERT INTO knowledge_base.knowledge_data_sources
@@ -2260,12 +2396,14 @@ VALUES
     ('ds_demo_llm_file', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'dam_demo_file', 'file', '文件上传', '{}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 内置「文件存储直连」数据源
 INSERT INTO knowledge_base.knowledge_data_sources
     (id, tenant_id, knowledge_base_id, access_method_id, access_type, name, config_json, sync_mode, status)
 VALUES
     ('ds_demo_llm_storage', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'dam_demo_storage', 'storage', '文件存储直连', '{"bucket": "data-sourse", "prefix": "", "backend": "minio", "endpoint": "http://host.docker.internal:9000", "include_ext": ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "md", "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "opus", "amr", "mp4", "avi", "mov", "mkv", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp"], "credential_ref": "gAAAAABqYcT2YX64kUbkFm9jEv7bAJPsNEqp-E5hPooumz7l9zVxayioOhNIYekHNDCrT-6N1IFMBcOioi3lym9CF_l030gDJB69O2lnt_VwXsNSTsJq5zg="}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 内置「API 接入（拉取）」数据源
 INSERT INTO knowledge_base.knowledge_data_sources
@@ -2274,12 +2412,14 @@ VALUES
     ('ds_demo_llm_api', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'dam_demo_api', 'api', 'API 接入（拉取）', '{"auth": {"type": "bearer", "token_ref": "gAAAAABqYb_s0R4-CVHkZ_Lqz_t574xHegIohh5dC5TC4b0EKZ2gylIclpYqIzkIf6NcFRFWWdVnBoHthLrUsdq2nH5tVr_ivnny62zk5HCNISNyD5HupUU="}, "method": "GET", "endpoint": "http://host.docker.internal:8910/api/documents", "list_path": "$.data.items", "file_url_field": "url", "file_name_field": "name"}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 内置「API 开放（推送）」数据源
 INSERT INTO knowledge_base.knowledge_data_sources
     (id, tenant_id, knowledge_base_id, access_method_id, access_type, name, config_json, sync_mode, status)
 VALUES
     ('ds_demo_llm_api_push', 'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'dam_api_push_demo', 'api_push', 'API 开放（推送）', '{"allowed_ext": ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "md", "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "opus", "amr", "mp4", "avi", "mov", "mkv", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp"], "max_file_mb": 50, "ingest_key_hash": "7f2c677abaa4838cbb8ebcf8da0634262c6135c2df4abeabca8be659d24f4c49"}'::jsonb, 'manual', 'active')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 内置解析器设置（document/txt/image/audio/video 五类，开箱即用；上传按文件后缀路由到对应解析器）
 INSERT INTO knowledge_base.knowledge_parser_settings
@@ -2292,17 +2432,20 @@ VALUES
     ('ps_demo_llmtr_video',   'tenant_jonex_demo', 'kb_demo_llm_tech_report', 'video',    'video_full_pipeline', NULL, 'active', 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 领域服务
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, name, description, domain_type, status, api_key_encrypted)
 VALUES
     ('svc_demo_llm_tech_report', 'tenant_jonex_demo', 'space_demo_test', 'AI大模型技术报告领域服务', 'AI大模型技术报告解析领域服务', 'AI大模型', 'active', 'sk-llmtr-0123456789abcdef0123456789abcdef')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 领域服务和知识库关联关系
 INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id)
 VALUES
     ('skb_demo_llmtr', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'kb_demo_llm_tech_report')
 ON CONFLICT (id) DO NOTHING;
+
 
 -- 测试用 API Key
 INSERT INTO knowledge_base.service_api_keys (id, tenant_id, service_id, key_prefix, key_encrypted, expires_at, is_active)
@@ -2312,12 +2455,14 @@ VALUES
     ('sak_llmtr_expired', 'tenant_jonex_demo', 'svc_demo_llm_tech_report', 'sk', 'sk-expired-llmtr-000000000000000000000000', '2026-01-01'::timestamp, 0)
 ON CONFLICT (id) DO NOTHING;
 
+
 -- 本体模板绑定（KB -> 模板场景）
 INSERT INTO knowledge_base.ontology_template_bindings
     (tenant_id, knowledge_base_id, template_domain_id, template_scenario_id, source_type, status)
 VALUES
     ('tenant_jonex_demo','kb_demo_llm_tech_report','tpl_domain_ai_tech_report','tpl_scenario_llm_tech_report','business_template','active')
-ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- 11. 预编译本体 schema（AI大模型技术报告场景）
 -- 基于小米 MiMo-V2-Flash 技术报告逆向定义，v2 在原 12 类实体/11 类关系基础上补充
@@ -2646,10 +2791,11 @@ VALUES (
         ]
     }'::jsonb,
     'active', '2026-06-22T00:00:00+00'::timestamptz
-) ON CONFLICT (tenant_id, knowledge_base_id) DO NOTHING;
+) ON CONFLICT DO NOTHING;  -- 037 之后 (tenant,kb) 只剩部分唯一索引，普通 ON CONFLICT 推不出来
+
 
 -- ============================================================
--- Jonex 平台 - business_domain.prompt_templates 数据导出
+-- Jonex平台 - business_domain.prompt_templates 数据导出
 -- 导出时间: 2026-07-07 14:42:02
 -- 记录数: 6
 -- ============================================================
@@ -2658,39 +2804,767 @@ INSERT INTO business_domain.prompt_templates (id, tenant_id, space_id, name, cat
 VALUES ('seed_pt_dom_contract', 'tenant_jonex_demo', 'space_demo_test', '合同条款合规审查', '合同审查', 'domain', '识别合同中的风险条款与合规问题，给出修改建议。', '启用', '1', '[{"remark": "初始版本", "content": "请作为法律合规专家审查以下合同条款，输出：\\n- 风险条款清单（标注位置）\\n- 合规问题说明\\n- 修改建议\\n\\n合同文本：{{合同内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO business_domain.prompt_templates (id, tenant_id, space_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
 VALUES ('seed_pt_dom_report', 'tenant_jonex_demo', 'space_demo_test', '数据报表解读', '文档处理', 'domain', '基于数据报表自动生成业务洞察与趋势解读。', '启用', '1', '[{"remark": "初始版本", "content": "请基于以下报表数据，生成业务解读报告：\\n1. 关键指标同比/环比变化；\\n2. 异常波动归因；\\n3. 趋势预测与建议。\\n\\n报表数据：{{报表数据}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
+
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
 VALUES ('seed_pt_sys_docsum', NULL, '文档摘要生成', '文档处理', 'system', '对长文档进行自动摘要，输出核心观点与关键信息。', '启用', '1', '[{"remark": "初始版本", "content": "请阅读以下文档，生成一段不超过 200 字的摘要，包含：\\n- 核心主题\\n- 关键论点（3 条）\\n- 结论建议\\n\\n文档内容：{{文档内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
+
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
 VALUES ('seed_pt_sys_email', NULL, '邮件智能回复', '通用问答', 'system', '根据邮件内容生成专业、得体的回复草稿。', '启用', '1', '[{"remark": "初始版本", "content": "请根据收到的邮件内容，撰写一封得体的回复邮件，要求：\\n- 语气专业、礼貌；\\n- 覆盖对方所有问题；\\n- 200 字以内。\\n\\n收件邮件：{{邮件内容}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
+
 
 INSERT INTO business_domain.prompt_templates (id, tenant_id, name, category, scope, description, status, current_version, versions_json, created_by, created_at, updated_at)
 VALUES ('seed_pt_sys_qa', NULL, '智能问答助手', '通用问答', 'system', '面向通用知识问答场景，结合上下文给出准确、结构化的回答。', '启用', '1', '[{"remark": "初始版本", "content": "你是一个专业、严谨的知识问答助手。请根据以下上下文回答用户问题，要求：\\n1. 仅依据给定上下文作答，不编造信息；\\n2. 答案结构化、条理清晰；\\n3. 如上下文不足，请如实说明。\\n\\n上下文：{{检索内容}}\\n用户问题：{{用户问题}}", "version": "1", "updated_at": "2026-07-06 18:42", "updated_by": "系统用户"}]'::jsonb, '系统用户', '2026-07-06 18:42:58', '2026-07-06 18:42:58')
 ON CONFLICT (id) DO NOTHING;
 
+
 -- ============================================================
 -- 修自增序列：种子数据指定了 ID，须对齐序列避免后续 INSERT 冲突
 -- ============================================================
 SELECT setval('platform.roles_id_seq', (SELECT COALESCE(MAX(id), 0) FROM platform.roles));
+
 SELECT setval('platform.permissions_id_seq', (SELECT COALESCE(MAX(id), 0) FROM platform.permissions));
+
 SELECT setval('platform.menus_id_seq', (SELECT COALESCE(MAX(id), 0) FROM platform.menus));
+
 
 
 INSERT INTO knowledge_base.knowledge_info (id, tenant_id, space_id, "name", description, data_source_types, document_count, status, owner_id, created_at, updated_at, is_deleted) VALUES('b11dd30de0994178a3a4e388e6cf816e', 'tenant_jonex_demo', 'space_demo_test', '金融开源数据集', NULL, '["file"]', 0, 'synced', NULL, '2026-07-23 05:08:32.539', '2026-07-23 05:08:32.539', 0);
 
+
 INSERT INTO knowledge_base.knowledge_data_sources (id, tenant_id, knowledge_base_id, access_method_id, access_type, "name", config_json, sync_mode, cron_expr, schedule_task_id, status, last_sync_at, last_sync_status, last_sync_message, document_count, is_deleted, created_at, updated_at) VALUES('fda83241-9ec4-439d-bf71-b351c3d6db49', 'tenant_jonex_demo', 'b11dd30de0994178a3a4e388e6cf816e', 'dam_demo_file', 'file', '文件上传', '{}', 'manual', NULL, NULL, 'active', NULL, NULL, NULL, 1, 0, '2026-07-23 05:08:49.340', '2026-07-23 05:08:49.340');
 
+
 INSERT INTO knowledge_base.services (id, tenant_id, space_id, "name", description, domain_type, status, api_key_encrypted, created_at, updated_at, is_deleted) VALUES('68bb7dd208c54f45ac31b6fbb5d655f5', 'tenant_jonex_demo', 'space_demo_test', '金融开源数据集服务', NULL, NULL, 'active', NULL, '2026-07-23 06:14:29.743', '2026-07-23 06:14:29.743', 0);
+
 
 INSERT INTO knowledge_base.service_knowledge_bases (id, tenant_id, service_id, kb_id, created_at, updated_at, is_deleted) VALUES('0fc886a5083646e188e7e1c84a95b7f7', 'tenant_jonex_demo', '68bb7dd208c54f45ac31b6fbb5d655f5', 'b11dd30de0994178a3a4e388e6cf816e', '2026-07-23 06:14:29.748', '2026-07-23 06:14:29.748', 0);
 
 
+
 INSERT INTO knowledge_base.ontology_compiled_schemas (tenant_id, knowledge_base_id, template_domain_id, template_scenario_id, source_type, source_version, source_hash, schema_version, entity_types, relation_types, "constraints", disambiguation, prompt_schema, schema_mode, sync_status, edited_at, edited_by, status, compiled_at, created_at, updated_at) VALUES('tenant_jonex_demo', 'b11dd30de0994178a3a4e388e6cf816e', NULL, NULL, 'yaml_default', 1, NULL, 1, '[{"name": "Organization", "status": "active", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false, "description": "", "display_name": "legal_name", "is_primary_key": false, "source_attribute_id": null}, {"name": "industry", "type": "string", "required": false, "description": "", "display_name": "industry", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Organization", "source_object_id": null}, {"name": "Person", "status": "active", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false, "description": "", "display_name": "title", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Person", "source_object_id": null}, {"name": "Location", "status": "active", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false, "description": "", "display_name": "address", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Location", "source_object_id": null}, {"name": "Product", "status": "active", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false, "description": "", "display_name": "model", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Product", "source_object_id": null}, {"name": "Concept", "status": "active", "aliases": ["概念", "术语", "定义"], "attributes": [], "description": "", "requirement": "", "display_name": "Concept", "source_object_id": null}, {"name": "Method", "status": "active", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": [], "description": "", "requirement": "", "display_name": "Method", "source_object_id": null}, {"name": "Event", "status": "active", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false, "description": "", "display_name": "date", "is_primary_key": false, "source_attribute_id": null}], "description": "", "requirement": "", "display_name": "Event", "source_object_id": null}]', '[{"name": "BELONGS_TO", "source": "Person", "status": "active", "target": "Organization", "aliases": [], "cardinality": "custom", "description": "", "display_name": "BELONGS_TO", "source_relation_id": null}, {"name": "PRODUCES", "source": "Organization", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PRODUCES", "source_relation_id": null}, {"name": "LOCATED_AT", "source": "Organization", "status": "active", "target": "Location", "aliases": [], "cardinality": "custom", "description": "", "display_name": "LOCATED_AT", "source_relation_id": null}, {"name": "WORKS_WITH", "source": "Person", "status": "active", "target": "Person", "aliases": [], "cardinality": "custom", "description": "", "display_name": "WORKS_WITH", "source_relation_id": null}, {"name": "USES", "source": "Organization", "status": "active", "target": "Method", "aliases": [], "cardinality": "custom", "description": "", "display_name": "USES", "source_relation_id": null}, {"name": "RELATES_TO", "source": "Concept", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "RELATES_TO", "source_relation_id": null}, {"name": "PART_OF", "source": "Concept", "status": "active", "target": "Product", "aliases": [], "cardinality": "custom", "description": "", "display_name": "PART_OF", "source_relation_id": null}, {"name": "HAS_FEATURE", "source": "Product", "status": "active", "target": "Concept", "aliases": [], "cardinality": "custom", "description": "", "display_name": "HAS_FEATURE", "source_relation_id": null}]', '[]', '{"alias_merge": true, "case_insensitive": true}', '{"entity_types": [{"name": "Organization", "aliases": ["公司", "企业", "机构", "集团", "组织"], "attributes": [{"name": "legal_name", "type": "string", "required": false}, {"name": "industry", "type": "string", "required": false}]}, {"name": "Person", "aliases": ["人", "人员", "个人", "员工"], "attributes": [{"name": "title", "type": "string", "required": false}]}, {"name": "Location", "aliases": ["地点", "位置", "地区", "城市"], "attributes": [{"name": "address", "type": "string", "required": false}]}, {"name": "Product", "aliases": ["产品", "服务", "解决方案"], "attributes": [{"name": "model", "type": "string", "required": false}]}, {"name": "Concept", "aliases": ["概念", "术语", "定义"], "attributes": []}, {"name": "Method", "aliases": ["方法", "技术", "算法", "方法论"], "attributes": []}, {"name": "Event", "aliases": ["事件", "活动", "会议"], "attributes": [{"name": "date", "type": "string", "required": false}]}], "relation_types": [{"name": "BELONGS_TO", "source": "Person", "target": "Organization"}, {"name": "PRODUCES", "source": "Organization", "target": "Product"}, {"name": "LOCATED_AT", "source": "Organization", "target": "Location"}, {"name": "WORKS_WITH", "source": "Person", "target": "Person"}, {"name": "USES", "source": "Organization", "target": "Method"}, {"name": "RELATES_TO", "source": "Concept", "target": "Concept"}, {"name": "PART_OF", "source": "Concept", "target": "Product"}, {"name": "HAS_FEATURE", "source": "Product", "target": "Concept"}]}', 'template_seeded', 'synced', NULL, NULL, 'active', '2026-07-23 13:09:04.065', '2026-07-23 05:09:04.067', '2026-07-23 05:09:04.067');
 
+
 INSERT INTO knowledge_base.knowledge_parser_settings (id, tenant_id, knowledge_base_id, parser_type, parser_config_id, prompt_config_id, preprocessing_json, postprocessing_json, prompt_text, prompt_template_id, prompt_template_version, summary_prompt_text, summary_template_id, summary_template_version, tag_prompt_text, tag_template_id, tag_template_version, status, is_deleted, created_at, updated_at) VALUES('94688b83c58f461cb74af4f5f661bffd', 'tenant_jonex_demo', 'b11dd30de0994178a3a4e388e6cf816e', 'document', 'document_parse', NULL, '[]', '[]', '', NULL, NULL, '', NULL, NULL, '', NULL, NULL, 'active', 0, '2026-07-23 05:09:01.974', '2026-07-23 05:09:01.974');
+
+-- ==================================================================
+-- 以下为「种子之后的数据修正」：原本散在各库文件里、按老顺序排在
+-- 006_seed_data.sql 之后执行。种子移到 090 后必须仍然排在种子之后，
+-- 否则这些 UPDATE/INSERT 在种子行还不存在时执行，等于失效。
+-- ==================================================================
+
+
+-- >>> 并入 008_task_center.sql
+
+-- 来源：migrations/008_task_center.sql
+
+
+-- ============================================================
+-- 内置清单预置数据（§3.4 内置数据示例）
+-- 平台预置、只读；ON CONFLICT DO NOTHING 保证可重复执行
+-- ============================================================
+-- 全局内置步骤清单（2026-10-23 起没有「内置任务」这一层）。
+-- 任务中心要支持自由编排：定义不再绑定某种任务类型，一版编排直接从下面这些步骤里选节点。
+-- 目前只有两类节点 —— `parse`（文件解析）/ `compile`（知识编译），都交给知识库运行方。
+-- 「哪类库」现在由**编排定义名**承载，不再靠目录/步骤名区分。
+--
+-- 三类知识库（Ontology / Ontology Wiki / Jonex Wiki）的差异
+-- 全在运行方内部按 KB 的 `kb_type` 分流（parse 落 content.md 还是 content_list.json、
+-- compile 走 recompile_openkb 还是 recompile_jonex_wiki），编排不承载这个差别。
+
+-- 步骤超时必须**大于知识库自己的看门狗阈值**，否则会出现「任务中心先判超时、
+-- 知识库后上报却被幂等吸收」——用户看到「任务超时失败」而文档状态是另一回事，
+-- 两头说法不一致。两类步骤统一取 25200（7 小时），比知识库那道晚一档。
+--
+-- 知识库侧对**上传链路建的那些文档**（带任务中心标记的），对账循环那套超时巡检
+-- （`patrol_parsing_timeout`，SOFT 3600 只探活 / HARD 21600 才判死）整条跳过 ——
+-- 它那套「探活 + 自动重推」跟编排并起来会互相踩（PARSING 分支的 re-insert 等于绕开
+-- 编排把一个文档解析两遍）。于是判死改由运行方自己做，读的是同一个阈值
+-- `TC_STEP_HARD_TIMEOUT_SEC`（独立的环境变量，默认值与 `RAG_TASK_HARD_TIMEOUT_SEC`
+-- 恰好相同、都是 21600 —— 但**两者没有联动**，改一个不会带动另一个）：超了它就上报 failed
+-- 并连文档一起落
+-- FAILED。25200 = 21600 + 1 小时余量，保证正常情况下知识库先判死、管理方按终态
+-- 吸收，永远走不到这里；这里只是「运行方自己也彻底没动静了」的最后一层兜底。
+--
+-- 两种 llm-wiki 库的编译各另有一道阈值（openkb 是 `OPENKB_COMPILE_TIMEOUT_SEC`，
+-- jonex_wiki 是 `JONEX_WIKI_COMPILE_TIMEOUT_SEC`，都回落到 1800，到点**直接判死**，
+-- `patrol_openkb_compile` / `patrol_jonex_wiki_compile` 都不探活），同样早于这里的 25200。
+--
+-- max_concurrency：两类步骤统一取 10。
+--
+-- 这个上限是**全局按 `runner_code + step_code` 统计**的（全平台共用同一份额度，见
+-- 设计文档 §6.3）—— 不是「每个库各 10」。原来的 parse=5 / ingest=2 / compile=2 是按
+-- 「单份文档走到这一步有多重」定的（ingest 逐 chunk 抽实体关系 + 写图/向量库，最重所以
+-- 最保守），但会让人看见的瓶颈不在单份有多重，而在名额太少让批次走不动：「整库重抽」
+-- 这类场景里一批文档会卡在同一个相位上排队，前端上就是十几份一起长时间停在「解析中」/
+-- 「知识抽取入库中」/「待编译」，看着像卡死其实只是没轮到。
+--
+-- 10 是让「一次重抽十几份」这种批次能整体推进的量级。代价是同一时刻最多有 10 份文档
+-- 一起压 LLM 与图库；真要回退，这三个数是并发调优的第一顺位。
+--
+-- 步骤名**全平台只有两个字面量**：文件解析 / 知识编译。同一件事叫不同名字会让用户
+-- 对着页面找不到任务；**「哪类库」由任务定义名承载，不由步骤名承载**。
+-- 名字是给人看的；运行方认的是 `step_code`（parse / compile），改名不影响派活。
+--
+-- ⚠️ 2026-10-23 起只预置 **parse + compile**：`ingest`（「知识抽取」，其实是推切片）
+-- **不再预置** —— Ontology 链 2026-09-29 由三步改两步，`parse` 自己推切片。
+-- 运行方代码里仍留着 `ingest` 的 handler，只服务改版前遗留的在途任务；存量库里的
+-- 那些任务由 `update/055` 在迁移时直接判失败。
+--
+-- output_schema 里声明 document_id，是给下游 `@<节点>.outputs.document_id` 用的
+-- （见下方「数据怎么传」）：运行方上报成功时把它带回来。
+INSERT INTO task_center.task_catalog_steps
+  (id, step_code, name, runner_code, max_concurrency, timeout_seconds, input_schema, output_schema) VALUES
+  ('step-parse', 'parse', '文件解析', 'knowledge_base', 10, 25200,
+   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
+   '{"document_id":{"type":"string","required":true}}'),
+  ('step-compile', 'compile', '知识编译', 'knowledge_base', 10, 25200,
+   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
+   '{}')
+ON CONFLICT DO NOTHING;
+
+
+INSERT INTO task_center.runner_definitions (id, code, name, capability_id) VALUES
+  ('runner-knowledge-base', 'knowledge_base', '知识库', 'business.knowledge_base.v1')
+ON CONFLICT DO NOTHING;
+
+
+-- ------------------------------------------------------------
+-- 平台级任务定义：知识库上传后的处理链路（**三条，都是两步串行**）
+--   definition-file-processing-ontology                    file_processing_ontology                    第一步 atomic-rag `full`（上传）/ `reparse_strict`（重新解析）—— 解析 + 推切片一趟
+--   definition-file-processing-ontology-wiki               file_processing_ontology_wiki               第一步 atomic-rag `parse_only`（只解析）
+--   definition-file-processing-jonex-wiki                  file_processing_jonex_wiki                  第一步 atomic-rag `parse_only`（只解析）
+-- 三条链的**第二步都是 `compile`**（atomic-rag `ontology_only`：不读原文件，按 document_id
+-- 从 LightRAG 读实体做本体归类、写 Neo4j）。
+-- ⚠️ Ontology 那条 2026-09-29 由**三步**（文件解析 → 知识抽取 → 知识编译）改成两步 ——
+-- 理由见上一段 `ingest` 那几行；另外两条 wiki 链本来就是两步。
+-- 定义名就是任务中心页面上的「这条任务属于哪类库」，所以带上库类型后缀；步骤名不带。
+-- 上传时按 kb_type 挑一个（知识库侧用固定 definition_id 映射，见
+-- `task_runner_service.definition_for_kb_type`）。
+-- scope=system，所以 tenant_id / space_id 都为 NULL（ck_tc_def_scope_fields 强制）
+--
+-- 数据怎么传：**优先从上游产出取**（`@<节点>.outputs.<字段>`），哪一步都不产出它
+-- 才回落到任务入参（`@task.inputs.<字段>`）。于是：
+--   · 源头那一步 parse_1 没有上游，两个入参只能取任务入参 —— 文档 id 在上传时就
+--     已生成落库（「一个文件一条任务」）；
+--   · 下游各步的 document_id 一律取**上一步的产出**；
+--   · knowledge_base_id 没有任何一步会产出它（它是任务级入参），所以全程取任务入参。
+-- 为什么下游不图省事重复写 @task.inputs.document_id：两者取值相同，但取上游产出能让
+-- 编排自己表达出「谁喂谁」，而且一版编排里如果出现多个 parse 节点（解析两个不同文件、
+-- 各推各的切片），**只有这种写法能让每份产物喂对下游** —— 都用任务入参的话，两个
+-- parse 节点会把同一个文档推两遍。串行顺序另由 depends_on 保证（跟数据传递是两回事）。
+-- 代价：运行方上报时必须带回 outputs.document_id；漏报不静默 —— 下游拿到空值就失败。
+-- ------------------------------------------------------------
+INSERT INTO task_center.task_definitions
+  (id, scope, tenant_id, space_id, name, description, current_version_no) VALUES
+  ('definition-file-processing-ontology', 'system', NULL, NULL, '文件处理（Ontology）', '上传文件后自动解析并编译本体知识', 1),
+  ('definition-file-processing-ontology-wiki', 'system', NULL, NULL, '文件处理（Ontology Wiki）', '上传文件后自动解析并编译 Ontology Wiki', 1),
+  ('definition-file-processing-jonex-wiki', 'system', NULL, NULL, '文件处理（Jonex Wiki）', '上传文件后自动解析并编译 Jonex Wiki', 1)
+ON CONFLICT DO NOTHING;
+
+
+INSERT INTO task_center.task_definition_versions
+  (id, scope, tenant_id, definition_id, space_id, version_no, status, config, published_at) VALUES
+  ('version-file-processing-ontology-v1', 'system', NULL, 'definition-file-processing-ontology', NULL, 1, 'published',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   CURRENT_TIMESTAMP),
+  ('version-file-processing-ontology-wiki-v1', 'system', NULL, 'definition-file-processing-ontology-wiki', NULL, 1, 'published',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   CURRENT_TIMESTAMP),
+  ('version-file-processing-jonex-wiki-v1', 'system', NULL, 'definition-file-processing-jonex-wiki', NULL, 1, 'published',
+   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+   CURRENT_TIMESTAMP)
+ON CONFLICT DO NOTHING;
+
+
+-- >>> 并入 009_structured_data.sql
+
+-- 来源：migrations/012_lineage_edge_last_seen.sql
+
+
+-- 存量行以最后一次写库时间为准；再退到创建时间，最后退到当前时间。
+UPDATE knowledge_base.lineage_edges
+   SET last_seen_at = COALESCE(updated_at, created_at, now())
+ WHERE last_seen_at IS NULL;
+
+
+-- ------------------------------------------------------------------
+-- 来源：migrations/015_kb_structured_enabled.sql
+-- ------------------------------------------------------------------
+
+-- deploy/postgres/migrations/015_kb_structured_enabled.sql
+-- 每 KB 的「结构化数据支持」开关。
+-- 列本身由 003_knowledge_base.sql 加（保证列序与历史库一致），这里只做数据修正：
+-- 存量/种子 KB 默认开启；用户之后手工关闭的值不会被重跑复活（本文件只在空卷跑一次）。
+UPDATE knowledge_base.knowledge_info SET structured_enabled = TRUE;
+
+-- 来源：migrations/016_evolution_console.sql
+
+
+-- ------------------------------------------------------------
+-- 语料种子：仅 demo 租户 + kb_assets_r2 + jinpin 源齐备时插入。
+-- 生产环境（无该 KB / 源）不留指向不存在对象的数据。
+-- 由 tests/eval/nl2sql/corpus.yaml 生成（2026-10-18 时为 35 条：
+-- 31 条 answer 带 control，4 条 refuse 的 control 为 NULL）。
+-- ------------------------------------------------------------
+INSERT INTO knowledge_base.evolution_corpus_cases
+  (id, tenant_id, name, question, tier, expect, control, kb_id, ds_id)
+SELECT md5('evo:'||c.name), 'tenant_jonex_demo', c.name, c.question, c.tier, c.expect,
+       c.control::jsonb, 'kb_assets_r2', '4cdb29e4-268c-4daf-8abe-7b879fa6abf0'
+FROM (VALUES
+      ('jobs_total', '一共有多少个职位', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs"]'),
+      ('company_total', '一共有多少家公司', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company"]'),
+      ('city_total', '系统里一共有多少个城市', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.citys"]'),
+      ('benefit_total', '一共有多少种福利', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.benefits"]'),
+      ('stock_cash_total', '一共有多少条余额流水', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.user_stock_cash"]'),
+      ('users_total', '一共有多少个用户', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.users"]'),
+      ('jobs_not_deleted', '有多少个职位还没被删除', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE is_del = 0"]'),
+      ('company_in_shenzhen', '在深圳市的公司有多少家', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company WHERE city_name = N''深圳市''"]'),
+      ('jobs_high_salary', '综合薪资上限超过一万的职位有多少个', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE max_comprehensive_salary > 10000"]'),
+      ('company_name_like_shenzhen', '公司名称里带“深圳”的有多少家', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company WHERE name LIKE N''%深圳%''"]'),
+      ('jobs_recruiting', '有多少个职位正在招聘中', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE status = ''1'' AND is_del = ''False''"]'),
+      ('jobs_recruiting_wording', '有多少个职位正在招人', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE status = ''1'' AND is_del = ''False''"]'),
+      ('jobs_pay_date_20th', '每月 20 号发工资的职位有多少个', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE pay_money_detail_date = N''每月20号''"]'),
+      ('jobs_created_2026', '2026 年发布的职位有多少个', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE create_time >= ''2026-01-01'' AND create_time < ''2027-01-01''"]'),
+      ('jobs_by_year', '按年份统计职位发布数量，从早到晚列出每一年', 'time_dim', 'answer', '["SELECT YEAR(create_time) AS y, COUNT(*) AS n FROM dbo.jobs GROUP BY YEAR(create_time) ORDER BY y"]'),
+      ('apply_jobs_2025', '2025 年一共有多少条投递记录', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.apply_jobs WHERE create_time >= ''2025-01-01'' AND create_time < ''2026-01-01''"]'),
+      ('jobs_created_2026_06', '2026 年 6 月发布了多少个职位', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE create_time >= ''2026-06-01'' AND create_time < ''2026-07-01''"]'),
+      ('jobs_by_working_life', '按工作年限统计职位数量，只要两列：工作年限的名称，以及该年限下的职位数量（不要额外列出年限 ID）', 'cross_table', 'answer', '["SELECT w.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.working_lifes w ON j.working_lifes_id = w.id GROUP BY w.name ORDER BY COUNT(*) DESC", "SELECT w.name, COUNT(*) AS n FROM dbo.jobs j LEFT JOIN dbo.working_lifes w ON j.working_lifes_id = w.id GROUP BY w.name ORDER BY COUNT(*) DESC"]'),
+      ('top5_company_by_jobs', '发布职位最多的5家公司分别是哪几家，各发布了多少职位', 'cross_table', 'answer', '["SELECT TOP 5 c.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON j.company_id = c.id GROUP BY c.name ORDER BY COUNT(*) DESC", "SELECT TOP 5 c.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON j.company_id = c.id GROUP BY c.id, c.name ORDER BY COUNT(*) DESC"]'),
+      ('company_name_shenzhen_jobs', '公司名字里带“深圳”的公司一共发布了多少个职位', 'cross_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id WHERE c.name LIKE N''%深圳%''"]'),
+      ('companies_with_intro', '在填了公司简介的公司里，这些公司一共发布了多少个职位（只要一个数字）', 'cross_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id WHERE c.intro IS NOT NULL AND c.intro <> ''''"]'),
+      ('top3_company_license', '发布职位最多的3家公司，它们的营业执照号分别是什么', 'cross_table', 'answer', '["SELECT TOP 3 c.name, c.business_license_number FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id GROUP BY c.id, c.name, c.business_license_number ORDER BY COUNT(*) DESC", "SELECT TOP 3 c.name, c.business_license_number FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id GROUP BY c.name, c.business_license_number ORDER BY COUNT(*) DESC"]'),
+      ('jobs_within_500km_guangzhou', '从广州到上班地点少于 500 千米的职位有多少个？', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE 111*SQRT(SQUARE(work_address_lat-23.1291)+SQUARE((work_address_lng-113.2644)*COS(RADIANS(23.1291)))) < 500"]'),
+      ('jobs_avg_salary_all', '所有职位的平均薪资是多少？', 'filtered', 'answer', '["SELECT ROUND(AVG((min_comprehensive_salary+max_comprehensive_salary)/2.0), 2) AS v FROM dbo.jobs WHERE min_comprehensive_salary > 0 AND max_comprehensive_salary > 0"]'),
+      ('jobs_avg_salary_guangzhou', '广州市职位的平均薪资是多少？', 'filtered', 'answer', '["SELECT ROUND(AVG((min_comprehensive_salary+max_comprehensive_salary)/2.0), 2) AS v FROM dbo.jobs WHERE min_comprehensive_salary > 0 AND max_comprehensive_salary > 0 AND work_address_city_name = N''广州市''"]'),
+      ('multi_hop_working_life_companies', '按工作年限统计发布过职位的公司数量，只要两列：工作年限名称，以及该年限下发布过职位的公司数量（不要额外列出年限 ID）', 'multi_hop', 'answer', '["SELECT w.name, COUNT(DISTINCT c.id) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.company c ON c.id = j.company_id GROUP BY w.name ORDER BY n DESC", "SELECT w.name, COUNT(DISTINCT c.name) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.company c ON c.id = j.company_id GROUP BY w.name ORDER BY n DESC"]'),
+      ('multi_hop_browsed_companies', '用户浏览过的职位一共来自多少家不同的公司？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT c.id) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.company c ON c.id = j.company_id", "SELECT COUNT(DISTINCT c.name) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.company c ON c.id = j.company_id"]'),
+      ('multi_hop_applied_companies', '收到过投递记录的职位，一共属于多少家不同的公司？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT c.id) AS n FROM dbo.apply_jobs a JOIN dbo.jobs j ON j.id = a.job_id JOIN dbo.company c ON c.id = j.company_id", "SELECT COUNT(DISTINCT c.name) AS n FROM dbo.apply_jobs a JOIN dbo.jobs j ON j.id = a.job_id JOIN dbo.company c ON c.id = j.company_id"]'),
+      ('multi_hop_applies_by_experience', '要求 1 年以下工作经验的职位一共收到了多少条投递记录？', 'multi_hop', 'answer', '["SELECT COUNT(*) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.apply_jobs a ON a.job_id = j.id WHERE w.name = N''1年以下''"]'),
+      ('multi_hop_shenzhen_company_browsed', '公司名称里带“深圳”的公司的职位，一共被用户浏览了多少次？', 'multi_hop', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company c JOIN dbo.jobs j ON j.company_id = c.id JOIN dbo.browsing_histories b ON b.job_id = j.id WHERE c.name LIKE N''%深圳%''"]'),
+      ('multi_hop_browsed_and_applied_jobs', '既被用户浏览过、又收到过投递的职位一共有多少个？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT j.id) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.apply_jobs a ON a.job_id = j.id"]'),
+      ('refuse_gross_margin', '上个月的毛利是多少', 'ambiguous', 'refuse', NULL),
+      ('refuse_avg_performance', '员工的平均绩效分是多少', 'ambiguous', 'refuse', NULL),
+      ('refuse_stock_price', '哪家公司的股价最高', 'ambiguous', 'refuse', NULL),
+      ('refuse_customer_churn', '这个月的客户流失率是多少', 'ambiguous', 'refuse', NULL)
+) AS c(name, question, tier, expect, control)
+WHERE EXISTS (
+    SELECT 1 FROM knowledge_base.knowledge_info
+    WHERE id = 'kb_assets_r2'
+      AND tenant_id = 'tenant_jonex_demo'
+      AND is_deleted = 0
+  )
+  AND EXISTS (
+    SELECT 1 FROM knowledge_base.knowledge_data_sources
+    WHERE id = '4cdb29e4-268c-4daf-8abe-7b879fa6abf0'
+      AND tenant_id = 'tenant_jonex_demo'
+      AND knowledge_base_id = 'kb_assets_r2'
+      AND is_deleted = 0
+  )
+ON CONFLICT DO NOTHING;
+
+
+-- >>> 并入 018_template_scenarios_menu.sql
+
+-- 来源：migrations/018_template_scenarios_menu.sql
+-- 标准侧审批流：把「本体模板场景」暴露为菜单入口（原仅能从领域模板跳转）
+INSERT INTO platform.menus
+    (id, parent_id, name, path, icon, app_id, sort_order, visible, status, permission_code)
+SELECT COALESCE(MAX(id), 0) + 1,
+       1,
+       'navigation.templateScenarios',
+       '/apps/ecosystem-management/template-scenarios',
+       'CopyOutlined',
+       NULL,
+       5,
+       1,
+       1,
+       'template:read'
+  FROM platform.menus
+ WHERE NOT EXISTS (
+       SELECT 1 FROM platform.menus
+        WHERE path = '/apps/ecosystem-management/template-scenarios'
+          AND is_deleted = 0
+ );
+
+
+-- >>> 并入 019_document_versions.sql
+
+-- 来源：migrations/019_document_versions.sql
+
+
+-- 存量文档回填为 v1（幂等）：没有历史可追溯，当前行即第一版
+INSERT INTO knowledge_base.knowledge_document_versions
+    (id, tenant_id, document_id, version_no, file_name, file_size, mime_type,
+     storage_backend, storage_key, content_hash, source, created_at)
+SELECT md5(random()::text || clock_timestamp()::text || d.id),
+       d.tenant_id, d.id, 1, d.file_name, d.file_size, d.mime_type,
+       coalesce(d.storage_backend, 'local'), d.storage_key, d.content_hash,
+       'backfill', d.created_at
+  FROM knowledge_base.knowledge_documents d
+ WHERE d.is_deleted = 0
+   AND NOT EXISTS (
+       SELECT 1 FROM knowledge_base.knowledge_document_versions v
+        WHERE v.tenant_id = d.tenant_id AND v.document_id = d.id
+   );
+
+
+-- >>> 并入 037_nl2sql_observability.sql
+
+-- 来源：migrations/037_nl2sql_observability.sql
+-- ============================================================
+-- 037 数据运营·数据问答观测：nl2sql_observations 3 列 + 2 索引
+--
+-- 变更：
+--   · total_ms              integer        端到端耗时（毫秒）
+--   · precompile_violation  varchar(32)    预编译校验违规原因
+--   · precompile_retried    boolean NOT NULL DEFAULT false  是否重试过
+--   · idx_n2s_obs_tenant_time     (tenant_id, created_at DESC)
+--   · idx_n2s_obs_tenant_kb_time  (tenant_id, knowledge_base_id, created_at DESC)
+--
+-- 回填：历史上这三项曾临时塞在 scene JSONB 里（键 precompile_violation /
+-- precompile_retried），此处一次性搬到独立列；scene 里的旧键保留不动。
+--
+-- 幂等：ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT EXISTS，可重复执行。
+-- 应用：空卷随 initdb 自动执行；存量库手工 `psql -f`（或 make db-migrate）。
+-- 本文件与 migrations/037、update/105 两份内容逐字节相同。
+-- ============================================================
+BEGIN;
+
+
+ALTER TABLE knowledge_base.nl2sql_observations
+    ADD COLUMN IF NOT EXISTS total_ms integer,
+    ADD COLUMN IF NOT EXISTS precompile_violation varchar(32),
+    ADD COLUMN IF NOT EXISTS precompile_retried boolean NOT NULL DEFAULT false;
+
+
+UPDATE knowledge_base.nl2sql_observations
+SET precompile_violation = NULLIF(scene->>'precompile_violation', ''),
+    precompile_retried = COALESCE((scene->>'precompile_retried')::boolean, false)
+WHERE scene ? 'precompile_violation' OR scene ? 'precompile_retried';
+
+
+CREATE INDEX IF NOT EXISTS idx_n2s_obs_tenant_time
+    ON knowledge_base.nl2sql_observations (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_n2s_obs_tenant_kb_time
+    ON knowledge_base.nl2sql_observations (tenant_id, knowledge_base_id, created_at DESC);
+
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库此前缺 knowledge_base.kb_tools / ontology_tool_bindings + knowledge_info.procedural_extract
+-- 以下数据修正 DML（必须晚于种子）逐条取自 deploy/postgres/update/000_baseline.sql 的
+-- `-- >>> SECTION: 084_ontology_skill_action_tools.sql` 段（去掉事务包裹与无关段落，语句原文不变）。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/084_ontology_skill_action_tools.sql
+
+BEGIN;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'ck_ontology_tool_bindings_tool_source'
+    ) THEN
+        ALTER TABLE knowledge_base.ontology_tool_bindings
+            ADD CONSTRAINT ck_ontology_tool_bindings_tool_source CHECK (tool_source IN ('platform', 'kb'));
+    END IF;
+END $$;
+
+
+-- ------------------------------------------------------------
+-- 3. 导航「工具目录」入口（/apps/ecosystem-management/skills）
+--
+-- 为什么需要
+--   shell 托管模式的侧栏只认 platform.menus（GET /platform/menus/my），子应用自己路由里的
+--   菜单元数据只用于 standalone 侧栏。这个页面（租户启用 / 停用工具，平台管理员另有
+--   「目录管理」页签）此前从未进过菜单表 ⇒ 托管模式下没有入口，只能手输地址。
+--   菜单键沿用 navigation.skillCatalog（显示文案在共享语言包里是「工具目录」）。
+--
+-- 挂在哪
+--   优先挂「集成扩展」组（navigation.integrationExtension）；旧结构的库没有这个组，
+--   回退到「生态管理」组（navigation.ecosystemManagement）；两者都没有时挂顶层。
+--   权限码 skill:read（tenant scope）：租户管理员也能看到，与页面路由守卫、后端 list_skills 同一个码。
+--
+-- 幂等：按 path 判断已存在（含软删）即跳过 —— 运维软删隐藏后重跑本脚本不会把它复活。
+--
+-- id：先把 menus_id_seq 推到 MAX(id)，再走序列取号。有的存量脚本用 MAX(id)+1 显式插 id、
+--   不推序列，序列可能落后于现有最大 id，直接取号会撞主键。
+-- ------------------------------------------------------------
+SELECT setval('platform.menus_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM platform.menus), 1));
+
+
+DO $$
+DECLARE
+    v_parent BIGINT;
+    v_sort   INT;
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM platform.menus WHERE path = '/apps/ecosystem-management/skills'
+    ) THEN
+        RAISE NOTICE '工具目录菜单已存在，跳过';
+        RETURN;
+    END IF;
+
+    SELECT id INTO v_parent
+      FROM platform.menus
+     WHERE name = 'navigation.integrationExtension' AND is_deleted = 0
+     ORDER BY id
+     LIMIT 1;
+
+    IF v_parent IS NULL THEN
+        SELECT id INTO v_parent
+          FROM platform.menus
+         WHERE name = 'navigation.ecosystemManagement' AND is_deleted = 0
+         ORDER BY id
+         LIMIT 1;
+    END IF;
+
+    v_parent := COALESCE(v_parent, 0);
+
+    -- 排在同组现有项之后
+    SELECT COALESCE(MAX(sort_order), 0) + 1 INTO v_sort
+      FROM platform.menus
+     WHERE parent_id = v_parent AND is_deleted = 0;
+
+    INSERT INTO platform.menus
+        (parent_id, name, path, icon, app_id, sort_order, visible, status, permission_code)
+    VALUES
+        (v_parent,
+         'navigation.skillCatalog',
+         '/apps/ecosystem-management/skills',
+         'ThunderboltOutlined',
+         NULL,
+         v_sort,
+         1,
+         1,
+         'skill:read');
+END $$;
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 constraint
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 009_structured_data.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/009_structured_data.sql
+BEGIN;
+
+
+-- 存量行以最后一次写库时间为准；再退到创建时间，最后退到当前时间。
+UPDATE knowledge_base.lineage_edges
+   SET last_seen_at = COALESCE(updated_at, created_at, now())
+ WHERE last_seen_at IS NULL;
+
+-- ------------------------------------------------------------
+-- 语料种子：仅 demo 租户 + kb_assets_r2 + jinpin 源齐备时插入。
+-- 生产环境（无该 KB / 源）不留指向不存在对象的数据。
+-- 由 tests/eval/nl2sql/corpus.yaml 生成（2026-10-18 时为 35 条：
+-- 31 条 answer 带 control，4 条 refuse 的 control 为 NULL）。
+-- ------------------------------------------------------------
+INSERT INTO knowledge_base.evolution_corpus_cases
+  (id, tenant_id, name, question, tier, expect, control, kb_id, ds_id)
+SELECT md5('evo:'||c.name), 'tenant_jonex_demo', c.name, c.question, c.tier, c.expect,
+       c.control::jsonb, 'kb_assets_r2', '4cdb29e4-268c-4daf-8abe-7b879fa6abf0'
+FROM (VALUES
+      ('jobs_total', '一共有多少个职位', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs"]'),
+      ('company_total', '一共有多少家公司', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company"]'),
+      ('city_total', '系统里一共有多少个城市', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.citys"]'),
+      ('benefit_total', '一共有多少种福利', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.benefits"]'),
+      ('stock_cash_total', '一共有多少条余额流水', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.user_stock_cash"]'),
+      ('users_total', '一共有多少个用户', 'single_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.users"]'),
+      ('jobs_not_deleted', '有多少个职位还没被删除', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE is_del = 0"]'),
+      ('company_in_shenzhen', '在深圳市的公司有多少家', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company WHERE city_name = N''深圳市''"]'),
+      ('jobs_high_salary', '综合薪资上限超过一万的职位有多少个', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE max_comprehensive_salary > 10000"]'),
+      ('company_name_like_shenzhen', '公司名称里带“深圳”的有多少家', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company WHERE name LIKE N''%深圳%''"]'),
+      ('jobs_recruiting', '有多少个职位正在招聘中', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE status = ''1'' AND is_del = ''False''"]'),
+      ('jobs_recruiting_wording', '有多少个职位正在招人', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE status = ''1'' AND is_del = ''False''"]'),
+      ('jobs_pay_date_20th', '每月 20 号发工资的职位有多少个', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE pay_money_detail_date = N''每月20号''"]'),
+      ('jobs_created_2026', '2026 年发布的职位有多少个', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE create_time >= ''2026-01-01'' AND create_time < ''2027-01-01''"]'),
+      ('jobs_by_year', '按年份统计职位发布数量，从早到晚列出每一年', 'time_dim', 'answer', '["SELECT YEAR(create_time) AS y, COUNT(*) AS n FROM dbo.jobs GROUP BY YEAR(create_time) ORDER BY y"]'),
+      ('apply_jobs_2025', '2025 年一共有多少条投递记录', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.apply_jobs WHERE create_time >= ''2025-01-01'' AND create_time < ''2026-01-01''"]'),
+      ('jobs_created_2026_06', '2026 年 6 月发布了多少个职位', 'time_dim', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE create_time >= ''2026-06-01'' AND create_time < ''2026-07-01''"]'),
+      ('jobs_by_working_life', '按工作年限统计职位数量，只要两列：工作年限的名称，以及该年限下的职位数量（不要额外列出年限 ID）', 'cross_table', 'answer', '["SELECT w.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.working_lifes w ON j.working_lifes_id = w.id GROUP BY w.name ORDER BY COUNT(*) DESC", "SELECT w.name, COUNT(*) AS n FROM dbo.jobs j LEFT JOIN dbo.working_lifes w ON j.working_lifes_id = w.id GROUP BY w.name ORDER BY COUNT(*) DESC"]'),
+      ('top5_company_by_jobs', '发布职位最多的5家公司分别是哪几家，各发布了多少职位', 'cross_table', 'answer', '["SELECT TOP 5 c.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON j.company_id = c.id GROUP BY c.name ORDER BY COUNT(*) DESC", "SELECT TOP 5 c.name, COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON j.company_id = c.id GROUP BY c.id, c.name ORDER BY COUNT(*) DESC"]'),
+      ('company_name_shenzhen_jobs', '公司名字里带“深圳”的公司一共发布了多少个职位', 'cross_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id WHERE c.name LIKE N''%深圳%''"]'),
+      ('companies_with_intro', '在填了公司简介的公司里，这些公司一共发布了多少个职位（只要一个数字）', 'cross_table', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id WHERE c.intro IS NOT NULL AND c.intro <> ''''"]'),
+      ('top3_company_license', '发布职位最多的3家公司，它们的营业执照号分别是什么', 'cross_table', 'answer', '["SELECT TOP 3 c.name, c.business_license_number FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id GROUP BY c.id, c.name, c.business_license_number ORDER BY COUNT(*) DESC", "SELECT TOP 3 c.name, c.business_license_number FROM dbo.jobs j JOIN dbo.company c ON c.id = j.company_id GROUP BY c.name, c.business_license_number ORDER BY COUNT(*) DESC"]'),
+      ('jobs_within_500km_guangzhou', '从广州到上班地点少于 500 千米的职位有多少个？', 'filtered', 'answer', '["SELECT COUNT(*) AS n FROM dbo.jobs WHERE 111*SQRT(SQUARE(work_address_lat-23.1291)+SQUARE((work_address_lng-113.2644)*COS(RADIANS(23.1291)))) < 500"]'),
+      ('jobs_avg_salary_all', '所有职位的平均薪资是多少？', 'filtered', 'answer', '["SELECT ROUND(AVG((min_comprehensive_salary+max_comprehensive_salary)/2.0), 2) AS v FROM dbo.jobs WHERE min_comprehensive_salary > 0 AND max_comprehensive_salary > 0"]'),
+      ('jobs_avg_salary_guangzhou', '广州市职位的平均薪资是多少？', 'filtered', 'answer', '["SELECT ROUND(AVG((min_comprehensive_salary+max_comprehensive_salary)/2.0), 2) AS v FROM dbo.jobs WHERE min_comprehensive_salary > 0 AND max_comprehensive_salary > 0 AND work_address_city_name = N''广州市''"]'),
+      ('multi_hop_working_life_companies', '按工作年限统计发布过职位的公司数量，只要两列：工作年限名称，以及该年限下发布过职位的公司数量（不要额外列出年限 ID）', 'multi_hop', 'answer', '["SELECT w.name, COUNT(DISTINCT c.id) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.company c ON c.id = j.company_id GROUP BY w.name ORDER BY n DESC", "SELECT w.name, COUNT(DISTINCT c.name) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.company c ON c.id = j.company_id GROUP BY w.name ORDER BY n DESC"]'),
+      ('multi_hop_browsed_companies', '用户浏览过的职位一共来自多少家不同的公司？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT c.id) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.company c ON c.id = j.company_id", "SELECT COUNT(DISTINCT c.name) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.company c ON c.id = j.company_id"]'),
+      ('multi_hop_applied_companies', '收到过投递记录的职位，一共属于多少家不同的公司？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT c.id) AS n FROM dbo.apply_jobs a JOIN dbo.jobs j ON j.id = a.job_id JOIN dbo.company c ON c.id = j.company_id", "SELECT COUNT(DISTINCT c.name) AS n FROM dbo.apply_jobs a JOIN dbo.jobs j ON j.id = a.job_id JOIN dbo.company c ON c.id = j.company_id"]'),
+      ('multi_hop_applies_by_experience', '要求 1 年以下工作经验的职位一共收到了多少条投递记录？', 'multi_hop', 'answer', '["SELECT COUNT(*) AS n FROM dbo.working_lifes w JOIN dbo.jobs j ON j.working_lifes_id = w.id JOIN dbo.apply_jobs a ON a.job_id = j.id WHERE w.name = N''1年以下''"]'),
+      ('multi_hop_shenzhen_company_browsed', '公司名称里带“深圳”的公司的职位，一共被用户浏览了多少次？', 'multi_hop', 'answer', '["SELECT COUNT(*) AS n FROM dbo.company c JOIN dbo.jobs j ON j.company_id = c.id JOIN dbo.browsing_histories b ON b.job_id = j.id WHERE c.name LIKE N''%深圳%''"]'),
+      ('multi_hop_browsed_and_applied_jobs', '既被用户浏览过、又收到过投递的职位一共有多少个？', 'multi_hop', 'answer', '["SELECT COUNT(DISTINCT j.id) AS n FROM dbo.browsing_histories b JOIN dbo.jobs j ON j.id = b.job_id JOIN dbo.apply_jobs a ON a.job_id = j.id"]'),
+      ('refuse_gross_margin', '上个月的毛利是多少', 'ambiguous', 'refuse', NULL),
+      ('refuse_avg_performance', '员工的平均绩效分是多少', 'ambiguous', 'refuse', NULL),
+      ('refuse_stock_price', '哪家公司的股价最高', 'ambiguous', 'refuse', NULL),
+      ('refuse_customer_churn', '这个月的客户流失率是多少', 'ambiguous', 'refuse', NULL)
+) AS c(name, question, tier, expect, control)
+WHERE EXISTS (
+    SELECT 1 FROM knowledge_base.knowledge_info
+    WHERE id = 'kb_assets_r2'
+      AND tenant_id = 'tenant_jonex_demo'
+      AND is_deleted = 0
+  )
+  AND EXISTS (
+    SELECT 1 FROM knowledge_base.knowledge_data_sources
+    WHERE id = '4cdb29e4-268c-4daf-8abe-7b879fa6abf0'
+      AND tenant_id = 'tenant_jonex_demo'
+      AND knowledge_base_id = 'kb_assets_r2'
+      AND is_deleted = 0
+  )
+ON CONFLICT DO NOTHING;
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 index
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 037_roles_tenant_name_unique.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/037_roles_tenant_name_unique.sql
+BEGIN;
+
+-- ============================================================
+-- platform.roles 补 (tenant_id, name) partial unique index（存量库增量 DDL，幂等可重跑）
+-- 版本: 037
+-- 对应全量 DDL: deploy/postgres/migrations/002_platform.sql（RBAC 角色表段）
+-- 依据: SSO 首登 / 企业身份同步建号后需按名绑「普通用户」角色，该方法因此进入登录与同步关键链路
+-- 命名对齐: 002_platform.sql:61 的 users_tenant_id_username_key（同类 partial unique，软删隔离）
+--
+-- 用途
+--   002 建 platform.roles 时只给了 roles_pkey 与 idx_roles_tenant(tenant_id)，**没有**
+--   (tenant_id, name) 唯一约束。034 头部注释第 29 行已记载这一事实（"ON CONFLICT 在 role 表
+--   上无效，故角色插入一律用 NOT EXISTS 自保"），006_seed_data.sql:265 的
+--   `ON CONFLICT DO NOTHING` 在 role 表上同样是空转。
+--
+--   后果有两层：
+--     1) 数据层：靠 name 对齐的播种/复制语句（006:279/290/299、034:155/157）一旦库里有
+--        同名重复行，JOIN 会**成倍放大**插入行 —— 多建角色、多绑权限、多绑用户角色。
+--     2) 代码层：RoleRepository.get_by_name()（capabilities/platform/repository/role_repository.py:14-23）
+--        用 result.scalar_one_or_none()。同名重复时 SQLAlchemy 抛 MultipleResultsFound。
+--        该方法当前只被角色管理的 create/update（role_service.py:50/96）调用，炸掉影响面有限；
+--        但同批落地的建号绑角色修复要把它放进 **SSO 首登与企业身份同步建号** 的关键链路（建号后
+--        按名绑「普通用户」角色），届时任一租户存在同名角色 → 登录与同步整条链路 500。
+--
+--   已拍板的处置方向是**加唯一约束、不改查询**：约束在数据层把「同名重复」这个状态变成不可表达，
+--   比在代码层做去重分流更省、更不容易漏调用点。
+--
+-- 语义（为什么是 partial index 而非普通 unique 约束）
+--   带 `WHERE is_deleted = 0`，即**只对活跃行**要求 (tenant_id, name) 唯一。正确性在于：
+--   该表是软删模型 —— 删掉「临时管理员」再重建一个同名角色，是合法且常见的运维动作
+--   （role_service.delete 走 is_deleted 而非物理删除）。若唯一性覆盖已软删行，这个动作就会
+--   被约束挡住，等于把软删语义在角色表上打折。partial 让「同名只可能有一个活着」成立，
+--   同时历史软删行不影响任何新写入 —— 与 users_tenant_id_username_key 的取舍完全一致。
+--
+--   注意 NULL：is_deleted 列有 DEFAULT 0，但历史行若为 NULL，`NULL = 0` 不为真，该行既不进
+--   索引、也不会被 get_by_name 的 `is_deleted == 0` 谓词命中 —— 两边谓词严格对齐，
+--   不存在「索引不管、查询能查到」的缝隙。
+--
+-- 幂等
+--   建索引用 IF NOT EXISTS；重复执行不会报错、不会重建。前置检查块在无重复时静默通过。
+--   本文件是增量 DDL，不在 migrations/ 新增或修改任何 sql；由人工触发
+--   （make db-migrate-dry 预览 / make db-migrate 执行），版本表按文件名追踪。
+--
+-- 前置条件（无法由脚本代替人工判断）
+--   脚本会自检活跃重复行，**有重复则 RAISE EXCEPTION 中止**（不登记版本、修复后可重跑），
+--   报错信息会列出冲突的 tenant_id / name。人工处置口径见脚本内 HINT。
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- 1. 前置检查：活跃（is_deleted = 0）同名角色必须为空集
+--    否则第 2 步的 CREATE UNIQUE INDEX 会失败于裸的 Postgres 错误（23505 + 重复键值），
+--    信息量不足以定位到具体租户/角色名。这里先自检并给出中文原因与冲突清单。
+--    无重复时为 no-op，可重复执行。
+-- ------------------------------------------------------------
+DO $$
+DECLARE
+    dup_groups INTEGER;
+    dup_detail TEXT;
+BEGIN
+    SELECT COUNT(*), string_agg(
+               format('tenant_id=%L  name=%L  重复 %s 行', d.tenant_id, d.name, d.cnt),
+               E'\n  ' ORDER BY d.tenant_id, d.name)
+      INTO dup_groups, dup_detail
+      FROM (
+          SELECT tenant_id, name, COUNT(*) AS cnt
+            FROM platform.roles
+           WHERE is_deleted = 0
+           GROUP BY tenant_id, name
+          HAVING COUNT(*) > 1
+      ) d;
+
+    IF dup_groups > 0 THEN
+        RAISE EXCEPTION E'platform.roles 存在 % 组活跃（is_deleted = 0）同名角色，无法建立 (tenant_id, name) 唯一索引。\n冲突清单：\n  %\n处置：每个 (tenant_id, name) 只保留一行，其余行置 is_deleted = 1（软删）或改名，然后重跑本脚本。\n注意先确认保留下来的那一行的 role_permissions / user_roles 绑定是否完整，被软删行的绑定不会自动迁移。',
+            dup_groups, dup_detail;
+    END IF;
+END $$;
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 column
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 049_task_center_subtask_report_columns.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/049_task_center_subtask_report_columns.sql
+BEGIN;
+
+
+-- ④ `task_id` 收紧为 NOT NULL（与 ORM 对齐）：先按 `execution_id` 回填存量行，对不上
+--    （任务已删 / 凭证已被重试清掉 —— 收件箱本来就允许这类报文落库）的置空串兜底，
+--    最后才 `SET NOT NULL`。重复执行安全：回填是空操作、`SET NOT NULL` 幂等。
+UPDATE task_center.subtask_reports r
+   SET task_id = s.task_id
+  FROM task_center.subtasks s
+ WHERE r.task_id IS NULL AND s.execution_id IS NOT NULL AND r.execution_id = s.execution_id;
+
+UPDATE task_center.subtask_reports SET task_id = '' WHERE task_id IS NULL;
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 constraint
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 052_task_stopped_status.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/052_task_stopped_status.sql
+BEGIN;
+
+
+-- ── 预置编排：开 v2，把两个下游联动开关显式写进每个节点 ──
+--
+-- 内容从 v1 **派生**（`jsonb_set` 只替换 `steps`，每个 step 用 `||` 补两个键，
+-- 其余一字不动）；新 id 由 v1 的 id 换尾号得来。`ORDER BY ord` 保住步骤顺序 ——
+-- 顺序在这里是有意义的（同层 `sort` 与拓扑序都靠它）。
+INSERT INTO task_center.task_definition_versions
+  (id, scope, tenant_id, definition_id, space_id, version_no, status, config, published_at)
+SELECT
+  replace(v.id, '-v1', '-v2'),
+  v.scope, v.tenant_id, v.definition_id, v.space_id,
+  2,
+  'published',
+  jsonb_set(
+    v.config,
+    '{steps}',
+    coalesce(
+      (
+        SELECT jsonb_agg(
+                 step || '{"downstream_on_retry": true, "downstream_on_stop": true}'::jsonb
+                 ORDER BY ord
+               )
+        FROM jsonb_array_elements(v.config -> 'steps') WITH ORDINALITY AS t(step, ord)
+      ),
+      '[]'::jsonb
+    )
+  ),
+  CURRENT_TIMESTAMP
+FROM task_center.task_definition_versions v
+WHERE v.version_no = 1
+  AND v.status = 'published'
+  AND v.definition_id IN (
+    'definition-file-processing-ontology',
+    'definition-file-processing-ontology-wiki',
+    'definition-file-processing-jonex-wiki'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM task_center.task_definition_versions x
+    WHERE x.definition_id = v.definition_id AND x.version_no = 2
+  );
+
+-- 定义指向新版本（`EXISTS` 保证只有 v2 真落库了才推）
+UPDATE task_center.task_definitions d
+SET current_version_no = 2, updated_at = CURRENT_TIMESTAMP
+WHERE d.id IN (
+    'definition-file-processing-ontology',
+    'definition-file-processing-ontology-wiki',
+    'definition-file-processing-jonex-wiki'
+  )
+  AND d.current_version_no < 2
+  AND EXISTS (
+    SELECT 1 FROM task_center.task_definition_versions x
+    WHERE x.definition_id = d.id AND x.version_no = 2 AND x.status = 'published'
+  );
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 constraint
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 063_kb_type_normalization.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/063_kb_type_normalization.sql
+BEGIN;
+
+
+-- 1) knowledge_info.kb_type：strip + lower
+UPDATE knowledge_base.knowledge_info
+   SET kb_type = lower(btrim(kb_type)),
+       updated_at = NOW()
+ WHERE kb_type IS DISTINCT FROM lower(btrim(kb_type));
+
+-- 2) 文档快照 extra_metadata.kb_type：与库表同一口径
+UPDATE knowledge_base.knowledge_documents
+   SET extra_metadata = jsonb_set(
+           extra_metadata,
+           '{kb_type}',
+           to_jsonb(lower(btrim(extra_metadata->>'kb_type'))),
+           false
+       ),
+       updated_at = NOW()
+ WHERE extra_metadata ? 'kb_type'
+   AND extra_metadata->>'kb_type' IS DISTINCT FROM lower(btrim(extra_metadata->>'kb_type'));
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 2026-11-12 补全：全新库 constraint
+-- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 102_monitor_call_log_call_scope.sql` 段。
+-- ------------------------------------------------------------------
+-- >>> 并入 update/102_monitor_call_log_call_scope.sql
+BEGIN;
+
+
+-- 回填历史行。幂等：只碰 NULL，回填后不再命中。
+UPDATE monitor.call_log
+SET call_scope = CASE
+    WHEN direction = 'inbound' THEN 'open'
+    WHEN protocol = 'openai' THEN 'external'
+    ELSE 'internal'
+END
+WHERE call_scope IS NULL;
+
+COMMIT;
+
+
+-- ------------------------------------------------------------------
+-- 种子之后：business_domain.data_access_methods 补 dam_database
+--
+-- 为什么在种子之后：这张表的 5 条示例数据由本文件的种子段写入，而「数据库接入」
+-- 这一条是后来在 update/038_database_access_method.sql 里加的 —— 只在 update/ 里
+-- 加过、migrations/ 没跟上，全新库就少一条（生产库有，access_type='database'，
+-- 后端 `_VALID_ACCESS_TYPES` 认它）。幂等：ON CONFLICT (id) DO NOTHING。
+-- ------------------------------------------------------------------
+BEGIN;
+
+INSERT INTO business_domain.data_access_methods (id, name, access_type, config_json, status) VALUES
+    ('dam_database', '数据库接入', 'database',
+     '{"description":"直连 PostgreSQL / MySQL / SQL Server 读取库表结构（只读 information_schema，不取业务数据）"}'::jsonb,
+     'active')
+ON CONFLICT (id) DO NOTHING;
+
+COMMIT;

@@ -30,6 +30,18 @@ RUN if [ "$USE_OVERSEAS_MIRROR" = "true" ]; then \
         && pip config set global.trusted-host mirrors.cloud.tencent.com; \
     fi
 
+# 替换腾讯源；国外源构建时跳过。
+# trixie-updates 组件腾讯云镜像未同步（无 Release 文件），apt update 会失败，故从 Suites 中移除。
+# 口径同 atomic-rag.Dockerfile；此前缺失导致国内构建走 deb.debian.org 官方源，
+# ffmpeg/poppler 依赖下载耗时 60+ 分钟（2026-10-21 服务器实测）。
+RUN if [ "$USE_OVERSEAS_MIRROR" != "true" ]; then \
+        sed -i \
+            -e 's|^URIs: http://deb.debian.org/debian$|URIs: http://mirrors.cloud.tencent.com/debian|' \
+            -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: http://mirrors.cloud.tencent.com/debian-security|' \
+            -e 's| trixie-updates||g' \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi
+
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 

@@ -31,6 +31,16 @@ COPY jonex_core/ ./jonex_core/
 ARG CAPABILITY_NAME
 COPY capabilities/${CAPABILITY_NAME}/ ./capabilities/${CAPABILITY_NAME}/
 
+# W1.6：只有 knowledge-base 需要 Arrow IPC 序列化（查询结果契约 output="arrow"）。
+# 三个理由不做进共享 requirements.txt：
+#   1. pyarrow 的 wheel 约 30–40MB，会把所有后端镜像一起撑大；
+#   2. 它是**可选**能力 —— 没装时契约回明确的 400（kind="format"），不会静默降级；
+#   3. 版本跟 uv.lock 对齐（`pyproject.toml` 的 `arrow` extra 解析到同一版本）。
+# 升级 pyarrow 时先 `uv lock`，再同步这里的 pin。
+RUN if [ "$CAPABILITY_NAME" = "knowledge_base" ]; then \
+        pip install --no-cache-dir "pyarrow==26.0.1"; \
+    fi
+
 # 复制能力启动模板
 COPY deploy/start_capability.py .
 

@@ -4,10 +4,20 @@
 #
 # 背景：Docker PostgreSQL 的 /docker-entrypoint-initdb.d 只在数据卷首次初始化执行，
 #   只覆盖 migrations/（全量 DDL）。后续迭代的表结构/字段变更统一沉淀为
-#   update/NNN_*.sql（存量库增量 DDL，全部 IF [NOT] EXISTS 幂等）。
+#   update/ 下的增量 DDL（全部 IF [NOT] EXISTS 幂等）。
 #
-# 本脚本按文件名序应用 update/*.sql 到运行中的 jonex-postgres 容器。
-# 迁移状态记录在 public.schema_migrations 版本表：已应用文件跳过、不重复执行，
+# 形态：**2026-11-12 起，历史 91 份增量脚本已从仓库删除**（它们在所有现有环境
+#   都已执行过；全新库由 migrations/ 一次建好，不需要再回放历史）。因此本目录现在
+#   只有两类东西：本执行器 + 真实的新增量脚本，命名「14 位时间戳_描述.sql」，
+#   例如 `20261112160612_add_kb_archive_flag.sql`（时间戳 = YYYYMMDDHHMMSS）。
+#   执行顺序 = 文件名字典序，时间戳天然就是时间顺序，不需要人工维护编号上限。
+#
+#   兼容：若以后又要把历史脚本合并回一个文件，放进 `update/*_baseline.sql`
+#   （段标记 `-- >>> SECTION: <原脚本文件名>`）即可 —— 脚本按 `*_baseline.sql`
+#   匹配（文件名不作约定，`000_baseline.sql` / `20261112160612_baseline.sql` 都认），
+#   先把 91 段按段执行并**按段登记**（登记名 = 段名 = 原文件名），再按字典序跑独立脚本。
+#
+# 迁移状态记录在 public.schema_migrations 版本表：已应用（段）跳过、不重复执行，
 # 执行成功才登记，失败中断不登记（修复后重跑将重试）。
 # 迁移须由人工显式触发（make db-migrate），不再由 make up 自动执行。
 #
@@ -48,20 +58,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---- 参数解析 ----
 DRY_RUN=0
 ASSUME_YES=0
+ONLY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
+    --only) ONLY="${2:-}"; shift ;;
+    --only=*) ONLY="${1#--only=}" ;;
     --help|-h)
       cat <<'EOF'
-用法: apply.sh [--dry-run] [--yes]
+用法: apply.sh [--dry-run] [--yes] [--only <段名>]
 
   （无参数）交互确认后执行待应用迁移
   --dry-run  只预览待应用迁移列表，不执行、不登记
   --yes/-y   跳过确认直接执行（CI / 自动化）
+  --only <段名>  只执行指定单元（段名 = 原脚本文件名，如 009_structured_data.sql）；
+             **已登记也照跑**，用于「旧内容已登记、需按新内容手工补跑一次」的场景。
 
 环境变量: JONEX_PG_CONTAINER / JONEX_PG_USER / JONEX_PG_DB / JONEX_PG_SKIP_FILE
           JONEX_PG_DISABLE_STRUCTURAL_SKIP=1（关掉结构前提自动豁免，排障用）
+
+单元名 = update/ 下的脚本文件名；用 --only 可单独补跑一个（已登记也照跑）。
 
 结构前提自动豁免（默认开启）：依赖旧结构（已被后续版本删除）的历史脚本，
 在新结构库上会登记为已应用并跳过，不再必然失败。判据只看库的真实结构。
@@ -142,9 +159,74 @@ SQL
 # ---- 探测库的真实结构（决定哪些历史脚本可以安全豁免）----
 structural_probe
 
+# ---- 迁移单元解析：单文件基线按段拆出，逐文件模式直接沿用 ----
+# 拆到临时目录，段名即原文件名；这样已应用判断、全新库豁免、结构豁免都按「段名」走，
+# 与合并前逐文件完全一致。临时目录在退出时清理。
+WORK_DIR="$(mktemp -d)"
+# 基线文件 = update/ 下名字以 `_baseline.sql` 结尾的那一个。**当前没有**
+# （历史合并体已于 2026-11-12 删除），此时直接走「逐文件」模式；
+# 以后若重新合并历史脚本，放进来就能自动按段执行，文件名不作约定。
+BASELINE=""
+baseline_found=()
+for f in "${SCRIPT_DIR}"/*_baseline.sql; do
+  [[ -f "$f" ]] && baseline_found+=("$f")
+done
+if [[ ${#baseline_found[@]} -gt 1 ]]; then
+  echo "==> update/ 下有多个基线文件（*_baseline.sql），只允许保留一个：" >&2
+  printf '    - %s\n' "${baseline_found[@]##*/}" >&2
+  exit 2
+fi
+[[ ${#baseline_found[@]} -eq 1 ]] && BASELINE="${baseline_found[0]}"
+
+SCRIPTS=()
+if [[ -n "$BASELINE" ]] && grep -q '^-- >>> SECTION: ' "$BASELINE"; then
+  awk -v dir="$WORK_DIR" '
+    /^-- >>> SECTION: / {
+      name = $0; sub(/^-- >>> SECTION: /, "", name); sub(/\r$/, "", name)
+      out = dir "/" name; printf "" > out; next
+    }
+    /^-- <<< SECTION: / { out = ""; next }
+    out != "" { print >> out }
+  ' "$BASELINE"
+  while IFS= read -r seg; do
+    SCRIPTS+=("$WORK_DIR/$seg")
+  done < <(awk '/^-- >>> SECTION: / { sub(/^-- >>> SECTION: /, ""); sub(/\r$/, ""); print }' "$BASELINE")
+  seg_count=${#SCRIPTS[@]}
+  # 基线段跑完之后，再按字典序跑目录里其余的独立增量脚本。
+  # 命名约定：新增脚本用「14 位时间戳_描述.sql」，字典序即时序（老交付包里的
+  # NNN_*.sql 也照样能跑，只是会提示迁移到新命名）。
+  extra=0
+  for f in "${SCRIPT_DIR}"/*.sql; do
+    [[ "$f" == "$BASELINE" ]] && continue
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"
+    if [[ ! "$base" =~ ^[0-9]{14}_ ]]; then
+      echo "WARN  ${base} 不是「时间戳_描述.sql」命名（如 20261112160612_add_flag.sql），建议改名" >&2
+    fi
+    SCRIPTS+=("$f")
+    extra=$((extra + 1))
+  done
+  UNIT_MODE="分段（$(basename "$BASELINE")，${seg_count} 段）+ 独立脚本 ${extra} 个"
+else
+  for f in "${SCRIPT_DIR}"/*.sql; do
+    # 目录为空时通配符不展开，会得到字面量 "*.sql" —— 必须显式挡掉。
+    [[ -f "$f" ]] || continue
+    SCRIPTS+=("$f")
+  done
+  UNIT_MODE="逐文件（update/*.sql）"
+fi
+if [[ ${#SCRIPTS[@]} -eq 0 ]]; then
+  # 正常状态：历史基线已删除，且还没有新增量。不是错误，退出码 0，
+  # 否则 `make db-migrate` 在「无事可做」时会误报失败。
+  echo "==> update/ 下没有迁移脚本（历史基线已于 2026-11-12 删除，暂无新增量）。"
+  exit 0
+fi
+
+echo "==> 迁移单元：${UNIT_MODE}"
+
 # ---- 读取已应用文件列表 ----
 applied_file="$(mktemp)"
-trap 'rm -f "$applied_file"' EXIT
+trap 'rm -f "$applied_file"; rm -rf "${WORK_DIR:-}"' EXIT
 docker exec -i "$CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tA \
   -c "SELECT filename FROM public.schema_migrations;" > "$applied_file"
 
@@ -156,7 +238,22 @@ pending=()
 to_register=()
 skipped=0
 structural_skipped=0
-for f in "${SCRIPT_DIR}"/*.sql; do
+if [[ -n "$ONLY" ]]; then
+  filtered=()
+  for f in "${SCRIPTS[@]}"; do
+    [[ "$(basename "$f")" == "$ONLY" ]] && filtered+=("$f")
+  done
+  if [[ ${#filtered[@]} -eq 0 ]]; then
+    echo "==> 找不到单元: ${ONLY}（可用 --dry-run 看单元清单）" >&2
+    exit 2
+  fi
+  SCRIPTS=("${filtered[@]}")
+  echo "==> --only ${ONLY}：忽略登记状态，强制执行该单元"
+  # 让「已应用」判断失效：把已应用清单换成空文件
+  : > "$applied_file"
+fi
+
+for f in "${SCRIPTS[@]}"; do
   name="$(basename "$f")"
   if grep -qxF "$name" "$applied_file"; then
     echo "SKIP  ${name}（已应用）"

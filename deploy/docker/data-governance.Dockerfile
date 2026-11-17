@@ -24,7 +24,12 @@ COPY jonex_core/ ./jonex_core/
 ARG CAPABILITY_NAME
 COPY capabilities/${CAPABILITY_NAME}/ ./capabilities/${CAPABILITY_NAME}/
 
-# 数据治理额外依赖 knowledge_base 包（血缘来源的能力侧定义）
+# 数据治理额外依赖 knowledge_base 包（空间/KB 授权、指标校验直接复用其服务）。
+# 注意：**不要**为此再 COPY reasoner/ —— KB 侧唯一用到它的 tbox/editor_service
+# 已改为函数内按需 import（2026-11-17），租户管理员判定也上移内核
+# `jonex_core/common/tenant_admin.py`。本镜像此前因缺 reasoner 启动即崩
+# （ModuleNotFoundError 循环重启），修的是「KB 别在模块级依赖 reasoner」，
+# 不是「给数据治理补一个 reasoner」。
 COPY capabilities/knowledge_base/ ./capabilities/knowledge_base/
 
 # 复制能力启动模板
