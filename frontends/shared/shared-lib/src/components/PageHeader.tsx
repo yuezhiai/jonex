@@ -7,6 +7,8 @@ import { useTranslation } from 'react-i18next';
 export interface PageHeaderProps {
   /** 页头标题。 */
   title: React.ReactNode;
+  /** 标题下方的说明文字，用于原来各页面手写的副标题段落。 */
+  subtitle?: React.ReactNode;
   /** 标题旁的附加内容，与标题同一行。 */
   extra?: React.ReactNode;
   /** 返回按钮，渲染在标题左侧。传路径按该路径跳转，传函数自行处理；不传则不渲染。 */
@@ -66,11 +68,21 @@ const BackButton: React.FC<{ backTo: string | (() => void); backText?: boolean |
   );
 };
 
-/** 页面头部：可选返回按钮 + h1 标题 + 同行附加内容；都不传时退化成裸 h1。 */
-const PageHeader: React.FC<PageHeaderProps> = ({ title, extra, backTo, backText, style }) => {
-  const merged = { ...DEFAULT_STYLE, ...style };
+/** 页头行：返回按钮 + 标题 + 附加内容。 */
+const ROW_STYLE: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-end',
+  gap: EXTRA_GAP,
+};
 
-  if (!hasBack(backTo) && !hasContent(extra)) {
+/**
+ * 页面头部：可选返回按钮 + h1 标题 + 同行附加内容 + 可选副标题；都不传时退化成裸 h1。
+ */
+const PageHeader: React.FC<PageHeaderProps> = ({ title, subtitle, extra, backTo, backText, style }) => {
+  const merged = { ...DEFAULT_STYLE, ...style };
+  const hasSubtitle = hasContent(subtitle);
+
+  if (!hasBack(backTo) && !hasContent(extra) && !hasSubtitle) {
     return (
       // level={1} 而非 level={3}：level 同时决定 DOM 标签，用 1 保住 <h1> 语义（字号已被覆盖）
       <Typography.Title level={1} style={merged}>
@@ -82,13 +94,26 @@ const PageHeader: React.FC<PageHeaderProps> = ({ title, extra, backTo, backText,
   // 下边距挂在这一行上：flex item 的 margin 不参与塌陷，留在标题上会把标题顶高、与其他元素底边错开。
   // alignItems 用 flex-end 让 extra 的底边与标题对齐，返回按钮更矮、对齐后视觉上即居中。
   const { marginBottom, ...titleStyle } = merged;
-  return (
-    <div style={{ display: 'flex', alignItems: 'flex-end', gap: EXTRA_GAP, marginBottom }}>
+
+  const row = (
+    <div style={ROW_STYLE}>
       {hasBack(backTo) && <BackButton backTo={backTo} backText={backText} />}
       <Typography.Title level={1} style={{ ...titleStyle, marginBottom: 0, ...TITLE_IN_ROW_STYLE }}>
         {title}
       </Typography.Title>
       {extra}
+    </div>
+  );
+
+  if (!hasSubtitle) {
+    return <div style={{ ...ROW_STYLE, marginBottom }}>{row}</div>;
+  }
+
+  return (
+    <div style={{ marginBottom }}>
+      {row}
+      {/* 样式取 layout.css 的 .yx-page-subtitle（token 化），不在这里另定一套 */}
+      <div className="yx-page-subtitle">{subtitle}</div>
     </div>
   );
 };

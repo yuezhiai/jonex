@@ -6,7 +6,7 @@ import { StyleProvider } from '@ant-design/cssinjs';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
 import { LANGUAGE_STORAGE_KEY } from '@jonex/i18n-resources';
-import { antdTheme, sharedCache } from '@jonex/platform-theme';
+import { sharedCache, withCssVarKey } from '@jonex/platform-theme';
 import { redirectToLogin, writeCachedUser, scheduleAutoRefresh, refreshTokens } from '@jonex/shell-sdk';
 import Login from './pages/Login';
 import SsoError from './pages/SsoError';
@@ -201,7 +201,7 @@ function App() {
     // StyleProvider 统一共享 cssinjs cache（跨所有应用同一 instanceId）：
     // 避免 MF 切换子项目时组件 token 变量 <style>（.antd.ant-dropdown-css-var）被误删
     <StyleProvider cache={sharedCache}>
-      <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+      <ConfigProvider locale={antdLocale} theme={withCssVarKey('jonex-shell')}>
         <BrowserRouter>
           {/* 子应用之间的跳转（jonex:navigate）：交给本 router 做 SPA 导航，不重载文档 */}
           <CrossAppNavigator />

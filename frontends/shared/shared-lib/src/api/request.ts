@@ -49,6 +49,20 @@ function toHttpApiError(error: import('axios').AxiosError): ApiError {
   return apiError;
 }
 
+/**
+ * 当前 UI 语言对应的后端 `X-Lang` 取值（与 `jonex_locale` 存储唯一同源）。
+ *
+ * axios 拦截器会自动注入；**裸 `fetch`（SSE 流式检索等）不走拦截器**，
+ * 必须自己带上，否则后端按 `DEFAULT_LOCALE`（en-US）回文案，
+ * 中文界面反而拿到英文错误。
+ */
+export function getLangHeader(): string {
+  // node 环境（vitest 纯逻辑测试）没有 localStorage：按默认 en 处理，不抛错。
+  const locale =
+    typeof localStorage === 'undefined' ? 'en' : localStorage.getItem('jonex_locale') || 'en';
+  return locale === 'en' ? 'en-US' : 'zh-CN';
+}
+
 /** 登录接口 401 语义为凭据错误，不做 token 过期处理（兼容相对路径 /auth/login 与绝对路径 /api/v1/auth/login） */
 function isLoginRequest(config: AxiosRequestConfig | undefined): boolean {
   return /\/auth\/login(\?.*)?$/.test(config?.url ?? '');
@@ -102,8 +116,7 @@ export function createRequest(options: CreateRequestOptions = {}): ApiClient {
       }
     }
     if (injectLang) {
-      const locale = localStorage.getItem('jonex_locale') || 'en';
-      config.headers['X-Lang'] = locale === 'en' ? 'en-US' : 'zh-CN';
+      config.headers['X-Lang'] = getLangHeader();
     }
     return config;
   });

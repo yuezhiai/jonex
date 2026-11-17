@@ -112,7 +112,14 @@ export function useTableQuery<Row, F extends Record<string, unknown>>({
       })
       .finally(() => {
         if (seq !== seqRef.current) return;
-        if (!silent) setLoading(false);
+        // 最后一次取数落定，遮罩就必须摘掉——不能只看自己是不是静默的那一次。
+        // 静默重取会顶掉仍在飞的非静默取数（典型：详情页首屏加载时，Wiki 编译状态
+        // 轮询先回来触发了 silent refresh），那条被顶掉的请求 finally 里因 seq 不匹配
+        // 提前 return，如果这里也按 silent 跳过，就再没人把 loading 置回 false，
+        // 表格会永久停在加载态。
+        // 静默本身从不点亮 loading，所以这里对「静默且没有非静默在飞」的情况是无害的
+        // 幂等写：值没变，React 直接跳过重渲染。
+        setLoading(false);
       });
   }, [page, pageSize, filters, paginated, tick]);
 

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
-import { antdTheme } from '@jonex/platform-theme';
+import { withCssVarKey } from '@jonex/platform-theme';
 import '@/locales/i18n';
 import AppRoute from '@/router';
 import { writeAccessToken, writeCachedUser } from '@jonex/shell-sdk';
@@ -29,7 +29,7 @@ export default function mount(container: HTMLElement, shellContext?: ShellContex
   const root = createRoot(container);
 
   root.render(
-    <ConfigProvider locale={antdLocale} theme={antdTheme}>
+    <ConfigProvider locale={antdLocale} theme={withCssVarKey('jonex-template')}>
       <AppRoute basename={basePath || '/apps/{{APP_ID}}'} mode="hosted" shellContext={shellContext} />
     </ConfigProvider>,
   );

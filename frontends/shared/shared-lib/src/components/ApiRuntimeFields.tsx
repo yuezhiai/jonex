@@ -196,7 +196,12 @@ export default function ApiRuntimeFields({ allowNone = true, hasSecret = false }
               extra={t('toolRuntime.urlHint')}
               rules={[
                 { required: true, whitespace: true, message: t('toolRuntime.urlRequired') },
-                { pattern: /^https?:\/\/[^\s{}/]+(\/\S*)?$/i, message: t('toolRuntime.urlInvalid') },
+                {
+                  pattern: /^https?:\/\/[^\s{}/]+(\/\S*)?$/i,
+                  message: t('toolRuntime.urlInvalid'),
+                  // 粘贴地址常带首尾空白；先在规则里 trim，避免“改完仍报地址不合法”
+                  transform: (value: string | undefined) => (value || '').trim(),
+                },
               ]}
             >
               <Input placeholder="https://api.example.com/cards/{card_no}/status" />

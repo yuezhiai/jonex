@@ -68,7 +68,7 @@ function DebouncedInput<F extends Record<string, unknown>>({ config, ctx }: Filt
     <Input
       allowClear
       // 存量 17 个列表页的筛选输入框清一色是关键词搜索，统一带图标
-      prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+      prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
       placeholder={config.placeholder}
       style={{ width: config.width ?? DEFAULT_WIDTH }}
       value={text}

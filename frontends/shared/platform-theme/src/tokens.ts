@@ -40,14 +40,21 @@ export const colors = {
   overlay: 'rgba(0, 0, 0, 0.03)',
 } as const;
 
+/**
+ * 页面尺度的 JS 侧镜像。
+ *
+ * 运行时真源是 theme.css / layout.css 里的 --yx-* 变量，侧栏宽度则来自
+ * AppLayout.tsx 的 SIDEBAR_WIDTH 常量。本对象只服务确实需要数值的场景（JS 计算、
+ * 内联 style），任何一项改动都必须与 CSS 变量同步，否则两套值会再次漂移。
+ */
 export const spacing = {
-  sidebarWidth: 240,
-  topbarHeight: 64,
-  contentPaddingX: 32,
-  contentPaddingY: 28,
-  cardPadding: 16,
-  pageTitleMb: 24,
-  toolbarMb: 20,
+  sidebarWidth: 200, // AppLayout.tsx SIDEBAR_WIDTH
+  topbarHeight: 50, // --yx-topbar-height
+  contentPaddingX: 16, // --yx-content-padding-x
+  contentPaddingY: 16, // --yx-content-padding-y
+  cardPadding: 16, // --yx-card-padding
+  pageTitleMb: 16, // PageHeader DEFAULT_STYLE.marginBottom
+  toolbarMb: 20, // .yx-toolbar margin-bottom
   sectionHeaderMb: 16,
   paginationMt: 20,
 } as const;

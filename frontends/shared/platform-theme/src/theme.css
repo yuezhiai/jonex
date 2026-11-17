@@ -32,6 +32,10 @@
      宽度必须以数值传给 Sider，CSS 变量无法参与其内联 style 计算。 */
   --yx-topbar-height: 50px; /* 通栏顶栏高度基线（layout.css 用 min-height 消费，内容可上撑） */
   --yx-card-radius: 10px;
+  --yx-modal-radius: 12px;
+  --yx-bg-card: #ffffff;
+  --yx-bg-subtle: #f8fafc;
+  --yx-bg-muted: #f1f5f9;
   --yx-btn-radius: 8px;
   --yx-tag-radius: 12px;
   --yx-input-radius: 8px;
@@ -46,12 +50,15 @@
   --yx-font-mono: 'SF Mono', 'Fira Code', monospace;
   --yx-success-text: #059669;
   --yx-warning-text: #d97706;
+  --yx-error-text: #dc2626;
   --yx-success-bg: #ecfdf5;
   --yx-warning-bg: #fff7ed;
+  --yx-info-bg: #eff6ff;
   --yx-result-card-radius: 12px;
   --yx-font-size-page-title: 24px;
   --yx-font-size-section-title: 17px;
   --yx-font-size-card-title: 16px;
+  --yx-font-size-kpi: 24px;
   --yx-font-size-body: 14px;
   --yx-font-size-small: 13px;
   --yx-font-size-caption: 12px;
@@ -59,7 +66,6 @@
   --yx-font-weight-page-title: 700;
   --yx-font-weight-section-title: 600;
   --yx-font-weight-card-title: 600;
-  --yx-page-btn-size: 34px;
   --yx-danger-bg: #fef2f2;
 }
 

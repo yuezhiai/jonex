@@ -4,8 +4,8 @@ export type { PermButtonProps } from './components/PermButton';
 export { default as usePermission } from './hooks/usePermission';
 export type { UsePermissionResult } from './hooks/usePermission';
 
-// 统一请求入口：createRequest / getData / ApiClient / ApiResponse / ApiError
-export { createRequest, getData } from './api/request';
+// 统一请求入口：createRequest / getData / getLangHeader / ApiClient / ApiResponse / ApiError
+export { createRequest, getData, getLangHeader } from './api/request';
 export type { ApiClient, CreateRequestOptions } from './api/request';
 export type { ApiError, ApiResponse } from './api/types';
 
@@ -28,6 +28,20 @@ export { default as PageHeader } from './components/PageHeader';
 export type { PageHeaderProps } from './components/PageHeader';
 export { default as PageContent } from './components/PageContent';
 export type { PageContentProps } from './components/PageContent';
+
+// 应用首页入口宫格：图标 + 标题 + 说明，自适应列数
+export { default as EntryGrid } from './components/EntryGrid';
+export type { EntryGridItem, EntryGridProps } from './components/EntryGrid';
+
+// 页面内分区与 KPI 卡组：标题行 + 内容外壳 / 指标卡
+export { default as SectionCard } from './components/SectionCard';
+export type { SectionCardProps } from './components/SectionCard';
+export { default as KpiCards } from './components/KpiCards';
+export type { KpiCardItem, KpiCardsProps } from './components/KpiCards';
+
+// 危险操作二次确认：全平台删除类弹窗统一走这里
+export { default as DangerConfirmModal } from './components/DangerConfirmModal';
+export type { DangerConfirmModalProps } from './components/DangerConfirmModal';
 
 // 可执行工具的运行时配置表单段（平台工具目录 / 知识库工具共用）
 export {
