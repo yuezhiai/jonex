@@ -6,10 +6,10 @@
  * active 时只读，提供「转为草稿」；编辑期间（proposed）投影与检索概念扩展不生效
  * ——按钮 tooltip 里说清（设计决策）。
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Alert, Button, Drawer, Empty, Input, Modal, Space, Spin, Table, Tag, Tooltip, Typography, message } from 'antd';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Alert, Button, Checkbox, Drawer, Empty, Input, Modal, Space, Spin, Table, Tag, Tooltip, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { PartitionOutlined, ReloadOutlined, SaveOutlined, CheckCircleOutlined, EditOutlined, UploadOutlined, ThunderboltOutlined, HistoryOutlined } from '@ant-design/icons';
+import { PartitionOutlined, ReloadOutlined, SaveOutlined, CheckCircleOutlined, EditOutlined, UploadOutlined, ThunderboltOutlined, HistoryOutlined, LeftOutlined, RightOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 
 import {
@@ -24,6 +24,11 @@ import {
   type AbstractSchemaHistoryDetail,
   type AbstractSchemaHistoryItem,
 } from '@/api/abstractSchema';
+import {
+  getLandingRun,
+  startLandingRun,
+  type LandingRunMode,
+} from '@/api/landingAgent';
 import type { AttributeType } from '../ontologyCanvas/domain/index.js';
 import { ModelCanvas } from '../ontologyCanvas/components/ModelCanvas.js';
 import { PropertiesPanel } from '../ontologyCanvas/components/PropertiesPanel.js';
@@ -58,8 +63,16 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
   const [loading, setLoading] = useState(true);
   /** 生成概念候选（与「抽象 Schema」页签同一动作）：空态与有数据时都可触发 */
   const [generating, setGenerating] = useState(false);
+  /** 后台 run 的进度（仅生成中非空）：`已处理 n/总数` + 阶段。 */
+  const [runProgress, setRunProgress] = useState<{ done: number; total: number; phase: string } | null>(null);
+  /** 轮询定时器句柄：重生成与卸载都必须清掉，否则旧 run 的轮询会写进新状态。 */
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 生成代次：卸载/重新生成会自增，用来丢弃在途的 start / poll 响应（不能只清定时器）。 */
+  const runTokenRef = useRef(0);
   /** 生成前的小弹窗：可选填业务词表（客户会怎么说），生成时挂到对应实体上 */
   const [generateOpen, setGenerateOpen] = useState(false);
+  /** 有草稿时默认只补落点；勾上 = 清空草稿全量重来。 */
+  const [restartAll, setRestartAll] = useState(false);
   const [aliasHints, setAliasHints] = useState('');
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
@@ -81,6 +94,15 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
   const [restoring, setRestoring] = useState(false);
 
   const store = useEditorStore();
+
+  // 左右两栏的展开/收起：
+  // - 左栏（实体列表）由人手动控制，默认展开；
+  // - 右栏（属性面板）**跟随选中**：选中实体自动展开，取消选中自动收起；
+  //   人也可以手动收起，下次重新选中时再自动展开（可预期，不用记上次手动的状态）。
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(false);
+  const hasSelection = Boolean(store.selection);
+  useEffect(() => { setRightOpen(hasSelection); }, [hasSelection]);
   const { workingDocument: document } = store;
   const readOnly = !canWrite || schema?.status === 'active';
 
@@ -318,9 +340,22 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
     // ——点保存提交的就是旧指标（静默丢编辑），与 load() 注释里的同一类坑。
   }, [document, kbId, metrics, schema, store, t]);
 
-  const handleGenerateConcepts = useCallback(async (force = false, hints = ''): Promise<void> => {
-    if (!canWrite) return;
-    setGenerating(true);
+  const stopPolling = useCallback(() => {
+    if (pollRef.current != null) {
+      clearTimeout(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // 卸载兜底：切页/关抽屉时后台 run 照常跑完，但本页不能再轮询（会对已卸载组件 setState）。
+  // 自增代次是为了让「startLandingRun 还没回来就卸载」的在途响应也作废（此时定时器还没建）。
+  useEffect(() => () => {
+    runTokenRef.current += 1;
+    stopPolling();
+  }, [stopPolling]);
+
+  /** 旧同步生成路径（开关关闭的兜底 / 1001 回退）。保持原有 409 二次确认。 */
+  const runLegacyGenerate = useCallback(async (force: boolean, hints: string): Promise<void> => {
     try {
       // 默认走「复用文档本体 + 自动落点」：只做结构化聚类会得到泛化属性名
       // （「发电量」同时挂在汇总/明细实体上）且没有业务别名/落点 —— 检索词面
@@ -339,17 +374,116 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
       // 已有已确认的抽象 schema：显式确认后才 force 覆盖（与抽象 Schema 页签同口径）
       if (!force && (e?.status === 409 || e?.bizCode === 1003)) {
         if (window.confirm(t('abstractSchema.overwriteConfirm'))) {
-          setGenerating(false);
-          await handleGenerateConcepts(true, hints);
-          return;
+          await runLegacyGenerate(true, hints);
         }
         return;
       }
       message.error(e?.message || t('abstractSchema.generateFailed'));
-    } finally {
-      setGenerating(false);
     }
-  }, [canWrite, kbId, load, t]);
+  }, [kbId, load, t]);
+
+  /**
+   * 生成入口：优先走后台 run（`landings` 只补落点、`full` 全量重来），每 2s 轮询；
+   * 开关关闭 / 参数无效（1001）回退到旧同步 generate，保证关闭态部署仍可用。
+   */
+  const handleGenerateConcepts = useCallback(async (
+    runMode: LandingRunMode,
+    hints = '',
+    force = false,
+  ): Promise<void> => {
+    // 只读（active / 无写权）时不许生成：按钮已禁用，这里是最后一道守卫。
+    if (readOnly) return;
+    // 重新生成 = 旧 run 的轮询必须立刻停（它只会把过期进度写进新一次生成）。
+    stopPolling();
+    const token = ++runTokenRef.current;
+    setGenerating(true);
+    setRunProgress(null);
+    let polling = false;
+    try {
+      let started = await startLandingRun(kbId, runMode, {
+        aliasHints: hints,
+        force,
+      }).catch(async (e: any) => {
+        // 已有已确认（active）的抽象 schema：没带 force 时后端回 1003。
+        // 与旧同步生成同口径，先让用户确认覆盖，再带 force 重试一次。
+        if (!force && (e?.status === 409 || e?.bizCode === 1003)) {
+          if (!window.confirm(t('abstractSchema.overwriteConfirm'))) return null;
+          return startLandingRun(kbId, runMode, { aliasHints: hints, force: true });
+        }
+        throw e;
+      });
+      if (started == null) return;
+      // 在途期间被重新生成/卸载：这次响应作废，别建定时器。
+      if (token !== runTokenRef.current) return;
+      const runId = started.runId;
+      polling = true;
+      // 这次 run 已经落单，「全部重来」不再粘住下一次。
+      setRestartAll(false);
+      let stopped = false;
+      // 自调度 setTimeout 链：只有当前响应落地后才排下一拍。
+      // 固定 interval 在慢请求下会叠加并发轮询，同一终态可能触发两次 load()/toast。
+      function schedule(): void {
+        if (stopped || token !== runTokenRef.current) return;
+        pollRef.current = setTimeout(() => { void tick(); }, 2000);
+      }
+      async function tick(): Promise<void> {
+        pollRef.current = null;
+        try {
+          const run = await getLandingRun(kbId, runId);
+          if (stopped || token !== runTokenRef.current) return;
+          const { conceptsDone, conceptsTotal } = run.progress;
+          setRunProgress({ done: conceptsDone, total: conceptsTotal, phase: run.phase });
+          if (run.status === 'succeeded') {
+            stopped = true;
+            stopPolling();
+            setRunProgress(null);
+            setGenerating(false);
+            message.success(t('abstractSchema.landingAgent.succeeded'));
+            await load();
+          } else if (run.status === 'failed') {
+            stopped = true;
+            stopPolling();
+            setRunProgress(null);
+            setGenerating(false);
+            message.error(run.error || t('abstractSchema.generateFailed'));
+          } else {
+            schedule();
+          }
+        } catch (e: any) {
+          if (stopped || token !== runTokenRef.current) return;
+          // run 不见了（1002）是终态；其它错误（网络抖动）留到下一拍重试。
+          if (e?.status === 404 || e?.bizCode === 1002) {
+            stopped = true;
+            stopPolling();
+            setRunProgress(null);
+            setGenerating(false);
+            message.error(e?.message || t('abstractSchema.generateFailed'));
+          } else {
+            schedule();
+          }
+        }
+      }
+      // 立即拉一次：queued/running 的第一帧进度不必等满 2s。
+      void tick();
+    } catch (e: any) {
+      if (token !== runTokenRef.current) return;
+      if (e?.bizCode === 1001) {
+        // 开关关闭 / 参数无效：后台入口不可用时旧同步生成仍然可用。
+        message.info(t('abstractSchema.landingAgent.fallbackHint'));
+        await runLegacyGenerate(false, hints);
+        return;
+      }
+      if (e?.status === 429 || e?.bizCode === 3007) {
+        message.error(t('abstractSchema.landingAgent.busy'));
+        return;
+      }
+      message.error(e?.message || t('abstractSchema.generateFailed'));
+    } finally {
+      // 成功建单后由轮询收口；这里只负责「没进轮询」的分支复位按钮态。
+      // 代次变了说明已被重新生成/卸载接管，不能再改当前状态。
+      if (!polling && token === runTokenRef.current) setGenerating(false);
+    }
+  }, [kbId, load, readOnly, runLegacyGenerate, stopPolling, t]);
 
   const addEntity = useCallback(() => {
     // 只读守卫：UI 已处处禁用，这里是最后一道（抽象 schema 的 active = 全只读契约）
@@ -380,6 +514,30 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
     );
   }, [document, readOnly, store]);
 
+  // 判「有草稿」看**实体数**而不是 document 非空：空 schema 也会建出 workingDocument，
+  // 拿它跑 landings 就是零概念走一遍、upsert 回原样的空 schema 并报成功。
+  const hasDraft = Boolean(document && document.model.entities.length > 0);
+  /** 本次提交模式：有内容的草稿默认只补落点；「全部重来」或空草稿走全量。 */
+  const draftMode: LandingRunMode = hasDraft && !restartAll ? 'landings' : 'full';
+  // queued 阶段后端 phase 为空串；别把 `...phase.` 这种残缺 key 显示出来。
+  const phaseLabel = (phase: string) => (phase ? t(`abstractSchema.landingAgent.phase.${phase}`) : '');
+  /** 生成进度：与生成按钮同一处显示（空态/有数据两分支共用）。 */
+  const runProgressNode = generating && runProgress ? (
+    <Text className="ae-run-progress">
+      {/* queued 阶段 phase 为空串：走无阶段文案，别渲染出「已处理 0/0 · 」的悬挂分隔符。 */}
+      {phaseLabel(runProgress.phase)
+        ? t('abstractSchema.landingAgent.progress', {
+            done: runProgress.done,
+            total: runProgress.total,
+            phase: phaseLabel(runProgress.phase),
+          })
+        : t('abstractSchema.landingAgent.progressOnly', {
+            done: runProgress.done,
+            total: runProgress.total,
+          })}
+    </Text>
+  ) : null;
+
   /**
    * 生成前的小弹窗：业务词表可选。词表语法是「别名1,别名2 => 实体名或物理表名」，
    * 生成后由后端 `apply_alias_hints` 确定性挂到实体上（不调模型）——客户怎么叫，
@@ -389,21 +547,38 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
     <Modal
       title={t('abstractSchema.generate')}
       open={generateOpen}
-      onCancel={() => setGenerateOpen(false)}
+      onCancel={() => { setGenerateOpen(false); setRestartAll(false); }}
       okText={t('abstractSchema.aliasHints.confirm')}
       cancelText={t('common.cancel')}
       confirmLoading={generating}
       onOk={() => {
         setGenerateOpen(false);
-        void handleGenerateConcepts(false, aliasHints.trim());
+        void handleGenerateConcepts(draftMode, aliasHints.trim());
       }}
       width={640}
     >
       <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+        <Text type="secondary">
+          {t('abstractSchema.landingAgent.modeLabel', {
+            mode: draftMode === 'full'
+              ? t('abstractSchema.landingAgent.modeFull')
+              : t('abstractSchema.landingAgent.modeLandings'),
+          })}
+        </Text>
+        <Checkbox
+          checked={restartAll}
+          disabled={!hasDraft}
+          onChange={(e) => setRestartAll(e.target.checked)}
+        >
+          {t('abstractSchema.landingAgent.restart')}
+        </Checkbox>
         <Text type="secondary">{t('abstractSchema.aliasHints.hint')}</Text>
+        {/* 落点模式不重造概念/别名（那是「全部重来」的职责），词表在本模式下
+            没有作用域：禁用输入，避免用户填了却完全不生效。 */}
         <Input.TextArea
           rows={6}
           value={aliasHints}
+          disabled={draftMode === 'landings'}
           onChange={(e) => setAliasHints(e.target.value)}
           placeholder={t('abstractSchema.aliasHints.placeholder')}
         />
@@ -420,7 +595,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
           <Space direction="vertical" align="center" size="small">
             <Text type="secondary">{t('abstractEditor.emptyHint')}</Text>
             {/* 空态也要有「下一步」：与概念对齐一致，按钮常驻而不是只留一句提示 */}
-            <Button type="primary" icon={<ThunderboltOutlined />} loading={generating} disabled={!canWrite}
+            <Button type="primary" icon={<ThunderboltOutlined />} loading={generating} disabled={readOnly}
               onClick={() => setGenerateOpen(true)}>
               {t('abstractSchema.generate')}
             </Button>
@@ -428,6 +603,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
               onClick={() => setImportOpen(true)}>
               {t('abstractEditor.importTbox')}
             </Button>
+            {runProgressNode}
           </Space>
         </Empty>
         <ImportTboxModal
@@ -460,7 +636,9 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
           {store.dirty || metricsDirty ? <Tag color="blue">{t('abstractSchema.unsaved')}</Tag> : null}
         </Space>
         <Space>
-          <Button icon={<ThunderboltOutlined />} loading={generating} disabled={!canWrite}
+          {/* 只读（active）下禁用：landings-only 不能改已确认基线，full 也不该
+              在无提示下覆盖 —— 与 save/确认按钮同一道 readOnly 闸。 */}
+          <Button icon={<ThunderboltOutlined />} loading={generating} disabled={readOnly}
             onClick={() => setGenerateOpen(true)}>
             {t('abstractSchema.generate')}
           </Button>
@@ -507,13 +685,30 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
         </Space>
       </header>
 
+      {runProgressNode ? <div className="ae-run-progress-row">{runProgressNode}</div> : null}
+
       {mustFix.length ? (
         <Alert type="error" showIcon className="ontology-canvas-issues"
           message={t('ontologyCanvas.mustFix', { n: mustFix.length })}
           description={mustFix.slice(0, 5).map((item) => `${item.code} · ${item.target?.id ?? '-'}`).join('；')} />
       ) : null}
 
-      <div className="ontology-canvas-body">
+      <div
+        className={[
+          'ontology-canvas-body',
+          leftOpen ? '' : 'is-left-collapsed',
+          rightOpen && hasSelection ? '' : 'is-right-collapsed',
+        ].filter(Boolean).join(' ')}
+      >
+        <button
+          type="button"
+          className="canvas-panel-toggle canvas-panel-toggle--left"
+          title={leftOpen ? t('abstractEditor.collapseList') : t('abstractEditor.expandList')}
+          aria-label={leftOpen ? t('abstractEditor.collapseList') : t('abstractEditor.expandList')}
+          onClick={() => setLeftOpen((open) => !open)}
+        >
+          {leftOpen ? <LeftOutlined /> : <RightOutlined />}
+        </button>
         <aside className="ontology-canvas-list">
           {document.model.entities.length === 0 ? (
             <p className="ontology-canvas-list-empty">{t('editor.emptyCanvas')}</p>
@@ -574,6 +769,20 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
             </div>
           )}
         />
+        <button
+          type="button"
+          className="canvas-panel-toggle canvas-panel-toggle--right"
+          title={rightOpen && hasSelection
+            ? t('abstractEditor.collapsePanel')
+            : t('abstractEditor.expandPanel')}
+          aria-label={rightOpen && hasSelection
+            ? t('abstractEditor.collapsePanel')
+            : t('abstractEditor.expandPanel')}
+          disabled={!hasSelection}
+          onClick={() => setRightOpen((open) => !open)}
+        >
+          {rightOpen && hasSelection ? <RightOutlined /> : <LeftOutlined />}
+        </button>
       </div>
 
       {/* 保存仍走页面 toolbar 那两个按钮——Drawer footer 只给「完成」关闭

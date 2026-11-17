@@ -66,8 +66,8 @@ function llmWikiDocStatusText(doc: ManualDocItem, t: (key: string) => string): s
 
 const DOC_STATUS_COLOR: Record<string, string> = {
   compiled: '#22c55e',
-  parsing: '#3b82f6',
-  pending: '#94a3b8',
+  parsing: 'var(--yx-accent)',
+  pending: 'var(--yx-text-muted)',
 };
 
 export default function DomainKnowledgeDocumentResult() {
@@ -188,7 +188,7 @@ export default function DomainKnowledgeDocumentResult() {
     const t = (type || '').toLowerCase();
     // 与知识库详情页头同尺寸：页标题本身是 24px，图标跟着标题走
     if (t === 'pdf') return <FilePdfOutlined style={{ color: '#ef4444', fontSize: 24 }} />;
-    return <FileTextOutlined style={{ color: '#3b82f6', fontSize: 24 }} />;
+    return <FileTextOutlined style={{ color: 'var(--yx-accent)', fontSize: 24 }} />;
   };
 
   // 质量报告独立成 Tab：它与片段查看器同处一个纵向 flex 时，报告高度会挤占
@@ -313,7 +313,7 @@ export default function DomainKnowledgeDocumentResult() {
                 color: '#fff',
                 // Tag 自带 margin-inline-end，会在 Space 的 gap 之外再多一份间距，这里清掉
                 margin: 0,
-                background: DOC_STATUS_COLOR[doc?.status || ''] || '#94a3b8',
+                background: DOC_STATUS_COLOR[doc?.status || ''] || 'var(--yx-text-muted)',
               }}
             >
               {isLlmWikiType(kbType)

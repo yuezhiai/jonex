@@ -13,7 +13,7 @@ const h3Style: React.CSSProperties = {
   margin: 0,
   fontSize: 15,
   fontWeight: 600,
-  color: '#0b2b5c',
+  color: 'var(--yx-brand-dark)',
   display: 'flex',
   alignItems: 'center',
   gap: 8,
@@ -36,14 +36,14 @@ export default function EngineBasicSection({ engine, loading, onSave }: Props) {
     <div style={sectionStyle}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
         <h3 style={h3Style}>
-          <SettingOutlined style={{ color: '#3b82f6' }} /> {t('compile.engine.sectionTitle')}
+          <SettingOutlined style={{ color: 'var(--yx-accent)' }} /> {t('compile.engine.sectionTitle')}
         </h3>
       </div>
-      <p style={{ fontSize: 13, color: '#94a3b8', marginBottom: 12 }}>{t('compile.engine.sectionDesc')}</p>
-      <div style={{ padding: 20, maxWidth: 560, border: '1px solid #eef2f6', borderRadius: 10 }}>
+      <p style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginBottom: 12 }}>{t('compile.engine.sectionDesc')}</p>
+      <div style={{ padding: 20, maxWidth: 560, border: '1px solid var(--yx-border-light)', borderRadius: 10 }}>
         <div className="yx-form-row">
           <label>
-            {t('compile.engine.modelLabel')} <span style={{ color: '#dc2626' }}>*</span>
+            {t('compile.engine.modelLabel')} <span style={{ color: 'var(--yx-error-text)' }}>*</span>
           </label>
           <Select
             value={model}
@@ -56,7 +56,7 @@ export default function EngineBasicSection({ engine, loading, onSave }: Props) {
         <div className="yx-form-row" style={{ marginTop: 16 }}>
           <label>{t('compile.engine.promptLabel')}</label>
           <Input.TextArea rows={4} disabled placeholder={t('compile.engine.promptPlaceholder')} />
-          <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 6 }}>{t('compile.engine.promptHint')}</div>
+          <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 6 }}>{t('compile.engine.promptHint')}</div>
         </div>
         <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
           <Button type="primary" icon={<SaveOutlined />} onClick={() => onSave(model)}>

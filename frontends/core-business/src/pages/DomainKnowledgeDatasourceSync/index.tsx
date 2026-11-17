@@ -2,20 +2,19 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Input, Space, message, Spin } from 'antd';
-import { ArrowLeftOutlined, CloudOutlined, SyncOutlined } from '@ant-design/icons';
-import { useNavigate, useParams } from 'react-router-dom';
+import { CloudOutlined, SyncOutlined } from '@ant-design/icons';
+import { useParams } from 'react-router-dom';
 import { getDataSource, listDataSourceDocuments, syncDataSource } from '@/api/dataSource';
 import { formatLocalDateTime } from '@/utils/dateTime';
 import type { DataSourceInstance } from '@/types/dataSource';
 import type { ManualDocItem } from '@/types/domainKnowledge';
 import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
-import { PageContent } from '@jonex/shared-lib';
+import { PageContent, PageHeader } from '@jonex/shared-lib';
 
 export default function DomainKnowledgeDatasourceSync() {
   const { t } = useTranslation();
   const { id, dsId } = useParams();
   const { canWrite } = useKbPermission(id);
-  const navigate = useNavigate();
 
   const [ds, setDs] = useState<DataSourceInstance | null>(null);
   const [docs, setDocs] = useState<ManualDocItem[]>([]);
@@ -60,11 +59,11 @@ export default function DomainKnowledgeDatasourceSync() {
   const cfg = ds?.configJson || {};
   const stats = [
     { label: t('domainKnowledge.sync.totalDocuments'), value: String(ds?.documentCount ?? '--'), color: '#10b981' },
-    { label: t('domainKnowledge.sync.status'), value: ds?.lastSyncStatus || t('status.unsynced'), color: '#3b82f6' },
+    { label: t('domainKnowledge.sync.status'), value: ds?.lastSyncStatus || t('status.unsynced'), color: 'var(--yx-accent)' },
     {
       label: t('domainKnowledge.sync.mode'),
       value: ds?.syncMode === 'scheduled' ? t('domainKnowledge.sync.scheduled') : t('domainKnowledge.sync.manual'),
-      color: '#3b82f6',
+      color: 'var(--yx-accent)',
     },
     {
       label: t('domainKnowledge.sync.lastSyncTime'),
@@ -75,29 +74,21 @@ export default function DomainKnowledgeDatasourceSync() {
   const filtered = docs.filter((d) => d.name.includes(keyword));
 
   return (
-    <PageContent showCard={false}>
-      <a
-        onClick={() => navigate(`/domain-knowledge/${id}/detail`)}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          marginBottom: 16,
-          fontSize: 14,
-          color: '#64748b',
-          cursor: 'pointer',
-        }}
-      >
-        <ArrowLeftOutlined /> {t('domainKnowledge.backToKnowledgeDetail')}
-      </a>
+    <>
+      <PageHeader
+        title={t('route.datasourceSync')}
+        backTo={`/domain-knowledge/${id}/detail`}
+        backText={t('domainKnowledge.backToKnowledgeDetail')}
+      />
+      <PageContent showCard={false}>
 
       <Spin spinning={loading}>
         <Card
           style={{
-            borderRadius: 10,
+            borderRadius: 'var(--yx-card-radius)',
             marginBottom: 24,
-            border: '1px solid #eef2f6',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+            border: '1px solid var(--yx-border-light)',
+            boxShadow: 'var(--yx-card-shadow)',
           }}
           bodyStyle={{ padding: '20px 24px', display: 'flex', alignItems: 'center', gap: 16 }}
         >
@@ -106,7 +97,7 @@ export default function DomainKnowledgeDatasourceSync() {
               width: 48,
               height: 48,
               borderRadius: 12,
-              background: '#ecfdf5',
+              background: 'var(--yx-success-bg)',
               color: '#10b981',
               display: 'flex',
               alignItems: 'center',
@@ -118,8 +109,8 @@ export default function DomainKnowledgeDatasourceSync() {
             <CloudOutlined />
           </div>
           <div style={{ flex: 1 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 700, color: '#0b2b5c', margin: 0 }}>{ds?.name || '—'}</h2>
-            <div style={{ display: 'flex', gap: 16, marginTop: 4, fontSize: 13, color: '#64748b', flexWrap: 'wrap' }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--yx-brand-dark)', margin: 0 }}>{ds?.name || '—'}</h2>
+            <div style={{ display: 'flex', gap: 16, marginTop: 4, fontSize: 13, color: 'var(--yx-text-secondary)', flexWrap: 'wrap' }}>
               <span>{t('domainKnowledge.dataSourceType.api')}</span>
               <span>{cfg.endpoint || '-'}</span>
               <span>{t('domainKnowledge.docsWithCount', { count: ds?.documentCount ?? 0 })}</span>
@@ -139,15 +130,15 @@ export default function DomainKnowledgeDatasourceSync() {
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 16, marginBottom: 20 }}>
           {stats.map((s) => (
-            <Card key={s.label} style={{ borderRadius: 10, textAlign: 'center' }} bodyStyle={{ padding: 16 }}>
-              <div style={{ fontSize: 16, fontWeight: 600, color: s.color || '#0b2b5c' }}>{s.value}</div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>{s.label}</div>
+            <Card key={s.label} style={{ borderRadius: 'var(--yx-card-radius)', textAlign: 'center' }} bodyStyle={{ padding: 16 }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: s.color || 'var(--yx-brand-dark)' }}>{s.value}</div>
+              <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 4 }}>{s.label}</div>
             </Card>
           ))}
         </div>
 
         <Card
-          style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+          style={{ borderRadius: 'var(--yx-card-radius)', border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
           bodyStyle={{ padding: 0 }}
         >
           <div
@@ -156,11 +147,11 @@ export default function DomainKnowledgeDatasourceSync() {
               alignItems: 'center',
               justifyContent: 'space-between',
               padding: '16px 20px',
-              borderBottom: '1px solid #eef2f6',
+              borderBottom: '1px solid var(--yx-border-light)',
             }}
           >
             <Space>
-              <span style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                 {t('domainKnowledge.sync.docList')}
               </span>
               <Input
@@ -170,7 +161,7 @@ export default function DomainKnowledgeDatasourceSync() {
                 onChange={(e) => setKeyword(e.target.value)}
               />
             </Space>
-            <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('domainKnowledge.sync.syncDesc')}</span>
+            <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.sync.syncDesc')}</span>
           </div>
           <div style={{ padding: '0 8px 8px' }}>
             <DataSourceDocTable
@@ -183,6 +174,7 @@ export default function DomainKnowledgeDatasourceSync() {
           </div>
         </Card>
       </Spin>
-    </PageContent>
+      </PageContent>
+    </>
   );
 }

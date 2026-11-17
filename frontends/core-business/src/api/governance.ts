@@ -266,15 +266,21 @@ export async function evaluateGovernance(
 
 // ── 指标调用审批（W4.8）──────────────────────────────────────────────
 export type MetricCallApprovalStatus = 'pending' | 'approved' | 'suspended';
+/** 生效状态：存储状态 + 到期计算（`expired` 不写回库）。 */
+export type MetricCallEffectiveStatus = MetricCallApprovalStatus | 'expired';
 
 export interface MetricCallApproval {
   id: string;
   knowledge_base_id: string;
   metric_name: string;
   status: MetricCallApprovalStatus;
+  effective_status?: MetricCallEffectiveStatus;
   requested_by?: string | null;
   decided_by?: string | null;
   reason?: string | null;
+  /** 批准的有效期（ISO 时间）；null = 不过期 */
+  expires_at?: string | null;
+  expired?: boolean;
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -301,9 +307,12 @@ export async function requestMetricCallApproval(
 
 export async function approveMetricCall(
   kbId: string, metricName: string, reason?: string,
+  expiresInDays?: number,
 ): Promise<{ item: MetricCallApproval; status: string }> {
   return postData<{ item: MetricCallApproval; status: string }>('/knowledge-base/metrics/approvals/approve', {
     knowledge_base_id: kbId, metric_name: metricName, reason,
+    // 留空 = 走服务端默认（METRIC_APPROVAL_TTL_DAYS，0 = 不过期）
+    expires_in_days: expiresInDays && expiresInDays > 0 ? expiresInDays : undefined,
   });
 }
 

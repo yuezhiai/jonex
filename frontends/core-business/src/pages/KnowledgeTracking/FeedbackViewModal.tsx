@@ -26,7 +26,7 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
 
   return (
     <Modal
-      title={<span style={{ fontSize: 16, fontWeight: 600, color: '#0b2b5c' }}>{t('tracking.feedbackDetail')}</span>}
+      title={<span style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{t('tracking.feedbackDetail')}</span>}
       open={open}
       onCancel={onClose}
       footer={<Button onClick={onClose}>{t('common.close')}</Button>}
@@ -36,7 +36,7 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
         <div>
           {getFeedbackSource(item) === 'mcp' ? (
             <div style={{ marginBottom: 16 }}>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
                 {t('tracking.mcpKey')}
               </label>
               <div style={{ fontSize: 14, color: '#475569', lineHeight: 1.6, wordBreak: 'break-all' }}>
@@ -45,17 +45,17 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
             </div>
           ) : null}
           <div style={{ marginBottom: 16 }}>
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
               {t('compile.feedback.question')}
             </label>
             <div
               style={{
                 padding: '12px 14px',
-                background: '#f8fafc',
-                border: '1px solid #eef2f6',
+                background: 'var(--yx-bg-subtle)',
+                border: '1px solid var(--yx-border-light)',
                 borderRadius: 8,
                 fontSize: 14,
-                color: getQuerySnapshot(item) ? '#0b2b5c' : '#94a3b8',
+                color: getQuerySnapshot(item) ? 'var(--yx-brand-dark)' : 'var(--yx-text-muted)',
                 lineHeight: 1.6,
               }}
             >
@@ -64,14 +64,14 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
             </div>
           </div>
           <div style={{ marginBottom: 16 }}>
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
               {t('tracking.columnAnswer')}
             </label>
             <div
               style={{
                 padding: '12px 14px',
-                background: '#f8fafc',
-                border: '1px solid #eef2f6',
+                background: 'var(--yx-bg-subtle)',
+                border: '1px solid var(--yx-border-light)',
                 borderRadius: 8,
                 fontSize: 14,
                 color: '#475569',
@@ -85,7 +85,7 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
           </div>
           {item.feedback_type === 'dislike' && item.feedback_reason ? (
             <div style={{ marginBottom: 16 }}>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
                 {t('knowledgeSearch.feedbackReasonLabel')}
               </label>
               <div style={{ fontSize: 14, color: '#475569', lineHeight: 1.6 }}>
@@ -95,14 +95,14 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
           ) : null}
           {item.feedback_comment ? (
             <div style={{ marginBottom: 16 }}>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: '#0b2b5c', marginBottom: 6 }}>
+              <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
                 {t('knowledgeSearch.feedbackCommentLabel')}
               </label>
               <div
                 style={{
                   padding: '12px 14px',
-                  background: '#f8fafc',
-                  border: '1px solid #eef2f6',
+                  background: 'var(--yx-bg-subtle)',
+                  border: '1px solid var(--yx-border-light)',
                   borderRadius: 8,
                   fontSize: 14,
                   color: '#475569',
@@ -113,7 +113,7 @@ export default function FeedbackViewModal({ open, item, onClose }: FeedbackViewM
               </div>
             </div>
           ) : null}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, fontSize: 13, color: '#94a3b8' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, fontSize: 13, color: 'var(--yx-text-muted)' }}>
             <span>
               {t('tracking.sourceLabel')}
               {t(getFeedbackSource(item) === 'mcp' ? 'tracking.sourceMcp' : 'tracking.sourceWeb')}

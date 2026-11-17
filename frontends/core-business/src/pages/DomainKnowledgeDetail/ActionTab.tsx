@@ -41,7 +41,7 @@ export default function ActionTab({ actionRules, actionLoading, ruleStatusLabel,
             <div key={rule.id} className="yx-kb-rule-box">
               <div className="yx-kb-flex-between">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>{rule.name}</span>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{rule.name}</span>
                   <Tag color={rule.status === '启用' ? 'success' : 'warning'} style={{ fontSize: 11 }}>
                     {ruleStatusLabel(rule.status)}
                   </Tag>
@@ -61,7 +61,7 @@ export default function ActionTab({ actionRules, actionLoading, ruleStatusLabel,
                         left: 0,
                         right: 0,
                         bottom: 0,
-                        background: rule.status === '启用' ? '#3b82f6' : '#cbd5e1',
+                        background: rule.status === '启用' ? 'var(--yx-accent)' : '#cbd5e1',
                         borderRadius: 20,
                         transition: '0.3s',
                       }}

@@ -113,7 +113,9 @@ export default function DocumentLibrary({
   const compilation = useWikiCompilation(kbId, kbType === 'jonex_wiki');
   useEffect(() => {
     if (!compilation.state) return;
-    tableRef.current?.refresh();
+    // 编译进度轮询触发的重取走 silent：编译中状态每隔几秒可能变一次，若照常置 loading，
+    // 列表会一直闪遮罩、像页面在重载。静默重取只换数据，失败也不清空列表。
+    tableRef.current?.refresh({ silent: true });
     onRefreshStats?.();
   }, [compilation.state]);
   // 切换目录要显式通知 CommonTable 重取（见下方 effect），首次挂载除外
@@ -506,7 +508,7 @@ export default function DocumentLibrary({
                     display: 'inline-flex',
                     alignItems: 'center',
                     fontSize: 12,
-                    color: '#64748b',
+                    color: 'var(--yx-text-secondary)',
                   }}
                   onClick={(e) => {
                     e.stopPropagation();

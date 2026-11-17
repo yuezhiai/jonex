@@ -18,7 +18,7 @@ const TAG_STYLE: CSSProperties = {
   borderRadius: 6,
   background: '#f5f8fb',
   border: '1px solid #e8eef4',
-  color: '#64748b',
+  color: 'var(--yx-text-secondary)',
   fontSize: 12,
   fontWeight: 500,
   // 图标走 children 而非 Tag 的 icon prop 渲染——后者会丢掉图标自己的 style，

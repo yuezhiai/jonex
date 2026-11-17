@@ -205,7 +205,12 @@ export async function deleteLineageForbiddenPair(
 export async function suggestLineageForbiddenPairs(
   knowledgeBaseId: string,
   dataSourceId: string,
-): Promise<{ created: number; skipped: number; total: number }> {
+): Promise<{
+  created: number;
+  skipped: number;
+  total: number;
+  truncated?: boolean;
+}> {
   return postData(
     `/knowledge-base/data-sources/${dataSourceId}/lineage-forbidden-suggest`,
     { knowledge_base_id: knowledgeBaseId },

@@ -9,9 +9,9 @@ import Tag from 'antd/es/tag';
 
 type StepState = 'done' | 'active' | 'pending';
 const stepColors: Record<StepState, { bg: string; text: string }> = {
-  done: { bg: '#ecfdf5', text: '#10b981' },
-  active: { bg: '#eff6ff', text: '#3b82f6' },
-  pending: { bg: '#f1f5f9', text: '#cbd5e1' },
+  done: { bg: 'var(--yx-success-bg)', text: '#10b981' },
+  active: { bg: 'var(--yx-info-bg)', text: 'var(--yx-accent)' },
+  pending: { bg: 'var(--yx-bg-muted)', text: '#cbd5e1' },
 };
 
 function getStepStates(status: string): StepState[] {
@@ -38,8 +38,8 @@ function renderStatus(v: string, t: (key: string) => string) {
           padding: '2px 8px',
           border: 'none',
           fontWeight: 500,
-          background: isError ? '#fef2f2' : '#f1f5f9',
-          color: isError ? '#ef4444' : '#64748b',
+          background: isError ? '#fef2f2' : 'var(--yx-bg-muted)',
+          color: isError ? '#ef4444' : 'var(--yx-text-secondary)',
         }}
       >
         {isError ? t('status.failed') : v}

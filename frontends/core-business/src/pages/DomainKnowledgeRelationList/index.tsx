@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
-import { Input, Table, Breadcrumb, message, Button, Modal } from 'antd';
+import { Input, Table, Breadcrumb, message, Button, Modal, Pagination } from 'antd';
 import {
   SearchOutlined,
   LinkOutlined,
@@ -150,19 +150,19 @@ export default function DomainKnowledgeRelationList() {
   const breadcrumbItems = [
     {
       title: (
-        <a onClick={() => navigate('/domain-knowledge')} style={{ color: '#64748b' }}>
+        <a onClick={() => navigate('/domain-knowledge')} style={{ color: 'var(--yx-text-secondary)' }}>
           {t('domainKnowledge.management')}
         </a>
       ),
     },
     {
       title: (
-        <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: '#64748b' }}>
+        <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: 'var(--yx-text-secondary)' }}>
           {t('domainKnowledge.detail')}
         </a>
       ),
     },
-    { title: <span style={{ color: '#0b2b5c', fontWeight: 500 }}>{t('common.instance', { name: decodedName })}</span> },
+    { title: <span style={{ color: 'var(--yx-brand-dark)', fontWeight: 500 }}>{t('common.instance', { name: decodedName })}</span> },
   ];
 
   // ── 表格列 ──
@@ -178,8 +178,8 @@ export default function DomainKnowledgeRelationList() {
             style={{
               padding: '2px 8px',
               borderRadius: 6,
-              background: '#eff6ff',
-              color: '#3b82f6',
+              background: 'var(--yx-info-bg)',
+              color: 'var(--yx-accent)',
               fontSize: 12,
               fontWeight: 500,
             }}
@@ -187,7 +187,7 @@ export default function DomainKnowledgeRelationList() {
             {v}
           </span>
           {r.source_type && (
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-secondary)', marginTop: 2 }}>
               {typeNameMap[r.source_type] || r.source_type}
             </div>
           )}
@@ -204,8 +204,8 @@ export default function DomainKnowledgeRelationList() {
           style={{
             padding: '2px 8px',
             borderRadius: 6,
-            background: '#eff6ff',
-            color: '#3b82f6',
+            background: 'var(--yx-info-bg)',
+            color: 'var(--yx-accent)',
             fontSize: 12,
             fontWeight: 500,
           }}
@@ -225,7 +225,7 @@ export default function DomainKnowledgeRelationList() {
             style={{
               padding: '2px 8px',
               borderRadius: 6,
-              background: '#ecfdf5',
+              background: 'var(--yx-success-bg)',
               color: '#059669',
               fontSize: 12,
               fontWeight: 500,
@@ -234,7 +234,7 @@ export default function DomainKnowledgeRelationList() {
             {v}
           </span>
           {r.target_type && (
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+            <div style={{ fontSize: 11, color: 'var(--yx-text-secondary)', marginTop: 2 }}>
               {typeNameMap[r.target_type] || r.target_type}
             </div>
           )}
@@ -291,7 +291,7 @@ export default function DomainKnowledgeRelationList() {
         backTo={() => navigate(`/domain-knowledge/${id}`)}
         title={t('domainKnowledge.instanceTitle', { name: decodedName })}
         extra={
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
             <span style={{ fontSize: 20, fontWeight: 700, color: '#8b5cf6', marginRight: 6 }}>
               {total.toLocaleString()}
             </span>
@@ -300,14 +300,14 @@ export default function DomainKnowledgeRelationList() {
         }
         style={{ marginBottom: 4 }}
       />
-      <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 20 }}>{t('domainKnowledge.instanceDesc')}</div>
+      <div style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginBottom: 20 }}>{t('domainKnowledge.instanceDesc')}</div>
 
       <PageContent showCard={false}>
         <div
           style={{
             background: '#fff',
             borderRadius: 10,
-            border: '1px solid #eef2f6',
+            border: '1px solid var(--yx-border-light)',
             padding: 24,
             boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
           }}
@@ -318,7 +318,7 @@ export default function DomainKnowledgeRelationList() {
                 margin: 0,
                 fontSize: 15,
                 fontWeight: 600,
-                color: '#0b2b5c',
+                color: 'var(--yx-brand-dark)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
@@ -350,7 +350,7 @@ export default function DomainKnowledgeRelationList() {
           </div>
 
           {error && instances.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 48, color: '#94a3b8' }}>{error}</div>
+            <div style={{ textAlign: 'center', padding: 48, color: 'var(--yx-text-muted)' }}>{error}</div>
           ) : (
             <>
               <Table
@@ -361,88 +361,20 @@ export default function DomainKnowledgeRelationList() {
                 size="middle"
                 loading={loading}
                 scroll={{ x: 720 }}
-                locale={{ emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyRelationInstances')}</span> }}
+                locale={{ emptyText: t('compile.emptyRelationInstances') }}
               />
 
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'flex-end',
-                  gap: 6,
-                  padding: '12px 0 0',
-                  borderTop: '1px solid #eef2f6',
-                  marginTop: 12,
-                }}
-              >
-                <span
-                  className={`yx-page-btn${page <= 1 ? ' disabled' : ''}`}
-                  onClick={() => page > 1 && setPage((p) => p - 1)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: 8,
-                    border: '1px solid #e2e8f0',
-                    cursor: page <= 1 ? 'not-allowed' : 'pointer',
-                    color: '#94a3b8',
-                    fontSize: 12,
-                    opacity: page <= 1 ? 0.4 : 1,
-                  }}
-                >
-                  {'<'}
-                </span>
-                {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => {
-                  const n = i + 1;
-                  return (
-                    <span
-                      key={n}
-                      className={`yx-page-btn${n === page ? ' active' : ''}`}
-                      onClick={() => setPage(n)}
-                      style={{
-                        width: 34,
-                        height: 34,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        borderRadius: 8,
-                        background: n === page ? '#3b82f6' : 'transparent',
-                        color: n === page ? '#fff' : '#64748b',
-                        fontWeight: n === page ? 600 : 400,
-                        fontSize: 13,
-                        cursor: 'pointer',
-                        border: n === page ? 'none' : '1px solid #e2e8f0',
-                      }}
-                    >
-                      {n}
-                    </span>
-                  );
-                })}
-                <span
-                  className={`yx-page-btn${page >= totalPages ? ' disabled' : ''}`}
-                  onClick={() => page < totalPages && setPage((p) => p + 1)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: 8,
-                    border: '1px solid #e2e8f0',
-                    cursor: page >= totalPages ? 'not-allowed' : 'pointer',
-                    color: '#94a3b8',
-                    fontSize: 12,
-                    opacity: page >= totalPages ? 0.4 : 1,
-                  }}
-                >
-                  {'>'}
-                </span>
-                <span style={{ fontSize: 13, color: '#94a3b8', marginLeft: 12 }}>
-                  {t('domainKnowledge.pagination', { total: total.toLocaleString(), page, pages: totalPages })}
-                </span>
-              </div>
+              <Pagination
+                current={page}
+                pageSize={PAGE_SIZE}
+                total={total}
+                showSizeChanger={false}
+                showTotal={(count) =>
+                  t('domainKnowledge.pagination', { total: count.toLocaleString(), page, pages: totalPages })
+                }
+                onChange={setPage}
+                style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}
+              />
             </>
           )}
         </div>

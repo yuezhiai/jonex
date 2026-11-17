@@ -107,7 +107,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
             name,
             department: '',
             avatar: name.charAt(0).toUpperCase(),
-            avatarColor: '#94a3b8',
+            avatarColor: 'var(--yx-text-muted)',
             role,
           };
         }),
@@ -268,20 +268,20 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
               style={{
                 fontSize: 17,
                 fontWeight: 600,
-                color: '#0b2b5c',
+                color: 'var(--yx-brand-dark)',
                 marginBottom: 16,
                 paddingBottom: 12,
-                borderBottom: '1px solid #eef2f6',
+                borderBottom: '1px solid var(--yx-border-light)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
               }}
             >
-              <InfoCircleOutlined style={{ color: '#3b82f6' }} /> {t('domainSpace.sectionInfo')}
+              <InfoCircleOutlined style={{ color: 'var(--yx-accent)' }} /> {t('domainSpace.sectionInfo')}
             </h2>
             <div className="yx-card" style={{ padding: '24px 28px' }}>
               <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 13, color: '#64748b', marginBottom: 6 }}>{t('domainSpace.name')}</div>
+                <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginBottom: 6 }}>{t('domainSpace.name')}</div>
                 <Input
                   value={name}
                   onChange={(e) => setName(e.target.value)}
@@ -290,7 +290,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                 />
               </div>
               <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 13, color: '#64748b', marginBottom: 6 }}>{t('domainSpace.description')}</div>
+                <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginBottom: 6 }}>{t('domainSpace.description')}</div>
                 <Input.TextArea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
@@ -319,16 +319,16 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
               style={{
                 fontSize: 17,
                 fontWeight: 600,
-                color: '#0b2b5c',
+                color: 'var(--yx-brand-dark)',
                 marginBottom: 16,
                 paddingBottom: 12,
-                borderBottom: '1px solid #eef2f6',
+                borderBottom: '1px solid var(--yx-border-light)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
               }}
             >
-              <TeamOutlined style={{ color: '#3b82f6' }} /> {t('domainSpace.permissionSettings')}
+              <TeamOutlined style={{ color: 'var(--yx-accent)' }} /> {t('domainSpace.permissionSettings')}
             </h2>
             <div className="yx-card" style={{ padding: '24px 28px' }}>
               {/* 添加成员 */}
@@ -357,15 +357,15 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                       background: '#fff',
                       borderRadius: 8,
                       boxShadow: '0 4px 20px rgba(0,0,0,.12)',
-                      border: '1px solid #e2e8f0',
+                      border: '1px solid var(--yx-border)',
                       overflow: 'hidden',
                     }}
                   >
-                    <div style={{ padding: '8px 12px', borderBottom: '1px solid #e2e8f0' }}>
+                    <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--yx-border)' }}>
                       <Input
                         size="small"
                         placeholder={t('domainSpace.searchUserPlaceholder')}
-                        prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+                        prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
                         value={userSearchText}
                         onChange={(e) => setUserSearchText(e.target.value)}
                         allowClear
@@ -377,7 +377,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                           <Spin size="small" />
                         </div>
                       ) : filteredAvailableUsers.length === 0 ? (
-                        <div style={{ textAlign: 'center', padding: 20, color: '#94a3b8', fontSize: 13 }}>
+                        <div style={{ textAlign: 'center', padding: 20, color: 'var(--yx-text-muted)', fontSize: 13 }}>
                           {userSearchText ? t('domainSpace.noMatchUser') : t('domainSpace.noAvailableUser')}
                         </div>
                       ) : (
@@ -403,7 +403,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                               </div>
                               <div className="yx-perm-user-dept">{user.email || user.username || ''}</div>
                             </div>
-                            <span style={{ fontSize: 20, color: '#3b82f6', lineHeight: 1 }}>+</span>
+                            <span style={{ fontSize: 20, color: 'var(--yx-accent)', lineHeight: 1 }}>+</span>
                           </div>
                         ))
                       )}
@@ -414,7 +414,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
 
               {/* 已有成员搜索 */}
               <Input
-                prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+                prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)', fontSize: 14 }} />}
                 placeholder={t('domainSpace.searchMemberPlaceholder')}
                 value={permSearch}
                 onChange={(e) => setPermSearch(e.target.value)}
@@ -428,7 +428,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                     <Spin />
                   </div>
                 ) : filteredPermMembers.length === 0 && !permOwner ? (
-                  <div style={{ textAlign: 'center', padding: 24, color: '#94a3b8', fontSize: 13 }}>
+                  <div style={{ textAlign: 'center', padding: 24, color: 'var(--yx-text-muted)', fontSize: 13 }}>
                     {permSearch ? t('domainSpace.noMatchMember') : t('domainSpace.noMembers')}
                   </div>
                 ) : (
@@ -436,7 +436,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                     {/* 创建者（owner）：只读展示，不落 space_permissions、不可删/改角色 */}
                     {permOwner && (
                       <div className="yx-perm-user-row">
-                        <div className="yx-perm-avatar" style={{ background: '#3b82f6' }}>
+                        <div className="yx-perm-avatar" style={{ background: 'var(--yx-accent)' }}>
                           {(permOwner.display_name || permOwner.user_id).charAt(0).toUpperCase()}
                         </div>
                         <div className="yx-perm-user-info" style={{ flex: 1 }}>
@@ -448,8 +448,8 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                         <span
                           style={{
                             fontSize: 12,
-                            color: '#3b82f6',
-                            background: '#eff6ff',
+                            color: 'var(--yx-accent)',
+                            background: 'var(--yx-info-bg)',
                             padding: '2px 10px',
                             borderRadius: 10,
                           }}
@@ -498,7 +498,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                             type="text"
                             onClick={() => removePermMember(member.id)}
                             title={t('domainSpace.removeMember')}
-                            style={{ color: '#94a3b8', fontSize: 16, padding: '0 0 0 8px', lineHeight: 1 }}
+                            style={{ color: 'var(--yx-text-muted)', fontSize: 16, padding: '0 0 0 8px', lineHeight: 1 }}
                           >
                             <CloseOutlined />
                           </Button>
@@ -534,7 +534,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                   alignItems: 'center',
                   gap: 8,
                   fontWeight: 600,
-                  color: '#dc2626',
+                  color: 'var(--yx-error-text)',
                   fontSize: 15,
                 }}
               >
@@ -553,7 +553,7 @@ const DomainSpaceSettings = function DomainSpaceSettings() {
                   <p style={{ fontSize: 14, color: '#1e293b', fontWeight: 500, marginBottom: 4 }}>
                     {t('domainSpace.deleteSpaceTitle')}
                   </p>
-                  <p style={{ fontSize: 13, color: '#64748b' }}>{t('domainSpace.deleteWarning')}</p>
+                  <p style={{ fontSize: 13, color: 'var(--yx-text-secondary)' }}>{t('domainSpace.deleteWarning')}</p>
                 </div>
                 <Button
                   danger

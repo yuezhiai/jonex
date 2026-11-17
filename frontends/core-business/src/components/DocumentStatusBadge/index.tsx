@@ -91,7 +91,7 @@ export default function DocumentStatusBadge({
           Wiki 编译产物，只有 compiled 后才可搜索；待编译/编译中/编译失败都不该提示可搜
           （compiled 本无 hint）。lightrag（向量已入库）保持原 hint。 */}
       {!isLlmWikiType(kbType) && d.hint && (
-        <span style={{ fontSize: 11, color: '#94a3b8' }}>{t(d.hint)}</span>
+        <span style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t(d.hint)}</span>
       )}
     </span>
   );

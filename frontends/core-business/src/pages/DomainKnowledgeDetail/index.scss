@@ -9,26 +9,26 @@
   line-height: 18px;
   padding: 2px 10px;
   border-radius: 999px;
-  background: #f8fafc;
-  border: 1px solid #eef2f6;
-  color: #94a3b8;
+  background: var(--yx-bg-subtle);
+  border: 1px solid var(--yx-border-light);
+  color: var(--yx-text-muted);
 }
 
 .yx-kb-stat-badge b {
-  color: #334155;
+  color: var(--yx-text-body);
   font-weight: 600;
 }
 
 /* 三类统计按语义配色：文档=数据(蓝)、实体=知识(绿)、关系=连接(橙)。
    底色、边框、图标与单位文字同取一个色相（color 会同时作用于图标和后面的单位文字），数字保持统一深色。 */
 .yx-kb-stat-badge-docs {
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   border-color: #bfdbfe;
   color: #2563eb;
 }
 
 .yx-kb-stat-badge-entities {
-  background: #ecfdf5;
+  background: var(--yx-success-bg);
   border-color: #a7f3d0;
   color: #059669;
 }
@@ -44,8 +44,9 @@
   font-size: 12px;
 }
 
-/* 「知识库级 schema」页签：内嵌本体画布（画布要一个确定高度；PageContent 的卡片 body
-   不是 flex 列，这里用视口估算）。⚠️ 数值按页头/页签栏实测调，改版式要重核。 */
+/* 「知识库级 schema」页签：内嵌本体画布。
+   高度由 index.tsx 在运行时测量后写成内联 style（视口高 - 元素文档顶部 - 24px）；
+   这里的 `calc(100vh - 320px)` 只是首帧兜底 —— 320 是旧版页头的经验值，不要再当准。 */
 .yx-kb-schema-embed {
   height: calc(100vh - 320px);
   min-height: 520px;
@@ -123,7 +124,7 @@
 .yx-kb-detail-tabs {
   display: flex;
   margin-bottom: 12px;
-  border-bottom: 1px solid #eef2f6;
+  border-bottom: 1px solid var(--yx-border-light);
   overflow-x: auto;
   /* 不参与 flex 压缩。外层 PageContent 是 flex column，而 overflow 非 visible 的
      flex item 自动最小尺寸为 0，内容一超长（编译配置 tab）就会把它压成一条边线。 */
@@ -137,7 +138,7 @@
   padding: 10px 16px;
   font-size: 13px;
   font-weight: 500;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   cursor: pointer;
   border-bottom: 2px solid transparent;
   white-space: nowrap;
@@ -146,12 +147,12 @@
 }
 
 .yx-kb-detail-tab:hover {
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 .yx-kb-detail-tab.active {
-  color: #3b82f6;
-  border-bottom-color: #3b82f6;
+  color: var(--yx-accent);
+  border-bottom-color: var(--yx-accent);
 }
 
 /* 通用工具类 */
@@ -163,12 +164,12 @@
 
 .yx-kb-section-desc {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   margin-bottom: 12px;
 }
 
 .yx-kb-icon-blue {
-  color: #3b82f6;
+  color: var(--yx-accent);
 }
 
 .yx-kb-icon-purple {
@@ -178,18 +179,18 @@
 .yx-kb-empty-state {
   text-align: center;
   padding: 40px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .yx-kb-instance-count {
   font-weight: 600;
-  color: #3b82f6;
+  color: var(--yx-accent);
 }
 
 .yx-kb-sub-text {
   font-size: 12px;
   font-weight: 400;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 
@@ -197,7 +198,7 @@
 .yx-modal-access-method {
   margin-bottom: 16px;
   font-size: 13px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 
@@ -211,7 +212,7 @@
   margin: 0;
   font-size: 15px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -220,7 +221,7 @@
   margin: 0 0 4px;
   font-size: 15px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -237,7 +238,7 @@
 }
 .yx-kb-meta-label {
   font-size: 11px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin-bottom: 2px;
@@ -256,36 +257,36 @@
 .yx-kb-stat-card {
   text-align: center;
   padding: 20px;
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
   border-radius: 10px;
-  border: 1px solid #eef2f6;
+  border: 1px solid var(--yx-border-light);
 }
 .yx-kb-stat-label {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   margin-top: 4px;
 }
 
 
 .yx-kb-flex-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-.yx-kb-section-title { margin: 0; font-size: 15px; font-weight: 600; color: #0b2b5c; display: flex; align-items: center; gap: 8px; }
+.yx-kb-section-title { margin: 0; font-size: 15px; font-weight: 600; color: var(--yx-brand-dark); display: flex; align-items: center; gap: 8px; }
 .yx-kb-flex-between { display: flex; align-items: center; justify-content: space-between; }
 .yx-kb-flex-gap { display: flex; gap: 10px; align-items: flex-start; }
 /* 首层卡面已由 PageContent 的卡片承担，tab 内不再重复描边；-mb 只留分区间距 */
 .yx-kb-section-card-mb { margin-bottom: 20px; }
-.yx-kb-section-title-mb { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: #0b2b5c; display: flex; align-items: center; gap: 8px; }
-.yx-kb-meta-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+.yx-kb-section-title-mb { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--yx-brand-dark); display: flex; align-items: center; gap: 8px; }
+.yx-kb-meta-label { font-size: 11px; color: var(--yx-text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
 .yx-kb-stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
-.yx-kb-chip-blue { padding: 2px 8px; border-radius: 6px; background: #eff6ff; color: #3b82f6; font-size: 12px; font-weight: 500; }
-.yx-kb-chip-green { padding: 2px 8px; border-radius: 6px; background: #ecfdf5; color: #059669; font-size: 12px; font-weight: 500; }
-.yx-kb-ds-link-edit { font-size: 12px; color: #3b82f6; cursor: pointer; padding: 4px 12px; border-radius: 6px; }
+.yx-kb-chip-blue { padding: 2px 8px; border-radius: 6px; background: var(--yx-info-bg); color: var(--yx-accent); font-size: 12px; font-weight: 500; }
+.yx-kb-chip-green { padding: 2px 8px; border-radius: 6px; background: var(--yx-success-bg); color: #059669; font-size: 12px; font-weight: 500; }
+.yx-kb-ds-link-edit { font-size: 12px; color: var(--yx-accent); cursor: pointer; padding: 4px 12px; border-radius: 6px; }
 .yx-kb-ds-link-del { font-size: 12px; color: #ef4444; cursor: pointer; padding: 4px 12px; border-radius: 6px; }
-.yx-kb-graph-desc { font-size: 13px; color: #94a3b8; margin-bottom: 0; margin-top: 8px; }
-.yx-kb-rule-box { border: 1px solid #eef2f6; border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; background: #fff; }
+.yx-kb-graph-desc { font-size: 13px; color: var(--yx-text-muted); margin-bottom: 0; margin-top: 8px; }
+.yx-kb-rule-box { border: 1px solid var(--yx-border-light); border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; background: #fff; }
 .yx-kb-toggle-track { position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer; margin: 0; }
-.yx-kb-trigger-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 14px; padding-top: 14px; border-top: 1px solid #f1f5f9; }
-.yx-kb-save-bar { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; padding-top: 16px; border-top: 1px solid #eef2f6; }
-.yx-kb-ds-card { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid #eef2f6; border-radius: 10px; margin-bottom: 10px; cursor: pointer; }
+.yx-kb-trigger-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--yx-bg-muted); }
+.yx-kb-save-bar { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--yx-border-light); }
+.yx-kb-ds-card { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--yx-border-light); border-radius: 10px; margin-bottom: 10px; cursor: pointer; }
 .yx-kb-rule-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0; }
 
 
@@ -323,7 +324,7 @@
 
 .yx-kb-header-updated {
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 /* 库型未知时的页签占位：详情要等 with_stats（jonex_wiki 可达数秒），

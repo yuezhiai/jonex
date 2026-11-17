@@ -2,7 +2,7 @@
 .yx-domain-management-page {
   .yx-page-desc {
     font-size: 14px;
-    color: #64748b;
+    color: var(--yx-text-secondary);
     margin-top: 6px;
   }
 
@@ -24,7 +24,7 @@
 
   .yx-filter-count {
     font-size: 13px;
-    color: #94a3b8;
+    color: var(--yx-text-muted);
     margin-left: 8px;
   }
 
@@ -34,7 +34,7 @@
     border-radius: 10px;
     padding: 24px;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-    border: 1px solid #eef2f6;
+    border: 1px solid var(--yx-border-light);
 
     .ant-table {
       font-size: 14px;
@@ -60,14 +60,14 @@
     display: flex;
     align-items: center;
     background: #fff;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--yx-border);
     border-radius: 8px;
     padding: 0 12px;
     transition: border-color 0.2s;
     width: 280px;
 
     &:focus-within {
-      border-color: #3b82f6;
+      border-color: var(--yx-accent);
       box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
     }
 
@@ -83,7 +83,7 @@
       font-family: inherit;
 
       &::placeholder {
-        color: #94a3b8;
+        color: var(--yx-text-muted);
       }
     }
   }
@@ -99,8 +99,8 @@
     font-size: 11px;
     padding: 2px 8px;
     border-radius: 4px;
-    background: #f1f5f9;
-    color: #64748b;
+    background: var(--yx-bg-muted);
+    color: var(--yx-text-secondary);
     white-space: nowrap;
   }
 
@@ -112,22 +112,22 @@
     font-size: 12px;
     padding: 2px 10px;
     border-radius: 6px;
-    background: #f1f5f9;
-    color: #64748b;
+    background: var(--yx-bg-muted);
+    color: var(--yx-text-secondary);
     cursor: pointer;
     transition: all 0.2s ease;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--yx-border);
 
     &:hover {
-      background: #eff6ff;
-      color: #3b82f6;
+      background: var(--yx-info-bg);
+      color: var(--yx-accent);
       border-color: #bfdbfe;
     }
   }
 
   /* 表格操作链接 */
   .yx-table-action {
-    color: #3b82f6;
+    color: var(--yx-accent);
     text-decoration: none;
     font-size: 13px;
     margin: 0 4px;
@@ -141,37 +141,14 @@
     & + .yx-table-action {
       margin-left: 12px;
       padding-left: 12px;
-      border-left: 1px solid #e2e8f0;
+      border-left: 1px solid var(--yx-border);
     }
   }
 }
 
-/* ── 弹窗样式（渲染在 body 下，独立作用域） ── */
+/* ── 弹窗样式（渲染在 body 下，独立作用域）──
+   modal 骨架统一由 layout.css 的 .yx-modal 提供，这里只放页面特有的内容 */
 .yx-domain-space-modal {
-  .ant-modal-container {
-    border-radius: 16px;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
-    overflow: hidden;
-  }
-
-  .ant-modal-header {
-    padding: 20px 24px;
-    border-bottom: 1px solid #eef2f6;
-  }
-
-  .ant-modal-title {
-    font-size: 17px;
-    font-weight: 600;
-    color: #0b2b5c;
-  }
-
-
-  .ant-modal-footer {
-    padding: 16px 24px;
-    border-top: 1px solid #eef2f6;
-    margin-top: 0;
-  }
-
   /* 搜索框（弹窗内） */
   .yx-search-box {
     width: 100%;
@@ -185,7 +162,7 @@
     gap: 12px;
     padding: 10px 12px;
     border-radius: 8px;
-    border: 1px solid #eef2f6;
+    border: 1px solid var(--yx-border-light);
     margin-bottom: 8px;
     transition: all 0.2s;
 
@@ -221,9 +198,9 @@
     padding: 4px 12px;
     border-radius: 6px;
     font-size: 12px;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--yx-border);
     cursor: pointer;
-    color: #64748b;
+    color: var(--yx-text-secondary);
     transition: all 0.2s;
     user-select: none;
 
@@ -232,14 +209,14 @@
     }
 
     &:hover {
-      border-color: #3b82f6;
-      color: #3b82f6;
+      border-color: var(--yx-accent);
+      color: var(--yx-accent);
     }
 
     &.is-checked {
-      background: #eff6ff;
-      border-color: #3b82f6;
-      color: #3b82f6;
+      background: var(--yx-info-bg);
+      border-color: var(--yx-accent);
+      color: var(--yx-accent);
       font-weight: 500;
     }
   }
@@ -251,7 +228,7 @@
     label {
       display: block;
       font-size: 13px;
-      color: #64748b;
+      color: var(--yx-text-secondary);
       margin-bottom: 4px;
       font-weight: 500;
     }
@@ -301,7 +278,7 @@
   }
 
   .yx-switch-label input:checked + .yx-switch-slider {
-    background: #3b82f6;
+    background: var(--yx-accent);
 
     &::before {
       transform: translateX(18px);
@@ -312,7 +289,7 @@
   .yx-key-text {
     font-family: var(--yx-font-mono);
     font-size: 12px;
-    background: #f1f5f9;
+    background: var(--yx-bg-muted);
     padding: 2px 8px;
     border-radius: 4px;
     color: #475569;
@@ -321,19 +298,19 @@
 
   .yx-copy-btn {
     background: none;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--yx-border);
     border-radius: 6px;
     padding: 4px 8px;
     cursor: pointer;
-    color: #64748b;
+    color: var(--yx-text-secondary);
     font-size: 12px;
     transition: all 0.2s;
     margin-left: 8px;
     vertical-align: middle;
 
     &:hover {
-      background: #eff6ff;
-      color: #3b82f6;
+      background: var(--yx-info-bg);
+      color: var(--yx-accent);
       border-color: #bfdbfe;
     }
 

@@ -34,7 +34,7 @@ export default function PromptViewModal({ open, title, desc, content, onClose }:
         </Button>,
       ]}
     >
-      <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>{desc}</p>
+      <p style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginBottom: 12 }}>{desc}</p>
       <Input.TextArea value={content} readOnly rows={14} style={{ fontSize: 13 }} />
     </Modal>
   );

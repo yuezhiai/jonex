@@ -1,7 +1,6 @@
 import React from 'react';
-import { Modal, Button } from 'antd';
-import { DeleteOutlined, StopOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
+import { DangerConfirmModal } from '@jonex/shared-lib';
 import type { DomainServiceItem } from '../../types/domainService';
 
 interface DeleteConfirmModalProps {
@@ -22,40 +21,15 @@ export default function DeleteConfirmModal({
   const { t } = useTranslation();
 
   return (
-    <Modal
-      wrapClassName="yx-domain-space-modal"
-      title={
-        <span>
-          <StopOutlined style={{ color: '#ef4444', marginRight: 8 }} />
-          {t('common.confirmDeleteTitle')}
-        </span>
-      }
+    <DangerConfirmModal
       open={open}
+      title={t('common.confirmDeleteContent', { name: deleteTarget?.name || '' })}
+      description={t('common.deleteWarning')}
+      okText={t('common.okText')}
+      cancelText={t('common.cancel')}
+      confirmLoading={submitting}
+      onOk={onConfirm}
       onCancel={onCancel}
-      footer={
-        <div style={{ display: 'flex', justifyContent: 'center', gap: 12 }}>
-          <Button onClick={onCancel}>{t('common.cancel')}</Button>
-          <Button danger type="primary" loading={submitting} onClick={onConfirm}>
-            {t('common.okText')}
-          </Button>
-        </div>
-      }
-      width={420}
-    >
-      <div style={{ textAlign: 'center', padding: '12px 0' }}>
-        <DeleteOutlined
-          style={{
-            fontSize: 48,
-            color: '#ef4444',
-            marginBottom: 16,
-            display: 'block',
-          }}
-        />
-        <p style={{ fontSize: 16, color: '#1e293b', fontWeight: 500 }}>
-          {t('common.confirmDeleteContent', { name: deleteTarget?.name || '' })}
-        </p>
-        <p style={{ fontSize: 13, color: '#94a3b8', marginTop: 8 }}>{t('common.deleteWarning')}</p>
-      </div>
-    </Modal>
+    />
   );
 }

@@ -119,7 +119,7 @@ export default function EditOntologyModal({
   return (
     <Modal
       title={
-        <span style={{ fontSize: 18, fontWeight: 700, color: '#0b2b5c' }}>
+        <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--yx-brand-dark)' }}>
           {isCreate ? t('compile.createInstance') : t('compile.editInstance', { name: record?.name || '' })}
         </span>
       }
@@ -138,7 +138,7 @@ export default function EditOntologyModal({
         </div>
       }
       styles={{ body: { padding: '24px 24px 12px' } }}
-      closeIcon={<CloseOutlined style={{ color: '#64748b' }} />}
+      closeIcon={<CloseOutlined style={{ color: 'var(--yx-text-secondary)' }} />}
     >
       <Form form={form} layout="vertical">
         <Form.Item
@@ -163,7 +163,7 @@ export default function EditOntologyModal({
             style={{
               fontSize: 14,
               fontWeight: 600,
-              color: '#0b2b5c',
+              color: 'var(--yx-brand-dark)',
               marginBottom: 8,
             }}
           >
@@ -194,8 +194,8 @@ export default function EditOntologyModal({
                     gap: 4,
                     padding: '2px 8px',
                     borderRadius: 6,
-                    background: '#eff6ff',
-                    color: '#3b82f6',
+                    background: 'var(--yx-info-bg)',
+                    color: 'var(--yx-accent)',
                     fontSize: 12,
                   }}
                 >
@@ -215,10 +215,10 @@ export default function EditOntologyModal({
         <Form.Item label={t('compile.customAttributes')}>
           <div
             style={{
-              background: '#f8fafc',
+              background: 'var(--yx-bg-subtle)',
               borderRadius: 12,
               padding: 16,
-              border: '1px solid #eef2f6',
+              border: '1px solid var(--yx-border-light)',
             }}
           >
             <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
@@ -254,11 +254,11 @@ export default function EditOntologyModal({
                       padding: '4px 10px',
                       borderRadius: 6,
                       background: '#fff',
-                      border: '1px solid #e2e8f0',
+                      border: '1px solid var(--yx-border)',
                       fontSize: 13,
                     }}
                   >
-                    <span style={{ fontWeight: 500, color: '#0b2b5c' }}>{k}</span>
+                    <span style={{ fontWeight: 500, color: 'var(--yx-brand-dark)' }}>{k}</span>
                     <span
                       style={{
                         display: 'flex',
@@ -266,12 +266,12 @@ export default function EditOntologyModal({
                         gap: 8,
                       }}
                     >
-                      <span style={{ color: '#64748b' }}>{v}</span>
+                      <span style={{ color: 'var(--yx-text-secondary)' }}>{v}</span>
                       <CloseOutlined
                         style={{
                           fontSize: 10,
                           cursor: 'pointer',
-                          color: '#94a3b8',
+                          color: 'var(--yx-text-muted)',
                         }}
                         onClick={() => removeAttributeItem(k)}
                       />

@@ -153,12 +153,12 @@ export default function DomainKnowledgeBlank() {
       labelKey: 'docPhase.total',
       value: (docStats?.total ?? detail?.documentCount ?? 0).toLocaleString(),
       suffixKey: 'docPhase.docSuffix',
-      icon: <FileTextOutlined style={{ color: '#3b82f6' }} />,
+      icon: <FileTextOutlined style={{ color: 'var(--yx-accent)' }} />,
     },
     {
       labelKey: 'docPhase.processing',
       value: docStats ? docStats.processing.toLocaleString() : '—',
-      icon: <ClockCircleOutlined style={{ color: '#3b82f6' }} />,
+      icon: <ClockCircleOutlined style={{ color: 'var(--yx-accent)' }} />,
     },
     {
       labelKey: 'docPhase.completedStat',
@@ -194,7 +194,7 @@ export default function DomainKnowledgeBlank() {
         title={
           // wrap：库名 + 三个标签在窄屏放不下时换行，而不是把页头撑出横向滚动
           <Space align="center" size={10} wrap>
-            <FileTextOutlined style={{ fontSize: 24, color: '#3b82f6' }} />
+            <FileTextOutlined style={{ fontSize: 24, color: 'var(--yx-accent)' }} />
             <span>{detail?.name}</span>
             {assetTags.map((tag) => (
               <AssetStatTag key={tag.label} label={tag.label} value={tag.value} icon={tag.icon} tone={tag.tone} />
@@ -214,7 +214,7 @@ export default function DomainKnowledgeBlank() {
               <>
                 <div>{detailError}</div>
                 {/* 后端 404 同时覆盖「不存在」与「无权访问」，措辞用条件句，不泄露存在性 */}
-                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
+                <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 4 }}>
                   {t('domainKnowledge.loadErrorHint')}
                 </div>
               </>
@@ -256,13 +256,13 @@ export default function DomainKnowledgeBlank() {
                       {stats.map((s) => (
                         <Space key={s.labelKey} align="center" size={8}>
                           {s.icon}
-                          <span style={{ color: '#64748b', fontSize: 14 }}>{t(s.labelKey)}</span>
-                          <span style={{ color: '#0b2b5c', fontSize: 18, fontWeight: 700 }}>{s.value}</span>
-                          {s.suffixKey && <span style={{ color: '#64748b', fontSize: 14 }}>{t(s.suffixKey)}</span>}
+                          <span style={{ color: 'var(--yx-text-secondary)', fontSize: 14 }}>{t(s.labelKey)}</span>
+                          <span style={{ color: 'var(--yx-brand-dark)', fontSize: 18, fontWeight: 700 }}>{s.value}</span>
+                          {s.suffixKey && <span style={{ color: 'var(--yx-text-secondary)', fontSize: 14 }}>{t(s.suffixKey)}</span>}
                         </Space>
                       ))}
                     </Space>
-                    <Space align="center" size={6} style={{ color: '#64748b', fontSize: 14 }}>
+                    <Space align="center" size={6} style={{ color: 'var(--yx-text-secondary)', fontSize: 14 }}>
                       <CloudServerOutlined style={{ color: '#8b5cf6' }} />
                       <span>
                         {t('dataSource.title')}: {dataSources}

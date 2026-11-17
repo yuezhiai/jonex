@@ -79,7 +79,8 @@ export default function RelationFormModal({ open, editing, objectNames, submitti
       targetObject: values.targetObject,
       relationType: values.relationType,
       status: editing?.status || 'active',
-      inverseOf: (values.inverseOf || '').trim() || undefined,
+      // 空串 = 显式清空（不能转 undefined：JSON 会丢掉这个键，保存侧只能回落到 existing）
+      inverseOf: (values.inverseOf || '').trim(),
       sourceTypes: values.sourceTypes || [],
       targetTypes: values.targetTypes || [],
     });

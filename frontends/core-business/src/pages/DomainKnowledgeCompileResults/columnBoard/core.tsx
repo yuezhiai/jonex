@@ -27,7 +27,7 @@ export const CARD_ACTIVE = { border: '#3478ee', background: '#eef4ff', shadow: '
 // 没法靠外层作用域隔离，所以逐处传 props 而不是改全局主题。
 // color 同时决定箭头底色，文字色单独给 container（浅灰底配默认白字会看不清）。
 export const CARD_TOOLTIP = {
-  color: '#f1f5f9',
+  color: 'var(--yx-bg-muted)',
   styles: { container: { color: '#1e293b' } },
 };
 

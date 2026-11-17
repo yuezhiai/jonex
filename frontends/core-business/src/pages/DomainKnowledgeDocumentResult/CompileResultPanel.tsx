@@ -91,7 +91,7 @@ export default function CompileResultPanel({
       <div
         style={{
           width: 180,
-          borderRight: '1px solid #f1f5f9',
+          borderRight: '1px solid var(--yx-bg-muted)',
           padding: '12px 8px',
           flexShrink: 0,
           overflowY: 'auto',
@@ -112,8 +112,8 @@ export default function CompileResultPanel({
                 cursor: 'pointer',
                 fontSize: 14,
                 fontWeight: 500,
-                color: active ? '#3b82f6' : '#64748b',
-                background: active ? '#eff6ff' : 'transparent',
+                color: active ? 'var(--yx-accent)' : 'var(--yx-text-secondary)',
+                background: active ? 'var(--yx-info-bg)' : 'transparent',
                 transition: 'all 0.2s',
                 marginBottom: 4,
               }}

@@ -65,14 +65,14 @@ export default function WikiHomeView({
           styles={{ body: { padding: '20px 24px' } }}
         >
           <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
-            <div style={{ fontSize: 22, color: '#3b82f6' }}>
+            <div style={{ fontSize: 22, color: 'var(--yx-accent)' }}>
               <BulbOutlined />
             </div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 16, fontWeight: 600, color: '#0b2b5c' }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                 {t('domainKnowledge.wikiReader.emptyTitle')}
               </div>
-              <div style={{ fontSize: 13, color: '#64748b', marginTop: 6, lineHeight: 1.8 }}>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginTop: 6, lineHeight: 1.8 }}>
                 {t('domainKnowledge.wikiReader.emptyDesc')}
               </div>
               <div style={{ marginTop: 12 }}>
@@ -81,7 +81,7 @@ export default function WikiHomeView({
                     {t('domainKnowledge.wikiReader.generate')}
                   </Button>
                 ) : (
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>
+                  <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
                     {t('domainKnowledge.wikiReader.needWritePermission')}
                   </span>
                 )}
@@ -119,10 +119,10 @@ export default function WikiHomeView({
           )}
 
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
-            <h2 style={{ margin: 0, fontSize: 22, color: '#0b2b5c' }}>
+            <h2 style={{ margin: 0, fontSize: 22, color: 'var(--yx-brand-dark)' }}>
               {t('domainKnowledge.wikiReader.outlineTitle')}
             </h2>
-            <span style={{ color: '#94a3b8', fontSize: 13 }}>
+            <span style={{ color: 'var(--yx-text-muted)', fontSize: 13 }}>
               {t('domainKnowledge.wikiReader.outlineStats', {
                 topics: topics.length,
                 pages: pages.length,
@@ -160,13 +160,13 @@ export default function WikiHomeView({
                   onClick={() => onOpenTopic(topic.id)}
                   style={{
                     borderRadius: 12,
-                    border: '1px solid #eef2f6',
+                    border: '1px solid var(--yx-border-light)',
                     opacity: topic.kind === 'unclassified' ? 0.92 : 1,
                   }}
                   styles={{ body: { padding: '16px 18px' } }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c', flex: 1 }}>
+                    <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)', flex: 1 }}>
                       {topic.kind === 'unclassified' ? t('domainKnowledge.wikiReader.unclassified') : topic.title}
                     </span>
                     <Tag
@@ -177,7 +177,7 @@ export default function WikiHomeView({
                     </Tag>
                   </div>
                   {topic.description && (
-                    <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 6, lineHeight: 1.7 }}>
+                    <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 6, lineHeight: 1.7 }}>
                       {topic.description}
                     </div>
                   )}
@@ -219,7 +219,7 @@ export default function WikiHomeView({
       {/* 分类兜底浏览（未生成目录时的主要入口；已生成时作为附录） */}
       {!outline && (
         <div style={{ marginTop: 20 }}>
-          <div style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c', marginBottom: 10 }}>
+          <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 10 }}>
             <FileTextOutlined /> {t('domainKnowledge.wikiReader.browseByCategory')}
           </div>
           {categoryGroups.length === 0 ? (
@@ -237,11 +237,11 @@ export default function WikiHomeView({
                   key={category}
                   hoverable
                   onClick={() => setExpandedCategory((prev) => (prev === category ? '' : category))}
-                  style={{ borderRadius: 12, border: '1px solid #eef2f6' }}
+                  style={{ borderRadius: 12, border: '1px solid var(--yx-border-light)' }}
                   styles={{ body: { padding: '14px 16px' } }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c', flex: 1 }}>{category}</span>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)', flex: 1 }}>{category}</span>
                     <Tag style={{ margin: 0 }}>{items.length}</Tag>
                   </div>
                   {expandedCategory === category && (
@@ -255,7 +255,7 @@ export default function WikiHomeView({
                             onOpenPage(page.path);
                           }}
                         >
-                          <span style={{ color: '#94a3b8', marginRight: 6 }}>[{t(roleLabelKey(page.type))}]</span>
+                          <span style={{ color: 'var(--yx-text-muted)', marginRight: 6 }}>[{t(roleLabelKey(page.type))}]</span>
                           {page.title}
                         </div>
                       ))}
@@ -273,7 +273,7 @@ export default function WikiHomeView({
           <Button icon={<RobotOutlined />} onClick={onAdjust} loading={busy}>
             {t('domainKnowledge.wikiReader.adjust')}
           </Button>
-          <span style={{ fontSize: 12, color: '#94a3b8', marginLeft: 10 }}>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginLeft: 10 }}>
             {t('domainKnowledge.wikiReader.adjustHint')}
           </span>
         </div>

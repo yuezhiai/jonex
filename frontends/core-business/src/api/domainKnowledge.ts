@@ -92,9 +92,17 @@ import { dataSourceInstanceDisplayName } from '@/utils/dataSourceDisplay';
 import type { SourceSpan } from '@/components/bboxOverlay';
 import type { SpanExpect } from '@/components/documentBBox';
 
-export function getDomainKnowledgeSpaces(): Promise<DomainKnowledgeSpace[]> {
+/**
+ * 空间列表。
+ *
+ * `scope='search'` 用于检索面：此时每项额外带 `has_enabled_service`（是否有启用的领域服务）。
+ * 不传 scope 时行为与既有调用一致（不请求该字段）。
+ */
+export function getDomainKnowledgeSpaces(scope?: 'search'): Promise<DomainKnowledgeSpace[]> {
   return getData<{ items: DomainKnowledgeSpace[] }>(
-    request.get('/knowledge-base/spaces', { params: { limit: 100 } }),
+    request.get('/knowledge-base/spaces', {
+      params: { limit: 100, ...(scope ? { scope } : {}) },
+    }),
   ).then((res) => res.items);
 }
 
@@ -1246,7 +1254,7 @@ function ontologyRelationToCompiledCardinality(
   const mapping: Record<string, CompiledSchemaRelationType['cardinality']> = {
     一对一: 'one_to_one',
     一对多: 'one_to_many',
-    多对一: 'custom',
+    多对一: 'many_to_one',
     多对多: 'many_to_many',
     自定义: 'custom',
   };
@@ -1584,8 +1592,11 @@ function buildCompiledRelationFromPayload(
     target: targetCode,
     source_relation_id: existing?.source_relation_id || null,
     cardinality: ontologyRelationToCompiledCardinality(payload.relationType),
-    // [jonex] P1：新字段保存（payload 优先；未填则保留 existing，防静默丢失）
-    inverse_of: payload.inverseOf?.trim() || existing?.inverse_of || null,
+    // [jonex] P1：新字段保存。payload 里**给了** inverseOf 就以它为准（空串 = 显式清空，
+    // 必须落 null）；只有键缺失（undefined，如模板导入）才保留 existing，防静默丢失。
+    inverse_of: payload.inverseOf !== undefined
+      ? (payload.inverseOf.trim() || null)
+      : (existing?.inverse_of || null),
     source_types: (payload.sourceTypes || existing?.source_types || [])
       .map((t) => entityCodeByDisplay.get(t) || t),
     target_types: (payload.targetTypes || existing?.target_types || [])

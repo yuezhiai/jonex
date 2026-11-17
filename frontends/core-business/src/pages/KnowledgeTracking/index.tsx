@@ -25,9 +25,9 @@ type TabKey = 'all' | 'like' | 'dislike';
 type SourceFilter = 'all' | AnswerFeedbackSource;
 
 const TAB_CONFIG: { key: TabKey; labelKey: string; icon: React.ReactNode; color: string }[] = [
-  { key: 'all', labelKey: 'domainManagementSearch.chip.all', icon: null, color: '#3b82f6' },
+  { key: 'all', labelKey: 'domainManagementSearch.chip.all', icon: null, color: 'var(--yx-accent)' },
   { key: 'like', labelKey: 'knowledgeSearch.helpful', icon: <LikeOutlined />, color: '#059669' },
-  { key: 'dislike', labelKey: 'knowledgeSearch.unhelpful', icon: <DislikeOutlined />, color: '#dc2626' },
+  { key: 'dislike', labelKey: 'knowledgeSearch.unhelpful', icon: <DislikeOutlined />, color: 'var(--yx-error-text)' },
 ];
 
 interface KnowledgeTrackingProps {
@@ -154,14 +154,14 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         labelKey: 'tracking.totalFeedback',
         value: stats?.total ?? '-',
         icon: null,
-        bg: '#eff6ff',
-        color: '#3b82f6',
+        bg: 'var(--yx-info-bg)',
+        color: 'var(--yx-accent)',
       },
       {
         labelKey: 'knowledgeSearch.helpful',
         value: stats?.like_count ?? '-',
         icon: <LikeOutlined />,
-        bg: '#ecfdf5',
+        bg: 'var(--yx-success-bg)',
         color: '#059669',
       },
       {
@@ -169,7 +169,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         value: stats?.dislike_count ?? '-',
         icon: <DislikeOutlined />,
         bg: '#fef2f2',
-        color: '#dc2626',
+        color: 'var(--yx-error-text)',
       },
       {
         labelKey: 'tracking.satisfactionRate',
@@ -211,13 +211,13 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
                 style={{
                   fontSize: 24,
                   fontWeight: 700,
-                  color: '#0b2b5c',
+                  color: 'var(--yx-brand-dark)',
                   lineHeight: 1.2,
                 }}
               >
                 {loading ? '-' : c.value}
               </div>
-              <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 2 }}>{t(c.labelKey)}</div>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginTop: 2 }}>{t(c.labelKey)}</div>
             </div>
           </Card>
         ))}
@@ -234,7 +234,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         justifyContent: 'space-between',
         alignItems: 'center',
         gap: 12,
-        borderBottom: '2px solid #eef2f6',
+        borderBottom: '2px solid var(--yx-border-light)',
         marginBottom: 20,
       }}
     >
@@ -250,7 +250,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
                 padding: '10px 24px',
                 fontSize: 14,
                 fontWeight: 500,
-                color: isActive ? tab.color : '#94a3b8',
+                color: isActive ? tab.color : 'var(--yx-text-muted)',
                 borderBottom: `2px solid ${isActive ? tab.color : 'transparent'}`,
                 marginBottom: -2,
                 borderRadius: 0,
@@ -321,7 +321,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         key: 'time',
         width: 150,
         render: (val: string | null) => (
-          <span style={{ whiteSpace: 'nowrap', color: '#94a3b8', fontSize: 12 }}>{formatTime(val)}</span>
+          <span style={{ whiteSpace: 'nowrap', color: 'var(--yx-text-muted)', fontSize: 12 }}>{formatTime(val)}</span>
         ),
       },
       {
@@ -342,8 +342,8 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
                   borderRadius: 6,
                   fontSize: 12,
                   fontWeight: 500,
-                  background: isMcp ? '#f5f3ff' : '#eff6ff',
-                  color: isMcp ? '#7c3aed' : '#3b82f6',
+                  background: isMcp ? '#f5f3ff' : 'var(--yx-info-bg)',
+                  color: isMcp ? '#7c3aed' : 'var(--yx-accent)',
                 }}
               >
                 {t(isMcp ? 'tracking.sourceMcp' : 'tracking.sourceWeb')}
@@ -352,7 +352,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
                 <span
                   style={{
                     fontSize: 11,
-                    color: '#94a3b8',
+                    color: 'var(--yx-text-muted)',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
@@ -375,7 +375,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
           const query = getQuerySnapshot(record);
           if (!query) {
             return (
-              <span style={{ color: '#94a3b8', fontSize: 12 }}>
+              <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>
                 {record.mcp_key_id ? t('tracking.mcpNoQuerySnapshot') : '-'}
               </span>
             );
@@ -404,7 +404,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
         render: (val: string | null) => (
           <div
             style={{
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               fontSize: 12,
               lineHeight: 1.6,
               display: '-webkit-box',
@@ -433,8 +433,8 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
                 borderRadius: 6,
                 fontSize: 12,
                 fontWeight: 500,
-                background: val === 'like' ? '#ecfdf5' : '#fef2f2',
-                color: val === 'like' ? '#059669' : '#dc2626',
+                background: val === 'like' ? 'var(--yx-success-bg)' : '#fef2f2',
+                color: val === 'like' ? '#059669' : 'var(--yx-error-text)',
                 alignSelf: 'flex-start',
               }}
             >
@@ -442,7 +442,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
               {val === 'like' ? t('knowledgeSearch.helpful') : t('knowledgeSearch.unhelpful')}
             </span>
             {val === 'dislike' && record.feedback_reason ? (
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+              <span style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>
                 {t(`knowledgeSearch.feedbackReason_${record.feedback_reason}`)}
               </span>
             ) : null}
@@ -461,7 +461,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
               alignItems: 'center',
               gap: 4,
               fontSize: 12,
-              color: adopted ? '#059669' : '#94a3b8',
+              color: adopted ? '#059669' : 'var(--yx-text-muted)',
             }}
           >
             {adopted ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CheckCircleOutlined />}
@@ -480,9 +480,9 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
               style={{
                 padding: '3px 12px',
                 fontSize: 12,
-                color: '#64748b',
-                background: '#f1f5f9',
-                border: '1px solid #e2e8f0',
+                color: 'var(--yx-text-secondary)',
+                background: 'var(--yx-bg-muted)',
+                border: '1px solid var(--yx-border)',
                 borderRadius: 6,
                 cursor: 'pointer',
                 display: 'inline-flex',
@@ -497,8 +497,8 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
               style={{
                 padding: '3px 12px',
                 fontSize: 12,
-                color: record.adopted ? '#059669' : '#3b82f6',
-                background: record.adopted ? '#ecfdf5' : '#eff6ff',
+                color: record.adopted ? '#059669' : 'var(--yx-accent)',
+                background: record.adopted ? 'var(--yx-success-bg)' : 'var(--yx-info-bg)',
                 border: `1px solid ${record.adopted ? '#a7f3d0' : '#bfdbfe'}`,
                 borderRadius: 6,
                 cursor: 'pointer',
@@ -577,7 +577,7 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
             onClick={() => navigate(-1)}
             style={{
               fontSize: 14,
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               display: 'flex',
               alignItems: 'center',
               gap: 6,
@@ -590,14 +590,14 @@ export default function KnowledgeTracking({ embedded = false }: KnowledgeTrackin
             style={{
               fontSize: 22,
               fontWeight: 700,
-              color: '#0b2b5c',
+              color: 'var(--yx-brand-dark)',
               display: 'flex',
               alignItems: 'center',
               gap: 10,
             }}
           >
             {t('route.tracking')}
-            <span style={{ fontSize: 14, fontWeight: 400, color: '#94a3b8' }}>— {kbName}</span>
+            <span style={{ fontSize: 14, fontWeight: 400, color: 'var(--yx-text-muted)' }}>— {kbName}</span>
           </h1>
         </div>
       )}

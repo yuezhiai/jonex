@@ -26,7 +26,7 @@
   align-items: center;
   gap: 8px;
   margin: 0;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 15px;
   font-weight: 600;
   line-height: 1.4;
@@ -45,9 +45,9 @@
   gap: 6px;
   height: 32px;
   padding: 6px 16px;
-  border: 1px solid #3b82f6;
+  border: 1px solid var(--yx-accent);
   border-radius: 8px;
-  background: #3b82f6;
+  background: var(--yx-accent);
   color: #fff;
   font-size: 13px;
   font-weight: 500;
@@ -81,7 +81,7 @@
   padding: 8px 12px;
   border: 1px solid #bfdbfe;
   border-radius: 8px;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   color: #1e4fd6;
   font-size: 13px;
 }
@@ -95,7 +95,7 @@
   border: 0;
   border-radius: 5px;
   background: transparent;
-  color: #3b82f6;
+  color: var(--yx-accent);
   cursor: pointer;
 }
 
@@ -113,7 +113,7 @@
   border: 1px solid #fecaca;
   border-radius: 8px;
   background: #fef2f2;
-  color: #dc2626;
+  color: var(--yx-error-text);
   font-size: 13px;
 }
 
@@ -121,7 +121,7 @@
   flex-shrink: 0;
   border: 0;
   border-radius: 6px;
-  background: #dc2626;
+  background: var(--yx-error-text);
   color: #fff;
   font-size: 12px;
   padding: 5px 10px;
@@ -143,7 +143,7 @@
 .parser-config-data-table th {
   padding: 12px 16px;
   border-bottom: 2px solid #e8edf3;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 13px;
   font-weight: 600;
   text-align: left;
@@ -152,8 +152,8 @@
 
 .parser-config-data-table td {
   padding: 12px 16px;
-  border-bottom: 1px solid #f1f5f9;
-  color: #334155;
+  border-bottom: 1px solid var(--yx-bg-muted);
+  color: var(--yx-text-body);
   font-size: 14px;
   line-height: 1.45;
   vertical-align: middle;
@@ -164,7 +164,7 @@
 }
 
 .parser-config-data-table tbody tr:hover {
-  background: #f8fafc;
+  background: var(--yx-bg-subtle);
 }
 
 .parser-config-data-table tbody tr:last-child td {
@@ -176,7 +176,7 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: #334155;
+  color: var(--yx-text-body);
   font-size: 14px;
   font-weight: 400;
 }
@@ -203,7 +203,7 @@
 }
 
 .parser-file-icon.word {
-  color: #3b82f6;
+  color: var(--yx-accent);
 }
 
 .parser-file-icon.excel {
@@ -225,7 +225,7 @@
 
 .parser-file-icon.text,
 .parser-file-icon.cad {
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 .parser-config-tags {
@@ -255,11 +255,11 @@
 
 .parser-config-tag.post {
   color: #059669;
-  background: #ecfdf5;
+  background: var(--yx-success-bg);
 }
 
 .parser-config-muted {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
 }
 
@@ -274,7 +274,7 @@
   border: 0;
   padding: 0 4px;
   background: transparent;
-  color: #3b82f6;
+  color: var(--yx-accent);
   font: inherit;
   font-size: 13px;
   line-height: 1;
@@ -292,14 +292,14 @@
 }
 
 .parser-config-actions button.danger:hover {
-  color: #dc2626;
+  color: var(--yx-error-text);
 }
 
 .parser-config-actions span {
   width: 1px;
   height: 14px;
   margin: 0 8px;
-  background: #e2e8f0;
+  background: var(--yx-border);
 }
 
 .parser-modal-mask {
@@ -337,7 +337,7 @@
 
 .parser-modal-header h2 {
   margin: 0;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 17px;
   font-weight: 600;
   line-height: 1.4;
@@ -352,16 +352,16 @@
   height: 32px;
   border: 0;
   border-radius: 8px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--yx-bg-muted);
+  color: var(--yx-text-secondary);
   font-size: 16px;
   cursor: pointer;
   transition: all 0.2s ease;
 }
 
 .parser-modal-close:hover {
-  background: #e2e8f0;
-  color: #0b2b5c;
+  background: var(--yx-border);
+  color: var(--yx-brand-dark);
 }
 
 .parser-modal-body {
@@ -376,7 +376,7 @@
   border: 1px solid #fecaca;
   border-radius: 8px;
   background: #fef2f2;
-  color: #dc2626;
+  color: var(--yx-error-text);
   font-size: 13px;
 }
 
@@ -389,27 +389,27 @@
 .parser-post-field > label {
   display: block;
   margin-bottom: 4px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 13px;
   font-weight: 500;
   line-height: 1.4;
 }
 
 .parser-form-row > label em {
-  color: #dc2626;
+  color: var(--yx-error-text);
   font-style: normal;
 }
 
 .parser-form-row > label > span {
   margin-left: 8px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
   font-weight: 400;
 }
 
 .parser-form-control {
   width: 100%;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   border-radius: 8px;
   background: #fff;
   color: #1e293b;
@@ -424,18 +424,38 @@
 }
 
 .parser-form-control:focus {
-  border-color: #3b82f6;
+  border-color: var(--yx-accent);
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
 }
 
+/*
+ * antd Select（根节点就是 .ant-select 本身，不是原生 <select>）：
+ * 箭头用组件自带的 .ant-select-suffix，这里不能再用 background-image 画一个原生下拉箭头，
+ * 否则右侧会出现两个箭头；左右内边距也交回 flex 布局，不再给根节点留 32px 避让箭头。
+ */
 .parser-select-control {
   height: 36px;
-  padding: 7px 32px 7px 12px;
+  padding: 0 12px;
   cursor: pointer;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
+}
+
+.parser-select-control .ant-select-suffix {
+  color: var(--yx-text-muted);
+}
+
+.parser-select-control.ant-select-disabled {
+  background: #f8fafc;
+  cursor: not-allowed;
+}
+
+.parser-select-control.ant-select-disabled .ant-select-content,
+.parser-select-control.ant-select-disabled .ant-select-suffix {
+  color: var(--yx-text-muted);
+}
+
+/* 焦点环交给 antd 自带样式，这里只把边框改成主题色，避免和文本输入框视觉不一致 */
+.parser-select-control:focus-within {
+  border-color: var(--yx-accent);
 }
 
 .parser-textarea {
@@ -452,7 +472,7 @@
 }
 
 .parser-form-control::placeholder {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .parser-template-button {
@@ -465,7 +485,7 @@
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #3b82f6;
+  color: var(--yx-accent);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.4;
@@ -474,7 +494,7 @@
 }
 
 .parser-template-button:hover {
-  background: #eff6ff;
+  background: var(--yx-info-bg);
 }
 
 .parser-skill-tags {
@@ -492,7 +512,7 @@
   padding: 3px 8px;
   border: 1px solid #bfdbfe;
   border-radius: 6px;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   color: #1e4fd6;
   font-size: 12px;
   font-weight: 500;
@@ -510,10 +530,10 @@
   width: 100%;
   min-height: 36px;
   padding: 7px 12px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   border-radius: 8px;
   background: #fff;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 13px;
   cursor: pointer;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
@@ -521,12 +541,12 @@
 
 .parser-skill-input-wrap:hover,
 .parser-skill-input-wrap:focus {
-  border-color: #3b82f6;
+  border-color: var(--yx-accent);
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
 }
 
 .parser-skill-input-wrap .anticon {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 10px;
 }
 
@@ -539,7 +559,7 @@
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #334155;
+  color: var(--yx-text-body);
   font-size: 13px;
   font-family: inherit;
   cursor: pointer;
@@ -547,18 +567,18 @@
 }
 
 .parser-skill-option:hover {
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
 }
 
 .parser-skill-option.is-checked {
-  color: #0b2b5c;
-  background: #eff6ff;
+  color: var(--yx-brand-dark);
+  background: var(--yx-info-bg);
 }
 
 .parser-modal-divider {
   height: 1px;
   margin: 16px 0;
-  background: #e2e8f0;
+  background: var(--yx-border);
 }
 
 .parser-post-row {
@@ -574,7 +594,7 @@
   padding: 0;
   border: 0;
   background: transparent;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-family: inherit;
   font-size: 14px;
   font-weight: 500;
@@ -588,15 +608,15 @@
   width: 16px;
   height: 16px;
   flex: 0 0 16px;
-  border: 1px solid #94a3b8;
+  border: 1px solid var(--yx-text-muted);
   border-radius: 3px;
   background: #fff;
 }
 
 .parser-checkbox.is-checked .parser-checkbox-box,
 .parser-skill-option.is-checked .parser-checkbox-box {
-  border-color: #3b82f6;
-  background: #3b82f6;
+  border-color: var(--yx-accent);
+  background: var(--yx-accent);
 }
 
 .parser-checkbox.is-checked .parser-checkbox-box::after,
@@ -647,20 +667,20 @@
 }
 
 .parser-modal-cancel {
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--yx-border);
   background: #fff;
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 .parser-modal-cancel:hover {
   border-color: #cbd5e1;
-  background: #f8fafc;
-  color: #0b2b5c;
+  background: var(--yx-bg-subtle);
+  color: var(--yx-brand-dark);
 }
 
 .parser-modal-save {
   border: 0;
-  background: #3b82f6;
+  background: var(--yx-accent);
   color: #fff;
 }
 
@@ -671,7 +691,7 @@
 .parser-modal-danger {
   border: 1px solid #fecaca;
   background: #fef2f2;
-  color: #dc2626;
+  color: var(--yx-error-text);
 }
 
 .parser-modal-danger:hover {
@@ -696,18 +716,18 @@
   margin: 0 auto 12px;
   border-radius: 12px;
   background: #fef2f2;
-  color: #dc2626;
+  color: var(--yx-error-text);
   font-size: 22px;
 }
 
 .parser-delete-body strong {
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-size: 16px;
 }
 
 .parser-delete-body p {
   margin: 4px 0 0;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   font-size: 14px;
 }
 
@@ -732,42 +752,66 @@
 }
 
 .parser-template-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 132px;
   padding: 28px 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 13px;
   text-align: center;
 }
 
-.parser-template-list button {
+/*
+ * 原生 button：高度由内容撑着（名称 + 描述两行）。
+ * 改用 antd Button 会被 .ant-btn 的 height:32px 锁死，两行内容溢出到下一个条目上。
+ */
+.parser-template-item {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
   width: 100%;
-  padding: 12px 16px;
-  border: 1px solid #eef2f6;
-  border-radius: 8px;
+  min-height: 64px;
+  padding: 12px 14px;
+  border: 1px solid var(--yx-border-light);
+  border-radius: 10px;
   background: #fff;
+  color: inherit;
+  font: inherit;
   cursor: pointer;
   text-align: left;
-  transition: all 0.2s ease;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
 }
 
-.parser-template-list button:hover {
-  border-color: #3b82f6;
+.parser-template-item:hover {
+  border-color: var(--yx-accent);
   background: #fafcff;
+  box-shadow: 0 4px 14px rgba(59, 130, 246, 0.1);
+}
+
+.parser-template-item:active {
+  background: #f3f8ff;
+}
+
+.parser-template-item:focus-visible {
+  outline: 2px solid var(--yx-accent);
+  outline-offset: 1px;
 }
 
 .parser-template-icon {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
-  border-radius: 8px;
-  background: #3b82f6;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 10px;
+  background: var(--yx-accent);
   color: #fff;
-  font-size: 16px;
+  font-size: 15px;
 }
 
 .parser-template-info {
@@ -778,23 +822,36 @@
 }
 
 .parser-template-desc {
-  margin-top: 2px;
+  margin-top: 3px;
   overflow: hidden;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 12px;
+  line-height: 1.5;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.parser-template-list em {
+.parser-template-item em {
   align-self: center;
   flex-shrink: 0;
   padding: 4px 12px;
   border: 1px solid #bfdbfe;
   border-radius: 6px;
-  color: #3b82f6;
+  background: var(--yx-info-bg);
+  color: var(--yx-accent);
   font-size: 12px;
   font-style: normal;
+  font-weight: 500;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    color 0.18s ease;
+}
+
+.parser-template-item:hover em {
+  border-color: var(--yx-accent);
+  background: var(--yx-accent);
+  color: #fff;
 }
 
 @media (max-width: 900px) {

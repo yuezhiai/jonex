@@ -47,7 +47,7 @@ export default function DocumentQualityBadge({
       .join('；');
     return (
       <Tooltip title={tip || undefined}>
-        <span style={{ color: '#dc2626', fontSize: 12, fontWeight: 500 }}>
+        <span style={{ color: 'var(--yx-error-text)', fontSize: 12, fontWeight: 500 }}>
           {t('domainKnowledge.quality.bad')}
         </span>
       </Tooltip>
@@ -55,7 +55,7 @@ export default function DocumentQualityBadge({
   }
 
   return (
-    <span style={{ color: '#94a3b8', fontSize: 12 }}>
+    <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>
       {t('domainKnowledge.quality.unknown')}
     </span>
   );

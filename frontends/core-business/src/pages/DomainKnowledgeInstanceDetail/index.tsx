@@ -27,10 +27,10 @@ export default function DomainKnowledgeInstanceDetail() {
         <PageContent showCard={false}>
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 48, textAlign: 'center' as const } }}
           >
-            <div style={{ fontSize: 16, color: '#94a3b8' }}>{t('domainKnowledge.entityNotFound')}</div>
+            <div style={{ fontSize: 16, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.entityNotFound')}</div>
             <Button type="primary" style={{ marginTop: 16 }} onClick={() => navigate(`/domain-knowledge/${id}/graph`)}>
               {t('domainKnowledge.backToGraph')}
             </Button>
@@ -46,7 +46,7 @@ export default function DomainKnowledgeInstanceDetail() {
       dataIndex: 'key',
       key: 'key',
       width: 160,
-      render: (v: string) => <span style={{ fontWeight: 600, color: '#0b2b5c', fontSize: 13 }}>{v}</span>,
+      render: (v: string) => <span style={{ fontWeight: 600, color: 'var(--yx-brand-dark)', fontSize: 13 }}>{v}</span>,
     },
     {
       title: t('domainKnowledge.propertyValue'),
@@ -94,26 +94,26 @@ export default function DomainKnowledgeInstanceDetail() {
           items={[
             {
               title: (
-                <a onClick={() => navigate('/domain-knowledge')} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate('/domain-knowledge')} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('navigation.domainKnowledge')}
                 </a>
               ),
             },
             {
               title: (
-                <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('domainKnowledge.detail')}
                 </a>
               ),
             },
             {
               title: (
-                <a onClick={() => navigate(`/domain-knowledge/${id}/graph`)} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate(`/domain-knowledge/${id}/graph`)} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('domainKnowledge.graphBreadcrumb')}
                 </a>
               ),
             },
-            { title: <span style={{ color: '#0b2b5c', fontWeight: 500 }}>{t('route.ontologyInstanceDetail')}</span> },
+            { title: <span style={{ color: 'var(--yx-brand-dark)', fontWeight: 500 }}>{t('route.ontologyInstanceDetail')}</span> },
           ]}
         />
       </div>
@@ -136,12 +136,12 @@ export default function DomainKnowledgeInstanceDetail() {
           {/* Properties */}
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 24 } }}
             title={
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <FileTextOutlined style={{ color: '#3b82f6' }} />
-                <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+                <FileTextOutlined style={{ color: 'var(--yx-accent)' }} />
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                   {t('domainKnowledge.entityProperties')}
                 </span>
               </div>
@@ -160,12 +160,12 @@ export default function DomainKnowledgeInstanceDetail() {
           {/* Relations */}
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 24 } }}
             title={
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <LinkOutlined style={{ color: '#10b981' }} />
-                <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                   {t('domainKnowledge.relatedRelations')}
                 </span>
               </div>
@@ -186,7 +186,7 @@ export default function DomainKnowledgeInstanceDetail() {
           className="yx-card"
           style={{
             borderRadius: 10,
-            border: '1px solid #eef2f6',
+            border: '1px solid var(--yx-border-light)',
             boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
             marginTop: 20,
           }}
@@ -194,7 +194,7 @@ export default function DomainKnowledgeInstanceDetail() {
           title={
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <FileTextOutlined style={{ color: '#f97316' }} />
-              <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                 {t('domainKnowledge.sourceDocuments')}
               </span>
             </div>
@@ -210,13 +210,13 @@ export default function DomainKnowledgeInstanceDetail() {
                   gap: 10,
                   padding: '10px 14px',
                   borderRadius: 8,
-                  background: '#f8fafc',
-                  border: '1px solid #eef2f6',
+                  background: 'var(--yx-bg-subtle)',
+                  border: '1px solid var(--yx-border-light)',
                   fontSize: 13,
                   color: '#475569',
                 }}
               >
-                <FileTextOutlined style={{ color: '#94a3b8' }} />
+                <FileTextOutlined style={{ color: 'var(--yx-text-muted)' }} />
                 {doc}
               </div>
             ))}

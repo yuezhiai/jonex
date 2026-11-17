@@ -67,8 +67,8 @@ export default function WikiRelationTab({ kbId, title: propTitle }: WikiRelation
               maxWidth: '100%',
               padding: '2px 8px',
               borderRadius: 6,
-              background: '#eff6ff',
-              color: '#3b82f6',
+              background: 'var(--yx-info-bg)',
+              color: 'var(--yx-accent)',
               fontSize: 12,
               fontWeight: 500,
               overflow: 'hidden',
@@ -95,7 +95,7 @@ export default function WikiRelationTab({ kbId, title: propTitle }: WikiRelation
               maxWidth: '100%',
               padding: '2px 8px',
               borderRadius: 6,
-              background: '#ecfdf5',
+              background: 'var(--yx-success-bg)',
               color: '#059669',
               fontSize: 12,
               fontWeight: 500,
@@ -115,7 +115,7 @@ export default function WikiRelationTab({ kbId, title: propTitle }: WikiRelation
       key: 'description',
       width: 320,
       ellipsis: true,
-      render: (v: string) => <span style={{ color: '#64748b', fontSize: 13 }}>{v || '—'}</span>,
+      render: (v: string) => <span style={{ color: 'var(--yx-text-secondary)', fontSize: 13 }}>{v || '—'}</span>,
     },
   ];
 
@@ -127,12 +127,12 @@ export default function WikiRelationTab({ kbId, title: propTitle }: WikiRelation
           justifyContent: 'space-between',
           alignItems: 'center',
           padding: '16px 24px',
-          borderTop: '1px solid #f1f5f9',
+          borderTop: '1px solid var(--yx-bg-muted)',
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
-          <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+          <span style={{ fontSize: 13, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
             {t('compile.totalInstances', { count: total })}
           </span>
         </div>
@@ -169,7 +169,7 @@ export default function WikiRelationTab({ kbId, title: propTitle }: WikiRelation
         style={{ padding: '0 24px 24px' }}
         scroll={{ y: 'calc(100vh - 480px)' }}
         locale={{
-          emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyWikiRelations')}</span>,
+          emptyText: t('compile.emptyWikiRelations'),
         }}
       />
     </>

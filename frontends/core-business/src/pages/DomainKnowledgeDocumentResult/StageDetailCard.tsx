@@ -82,7 +82,7 @@ export default function StageDetailCard({ stage, docId, refreshKey, mediaType, o
         style={{
           width: 220,
           padding: '16px 12px',
-          borderRight: '1px solid #f1f5f9',
+          borderRight: '1px solid var(--yx-bg-muted)',
           flexShrink: 0,
           display: 'flex',
           flexDirection: 'column',
@@ -93,7 +93,7 @@ export default function StageDetailCard({ stage, docId, refreshKey, mediaType, o
           style={{
             fontSize: 13,
             fontWeight: 600,
-            color: '#0b2b5c',
+            color: 'var(--yx-brand-dark)',
             marginBottom: 12,
             flexShrink: 0,
           }}
@@ -113,9 +113,9 @@ export default function StageDetailCard({ stage, docId, refreshKey, mediaType, o
                     borderRadius: 8,
                     cursor: 'pointer',
                     background: active ? '#fff' : 'transparent',
-                    border: `1px solid ${active ? '#e2e8f0' : 'transparent'}`,
+                    border: `1px solid ${active ? 'var(--yx-border)' : 'transparent'}`,
                     fontSize: 13,
-                    color: active ? '#3b82f6' : '#475569',
+                    color: active ? 'var(--yx-accent)' : '#475569',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
@@ -158,14 +158,14 @@ export default function StageDetailCard({ stage, docId, refreshKey, mediaType, o
                   style={{
                     fontSize: 16,
                     fontWeight: 600,
-                    color: '#0b2b5c',
+                    color: 'var(--yx-brand-dark)',
                     marginBottom: 10,
                     display: 'flex',
                     alignItems: 'center',
                     gap: 8,
                   }}
                 >
-                  <FileTextOutlined style={{ color: '#3b82f6' }} />
+                  <FileTextOutlined style={{ color: 'var(--yx-accent)' }} />
                   <span
                     style={{
                       overflow: 'hidden',
@@ -180,8 +180,8 @@ export default function StageDetailCard({ stage, docId, refreshKey, mediaType, o
                   style={{
                     border: 'none',
                     borderRadius: 6,
-                    background: '#f1f5f9',
-                    color: '#64748b',
+                    background: 'var(--yx-bg-muted)',
+                    color: 'var(--yx-text-secondary)',
                     fontSize: 12,
                   }}
                 >

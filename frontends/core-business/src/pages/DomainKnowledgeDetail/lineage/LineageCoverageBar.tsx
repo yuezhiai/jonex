@@ -97,9 +97,9 @@ export default function LineageCoverageBar({ kbId, dsId, revision }: Props) {
       style={{
         marginBottom: 12,
         padding: '8px 12px',
-        border: '1px solid #e2e8f0',
+        border: '1px solid var(--yx-border)',
         borderRadius: 8,
-        background: '#f8fafc',
+        background: 'var(--yx-bg-subtle)',
       }}
     >
       <Space wrap size={[16, 4]}>

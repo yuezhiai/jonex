@@ -59,6 +59,80 @@ function mapTool(t: BackendKbTool): KbTool {
 
 const BASE = '/knowledge-base/ontology/kb-tools';
 
+export interface KbToolAiDraft {
+  toolName: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema: Record<string, unknown>;
+  runtime: Record<string, any> | null;
+  readOnlySuggestion: { value: boolean; reason: string } | null;
+  assumptions: string[];
+  unsupported: string[];
+}
+
+export interface KbToolAiProposal {
+  assistSessionId: string;
+  status: 'ready' | 'invalid' | 'disabled' | 'failed';
+  draft: KbToolAiDraft | null;
+  warnings: string[];
+  error: string | null;
+}
+
+interface BackendKbToolAiDraft {
+  tool_name?: string;
+  name?: string;
+  description?: string;
+  input_schema?: Record<string, unknown>;
+  output_schema?: Record<string, unknown>;
+  runtime?: Record<string, any> | null;
+  read_only_suggestion?: { value?: boolean; reason?: string } | null;
+  assumptions?: string[];
+  unsupported?: string[];
+}
+
+interface BackendKbToolAiProposal {
+  assist_session_id?: string;
+  status?: KbToolAiProposal['status'];
+  draft?: BackendKbToolAiDraft | null;
+  warnings?: string[];
+  error?: string | null;
+}
+
+/** AI 生成知识库工具草稿；只返回建议，不写库、不联网。 */
+export async function proposeKbToolDraft(kbId: string, text: string): Promise<KbToolAiProposal> {
+  const res = await postData<BackendKbToolAiProposal>(
+    '/knowledge-base/ontology/kb-tools/ai-draft',
+    { knowledge_base_id: kbId, text },
+    { timeout: 60000 },
+  );
+  const draft = res.draft
+    ? {
+        toolName: res.draft.tool_name || '',
+        name: res.draft.name || '',
+        description: res.draft.description || '',
+        inputSchema: res.draft.input_schema || {},
+        outputSchema: res.draft.output_schema || {},
+        runtime: res.draft.runtime ?? null,
+        readOnlySuggestion: res.draft.read_only_suggestion
+          ? {
+              value: res.draft.read_only_suggestion.value === true,
+              reason: res.draft.read_only_suggestion.reason || '',
+            }
+          : null,
+        assumptions: res.draft.assumptions || [],
+        unsupported: res.draft.unsupported || [],
+      }
+    : null;
+  return {
+    assistSessionId: res.assist_session_id || '',
+    status: res.status || 'failed',
+    draft,
+    warnings: res.warnings || [],
+    error: res.error ?? null,
+  };
+}
+
 export async function listKbTools(kbId: string, keyword?: string): Promise<{ items: KbTool[]; total: number }> {
   const res = await getData<{ items: BackendKbTool[]; total: number }>(
     request.get(BASE, { params: { knowledge_base_id: kbId, page: 1, page_size: 200, keyword: keyword || undefined } }),

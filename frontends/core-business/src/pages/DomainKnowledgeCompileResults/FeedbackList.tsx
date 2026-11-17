@@ -148,7 +148,7 @@ export default function FeedbackList({ kbId, feedbackType, title }: FeedbackList
           <div
             style={{
               fontWeight: 500,
-              color: '#0b2b5c',
+              color: 'var(--yx-brand-dark)',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
@@ -167,7 +167,7 @@ export default function FeedbackList({ kbId, feedbackType, title }: FeedbackList
         render: (v: string | null) => (
           <div
             style={{
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               fontSize: 13,
               lineHeight: 1.6,
               overflow: 'hidden',
@@ -219,12 +219,12 @@ export default function FeedbackList({ kbId, feedbackType, title }: FeedbackList
           justifyContent: 'space-between',
           alignItems: 'center',
           padding: '16px 24px',
-          borderTop: '1px solid #f1f5f9',
+          borderTop: '1px solid var(--yx-bg-muted)',
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
-          <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+          <span style={{ fontSize: 13, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
             {t('common.totalItems', { total })}
           </span>
         </div>
@@ -245,7 +245,7 @@ export default function FeedbackList({ kbId, feedbackType, title }: FeedbackList
         }}
         size="middle"
         style={{ padding: '0 24px 24px' }}
-        locale={{ emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyFeedback')}</span> }}
+        locale={{ emptyText: t('compile.emptyFeedback') }}
       />
     </div>
   );

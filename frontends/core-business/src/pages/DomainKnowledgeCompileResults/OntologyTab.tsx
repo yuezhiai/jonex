@@ -239,8 +239,8 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           style={{
             padding: '2px 8px',
             borderRadius: 6,
-            background: '#eff6ff',
-            color: '#3b82f6',
+            background: 'var(--yx-info-bg)',
+            color: 'var(--yx-accent)',
             fontSize: 12,
             fontWeight: 500,
           }}
@@ -254,7 +254,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
       dataIndex: 'name',
       key: 'name',
       width: 220,
-      render: (v: string) => <strong style={{ color: '#0b2b5c' }}>{v}</strong>,
+      render: (v: string) => <strong style={{ color: 'var(--yx-brand-dark)' }}>{v}</strong>,
     },
     {
       title: t('domainKnowledge.alias'),
@@ -269,7 +269,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
       key: 'description',
       width: 400,
       ellipsis: true,
-      render: (v: string) => <span style={{ color: '#64748b', fontSize: 13 }}>{v || '—'}</span>,
+      render: (v: string) => <span style={{ color: 'var(--yx-text-secondary)', fontSize: 13 }}>{v || '—'}</span>,
     },
     {
       title: t('domainKnowledge.attributeCount'),
@@ -329,12 +329,12 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           flexShrink: 0,
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
           <span
             style={{
               fontSize: 13,
-              color: '#94a3b8',
+              color: 'var(--yx-text-muted)',
               fontWeight: 400,
               marginLeft: 8,
             }}
@@ -365,7 +365,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
         </div>
       </div>
 
-      <div className="yx-fill-table" ref={tableHostRef}>
+      <div className="yx-table-fill" ref={tableHostRef}>
         <Table
           rowKey="name"
           columns={columns}
@@ -386,7 +386,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           style={{ padding: '0 16px' }}
           scroll={{ y: tableBodyHeight }}
           locale={{
-            emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyOntologyInstances')}</span>,
+            emptyText: t('compile.emptyOntologyInstances'),
           }}
         />
       </div>

@@ -137,13 +137,13 @@ export default function WikiArticleView({
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* 标题 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <h1 style={{ margin: 0, fontSize: 26, color: '#0b2b5c' }}>{displayTitle}</h1>
+          <h1 style={{ margin: 0, fontSize: 26, color: 'var(--yx-brand-dark)' }}>{displayTitle}</h1>
           <Tag color={roleColor(role)} style={{ borderRadius: 6 }}>
             {t(roleLabelKey(role))}
           </Tag>
           {location && (
             <Tooltip title={t('domainKnowledge.wikiReader.locateInOutline')}>
-              <a style={{ fontSize: 12, color: '#94a3b8' }} onClick={() => onOpenTopic(location.topicId)}>
+              <a style={{ fontSize: 12, color: 'var(--yx-text-muted)' }} onClick={() => onOpenTopic(location.topicId)}>
                 <BookOutlined /> {location.trailText}
               </a>
             </Tooltip>
@@ -152,7 +152,7 @@ export default function WikiArticleView({
 
         {/* 导语 */}
         {leadMarkdown ? (
-          <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.9, color: '#334155' }}>
+          <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.9, color: 'var(--yx-text-body)' }}>
             <MarkdownContent content={leadMarkdown} onInternalLink={onOpenPage} images={page.images} onOpenImageSource={openImageSource} />
           </div>
         ) : (
@@ -164,15 +164,15 @@ export default function WikiArticleView({
           <div
             style={{
               display: 'inline-block',
-              background: '#f8fafc',
-              border: '1px solid #e2e8f0',
+              background: 'var(--yx-bg-subtle)',
+              border: '1px solid var(--yx-border)',
               borderRadius: 8,
               padding: '10px 16px',
               margin: '16px 0 4px',
               minWidth: 220,
             }}
           >
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#0b2b5c', marginBottom: 6 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
               <NumberOutlined /> {t('domainKnowledge.wikiReader.inPageToc')}
             </div>
             {toc
@@ -207,13 +207,13 @@ export default function WikiArticleView({
 
         {(page.images || []).filter((image) => image.placement !== 'inline').map((image) =>
           <WikiSourcePicture key={image.asset_id} image={image} onOpenSource={openImageSource} />)}
-        {page.imageError && <div role="status" style={{ color: '#64748b' }}>图片暂不可读，正文仍可阅读。请查看原文。</div>}
-        {(page.imagesTotal || 0) > (page.images?.length || 0) && <p style={{ color: '#64748b' }}>本页还有更多原文图片，可通过顶部「找图」分页浏览。</p>}
+        {page.imageError && <div role="status" style={{ color: 'var(--yx-text-secondary)' }}>图片暂不可读，正文仍可阅读。请查看原文。</div>}
+        {(page.imagesTotal || 0) > (page.images?.length || 0) && <p style={{ color: 'var(--yx-text-secondary)' }}>本页还有更多原文图片，可通过顶部「找图」分页浏览。</p>}
 
         {/* 相关页面 */}
         {seeAlso.length > 0 && (
           <div style={{ marginTop: 26 }}>
-            <div style={{ fontSize: 16, fontWeight: 600, color: '#0b2b5c', marginBottom: 8 }}>
+            <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 8 }}>
               <LinkOutlined /> {t('domainKnowledge.wikiReader.seeAlso')}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -225,9 +225,9 @@ export default function WikiArticleView({
                     color: '#2563eb',
                     fontSize: 14,
                     padding: '2px 10px',
-                    background: '#f8fafc',
+                    background: 'var(--yx-bg-subtle)',
                     borderRadius: 14,
-                    border: '1px solid #e2e8f0',
+                    border: '1px solid var(--yx-border)',
                   }}
                 >
                   {target.title}
@@ -242,10 +242,10 @@ export default function WikiArticleView({
 
         {/* 参考来源：页面级溯源 → 源文档 */}
         <div style={{ marginTop: 26 }}>
-          <div style={{ fontSize: 16, fontWeight: 600, color: '#0b2b5c', marginBottom: 8 }}>
+          <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 8 }}>
             <FileTextOutlined /> {t('domainKnowledge.wikiReader.references')}
             {references.length > 0 && (
-              <span style={{ fontSize: 12, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+              <span style={{ fontSize: 12, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
                 {t('domainKnowledge.wikiReader.referencesCount', { count: references.length })}
               </span>
             )}
@@ -273,8 +273,8 @@ export default function WikiArticleView({
                     <div
                       key={excerpt}
                       style={{
-                        color: '#64748b',
-                        borderLeft: '2px solid #e2e8f0',
+                        color: 'var(--yx-text-secondary)',
+                        borderLeft: '2px solid var(--yx-border)',
                         paddingLeft: 8,
                         marginTop: 4,
                       }}
@@ -293,9 +293,9 @@ export default function WikiArticleView({
           style={{
             marginTop: 24,
             paddingTop: 12,
-            borderTop: '1px solid #f1f5f9',
+            borderTop: '1px solid var(--yx-bg-muted)',
             fontSize: 12,
-            color: '#94a3b8',
+            color: 'var(--yx-text-muted)',
             display: 'flex',
             gap: 8,
             flexWrap: 'wrap',
@@ -314,7 +314,7 @@ export default function WikiArticleView({
       {!page.tableData && <div style={{ width: 240, flex: '0 0 240px', display: 'grid', gap: 12 }}>
         <div
           style={{
-            border: '1px solid #e2e8f0',
+            border: '1px solid var(--yx-border)',
             borderRadius: 10,
             background: '#fbfdff',
             fontSize: 13,
@@ -324,8 +324,8 @@ export default function WikiArticleView({
           <div
             style={{
               padding: '8px 12px',
-              background: '#eff6ff',
-              color: '#0b2b5c',
+              background: 'var(--yx-info-bg)',
+              color: 'var(--yx-brand-dark)',
               fontWeight: 600,
               fontSize: 13,
             }}
@@ -380,8 +380,8 @@ export default function WikiArticleView({
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', gap: 8 }}>
-      <span style={{ color: '#94a3b8', flex: '0 0 62px' }}>{label}</span>
-      <span style={{ color: '#334155', flex: 1, wordBreak: 'break-word' }}>{value}</span>
+      <span style={{ color: 'var(--yx-text-muted)', flex: '0 0 62px' }}>{label}</span>
+      <span style={{ color: 'var(--yx-text-body)', flex: 1, wordBreak: 'break-word' }}>{value}</span>
     </div>
   );
 }

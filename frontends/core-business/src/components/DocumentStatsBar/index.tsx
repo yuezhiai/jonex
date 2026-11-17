@@ -18,8 +18,8 @@ interface Metric {
 // 互斥四桶（处理中+已完成+编译失败+解析失败=总计），与后端 documents_stats、设计 §5 同源。
 // 失败类指标常驻显示（即使为 0），便于随时看到指标存在。
 const METRICS: Metric[] = [
-  { key: 'total', labelKey: 'docPhase.total', color: '#0b2b5c' },
-  { key: 'processing', labelKey: 'docPhase.processing', color: '#3b82f6' },
+  { key: 'total', labelKey: 'docPhase.total', color: 'var(--yx-brand-dark)' },
+  { key: 'processing', labelKey: 'docPhase.processing', color: 'var(--yx-accent)' },
   { key: 'completed', labelKey: 'docPhase.completedStat', color: '#10b981' },
   { key: 'compileFailed', labelKey: 'docPhase.compileFailedStat', color: '#f59e0b' },
   { key: 'parseFailed', labelKey: 'docPhase.parseFailedStat', color: '#ef4444' },
@@ -56,7 +56,7 @@ export default function DocumentStatsBar({ knowledgeBaseId, reloadFlag = 0 }: Do
         return (
           <span key={m.key} style={{ display: 'inline-flex', alignItems: 'baseline', gap: 6 }}>
             <span style={{ fontSize: 20, fontWeight: 700, color: m.color, lineHeight: 1 }}>{value}</span>
-            <span style={{ fontSize: 12, color: '#64748b' }}>{t(m.labelKey)}</span>
+            <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{t(m.labelKey)}</span>
           </span>
         );
       })}

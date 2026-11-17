@@ -148,7 +148,7 @@ export default function DataSourceTab({
               }}
               onMouseLeave={(e) => {
                 if (schemaEntryBlocked) return;
-                (e.currentTarget as HTMLElement).style.borderColor = '#eef2f6';
+                (e.currentTarget as HTMLElement).style.borderColor = 'var(--yx-border-light)';
                 (e.currentTarget as HTMLElement).style.background = '#fff';
               }}
             >
@@ -170,9 +170,9 @@ export default function DataSourceTab({
               </div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 14, fontWeight: 500, color: '#1e293b' }}>
-                  {ds.name} <span style={{ fontSize: 12, color: '#94a3b8', fontWeight: 400 }}>· {ds.type}</span>
+                  {ds.name} <span style={{ fontSize: 12, color: 'var(--yx-text-muted)', fontWeight: 400 }}>· {ds.type}</span>
                 </div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>{ds.desc}</div>
+                <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 2 }}>{ds.desc}</div>
               </div>
               {/* 数据库数据源独有：生成**该库自己那份** schema。
                   同一个连接被两个库引用时，两个库各生成各的、互不影响。 */}

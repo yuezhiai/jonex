@@ -159,7 +159,7 @@ const RelationFormModal = forwardRef<RelationFormModalHandle, RelationFormModalP
   return (
     <Modal
       title={
-        <span style={{ fontSize: 18, fontWeight: 700, color: '#0b2b5c' }}>
+        <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--yx-brand-dark)' }}>
           {modalMode === 'create' ? t('domainKnowledge.newRelation') : t('compile.relation.editBtn')}
         </span>
       }
@@ -184,10 +184,10 @@ const RelationFormModal = forwardRef<RelationFormModalHandle, RelationFormModalP
             <div
               style={{
                 padding: '6px 12px',
-                background: '#f8fafc',
+                background: 'var(--yx-bg-subtle)',
                 borderRadius: 6,
-                border: '1px solid #e2e8f0',
-                color: '#64748b',
+                border: '1px solid var(--yx-border)',
+                color: 'var(--yx-text-secondary)',
                 fontSize: 13,
                 minHeight: 34,
                 display: 'flex',
@@ -240,10 +240,10 @@ const RelationFormModal = forwardRef<RelationFormModalHandle, RelationFormModalP
             <div
               style={{
                 padding: '6px 12px',
-                background: '#f8fafc',
+                background: 'var(--yx-bg-subtle)',
                 borderRadius: 6,
-                border: '1px solid #e2e8f0',
-                color: '#64748b',
+                border: '1px solid var(--yx-border)',
+                color: 'var(--yx-text-secondary)',
                 fontSize: 13,
                 minHeight: 34,
                 display: 'flex',

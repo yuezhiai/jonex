@@ -422,7 +422,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
           <Breadcrumb items={breadcrumbItems} style={{ flex: 1, fontSize: 13 }} />
           {/* 文档级：目录是知识库级的投影，这里只读 */}
           {readOnly && (
-            <span style={{ fontSize: 12, color: '#94a3b8' }}>
+            <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
               {t('domainKnowledge.wikiReader.docScopedHint')}
             </span>
           )}
@@ -444,7 +444,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
         </div>
 
         {busy && (
-          <div style={{ fontSize: 12, color: '#3b82f6', marginBottom: 10 }}>
+          <div style={{ fontSize: 12, color: 'var(--yx-accent)', marginBottom: 10 }}>
             <Spin size="small" /> {t('domainKnowledge.wikiReader.llmBusy')}
           </div>
         )}
@@ -538,7 +538,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
         cancelText={t('common.cancel')}
         okButtonProps={{ disabled: !adjustText.trim() }}
       >
-        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8, lineHeight: 1.8 }}>
+        <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginBottom: 8, lineHeight: 1.8 }}>
           {t('domainKnowledge.wikiReader.adjustHint')}
         </div>
         <Input.TextArea

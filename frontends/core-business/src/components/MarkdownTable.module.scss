@@ -32,9 +32,9 @@
 
 .table td {
   padding: 9px 14px;
-  color: #334155;
+  color: var(--yx-text-body);
   vertical-align: top;
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--yx-bg-muted);
   // 长文本列（如「权限项」描述）换行，别把整张表撑到屏幕外
   overflow-wrap: anywhere;
   max-width: 340px;

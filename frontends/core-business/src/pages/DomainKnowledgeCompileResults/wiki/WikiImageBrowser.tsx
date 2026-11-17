@@ -69,7 +69,7 @@ export default function WikiImageBrowser({ kbId, documentId = '' }: { kbId: stri
           loading={loading}
           maxLength={512}
         />
-        <p style={{ color: '#64748b', fontSize: 12 }}>
+        <p style={{ color: 'var(--yx-text-secondary)', fontSize: 12 }}>
           使用已有图注、OCR 和原文线索。附近文字仅作候选；没有文字线索的图片可能无法检出。
         </p>
         {error && <Alert type="error" title={error} showIcon />}
@@ -82,7 +82,7 @@ export default function WikiImageBrowser({ kbId, documentId = '' }: { kbId: stri
         {result?.items.map((image) => (
           <div
             key={`${image.bundle_sha}:${image.asset_id}`}
-            style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: 16 }}
+            style={{ borderBottom: '1px solid var(--yx-border)', paddingBottom: 16 }}
           >
             <WikiSourcePicture
               image={image}
@@ -151,7 +151,7 @@ function ReadPicture({ kbId, image }: { kbId: string; image: WikiSourceImage }) 
               {line}
             </p>
           ))}
-          <small style={{ color: '#64748b' }}>
+          <small style={{ color: 'var(--yx-text-secondary)' }}>
             已读取当前图片{result.cached ? '（复用之前的同图同问题记录）' : ''} · {result.read_id}
           </small>
         </div>

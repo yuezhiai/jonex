@@ -626,7 +626,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
     <Modal
       title={
         <Space>
-          <PlusOutlined style={{ color: '#3b82f6' }} />
+          <PlusOutlined style={{ color: 'var(--yx-accent)' }} />
           <span>{t('common.addDocument')}</span>
         </Space>
       }
@@ -653,7 +653,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
       }
     >
       <div style={{ marginBottom: 16 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c', marginBottom: 6 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 6 }}>
           {t('common.targetDirectory')}
         </div>
         <Select
@@ -681,12 +681,12 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
       >
         <div style={{ padding: '20px 0' }}>
           <p className="ant-upload-drag-icon">
-            <CloudUploadOutlined style={{ fontSize: 48, color: '#3b82f6' }} />
+            <CloudUploadOutlined style={{ fontSize: 48, color: 'var(--yx-accent)' }} />
           </p>
-          <p style={{ fontSize: 16, color: '#0b2b5c', fontWeight: 500, marginBottom: 8 }}>
+          <p style={{ fontSize: 16, color: 'var(--yx-brand-dark)', fontWeight: 500, marginBottom: 8 }}>
             {t('common.uploadDraggerText')}
           </p>
-          <p style={{ fontSize: 14, color: '#64748b', marginBottom: 8, lineHeight: 1.6 }}>
+          <p style={{ fontSize: 14, color: 'var(--yx-text-secondary)', marginBottom: 8, lineHeight: 1.6 }}>
             {t('common.uploadDescription')}
           </p>
           <p style={{ fontSize: 13, color: '#f97316', margin: 0 }}>
@@ -705,7 +705,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
           style={{
             marginTop: 12,
             fontSize: 13,
-            color: countReached ? '#ef4444' : '#64748b',
+            color: countReached ? '#ef4444' : 'var(--yx-text-secondary)',
             textAlign: 'right',
           }}
         >
@@ -734,7 +734,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
                         fontSize: 14,
-                        color: '#0b2b5c',
+                        color: 'var(--yx-brand-dark)',
                       }}
                     >
                       {it.file.name}
@@ -743,7 +743,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
                       {statusText(it.status)}
                     </Tag>
                   </div>
-                  <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
+                  <div style={{ fontSize: 12, color: 'var(--yx-text-secondary)', marginTop: 2 }}>
                     {formatSize(it.file.size)}
                   </div>
                   {it.error && (
@@ -767,7 +767,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ kbId, open, onClose, onSucces
 
           <div style={{ marginTop: 12 }}>
             <Progress percent={totalProgress} />
-            <div style={{ fontSize: 13, color: '#64748b', textAlign: 'center' }}>
+            <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', textAlign: 'center' }}>
               {t('common.batchUploadSummary', {
                 success: summary.success,
                 failed: summary.failed,

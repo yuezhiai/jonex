@@ -94,7 +94,7 @@ function GroupRows({
                   display: 'block',
                   fontSize: 11,
                   lineHeight: '15px',
-                  color: '#94a3b8',
+                  color: 'var(--yx-text-muted)',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',

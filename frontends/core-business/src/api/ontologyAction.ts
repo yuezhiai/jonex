@@ -70,6 +70,10 @@ export interface ExecuteResult {
   error?: string | null;
   missing_inputs?: string[];
   pending_confirmations?: ExecutionChecklistItem[];
+  /** 契约在提问后变过：需要按新 checklist 重新确认 */
+  contract_changed?: boolean;
+  /** 最终入参及来源（ontology / ai / literal / user） */
+  arguments_view?: { key: string; value: unknown; source: string }[];
   post_actions?: { follow_ups: string[]; failure_policy: string };
   dry_run: boolean;
   duration_ms?: number;
@@ -81,6 +85,8 @@ export interface ExecuteInput {
   inputs: Record<string, unknown>;
   confirmations: Record<string, boolean>;
   dryRun: boolean;
+  /** 问答动作卡片的服务端待办 id；人工试执行不传 */
+  qaPendingId?: string;
 }
 
 /** 执行前预览：契约状态、判定、绑定工具与参数计划（不执行）。 */
@@ -99,5 +105,6 @@ export function executeOntologyAction(input: ExecuteInput): Promise<ExecuteResul
     inputs: input.inputs,
     confirmations: input.confirmations,
     dry_run: input.dryRun,
+    ...(input.qaPendingId ? { qa_pending_id: input.qaPendingId } : {}),
   });
 }

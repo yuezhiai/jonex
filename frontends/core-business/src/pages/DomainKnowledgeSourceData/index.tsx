@@ -68,13 +68,13 @@ export default function DomainKnowledgeSourceData() {
   return (
     <>
       <PageHeader title={t('knowledgeSource.title')} style={{ marginBottom: 4 }} />
-      <p style={{ color: '#64748b', margin: '0 0 16px', fontSize: 14 }}>{t('knowledgeSource.description')}</p>
+      <p style={{ color: 'var(--yx-text-secondary)', margin: '0 0 16px', fontSize: 14 }}>{t('knowledgeSource.description')}</p>
       <PageContent showCard={false}>
         <Card
-          style={{ borderRadius: 10, marginBottom: 20, border: '1px solid #eef2f6' }}
+          style={{ borderRadius: 10, marginBottom: 20, border: '1px solid var(--yx-border-light)' }}
           bodyStyle={{ padding: '0 20px' }}
         >
-          <div style={{ display: 'flex', borderBottom: '2px solid #e2e8f0' }}>
+          <div style={{ display: 'flex', borderBottom: '2px solid var(--yx-border)' }}>
             {tabs.map((tab) => (
               <div
                 key={tab.key}
@@ -83,7 +83,7 @@ export default function DomainKnowledgeSourceData() {
                   padding: '10px 24px',
                   cursor: 'pointer',
                   fontSize: 14,
-                  color: activeTab === tab.key ? '#3b82f6' : '#64748b',
+                  color: activeTab === tab.key ? 'var(--yx-accent)' : 'var(--yx-text-secondary)',
                   borderBottom: activeTab === tab.key ? '2px solid #3b82f6' : '2px solid transparent',
                   marginBottom: -2,
                   fontWeight: activeTab === tab.key ? 600 : 400,
@@ -103,27 +103,27 @@ export default function DomainKnowledgeSourceData() {
           {stats.map((s, idx) => (
             <Card
               key={statKeys[idx]}
-              style={{ borderRadius: 8, textAlign: 'center', border: '1px solid #e2e8f0' }}
+              style={{ borderRadius: 8, textAlign: 'center', border: '1px solid var(--yx-border)' }}
               bodyStyle={{ padding: 16 }}
             >
-              <div style={{ fontSize: 24, fontWeight: 700, color: '#3b82f6' }}>{s.value}</div>
-              <div style={{ fontSize: 13, color: '#64748b', marginTop: 4 }}>{t(statKeys[idx])}</div>
+              <div style={{ fontSize: 24, fontWeight: 700, color: 'var(--yx-accent)' }}>{s.value}</div>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginTop: 4 }}>{t(statKeys[idx])}</div>
             </Card>
           ))}
         </div>
 
-        <Card style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #eef2f6' }} bodyStyle={{ padding: 0 }}>
+        <Card style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid var(--yx-border-light)' }} bodyStyle={{ padding: 0 }}>
           <div
             style={{
               padding: '12px 20px',
-              background: '#f8fafc',
-              borderBottom: '1px solid #e2e8f0',
+              background: 'var(--yx-bg-subtle)',
+              borderBottom: '1px solid var(--yx-border)',
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
             }}
           >
-            <span style={{ fontWeight: 600, fontSize: 14, color: '#0b2b5c' }}>{t('knowledgeSource.dataPreview')}</span>
+            <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--yx-brand-dark)' }}>{t('knowledgeSource.dataPreview')}</span>
             <Space>
               <Button size="small" icon={<DownloadOutlined />}>
                 {t('common.export')}
@@ -137,7 +137,7 @@ export default function DomainKnowledgeSourceData() {
             <pre
               style={{
                 background: '#1e293b',
-                color: '#e2e8f0',
+                color: 'var(--yx-border)',
                 borderRadius: 8,
                 padding: 20,
                 fontSize: 13,

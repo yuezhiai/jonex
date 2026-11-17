@@ -24,6 +24,7 @@ import {
   SwapOutlined,
   DatabaseOutlined,
   SafetyCertificateOutlined,
+  CheckCircleOutlined,
 } from '@ant-design/icons';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
@@ -63,6 +64,7 @@ import JonexWikiPromptTab from './llmWikiSchema/JonexWikiPromptTab';
 import SynonymTab from './synonym/SynonymTab';
 import GovernanceTab from './governance/GovernanceTab';
 import ToolsTab from './toolBinding/ToolsTab';
+import VerifiedQueryTab from './verifiedQuery/VerifiedQueryTab';
 import DataSourceTab from './DataSourceTab';
 import ResultTab from './ResultTab';
 import ActionTab from './ActionTab';
@@ -124,6 +126,12 @@ function getTabs(t: (key: string) => string, kbType?: KnowledgeBaseType) {
       icon: SafetyCertificateOutlined,
     },
     {
+      // ② 已验证查询（N1-1）：高频问句的带参模板，激活后命中走快路径。组件内自取。
+      key: 'verifiedQuery',
+      label: t('domainKnowledge.tab.verifiedQuery'),
+      icon: CheckCircleOutlined,
+    },
+    {
       key: 'permission',
       label: t('domainKnowledge.tab.permission'),
       icon: TeamOutlined,
@@ -159,7 +167,7 @@ export const actionIconMap: Record<string, React.ComponentType<any>> = {
 function renderRuleText(segments: RuleTextSegment[]): React.ReactNode {
   return segments.map((seg, i) =>
     seg.bold ? (
-      <strong key={i} style={{ color: seg.color || '#0b2b5c' }}>
+      <strong key={i} style={{ color: seg.color || 'var(--yx-brand-dark)' }}>
         {seg.text}
       </strong>
     ) : (
@@ -289,7 +297,7 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
           name,
           dept: '',
           avatarText: name.charAt(0).toUpperCase(),
-          avatarColor: '#94a3b8',
+          avatarColor: 'var(--yx-text-muted)',
           role: 'member',
         },
       ];
@@ -469,7 +477,11 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
         // 「知识库级」= 抽象 schema 编辑器（v2 起，知识库级那份的**唯一**写入口）；
         // 「全部数据源」= 各源 ds 级编译 schema 的只读合并视图（MultiSourceView）。
         return (
-          <div className="yx-kb-schema-embed">
+          <div
+            className="yx-kb-schema-embed"
+            ref={embedRef}
+            style={embedHeight ? { height: embedHeight } : undefined}
+          >
             <div className="yx-kb-schema-switch">
               <Segmented
                 value={schemaMode}
@@ -502,6 +514,9 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
         return <GovernanceTab kbId={id!} canWrite={detail?.can_write ?? false} />;
       case 'toolBinding':
         return <ToolsTab kbId={id!} canWrite={detail?.can_write ?? false} />;
+
+      case 'verifiedQuery':
+        return <VerifiedQueryTab kbId={id!} canWrite={detail?.can_write ?? false} />;
 
       case 'result':
         return (
@@ -552,6 +567,27 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
 
   // 页头三个标签：与知识库详情页共用 buildAssetTags，两处页头永远同款（口径见该函数注释）
   const assetTags = detail ? buildAssetTags(t, detail, wikiStats) : [];
+
+  // ── 「知识库级 schema」内嵌画布的高度 ───────────────────────────
+  // 以前是 CSS 里的 `calc(100vh - 320px)`：320 是页头 + 页签栏的**估算值**，
+  // 换个视口/字体/页头高度就不准，底部会空出一大块（或反过来溢出）。
+  // 这里改成实测：元素在文档中的顶部位置 → 视口高度减去它，再留 24px 呼吸。
+  // 只在挂载/切页签/切视图/窗口 resize 时重算，滚动不重算（高度不该随滚轮跳）。
+  const embedRef = useRef<HTMLDivElement | null>(null);
+  const [embedHeight, setEmbedHeight] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    if (activeTab !== 'schema') return;
+    const measure = () => {
+      const el = embedRef.current;
+      if (!el) return;
+      const docTop = el.getBoundingClientRect().top + window.scrollY;
+      const available = window.innerHeight - docTop - 24;
+      setEmbedHeight(Math.max(520, Math.round(available)));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [activeTab, schemaMode]);
 
   // ── main render ──
   return (

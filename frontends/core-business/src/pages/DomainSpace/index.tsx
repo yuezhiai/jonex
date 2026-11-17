@@ -1,17 +1,15 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Input, Button, Table, Tag, Modal, Popconfirm, Space, message, Result, Spin } from 'antd';
+import { Input, Button, Table, Tag, Popconfirm, Space, message, Result, Spin } from 'antd';
 import {
   PlusOutlined,
   SearchOutlined,
   ReloadOutlined,
   TeamOutlined,
-  WarningOutlined,
-  DeleteOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { emitSpacesInvalidated, emitSpaceChanged } from '@jonex/shell-sdk';
-import { PageContent, PageHeader } from '@jonex/shared-lib';
+import { DangerConfirmModal, PageContent, PageHeader } from '@jonex/shared-lib';
 import { listSpaces, updateSpace, deleteSpace } from '../../api/domainSpace';
 import { getSpaceStatusMap, type DomainSpace } from '../../types/domainSpace';
 import { useStore } from '../../store';
@@ -140,7 +138,7 @@ export default function DomainSpace() {
       dataIndex: 'name',
       key: 'name',
       width: 160,
-      render: (v: string) => <span style={{ color: '#3b82f6', cursor: 'pointer' }}>{v}</span>,
+      render: (v: string) => <span style={{ color: 'var(--yx-accent)', cursor: 'pointer' }}>{v}</span>,
     },
     {
       title: t('domainSpace.description'),
@@ -223,8 +221,8 @@ export default function DomainSpace() {
               className="yx-table-action"
               style={
                 r.can_manage_permissions
-                  ? { color: '#dc2626' }
-                  : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
+                  ? { color: 'var(--yx-error-text)' }
+                  : { color: 'var(--yx-error-text)', opacity: 0.4, cursor: 'not-allowed' }
               }
               title={r.can_manage_permissions ? undefined : t('domainSpace.noManagePermission')}
               onClick={() => r.can_manage_permissions && setDeleting(r)}
@@ -269,12 +267,12 @@ export default function DomainSpace() {
           {/* 工具栏 */}
           <div className="yx-toolbar">
             <Input
-              prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+              prefix={<SearchOutlined />}
               placeholder={t('domainSpace.searchPlaceholder')}
               allowClear
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              style={{ width: 280 }}
+              style={{ width: 240 }}
             />
             {canCreateSpace && (
               <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
@@ -311,34 +309,16 @@ export default function DomainSpace() {
           />
 
           {/* ── Delete Confirm Modal ── */}
-          <Modal
-            wrapClassName="yx-domain-space-modal"
-            title={
-              <span>
-                <WarningOutlined style={{ color: '#ef4444', marginRight: 8 }} />
-                {t('domainSpace.confirmDelete')}
-              </span>
-            }
+          <DangerConfirmModal
             open={!!deleting}
+            title={t('domainSpace.confirmDeleteMessage', { name: deleting?.name || '' })}
+            description={t('domainSpace.deleteWarning')}
+            okText={t('domainSpace.confirmDelete')}
+            cancelText={t('common.cancel')}
+            confirmLoading={submitting}
+            onOk={handleDelete}
             onCancel={() => setDeleting(null)}
-            footer={
-              <div style={{ display: 'flex', justifyContent: 'center', gap: 12 }}>
-                <Button onClick={() => setDeleting(null)}>{t('common.cancel')}</Button>
-                <Button danger type="primary" loading={submitting} onClick={handleDelete}>
-                  {t('domainSpace.confirmDelete')}
-                </Button>
-              </div>
-            }
-            width={420}
-          >
-            <div style={{ textAlign: 'center', padding: '12px 0' }}>
-              <DeleteOutlined style={{ fontSize: 48, color: '#ef4444', marginBottom: 16, display: 'block' }} />
-              <p style={{ fontSize: 16, color: '#1e293b', fontWeight: 500 }}>
-                {t('domainSpace.confirmDeleteMessage', { name: deleting?.name || '' })}
-              </p>
-              <p style={{ fontSize: 13, color: '#94a3b8', marginTop: 8 }}>{t('domainSpace.deleteWarning')}</p>
-            </div>
-          </Modal>
+          />
 
           <SpacePermissionModal ref={permRef} onSaved={handlePermSaved} />
         </div>

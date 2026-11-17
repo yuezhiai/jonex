@@ -102,7 +102,7 @@ export default function DomainSpaceCreate() {
         <div className="yx-domain-space-page">
           <div className="yx-card" style={{ padding: '28px 32px', maxWidth: 640 }}>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 13, color: '#64748b', marginBottom: 6 }}>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginBottom: 6 }}>
                 <span style={{ color: '#ef4444', marginRight: 4 }}>*</span>
                 {t('domainSpace.name')}
               </div>
@@ -115,7 +115,7 @@ export default function DomainSpaceCreate() {
               />
             </div>
             <div style={{ marginBottom: 24 }}>
-              <div style={{ fontSize: 13, color: '#64748b', marginBottom: 6 }}>{t('domainSpace.description')}</div>
+              <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', marginBottom: 6 }}>{t('domainSpace.description')}</div>
               <Input.TextArea
                 value={form.description}
                 onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}

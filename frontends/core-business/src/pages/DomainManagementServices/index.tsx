@@ -5,14 +5,12 @@ import {
   SearchOutlined,
   ReloadOutlined,
   KeyOutlined,
-  DeleteOutlined,
-  StopOutlined,
 } from '@ant-design/icons';
 import { useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useStore } from '@/store';
 import { SPACE_URL_PARAM } from '@jonex/shell-sdk';
-import { PageContent, PageHeader } from '@jonex/shared-lib';
+import { DangerConfirmModal, PageContent, PageHeader } from '@jonex/shared-lib';
 import type { ColumnsType } from 'antd/es/table';
 import {
   listServices,
@@ -364,7 +362,7 @@ const DomainManagementServices = function DomainManagementServices() {
             <a
               className="yx-table-action"
               style={
-                canManageServices ? { color: '#dc2626' } : { color: '#dc2626', opacity: 0.4, cursor: 'not-allowed' }
+                canManageServices ? { color: 'var(--yx-error-text)' } : { color: 'var(--yx-error-text)', opacity: 0.4, cursor: 'not-allowed' }
               }
               title={canManageServices ? undefined : t('domainSpace.noManagePermission')}
               onClick={() => canManageServices && setDeleteTarget(r)}
@@ -414,7 +412,7 @@ const DomainManagementServices = function DomainManagementServices() {
           <div className="yx-card">
             <div className="yx-toolbar">
               <Input
-                prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+                prefix={<SearchOutlined />}
                 placeholder={t('domainManagementServices.searchPlaceholder')}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
@@ -458,34 +456,16 @@ const DomainManagementServices = function DomainManagementServices() {
           />
 
           {/* ===== Delete Confirm Modal ===== */}
-          <Modal
-            wrapClassName="yx-domain-space-modal"
-            title={
-              <span>
-                <StopOutlined style={{ color: '#ef4444', marginRight: 8 }} />
-                {t('common.confirmDeleteTitle')}
-              </span>
-            }
+          <DangerConfirmModal
             open={!!deleteTarget}
+            title={t('common.confirmDeleteContent', { name: deleteTarget?.name || '' })}
+            description={t('common.deleteWarning')}
+            okText={t('common.okText')}
+            cancelText={t('common.cancel')}
+            confirmLoading={submitting}
+            onOk={handleDelete}
             onCancel={() => setDeleteTarget(null)}
-            footer={
-              <div style={{ display: 'flex', justifyContent: 'center', gap: 12 }}>
-                <Button onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</Button>
-                <Button danger type="primary" loading={submitting} onClick={handleDelete}>
-                  {t('common.okText')}
-                </Button>
-              </div>
-            }
-            width={420}
-          >
-            <div style={{ textAlign: 'center', padding: '12px 0' }}>
-              <DeleteOutlined style={{ fontSize: 48, color: '#ef4444', marginBottom: 16, display: 'block' }} />
-              <p style={{ fontSize: 16, color: '#1e293b', fontWeight: 500 }}>
-                {t('common.confirmDeleteContent', { name: deleteTarget?.name || '' })}
-              </p>
-              <p style={{ fontSize: 13, color: '#94a3b8', marginTop: 8 }}>{t('common.deleteWarning')}</p>
-            </div>
-          </Modal>
+          />
 
           {/* ===== 服务配置（API Key / MCP 接入）===== */}
           <ServiceConfigModal

@@ -39,7 +39,7 @@ export default function PermissionModal({
     <Modal open={open} onCancel={onCancel} footer={null} width={600} closable={false} styles={{ body: { padding: 0 } }}>
       <div className="yx-modal-header">
         <h2>
-          <SettingOutlined style={{ color: '#3b82f6' }} /> {t('domainKnowledge.permissionSettingsTitle')}
+          <SettingOutlined style={{ color: 'var(--yx-accent)' }} /> {t('domainKnowledge.permissionSettingsTitle')}
         </h2>
         <Button type="text" className="yx-modal-close-btn" onClick={onCancel}>
           <CloseOutlined />
@@ -50,14 +50,14 @@ export default function PermissionModal({
           {t('domainKnowledge.permissionDescription', { name: currentKb?.name })}
         </p>
         <Input
-          prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+          prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)', fontSize: 14 }} />}
           placeholder={t('domainKnowledge.searchUserOrRole')}
           value={keyword}
           onChange={(e) => onKeywordChange(e.target.value)}
           style={{ width: '100%', marginBottom: 12 }}
         />
         {loading ? (
-          <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>{t('common.loading')}</div>
+          <div style={{ textAlign: 'center', padding: 40, color: 'var(--yx-text-muted)' }}>{t('common.loading')}</div>
         ) : (
           members.map((u, i) => {
             const checked = u.role;

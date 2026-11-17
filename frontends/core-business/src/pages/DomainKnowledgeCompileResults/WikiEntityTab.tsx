@@ -64,8 +64,8 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
             style={{
               padding: '2px 8px',
               borderRadius: 6,
-              background: '#eff6ff',
-              color: '#3b82f6',
+              background: 'var(--yx-info-bg)',
+              color: 'var(--yx-accent)',
               fontSize: 12,
               fontWeight: 500,
             }}
@@ -73,7 +73,7 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
             {v}
           </span>
         ) : (
-          <span style={{ color: '#94a3b8' }}>—</span>
+          <span style={{ color: 'var(--yx-text-muted)' }}>—</span>
         ),
     },
     {
@@ -81,7 +81,7 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
       dataIndex: 'name',
       key: 'name',
       width: 260,
-      render: (v: string) => <strong style={{ color: '#0b2b5c' }}>{v || '—'}</strong>,
+      render: (v: string) => <strong style={{ color: 'var(--yx-brand-dark)' }}>{v || '—'}</strong>,
     },
     {
       title: t('common.description'),
@@ -89,7 +89,7 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
       key: 'description',
       width: 400,
       ellipsis: true,
-      render: (v: string) => <span style={{ color: '#64748b', fontSize: 13 }}>{v || '—'}</span>,
+      render: (v: string) => <span style={{ color: 'var(--yx-text-secondary)', fontSize: 13 }}>{v || '—'}</span>,
     },
     {
       title: t('compile.relation.name'),
@@ -108,12 +108,12 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
           justifyContent: 'space-between',
           alignItems: 'center',
           padding: '16px 24px',
-          borderTop: '1px solid #f1f5f9',
+          borderTop: '1px solid var(--yx-bg-muted)',
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
-          <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+          <span style={{ fontSize: 13, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
             {t('compile.totalInstances', { count: total })}
           </span>
         </div>
@@ -150,7 +150,7 @@ export default function WikiEntityTab({ kbId, title: propTitle }: WikiEntityTabP
         style={{ padding: '0 24px 24px' }}
         scroll={{ y: 'calc(100vh - 480px)' }}
         locale={{
-          emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyWikiEntities')}</span>,
+          emptyText: t('compile.emptyWikiEntities'),
         }}
       />
     </>

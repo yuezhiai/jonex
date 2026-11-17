@@ -35,8 +35,8 @@ export default function WikiTopicView({
         style={{
           fontSize: depth === 0 ? 15 : 14,
           fontWeight: 600,
-          color: '#0b2b5c',
-          borderLeft: '3px solid #3b82f6',
+          color: 'var(--yx-brand-dark)',
+          borderLeft: '3px solid var(--yx-accent)',
           paddingLeft: 10,
           marginBottom: 6,
           display: 'flex',
@@ -50,7 +50,7 @@ export default function WikiTopicView({
         </span>
       </div>
       {section.description && (
-        <div style={{ fontSize: 13, color: '#64748b', paddingLeft: 13, marginBottom: 6 }}>
+        <div style={{ fontSize: 13, color: 'var(--yx-text-secondary)', paddingLeft: 13, marginBottom: 6 }}>
           {section.description}
         </div>
       )}
@@ -80,7 +80,7 @@ export default function WikiTopicView({
                 cursor: 'pointer',
               }}
               onMouseEnter={(e) => {
-                e.currentTarget.style.background = '#f8fafc';
+                e.currentTarget.style.background = 'var(--yx-bg-subtle)';
               }}
               onMouseLeave={(e) => {
                 e.currentTarget.style.background = 'transparent';
@@ -89,7 +89,7 @@ export default function WikiTopicView({
               <span
                 style={{
                   minWidth: 22,
-                  color: '#94a3b8',
+                  color: 'var(--yx-text-muted)',
                   fontSize: 12,
                   fontVariantNumeric: 'tabular-nums',
                 }}
@@ -105,7 +105,7 @@ export default function WikiTopicView({
                   {t(roleLabelKey(entry.role))}
                 </Tag>
                 {(entry.note || page?.description) && (
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>
+                  <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 2 }}>
                     {entry.note || page?.description}
                   </div>
                 )}
@@ -122,10 +122,10 @@ export default function WikiTopicView({
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-        <h2 style={{ margin: 0, fontSize: 22, color: '#0b2b5c' }}>
+        <h2 style={{ margin: 0, fontSize: 22, color: 'var(--yx-brand-dark)' }}>
           {node.kind === 'unclassified' ? t('domainKnowledge.wikiReader.unclassified') : node.title}
         </h2>
-        <span style={{ color: '#94a3b8', fontSize: 13 }}>
+        <span style={{ color: 'var(--yx-text-muted)', fontSize: 13 }}>
           {t('domainKnowledge.wikiReader.topicEntries', { count: countEntries(node) })}
         </span>
       </div>

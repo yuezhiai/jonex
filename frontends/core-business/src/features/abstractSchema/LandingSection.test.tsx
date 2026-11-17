@@ -191,6 +191,60 @@ describe('LandingSection 建议落点', () => {
   });
 });
 
+describe('LandingSection 落点置信度', () => {
+  const withLanding = (extra: Record<string, unknown>): EntityType => ({
+    ...makeEntity(),
+    landings: [{
+      dataSourceId: 'ds_a', entityName: 'job_title', included: true,
+      sourceName: 'genesis', stale: false, ...extra,
+    }],
+  });
+
+  /** 置信度 Tag 的 DOM 根（按文案找 span → 最近的 antd Tag）。 */
+  const confidenceTag = (key: string): HTMLElement =>
+    screen.getByText(`abstractSchema.landingAgent.${key}`).closest('.ant-tag') as HTMLElement;
+
+  // ⚠️ 依据走 antd Tooltip（v6 不往子节点写 title 属性）→ 只能靠悬停把弹层「打开」再断言，
+  // 不能像原生 title 那样用 getByTitle。
+  it('低置信 → 橙色「待确认」，依据进 Tooltip（悬停才出，不占行宽）', async () => {
+    renderSection(withLanding({ origin: 'agent', confidence: 'low', rationale: '样本不足' }));
+
+    const tag = confidenceTag('confidenceLow');
+    expect(tag.className).toContain('ant-tag-orange');
+    // 依据不直接铺在行里
+    expect(screen.queryByText('样本不足')).toBeNull();
+
+    fireEvent.mouseEnter(tag);
+    expect(await screen.findByText('样本不足')).toBeTruthy();
+  });
+
+  it('高置信 → 绿色；无 rationale 时不挂 Tooltip', async () => {
+    renderSection(withLanding({ origin: 'agent', confidence: 'high' }));
+
+    const tag = confidenceTag('confidenceHigh');
+    expect(tag.className).toContain('ant-tag-green');
+
+    // 悬停也弹不出任何东西（Tooltip 从未挂上）
+    fireEvent.mouseEnter(tag);
+    await new Promise((resolve) => { setTimeout(resolve, 150); });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('中置信 → 蓝色', () => {
+    renderSection(withLanding({ origin: 'agent', confidence: 'medium' }));
+
+    expect(confidenceTag('confidenceMedium').className).toContain('ant-tag-blue');
+  });
+
+  it('无 confidence 的旧落点行不渲染任何置信度元素（不留空位）', () => {
+    const { container } = render(<LandingSection kbId="kb_1" entity={withLanding({})} entityNames={['job_title']}
+                                             execute={vi.fn()} readOnly={false} />);
+
+    expect(screen.queryByText(/abstractSchema\.landingAgent\.confidence/)).toBeNull();
+    expect(container.querySelector('.ae-landing-confidence')).toBeNull();
+  });
+});
+
 describe('LandingSection 落点行视觉', () => {
   it('included=false 的落点行整行淡化，但「打开源画布」链接保持可点观感', () => {
     const entity: EntityType = {

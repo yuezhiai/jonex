@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, Input, Space, message } from 'antd';
 import {
-  ArrowLeftOutlined,
   UploadOutlined,
   TagOutlined,
   GlobalOutlined,
@@ -10,7 +9,7 @@ import {
   FileOutlined,
   SearchOutlined,
 } from '@ant-design/icons';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import type { ManualDocItem, DomainKnowledgeDetail as DomainKnowledgeDetailType } from '@/types/domainKnowledge';
 import { getDomainKnowledgeDetail } from '@/api/domainKnowledge';
 import { getManualDocList } from '@/api/domainKnowledge';
@@ -18,7 +17,7 @@ import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
 import DocumentStatusFilter from '@/components/DocumentStatusFilter';
 import DocumentStatsBar from '@/components/DocumentStatsBar';
 import { type DocPhase } from '@/utils/docPhase';
-import { PageContent } from '@jonex/shared-lib';
+import { PageContent, PageHeader } from '@jonex/shared-lib';
 import { FORMAT_DISPLAY } from '@/constants/upload';
 
 const PAGE_SIZE = 7;
@@ -26,7 +25,6 @@ const PAGE_SIZE = 7;
 export default function DomainKnowledgeDatasourceManual() {
   const { t } = useTranslation();
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
 
   // ── header info ──────────────────────────────────────
   const [detail, setDetail] = useState<DomainKnowledgeDetailType | null>(null);
@@ -41,7 +39,7 @@ export default function DomainKnowledgeDatasourceManual() {
   const [phase, setPhase] = useState<DocPhase[]>([]);
   const [loading, setLoading] = useState(false);
   // 手动刷新计数器：删除后递增，强制单一数据 effect 重新拉取（即使 page 未变）
-  const [reloadFlag, setReloadFlag] = useState(0);
+  const [reloadFlag] = useState(0);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
   // ── fetch header ──────────────────────────────────────
@@ -97,28 +95,20 @@ export default function DomainKnowledgeDatasourceManual() {
   }, [page, keyword, phase, reloadFlag, fetchList]);
 
   return (
-    <PageContent showCard={false}>
-      <a
-        onClick={() => navigate(`/domain-knowledge/${id}/detail`)}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          marginBottom: 16,
-          fontSize: 14,
-          color: '#64748b',
-          cursor: 'pointer',
-        }}
-      >
-        <ArrowLeftOutlined /> {t('domainKnowledge.backToKnowledgeDetail')}
-      </a>
+    <>
+      <PageHeader
+        title={t('route.datasourceManual')}
+        backTo={`/domain-knowledge/${id}/detail`}
+        backText={t('domainKnowledge.backToKnowledgeDetail')}
+      />
+      <PageContent showCard={false}>
 
       <Card
         style={{
-          borderRadius: 10,
+          borderRadius: 'var(--yx-card-radius)',
           marginBottom: 24,
-          border: '1px solid #eef2f6',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          border: '1px solid var(--yx-border-light)',
+          boxShadow: 'var(--yx-card-shadow)',
         }}
         bodyStyle={{
           padding: '20px 24px',
@@ -132,8 +122,8 @@ export default function DomainKnowledgeDatasourceManual() {
             width: 48,
             height: 48,
             borderRadius: 12,
-            background: '#eff6ff',
-            color: '#3b82f6',
+            background: 'var(--yx-info-bg)',
+            color: 'var(--yx-accent)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -148,7 +138,7 @@ export default function DomainKnowledgeDatasourceManual() {
             style={{
               fontSize: 18,
               fontWeight: 700,
-              color: '#0b2b5c',
+              color: 'var(--yx-brand-dark)',
               margin: 0,
             }}
           >
@@ -166,7 +156,7 @@ export default function DomainKnowledgeDatasourceManual() {
               gap: 16,
               marginTop: 4,
               fontSize: 13,
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
               flexWrap: 'wrap',
             }}
           >
@@ -192,9 +182,9 @@ export default function DomainKnowledgeDatasourceManual() {
 
       <Card
         style={{
-          borderRadius: 10,
-          border: '1px solid #eef2f6',
-          boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+          borderRadius: 'var(--yx-card-radius)',
+          border: '1px solid var(--yx-border-light)',
+          boxShadow: 'var(--yx-card-shadow)',
         }}
         bodyStyle={{ padding: 0 }}
       >
@@ -204,7 +194,7 @@ export default function DomainKnowledgeDatasourceManual() {
             alignItems: 'center',
             justifyContent: 'space-between',
             padding: '16px 20px',
-            borderBottom: '1px solid #eef2f6',
+            borderBottom: '1px solid var(--yx-border-light)',
           }}
         >
           <Space>
@@ -212,13 +202,13 @@ export default function DomainKnowledgeDatasourceManual() {
               style={{
                 fontSize: 14,
                 fontWeight: 600,
-                color: '#0b2b5c',
+                color: 'var(--yx-brand-dark)',
               }}
             >
               {t('domainKnowledge.documentList')}
             </span>
             <Input
-              prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+              prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
               placeholder={t('common.keywordSearch')}
               style={{ width: 240 }}
               value={keywordInput}
@@ -236,13 +226,14 @@ export default function DomainKnowledgeDatasourceManual() {
         <div
           style={{
             padding: '12px 20px',
-            borderBottom: '1px solid #eef2f6',
+            borderBottom: '1px solid var(--yx-border-light)',
           }}
         >
           <DocumentStatsBar knowledgeBaseId={id || ''} reloadFlag={reloadFlag} />
         </div>
         <DataSourceDocTable kbId={id || ''} docs={docs} loading={loading} pageSize={PAGE_SIZE} />
       </Card>
-    </PageContent>
+      </PageContent>
+    </>
   );
 }

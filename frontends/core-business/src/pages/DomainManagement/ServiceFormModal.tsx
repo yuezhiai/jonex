@@ -65,7 +65,7 @@ export default function ServiceFormModal({
 
   return (
     <Modal
-      wrapClassName="sfm-modal"
+      wrapClassName="yx-modal"
       title={
         <span className="sfm-title">
           <span className="sfm-title-ico">{editing ? <EditOutlined /> : <PlusOutlined />}</span>

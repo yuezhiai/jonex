@@ -122,10 +122,10 @@ export const createColumns = (
           : '';
         return (
           <Space style={{ minWidth: 0 }}>
-            <FileOutlined style={{ color: '#3b82f6', flex: 'none' }} />
+            <FileOutlined style={{ color: 'var(--yx-accent)', flex: 'none' }} />
             <span
               style={{
-                color: '#3b82f6',
+                color: 'var(--yx-accent)',
                 cursor: 'pointer',
                 textDecoration: 'underline',
                 // 长文件名先收缩并省略，给徽标保留位置
@@ -169,7 +169,7 @@ export const createColumns = (
       key: 'dataSourceType',
       width: 100,
       render: (v: string) => {
-        if (!v) return <span style={{ color: '#94a3b8' }}>—</span>;
+        if (!v) return <span style={{ color: 'var(--yx-text-muted)' }}>—</span>;
         const displayName = typeNameMap.get(v);
         return (
           <Tag

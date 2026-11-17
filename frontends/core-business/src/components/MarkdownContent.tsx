@@ -43,7 +43,7 @@ const sanitizeSchema = {
 };
 
 const headingStyle: React.CSSProperties = {
-  color: '#0b2b5c',
+  color: 'var(--yx-brand-dark)',
   fontWeight: 600,
   margin: '0 0 10px',
   lineHeight: 1.5,
@@ -55,7 +55,7 @@ export const WIKI_LINK_PREFIX = '#wiki/';
 
 /** 行内代码：浅底玫红字的色块 */
 const inlineCodeStyle: React.CSSProperties = {
-  background: '#f1f5f9',
+  background: 'var(--yx-bg-muted)',
   borderRadius: 4,
   padding: '1px 6px',
   fontSize: 13,
@@ -77,7 +77,7 @@ const blockCodeStyle: React.CSSProperties = {
 /** 围栏代码块的 pre 外壳（深底浅字） */
 const preStyle: React.CSSProperties = {
   background: '#0f172a',
-  color: '#e2e8f0',
+  color: 'var(--yx-border)',
   borderRadius: 8,
   padding: 12,
   fontSize: 13,
@@ -88,10 +88,10 @@ const preStyle: React.CSSProperties = {
 
 /**
  * 子文档容器的外观：纯浅底圆角块，不加边框。
- * 底色比 blockquote 的 #f8fafc 深一档，两者叠在一起仍分得清。
+ * 底色比 blockquote 的 var(--yx-bg-subtle) 深一档，两者叠在一起仍分得清。
  */
 const embedStyle: React.CSSProperties = {
-  background: '#f1f5f9',
+  background: 'var(--yx-bg-muted)',
   borderRadius: 6,
   padding: '10px 14px',
   margin: '0 0 12px',
@@ -176,7 +176,7 @@ function buildComponents({
     h5: ({ children }) => <h5 style={{ ...headingStyle, fontSize: headingSizes.h5 }}>{children}</h5>,
     h6: ({ children }) => <h6 style={{ ...headingStyle, fontSize: headingSizes.h6 }}>{children}</h6>,
     p: ({ children }) => <p style={{ margin: '0 0 10px' }}>{children}</p>,
-    strong: ({ children }) => <strong style={{ color: '#0b2b5c' }}>{children}</strong>,
+    strong: ({ children }) => <strong style={{ color: 'var(--yx-brand-dark)' }}>{children}</strong>,
     ul: ({ children }) => <ul style={{ margin: '0 0 10px', paddingLeft: 22 }}>{children}</ul>,
     ol: ({ children }) => <ol style={{ margin: '0 0 10px', paddingLeft: 22 }}>{children}</ol>,
     li: ({ children }) => <li style={{ marginBottom: 2 }}>{children}</li>,
@@ -185,8 +185,8 @@ function buildComponents({
         style={{
           margin: '0 0 12px',
           padding: '4px 12px',
-          borderLeft: '3px solid #3b82f6',
-          background: '#f8fafc',
+          borderLeft: '3px solid var(--yx-accent)',
+          background: 'var(--yx-bg-subtle)',
           color: '#475569',
         }}
       >
@@ -217,7 +217,7 @@ function buildComponents({
         );
       }
       return (
-        <a href={href} target="_blank" rel="noreferrer" style={{ color: '#3b82f6' }}>
+        <a href={href} target="_blank" rel="noreferrer" style={{ color: 'var(--yx-accent)' }}>
           {children}
         </a>
       );
@@ -261,7 +261,7 @@ function buildComponents({
       const id = typeof src === 'string' && src.startsWith('#wiki-image/') ? src.slice('#wiki-image/'.length) : '';
       const image = images?.find((item) => item.asset_id === id);
       return image ? <WikiSourcePicture image={image} onOpenSource={onOpenImageSource} /> : (
-      <span style={{ color: '#94a3b8', fontSize: 12 }}>
+      <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>
         <PictureOutlined /> {alt || imagePlaceholder}
       </span>
     ); },
@@ -283,7 +283,7 @@ export default function MarkdownContent({
   onOpenImageSource,
 }: MarkdownContentProps) {
   return (
-    <div style={{ fontSize: 14, lineHeight: 1.8, color: '#334155', wordBreak: 'break-word' }}>
+    <div style={{ fontSize: 14, lineHeight: 1.8, color: 'var(--yx-text-body)', wordBreak: 'break-word' }}>
       <MarkdownBody
         content={content}
         components={buildComponents({ markdownFence: true, headingIds, onInternalLink, imagePlaceholder, images, onOpenImageSource })}

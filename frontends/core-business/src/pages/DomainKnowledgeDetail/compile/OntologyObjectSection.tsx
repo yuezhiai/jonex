@@ -24,7 +24,7 @@ interface Props {
 }
 
 function AttrInlineTable({ attrs, t }: { attrs: OntologyAttribute[]; t: (key: string, opts?: any) => string }) {
-  if (!attrs.length) return <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('compile.object.noAttributes')}</span>;
+  if (!attrs.length) return <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>{t('compile.object.noAttributes')}</span>;
   return (
     <div style={{ margin: 0, padding: 0 }}>
       <Table<OntologyAttribute>
@@ -108,14 +108,14 @@ export default function OntologyObjectSection({
       dataIndex: 'description',
       key: 'description',
       width: 220,
-      render: (value: string) => value || <span style={{ color: '#94a3b8' }}>{t('compile.object.noneFallback')}</span>,
+      render: (value: string) => value || t('compile.object.noneFallback'),
     },
     {
       title: t('compile.object.requirement'),
       dataIndex: 'requirement',
       key: 'requirement',
       width: 220,
-      render: (value: string) => value || <span style={{ color: '#94a3b8' }}>{t('compile.object.noneFallback')}</span>,
+      render: (value: string) => value || t('compile.object.noneFallback'),
     },
     {
       title: t('compile.object.attributes'),

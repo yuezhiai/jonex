@@ -51,7 +51,7 @@ const groupTitleStyle: React.CSSProperties = {
   gap: 6,
   fontSize: 13,
   fontWeight: 600,
-  color: '#0b2b5c',
+  color: 'var(--yx-brand-dark)',
   padding: '6px 6px',
   cursor: 'pointer',
   borderRadius: 6,
@@ -88,13 +88,13 @@ export default function WikiOutlineRail({
       <span
         style={{
           ...entryStyle,
-          background: activePath === path ? '#eff6ff' : 'transparent',
+          background: activePath === path ? 'var(--yx-info-bg)' : 'transparent',
           color: activePath === path ? '#1d4ed8' : '#475569',
           fontWeight: activePath === path ? 600 : 400,
         }}
         onClick={() => onOpenPage(path)}
         onMouseEnter={(e) => {
-          if (activePath !== path) e.currentTarget.style.background = '#f8fafc';
+          if (activePath !== path) e.currentTarget.style.background = 'var(--yx-bg-subtle)';
         }}
         onMouseLeave={(e) => {
           if (activePath !== path) e.currentTarget.style.background = 'transparent';
@@ -119,7 +119,7 @@ export default function WikiOutlineRail({
         <div
           style={{
             ...groupTitleStyle,
-            background: activeTopicId === node.id ? '#eff6ff' : 'transparent',
+            background: activeTopicId === node.id ? 'var(--yx-info-bg)' : 'transparent',
           }}
           onClick={() => {
             if (node.kind === 'topic' || node.kind === 'unclassified') onOpenTopic(node.id);
@@ -131,7 +131,7 @@ export default function WikiOutlineRail({
               event.stopPropagation();
               setCollapsed((prev) => ({ ...prev, [node.id]: !prev[node.id] }));
             }}
-            style={{ color: '#94a3b8', fontSize: 10, width: 10 }}
+            style={{ color: 'var(--yx-text-muted)', fontSize: 10, width: 10 }}
           >
             {isCollapsed ? <CaretRightOutlined /> : <CaretDownOutlined />}
           </span>
@@ -157,7 +157,7 @@ export default function WikiOutlineRail({
       style={{
         width: 268,
         flex: '0 0 268px',
-        borderRight: '1px solid #eef2f6',
+        borderRight: '1px solid var(--yx-border-light)',
         padding: '12px 10px',
         // 撑满宿主的定高盒子并自己滚动——不再用 calc(100vh - N) 猜剩余空间
         // （那个值在知识库级 `?tab=assets` 与文档级两个宿主里都不成立）。
@@ -182,7 +182,7 @@ export default function WikiOutlineRail({
       <Input
         size="small"
         allowClear
-        prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+        prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
         placeholder={t('domainKnowledge.wikiReader.searchPlaceholder')}
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
@@ -191,7 +191,7 @@ export default function WikiOutlineRail({
 
       {query.trim() ? (
         <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', padding: '0 6px 6px' }}>
+          <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', padding: '0 6px 6px' }}>
             {t('domainKnowledge.wikiReader.searchResults', { count: searchResults.length })}
           </div>
           {searchResults.length === 0 ? (
@@ -210,13 +210,13 @@ export default function WikiOutlineRail({
         (outline.topics || []).map((topic) => renderNode(topic, 0))
       ) : (
         <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', padding: '0 6px 6px' }}>
+          <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', padding: '0 6px 6px' }}>
             <UnorderedListOutlined /> {t('domainKnowledge.wikiReader.browseByCategory')}
           </div>
           {categoryGroups.map(([category, items]) => (
             <div key={category} style={{ marginBottom: 6 }}>
               <div style={{ ...groupTitleStyle, fontSize: 12, cursor: 'default' }}>
-                <FileTextOutlined style={{ color: '#94a3b8' }} />
+                <FileTextOutlined style={{ color: 'var(--yx-text-muted)' }} />
                 <span style={{ flex: 1 }}>{category}</span>
                 <span style={{ color: '#cbd5e1', fontWeight: 400 }}>{items.length}</span>
               </div>
@@ -233,9 +233,9 @@ export default function WikiOutlineRail({
           style={{
             marginTop: 12,
             padding: '8px 6px 0',
-            borderTop: '1px solid #f1f5f9',
+            borderTop: '1px solid var(--yx-bg-muted)',
             fontSize: 11,
-            color: '#94a3b8',
+            color: 'var(--yx-text-muted)',
             lineHeight: 1.6,
           }}
         >

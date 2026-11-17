@@ -385,11 +385,11 @@ const DomainManagement = function DomainManagement() {
           <div className="yx-card">
             <div className="yx-toolbar">
               <Input
-                prefix={<SearchOutlined style={{ color: '#94a3b8', fontSize: 14 }} />}
+                prefix={<SearchOutlined />}
                 placeholder={t('domainManagement.search')}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                style={{ width: 280 }}
+                style={{ width: 240 }}
               />
               <Button
                 type="primary"

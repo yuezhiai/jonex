@@ -3,7 +3,7 @@ import { I18nextProvider, useTranslation } from 'react-i18next';
 import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
-import { antdTheme } from '@jonex/platform-theme';
+import { withCssVarKey } from '@jonex/platform-theme';
 import i18n from '@/locales/i18n';
 import AppRoute from '@/router';
 
@@ -11,12 +11,9 @@ import AppRoute from '@/router';
 function AntdGate({ children }: { children: React.ReactNode }) {
   const { i18n: appI18n } = useTranslation();
   const antdLocale = appI18n.language === 'zh' ? zhCN : enUS;
-  // cssVar 关闭：antd v5 cssVar 模式下 popup 的 z-index 走 CSS 变量下发
-  // (--ant-*-z-index-popup)，懒加载 chunk 挂载会打乱 cssinjs 变量插入顺序、
-  // 导致变量丢失 → z-index 解析为 auto、弹层被内容盖住。关掉后 antd 把
-  // z-index 等 token 直接编成静态值，永不丢失（各 popup 层叠仍由 antd 算对）。
+  // cssVar key 固定为本应用的 app key，避免与 shell 的 cssVar 作用域串号（原因见 withCssVarKey 注释）。
   return (
-    <ConfigProvider locale={antdLocale} theme={{ ...antdTheme }}>
+    <ConfigProvider locale={antdLocale} theme={withCssVarKey('jonex-core-business')}>
       {children}
     </ConfigProvider>
   );

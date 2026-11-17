@@ -1,7 +1,7 @@
 /** 抽象编辑器（在 ontologyCanvas/styles.scss 之外，只加落点/背书两块）。 */
 .ae-page {
   .ae-landings { margin: 8px 0; border-top: 1px dashed #d9e2ec; padding-top: 8px; }
-  .ae-landings-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; color: #0b2b5c; }
+  .ae-landings-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; color: var(--yx-brand-dark); }
   .ae-landings-empty { color: #65758b; font-size: 12px; margin: 4px 0; }
   /* 落点/来源行：允许换行——行内放不下（长列名 + role 输入 + 删除）就折行，
      不把属性面板单列 grid 的轨道 min-content 撑宽（横向溢出的根因）。 */
@@ -14,11 +14,11 @@
   .ae-sources-hint { color: #65758b; font-size: 12px; margin: 2px 0 6px; }
   .ae-landing > code { min-width: 0; overflow-wrap: anywhere; }
   .ae-picker-list { max-height: 320px; overflow: auto; margin-top: 8px; }
-  .ae-picker-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #f1f5f9; }
+  .ae-picker-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--yx-bg-muted); }
   .ae-backings { margin: 8px 0; border-top: 1px dashed #d9e2ec; padding-top: 8px; }
-  .ae-backings-title { font-weight: 600; color: #0b2b5c; margin: 0 0 4px; }
+  .ae-backings-title { font-weight: 600; color: var(--yx-brand-dark); margin: 0 0 4px; }
   .ae-attr-sources { margin: 4px 0 0; min-width: 0; }
-  .ae-attr-sources-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; color: #0b2b5c; font-size: 12px; }
+  .ae-attr-sources-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; color: var(--yx-brand-dark); font-size: 12px; }
   .ae-attr-source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 0; font-size: 12px; min-width: 0; }
   .ae-attr-source-row > code { min-width: 0; overflow-wrap: anywhere; }
   .ae-attr-source-role { width: 120px; max-width: 100%; }

@@ -4,7 +4,8 @@ import { resolveActiveTab, visibleTabs } from './tabVisibility';
 const TABS = [
   { key: 'datasource' }, { key: 'parse' }, { key: 'schema' },
   { key: 'synonym' }, { key: 'lineage' }, { key: 'etl' },
-  { key: 'governance' }, { key: 'abstractSchema' }, { key: 'permission' },
+  { key: 'governance' }, { key: 'verifiedQuery' }, { key: 'abstractSchema' },
+  { key: 'permission' },
 ];
 
 describe('visibleTabs', () => {

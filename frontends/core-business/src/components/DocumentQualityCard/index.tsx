@@ -103,7 +103,7 @@ export default function DocumentQualityCard({
       }}
     >
       <Space size={8}>
-        <span style={{ fontSize: 13, fontWeight: 600, color: '#0b2b5c' }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {t('domainKnowledge.quality.cardTitle')}
         </span>
         {/* 失败时**不显示**旧档位徽标：body 已变成网络错误提示，头部还挂一个
@@ -198,7 +198,7 @@ export default function DocumentQualityCard({
   return (
     <div
       style={{
-        border: '1px solid #e2e8f0',
+        border: '1px solid var(--yx-border)',
         borderRadius: 8,
         padding: '12px 14px',
         marginBottom: 12,
@@ -208,7 +208,7 @@ export default function DocumentQualityCard({
       {header}
 
       {report.verdict === 'ok' && (
-        <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>
+        <div style={{ fontSize: 12, color: 'var(--yx-text-secondary)', marginBottom: 8 }}>
           {t('domainKnowledge.quality.calibrated', { count: calibrated })}
         </div>
       )}
@@ -272,7 +272,7 @@ export default function DocumentQualityCard({
                 style={{
                   margin: 0,
                   padding: 8,
-                  background: '#f8fafc',
+                  background: 'var(--yx-bg-subtle)',
                   border: '1px solid #eef2f7',
                   borderRadius: 6,
                   fontSize: 12,
@@ -321,7 +321,7 @@ export default function DocumentQualityCard({
         )}
 
         {data.status && (
-          <div style={{ fontSize: 11, color: '#94a3b8' }}>
+          <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>
             {t('domainKnowledge.quality.taskStatus')}：{data.status}
           </div>
         )}

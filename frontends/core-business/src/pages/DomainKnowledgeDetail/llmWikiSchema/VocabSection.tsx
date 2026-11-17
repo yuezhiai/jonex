@@ -112,7 +112,7 @@ export default function VocabSection({ kind, value, onChange }: Props) {
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <p style={{ fontSize: 13, color: '#64748b', margin: 0, flex: 1 }}>
+        <p style={{ fontSize: 13, color: 'var(--yx-text-secondary)', margin: 0, flex: 1 }}>
           {kind === 'entity'
             ? t('llmWikiSchema.entityTypeHint')
             : t('llmWikiSchema.conceptTypeHint')}

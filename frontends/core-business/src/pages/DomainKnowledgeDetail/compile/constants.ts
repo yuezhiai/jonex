@@ -29,6 +29,7 @@ export const ATTR_TYPE_LABEL_KEYS: Record<string, string> = {
 export const RELATION_CARDINALITY_OPTIONS: { label: string; value: CompiledRelationCardinality }[] = [
   { label: i18n.t('compile.cardinality.oneToOne'), value: 'one_to_one' },
   { label: i18n.t('compile.cardinality.oneToMany'), value: 'one_to_many' },
+  { label: i18n.t('compile.cardinality.manyToOne'), value: 'many_to_one' },
   { label: i18n.t('compile.cardinality.manyToMany'), value: 'many_to_many' },
   { label: i18n.t('compile.cardinality.custom'), value: 'custom' },
 ];
@@ -36,6 +37,7 @@ export const RELATION_CARDINALITY_OPTIONS: { label: string; value: CompiledRelat
 export const RELATION_CARDINALITY_TEXT: Record<CompiledRelationCardinality, string> = {
   one_to_one: i18n.t('compile.cardinality.oneToOne'),
   one_to_many: i18n.t('compile.cardinality.oneToMany'),
+  many_to_one: i18n.t('compile.cardinality.manyToOne'),
   many_to_many: i18n.t('compile.cardinality.manyToMany'),
   custom: i18n.t('compile.cardinality.custom'),
 };
@@ -44,6 +46,7 @@ export const RELATION_CARDINALITY_TEXT: Record<CompiledRelationCardinality, stri
 export const RELATION_CARDINALITY_LABEL_KEYS: Record<CompiledRelationCardinality, string> = {
   one_to_one: 'compile.cardinality.oneToOne',
   one_to_many: 'compile.cardinality.oneToMany',
+  many_to_one: 'compile.cardinality.manyToOne',
   many_to_many: 'compile.cardinality.manyToMany',
   custom: 'compile.cardinality.custom',
 };
@@ -51,6 +54,7 @@ export const RELATION_CARDINALITY_LABEL_KEYS: Record<CompiledRelationCardinality
 export const RELATION_TYPE_TAG: Record<CompiledRelationCardinality, { bg: string; color: string }> = {
   one_to_one: { bg: '#ecfdf5', color: '#059669' },
   one_to_many: { bg: '#eff6ff', color: '#2563eb' },
+  many_to_one: { bg: '#eef2ff', color: '#4f46e5' },
   many_to_many: { bg: '#fef3c7', color: '#d97706' },
   custom: { bg: '#f3e8ff', color: '#7c3aed' },
 };
@@ -118,6 +122,8 @@ export function normalizeAttrType(raw?: string): OntologyAttrType {
 }
 
 export function normalizeRelationCardinality(raw?: string): CompiledRelationCardinality {
-  const allowed: CompiledRelationCardinality[] = ['one_to_one', 'one_to_many', 'many_to_many', 'custom'];
+  const allowed: CompiledRelationCardinality[] = [
+    'one_to_one', 'one_to_many', 'many_to_one', 'many_to_many', 'custom',
+  ];
   return allowed.includes((raw || '') as CompiledRelationCardinality) ? (raw as CompiledRelationCardinality) : 'custom';
 }

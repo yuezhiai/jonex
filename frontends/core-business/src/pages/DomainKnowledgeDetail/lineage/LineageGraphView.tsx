@@ -430,7 +430,7 @@ export default function LineageGraphView({ kbId, dsId, tables, revision }: Props
       return (
         <div style={{ padding: 24, textAlign: 'center' }}>
           <Spin />
-          <div style={{ marginTop: 8, color: '#64748b' }}>
+          <div style={{ marginTop: 8, color: 'var(--yx-text-secondary)' }}>
             {t('domainKnowledge.lineage.graph.loading')}
           </div>
         </div>
@@ -550,7 +550,7 @@ export default function LineageGraphView({ kbId, dsId, tables, revision }: Props
           gap: 12,
           marginBottom: 12,
           fontSize: 12,
-          color: '#64748b',
+          color: 'var(--yx-text-secondary)',
         }}
       >
         <span>{t('domainKnowledge.lineage.graph.legendOrigin')}</span>
@@ -575,7 +575,7 @@ export default function LineageGraphView({ kbId, dsId, tables, revision }: Props
       {loading ? (
         <div style={{ padding: 24, textAlign: 'center' }}>
           <Spin />
-          <div style={{ marginTop: 8, color: '#64748b' }}>
+          <div style={{ marginTop: 8, color: 'var(--yx-text-secondary)' }}>
             {t('domainKnowledge.lineage.graph.loading')}
           </div>
         </div>
@@ -616,10 +616,10 @@ export default function LineageGraphView({ kbId, dsId, tables, revision }: Props
           <div
             style={{
               height: CANVAS_HEIGHT,
-              border: '1px solid #e2e8f0',
+              border: '1px solid var(--yx-border)',
               borderRadius: 8,
               overflow: 'hidden',
-              background: '#f8fafc',
+              background: 'var(--yx-bg-subtle)',
             }}
           >
             <ReactFlow<LineageRFNode, LineageRFEdge>
@@ -648,7 +648,7 @@ export default function LineageGraphView({ kbId, dsId, tables, revision }: Props
 
           {/* 路径查询四态：loading / error 就地显示在画布下方；empty·unknown·success 走面板。 */}
           {pathsLoading && (
-            <div style={{ padding: 12, textAlign: 'center', color: '#64748b' }}>
+            <div style={{ padding: 12, textAlign: 'center', color: 'var(--yx-text-secondary)' }}>
               <Spin size="small" />
               <span style={{ marginLeft: 8 }}>
                 {t('domainKnowledge.lineage.paths.loading')}

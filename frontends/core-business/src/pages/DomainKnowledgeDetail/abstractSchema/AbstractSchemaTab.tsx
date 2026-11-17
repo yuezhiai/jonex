@@ -29,6 +29,8 @@ import {
 import ConceptCard from './ConceptCard';
 import DataAlignmentSection from './DataAlignmentSection';
 import FocusGenerateModal from './FocusGenerateModal';
+import JoinProposalSection from './JoinProposalSection';
+import MetricProposalSection from './MetricProposalSection';
 
 const { Text, Paragraph } = Typography;
 
@@ -436,6 +438,10 @@ export default function AbstractSchemaTab({ kbId, canWrite }: Props) {
           ))}
         </Space>
       )}
+
+      <MetricProposalSection kbId={kbId} canWrite={canWrite} />
+
+      <JoinProposalSection kbId={kbId} canWrite={canWrite} />
 
       <Paragraph type="secondary" style={{ marginBottom: 0 }}>
         {t('abstractSchema.footerHint')}

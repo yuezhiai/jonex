@@ -1,7 +1,8 @@
 // 本库工具新建 / 编辑弹窗：基础信息 + 入参 / 出参 Schema + 运行时（与平台工具共用 ApiRuntimeFields）。
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Checkbox, Form, Input, Modal, Switch, message } from 'antd';
+import { Alert, Button, Checkbox, Form, Input, Modal, Switch, message } from 'antd';
+import { RobotOutlined } from '@ant-design/icons';
 import {
   ApiRuntimeFields,
   formValuesToRuntime,
@@ -9,7 +10,8 @@ import {
   type ApiRuntimeFormValues,
 } from '@jonex/shared-lib';
 import type { KbTool } from '@/types/domainKnowledge';
-import type { SaveKbToolPayload } from '@/api/kbTool';
+import type { KbToolAiDraft, SaveKbToolPayload } from '@/api/kbTool';
+import KbToolAiDraftModal from './KbToolAiDraftModal';
 
 const { TextArea } = Input;
 const TOOL_NAME_RE = /^[a-z][a-z0-9_]{1,127}$/;
@@ -27,6 +29,7 @@ interface FormValues extends ApiRuntimeFormValues {
 
 interface Props {
   open: boolean;
+  kbId: string;
   /** 为 null 时是新建 */
   tool: KbTool | null;
   onClose: () => void;
@@ -46,15 +49,19 @@ function parseObject(text?: string): Record<string, unknown> | undefined {
   return v as Record<string, unknown>;
 }
 
-export default function KbToolFormModal({ open, tool, onClose, onSubmit }: Props) {
+export default function KbToolFormModal({ open, kbId, tool, onClose, onSubmit }: Props) {
   const { t } = useTranslation();
   const [form] = Form.useForm<FormValues>();
   const [saving, setSaving] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [readOnlySuggestion, setReadOnlySuggestion] = useState<{ value: boolean; reason: string } | null>(null);
   const isEdit = !!tool;
 
   useEffect(() => {
     if (!open) return;
     form.resetFields();
+    setAiOpen(false);
+    setReadOnlySuggestion(null);
     if (tool) {
       form.setFieldsValue({
         tool_name: tool.toolName,
@@ -95,7 +102,10 @@ export default function KbToolFormModal({ open, tool, onClose, onSubmit }: Props
     let values: FormValues;
     try {
       values = await form.validateFields();
-    } catch {
+    } catch (err: any) {
+      const first = err?.errorFields?.[0]?.name;
+      if (first) form.scrollToField(first, { block: 'center' });
+      message.warning(t('kbTool.validationFailed'));
       return;
     }
     const runtimePart = formValuesToRuntime(values);
@@ -122,6 +132,22 @@ export default function KbToolFormModal({ open, tool, onClose, onSubmit }: Props
     }
   };
 
+  const applyAiDraft = (draft: KbToolAiDraft) => {
+    setReadOnlySuggestion(draft.readOnlySuggestion);
+    const runtime = draft.runtime && typeof draft.runtime.url === 'string'
+      ? { ...draft.runtime, url: draft.runtime.url.trim() }
+      : draft.runtime;
+    form.setFieldsValue({
+      tool_name: draft.toolName,
+      name: draft.name,
+      description: draft.description,
+      input_schema: pretty(draft.inputSchema) || DEFAULT_INPUT_SCHEMA,
+      output_schema: pretty(draft.outputSchema),
+      ...(runtime ? runtimeToFormValues(runtime) : {}),
+    });
+    // read_only 只给建议，不自动勾选
+  };
+
   return (
     <Modal
       title={isEdit ? t('kbTool.editTitle') : t('kbTool.createTitle')}
@@ -134,6 +160,13 @@ export default function KbToolFormModal({ open, tool, onClose, onSubmit }: Props
       width={760}
       destroyOnHidden
     >
+      {!isEdit && (
+        <div style={{ marginBottom: 12 }}>
+          <Button icon={<RobotOutlined />} onClick={() => setAiOpen(true)}>
+            {t('kbTool.ai.open')}
+          </Button>
+        </div>
+      )}
       <Form form={form} layout="vertical">
         <Form.Item
           name="tool_name"
@@ -178,11 +211,30 @@ export default function KbToolFormModal({ open, tool, onClose, onSubmit }: Props
         >
           <Checkbox>{t('toolRuntime.readOnlyCheckbox')}</Checkbox>
         </Form.Item>
+        {readOnlySuggestion && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title={t('kbTool.ai.readOnlySuggestion', {
+              value: readOnlySuggestion.value
+                ? t('kbTool.ai.readOnlyYes')
+                : t('kbTool.ai.readOnlyNo'),
+              reason: readOnlySuggestion.reason || '—',
+            })}
+          />
+        )}
 
         <Form.Item name="enabled" label={t('kbTool.enabled')} valuePropName="checked" extra={t('kbTool.enabledHint')}>
           <Switch />
         </Form.Item>
       </Form>
+      <KbToolAiDraftModal
+        open={aiOpen}
+        kbId={kbId}
+        onClose={() => setAiOpen(false)}
+        onApply={applyAiDraft}
+      />
     </Modal>
   );
 }

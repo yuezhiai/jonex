@@ -33,10 +33,10 @@ export default function WikiBacklinks({ result, loading, onOpenPage }: WikiBackl
 
   return (
     <div style={{ marginTop: 26 }}>
-      <div style={{ fontSize: 16, fontWeight: 600, color: '#0b2b5c', marginBottom: 8 }}>
+      <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 8 }}>
         <ImportOutlined /> {t('domainKnowledge.wikiReader.backlinks')}
         {items.length > 0 && (
-          <span style={{ fontSize: 12, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
             {t('domainKnowledge.wikiReader.backlinksCount', { count: result?.total || items.length })}
             {result && result.mentionCount > 0
               ? ` · ${t('domainKnowledge.wikiReader.backlinksMention', { count: result.mentionCount })}`
@@ -47,7 +47,7 @@ export default function WikiBacklinks({ result, loading, onOpenPage }: WikiBackl
       {loading && items.length === 0 ? (
         <Skeleton active paragraph={{ rows: 1 }} title={false} />
       ) : items.length === 0 ? (
-        <div style={{ fontSize: 13, color: '#94a3b8' }}>{t('domainKnowledge.wikiReader.noBacklinks')}</div>
+        <div style={{ fontSize: 13, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.wikiReader.noBacklinks')}</div>
       ) : (
         <>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -59,9 +59,9 @@ export default function WikiBacklinks({ result, loading, onOpenPage }: WikiBackl
                   color: '#2563eb',
                   fontSize: 13,
                   padding: '2px 10px',
-                  background: '#f8fafc',
+                  background: 'var(--yx-bg-subtle)',
                   borderRadius: 14,
-                  border: '1px solid #e2e8f0',
+                  border: '1px solid var(--yx-border)',
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 6,

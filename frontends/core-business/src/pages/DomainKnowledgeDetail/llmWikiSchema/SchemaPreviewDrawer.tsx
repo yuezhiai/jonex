@@ -41,7 +41,7 @@ export default function SchemaPreviewDrawer({ open, onClose, schema }: Props) {
                   whiteSpace: 'pre-wrap',
                   fontSize: 12,
                   lineHeight: 1.7,
-                  background: '#f8fafc',
+                  background: 'var(--yx-bg-subtle)',
                   padding: 12,
                   borderRadius: 8,
                   maxHeight: 'calc(100vh - 200px)',
@@ -61,7 +61,7 @@ export default function SchemaPreviewDrawer({ open, onClose, schema }: Props) {
                   whiteSpace: 'pre-wrap',
                   fontSize: 12,
                   lineHeight: 1.7,
-                  background: '#f8fafc',
+                  background: 'var(--yx-bg-subtle)',
                   padding: 12,
                   borderRadius: 8,
                 }}

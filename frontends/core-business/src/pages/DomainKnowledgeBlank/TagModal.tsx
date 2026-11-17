@@ -6,7 +6,7 @@ import { getKnowledgeBaseTags, createKnowledgeBaseTag, getDocumentTags, setDocum
 import type { TagItem } from '@/api/domainKnowledge';
 import './index.scss';
 
-const TAG_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
+const TAG_COLORS = ['var(--yx-accent)', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
 
 interface TagModalProps {
   open: boolean;
@@ -105,8 +105,8 @@ export default function TagModal({ open, kbId, docId, docName, onClose }: TagMod
     <Modal
       open={open}
       title={
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 18, color: '#0b2b5c' }}>
-          <TagOutlined style={{ color: '#3b82f6', fontSize: 22 }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 18, color: 'var(--yx-brand-dark)' }}>
+          <TagOutlined style={{ color: 'var(--yx-accent)', fontSize: 22 }} />
           {t('common.setTags')}
         </div>
       }

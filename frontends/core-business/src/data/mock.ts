@@ -43,71 +43,6 @@ export interface KnowledgeSearchResult {
   updatedAt: string;
 }
 
-export interface DomainPermission {
-  id: string;
-  username: string;
-  displayName: string;
-  role: 'admin' | 'editor' | 'viewer';
-  avatar?: string;
-}
-
-export const MOCK_DOMAIN_SPACES: DomainSpace[] = [
-  {
-    id: '1',
-    name: 'Healthcare Knowledge Space',
-    description: 'Clinical medicine, drug R&D, and public health knowledge',
-    status: 'active',
-    docCount: 1248,
-    knowledgeCount: 3456,
-    createdAt: '2025-08-15',
-  },
-  {
-    id: '2',
-    name: 'FinTech Knowledge Space',
-    description: 'Risk models, quantitative trading, regulatory compliance',
-    status: 'active',
-    docCount: 892,
-    knowledgeCount: 2340,
-    createdAt: '2025-09-01',
-  },
-  {
-    id: '3',
-    name: 'Smart Manufacturing Space',
-    description: 'Industry 4.0, predictive maintenance, digital twins',
-    status: 'active',
-    docCount: 567,
-    knowledgeCount: 1823,
-    createdAt: '2025-10-12',
-  },
-  {
-    id: '4',
-    name: 'Education & Training Space',
-    description: 'Adaptive learning, resource recommendation, learning analytics',
-    status: 'active',
-    docCount: 1023,
-    knowledgeCount: 2891,
-    createdAt: '2025-08-28',
-  },
-  {
-    id: '5',
-    name: 'Retail E-commerce Space',
-    description: 'User profiling, recommendation systems, supply chain optimization',
-    status: 'active',
-    docCount: 756,
-    knowledgeCount: 1654,
-    createdAt: '2025-11-05',
-  },
-  {
-    id: '6',
-    name: 'Energy & Environment Space',
-    description: 'Carbon management, renewable energy, environmental monitoring',
-    status: 'inactive',
-    docCount: 234,
-    knowledgeCount: 678,
-    createdAt: '2025-07-20',
-  },
-];
-
 export const MOCK_KNOWLEDGE_ITEMS: KnowledgeItem[] = [
   {
     id: '1',
@@ -266,15 +201,6 @@ export const MOCK_DOMAINS: Domain[] = [
     status: 'inactive',
     createdAt: '2025-08-15',
   },
-];
-
-export const MOCK_DOMAIN_PERMISSIONS: DomainPermission[] = [
-  { id: '1', username: 'azhang', displayName: 'Alice Zhang', role: 'admin' },
-  { id: '2', username: 'bli', displayName: 'Bob Li', role: 'editor' },
-  { id: '3', username: 'cwang', displayName: 'Carol Wang', role: 'editor' },
-  { id: '4', username: 'dchen', displayName: 'Daisy Chen', role: 'viewer' },
-  { id: '5', username: 'ezhao', displayName: 'Eve Zhao', role: 'viewer' },
-  { id: '6', username: 'fliu', displayName: 'Frank Liu', role: 'editor' },
 ];
 
 export interface GraphInstance {

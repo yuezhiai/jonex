@@ -12,6 +12,25 @@ export function sourceCanvasPath(kbId: string, dataSourceId: string): string {
   return `/domain-knowledge/${kbId}/schema/${dataSourceId}`;
 }
 
+/**
+ * 排除一条落点：**保留该行**、只把 `included` 置 false。
+ *
+ * 不用「从数组里删掉」：删掉的行下次自动生成/对齐会**重新被提议**，用户得每次
+ * 再删一遍；`included: false` 是持久化的排除事实（投影/检索/DI 都不含它，UI 灰显），
+ * 生成侧看到它还知道「这条已被否掉」。纯函数：不改入参，未命中的行原样返回。
+ */
+export function excludeLanding(
+  list: readonly EntityLanding[],
+  dataSourceId: string,
+  entityName: string,
+): EntityLanding[] {
+  return list.map((l) => (
+    l.dataSourceId === dataSourceId && l.entityName === entityName
+      ? { ...l, included: false }
+      : l
+  ));
+}
+
 /** 该落点能不能「打开源画布」。数据源已被删（source_gone）→ 画布无处可开：
  *  点进去只会回落到知识库级那份（画布页会挂「回落」标记），对用户是误导；
  *  其余失效（实体/属性在源里不在）照开 —— 画布本身要看的就是该源的现状。 */

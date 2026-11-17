@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { navigateCrossApp } from '@jonex/shell-sdk';
-import { Card, Typography, Button, Table, Divider, Modal, message, Flex, Input, Tag } from 'antd';
+import { Card, Typography, Button, Table, Divider, Modal, message, Flex, Input, Tag, Alert } from 'antd';
 import { SaveOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { request, getData } from '../../api/request';
@@ -51,7 +51,7 @@ interface McpKeyTabProps {
 const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <Flex align="center" gap={8} style={{ marginBottom: 12 }}>
     <span style={{ width: 3, height: 16, background: '#1C6FEA', borderRadius: 2, flexShrink: 0 }} />
-    <Text strong style={{ fontSize: 15, color: '#334155' }}>
+    <Text strong style={{ fontSize: 15, color: 'var(--yx-text-body)' }}>
       {children}
     </Text>
   </Flex>
@@ -66,9 +66,16 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
   const [saving, setSaving] = useState(false);
   /** 最后一次落库/回读的 Tool 名称：已发布改名二次确认的比对基准 */
   const [savedToolName, setSavedToolName] = useState('');
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [keysError, setKeysError] = useState<string | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  /** 重试触发器：变化时重新拉取授权 Key 与详情 */
+  const [reloadSeq, setReloadSeq] = useState(0);
 
   useEffect(() => {
     if (!visible || !service) return;
+    let cancelled = false;
     // 切服务/重新打开先清空 Tool 配置，避免详情回读前残留上一个服务的值
     // （Tool 名是 MCP 工具标识符，与领域服务名无关，不预填服务名）
     setToolName('');
@@ -76,20 +83,43 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
     setPublished(false);
     setAuthKeys([]);
     setSavedToolName('');
+    setKeysLoading(true);
+    setKeysError(null);
+    setDetailLoading(true);
+    setDetailError(null);
     // 访问授权列表
     getData<{ items: AuthKeyItem[] }>(request.get(`/platform/mcp-services/${service.id}/authorized-keys`))
-      .then((data) => setAuthKeys(data?.items ?? []))
-      .catch(() => setAuthKeys([]));
+      .then((data) => {
+        if (!cancelled) setAuthKeys(data?.items ?? []);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setAuthKeys([]);
+        setKeysError(err instanceof Error ? err.message : '');
+      })
+      .finally(() => {
+        if (!cancelled) setKeysLoading(false);
+      });
     // MCP 服务详情：发布状态 + 已保存的 Tool 配置（有值则回填表单，并记录比对基准）
     getData<McpServiceDetail>(request.get(`/platform/mcp-services/${service.id}`))
       .then((data) => {
+        if (cancelled) return;
         setPublished(data?.is_published === true);
         setToolName(data?.tool ?? '');
         setToolDesc(data?.tool_description ?? '');
         setSavedToolName(data?.tool || '');
       })
-      .catch(() => {});
-  }, [visible, service]);
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setDetailError(err instanceof Error ? err.message : '');
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, service, reloadSeq]);
 
   /** 提交保存请求（已通过校验与二次确认） */
   const doSaveTool = async (name: string) => {
@@ -193,11 +223,11 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
   };
 
   const handleGoToKeyManagement = () => {
-    // 跳转到生态管理 MCP 服务目录，并定位到「服务访问 Key」视图（area=domain + view=access）。
+    // 跳转到生态管理 MCP 服务目录，并定位到「Key 管理」页签（目标页只识别 ?tab=keys）。
     // 目标页归属 ecosystem-management，是另一个子应用 —— ShellContext.navigate 只会拼本应用的
     // basePath，改走 shell-sdk 的跨应用导航：hosted 下由 shell 的 SPA 路由切过去（文档不重载），
     // standalone / iframe fallback 下没人接管，SDK 内部回落到顶层窗口整页导航
-    navigateCrossApp('/apps/ecosystem-management/mcp-service-directory?area=domain&view=access');
+    navigateCrossApp('/apps/ecosystem-management/mcp-service-directory?tab=keys');
   };
 
   const columns: ColumnsType<AuthKeyItem> = [
@@ -232,12 +262,16 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
       dataIndex: 'key_status',
       key: 'key_status',
       width: 100,
-      render: (v: string) =>
-        v === 'active' ? (
-          <Tag color="success">{t('domainManagement.mcpKeyStatusActive')}</Tag>
-        ) : (
-          <Tag color="error">{t('domainManagement.mcpKeyStatusRevoked')}</Tag>
-        ),
+      render: (v: string) => {
+        const statusMeta: Record<string, { color: string; label: string }> = {
+          active: { color: 'success', label: t('domainManagement.mcpKeyStatusActive') },
+          revoked: { color: 'error', label: t('domainManagement.mcpKeyStatusRevoked') },
+          expired: { color: 'warning', label: t('domainManagement.mcpKeyStatusExpired') },
+          disabled: { color: 'default', label: t('domainManagement.mcpKeyStatusDisabled') },
+        };
+        const meta = statusMeta[v] ?? { color: 'default', label: v };
+        return <Tag color={meta.color}>{meta.label}</Tag>;
+      },
     },
     {
       title: t('domainManagement.mcpAuthExpiry'),
@@ -264,11 +298,33 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
   ];
 
   const kbNames = service?.kb_names && service.kb_names.length > 0 ? service.kb_names.join('、') : '-';
+  // 详情读失败时禁止保存/发布：published 与 savedToolName 都是空值，继续操作可能覆盖线上配置
+  const actionsDisabled = detailLoading || Boolean(detailError);
 
   return (
     <Card bordered={false} style={{ borderRadius: 12 }}>
       {/* ===== 工具信息展示区 ===== */}
       <SectionTitle>{t('domainManagement.mcpAbilityTitle')}</SectionTitle>
+
+      {detailLoading && (
+        <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+          {t('common.loading')}
+        </Text>
+      )}
+      {detailError && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={t('common.loadFailed')}
+          description={detailError || undefined}
+          action={
+            <Button size="small" onClick={() => setReloadSeq((n) => n + 1)}>
+              {t('common.retry')}
+            </Button>
+          }
+        />
+      )}
 
       <div style={{ marginBottom: 14 }}>
         <Text type="secondary" style={{ display: 'block', marginBottom: 6 }}>
@@ -310,7 +366,13 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
 
       {/* 保存 Tool 配置按钮 */}
       <Flex justify="flex-start">
-        <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={handleSaveTool}>
+        <Button
+          type="primary"
+          icon={<SaveOutlined />}
+          loading={saving}
+          disabled={actionsDisabled}
+          onClick={handleSaveTool}
+        >
           {t('domainManagement.saveToolConfig')}
         </Button>
       </Flex>
@@ -330,18 +392,18 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
               background: published ? '#10b981' : '#d1d5db',
             }}
           />
-          <Text strong style={{ color: published ? '#10b981' : '#64748b' }}>
+          <Text strong style={{ color: published ? '#10b981' : 'var(--yx-text-secondary)' }}>
             {published ? t('domainManagement.mcpPublished') : t('domainManagement.mcpUnpublished')}
           </Text>
           <Text type="secondary">{t('domainManagement.mcpPublishHint')}</Text>
         </Flex>
         {/* 右侧：发布 / 取消发布 按钮 */}
         {published ? (
-          <Button type="primary" danger onClick={handleUnpublish}>
+          <Button type="primary" danger disabled={actionsDisabled} onClick={handleUnpublish}>
             {t('domainManagement.mcpUnpublish')}
           </Button>
         ) : (
-          <Button type="primary" onClick={handlePublish}>
+          <Button type="primary" disabled={actionsDisabled} onClick={handlePublish}>
             {t('domainManagement.mcpPublishBtn')}
           </Button>
         )}
@@ -360,10 +422,25 @@ export default function McpKeyTab({ service, visible }: McpKeyTabProps) {
         {t('domainManagement.mcpAccessAuthDesc')}
       </Text>
 
+      {keysError && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={t('common.loadFailed')}
+          description={keysError || undefined}
+          action={
+            <Button size="small" onClick={() => setReloadSeq((n) => n + 1)}>
+              {t('common.retry')}
+            </Button>
+          }
+        />
+      )}
       <Table
         columns={columns}
         dataSource={authKeys}
         rowKey="key_id"
+        loading={keysLoading}
         pagination={false}
         bordered
         size="middle"

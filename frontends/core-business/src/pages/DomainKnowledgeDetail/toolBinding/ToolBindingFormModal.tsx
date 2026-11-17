@@ -1,9 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Alert, Form, Input, Modal, Select, Space, Switch, Tag, Typography } from 'antd';
-import type { BindableTool, ToolBinding } from '@/types/domainKnowledge';
+import {
+  Alert, Button, Form, Input, Modal, Radio, Select, Space, Switch, Tag, Typography, message,
+} from 'antd';
+import type {
+  BindableTool, BindingMappingProposal, BindingMappingSuggestion, MappingPreview, ToolBinding,
+} from '@/types/domainKnowledge';
 import { searchOntologyInstances } from '@/api/domainKnowledge';
-import type { CreateToolBindingInput, UpdateToolBindingInput } from '@/api/ontologyToolBinding';
+import {
+  previewToolBindingMapping,
+  recommendToolBindingMapping,
+  refineToolBindingMapping,
+  type CreateToolBindingInput,
+  type UpdateToolBindingInput,
+} from '@/api/ontologyToolBinding';
+import MappingEditor from './MappingEditor';
+import { mappingToText, parseMapping, sameMapping } from './mappingUtils';
 
 // 新绑定只接受 Action：执行器只执行单个动作；Skill 是多步规程，后端同样拒绝
 const ENTITY_TYPE = 'Action' as const;
@@ -33,30 +45,6 @@ function toolKey(tool: { source: string; toolName: string }): string {
   return `${tool.source}:${tool.toolName}`;
 }
 
-/** 解析参数映射 JSON：空 → {}；不是对象 → null（校验失败）。 */
-export function parseMapping(raw?: string): Record<string, unknown> | null {
-  const text = (raw || '').trim();
-  if (!text) return {};
-  try {
-    const value = JSON.parse(text);
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 参数映射回填到文本框：空映射给空串（与新建一致） */
-function mappingToText(mapping?: Record<string, unknown> | null): string {
-  return mapping && Object.keys(mapping).length ? JSON.stringify(mapping, null, 2) : '';
-}
-
-/** 两份映射是否相同（按键排序后比较，避免只是键顺序不同也当成修改） */
-function sameMapping(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-  const norm = (m: Record<string, unknown>) =>
-    JSON.stringify(Object.keys(m).sort().map((k) => [k, m[k]]));
-  return norm(a) === norm(b);
-}
-
 export default function ToolBindingFormModal({
   open,
   kbId,
@@ -70,8 +58,22 @@ export default function ToolBindingFormModal({
 }: Props) {
   const { t } = useTranslation();
   const [form] = Form.useForm<FormValues>();
+  const canonicalName = Form.useWatch('canonicalName', form);
   const toolName = Form.useWatch('toolName', form);
   const qaCallable = Form.useWatch('qaCallable', form);
+  const [preview, setPreview] = useState<MappingPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewStale, setPreviewStale] = useState(false);
+  const [mappingValid, setMappingValid] = useState(true);
+  const previewSeq = useRef(0);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiProposal, setAiProposal] = useState<BindingMappingProposal | null>(null);
+  const [aiRecommendations, setAiRecommendations] = useState<BindingMappingSuggestion[]>([]);
+  const [aiRecommendationSeq, setAiRecommendationSeq] = useState(0);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiAnswers, setAiAnswers] = useState<Record<string, string>>({});
+  const aiRequestSeq = useRef(0);
   const [entityOptions, setEntityOptions] = useState<{ label: string; value: string }[]>([]);
   const [searching, setSearching] = useState(false);
   const searchSeq = useRef(0);
@@ -79,6 +81,19 @@ export default function ToolBindingFormModal({
 
   useEffect(() => {
     if (!open) return;
+    setPreview(null);
+    setPreviewLoading(false);
+    setPreviewError(null);
+    setPreviewStale(false);
+    setMappingValid(true);
+    previewSeq.current = 0;
+    setAiLoading(false);
+    setAiProposal(null);
+    setAiRecommendations([]);
+    setAiRecommendationSeq(0);
+    setAiError(null);
+    setAiAnswers({});
+    aiRequestSeq.current = 0;
     if (editing) {
       form.setFieldsValue({
         canonicalName: editing.canonicalName,
@@ -136,6 +151,142 @@ export default function ToolBindingFormModal({
 
   // 选项值 = `${source}:${toolName}`：本库工具与平台工具可以同名，必须带来源才能区分
   const selectedTool = useMemo(() => tools.find((x) => toolKey(x) === toolName), [toolName, tools]);
+
+  const runPreview = useCallback(async () => {
+    const actionName = editing ? editing.canonicalName : canonicalName;
+    if (!actionName || !selectedTool) {
+      previewSeq.current += 1;
+      setPreview(null);
+      setPreviewStale(false);
+      return;
+    }
+    const mapping = parseMapping(form.getFieldValue('mappingText'));
+    if (mapping === null) {
+      previewSeq.current += 1;
+      setPreview(null);
+      setPreviewStale(false);
+      return;
+    }
+    const seq = ++previewSeq.current;
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const res = await previewToolBindingMapping(kbId, {
+        canonicalName: actionName,
+        toolSource: selectedTool.source,
+        toolName: selectedTool.toolName,
+        paramMapping: mapping,
+      });
+      if (seq !== previewSeq.current) return;
+      setPreview(res);
+      setPreviewStale(false);
+    } catch (e: any) {
+      if (seq !== previewSeq.current) return;
+      setPreview(null);
+      setPreviewStale(false);
+      setPreviewError(e?.message || t('toolBinding.mappingPreviewFailed'));
+    } finally {
+      if (seq === previewSeq.current) setPreviewLoading(false);
+    }
+  }, [canonicalName, editing, form, kbId, selectedTool, t]);
+
+  const markMappingDirty = useCallback(() => {
+    previewSeq.current += 1;
+    setPreviewLoading(false);
+    setPreviewStale(true);
+  }, []);
+
+  const applyAiProposal = useCallback((proposal: BindingMappingProposal) => {
+    setAiProposal(proposal);
+    setAiRecommendations(proposal.mappings);
+    if (proposal.mappings.length) setAiRecommendationSeq((value) => value + 1);
+    setAiError(proposal.error);
+    setAiAnswers({});
+  }, []);
+
+  const runRecommend = useCallback(async () => {
+    const actionName = editing ? editing.canonicalName : canonicalName;
+    if (!actionName || !selectedTool) return;
+    const mapping = parseMapping(form.getFieldValue('mappingText'));
+    if (mapping === null) return;
+    const seq = ++aiRequestSeq.current;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const res = await recommendToolBindingMapping(kbId, {
+        canonicalName: actionName,
+        toolSource: selectedTool.source,
+        toolName: selectedTool.toolName,
+        currentMapping: mapping,
+      });
+      if (seq !== aiRequestSeq.current) return;
+      applyAiProposal(res);
+    } catch (e: any) {
+      if (seq !== aiRequestSeq.current) return;
+      setAiError(e?.message || t('toolBinding.mappingAiFailed'));
+    } finally {
+      if (seq === aiRequestSeq.current) setAiLoading(false);
+    }
+  }, [applyAiProposal, canonicalName, editing, form, kbId, selectedTool, t]);
+
+  const runRefine = useCallback(async () => {
+    const actionName = editing ? editing.canonicalName : canonicalName;
+    if (!actionName || !selectedTool || !aiProposal) return;
+    const mapping = parseMapping(form.getFieldValue('mappingText'));
+    if (mapping === null) return;
+    const answers = aiProposal.questions
+      .map((q) => ({ question: q.question, answer: (aiAnswers[q.id] || '').trim() }))
+      .filter((item) => item.answer);
+    if (!answers.length) {
+      message.warning(t('toolBinding.mappingAiAnswerRequired'));
+      return;
+    }
+    const seq = ++aiRequestSeq.current;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const res = await refineToolBindingMapping(kbId, {
+        canonicalName: actionName,
+        toolSource: selectedTool.source,
+        toolName: selectedTool.toolName,
+        currentMapping: mapping,
+        assistSessionId: aiProposal.assistSessionId,
+        answers,
+        contextHash: aiProposal.contextHash,
+        round: aiProposal.round,
+      });
+      if (seq !== aiRequestSeq.current) return;
+      applyAiProposal(res);
+    } catch (e: any) {
+      if (seq !== aiRequestSeq.current) return;
+      setAiError(e?.message || t('toolBinding.mappingAiFailed'));
+    } finally {
+      if (seq === aiRequestSeq.current) setAiLoading(false);
+    }
+  }, [aiAnswers, aiProposal, applyAiProposal, canonicalName, editing, form, kbId, selectedTool, t]);
+
+  useEffect(() => {
+    if (!open) return;
+    setPreviewError(null);
+    aiRequestSeq.current += 1;
+    setAiLoading(false);
+    setAiProposal(null);
+    setAiRecommendations([]);
+    setAiError(null);
+    const actionName = editing ? editing.canonicalName : canonicalName;
+    if (!actionName || !selectedTool) {
+      previewSeq.current += 1;
+      setPreview(null);
+      setPreviewStale(false);
+      return;
+    }
+    // 工具 / 动作变了，旧预览不再对应当前配置
+    setPreviewStale(true);
+    void runPreview();
+    // 只在动作 / 工具变化时自动预览；映射改动由「校验映射」手动触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing, canonicalName, toolName, selectedTool]);
+
   const toolOptions = useMemo(() => {
     const group = (source: 'kb' | 'platform', label: string) => {
       const opts = tools
@@ -171,6 +322,10 @@ export default function ToolBindingFormModal({
 
   async function handleOk() {
     const values = await form.validateFields();
+    if (!mappingValid) {
+      message.error(t('toolBinding.mappingInvalid'));
+      return;
+    }
     const mapping = parseMapping(values.mappingText) || {};
     if (editing) {
       // 只提交改动过的字段：工具没换就不提交，当前工具不可用时也能保存映射 / 开关
@@ -209,7 +364,9 @@ export default function ToolBindingFormModal({
       okText={t('common.confirm')}
       cancelText={t('common.cancel')}
       confirmLoading={submitting}
-      okButtonProps={{ disabled: !isEdit && !toolsLoading && tools.length === 0 }}
+      okButtonProps={{
+        disabled: (!isEdit && !toolsLoading && tools.length === 0) || !mappingValid,
+      }}
       width={600}
       destroyOnHidden
     >
@@ -280,17 +437,115 @@ export default function ToolBindingFormModal({
             },
           ]}
         >
-          <Input.TextArea rows={4} placeholder='{"card_no": "$input.card_no", "reason": "$attr.definition"}' />
+          <MappingEditor
+            tool={selectedTool}
+            preview={preview}
+            previewStale={previewStale}
+            previewLoading={previewLoading}
+            onPreview={() => void runPreview()}
+            onDirty={markMappingDirty}
+            onValidityChange={setMappingValid}
+            recommendations={aiRecommendations}
+            recommendationSeq={aiRecommendationSeq}
+            onRecommend={selectedTool && (isEdit || !!canonicalName) ? () => void runRecommend() : undefined}
+            recommendLoading={aiLoading}
+          />
         </Form.Item>
+        {aiError && (
+          <Alert type="error" showIcon style={{ marginBottom: 12 }} message={aiError} />
+        )}
+        {!!aiProposal?.warnings?.length && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            description={<ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              {aiProposal.warnings.map((w) => <li key={w}>{w}</li>)}
+            </ul>}
+          />
+        )}
+        {aiProposal && aiProposal.status === 'ready' && aiProposal.mappings.length > 0
+          && aiProposal.questions.length === 0 && (
+          <Alert
+            type="success"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={t('toolBinding.mappingAiReady')}
+          />
+        )}
+        {aiProposal && aiProposal.questions.length > 0 && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={t('toolBinding.mappingAiNeedsInput', { round: aiProposal.round })}
+            description={(
+              <div>
+                {aiProposal.questions.map((q) => (
+                  <div key={q.id} style={{ marginBottom: 10 }}>
+                    <div style={{ marginBottom: 4 }}>{q.question}</div>
+                    <Radio.Group
+                      value={aiAnswers[q.id] || ''}
+                      onChange={(e) => setAiAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                    >
+                      {q.options.map((o) => (
+                        <Radio key={o.value} value={o.value}>
+                          {o.label}
+                          {o.recommended ? ` ${t('toolBinding.mappingAiRecommended')}` : ''}
+                        </Radio>
+                      ))}
+                    </Radio.Group>
+                    {q.allowFreeText && !q.options.some((o) => o.value === aiAnswers[q.id]) && (
+                      <Input
+                        style={{ marginTop: 4 }}
+                        value={aiAnswers[q.id] || ''}
+                        placeholder={t('toolBinding.mappingAiAnswerPlaceholder')}
+                        onChange={(e) => setAiAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                      />
+                    )}
+                  </div>
+                ))}
+                <Space>
+                  <Button size="small" type="primary" loading={aiLoading} onClick={() => void runRefine()}>
+                    {t('toolBinding.mappingAiContinue')}
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => setAiProposal((prev) => (
+                      prev ? { ...prev, questions: [], status: 'ready' } : prev
+                    ))}
+                  >
+                    {t('toolBinding.mappingAiClose')}
+                  </Button>
+                </Space>
+              </div>
+            )}
+          />
+        )}
+        {previewError && (
+          <Alert type="error" showIcon style={{ marginBottom: 12 }} message={previewError} />
+        )}
+        {!selectedTool && isEdit && currentToolMissing && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={t('toolBinding.mappingPreviewNoTool')}
+          />
+        )}
         <Form.Item label={t('toolBinding.enabledLabel')} name="enabled" valuePropName="checked">
           <Switch />
         </Form.Item>
         {(!editing || editing.executable) && (
           <Form.Item
-            label={t('toolBinding.qaCallableLabel')}
+            label={selectedReadOnly
+              ? t('toolBinding.qaCallableLabel')
+              : t('toolBinding.qaCallableLabelWrite')}
             name="qaCallable"
             valuePropName="checked"
-            extra={t('toolBinding.qaCallableHint')}
+            extra={selectedReadOnly
+              ? t('toolBinding.qaCallableHint')
+              : t('toolBinding.qaCallableHintWrite')}
           >
             <Switch />
           </Form.Item>

@@ -201,7 +201,7 @@ function NodeDetail({ kbId, documentId, revision, detail, onClose }: {
   };
   return <Drawer open title={detail.node.label} onClose={onClose} size="large">
     <Tag>{t(typeKey(detail.node.node_type))}</Tag>
-    <div style={{ margin: '12px 0', color: '#64748b' }}>{t('domainKnowledge.wikiGraph.version')} {revision.slice(0, 12)}</div>
+    <div style={{ margin: '12px 0', color: 'var(--yx-text-secondary)' }}>{t('domainKnowledge.wikiGraph.version')} {revision.slice(0, 12)}</div>
     {imageUrl && <Image src={imageUrl} alt={detail.node.label} style={{ maxHeight: 520, objectFit: 'contain' }} />}
     {detail.node.description && <MarkdownContent content={detail.node.description} />}
     {detail.edge && <>
@@ -212,7 +212,7 @@ function NodeDetail({ kbId, documentId, revision, detail, onClose }: {
     {detail.node.page_path && <Button loading={contentLoading} onClick={() => void openPage()}>{t('domainKnowledge.wikiGraph.openPage')}</Button>}
     {detail.node.document_id && detail.node.node_type === 'document' && <Button onClick={() => openSource(detail.node.document_id!, detail.node.label, detail.node.mime_type)}>{t('domainKnowledge.wikiGraph.openSource')}</Button>}
     <h3>{t('domainKnowledge.wikiGraph.sourceEvidence')}</h3>
-    {items.map(item => <section key={item.evidence_id} style={{ borderTop: '1px solid #e2e8f0', padding: '16px 0' }}>
+    {items.map(item => <section key={item.evidence_id} style={{ borderTop: '1px solid var(--yx-border)', padding: '16px 0' }}>
       <strong>{item.file_name || item.document_id || item.passage_id}</strong> <Tag>{item.support_status}</Tag>
       <blockquote style={{ whiteSpace: 'pre-wrap', margin: '12px 0', paddingLeft: 12, borderLeft: '3px solid #4b84eb' }}>{item.excerpt}</blockquote>
       <div>{item.chunk_id}{item.start_char != null ? ` · ${item.start_char}–${item.end_char}` : ''}</div>

@@ -321,7 +321,7 @@ export default function LineageTab({ kbId, canWrite = false,
       key: 'arrow',
       width: 48,
       align: 'center',
-      render: () => <ArrowRightOutlined style={{ color: '#94a3b8' }} />,
+      render: () => <ArrowRightOutlined style={{ color: 'var(--yx-text-muted)' }} />,
     },
     {
       title: t('domainKnowledge.lineage.toEndpoint'),
@@ -403,21 +403,21 @@ export default function LineageTab({ kbId, canWrite = false,
     ? [
         {
           title: (
-            <a onClick={() => setDrill(null)} style={{ color: '#64748b' }}>
+            <a onClick={() => setDrill(null)} style={{ color: 'var(--yx-text-secondary)' }}>
               {t('domainKnowledge.lineage.all')}
             </a>
           ),
         },
         {
           title: (
-            <span style={{ color: '#0b2b5c', fontWeight: 500, fontFamily: 'Consolas, monospace' }}>
+            <span style={{ color: 'var(--yx-brand-dark)', fontWeight: 500, fontFamily: 'Consolas, monospace' }}>
               {drill.node}
             </span>
           ),
         },
         {
           title: (
-            <span style={{ color: '#0b2b5c' }}>
+            <span style={{ color: 'var(--yx-brand-dark)' }}>
               {drill.dir === 'up'
                 ? t('domainKnowledge.lineage.upstream')
                 : t('domainKnowledge.lineage.downstream')}

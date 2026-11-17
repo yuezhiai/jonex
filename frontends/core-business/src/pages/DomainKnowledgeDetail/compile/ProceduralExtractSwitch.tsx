@@ -89,7 +89,7 @@ export default function ProceduralExtractSwitch({ kbId, canWrite }: Props) {
   }
 
   return (
-    <div style={{ marginBottom: 12, padding: '12px 16px', background: '#f8fafc', borderRadius: 8 }}>
+    <div style={{ marginBottom: 12, padding: '12px 16px', background: 'var(--yx-bg-subtle)', borderRadius: 8 }}>
       <Space orientation="vertical" size={6} style={{ width: '100%' }}>
         <Space wrap>
           <Typography.Text strong>{t('compile.procedural.title')}</Typography.Text>

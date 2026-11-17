@@ -32,16 +32,16 @@ export default function DomainManagementSearch() {
   return (
     <>
       <PageHeader title={t('knowledgeSearch.pageTitle')} style={{ marginBottom: 4 }} />
-      <p style={{ color: '#64748b', margin: '0 0 16px', fontSize: 14 }}>{t('domainManagementSearch.subtitle')}</p>
+      <p style={{ color: 'var(--yx-text-secondary)', margin: '0 0 16px', fontSize: 14 }}>{t('domainManagementSearch.subtitle')}</p>
       <PageContent showCard={false}>
         <Card style={{ borderRadius: 16, marginBottom: 24, textAlign: 'center' }} bodyStyle={{ padding: 32 }}>
-          <div style={{ fontSize: 15, color: '#64748b' }}>{t('domainManagementSearch.searchDesc')}</div>
+          <div style={{ fontSize: 15, color: 'var(--yx-text-secondary)' }}>{t('domainManagementSearch.searchDesc')}</div>
           <div style={{ display: 'flex', maxWidth: 700, margin: '16px auto 0', gap: 8 }}>
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t('domainManagementSearch.searchPlaceholder')}
-              style={{ flex: 1, padding: '14px 20px', border: '2px solid #e2e8f0', borderRadius: 12, fontSize: 16 }}
+              style={{ flex: 1, padding: '14px 20px', border: '2px solid var(--yx-border)', borderRadius: 12, fontSize: 16 }}
               onPressEnter={() => {}}
             />
             <Button
@@ -61,9 +61,9 @@ export default function DomainManagementSearch() {
                   borderRadius: 20,
                   fontSize: 13,
                   cursor: 'pointer',
-                  border: `1px solid ${activeChip === ck ? '#3b82f6' : '#d1d5db'}`,
-                  background: activeChip === ck ? '#3b82f6' : '#fff',
-                  color: activeChip === ck ? '#fff' : '#64748b',
+                  border: `1px solid ${activeChip === ck ? 'var(--yx-accent)' : '#d1d5db'}`,
+                  background: activeChip === ck ? 'var(--yx-accent)' : '#fff',
+                  color: activeChip === ck ? '#fff' : 'var(--yx-text-secondary)',
                 }}
                 onClick={() => setActiveChip(ck)}
               >
@@ -74,7 +74,7 @@ export default function DomainManagementSearch() {
         </Card>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <span style={{ fontSize: 14, color: '#64748b' }}>
+          <span style={{ fontSize: 14, color: 'var(--yx-text-secondary)' }}>
             {t('domainManagementSearch.resultSummary', { count: 42, time: '0.35' })}
           </span>
           <Select
@@ -90,16 +90,16 @@ export default function DomainManagementSearch() {
         {localizedResults.map((r, i) => (
           <Card
             key={i}
-            style={{ borderRadius: 12, marginBottom: 12, border: '1px solid #e2e8f0' }}
+            style={{ borderRadius: 12, marginBottom: 12, border: '1px solid var(--yx-border)' }}
             bodyStyle={{ padding: 20 }}
             hoverable
           >
             <h3 style={{ margin: '0 0 8px', fontSize: 16 }}>
-              <a style={{ color: '#3b82f6' }}>{r.title}</a>
+              <a style={{ color: 'var(--yx-accent)' }}>{r.title}</a>
             </h3>
-            <p style={{ margin: '0 0 12px', color: '#64748b', fontSize: 14, lineHeight: 1.6 }}>{r.snippet}</p>
-            <div style={{ display: 'flex', gap: 16, fontSize: 12, color: '#94a3b8', alignItems: 'center' }}>
-              <Tag style={{ background: '#f1f5f9', border: 'none' }}>{r.source}</Tag>
+            <p style={{ margin: '0 0 12px', color: 'var(--yx-text-secondary)', fontSize: 14, lineHeight: 1.6 }}>{r.snippet}</p>
+            <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--yx-text-muted)', alignItems: 'center' }}>
+              <Tag style={{ background: 'var(--yx-bg-muted)', border: 'none' }}>{r.source}</Tag>
               <span>{r.date}</span>
               <span style={{ color: '#22c55e', fontWeight: 600 }}>
                 <StarFilled style={{ fontSize: 10 }} />{' '}
@@ -109,18 +109,7 @@ export default function DomainManagementSearch() {
           </Card>
         ))}
 
-        <div className="yx-pagination" style={{ marginTop: 16 }}>
-          <span className="yx-page-btn disabled">‹</span>
-          <span className="yx-page-btn active">1</span>
-          <span className="yx-page-btn">2</span>
-          <span className="yx-page-btn">3</span>
-          <span className="yx-page-btn">4</span>
-          <span className="yx-page-btn">5</span>
-          <span className="yx-page-btn">›</span>
-          <span className="yx-page-info">
-            {t('domainManagementSearch.pagination', { total: '42', page: '1', pages: '9' })}
-          </span>
-        </div>
+        {/* 结果分页等接入真实接口后再上 antd Pagination：现在的数据是静态演示，不放假分页器 */}
       </PageContent>
     </>
   );

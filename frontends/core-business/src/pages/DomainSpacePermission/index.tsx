@@ -22,7 +22,7 @@ export default function DomainSpacePermission() {
       key: 'read',
       width: 80,
       render: (v: boolean) =>
-        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: '#dc2626' }} />,
+        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: 'var(--yx-error-text)' }} />,
     },
     {
       title: t('domainPermission.columnWrite'),
@@ -30,7 +30,7 @@ export default function DomainSpacePermission() {
       key: 'write',
       width: 80,
       render: (v: boolean) =>
-        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: '#dc2626' }} />,
+        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: 'var(--yx-error-text)' }} />,
     },
     {
       title: t('domainPermission.columnManage'),
@@ -38,7 +38,7 @@ export default function DomainSpacePermission() {
       key: 'manage',
       width: 80,
       render: (v: boolean) =>
-        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: '#dc2626' }} />,
+        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: 'var(--yx-error-text)' }} />,
     },
     {
       title: t('domainPermission.columnDelete'),
@@ -46,7 +46,7 @@ export default function DomainSpacePermission() {
       key: 'delete',
       width: 80,
       render: (v: boolean) =>
-        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: '#dc2626' }} />,
+        v ? <CheckCircleFilled style={{ color: '#059669' }} /> : <CloseCircleFilled style={{ color: 'var(--yx-error-text)' }} />,
     },
     {
       title: t('domainPermission.columnActions'),
@@ -75,10 +75,10 @@ export default function DomainSpacePermission() {
             style={{
               marginTop: 16,
               padding: '10px 14px',
-              background: '#eff6ff',
+              background: 'var(--yx-info-bg)',
               borderRadius: 8,
               fontSize: 13,
-              color: '#64748b',
+              color: 'var(--yx-text-secondary)',
             }}
           >
             {t('domainPermission.noteText')}

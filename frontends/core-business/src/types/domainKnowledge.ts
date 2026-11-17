@@ -5,6 +5,12 @@ export type DomainKnowledgeSourceType = 'api' | 'api_push' | 'storage' | 'file';
 export interface DomainKnowledgeSpace {
   id: string;
   name: string;
+  /**
+   * 空间下是否存在启用的领域服务（与后端检索可用性判定同源）。
+   * **仅 `scope=search` 时后端返回**；不带 scope 的调用拿不到该字段 ——
+   * undefined 表示「后端未提供」，调用方不得据此判定为「无启用服务」。
+   */
+  has_enabled_service?: boolean;
 }
 
 export interface DomainKnowledgeItem {
@@ -787,7 +793,7 @@ export interface BackendPaginatedResult<T> {
 }
 
 export type CompiledAttrType = 'string' | 'text' | 'number' | 'date' | 'enum' | 'boolean';
-export type CompiledRelationCardinality = 'one_to_one' | 'one_to_many' | 'many_to_many' | 'custom';
+export type CompiledRelationCardinality = 'one_to_one' | 'one_to_many' | 'many_to_one' | 'many_to_many' | 'custom';
 export type SchemaMode = 'template_seeded' | 'manual_edited';
 export type SchemaSyncStatus = 'synced' | 'outdated';
 
@@ -1112,6 +1118,8 @@ export interface ToolBinding {
   toolReadOnly: boolean;
   /** 绑定目标在本体中是否存在；本体不可用时为 null（未知） */
   targetExists: boolean | null;
+  /** 必填参数由调用方提供（未映射的同名透传，或显式 $input） */
+  callerSupplied: string[];
   createdAt?: string | null;
   updatedAt?: string | null;
 }
@@ -1129,8 +1137,83 @@ export interface BindableTool {
   name: string;
   description: string;
   inputSchema: Record<string, any>;
+  outputSchema: Record<string, any>;
   /** 工具是否声明了只读 */
   readOnly: boolean;
+}
+
+export interface MappingPreviewAttribute {
+  name: string;
+  hasValue: boolean;
+}
+
+export interface MappingPreview {
+  status: 'ok' | 'action_not_found' | 'ontology_unavailable' | 'tool_unavailable' | 'invalid_mapping';
+  statusMessage: string | null;
+  action: { name: string; found: boolean; attributes: MappingPreviewAttribute[] };
+  tool: {
+    source: ToolSource;
+    toolName: string;
+    name: string | null;
+    readOnly: boolean;
+    available: boolean;
+    inputSchema: Record<string, any>;
+  };
+  mapping: Record<string, unknown>;
+  parameters: {
+    resolved: Record<string, unknown>;
+    inputRefs: Record<string, string>;
+    unresolvedAttrs: string[];
+  };
+  required: string[];
+  callerSupplied: string[];
+  emptyAttr: string[];
+  unknownKeys: string[];
+  inputSchemaDeclared: boolean;
+  warnings: string[];
+  errors: string[];
+}
+
+export type BindingMappingProvenance = 'rule' | 'ai' | 'user';
+
+export interface BindingMappingSuggestion {
+  param: string;
+  value: unknown;
+  provenance: 'rule' | 'ai';
+  confidence: number;
+  reason: string;
+}
+
+export interface BindingMappingOption {
+  label: string;
+  value: string;
+  recommended: boolean;
+}
+
+export interface BindingMappingQuestion {
+  id: string;
+  question: string;
+  options: BindingMappingOption[];
+  allowFreeText: boolean;
+}
+
+export interface BindingMappingProposal {
+  assistSessionId: string;
+  status:
+    | 'ready'
+    | 'needs_input'
+    | 'invalid'
+    | 'disabled'
+    | 'tool_unavailable'
+    | 'ontology_unavailable'
+    | 'action_not_found'
+    | 'failed';
+  round: number;
+  contextHash: string | null;
+  mappings: BindingMappingSuggestion[];
+  questions: BindingMappingQuestion[];
+  warnings: string[];
+  error: string | null;
 }
 
 /** 本库工具运行时的列表摘要 */

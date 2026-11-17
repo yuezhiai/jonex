@@ -176,7 +176,7 @@ export default function EditRelationModal({
   return (
     <Modal
       title={
-        <span style={{ fontSize: 18, fontWeight: 700, color: '#0b2b5c' }}>
+        <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--yx-brand-dark)' }}>
           {isCreate ? t('compile.relation.createBtn') : t('compile.relation.editBtn')}
         </span>
       }
@@ -195,7 +195,7 @@ export default function EditRelationModal({
         </div>
       }
       styles={{ body: { padding: '24px 24px 12px' } }}
-      closeIcon={<CloseOutlined style={{ color: '#64748b' }} />}
+      closeIcon={<CloseOutlined style={{ color: 'var(--yx-text-secondary)' }} />}
     >
       <Form form={form} layout="vertical">
         <Form.Item

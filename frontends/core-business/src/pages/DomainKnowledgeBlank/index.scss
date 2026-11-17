@@ -55,7 +55,7 @@
   &-sidebar {
     width: 220px;
     flex-shrink: 0;
-    border-right: 1px solid #eef2f6;
+    border-right: 1px solid var(--yx-border-light);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -67,11 +67,11 @@
       margin-bottom: 4px;
       padding: 0 16px;
       font-weight: 600;
-      color: #0b2b5c;
+      color: var(--yx-brand-dark);
       flex-shrink: 0;
 
       .anticon {
-        color: #3b82f6;
+        color: var(--yx-accent);
       }
     }
   }
@@ -90,21 +90,21 @@
       margin: 2px 8px;
       padding-inline: 12px !important;
       font-size: 14px;
-      color: #0b2b5c;
+      color: var(--yx-brand-dark);
 
       &:hover {
-        background: #f8fafc !important;
+        background: var(--yx-bg-subtle) !important;
       }
 
       &-selected {
-        background: #eff6ff !important;
+        background: var(--yx-info-bg) !important;
         font-weight: 600;
-        color: #3b82f6 !important;
+        color: var(--yx-accent) !important;
       }
 
       .ant-menu-item-icon {
         font-size: 16px;
-        color: #3b82f6;
+        color: var(--yx-accent);
       }
     }
 
@@ -135,8 +135,8 @@
 
     // 拖拽迁移：悬停目录高亮（表格行拖入）
     .doc-library-drop-target--active {
-      background: #eff6ff !important;
-      outline: 1px dashed #3b82f6;
+      background: var(--yx-info-bg) !important;
+      outline: 1px dashed var(--yx-accent);
       outline-offset: -1px;
       border-radius: 8px;
     }
@@ -155,70 +155,7 @@
   // 拖拽迁移：拖拽中的表格行
   &-row--dragging {
     opacity: 0.6;
-    background: #f8fafc;
-  }
-
-  // 表格宿主：承接 main 的剩余高度，内部滚动交给 antd 的固定表头结构
-  &-table-host {
-    flex: 1;
-    min-height: 0;
-  }
-
-  // 这个 class 挂在 CommonTable 的**根容器**上（筛选区 + 表格的 flex column），不是 antd Table。
-  // 表格自适应填充的链路比过去多一层：根容器是 flex 子项，Table 是根容器里筛选区之后的那个
-  // flex 子项。当前 antd 渲染的是 .ant-table-wrapper > .ant-spin > .ant-spin-container，没有
-  // .ant-spin-nested-loading 这一层；必须逐层给确定高度，表体才会在容器内滚、分页钉底。
-  // 每条都限定在 > .ant-table-wrapper 内，免得误伤筛选区里可能出现的 spin。
-  &-table {
-    height: 100%;
-
-    > .ant-form {
-      flex-shrink: 0;
-    }
-
-    > .ant-table-wrapper {
-      flex: 1;
-      min-height: 0;
-    }
-
-    > .ant-table-wrapper .ant-spin {
-      height: 100%;
-    }
-
-    > .ant-table-wrapper .ant-spin-container {
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
-    }
-
-    > .ant-table-wrapper .ant-table {
-      flex: 1;
-      min-height: 0;
-      overflow: hidden;
-    }
-
-    > .ant-table-wrapper .ant-table-container {
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-    }
-
-    > .ant-table-wrapper .ant-table-header {
-      flex-shrink: 0;
-    }
-
-    > .ant-table-wrapper .ant-table-body {
-      flex: 1;
-      overflow-y: auto !important;
-      overflow-x: auto !important;
-    }
-
-    > .ant-table-wrapper .ant-pagination {
-      flex-shrink: 0;
-      padding-top: 12px;
-      margin: 0 !important;
-    }
+    background: var(--yx-bg-subtle);
   }
 }
 
@@ -229,20 +166,20 @@
 
 .tag-modal-doc {
   font-size: 16px;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   font-weight: 500;
   margin-bottom: 20px;
 
   span {
-    color: #3b82f6;
+    color: var(--yx-accent);
   }
 }
 
 .tag-modal-tags {
   min-height: 48px;
   padding: 12px 16px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: var(--yx-bg-subtle);
+  border: 1px solid var(--yx-border);
   border-radius: 8px;
   margin-bottom: 16px;
   display: flex;
@@ -255,8 +192,8 @@
   height: 28px;
   padding: 2px 8px;
   font-size: 13px;
-  color: #3b82f6;
-  background: #eff6ff;
+  color: var(--yx-accent);
+  background: var(--yx-info-bg);
   border: 1px solid #bfdbfe;
   border-radius: 4px;
 
@@ -289,7 +226,7 @@
 
   &-title {
     font-size: 14px;
-    color: #94a3b8;
+    color: var(--yx-text-muted);
     margin-bottom: 12px;
   }
 

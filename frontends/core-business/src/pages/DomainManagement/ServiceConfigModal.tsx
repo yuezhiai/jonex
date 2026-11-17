@@ -149,7 +149,7 @@ export default function ServiceConfigModal({
 
   return (
     <Modal
-      wrapClassName="scm-modal"
+      wrapClassName="yx-modal"
       title={
         <span className="scm-title">
           <span className="scm-title-ico">

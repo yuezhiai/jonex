@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { toDocument, toServerBody } from './adapters.js';
+import { DomainDocumentSchema } from '../ontologyCanvas/domain/index.js';
 import type { AbstractSchemaBody } from '@/api/abstractSchema';
 
 const BODY: AbstractSchemaBody = {
@@ -135,6 +136,45 @@ describe('抽象 schema 适配', () => {
     });
     const back = toServerBody(document);
     expect(back.relations[0].sourceTypes).toBeUndefined();
+  });
+
+  it('落点 provenance 往返不丢', () => {
+    const body: AbstractSchemaBody = {
+      ...BODY,
+      entities: [{
+        name: 'Asset', description: '', aliases: [], attributes: [],
+        sources: [{ dataSourceId: 'd1', entityName: 'asset', included: true, stale: false,
+          origin: 'agent', confidence: 'low', rationale: '样本一致' }],
+      }],
+      relations: [],
+    };
+    const document = toDocument('kb_x', body);
+    expect(document.model.entities[0].landings?.[0]).toMatchObject({
+      origin: 'agent', confidence: 'low', rationale: '样本一致',
+    });
+    const back = toServerBody(document);
+    expect(back.entities[0].sources[0]).toMatchObject({
+      origin: 'agent', confidence: 'low', rationale: '样本一致',
+    });
+  });
+
+  it('provenance 过画布 domain 的 zod parse 仍存活（EntityLandingSchema 必须登记三键）', () => {
+    // 画布加载/保存都经 `DomainDocumentSchema.parse`，未登记的键被 zod 静默剥掉——
+    // 这条直接对 schema 下断言：把 schemas.ts 里三个 `.optional()` 删掉，本用例必挂。
+    const document = toDocument('kb_x', {
+      ...BODY,
+      entities: [{
+        name: 'Asset', description: '', aliases: [], attributes: [],
+        sources: [{ dataSourceId: 'd1', entityName: 'asset', included: true, stale: false,
+          origin: 'agent', confidence: 'low', rationale: '样本一致' }],
+      }],
+      relations: [],
+    });
+
+    const parsed = DomainDocumentSchema.parse(document);
+    expect(parsed.model.entities[0]!.landings![0]).toMatchObject({
+      origin: 'agent', confidence: 'low', rationale: '样本一致',
+    });
   });
 
   it('round-trips landing slots without materializing them', () => {

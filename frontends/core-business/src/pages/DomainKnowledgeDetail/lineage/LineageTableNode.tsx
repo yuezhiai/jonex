@@ -39,14 +39,14 @@ const NODE_STYLE = {
 const ANCHOR_STYLE = {
   border: '2px solid #1677ff',
   boxShadow: '0 0 0 3px rgba(22, 119, 255, 0.16)',
-  background: '#eff6ff',
+  background: 'var(--yx-info-bg)',
 } as const;
 
 const TITLE_STYLE = {
   fontSize: 13,
   fontWeight: 600,
   lineHeight: '18px',
-  color: '#0b2b5c',
+  color: 'var(--yx-brand-dark)',
   whiteSpace: 'nowrap',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
@@ -55,7 +55,7 @@ const TITLE_STYLE = {
 const TABLE_STYLE = {
   fontSize: 11,
   lineHeight: '14px',
-  color: '#64748b',
+  color: 'var(--yx-text-secondary)',
   whiteSpace: 'nowrap',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
@@ -64,7 +64,7 @@ const TABLE_STYLE = {
 const META_STYLE = {
   fontSize: 11,
   lineHeight: '14px',
-  color: '#94a3b8',
+  color: 'var(--yx-text-muted)',
 } as const;
 
 export function LineageTableNode({ data }: NodeProps<LineageRFNode>): ReactNode {

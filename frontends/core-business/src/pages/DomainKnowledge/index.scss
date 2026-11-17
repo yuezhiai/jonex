@@ -18,7 +18,7 @@
 
   .yx-filter-count {
     font-size: 13px;
-    color: #94a3b8;
+    color: var(--yx-text-muted);
     margin-left: 8px;
   }
 }
@@ -38,7 +38,7 @@
   height: 34px;
   padding-inline: 11px;
   border-radius: 9px;
-  border-color: #e2e8f0;
+  border-color: var(--yx-border);
   background: #fff;
   transition: border-color 0.2s, box-shadow 0.2s;
 
@@ -49,7 +49,7 @@
 
   .ant-input-prefix {
     margin-inline-end: 7px;
-    color: #94a3b8;
+    color: var(--yx-text-muted);
     font-size: 14px;
   }
 
@@ -58,7 +58,7 @@
   }
 
   &.ant-input-affix-wrapper-focused {
-    border-color: #3b82f6;
+    border-color: var(--yx-accent);
     box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
   }
 }
@@ -96,7 +96,7 @@
 
   /* 禁用空间的空态说明：非警告语气，用灰色中性提示 */
   &.is-muted {
-    color: #94a3b8;
+    color: var(--yx-text-muted);
   }
 }
 
@@ -130,7 +130,7 @@
 
 .kb-card {
   --kb-accent: #2563eb;
-  --kb-accent-soft: #eff6ff;
+  --kb-accent-soft: var(--yx-info-bg);
   --kb-accent-line: #dbeafe;
 
   position: relative;
@@ -213,7 +213,7 @@
   font-size: 15px;
   font-weight: 600;
   line-height: 1.4;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   cursor: pointer;
   min-width: 0;
   overflow: hidden;
@@ -249,7 +249,7 @@
   margin-top: 5px;
   min-width: 0;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 
   span {
     display: inline-flex;
@@ -276,7 +276,7 @@
   margin: -3px -5px 0 0;
   padding: 4px;
   border-radius: 7px;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
   font-size: 16px;
   cursor: pointer;
   opacity: 0.65;
@@ -285,7 +285,7 @@
   &:hover {
     opacity: 1;
     color: #475569;
-    background: #f1f5f9;
+    background: var(--yx-bg-muted);
   }
 }
 
@@ -302,14 +302,14 @@
   min-height: calc(2 * 1.65em);
   font-size: 12.5px;
   line-height: 1.65;
-  color: #64748b;
+  color: var(--yx-text-secondary);
 }
 
 /* 卡片底部标签区 */
 .kb-card-tags {
   margin-top: auto;
   padding: 11px 18px 14px;
-  border-top: 1px solid #f1f5f9;
+  border-top: 1px solid var(--yx-bg-muted);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -329,7 +329,7 @@
 /* 「已授权共享」：与主色同源的浅蓝胶囊，替代 antd 默认 purple */
 .source-tag.is-shared {
   color: #2563eb;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   border-color: #dbeafe;
 }
 
@@ -348,8 +348,8 @@
   font-size: 11px;
   white-space: nowrap;
   color: #475569;
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
+  background: var(--yx-bg-muted);
+  border: 1px solid var(--yx-border);
 }
 
 /* 窄屏（手机/分屏）：单列铺满，避免两张卡挤成一行 */

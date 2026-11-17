@@ -56,20 +56,20 @@ export default function OntologyConstraintSection({ data, loading, canWrite = fa
       dataIndex: 'constraintType',
       key: 'constraintType',
       width: 120,
-      render: (value: string) => value || <span style={{ color: '#94a3b8' }}>—</span>,
+      render: (value: string) => value || <span style={{ color: 'var(--yx-text-muted)' }}>—</span>,
     },
     {
       title: t('compile.constraint.expression'),
       dataIndex: 'expression',
       key: 'expression',
-      render: (value: string) => value || <span style={{ color: '#94a3b8' }}>—</span>,
+      render: (value: string) => value || <span style={{ color: 'var(--yx-text-muted)' }}>—</span>,
     },
     {
       title: t('compile.constraint.suggestion'),
       dataIndex: 'suggestion',
       key: 'suggestion',
       width: 200,
-      render: (value: string) => value || <span style={{ color: '#94a3b8' }}>—</span>,
+      render: (value: string) => value || <span style={{ color: 'var(--yx-text-muted)' }}>—</span>,
     },
     {
       title: t('common.operation'),

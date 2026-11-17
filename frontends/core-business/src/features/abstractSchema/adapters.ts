@@ -64,6 +64,11 @@ export function toDocument(kbId: string, body: AbstractSchemaBody): DomainDocume
           entityName: s.entityName,
           included: s.included !== false,
           sourceName: s.sourceName ?? null,
+          // provenance（landing-agent 线）：**有值才带**——缺键不物化空串，
+          // 存量落点（无这三键）的往返形状与引入前逐字节一致。
+          ...(s.origin ? { origin: s.origin } : {}),
+          ...(s.confidence ? { confidence: s.confidence } : {}),
+          ...(s.rationale ? { rationale: s.rationale } : {}),
           stale: s.stale,
           staleReason: s.staleReason ?? null,
         })),
@@ -124,6 +129,9 @@ export function toServerBody(document: DomainDocument): AbstractSchemaBody {
         entityName: s.entityName,
         included: s.included !== false,
         ...(s.sourceName != null ? { sourceName: s.sourceName } : {}),
+        ...(s.origin ? { origin: s.origin } : {}),
+        ...(s.confidence ? { confidence: s.confidence } : {}),
+        ...(s.rationale ? { rationale: s.rationale } : {}),
         stale: Boolean(s.stale),
         // 画布侧 staleReason 是自由字符串（见 domain/types.ts 的说明），服务端要的是字面量联合 —— 在边界收窄
         ...(s.staleReason != null ? { staleReason: s.staleReason as AbstractLanding['staleReason'] } : {}),

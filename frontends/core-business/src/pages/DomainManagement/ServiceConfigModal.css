@@ -3,50 +3,13 @@
    颜色全部取 @jonex/platform-theme 的语义 token，与卡片页同源
    ═══════════════════════════════════════════════════════════ */
 
-.scm-modal {
-  .ant-modal-content {
-    padding: 0;
-    border-radius: 14px;
-    overflow: hidden;
-  }
-
-  .ant-modal-header {
-    margin-bottom: 0;
-    padding: 18px 22px 16px;
-    border-bottom: 1px solid #eef2f6;
-    background: #fff;
-  }
-
-  .ant-modal-title {
-    font-size: 15px;
-  }
-
-  .ant-modal-close {
-    top: 20px;
-    inset-inline-end: 18px;
-  }
-
-  .ant-modal-body {
-    padding: 18px 22px 4px;
-    max-height: calc(100vh - 260px);
-    overflow-y: auto;
-    background: #fff;
-  }
-
-  .ant-modal-footer {
-    margin-top: 0;
-    padding: 12px 22px 16px;
-    border-top: 1px solid #f1f5f9;
-  }
-}
-
 .scm-title {
   display: inline-flex;
   align-items: center;
   gap: 9px;
   font-size: 15px;
   font-weight: 600;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
 }
 
 .scm-title-ico {
@@ -58,7 +21,7 @@
   border-radius: 7px;
   font-size: 13px;
   color: #2563eb;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   border: 1px solid #dbeafe;
 }
 
@@ -80,7 +43,7 @@
   flex-shrink: 0;
   font-size: 17px;
   color: #2563eb;
-  background: #eff6ff;
+  background: var(--yx-info-bg);
   border: 1px solid #dbeafe;
 }
 
@@ -99,7 +62,7 @@
   font-size: 15px;
   font-weight: 600;
   line-height: 1.4;
-  color: #0b2b5c;
+  color: var(--yx-brand-dark);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -108,7 +71,7 @@
 .scm-hero-sub {
   margin-top: 3px;
   font-size: 12.5px;
-  color: #64748b;
+  color: var(--yx-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -129,7 +92,7 @@
 
   &.is-active {
     color: #059669;
-    background: #ecfdf5;
+    background: var(--yx-success-bg);
     border: 1px solid #d1fae5;
   }
 
@@ -140,9 +103,9 @@
   }
 
   &.is-idle {
-    color: #64748b;
-    background: #f1f5f9;
-    border: 1px solid #e2e8f0;
+    color: var(--yx-text-secondary);
+    background: var(--yx-bg-muted);
+    border: 1px solid var(--yx-border);
   }
 }
 
@@ -154,15 +117,15 @@
   margin: 0 0 6px;
   padding: 12px 16px;
   border-radius: 10px;
-  background: #f8fafc;
-  border: 1px solid #eef2f6;
+  background: var(--yx-bg-subtle);
+  border: 1px solid var(--yx-border-light);
 
   dt {
     margin-bottom: 5px;
     font-size: 11.5px;
     font-weight: 500;
     letter-spacing: 0.2px;
-    color: #94a3b8;
+    color: var(--yx-text-muted);
   }
 
   dd {
@@ -183,7 +146,7 @@
   font-size: 12.5px;
   padding: 1px 6px;
   border-radius: 5px;
-  background: #f1f5f9;
+  background: var(--yx-bg-muted);
   color: #475569;
   border: none;
 }
@@ -232,13 +195,13 @@
     margin: 3px 0 0;
     font-size: 12.5px;
     line-height: 1.5;
-    color: #64748b;
+    color: var(--yx-text-secondary);
   }
 }
 
 .scm-table {
   .ant-table {
-    border: 1px solid #eef2f6;
+    border: 1px solid var(--yx-border-light);
     border-radius: 10px;
     overflow: hidden;
   }
@@ -247,9 +210,9 @@
     padding: 9px 12px;
     font-size: 12px;
     font-weight: 500;
-    color: #64748b;
-    background: #f8fafc;
-    border-bottom: 1px solid #eef2f6;
+    color: var(--yx-text-secondary);
+    background: var(--yx-bg-subtle);
+    border-bottom: 1px solid var(--yx-border-light);
 
     &::before {
       display: none;
@@ -259,7 +222,7 @@
   .ant-table-tbody > tr > td {
     padding: 9px 12px;
     font-size: 12.5px;
-    border-bottom: 1px solid #f1f5f9;
+    border-bottom: 1px solid var(--yx-bg-muted);
   }
 
   .ant-table-tbody > tr:last-child > td {
@@ -267,7 +230,7 @@
   }
 
   .ant-table-tbody > tr:hover > td {
-    background: #f8fafc;
+    background: var(--yx-bg-subtle);
   }
 }
 
@@ -293,11 +256,11 @@
   width: 24px;
   height: 24px;
   padding: 0;
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 
   &:hover {
     color: #2563eb;
-    background: #eff6ff;
+    background: var(--yx-info-bg);
   }
 
   &.is-copied {
@@ -314,17 +277,17 @@
   font-family: var(--yx-font-mono, 'SF Mono', 'Fira Code', monospace);
   font-size: 11.5px;
   color: #475569;
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
+  background: var(--yx-bg-muted);
+  border: 1px solid var(--yx-border);
 }
 
 .scm-dim {
-  color: #94a3b8;
+  color: var(--yx-text-muted);
 }
 
 .scm-del.ant-btn {
   font-size: 12px;
-  color: #dc2626;
+  color: var(--yx-error-text);
 
   &:hover {
     color: #b91c1c;

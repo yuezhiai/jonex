@@ -32,11 +32,11 @@ export default function WikiSourcePicture({
           preview={{ src: isWikiPictureUrl(image.display_url) ? image.display_url : image.preview_url }}
         />
       ) : (
-        <span role="status" style={{ color: '#64748b' }}>
+        <span role="status" style={{ color: 'var(--yx-text-secondary)' }}>
           图片暂不可读，请刷新页面或查看原文。
         </span>
       )}
-      <span style={{ display: 'block', fontSize: 12, color: '#64748b', marginTop: 6 }}>
+      <span style={{ display: 'block', fontSize: 12, color: 'var(--yx-text-secondary)', marginTop: 6 }}>
         {label} · {image.source_name}
         {page ? ` · 第 ${page} 页` : ''}
         {image.usage === 'visual_evidence' ? ' · 已读图' : ' · 原文配图'}

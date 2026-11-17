@@ -37,7 +37,7 @@ export default function OntologyRelationSection({
   const relationTypeToCardinality: Record<string, string> = {
     一对一: 'one_to_one',
     一对多: 'one_to_many',
-    多对一: 'one_to_many',
+    多对一: 'many_to_one',
     多对多: 'many_to_many',
     自定义: 'custom',
   };
@@ -50,7 +50,7 @@ export default function OntologyRelationSection({
       width: 110,
       render: (v) => (
         <span
-          style={{ background: '#eff6ff', color: '#3b82f6', padding: '2px 8px', borderRadius: 4, fontSize: 12 }}
+          style={{ background: 'var(--yx-info-bg)', color: 'var(--yx-accent)', padding: '2px 8px', borderRadius: 4, fontSize: 12 }}
         >
           {v}
         </span>
@@ -70,7 +70,7 @@ export default function OntologyRelationSection({
       width: 110,
       render: (v) => (
         <span
-          style={{ background: '#ecfdf5', color: '#059669', padding: '2px 8px', borderRadius: 4, fontSize: 12 }}
+          style={{ background: 'var(--yx-success-bg)', color: '#059669', padding: '2px 8px', borderRadius: 4, fontSize: 12 }}
         >
           {v}
         </span>
@@ -80,7 +80,7 @@ export default function OntologyRelationSection({
       title: t('compile.relation.description'),
       dataIndex: 'description',
       key: 'description',
-      render: (v) => <span style={{ fontSize: 12, color: '#64748b' }}>{v || '—'}</span>,
+      render: (v) => <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{v || '—'}</span>,
     },
     {
       title: t('compile.relation.type'),
@@ -90,8 +90,8 @@ export default function OntologyRelationSection({
       render: (v: OntologyRelationType) => {
         const cardinality = relationTypeToCardinality[v] || 'custom';
         const c = RELATION_TYPE_TAG[cardinality as keyof typeof RELATION_TYPE_TAG] || {
-          bg: '#eff6ff',
-          color: '#3b82f6',
+          bg: 'var(--yx-info-bg)',
+          color: 'var(--yx-accent)',
         };
         return (
           <span style={{ background: c.bg, color: c.color, padding: '2px 8px', borderRadius: 4, fontSize: 12 }}>
@@ -106,7 +106,7 @@ export default function OntologyRelationSection({
       dataIndex: 'inverseOf',
       key: 'inverseOf',
       width: 120,
-      render: (v) => <span style={{ fontSize: 12, color: '#64748b' }}>{v || '—'}</span>,
+      render: (v) => <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{v || '—'}</span>,
     },
     {
       title: t('common.status'),

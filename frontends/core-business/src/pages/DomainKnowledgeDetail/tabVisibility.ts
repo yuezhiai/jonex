@@ -14,6 +14,7 @@ export const STRUCTURED_TAB_KEYS = new Set([
   'lineage',
   'etl',
   'governance',
+  'verifiedQuery',
 ]);
 
 export function visibleTabs<T extends { key: string }>(

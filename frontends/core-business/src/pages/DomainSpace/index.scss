@@ -20,7 +20,7 @@
     border-radius: 10px;
     padding: 24px;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-    border: 1px solid #eef2f6;
+    border: 1px solid var(--yx-border-light);
 
     .ant-table {
       font-size: 14px;
@@ -33,7 +33,7 @@
 
   /* 表格操作链接 */
   .yx-table-action {
-    color: #3b82f6;
+    color: var(--yx-accent);
     text-decoration: none;
     font-size: 13px;
     margin: 0 4px;
@@ -47,7 +47,7 @@
     & + .yx-table-action {
       margin-left: 12px;
       padding-left: 12px;
-      border-left: 1px solid #e2e8f0;
+      border-left: 1px solid var(--yx-border);
     }
   }
 
@@ -59,15 +59,15 @@
     font-size: 12px;
     padding: 2px 10px;
     border-radius: 6px;
-    background: #f1f5f9;
-    color: #64748b;
+    background: var(--yx-bg-muted);
+    color: var(--yx-text-secondary);
     cursor: pointer;
     transition: all 0.2s ease;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--yx-border);
 
     &:hover {
-      background: #eff6ff;
-      color: #3b82f6;
+      background: var(--yx-info-bg);
+      color: var(--yx-accent);
       border-color: #bfdbfe;
     }
   }

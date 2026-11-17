@@ -228,7 +228,7 @@ export default function AddDataSourceModal({
                 onClick={() => setShowApiHelp((prev) => !prev)}
                 style={{
                   cursor: 'pointer',
-                  color: '#3b82f6',
+                  color: 'var(--yx-accent)',
                   fontSize: 13,
                   marginBottom: showApiHelp ? 8 : 16,
                   userSelect: 'none',
@@ -245,7 +245,7 @@ export default function AddDataSourceModal({
                     <div style={{ fontSize: 13 }}>
                       <p style={{ margin: '4px 0' }}>{t('dataSource.apiPullDesc1')}</p>
                       <p style={{ margin: '4px 0' }}>{t('dataSource.apiPullDesc2')}</p>
-                      <p style={{ margin: '4px 0', color: '#94a3b8' }}>
+                      <p style={{ margin: '4px 0', color: 'var(--yx-text-muted)' }}>
                         {t('dataSource.apiPullDesc3')}
                         {`{"code":0,"data":{"items":[{"url":"https://...","name":"report.pdf"},{"url":"https://...","name":"contract.docx"}]}}`}
                       </p>

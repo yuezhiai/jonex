@@ -303,9 +303,9 @@ const DomainKnowledge = function DomainKnowledge() {
         extra={
           <div className="yx-filter-row">
             <label>
-              <GlobalOutlined style={{ color: '#3b82f6' }} /> {t('domainKnowledge.currentSpace')}
+              <GlobalOutlined style={{ color: 'var(--yx-accent)' }} /> {t('domainKnowledge.currentSpace')}
             </label>
-            <span style={{ fontWeight: 500, color: '#0b2b5c' }}>
+            <span style={{ fontWeight: 500, color: 'var(--yx-brand-dark)' }}>
               {global.currentSpace?.name || t('domainKnowledge.notSelected')}
             </span>
             <span className="yx-filter-count">{t('domainKnowledge.knowledgeBaseCount', { total })}</span>

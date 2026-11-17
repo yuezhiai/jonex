@@ -122,15 +122,15 @@ export default function PermissionTab({
                   background: '#fff',
                   borderRadius: 8,
                   boxShadow: '0 4px 20px rgba(0,0,0,.12)',
-                  border: '1px solid #e2e8f0',
+                  border: '1px solid var(--yx-border)',
                   overflow: 'hidden',
                 }}
               >
-                <div style={{ padding: '8px 12px', borderBottom: '1px solid #e2e8f0' }}>
+                <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--yx-border)' }}>
                   <Input
                     size="small"
                     placeholder={t('domainSpace.searchUserPlaceholder')}
-                    prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+                    prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
                     value={userSearchText}
                     onChange={(e) => setUserSearchText(e.target.value)}
                     allowClear
@@ -138,28 +138,28 @@ export default function PermissionTab({
                 </div>
                 <div style={{ maxHeight: 220, overflowY: 'auto' }}>
                   {usersLoading ? (
-                    <div style={{ textAlign: 'center', padding: 20, color: '#94a3b8', fontSize: 13 }}>
+                    <div style={{ textAlign: 'center', padding: 20, color: 'var(--yx-text-muted)', fontSize: 13 }}>
                       {t('common.loading')}
                     </div>
                   ) : filteredAvailableUsers.length === 0 ? (
-                    <div style={{ textAlign: 'center', padding: 20, color: '#94a3b8', fontSize: 13 }}>
+                    <div style={{ textAlign: 'center', padding: 20, color: 'var(--yx-text-muted)', fontSize: 13 }}>
                       {userSearchText ? t('domainSpace.noMatchUser') : t('domainSpace.noAvailableUser')}
                     </div>
                   ) : (
                     filteredAvailableUsers.slice(0, 30).map((user) => (
                       <div
                         key={user.user_id}
-                        style={{ cursor: 'pointer', padding: '8px 12px', borderBottom: '1px solid #f1f5f9' }}
+                        style={{ cursor: 'pointer', padding: '8px 12px', borderBottom: '1px solid var(--yx-bg-muted)' }}
                         onClick={() => {
                           onAdd(user);
                           setUserSearchText('');
                           setUserSelectOpen(false);
                         }}
                       >
-                        <div style={{ fontWeight: 500, color: '#0b2b5c' }}>
+                        <div style={{ fontWeight: 500, color: 'var(--yx-brand-dark)' }}>
                           {user.display_name || user.username || user.user_id}
                         </div>
-                        <div style={{ fontSize: 12, color: '#94a3b8' }}>{user.email || user.username || ''}</div>
+                        <div style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>{user.email || user.username || ''}</div>
                       </div>
                     ))
                   )}
@@ -187,7 +187,7 @@ export default function PermissionTab({
             key: 'user',
             width: 200,
             render: (_: unknown, record: DomainKnowledgePermissionMember) => (
-              <div style={{ fontWeight: 500, color: '#0b2b5c' }}>{memberName(record)}</div>
+              <div style={{ fontWeight: 500, color: 'var(--yx-brand-dark)' }}>{memberName(record)}</div>
             ),
           },
           {

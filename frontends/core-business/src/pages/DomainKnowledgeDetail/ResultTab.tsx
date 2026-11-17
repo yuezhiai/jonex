@@ -32,7 +32,7 @@ export default function ResultTab({
         {
           label: t('domainKnowledge.ontologyInstanceCount'),
           value: resultStats.ontology_instance_count.toLocaleString(),
-          color: '#3b82f6',
+          color: 'var(--yx-accent)',
         },
         {
           label: t('domainKnowledge.ontologyRelationCount'),
@@ -42,7 +42,7 @@ export default function ResultTab({
       ]
     : [
         { label: t('domainKnowledge.sourceFilesCount'), value: '--', color: '#f97316' },
-        { label: t('domainKnowledge.ontologyInstanceCount'), value: '--', color: '#3b82f6' },
+        { label: t('domainKnowledge.ontologyInstanceCount'), value: '--', color: 'var(--yx-accent)' },
         { label: t('domainKnowledge.ontologyRelationCount'), value: '--', color: '#10b981' },
       ];
 
@@ -70,14 +70,14 @@ export default function ResultTab({
               dataIndex: 'display_name',
               key: 'display_name',
               render: (v: string, r: OntologyInstanceSummary) => (
-                <span style={{ fontWeight: 600, color: '#0b2b5c' }}>{v || r.name}</span>
+                <span style={{ fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{v || r.name}</span>
               ),
             },
             {
               title: t('domainKnowledge.description'),
               dataIndex: 'description',
               key: 'description',
-              render: (v: string) => <span style={{ color: '#64748b' }}>{v || '—'}</span>,
+              render: (v: string) => <span style={{ color: 'var(--yx-text-secondary)' }}>{v || '—'}</span>,
             },
             {
               title: t('domainKnowledge.buildStatus'),
@@ -91,7 +91,7 @@ export default function ResultTab({
                     borderRadius: 12,
                     fontSize: 12,
                     fontWeight: 500,
-                    background: v === 'built' ? '#ecfdf5' : '#fef3c7',
+                    background: v === 'built' ? 'var(--yx-success-bg)' : '#fef3c7',
                     color: v === 'built' ? '#059669' : '#d97706',
                   }}
                 >
@@ -150,7 +150,7 @@ export default function ResultTab({
               dataIndex: 'display_name',
               key: 'display_name',
               render: (v: string, r: RelationInstanceSummary) => (
-                <strong style={{ color: '#0b2b5c' }}>{v || r.name}</strong>
+                <strong style={{ color: 'var(--yx-brand-dark)' }}>{v || r.name}</strong>
               ),
             },
             {
@@ -165,7 +165,7 @@ export default function ResultTab({
               title: t('compile.relation.description'),
               dataIndex: 'description',
               key: 'description',
-              render: (v: string) => <span style={{ fontSize: 13, color: '#64748b' }}>{v || '—'}</span>,
+              render: (v: string) => <span style={{ fontSize: 13, color: 'var(--yx-text-secondary)' }}>{v || '—'}</span>,
             },
             {
               title: t('domainKnowledge.relationType'),
@@ -173,10 +173,10 @@ export default function ResultTab({
               key: 'cardinality',
               render: (v: string) => {
                 const cm: Record<string, { bg: string; color: string }> = {
-                  many_to_one: { bg: '#eff6ff', color: '#3b82f6' },
+                  many_to_one: { bg: 'var(--yx-info-bg)', color: 'var(--yx-accent)' },
                   many_to_many: { bg: '#fef3c7', color: '#d97706' },
-                  one_to_one: { bg: '#ecfdf5', color: '#059669' },
-                  one_to_many: { bg: '#eff6ff', color: '#3b82f6' },
+                  one_to_one: { bg: 'var(--yx-success-bg)', color: '#059669' },
+                  one_to_many: { bg: 'var(--yx-info-bg)', color: 'var(--yx-accent)' },
                 };
                 const lm: Record<string, string> = {
                   many_to_one: t('compile.cardinality.manyToOne'),
@@ -184,7 +184,7 @@ export default function ResultTab({
                   one_to_one: t('compile.cardinality.oneToOne'),
                   one_to_many: t('compile.cardinality.oneToMany'),
                 };
-                const c = cm[v] || { bg: '#f1f5f9', color: '#64748b' };
+                const c = cm[v] || { bg: 'var(--yx-bg-muted)', color: 'var(--yx-text-secondary)' };
                 return (
                   <span
                     style={{
@@ -213,7 +213,7 @@ export default function ResultTab({
                     borderRadius: 12,
                     fontSize: 12,
                     fontWeight: 500,
-                    background: v === 'built' ? '#ecfdf5' : '#fef3c7',
+                    background: v === 'built' ? 'var(--yx-success-bg)' : '#fef3c7',
                     color: v === 'built' ? '#059669' : '#d97706',
                   }}
                 >

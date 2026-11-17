@@ -251,6 +251,145 @@ describe('mapImportResult', () => {
   });
 });
 
+describe('metric formula / enabled 往返', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('读映射保留 formula 与 enabled:false，保存映射原样带回', async () => {
+    const read = mapImportResult({
+      dry_run: false, summary: {}, warnings: [],
+      id: 'row_1', knowledge_base_id: 'kb_1', schema_version: 2, status: 'proposed',
+      schema: {
+        entities: [],
+        relations: [],
+        metrics: [
+          {
+            name: '客单价',
+            aliases: ['AOV'],
+            additivity: 'non_additive',
+            formula: 'SUM(amount) / COUNT(order_id)',
+            enabled: false,
+            landings: [{ data_source_id: 'ds_1', di_metric: 'aov', entity_name: 'Order' }],
+          },
+        ],
+      },
+      stale_count: 0,
+    });
+    const metrics = read.schema!.schema.metrics!;
+    expect(metrics[0]).toMatchObject({
+      formula: 'SUM(amount) / COUNT(order_id)',
+      enabled: false,
+    });
+
+    getDataMock.mockResolvedValueOnce({
+      id: 'row_1', knowledge_base_id: 'kb_1', schema_version: 3, status: 'proposed',
+      schema: { entities: [], relations: [], metrics }, stale_count: 0,
+    });
+    await saveAbstractSchema({
+      knowledgeBaseId: 'kb_1', status: 'proposed', expectedSchemaVersion: 2,
+      schema: { entities: [], relations: [], metrics },
+    });
+
+    const sent = putMock.mock.calls[0]![1] as any;
+    expect(sent.schema.metrics[0]).toMatchObject({
+      name: '客单价',
+      formula: 'SUM(amount) / COUNT(order_id)',
+      enabled: false,
+    });
+  });
+
+  it('enabled:true 不被吞；缺省 formula/enabled 不序列化出键', async () => {
+    getDataMock.mockResolvedValueOnce({
+      id: 'row_1', knowledge_base_id: 'kb_1', schema_version: 2, status: 'proposed',
+      schema: { entities: [], relations: [], metrics: [] }, stale_count: 0,
+    });
+    await saveAbstractSchema({
+      knowledgeBaseId: 'kb_1', status: 'proposed', expectedSchemaVersion: 1,
+      schema: {
+        entities: [],
+        relations: [],
+        metrics: [
+          {
+            name: '订单量', aliases: [], additivity: 'additive', enabled: true,
+            landings: [],
+          },
+          {
+            name: '裸指标', aliases: [], additivity: 'unknown',
+            landings: [],
+          },
+        ],
+      },
+    });
+
+    const sent = putMock.mock.calls[0]![1] as any;
+    const [enabledOnly, bare] = sent.schema.metrics;
+    expect(enabledOnly.enabled).toBe(true);
+    expect('formula' in enabledOnly).toBe(false);
+    expect('enabled' in bare).toBe(false);
+    expect('formula' in bare).toBe(false);
+  });
+});
+
+describe('落点 provenance（origin/confidence/rationale）', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('保存载荷原样带回三键（显式 payload 路径，丢一处 = 人定的来源被静默抹平）', async () => {
+    getDataMock.mockResolvedValueOnce({
+      id: 'row_1', knowledge_base_id: 'kb_1', schema_version: 2, status: 'proposed',
+      schema: { entities: [], relations: [] }, stale_count: 0,
+    });
+    await saveAbstractSchema({
+      knowledgeBaseId: 'kb_1', status: 'proposed', expectedSchemaVersion: 1,
+      schema: {
+        entities: [{
+          name: 'Asset', description: '', aliases: [],
+          sources: [{
+            dataSourceId: 'd1', entityName: 'asset', included: true, stale: false,
+            origin: 'agent', confidence: 'low', rationale: '样本一致',
+          }],
+          attributes: [],
+        }],
+        relations: [],
+      },
+    });
+
+    const sent = putMock.mock.calls[0]![1] as any;
+    expect(sent.schema.entities[0].sources[0]).toMatchObject({
+      data_source_id: 'd1', entity_name: 'asset', included: true,
+      origin: 'agent', confidence: 'low', rationale: '样本一致',
+    });
+  });
+
+  it('读映射（mapLanding）带回三键；缺键不物化空键', () => {
+    const mapped = mapImportResult({
+      dry_run: false, summary: {}, warnings: [],
+      id: 'row_1', knowledge_base_id: 'kb_1', schema_version: 1, status: 'proposed',
+      schema: {
+        entities: [{
+          name: 'E', description: '', aliases: [], attributes: [],
+          sources: [
+            { data_source_id: 'd1', entity_name: 'asset', included: true,
+              origin: 'manual', confidence: 'high', rationale: '人工确认' },
+            { data_source_id: 'd2', entity_name: 'asset', included: true },
+          ],
+        }],
+        relations: [],
+      },
+      stale_count: 0,
+    });
+    const [withProvenance, bare] = mapped.schema!.schema.entities[0]!.sources;
+    expect(withProvenance).toMatchObject({
+      origin: 'manual', confidence: 'high', rationale: '人工确认',
+    });
+    expect('origin' in bare!).toBe(false);
+    expect('confidence' in bare!).toBe(false);
+    expect('rationale' in bare!).toBe(false);
+  });
+});
+
 describe('落点语义槽 P1-5（filter/aggregation/grain/enabled）', () => {
   beforeEach(() => {
     vi.resetAllMocks();

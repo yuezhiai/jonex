@@ -133,7 +133,9 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
       return;
     }
     Modal.confirm({
-      title: t('toolBinding.qaCallableEnableTitle'),
+      title: record.toolReadOnly
+        ? t('toolBinding.qaCallableEnableTitle')
+        : t('toolBinding.qaCallableEnableTitleWrite'),
       content: (
         <>
           <p style={{ marginBottom: 6 }}>{t('toolBinding.qaCallableEgress')}</p>
@@ -182,9 +184,27 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
           </Tag>
           <span>
             {r.toolLabel || r.toolName}
-            {r.toolLabel ? <span style={{ color: '#94a3b8' }}>（{r.toolName}）</span> : null}
+            {r.toolLabel ? <span style={{ color: 'var(--yx-text-muted)' }}>（{r.toolName}）</span> : null}
           </span>
         </Space>
+      ),
+    },
+    {
+      title: t('toolBinding.colToolNature'),
+      key: 'toolNature',
+      width: 100,
+      render: (_, r) => (
+        <Tooltip title={t('toolBinding.toolNatureHint')}>
+          {r.toolAvailable ? (
+            <Tag color={r.toolReadOnly ? 'green' : 'orange'}>
+              {r.toolReadOnly
+                ? t('toolBinding.toolNatureReadOnly')
+                : t('toolBinding.toolNatureWrite')}
+            </Tag>
+          ) : (
+            <Tag>{t('toolBinding.toolNatureUnknown')}</Tag>
+          )}
+        </Tooltip>
       ),
     },
     {
@@ -192,7 +212,7 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
       key: 'mapping',
       render: (_, r) => {
         const entries = Object.entries(r.paramMapping || {});
-        if (!entries.length) return <span style={{ color: '#94a3b8' }}>{t('toolBinding.noMapping')}</span>;
+        if (!entries.length) return t('toolBinding.noMapping');
         return (
           <Space size={[4, 4]} wrap>
             {entries.map(([k, v]) => (
@@ -210,6 +230,16 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
       width: 160,
       render: (_, r) => {
         const tags: React.ReactNode[] = [];
+        if (r.qaCallable && r.callerSupplied.length) {
+          tags.push(
+            <Tooltip
+              key="c"
+              title={`${t('toolBinding.callerSuppliedHint')}：${r.callerSupplied.join(', ')}`}
+            >
+              <Tag>{t('toolBinding.callerSuppliedTag', { count: r.callerSupplied.length })}</Tag>
+            </Tooltip>,
+          );
+        }
         if (r.targetExists === false) tags.push(<Tag key="t" color="red">{t('toolBinding.targetMissing')}</Tag>);
         if (r.targetExists === null) tags.push(<Tag key="u" color="default">{t('toolBinding.targetUnknown')}</Tag>);
         if (!r.toolAvailable) tags.push(<Tag key="x" color="orange">{t('toolBinding.toolUnavailable')}</Tag>);
@@ -235,7 +265,7 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
       key: 'qaCallable',
       width: 110,
       render: (_, r) => {
-        if (!r.executable) return <span style={{ color: '#94a3b8' }}>—</span>;
+        if (!r.executable) return <span style={{ color: 'var(--yx-text-muted)' }}>—</span>;
         return (
           <Space size={4}>
             <Switch
@@ -247,7 +277,9 @@ export default function ToolBindingTab({ kbId, canWrite = false }: Props) {
             />
             {r.qaCallable && !r.toolReadOnly && (
               <Tooltip title={t('toolBinding.qaCallableTipOff')}>
-                <Tag color="orange" style={{ marginInlineEnd: 0 }}>!</Tag>
+                <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                  {t('toolBinding.qaCallableWriteTag')}
+                </Tag>
               </Tooltip>
             )}
           </Space>

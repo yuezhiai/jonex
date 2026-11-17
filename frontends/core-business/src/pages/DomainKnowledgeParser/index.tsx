@@ -961,7 +961,14 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
               ) : (
                 <div className="parser-template-list">
                   {templates.map((template) => (
-                    <Button key={template.id} onClick={() => applyTemplate(template)}>
+                    // 原生 button 而不是 antd Button：.ant-btn 把高度锁死在 32px，
+                    // 名称 + 描述两行会被裁掉、压到下一个条目上
+                    <button
+                      key={template.id}
+                      type="button"
+                      className="parser-template-item"
+                      onClick={() => applyTemplate(template)}
+                    >
                       <span className="parser-template-icon">
                         <FileTextOutlined />
                       </span>
@@ -969,14 +976,14 @@ export function ParserConfigContent({ kbId, spaceId, canWrite = false }: ParserC
                         {/* 名称单行省略 + 溢出 hover 全文，交由 Typography 组件处理（不使用 CSS 省略） */}
                         <Typography.Text
                           ellipsis={{ tooltip: template.name }}
-                          style={{ display: 'block', color: '#0b2b5c', fontSize: 14, fontWeight: 500 }}
+                          style={{ display: 'block', color: 'var(--yx-brand-dark)', fontSize: 14, fontWeight: 500, lineHeight: 1.45 }}
                         >
                           {template.name}
                         </Typography.Text>
                         <span className="parser-template-desc">{templateDesc(template, t)}</span>
                       </span>
                       <em>{t('parserConfig.useTemplate')}</em>
-                    </Button>
+                    </button>
                   ))}
                 </div>
               )}

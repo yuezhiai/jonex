@@ -171,7 +171,7 @@ export default function SimilarityCheckSettings({ kbId, canWrite }: Props) {
   return (
     <div
       className="similarity-check-settings"
-      style={{ marginBottom: 16, padding: 16, background: '#f8fafc', borderRadius: 8 }}
+      style={{ marginBottom: 16, padding: 16, background: 'var(--yx-bg-subtle)', borderRadius: 8 }}
     >
       <Space orientation="vertical" size={8} style={{ width: '100%' }}>
         <Space>

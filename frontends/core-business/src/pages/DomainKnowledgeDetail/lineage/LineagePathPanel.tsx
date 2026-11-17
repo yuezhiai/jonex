@@ -67,7 +67,7 @@ export default function LineagePathPanel({
       style={{
         marginTop: 12,
         padding: 12,
-        border: '1px solid #e2e8f0',
+        border: '1px solid var(--yx-border)',
         borderRadius: 8,
         background: '#fff',
       }}
@@ -90,7 +90,7 @@ export default function LineagePathPanel({
       <Space
         wrap
         size={[12, 4]}
-        style={{ marginBottom: 8, fontSize: 12, color: '#64748b' }}
+        style={{ marginBottom: 8, fontSize: 12, color: 'var(--yx-text-secondary)' }}
       >
         <span>
           {t('domainKnowledge.lineage.paths.explored', { count: result.explored })}

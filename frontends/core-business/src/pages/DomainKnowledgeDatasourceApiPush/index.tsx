@@ -2,19 +2,18 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import { useTranslation } from 'react-i18next';
 import { Button, Card, Input, Space, message, Spin, Modal, Typography, Alert } from 'antd';
-import { ArrowLeftOutlined, ApiOutlined, KeyOutlined } from '@ant-design/icons';
-import { useNavigate, useParams } from 'react-router-dom';
+import { ApiOutlined, KeyOutlined } from '@ant-design/icons';
+import { useParams } from 'react-router-dom';
 import { getDataSource, listDataSourceDocuments, resetIngestKey } from '@/api/dataSource';
 import type { DataSourceInstance } from '@/types/dataSource';
 import type { ManualDocItem } from '@/types/domainKnowledge';
 import DataSourceDocTable from '@/components/datasource/DataSourceDocTable';
-import { PageContent } from '@jonex/shared-lib';
+import { PageContent, PageHeader } from '@jonex/shared-lib';
 
 export default function DomainKnowledgeDatasourceApiPush() {
   const { t } = useTranslation();
   const { id, dsId } = useParams();
   const { canWrite } = useKbPermission(id);
-  const navigate = useNavigate();
 
   const [ds, setDs] = useState<DataSourceInstance | null>(null);
   const [docs, setDocs] = useState<ManualDocItem[]>([]);
@@ -60,29 +59,21 @@ export default function DomainKnowledgeDatasourceApiPush() {
   const filtered = docs.filter((d) => d.name.includes(keyword));
 
   return (
-    <PageContent showCard={false}>
-      <a
-        onClick={() => navigate(`/domain-knowledge/${id}/detail`)}
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          marginBottom: 16,
-          fontSize: 14,
-          color: '#64748b',
-          cursor: 'pointer',
-        }}
-      >
-        <ArrowLeftOutlined /> {t('domainKnowledge.backToKnowledgeDetail')}
-      </a>
+    <>
+      <PageHeader
+        title={t('route.datasourceApiPush')}
+        backTo={`/domain-knowledge/${id}/detail`}
+        backText={t('domainKnowledge.backToKnowledgeDetail')}
+      />
+      <PageContent showCard={false}>
 
       <Spin spinning={loading}>
         <Card
           style={{
-            borderRadius: 10,
+            borderRadius: 'var(--yx-card-radius)',
             marginBottom: 24,
-            border: '1px solid #eef2f6',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+            border: '1px solid var(--yx-border-light)',
+            boxShadow: 'var(--yx-card-shadow)',
           }}
           bodyStyle={{ padding: '20px 24px', display: 'flex', alignItems: 'center', gap: 16 }}
         >
@@ -91,8 +82,8 @@ export default function DomainKnowledgeDatasourceApiPush() {
               width: 48,
               height: 48,
               borderRadius: 12,
-              background: '#eff6ff',
-              color: '#3b82f6',
+              background: 'var(--yx-info-bg)',
+              color: 'var(--yx-accent)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -103,8 +94,8 @@ export default function DomainKnowledgeDatasourceApiPush() {
             <ApiOutlined />
           </div>
           <div style={{ flex: 1 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 700, color: '#0b2b5c', margin: 0 }}>{ds?.name || '—'}</h2>
-            <div style={{ display: 'flex', gap: 16, marginTop: 4, fontSize: 13, color: '#64748b', flexWrap: 'wrap' }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--yx-brand-dark)', margin: 0 }}>{ds?.name || '—'}</h2>
+            <div style={{ display: 'flex', gap: 16, marginTop: 4, fontSize: 13, color: 'var(--yx-text-secondary)', flexWrap: 'wrap' }}>
               <span>{t('domainKnowledge.apiPush.typeLabel')}</span>
               <span>{t('domainKnowledge.apiPush.receivedDocs', { count: ds?.documentCount ?? 0 })}</span>
             </div>
@@ -137,35 +128,35 @@ export default function DomainKnowledgeDatasourceApiPush() {
 
         <Card
           style={{
-            borderRadius: 10,
+            borderRadius: 'var(--yx-card-radius)',
             marginBottom: 20,
-            border: '1px solid #eef2f6',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+            border: '1px solid var(--yx-border-light)',
+            boxShadow: 'var(--yx-card-shadow)',
           }}
           bodyStyle={{ padding: 24 }}
         >
-          <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+          <h3 style={{ margin: '0 0 16px', fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
             {t('domainKnowledge.apiPush.connectionInfo')}
           </h3>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
             <div>
-              <span style={{ color: '#94a3b8', marginRight: 8 }}>{t('domainKnowledge.apiPush.ingestEndpoint')}</span>
+              <span style={{ color: 'var(--yx-text-muted)', marginRight: 8 }}>{t('domainKnowledge.apiPush.ingestEndpoint')}</span>
               <Typography.Text copyable>{ingestUrl}</Typography.Text>
             </div>
             <div>
-              <span style={{ color: '#94a3b8', marginRight: 8 }}>{t('domainKnowledge.apiPush.apiKeyLabel')}</span>
-              <span style={{ color: '#64748b' }}>{t('domainKnowledge.apiPush.keyHiddenHint')}</span>
+              <span style={{ color: 'var(--yx-text-muted)', marginRight: 8 }}>{t('domainKnowledge.apiPush.apiKeyLabel')}</span>
+              <span style={{ color: 'var(--yx-text-secondary)' }}>{t('domainKnowledge.apiPush.keyHiddenHint')}</span>
             </div>
             <div>
-              <span style={{ color: '#94a3b8', marginRight: 8 }}>{t('domainKnowledge.apiPush.allowedTypes')}</span>
+              <span style={{ color: 'var(--yx-text-muted)', marginRight: 8 }}>{t('domainKnowledge.apiPush.allowedTypes')}</span>
               <span>{(cfg.allowed_ext || []).join('、') || '-'}</span>
             </div>
             <div>
-              <span style={{ color: '#94a3b8', marginRight: 8 }}>{t('domainKnowledge.apiPush.maxFileSize')}</span>
+              <span style={{ color: 'var(--yx-text-muted)', marginRight: 8 }}>{t('domainKnowledge.apiPush.maxFileSize')}</span>
               <span>{cfg.max_file_mb || 50} MB</span>
             </div>
             <div>
-              <span style={{ color: '#94a3b8', marginRight: 8 }}>{t('domainKnowledge.apiPush.curlExampleLabel')}</span>
+              <span style={{ color: 'var(--yx-text-muted)', marginRight: 8 }}>{t('domainKnowledge.apiPush.curlExampleLabel')}</span>
               <Typography.Text copyable code style={{ fontSize: 12 }}>
                 {`curl -X POST "${ingestUrl}" -H "X-Ingest-Key: <API Key>" -F "file=@./doc.pdf"`}
               </Typography.Text>
@@ -174,7 +165,7 @@ export default function DomainKnowledgeDatasourceApiPush() {
         </Card>
 
         <Card
-          style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+          style={{ borderRadius: 'var(--yx-card-radius)', border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
           bodyStyle={{ padding: 0 }}
         >
           <div
@@ -183,11 +174,11 @@ export default function DomainKnowledgeDatasourceApiPush() {
               alignItems: 'center',
               justifyContent: 'space-between',
               padding: '16px 20px',
-              borderBottom: '1px solid #eef2f6',
+              borderBottom: '1px solid var(--yx-border-light)',
             }}
           >
             <Space>
-              <span style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                 {t('domainKnowledge.apiPush.documentList')}
               </span>
               <Input
@@ -197,7 +188,7 @@ export default function DomainKnowledgeDatasourceApiPush() {
                 onChange={(e) => setKeyword(e.target.value)}
               />
             </Space>
-            <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('domainKnowledge.apiPush.externalPushDesc')}</span>
+            <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.apiPush.externalPushDesc')}</span>
           </div>
           <div style={{ padding: '0 8px 8px' }}>
             <DataSourceDocTable
@@ -210,6 +201,7 @@ export default function DomainKnowledgeDatasourceApiPush() {
           </div>
         </Card>
       </Spin>
-    </PageContent>
+      </PageContent>
+    </>
   );
 }

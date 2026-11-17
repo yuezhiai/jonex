@@ -14,7 +14,7 @@ const h3Style: React.CSSProperties = {
   margin: 0,
   fontSize: 15,
   fontWeight: 600,
-  color: '#0b2b5c',
+  color: 'var(--yx-brand-dark)',
   display: 'flex',
   alignItems: 'center',
   gap: 8,
@@ -37,14 +37,14 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
       key: 'order',
       width: 80,
       align: 'center',
-      render: (v) => <span style={{ fontWeight: 600, color: '#0b2b5c' }}>{v}</span>,
+      render: (v) => <span style={{ fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{v}</span>,
     },
     { title: t('compile.step.name'), dataIndex: 'name', key: 'name', width: 110, render: (v) => <strong>{v}</strong> },
     {
       title: t('compile.step.prompt'),
       dataIndex: 'prompt',
       key: 'prompt',
-      render: (v) => <span style={{ fontSize: 12, color: '#64748b' }}>{v}</span>,
+      render: (v) => <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{v}</span>,
     },
     {
       title: t('compile.step.skill'),
@@ -57,7 +57,7 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
             {v}
           </span>
         ) : (
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>—</span>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>—</span>
         ),
     },
     {
@@ -68,8 +68,8 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
       render: (v: CompileStep['scope']) => (
         <span
           style={{
-            background: v === 'single' ? '#eff6ff' : '#ecfdf5',
-            color: v === 'single' ? '#3b82f6' : '#059669',
+            background: v === 'single' ? 'var(--yx-info-bg)' : 'var(--yx-success-bg)',
+            color: v === 'single' ? 'var(--yx-accent)' : '#059669',
             padding: '2px 8px',
             borderRadius: 4,
             fontSize: 12,
@@ -85,7 +85,7 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
       key: 'trigger',
       width: 160,
       render: (v: CompileStep['trigger']) => (
-        <span style={{ fontSize: 12, color: '#64748b' }}>{t(compileTriggerLabelKey[v])}</span>
+        <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{t(compileTriggerLabelKey[v])}</span>
       ),
     },
     {
@@ -93,7 +93,7 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
       dataIndex: 'template',
       key: 'template',
       width: 180,
-      render: (v) => <span style={{ fontSize: 12, color: '#64748b' }}>{v}</span>,
+      render: (v) => <span style={{ fontSize: 12, color: 'var(--yx-text-secondary)' }}>{v}</span>,
     },
     {
       title: t('common.operation'),
@@ -121,7 +121,7 @@ export default function CompileStepSection({ data, loading, onCreate, onEdit, on
           {t('compile.step.create')}
         </Button>
       </div>
-      <p style={{ fontSize: 13, color: '#94a3b8', marginBottom: 12 }}>{t('compile.step.description')}</p>
+      <p style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginBottom: 12 }}>{t('compile.step.description')}</p>
       <Table
         columns={columns}
         dataSource={data}

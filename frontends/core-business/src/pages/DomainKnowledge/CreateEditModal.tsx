@@ -135,9 +135,9 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
       title={
         <span>
           {isEdit ? (
-            <EditOutlined style={{ color: '#3b82f6', marginRight: 8 }} />
+            <EditOutlined style={{ color: 'var(--yx-accent)', marginRight: 8 }} />
           ) : (
-            <PlusOutlined style={{ color: '#3b82f6', marginRight: 8 }} />
+            <PlusOutlined style={{ color: 'var(--yx-accent)', marginRight: 8 }} />
           )}
           {isEdit ? t('domainKnowledge.editKnowledgeBase') : t('domainKnowledge.createKnowledgeBase')}
         </span>
@@ -184,7 +184,7 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
               <Tag color={KB_TYPE_TAG_COLOR[editingKbType]} style={{ marginInlineEnd: 0 }}>
                 {t(editingOption.labelKey)}
               </Tag>
-              <span style={{ color: '#94a3b8', fontSize: 12 }}>
+              <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>
                 <LockOutlined style={{ marginRight: 4 }} />
                 {t('domainKnowledge.kbTypeImmutable')}
               </span>
@@ -201,14 +201,14 @@ export default function CreateEditModal({ open, editingKb, submitting, onOk, onC
                       alignItems: 'flex-start',
                       width: '100%',
                       padding: '10px 12px',
-                      border: '1px solid #e2e8f0',
+                      border: '1px solid var(--yx-border)',
                       borderRadius: 8,
                       marginInlineEnd: 0,
                     }}
                   >
                     <div style={{ marginLeft: 2 }}>
-                      <div style={{ fontWeight: 500, color: '#0b2b5c' }}>{t(opt.labelKey)}</div>
-                      <div style={{ color: '#64748b', fontSize: 12, marginTop: 2, whiteSpace: 'normal' }}>
+                      <div style={{ fontWeight: 500, color: 'var(--yx-brand-dark)' }}>{t(opt.labelKey)}</div>
+                      <div style={{ color: 'var(--yx-text-secondary)', fontSize: 12, marginTop: 2, whiteSpace: 'normal' }}>
                         {t(opt.descKey)}
                       </div>
                     </div>

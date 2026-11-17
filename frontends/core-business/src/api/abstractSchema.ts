@@ -14,6 +14,11 @@ export interface AbstractLanding {
   /** 是否纳入 schema（false = 对齐保留、不生效：投影/检索/DI 都不含它）。 */
   included: boolean;
   sourceName?: string | null;
+  /** provenance（landing-agent 线，**有值才带**）：谁定的（name|agent|manual）、
+   *  多确信（high|medium|low）、为什么（≤200 字）。缺键 = 未知。 */
+  origin?: string;
+  confidence?: string;
+  rationale?: string;
   stale: boolean;
   staleReason?: 'source_gone' | 'entity_gone' | 'attribute_gone' | 'relation_gone' | null;
 }
@@ -89,6 +94,10 @@ export interface AbstractMetric {
   name: string;
   displayName?: string;
   description?: string;
+  /** 计算公式（不是所有指标都有）；编辑面板暂不展示，但保存必须原样往返。 */
+  formula?: string;
+  /** 指标是否启用；显式 false = 停用（缺省 = 启用），保存时必须保留 false。 */
+  enabled?: boolean;
   aliases: string[];
   additivity: 'additive' | 'semi_additive' | 'non_additive' | 'unknown';
   landings: AbstractMetricLanding[];
@@ -198,6 +207,10 @@ function mapLanding(raw: any): AbstractLanding {
     entityName: raw?.entity_name || '',
     included: raw?.included !== false,
     sourceName: raw?.source_name ?? null,
+    // provenance：与语义槽同「有值才带」纪律（缺键不物化成空串）。
+    ...(raw?.origin ? { origin: raw.origin } : {}),
+    ...(raw?.confidence ? { confidence: raw.confidence } : {}),
+    ...(raw?.rationale ? { rationale: raw.rationale } : {}),
     stale: Boolean(raw?.stale),
     staleReason: raw?.stale_reason ?? null,
   };
@@ -275,6 +288,9 @@ function mapMetric(raw: any): AbstractMetric {
     name: raw?.name ?? '',
     displayName: raw?.display_name ?? undefined,
     description: raw?.description ?? undefined,
+    formula: raw?.formula ?? undefined,
+    // 注意：不能写成 `raw?.enabled || undefined`——false 是有效值（停用），会被吞掉。
+    enabled: raw?.enabled,
     aliases: Array.isArray(raw?.aliases) ? raw.aliases : [],
     additivity: ['additive', 'semi_additive', 'non_additive'].includes(additivity)
       ? additivity
@@ -389,6 +405,10 @@ export async function saveAbstractSchema(payload: {
             data_source_id: s.dataSourceId,
             entity_name: s.entityName,
             included: s.included,
+            // provenance：有值才带（缺键由后端从旧行继承，不会静默清掉 agent 标记）。
+            ...(s.origin ? { origin: s.origin } : {}),
+            ...(s.confidence ? { confidence: s.confidence } : {}),
+            ...(s.rationale ? { rationale: s.rationale } : {}),
           })),
           attributes: e.attributes.map((a) => ({
             name: a.name,
@@ -432,6 +452,9 @@ export async function saveAbstractSchema(payload: {
           name: m.name,
           display_name: m.displayName,
           description: m.description,
+          // 有值才带（undefined 不序列化出键）；`enabled:false` 必须照常写出。
+          ...(m.formula ? { formula: m.formula } : {}),
+          ...(typeof m.enabled === 'boolean' ? { enabled: m.enabled } : {}),
           aliases: m.aliases,
           additivity: m.additivity,
           landings: m.landings.map((l) => ({

@@ -126,6 +126,45 @@ function refToDraft(group: ExtractGroup, ref: ExtractionSkillRef): CatalogDraft 
   };
 }
 
+/**
+ * 只探测工具输出的最小声明：忽略空 writes，补一个临时写入口。
+ * 仅用于「还没填写入属性时先试跑」，不代表最终声明。
+ */
+export function draftToProbeRef(d: CatalogDraft): ExtractionSkillRef | null {
+  const tool = (d.tool || '').trim();
+  if (!TOOL_RE.test(tool)) return null;
+  const inputs: Record<string, string> = {};
+  for (const row of d.inputs) {
+    const param = (row.param || '').trim();
+    if (!KEY_RE.test(param) || param in inputs) return null;
+    if (row.source === 'name') inputs[param] = '$entity.name';
+    else if (row.source === 'type') inputs[param] = '$entity.type';
+    else if (row.source === 'attr') {
+      const attr = (row.attr || '').trim();
+      if (!KEY_RE.test(attr)) return null;
+      inputs[param] = `$attr.${attr}`;
+    } else {
+      const literal = row.literal ?? '';
+      if (literal.startsWith('$')) return null;
+      inputs[param] = literal;
+    }
+  }
+  const ref: ExtractionSkillRef = {
+    skill: `${CATALOG_PREFIX}${tool}`,
+    inputs,
+    writes: { probe: '$.data' },
+    on_error: d.onError,
+  };
+  if (d.description.trim()) ref.description = d.description.trim();
+  return ref;
+}
+
+/** 把 AI 返回的声明应用到现有草稿，保留草稿 key（避免 React 行重挂载）。 */
+export function applyRefToDraft(d: CatalogDraft, ref: ExtractionSkillRef): CatalogDraft {
+  const next = refToDraft(d.group, ref);
+  return { ...next, key: d.key };
+}
+
 /** 把一份 extraction_skills 拆成「内置（只读，原样保留）」与「catalog: 草稿」。 */
 export function splitSkills(cfg?: ExtractionSkillsConfig | null): {
   builtin: { refine: ExtractionSkillRef[]; constrain: ExtractionSkillRef[] };

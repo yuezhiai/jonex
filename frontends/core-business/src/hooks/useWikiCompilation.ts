@@ -11,19 +11,29 @@ export function useWikiCompilation(kbId: string, enabled: boolean) {
   const mutating = useRef(false);
   const currentKb = useRef(kbId);
   currentKb.current = kbId;
+  // 上一份状态的签名：轮询每 5 秒都会拿到一个新对象，但状态没变时不该 setState——
+  // 下游（DocumentLibrary）依赖 state 引用变化来重取文档列表，无脑换对象会让
+  // 列表每 5 秒跟着刷一次（loading / 请求噪音，见 2026-11-12 真机反馈）。
+  const lastSignature = useRef('');
   const refresh = useCallback(async () => {
     if (mutating.current) return;
     const request = ++sequence.current;
     try {
       const next = await getWikiCompilationState(kbId);
       if (currentKb.current === kbId && request === sequence.current) {
-        setState(next); setError(false);
+        const signature = JSON.stringify(next);
+        if (signature !== lastSignature.current) {
+          lastSignature.current = signature;
+          setState(next);
+        }
+        setError(false);
       }
     } catch {
       if (currentKb.current === kbId && request === sequence.current) setError(true);
     }
   }, [kbId]);
   useEffect(() => {
+    lastSignature.current = '';
     setState(null); setError(false); setLoading(false);
     if (!enabled || !kbId) return;
     let alive = true;

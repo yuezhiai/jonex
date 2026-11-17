@@ -105,10 +105,10 @@ export default function DataSourceEditModal({ editingDs, onClose, onSaved }: Dat
 
   return (
     <Modal
-      wrapClassName="yx-domain-space-modal"
+      wrapClassName="yx-modal yx-domain-space-modal"
       title={
         <span>
-          <EditOutlined style={{ color: '#3b82f6', marginRight: 8 }} />
+          <EditOutlined style={{ color: 'var(--yx-accent)', marginRight: 8 }} />
           {t('domainKnowledge.editDataSource')}
         </span>
       }

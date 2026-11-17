@@ -31,7 +31,7 @@ const renderTabLabel = (item: TabConfig) => (
   <Space size={6}>
     {item.icon}
     <span>{item.label}</span>
-    {item.count > 0 && <span style={{ color: '#94a3b8', fontSize: 12 }}>{item.count}</span>}
+    {item.count > 0 && <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>{item.count}</span>}
   </Space>
 );
 
@@ -252,7 +252,7 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
               <>
                 <div>{statsError}</div>
                 {/* 与知识库页整页错误态同一措辞：404 同时覆盖「不存在」与「无权访问」 */}
-                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
+                <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginTop: 4 }}>
                   {t('domainKnowledge.loadErrorHint')}
                 </div>
               </>

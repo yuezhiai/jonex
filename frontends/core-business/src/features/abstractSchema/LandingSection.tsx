@@ -14,7 +14,7 @@ import { BulbOutlined, PlusOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 
-import type { DomainCommand, EntityType } from '../ontologyCanvas/domain/index.js';
+import type { DomainCommand, EntityLanding, EntityType } from '../ontologyCanvas/domain/index.js';
 import type { Selection } from '../ontologyCanvas/store/editorStore.js';
 import type { ServerSchema } from '../ontologyCanvas/adapters.js';
 import { getCompiledSchema } from '../ontologyCanvas/multiSource/load.js';
@@ -23,13 +23,24 @@ import { loadSynonymIndex } from '../ontologyCanvas/components/synonymIndexCache
 import {
   suggestEntityLandings, type CandidateEntity, type EntitySuggestion, type EntitySuggestionGroup,
 } from '../ontologyCanvas/components/suggestEntityLandings';
-import { canOpenSourceCanvas, sourceCanvasPath } from './landings.js';
+import { canOpenSourceCanvas, excludeLanding, sourceCanvasPath } from './landings.js';
 import { listDataSources } from '@/api/dataSource';
 import { compiledSchemaSources } from '@/utils/dataSourceDisplay';
 
 /** 命中档 → i18n key（`abstractEditor.hitExact` / `hitDisplay` / …）。 */
 const hitLabelKey = (hit: HitKind): string =>
   `abstractEditor.hit${hit[0]!.toUpperCase()}${hit.slice(1)}`;
+
+/** 落点置信度 → 颜色 + i18n key。只认 high/medium/low；
+ *  缺键（旧落点、名字命中的落点）与未知值一律返回 null —— 不渲染、不占位。 */
+const confidenceMeta = (confidence: string | undefined): { color: string; labelKey: string } | null => {
+  switch (confidence) {
+    case 'high': return { color: 'green', labelKey: 'confidenceHigh' };
+    case 'medium': return { color: 'blue', labelKey: 'confidenceMedium' };
+    case 'low': return { color: 'orange', labelKey: 'confidenceLow' };
+    default: return null;
+  }
+};
 
 interface Props {
   kbId: string;
@@ -172,10 +183,23 @@ export function LandingSection({ kbId, entity, entityNames, execute, readOnly }:
     ));
   };
 
-  const removeLanding = (dataSourceId: string, entityName: string) => {
-    updateLandings((landings ?? []).filter(
-      (l) => !(l.dataSourceId === dataSourceId && l.entityName === entityName),
-    ));
+  // 「排除」不是删除：行保留、只置 included=false —— 删掉的行下次重新生成/对齐
+  // 会再被提议一遍（见 landings.ts `excludeLanding` 的说明）。
+  const excludeRow = (dataSourceId: string, entityName: string) => {
+    updateLandings(excludeLanding(landings ?? [], dataSourceId, entityName));
+  };
+
+  // 「这一行为什么是 AI 连的、敢不敢信」——置信度只做展示，不参与 included 判定；
+  // 依据（rationale）进 Tooltip，避免长文本把行撑开。没有 confidence → 什么都不渲染。
+  const renderConfidence = (l: EntityLanding): ReactNode => {
+    const meta = confidenceMeta(l.confidence);
+    if (meta === null) return null;
+    const tag = (
+      <Tag color={meta.color} className={`ae-landing-confidence is-${l.confidence}`}>
+        {t(`abstractSchema.landingAgent.${meta.labelKey}`)}
+      </Tag>
+    );
+    return l.rationale ? <Tooltip title={l.rationale}>{tag}</Tooltip> : tag;
   };
 
   const openPicker = async () => {
@@ -253,6 +277,7 @@ export function LandingSection({ kbId, entity, entityNames, execute, readOnly }:
           />
           <Tag className="ae-landing-src">{l.sourceName || l.dataSourceId}</Tag>
           <code>{l.entityName}</code>
+          {renderConfidence(l)}
           {l.stale ? (
             <Tooltip title={t(`abstractEditor.stale.${l.staleReason ?? 'entity_gone'}`)}>
               <Tag color="warning">{t('abstractEditor.staleTag')}</Tag>
@@ -265,8 +290,11 @@ export function LandingSection({ kbId, entity, entityNames, execute, readOnly }:
               {t('abstractEditor.openSourceCanvas')}
             </Button>
           ) : null}
-          <Button size="small" type="text" danger disabled={readOnly} onClick={() => removeLanding(l.dataSourceId, l.entityName)}>
-            {t('common.delete')}
+          {/* 已排除的行再点一次是无操作（且会把文档无谓标脏）→ 直接禁用；
+              重新纳入走左侧勾选框。 */}
+          <Button size="small" type="text" danger disabled={readOnly || !l.included}
+            onClick={() => excludeRow(l.dataSourceId, l.entityName)}>
+            {t('abstractEditor.excludeLanding')}
           </Button>
         </div>
       ))}

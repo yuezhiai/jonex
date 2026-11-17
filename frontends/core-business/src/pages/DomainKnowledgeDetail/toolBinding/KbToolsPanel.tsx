@@ -307,6 +307,7 @@ export default function KbToolsPanel({ kbId, canWrite }: Props) {
 
       <KbToolFormModal
         open={formOpen}
+        kbId={kbId}
         tool={editing}
         onClose={() => {
           setFormOpen(false);

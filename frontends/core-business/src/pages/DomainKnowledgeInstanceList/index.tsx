@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Input, Table, Breadcrumb, message } from 'antd';
+import { Input, Table, Breadcrumb, message, Pagination } from 'antd';
 import { SearchOutlined, BlockOutlined } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { PageContent, PageHeader } from '@jonex/shared-lib';
@@ -68,19 +68,19 @@ export default function DomainKnowledgeInstanceList() {
   const breadcrumbItems = [
     {
       title: (
-        <a onClick={() => navigate('/domain-knowledge')} style={{ color: '#64748b' }}>
+        <a onClick={() => navigate('/domain-knowledge')} style={{ color: 'var(--yx-text-secondary)' }}>
           {t('navigation.domainKnowledge')}
         </a>
       ),
     },
     {
       title: (
-        <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: '#64748b' }}>
+        <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: 'var(--yx-text-secondary)' }}>
           {t('domainKnowledge.detail')}
         </a>
       ),
     },
-    { title: <span style={{ color: '#0b2b5c', fontWeight: 500 }}>{t('common.instance', { name: decodedType })}</span> },
+    { title: <span style={{ color: 'var(--yx-brand-dark)', fontWeight: 500 }}>{t('common.instance', { name: decodedType })}</span> },
   ];
 
   return (
@@ -93,8 +93,8 @@ export default function DomainKnowledgeInstanceList() {
         backTo={() => navigate(`/domain-knowledge/${id}`)}
         title={`${decodedType} - ${t('domainKnowledge.ontologyInstances')}`}
         extra={
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>
-            <span style={{ fontSize: 20, fontWeight: 700, color: '#3b82f6', marginRight: 6 }}>
+          <span style={{ fontSize: 12, color: 'var(--yx-text-muted)' }}>
+            <span style={{ fontSize: 20, fontWeight: 700, color: 'var(--yx-accent)', marginRight: 6 }}>
               {total.toLocaleString()}
             </span>
             {t('domainKnowledge.instanceTotalCount')}
@@ -102,14 +102,14 @@ export default function DomainKnowledgeInstanceList() {
         }
         style={{ marginBottom: 4 }}
       />
-      <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 20 }}>{t('domainKnowledge.instanceListDesc')}</div>
+      <div style={{ fontSize: 13, color: 'var(--yx-text-muted)', marginBottom: 20 }}>{t('domainKnowledge.instanceListDesc')}</div>
 
       <PageContent showCard={false}>
         <div
           style={{
             background: '#fff',
             borderRadius: 10,
-            border: '1px solid #eef2f6',
+            border: '1px solid var(--yx-border-light)',
             padding: 24,
             boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
           }}
@@ -120,13 +120,13 @@ export default function DomainKnowledgeInstanceList() {
                 margin: 0,
                 fontSize: 15,
                 fontWeight: 600,
-                color: '#0b2b5c',
+                color: 'var(--yx-brand-dark)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
               }}
             >
-              <BlockOutlined style={{ color: '#3b82f6' }} /> {t('domainKnowledge.instanceList')}
+              <BlockOutlined style={{ color: 'var(--yx-accent)' }} /> {t('domainKnowledge.instanceList')}
             </h3>
             <Input
               prefix={<SearchOutlined />}
@@ -141,7 +141,7 @@ export default function DomainKnowledgeInstanceList() {
           </div>
 
           {error && instances.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 48, color: '#94a3b8' }}>{error}</div>
+            <div style={{ textAlign: 'center', padding: 48, color: 'var(--yx-text-muted)' }}>{error}</div>
           ) : (
             <>
               <Table
@@ -151,7 +151,7 @@ export default function DomainKnowledgeInstanceList() {
                     dataIndex: 'name',
                     key: 'name',
                     width: 220,
-                    render: (v: string) => <strong style={{ color: '#0b2b5c' }}>{v}</strong>,
+                    render: (v: string) => <strong style={{ color: 'var(--yx-brand-dark)' }}>{v}</strong>,
                   },
                   {
                     title: t('domainKnowledge.entityType'),
@@ -163,8 +163,8 @@ export default function DomainKnowledgeInstanceList() {
                         style={{
                           padding: '2px 8px',
                           borderRadius: 6,
-                          background: '#eff6ff',
-                          color: '#3b82f6',
+                          background: 'var(--yx-info-bg)',
+                          color: 'var(--yx-accent)',
                           fontSize: 12,
                           fontWeight: 500,
                         }}
@@ -187,7 +187,7 @@ export default function DomainKnowledgeInstanceList() {
                     title: t('common.description'),
                     dataIndex: 'description',
                     key: 'description',
-                    render: (v: string) => <span style={{ color: '#64748b', fontSize: 13 }}>{v || '—'}</span>,
+                    render: (v: string) => <span style={{ color: 'var(--yx-text-secondary)', fontSize: 13 }}>{v || '—'}</span>,
                   },
                   {
                     title: t('domainKnowledge.attributeCount'),
@@ -208,88 +208,20 @@ export default function DomainKnowledgeInstanceList() {
                 pagination={false}
                 size="middle"
                 loading={loading}
-                locale={{ emptyText: <span style={{ color: '#94a3b8' }}>{t('domainKnowledge.emptyInstances')}</span> }}
+                locale={{ emptyText: t('domainKnowledge.emptyInstances') }}
               />
 
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'flex-end',
-                  gap: 6,
-                  padding: '12px 0 0',
-                  borderTop: '1px solid #eef2f6',
-                  marginTop: 12,
-                }}
-              >
-                <span
-                  className={`yx-page-btn${page <= 1 ? ' disabled' : ''}`}
-                  onClick={() => page > 1 && setPage((p) => p - 1)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: 8,
-                    border: '1px solid #e2e8f0',
-                    cursor: page <= 1 ? 'not-allowed' : 'pointer',
-                    color: '#94a3b8',
-                    fontSize: 12,
-                    opacity: page <= 1 ? 0.4 : 1,
-                  }}
-                >
-                  {'<'}
-                </span>
-                {Array.from({ length: Math.min(totalPages, 5) }, (_, i) => {
-                  const n = i + 1;
-                  return (
-                    <span
-                      key={n}
-                      className={`yx-page-btn${n === page ? ' active' : ''}`}
-                      onClick={() => setPage(n)}
-                      style={{
-                        width: 34,
-                        height: 34,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        borderRadius: 8,
-                        background: n === page ? '#3b82f6' : 'transparent',
-                        color: n === page ? '#fff' : '#64748b',
-                        fontWeight: n === page ? 600 : 400,
-                        fontSize: 13,
-                        cursor: 'pointer',
-                        border: n === page ? 'none' : '1px solid #e2e8f0',
-                      }}
-                    >
-                      {n}
-                    </span>
-                  );
-                })}
-                <span
-                  className={`yx-page-btn${page >= totalPages ? ' disabled' : ''}`}
-                  onClick={() => page < totalPages && setPage((p) => p + 1)}
-                  style={{
-                    width: 34,
-                    height: 34,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: 8,
-                    border: '1px solid #e2e8f0',
-                    cursor: page >= totalPages ? 'not-allowed' : 'pointer',
-                    color: '#94a3b8',
-                    fontSize: 12,
-                    opacity: page >= totalPages ? 0.4 : 1,
-                  }}
-                >
-                  {'>'}
-                </span>
-                <span style={{ fontSize: 13, color: '#94a3b8', marginLeft: 12 }}>
-                  {t('domainKnowledge.pagination', { total: total.toLocaleString(), page, pages: totalPages })}
-                </span>
-              </div>
+              <Pagination
+                current={page}
+                pageSize={PAGE_SIZE}
+                total={total}
+                showSizeChanger={false}
+                showTotal={(count) =>
+                  t('domainKnowledge.pagination', { total: count.toLocaleString(), page, pages: totalPages })
+                }
+                onChange={setPage}
+                style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}
+              />
             </>
           )}
         </div>

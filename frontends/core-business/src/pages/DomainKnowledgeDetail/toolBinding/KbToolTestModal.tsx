@@ -123,7 +123,7 @@ export default function KbToolTestModal({ open, tool, onClose }: Props) {
               </Typography.Text>
               <pre
                 style={{
-                  background: '#f8fafc',
+                  background: 'var(--yx-bg-subtle)',
                   padding: 12,
                   borderRadius: 8,
                   fontSize: 12,

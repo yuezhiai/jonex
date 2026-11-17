@@ -24,7 +24,7 @@ interface Props {
 const sectionCardStyle: React.CSSProperties = {
   background: '#fff',
   borderRadius: 14,
-  border: '1px solid #eef2f6',
+  border: '1px solid var(--yx-border-light)',
   padding: 24,
   boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
 };

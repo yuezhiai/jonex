@@ -17,12 +17,21 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, ExperimentOutlined, PlusOutlined } from '@ant-design/icons';
+import { DeleteOutlined, ExperimentOutlined, PlusOutlined, RobotOutlined } from '@ant-design/icons';
 import type { BindableTool, ExtractionSkillRef } from '@/types/domainKnowledge';
 import { listBindableTools } from '@/api/ontologyToolBinding';
-import { previewExtractTool, type ExtractToolPreviewResult } from '@/api/extractTool';
+import {
+  previewExtractTool,
+  proposeExtractToolDeclaration,
+  refineExtractToolDeclaration,
+  type ExtractToolAiProposal,
+  type ExtractToolAiPreviewSummary,
+  type ExtractToolPreviewResult,
+} from '@/api/extractTool';
 import {
   CONTRACT_FIELDS,
+  applyRefToDraft,
+  draftToProbeRef,
   type CatalogDraft,
   type DraftError,
   type ExtractGroup,
@@ -53,6 +62,37 @@ interface PreviewState {
   result?: ExtractToolPreviewResult;
   error?: string;
   entity?: string;
+}
+
+interface AiState {
+  loading: boolean;
+  error?: string;
+  warnings: string[];
+  proposal?: ExtractToolAiProposal;
+}
+
+/** 只把输出路径 / 类型 / 截断样例发给 AI，不发送完整输出。 */
+function summarizeOutput(value: unknown, limit = 40): { path: string; type: string; sample: string }[] {
+  const out: { path: string; type: string; sample: string }[] = [];
+  const walk = (node: unknown, path: string, depth: number) => {
+    if (out.length >= limit || depth > 3) return;
+    if (Array.isArray(node)) {
+      node.slice(0, 5).forEach((item, index) => walk(item, `${path}[${index}]`, depth + 1));
+      return;
+    }
+    if (node && typeof node === 'object') {
+      Object.entries(node as Record<string, unknown>).slice(0, 20)
+        .forEach(([key, child]) => walk(child, `${path}.${key}`, depth + 1));
+      return;
+    }
+    out.push({
+      path,
+      type: node === null ? 'null' : typeof node,
+      sample: String(node).slice(0, 80),
+    });
+  };
+  walk(value, '$', 0);
+  return out;
 }
 
 function pretty(value: unknown): string {
@@ -87,6 +127,7 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
   const [toolsError, setToolsError] = useState(false);
   const [reload, setReload] = useState(0);
   const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
+  const [aiStates, setAiStates] = useState<Record<string, AiState>>({});
 
   useEffect(() => {
     let alive = true;
@@ -136,6 +177,12 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
       delete next[key];
       return next;
     });
+    setAiStates((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
   };
 
   const changeTool = (d: CatalogDraft, toolName: string) => {
@@ -157,30 +204,192 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
   const errorText = (e: DraftError) => t(`compile.extractTool.err.${e.code}`, e.params || {});
 
   const runPreview = async (d: CatalogDraft, entity?: string) => {
-    if (!entityType) return;
+    if (!entityType) return null;
     const { ref, errors } = draftToRef(d);
-    if (!ref) {
+    // 还没填写入属性时允许「只探测输出」：用一个临时写入口过校验，
+    // 拿到工具输出后再让 AI 根据输出路径生成 writes。
+    let declaration = ref;
+    let probeOnly = false;
+    if (!ref && d.group === 'refine' && d.tool) {
+      declaration = draftToProbeRef(d);
+      probeOnly = true;
+    }
+    if (!declaration) {
       setPreviews((prev) => ({ ...prev, [d.key]: { loading: false, error: errors.map(errorText).join('；') } }));
-      return;
+      return null;
     }
     setPreviews((prev) => ({ ...prev, [d.key]: { ...prev[d.key], loading: true, error: undefined } }));
     try {
       const result = await previewExtractTool(kbId, {
         entityType,
         group: d.group,
-        declaration: ref,
+        declaration,
         canonicalName: entity,
+        probeOnly,
       });
       setPreviews((prev) => ({
         ...prev,
         [d.key]: { loading: false, result, entity: result.entity?.canonical_name || entity },
       }));
+      return result;
     } catch (err) {
       setPreviews((prev) => ({
         ...prev,
         [d.key]: {
           loading: false,
           error: (err as { message?: string })?.message || t('compile.extractTool.preview.failed'),
+        },
+      }));
+      return null;
+    }
+  };
+
+  const applyAi = (d: CatalogDraft, proposal: ExtractToolAiProposal) => {
+    if (!proposal.declaration) return;
+    const applied = applyRefToDraft(d, proposal.declaration);
+    onChange(value.map((item) => (item.key === d.key ? applied : item)));
+    setPreviews((prev) => {
+      if (!prev[d.key]) return prev;
+      const next = { ...prev };
+      delete next[d.key];
+      return next;
+    });
+  };
+
+  const runAi = async (d: CatalogDraft) => {
+    const tool = toolByName.get(d.tool);
+    if (!tool) {
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: { loading: false, warnings: [], error: t('compile.extractTool.ai.needTool') },
+      }));
+      return;
+    }
+    if (!tool.readOnly) {
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: { loading: false, warnings: [], error: t('compile.extractTool.ai.notReadOnly') },
+      }));
+      return;
+    }
+    if (d.group === 'refine' && !attrKeys.length) {
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: { loading: false, warnings: [], error: t('compile.extractTool.ai.needAttributes') },
+      }));
+      return;
+    }
+    setAiStates((prev) => ({
+      ...prev,
+      [d.key]: { ...prev[d.key], loading: true, error: undefined, warnings: [] },
+    }));
+    const outputProps = (tool.outputSchema?.properties || {}) as Record<string, unknown>;
+    if (d.group === 'refine' && !Object.keys(outputProps).length) {
+      // 没有出参 schema：AI 无法凭空知道路径。自动探测一次工具输出，
+      // 拿到 output 后再按路径生成 writes，而不是要求用户手工填完再点。
+      if (!entityType) {
+        setAiStates((prev) => ({
+          ...prev,
+          [d.key]: { loading: false, warnings: [], error: t('compile.extractTool.preview.needSaved') },
+        }));
+        return;
+      }
+      const existing = previews[d.key]?.result;
+      const result = existing || await runPreview(d);
+      if (result && (result.output !== undefined || result.status === 'missing_inputs')) {
+        await runAiFix(d, result);
+        return;
+      }
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: { loading: false, warnings: [], error: t('compile.extractTool.ai.noOutput') },
+      }));
+      return;
+    }
+    // AI 生成本来就要补空行/空属性；当前草稿不完整不能挡住请求。
+    // 只有当前草稿本身合法时才把它作为上下文，否则让后端从空声明开始。
+    const { ref } = draftToRef(d);
+    setAiStates((prev) => ({
+      ...prev,
+      [d.key]: { ...prev[d.key], loading: true, error: undefined, warnings: [] },
+    }));
+    try {
+      const res = await proposeExtractToolDeclaration(kbId, {
+        entityType,
+        group: d.group,
+        toolSource: tool.source,
+        toolName: d.tool,
+        attributes: attrKeys,
+        currentDeclaration: ref,
+      });
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: {
+          loading: false,
+          error: res.error || undefined,
+          warnings: res.warnings,
+          proposal: res,
+        },
+      }));
+      if (res.status === 'ready') applyAi(d, res);
+    } catch (err) {
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: {
+          loading: false,
+          warnings: [],
+          error: (err as { message?: string })?.message || t('compile.extractTool.ai.failed'),
+        },
+      }));
+    }
+  };
+
+  const runAiFix = async (d: CatalogDraft, result: ExtractToolPreviewResult) => {
+    const proposal = aiStates[d.key]?.proposal;
+    const tool = toolByName.get(d.tool);
+    if (!tool) return;
+    // 当前草稿可能仍是默认空写入；AI 修正正是要补它，不能因此提前返回
+    const { ref } = draftToRef(d);
+    const preview: ExtractToolAiPreviewSummary = {
+      status: result.status,
+      unresolved_writes: result.unresolved_writes || [],
+      writes: result.writes || {},
+      output_paths: summarizeOutput(result.output),
+    };
+    setAiStates((prev) => ({
+      ...prev,
+      [d.key]: { ...prev[d.key], loading: true, error: undefined, warnings: [] },
+    }));
+    try {
+      const res = await refineExtractToolDeclaration(kbId, {
+        entityType,
+        group: d.group,
+        toolSource: tool.source,
+        toolName: d.tool,
+        attributes: attrKeys,
+        currentDeclaration: ref,
+        assistSessionId: proposal?.assistSessionId || '',
+        round: proposal?.round || 1,
+        contextHash: proposal?.contextHash ?? null,
+        preview,
+      });
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: {
+          loading: false,
+          error: res.error || undefined,
+          warnings: res.warnings,
+          proposal: res,
+        },
+      }));
+      if (res.status === 'ready') applyAi(d, res);
+    } catch (err) {
+      setAiStates((prev) => ({
+        ...prev,
+        [d.key]: {
+          loading: false,
+          warnings: [],
+          error: (err as { message?: string })?.message || t('compile.extractTool.ai.failed'),
         },
       }));
     }
@@ -429,6 +638,16 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
                   <Typography.Text type="secondary">—</Typography.Text>
                 )}
                 {statusTag(r.status)}
+                {(r.output !== undefined || r.status === 'missing_inputs') && (
+                  <Button
+                    size="small"
+                    icon={<RobotOutlined />}
+                    loading={aiStates[d.key]?.loading}
+                    onClick={() => void runAiFix(d, r)}
+                  >
+                    {t('compile.extractTool.ai.fix')}
+                  </Button>
+                )}
                 {r.tool && (
                   <Tag color={r.tool.source === 'kb' ? 'cyan' : 'geekblue'}>
                     {r.tool.source === 'kb' ? t('toolBinding.sourceKb') : t('toolBinding.sourcePlatform')} · {r.tool.tool_name}
@@ -524,7 +743,7 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
   };
 
   return (
-    <div style={{ marginTop: 16, padding: '12px 14px', background: '#f8fafc', borderRadius: 8 }}>
+    <div style={{ marginTop: 16, padding: '12px 14px', background: 'var(--yx-bg-subtle)', borderRadius: 8 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
         <Typography.Text strong>{t('compile.extractTool.decl.title')}</Typography.Text>
         <Space size={6}>
@@ -607,23 +826,46 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
                 optionFilterProp="value"
                 onChange={(toolName) => changeTool(d, toolName)}
               />
-              <Tooltip
-                title={
-                  !entityType
-                    ? t('compile.extractTool.preview.needSaved')
-                    : t('compile.extractTool.preview.tooltip')
-                }
-              >
-                <Button
-                  size="small"
-                  icon={<ExperimentOutlined />}
-                  disabled={!canPreview}
-                  loading={previews[d.key]?.loading}
-                  onClick={() => void runPreview(d, previews[d.key]?.entity)}
+              <Space size={6}>
+                <Tooltip
+                  title={
+                    !entityType
+                      ? t('compile.extractTool.preview.needSaved')
+                      : t('compile.extractTool.preview.tooltip')
+                  }
                 >
-                  {t('compile.extractTool.preview.button')}
-                </Button>
-              </Tooltip>
+                  <Button
+                    size="small"
+                    icon={<ExperimentOutlined />}
+                    disabled={!canPreview}
+                    loading={previews[d.key]?.loading}
+                    onClick={() => void runPreview(d, previews[d.key]?.entity)}
+                  >
+                    {t('compile.extractTool.preview.button')}
+                  </Button>
+                </Tooltip>
+                <Tooltip title={t('compile.extractTool.ai.generateHint')}>
+                  <Button
+                    size="small"
+                    icon={<RobotOutlined />}
+                    disabled={!d.tool || !toolByName.get(d.tool)?.readOnly}
+                    loading={aiStates[d.key]?.loading}
+                    onClick={() => {
+                      const previewResult = previews[d.key]?.result;
+                      if (previewResult && (
+                        previewResult.output !== undefined
+                        || previewResult.status === 'missing_inputs'
+                      )) {
+                        void runAiFix(d, previewResult);
+                      } else {
+                        void runAi(d);
+                      }
+                    }}
+                  >
+                    {t('compile.extractTool.ai.generate')}
+                  </Button>
+                </Tooltip>
+              </Space>
               <Popconfirm
                 title={t('compile.extractTool.decl.removeConfirm')}
                 onConfirm={() => onChange(value.filter((x) => x.key !== d.key))}
@@ -638,6 +880,29 @@ export default function ExtractToolDeclarations({ kbId, entityType, attributes, 
               placeholder={t('compile.extractTool.decl.descPlaceholder')}
               onChange={(e) => update(d.key, { description: e.target.value })}
             />
+            {aiStates[d.key]?.error && (
+              <Alert
+                type="error"
+                showIcon
+                style={{ marginTop: 8 }}
+                title={aiStates[d.key].error}
+              />
+            )}
+            {!!aiStates[d.key]?.warnings?.length && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginTop: 8 }}
+                title={<ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                  {aiStates[d.key].warnings.map((w) => <li key={w}>{w}</li>)}
+                </ul>}
+              />
+            )}
+            {aiStates[d.key]?.proposal?.status === 'ready' && (
+              <div style={{ marginTop: 6 }}>
+                <Tag color="green">{t('compile.extractTool.ai.ready')}</Tag>
+              </div>
+            )}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 8 }}>
               {renderInputs(d)}
               {d.group === 'refine' ? renderWrites(d) : renderReject(d)}

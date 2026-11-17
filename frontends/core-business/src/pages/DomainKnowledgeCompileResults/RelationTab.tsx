@@ -242,8 +242,8 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
           style={{
             padding: '2px 8px',
             borderRadius: 6,
-            background: '#eff6ff',
-            color: '#3b82f6',
+            background: 'var(--yx-info-bg)',
+            color: 'var(--yx-accent)',
             fontSize: 12,
             fontWeight: 500,
           }}
@@ -259,7 +259,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
       dataIndex: 'relation_type',
       key: 'relation_type',
       width: 140,
-      render: (v: string) => <strong style={{ color: '#0b2b5c' }}>{relationTypeDisplayMap[v] || v}</strong>,
+      render: (v: string) => <strong style={{ color: 'var(--yx-brand-dark)' }}>{relationTypeDisplayMap[v] || v}</strong>,
     },
     {
       title: t('compile.relation.targetObject'),
@@ -271,7 +271,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
           style={{
             padding: '2px 8px',
             borderRadius: 6,
-            background: '#ecfdf5',
+            background: 'var(--yx-success-bg)',
             color: '#059669',
             fontSize: 12,
             fontWeight: 500,
@@ -335,9 +335,9 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
           flexShrink: 0,
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
-          <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 400, marginLeft: 8 }}>
+          <span style={{ fontSize: 13, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
             {t('compile.totalInstances', { count: total })}
           </span>
         </div>
@@ -366,7 +366,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         </div>
       </div>
 
-      <div className="yx-fill-table" ref={tableHostRef}>
+      <div className="yx-table-fill" ref={tableHostRef}>
         <Table
           rowKey={(r) => `${r.source_type}|${r.source}|${r.relation_type}|${r.target_type}|${r.target}`}
           columns={columns}
@@ -386,7 +386,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
           size="middle"
           style={{ padding: '0 16px' }}
           scroll={{ y: tableBodyHeight }}
-          locale={{ emptyText: <span style={{ color: '#94a3b8' }}>{t('compile.emptyRelationInstances')}</span> }}
+          locale={{ emptyText: t('compile.emptyRelationInstances') }}
         />
       </div>
 

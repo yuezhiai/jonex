@@ -61,7 +61,7 @@ export default function SpaceFormModal({ open, editing, onClose, onSaved }: Spac
     <Modal
       title={
         <span>
-          <PlusCircleOutlined style={{ color: '#3b82f6', marginRight: 8 }} />
+          <PlusCircleOutlined style={{ color: 'var(--yx-accent)', marginRight: 8 }} />
           {editing ? t('domainSpace.edit') : t('domainSpace.create')}
         </span>
       }

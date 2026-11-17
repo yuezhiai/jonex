@@ -24,10 +24,10 @@ export default function DomainKnowledgeRelationDetail() {
         <PageContent showCard={false}>
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 48, textAlign: 'center' as const } }}
           >
-            <div style={{ fontSize: 16, color: '#94a3b8' }}>{t('domainKnowledge.relationNotFound')}</div>
+            <div style={{ fontSize: 16, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.relationNotFound')}</div>
             <Button type="primary" style={{ marginTop: 16 }} onClick={() => navigate(`/domain-knowledge/${id}/graph`)}>
               {t('domainKnowledge.backToGraph')}
             </Button>
@@ -43,7 +43,7 @@ export default function DomainKnowledgeRelationDetail() {
       dataIndex: 'key',
       key: 'key',
       width: 160,
-      render: (v: string) => <span style={{ fontWeight: 600, color: '#0b2b5c', fontSize: 13 }}>{v}</span>,
+      render: (v: string) => <span style={{ fontWeight: 600, color: 'var(--yx-brand-dark)', fontSize: 13 }}>{v}</span>,
     },
     {
       title: t('domainKnowledge.propertyValue'),
@@ -61,26 +61,26 @@ export default function DomainKnowledgeRelationDetail() {
           items={[
             {
               title: (
-                <a onClick={() => navigate('/domain-knowledge')} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate('/domain-knowledge')} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('navigation.domainKnowledge')}
                 </a>
               ),
             },
             {
               title: (
-                <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate(`/domain-knowledge/${id}`)} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('domainKnowledge.detail')}
                 </a>
               ),
             },
             {
               title: (
-                <a onClick={() => navigate(`/domain-knowledge/${id}/graph`)} style={{ color: '#64748b' }}>
+                <a onClick={() => navigate(`/domain-knowledge/${id}/graph`)} style={{ color: 'var(--yx-text-secondary)' }}>
                   {t('domainKnowledge.graphBreadcrumb')}
                 </a>
               ),
             },
-            { title: <span style={{ color: '#0b2b5c', fontWeight: 500 }}>{t('route.relationDetail')}</span> },
+            { title: <span style={{ color: 'var(--yx-brand-dark)', fontWeight: 500 }}>{t('route.relationDetail')}</span> },
           ]}
         />
       </div>
@@ -103,7 +103,7 @@ export default function DomainKnowledgeRelationDetail() {
           className="yx-card"
           style={{
             borderRadius: 10,
-            border: '1px solid #eef2f6',
+            border: '1px solid var(--yx-border-light)',
             boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
             marginBottom: 20,
           }}
@@ -111,7 +111,7 @@ export default function DomainKnowledgeRelationDetail() {
           title={
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <LinkOutlined style={{ color: '#10b981' }} />
-              <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+              <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                 {t('domainKnowledge.relationOverview')}
               </span>
             </div>
@@ -125,18 +125,18 @@ export default function DomainKnowledgeRelationDetail() {
                 gap: 8,
                 padding: '10px 18px',
                 borderRadius: 10,
-                background: '#eff6ff',
+                background: 'var(--yx-info-bg)',
                 border: '1px solid #dbeafe',
               }}
             >
-              <NodeIndexOutlined style={{ color: '#3b82f6', fontSize: 16 }} />
+              <NodeIndexOutlined style={{ color: 'var(--yx-accent)', fontSize: 16 }} />
               <div>
-                <div style={{ fontSize: 11, color: '#94a3b8' }}>{t('domainKnowledge.sourceEntity')}</div>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>{relation.sourceEntity}</div>
+                <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.sourceEntity')}</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{relation.sourceEntity}</div>
               </div>
             </div>
 
-            <div style={{ fontSize: 20, color: '#94a3b8', fontWeight: 700 }}>
+            <div style={{ fontSize: 20, color: 'var(--yx-text-muted)', fontWeight: 700 }}>
               <ArrowLeftOutlined style={{ transform: 'rotate(180deg)' }} />
             </div>
 
@@ -147,14 +147,14 @@ export default function DomainKnowledgeRelationDetail() {
                 gap: 8,
                 padding: '10px 18px',
                 borderRadius: 10,
-                background: '#ecfdf5',
+                background: 'var(--yx-success-bg)',
                 border: '1px solid #bbf7d0',
               }}
             >
               <NodeIndexOutlined style={{ color: '#10b981', fontSize: 16 }} />
               <div>
-                <div style={{ fontSize: 11, color: '#94a3b8' }}>{t('domainKnowledge.targetEntity')}</div>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#0b2b5c' }}>{relation.targetEntity}</div>
+                <div style={{ fontSize: 11, color: 'var(--yx-text-muted)' }}>{t('domainKnowledge.targetEntity')}</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>{relation.targetEntity}</div>
               </div>
             </div>
           </div>
@@ -165,12 +165,12 @@ export default function DomainKnowledgeRelationDetail() {
           {/* Properties */}
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 24 } }}
             title={
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <FileTextOutlined style={{ color: '#3b82f6' }} />
-                <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+                <FileTextOutlined style={{ color: 'var(--yx-accent)' }} />
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                   {t('domainKnowledge.relationProperties')}
                 </span>
               </div>
@@ -189,12 +189,12 @@ export default function DomainKnowledgeRelationDetail() {
           {/* Source Text Snippets */}
           <Card
             className="yx-card"
-            style={{ borderRadius: 10, border: '1px solid #eef2f6', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+            style={{ borderRadius: 10, border: '1px solid var(--yx-border-light)', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
             styles={{ body: { padding: 24 } }}
             title={
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <FileTextOutlined style={{ color: '#f97316' }} />
-                <span style={{ fontSize: 15, fontWeight: 600, color: '#0b2b5c' }}>
+                <span style={{ fontSize: 15, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
                   {t('domainKnowledge.sourceSnippets')}
                 </span>
               </div>
