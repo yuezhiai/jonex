@@ -9,6 +9,29 @@ except ImportError:
 
 VALID_SERVICE_PERMISSION_LEVELS = {"call", "view"}
 
+#: allowed_kb_ids 上限（条数 / 单元素长度），与历史 DTO 校验口径一致
+ALLOWED_KB_IDS_MAX = 100
+ALLOWED_KB_ID_MAX_LENGTH = 64
+
+
+def _validate_kb_id_list(v: list[str] | None) -> list[str] | None:
+    """allowed_kb_ids 元素级校验：最多 100 个、元素非空、单元素 ≤64 字符。
+
+    None（编辑态未传）直接放行，由 service 层按「未传则保留原值」处理。
+    """
+    if v is None:
+        return v
+    if len(v) > ALLOWED_KB_IDS_MAX:
+        raise ValueError(f"allowed_kb_ids 最多 {ALLOWED_KB_IDS_MAX} 个")
+    for element in v:
+        if not isinstance(element, str) or not element.strip():
+            raise ValueError("allowed_kb_ids 元素不能为空字符串")
+        if len(element) > ALLOWED_KB_ID_MAX_LENGTH:
+            raise ValueError(
+                f"allowed_kb_ids 元素过长: {element[:20]}..., 最大 {ALLOWED_KB_ID_MAX_LENGTH} 字符"
+            )
+    return v
+
 
 class ServicePermissionItem(BaseModel):
     """单条 service-permission 映射"""
@@ -58,6 +81,12 @@ class McpKeyCreateRequest(BaseModel):
     expires_at: datetime | None = Field(default=None)
     client_request_id: str = Field(..., max_length=64)
     write_grants: Optional[list[WriteGrant]] = Field(default=None)
+    #: Key 级知识库白名单（上界）：空数组 = 不限；非空 = 服务关联库 ∩ 白名单
+    allowed_kb_ids: list[str] = Field(default=[])
+
+    @validator("allowed_kb_ids")
+    def validate_allowed_kb_ids(cls, v):
+        return _validate_kb_id_list(v)
 
     @validator("space_id")
     def validate_space_id(cls, v):
@@ -84,6 +113,8 @@ class McpKeyResponse(BaseModel):
     space_id: str | None = None
     service_permissions: list[dict] = []
     write_grants: Optional[list[WriteGrant]] = None
+    #: Key 级知识库白名单（上界）：空数组 = 不限
+    allowed_kb_ids: list[str] = []
     auth_summary: str = ""
     write_scope_summary: str = ""
     created_by: str | None = None
@@ -109,6 +140,7 @@ class McpKeyCreateResponse(BaseModel):
     space_id: str | None = None
     service_permissions: list[dict] = []
     write_grants: Optional[list[WriteGrant]] = None
+    allowed_kb_ids: list[str] = Field(default=[])
     status: str = "active"
     auth_summary: str = ""
     write_scope_summary: str = ""
@@ -141,6 +173,12 @@ class _McpKeyUpsertFields(BaseModel):
     service_permissions: Optional[list[ServicePermissionItem]] = Field(default=None)
     expires_at: Optional[datetime] = None
     write_grants: Optional[list[WriteGrant]] = Field(default=None)
+    #: 知识库白名单（上界）：显式 [] = 放开全部；不传 = 保留原值
+    allowed_kb_ids: Optional[list[str]] = Field(default=None)
+
+    @validator("allowed_kb_ids")
+    def validate_allowed_kb_ids_upsert(cls, v):
+        return _validate_kb_id_list(v)
 
     @validator("space_id")
     def validate_space_id_upsert(cls, v):

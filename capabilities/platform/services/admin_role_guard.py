@@ -24,6 +24,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jonex_core.common.exceptions import PermissionDeniedError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
+from jonex_core.common.tenant_admin import (
+    PLATFORM_ADMIN_CODE as KERNEL_PLATFORM_ADMIN_CODE,
+)
+from jonex_core.common.tenant_admin import (
+    TENANT_ADMIN_CODE as KERNEL_TENANT_ADMIN_CODE,
+)
 
 from capabilities.platform.models.permission import Permission
 from capabilities.platform.models.role import Role
@@ -31,8 +37,10 @@ from capabilities.platform.models.role_permission import RolePermission
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_ADMIN_CODE = "platform:admin"
-TENANT_ADMIN_CODE = "tenant:admin"
+# 2026-11-17：标识码上移内核（`jonex_core/common/tenant_admin.py`）作唯一定义点，
+# 这里只做别名，平台内既有 `from .admin_role_guard import TENANT_ADMIN_CODE` 不受影响。
+PLATFORM_ADMIN_CODE = KERNEL_PLATFORM_ADMIN_CODE
+TENANT_ADMIN_CODE = KERNEL_TENANT_ADMIN_CODE
 
 
 async def find_admin_role_ids(

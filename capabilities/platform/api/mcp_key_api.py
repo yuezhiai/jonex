@@ -117,7 +117,8 @@ async def update_mcp_key(
     """编辑 MCP Key 元数据（不重置 Key，不生成新明文）。
 
     传入字段覆盖原值，未传入字段保持原值。
-    支持更新 name、permissions、allowed_kb_ids、service_ids。
+    支持更新 name、note、space_id、service_permissions、expires_at、
+    write_grants、allowed_kb_ids（知识库白名单，上界语义）。
     """
     _validate_key_id(key_id)
     tenant_id = extract_tenant_id(request)

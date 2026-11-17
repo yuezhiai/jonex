@@ -81,7 +81,7 @@ def _is_tenant_admin(perms: set[str]) -> bool:
     `space_permission_service.is_tenant_admin` 看 `tenant:write`，两套口径。
     自定义角色只配 `user:write` 时，前端把人当租户管理员渲染（显示全部管理入口），
     后端却拒绝 → 用户看得到点不动。现在两边看同一组码，必须保持同步：
-    改这里就要同步改 space_permission_service._TENANT_ADMIN，反之亦然。
+    改这里的语义要同步内核 `jonex_core/common/tenant_admin.py`（唯一实现处），反之亦然。
     回归护栏见 tests/unit/test_tenant_admin_code.py::TestFrontBackAgreement。
 
     提取成模块级纯函数的原因：原先这个表达式在 login() 与 me() 两处内联，

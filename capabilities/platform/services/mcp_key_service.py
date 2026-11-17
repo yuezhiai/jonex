@@ -143,14 +143,17 @@ class McpKeyService:
         return row[0]
 
     async def _validate_kb_ids_in_space(
-        self, tenant_id: str, space_id: str, kb_ids: list[str]
+        self, tenant_id: str, space_id: str, kb_ids: list[str], *, allow_empty: bool = False
     ) -> None:
         """校验 kb_ids 中所有知识库都属于指定 space（跨 schema 查 knowledge_info）。
 
-        空 kb_ids → InvalidParameterError；任何 kb 缺失（跨 space/跨租户）
-        → InvalidParameterError。
+        空 kb_ids：allow_empty=True（白名单「空 = 不限」）时直接放行，
+        否则按 grants 语义抛 InvalidParameterError；
+        任何 kb 缺失（跨 space/跨租户）→ InvalidParameterError。
         """
         if not kb_ids:
+            if allow_empty:
+                return
             raise InvalidParameterError(
                 message="grants 不能为空", details={"space_id": space_id}
             )
@@ -374,6 +377,12 @@ class McpKeyService:
         # 1. 校验 space_id 归属
         await self._validate_space_id(tenant_id, req.space_id)
 
+        # 1.5 Key 级知识库白名单（上界）：空 = 不限；非空则必须都属于该空间
+        allowed_kb_ids = list(dict.fromkeys(req.allowed_kb_ids or []))
+        await self._validate_kb_ids_in_space(
+            tenant_id, req.space_id, allowed_kb_ids, allow_empty=True
+        )
+
         # 2. 至少一授权（仅当写入关闭 write_grants=None 且无 service_permissions 时触发；
         #    write_grants=[] 属「写入开启但无知识库」，交由下方三态校验产出特定文案）
         if not req.service_permissions and req.write_grants is None:
@@ -423,6 +432,7 @@ class McpKeyService:
             key_prefix=key_prefix,
             key_hash=key_hash_value,
             write_grants=write_grants_value,
+            allowed_kb_ids=allowed_kb_ids,
             client_request_id=req.client_request_id,
             created_by=created_by,
             created_at=datetime.now(timezone.utc),
@@ -456,6 +466,7 @@ class McpKeyService:
                 key_prefix=key_prefix,
                 key_hash=key_hash_value,
                 write_grants=write_grants_value,
+                allowed_kb_ids=allowed_kb_ids,
                 client_request_id=req.client_request_id,
                 created_by=created_by,
                 created_at=datetime.now(timezone.utc),
@@ -513,6 +524,7 @@ class McpKeyService:
             "space_id": req.space_id,
             "service_permissions": service_permissions_dicts,
             "write_grants": write_grants_value,
+            "allowed_kb_ids": allowed_kb_ids,
             "status": McpKey._derive_status(mcp_key),
             "auth_summary": self._build_auth_summary(service_permissions_dicts, write_grants_value),
             "write_scope_summary": self._build_write_scope_summary(req.write_grants or []),
@@ -760,6 +772,7 @@ class McpKeyService:
             key_prefix=key_prefix,
             key_hash=key_hash_value,
             write_grants=old_write_grants,
+            allowed_kb_ids=list(old_key.allowed_kb_ids or []),
             created_by=created_by,
             created_at=datetime.now(timezone.utc),
             expires_at=new_expires_at,
@@ -787,6 +800,7 @@ class McpKeyService:
                 key_prefix=key_prefix,
                 key_hash=key_hash_value,
                 write_grants=old_write_grants,
+                allowed_kb_ids=list(old_key.allowed_kb_ids or []),
                 created_by=created_by,
                 created_at=datetime.now(timezone.utc),
                 expires_at=new_expires_at,
@@ -838,6 +852,7 @@ class McpKeyService:
             "space_id": old_key.space_id,
             "service_permissions": service_permissions_dicts,
             "write_grants": old_write_grants,
+            "allowed_kb_ids": list(old_key.allowed_kb_ids or []),
             "status": McpKey._derive_status(new_key),
             "auth_summary": self._build_auth_summary(service_permissions_dicts, old_write_grants),
             "write_scope_summary": self._build_write_scope_summary(old_write_grants),
@@ -911,8 +926,9 @@ class McpKeyService:
         """原位编辑 MCP Key 元数据（不重置 Key，不生成新 plaintext）。
 
         所有字段可选——不传则保持原值。
-        支持更新 name、space_id、service_permissions、expires_at、write_grants。
-        write_grants 用 __fields_set__ 区分「未传」（保留原值）与「显式 null」（关闭写入）。
+        支持更新 name、space_id、service_permissions、expires_at、write_grants、allowed_kb_ids。
+        write_grants 用 __fields_set__ 区分「未传」（保留原值）与「显式 null」（关闭写入）；
+        allowed_kb_ids 用 __fields_set__ 区分「未传」与「显式 []」（放开全部知识库）。
         返回更新后的 McpKeyResponse DTO（含 service_permissions）。
         """
         tenant_id = require_tenant(tenant_id)
@@ -952,9 +968,25 @@ class McpKeyService:
                     await self._validate_kb_ids_in_space(
                         tenant_id, req.space_id, existing_kb_ids
                     )
+                # 变更 space：若本次未同步更新 allowed_kb_ids，现有白名单的库
+                # 必须仍属于新 space，否则拒绝跨空间范围残留（对称于 write_grants）
+                if key.allowed_kb_ids and "allowed_kb_ids" not in req.__fields_set__:
+                    await self._validate_kb_ids_in_space(
+                        tenant_id,
+                        req.space_id,
+                        list(key.allowed_kb_ids),
+                        allow_empty=True,
+                    )
             key.space_id = req.space_id
         if "expires_at" in req.__fields_set__:
             key.expires_at = req.expires_at
+        if "allowed_kb_ids" in req.__fields_set__:
+            # 显式传了（含 []）：[] = 放开全部；非空则必须都属于该 Key 的空间
+            new_allowed_kb_ids = list(dict.fromkeys(req.allowed_kb_ids or []))
+            await self._validate_kb_ids_in_space(
+                tenant_id, key.space_id, new_allowed_kb_ids, allow_empty=True
+            )
+            key.allowed_kb_ids = new_allowed_kb_ids
         if "write_grants" in req.__fields_set__:
             # 显式传了（含 null）：null 关闭写入；非空才重跑三态/跨 schema 校验
             if req.write_grants is None:
@@ -1021,7 +1053,11 @@ class McpKeyService:
                 await self._validate_service_ids_in_space(
                     tenant_id, key.space_id, active_sids
                 )
-            await self._validate_service_publish(tenant_id, active_sids)
+            # 发布态校验只针对「本次新增」的授权：已在 Key 上的服务事后被停用/取消发布，
+            # 不应让整把 Key 无法保存（改名、改有效期都会被误伤，且前端编辑态只能取消勾选、
+            # 无其他出路）。存量绑定保留，对停用服务的调用由 mcp_server 执行前拦截（-32004）。
+            added_sids = [sid for sid in active_sids if sid not in old_levels]
+            await self._validate_service_publish(tenant_id, added_sids)
             await mapping_repo.set_mappings(key_id, merged)
 
         # 最终态复查：更新后 Key 至少需保留一个服务授权或写入授权。

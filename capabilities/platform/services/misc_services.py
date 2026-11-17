@@ -321,16 +321,35 @@ class TaskScheduleService:
 # 「领域服务管理员/知识编辑者/观察者」已取消 —— 其能力改由资源身份承担
 # （空间 space_manager/member、知识库 kb_manager/member）。
 #
-# ⚠️ 这个常量必须与 migrations/006_seed_data.sql 的「每租户预设角色播种」块、
+# ⚠️ 这个常量必须与 migrations/090_seed_data.sql 的「每租户预设角色播种」块、
 #    以及 update/034 的第 3、5 节保持一致。三处描述的是同一件事：一个租户开箱应有哪些账号角色。
 #
 # 「普通用户」不再写字面量，改引用 role_binding.DEFAULT_USER_ROLE_NAME ——
 #    自动建号补默认角色绑定时查的就是这个角色名，两处必须字面一致，否则建号会静默绑不上。
 _TENANT_ROLE_TEMPLATE = ("租户管理员", DEFAULT_USER_ROLE_NAME)
 
+# [jonex] 租户管理员可使用平台监控读接口（2026-11-06 确认）。
+# 这是「租户管理员不含平台面码」的**唯一例外**，必须与
+# deploy/postgres/update/107_grant_monitor_read_to_tenant_admin.sql 保持一致。
+_TENANT_ADMIN_PLATFORM_CODES = frozenset({"platform:monitor:read"})
+
+
+def _should_copy_permission(role_name: str, scope: str | None, code: str) -> bool:
+    """新租户复制 demo 角色权限时，是否应带上该权限。
+
+    - 租户级码（scope != 'platform'）：照旧全部复制；
+    - 平台级码：默认不复制；仅「租户管理员」角色对白名单里的码放行。
+    """
+    if scope != "platform":
+        return True
+    return role_name == "租户管理员" and code in _TENANT_ADMIN_PLATFORM_CODES
+
 
 async def seed_tenant_roles(session, tenant_id: str) -> None:
-    """新租户预设角色播种：2 角色 + scope='tenant' 权限映射（与 demo 模板同构，不含平台码）。
+    """新租户预设角色播种：2 角色 + 权限映射（与 demo 模板同构）。
+
+    租户级码全量复制；平台级码默认不复制，唯一例外见
+    ``_TENANT_ADMIN_PLATFORM_CODES``（租户管理员获 ``platform:monitor:read``）。
 
     与 015 第 4/5 步逻辑同构；由 TenantService.create 复用。
     **is_system 一律置 0**（已决策）：仅 demo 租户的租户管理员受系统角色保护；
@@ -372,7 +391,7 @@ async def seed_tenant_roles(session, tenant_id: str) -> None:
         role = Role(tenant_id=tenant_id, name=name, description=description, is_system=0)
         session.add(role)
         await session.flush()
-        # 复制 demo 同名角色的 role_permissions（仅 scope='tenant'）
+        # 复制 demo 同名角色的 role_permissions（租户级码全量；平台级码仅租户管理员白名单）
         demo_role_id = (
             await session.execute(
                 select(Role.id).where(
@@ -382,19 +401,16 @@ async def seed_tenant_roles(session, tenant_id: str) -> None:
         ).scalar_one()
         rows = (
             await session.execute(
-                select(RolePermission.permission_id).where(
+                select(Permission.id, Permission.scope, Permission.code)
+                .join(RolePermission, RolePermission.permission_id == Permission.id)
+                .where(
                     RolePermission.tenant_id == "tenant_jonex_demo",
                     RolePermission.role_id == demo_role_id,
                 )
             )
-        ).scalars().all()
-        for pid in rows:
-            perm_scope = (
-                await session.execute(
-                    select(Permission.scope).where(Permission.id == pid)
-                )
-            ).scalar_one_or_none()
-            if perm_scope == "platform":
+        ).all()
+        for pid, perm_scope, perm_code in rows:
+            if not _should_copy_permission(name, perm_scope, perm_code):
                 continue
             session.add(RolePermission(tenant_id=tenant_id, role_id=role.id, permission_id=pid))
     await session.flush()
