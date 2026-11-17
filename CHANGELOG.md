@@ -4,7 +4,35 @@ All notable changes to Jonex Platform will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to follow [Semantic Versioning](https://semver.org/). Release sections are dated by public release; version tags have not yet been adopted.
 
-## [Unreleased] — 2026-11-05
+## [2026-11-17]
+
+### Added
+
+- Data governance approvals, classification and standard catalog updates.
+- Task center runtime scheduling and task result updates.
+- Schema generation for ClickHouse and InfluxDB v3 sources, with per-knowledge-base model settings.
+- NL2SQL data search, evolution and retrieval metrics updates.
+- Document versions, similarity, image queries and wiki delivery updates.
+- Search answers with citations and evidence viewers.
+- Ontology canvas, document detail, ETL and knowledge-base UI updates.
+- Jonex Wiki compile, media and retrieval updates; RAG parsing and VLM updates.
+- Template scenario and ecosystem updates.
+- Platform authentication, roles, audit and MCP administration updates.
+- Gateway and MCP server updates; shared frontend shell, end-to-end and build updates.
+- Local development and inspection utilities, including landing A/B evaluation.
+
+### Changed
+
+- PostgreSQL migrations reorganized to one file per database/subsystem (001–010, 090 seed data, 091 comments).
+- Deployment service wiring, environment templates and build configuration refreshed.
+- Project metadata and dependency baselines refreshed.
+
+### Fixed
+
+- Knowledge-base ingestion, parsing, reconciliation and task hardening.
+- Core configuration, lifecycle and gateway hardening.
+
+## [2026-11-05]
 
 ### Added
 
