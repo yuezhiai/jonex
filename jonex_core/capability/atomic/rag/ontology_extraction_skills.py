@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from jonex_core.capability.atomic.rag.ontology_extractor import (
     ExtractedEntity,
     ExtractedRelation,
+    _coerce_int,
     _post_validate,
     merge_entity_attributes,
 )
@@ -496,10 +497,18 @@ def _skill_synonym_merger(ctx: SkillContext) -> None:
 
 
 def _skill_dedup_merger(ctx: SkillContext) -> None:
-    """同名合并（大小写不敏感）：描述取长、aliases 并集、source_chunks 聚合。"""
-    merged: Dict[str, ExtractedEntity] = {}
+    """同名同类合并（大小写不敏感）：描述取长、aliases 并集、source_chunks 聚合。
+
+    合并键带 entity_type：同名的 Skill 与 Action 是两类实体，不能合成一个。
+    大小写变体合并到先出现的规范名后，挂接关系端点同步改到规范名——否则图上
+    会多出一个指向旧拼写的 unknown 桩节点。
+    """
+    merged: Dict[tuple, ExtractedEntity] = {}
+    # 变体名 → 规范名；同名变体在不同类型下映射到不同规范名时放弃改写（有歧义）
+    renames: Dict[str, str] = {}
+    ambiguous: set[str] = set()
     for e in ctx.entities:
-        key = e.canonical_name.casefold()
+        key = (e.canonical_name.casefold(), e.entity_type)
         if key not in merged:
             merged[key] = ExtractedEntity(
                 canonical_name=e.canonical_name, entity_type=e.entity_type,
@@ -510,6 +519,11 @@ def _skill_dedup_merger(ctx: SkillContext) -> None:
             )
             continue
         m = merged[key]
+        if e.canonical_name != m.canonical_name and e.canonical_name:
+            prev = renames.get(e.canonical_name)
+            if prev is not None and prev != m.canonical_name:
+                ambiguous.add(e.canonical_name)
+            renames[e.canonical_name] = m.canonical_name
         if len(e.description) > len(m.description):
             m.description = e.description
         if e.confidence > m.confidence:
@@ -526,32 +540,54 @@ def _skill_dedup_merger(ctx: SkillContext) -> None:
                 seen.add(key2)
                 m.source_chunks.append(dict(sc))
     ctx.entities = list(merged.values())
+    for name in ambiguous:
+        renames.pop(name, None)
+    if renames:
+        for r in ctx.relations:
+            r.source_name = renames.get(r.source_name, r.source_name)
+            r.target_name = renames.get(r.target_name, r.target_name)
 
 
 def _skill_schema_validator(ctx: SkillContext) -> None:
-    """_post_validate：端点集合校验 + inverse 归一翻转（schema 外丢弃）。"""
-    kept_e, kept_r = _post_validate(ctx.entities, ctx.relations, ctx.schema)
+    """_post_validate：端点集合校验 + inverse 归一翻转（schema 外丢弃）。
+
+    - relation_type 为空的自由关键词关系不归 schema 管：不送校验、原样保留
+      （否则会被当成 no_constraint 丢掉，并从关系全集里同步删除）；
+    - fallback_types 由调用方经 ctx.params 透传，与抽取器最终 `_post_validate`
+      同一口径，避免技能链先把兜底档实体/关系误杀。
+    """
+    untyped = [r for r in ctx.relations if not (r.relation_type or "").strip()]
+    typed = [r for r in ctx.relations if (r.relation_type or "").strip()]
+    fallback_types = ctx.params.get("fallback_types") or ()
+    kept_e, kept_r = _post_validate(
+        ctx.entities, typed, ctx.schema, fallback_types=set(fallback_types),
+    )
     for e in ctx.entities:
         if e not in kept_e:
             ctx.rejected.append(SkillReject(
                 "entity", e.canonical_name, "schema 外类型",
                 "builtin:schema_validator",
             ))
-    for r in ctx.relations:
+    for r in typed:
         if r not in kept_r:
             ctx.rejected.append(SkillReject(
                 "relation", f"{r.source_name}→{r.target_name}", "schema 外/端点越界",
                 "builtin:schema_validator",
             ))
     ctx.entities = kept_e
-    ctx.relations = kept_r
+    ctx.relations = kept_r + untyped
 
 
 def _skill_step_serializer(ctx: SkillContext) -> None:
     """无序清单编 step_no、补 NEXT_STEP：同 Skill 的 Action 按 HAS_STEP 关系
-    出现顺序编号（缺失时），连续 step_no 间补 NEXT_STEP 关系。"""
-    # 同 skill 分组：HAS_STEP 关系 (Skill→Action)
-    groups: Dict[str, List[ExtractedEntity]] = {}
+    出现顺序编号（缺失时），连续 step_no 间补 NEXT_STEP 关系。
+
+    序号权威在边上（D3）：同一 Action 挂在多个 Skill 下时，实体上的单值 step_no
+    写不下各 Skill 的序号。边已有 step_no 就保留（字符串先 `_coerce_int`），
+    缺失时才用实体值 / 顺序补。
+    """
+    # 同 skill 分组：HAS_STEP 关系 (Skill→Action)，保留边对象以读取边属性
+    groups: Dict[str, List[Tuple[ExtractedRelation, ExtractedEntity]]] = {}
     for r in ctx.relations:
         if r.relation_type != "HAS_STEP":
             continue
@@ -559,19 +595,19 @@ def _skill_step_serializer(ctx: SkillContext) -> None:
             (e for e in ctx.entities if e.canonical_name == r.target_name), None,
         )
         if target is not None:
-            groups.setdefault(r.source_name, []).append(target)
+            groups.setdefault(r.source_name, []).append((r, target))
     next_rel_exists = {
         (r.source_name, r.target_name)
         for r in ctx.relations if r.relation_type == "NEXT_STEP"
     }
-    for skill_name, actions in groups.items():
-        # 现有序号
+    for skill_name, pairs in groups.items():
+        # 现有序号：边属性优先，实体属性只作缺失时的兜底
         nums: List[int] = []
-        for a in actions:
-            try:
-                nums.append(int((a.attributes or {}).get("step_no", 0)))
-            except (ValueError, TypeError):
-                nums.append(0)
+        for r, a in pairs:
+            n = _coerce_int((r.attributes or {}).get("step_no"))
+            if n is None:
+                n = _coerce_int((a.attributes or {}).get("step_no"))
+            nums.append(n if n is not None and n > 0 else 0)
         # 缺失序号按出现顺序补齐（从现有最大值+1 或 1 开始）
         missing = [i for i, n in enumerate(nums) if n <= 0]
         if missing:
@@ -579,20 +615,24 @@ def _skill_step_serializer(ctx: SkillContext) -> None:
             for i in missing:
                 nums[i] = nxt
                 nxt += 1
-                attrs = dict(actions[i].attributes or {})
+                action = pairs[i][1]
+                attrs = dict(action.attributes or {})
+                # 实体上的 step_no 只在缺失（含 0 / 非法值）时补：已有值可能属于另一个 Skill
+                existing_entity = _coerce_int(attrs.get("step_no"))
+                if existing_entity is None or existing_entity <= 0:
+                    attrs["step_no"] = nums[i]
+                    action.attributes = attrs
+        # HAS_STEP 边属性是权威：已有就不覆盖，只在缺失时补；统一成整数
+        for i, (r, _a) in enumerate(pairs):
+            attrs = dict(r.attributes or {})
+            existing = _coerce_int(attrs.get("step_no"))
+            if existing is not None and existing > 0:
+                attrs["step_no"] = existing
+            else:
                 attrs["step_no"] = nums[i]
-                actions[i].attributes = attrs
-        # HAS_STEP 关系属性补权威 step_no（D3）
-        for r in ctx.relations:
-            if r.relation_type != "HAS_STEP":
-                continue
-            tgt = next(
-                (a for a in actions if a.canonical_name == r.target_name), None,
-            )
-            if tgt is not None:
-                r.attributes = {**(r.attributes or {}),
-                                "step_no": (tgt.attributes or {}).get("step_no")}
+            r.attributes = attrs
         # 连续 step_no 间补 NEXT_STEP
+        actions = [a for _, a in pairs]
         ordered = sorted(zip(nums, actions), key=lambda t: t[0])
         for (n1, a1), (n2, a2) in zip(ordered, ordered[1:]):
             if n1 <= 0 or n2 <= 0 or n2 != n1 + 1:

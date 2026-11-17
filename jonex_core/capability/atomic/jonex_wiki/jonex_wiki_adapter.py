@@ -3,11 +3,13 @@ import asyncio
 import hashlib
 import html
 import json
+import logging
 import re
 import time
 from typing import Any
 
 from jonex_core.capability.base import BaseCapability
+from jonex_core.common.config import get_config
 from jonex_core.capability.models import (
     CapabilityMetadata,
     CapabilityRequest,
@@ -39,6 +41,34 @@ _MAX_EXCERPT_LEN = 240
 # claim 级审计（列式视图「溯源审计」）单次返回上限
 _MAX_CLAIMS_PER_QUERY = 500
 _MAX_CLAIM_TEXT_LEN = 400
+
+# 图源上限的兜底默认值：契约 §4.9 规定取值范围 1..100000 / 1..1000000，
+# `<=0` 属误配；直接按 0 截断会让全库图静默变空，这里回落到默认值并告警一次。
+_DEFAULT_GRAPH_MAX_PAGES = 2000
+_DEFAULT_GRAPH_MAX_LINKS = 10000
+_graph_limit_warned: set[str] = set()
+logger = logging.getLogger(__name__)
+
+
+def _resolve_graph_limit(name: str, value: Any, default: int) -> int:
+    """图源上限兜底：非正数按误配处理，回落默认值并只告警一次。
+
+    0 / 负数不在契约取值范围内（1..100000 / 1..1000000）；直接按 0 截断
+    会产生「工具正常返回但图恒为空」的静默故障，故不沿用 0。
+    """
+    try:
+        resolved = int(value or 0)
+    except (TypeError, ValueError):
+        resolved = 0
+    if resolved <= 0:
+        if name not in _graph_limit_warned:
+            _graph_limit_warned.add(name)
+            logger.warning(
+                "%s=%r 非法（契约范围 1..），已回落默认值 %s",
+                name, value, default,
+            )
+        return default
+    return resolved
 
 # [jonex] 引擎 query 是异步任务(app.query → task_id)，同步等待完成时的轮询参数。
 # 等待须覆盖引擎180s运行预算和冷加载，且小于 RemoteJonexWikiClient 的300s。
@@ -205,7 +235,7 @@ def _compile_model(data: dict) -> str:
 
 _ACTIONS = {
     "init_kb", "compile_parsed_document", "compile_parsed_documents", "query", "status", "list_contents",
-    "recompile", "remove_document", "delete_kb", "list_graph", "read_page",
+    "recompile", "remove_document", "delete_kb", "list_graph", "list_page_graph", "read_page",
     "list_wiki_contents", "get_compile_status", "list_compile_tasks", "get_document_chunks",
     "apply_schema", "reparse", "cancel_task", "cancel_query", "resolve_evidence",
     "compilation_state", "pause_compilation", "resume_compilation",
@@ -310,7 +340,8 @@ class JonexWikiCapability(BaseCapability):
             return CapabilityResponse.error(request.request_id, 400, "缺少 knowledge_base_id",
                                             details={"error_code": "MISSING_PARAM"})
         try:
-            result = await self._dispatch(action, tenant_id, kb_id, data)
+            result = await self._dispatch(action, tenant_id, kb_id, data,
+                                          request_id=request.request_id)
             return CapabilityResponse.ok(request.request_id, data=result)
         except DomainError as exc:
             # 引擎业务错误:稳定 error_code 透传给 knowledge_base（与原 HTTP 信封口径一致）
@@ -320,7 +351,7 @@ class JonexWikiCapability(BaseCapability):
             return CapabilityResponse.error(request.request_id, 500, str(exc),
                                             details={"error_code": "JONEX_WIKI_INTERNAL"})
 
-    async def _dispatch(self, action, tenant_id, kb_id, data) -> dict:
+    async def _dispatch(self, action, tenant_id, kb_id, data, *, request_id: str = "") -> dict:
         app = self._app
         if action == "init_kb":
             # jonex_wiki KB 隐式:首次 ingest 即建,无显式 init
@@ -342,7 +373,8 @@ class JonexWikiCapability(BaseCapability):
                                           bool(data.get("return_trace")),
                                           thinking_mode=data.get("thinking_mode", "fast"),
                                           progress_session=data.get("progress_session"),
-                                          query_context=data.get('query_context'))
+                                          query_context=data.get('query_context'),
+                                          trace_id=request_id)
         if action == "resolve_evidence":
             from jonex_wiki.adapters.evidence_view import resolve_evidence
             return await resolve_evidence(app, tenant_id, kb_id, data["query_id"], data["handle"])
@@ -400,6 +432,10 @@ class JonexWikiCapability(BaseCapability):
         if action == "list_graph":
             return await self._list_graph(app, tenant_id, kb_id,
                                           str(data.get("document_id") or ""))
+        if action == "list_page_graph":
+            # MCP 列式浏览的「带语义全库图」：pages + links（kind / why_visit），
+            # 与 list_graph 的裸边投影刻意分开（后者丢 kind / why_visit）。
+            return await self._list_page_graph(app, tenant_id, kb_id)
         if action == "get_wiki_backlinks":
             return await self._get_backlinks(app, tenant_id, kb_id,
                                              str(data.get("path") or ""),
@@ -441,7 +477,8 @@ class JonexWikiCapability(BaseCapability):
     async def _query_sync(self, app, tenant_id: str, kb_id: str,
                           question: str, want_trace: bool,
                           *, thinking_mode: str | None = None, progress_session: str | None = None,
-                          query_context: dict | None = None) -> dict:
+                          query_context: dict | None = None,
+                          trace_id: str | None = None) -> dict:
         """[jonex] 引擎 query 是异步任务(app.query 返回 task_id)，这里提交后同步等待完成。
 
         投影为平台契约，服务三条消费线（平台 /search/jonex_wiki）：
@@ -455,6 +492,10 @@ class JonexWikiCapability(BaseCapability):
         options = {'thinking_mode':thinking_mode} if thinking_mode is not None else {}
         if query_context is not None:
             options['query_context'] = query_context
+        # [jonex] 平台检索 trace：Sidecar 的 request_id 原样带到引擎，引擎把它作为本次
+        # 查询的 trace_id（→ 每次模型调用的 X-Jonex-Trace-Id）。空 = 引擎用 bundle 级标识。
+        if trace_id:
+            options['trace_id'] = trace_id
         task = await app.query(tenant_id, kb_id, question, **options)
         task_id = str(task.get("task_id") or "") if isinstance(task, dict) else ""
         if not task_id:
@@ -647,6 +688,107 @@ class JonexWikiCapability(BaseCapability):
             "relationships": relationships,
             "entities_count": len(entities),
             "relationships_count": len(relationships),
+        }
+
+    async def _list_page_graph(self, app, tenant_id: str, kb_id: str) -> dict:
+        """[jonex] 带语义的全库图（MCP 列式浏览「链接多跳」的图源）。
+
+        与 ``_list_graph`` 的区别（**不要合并**）：
+
+        * **source 页入图**：源页同样被引擎写入 ``page.links``，浏览语义下它是
+          合法节点（无出链时自然成叶子）；``_list_graph`` 排除 source 是图谱页签
+          的投影口径，不是数据缺失。
+        * **保留 `kind` / `why_visit`**：``_list_graph`` 只出裸边，丢掉了导航/支撑
+          关系与「为什么点它」，而多跳浏览要靠这两项解释路径。
+        * **pages / links 的身份都是 canonical 引擎路径**（如
+          ``canteen/lunch-dishes.md``），与 ``pages[].path`` 同一套。
+          ⚠️ 契约 §4.4 曾写「`target` 用 `_target_stem` 归一」，但 ``_target_stem``
+          返回的是**实体 stem**（剥 section 前缀与 ``.md``），会让 BFS 拿 stem 去
+          匹配 canonical path 时永远落空。以 §2（「source/target 都是 canonical
+          路径」）+ §4.7（BFS 按 path 建邻接表）为准，不做 stem 归一。
+
+        图源上限只在这里截断一次：本方法持有原始图，能给出截断前的真实总数；
+        业务层（``WikiBrowseService``）只补 ``knowledge_base_id`` / ``degraded``，
+        不重复截断。引擎异常不在这里吞——交给业务层统一降级。
+        """
+        pages_res = await app.list_pages(tenant_id, kb_id)
+        raw_pages = (pages_res or {}).get("pages", []) or []
+
+        pages: list[dict] = []
+        links_by_key: dict[tuple[str, str], dict] = {}
+        for p in raw_pages:
+            if not isinstance(p, dict):
+                continue
+            path = str(p.get("path") or "")
+            if not path:
+                continue
+            ptype = str(p.get("type") or "concept")
+            stem = _page_stem(path, ptype)
+            pages.append({
+                "path": path,
+                "title": _clean_title(p.get("title"), stem, alt=p.get("title")),
+                "type": ptype,
+                "aliases": [str(a) for a in (p.get("aliases") or [])],
+                "description": str(p.get("description") or ""),
+            })
+            page = p.get("page") or {}
+            for link in (page.get("links") or []):
+                if not isinstance(link, dict):
+                    continue
+                target = str(link.get("target_id") or "").strip()
+                if not target or target == path:
+                    continue
+                key = (path, target)
+                why_visit = _clean_excerpt(link.get("why_visit") or "")
+                existing = links_by_key.get(key)
+                if existing is None:
+                    links_by_key[key] = {
+                        "source": path,
+                        "target": target,
+                        "kind": str(link.get("kind") or ""),
+                        "why_visit": why_visit,
+                    }
+                elif not existing["why_visit"] and why_visit:
+                    # 同一对多 kind 时保留第一条；但空 why_visit 让位给非空者。
+                    existing["why_visit"] = why_visit
+
+        # 确定性：pages 按 path，links 按 (source, target)，保证截断与重放稳定。
+        pages.sort(key=lambda item: item["path"])
+        links = sorted(links_by_key.values(),
+                       key=lambda item: (item["source"], item["target"]))
+
+        page_total = len(pages)
+        link_total = len(links)
+
+        cfg = get_config()
+        max_pages = _resolve_graph_limit(
+            "WIKI_BROWSE_GRAPH_MAX_PAGES",
+            cfg.WIKI_BROWSE_GRAPH_MAX_PAGES,
+            _DEFAULT_GRAPH_MAX_PAGES,
+        )
+        max_links = _resolve_graph_limit(
+            "WIKI_BROWSE_GRAPH_MAX_LINKS",
+            cfg.WIKI_BROWSE_GRAPH_MAX_LINKS,
+            _DEFAULT_GRAPH_MAX_LINKS,
+        )
+        truncated = False
+        truncated_reason: list[str] = []
+        if max_pages >= 0 and page_total > max_pages:
+            pages = pages[:max_pages]
+            truncated = True
+            truncated_reason.append("source_pages")
+        if max_links >= 0 and link_total > max_links:
+            links = links[:max_links]
+            truncated = True
+            truncated_reason.append("source_links")
+
+        return {
+            "pages": pages,
+            "links": links,
+            "page_total": page_total,
+            "link_total": link_total,
+            "truncated": truncated,
+            "truncated_reason": truncated_reason,
         }
 
     async def _read_page(self, app, tenant_id: str, kb_id: str, path: str) -> dict:

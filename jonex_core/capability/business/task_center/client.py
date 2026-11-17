@@ -236,6 +236,27 @@ class TaskCenterClient(ABC):
         """
 
     @abstractmethod
+    async def delete_task(
+        self, tenant_id: str, task_id: str, *, force: bool = False
+    ) -> ApiResponse[None]:
+        """删除一条任务（§4.3 `task.delete`，2026-11-17 加）。
+
+        ⚠️ **级联出口，不是常规写口**：只在**源头（文档 / 知识库 / 数据源）已经被
+        删除或重置**时调用。`force=True` 跳过 K1，连 `running` 子任务一起假删 ——
+        运行方随后上报的结果会因「任务已删」被丢弃，这是预期结局。
+        """
+
+    @abstractmethod
+    async def delete_tasks_batch(
+        self, tenant_id: str, task_ids: List[str], *, force: bool = False
+    ) -> ApiResponse[Dict[str, Any]]:
+        """批量删任务（§4.3 `task.delete_batch`，2026-11-17 加）。
+
+        纪律与 `delete_task` 相同；**单次最多 200 条**，超出回 1001，调用方自行切片。
+        返回 `{deleted, skipped, failed, cleanup_failed}`。
+        """
+
+    @abstractmethod
     async def init_task(
         self,
         tenant_id: str,
@@ -517,6 +538,11 @@ _ACTION_SUBTASK_GET = "task.subtask_get"
 # 读整条任务（同上，2026-09-30）：运行方的「退路」必须能问出**任务**是不是终态，
 # 只看某一步是不够的（见 `TaskRuntime.get_task` 的说明）。
 _ACTION_TASK_GET = "task.get"
+# 删除（2026-11-17 加）：**只在源头已被删除时由运行方调用**。这不是 §4.2 的正常
+# 运行方写口，而是「文档 / 知识库已经没了，把挂在它下面的任务一并清掉」的级联出口；
+# 默认严格语义（K1），`force=True` 才允许连 running 子任务一起假删。
+_ACTION_TASK_DELETE = "task.delete"
+_ACTION_TASK_DELETE_BATCH = "task.delete_batch"
 
 
 def _timeout_for(action: str) -> float:
@@ -742,6 +768,53 @@ class _TaskCenterActions(ABC):
         if attempt is not None:
             data["attempt"] = attempt
         return await self._call(tenant_id, _ACTION_SUBTASK_GET, data)
+
+    async def delete_task(
+        self, tenant_id: str, task_id: str, *, force: bool = False
+    ) -> ApiResponse[None]:
+        """删除一条任务（`task.delete`，2026-11-17 加）。
+
+        ⚠️ **这是级联出口，不是常规运行方写口**：只有「源头（文档 / 知识库 / 数据源）
+        已经被删除或重置」时才调用。`force=True` 会跳过 K1（允许删带 `running` /
+        `pending` 的任务），代价见 `TaskService.delete_task` 的 force 段：
+        运行中的活会被假删，它后续的上报会被当「任务已删」丢弃。
+        """
+        if not isinstance(force, bool):
+            # 不做 `bool()` 宽松转换：`"false"` / `1` 会被转成 True，把严格删除
+            # 静默升级成强制删除。
+            return ApiResponse.fail(
+                "参数 force 必须是布尔值", code=InvalidParameterError.code
+            )
+        return await self._call(
+            tenant_id,
+            _ACTION_TASK_DELETE,
+            {"task_id": task_id, "force": force},
+        )
+
+    async def delete_tasks_batch(
+        self, tenant_id: str, task_ids: List[str], *, force: bool = False
+    ) -> ApiResponse[Dict[str, Any]]:
+        """批量删除任务（`task.delete_batch`，2026-11-17 加）。
+
+        与 `delete_task` 同一条纪律（只在源头已删时调用），**一次请求最多 200 条**；
+        超出会回 1001，调用方自己切片。返回 `{deleted, skipped, failed, cleanup_failed}`
+        —— 级联删除是「尽力而为」，部分失败必须让调用方看得见具体是哪条。
+        """
+        # **不能在这里 `list(task_ids)`**：传单个字符串会被拆成单个字符，
+        # 服务端看到的是合法 list，类型校验就失效了。
+        if not isinstance(task_ids, (list, tuple)):
+            return ApiResponse.fail(
+                "参数 task_ids 必须是数组", code=InvalidParameterError.code
+            )
+        if not isinstance(force, bool):
+            return ApiResponse.fail(
+                "参数 force 必须是布尔值", code=InvalidParameterError.code
+            )
+        return await self._call(
+            tenant_id,
+            _ACTION_TASK_DELETE_BATCH,
+            {"task_ids": list(task_ids), "force": force},
+        )
 
 
 # ============================================================

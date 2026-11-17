@@ -25,6 +25,9 @@ def _resolve_error(exc: JonexException):
     ① 有结构化 params：走模板本地化（含变量的消息也能翻译）
     ② 有显式 message 但无 params：历史/动态原文，原样返回避免丢信息
     ③ 纯默认：按 code 本地化
+
+    ⚠ 能力层（``CapabilityResponse`` 信封，不经本处理器）复用同一套分支，
+    见 ``JonexException.localized_message`` —— 改这里的分支口径要同步那边。
     """
     if getattr(exc, "params", None):
         return exc.code, exc.params, (exc.message or exc.default_message), True

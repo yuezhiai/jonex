@@ -401,6 +401,14 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "update_tool_binding": "ontology_tool_binding",
     "delete_tool_binding": "ontology_tool_binding",
     "resolve_action_execution": "ontology_tool_binding",
+    # 只读预览未保存的参数映射（不调用工具）
+    "preview_tool_binding_mapping": "ontology_tool_binding",
+    # AI 辅助参数映射：只生成建议，不写库
+    "propose_tool_binding_mapping": "ontology_tool_binding",
+    "refine_tool_binding_mapping": "ontology_tool_binding",
+    "propose_extract_tool_declaration": "kb_tool",
+    "refine_extract_tool_declaration": "kb_tool",
+    "propose_kb_tool_draft": "kb_tool",
     # 执行器代用户取执行计划（按知识库写权限判定）
     "prepare_action_execution": "ontology_tool_binding",
     # 知识库问答自动调用绑定工具（服务内自己落审计）

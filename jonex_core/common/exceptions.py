@@ -58,6 +58,31 @@ class JonexException(Exception):
             result["params"] = self.params
         return result
 
+    def localized_message(self) -> str:
+        """按当前 locale 返回给用户看的文案。
+
+        HTTP 出口有 ``register_exception_handlers`` 兜底翻译；**能力信封
+        (``CapabilityResponse``) 是自己拼的**，不会经过它。若把 ``self.message``
+        （未显式传入时就是类默认的**中文** ``default_message``）原样塞进信封，
+        Gateway 的 ``raise_from_capability_result`` 会当成「显式原文」跳过翻译，
+        英文用户就拿到中文（如 3029「空间下无启用服务」）。
+
+        三分支与 ``common/exception_handler._resolve_error`` 同口径：
+        ① 有 params → 按 code+params 取模板（模板里带变量也能翻译）
+        ② 显式 message 无 params → 原样（动态原文不丢）
+        ③ 纯默认 → 按 code 取模板
+        """
+        from jonex_core.common.i18n import translate  # 局部导入避免模块级循环依赖
+
+        if self.params:
+            return translate(
+                self.code, params=self.params,
+                fallback=self.message or self.default_message,
+            )
+        if self._message_explicit:
+            return self.message
+        return translate(self.code, fallback=self.default_message)
+
 
 # ==================== 1xxx 通用错误 ====================
 class InternalError(JonexException):
@@ -451,6 +476,32 @@ class OidcAccessDeniedError(AuthError):
         self.tenant_id = tenant_id
 
 
+class ServiceNotSearchableError(AuthError):
+    """检索命中的领域服务不可用（不存在 / 跨租户 / 已软删 / 停用）。
+
+    停用口径取「或」：``status != 'active'`` **或** ``enabled == 0`` —— 页面停用按钮
+    写 ``status``、``/disable`` 端点写 ``enabled``，两条写入口都要覆盖。
+
+    ⛔ **必须保持「无必填位置参数」**（不覆写 ``__init__``）：``EXCEPTION_REGISTRY``
+    会按通用形状 ``exc_cls(message=..., details=..., params=...)`` 重建异常（先例：
+    ``3027 OidcAccessDeniedError`` 因带必填位参而刻意不登记）。
+    """
+    code = 3028
+    status_code = 403
+    default_message = "领域服务已停用，无法检索"
+
+
+class SpaceNoEnabledServiceError(AuthError):
+    """检索目标空间下没有任何启用中的领域服务，该空间不可检索。
+
+    与 ``SpaceNotActiveError``（空间被禁用）区分：空间本身可用，只是没有可用服务入口。
+    同样必须保持无必填位置参数，以便进入 ``EXCEPTION_REGISTRY`` 反查重建。
+    """
+    code = 3029
+    status_code = 403
+    default_message = "领域空间下没有启用中的服务，无法检索"
+
+
 class ImpersonationForbiddenError(AuthError):
     """租户模拟被拒绝（无 platform:admin 或嵌套切换）"""
     code = 3010
@@ -668,6 +719,10 @@ EXCEPTION_REGISTRY: Dict[int, type] = {
     # ``exc_cls(message=..., details=..., params=...)`` 重建它 —— reason 缺失 → TypeError → 500。
     # 今天打不着只是因为 api_gateway/routes/auth.py 对下游 4xx 原样透传；这层保护不牢靠，
     # 所以用「不登记」从源头堵死。它由调用方（路由层）就地接住，本就不需要码表反查。
+    # 检索按领域服务可用性判定：服务停用 / 空间无启用服务。
+    # 两者都是无必填位置参数，可安全反查重建。
+    3028: ServiceNotSearchableError,
+    3029: SpaceNoEnabledServiceError,
     # 数据相关
     4000: DataError,
     4001: DatabaseError,

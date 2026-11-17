@@ -12,6 +12,7 @@ Sidecar 代理主应用
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -34,7 +35,7 @@ from jonex_core.sidecar.hooks import (
     get_audit_forwarder,
 )
 from jonex_core.common.audit_enums import _ACTION_TO_RESOURCE, _RESOURCE_TO_ID_FIELD
-from jonex_core.common.monitor_collector import get_monitor_collector
+from jonex_core.common.monitor_collector import attempt_span, get_monitor_collector
 from jonex_core.common.monitor_identity import format_user_identity
 from jonex_core.common.monitor_models import (
     CallDirection,
@@ -501,9 +502,82 @@ def _caller_from_auth(auth: dict, user_id: Optional[str] = None) -> tuple:
     return (auth_type or "unknown", CallTrigger.SYSTEM.value)
 
 
+def _resolve_call_ids(headers) -> tuple[str, str]:
+    """解析本次 ``/invoke`` 的 ``(request_id, trace_id)`` —— **两个 ID 职责不同**。
+
+    改前这里只有一个 ID：入站 ``X-Request-ID`` 同时充当「本次调用的身份」
+    （``monitor.call_log`` 的唯一键）和「链路追踪」。嵌套调用复用外层 trace 当身份，
+    内层 atomic 行就会在 ``ON CONFLICT`` 时顶掉外层 MCP 行。
+
+    取值规则：
+
+    - ``request_id`` —— 本次调用自己的身份，取 ``X-Request-ID``；调用方（能力服务
+      发起的嵌套调用）**不带**该头，于是每次调用各生成一个；
+    - ``trace_id`` —— 全链路不变的追踪号，取 ``X-Jonex-Trace-Id``，回落
+      ``X-Request-ID``，再回落 ``request_id``。
+
+    只带 ``X-Request-ID`` 的网关外层调用 ⇒ 两值相等，行为与改前逐字节一致。
+    与 :mod:`jonex_core.llm_gateway.context` 的 ID 拆分方式一致（那边早已拆分）。
+    """
+    import uuid as _uuid
+
+    request_id = headers.get("X-Request-ID") or _uuid.uuid4().hex
+    trace_id = headers.get("X-Jonex-Trace-Id") or request_id
+    return request_id, trace_id
+
+
+def _owns_inbound_attempt(headers) -> bool:
+    """本次 ``/invoke`` 的 ``call_attempt``（物理尝试记录）是否由 Sidecar 负责写。
+
+    判据是入站**没有** ``X-Request-ID``：
+
+    - 网关四个路由 / task_center / internal MCP 都会带该头，且各自的重试循环
+      已经通过 ``attempt_span`` 写过 ``call_attempt`` ⇒ Sidecar **不能再写**，
+      否则同一 ``(request_id, attempt_no)`` 会被后写者覆盖，网关的重试语义就乱了；
+    - 能力服务发起的嵌套调用（如 knowledge_base → sidecar →
+      ``atomic.jonex_wiki.v1``）只带 ``X-Jonex-Trace-Id``，没有人为这次物理
+      尝试记账。Sidecar 是唯一同时握有该次调用的 ``request_id`` 与租户的
+      点位，由它补一条 ``attempt_no=1`` 的入站记录，才能保证
+      ``call_log`` 与 ``call_attempt`` 一一对应。
+
+    ⚠️ 新增调用方若带 ``X-Request-ID``，必须自己写 ``call_attempt``，
+    否则覆盖缺口会静默回归。
+    """
+    return not headers.get("X-Request-ID")
+
+
+class _NullAttemptSpan:
+    """未启用 ``call_attempt`` 采集时的空句柄，保证调用点不用写分支。"""
+
+    __slots__ = ()
+
+    def fail(self, *args, **kwargs) -> None:
+        return None
+
+    def cancel(self, *args, **kwargs) -> None:
+        return None
+
+    def mark(self, *args, **kwargs) -> None:
+        return None
+
+    def mark_final(self, *args, **kwargs) -> None:
+        return None
+
+
+@contextlib.contextmanager
+def _inbound_attempt_span(*, enabled: bool, **kwargs):
+    """``enabled`` 为真时走 :func:`attempt_span`，否则给一个空句柄。"""
+    if not enabled:
+        yield _NullAttemptSpan()
+        return
+    with attempt_span(**kwargs) as span:
+        yield span
+
+
 def _monitor_n1_fields(
     *,
     request_id: str,
+    trace_id: Optional[str] = None,
     tenant_id: str,
     capability_id: str,
     start_time: float,
@@ -531,6 +605,9 @@ def _monitor_n1_fields(
     能力标识（读侧用 ``COALESCE(mcp_tool, target)`` 展示对象）。``source`` 始终是真实调用方
     （如 MCP 链路经 API Key 认证为 ``apikey``），不参与 MCP 判定。其余链路协议恒
     ``invoke``、工具名恒空。
+
+    ``trace_id`` 缺省回落 ``request_id``：外层调用两者相等，嵌套调用则由
+    :func:`_resolve_call_ids` 给出「新身份 + 外层 trace」，靠 trace 串成一条链。
     """
     success = status_code < 400
     # 流式端点无法在开流后改 HTTP 状态码，取消等三态必须由调用方显式指定。
@@ -539,7 +616,7 @@ def _monitor_n1_fields(
     )
     return {
         "request_id": request_id,
-        "trace_id": request_id,  # 现与 request_id 同源，是否分离待定
+        "trace_id": trace_id or request_id,
         "tenant_id": tenant_id,
         "direction": CallDirection.INBOUND.value,
         "source": source,
@@ -581,13 +658,15 @@ async def _monitored_stream(
     source,
     *,
     request_id: str,
+    trace_id: Optional[str] = None,
     tenant_id: str,
     capability_id: str,
     start_time: float,
     source_name: str,
     trigger_type: str,
+    own_attempt: bool = False,
 ):
-    """把上游流包一层 N1 采集：成功 / 失败 / 取消三态各记一条，且只记一条。
+    """把上游流包一层 ``call_log`` / ``call_attempt`` 采集：三态各记一条，且只记一条。
 
     ⚠️ 流式响应一旦开流，HTTP 状态码就改不了了，N1 的结局只能按**流内结果**判定：
 
@@ -595,7 +674,9 @@ async def _monitored_stream(
     - ``asyncio.CancelledError`` / ``GeneratorExit``（客户端断开）⇒ ``cancelled`` 后重抛；
     - 其他异常 ⇒ ``failed``（带 error_code/message）后重抛。
 
-    不采 N2：流式路径没有 per-attempt 语义，避免与能力侧重试记录重复。
+    ``own_attempt`` 见 :func:`_owns_inbound_attempt`：嵌套流式调用同样没人写
+    ``call_attempt``，由 Sidecar 补一条入站记录；上游自带 ``X-Request-ID`` 时传 ``False``，
+    避免与上游的重试记录重复。
     ``recorded`` 标志保证「异常路径记过之后，finally / 关闭路径不会补记第二条」。
     """
     recorded = False
@@ -607,6 +688,7 @@ async def _monitored_stream(
         recorded = True
         _collect_monitor_n1(
             request_id=request_id,
+            trace_id=trace_id,
             tenant_id=tenant_id,
             capability_id=capability_id,
             start_time=start_time,
@@ -616,24 +698,33 @@ async def _monitored_stream(
             **kwargs,
         )
 
-    try:
-        async for line in source:
-            yield line + "\n"
-    except (asyncio.CancelledError, GeneratorExit):
-        _record_once(
-            status_code=499,  # 仅占位；终态由 final_status 决定
-            final_status=CallFinalStatus.CANCELLED.value,
-        )
-        raise
-    except Exception as exc:
-        _record_once(
-            status_code=500,
-            error_code=getattr(exc, "code", None),
-            error_message=str(exc),
-        )
-        raise
-    else:
-        _record_once(status_code=200)
+    with _inbound_attempt_span(
+        enabled=own_attempt,
+        request_id=request_id,
+        tenant_id=tenant_id,
+        attempt_no=1,
+        is_final=True,
+    ) as att:
+        try:
+            async for line in source:
+                yield line + "\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            att.cancel()
+            _record_once(
+                status_code=499,  # 仅占位；终态由 final_status 决定
+                final_status=CallFinalStatus.CANCELLED.value,
+            )
+            raise
+        except Exception as exc:
+            att.fail(error_code=getattr(exc, "code", None), error_message=str(exc))
+            _record_once(
+                status_code=500,
+                error_code=getattr(exc, "code", None),
+                error_message=str(exc),
+            )
+            raise
+        else:
+            _record_once(status_code=200)
 
 
 async def _record_platform_metrics(
@@ -745,7 +836,13 @@ async def _proxy_to_platform(
     original_tenant_id = auth.get("original_tenant_id") if auth else None
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            kwargs = {"headers": headers, "params": request.query_params}
+            # 必须传 ``multi_items()`` 的**二元组列表**：直接给 Starlette ``QueryParams``
+            # 会被 httpx 走 ``Mapping.items()``，同名参数只剩最后一个
+            # （实测 ``target_any=a&target_any=b`` 到平台侧只剩 ``b``）。
+            kwargs = {
+                "headers": headers,
+                "params": list(request.query_params.multi_items()),
+            }
             if body is not None:
                 kwargs["json"] = body
             elif "application/x-www-form-urlencoded" in content_type:
@@ -1118,9 +1215,11 @@ class SidecarApp:
                 request.client.host if request.client else "",
             ).split(",")[0].strip()
             ip = invoke_request.ip or client_ip
-            # 链路追踪 ID：透传入站 X-Request-ID，缺失则生成，贯穿整条能力调用链路
-            import uuid as _uuid
-            trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+            # 本次调用的身份 + 全链路追踪号，**两个不同的 ID**（见 _resolve_call_ids）：
+            # 入站 X-Request-ID 是上游的追踪号，嵌套调用不再拿它当身份。
+            request_id, trace_id = _resolve_call_ids(request.headers)
+            # call_attempt 归属：嵌套调用无人记账 ⇒ 由 Sidecar 补（见 _owns_inbound_attempt）。
+            _own_attempt = _owns_inbound_attempt(request.headers)
             # 监控采集：真实调用方 + 触发方。「来源服务」列记发起方本人，
             # 来源列记真实调用方，不记内部中转站。
             _monitor_source, _monitor_trigger = _caller_from_auth(auth, user_id)
@@ -1159,137 +1258,154 @@ class SidecarApp:
             if not await breaker.before_call(service_name):
                 raise CapabilityInvokeError(message=translate("err.capability.circuit_open", params={"service_name": service_name}, fallback=f"服务 {service_name} 已熔断，请稍后重试"))
 
-            try:
-                logger.info(
-                    f"[Sidecar] 转发能力调用: {invoke_request.capability_id}, "
-                    f"tenant: {tenant_id}, auth_type: {auth['auth_type']}"
-                )
+            with _inbound_attempt_span(
+                enabled=_own_attempt,
+                request_id=request_id,
+                tenant_id=tenant_id,
+                attempt_no=1,
+                is_final=True,
+            ) as att:
+                try:
+                    logger.info(
+                        f"[Sidecar] 转发能力调用: {invoke_request.capability_id}, "
+                        f"tenant: {tenant_id}, auth_type: {auth['auth_type']}"
+                    )
 
-                result = await self.proxy.invoke_capability(
-                    capability_id=invoke_request.capability_id,
-                    payload=invoke_request.payload,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    username=username,
-                    ip=ip,
-                    request_id=trace_id,
-                    impersonated=impersonated,
-                    perms=perms,
-                    original_tenant_id=original_tenant_id,
-                    context=invoke_request.context,
-                )
+                    result = await self.proxy.invoke_capability(
+                        capability_id=invoke_request.capability_id,
+                        payload=invoke_request.payload,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        username=username,
+                        ip=ip,
+                        request_id=trace_id,
+                        impersonated=impersonated,
+                        perms=perms,
+                        original_tenant_id=original_tenant_id,
+                        context=invoke_request.context,
+                    )
 
-                latency = (time.time() - start_time) * 1000
-                # 能力侧 /invoke 恒返回 HTTP 200，业务成败只体现在响应体上；
-                # 记录用状态码必须由 result 推导，否则审计/监控把失败调用记成成功。
-                record_status = _derive_invoke_status_code(result)
-                await breaker.on_success(service_name)
-                await metering.record(tenant_id, invoke_request.capability_id, latency, record_status, user_id)
+                    latency = (time.time() - start_time) * 1000
+                    # 能力侧 /invoke 恒返回 HTTP 200，业务成败只体现在响应体上；
+                    # 记录用状态码必须由 result 推导，否则审计/监控把失败调用记成成功。
+                    record_status = _derive_invoke_status_code(result)
+                    # HTTP 200 + success=false 也是失败：call_attempt 与 call_log
+                    # 必须同口径，否则两条记录会一个说成功、一个说失败。
+                    if not result.get("success", True):
+                        att.fail(
+                            error_code=result.get("code"),
+                            error_message=result.get("message"),
+                        )
+                    await breaker.on_success(service_name)
+                    await metering.record(tenant_id, invoke_request.capability_id, latency, record_status, user_id)
 
-                await get_audit_forwarder().collect(
-                    tenant_id=tenant_id,
-                    method="POST",
-                    path=f"invoke/{invoke_request.capability_id}",
-                    status_code=record_status,
-                    latency_ms=latency,
-                    trace_id=trace_id,
-                    user_id=user_id,
-                    username=username,
-                    ip=ip,
-                    service_name="sidecar",
-                    invoke_action=_action,
-                    is_invoke=True,
-                    resource_id=_resource_id,
-                    request_params=_audit_request_params,
-                    response_body=(
-                        _compiled_schema_audit_response_body(result)
-                        if _audit_schema_action else None
-                    ),
-                    impersonated=impersonated,
-                    original_tenant_id=original_tenant_id,
-                )
+                    await get_audit_forwarder().collect(
+                        tenant_id=tenant_id,
+                        method="POST",
+                        path=f"invoke/{invoke_request.capability_id}",
+                        status_code=record_status,
+                        latency_ms=latency,
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        username=username,
+                        ip=ip,
+                        service_name="sidecar",
+                        invoke_action=_action,
+                        is_invoke=True,
+                        resource_id=_resource_id,
+                        request_params=_audit_request_params,
+                        response_body=(
+                            _compiled_schema_audit_response_body(result)
+                            if _audit_schema_action else None
+                        ),
+                        impersonated=impersonated,
+                        original_tenant_id=original_tenant_id,
+                    )
 
-                # 监控采集（旁路，非阻塞）：N1 主记录。失败恒不抛出。
-                _collect_monitor_n1(
-                    request_id=trace_id,
-                    tenant_id=tenant_id,
-                    capability_id=invoke_request.capability_id,
-                    start_time=start_time,
-                    status_code=record_status,
-                    source=_monitor_source,
-                    trigger_type=_monitor_trigger,
-                    error_code=result.get("code"),
-                    error_message=result.get("message"),
-                    mcp_tool=_monitor_mcp_tool,
-                    is_mcp=_monitor_is_mcp,
-                )
+                    # 监控采集（旁路，非阻塞）：逻辑调用主记录。失败恒不抛出。
+                    _collect_monitor_n1(
+                        request_id=request_id,
+                        trace_id=trace_id,
+                        tenant_id=tenant_id,
+                        capability_id=invoke_request.capability_id,
+                        start_time=start_time,
+                        status_code=record_status,
+                        source=_monitor_source,
+                        trigger_type=_monitor_trigger,
+                        error_code=result.get("code"),
+                        error_message=result.get("message"),
+                        mcp_tool=_monitor_mcp_tool,
+                        is_mcp=_monitor_is_mcp,
+                    )
 
-                logger.info(
-                    f"[Sidecar] 转发完成: {invoke_request.capability_id}, "
-                    f"success: {result.get('success', True)}, latency: {latency:.2f}ms"
-                )
+                    logger.info(
+                        f"[Sidecar] 转发完成: {invoke_request.capability_id}, "
+                        f"success: {result.get('success', True)}, latency: {latency:.2f}ms"
+                    )
 
-                return InvokeResult(
-                    request_id=result.get("request_id", ""),
-                    success=result.get("success", True),
-                    code=result.get("code", 0),
-                    message=result.get("message", "success"),
-                    data=result.get("data"),
-                    details=result.get("details"),
-                    params=result.get("params"),
-                    latency_ms=latency,
-                )
+                    return InvokeResult(
+                        request_id=result.get("request_id", ""),
+                        success=result.get("success", True),
+                        code=result.get("code", 0),
+                        message=result.get("message", "success"),
+                        data=result.get("data"),
+                        details=result.get("details"),
+                        params=result.get("params"),
+                        latency_ms=latency,
+                    )
 
-            except Exception as e:
-                latency = (time.time() - start_time) * 1000
-                await breaker.on_failure(service_name)
-                await metering.record(tenant_id, invoke_request.capability_id, latency, 500, user_id)
-                await get_audit_forwarder().collect(
-                    tenant_id=tenant_id,
-                    method="POST",
-                    path=f"invoke/{invoke_request.capability_id}",
-                    status_code=500,
-                    latency_ms=latency,
-                    trace_id=trace_id,
-                    user_id=user_id,
-                    username=username,
-                    ip=ip,
-                    service_name="sidecar",
-                    invoke_action=_action,
-                    is_invoke=True,
-                    resource_id=_resource_id,
-                    request_params=_audit_request_params,
-                    impersonated=impersonated,
-                    original_tenant_id=original_tenant_id,
-                )
-                # 监控采集（旁路，非阻塞）：异常路径记 failed（status_code=500）。
-                # 异常可能是 JonexException（带 code）也可能是裸异常（无 code）。
-                _collect_monitor_n1(
-                    request_id=trace_id,
-                    tenant_id=tenant_id,
-                    capability_id=invoke_request.capability_id,
-                    start_time=start_time,
-                    status_code=500,
-                    source=_monitor_source,
-                    trigger_type=_monitor_trigger,
-                    error_code=getattr(e, "code", None),
-                    error_message=str(e),
-                    mcp_tool=_monitor_mcp_tool,
-                    is_mcp=_monitor_is_mcp,
-                )
-                msg = str(e)
-                cid = invoke_request.capability_id
-                if "Name or service not known" in msg:
-                    hint = f"依赖的服务容器未启动或 DNS 无法解析"
-                elif "Connection refused" in msg:
-                    hint = "依赖的服务端口未就绪"
-                else:
-                    hint = msg
-                logger.error(f"[Sidecar] 转发异常: {cid}, {hint}, latency={latency:.0f}ms")
-                raise CapabilityInvokeError(
-                    message=translate("err.capability.invoke_failed", params={"hint": hint}, fallback=f"能力调用失败: {hint}"),
-                    cause=e,
-                )
+                except Exception as e:
+                    att.fail(error_code=getattr(e, "code", None), error_message=str(e))
+                    latency = (time.time() - start_time) * 1000
+                    await breaker.on_failure(service_name)
+                    await metering.record(tenant_id, invoke_request.capability_id, latency, 500, user_id)
+                    await get_audit_forwarder().collect(
+                        tenant_id=tenant_id,
+                        method="POST",
+                        path=f"invoke/{invoke_request.capability_id}",
+                        status_code=500,
+                        latency_ms=latency,
+                        trace_id=trace_id,
+                        user_id=user_id,
+                        username=username,
+                        ip=ip,
+                        service_name="sidecar",
+                        invoke_action=_action,
+                        is_invoke=True,
+                        resource_id=_resource_id,
+                        request_params=_audit_request_params,
+                        impersonated=impersonated,
+                        original_tenant_id=original_tenant_id,
+                    )
+                    # 监控采集（旁路，非阻塞）：异常路径记 failed（status_code=500）。
+                    # 异常可能是 JonexException（带 code）也可能是裸异常（无 code）。
+                    _collect_monitor_n1(
+                        request_id=request_id,
+                        trace_id=trace_id,
+                        tenant_id=tenant_id,
+                        capability_id=invoke_request.capability_id,
+                        start_time=start_time,
+                        status_code=500,
+                        source=_monitor_source,
+                        trigger_type=_monitor_trigger,
+                        error_code=getattr(e, "code", None),
+                        error_message=str(e),
+                        mcp_tool=_monitor_mcp_tool,
+                        is_mcp=_monitor_is_mcp,
+                    )
+                    msg = str(e)
+                    cid = invoke_request.capability_id
+                    if "Name or service not known" in msg:
+                        hint = f"依赖的服务容器未启动或 DNS 无法解析"
+                    elif "Connection refused" in msg:
+                        hint = "依赖的服务端口未就绪"
+                    else:
+                        hint = msg
+                    logger.error(f"[Sidecar] 转发异常: {cid}, {hint}, latency={latency:.0f}ms")
+                    raise CapabilityInvokeError(
+                        message=translate("err.capability.invoke_failed", params={"hint": hint}, fallback=f"能力调用失败: {hint}"),
+                        cause=e,
+                    )
 
         @self.app.post("/invoke/stream")
         async def invoke_capability_stream(
@@ -1306,8 +1422,10 @@ class SidecarApp:
             impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
             original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
             perms = invoke_request.perms or auth.get("perms") or []
-            import uuid as _uuid
-            trace_id = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+            # 身份与追踪号分离，取法同 /invoke（见 _resolve_call_ids）。
+            request_id, trace_id = _resolve_call_ids(request.headers)
+            # call_attempt 归属同非流式：嵌套调用由 Sidecar 补（见 _owns_inbound_attempt）。
+            _own_attempt = _owns_inbound_attempt(request.headers)
             # 来源 / 触发方取法与 /invoke 一致：记真实调用方，不记中转站。
             _monitor_source, _monitor_trigger = _caller_from_auth(auth, user_id)
 
@@ -1320,17 +1438,20 @@ class SidecarApp:
                         payload=invoke_request.payload,
                         tenant_id=tenant_id,
                         user_id=user_id,
+                        # 下游能力继续拿 trace 当 request_id：引擎侧 trace 与计量不变。
                         request_id=trace_id,
                         impersonated=impersonated,
                         perms=perms,
                         original_tenant_id=original_tenant_id,
                     ),
-                    request_id=trace_id,
+                    request_id=request_id,
+                    trace_id=trace_id,
                     tenant_id=tenant_id,
                     capability_id=invoke_request.capability_id,
                     start_time=start_time,
                     source_name=_monitor_source,
                     trigger_type=_monitor_trigger,
+                    own_attempt=_own_attempt,
                 ),
                 media_type="application/x-ndjson",
             )
@@ -1356,8 +1477,10 @@ class SidecarApp:
             if tenant_id is None:
                 raise TenantIsolationError(message=translate("err.tenant.required_for_rag", fallback="流式 RAG 查询必须携带明确租户"))
 
-            import uuid as _uuid2
-            _trace_id = request.headers.get("X-Request-ID") or _uuid2.uuid4().hex
+            # 身份与追踪号分离，取法同 /invoke（见 _resolve_call_ids）。
+            _request_id, _trace_id = _resolve_call_ids(request.headers)
+            # call_attempt 归属同非流式：嵌套调用由 Sidecar 补（见 _owns_inbound_attempt）。
+            _own_attempt = _owns_inbound_attempt(request.headers)
             _monitor_source, _monitor_trigger = _caller_from_auth(
                 auth, auth.get("user_id")
             )
@@ -1368,13 +1491,15 @@ class SidecarApp:
                         query=query, tenant_id=tenant_id, mode=mode, top_k=top_k,
                         knowledge_base_id=knowledge_base_id, request_id=_trace_id,
                     ),
-                    request_id=_trace_id,
+                    request_id=_request_id,
+                    trace_id=_trace_id,
                     tenant_id=tenant_id,
                     # 调用链终点是原子能力（proxy 侧服务名 rag.lightrag 的完整能力 ID）。
                     capability_id="atomic.rag.lightrag.v1",
                     start_time=start_time,
                     source_name=_monitor_source,
                     trigger_type=_monitor_trigger,
+                    own_attempt=_own_attempt,
                 ),
                 media_type="application/x-ndjson",
             )

@@ -27,8 +27,19 @@ REQUIRED_THINKING_OFF_SCENES = frozenset(
         "nl2sql_alias_suggest",
         "nl2sql_entry_revise",
         "nl2sql_value_synonym_suggest",
+        "nl2sql_metric_suggest",
         "concept_relevance_filter",
         "nl2sql_supplement_fuse",
+        # 落点 agent 的单步调用：输出是一个 JSON 动作（≤2048 tokens），思考 token
+        # 会把预算吃光 → 空正文 / JSON 截断，调用侧只看到「模型不会用工具」。
+        "abstract_schema_landing_agent",
+        # 指标构建 agent：同样是「每步一个 JSON 动作」，思考 token 会吃光预算。
+        "metric_construction",
+        # join 复核 agent：同上。
+        "join_review",
+        "config_tool_binding_mapping",
+        "config_extract_tool_declaration",
+        "config_kb_tool_draft",
     }
 )
 

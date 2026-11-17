@@ -42,7 +42,8 @@ class JonexWikiClient(ABC):
 
     @abstractmethod
     async def query(self, kb_name: str, question: str, tenant_id: str, kb_id: str,
-                    return_trace: bool = False, thinking_mode: str | None = None, query_context: dict | None = None) -> dict: ...
+                    return_trace: bool = False, thinking_mode: str | None = None, query_context: dict | None = None,
+                    trace_id: str | None = None) -> dict: ...
 
     @abstractmethod
     async def status(self, kb_name: str, tenant_id: str, kb_id: str) -> dict: ...
@@ -59,6 +60,14 @@ class JonexWikiClient(ABC):
     @abstractmethod
     async def list_graph(self, kb_name: str, tenant_id: str, kb_id: str,
                          document_id: str = "") -> dict: ...
+
+    @abstractmethod
+    async def list_page_graph(self, kb_name: str, tenant_id: str, kb_id: str) -> dict:
+        """带语义的全库图（pages + links，含 kind / why_visit），供 MCP 列式浏览。
+
+        返回 ``{pages, links, page_total, link_total, truncated, truncated_reason}``；
+        ``page_total`` / ``link_total`` 是**图源上限截断前**的真实计数。
+        """
 
     @abstractmethod
     async def read_page(self, kb_name: str, path: str, tenant_id: str, kb_id: str) -> dict: ...
@@ -132,7 +141,8 @@ class RemoteJonexWikiClient(JonexWikiClient):
         )
         self._capability_id = capability_id
 
-    async def _invoke(self, action: str, data: dict, tenant_id: str, kb_id: str) -> dict:
+    async def _invoke(self, action: str, data: dict, tenant_id: str, kb_id: str,
+                      trace_id: str | None = None) -> dict:
         from jonex_core.common.exceptions import InvalidParameterError, ResourceNotFoundError
 
         body = {
@@ -141,7 +151,13 @@ class RemoteJonexWikiClient(JonexWikiClient):
             "tenant_id": tenant_id,
         }
         from jonex_core.common.sidecar_client import post_sidecar
-        resp = await post_sidecar(self._client, body, tenant_id)
+        # [jonex] 平台检索 trace 透传：**只发追踪号，不发调用身份**。
+        # Sidecar 以 X-Jonex-Trace-Id 作本次调用的 trace_id、另生成自己的 request_id
+        # —— 这样每次嵌套原子调用各占一条 monitor.call_log，不会顶掉外层 MCP 行。
+        # trace 仍由 Sidecar 作为 request_id 传给下游能力，最终成为引擎侧每次模型调用
+        # 的 X-Jonex-Trace-Id，计量归集口径不变。
+        headers = {"X-Jonex-Trace-Id": trace_id} if trace_id else None
+        resp = await post_sidecar(self._client, body, tenant_id, headers=headers)
         result = resp.json()
         if not result.get("success"):
             err_code = (result.get("details") or {}).get("error_code", "")
@@ -193,13 +209,14 @@ class RemoteJonexWikiClient(JonexWikiClient):
         return await self._invoke("delete_kb", {"kb": kb_name}, tenant_id, kb_id)
 
     async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False,
-                    thinking_mode: str | None = None, progress_session: str | None = None, query_context: dict | None = None):
+                    thinking_mode: str | None = None, progress_session: str | None = None, query_context: dict | None = None,
+                    trace_id: str | None = None):
         return await self._invoke("query", {
             "kb": kb_name, "question": question, "return_trace": return_trace,
             **({"progress_session": progress_session} if progress_session else {}),
             **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
             **({'query_context':query_context} if query_context is not None else {}),
-        }, tenant_id, kb_id)
+        }, tenant_id, kb_id, trace_id=trace_id)
 
     async def status(self, kb_name, tenant_id, kb_id):
         return await self._invoke("status", {"kb": kb_name}, tenant_id, kb_id)
@@ -221,6 +238,11 @@ class RemoteJonexWikiClient(JonexWikiClient):
 
     async def list_graph(self, kb_name, tenant_id, kb_id, document_id: str = ""):
         return await self._invoke("list_graph", {"kb": kb_name, "document_id": document_id},
+                                  tenant_id, kb_id)
+
+    async def list_page_graph(self, kb_name, tenant_id, kb_id):
+        # v1 MCP 不传 document_id，保留字段以便后续扩展（契约 §4.4）。
+        return await self._invoke("list_page_graph", {"kb": kb_id, "document_id": ""},
                                   tenant_id, kb_id)
 
     async def read_page(self, kb_name, path, tenant_id, kb_id):
@@ -290,6 +312,9 @@ class MockJonexWikiClient(JonexWikiClient):
     async def query(self, *a, **kw): return {"answer": "mock answer"}
     async def status(self, *a, **kw): return {"documents": 0}
     async def list_graph(self, *a, **kw): return {"entities": [], "relationships": []}
+    async def list_page_graph(self, *a, **kw):
+        return {"pages": [], "links": [], "page_total": 0, "link_total": 0,
+                "truncated": False, "truncated_reason": []}
     async def read_page(self, *a, **kw): return {"path": "", "content": ""}
     async def list_wiki_contents(self, *a, view: str = "", **kw):
         # [jonex] counts 视图与条目视图的返回形状不同，桩按 view 分流

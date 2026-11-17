@@ -36,7 +36,9 @@ from jonex_core.capability.atomic.rag.ontology_extractor import (
     _post_validate,
     _type_alias_map,
     merge_entity_attributes,
+    PROCEDURAL_EXTRACTION_METHOD,
     PROCEDURAL_GATE_KEY,
+    PROCEDURAL_PRIORITY_TYPES,
     _coerce_bool,
     _coerce_int,
     coerce_attribute_types,
@@ -64,6 +66,19 @@ class NativeExtractionResult(ExtractionResult):
 
     ontology_entities: List[ExtractedEntity] = field(default_factory=list)
     ontology_relations: List[ExtractedRelation] = field(default_factory=list)
+
+
+def _is_extraction_ok(
+    entities: List[Any], relations: List[Any]
+) -> bool:
+    """本次抽取算不算「有产出」——**只看最终结果，不看产出是哪条路径来的**。
+
+    主批、gleaning、procedural、单 chunk 补跑最终都会并进同一份 `entities` /
+    `relations`；只要其中有任意一个，本次抽取就有可回写、可检索的内容。反过来，
+    「主批全失败」本身不足以判死（procedural 可能已抽出可用本体），只有**两条
+    都为空**才是真的没产出。
+    """
+    return bool(entities or relations)
 
 
 # ============================================================
@@ -826,7 +841,12 @@ class NativeOntologyExtractor:
             entities, relations, rejects, skill_logs = await run_entity_skill_chains(
                 entities, relations, schema,
                 chunk_texts=[str(c.get("content") or "") for c in usable],
-                params={"name_maxlen": _env_int("ONTOLOGY_PROCEDURAL_NAME_MAXLEN", 30)},
+                params={
+                    "name_maxlen": _env_int("ONTOLOGY_PROCEDURAL_NAME_MAXLEN", 30),
+                    # 与下方最终 _post_validate 同一兜底口径：技能链里的 schema_validator
+                    # 不能先把兜底档实体/关系误杀
+                    "fallback_types": load_fallback_types(),
+                },
                 chunk_text_by_id={
                     str(c.get("chunk_id")): str(c.get("content") or "")
                     for c in usable if c.get("chunk_id")
@@ -912,9 +932,17 @@ class NativeOntologyExtractor:
                 sorted(tbox_attr_names - used_attr_names),
             )
 
-        ok = any_batch_ok and bool(entities)
+        # **「有产出」就算成功，不只看主批。** `any_batch_ok` 只来自主批
+        # `_parse_results`；gleaning（686）、procedural（750）、单 chunk 补跑（798）
+        # 的产出都是之后才并进 `entities` / `relations` 的，它们成功不会被
+        # `any_batch_ok` 看见。2026-11-17 实测：主批失败、procedural 抽出 4 实体 2
+        # 关系并已回写 LightRAG，仍被判 `ok=False` → 任务标 failed → 文档永远
+        # 「编译中」。判据改为「最终有没有可用实体或关系」。
+        ok = _is_extraction_ok(entities, relations)
         if not any_batch_ok:
-            errors.append("所有批次 LLM 调用失败")
+            errors.append(
+                "所有主批 LLM 调用失败" + ("（其余来源仍有产出）" if ok else "")
+            )
         return NativeExtractionResult(
             entities=entities,
             relations=relations,
@@ -1309,7 +1337,15 @@ class NativeOntologyExtractor:
             results = await asyncio.gather(*[_glean_one(i) for i in idxs])
             for i, (raw, fr, err) in zip(idxs, results):
                 if err is not None:
-                    errors.append(f"gleaning 轮#{rnd} 批#{i} 调用失败: {err}")
+                    # 与主批同口径：异常无消息时也要能看出类型（见 `_parse_results`）。
+                    logger.warning(
+                        "gleaning 轮#%d 批#%d 本体抽取 LLM 调用失败",
+                        rnd, i, exc_info=err,
+                    )
+                    errors.append(
+                        f"gleaning 轮#{rnd} 批#{i} 调用失败: "
+                        f"{type(err).__name__}: {err!r}"
+                    )
                     continue
                 data = _load_json(raw or "")
                 if data is None:
@@ -1415,7 +1451,16 @@ class NativeOntologyExtractor:
         any_ok = False
         for bi, (raw, _fr, err, batch) in enumerate(raw_items):
             if err is not None:
-                errors.append(f"批#{bi} 调用失败: {err}")
+                # **必须带类型名与 repr**：异常对象可能没有消息（如无参数的
+                # TimeoutError），只写 `{err}` 会得到「批#0 调用失败: 」这种
+                # 查不出任何原因的文本（2026-11-17 线上实测）。类型 + repr
+                # 至少能区分时间/鉴权/解析；完整堆栈另记一条 warning。
+                logger.warning(
+                    "批#%d 本体抽取 LLM 调用失败", bi, exc_info=err
+                )
+                errors.append(
+                    f"批#{bi} 调用失败: {type(err).__name__}: {err!r}"
+                )
                 continue
             data = _load_json(raw or "")
             if data is None:
@@ -1512,13 +1557,42 @@ class NativeOntologyExtractor:
     # ── ⑤ 跨批合并 ────────────────────────────
 
     @staticmethod
+    def _merge_into(m: ExtractedEntity, e: ExtractedEntity) -> None:
+        """把 e 合并进 m：描述取长、confidence 取大、属性按既有优先级、aliases/chunks 去重并集。"""
+        if len(e.description) > len(m.description):
+            m.description = e.description
+        if e.confidence > m.confidence:
+            m.confidence = e.confidence
+        # Action/Skill 以 procedural 属性为准、字段级并集；其余类型先到者优先
+        merge_entity_attributes(m, e)
+        for alias in e.aliases:
+            if alias and alias not in m.aliases:
+                m.aliases.append(alias)
+        seen = {(sc.get("source_id"), sc.get("file_path")) for sc in m.source_chunks}
+        for sc in e.source_chunks:
+            key = (sc.get("source_id"), sc.get("file_path"))
+            if key not in seen:
+                seen.add(key)
+                m.source_chunks.append(dict(sc))
+
+    @staticmethod
     def _merge_entities(entities: List[ExtractedEntity]) -> List[ExtractedEntity]:
-        """同名实体合并：描述取长、aliases 并集、source_chunks 按 source_id 去重聚合。"""
-        merged: Dict[str, ExtractedEntity] = {}
+        """同名同类实体合并：描述取长、aliases 并集、source_chunks 去重聚合。
+
+        合并键是 `(canonical_name, entity_type)`：同名的 Skill 与 Action 是两类实体，
+        不能合成一个（否则其中一个类型会整个丢失），关系端点也会指向错的类型。
+
+        唯一例外：主抽取可能把 procedural 的 Action/Skill 判成 Concept 等泛化类型。
+        同名组里恰有一个 procedural 的 Action/Skill 时，把其余**非 procedural** 条目
+        并入它（与 ``merge_entity_attributes`` 的优先级口径一致）；两个 procedural
+        类型同时同名时保持独立。
+        """
+        merged: Dict[Tuple[str, str], ExtractedEntity] = {}
+        order: List[Tuple[str, str]] = []
         for e in entities:
-            name = e.canonical_name
-            if name not in merged:
-                merged[name] = ExtractedEntity(
+            key = (e.canonical_name, e.entity_type)
+            if key not in merged:
+                merged[key] = ExtractedEntity(
                     canonical_name=e.canonical_name,
                     entity_type=e.entity_type,
                     aliases=list(e.aliases),
@@ -1528,24 +1602,36 @@ class NativeOntologyExtractor:
                     source_chunks=[dict(sc) for sc in e.source_chunks],
                     extraction_method=e.extraction_method,
                 )
+                order.append(key)
                 continue
-            m = merged[name]
-            if len(e.description) > len(m.description):
-                m.description = e.description
-            if e.confidence > m.confidence:
-                m.confidence = e.confidence
-            # Action/Skill 以 procedural 属性为准、字段级并集；其余类型先到者优先
-            merge_entity_attributes(m, e)
-            for alias in e.aliases:
-                if alias and alias not in m.aliases:
-                    m.aliases.append(alias)
-            seen = {(sc.get("source_id"), sc.get("file_path")) for sc in m.source_chunks}
-            for sc in e.source_chunks:
-                key = (sc.get("source_id"), sc.get("file_path"))
-                if key not in seen:
-                    seen.add(key)
-                    m.source_chunks.append(dict(sc))
-        return list(merged.values())
+            NativeOntologyExtractor._merge_into(merged[key], e)
+
+        def _is_proc(item: ExtractedEntity) -> bool:
+            return (
+                item.extraction_method == PROCEDURAL_EXTRACTION_METHOD
+                and item.entity_type in PROCEDURAL_PRIORITY_TYPES
+            )
+
+        by_name: Dict[str, List[Tuple[str, str]]] = {}
+        for key in order:
+            by_name.setdefault(key[0], []).append(key)
+        dropped: set[Tuple[str, str]] = set()
+        for keys in by_name.values():
+            if len(keys) < 2:
+                continue
+            proc_keys = [k for k in keys if _is_proc(merged[k])]
+            if len(proc_keys) != 1:
+                continue
+            target = merged[proc_keys[0]]
+            for k in keys:
+                if k == proc_keys[0] or k in dropped:
+                    continue
+                incoming = merged[k]
+                if _is_proc(incoming):
+                    continue
+                NativeOntologyExtractor._merge_into(target, incoming)
+                dropped.add(k)
+        return [merged[k] for k in order if k not in dropped]
 
     @staticmethod
     def _merge_relations(relations: List[ExtractedRelation]) -> List[ExtractedRelation]:

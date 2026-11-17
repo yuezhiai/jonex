@@ -30,6 +30,7 @@ class OpenKBClient(ABC):
     async def query(
         self, kb_name: str, question: str, tenant_id: str, kb_id: str,
         return_trace: bool = False,  # [jonex]
+        trace_id: str | None = None,  # [jonex] 平台检索 trace 透传（缺省不改行为）
     ) -> dict: ...
 
     @abstractmethod
@@ -76,7 +77,8 @@ class RemoteOpenKBClient(OpenKBClient):
     def _workspace(self, tenant_id: str, kb_id: str) -> str:
         return f"{tenant_id}__{kb_id}"
 
-    async def _invoke(self, action: str, data: dict, tenant_id: str, kb_id: str) -> dict:
+    async def _invoke(self, action: str, data: dict, tenant_id: str, kb_id: str,
+                      trace_id: str | None = None) -> dict:
         from jonex_core.common.exceptions import (
             InvalidParameterError,
             ResourceNotFoundError,
@@ -87,10 +89,18 @@ class RemoteOpenKBClient(OpenKBClient):
             "payload": {"action": action, "knowledge_base_id": kb_id, "data": data},
             "tenant_id": tenant_id,
         }
+        headers = {"X-Tenant-ID": tenant_id}
+        # [jonex] 平台检索 trace 透传：**只发追踪号，不发调用身份**。
+        # Sidecar 以 X-Jonex-Trace-Id 作本次调用的 trace_id、另生成自己的 request_id
+        # —— 每次嵌套原子调用各占一条 monitor.call_log，不会顶掉外层行。
+        # trace 仍由 Sidecar 作为 request_id 传给下游能力，adapter 把它写进 openkb
+        # 计量上下文，最终成为每次模型调用的 X-Jonex-Trace-Id。
+        if trace_id:
+            headers["X-Jonex-Trace-Id"] = trace_id
         resp = await self._client.post(
             "/invoke",
             json=body,
-            headers={"X-Tenant-ID": tenant_id},
+            headers=headers,
         )
         resp.raise_for_status()
         result = resp.json()
@@ -136,10 +146,11 @@ class RemoteOpenKBClient(OpenKBClient):
         """删除当前 tenant + kb 对应的 OpenKB KB 目录。"""
         return await self._invoke("delete_kb", {"kb": kb_name}, tenant_id, kb_id)
 
-    async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False):  # [jonex]
+    async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False,  # [jonex]
+                    trace_id: str | None = None):
         return await self._invoke("query", {
             "kb": kb_name, "question": question, "return_trace": return_trace,
-        }, tenant_id, kb_id)
+        }, tenant_id, kb_id, trace_id=trace_id)
 
     async def status(self, kb_name, tenant_id, kb_id):
         return await self._invoke("status", {"kb": kb_name}, tenant_id, kb_id)

@@ -698,6 +698,8 @@ class LLMGatewaySettings(BaseSettings):
     # 思考 token 会吃光 1200 / 400 max_tokens → 正文为空 → 静默回退（调用侧看不出根因）。
     # nl2sql_value_synonym_suggest（值同义词候选）同属抽取档恒禁：一次性结构化 JSON，
     # 漏登记 = 网关静默不关思考 → 回包截断 / 空正文，候选生成直接 failed。
+    # nl2sql_metric_suggest（指标口径候选）同属抽取档恒禁：一次性结构化 JSON，
+    # 漏登记 = 网关静默不关思考 → 回包截断 / 空正文，候选生成直接 failed。
     LLMGW_DISABLE_THINKING_SCENES: str = (
         "lightrag_extract,ontology_extract,raganything_ingest,abstract_schema_align,"
         "abstract_schema_landing_align,abstract_schema_focus,"
@@ -705,9 +707,11 @@ class LLMGatewaySettings(BaseSettings):
         "image_query_caption,"
         "nl2sql_generate,nl2sql_multiturn,nl2sql_format,nl2sql_value_map,"
         "nl2sql_probe_summary,nl2sql_candidate_select,"
-        "abstract_schema_attr_names,"
+        "abstract_schema_attr_names,abstract_schema_landing_agent,"
         "concept_relevance_filter,nl2sql_alias_suggest,nl2sql_entry_revise,"
-        "nl2sql_value_synonym_suggest,nl2sql_supplement_fuse,ontology_qa_tools"
+        "nl2sql_value_synonym_suggest,nl2sql_metric_suggest,"
+        "nl2sql_supplement_fuse,ontology_qa_tools,config_tool_binding_mapping,"
+        "config_extract_tool_declaration,config_kb_tool_draft"
     )
     # 思考字段注入写法，语法 <字段路径>.<类型>[.<取值>][,...]（见 jonex_core/common/thinking.py）：
     #   string → enabled / disabled（省略取值 = disabled）
@@ -1009,6 +1013,17 @@ class NL2SqlSettings(BaseSettings):
     #: `0`（默认）= 提示词/payload/流程与引入前**逐字节相同**。
     NL2SQL_PROJECTION_CONTRACT: bool = False
 
+    #: 执行前 schema 级可构建性校验（A1b）：列/别名解析失败 → retry_note 再生成一次。
+    #: 默认关；关档时 SQL、payload、观测与今天逐字节相同。
+    NL2SQL_PRECOMPILE_CHECK: bool = False
+
+    #: 已验证查询快路径（N1-1）：`1` = 命中 KB 级带参模板时直接渲染执行、不调 LLM；
+    #: `0`（默认）= 行为、响应、观测与引入前逐字节相同（连仓储都不读）。
+    NL2SQL_VERIFIED_QUERY: bool = False
+    #: 已验证查询的匹配下限（词元 Jaccard）。低于该值不命中；最高与次高差 <0.02 也
+    #: 判歧义并回退正常链路。只在上一个开关打开时生效。
+    NL2SQL_VERIFIED_MATCH_FLOOR: float = 0.8
+
     #: evidence/hints（2026-10-28，P0-A2）：`1` = `ask` 接受可选 `hints` 并注入
     #: payload/提示词（BIRD evidence、业务口径、值映射）。`0`（默认）= 忽略 hints，
     #: 请求/提示词/payload 与引入前逐字节相同。
@@ -1025,6 +1040,9 @@ class NL2SqlSettings(BaseSettings):
     #: 列描述注入（2026-10-30）：`1` = 锚点/1 跳列的 `description` 随列清单进 payload
     #: （截 120 字符）。`0`（默认）= 列清单与今天逐字节相同。
     NL2SQL_COLUMN_DESC: bool = False
+    #: 列级语义（N0-3）：`1` = 把 compiled 属性的 `role/unit/grain/values` 带进
+    #: ② 的列清单与提示词（4y 段）；`0`（默认）= payload 与今天逐字节相同。
+    NL2SQL_COLUMN_SEMANTICS: bool = False
     #: 空结果修复（P0-2，2026-10-28）：`1` = 最终 SQL 执行成功但 0 行时，
     #: 带“0 rows + 列样例”反馈重生成**一次**；`0`（默认）= 不重试，空结果照常返回。
     #: 合法空结果存在（问“没有 X 的公司”），所以必须开关 + A/B。
@@ -1036,12 +1054,20 @@ class NL2SqlSettings(BaseSettings):
     NL2SQL_METRIC_SHADOW: bool = False
     # W4.8：指标级调用审批（默认关；关时 ask_metric 不查审批表）。
     METRIC_CALL_APPROVAL_ENABLED: bool = False
+    # W4.8：批准指标的默认有效期（天）。0（默认）= 不过期，行为与引入前一致。
+    METRIC_APPROVAL_TTL_DAYS: int = 0
     # W4.3b：单元格级溯源（只描述定义/落点/SQL 快照，不抓源行）。
     METRIC_CELL_PROVENANCE_ENABLED: bool = True
     METRIC_CELL_PROVENANCE_MAX_CELLS: int = 200
     # W1.6：只读查询结果缓存（默认关；键含 engine + 实际执行 SQL）。
     NL2SQL_QUERY_CACHE_TTL_SECONDS: int = 0
     NL2SQL_QUERY_CACHE_MAX_ENTRIES: int = 128
+    # W4.5：血缘检索的语义（embedding）召回，默认关；关时响应与引入前逐字节一致。
+    NL2SQL_LINEAGE_SEMANTIC: bool = False
+    NL2SQL_LINEAGE_SEMANTIC_TIMEOUT: float = 8.0
+    #: 余弦下限：低于它的资产不进候选（避免「什么都能召回一点」）。
+    NL2SQL_LINEAGE_SEMANTIC_FLOOR: float = 0.35
+    NL2SQL_LINEAGE_SEMANTIC_MAX_ASSETS: int = 200
 
     # ── W4.2 指标问数执行面 ──────────────────────────────────────────
     #: 指标结果进程内缓存 TTL（秒）：`0`（默认）= 关闭。键含 schema 写代号，
@@ -1227,6 +1253,23 @@ class NL2SqlSettings(BaseSettings):
     #: 题面点名的实体表提升为 CTE 选择种子（2026-11-01）：修复 works_cycles 三条
     #: 多跳题 vendor/department/person 被预算挤掉。默认关。
     NL2SQL_CTE_ENTITY_SEEDS: bool = False
+    #: 检索式 schema 选择（N1-2，2026-11-07）：`1` = 把编译 schema 切成表块后按
+    #: 词面/嵌入信号排序 + MMR 选表，作为**召回增强**：基线（词面展开）候选优先，
+    #: 检索只补基线没有的实体；基线为空时才用检索 top1。列注入（把命中列补进预览）
+    #: **需要 `NL2SQL_SCHEMA_PREVIEW` 或 `NL2SQL_CTE_VIEW` 同时开启**，两者都关时
+    #: 本开关只影响候选召回。`0`（默认）= 不调用，payload 与今天逐字节相同。
+    NL2SQL_SCHEMA_RETRIEVAL: bool = False
+    #: 检索产出的**候选实体数**上限（MMR 选择后的块数）——不是注入 prompt 的表数，
+    #: 注入表由 preview/CTE 路径决定。
+    NL2SQL_SCHEMA_RETRIEVAL_TOP_K: int = 8
+    #: 嵌入召回阶段保留的候选表数（再交给 MMR 去冗余）；需 ≥ TOP_K。
+    NL2SQL_SCHEMA_RETRIEVAL_EMBED_TOPN: int = 20
+    #: MMR 的相关性/多样性权衡：1.0 = 纯相关性，越小越鼓励去冗余。
+    NL2SQL_SCHEMA_RETRIEVAL_MMR_LAMBDA: float = 0.7
+    #: 嵌入/召回调用的超时（秒）；失败 fail-open 回退规则选择，不影响回答。
+    NL2SQL_SCHEMA_RETRIEVAL_TIMEOUT: float = 8.0
+    #: 每张已选表最多补几个「题面命中但原本未选」的列（0 = 不补列）。
+    NL2SQL_SCHEMA_RETRIEVAL_MAX_EXTRA_COLUMNS: int = 10
     #: 预览列示例值（P2-4a，2026-10-29）：**依赖 `NL2SQL_SCHEMA_PREVIEW`**。`1` = 预览表
     #: 每列再带 ≤3 个示例值（`column_examples`），数据只取编译行里**已存证据**，不查源库。
     #: `0`（默认）= 预览形状与今天逐字节相同。
@@ -1329,6 +1372,26 @@ class LineageSettings(BaseSettings):
     #: 标 `stale=true`。只标注、不删除、不写回（与抽象 schema 的 stale 同口径）。
     #: `0` = 关闭失效标记。
     LINEAGE_STALE_AFTER_DAYS: int = 30
+
+
+# ==================== Jonex Wiki 列式浏览（MCP） ====================
+class WikiBrowseSettings(BaseSettings):
+    """Jonex Wiki 列式浏览的全库语义图「图源安全网」上限。
+
+    这两个上限由 **capability 侧**（atomic jonex_wiki 适配器）执行：它持有原始图，
+    知道截断前的真实总数，业务层只补 `knowledge_base_id` / `degraded`，不重复截断。
+
+    ⚠️ 它们只决定「返回多少页/边」，不影响引擎读取；超出时确定性截断并置
+    `truncated=true`、`truncated_reason` 追加 `source_pages` / `source_links`。
+    ⚠️ 缺省值是第一道安全网，不是用户参数；集成收口时按真实大库实测体积调整。
+    """
+
+    #: 图源页上限（超过则按 path 排序取前 N）。
+    WIKI_BROWSE_GRAPH_MAX_PAGES: int = 2000
+    #: 图源边上限（超过则按 (source, target) 排序取前 N）。
+    WIKI_BROWSE_GRAPH_MAX_LINKS: int = 10000
+
+
 class ImageQuerySettings(BaseSettings):
     """以图问知识（图片转查询）的全部配置。
 
@@ -1424,6 +1487,69 @@ class AbstractConstructSettings(BaseSettings):
     #: 不再按 `probe_distinct` 默认的 60s 跑满 —— 只挡「起新探」时阶段能超到 30+60s。
     ABSTRACT_CONSTRUCT_PROBE_BUDGET_S: float = 30.0
     ABSTRACT_CONSTRUCT_MAX_PROBE_QUERIES: int = 40
+
+    #: 落点 provenance 的保存侧开关（landing-agent 线）。**关闭时公开保存不得
+    #: 新增任何 provenance 键**（G5 逐字节回归：老行为的下游字节完全一致）；
+    #: 开启后公开保存才按 diff 把新增 / included 翻转的落点标 `origin="manual"`。
+    #: 同时也是「自动落点走 agent 还是走下线的 LLM 对齐」的总开关（设计 §5.10）：
+    #: 关闭 = 今日行为（`auto_landings` 仍走 `align_document_landings`）。
+    ABSTRACT_LANDING_AGENT_ENABLED: bool = False
+    #: 落点 agent 的判定模型。**空串 = 沿用默认模型**（`ONTOLOGY_LLM_MODEL` 的解析链，
+    #: 与 `landing_agent_step` 的既有口径一致）：模型名只允许经环境/配置解析，
+    #: 代码里不留字面量（2026-10-08 事故的规矩）。
+    ABSTRACT_LANDING_AGENT_MODEL: str = ""
+    #: 单次 run 参与判定的概念上限。超出的概念**不判**（显式 warning），
+    #: 既有落点原样保留 —— 截断不是「删掉没判到的落点」。
+    ABSTRACT_LANDING_AGENT_MAX_CONCEPTS: int = 300
+    #: 单概念的工具步数上限（含 decide/give_up 终止轮）。耗尽 → `give_up`。
+    ABSTRACT_LANDING_AGENT_MAX_STEPS: int = 6
+    #: 单概念的 token 上限（不是单步 —— 单步预算由模型步自己的 2048 管）。
+    ABSTRACT_LANDING_AGENT_MAX_TOKENS: int = 24000
+    #: 召回候选数（进模型候选卡的表数）。调大能减少漏召回，但 prompt 也线性变长。
+    ABSTRACT_LANDING_AGENT_TOP_K: int = 8
+    #: 是否启用 S3 语义召回（embedding）。关闭后只剩词面/证据/图三路信号，
+    #: 用于 embedding 服务不可用时的降级排查（不是常规运行态）。
+    ABSTRACT_LANDING_AGENT_EMBEDDING: bool = True
+
+
+class JoinAgentSettings(BaseSettings):
+    """join 边复核 agent（确定性发现 + 有界复核）的配置。默认关闭。"""
+
+    JOIN_AGENT_ENABLED: bool = False
+    #: 复核模型。空串 = 沿用默认模型解析链。
+    JOIN_AGENT_MODEL: str = ""
+    #: 单次复核的步数上限（含 propose/give_up）。
+    JOIN_AGENT_MAX_STEPS: int = 6
+    #: 单次复核的墙钟上限（秒）。
+    JOIN_AGENT_TIMEOUT_S: float = 120.0
+    #: 交给 agent 的候选上限（发现器自身也有上限，这里再收一道）。
+    JOIN_AGENT_MAX_CANDIDATES: int = 40
+    #: agent 手动 `check_overlap` 的次数上限（每次一条 LEFT JOIN 计数）。
+    JOIN_AGENT_CHECK_BUDGET: int = 12
+
+
+class MetricAgentSettings(BaseSettings):
+    """指标构建 agent（进程内，有界循环 + 只读工具）的配置。
+
+    ⚠️ 本模块所有 `METRIC_AGENT_*` 配置**只在这个类里**。
+    默认关闭：入口在开关关闭时直接回软失败，不产生任何模型调用。
+    """
+
+    #: 总开关。关闭时 `build_metric_proposal` 回 `metric_agent_disabled`。
+    METRIC_AGENT_ENABLED: bool = False
+    #: 判定模型。**空串 = 沿用默认模型**（`ONTOLOGY_LLM_MODEL` 解析链）——
+    #: 代码里不留模型名字面量（2026-10-08 事故的规矩）。
+    METRIC_AGENT_MODEL: str = ""
+    #: 单次构建的工具步数上限（含 propose/give_up 终止轮）。耗尽 → `budget_exhausted`。
+    METRIC_AGENT_MAX_STEPS: int = 12
+    #: 单次构建的 token 上限（不是单步 —— 单步预算由 2048 管）。超限后不再发新步。
+    METRIC_AGENT_MAX_TOKENS: int = 60000
+    #: 单次构建的墙钟上限（秒）。到点即按 `timeout` 收口，已跑出的证据保留在提案里。
+    METRIC_AGENT_TIMEOUT_S: float = 150.0
+    #: 一次构建里允许的预览次数（`execute_preview` / `check_join_overlap`）。
+    METRIC_AGENT_PREVIEW_BUDGET: int = 16
+
+
 class DataGovernanceSettings(BaseSettings):
     """数据治理保留策略的全局默认值（第 3 期）。
 
@@ -1487,7 +1613,10 @@ class Settings(
     TaskCenterSettings,
     NL2SqlSettings,          # ← 新增（② NL→SQL 分源查询）
     LineageSettings,         # ← 新增（血缘 / ETL 来源）
+    WikiBrowseSettings,      # ← 新增（Jonex Wiki 列式浏览图源上限）
     AbstractConstructSettings,  # ← 新增（抽象 schema「自动构造」）
+    MetricAgentSettings,     # ← 新增（指标构建 agent）
+    JoinAgentSettings,       # ← 新增（join 边复核 agent）
     IdentityIntegrationSettings,
     ImageQuerySettings,
     DataGovernanceSettings,
