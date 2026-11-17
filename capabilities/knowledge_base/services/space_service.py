@@ -217,7 +217,7 @@ class SpaceService:
             return result
 
     async def list(self, tenant_id: str, offset: int = 0, limit: int = 20,
-                   user_id: str | None = None) -> dict:
+                   user_id: str | None = None, scope: str = "manage") -> dict:
         tenant_id = require_tenant(tenant_id)
         # [jonex] 默认空间懒创建：ensure 内部自判「租户管理员 + 空空间」，
         # 匿名/非管理员/已有空间一律 no-op。放在查列表之前，保证本次 list 就含默认空间。
@@ -261,6 +261,17 @@ class SpaceService:
                 row["can_write_space"] = (
                     write_ids is None or row.get("id") in write_ids
                 )
+            # [jonex] 检索视角标注：每个空间是否「至少有 1 个启用中服务」。
+            # 判据与后端 3029 同源（service_availability.get_space_ids_with_enabled_service），
+            # 不另写谓词；只对本页空间做一次批量判定，不查全租户。
+            # 管理视角不标注 —— 停用服务/无服务空间在管理页仍需可见可操作。
+            if scope == "search" and rows:
+                from .service_availability import get_space_ids_with_enabled_service
+                enabled_space_ids = await get_space_ids_with_enabled_service(
+                    tenant_id, [row["id"] for row in rows]
+                )
+                for row in rows:
+                    row["has_enabled_service"] = row["id"] in enabled_space_ids
             return {
                 "items": rows,
                 "total": total, "offset": offset, "limit": limit,

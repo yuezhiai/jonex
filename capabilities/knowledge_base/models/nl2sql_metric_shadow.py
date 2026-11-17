@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """② 指标编译影子对比行 — Nl2SqlMetricShadow（W3.3 M4）。
 
-迁移：`deploy/postgres/migrations/034_metric_shadow.sql`（列与本模型一一对应）。
+迁移：`deploy/postgres/migrations/003_knowledge_base.sql`（列与本模型一一对应）。
 设计：docs/superpowers/specs/2026-11-01-w3-metric-shadow-design.md（工作区文档，不入库）。
 
 ⚠️ 纯追加诊断，**不参与业务 CRUD**，也**不存原始数据值**（只记行数与比较口径）。

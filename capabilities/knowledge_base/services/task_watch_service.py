@@ -453,6 +453,87 @@ class TaskWatchService:
                 KnowledgeInfo.is_deleted == 1,
             )))
 
+    async def retry_cleanup_outbox(self, limit: int = 50) -> Dict[str, int]:
+        """补删「源头已删、但任务中心没删掉」的任务（2026-11-17 加）。
+
+        删库 / 删文档时会把待清理的 `task_id` 写进
+        `knowledge_base.task_center_cleanup_outbox`（与源头删除同一事务），
+        这里按 30 秒循环补删：`force=True`（源头已失，任务在不在跑都不再重要）。
+
+        清行口径：任务中心回「已删（deleted）」或「本来就不存在（skipped）」都算
+        目标达成 —— 后者说明别的路径已经删过，outbox 不该再排。其余（批量调用
+        异常 / 明确拒绝 / 未确认）一律退避重试。
+        """
+        from jonex_core.capability.business.task_center import (
+            get_task_center_client,
+        )
+
+        async with get_db_session() as session:
+            rows = await TaskCenterDocumentRepository(session).list_due_cleanups(
+                limit
+            )
+        if not rows:
+            return {"checked": 0, "done": 0, "failed": 0}
+
+        groups: Dict[str, List[str]] = {}
+        for row in rows:
+            groups.setdefault(row["tenant_id"], []).append(row["task_id"])
+
+        client = get_task_center_client()
+        done = 0
+        failed = 0
+        for tenant_id, task_ids in groups.items():
+            try:
+                result = await client.delete_tasks_batch(
+                    tenant_id, task_ids, force=True
+                )
+            except Exception as exc:  # noqa: BLE001 —— 下一拍再试
+                logger.warning(
+                    "任务中心清理补偿失败（调用异常）tenant=%s n=%d：%s",
+                    tenant_id, len(task_ids), exc,
+                )
+                async with get_db_session() as session:
+                    repo = TaskCenterDocumentRepository(session)
+                    for task_id in task_ids:
+                        await repo.defer_cleanup(tenant_id, task_id, str(exc))
+                    await session.commit()
+                failed += len(task_ids)
+                continue
+
+            if not result.success:
+                logger.warning(
+                    "任务中心清理补偿被拒 tenant=%s n=%d code=%s: %s",
+                    tenant_id, len(task_ids), result.code, result.message,
+                )
+                async with get_db_session() as session:
+                    repo = TaskCenterDocumentRepository(session)
+                    for task_id in task_ids:
+                        await repo.defer_cleanup(
+                            tenant_id, task_id, result.message
+                        )
+                    await session.commit()
+                failed += len(task_ids)
+                continue
+
+            data = result.data if isinstance(result.data, dict) else {}
+            settled = set(data.get("deleted") or []) | set(
+                data.get("skipped") or []
+            )
+            async with get_db_session() as session:
+                repo = TaskCenterDocumentRepository(session)
+                for task_id in task_ids:
+                    if task_id in settled:
+                        await repo.clear_cleanup(tenant_id, task_id)
+                        done += 1
+                    else:
+                        await repo.defer_cleanup(
+                            tenant_id, task_id, "任务中心未确认删除"
+                        )
+                        failed += 1
+                await session.commit()
+
+        return {"checked": len(rows), "done": done, "failed": failed}
+
     async def _inspect(self, row: Dict[str, Any]) -> str:
         """一条接管行现在该干什么。返回一个档位名（只用于计数与日志）。"""
         # 删库收口**必须放在所有分支之前**（2026-10-18）：
@@ -1059,7 +1140,11 @@ class TaskWatchService:
                         doc, DocStatus.FAILED, error_message=error_message[:2000],
                     )
             await TaskCenterDocumentRepository(session).mark_released(
-                document_id, error_message=error_message[:2000],
+                document_id,
+                # 只拆「我盯的这一单」：row 里的 execution_id 为空（还没派活）时
+                # 不加条件，行为与从前一致。
+                expect_execution_id=row.get("execution_id"),
+                error_message=error_message[:2000],
                 # 把**失败报文**存进接管行 —— 管理方主动问时（`query_step_status`）
                 # 拿它当一条上报消化。带上代号与参数（管理方按读的人的语言渲染）。
                 # 不写的话管理方只能答「这活不归我」，一次真实的失败就被读成「配置错误」。

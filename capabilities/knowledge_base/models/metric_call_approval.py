@@ -2,12 +2,12 @@
 # -*- coding:utf-8 -*-
 """指标级调用审批行 — MetricCallApproval（W4.8）。
 
-迁移：`deploy/postgres/migrations/035_metric_call_approvals.sql`（列与本模型一一对应）。
+迁移：`deploy/postgres/migrations/003_knowledge_base.sql`（列与本模型一一对应）。
 设计：docs/superpowers/specs/2026-11-01-w4.8-metric-call-approval-design.md（工作区文档，不入库）。
 """
 import uuid
 
-from sqlalchemy import Column, String
+from sqlalchemy import Column, DateTime, String
 
 from jonex_core.common.database import Base
 from jonex_core.common.entity import SoftDeleteMixin, TenantMixin, TimestampMixin
@@ -26,6 +26,8 @@ class MetricCallApproval(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     requested_by = Column(String(128), nullable=True)
     decided_by = Column(String(128), nullable=True)
     reason = Column(String(500), nullable=True)
+    #: 批准的有效期（W4.8）；NULL = 不过期。只对 `approved` 有意义。
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 __all__ = ["MetricCallApproval"]

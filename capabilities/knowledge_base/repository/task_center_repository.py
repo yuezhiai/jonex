@@ -20,7 +20,7 @@ contextvar 回落。这也让「谁在什么身份下读这张表」在调用点
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, select, text, update
 
 from jonex_core.common.repository import BaseRepository
 
@@ -129,6 +129,87 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         )
         return bool((await self.session.execute(stmt)).scalar())
 
+    async def list_task_ids_by_kb(
+        self, knowledge_base_id: str, tenant_id: str
+    ) -> list[str]:
+        """取该库下所有接管行的 `task_id`（删库级联清任务用，2026-11-17 加）。
+
+        **不过滤 `state`**：已交还（`released`）、已跑完的行也要算 —— 源头（知识库）
+        马上要没了，它名下所有任务都不该再留在任务中心里。只要 `task_id`
+        （这一列 `NOT NULL`），`distinct` 去重，一条 SQL。
+        """
+        stmt = (
+            select(TaskCenterDocument.task_id)
+            .where(
+                TaskCenterDocument.knowledge_base_id == knowledge_base_id,
+                TaskCenterDocument.tenant_id == tenant_id,
+            )
+            .distinct()
+        )
+        result = await self.session.execute(stmt)
+        return [t for t in result.scalars().all() if t]
+
+    # ---------------------------------------------------------------- 清理补偿 outbox
+
+    async def enqueue_cleanups(self, tenant_id: str, task_ids: list[str]) -> None:
+        """把「要请任务中心删掉的任务」排进 outbox（与源头删除同一事务）。
+
+        `ON CONFLICT DO NOTHING`：同一个任务只排一次，重复删库/重发不会撑大队列。
+        调用方负责 `commit`。
+        """
+        if not task_ids:
+            return
+        await self.session.execute(
+            text(
+                "INSERT INTO knowledge_base.task_center_cleanup_outbox "
+                "(tenant_id, task_id) "
+                "SELECT :t, unnest(CAST(:ids AS varchar[])) "
+                "ON CONFLICT (tenant_id, task_id) DO NOTHING"
+            ),
+            {"t": tenant_id, "ids": list(task_ids)},
+        )
+
+    async def list_due_cleanups(self, limit: int = 50) -> list[dict]:
+        """取到点该补删的 outbox 行（跨租户，后台循环用）。"""
+        result = await self.session.execute(
+            text(
+                "SELECT tenant_id, task_id, attempts "
+                "FROM knowledge_base.task_center_cleanup_outbox "
+                "WHERE next_attempt_at <= now() "
+                "ORDER BY next_attempt_at "
+                "LIMIT :n"
+            ),
+            {"n": limit},
+        )
+        return [dict(r) for r in result.mappings().all()]
+
+    async def clear_cleanup(self, tenant_id: str, task_id: str) -> None:
+        """任务中心已删成功：把 outbox 行清掉。"""
+        await self.session.execute(
+            text(
+                "DELETE FROM knowledge_base.task_center_cleanup_outbox "
+                "WHERE tenant_id = :t AND task_id = :tid"
+            ),
+            {"t": tenant_id, "tid": task_id},
+        )
+
+    async def defer_cleanup(
+        self, tenant_id: str, task_id: str, error: str | None = None
+    ) -> None:
+        """这次没删成：次数 +1、线性退避（60s × 次数，上限 1 小时）。"""
+        await self.session.execute(
+            text(
+                "UPDATE knowledge_base.task_center_cleanup_outbox "
+                "SET attempts = attempts + 1, "
+                "    next_attempt_at = now() + make_interval("
+                "        secs => LEAST(3600, 60 * (attempts + 1))::int), "
+                "    last_error = :err, "
+                "    updated_at = now() "
+                "WHERE tenant_id = :t AND task_id = :tid"
+            ),
+            {"t": tenant_id, "tid": task_id, "err": (error or "")[:1000]},
+        )
+
     # ---------------------------------------------------------------- 写
 
     async def mark_managed(
@@ -213,6 +294,11 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
                 current_step=step_code,
                 execution_id=execution_id,
                 step_started_at=datetime.now(),
+                # **必须清掉上一轮的下游任务号**：`task_stopped` 通知丢失等情况下，
+                # 行仍带着旧 `execution_id + rag_task_id` 被新一次派活接手；不清的话，
+                # 新执行写完 `execution_id`、还没写回新任务号的那段窗口里，看门狗会
+                # 拿**旧任务号**判出完成并以新 `execution_id` 上报「成功」。
+                rag_task_id=None,
                 # 新一步开始，清掉上一步留下的判死原因 —— 否则一次早已恢复的失败
                 # 会一直挂在这一列上，把排障的人引向错误的方向。
                 error_message=None,
@@ -411,6 +497,7 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         *,
         error_message: str | None = None,
         only_if_idle: bool = False,
+        expect_execution_id: str | None = None,
         report: dict | None = None,
     ) -> bool:
         """判死 / 放弃接力：把接管行交还给既有对账（`state = released`）。
@@ -443,6 +530,15 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         ]
         if only_if_idle:
             conditions.append(TaskCenterDocument.execution_id.is_(None))
+        if expect_execution_id is not None:
+            # **「我这一单」的 CAS**：调用方是在处置**自己这次的**执行痕迹
+            # （发下游失败 / 看门狗判死）。出站可能耗时数十秒，期间任务被停止、
+            # 用户重试、新一次派活以另一个 `execution_id` 接手了这张卡 ——
+            # 不比对的话，旧执行的失败会把**新执行**的接管行拆掉（清掉它的
+            # `execution_id`/`rag_task_id`），新下游任务成无人认领的孤儿。
+            conditions.append(
+                TaskCenterDocument.execution_id == expect_execution_id
+            )
         stmt = (
             update(TaskCenterDocument)
             .where(*conditions)

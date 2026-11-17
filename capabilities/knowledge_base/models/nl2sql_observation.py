@@ -2,7 +2,8 @@
 # -*- coding:utf-8 -*-
 """② NL→SQL 运行时观测行 — Nl2SqlObservation（运行时证据回写）。
 
-迁移：`deploy/postgres/migrations/009_structured_data.sql`（原 `009_nl2sql_observations.sql` 已并入；列与本模型一一对应）。
+迁移：`deploy/postgres/migrations/003_knowledge_base.sql`（原 `009_nl2sql_observations.sql` 已并入）
+      + `deploy/postgres/migrations/003_knowledge_base.sql`（`total_ms` / `precompile_*` 三列与两枚索引）；列与本模型一一对应。
 设计：docs/superpowers/specs/2026-10-12-nl2sql-runtime-observation-design.md（工作区文档，不入库）。
 
 ⚠️ 纯追加观测，**不参与业务 CRUD**：**不继承** `SoftDeleteMixin` / `TimestampMixin`
@@ -11,7 +12,7 @@
 """
 import uuid
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
@@ -39,6 +40,13 @@ class Nl2SqlObservation(TenantMixin, Base):
     rejected_sql = Column(Text)
     row_count = Column(Integer)
     elapsed_ms = Column(Integer)
+    #: 端到端耗时（毫秒）。`elapsed_ms` 是 SQL 执行段耗时，两者不互相替代。
+    total_ms = Column(Integer)
+    #: 预编译校验违规原因（`table_not_in_schema` / `column_not_in_schema` / ...）。
+    precompile_violation = Column(String(32))
+    #: 本条是否因预编译校验失败而重试过一次。
+    precompile_retried = Column(Boolean, nullable=False, default=False,
+                                server_default=text("false"))
     #: 现场（形状见设计 §4.1）：全部键可选、按档出现；无现场时 `{}`。
     scene = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     #: 观测发生时刻。**不是** TimestampMixin 的语义（本表刻意不继承它）——

@@ -18,6 +18,8 @@ from jonex_core.common import get_db_session
 from jonex_core.common.exceptions import PermissionDeniedError, ResourceNotFoundError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
+from jonex_core.common.tenant_admin import is_tenant_admin
+from jonex_core.common.tenant_admin import coerce_user_id as _coerce_user_id
 from jonex_core.security.permission import has_permission
 
 from ..models.space import Space, SpacePermission
@@ -44,9 +46,10 @@ WRITABLE_SPACE_STATUSES = frozenset({SPACE_STATUS_ACTIVE, SPACE_STATUS_DISABLED}
 # 原先是 _TENANT_WRITE = "tenant:write" —— tenant:write 语义过载（既是租户 CRUD
 # 又是"全租户知识库超级开关"），且与前端 auth_service 看 user:write 的口径不一致。
 # 现在统一为标识码 tenant:admin，platform:admin 为其上位（方案 §3.4 判定链 ①）。
+# 2026-11-17：`is_tenant_admin` 与两个标识码上移内核
+# `jonex_core/common/tenant_admin.py`（数据治理能力要复用，但不能因此拖入本包的
+# import 链 —— 它的镜像不带 reasoner，真机起不来）。本模块只做转发，口径不变。
 # 方案：docs/permissions/PERMISSIONS_REDESIGN.md §3.2-A / §11.3
-_TENANT_ADMIN = "tenant:admin"
-_PLATFORM_ADMIN = "platform:admin"
 
 # [jonex] W2（2026-10-19）：建空间的租户级能力码。
 # 权限重构原设计里 space:write 就是「租户级空间管理：建新空间 / 管所有空间」
@@ -57,38 +60,8 @@ _PLATFORM_ADMIN = "platform:admin"
 _SPACE_WRITE = "space:write"
 
 
-def _coerce_user_id(user_id: str | None) -> int | None:
-    """invoke 链路 user_id 是 str（''/'anonymous' 表示无用户）；权限码查询需要 int。"""
-    if not user_id or user_id == "anonymous":
-        return None
-    try:
-        return int(user_id)
-    except (TypeError, ValueError):
-        return None
-
-
-async def is_tenant_admin(tenant_id: str, user_id: str | None) -> bool:
-    """租户管理员（平台/租户管理员）：持有 tenant:admin 或 platform:admin（30s 缓存）。
-
-    判定链 ①（方案 §3.4）：platform:admin 全平台放行；tenant:admin 本租户全业务放行。
-    两者都是**纯标识码**，不参与任何具体资源的准入 —— 具体准入走资源身份。
-
-    空间权限的唯一特权判据：全空间可见 + 空间级管理 + 创建空间。
-    service:write 与空间权限完全解耦（2026-08-19 收紧终版）。
-
-    [jonex] B1 变更：判据从 tenant:write 换为 tenant:admin。
-    tenant:write 回归字面语义（租户 CRUD），不再兼任管理员标识 —— 它与
-    前端 auth_service 曾用的 user:write 都**不再**使 is_tenant_admin 为真。
-    改这里等于改了全部空间/KB 判定的租户管理员豁免口径，勿轻易加回旧码。
-    """
-    uid = _coerce_user_id(user_id)
-    if uid is None:
-        return False
-    if await has_permission(tenant_id, uid, _TENANT_ADMIN):
-        return True
-    # 上位兜底：platform:admin 角色理应同时持有全部 tenant 码（含 tenant:admin），
-    # 这里显式再判一次，避免角色矩阵播种漏配时平台管理员被挡在租户业务之外。
-    return await has_permission(tenant_id, uid, _PLATFORM_ADMIN)
+# `is_tenant_admin` / `coerce_user_id` 由内核提供（本模块顶部 import 转发）：
+# 判定口径见 `jonex_core/common/tenant_admin.py` 的模块 docstring。
 
 
 async def can_create_space(tenant_id: str, user_id: str | None) -> bool:

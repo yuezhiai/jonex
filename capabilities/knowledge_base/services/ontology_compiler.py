@@ -37,14 +37,16 @@ ONTOLOGY_SCHEMA_FALLBACK_PATH = os.getenv(
 )
 
 VALID_ATTR_TYPES = {"string", "text", "number", "date", "enum", "boolean"}
-VALID_CARDINALITY = {"one_to_one", "one_to_many", "many_to_many", "custom"}
+VALID_CARDINALITY = {"one_to_one", "one_to_many", "many_to_one", "many_to_many", "custom"}
 
 CARDINALITY_MAP = {
     "一对多": "one_to_many",
+    "多对一": "many_to_one",
     "多对多": "many_to_many",
     "一对一": "one_to_one",
     "自定义": "custom",
     "one_to_many": "one_to_many",
+    "many_to_one": "many_to_one",
     "many_to_many": "many_to_many",
     "one_to_one": "one_to_one",
     "custom": "custom",
@@ -85,7 +87,7 @@ def abstract_to_compiled_types(schema: dict) -> tuple[list[dict], list[dict]]:
             "description": e.get("description") or "",
             "aliases": list(e.get("aliases") or []),
             "attributes": [
-                {
+                _mark_manual_semantics({
                     "name": a.get("name"),
                     "type": a.get("type") or "string",
                     "required": bool(a.get("required")),
@@ -93,7 +95,12 @@ def abstract_to_compiled_types(schema: dict) -> tuple[list[dict], list[dict]]:
                     **({"display_name": a["display_name"]} if a.get("display_name") else {}),
                     **({"description": a["description"]} if a.get("description") else {}),
                     **({"enum_values": list(a["enum_values"])} if a.get("enum_values") else {}),
-                }
+                    **({"role": str(a["role"]).strip()[:32]} if a.get("role") else {}),
+                    **({"unit": str(a["unit"]).strip()[:64]} if a.get("unit") else {}),
+                    **({"grain": str(a["grain"]).strip()[:64]} if a.get("grain") else {}),
+                    **({"values": _dedupe_strings(a["values"])[:50]}
+                       if a.get("values") else {}),
+                })
                 for a in e.get("attributes") or []
                 if isinstance(a, dict) and a.get("name")
             ],
@@ -185,6 +192,26 @@ def _dedupe_strings(items: list[str]) -> list[str]:
         result.append(value)
     return result
 
+
+
+def _mark_manual_semantics(attr: dict) -> dict:
+    """把**没有来源**的语义字段标成 `manual`（人工编辑/抽象 schema 落点）。
+
+    N1-5：来源决定冲突时谁赢；这里只补「确实是人给的」那部分，已有
+    `semantic_sources` 的字段原样保留（不把 derived 升级成 manual）。
+    """
+    # 延迟导入：`nl2sql` 包会经 service → evolution.schema_io 反向 import 本模块。
+    from .nl2sql import semantics
+
+    out = dict(attr)
+    sources = out.get("semantic_sources") or {}
+    for field in semantics.FIELDS:
+        if sources.get(field):
+            continue
+        if out.get(field) in (None, "", []):
+            continue
+        out = semantics.merge_contribution(out, field, out[field], "manual")
+    return out
 
 def resolve_freshness(
     stored,
@@ -1669,7 +1696,7 @@ class OntologyCompiler:
                 attr_type = (attr.get("type") or "string").strip().lower()
                 if attr_type not in VALID_ATTR_TYPES:
                     raise InvalidParameterError(message=translate("err.ontology.invalid_attr_type", params={"name": name, "attr_name": attr_name, "attr_type": attr_type}, fallback=f"属性类型不合法: {name}.{attr_name}={attr_type}")  )  # 原消息)
-                attributes.append({
+                attr_item = {
                     "name": attr_name,
                     "display_name": (attr.get("display_name") or attr_name).strip(),
                     "description": (attr.get("description") or "").strip(),
@@ -1682,7 +1709,18 @@ class OntologyCompiler:
                     # 一张没有该列的表（2026-10-23 BIRD 实测）。
                     **({"physical_name": str(attr["physical_name"])}
                        if attr.get("physical_name") else {}),
-                })
+                    **({"role": str(attr["role"]).strip()[:32]} if attr.get("role") else {}),
+                    **({"unit": str(attr["unit"]).strip()[:64]} if attr.get("unit") else {}),
+                    **({"grain": str(attr["grain"]).strip()[:64]} if attr.get("grain") else {}),
+                    **({"values": _dedupe_strings(attr["values"])[:50]}
+                       if attr.get("values") else {}),
+                }
+                # N1-5：编辑器保存视为人工确认；显式来源原样保留（不把 derived 升级）。
+                if isinstance(attr.get("semantic_sources"), dict):
+                    attr_item["semantic_sources"] = dict(attr["semantic_sources"])
+                if isinstance(attr.get("semantic_conflicts"), dict):
+                    attr_item["semantic_conflicts"] = dict(attr["semantic_conflicts"])
+                attributes.append(_mark_manual_semantics(attr_item))
 
             normalized.append({
                 "name": name,

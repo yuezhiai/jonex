@@ -741,9 +741,28 @@ class KnowledgeInfoService:
 
     async def delete(self, kb_id: str, tenant_id: str) -> dict:
         tenant_id = require_tenant(tenant_id)
+        task_ids: list[str] = []
         async with get_db_session() as session:
             repo = KnowledgeInfoRepository(session)
             await repo.get_required(kb_id, tenant_id)
+
+            # 删库前先取该库名下全部任务 id：下面 `cleanup_kb_residue` 会把这些
+            # 接管行连同文档一起改掉，事后再查就查不到了。
+            from ..repository.task_center_repository import (
+                TaskCenterDocumentRepository,
+            )
+
+            # ⚠️ **必须用关键字**：这两个参数都是字符串，位置传反不会报错，
+            # 只会静默查出 0 行、让整个删库级联失效（`_delete_task_center_tasks`
+            # 开头 `if not task_ids: return`）。
+            task_ids = await TaskCenterDocumentRepository(session).list_task_ids_by_kb(
+                knowledge_base_id=kb_id, tenant_id=tenant_id
+            )
+            # **与源头删除同一事务落 outbox**：下面那次出站调用失败时，task_id
+            # 不能只留在日志里 —— 后台 30 秒循环按这张表补删。
+            await TaskCenterDocumentRepository(session).enqueue_cleanups(
+                tenant_id, task_ids
+            )
 
             # 删库残留清理：文档行/配置/派生关联/对象存储。
             # 检索索引不在这里清（归文档删除链路与任务看门狗）。
@@ -774,6 +793,9 @@ class KnowledgeInfoService:
                 await syn_repo.delete_soft(group)
 
             await session.commit()
+
+        # 删库事务已提交：把该库名下的任务从任务中心一并清掉（级联，best-effort）。
+        await self._delete_task_center_tasks(tenant_id, kb_id, task_ids)
 
         # 对象存储放在事务提交后 best-effort 清理：失败时文档行仍保留
         # `storage_key`（软删不清列），可据此重试；不能因为一个对象失败就回滚删库。
@@ -806,6 +828,84 @@ class KnowledgeInfoService:
             "storage_failed": storage_failed,
         }
         return {"deleted": True, "cleanup": summary}
+
+    async def _delete_task_center_tasks(
+        self, tenant_id: str, kb_id: str, task_ids: "list[str]"
+    ) -> None:
+        """删库后把该库名下的任务从任务中心一并强制删掉（2026-11-17 加）。
+
+        **为什么必须做**：删库走的是 `cleanup_kb_residue` 的批量软删，绕过了
+        `delete_document` 的 `exists_active` 拦截；任务中心一侧的任务仍是
+        `is_deleted=0`，它名下 `running` 的子任务会继续吃 `compile` 并发名额
+        （全平台共享上限 10）。2026-11-17 的「文档永远编译中」事故正是这么来的：
+        孤儿任务不清理，所有新文档都派不出去。
+
+        **为什么排在删库提交之后**：
+        - 任务中心 `remove_task` 会回调本服务的 `TaskRunnerService.remove_task`，
+          它要读接管行；删库事务没提交时它看到的是半状态。提交后回调看到「KB 已删」，
+          与看门狗判死的既有口径一致；
+        - 出站调用不能跨在删库事务里（长耗时会把连接与行锁一起占着）。
+
+        **为什么 best-effort**：任务中心不可用不能反过来把删库卡住 —— 源头删不掉比
+        残留任务更糟。失败只记 `error`，人工可按日志里的 `task_ids` 补删。
+
+        `force=True`：删库不看任务是否还在跑（源头都没了）。代价见
+        `TaskService.delete_task` 的 force 段（运行方后续上报会被当「任务已删」丢弃）。
+        """
+        if not task_ids:
+            return
+
+        from jonex_core.capability.business.task_center import (
+            get_task_center_client,
+        )
+        from ..repository.task_center_repository import (
+            TaskCenterDocumentRepository,
+        )
+
+        # 单次上限由任务中心协议定死（`task.delete_batch` 最多 200 条），这里按批切片。
+        _BATCH = 200
+        client = get_task_center_client()
+        for start in range(0, len(task_ids), _BATCH):
+            chunk = task_ids[start : start + _BATCH]
+            try:
+                result = await client.delete_tasks_batch(tenant_id, chunk, force=True)
+            except Exception:
+                logger.error(
+                    "删库级联清任务中心失败 kb=%s tasks=%d", kb_id, len(chunk),
+                    exc_info=True,
+                )
+                continue
+            if not result.success:
+                logger.error(
+                    "删库级联清任务中心被拒 kb=%s tasks=%d code=%s: %s",
+                    kb_id, len(chunk), result.code, result.message,
+                )
+                continue
+            data = result.data if isinstance(result.data, dict) else {}
+            # 删成功 / 本来就不存在 → 目标达成，清掉 outbox；没确认的留给后台补。
+            settled = set(data.get("deleted") or []) | set(data.get("skipped") or [])
+            if settled:
+                async with get_db_session() as cleanup_session:
+                    cleanup_repo = TaskCenterDocumentRepository(cleanup_session)
+                    for tid in chunk:
+                        if tid in settled:
+                            await cleanup_repo.clear_cleanup(tenant_id, tid)
+                    await cleanup_session.commit()
+            failed = data.get("failed") or []
+            if failed:
+                logger.error(
+                    "删库级联清任务中心部分失败 kb=%s tasks=%d failed=%s",
+                    kb_id, len(chunk), failed,
+                )
+            logger.info(
+                "删库级联清任务中心 kb=%s 本批 %d 条：deleted=%s skipped=%s "
+                "cleanup_failed=%d",
+                kb_id,
+                len(chunk),
+                len(data.get("deleted") or []),
+                len(data.get("skipped") or []),
+                len(data.get("cleanup_failed") or []),
+            )
 
     async def get_kb_space_id(self, kb_id: str, tenant_id: str) -> str | None:
         """KB → space_id（权限管理判定用）；KB 不存在返回 None。"""

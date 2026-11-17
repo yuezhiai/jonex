@@ -7,6 +7,9 @@
 终止整个 models 包的加载并指示失败的模型，从而不会注册部分模型。
 """
 
+from .abstract_landing_run import RUN_STATUSES, AbstractLandingRun
+from .join_proposal import JOIN_PROPOSAL_STATUSES, JoinProposal
+from .metric_proposal import PROPOSAL_STATUSES, MetricProposal
 from .document import (
     DocStatus,
     KnowledgeDocument,
@@ -38,6 +41,7 @@ from .ontology_synonym import OntologySynonym
 from .metric_call_approval import MetricCallApproval
 from .nl2sql_metric_shadow import Nl2SqlMetricShadow
 from .nl2sql_observation import Nl2SqlObservation
+from .nl2sql_verified_query import Nl2SqlVerifiedQuery
 from .lineage_edge import LineageEdge
 from .ontology_tool_binding import OntologyToolBinding
 from .parser_setting import KnowledgeParserSetting
@@ -77,6 +81,11 @@ from .task_center import (
 __all__ = [
     "ACTIVE_STATES",
     "MANAGED_STATES",
+    "AbstractLandingRun",
+    "MetricProposal",
+    "JoinProposal",
+    "JOIN_PROPOSAL_STATUSES",
+    "PROPOSAL_STATUSES",
     "AbstractSchemaSaveHistory",
     "AssetStatusEvent",
     "DataSourceConnection",
@@ -109,6 +118,7 @@ __all__ = [
     "OntologySynonym",
     "OntologyToolBinding",
     "ProcessingTaskEvent",
+    "RUN_STATUSES",
     "SearchAdoptionEvent",
     "SearchHitEvent",
     "SearchRequestEvent",

@@ -19,6 +19,7 @@ from .model_setting_service import ModelSettingService
 from .llm_wiki_schema_service import LlmWikiSchemaService
 from .nl2sql import Nl2SqlService
 from .wiki_outline_service import WikiOutlineService
+from .wiki_browse_service import WikiBrowseService
 from .reconciliation_service import ReconciliationService
 from .search_feedback_service import SearchFeedbackService
 from .search_history_service import SearchHistoryService
@@ -60,6 +61,8 @@ class KnowledgeBaseService:
         self.llm_wiki_schemas = LlmWikiSchemaService()
         # [jonex] Wiki 阅读目录（LLM 起草 + LLM 调整，纯展示投影，不参与检索）
         self.wiki_outlines = WikiOutlineService()
+        # [jonex] Wiki 列式浏览（MCP 链接多跳的图源）：类型校验 + 全库图 + 降级
+        self.wiki_browse = WikiBrowseService()
         self.synonyms = OntologySynonymService()
         # [jonex] 跨数据源抽象 schema（概念对齐层）：LLM 提候选 → 人工确认 → 检索期概念扩展
         self.abstract_schemas = AbstractSchemaService()

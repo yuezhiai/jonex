@@ -14,6 +14,7 @@ from jonex_core.capability.atomic.rag.client import get_rag_client
 from jonex_core.common.model_config import resolve_llm_model
 from .openkb_service import KnowledgeCompilerService  # [jonex]
 from .jonex_wiki_service import JonexWikiService  # [jonex]
+from .trace_token import attach_total_tokens  # 检索 Token 合计
 from jonex_core.common.config import config
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import (
@@ -1252,13 +1253,26 @@ async def _filter_kbs_by_classification(
     return allowed
 
 
-async def _embed_query_cached(query: str, tenant_id: str) -> list[float] | None:
+async def _attach_total_tokens(
+    result: dict, tenant_id: str, trace_id: str | None,
+) -> None:
+    """把本次检索按 trace 汇总的精确 Token 挂到返回 dict。
+
+    薄封装：实体逻辑在 :func:`trace_token.attach_total_tokens`（capability 层的
+    ``search_data`` / ``search_ontology_data`` 也复用它）。
+    """
+    await attach_total_tokens(result, tenant_id, trace_id)
+
+
+async def _embed_query_cached(
+    query: str, tenant_id: str, trace_id: str | None = None,
+) -> list[float] | None:
     key = hashlib.sha256(query.encode("utf-8")).hexdigest()
     now = time.time()
     hit = _query_embedding_cache.get(key)
     if hit and now - hit[0] < _QUERY_EMBED_CACHE_TTL:
         return hit[1]
-    vec = await embed(query, tenant_id=tenant_id)
+    vec = await embed(query, tenant_id=tenant_id, trace_id=trace_id)
     if vec is not None:
         _query_embedding_cache[key] = (now, vec)
         if len(_query_embedding_cache) > _QUERY_EMBED_CACHE_MAX * 1.2:
@@ -2059,7 +2073,9 @@ class SearchService:
         kb_type = await self._get_kb_type(tenant_id, req.knowledge_base_id)
         if kb_type in LLM_WIKI_TYPES:
             if kb_type == "openkb":
-                return await self._search_openkb(tenant_id, user_id, req)
+                return await self._search_openkb(
+                    tenant_id, user_id, req, trace_id=trace_id or None,
+                )
             # [jonex] jonex_wiki 走专用链路（与 /search/jonex_wiki 端点、search_mix 的 jw 侧同源）。
             # 原先这里直接抛「即将上线」——但 DomainService.search 是**逐个 KB 调本方法**的，
             # 于是任何含 jonex_wiki KB 的领域服务检索都被判失败；纯 jonex_wiki 的服务更是
@@ -2090,6 +2106,7 @@ class SearchService:
         references = await self._build_references(
             tenant_id, raw_refs, allowed_kb_ids=[req.knowledge_base_id],
             query=req.query,   # [jonex] §10 L2 页段打分
+            trace_id=trace_id,
         )
         # [jonex] 引用归一化（LightRAG 原生路径）：剥掉答案末尾 References 尾注段，
         # 与 references 卡片去重。内联 [n] 暂不做重排（LightRAG 的 [n] 对应其自身
@@ -2190,6 +2207,7 @@ class SearchService:
         allowed_kb_ids: list[str] | None = None,
         doc_map: dict[str, Any] | None = None,
         query: str | None = None,
+        trace_id: str | None = None,
     ) -> list[dict]:
         """从 RAG 返回的原始引用片段富化出完整的 references。
 
@@ -2395,6 +2413,7 @@ class SearchService:
                 results = await rerank(
                     query, texts, tenant_id=tenant_id,
                     kb_id=d.knowledge_base_id or None,
+                    trace_id=trace_id,
                 )
                 if results:
                     score_by_idx = {
@@ -2676,13 +2695,20 @@ class SearchService:
         return []
 
     async def _match_ontology(
-        self, gdao: OntologyGraphRepository, tenant_id: str, kb_ids: list[str], query: str,
+        self, gdao: OntologyGraphRepository, tenant_id: str, kb_ids: list[str],
+        query: str, trace_id: str | None = None,
+        entity_types: list[str] | None = None,
     ) -> list[dict]:
-        """四级递进实体匹配（精确 → 前缀 → 全文+向量并行 → RRF 融合），跨 KB 合并后按 fused_score 降序。"""
-        instances: list[dict] = []
+        """四级递进实体匹配（精确 → 前缀 → 全文+向量并行 → RRF 融合），跨 KB 合并后按 fused_score 降序。
 
-        # 1a) 精确匹配旁路（canonical_name 或 alias 完全相等）
-        exact = await gdao.exact_match_entities(tenant_id, kb_ids, query)
+        `entity_types` 用于按类型定位（如只找 Skill）：精确 / 前缀阶段直接在 Cypher
+        里过滤，避免同名的其它类型先命中就提前返回、把目标类型挤掉。
+        """
+        instances: list[dict] = []
+        wanted = list(entity_types) if entity_types else None
+
+        # 1a) 精确匹配旁路（canonical_name 或 alias 完全相等；名称完全相等优先）
+        exact = await gdao.exact_match_entities(tenant_id, kb_ids, query, entity_types=wanted)
         if exact:
             for r in exact:
                 r["source"] = "exact"
@@ -2694,7 +2720,9 @@ class SearchService:
             return instances
 
         # 1b) 前缀匹配（"研发"→"研发流程"）
-        prefix = await gdao.prefix_match_entities(tenant_id, kb_ids, query, limit=3)
+        prefix = await gdao.prefix_match_entities(
+            tenant_id, kb_ids, query, limit=3, entity_types=wanted,
+        )
         if prefix:
             for r in prefix:
                 r["source"] = "prefix"
@@ -2716,7 +2744,7 @@ class SearchService:
                 return []
             try:
                 qvec = await asyncio.wait_for(
-                    _embed_query_cached(query, tenant_id),
+                    _embed_query_cached(query, tenant_id, trace_id=trace_id),
                     timeout=_ONTOLOGY_EMBED_TIMEOUT,
                 )
                 if qvec is None:
@@ -2736,6 +2764,10 @@ class SearchService:
 
         # 1e) RRF 融合（保留 vscore / ft_score 供路由用）
         instances = _fuse_hits(fulltext_hits, vector_hits)
+        if wanted:
+            # 全文/向量召回不带类型条件，按调用方要求收敛（精确/前缀阶段已在 Cypher 过滤）
+            wanted_set = set(wanted)
+            instances = [i for i in instances if i.get("type") in wanted_set]
 
         if instances:
             logger.info(
@@ -2789,6 +2821,7 @@ class SearchService:
         kb_ids: list[str],
         query: str,
         collector: ReasoningCollector | None = None,
+        trace_id: str | None = None,
     ) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
         """查询词 → 命中实体（v2 `row.schema["entities"]`）→ 带 `data_source_id` 的候选。
 
@@ -2902,6 +2935,7 @@ class SearchService:
             candidates, filter_status = await filter_candidates(
                 query, candidates, tenant_id=tenant_id,
                 kb_id=(kb_ids[0] if len(kb_ids) == 1 else None),
+                trace_id=trace_id,
             )
             if collector:
                 collector.step(
@@ -3113,10 +3147,14 @@ class SearchService:
         budget: float,
         candidates: list[dict] | None = None,
         require_external_call: bool = False,
-    ) -> tuple[str, list[dict], list[dict]] | None:
-        """本体查询工具化：成功返回 `(answer, facts, tool_results)`，否则返回 None 由调用方回落正则路由。
+        allow_action_proposals: bool = True,
+    ) -> tuple[str, list[dict], list[dict], list[dict]] | None:
+        """本体查询工具化：成功返回 `(answer, facts, tool_results, pending_actions)`。
 
         `tool_results`：本次 ontology_call_tool 的调用摘要（总闸关时恒为空），回给前端「实时数据」区块。
+        `pending_actions`：本次生成的写操作/待确认卡片（脱敏视图）。
+        `allow_action_proposals=False` 用于深度/严格/混合检索的内层子调用：只允许只读直调，
+        不生成待办，避免重复卡片与重复审计；卡片只由最外层响应透出。
 
         `facts` 的下标与答案里 `[ref_N]` 的 N 对齐（见 ontology_tools 模块说明），
         调用方照常走 `_ontology_refs` / `normalize_citations` / `_cross_verify`。
@@ -3131,14 +3169,17 @@ class SearchService:
         binding_svc = OntologyToolBindingService()
 
         async def _call_tool(kb_id: str, action_name: str, inputs: dict) -> dict:
-            # 四道闸在 qa_call 里：总闸 + 绑定 qa_callable、绑定启用且工具可用、判定 allow、工具只读
+            # 四道闸在 qa_call 里；allow_card=False 的内层调用只拼回只读直调
             return await binding_svc.qa_call(
                 tenant_id, kb_id, action_name, inputs, user_id=user_id, request_id=trace_id,
+                allow_card=allow_action_proposals,
             )
 
         session = OntologyToolSession(
             gdao=gdao, tenant_id=tenant_id, kb_ids=list(kb_ids),
-            match_fn=lambda q: self._match_ontology(gdao, tenant_id, kb_ids, q),
+            match_fn=lambda q, types=None: self._match_ontology(
+                gdao, tenant_id, kb_ids, q, trace_id=trace_id, entity_types=types,
+            ),
             inverse_map_fn=_inverse_map if ONTOLOGY_INVERSE_EXPAND_ENABLED else None,
             expand_inverse_fn=self._expand_inverse_relations,
             binding_fn=binding_svc.binding_lookup(tenant_id),
@@ -3233,7 +3274,10 @@ class SearchService:
                 )],
                 t_start=t,
             )
-        return outcome.answer, session.facts, list(session.tool_results)
+        return (
+            outcome.answer, session.facts,
+            list(session.tool_results), list(session.pending_actions),
+        )
 
     async def _execute_graph_query(
         self,
@@ -4692,6 +4736,7 @@ class SearchService:
             tenant_id, raw_refs, allowed_kb_ids=kb_ids,
             query=query,       # [jonex] 方案 G1：打通 E3 图片描述 rerank 兜底
             doc_map=_doc_map,  # [S1] 复用上面的预查；None 时其内部自查
+            trace_id=trace_id,
         ) if raw_refs else []
 
         # ── 文档级兜底（source_chunks 为空或 stub 实体）──
@@ -5298,6 +5343,7 @@ class SearchService:
             tenant_id, prompt_refs,
             allowed_kb_ids=kb_ids, doc_map=doc_map,
             query=req.query,   # [jonex] §10 L2 页段打分
+            trace_id=trace_id,
         )
 
         # [jonex] 引用编号归一化：把答案里的 [ref_i] 重排为 references 下标 [n]。
@@ -5818,6 +5864,7 @@ class SearchService:
             })
             result = await self.query_with_ontology(
                 tenant_id, user_id, sub_req, trace_id,
+                allow_action_proposals=False, expose_pending_actions=False,
             )
             # 合并 deep 分类步骤到内层 reasoning
             if result.get("reasoning") and isinstance(result["reasoning"], dict):
@@ -5826,6 +5873,8 @@ class SearchService:
                 result["reasoning"]["deep_intent"] = "simple"
             else:
                 result["reasoning"] = collector.build(result.get("source", "unknown"))
+            # deep simple 分支委托 query_with_ontology，在此汇总
+            await _attach_total_tokens(result, tenant_id, trace_id)
             return result
 
         # ── complex：规划 ──
@@ -5850,8 +5899,11 @@ class SearchService:
             # 规划失败 → 降级到普通查询
             fallback = await self.query_with_ontology(
                 tenant_id, user_id, req, trace_id,
+                allow_action_proposals=False, expose_pending_actions=False,
             )
             fallback["source"] = "deep_degraded"
+            # 规划失败降级到普通查询，同样要带本次 Token
+            await _attach_total_tokens(fallback, tenant_id, trace_id)
             return fallback
 
         # ── 并发取证 ──
@@ -5870,6 +5922,7 @@ class SearchService:
                 try:
                     r = await self.query_with_ontology(
                         tenant_id, user_id, sub, trace_id,
+                        allow_action_proposals=False, expose_pending_actions=False,
                     )
                     fact = self._extract_fact(r, sq)
                     collector.step(
@@ -6011,6 +6064,8 @@ class SearchService:
                 collector=collector,
                 kb_ids=kb_ids,
             )
+        # deep complex 主路径（规划/取证/汇总）的 Token 汇总
+        await _attach_total_tokens(result, tenant_id, trace_id)
         return result
 
     async def query_with_ontology_strict(
@@ -6070,6 +6125,7 @@ class SearchService:
                 result = await asyncio.wait_for(
                     self.query_with_ontology(
                         tenant_id, user_id, sub_req, trace_id,
+                        allow_action_proposals=False, expose_pending_actions=False,
                     ),
                     timeout=gear_timeout,
                 )
@@ -6234,6 +6290,9 @@ class SearchService:
         user_id: str,
         request: OntologySearchRequest | dict,
         trace_id: str | None = None,
+        *,
+        allow_action_proposals: bool = True,
+        expose_pending_actions: bool = True,
     ) -> dict:
         """本体优先 → RAG fallback 分流查询（多 KB 并行）。
 
@@ -6278,6 +6337,8 @@ class SearchService:
 
         # 问答调用外部工具的摘要（总闸关 / 没走工具化时恒为空，结果里不出这个键）
         tool_results: list[dict] = []
+        # 问答动作提案卡片（只由最外层透出；内层子调用 allow_action_proposals=False）
+        pending_actions: list[dict] = []
 
         # ── 阶段 1：多 KB 本体实体匹配（采集点①）──
         ontology_instances: list[dict] = []
@@ -6288,7 +6349,9 @@ class SearchService:
         _hits_detail: list[dict] = []
         t = time.perf_counter()
         try:
-            ontology_instances = await self._match_ontology(gdao, tenant_id, kb_ids, req.query)
+            ontology_instances = await self._match_ontology(
+                gdao, tenant_id, kb_ids, req.query, trace_id=trace_id,
+            )
             _hits_src = list(ontology_instances[:5])
             _hits_detail = [_hit_trace_of(i) for i in _hits_src]
             collector.step(
@@ -6314,7 +6377,7 @@ class SearchService:
         # 也不动实例集合，检索结果与改造前逐条相同；产出的候选是给下游
         # 「分源列举」（§七 的 NL→SQL spec）用的输入。
         concept_candidates, _entities_by_kb, metric_candidates = await self._expand_concepts(
-            tenant_id, kb_ids, req.query, collector=collector,
+            tenant_id, kb_ids, req.query, collector=collector, trace_id=trace_id,
         )
         if _entities_by_kb and ontology_instances:
             # ⚠️ **逐实例、按它自己的 KB 取实体池**，两个坑一起躲开：
@@ -6533,9 +6596,10 @@ class SearchService:
                         trace_id, collector, budget=_answer_timeout,
                         candidates=ontology_instances[:5],
                         require_external_call=_tool_mode == "live_data",
+                        allow_action_proposals=allow_action_proposals,
                     )
                     if _tool_out is not None:
-                        answer, _tool_facts, tool_results = _tool_out
+                        answer, _tool_facts, tool_results, pending_actions = _tool_out
                         source = "ontology"
                         rag_used = False
                         _tool_done = True
@@ -6946,9 +7010,26 @@ class SearchService:
         if tool_results and source == "ontology":
             result["tool_results"] = [
                 {k: r.get(k) for k in ("seq", "action", "tool_name", "tool_label", "tool_source",
-                                       "status", "http_status", "called_at", "fact_no")}
+                                       "status", "http_status", "called_at", "fact_no",
+                                       "pending_id")}
                 for r in tool_results
             ]
+        # 动作提案卡片：只由最外层响应透出；同一 (kb, action, 入参键) 去重
+        if pending_actions and source == "ontology" and expose_pending_actions:
+            seen_pending: set[tuple] = set()
+            cards: list[dict] = []
+            for card in pending_actions:
+                key = (
+                    card.get("kb_id"), card.get("action"),
+                    tuple(card.get("provided_input_keys") or []),
+                )
+                if key in seen_pending:
+                    continue
+                seen_pending.add(key)
+                cards.append(card)
+            pending_actions = cards
+            if cards:
+                result["pending_actions"] = cards
         # A（解释块）：命中实体 → 物理表 → 上下游。fail-open；无内容不写键。
         # 只挂在 ontology 答案上（data/clarify/rag/none 等路径不带，避免误导）。
         if should_attach_lineage(source):
@@ -6971,10 +7052,38 @@ class SearchService:
                         "knowledge_base_ids": kb_ids,
                         "source": source,
                         "pipeline": "ontology",
+                        # 历史只存卡片脱敏视图（入参只留键名）与工具摘要，供刷新后回放
+                        **(
+                            {"tool_results": result.get("tool_results") or []}
+                            if result.get("tool_results") else {}
+                        ),
+                        **(
+                            {
+                                "pending_actions": [
+                                    {k: v for k, v in card.items() if k != "inputs"}
+                                    for card in pending_actions
+                                ]
+                            }
+                            if pending_actions and source == "ontology" and expose_pending_actions
+                            else {}
+                        ),
                     },
                 ),
             )
             result["history_id"] = history.get("id")
+            pending_ids = [
+                card.get("pending_id") for card in pending_actions
+                if card.get("pending_id")
+            ]
+            if pending_ids and source == "ontology" and expose_pending_actions:
+                try:
+                    from . import qa_action_pending as qa_pending
+
+                    await qa_pending.bind_history(
+                        tenant_id, pending_ids, str(result["history_id"]),
+                    )
+                except Exception as exc:  # noqa: BLE001 — 绑定失败只影响历史回显
+                    logger.warning("[qa-action] 历史绑定待办失败: %s", exc)
             # [jonex] 数据运营二期：检索轨迹埋点（本体优先）。
             await write_trace_events(
                 tenant_id=tenant_id,
@@ -8434,8 +8543,13 @@ class SearchService:
         user_id: str,
         request: LlmWikiSearchRequest | dict,
         trace_id: str | None = None,
+        attach_tokens: bool = True,
     ) -> dict:
-        """[jonex] OpenKB Wiki 检索（只查 openkb 管线，D3 异管线拒绝）。"""
+        """[jonex] OpenKB Wiki 检索（只查 openkb 管线，D3 异管线拒绝）。
+
+        ``attach_tokens``：``search_mix`` 混合分支会自己在外层统一汇总，
+        子调用传 ``False`` 避免同一 trace 重复等待（最坏叠加约 6s）。
+        """
         tenant_id = require_tenant(tenant_id)
         req = LlmWikiSearchRequest(**_payload(request))
         t_total = time.perf_counter()
@@ -8496,6 +8610,7 @@ class SearchService:
                     _res = await compiler.search_compiled_knowledge(
                         kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
                         return_trace=_want_trace,
+                        trace_id=trace_id,
                     )
                     return (kid, _res, int((time.perf_counter() - _t0) * 1000))
                 except Exception as e:
@@ -8675,6 +8790,9 @@ class SearchService:
             "references_available": bool(_references),
             "ontology_instances_available": False,
         }
+        # 按 trace 汇总本次检索 Token（查不到则不写键）
+        if attach_tokens:
+            await _attach_total_tokens(result, tenant_id, trace_id)
 
         # 8. 保存检索历史（D8: 多 KB knowledge_base_id=""）
         if req.save_history:
@@ -8718,8 +8836,13 @@ class SearchService:
         request: JonexWikiSearchRequest | dict,
         trace_id: str | None = None,
         progress_session: str | None = None,
+        attach_tokens: bool = True,
     ) -> dict:
-        """[jonex] jonex_wiki 管线检索（只查 jonex_wiki 管线，D3 异管线拒绝）。"""
+        """[jonex] jonex_wiki 管线检索（只查 jonex_wiki 管线，D3 异管线拒绝）。
+
+        ``attach_tokens``：``search_mix`` 混合分支会自己在外层统一汇总，
+        子调用传 ``False`` 避免同一 trace 重复等待（最坏叠加约 6s）。
+        """
         tenant_id = require_tenant(tenant_id)
         req = JonexWikiSearchRequest(**_payload(request))
         t_total = time.perf_counter()
@@ -8789,6 +8912,7 @@ class SearchService:
                         kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
                         return_trace=_want_trace,
                         thinking_mode=req.thinking_mode,
+                        trace_id=trace_id,
                         **({'query_context':query_context} if query_context else {}),
                         **({"progress_session": progress_session} if progress_session else {}),
                     )
@@ -8974,6 +9098,10 @@ class SearchService:
             "references_available": bool(_references),
             "ontology_instances_available": False,
         }
+        # 按 trace 汇总本次检索 Token（查不到则不写键）。
+        # 该 dict 会被 WikiSearchSessionService 原样序列化，作为 SSE complete 事件透出。
+        if attach_tokens:
+            await _attach_total_tokens(result, tenant_id, trace_id)
 
         # 8. 保存检索历史（D8: 多 KB knowledge_base_id=""）
         if req.save_history:
@@ -9099,7 +9227,15 @@ class SearchService:
                 strict_require_reference=req.strict_require_reference,
                 strict_require_grounded=req.strict_require_grounded,
             )
-            return await self.query_with_ontology(tenant_id, user_id, req_ont, trace_id=trace_id)
+            # 纯 LightRAG 是 `/search/mix` 的**最外层**：与直接调 /search/ontology 同口径，
+            # 允许生成动作提案卡片并由这里透出（内层混合/深度/严格子调用才抑制）。
+            _lr_result = await self.query_with_ontology(
+                tenant_id, user_id, req_ont, trace_id=trace_id,
+                allow_action_proposals=True, expose_pending_actions=True,
+            )
+            # 纯 LightRAG 走委托返回，同样要带本次检索 Token
+            await _attach_total_tokens(_lr_result, tenant_id, trace_id)
+            return _lr_result
 
         # 4. 全 openkb → 委托 search_llmwiki
         if not lightrag_ids and not jonex_wiki_ids:
@@ -9141,6 +9277,7 @@ class SearchService:
                 )
                 return await self.query_with_ontology(
                     tenant_id, user_id, req_ont, trace_id=trace_id,
+                    allow_action_proposals=False, expose_pending_actions=False,
                 )
             except Exception as e:
                 return e
@@ -9154,7 +9291,10 @@ class SearchService:
                     with_reasoning=req.with_reasoning,
                     domain_space_id=req.domain_space_id,
                 )
-                return await self.search_llmwiki(tenant_id, user_id, req_wiki, trace_id=trace_id)
+                return await self.search_llmwiki(
+                    tenant_id, user_id, req_wiki,
+                    trace_id=trace_id, attach_tokens=False,
+                )
             except Exception as e:
                 return e
 
@@ -9185,7 +9325,10 @@ class SearchService:
             )
             try:
                 return await asyncio.wait_for(
-                    self.search_jonex_wiki(tenant_id, user_id, req_jw, trace_id=trace_id),
+                    self.search_jonex_wiki(
+                        tenant_id, user_id, req_jw,
+                        trace_id=trace_id, attach_tokens=False,
+                    ),
                     timeout=JONEX_WIKI_SEARCH_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
@@ -9455,6 +9598,8 @@ class SearchService:
             "references_available": references_available,
             "ontology_instances_available": ontology_instances_available,
         }
+        # 按 trace 汇总本次检索 Token（查不到则不写键）
+        await _attach_total_tokens(result, tenant_id, trace_id)
         # A（解释块）：命中实体 → 物理表 → 上下游。fail-open；无内容不写键。
         # 只挂在 ontology 答案上（mixed/rag/none 等融合或非本体路径不带）。
         if should_attach_lineage(source):
@@ -9516,7 +9661,9 @@ class SearchService:
         from .kb_type_service import get_kb_type
         return await get_kb_type(tenant_id, kb_id)
 
-    async def _search_openkb(self, tenant_id: str, user_id: str, req) -> dict:
+    async def _search_openkb(
+        self, tenant_id: str, user_id: str, req, trace_id: str | None = None,
+    ) -> dict:
         """openkb 管线查询 — 调用 OpenKB /query 而非 LightRAG。"""
         compiler = KnowledgeCompilerService()
         result = await compiler.search_compiled_knowledge(
@@ -9524,6 +9671,7 @@ class SearchService:
             tenant_id=tenant_id,
             kb_id=req.knowledge_base_id,
             question=req.query,
+            trace_id=trace_id,
         )
         return {
             "query": req.query,

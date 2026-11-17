@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from .metrics.executable import ADDITIVITY_VALUES, normalize_executable
 
@@ -36,6 +37,14 @@ MAX_TERM_LENGTH = 128
 #: 属性落点语义槽（`filter` / `aggregation` / `grain`）的单槽长度上限。
 #: 是「自由文本提示」不是 SQL 片段仓库——超长一律截断，不拒绝（归一化承诺宽容）。
 MAX_LANDING_SLOT_CHARS = 240
+
+#: 落点 provenance 的三个可选键（landing-agent 线）：谁定的（origin）、多确信
+#: （confidence）、为什么（rationale）。**白名单式**校验：值域外的值整键丢弃而
+#: 不抛——归一化的承诺是宽容，且非法 provenance 比没有 provenance 更糟（下游会
+#: 把它当事实）。`rationale` 是短理由文本，不是证据仓库，超长截断不拒绝。
+LANDING_ORIGINS = ("name", "agent", "manual")
+LANDING_CONFIDENCES = ("high", "medium", "low")
+MAX_RATIONALE_CHARS = 200
 
 #: 子串匹配的最短长度。短的别名一律不做子串匹配 —— 「不良」两个字还好，
 #: 单个字的别名会把整个查询都吞掉（"缺陷率" 会被别名 "率" 命中）。
@@ -64,7 +73,8 @@ _MATCH_KIND_ORDER: dict[str, int] = {
 #: 指标匹配的档位序。**独立于 `_MATCH_KIND_ORDER`** —— 后者被 `_match_entities_v1`
 #: 直接索引（新增档位漏改即 KeyError），指标档位面自持一张表、只服务 `match_metrics`。
 #: `aggregate` 是聚合词兜底档（T3），词面三档永远排在它前面。
-_METRIC_KIND_ORDER = {"exact": 0, "alias": 1, "description": 2, "aggregate": 3}
+_METRIC_KIND_ORDER = {"exact": 0, "alias": 1, "partial": 2,
+                     "description": 3, "aggregate": 4}
 
 #: v2 词表/打分开关（spec §七，默认开）。黑名单式「关」：白名单式会把运维最常写的
 #: `=on` 判成关，一次「照隔壁抄」的配置就能静默停掉整层改动且无处报错。
@@ -444,6 +454,88 @@ def match_entities(query: str, entities) -> list[dict]:
     return _match_entities_v1(query, entities)
 
 
+
+# ---------------------------------------------------------------------------
+# 指标词面匹配的归一与分词
+# ---------------------------------------------------------------------------
+#: 归一化时直接抹掉的字符：空白与常见中英文标点。
+_MATCH_STRIP = re.compile(r"[\s,，。.、:：;；!！?？·\-—_/\()（）\[\]【】\"'“”‘’]+")
+_ASCII_TOKEN = re.compile(r"[a-z0-9_]+")
+_CJK_RUN = re.compile(r"[一-鿿]+")
+
+
+def _normalize_match_text(text) -> str:
+    """大小写 + 空白 + 标点归一。
+
+    没有它，「AOI 良率」（中间一个空格）与指标名 `AOI良率` 就永远对不上 ——
+    2026-11-15 用户实测就是这个现象：名字带空格能问、不带空间反而"不能识别"。
+    """
+    return _MATCH_STRIP.sub("", _clean_str(text).casefold())
+
+
+def _match_tokens(text) -> list[str]:
+    """分词：ASCII 词 + 连续中文段（`AOI分箱良率` → `["aoi", "分箱良率"]`）。"""
+    normalized = _normalize_match_text(text)
+    return _ASCII_TOKEN.findall(normalized) + _CJK_RUN.findall(normalized)
+
+
+def _fuzzy_cjk_in(hay: str, needle: str, max_gap: int = 1) -> bool:
+    """中文词允许「隔一个字」命中：`良率` 能在 `良品率` 里命中。
+
+    只对中文放宽：英文标识符按字符插入会命中一堆无关词（`id` 之于 `paid`）。
+    """
+    if not needle:
+        return False
+    if needle in hay:
+        return True
+    if len(needle) < 2 or not _CJK_RUN.fullmatch(needle):
+        return False
+    start = hay.find(needle[0])
+    while start != -1:
+        pos = start
+        gaps = 0
+        ok = True
+        for char in needle[1:]:
+            nxt = hay.find(char, pos + 1)
+            if nxt == -1:
+                ok = False
+                break
+            gaps += nxt - pos - 1
+            if gaps > max_gap:
+                ok = False
+                break
+            pos = nxt
+        if ok:
+            return True
+        start = hay.find(needle[0], start + 1)
+    return False
+
+
+def _token_found(hay: str, token: str) -> bool:
+    return token in hay or _fuzzy_cjk_in(hay, token)
+
+
+def _partial_metric_match(q_norm: str, q_tokens: list[str], name: str) -> bool:
+    """指标名与问句的**词覆盖**匹配（弱于 exact/alias）。
+
+    两个方向都收，但要求覆盖完整，避免「良」这种单字把全库指标都命中：
+    - 指标名的每个词都在问句里（`AOI的良品率是多少` ⊇ `aoi` + `良率`）；
+    - 或问句的每个词都在指标名里（只问 `aoi` → 列出 AOI 家族，交给歧义澄清）。
+    """
+    name_tokens = _match_tokens(name)
+    if not name_tokens:
+        return False
+    if all(_token_found(q_norm, token) for token in name_tokens):
+        return True
+    name_norm = _normalize_match_text(name)
+    if q_tokens and all(_token_found(name_norm, token)
+                        or any(_token_found(token, name_token)
+                               for name_token in name_tokens)
+                        for token in q_tokens):
+        return len("".join(q_tokens)) >= 2
+    return False
+
+
 def match_metrics(query: str, metrics) -> list[dict]:
     """查询词 → 命中的指标（按 **档位序 → 命中词长降序 → 指标池序** 排序）。
 
@@ -458,9 +550,17 @@ def match_metrics(query: str, metrics) -> list[dict]:
     if not q:
         return []
     q_cf = q.casefold()
+    q_norm = _normalize_match_text(q)
+    q_tokens = _match_tokens(q)
     out: list[dict] = []
     for idx, m in enumerate(_as_list(metrics)):
         if not isinstance(m, dict):
+            continue
+        # disable 采纳写 `enabled=false`（不物删）：不挡掉的话指标照旧被展开、
+        # 经 `expand_metric_candidates` 进入 ② 的指标通道 = disable 等于没生效。
+        # 只认显式布尔 False（与 `auto_hints._metric_hints` / 落库归一
+        # `_normalize_metric` 同口径），缺键或怪值都视为启用。
+        if m.get("enabled") is False:
             continue
         name = _clean_str(m.get("name"))
         if not name:
@@ -475,10 +575,22 @@ def match_metrics(query: str, metrics) -> list[dict]:
             terms.append((desc, "description"))
         best: tuple[int, int, str, str] | None = None
         for term, kind in terms:
-            if term and _term_matches(q_cf, term.casefold()):
+            if not term:
+                continue
+            term_norm = _normalize_match_text(term)
+            hit = (term_norm == q_norm
+                   or (len(term_norm) >= MIN_SUBSTRING_LEN
+                       and term_norm in q_norm)
+                   or _term_matches(q_cf, term.casefold()))
+            if hit:
                 cur = (_METRIC_KIND_ORDER[kind], -len(term), term, kind)
                 if best is None or cur[:2] < best[:2]:
                     best = cur
+        # 弱档：词覆盖。matched_term 记整句 —— 多个指标同样弱命中时，
+        # `_match_executable` 才能判成「同档同词」的歧义并请用户点名，
+        # 而不是按池序替人挑一个。
+        if best is None and _partial_metric_match(q_norm, q_tokens, name):
+            best = (_METRIC_KIND_ORDER["partial"], -len(q), q, "partial")
         if best is not None:
             rank, neg_len, term, kind = best
             out.append({"name": name, "match_kind": kind, "matched_term": term,
@@ -527,6 +639,9 @@ def _pick_metric(query: str, metrics, entities) -> dict | None:
     fallback: list[tuple] = []
     for idx, m in enumerate(_as_list(metrics)):
         if not isinstance(m, dict) or not _clean_str(m.get("name")):
+            continue
+        # 与 `match_metrics` 同口径：disabled 指标不参与聚合词兜底。
+        if m.get("enabled") is False:
             continue
         for landing in _as_list(m.get("landings")):
             if not isinstance(landing, dict):
@@ -933,6 +1048,11 @@ def _unique_landings(raw_sources, max_items: int | None = MAX_LANDINGS_PER_ENTIT
     都显式写值，缺省只会在人手拼的 JSON 里出现，那种情况下「不纳入」会是更令
     人意外的解读。同 (ds, entity) 重复出现时**先到者胜**（含它的 included）。
 
+    另有 provenance 可选键 `origin` / `confidence` / `rationale`（landing-agent
+    线，**带键才带**）：值域外整键丢弃（见 `LANDING_ORIGINS` /
+    `LANDING_CONFIDENCES`），`rationale` 超 `MAX_RATIONALE_CHARS` 截断。
+    没带这三键的存量落点，输出形状与引入前逐字节一致。
+
     `max_items` 是条数上限，缺省取落库/展示共用的 `MAX_LANDINGS_PER_ENTITY`；
     只有**落库/展示形状**该受它约束 —— `annotate_instances` 显式传 `None`
     （无上限）：它产出的 `concept_sources` 是下游可见字段，被落库上限顺手截掉会
@@ -950,11 +1070,21 @@ def _unique_landings(raw_sources, max_items: int | None = MAX_LANDINGS_PER_ENTIT
         if (ds, ent) in seen:
             continue
         seen.add((ds, ent))
-        out.append({
+        item: dict = {
             "data_source_id": ds,
             "entity_name": ent,
             "included": s.get("included") is not False,
-        })
+        }
+        origin = _clean_str(s.get("origin"))
+        if origin in LANDING_ORIGINS:
+            item["origin"] = origin
+        confidence = _clean_str(s.get("confidence"))
+        if confidence in LANDING_CONFIDENCES:
+            item["confidence"] = confidence
+        rationale = _clean_str(s.get("rationale"))
+        if rationale:
+            item["rationale"] = rationale[:MAX_RATIONALE_CHARS]
+        out.append(item)
         if max_items is not None and len(out) >= max_items:
             break
     return out
@@ -972,6 +1102,10 @@ def _unique_attribute_sources(raw_sources) -> list[dict]:
       截断——它们是给 ② 生成提示的自由文本，不是 SQL 权威；
     - `enabled`：**入参带该键才带**，布尔化（只有显式 `False` 是停用，与
       `_carry_over_constraint_enabled` / 读取侧同口径）。缺键 = 启用，不回写。
+
+    provenance 键 `origin`（landing-agent 线）与实体落点同口径：只认
+    `LANDING_ORIGINS`，值域外整键丢弃；**属性来源不带 confidence / rationale**
+    ——它们描述的是「这条列映射凭什么成立」的实体级判断，不是属性级事实。
     """
     out: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
@@ -988,6 +1122,9 @@ def _unique_attribute_sources(raw_sources) -> list[dict]:
         role = _clean_str(s.get("role"))
         if role:
             item["role"] = role
+        origin = _clean_str(s.get("origin"))
+        if origin in LANDING_ORIGINS:
+            item["origin"] = origin
         for slot in ("filter", "aggregation", "grain"):
             value = _clean_str(s.get(slot))
             if value:
@@ -1093,7 +1230,13 @@ def _normalize_metric(raw) -> dict | None:
     """单个指标收敛；无名整条丢（与 `_normalize_attribute` 同款）。
 
     返回 `{name, aliases, additivity, landings}`，另有可选键 `display_name` /
-    `description`（洗得出才带）。`additivity` **恒写**（白名单外归 `unknown`）。
+    `description` / `formula` / `enabled`（洗得出才带）。`additivity` **恒写**
+    （白名单外归 `unknown`）。
+
+    `formula` 是给 LLM 的软提示（`nl2sql.auto_hints._metric_hints` 读它），
+    `enabled` **只有显式 `False` 才落键**（缺键 = 启用，与 `tools` / 约束同口径）。
+    两者都必须在这里保留：否则演化 `metric` 的 disable / 公式写入会被落库归一
+    静默丢掉，回读核对恒失败。旧指标没有这两个键，归一结果逐字节不变。
     """
     if not isinstance(raw, dict):
         return None
@@ -1117,6 +1260,10 @@ def _normalize_metric(raw) -> dict | None:
     executable = raw.get("executable")
     if isinstance(executable, dict):
         out["executable"] = normalize_executable(executable)
+    if _clean_str(raw.get("formula")):
+        out["formula"] = _clean_str(raw.get("formula"))
+    if raw.get("enabled") is False:
+        out["enabled"] = False
     return out
 
 

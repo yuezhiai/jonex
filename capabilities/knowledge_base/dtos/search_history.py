@@ -11,6 +11,9 @@ except ImportError:
 
 class SearchHistoryCreateRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
+    # 前端搜索结束后补存的同一条历史：带上后端返回的 history_id 走更新，
+    # 避免一次检索产生「后端一条 + 前端一条」的重复历史（后者会丢掉卡片元数据）。
+    history_id: Optional[str] = Field(default=None, max_length=64, alias="historyId")
     knowledge_base_id: str = Field(default="", min_length=0, max_length=128)
     domain_space_id: Optional[str] = Field(default=None, max_length=64, alias="domainSpaceId")
     mode: str = Field(default="hybrid", min_length=1, max_length=32)

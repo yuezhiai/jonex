@@ -31,11 +31,13 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from sqlalchemy import text
@@ -70,6 +72,7 @@ from ..repository.kb_tool_repository import KbToolRepository
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
 from ..repository.ontology_graph_repository import OntologyGraphRepository
 from ..repository.ontology_tool_binding_repository import OntologyToolBindingRepository
+from . import qa_action_pending as qa_pending
 from .ontology_tools import CONTRACT_FIELDS, contract_status
 
 logger = logging.getLogger(__name__)
@@ -112,6 +115,8 @@ QA_NOT_CALLABLE = "not_callable"            # 总闸关 / 未绑定 / 绑定未�
 QA_NEEDS_CONFIRMATION = "needs_confirmation"  # 判定为 confirm：文字规则需人确认
 QA_NOT_ALLOWED = "not_allowed"              # 判定为 manual / refuse
 QA_RATE_LIMITED = "rate_limited"
+# 动作提案（新链路）：写操作或只读 confirm 不直接执行，生成服务端待办卡片
+QA_PENDING_CONFIRMATION = "pending_confirmation"
 
 
 # ── 纯函数 ───────────────────────────────────────────────────────────
@@ -185,6 +190,49 @@ def plan_parameters(mapping: dict, entity: dict) -> dict:
     return {"resolved": resolved, "input_refs": input_refs, "unresolved_attrs": unresolved}
 
 
+def inspect_param_mapping(
+    mapping: dict, entity: Optional[dict], input_schema: Optional[dict],
+) -> dict:
+    """只读检查参数映射：不调用工具、不写库。
+
+    - caller_supplied：必填参数由调用方提供（显式 $input.* 或同名透传）
+    - empty_attr：映射到 $attr.* 但属性为空，执行时需要调用方补
+    - unknown_keys：映射键不在工具 input_schema.properties 中；properties 为空时不做判断
+    """
+    mapping = mapping or {}
+    plan = plan_parameters(mapping, entity or {})
+    schema = input_schema or {}
+    props = schema.get("properties") or {}
+    required = [str(r) for r in (schema.get("required") or [])]
+
+    caller_supplied: list[str] = []
+    for name in required:
+        value = mapping.get(name)
+        if name not in mapping:
+            caller_supplied.append(name)
+        elif isinstance(value, str) and _INPUT_REF_RE.match(value):
+            caller_supplied.append(name)
+
+    empty_attr = list(plan["unresolved_attrs"])
+    unknown_keys = [k for k in mapping if props and k not in props]
+
+    warnings: list[dict] = []
+    for name in unknown_keys:
+        warnings.append({"code": "msg.tool_binding.unknown_key", "params": {"name": name}})
+    for name in empty_attr:
+        warnings.append({"code": "msg.tool_binding.empty_attr", "params": {"name": name}})
+
+    return {
+        "plan": plan,
+        "required": required,
+        "caller_supplied": caller_supplied,
+        "empty_attr": empty_attr,
+        "unknown_keys": unknown_keys,
+        "input_schema_declared": bool(props),
+        "warnings": warnings,
+    }
+
+
 def decide_execution(
     contract: dict,
     binding: Optional[dict],
@@ -251,6 +299,7 @@ async def _available_tools(session, tenant_id: str, tool_names: Optional[list[st
     """本租户可用的工具：`{tool_name: {name, description, input_schema}}`。"""
     sql = (
         "SELECT sc.tool_name, sc.name, sc.description, sc.input_schema_json, "
+        "       sc.output_schema_json, "
         # 只读声明存在 capability_json.read_only；只认字面 true，其它一律按写操作
         "       (sc.capability_json->>'read_only') = 'true' AS read_only "
         "FROM business_domain.skill_catalog sc "
@@ -268,8 +317,9 @@ async def _available_tools(session, tenant_id: str, tool_names: Optional[list[st
     sql += " ORDER BY sc.name"
     rows = (await session.execute(text(sql), params)).all()
     return {
-        r[0]: {"tool_name": r[0], "name": r[1], "description": r[2] or "", "input_schema": r[3] or {},
-               "read_only": r[4] is True, "source": TOOL_SOURCE_PLATFORM}
+        r[0]: {"tool_name": r[0], "name": r[1], "description": r[2] or "",
+               "input_schema": r[3] or {}, "output_schema": r[4] or {},
+               "read_only": r[5] is True, "source": TOOL_SOURCE_PLATFORM}
         for r in rows
     }
 
@@ -285,8 +335,8 @@ async def _available_kb_tools(
         items = await repo.list_by_names(tenant_id, kb_id, tool_names, enabled_only=True)
     return {
         t.tool_name: {"tool_name": t.tool_name, "name": t.name, "description": t.description or "",
-                      "input_schema": t.input_schema or {}, "read_only": t.read_only is True,
-                      "source": TOOL_SOURCE_KB}
+                      "input_schema": t.input_schema or {}, "output_schema": t.output_schema or {},
+                      "read_only": t.read_only is True, "source": TOOL_SOURCE_KB}
         for t in items
     }
 
@@ -336,6 +386,23 @@ def _tool_unavailable(tool_name: str) -> InvalidParameterError:
         "err.tool_binding.tool_unavailable", params={"tool_name": tool_name[:64]},
         fallback=f"工具不可用（未上架、本租户未启用或本库工具已停用）：{tool_name[:64]}",
     ))
+
+
+_MSG_FALLBACKS = {
+    "msg.tool_binding.unknown_key": "参数 {name} 不在工具 input_schema 中",
+    "msg.tool_binding.empty_attr": "参数 {name} 引用的本体属性为空，执行时会缺参",
+    "msg.tool_binding.tool_unavailable": "工具不可用（未上架、本租户未启用或本库工具已停用）",
+    "msg.tool_binding.ontology_unavailable": "本体暂不可用，$attr 引用无法解析",
+    "msg.tool_binding.action_not_found": "动作在本体中不存在，$attr 引用无法解析",
+}
+
+
+def _translate_msg(item: dict) -> str:
+    code = str(item.get("code") or "")
+    return translate(
+        code, params=item.get("params"),
+        fallback=_MSG_FALLBACKS.get(code, code),
+    )
 
 
 # ── 服务 ─────────────────────────────────────────────────────────────
@@ -391,6 +458,14 @@ class OntologyToolBindingService:
             d["tool_available"] = tool is not None
             d["tool_read_only"] = bool(tool and tool.get("read_only"))
             d["target_exists"] = None if existing is None else (b.entity_type, b.canonical_name) in existing
+            tool_schema = (tool or {}).get("input_schema") or {}
+            required = [str(r) for r in (tool_schema.get("required") or [])]
+            mapping = b.param_mapping or {}
+            d["caller_supplied"] = [
+                r for r in required
+                if r not in mapping
+                or (isinstance(mapping.get(r), str) and _INPUT_REF_RE.match(mapping[r]))
+            ]
             out.append(d)
         return {"items": out, "total": total, "page": page, "page_size": page_size}
 
@@ -589,8 +664,161 @@ class OntologyToolBindingService:
 
         return _lookup
 
-    async def resolve_action_execution(self, tenant_id: str, data: dict) -> dict:
-        """执行器的唯一入口：返回动作的契约状态、D15 判定、绑定工具与参数计划。不执行任何操作。"""
+    async def load_tool(
+        self, tenant_id: str, kb_id: str, tool_source: str, tool_name: str,
+    ) -> Optional[dict]:
+        """读取本库/平台工具定义（只读，不调用工具）。"""
+        tenant_id = require_tenant(tenant_id)
+        source = _clean_source(tool_source)
+        name = str(tool_name or "").strip()
+        async with get_db_session() as session:
+            await self._ensure_kb(session, kb_id, tenant_id)
+            tools = await _tools_for(session, tenant_id, kb_id, [(source, name)])
+        return tools.get((source, name))
+
+    async def load_mapping_context(
+        self, tenant_id: str, kb_id: str, action_name: str,
+        tool_source: str, tool_name: str,
+    ) -> dict:
+        """读取参数映射所需的 Action 实体与工具 schema（只读，不调用工具）。"""
+        tenant_id = require_tenant(tenant_id)
+        source = _clean_source(tool_source)
+        tool_name = str(tool_name or "").strip()
+        async with get_db_session() as session:
+            await self._ensure_kb(session, kb_id, tenant_id)
+            tools = await _tools_for(session, tenant_id, kb_id, [(source, tool_name)])
+        tool = tools.get((source, tool_name))
+
+        entity: Optional[dict] = None
+        ontology_available = True
+        try:
+            entity = await self._graph_factory().get_entity_with_sources(
+                tenant_id, kb_id, "Action", action_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — 调用方决定是否降级
+            logger.warning(
+                "参数映射上下文：读取动作失败 kb=%s action=%s err=%s", kb_id, action_name, exc)
+            ontology_available = False
+        return {
+            "source": source,
+            "tool_name": tool_name,
+            "tool": tool,
+            "entity": entity,
+            "ontology_available": ontology_available,
+        }
+
+    async def preview_mapping(self, tenant_id: str, data: dict) -> dict:
+        """只读预览参数映射：读实体与工具 schema，不调用工具、不写库。"""
+        tenant_id = require_tenant(tenant_id)
+        kb_id = str(data.get("knowledge_base_id") or "").strip()
+        action_name = str(data.get("action_name") or "").strip()
+        source = _clean_source(data.get("tool_source"))
+        tool_name = str(data.get("tool_name") or "").strip()
+        if not kb_id:
+            raise InvalidParameterError(message=translate(
+                "err.tool_binding.kb_required", fallback="知识库 ID 不能为空",
+            ))
+        if not action_name:
+            raise InvalidParameterError(message=translate(
+                "err.tool_binding.name_required", fallback="绑定的实例名不能为空，且不超过 512 字",
+            ))
+        if not tool_name:
+            raise InvalidParameterError(message=translate(
+                "err.tool_binding.tool_required", fallback="工具名不能为空",
+            ))
+
+        errors: list[str] = []
+        try:
+            mapping = validate_param_mapping(data.get("param_mapping") or {})
+        except InvalidParameterError as exc:
+            mapping = {}
+            errors.append(exc.message)
+
+        async with get_db_session() as session:
+            await self._ensure_kb(session, kb_id, tenant_id)
+            tools = await _tools_for(session, tenant_id, kb_id, [(source, tool_name)])
+        tool = tools.get((source, tool_name))
+
+        entity: Optional[dict] = None
+        ontology_available = True
+        try:
+            entity = await self._graph_factory().get_entity_with_sources(
+                tenant_id, kb_id, "Action", action_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — 预览降级，不阻断语法检查
+            logger.warning(
+                "参数映射预览：读取动作失败 kb=%s action=%s err=%s", kb_id, action_name, exc)
+            ontology_available = False
+
+        inspection = inspect_param_mapping(
+            mapping, entity, (tool or {}).get("input_schema") or {},
+        )
+        warnings = [_translate_msg(w) for w in inspection["warnings"]]
+
+        status_message = None
+        if not tool:
+            status_message = _translate_msg({"code": "msg.tool_binding.tool_unavailable"})
+        elif not ontology_available:
+            status_message = _translate_msg({"code": "msg.tool_binding.ontology_unavailable"})
+        elif entity is None:
+            status_message = _translate_msg({"code": "msg.tool_binding.action_not_found"})
+
+        if errors:
+            status = "invalid_mapping"
+        elif not tool:
+            status = "tool_unavailable"
+        elif not ontology_available:
+            status = "ontology_unavailable"
+        elif entity is None:
+            status = "action_not_found"
+        else:
+            status = "ok"
+
+        attrs = (entity or {}).get("attributes") or {}
+        return {
+            "status": status,
+            "status_message": status_message,
+            "action": {
+                "name": action_name,
+                "found": entity is not None,
+                "attributes": [
+                    {"name": k, "has_value": v not in (None, "", [], {})}
+                    for k, v in attrs.items()
+                ],
+            },
+            "tool": {
+                "source": source,
+                "tool_name": tool_name,
+                "name": (tool or {}).get("name"),
+                "read_only": bool((tool or {}).get("read_only")),
+                "available": tool is not None,
+                "input_schema": (tool or {}).get("input_schema") or {},
+            },
+            "mapping": mapping,
+            "parameters": inspection["plan"],
+            "required": inspection["required"],
+            "caller_supplied": inspection["caller_supplied"],
+            "empty_attr": inspection["empty_attr"],
+            "unknown_keys": inspection["unknown_keys"],
+            "input_schema_declared": inspection["input_schema_declared"],
+            "warnings": warnings,
+            "errors": errors,
+        }
+
+    async def resolve_action_execution(
+        self, tenant_id: str, data: dict, *,
+        qa_pending_id: Optional[str] = None, user_id: Optional[str] = None,
+    ) -> dict:
+        """执行器的唯一入口：返回动作的契约状态、D15 判定、绑定工具与参数计划。不执行任何操作。
+
+        `qa_pending_id` 非空时（问答动作卡片）额外做三件事：
+        1. 校验待办归属提问人、KB/动作一致、状态仍是 pending；
+        2. 契约哈希与提问时不一致 → 标记 `decision.contract_changed=True`，
+           调用方必须要求用户按新 checklist 重新确认；
+        3. 把服务端保存的入参并入 `parameters.resolved`（来源 `ai`），
+           前端输入只能补缺失项，不能改写已确定的值。
+        这些校验都不认领待办；认领由执行器在调用工具前单独完成。
+        """
         tenant_id = require_tenant(tenant_id)
         kb_id = data["knowledge_base_id"]
         action_name = str(data.get("action_name") or "").strip()
@@ -625,7 +853,7 @@ class OntologyToolBindingService:
             plan_parameters(binding.get("param_mapping") or {}, entity)
             if binding and entity else {"resolved": {}, "input_refs": {}, "unresolved_attrs": []}
         )
-        return {
+        plan = {
             "knowledge_base_id": kb_id,
             "action": None if entity is None else {
                 "name": entity.get("name"),
@@ -646,7 +874,142 @@ class OntologyToolBindingService:
             "parameters": parameters,
         }
 
+        if qa_pending_id:
+            pending = await qa_pending.get_pending(tenant_id, qa_pending_id)
+            if (
+                pending is None
+                or str(pending.get("tenant_id") or "") != tenant_id
+                or str(pending.get("kb_id") or "") != kb_id
+                or str(pending.get("action_name") or "") != action_name
+                or str(pending.get("user_id") or "") != str(user_id or "")
+                or pending.get("status") != qa_pending.STATUS_PENDING
+            ):
+                # 1003：已认领 / 已终态 / 已过期 / 不属于本人
+                raise ResourceConflictError(message=translate(
+                    "err.qa_action.pending_conflict",
+                    fallback="该卡片已执行、已失效或结果未知，请先到业务系统核实；需要重办请重新提问",
+                ))
+            current_hash = qa_pending.contract_hash(
+                contract, decision.get("checklist") or [],
+                binding.get("tool_name") if binding else "",
+                binding.get("tool_source") if binding else "",
+            )
+            if current_hash != pending.get("contract_hash"):
+                # 契约变了：要求按新 checklist 重新确认；待办保持 pending，
+                # 新哈希写回后下一轮确认即可认领。
+                decision["contract_changed"] = True
+                await qa_pending.update_contract_hash(tenant_id, qa_pending_id, current_hash)
+            # 服务端保存的入参并入 resolved；前端不能再改写这些键
+            pending_inputs = pending.get("inputs") or {}
+            provenance = dict(parameters.get("provenance") or {})
+            props = ((binding or {}).get("input_schema") or {}).get("properties") or {}
+            for param, key in list((parameters.get("input_refs") or {}).items()):
+                if key in pending_inputs:
+                    parameters["resolved"][param] = pending_inputs[key]
+                    parameters["input_refs"].pop(param, None)
+                    provenance[param] = "ai"
+            for prop in props:
+                if prop in pending_inputs and prop not in parameters["resolved"]:
+                    parameters["resolved"][prop] = pending_inputs[prop]
+                    parameters["input_refs"].pop(prop, None)
+                    provenance[prop] = "ai"
+            # 本体侧解析出的值（$attr / $entity.name / 字面量）标记来源
+            for key in parameters.get("resolved") or {}:
+                provenance.setdefault(
+                    key,
+                    "literal" if not str((binding or {}).get("param_mapping", {}).get(key, "")).startswith("$")
+                    else "ontology",
+                )
+            parameters["provenance"] = provenance
+            plan["qa_pending"] = {
+                "pending_id": qa_pending_id,
+                "status": pending.get("status"),
+                "contract_changed": bool(decision.get("contract_changed")),
+            }
+        return plan
+
     # ── 知识库问答自动调用（ontology_call_tool）──
+
+    async def _can_execute(self, tenant_id: str, kb_id: str, user_id: Optional[str]) -> bool:
+        """提问人是否有执行写动作的权限（与 `_SPACE_WRITE_ACTIONS` 同口径）。
+
+        只用于卡片提示；真正执行时仍由 `prepare_action_execution` 重新判权。
+        """
+        if not user_id or str(user_id) in ("0", "anonymous"):
+            return False
+        from .kb_permission_service import KB_MANAGER, get_kb_grant_role
+        from .space_permission_service import SPACE_MANAGER, has_space_role, is_tenant_admin
+
+        try:
+            if await is_tenant_admin(tenant_id, user_id):
+                return True
+            async with get_db_session() as session:
+                row = (await session.execute(text(
+                    "SELECT space_id FROM knowledge_base.knowledge_info "
+                    "WHERE id = :k AND tenant_id = :t AND is_deleted = 0"
+                ), {"k": kb_id, "t": tenant_id})).first()
+            space_id = (row[0] if row else "") or ""
+            if space_id and await has_space_role(tenant_id, space_id, user_id, SPACE_MANAGER):
+                return True
+            return await get_kb_grant_role(tenant_id, kb_id, user_id) == KB_MANAGER
+        except Exception as exc:  # noqa: BLE001 — 权限判定失败按不可执行（卡片仍展示）
+            logger.warning("[qa-action] 写权限判定失败 kb=%s user=%s: %s", kb_id, user_id, exc)
+            return False
+
+    async def claim_qa_pending_action(self, tenant_id: str, pending_id: str) -> dict:
+        """执行器专用：原子认领 pending → executing；失败抛 1003。"""
+        tenant_id = require_tenant(tenant_id)
+        if not await qa_pending.claim(tenant_id, pending_id):
+            raise ResourceConflictError(message=translate(
+                "err.qa_action.pending_conflict",
+                fallback="该卡片已执行或已失效，请重新提问获取新卡片",
+            ))
+        return {"claimed": True}
+
+    async def record_qa_action_result(self, tenant_id: str, data: dict) -> dict:
+        """执行器专用：服务端回写执行结果（历史 + 待办终态）。前端不能调。"""
+        tenant_id = require_tenant(tenant_id)
+        pending_id = str(data.get("qa_pending_id") or "").strip()
+        status = str(data.get("status") or "").strip()
+        if not pending_id:
+            raise InvalidParameterError(message="qa_pending_id 必填")
+        pending = await qa_pending.get_pending(tenant_id, pending_id)
+        if pending is None:
+            return {"recorded": False, "reason": "pending_not_found"}
+        if str(pending.get("tenant_id") or "") != tenant_id:
+            return {"recorded": False, "reason": "tenant_mismatch"}
+        terminal = (
+            qa_pending.STATUS_EXECUTED if status == "executed" else qa_pending.STATUS_FAILED
+        )
+        await qa_pending.mark_result(tenant_id, pending_id, terminal)
+        history_id = str(pending.get("history_id") or "")
+        if history_id:
+            try:
+                from .search_history_service import SearchHistoryService
+
+                output = data.get("output")
+                try:
+                    output_text = json.dumps(output, ensure_ascii=False, default=str) if output is not None else None
+                except (TypeError, ValueError):
+                    output_text = str(output)[:2000] if output is not None else None
+                if output_text and len(output_text) > 2000:
+                    output_text = output_text[:2000]
+                await SearchHistoryService().append_action_result(
+                    tenant_id, str(pending.get("user_id") or ""), history_id, {
+                        "pending_id": pending_id,
+                        "action": pending.get("action_name"),
+                        "tool_name": pending.get("tool_name"),
+                        "status": terminal,
+                        "executed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "output": output_text,
+                        "output_truncated": bool(data.get("output_truncated")),
+                        "http_status": data.get("http_status"),
+                        "error": data.get("error"),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — 回写失败不影响已发生的执行
+                logger.warning("[qa-action] 历史回写失败 pending=%s: %s", pending_id, exc)
+        return {"recorded": True, "history_id": history_id or None}
 
     async def qa_call(
         self,
@@ -657,17 +1020,20 @@ class OntologyToolBindingService:
         *,
         user_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        allow_card: bool = True,
     ) -> dict:
-        """问答模型要调一个动作绑定的工具：四道闸都过才真的调用，否则回一个不调用的状态。
+        """问答模型要调一个动作绑定的工具。
 
-        闸门（任一不满足都不调用）：
-          1. 总闸 `ONTOLOGY_TOOL_EXECUTION_ENABLED` 打开，且该绑定 `qa_callable=true`；
-          2. 绑定启用、工具可用；
-          3. 执行判定为 allow（confirm 也不行 —— 问答里没有人逐项确认文字规则）；
-          4. 工具声明了只读（默认按写操作处理）。
-        入参只收工具 schema 声明的键与映射里 `$input.*` 的键；本体侧已解析的值（`$attr` /
-        `$entity.name` / 字面量）优先于模型给的同名值。每次尝试都落审计（入参只记键名）。
-        不抛异常：失败一律回 `status` 让模型据此作答。
+        旧链路（`ONTOLOGY_QA_ACTION_PROPOSAL_ENABLED=false`，默认）：
+          只读 + allow 才直接调用；只读 confirm 返回 needs_confirmation；
+          写工具返回 tool_not_read_only。
+
+        动作提案（总闸打开）：
+          - allow + 只读 → 直接调用（不变）；
+          - allow / confirm 的其余情况 → 生成服务端待办卡片（不执行）；
+          - manual / refuse → 不可执行的说明卡片（不建待办）；
+          - 卡片执行前由执行器原子认领，每张卡片只能执行一次。
+        每次尝试都落审计（入参只记键名）；不抛异常，失败回 status 让模型据此作答。
         """
         tenant_id = require_tenant(tenant_id)
         t0 = time.perf_counter()
@@ -688,6 +1054,18 @@ class OntologyToolBindingService:
             )
             return result
 
+        def _allowed_inputs(value: dict, plan_obj: dict) -> dict:
+            """卡片暂存只用工具 schema 声明的键与映射里 `$input.*` 的键。"""
+            binding_obj = plan_obj.get("binding") or {}
+            schema_obj = binding_obj.get("input_schema") or {}
+            allowed = set((schema_obj.get("properties") or {}).keys())
+            for mapped in (binding_obj.get("param_mapping") or {}).values():
+                if isinstance(mapped, str) and mapped.startswith("$input."):
+                    allowed.add(mapped[len("$input."):])
+            for key in ((plan_obj.get("parameters") or {}).get("input_refs") or {}).values():
+                allowed.add(str(key))
+            return {k: v for k, v in (value or {}).items() if k in allowed}
+
         try:
             if not ONTOLOGY_TOOL_EXECUTION_ENABLED:
                 return _done(QA_NOT_CALLABLE, reason="execution_disabled")
@@ -695,25 +1073,81 @@ class OntologyToolBindingService:
                 tenant_id, {"knowledge_base_id": kb_id, "action_name": action_name},
             )
             binding = plan.get("binding")
+            decision = plan.get("decision") or {}
+            verdict = decision.get("verdict")
+            reasons = [r.get("message") for r in decision.get("reasons") or []]
             if binding is None:
+                if allow_card and qa_pending.proposal_enabled():
+                    view = qa_pending.build_card_view(
+                        plan, pending_id=None, can_execute=False,
+                        inputs=_allowed_inputs(inputs, plan), status="explanation",
+                    )
+                    return _done(QA_PENDING_CONFIRMATION, pending_action=view,
+                                 verdict=verdict, reasons=reasons)
                 return _done(QA_NOT_CALLABLE, reason="no_binding")
             source = binding.get("tool_source") or TOOL_SOURCE_PLATFORM
             tool_name = binding.get("tool_name")
             result.update(tool_name=tool_name, tool_label=binding.get("tool_label"), tool_source=source)
             if not binding.get("qa_callable"):
                 return _done(QA_NOT_CALLABLE, reason="qa_callable_off")
-            if not binding.get("binding_enabled") or not binding.get("tool_available"):
-                return _done(STATUS_TOOL_UNAVAILABLE)
-            verdict = (plan.get("decision") or {}).get("verdict")
-            if verdict != "allow":
-                # confirm：文字规则要人确认；manual / refuse：本就不自动执行
-                return _done(
-                    QA_NEEDS_CONFIRMATION if verdict == "confirm" else QA_NOT_ALLOWED,
-                    verdict=verdict,
-                    reasons=[r.get("message") for r in (plan.get("decision") or {}).get("reasons") or []],
-                )
-            if not binding.get("read_only"):
-                return _done(QA_NOT_CALLABLE, reason="tool_not_read_only")
+            read_only = bool(binding.get("read_only"))
+
+            if allow_card and qa_pending.proposal_enabled():
+                # 动作提案：写工具 / confirm 不直接执行；manual / refuse 给说明卡片
+                allowed_inputs = _allowed_inputs(inputs, plan)
+                if verdict in ("manual", "refuse"):
+                    view = qa_pending.build_card_view(
+                        plan, pending_id=None, can_execute=False, inputs=allowed_inputs,
+                        status="explanation",
+                    )
+                    return _done(QA_PENDING_CONFIRMATION, pending_action=view,
+                                 verdict=verdict, reasons=reasons)
+                if not (binding.get("binding_enabled") and binding.get("tool_available")):
+                    view = qa_pending.build_card_view(
+                        plan, pending_id=None, can_execute=False, inputs=allowed_inputs,
+                        status="unavailable",
+                    )
+                    return _done(QA_PENDING_CONFIRMATION, pending_action=view,
+                                 verdict=verdict, reasons=reasons)
+                if not (verdict == "allow" and read_only):
+                    # 写工具（含 allow）或只读 confirm：生成待办卡片，不调用工具
+                    can_execute = await self._can_execute(tenant_id, kb_id, user_id)
+                    pending_id: Optional[str] = None
+                    if can_execute:
+                        ch = qa_pending.contract_hash(
+                            plan.get("contract") or {}, decision.get("checklist") or [],
+                            tool_name or "", source,
+                        )
+                        pending_id = await qa_pending.create_pending(
+                            tenant_id=tenant_id, user_id=str(user_id),
+                            kb_id=kb_id, action_name=action_name,
+                            tool_name=tool_name or "", tool_source=source,
+                            inputs=allowed_inputs, contract_hash_value=ch,
+                        )
+                        if pending_id is None:
+                            # 待办存储不可用：写工具 fail closed；只读 confirm 回到旧状态
+                            if read_only:
+                                return _done(QA_NEEDS_CONFIRMATION, verdict=verdict,
+                                             reasons=reasons)
+                            return _done(QA_NOT_CALLABLE, reason="pending_store_unavailable")
+                    view = qa_pending.build_card_view(
+                        plan, pending_id=pending_id, can_execute=can_execute,
+                        inputs=allowed_inputs,
+                        status="pending" if pending_id else "no_permission",
+                    )
+                    return _done(QA_PENDING_CONFIRMATION, pending_action=view,
+                                 verdict=verdict, reasons=reasons)
+            else:
+                # 旧链路：只读 + allow 才直接调用
+                if not binding.get("binding_enabled") or not binding.get("tool_available"):
+                    return _done(STATUS_TOOL_UNAVAILABLE)
+                if verdict != "allow":
+                    return _done(
+                        QA_NEEDS_CONFIRMATION if verdict == "confirm" else QA_NOT_ALLOWED,
+                        verdict=verdict, reasons=reasons,
+                    )
+                if not read_only:
+                    return _done(QA_NOT_CALLABLE, reason="tool_not_read_only")
 
             schema = binding.get("input_schema") or {}
             arguments, missing = qa_arguments(plan.get("parameters") or {}, inputs, schema)

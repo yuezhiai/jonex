@@ -108,6 +108,18 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         result = await self.session.execute(stmt)
         return list(result.scalars())
 
+    async def get_by_id_for_user(
+        self, tenant_id: str, user_id: str, history_id: str,
+    ) -> KnowledgeSearchHistory | None:
+        """按 (tenant, user, id) 取一条未删除历史；用于前端补存时更新同一条。"""
+        stmt = select(KnowledgeSearchHistory).where(
+            KnowledgeSearchHistory.id == history_id,
+            KnowledgeSearchHistory.tenant_id == self._tenant_id(tenant_id),
+            KnowledgeSearchHistory.user_id == user_id,
+            KnowledgeSearchHistory.is_deleted == 0,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def count_by_user(
         self,
         tenant_id: str,
@@ -169,6 +181,36 @@ class KnowledgeSearchHistoryRepository(BaseRepository[KnowledgeSearchHistory]):
         )
         result = await self.session.execute(stmt)
         return result.scalar_one()
+
+    async def append_action_result(
+        self, tenant_id: str, user_id: str, history_id: str, item: dict,
+    ) -> bool:
+        """把一条问答动作执行结果并入历史 `extra_metadata.action_results`。
+
+        同一 `pending_id` 只保留一条（重复回写覆盖）；历史不存在或不属于该用户返回 False。
+        """
+        stmt = select(KnowledgeSearchHistory).where(
+            KnowledgeSearchHistory.id == history_id,
+            KnowledgeSearchHistory.tenant_id == self._tenant_id(tenant_id),
+            KnowledgeSearchHistory.user_id == user_id,
+            KnowledgeSearchHistory.is_deleted == 0,
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return False
+        meta = dict(row.extra_metadata or {})
+        results = list(meta.get("action_results") or [])
+        pending_id = item.get("pending_id")
+        for index, existing in enumerate(results):
+            if pending_id and isinstance(existing, dict) and existing.get("pending_id") == pending_id:
+                results[index] = {**existing, **item}
+                break
+        else:
+            results.append(item)
+        meta["action_results"] = results
+        row.extra_metadata = meta
+        await self.session.flush()
+        return True
 
     async def trim_for_user(
         self,

@@ -173,6 +173,12 @@ class DomainServiceService:
 
             repo = DomainServiceRepository(session)
             conditions = [DomainService.space_id == space_id] if space_id else []
+            # [jonex] 检索面候选过滤：只返回可用服务（status/enabled）。
+            # ⚠️ 必须放在 `visible is not None` 分支**之外** —— 租户管理员
+            # （visible 为 None）同样不能在检索下拉看到停用服务。
+            if scope == "search":
+                from .service_availability import searchable_service_conditions
+                conditions.extend(searchable_service_conditions(DomainService))
             # [jonex] 空间隔离：不传 space_id 的租户级列表也只返回可见空间的服务
             visible = await get_visible_space_ids(tenant_id, user_id)
             if visible is not None:

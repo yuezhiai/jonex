@@ -2885,6 +2885,10 @@ class DocumentService:
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         req = DocumentScopeRequest(**_payload(request))
+        # 删完文档后要级联清掉它在任务中心的任务（2026-11-17 加）：文档是源头，
+        # 源头没了，任务再留着只会占列表、让历史脏数据牵着来。先记下 task_id，
+        # 真正调用排在软删提交之后（出站不跨事务）。
+        task_center_task_id: Optional[str] = None
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_by_id(document_id, tenant_id)
@@ -2918,6 +2922,12 @@ class DocumentService:
                         fallback="知识文档正在解析/入库中，请等待完成后再删除",
                     )
                 )
+            # 走到这里说明没有**在途**任务，但接管行可能还在（已交还 `released` /
+            # 历史行）。记下 task_id，删完文档后级联清掉任务中心那一行。
+            row = await TaskCenterDocumentRepository(session).read(
+                document_id, tenant_id
+            )
+            task_center_task_id = row.task_id if row is not None else None
             await repo.set_status(doc, DocStatus.DELETING)
             rag_doc_ids = list(doc.rag_doc_ids or [])
             kb_id = doc.knowledge_base_id or ""
@@ -2970,6 +2980,12 @@ class DocumentService:
             doc.archived_at = None
             await repo.set_status(doc, DocStatus.DELETED)
             await repo.delete_soft(doc, tenant_id)
+            # **与软删同一事务落 outbox**：下面那次出站删任务失败时，
+            # task_id 不能只留在日志里（后台 30 秒循环按这张表补删）。
+            if task_center_task_id:
+                await TaskCenterDocumentRepository(session).enqueue_cleanups(
+                    tenant_id, [task_center_task_id]
+                )
             # 相似建议/签名随文档删除一并清理；savepoint 隔离，失败不影响删除主流程
             await safe_clear_document_similarity_state(
                 session, tenant_id, document_id,
@@ -2992,7 +3008,49 @@ class DocumentService:
             audit_payload["request_params"] = {"source": "destroy"}
         schedule_emit(audit_payload)
 
+        # 文档（源头）已经删了：把任务中心那一行也清掉。best-effort —— 任务中心
+        # 不可用不能反过来让删文档失败（残留只是一条列表记录，且它若已是终态就
+        # 不再占并发名额；真正危险的是 running 孤儿，那条路由停用文档的闸挡着）。
+        if task_center_task_id:
+            await self._delete_task_center_task(tenant_id, task_center_task_id)
+
         return {"id": document_id, "deleted": True}
+
+    async def _delete_task_center_task(
+        self, tenant_id: str, task_id: str
+    ) -> None:
+        """删掉一条已经失去源头（文档）的任务（2026-11-17 加）。
+
+        与 `KnowledgeInfoService._delete_task_center_tasks` 同一套纪律：删完源头
+        之后调用、`force=True`（文档都没了，任务在不在跑都不再重要）、失败只记
+        `error` 不让删文档失败。单条版本不做切片。
+        """
+        from jonex_core.capability.business.task_center import (
+            get_task_center_client,
+        )
+
+        try:
+            result = await get_task_center_client().delete_task(
+                tenant_id, task_id, force=True
+            )
+        except Exception:
+            logger.error(
+                "删文档级联清任务中心失败 task=%s", task_id, exc_info=True
+            )
+            return
+        if not result.success:
+            logger.error(
+                "删文档级联清任务中心被拒 task=%s code=%s: %s",
+                task_id, result.code, result.message,
+            )
+            return
+        # 删成功才清 outbox；失败保留，由后台 30 秒循环补。
+        async with get_db_session() as session:
+            await TaskCenterDocumentRepository(session).clear_cleanup(
+                tenant_id, task_id
+            )
+            await session.commit()
+        logger.info("删文档级联清任务中心 task=%s", task_id)
 
     # ── 第 3 期生命周期：索引清理 / 归档 / 恢复 / 销毁 ──
 

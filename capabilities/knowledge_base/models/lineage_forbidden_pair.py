@@ -5,7 +5,7 @@
 对应表：knowledge_base.lineage_forbidden_pairs（迁移 013）。
 
 不是数据流边：没有列、没有方向，也不进路径图。`status=active` 才生效；
-`proposed` 是 1 跳血缘生成的建议，`disabled` 是人工停用/忽略。
+`proposed` 是从 1–2 跳血缘生成的建议，`disabled` 是人工停用/忽略。
 """
 from sqlalchemy import Column, String
 

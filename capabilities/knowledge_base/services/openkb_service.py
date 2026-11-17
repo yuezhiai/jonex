@@ -73,11 +73,16 @@ class KnowledgeCompilerService:
     async def search_compiled_knowledge(
         self, kb_name: str, tenant_id: str, kb_id: str, question: str,
         return_trace: bool = False,  # [jonex]
+        trace_id: str | None = None,  # [jonex] 平台检索 trace（缺省不改行为）
     ) -> dict:
-        """搜索已编译的 Wiki 知识。"""
+        """搜索已编译的 Wiki 知识。
+
+        ``trace_id`` 非空时作为 ``X-Request-ID`` 传给 Sidecar，经 capability 的
+        ``request.request_id`` 进入 openkb 计量上下文，模型调用据此归属到本次检索 trace。
+        """
         return await self._client.query(
             kb_name=kb_name, question=question, tenant_id=tenant_id, kb_id=kb_id,
-            return_trace=return_trace,
+            return_trace=return_trace, trace_id=trace_id,
         )
 
     async def remove_document(

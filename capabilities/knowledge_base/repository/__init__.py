@@ -2,6 +2,9 @@
 # -*- coding:utf-8 -*-
 """Knowledge Base repository exports."""
 
+from .abstract_landing_run_repository import AbstractLandingRunRepository
+from .join_proposal_repository import JoinProposalRepository
+from .metric_proposal_repository import MetricProposalRepository
 from .answer_feedback_repository import (
     KnowledgeAnswerFeedbackEventRepository,
     KnowledgeAnswerFeedbackRepository,
@@ -51,6 +54,9 @@ from .similarity_repository import KnowledgeSimilarityRepository
 from .space_repository import SpacePermissionRepository, SpaceRepository
 
 __all__ = [
+    "AbstractLandingRunRepository",
+    "MetricProposalRepository",
+    "JoinProposalRepository",
     "COMPILE_STATUS_MAP",
     "EXTRACT_STATUS_MAP",
     "PARSE_STATUS_MAP",

@@ -34,6 +34,7 @@ from jonex_core.common.exceptions import (
     PermissionDeniedError,
     ResourceConflictError,
     ResourceNotFoundError,
+    SpaceNoEnabledServiceError,
     TenantIsolationError,
 )
 from jonex_core.common.i18n import translate
@@ -166,6 +167,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "get_wiki_claims": ("knowledge_base_id",),  # path / document_id 至少一个，适配器校验
     # ── [jonex] Wiki 阅读目录（LLM 起草 + LLM 调整；仅 jonex_wiki）──
     "get_wiki_outline": ("knowledge_base_id",),
+    # MCP 列式浏览「链接多跳」的图源：一次取全库 pages + links（仅 jonex_wiki）。
+    "get_wiki_page_graph": ("knowledge_base_id",),
     "draft_wiki_outline": ("knowledge_base_id",),
     "adjust_wiki_outline": ("knowledge_base_id", "instruction"),
     # ── [jonex] LLM-Wiki Schema 编译设置（方案 llmwiki-schema-settings-execution-plan §9）──
@@ -264,6 +267,17 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "update_tool_binding": ("binding_id",),
     "delete_tool_binding": ("binding_id",),
     "resolve_action_execution": ("knowledge_base_id", "action_name"),
+    "preview_tool_binding_mapping": (
+        "knowledge_base_id", "action_name", "tool_source", "tool_name"),
+    "propose_tool_binding_mapping": (
+        "knowledge_base_id", "action_name", "tool_source", "tool_name"),
+    "refine_tool_binding_mapping": (
+        "knowledge_base_id", "action_name", "tool_source", "tool_name", "assist_session_id"),
+    "propose_extract_tool_declaration": (
+        "knowledge_base_id", "tool_source", "tool_name", "group"),
+    "refine_extract_tool_declaration": (
+        "knowledge_base_id", "tool_source", "tool_name", "group", "assist_session_id"),
+    "propose_kb_tool_draft": ("knowledge_base_id", "text"),
     # 执行器代真实用户取执行计划（按知识库写权限判定，无用户身份一律拒绝）
     "prepare_action_execution": ("knowledge_base_id", "action_name"),
     # ── 知识库工具（KB 级工具目录）──
@@ -276,6 +290,21 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "preview_extract_tool": ("knowledge_base_id", "entity_type", "group", "declaration"),
     # 内部：本体动作执行器调用本库工具（无 Gateway 路由，带用户身份的调用一律拒绝）
     "run_kb_tool": ("knowledge_base_id", "tool_name"),
+    # 问答动作提案：执行器原子认领待办 / 回写执行结果（都只供内部执行器调用）
+    "claim_qa_pending_action": ("qa_pending_id",),
+    "record_qa_action_result": ("qa_pending_id", "status"),
+    # ── 已验证查询（N1-1）──
+    "list_verified_queries": ("knowledge_base_id",),
+    "get_verified_query": ("verified_query_id", "knowledge_base_id"),
+    "save_verified_query": ("knowledge_base_id",),
+    "activate_verified_query": ("verified_query_id", "knowledge_base_id",
+                                "expected_version"),
+    "retire_verified_query": ("verified_query_id", "knowledge_base_id",
+                              "expected_version"),
+    "delete_verified_query": ("verified_query_id", "knowledge_base_id",
+                              "expected_version"),
+    "preview_verified_query_match": ("knowledge_base_id", "data_source_id",
+                                     "question"),
     # ── 知识库信息管理 ──
     "list_knowledge_info": (),
     "get_quota_view": (),  # [jonex] 系统配额查询（无空间语义）
@@ -374,6 +403,19 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "restore_abstract_schema_snapshot": (
         "knowledge_base_id", "snapshot_id", "expected_schema_version",
     ),
+    # 落点后台 run（Task 12）：start 建 run 后交给后台任务，get 只做轮询读取。
+    # 两条都必须带 `knowledge_base_id` —— 空间闸门靠它解析；只给 run_id 会让
+    # `_resolve_space_context` 返回 (None, None, None) ⇒ 一个校验都不做。
+    "start_abstract_landing_run": ("knowledge_base_id",),
+    "get_abstract_landing_run": ("knowledge_base_id", "run_id"),
+    # 指标构建 agent（进程内）：同步返回提案；列表/决定是读写分离的两条。
+    "build_metric_proposal": ("knowledge_base_id", "task"),
+    "list_metric_proposals": ("knowledge_base_id",),
+    "decide_metric_proposal": ("knowledge_base_id", "proposal_id", "decision"),
+    # join 复核 agent：一次运行复核一轮候选，产出 0..N 条边提案。
+    "run_join_agent": ("knowledge_base_id",),
+    "list_join_proposals": ("knowledge_base_id",),
+    "decide_join_proposal": ("knowledge_base_id", "proposal_id", "decision"),
     # ── 搜索结果反馈 ──
     "submit_search_feedback": ("session_id", "query", "feedback_type", "knowledge_base_ids"),
     "cancel_search_feedback": ("session_id", "feedback_type", "knowledge_base_ids"),
@@ -543,6 +585,13 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "get_abnormal_assets_analytics": (),
     # 解析质量异常（域空间/知识库筛选，全部可选）
     "get_quality_anomalies": (),
+    # ── 数据运营 ·「数据问答」观测面（设计 §4）──
+    # 总览 / 慢查询列表 / 失败复盘列表：窗口、范围、分页全部有默认值或可选，
+    # 所以一个必填字段都没有；detail 靠观测行 `id` 定位（设计 §4.4）。
+    "get_nl2sql_overview": (),
+    "get_nl2sql_slow": (),
+    "get_nl2sql_failures": (),
+    "get_nl2sql_detail": ("id",),
     # ── 任务中心接入（运行方**三个**入口：execute / remove_task / task_stopped，
     #    由 `dispatch.update(runner.bind())` 装配）──
     # ⚠️ **`execute` 是六个键，别漏 `node_id`**：`ExecutionEnvelope` 的字段是
@@ -587,6 +636,12 @@ _STRUCTURED_ACTIONS = frozenset({
     "save_abstract_schema", "import_abstract_schema",
     "list_abstract_schema_snapshots", "get_abstract_schema_snapshot",
     "restore_abstract_schema_snapshot",
+    # 落点后台 run 是抽象 schema 的派生能力（开关关闭时不存在可落点的概念库）；
+    # 读取一并设闸，与 `get_abstract_schema` 同口径 —— 开关关了就没有这个页签。
+    "start_abstract_landing_run", "get_abstract_landing_run",
+    # 指标构建 agent 读的是编译 schema（结构化派生物），与抽象 schema 同闸。
+    "build_metric_proposal", "list_metric_proposals", "decide_metric_proposal",
+    "run_join_agent", "list_join_proposals", "decide_join_proposal",
     "rebuild_ontology_data_assets", "list_ontology_data_assets",
     "suggest_ontology_alignments", "list_ontology_alignments",
     "set_ontology_alignment_status", "list_lineage_paths",
@@ -607,6 +662,10 @@ _STRUCTURED_ACTIONS = frozenset({
     "list_governance_audit", "evaluate_governance_policy",
     # W2.7a 敏感扫描（结构化库能力）
     "governance_sensitive_scan", "governance_adopt_sensitive_scan",
+    # 已验证查询（N1-1）依赖结构化数据源
+    "list_verified_queries", "get_verified_query", "save_verified_query",
+    "activate_verified_query", "retire_verified_query", "delete_verified_query",
+    "preview_verified_query_match",
 })
 
 
@@ -1092,14 +1151,23 @@ _SPACE_WRITE_ACTIONS = frozenset({
     "set_governance_clearance",
     "create_governance_policy", "update_governance_policy", "delete_governance_policy",
     "create_tool_binding", "update_tool_binding", "delete_tool_binding",
+    # AI 辅助参数映射 / 抽取期声明：只生成建议，不写库；仍按知识库写口径并只允许真实用户调用
+    "propose_tool_binding_mapping", "refine_tool_binding_mapping",
+    "propose_extract_tool_declaration", "refine_extract_tool_declaration",
+    "propose_kb_tool_draft",
     # 知识库工具：登记 / 改 / 删 / 试运行都按写口径（试运行会真的调对方接口）；
     # run_kb_tool 只给内部执行器用，放在写组里是兜底（带用户身份的调用在 dispatch 里已先拒绝）
     "create_kb_tool", "update_kb_tool", "delete_kb_tool", "test_kb_tool", "run_kb_tool",
+    # 问答动作提案的内部认领 / 回写：只供执行器调用（带用户身份在 dispatch 里先拒）
+    "claim_qa_pending_action", "record_qa_action_result",
     # 试跑抽取期工具声明：同试运行，会真的调对方接口
     "preview_extract_tool",
     # 执行本体动作前的计划解析：执行会真的调对方接口，所以按写口径判定调用人；
     # 无用户身份的调用在 dispatch 里先拒绝（_user_only），不会落到「无身份即跳过」的放行口
     "prepare_action_execution",
+    # 已验证查询（N1-1）：登记/激活/退役/删除都写库
+    "save_verified_query", "activate_verified_query", "retire_verified_query",
+    "delete_verified_query",
     "create_tag", "update_tag", "delete_tag",
     "create_parser_setting", "update_parser_setting", "delete_parser_setting",
     # KB 级模型配置：写与解析设置同口径（空间管理者/租户管理员/kb_manager 授权）
@@ -1110,6 +1178,13 @@ _SPACE_WRITE_ACTIONS = frozenset({
     "import_abstract_schema",
     # 快照还原会走公开保存（写库 + 版本推进）；列表/详情是读动作，不进本表。
     "restore_abstract_schema_snapshot",
+    # 落点后台 run：start 只是建单，但后台任务会写 schema（landing_pass /
+    # construct），按写口径收；get 是轮询读取，进 _SPACE_READ_ACTIONS。
+    "start_abstract_landing_run",
+    # 指标构建 agent：发起即调 LLM（有成本）并写一条提案；决定动作写状态。
+    "build_metric_proposal", "decide_metric_proposal",
+    # join 复核 agent：发起即调 LLM + 写提案；决定写状态。
+    "run_join_agent", "decide_join_proposal",
     # 聚焦解析虽不落库，但调 LLM 有成本，按写口径收（同 draft_wiki_outline 先例）
     "preview_focus_abstract_schema",
     "recompile_schema", "reextract_kb_documents", "retry_ontology_extract",
@@ -1198,6 +1273,11 @@ _SPACE_READ_ACTIONS = frozenset({
     # ⚠️ 漏登记 = 不在任何闸门集合里 = execute 的 if/elif 全不命中 ⇒ **静默不判权**
     # （任何租户用户都能读别的 KB 的快照）。
     "list_abstract_schema_snapshots", "get_abstract_schema_snapshot",
+    # 落点后台 run 的轮询读取：只读一行状态，与 get_abstract_schema 同权限级。
+    "get_abstract_landing_run",
+    # 指标提案列表：只读，与 get_abstract_schema 同权限级。
+    "list_metric_proposals",
+    "list_join_proposals",
     "get_compiled_schema_for_extraction",  # [jonex] atomic-rag 抽取入口（含同义词注入）
     "get_llm_wiki_schema", "list_synonyms", "list_tags", "list_parser_settings",
     "list_lineage_edges",  # 血缘边读取（KB 设置 → 血缘页签）
@@ -1207,16 +1287,21 @@ _SPACE_READ_ACTIONS = frozenset({
     "list_governance_audit", "evaluate_governance_policy",
     # W2.7a 敏感扫描是只读分析（不写标签）；采纳（adopt）才走写闸门。
     "governance_sensitive_scan",
+    # 已验证查询（N1-1）：列表/详情/预览匹配都是只读（预览不执行 SQL）
+    "list_verified_queries", "get_verified_query", "preview_verified_query_match",
     "list_lineage_paths",  # 血缘路径评分查询（P2b）：纯只读，与 list_ontology_data_assets 同级
     "analyze_lineage_impact",  # 血缘影响分析（W2.4a）：纯只读展开，不写库
     "get_lineage_coverage",  # 血缘覆盖率（W2.4a）：读时聚合，不写库
     # 工具绑定读 + 执行前解析（只读；执行器经 Sidecar 无用户身份调用时不走空间判定）
     "list_tool_bindings", "list_bindable_tools", "resolve_action_execution",
+    "preview_tool_binding_mapping",
     "list_kb_tools",
     "list_model_settings",
     "resolve_wiki_evidence", "get_wiki_page", "list_wiki_contents", "get_wiki_outline", "get_editor_state",
     "get_wiki_compilation_state",
     "get_wiki_backlinks", "get_wiki_claims",
+    # MCP 列式浏览图源：只读、按 single-KB 密级守卫；wiki 不受 structured_enabled 闸门约束
+    "get_wiki_page_graph",
     "get_wiki_graph_types", "search_wiki_nodes", "get_wiki_node",
     "get_wiki_neighbors", "get_wiki_graph_evidence", "get_wiki_media", "query_wiki_resources",
     "list_wiki_scenarios", "read_wiki_scenario_resources", "select_wiki_scenario_resources",
@@ -1256,6 +1341,10 @@ _ANALYTICS_ACTIONS = frozenset({
     # 抽屉 D（领域服务详情）：同一个口子。它**不抛 404**（详见 `ServiceDetail` 的
     # DTO 注释）—— 权限仍由本组的空间判定 + service 层的空间范围过滤承担。
     "get_data_service_detail",
+    # 数据运营 ·「数据问答」观测面（设计 §4）：四页同口径 —— 传 `domain_space_id`
+    # 走空间成员，不传则租户管理员。read-only（只跑聚合 SELECT），不写任何表。
+    "get_nl2sql_overview", "get_nl2sql_slow",
+    "get_nl2sql_failures", "get_nl2sql_detail",
 })
 
 # 空间解析路径（action 组 → space_id 数据来源）
@@ -1345,6 +1434,17 @@ class KnowledgeBaseCapability(BaseCapability):
 
     _INTERNAL_ACTIONS = {"ingest_push", "ingest_lineage_event"}
 
+    # 任务中心 → 运行方的四个动作：报文里自带 `tenant_id`，运行方 handler 直接
+    # 拿它构造 `ExecutionDispatch` / `RemoveTaskDispatch`。**必须与认证上下文比对**，
+    # 否则租户 A 可以在 payload 里填租户 B，让运行方按 B 读取/改写接管行
+    # （`remove_task` 会把 B 的行标成 `released`）。
+    _TASK_CENTER_RUNNER_ACTIONS = {
+        "execute",
+        "remove_task",
+        "task_stopped",
+        "query_step_status",
+    }
+
     # [jonex] 双向门禁（方案 §15）：本体 schema/抽取类 action 拒绝 openkb KB。
     # 清单与方案 §15 一致——这些 action 当前都在 dispatch 直接分发、无 kb_type 校验。
     _ONTOLOGY_GATED_ACTIONS = {
@@ -1365,6 +1465,10 @@ class KnowledgeBaseCapability(BaseCapability):
         # 工具绑定只对本体型 KB 有意义（绑定目标是本体实例）
         "create_tool_binding",
         "resolve_action_execution",
+        "preview_tool_binding_mapping",
+        "propose_tool_binding_mapping", "refine_tool_binding_mapping",
+        "propose_extract_tool_declaration", "refine_extract_tool_declaration",
+        "propose_kb_tool_draft",
         "prepare_action_execution",
         # 知识库工具只能绑定到本体实例，Wiki 型库登记了也用不上
         "create_kb_tool",
@@ -1707,6 +1811,20 @@ class KnowledgeBaseCapability(BaseCapability):
                 elif watch_result:
                     logger.info("对账→任务中心看门狗: %s", watch_result)
 
+                # [jonex] 任务中心清理补偿（2026-11-17 加）：删库/删文档时那次
+                # 出站清任务失败，task_id 落在 outbox 里；这里按 30 秒节拍补删，
+                # 否则孤儿任务会继续吃 compile 并发名额。
+                cleanup_result = await self._reconcile_pass(
+                    "任务中心清理补偿",
+                    lambda: self.service.task_watch.retry_cleanup_outbox(
+                        limit=50
+                    ),
+                )
+                if cleanup_result is _PASS_FAILED:
+                    failed.append("任务中心清理补偿")
+                elif cleanup_result.get("done", 0) > 0 or cleanup_result.get("failed", 0) > 0:
+                    logger.info("对账→任务中心清理补偿: %s", cleanup_result)
+
                 # [jonex] 以图问知识：查询图片兜底清理（B12）。
                 #
                 # 它补的是**同步清理漏掉的那部分**（删历史时删对象失败、进程在两步之间
@@ -1766,16 +1884,22 @@ class KnowledgeBaseCapability(BaseCapability):
     @staticmethod
     async def _search_data_action(r, d: dict, nl) -> dict:
         from .services.nl2sql.data_search import run_data_search
+        from .services.trace_token import attach_total_tokens
 
         question, kb_ids = KnowledgeBaseCapability._search_question_and_kbs(d)
-        return await run_data_search(
+        result = await run_data_search(
             nl, r.tenant_id, kb_ids, question,
             pins=d.get("entity_pins") or {},
             user_id=r.user_id or "", username=r.username or "", ip=r.ip or "",
+            trace_id=r.request_id,
         )
+        # 纯数据模式不经 search_service，Token 汇总在这里补
+        await attach_total_tokens(result, r.tenant_id, r.request_id)
+        return result
 
     async def _search_ontology_data_action(self, r, d: dict, nl) -> dict:
         from .services.nl2sql.ontology_data import run_ontology_data_search
+        from .services.trace_token import attach_total_tokens
 
         question, kb_ids = self._search_question_and_kbs(d)
         pins = d.get("entity_pins") or {}
@@ -1789,11 +1913,15 @@ class KnowledgeBaseCapability(BaseCapability):
         async def _ontology_call():
             return await self._query_with_ontology(r, ontology_body)
 
-        return await run_ontology_data_search(
+        result = await run_ontology_data_search(
             _ontology_call, nl, r.tenant_id, kb_ids, question,
             pins=pins,
             user_id=r.user_id or "", username=r.username or "", ip=r.ip or "",
+            trace_id=r.request_id,
         )
+        # 本体+数据模式的最终返回在这里，Token 汇总一并补上
+        await attach_total_tokens(result, r.tenant_id, r.request_id)
+        return result
 
     def _build_dispatch(self) -> dict[str, Any]:
         docs = self.service.documents
@@ -1811,9 +1939,13 @@ class KnowledgeBaseCapability(BaseCapability):
         compiler = self.service.compiler
         lws = self.service.llm_wiki_schemas  # [jonex] LLM-Wiki Schema
         wo = self.service.wiki_outlines  # [jonex] Wiki 阅读目录
+        wb = self.service.wiki_browse    # [jonex] Wiki 列式浏览（MCP 链接多跳图源）
         folders = self.service.folders
         syn = self.service.synonyms
         tb = self.service.tool_bindings
+        from .services.config_assist_service import ConfigAssistService  # noqa: PLC0415
+
+        ca = ConfigAssistService(tb)
         kt = self.service.kb_tools
         oq = self.service.ontology_query
         ds = self.service.data_sources
@@ -1844,6 +1976,7 @@ class KnowledgeBaseCapability(BaseCapability):
                 r.tenant_id, d["knowledge_base_id"], d["entity_type"], d["group"],
                 d["declaration"], d.get("canonical_name") or None,
                 user_id=r.user_id, username=r.username, request_id=getattr(r, "request_id", None),
+                probe_only=bool(d.get("probe_only")),
             )
 
         # 保存历史（2026-10-27）：三个动作都先 `_require_nonblank` 再进服务。
@@ -1880,6 +2013,164 @@ class KnowledgeBaseCapability(BaseCapability):
                 user_id=r.user_id or "",
                 kb_id=d["knowledge_base_id"],
             )
+
+        # 落点后台 run（Task 12）：建单与轮询。**调度必须在会话块之外** —— 会话
+        # 在块退出时才 commit，任务若先跑会按 run_id 查不到这一行。
+        async def _start_landing_run(r, d):
+            from .services.landing_agent.run_service import (  # noqa: PLC0415
+                LandingRunService,
+            )
+
+            _require_nonblank(d, "knowledge_base_id")
+            run_mode = d.get("run_mode") or "landings"
+            async with get_db_session() as session:
+                started = await LandingRunService(session).start(
+                    r.tenant_id, d["knowledge_base_id"], r.user_id or "", run_mode,
+                    # 与 construct 同口径：只认布尔 true，字符串 "false" 不算。
+                    force=d.get("force") is True,
+                    alias_hints=str(d.get("alias_hints") or "").strip(),
+                )
+            _schedule_landing_run(
+                r.tenant_id, d["knowledge_base_id"], started["run_id"], run_mode,
+            )
+            return started
+
+        async def _get_landing_run(r, d):
+            from .services.landing_agent.run_service import (  # noqa: PLC0415
+                LandingRunService,
+            )
+
+            _require_nonblank(d, "knowledge_base_id", "run_id")
+            async with get_db_session() as session:
+                return await LandingRunService(session).get(
+                    r.tenant_id, d["run_id"], kb_id=d["knowledge_base_id"],
+                )
+
+        # join 边复核 agent：确定性发现 → 有界复核 → 提案。
+        async def _run_join_agent(r, d):
+            from .services.join_agent.runner import (  # noqa: PLC0415
+                JoinAgentService,
+            )
+
+            _require_nonblank(d, "knowledge_base_id")
+            async with get_db_session() as session:
+                return await JoinAgentService(session).discover(
+                    r.tenant_id, d["knowledge_base_id"],
+                    data_source_id=str(d.get("data_source_id") or ""),
+                    task=str(d.get("task") or ""),
+                    user_id=r.user_id or "",
+                )
+
+        async def _list_join_proposals(r, d):
+            from .repository.join_proposal_repository import (  # noqa: PLC0415
+                JoinProposalRepository,
+            )
+
+            _require_nonblank(d, "knowledge_base_id")
+            async with get_db_session() as session:
+                rows = await JoinProposalRepository(session).list_for_kb(
+                    r.tenant_id, d["knowledge_base_id"],
+                    status=str(d.get("status") or ""),
+                )
+            return {"proposals": [row.to_dict() for row in rows]}
+
+        async def _decide_join_proposal(r, d):
+            from .repository.join_proposal_repository import (  # noqa: PLC0415
+                JoinProposalRepository,
+            )
+
+            _require_nonblank(d, "knowledge_base_id", "proposal_id",
+                              "decision")
+            decision = str(d["decision"]).strip()
+            if decision not in ("confirmed", "rejected"):
+                raise InvalidParameterError(
+                    message="decision 只能是 confirmed 或 rejected")
+            apply_result = None
+            async with get_db_session() as session:
+                repo = JoinProposalRepository(session)
+                changed = await repo.decide(
+                    r.tenant_id, d["proposal_id"], decision=decision,
+                    decided_by=r.user_id or "",
+                    note=str(d.get("note") or ""),
+                )
+                row = await repo.get(r.tenant_id, d["proposal_id"],
+                                     kb_id=d["knowledge_base_id"])
+                # 确认 = 真的落一条边（A 方案）。决定本身已生效，落边失败
+                # 不回滚决定，只把原因如实回给前端。
+                if changed and decision == "confirmed" and row is not None:
+                    from .services.join_agent.apply import (  # noqa: PLC0415
+                        apply_edge,
+                    )
+
+                    apply_result = await apply_edge(
+                        r.tenant_id, d["knowledge_base_id"], row.to_dict(),
+                        edited_by=r.user_id or "",
+                    )
+                    if apply_result.get("applied"):
+                        await repo.mark_applied(
+                            r.tenant_id, d["proposal_id"],
+                            apply_result["relation"]["name"],
+                        )
+                        # 同一会话里的 identity map 会返回旧实例（payload 还是
+                        # 上一版）—— 必须显式 refresh，否则响应里看不到落地关系名。
+                        await session.refresh(row)
+            if row is None:
+                raise ResourceNotFoundError(message="join 提案不存在")
+            return {"changed": changed, "proposal": row.to_dict(),
+                    "apply": apply_result}
+
+        # 指标构建 agent（进程内同步）：一次任务 = 一次有界循环，产出提案。
+        # 不建后台 run：单任务通常在 1–2 分钟内结束，建单+轮询的复杂度不值当；
+        # 超时由服务层自己收口（`METRIC_AGENT_TIMEOUT_S`），不会挂住请求。
+        async def _build_metric_proposal(r, d):
+            from .services.metric_agent.runner import (  # noqa: PLC0415
+                MetricAgentService,
+            )
+
+            _require_nonblank(d, "knowledge_base_id", "task")
+            async with get_db_session() as session:
+                return await MetricAgentService(session).build(
+                    r.tenant_id, d["knowledge_base_id"], d["task"],
+                    data_source_id=str(d.get("data_source_id") or ""),
+                    user_id=r.user_id or "",
+                )
+
+        async def _list_metric_proposals(r, d):
+            from .repository.metric_proposal_repository import (  # noqa: PLC0415
+                MetricProposalRepository,
+            )
+
+            _require_nonblank(d, "knowledge_base_id")
+            async with get_db_session() as session:
+                rows = await MetricProposalRepository(session).list_for_kb(
+                    r.tenant_id, d["knowledge_base_id"],
+                    status=str(d.get("status") or ""),
+                )
+            return {"proposals": [row.to_dict() for row in rows]}
+
+        async def _decide_metric_proposal(r, d):
+            from .repository.metric_proposal_repository import (  # noqa: PLC0415
+                MetricProposalRepository,
+            )
+
+            _require_nonblank(d, "knowledge_base_id", "proposal_id",
+                              "decision")
+            decision = str(d["decision"]).strip()
+            if decision not in ("confirmed", "rejected"):
+                raise InvalidParameterError(
+                    message="decision 只能是 confirmed 或 rejected")
+            async with get_db_session() as session:
+                repo = MetricProposalRepository(session)
+                changed = await repo.decide(
+                    r.tenant_id, d["proposal_id"], decision=decision,
+                    decided_by=r.user_id or "",
+                    note=str(d.get("note") or ""),
+                )
+                row = await repo.get(r.tenant_id, d["proposal_id"],
+                                     kb_id=d["knowledge_base_id"])
+            if row is None:
+                raise ResourceNotFoundError(message="指标提案不存在")
+            return {"changed": changed, "proposal": row.to_dict()}
 
         # 先摆业务 action，任务中心的两个入口在末尾 `dispatch.update(...)` 补进去
         # （SDK 的装配约定，理由见函数尾那一段）。
@@ -2025,6 +2316,12 @@ class KnowledgeBaseCapability(BaseCapability):
             "get_data_ontology_entity_detail": lambda r, d: analytics.ontology_entity_detail(r.tenant_id, _user_id(r), d),
             "get_data_kb_detail": lambda r, d: analytics.kb_detail(r.tenant_id, _user_id(r), d),
             "get_data_service_detail": lambda r, d: analytics.service_detail(r.tenant_id, _user_id(r), d),
+            # 数据运营 ·「数据问答」观测面（设计 §4）：窗口/范围参数由服务层
+            # `_parse_nl2sql_scope` 统一解析与限幅，能力层只负责判权与转发。
+            "get_nl2sql_overview": lambda r, d: analytics.nl2sql_overview(r.tenant_id, _user_id(r), d),
+            "get_nl2sql_slow": lambda r, d: analytics.nl2sql_slow(r.tenant_id, _user_id(r), d),
+            "get_nl2sql_failures": lambda r, d: analytics.nl2sql_failures(r.tenant_id, _user_id(r), d),
+            "get_nl2sql_detail": lambda r, d: analytics.nl2sql_detail(r.tenant_id, _user_id(r), d),
             "get_search_overview": lambda r, d: history.get_overview(r.tenant_id, _user_id(r), d),
             "list_search_history": lambda r, d: history.list_history(r.tenant_id, _user_id(r), d),
             "save_search_history": lambda r, d: history.save_history(r.tenant_id, _user_id(r), d),
@@ -2096,6 +2393,9 @@ class KnowledgeBaseCapability(BaseCapability):
             # document_id 非空 = 文档级阅读视图：页面清单按文档过滤 + 目录做过滤投影
             "get_wiki_outline": lambda r, d: wo.get_view(
                 r.tenant_id, d["knowledge_base_id"], d.get("document_id", "")),
+            # MCP 列式浏览：带语义全库图（BFS / depth / limit 都在 MCP 侧）
+            "get_wiki_page_graph": lambda r, d: wb.get_page_graph(
+                r.tenant_id, d["knowledge_base_id"]),
             "draft_wiki_outline": lambda r, d: wo.draft(
                 r.tenant_id, d["knowledge_base_id"], d, user_id=r.user_id),
             "adjust_wiki_outline": lambda r, d: wo.adjust(
@@ -2207,6 +2507,15 @@ class KnowledgeBaseCapability(BaseCapability):
             "list_abstract_schema_snapshots": _history_list,
             "get_abstract_schema_snapshot": _history_get,
             "restore_abstract_schema_snapshot": _history_restore,
+            # 落点后台 run（Task 12）：start 建单 + 调度，get 轮询进度。
+            "start_abstract_landing_run": _start_landing_run,
+            "get_abstract_landing_run": _get_landing_run,
+            "build_metric_proposal": _build_metric_proposal,
+            "list_metric_proposals": _list_metric_proposals,
+            "decide_metric_proposal": _decide_metric_proposal,
+            "run_join_agent": _run_join_agent,
+            "list_join_proposals": _list_join_proposals,
+            "decide_join_proposal": _decide_join_proposal,
             # [jonex] 抽取入口：get_compiled_schema + 注入 KB 级同义词（语义见
             # _get_compiled_schema_for_extraction）。atomic-rag Stage4 本体抽取走这条，
             # 使它不再依赖容器 REST 层（该层默认已不挂载）。
@@ -2418,10 +2727,42 @@ class KnowledgeBaseCapability(BaseCapability):
             "delete_tool_binding": lambda r, d: _deleted(tb.delete(r.tenant_id, d["binding_id"])),
             # 执行器唯一入口：只解析、不执行（business_domain 执行器经 Sidecar 调用）
             "resolve_action_execution": lambda r, d: tb.resolve_action_execution(r.tenant_id, d),
+            # 只读预览未保存的参数映射（不调用工具）
+            "preview_tool_binding_mapping": lambda r, d: tb.preview_mapping(r.tenant_id, d),
+            # AI 辅助参数映射：只生成建议；写口径 + 仅真实用户（避免内部调用绕过计量）
+            "propose_tool_binding_mapping": lambda r, d: _user_only(
+                r, lambda: ca.propose_binding_mapping(
+                    r.tenant_id, d, user_id=r.user_id, username=r.username,
+                    request_id=getattr(r, "request_id", None))),
+            "refine_tool_binding_mapping": lambda r, d: _user_only(
+                r, lambda: ca.refine_binding_mapping(
+                    r.tenant_id, d, user_id=r.user_id, username=r.username,
+                    request_id=getattr(r, "request_id", None))),
+            "propose_extract_tool_declaration": lambda r, d: _user_only(
+                r, lambda: ca.propose_extract_declaration(
+                    r.tenant_id, d, user_id=r.user_id, username=r.username,
+                    request_id=getattr(r, "request_id", None))),
+            "refine_extract_tool_declaration": lambda r, d: _user_only(
+                r, lambda: ca.refine_extract_declaration(
+                    r.tenant_id, d, user_id=r.user_id, username=r.username,
+                    request_id=getattr(r, "request_id", None))),
+            "propose_kb_tool_draft": lambda r, d: _user_only(
+                r, lambda: ca.propose_kb_tool_draft(
+                    r.tenant_id, d, user_id=r.user_id, username=r.username,
+                    request_id=getattr(r, "request_id", None))),
             # 执行器代真实用户取计划：与上面同一份解析，但调用人必须有知识库写权限
             # （写组判定在 execute()；无用户身份的调用在这里先拒，不走「无身份即跳过」）
             "prepare_action_execution": lambda r, d: _user_only(
-                r, lambda: tb.resolve_action_execution(r.tenant_id, d),
+                r, lambda: tb.resolve_action_execution(
+                    r.tenant_id, d, qa_pending_id=d.get("qa_pending_id"), user_id=r.user_id,
+                ),
+            ),
+            # 问答动作提案：认领与结果回写只供执行器经 Sidecar 调用（无 Gateway 路由）
+            "claim_qa_pending_action": lambda r, d: _internal_only(
+                r, lambda: tb.claim_qa_pending_action(r.tenant_id, d["qa_pending_id"]),
+            ),
+            "record_qa_action_result": lambda r, d: _internal_only(
+                r, lambda: tb.record_qa_action_result(r.tenant_id, d),
             ),
             # ── 知识库工具（KB 级工具目录）──
             "list_kb_tools": lambda r, d: kt.list(
@@ -2437,6 +2778,35 @@ class KnowledgeBaseCapability(BaseCapability):
             ),
             "run_kb_tool": lambda r, d: _internal_only(r, lambda: kt.run(r.tenant_id, d)),
             "preview_extract_tool": _preview_extract_tool,
+            # 已验证查询（N1-1）
+            "list_verified_queries": lambda r, d: _with_verified_query_service(
+                lambda s: s.list(r.tenant_id, d["knowledge_base_id"],
+                                 d.get("data_source_id") or "")),
+            "get_verified_query": lambda r, d: _with_verified_query_service(
+                lambda s: s.get(r.tenant_id, d["knowledge_base_id"],
+                                d["verified_query_id"])),
+            "save_verified_query": lambda r, d: _with_verified_query_service(
+                lambda s: s.save(r.tenant_id, d,
+                                 user_id=getattr(r, "user_id", None))),
+            "activate_verified_query": lambda r, d: _with_verified_query_service(
+                lambda s: s.activate(
+                    r.tenant_id, d["knowledge_base_id"], d["verified_query_id"],
+                    int(d["expected_version"]),
+                    user_id=getattr(r, "user_id", None))),
+            "retire_verified_query": lambda r, d: _with_verified_query_service(
+                lambda s: s.retire(
+                    r.tenant_id, d["knowledge_base_id"], d["verified_query_id"],
+                    int(d["expected_version"]),
+                    user_id=getattr(r, "user_id", None))),
+            "delete_verified_query": lambda r, d: _deleted(
+                _with_verified_query_service(lambda s: s.delete(
+                    r.tenant_id, d["knowledge_base_id"], d["verified_query_id"],
+                    int(d["expected_version"])))),
+            "preview_verified_query_match": lambda r, d: _with_verified_query_service(
+                lambda s: s.preview_match(
+                    r.tenant_id, d["knowledge_base_id"], d["data_source_id"],
+                    d["question"],
+                    floor=float(d.get("floor") or 0.8))),
             # ── 知识库信息管理 ──
             "list_knowledge_info": lambda r, d: kbinfo.list(
                 r.tenant_id, d.get("space_id"), d.get("status"),
@@ -2467,7 +2837,10 @@ class KnowledgeBaseCapability(BaseCapability):
                 kbinfo.get_permission_candidates(d["kb_id"], r.tenant_id, user_id=r.user_id)
             ),
             # ── 领域空间 ──
-            "list_spaces": lambda r, d: s.list(r.tenant_id, d.get("offset", 0), d.get("limit", 20), user_id=r.user_id),
+            "list_spaces": lambda r, d: s.list(
+                r.tenant_id, d.get("offset", 0), d.get("limit", 20),
+                user_id=r.user_id, scope=d.get("scope") or "manage",
+            ),
             "create_space": lambda r, d: s.create(r.tenant_id, d, owner_id=r.user_id),
             "get_space": lambda r, d: s.get(d["space_id"], r.tenant_id, user_id=r.user_id),
             "update_space": lambda r, d: s.update(d["space_id"], r.tenant_id, d, user_id=r.user_id),
@@ -2627,7 +3000,10 @@ class KnowledgeBaseCapability(BaseCapability):
             "approve_metric_call": lambda r, d: mca.decide_approval(
                 r.tenant_id, d["knowledge_base_id"], d["metric_name"],
                 "approved", user_id=r.user_id or "",
-                reason=d.get("reason") or ""),
+                reason=d.get("reason") or "",
+                # W4.8 审批策略：有效期；都没给时走 METRIC_APPROVAL_TTL_DAYS。
+                expires_at=d.get("expires_at"),
+                expires_in_days=d.get("expires_in_days")),
             "suspend_metric_call": lambda r, d: mca.decide_approval(
                 r.tenant_id, d["knowledge_base_id"], d["metric_name"],
                 "suspended", user_id=r.user_id or "",
@@ -3121,8 +3497,14 @@ class KnowledgeBaseCapability(BaseCapability):
         - knowledge_base_id 单个：无权限 → 403（明确拒绝；**只判断、不改写原值**）
         - knowledge_base_ids 数组：过滤后回写（可为空，handler 返回空结果。
           validate_input 无调用方、过滤发生在 execute 内，空数组不会撞必填校验）
-        - domain_space_id 空间维度：按空间角色整体 403（非成员）
+        - domain_space_id 空间维度：按空间角色整体 403（非成员/空间禁用/空间无启用服务）
         性能：可见空间一次 SQL 批量查（get_visible_space_ids），零 N+1。
+
+        空间维度的资源可用性：
+        - 空间下必须至少有一个启用中的服务（``3029``），空间入口不再绕过；
+        - 多 KB 跨空间时，剔除「无启用服务空间」下的 KB，全被剔除才拒（``3029``）。
+        ⚠ ``domain_space_id`` 分支**不再早退**：它只把 KB 范围收敛到该空间，随后
+        仍要走一遍 KB 过滤 —— 早退等于让带该字段的请求跳过全部 KB 判定。
         """
         from .services.space_permission_service import (
             get_active_space_ids,
@@ -3131,35 +3513,51 @@ class KnowledgeBaseCapability(BaseCapability):
 
         user_id = _user_id(request)
         active_ids = await get_active_space_ids(request.tenant_id)
-        if data.get("domain_space_id"):
-            space_id = data["domain_space_id"]
-            visible = await get_visible_space_ids(request.tenant_id, user_id)
-            if visible is not None and space_id not in visible:
-                raise PermissionDeniedError(
-                    message=translate(
-                        "err.space.insufficient_role",
-                        params={"space_id": space_id},
-                        fallback=f"无权操作空间: {space_id}",
-                    )
-                )
-            # [jonex] 空间可见 ≠ 空间可用：管理员 visible=None 也必须被禁用态挡住。
-            if space_id not in active_ids:
-                raise PermissionDeniedError(
-                    message=translate(
-                        "err.space.disabled",
-                        params={"space_id": space_id},
-                        fallback=f"领域空间已禁用: {space_id}",
-                    )
-                )
-            return data
+
+        # KB 入参归一放在空间判定之前：domain_space_id 分支也要收敛 KB 范围。
         kb_ids = data.get("knowledge_base_ids") or []
         single = False
         if not kb_ids and data.get("knowledge_base_id"):
             kb_ids = [data["knowledge_base_id"]]
             single = True
+        space_scope = data.get("domain_space_id")
+
+        # 可见空间集合只查一次（空间分支与 KB 分支共用）。
+        visible: list[str] | None = None
+        visible_set: set[str] | None = None
+        if space_scope or kb_ids:
+            visible = await get_visible_space_ids(request.tenant_id, user_id)
+            visible_set = set(visible) if visible is not None else None
+
+        if space_scope:
+            if visible_set is not None and space_scope not in visible_set:
+                raise PermissionDeniedError(
+                    message=translate(
+                        "err.space.insufficient_role",
+                        params={"space_id": space_scope},
+                        fallback=f"无权操作空间: {space_scope}",
+                    )
+                )
+            # [jonex] 空间可见 ≠ 空间可用：管理员 visible=None 也必须被禁用态挡住。
+            if space_scope not in active_ids:
+                raise PermissionDeniedError(
+                    message=translate(
+                        "err.space.disabled",
+                        params={"space_id": space_scope},
+                        fallback=f"领域空间已禁用: {space_scope}",
+                    )
+                )
+            # 空间可用 ≠ 空间可检索：空间下必须有启用中的服务。
+            from .services.service_availability import (
+                require_space_has_enabled_service,
+            )
+
+            await require_space_has_enabled_service(request.tenant_id, space_scope)
+
         if not kb_ids:
-            return data  # 无 KB 参数（如 search_mix 无 KB 维度）：交由 handler 处理
-        # 一次查 KB → space_id 映射；再一次查可见空间集合（None = 全可见）
+            # 无 KB 参数（如 search_mix 无 KB 维度 / 仅按空间检索）：交由 handler 处理。
+            return data
+        # 一次查 KB → space_id 映射
         from sqlalchemy import text
 
         async with get_db_session() as session:
@@ -3170,14 +3568,48 @@ class KnowledgeBaseCapability(BaseCapability):
                 ),
                 {"ids": kb_ids, "t": request.tenant_id},
             )).all()
+        # domain_space_id 与显式 kb_ids 同时出现时，KB 必须落在该空间内。
+        # 否则「空间选了 A、kb_ids 却带 B 空间的库」会绕过空间维度。
+        if space_scope:
+            rows = [row for row in rows if row[1] == space_scope]
+            if not rows:
+                raise PermissionDeniedError(
+                    message=translate(
+                        "err.space.insufficient_role",
+                        params={"space_id": space_scope},
+                        fallback=f"无权操作空间: {space_scope}",
+                    )
+                )
         # [jonex] 先剔除禁用空间下的 KB，**与调用者身份无关**：KB 授权是跨空间的，
         # 若只在 visible/granted 上做过滤，「非成员但有 KB 授权」的用户仍能读到
         # 禁用空间的内容。这一步必须在授权叠加之前。
         disabled_dropped = {row[0] for row in rows if row[1] not in active_ids}
         disabled_space_ids = {row[1] for row in rows if row[1] not in active_ids}
         rows = [row for row in rows if row[1] in active_ids]
-        visible = await get_visible_space_ids(request.tenant_id, user_id)
-        visible_set = set(visible) if visible is not None else None
+        # 再剔除「无启用服务空间」下的 KB —— 资源可用性与调用者身份无关。
+        # 放在禁用空间剔除之后、授权叠加之前；一次 SQL 批量判定（零 N+1）。
+        # space_scope 分支已单独校验过该空间有启用服务，无需重复查询。
+        if rows and not space_scope:
+            from .services.service_availability import (
+                get_space_ids_with_enabled_service,
+            )
+
+            enabled_service_space_ids = await get_space_ids_with_enabled_service(
+                request.tenant_id, list({row[1] for row in rows})
+            )
+            no_service_dropped = {
+                row[0] for row in rows if row[1] not in enabled_service_space_ids
+            }
+            no_service_space_ids = {
+                row[1] for row in rows if row[1] not in enabled_service_space_ids
+            }
+            rows = [row for row in rows if row[1] in enabled_service_space_ids]
+            # 全部落在无启用服务的空间：明确报 3029，而不是回写空列表让 handler
+            # 抛一个与真实原因无关的「缺少 knowledge_base_ids 参数」。
+            if not rows and no_service_dropped:
+                raise SpaceNoEnabledServiceError(
+                    details={"space_id": ", ".join(sorted(no_service_space_ids))}
+                )
         accessible = [
             kb_id for kb_id, space_id in rows
             if visible_set is None or space_id in visible_set
@@ -3459,6 +3891,41 @@ class KnowledgeBaseCapability(BaseCapability):
             # 的调用方也做过租户状态判定。失败走 TenantIsolationError（403/3005），
             # 不区分「不存在 / 软删 / 停用」。
             await require_active_tenant(request.tenant_id)
+            # **租户交叉校验**：任务中心 → 运行方的四个 action 报文里带 `tenant_id`，
+            # handler 直接采信它。Sidecar 只校验信封/认证租户，不校验 payload ——
+            # 不比对的话，租户 A 能让运行方按租户 B 读写接管行。
+            if action in self._TASK_CENTER_RUNNER_ACTIONS:
+                payload_tenant = data.get("tenant_id")
+                if payload_tenant and payload_tenant != request.tenant_id:
+                    raise TenantIsolationError(
+                        message="报文租户与认证租户不一致",
+                        details={"action": action},
+                    )
+            # 检索类 action 的「领域服务可用性」闸门：
+            # 服务必须存在/同租户/未删/active/enabled≠0（3028）；空间下必须至少
+            # 有一个启用中的服务（3029）。
+            #
+            # ⚠ 故意放在下面 `if not skip_space_check:` 块**之外**：MCP 链路
+            # （mcp_key_id 认证）与无 actor 的内部链路会把 skip_space_check 置 True，
+            # 闸门放进块内等于对 MCP 完全不拦 —— 而 MCP 检索正是本次要修的口子。
+            # 本判定只认 tenant_id + service_id/domain_space_id，不依赖任何 actor 语境。
+            # ⚠ 覆盖面必须含 ``_SERVICE_SEARCH_ACTIONS``（``search_service``）：
+            # Gateway 的 ``GET /services/{service_id}/search`` 直接调它，不经 MCP；
+            # 只认 ``_SEARCH_ACTIONS`` 会漏掉这条 REST 直连路径（MCP 本地闸门覆盖不到）。
+            if action in _SEARCH_ACTIONS or action in _SERVICE_SEARCH_ACTIONS:
+                from .services.service_availability import (
+                    require_service_searchable,
+                    require_space_has_enabled_service,
+                )
+
+                if data.get("service_id"):
+                    await require_service_searchable(
+                        request.tenant_id, data["service_id"]
+                    )
+                if data.get("domain_space_id"):
+                    await require_space_has_enabled_service(
+                        request.tenant_id, data["domain_space_id"]
+                    )
             kb_type = None
             # [jonex] 空间权限前置判定（设计 2026-08-19-space-permission-design §3）
             # 统一 bypass：无 user_id / "anonymous"（测试 token、内部链路）或 MCP Key 认证
@@ -3695,10 +4162,19 @@ class KnowledgeBaseCapability(BaseCapability):
                 await self._require_structured_enabled(request.tenant_id, data)
             result = await handler(request, data)
             return CapabilityResponse.ok(request.request_id, result)
+        # 能力信封不经 HTTP 异常处理器，文案必须在这里按 locale 本地化：
+        # 直接回 `exc.message` 会把类默认中文带出去，Gateway 见 message 非空就当
+        # 「显式原文」跳过翻译，英文界面就会拿到中文。
         except TenantIsolationError as exc:
-            return CapabilityResponse.error(request.request_id, exc.code, exc.message, details=exc.details or None)
+            return CapabilityResponse.error(
+                request.request_id, exc.code, exc.localized_message(),
+                details=exc.details or None, params=exc.params or None,
+            )
         except JonexException as exc:
-            return CapabilityResponse.error(request.request_id, exc.code, exc.message, details=exc.details or None)
+            return CapabilityResponse.error(
+                request.request_id, exc.code, exc.localized_message(),
+                details=exc.details or None, params=exc.params or None,
+            )
         except Exception as exc:
             # Pydantic ValidationError → 400 Bad Request（消息脱敏，不暴露字段名/类型）
             if "ValidationError" in type(exc).__name__:
@@ -3805,6 +4281,12 @@ async def _with_gov_policy_service(fn):
     from .services.governance.policy_service import GovernancePolicyService
     async with get_db_session() as session:
         return await fn(GovernancePolicyService(session))
+
+
+async def _with_verified_query_service(fn):
+    from .services.nl2sql_verified_query_service import Nl2SqlVerifiedQueryService
+    async with get_db_session() as session:
+        return await fn(Nl2SqlVerifiedQueryService(session))
 
 
 async def _with_gov_audit_service(fn):
@@ -4434,6 +4916,66 @@ def _schedule_evolution_batch_adopt(tenant_id: str,
     task.add_done_callback(_EVOLUTION_TASKS.discard)
 
 
+#: 落点 run 的后台任务集。与 `_EVOLUTION_TASKS` **分开**登记：两条线的并发与
+#: 排障口径不同，合一个集合会让「演化还在跑」把「落点没起来」的残留任务藏住。
+_LANDING_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_landing_run(tenant_id: str, kb_id: str, run_id: str,
+                          run_mode: str) -> None:
+    """建单成功后调度后台执行（仿 `_schedule_evolution_run`）。
+
+    新开一个会话：`execute()` 的整段生命周期（置 running、逐概念写进度、写终态）
+    都要有会话；能力动作自己那个会话在返回时已经提交并关闭。
+
+    `kb_id` / `run_mode` 只用于日志定位 —— `execute()` 以库里的行为准，
+    不拿调度参数当事实（重复投递时参数可能已经过时）。
+    """
+    async def _run() -> None:
+        from .services.landing_agent.run_service import LandingRunService
+
+        try:
+            async with get_db_session() as session:
+                await LandingRunService(session).execute(tenant_id, run_id)
+        except asyncio.CancelledError:
+            # 取消可能落在 `execute()` 的 try 之外（取行 / set_running 阶段），
+            # 那一段不归 execute 收口 —— 这里补一次 best-effort 终态再继续传播。
+            # 若 execute 已经写过终态，`fail_if_active` 的状态守卫会跳过它。
+            logger.warning(
+                "落点 run 后台任务被取消 run=%s kb=%s mode=%s",
+                run_id, kb_id, run_mode,
+            )
+            await _mark_landing_run_failed(tenant_id, run_id, "cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 后台任务不许留未观测异常
+            logger.warning(
+                "落点 run 后台执行失败 run=%s kb=%s mode=%s: %s",
+                run_id, kb_id, run_mode, exc,
+            )
+            await _mark_landing_run_failed(tenant_id, run_id, exc)
+
+    task = asyncio.create_task(_run())
+    _LANDING_TASKS.add(task)
+    task.add_done_callback(_LANDING_TASKS.discard)
+
+
+async def _mark_landing_run_failed(tenant_id: str, run_id: str,
+                                   exc: object) -> None:
+    """调度层兜底：`execute()` 自己没收口就逃出来的错误，用**新会话**补终态。
+
+    只改仍占用中的行（`fail_if_active`）—— 已 succeeded 的 run 不能被盖成 failed。
+    """
+    from .services.landing_agent.run_service import LandingRunService
+
+    try:
+        async with get_db_session() as session:
+            await LandingRunService(session).fail_if_active(
+                tenant_id, run_id, str(exc) or repr(exc),
+            )
+    except Exception as inner:  # noqa: BLE001 —— 兜底失败只留日志，不二次抛
+        logger.warning("落点 run 兜底收口失败 run=%s: %s", run_id, inner)
+
+
 #: 合并分页的 offset 上限。版本列表走单条 UNION 后仍保留这道闸：超大 offset
 #: 对用户的检索价值为零，却会让数据库扫描大量行。
 _EVOLUTION_MAX_OFFSET = 10000
@@ -4812,10 +5354,10 @@ async def _evolution_start_run(request: CapabilityRequest,
 
     kind = str(data.get("kind") or "").strip()
     if kind not in ("alias", "query_rule", "relation", "constraint",
-                    "mapping", "tool_schema", "synonym"):
+                    "mapping", "tool_schema", "metric", "synonym"):
         raise InvalidParameterError(
             message="kind 必须是 alias、query_rule、relation、constraint、"
-                    "mapping、tool_schema 或 synonym")
+                    "mapping、tool_schema、metric 或 synonym")
     _require_nonblank(data, "kb")
     kb_id = str(data["kb"]).strip()
     # compiled 家族（query_rule / relation / constraint）的候选都挂在某个数据源
@@ -4824,9 +5366,10 @@ async def _evolution_start_run(request: CapabilityRequest,
         _require_nonblank(data, "ds")
         ds_id = str(data.get("ds") or "").strip() or None
     else:
-        # alias / mapping / tool_schema / synonym 都是 KB 级链（ds 恒为 None；
-        # 前三个走 abstract 链、synonym 是独立链）：带 ds 是坏参数，不能静默
-        # 忽略 —— 否则会写出一条与链键不符的 run，采纳时按 ds 取 active 恒为空。
+        # alias / mapping / tool_schema / metric / synonym 都是 KB 级链（ds 恒为
+        # None；前四个走 abstract 链、synonym 是独立链）：带 ds 是坏参数，不能
+        # 静默忽略 —— 否则会写出一条与链键不符的 run，采纳时按 ds 取 active
+        # 恒为空。
         if str(data.get("ds") or "").strip():
             raise InvalidParameterError(
                 message=f"{kind} 演化是 KB 级版本链，不接受 ds")
@@ -4871,6 +5414,18 @@ async def _evolution_start_run(request: CapabilityRequest,
             raise InvalidParameterError(
                 message="tool_schema 演化需要抽象 schema 处于 active"
                         "（当前未激活），工具覆盖不会生效")
+    elif kind == "metric":
+        # 指标口径写在抽象 schema 上，生产侧只从 **active** 行注入 hints；
+        # 非 active（含无行）时演化测不到真实效果、采纳还会被 409 挡 ——
+        # 与 mapping / tool_schema 一样在开库前拒绝。
+        from .services.evolution import schema_io
+
+        row = await schema_io.get_row(
+            request.tenant_id, "metric", kb_id, None) or {}
+        if row.get("status") != "active":
+            raise InvalidParameterError(
+                message="指标演化需要抽象 schema 处于 active"
+                        "（当前未激活），指标不会进入生产 hints")
 
     async with get_db_session() as session:
         if kind in ("query_rule", "relation", "constraint"):
@@ -5027,7 +5582,11 @@ def _evolution_picks(data: dict[str, Any]) -> list[str] | None:
 
 async def _evolution_adhoc_evidence(request: CapabilityRequest,
                                     data: dict[str, Any]) -> dict:
-    """人工 ad-hoc 验真证据：临时 apply 候选 → 跑一次问句 → 恢复快照。
+    """人工 ad-hoc 验真证据：让候选生效 → 跑一次问句 → 还原状态。
+
+    三种形态的生效方式不同：**alias** 临时 apply schema 后恢复快照；
+    **synonym / metric** 走请求级注入（`extra_value_aliases` /
+    `extra_metric_hints`），**零写入、不取链锁、不碰快照**。
 
     只读辅助（不改 run 状态、不写台账）；`evidence_id` 绑定本次 picks 与
     case，采纳时由服务层校验「证据仍对应当前候选」。`picks` 缺省 = 全取。

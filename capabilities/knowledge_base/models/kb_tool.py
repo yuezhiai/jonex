@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 """Knowledge Base — 知识库工具（本库登记的可执行 API 工具）。
 
-对应表：knowledge_base.kb_tools（deploy/postgres/update/082_ontology_skill_action_tools.sql）
+对应表：knowledge_base.kb_tools（deploy/postgres/update/084_ontology_skill_action_tools.sql）
 """
 from sqlalchemy import Boolean, Column, String, Text
 from sqlalchemy.dialects.postgresql import JSONB

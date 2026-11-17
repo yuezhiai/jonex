@@ -860,6 +860,20 @@ def _detect_pipeline_version(raw) -> str | None:
 
 MAX_ONTOLOGY_RETRIES = 3
 
+
+def _should_finalize_ontology_failure(
+    *, managed: bool, retry_count: int, max_retries: int
+) -> bool:
+    """本体「完成但失败」时，这一拍是否就此落 FAILED（而不是留额度重抽）。
+
+    **托管文档一律收口**：它的重抽发起权在任务中心（旧对账的「新提交」闸门会
+    直接 return False），留额度的结果只能是「既不重试也不判失败」——
+    2026-11-17 线上：`retry_count=1 < 3`，文档永远停在「编译中」。
+
+    非托管文档维持原语义：额度用完才落 FAILED，否则留给下一轮重抽。
+    """
+    return managed or retry_count + 1 >= max_retries
+
 #: 重试上限文案的固定头。闸门要「不覆盖真因」，靠的就是认这个头判断
 #: 「当前 `ontology_error` 是不是上一轮闸门自己写的那句」——
 #: **写与认必须共用这一常量**：改文案时只改一边，幂等判定就失效，文案会一轮轮叠上去。
@@ -2491,6 +2505,30 @@ class ReconciliationService:
 
     # ── ontology retry ─────────────────────────────────────────
 
+    async def _record_ontology_error(self, doc, message: str) -> None:
+        """把「本体收尾卡住」的真因写到文档行（幂等，不改状态）。
+
+        **为什么必须写**：看门狗 `_inspect_compile` 的止损判据是「`ontology_status`
+        是 `EXTRACTING` **且 `ontology_error` 非空**」。只在对账日志里留一句话时，
+        看门狗读不到原因，文档只能等 `TC_STEP_HARD_TIMEOUT_SEC`（6 小时）——
+        2026-11-17 线上「一直编译中」就是这一格。
+
+        状态仍是 `EXTRACTING`：这一步还没收口，写 error 只是把真因交给看门狗与
+        人工；推进终态仍由看门狗的 `_fail_step`（或后续成功收尾）负责。
+        值没变就不写库：对账 30 秒一拍，避免每拍一次无意义 UPDATE。
+        """
+        message = (message or "").strip()
+        if not message:
+            return
+        if (doc.ontology_error or "").strip() == message:
+            return
+        async with get_db_session() as session:
+            repo = KnowledgeDocumentRepository(session)
+            await repo.set_ontology_status(
+                doc, OntologyStatus.EXTRACTING, error=message
+            )
+            await session.commit()
+
     async def _retry_ontology_one(self, doc) -> bool:
         """Retry ontology extraction for a single doc. Returns True if a new task was queued.
         """
@@ -2613,14 +2651,30 @@ class ReconciliationService:
                         return False
                     # 已完成但无 ontology_data（例如无候选实体）
                     ont_error = status_info.get("ontology_error") or status_info.get("error") or "无候选实体"
-                    if retry_count + 1 >= MAX_ONTOLOGY_RETRIES:
+                    # ⚠️ **托管文档没有「等对账重抽」这回事**：发起权归任务中心，
+                    # 下面那道闸（`_takeover_is_task_center_managed` → return False）
+                    # 会把重抽直接拦掉。若这里还按「还有额度」落空，结果就是
+                    # **既不重试也不判失败**，文档永远停在 EXTRACTING ——
+                    # 2026-11-17 线上实测：引擎 `completed + ontology_status=failed`、
+                    # `retry_count=1 < 3`，文档卡死「编译中」。
+                    managed = await self._takeover_is_task_center_managed(doc)
+                    if _should_finalize_ontology_failure(
+                        managed=managed,
+                        retry_count=retry_count,
+                        max_retries=MAX_ONTOLOGY_RETRIES,
+                    ):
                         async with get_db_session() as session:
                             repo = KnowledgeDocumentRepository(session)
                             await repo.set_ontology_status(doc, OntologyStatus.FAILED, error=ont_error)
                             await session.commit()
-                        logger.warning("Ontology retry exhausted for doc %s: %s", doc.id, ont_error)
+                        logger.warning(
+                            "Ontology retry finalized as FAILED (managed=%s) for doc %s: %s",
+                            managed, doc.id, ont_error,
+                        )
                         return False
-                    # 落空（还有额度）→ 跳出整条 if/elif，继续往下触发新一轮重抽
+                    # 落空（还有额度、且不归任务中心管）→ 重抽。真因**先写到文档行**：
+                    # 否则这一轮只有库里那句引擎错误，看门狗的 120 秒止损读不到。
+                    await self._record_ontology_error(doc, ont_error)
                 elif rag_status in _ONTOLOGY_TASK_FAILED_STATUSES:
                     # 下游任务**明确失败** → 把真因落到文档行上。
                     #
@@ -2662,21 +2716,33 @@ class ReconciliationService:
                     if managed:
                         return False
                 elif rag_status == "not_found":
-                    # 下游那一侧找不到这条任务。**不判死**（既有查证链就是为
-                    # 「任务行被清理了但产物还在」准备的），但必须留声：原先它与
-                    # `failed` 一样静默，排查时看不出「问到了、但对方说没有」。
+                    # 下游那一侧找不到这条任务。**不把文档判死**（任务行可能只是
+                    # 被清理了、产物还在），但真因必须写到文档行：否则看门狗的
+                    # `EXTRACTING + ontology_error` 止损读不到原因，只能等 6 小时
+                    # 硬超时（2026-11-17 线上就是这样卡住的）。
+                    backend = compile_backend.backend_for_document(doc)
                     logger.warning(
                         "本体任务在 %s 里不存在（保持 EXTRACTING 等下一轮）: "
                         "doc_id=%s task=%s",
-                        compile_backend.backend_for_document(doc),
-                        doc.id, doc.rag_task_id,
+                        backend, doc.id, doc.rag_task_id,
+                    )
+                    await self._record_ontology_error(
+                        doc,
+                        f"本体任务在 {backend} 中不存在"
+                        f"（task={doc.rag_task_id}，可能已被清理或问错了后端）",
                     )
                 else:
-                    # 没见过的状态词：不认识就别当已知的处理，留声后交给硬超时。
+                    # 没见过的状态词：不认识就别当已知的处理，但同样要把状态词
+                    # 写到文档行 —— 交给看门狗的宽限止损，而不是无限等硬超时。
                     logger.warning(
                         "本体任务状态词不认识（保持 EXTRACTING 等下一轮）: "
                         "doc_id=%s task=%s status=%r",
                         doc.id, doc.rag_task_id, rag_status,
+                    )
+                    await self._record_ontology_error(
+                        doc,
+                        f"本体编译返回无法识别的状态 {rag_status!r}"
+                        f"（task={doc.rag_task_id}）",
                     )
             except Exception as e:
                 logger.warning("Ontology retry handling failed for doc %s, skipping: %s", doc.id, e)

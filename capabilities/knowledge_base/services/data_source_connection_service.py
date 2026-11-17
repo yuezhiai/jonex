@@ -179,7 +179,18 @@ class DataSourceConnectionService:
                               space_id: str | None = None) -> dict:
         tenant_id = require_tenant(tenant_id)
         _, src, cfg = await self._catalog_source(tenant_id, conn_id, space_id)
-        return await src.test_connection(cfg)
+        result = await src.test_connection(cfg)
+        # 失败**不抛异常**，只回 `{ok: false, message}`，HTTP 仍是 200 —— 上游网关只按
+        # 状态码记 INFO 一行、nginx 也是 200，所以没有这条 warning 时**容器日志里看不到
+        # 任何痕迹**（2026-11-05 真机排查「测连接报错但日志无输出」踩过）。
+        # 只打目标地址与引擎，绝不带 `password`（`cfg` 里是解密后的明文）。
+        if not result.get("ok"):
+            logger.warning(
+                "数据源连接测试失败: conn=%s tenant=%s space=%s engine=%s target=%s:%s → %s",
+                conn_id, tenant_id, space_id, cfg.get("engine"),
+                cfg.get("host"), cfg.get("port"), result.get("message"),
+            )
+        return result
 
     async def read_connection_catalog(self, tenant_id: str, conn_id: str,
                                       space_id: str | None = None) -> dict:

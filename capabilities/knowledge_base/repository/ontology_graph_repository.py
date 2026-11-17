@@ -1062,12 +1062,25 @@ class OntologyGraphRepository:
             facts.append(f)
         return facts, total, total > len(facts)
 
-    async def exact_match_entities(self, tenant_id: str, kb_ids: list[str], name: str) -> list[dict]:
-        """精确匹配 canonical_name 或 aliases（多 KB），返回列表（同名实体在不同 KB 各命中一条）。"""
+    async def exact_match_entities(
+        self, tenant_id: str, kb_ids: list[str], name: str,
+        entity_types: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """精确匹配 canonical_name 或 aliases（多 KB），返回列表（同名实体在不同 KB 各命中一条）。
+
+        `entity_types` 在 Cypher 里过滤（调用方按名定位某类型实体时必须下推，
+        不能先取再在 Python 里筛，否则同名前缀会被别的类型抢占）；
+        名称完全相等的排在别名命中之前，同档按 confidence 降序。
+        """
         tenant_id = require_tenant(tenant_id)
-        cypher = """
-        MATCH (e:OntologyEntity {tenant_id:$t})
+        type_clause = "AND e.entity_type IN $ets" if entity_types else ""
+        params: dict = {"t": tenant_id, "kbs": kb_ids, "name": name}
+        if entity_types:
+            params["ets"] = list(entity_types)
+        cypher = f"""
+        MATCH (e:OntologyEntity {{tenant_id:$t}})
         WHERE e.kb_id IN $kbs AND coalesce(e.stub,false)=false
+          {type_clause}
           AND (e.canonical_name=$name OR $name IN coalesce(e.aliases,[]))
         RETURN e.canonical_name AS name, e.entity_type AS type,
                e.aliases AS aliases, e.attributes AS attributes,
@@ -1076,9 +1089,11 @@ class OntologyGraphRepository:
                // [jonex] S4（§3.4 排序豁免）：真行对象判据（见 search_entities）
                e.table_sig AS table_sig,
                e.kb_id AS kb_id, e.doc_ids AS doc_ids, e.source_chunks AS source_chunks, 1.0 AS score
+        ORDER BY CASE WHEN e.canonical_name = $name THEN 0 ELSE 1 END,
+                 coalesce(e.confidence,0) DESC
         """
         async with self._driver.session() as session:
-            result = await session.run(cypher, {"t": tenant_id, "kbs": kb_ids, "name": name})
+            result = await session.run(cypher, params)
             rows = [dict(record) async for record in result]
         for row in rows:
             if isinstance(row.get("attributes"), str):
@@ -1098,12 +1113,24 @@ class OntologyGraphRepository:
                     row["source_chunks"] = []
         return rows
 
-    async def prefix_match_entities(self, tenant_id: str, kb_ids: list[str], prefix: str, limit: int = 5) -> list[dict]:
-        """canonical_name 前缀匹配（多 KB），精确匹配的兜底，处理"研发"→"研发流程"这类场景。"""
+    async def prefix_match_entities(
+        self, tenant_id: str, kb_ids: list[str], prefix: str, limit: int = 5,
+        entity_types: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """canonical_name 前缀匹配（多 KB），精确匹配的兜底，处理"研发"→"研发流程"这类场景。
+
+        `entity_types` 必须在 LIMIT 之前过滤：同前缀的其它类型占满 limit 时，
+        目标类型会被挤掉，调用方再筛就只剩空结果。
+        """
         tenant_id = require_tenant(tenant_id)
-        cypher = """
-        MATCH (e:OntologyEntity {tenant_id:$t})
+        type_clause = "AND e.entity_type IN $ets" if entity_types else ""
+        params: dict = {"t": tenant_id, "kbs": kb_ids, "prefix": prefix, "limit": limit}
+        if entity_types:
+            params["ets"] = list(entity_types)
+        cypher = f"""
+        MATCH (e:OntologyEntity {{tenant_id:$t}})
         WHERE e.kb_id IN $kbs AND e.canonical_name STARTS WITH $prefix AND coalesce(e.stub,false)=false
+          {type_clause}
         RETURN e.canonical_name AS name, e.entity_type AS type,
                e.aliases AS aliases, e.attributes AS attributes,
                e.description AS description, e.confidence AS confidence,
@@ -1111,11 +1138,11 @@ class OntologyGraphRepository:
                // [jonex] S4（§3.4 排序豁免）：真行对象判据（见 search_entities）
                e.table_sig AS table_sig,
                e.kb_id AS kb_id, e.doc_ids AS doc_ids, e.source_chunks AS source_chunks, 1.0 AS score
-        ORDER BY size(e.canonical_name) ASC
+        ORDER BY size(e.canonical_name) ASC, coalesce(e.confidence,0) DESC
         LIMIT $limit
         """
         async with self._driver.session() as session:
-            result = await session.run(cypher, {"t": tenant_id, "kbs": kb_ids, "prefix": prefix, "limit": limit})
+            result = await session.run(cypher, params)
             rows = [dict(record) async for record in result]
         for row in rows:
             if isinstance(row.get("attributes"), str):

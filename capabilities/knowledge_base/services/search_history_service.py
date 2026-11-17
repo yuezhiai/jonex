@@ -14,8 +14,9 @@ from jonex_core.common.exceptions import ResourceNotFoundError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
+from ..models import build_query_hash
 from ..repository import KnowledgeQueryImageRepository, KnowledgeSearchHistoryRepository
-from ..repository.search_history_repository import MAX_HISTORY_PER_USER
+from ..repository.search_history_repository import MAX_HISTORY_PER_USER, _strip_raw_urls
 from ..dtos import (
     SearchHistoryCreateRequest,
     SearchHistoryDeleteRequest,
@@ -221,6 +222,9 @@ class SearchHistoryService:
         tenant_id = require_tenant(tenant_id)
         req = SearchHistoryCreateRequest(**_payload(request))
         data: dict[str, Any] = _payload(req)
+        # 前端搜索结束后补存同一条历史：带 history_id 时更新后端刚写的那一条，
+        # 不再插入重复行（否则列表顶部那条会缺 pending_actions/action_results）。
+        target_history_id = data.pop("history_id", None)
         metadata = dict(data.pop("metadata", {}) or {})
         domain = data.pop("domain", None)
         domain_id = data.pop("domain_id", None)
@@ -245,7 +249,38 @@ class SearchHistoryService:
         data["extra_metadata"] = metadata
         async with get_db_session() as session:
             repo = KnowledgeSearchHistoryRepository(session)
-            history = await repo.upsert_for_user(tenant_id, user_id, data)
+            existing = (
+                await repo.get_by_id_for_user(tenant_id, user_id, target_history_id)
+                if target_history_id else None
+            )
+            if existing is None:
+                history = await repo.upsert_for_user(tenant_id, user_id, data)
+            else:
+                # 前端补存：更新同一条历史，并保留后端写入的卡片/工具结果等元数据
+                old_meta = dict(existing.extra_metadata or {})
+                merged_meta = {**old_meta, **metadata}
+                for key in ("pending_actions", "tool_results", "action_results"):
+                    if key in old_meta:
+                        merged_meta[key] = old_meta[key]
+                existing.extra_metadata = merged_meta
+                existing.query = data.get("query") or existing.query
+                existing.query_hash = build_query_hash(existing.query)
+                if data.get("knowledge_base_id"):
+                    existing.knowledge_base_id = data["knowledge_base_id"]
+                if data.get("domain_space_id") is not None:
+                    existing.domain_space_id = data["domain_space_id"]
+                existing.mode = data.get("mode") or existing.mode
+                existing.top_k = data.get("top_k") or existing.top_k
+                existing.status = data.get("status") or existing.status
+                existing.answer_preview = data.get("answer_preview")
+                existing.reference_count = data.get("reference_count") or 0
+                existing.result_count = data.get("result_count") or 0
+                existing.duration_ms = data.get("duration_ms")
+                existing.answer = data.get("answer")
+                existing.references = _strip_raw_urls(data.get("references") or [])
+                existing.reasoning = data.get("reasoning")
+                await session.flush()
+                history = existing
             history_dict = history.to_dict()
 
         # [jonex] 图片落盘与关联在**独立事务**里（B9 四步），历史行已在上面的
@@ -273,6 +308,19 @@ class SearchHistoryService:
         if trimmed:
             await self._release(tenant_id, user_id, trimmed)
         return history_dict
+
+    async def append_action_result(
+        self, tenant_id: str, user_id: str, history_id: str, item: dict,
+    ) -> bool:
+        """服务端回写一条问答动作执行结果（只供执行器内部调用）。"""
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            ok = await KnowledgeSearchHistoryRepository(session).append_action_result(
+                tenant_id, user_id, history_id, item,
+            )
+            if ok:
+                await session.commit()
+            return ok
 
     async def delete_history(
         self,

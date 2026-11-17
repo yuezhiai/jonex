@@ -595,6 +595,10 @@ class TaskRunnerService(RunnerBase):
                         )
                 await TaskCenterDocumentRepository(session).mark_released(
                     snapshot.document_id,
+                    # **只拆自己这一单**：出站可能耗时数十秒，期间任务可能被停止、
+                    # 用户重试、新一次派活以另一个 execution_id 接手这张卡。
+                    # 不比对的话，旧执行的失败会把新执行的接管行一起交还掉。
+                    expect_execution_id=ctx.execution_id,
                     error_message=err_text[:2000],
                     # ⚠️ **也得写失败报文**（2026-10-11 补）：上面那句注释说「口径与看门狗的
                     # `_fail_step` 一致」，但在 `last_report` 这一维上原先并不一致 ——
@@ -843,6 +847,20 @@ class TaskRunnerService(RunnerBase):
                     )
                 )
             retrying = row.state not in ACTIVE_STATES
+            # **第二种「任务重试」形态**：行仍是 `managed`、`execution_id` 已清空、
+            # 但 `handled_execution_id` 有值 —— 上一轮 `parse` 已经成功收口、正等
+            # `compile` 派活，此时任务被收成终态、用户点了「任务重试」，任务中心
+            # 以新执行重新派 `parse_1`。
+            #
+            # 不把这一格也算成重跑的话：`begin_step` 直接收下，文档按「上传」意图
+            # 再解析一遍 —— 代次不 +1、旧切片不清、`tc_intent` 不是 reparse，
+            # 结果就是重复切片/重复向量，且没有任何报错。
+            console_retry_reparse = (
+                not retrying
+                and step_code == STEP_PARSE
+                and not (row.execution_id or "")
+                and bool(getattr(row, "handled_execution_id", None))
+            )
             if retrying:
                 # 已经被交还给既有对账（跑完了 / 判死了 / 用户停了 / 任务被删了）。
                 #
@@ -977,7 +995,7 @@ class TaskRunnerService(RunnerBase):
             #     排在任何一条回绝路径之前的话，那份文档会停在
             #     「接管行在途 + 自己 `parsing` + 任务中心那边这一步失败」的假状态，
             #     要等满看门狗的 30 分钟兜底才解开。
-            if retrying:
+            if retrying or console_retry_reparse:
                 await self._reset_document_after_console_retry(
                     session,
                     doc=doc,

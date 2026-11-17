@@ -17,12 +17,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import time
 import uuid
+from dataclasses import asdict
 from typing import NamedTuple, Optional
 
 from sqlalchemy import delete, func, insert, select
@@ -77,6 +80,7 @@ from .abstract_focus import (
     filter_focus_seeds,
     validate_focus_seeds,
 )
+from .abstract_merge import merge_duplicate_concepts
 from .concept_expansion import (
     MAX_ATTRIBUTES_PER_ENTITY,
     MAX_LANDING_SLOT_CHARS,
@@ -346,6 +350,144 @@ async def _release_generate_guard(guard: _GenerateGuard) -> None:
         logger.info("生成守卫已不属于本次生成，跳过删除: key=%s", guard.key)
 
 
+#: 守卫心跳的续期间隔（秒）。必须**显著小于** TTL（300s）：单次续期失败不该
+#: 立刻掉锁，连续多次失败才可能过期 —— 这是给 Redis 抖动留的余量。
+GENERATE_GUARD_HEARTBEAT_SECONDS = 60
+
+#: 在飞心跳任务的强引用集合。`asyncio.create_task` 只保留弱引用，任务被 GC
+#: 回收就等于心跳**静默停止**（长落在跑、锁却在 300 秒后自己过期，第三个请求
+#: 就能并发生成）。done callback 里移除，集合不会随进程增长。
+_GUARD_HEARTBEATS: set = set()
+
+
+async def _renew_generate_guard(guard: Optional[_GenerateGuard]) -> bool:
+    """把守卫的 TTL 续到满值；**任何失败都只 warning 返回 False**。
+
+    心跳是成本守卫的延伸，不是正确性守卫：续期失败意味着「最坏等 TTL 过期」，
+    与释放失败同口径。把它抛出去会把一次已经在跑的构造打成 500 —— 代价远大于
+    多花一次 token。
+
+    `guard=None`（Redis fail-open 的构造）直接 False：键根本没落，没有可续的。
+    """
+    if guard is None:
+        return False
+    try:
+        client = get_redis_client()
+    except Exception as exc:  # noqa: BLE001 —— 客户端都建不起来，续期无从谈起
+        logger.warning(
+            "守卫心跳：Redis 客户端不可用，本次不续期: key=%s err=%s",
+            guard.key, exc,
+        )
+        return False
+    try:
+        renewed = await client.expire(guard.key, GENERATE_GUARD_TTL_SECONDS)
+        return bool(renewed)
+    except Exception as exc:  # noqa: BLE001 —— 同上
+        logger.warning(
+            "守卫心跳续期失败（最坏等 TTL 过期）: key=%s err=%s", guard.key, exc,
+        )
+        return False
+    finally:
+        # 与 `_acquire_generate_guard` 同口径：收尾失败不得改写续期判定。
+        aclose = getattr(client, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("守卫心跳客户端关闭失败: key=%s err=%s", guard.key, exc)
+
+
+async def _guard_heartbeat_loop(guard: Optional[_GenerateGuard]) -> None:
+    """每 `GENERATE_GUARD_HEARTBEAT_SECONDS` 续一次期，直到被取消。"""
+    while True:
+        await asyncio.sleep(GENERATE_GUARD_HEARTBEAT_SECONDS)
+        await _renew_generate_guard(guard)
+
+
+def _guard_heartbeat(guard: Optional[_GenerateGuard]) -> asyncio.Task:
+    """启动守卫心跳任务（调用方在 `finally` 里必须 `_stop_guard_heartbeat`）。"""
+    task = asyncio.create_task(_guard_heartbeat_loop(guard))
+    _GUARD_HEARTBEATS.add(task)
+    task.add_done_callback(_GUARD_HEARTBEATS.discard)
+    return task
+
+
+async def _stop_guard_heartbeat(task: Optional[asyncio.Task]) -> None:
+    """取消并等待心跳收尾；`CancelledError` 是**预期**路径，吞掉不外抛。"""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 —— 收尾失败不该改写主流程结果
+        logger.warning("守卫心跳收尾异常（已忽略）: err=%s", exc)
+
+
+def _progress_cb_adapter(progress_cb):
+    """把 runner 的 `LandingProgress` 映射成可 JSON 序列化的 dict 再回调。
+
+    后台 run 的 progress 要写进 run 行的 jsonb（Task 12），所以**不把 dataclass
+    实例透传给外部**；回调可同步可异步（`inspect.isawaitable` 判定）。回调本身
+    抛错由 runner 统一降级成 warning —— 观测通道不许反噬落点工作。
+    """
+    if progress_cb is None:
+        return None
+
+    async def _emit(progress) -> None:
+        emitted = progress_cb(asdict(progress))
+        if inspect.isawaitable(emitted):
+            await emitted
+
+    return _emit
+
+
+def resolve_landing_mode(auto_landings: bool, requested: str, enabled: bool) -> str:
+    """决定本次构造的落点阶段走哪条路：``"agent"`` / ``"llm"`` / ``"off"``。
+
+    **六种输入组合全部在此钉死**（别再按「大概语义」重推，矩阵就是规格）：
+
+    ==================  ============  ========  =========
+    requested           auto_landings enabled   结果
+    ==================  ============  ========  =========
+    ``"agent"``         True          True      ``"agent"``
+    ``"agent"``         True          False     ``"llm"``
+    ``"agent"``         False         True      ``"agent"``
+    ``"agent"``         False         False     ``"off"``
+    ``"llm"``           True          任意      ``"llm"``
+    ``"llm"``           False         任意      ``"off"``
+    空（按开关自动）    True          True      ``"agent"``
+    空（按开关自动）    True          False     ``"llm"``
+    空（按开关自动）    False         任意      ``"off"``
+    ==================  ============  ========  =========
+
+    三条为什么这么写：
+
+    - 显式 ``"agent"`` 且开关开 → 直接 ``"agent"``，**不看** ``auto_landings``：
+      后台 run 调 ``construct(landing_mode="agent")`` 时它可能是 False，若回落到
+      ``"off"``，整条后台事件线会静默变成「什么都没跑」。
+    - 显式 ``"llm"`` / 空串都先看 ``auto_landings``：它是「用户这次要不要自动落点」
+      的总闸，没勾就只能是 ``"off"``（``"llm"`` 也只是「用旧对齐器实现自动落点」，
+      没有自动落点时同样无事可做）。
+    - 开关关 = 今日行为：勾了自动落点走旧 LLM 对齐（``"llm"``），没勾就是 ``"off"``，
+      agent 永远不会被选中 —— 这是 G5「关闭态逐字节一致」的入口保证。
+    """
+    requested = requested.strip().lower() if isinstance(requested, str) else ""
+    if requested == "agent":
+        # 开关开才允许 agent；开关关按旧路径降级（勾了自动落点才有事可做）。
+        if enabled:
+            return "agent"
+        return "llm" if auto_landings else "off"
+    if requested == "llm":
+        # 显式旧路径：没有自动落点就没得落（与「自动」分支的 off 同解）。
+        return "llm" if auto_landings else "off"
+    # requested 为空 = 「按开关自动」：开关只把「自动落点」的实现从 llm 换成 agent。
+    if not auto_landings:
+        return "off"
+    return "agent" if enabled else "llm"
+
+
 def _count_sources(concepts) -> int:
     """数 concepts 里的源映射条数 —— `dropped_sources` 那个差值的两侧都走它。
 
@@ -412,6 +554,15 @@ def _assert_attribute_caps(schema: dict) -> None:
 #: 旧客户端就再也删不掉人工填的角色。
 _LANDING_CARRY_SLOTS = ("filter", "aggregation", "grain", "enabled")
 
+#: 实体级落点里可跨层继承的 provenance 键（landing-agent 线）：谁定的
+#: （origin）、多确信（confidence）、为什么（rationale）。与语义槽同一条
+#: 「入参带键即入参赢」纪律 —— 旧客户端原样回传时不会静默清掉 agent 标记。
+_ENTITY_LANDING_CARRY_SLOTS = ("origin", "confidence", "rationale")
+
+#: 属性来源只继承 `origin`：归一化层（`_unique_attribute_sources`）不为属性
+#: 来源产出 confidence / rationale，继承它们等于凭空造键。
+_ATTRIBUTE_SOURCE_CARRY_SLOTS = (*_LANDING_CARRY_SLOTS, "origin")
+
 
 def _landing_slot_value(landing: dict, slot: str):
     """落点单槽的归一值；`None` = 该键**不落**。
@@ -424,6 +575,48 @@ def _landing_slot_value(landing: dict, slot: str):
         return landing.get("enabled") is not False
     value = _clean_str(landing.get(slot))
     return value[:MAX_LANDING_SLOT_CHARS] if value else None
+
+
+def _provenance_slot_value(landing: dict, slot: str):
+    """provenance 单槽的继承值；strip 后为空 = **不落**（`None`）。
+
+    值域校验与 `rationale` 的 200 字截断都在归一化层
+    （`concept_expansion._unique_landings`）完成，这里只判「有没有」。
+    """
+    return _clean_str(landing.get(slot)) or None
+
+
+def _attribute_carry_slot_value(landing: dict, slot: str):
+    """属性来源单槽的继承值：`origin` 走 provenance 口径，其余走语义槽口径。"""
+    if slot == "origin":
+        return _provenance_slot_value(landing, slot)
+    return _landing_slot_value(landing, slot)
+
+
+def _merge_carry_slots(landing: dict, old: dict | None, slots: tuple, value_fn) -> dict:
+    """「入参带键即入参赢、缺键从旧行继承」的槽合并，返回新 dict。
+
+    入参带键但值为空（`""` / None）时，该键从结果里**删掉**（显式清空），
+    不再从旧行继承 —— 与归一化「非空才落」同形状。
+    """
+    merged = dict(landing)
+    for slot in slots:
+        if slot in landing:
+            value = value_fn(landing, slot)
+            if value is None:
+                merged.pop(slot, None)
+            else:
+                merged[slot] = value
+        elif isinstance(old, dict) and slot in old:
+            value = value_fn(old, slot)
+            if value is not None:
+                merged[slot] = value
+    return merged
+
+
+def _landing_included(landing: dict) -> bool:
+    """落点 `included` 的归一值：只有显式 `False` 是排除（与 `_unique_landings` 同口径）。"""
+    return landing.get("included") is not False
 
 
 def _landing_index_key(entity_name: str, attribute_name: str, landing: dict) -> tuple:
@@ -621,7 +814,8 @@ class AbstractSchemaService:
                         auto_landings: bool = False,
                         mode: str = "append",
                         focus_seeds: Optional[list] = None,
-                        alias_hints: str = "") -> dict:
+                        alias_hints: str = "",
+                        landing_mode: str = "") -> dict:
         """补齐式构造：源结构 + 证据 → 完整草稿（`proposed`），返回构造摘要。
 
         `seed="document"` 时先以**文档本体**（KB 级 compiled schema）为种子，
@@ -660,6 +854,12 @@ class AbstractSchemaService:
                 params={"max": FOCUS_SEEDS_MAX},
                 fallback=f"focus_seeds 过多（最多 {FOCUS_SEEDS_MAX} 条）",
             ))
+        # 落点模式在**入口**解析：后面所有分支只看这一个值，开关的读取点唯一，
+        # 不会出现「构造按新路径、摘要按旧路径」的漂移。
+        landing_mode = resolve_landing_mode(
+            auto_landings, landing_mode,
+            bool(config.ABSTRACT_LANDING_AGENT_ENABLED),
+        )
         async with get_db_session() as session:
             existing = await OntologyAbstractSchemaRepository(session).get_by_kb(
                 tenant_id, kb_id,
@@ -682,13 +882,22 @@ class AbstractSchemaService:
                 ),
                 details={"knowledge_base_id": kb_id},
             )
+        # agent 档的构造可能跑几百个概念，远超守卫 TTL（300s）：只有这一档需要
+        # 心跳。关闭/llm 档不启动任何后台任务 —— 关闭态必须与今日逐字节一致。
+        # 心跳在 try 内部创建：`_guard_heartbeat` 若自己抛，`finally` 仍会释放守卫
+        # （否则一次任务创建失败就留下 300 秒幽灵锁）。
+        heartbeat = None
         try:
+            if landing_mode == "agent" and guard is not None:
+                heartbeat = _guard_heartbeat(guard)
             return await self._construct_locked(
                 tenant_id, kb_id, user_id, existing,
                 llm_names=llm_names, seed=seed, auto_landings=auto_landings,
                 mode=mode, focus_seeds=focus_seeds, alias_hints=alias_hints,
+                landing_mode=landing_mode,
             )
         finally:
+            await _stop_guard_heartbeat(heartbeat)
             if guard is not None:
                 await _release_generate_guard(guard)
 
@@ -752,7 +961,8 @@ class AbstractSchemaService:
                                 auto_landings: bool = False,
                                 mode: str = "append",
                                 focus_seeds: Optional[list] = None,
-                                alias_hints: str = "") -> dict:
+                                alias_hints: str = "",
+                                landing_mode: str = "off") -> dict:
         """守卫已在手的构造主体（读取 → 补齐 → 名字档 → 一次 upsert → 摘要）。"""
         rows, ds_names = await self._load_source_schemas(tenant_id, kb_id)
         all_source_entities = self._source_entities(rows, ds_names)
@@ -812,18 +1022,42 @@ class AbstractSchemaService:
                 tenant_id, kb_id,
             )
             warnings.extend(doc_warnings)
-            if doc_entities:
+            if doc_entities and landing_mode != "agent":
                 # 先按名称/别名挂上同名数据源落点，后面的属性补齐与关系提升才有依据。
+                # **agent 档不调它**：它写出的是「无 origin」的历史形状，Task 9 的
+                # 规则 7 会把这种落点当受保护历史数据、永远升不成 agent/name；
+                # 名字命中改由 runner 生成 A 档 decision（origin="name"）。
                 attach_landings_by_name(doc_entities, bundles)
             # 只增不删：已有草稿在前（先到者胜），文档种子追加；同名由 normalize 合并。
             base_entities = [*base_entities, *doc_entities]
             base_relations = [*base_relations, *doc_relations]
+            # 同一张表被两类文档各抽一遍（英文标识符 / 中文业务名）时，编译与
+            # normalize 都只按名字合并 —— 这里按身份键/别名做一次确定性聚类。
+            base_entities, base_relations, base_metrics, concept_merges = (
+                merge_duplicate_concepts(base_entities, base_relations, base_metrics)
+            )
+            if concept_merges:
+                warnings.append(
+                    "合并重复概念 %d 组：%s" % (
+                        len(concept_merges),
+                        "；".join(
+                            f"{merge['kept']}←{'/'.join(merge['merged'])}"
+                            for merge in concept_merges if merge.get("merged")
+                        ),
+                    )
+                )
 
         # 可选的 LLM 自动落点：只用于「复用文档本体」模式；失败 fail-open
         # （保留确定性落点并回 warning），不阻断构造。
+        # agent 档在**概念齐备之后**才跑（见下面 `landing_mode == "agent"`），
+        # 所以这里不能走 LLM 对齐 —— 两条落点路径互斥。
         landing_stats: dict = {"entities": 0, "attributes": 0, "error": None}
         dropped_total = 0
-        if auto_landings and seed == "document" and not focus_seeds and bundles and base_entities:
+        if (
+            landing_mode != "agent"
+            and auto_landings and seed == "document" and not focus_seeds
+            and bundles and base_entities
+        ):
             source_catalog, catalog_warnings = self._source_landing_catalog(bundles)
             warnings.extend(catalog_warnings)
             if source_catalog:
@@ -907,6 +1141,30 @@ class AbstractSchemaService:
                         added += 1
                 if added:
                     logger.info("抽象 schema 业务词表：登记 %d 个指标", added)
+
+        # agent 档的落点必须在概念**全部齐备之后**跑：文档种子、聚类补齐、业务词表
+        # 都会新增/改名概念，提前跑会漏判（那些概念既没有确定性落点、也没被 agent
+        # 看过）。同时必须在 `landing_map` 之前 —— 关系提升要看得见 agent 写下的落点。
+        if landing_mode == "agent":
+            if bundles and base_entities:
+                result = await self._run_landing_agent(
+                    tenant_id, kb_id, user_id, base_entities, bundles,
+                    warnings=warnings,
+                )
+                warnings.extend(result.get("warnings") or [])
+                stats = result.get("stats") or {}
+                landing_stats = {
+                    "entities": int(stats.get("entities", 0) or 0),
+                    "attributes": int(stats.get("attributes", 0) or 0),
+                    "skipped": int(stats.get("skipped", 0) or 0),
+                    "error": None,
+                    "progress": result.get("progress") or {},
+                    # spec §5.11：证据覆盖率与每源覆盖随 run summary 出去。
+                    "coverage": result.get("coverage") or {},
+                    "evidence_gap": bool(result.get("evidence_gap")),
+                }
+            else:
+                warnings.append("没有可判定的概念或数据源，落点 agent 已跳过")
 
         landing_map = build_landing_map(base_entities)
 
@@ -1051,6 +1309,183 @@ class AbstractSchemaService:
             result["focus"] = focus_meta
         return result
 
+    # ── 落点 agent（构造/landings-only 共用）────────────────────────
+
+    @staticmethod
+    def _landing_agent_config() -> dict:
+        """落点 agent 的运行参数（单一来源：`AbstractConstructSettings`）。
+
+        `model` 空串表示「用默认模型」——由模型步经 `ONTOLOGY_LLM_MODEL` 解析，
+        代码里不留模型名字面量。
+        """
+        return {
+            "model": str(getattr(config, "ABSTRACT_LANDING_AGENT_MODEL", "") or "").strip(),
+            "top_k": int(config.ABSTRACT_LANDING_AGENT_TOP_K),
+            "max_concepts": int(config.ABSTRACT_LANDING_AGENT_MAX_CONCEPTS),
+            "max_steps": int(config.ABSTRACT_LANDING_AGENT_MAX_STEPS),
+            "max_tokens": int(config.ABSTRACT_LANDING_AGENT_MAX_TOKENS),
+            "embedding": bool(config.ABSTRACT_LANDING_AGENT_EMBEDDING),
+        }
+
+    async def _run_landing_agent(self, tenant_id: str, kb_id: str, user_id: str,
+                                 entities: list, bundles: dict,
+                                 *, on_progress=None,
+                                 warnings: Optional[list[str]] = None) -> dict:
+        """跑一次落点 agent（**原地**给 `entities` 写落点），返回 runner 原始结果。
+
+        - 延迟 import：落点栈会拉起 NL→SQL 的检索模块，构造/读取的常规路径不该
+          为它付 import 成本，测试也可只在真正跑 agent 时才拉起。
+        - 失败**向上抛**：落点阶段与构造同语义（失败不落库）。单概念异常已在
+          runner 内隔离成 `unresolved`，能抛到这里的都是整 run 级错误。
+        - `warnings`：调用方传入**自己的**清单，探针的「某源无只读凭据」告警才能
+          真正随结果出去（传临时 list 再 extend 等于把告警扔进垃圾桶）。缺省时
+          用一次性 list（仅探针内部消费，返回值里已经带 runner 自己的 warnings）。
+        - **探针必须在这里接上**：`probe_column` 工具只在 `ctx.probe` 非空时可用；
+          不接的话工具恒回「未配置只读凭据」，模型永远拿不到缺证据的现场取样。
+          预算与超时复用构造探针的配置（同一份源侧约束，不另造旋钮）。
+        """
+        from .landing_agent.runner import LandingAgentRunner
+
+        probe_warnings = warnings if warnings is not None else []
+        runner = LandingAgentRunner(
+            tenant_id=tenant_id, kb_id=kb_id, user_id=user_id,
+            config=self._landing_agent_config(),
+            probe=self._make_probe(
+                tenant_id, probe_warnings,
+                budget_s=float(config.ABSTRACT_CONSTRUCT_PROBE_BUDGET_S),
+            ),
+            probe_budget=int(config.ABSTRACT_CONSTRUCT_MAX_PROBE_QUERIES),
+        )
+        return await runner.run(entities, bundles, on_progress=on_progress)
+
+    async def landing_pass(self, tenant_id: str, kb_id: str, user_id: str = "",
+                           progress_cb=None) -> dict:
+        """**只跑落点**（landings-only）：不重新聚类，也不改任何概念/关系/指标名。
+
+        与 `construct` 共享同一把生成守卫（同 KB 同时只许一个在飞，在飞 → 429），
+        并全程心跳续期 —— agent 可能跑几百个概念，远超守卫的 300 秒 TTL。
+
+        写路径只有一次 `upsert`，以**读到的那一版** `schema_version` 做 CAS：
+        期间有人保存过草稿 → 1003（由调用方把 run 标 failed），绝不覆盖别人的编辑。
+        `status` / `source_hash` 原样带回：landings-only 不改变「这份草稿是否确认」，
+        也不改变「它是对着哪一版源做的」。
+
+        Returns:
+            `{"landings": <runner stats>, "warnings": [...], "schema_version": int}`。
+        """
+        tenant_id = require_tenant(tenant_id)
+        # 总开关在这里**再判一次**：能力动作层（Task 12）会直接调本方法，若只靠
+        # `resolve_landing_mode` 兜，关掉开关后后台 run 依然能「显式 agent」写落点
+        # —— 开关就没有意义了。放在拿锁**之前**，被拒的请求不占任何资源。
+        if not config.ABSTRACT_LANDING_AGENT_ENABLED:
+            raise InvalidParameterError(message=translate(
+                "err.abstract_schema.landing_agent_disabled",
+                fallback="AI 落点未启用（ABSTRACT_LANDING_AGENT_ENABLED=false）",
+            ))
+        acquired, guard = await _acquire_generate_guard(tenant_id, kb_id)
+        if not acquired:
+            raise RateLimitExceededError(
+                message=translate(
+                    "err.abstract_schema.construct_in_flight",
+                    fallback="该知识库正在生成/构造中，请稍后再试",
+                ),
+                details={"knowledge_base_id": kb_id},
+            )
+        # 心跳在 try **内部**创建：`_guard_heartbeat` 自己若抛（任务创建失败等），
+        # `finally` 仍会按 lock_id 释放守卫 —— 否则一把 300 秒的幽灵锁会挡掉该 KB
+        # 接下来的每次构造。
+        heartbeat = None
+        try:
+            if guard is not None:
+                heartbeat = _guard_heartbeat(guard)
+            async with get_db_session() as session:
+                stored = await OntologyAbstractSchemaRepository(session).get_by_kb(
+                    tenant_id, kb_id,
+                )
+            if stored is None:
+                raise ResourceNotFoundError(message=translate(
+                    "err.common.resource_not_found",
+                    params={"entity": "abstract schema", "id": kb_id},
+                    fallback="该知识库还没有抽象 schema 草稿，无法只跑落点",
+                ))
+            # 已确认（active）是**只读基线**，而且已被镜像进 KB 级 compiled schema：
+            # landings-only 改的是同一份 schema，写进去就等于绕过「先退回草稿」的
+            # 人工确认。要求用户先转成草稿，避免「只补落点」静默改掉检索基线。
+            if (getattr(stored, "status", "") or "") == "active":
+                raise ResourceConflictError(message=translate(
+                    "err.abstract_schema.active_readonly_landings",
+                    fallback="抽象 schema 已确认（active），不能只补落点；"
+                             "请先将其退回草稿（保存为 proposed）再重试",
+                ))
+            # 形状不对**拒绝覆盖**：早期/迁移窗口的行可能不是 dict，强行 `{}` 再
+            # 写会把一版空 schema 写回去、版本号还加 1 —— 比直接报错糟得多。
+            if not isinstance(stored.schema, dict):
+                raise InvalidParameterError(message=translate(
+                    "err.abstract_schema.stored_schema_bad",
+                    fallback="存储的抽象 schema 形状异常，拒绝覆盖（请重新生成）",
+                ))
+            stored_schema = stored.schema
+            # 只把 entities 当工作列表：runner/apply_decisions 会**原地**给它们写落点，
+            # 剩下的 relations/metrics/tools 原样带回（landings-only 不碰结构）。
+            entities = [
+                ent for ent in _list_field(stored_schema.get("entities"))
+                if isinstance(ent, dict)
+            ]
+            rows, ds_names = await self._load_source_schemas(tenant_id, kb_id)
+            bundles = build_source_bundles(rows, ds_names)
+            # 没有概念 / 没有源时**一个字节都不写**：空跑一次会 upsert 回原样并
+            # 推进版本号，前端看到「成功 + 版本 +1」却什么都没变。与 construct
+            # 的「跳过 + warning」同口径。
+            if not entities or not bundles:
+                return {
+                    "landings": {},
+                    "warnings": ["没有可判定的概念或数据源，落点 agent 已跳过"],
+                    "schema_version": stored.schema_version,
+                }
+            probe_warnings: list[str] = []
+            result = await self._run_landing_agent(
+                tenant_id, kb_id, user_id, entities, bundles,
+                on_progress=_progress_cb_adapter(progress_cb),
+                warnings=probe_warnings,
+            )
+            # 写路径走**公开 save**（spec §5.5）：agent 落点必须与人的保存共用
+            # 同一套 CAS + 版本递增 + 保存历史快照。`trusted_origins=True` 让
+            # `_mark_manual_landings` 跳过 —— agent 自己写的 origin 不该被误标成
+            # 人工；`snapshot_source="agent"` 让快照来源可辨认。
+            # `edited_by=""` = 不写编辑者（落点不是「人编辑草稿」）。
+            # `save` 内部仍走 `normalize_schema`，并会把 relations/metrics/tools
+            # 原样透传（landings-only 不碰结构）。
+            updated = await self.save(
+                tenant_id, kb_id,
+                {
+                    "entities": entities,
+                    "relations": _list_field(stored_schema.get("relations")),
+                    "metrics": _list_field(stored_schema.get("metrics")),
+                    "tools": _list_field(stored_schema.get("tools")),
+                },
+                status=stored.status or "proposed",
+                edited_by="",
+                expected_version=stored.schema_version,
+                snapshot_source="agent",
+                trusted_origins=True,
+            )
+            warnings = list(result.get("warnings") or [])
+            # 探针告警（某源无只读凭据等）由 `_make_probe` 写进 side list，必须
+            # 并回结果，否则排障时完全看不到 probe 为什么不可用。
+            warnings.extend(probe_warnings)
+            return {
+                "landings": result.get("stats") or {},
+                "warnings": warnings,
+                "schema_version": updated.get("schema_version", stored.schema_version),
+                "coverage": result.get("coverage") or {},
+                "evidence_gap": bool(result.get("evidence_gap")),
+            }
+        finally:
+            # 顺序固定：先停心跳（不再续期），再释放（比对的还是本次 lock_id）。
+            await _stop_guard_heartbeat(heartbeat)
+            if guard is not None:
+                await _release_generate_guard(guard)
+
     # ── 读取（含读时标脏）─────────────────────────────────────────
 
     async def get(self, tenant_id: str, kb_id: str) -> Optional[dict]:
@@ -1106,6 +1541,22 @@ class AbstractSchemaService:
         payload["stale_count"] = stale_count
         return payload
 
+    async def get_status(self, tenant_id: str, kb_id: str) -> Optional[str]:
+        """只读一列状态（None = 还没有行）。
+
+        后台 run 的**建单前**检查专用：`get()` 会额外拉 compiled schema / 数据源
+        做标脏，建单路径只需要「是否已确认」一个布尔。独立成方法是为了让这条
+        读与 `get()` 的读路径解耦，也方便单测注入。
+        """
+        tenant_id = require_tenant(tenant_id)
+        async with get_db_session() as session:
+            row = await OntologyAbstractSchemaRepository(session).get_by_kb(
+                tenant_id, kb_id,
+            )
+        if row is None:
+            return None
+        return (getattr(row, "status", None) or None)
+
     # ── 保存 / 确认 ───────────────────────────────────────────────
 
     @staticmethod
@@ -1123,9 +1574,14 @@ class AbstractSchemaService:
         - 新落点 / 已存行缺该键 / 没有已存行 → 不落键（与今天逐字节相同）；
         - **`role` 不在继承范围**（既有语义是「省略 = 清空」）。
 
+        provenance（landing-agent 线）同一纪律：实体级落点继承
+        `origin` / `confidence` / `rationale`（`_ENTITY_LANDING_CARRY_SLOTS`），
+        属性来源只继承 `origin`（归一化不为属性来源产出另外两键）。
+        之所以要让它们可继承：公开保存回传整份 schema 时旧客户端不认识这三键，
+        不补回就会把 agent 打好的标记与「人改过」的 manual 标记一起抹掉。
+
         纯函数：不读库、不改入参，返回新的 dict/list 树（未触及的子树按引用复用，
-        不会被本函数写）。只处理**属性级**落点；实体级落点（`entities[].sources`）
-        不在此列。
+        不会被本函数写）。
         """
         if not isinstance(incoming, dict):
             return incoming
@@ -1141,6 +1597,11 @@ class AbstractSchemaService:
                 ent_name = _clean_str(entity.get("name"))
                 if not ent_name:
                     continue
+                # 实体级落点：provenance 三键（属性维留空串，与属性来源不撞键）
+                for landing in _list_field(entity.get("sources")):
+                    if isinstance(landing, dict):
+                        stored_by_key.setdefault(
+                            _landing_index_key(ent_name, "", landing), landing)
                 for attr in _list_field(entity.get("attributes")):
                     if not isinstance(attr, dict):
                         continue
@@ -1161,6 +1622,19 @@ class AbstractSchemaService:
                 continue
             ent_name = _clean_str(entity.get("name"))
             new_entity = dict(entity)
+            ent_sources = entity.get("sources")
+            if isinstance(ent_sources, list):
+                new_ent_sources: list = []
+                for landing in ent_sources:
+                    if not isinstance(landing, dict) or not ent_name:
+                        new_ent_sources.append(landing)
+                        continue
+                    old = stored_by_key.get(_landing_index_key(ent_name, "", landing))
+                    new_ent_sources.append(_merge_carry_slots(
+                        landing, old, _ENTITY_LANDING_CARRY_SLOTS,
+                        _provenance_slot_value,
+                    ))
+                new_entity["sources"] = new_ent_sources
             attrs = entity.get("attributes")
             if isinstance(attrs, list):
                 new_attrs: list = []
@@ -1179,20 +1653,130 @@ class AbstractSchemaService:
                                 continue
                             old = stored_by_key.get(
                                 _landing_index_key(ent_name, attr_name, landing))
-                            merged = dict(landing)
-                            for slot in _LANDING_CARRY_SLOTS:
-                                if slot in landing:
-                                    value = _landing_slot_value(landing, slot)
-                                    if value is None:
-                                        merged.pop(slot, None)
-                                    else:
-                                        merged[slot] = value
-                                elif isinstance(old, dict) and slot in old:
-                                    value = _landing_slot_value(old, slot)
-                                    if value is not None:
-                                        merged[slot] = value
-                            new_sources.append(merged)
+                            new_sources.append(_merge_carry_slots(
+                                landing, old, _ATTRIBUTE_SOURCE_CARRY_SLOTS,
+                                _attribute_carry_slot_value,
+                            ))
                         new_attr["sources"] = new_sources
+                    new_attrs.append(new_attr)
+                new_entity["attributes"] = new_attrs
+            out_entities.append(new_entity)
+
+        return {**incoming, "entities": out_entities}
+
+    @staticmethod
+    def _landing_index(schema: dict | None) -> dict[tuple, dict]:
+        """落点索引：身份键 → 落点 dict（实体级与属性来源共用一张表）。
+
+        键由 `_landing_index_key` 产出 —— `(实体, 属性, ds, entity_name,
+        attribute_name)`，名字两侧 casefold。实体级落点的属性维留空串，
+        属性来源带列名，因此两个列表共用一张表不会撞键。
+        """
+        index: dict[tuple, dict] = {}
+        if not isinstance(schema, dict):
+            return index
+        for entity in _list_field(schema.get("entities")):
+            if not isinstance(entity, dict):
+                continue
+            ent_name = _clean_str(entity.get("name"))
+            if not ent_name:
+                continue
+            for landing in _list_field(entity.get("sources")):
+                if isinstance(landing, dict):
+                    index.setdefault(
+                        _landing_index_key(ent_name, "", landing), landing)
+            for attr in _list_field(entity.get("attributes")):
+                if not isinstance(attr, dict):
+                    continue
+                attr_name = _clean_str(attr.get("name"))
+                if not attr_name:
+                    continue
+                for landing in _list_field(attr.get("sources")):
+                    if isinstance(landing, dict):
+                        index.setdefault(
+                            _landing_index_key(ent_name, attr_name, landing),
+                            landing,
+                        )
+        return index
+
+    @staticmethod
+    def _mark_manual_landings(incoming: dict, stored: dict | None) -> dict:
+        """公开保存的落点 diff：新增 / included 翻转 → origin=manual。
+
+        未变动的条目原样保留（origin/confidence/rationale 已在
+        `_carry_landing_slots_from_row` 里继承）。不认识的形状原样放行。
+
+        为什么按 diff 而不是「公开保存一律 manual」：画布每次保存都会把
+        **整份** schema 回传；若一律标记，agent 生成的落点在人保存一次后
+        就全变成 manual，后续重算再也无法自动更新它们 —— 那等于把
+        landing-agent 的收益一次保存就抹平。这里只认真正改动过归属的落点：
+
+        - **新增**（已存行里没有同一身份键）＝ 人手工加的源 → manual；
+        - **`included` 翻转**（人点「纳入 / 排除」）→ manual；
+        - 只改 `filter` / `role` 等映射细节**不在此列**：它们不改变「这个
+          实体归属这个源」的判断，标记成 manual 只会无谓地冻结 agent 更新。
+
+        存量落点（已存行没有 origin）且本次未改动 → 保持没有 origin，
+        不凭空补一个（那会把老数据误标成 agent/manual）。
+        """
+        if not isinstance(incoming, dict):
+            return incoming
+        entities = incoming.get("entities")
+        if not isinstance(entities, list):
+            return {**incoming}
+
+        stored_index = AbstractSchemaService._landing_index(stored)
+
+        def mark(landing, ent_name: str, attr_name: str):
+            if not isinstance(landing, dict) or not ent_name:
+                return landing
+            old = stored_index.get(_landing_index_key(ent_name, attr_name, landing))
+            if old is None:
+                # 新增：载荷**自带 origin 就尊重它**。版本还原走公开保存，
+                # 快照里现已被删掉的 agent 落点会落进这条分支 —— 无脑标
+                # manual 会把它永久冻结，违背「还原不得标记人工」。
+                # 只有没带 origin 的新落点才是人手新加的。
+                if _clean_str(landing.get("origin")):
+                    return landing
+                merged = dict(landing)
+                merged["origin"] = "manual"
+                return merged
+            # included 翻转仍然强制 manual（人点了「纳入 / 排除」）。
+            # 两侧 included 都按归一值比（缺键 = 纳入），否则旧客户端省略
+            # included 的保存会被误判成翻转。
+            if _landing_included(old) != _landing_included(landing):
+                merged = dict(landing)
+                merged["origin"] = "manual"
+                return merged
+            return landing
+
+        out_entities: list = []
+        for entity in entities:
+            if not isinstance(entity, dict):
+                out_entities.append(entity)
+                continue
+            ent_name = _clean_str(entity.get("name"))
+            new_entity = dict(entity)
+            sources = entity.get("sources")
+            if isinstance(sources, list):
+                new_entity["sources"] = [
+                    mark(landing, ent_name, "") for landing in sources
+                ]
+            attrs = entity.get("attributes")
+            if isinstance(attrs, list):
+                new_attrs: list = []
+                for attr in attrs:
+                    if not isinstance(attr, dict):
+                        new_attrs.append(attr)
+                        continue
+                    new_attr = dict(attr)
+                    attr_name = _clean_str(attr.get("name"))
+                    attr_sources = attr.get("sources")
+                    if isinstance(attr_sources, list):
+                        new_attr["sources"] = [
+                            mark(landing, ent_name, attr_name)
+                            for landing in attr_sources
+                        ]
                     new_attrs.append(new_attr)
                 new_entity["attributes"] = new_attrs
             out_entities.append(new_entity)
@@ -1244,6 +1828,52 @@ class AbstractSchemaService:
                     new_metric["executable"] = copy.deepcopy(inherited)
             out.append(new_metric)
         return {**incoming, "metrics": out}
+
+    @staticmethod
+    def _carry_metric_fields_from_row(incoming: dict, stored: dict | None) -> dict:
+        """入参 metrics 条目**缺键**时，按 name 从已存行继承 `formula` / `enabled`。
+
+        旧客户端（core-business 抽象 schema 编辑器）不认识这两个键，会把指标数组
+        原样回传 —— 原先「显式数组一律尊重」的实现于是把人工登记的公式与
+        `enabled=false`（disable 采纳的产物）**静默抹掉**。这里与
+        `_carry_landing_slots_from_row` 同一条纪律：
+
+        - 按 `name` 精确匹配（`strip` 后）；
+        - 入参**带键**即入参赢：`formula=""` = 显式清空，`enabled=True` = 显式启用；
+        - 入参缺键且已存条目带该键 → 继承；
+        - 新指标 / 已存行缺该键 / 没有已存行 → 不补键（与今天逐字节相同）。
+
+        只用于**公开保存**（`_carry_landing_slots=True`）。演化应用 / 版本恢复是
+        权威写：载荷已是本批意图，补键会让旧快照指纹对不上。
+        """
+        metrics = incoming.get("metrics")
+        stored_metrics = (_list_field(stored.get("metrics"))
+                          if isinstance(stored, dict) else [])
+        if not isinstance(metrics, list) or not stored_metrics:
+            return incoming
+        stored_by_name: dict[str, dict] = {}
+        for metric in stored_metrics:
+            if not isinstance(metric, dict):
+                continue
+            name = _clean_str(metric.get("name"))
+            if name:
+                stored_by_name.setdefault(name, metric)
+
+        out_metrics: list = []
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                out_metrics.append(metric)
+                continue
+            old = stored_by_name.get(_clean_str(metric.get("name")))
+            if old is None:
+                out_metrics.append(metric)
+                continue
+            merged = dict(metric)
+            for key in ("formula", "enabled"):
+                if key not in metric and key in old:
+                    merged[key] = old[key]
+            out_metrics.append(merged)
+        return {**incoming, "metrics": out_metrics}
 
     async def _record_snapshot(
         self,
@@ -1327,6 +1957,7 @@ class AbstractSchemaService:
         _carry_landing_slots: bool = True,
         record_snapshot: bool = True,
         snapshot_source: str = "manual",
+        trusted_origins: bool = False,
     ) -> dict:
         """界面的改名 / 合并 / 删源 / 确认都走它（入参是 v2 的 `{entities, relations}`）。
 
@@ -1348,9 +1979,15 @@ class AbstractSchemaService:
         `record_snapshot=False`（演化 UI 采纳）都**不产**快照；只有两者同时为
         True 才写。
 
-        `snapshot_source`：保存历史快照的来源（`manual` / `restore`）。只在
-        `_carry_landing_slots=True` 且 `record_snapshot=True` 时写快照；快照
-        失败只 warning，不影响保存。
+        `snapshot_source`：保存历史快照的来源（`manual` / `restore` / `agent`）。
+        只在 `_carry_landing_slots=True` 且 `record_snapshot=True` 时写快照；快照
+        失败只 warning，不影响保存。`agent` 由 landings-only 的落点回写使用
+        （spec §5.5：agent 与人的保存共用同一条 save 路径，只靠 source 区分）。
+
+        `trusted_origins`：默认 False = **公开保存**，落点 diff 把新增 /
+        `included` 翻转的条目标成 `origin="manual"`（见
+        `_mark_manual_landings`），供后续重算保护人工编辑。agent 自己回写
+        生成结果的路径传 True —— 那是 agent 的产出，不该被误标成人工。
         """
         tenant_id = require_tenant(tenant_id)
         if status not in ABSTRACT_STATUSES:
@@ -1384,12 +2021,24 @@ class AbstractSchemaService:
                 # 「旧客户端不认识的键」，同一道 gate：权威内部写不继承。
                 schema = self._carry_metric_executable_from_row(schema, old_schema)
                 schema = self._carry_landing_slots_from_row(schema, old_schema)
+                if not trusted_origins and config.ABSTRACT_LANDING_AGENT_ENABLED:
+                    # 公开保存 = 人手改的：新增 / included 翻转的落点标 manual。
+                    # **必须在继承之后**：否则「入参缺键」的未改动落点会被
+                    # 误当成新增，刚继承到的 agent 标记也被一并覆盖。
+                    # 开关关闭时**一个 provenance 键都不新增**（G5 逐字节回归）；
+                    # 继承不受开关影响 —— 它只保留已存在的键，拦了反而丢数据。
+                    schema = self._mark_manual_landings(schema, old_schema)
             if "metrics" not in schema:
                 # 键缺失 = 不管理 metrics 的调用方（旧前端 / YAML 导入 / 模板 reseed）——
                 # 从旧行保底，防整份替换清掉人工登记物（对称 construct 的 base_metrics 保底）。
                 # 显式 metrics=[...]（含空列表）= 调用方明确给定，原样尊重（空列表 = 用户清空）。
                 base_metrics = _list_field(old_schema.get("metrics")) if isinstance(old_schema, dict) else []
                 schema = {**schema, "metrics": [*base_metrics]}
+            if _carry_landing_slots:
+                # 显式 metrics 数组按 name 继承 formula/enabled：旧编辑器不管理
+                # 这两个键，原样回传会把人工公式与 disable 状态静默抹掉。
+                # 权威内部写（`_carry_landing_slots=False`）**不继承**。
+                schema = self._carry_metric_fields_from_row(schema, old_schema)
             if _carry_landing_slots and "tools" not in schema:
                 # **只对公开保存保底**：键缺失 = 不管理 tools 的调用方（旧前端 /
                 # YAML 导入 / 模板 reseed），从旧行继承；显式 `tools: []` = 用户

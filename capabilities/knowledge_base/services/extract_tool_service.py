@@ -67,6 +67,7 @@ from jonex_core.common.tool_invocation import (
     Runner,
     invoke_tool,
     tool_audit_entry,
+    truncate_output,
 )
 from jonex_core.common.tool_runtime import extract_path
 
@@ -81,6 +82,12 @@ TOOL_SOURCES_ATTR = "_tool_sources"
 MAX_SUMMARY_ERRORS = 10
 # 工具输出进实体属性前的上限（字符）：属性随实体写进图、进检索上下文，不能无限大
 MAX_OUTPUT_CHARS = 8000
+# 调用期原始输出上限：必须远大于 MAX_OUTPUT_CHARS —— 先按路径取值、再对取出的值截断。
+# 旧实现把整份输出按 8000 字符截成字符串，点路径必然取不到值（静默丢属性）；
+# 工具运行时本身已把响应体限制在 1 MB，这里取同一上限即可。
+MAX_RAW_OUTPUT_CHARS = 1_000_000
+# refine 投影缓存里 constrain 结果的键（避免与同名属性冲突）
+_REJECT_VALUE_KEY = "__reject__"
 
 # 试跑
 PREVIEW_AUDIT_ACTION = "preview_extract_tool"
@@ -147,6 +154,9 @@ class _Outcome:
     error: Optional[str] = None
     cached: bool = False
     skipped: bool = False          # 没调用（预算 / 限次 / 工具不可用）
+    # 按当前声明的 writes / reject_when 从输出里取出的值（refine: {属性: 值}；
+    # constrain: {_REJECT_VALUE_KEY: 值}）。None = 尚未投影，由调用方从 output 现取。
+    values: Optional[dict] = None
 
 
 ToolLoader = Callable[[str, str, str], Awaitable[Optional[ExtractTool]]]
@@ -158,6 +168,32 @@ def _args_key(tool: ExtractTool, args: dict) -> str:
         {"rt": tool.runtime or {}, "args": args}, ensure_ascii=False, sort_keys=True, default=str,
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _projection_key(call: CatalogSkillCall) -> str:
+    """缓存投影键：同一工具 + 入参，不同声明（writes / reject_when）取出的值不同。
+
+    缓存里只存「按该声明取出来的值」，所以键必须带上声明本身，否则两个实体类型
+    用同一工具、不同 writes 时会互相读到对方的投影。
+    """
+    raw = json.dumps(
+        {"group": call.group, "writes": call.writes, "reject_when": call.reject_when},
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _project_values(call: CatalogSkillCall, output: Any) -> dict:
+    """按声明从原始输出里取值，并对取出来的值单独限长（先取路径、再截断）。"""
+    if call.group == "refine":
+        values: dict = {}
+        for attr, path in call.writes.items():
+            value = extract_path(output, path)
+            if value is not None:
+                values[attr] = _fit_value(value)
+        return values
+    rw = call.reject_when or {}
+    return {_REJECT_VALUE_KEY: extract_path(output, rw.get("path", ""))}
 
 
 def _matches(value: Any, expected: Any) -> bool:
@@ -283,6 +319,7 @@ class ExtractToolService:
         self, tenant_id: str, kb_id: str, entity_type: str, group: str, declaration: dict,
         canonical_name: Optional[str] = None, *, user_id: Optional[str] = None,
         username: Optional[str] = None, request_id: Optional[str] = None,
+        probe_only: bool = False,
     ) -> dict:
         """拿图里一个现有实体，按（可能还没保存的）声明真实调用一次工具，返回会发生什么。
 
@@ -295,7 +332,12 @@ class ExtractToolService:
                 "err.extract_tool.invalid_declaration", params={"errors": "group / declaration"},
                 fallback="抽取期工具声明不合法：group / declaration",
             ))
-        call, errs = parse_catalog_item(group, declaration)
+        # probe_only：用户还没填写入属性，只想看工具返回什么。用一个临时写入口
+        # 过 inputs/on_error 校验，运行时把 writes 清空，避免拿不存在的属性/路径报错。
+        decl_for_parse = dict(declaration)
+        if probe_only and group == "refine":
+            decl_for_parse["writes"] = {"probe": "$.data"}
+        call, errs = parse_catalog_item(group, decl_for_parse)
         if call is None:
             raise InvalidParameterError(
                 message=translate(
@@ -304,9 +346,12 @@ class ExtractToolService:
                 ),
                 details={"errors": errs},
             )
+        if probe_only and group == "refine":
+            call.writes = {}
         entity, candidates = await self._entity_loader(tenant_id, kb_id, entity_type, canonical_name)
         out: dict = {"status": PREVIEW_NO_ENTITY, "candidates": candidates, "entity": None,
-                     "inputs": None, "tool": None, "group": group}
+                     "inputs": None, "tool": None, "group": group,
+                     "probe_only": probe_only}
         if entity is None:
             return out
         before = copy.deepcopy(entity.get("attributes") or {})
@@ -337,7 +382,8 @@ class ExtractToolService:
             out["status"] = STATUS_FAILED
             return out
         out["status"] = STATUS_EXECUTED if outcome.ok else STATUS_FAILED
-        out["output"] = outcome.output
+        # 展示仍按旧上限截断；写入判定用原始输出（见 _outcome 的投影）
+        out["output"] = truncate_output(outcome.output, MAX_OUTPUT_CHARS)[0]
         out["error"] = outcome.error
         if group == "refine":
             after = work.get("attributes") or {}
@@ -443,7 +489,10 @@ class _DocRun:
         self.deadline = self.t0 + settings.doc_budget
         self.sem = asyncio.Semaphore(settings.concurrency)
         self.tools: dict[str, Optional[ExtractTool]] = {}
-        self.memo: dict[str, _Outcome] = {}
+        # (args_key, projection_key) → 结果；同一工具 + 入参在不同声明下投影不同
+        self.memo: dict[tuple[str, str], _Outcome] = {}
+        # args_key → 真实调用的原始结果：同篇内同一入参只调一次，不同声明各自投影
+        self.raw_memo: dict[str, _Outcome] = {}
         self.rejected_keys: set[tuple] = set()
         self.calls = 0
         self.cached = 0
@@ -488,7 +537,7 @@ class _DocRun:
             return
 
         async def _one(key: str, args: dict, members: list[dict]) -> None:
-            outcome = await self._outcome(tool, key, args, members[0], etype)
+            outcome = await self._outcome(tool, key, args, members[0], etype, call)
             for e in members:
                 self._apply_outcome(e, call, outcome)
 
@@ -515,15 +564,32 @@ class _DocRun:
 
     # ── 一次（去重后的）调用 ─────────────────────────────────────
 
-    async def _outcome(self, tool: ExtractTool, key: str, args: dict, entity: dict, etype: str) -> _Outcome:
-        if key in self.memo:
+    async def _outcome(
+        self, tool: ExtractTool, key: str, args: dict, entity: dict, etype: str,
+        call: CatalogSkillCall,
+    ) -> _Outcome:
+        # 同工具 + 入参，不同声明取出的是不同的值：memo / 缓存都必须按投影区分
+        projection = _projection_key(call)
+        memo_key = (key, projection)
+        if memo_key in self.memo:
             self.cached += 1
-            return self.memo[key]
-        cached = await self._cache_get(tool, key)
+            return self.memo[memo_key]
+        # 同篇内同入参已真实调用过：复用原始输出，按本次声明重新投影（不再调用工具）
+        raw = self.raw_memo.get(key)
+        if raw is not None:
+            self.cached += 1
+            if raw.ok and raw.values is None:
+                raw = _Outcome(
+                    ok=True, output=raw.output, values=_project_values(call, raw.output),
+                )
+            self.memo[memo_key] = raw
+            return raw
+        cached = await self._cache_get(tool, key, projection)
         if cached is not None:
             self.cached += 1
-            out = _Outcome(ok=True, output=cached, cached=True)
-            self.memo[key] = out
+            # 缓存里只有按声明取出来的值，没有原始输出
+            out = _Outcome(ok=True, values=cached, cached=True)
+            self.memo[memo_key] = out
             return out
         # 预算与次数在 await 之前占位：单线程事件循环里「检查 + 计数」不会被打断
         if self.calls >= self.s.max_calls or time.monotonic() >= self.deadline:
@@ -543,8 +609,11 @@ class _DocRun:
                 result = await self._invoke(tool, args, entity, etype)
         if result.get("ok"):
             self.ok += 1
-            out = _Outcome(ok=True, output=result.get("output"))
-            await self._cache_set(tool, key, out.output)
+            output = result.get("output")
+            out = _Outcome(ok=True, output=output, values=_project_values(call, output))
+            # 只缓存「按声明取出来的值」：原始输出可能接近 1 MB，缓存 24 小时既占
+            # 空间又会在跨文档复用时带着无关字段
+            await self._cache_set(tool, key, projection, out.values)
         else:
             self.failed += 1
             err = result.get("error") or (
@@ -552,7 +621,9 @@ class _DocRun:
             )
             self._error(f"{tool.tool_name}:{err}")
             out = _Outcome(ok=False, error=str(err))
-        self.memo[key] = out
+        # 真实调用的结果按入参再记一份：同篇内其它声明复用，不再重复调用
+        self.raw_memo[key] = _Outcome(ok=out.ok, output=out.output, error=out.error)
+        self.memo[memo_key] = out
         return out
 
     @staticmethod
@@ -575,7 +646,7 @@ class _DocRun:
             result = await asyncio.wait_for(
                 invoke_tool(
                     tool.runtime, tool.secret_encrypted, tool.input_schema, args, context,
-                    timeout_cap=cap, runner=self.svc._runner, max_output_chars=MAX_OUTPUT_CHARS,
+                    timeout_cap=cap, runner=self.svc._runner, max_output_chars=MAX_RAW_OUTPUT_CHARS,
                 ),
                 timeout=cap + 1.0,
             )
@@ -629,11 +700,13 @@ class _DocRun:
         sources = attrs.get(TOOL_SOURCES_ATTR)
         sources = dict(sources) if isinstance(sources, dict) else {}
         if outcome.ok:
-            for attr, path in call.writes.items():
-                value = extract_path(outcome.output, path)
-                if value is None:
+            values = outcome.values
+            if values is None:
+                values = _project_values(call, outcome.output)
+            for attr in call.writes:
+                if attr not in values:
                     continue
-                attrs[attr] = _fit_value(value)
+                attrs[attr] = values[attr]
                 sources[attr] = f"tool:{call.tool_name}"
                 self.attrs_written += 1
         elif call.on_error == "drop_attr":
@@ -648,7 +721,12 @@ class _DocRun:
     def _apply_constrain(self, entity: dict, call: CatalogSkillCall, outcome: _Outcome) -> None:
         if outcome.ok:
             rw = call.reject_when or {}
-            reject = _matches(extract_path(outcome.output, rw.get("path", "")), rw.get("equals"))
+            actual = (
+                outcome.values.get(_REJECT_VALUE_KEY)
+                if outcome.values is not None
+                else extract_path(outcome.output, rw.get("path", ""))
+            )
+            reject = _matches(actual, rw.get("equals"))
         else:
             reject = call.on_error == "reject"
         if reject:
@@ -681,30 +759,36 @@ class _DocRun:
 
     # ── Redis：缓存与每日限次（都 fail-open）─────────────────────
 
-    def _cache_key(self, tool: ExtractTool, key: str) -> str:
-        return f"ontology_extract_tool:cache:{self.tenant_id}:{self.kb_id}:{tool.source}:{tool.tool_name}:{key}"
+    def _cache_key(self, tool: ExtractTool, key: str, projection: str) -> str:
+        return (
+            f"ontology_extract_tool:cache:{self.tenant_id}:{self.kb_id}"
+            f":{tool.source}:{tool.tool_name}:{key}:{projection}"
+        )
 
-    async def _cache_get(self, tool: ExtractTool, key: str) -> Any:
+    async def _cache_get(self, tool: ExtractTool, key: str, projection: str) -> Any:
         if not self.use_redis or self.s.cache_ttl <= 0:
             return None
         try:
-            raw = await get_redis_client().get(self._cache_key(tool, key))
+            raw = await get_redis_client().get(self._cache_key(tool, key, projection))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[extract-tool] 读缓存失败: %s", exc)
             return None
         if raw is None:
             return None
         try:
-            return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            value = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
         except (TypeError, ValueError):
             return None
+        # 只认「投影值」形状；旧版本缓存的原始输出（非 dict）直接忽略
+        return value if isinstance(value, dict) else None
 
-    async def _cache_set(self, tool: ExtractTool, key: str, output: Any) -> None:
-        if not self.use_redis or self.s.cache_ttl <= 0 or output is None:
+    async def _cache_set(self, tool: ExtractTool, key: str, projection: str, values: Any) -> None:
+        if not self.use_redis or self.s.cache_ttl <= 0 or not isinstance(values, dict):
             return
         try:
             await get_redis_client().set(
-                self._cache_key(tool, key), json.dumps(output, ensure_ascii=False, default=str),
+                self._cache_key(tool, key, projection),
+                json.dumps(values, ensure_ascii=False, default=str),
                 ex=self.s.cache_ttl,
             )
         except Exception as exc:  # noqa: BLE001

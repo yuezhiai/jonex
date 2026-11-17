@@ -72,6 +72,8 @@ _KB_ACTIONS = frozenset({
     # Wiki 派生产物
     "get_wiki_page", "list_wiki_contents", "get_wiki_backlinks",
     "get_wiki_claims", "get_wiki_outline",
+    # MCP 列式浏览图源（只读 KB 派生产物；漏登记 = 密级守卫 fail-open）
+    "get_wiki_page_graph",
     "get_wiki_graph_types", "search_wiki_nodes", "get_wiki_node",
     "get_wiki_neighbors", "get_wiki_graph_evidence", "get_wiki_media",
     "list_wiki_scenarios", "read_wiki_scenario_resources", "select_wiki_scenario_resources",

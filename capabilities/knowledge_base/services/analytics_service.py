@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 # ── 五个「解析器类目」的后缀表 ──────────────────────────────────
 # 这是「文档/文本/图像/音频/视频」五类在平台里的**唯一权威定义**，直接抄自 KB 详情页
 # 「解析配置 → 文件类解析配置」那张表（即 `business_domain.parser_configs.file_types`，
-# 种子数据见 `deploy/postgres/migrations/006_seed_data.sql`）。
+# 种子数据见 `deploy/postgres/migrations/090_seed_data.sql`）。
 # 顺序即判定优先级（五类后缀互不重叠，实际无所谓，但保持与展示顺序一致）。
 #
 # ⚠️ 与 `quota.py` 的配额类别**刻意有两处不同**，改回去就是口径漂移：
@@ -186,6 +186,37 @@ _UNUSED_DAYS_DEFAULT = 30
 _PAGE_DEFAULT = 1
 _PAGE_SIZE_DEFAULT = 20
 _PAGE_SIZE_MAX = 100
+
+# ── 数据问答观测面（nl2sql_observations）的限幅与固定值 ──
+# 慢阈值 100–60000ms：低于 100 的阈值会把绝大多数正常查询算成慢查询，高于 60s
+# 的平台侧几乎没有样本；两个端点共用同一个值（网关侧同样 100–60000）。
+_SLOW_MS_DEFAULT = 5000
+_SLOW_MS_MIN = 100
+_SLOW_MS_MAX = 60000
+# 慢查询表排序口径：`sql` = SQL 执行耗时（默认），`total` = 端到端耗时
+_NL2SQL_SORT_VALUES = ("sql", "total")
+_NL2SQL_SORT_DEFAULT = "sql"
+# 列表口径：慢查询 / 失败复盘（`_nl2sql_rows_agg` 的 kind）
+_NL2SQL_KIND_SLOW = "slow"
+_NL2SQL_KIND_FAILURES = "failures"
+# 失败原因展示上限（设计 §4.3「reason（截断 500）」；DB 列同为 varchar(500)）
+_NL2SQL_REASON_MAX = 500
+# `data_source_id = ''` 的展示哨兵：`no_candidate` 等「还没选到源」的行必须保留，
+# 它们是失败复盘最有价值的一档（设计 §3.4-2）。空串**只在本模块的筛选/展示层**
+# 转成哨兵，SQL builder 再把它翻回 `data_source_id = ''`。
+_UNASSIGNED_SOURCE = "__unassigned__"
+# `reason_code` 的空桶在库里是 NULL（前端显示「未分类」）。对外用哨兵
+# `__unclassified__` 表达「只要空码」—— 与 `_UNASSIGNED_SOURCE` 同思路：
+# 入参原样透传，SQL builder 再翻成 `reason_code IS NULL`，避免和「没传该参数
+# = 不按码过滤」混为一谈（空串本身就是「不过滤」）。
+_UNCLASSIFIED_REASON = "__unclassified__"
+# 演化基准（合成）流量过滤谓词：与失败诊断/点踩读取器同口径（scene 的 JSONB 布尔）。
+# 用 `coalesce(...)::boolean` 而不是字符串比较 —— scene 里可能没有这个键，
+# 也可能写成 JSON true；两边都要归一到 false/true。
+_SYNTHETIC_FALSE = "coalesce((scene->>'evolution_bench')::boolean, false) = false"
+# A1b 预编译校验的既有码值（见 `services/nl2sql/precompile.py`）。固定输出两档，
+# 即使某档为 0 也让前端标签列稳定；库里出现新码时追加在后面，不吞。
+_PRECOMPILE_CODES = ("unknown_column", "ambiguous_column")
 
 # 异常资产下钻的 stage 值域与展示顺序（对齐前端 DoStage）
 _STAGE_VALUES = (TASK_TYPE_PARSE, TASK_TYPE_EXTRACT, TASK_TYPE_COMPILE)
@@ -431,6 +462,56 @@ def _parse_scope(data: dict) -> dict:
     }
 
 
+def _parse_nl2sql_scope(data: dict) -> dict:
+    """解析「数据问答」观测面的入参（与 `_parse_scope` **分开**，字段集不同）。
+
+    为什么另写一个而不是往 `_parse_scope` 里加字段：那边是数据运营一/二期的公共
+    契约（`stages`/`handled`/`unused_threshold_days` 等），本页一个都不用；
+    混在一起会让两条线的限幅规则互相牵扯，且 `_resilient` 的降级路径会拿到
+    一堆无关字段（无妨，但读起来像共享状态）。
+
+    `__unassigned__` **原样保留**：它是对外哨兵，转成空串只在 SQL builder
+    里做（`_nl2sql_where`）—— 提前转换会让「未识别源」和「没传该参数」混为一谈。
+    其余非法值一律回落默认（能力层还可能被内部调用方经 invoke 打进来，
+    不该因为一个新参数给不出就 500）。
+    """
+    data = data or {}
+    start_date, end_date = _parse_range(data)
+    sort = str(data.get("sort") or "").strip().lower()
+    if sort not in _NL2SQL_SORT_VALUES:
+        sort = _NL2SQL_SORT_DEFAULT
+    data_source_id = data.get("data_source_id")
+    if data_source_id is not None:
+        data_source_id = str(data_source_id).strip() or None
+    slow_ms = _clamp_int(
+        data.get("slow_ms"), _SLOW_MS_DEFAULT, _SLOW_MS_MIN, _SLOW_MS_MAX
+    )
+    return {
+        "domain_space_id": data.get("domain_space_id") or None,
+        "kb_id": data.get("kb_id") or None,
+        # `__unassigned__` 是「`data_source_id = ''`（未识别源）」的对外哨兵，
+        # 原样往下传、由 `_nl2sql_where` 翻回空串；**空串本身按「未传」处理**
+        # （HTTP 上 `?data_source_id=` 就是没选源），转成 None = 不按源过滤。
+        "data_source_id": data_source_id,
+        "days": _clamp_int(data.get("days"), _DAYS_DEFAULT, _DAYS_MIN, _DAYS_MAX),
+        "start_date": start_date,
+        "end_date": end_date,
+        "slow_ms": slow_ms,
+        # 慢查询列表的过滤门槛：默认跟随 `slow_ms`（设计 §4.2），可单独收窄/放宽。
+        # 复用同一套 100–60000 限幅：低于 100 的「慢查询」没有业务意义。
+        "min_ms": _clamp_int(data.get("min_ms"), slow_ms, _SLOW_MS_MIN, _SLOW_MS_MAX),
+        "include_synthetic": _parse_bool(data.get("include_synthetic"), default=False),
+        # 空串 = 不按码过滤；`__unclassified__` 原样透传，由 `_nl2sql_rows_agg`
+        # 翻成 `reason_code IS NULL`（空码在库里是 NULL，等值比较匹配不到）。
+        "reason_code": data.get("reason_code") or None,
+        "sort": sort,
+        "page": _clamp_int(data.get("page"), _PAGE_DEFAULT, 1, 10**6),
+        "page_size": _clamp_int(
+            data.get("page_size"), _PAGE_SIZE_DEFAULT, 1, _PAGE_SIZE_MAX
+        ),
+    }
+
+
 def _resolve_window(today: date, days: int, start, end):
     """把「相对窗口 `days`」与「绝对区间 `start`~`end`」归一成同一个三元组。
 
@@ -485,6 +566,46 @@ def _sql_list(values) -> str:
     （租户、kb_ids、查询词一律走绑定参数）。
     """
     return ", ".join(f"'{v}'" for v in values)
+
+
+# ── 数据问答（nl2sql_observations）的公共 WHERE 片段 ──
+# 四个块（overview / slow / failures / detail 列表口径）共用同一份范围谓词：
+# 租户 + 半开时间窗 + KB 范围（`= ANY(:kb_ids)`，见文件头 asyncpg 约束 1）。
+# 绑定参数的类型一律显式 CAST（约束 2）：`win_*` 是 `date`、`data_source_id` 是
+# varchar，不 CAST 时 asyncpg 交给 PG 推断会踩 `UndefinedFunctionError`。
+_NL2SQL_BASE_WHERE = """
+       tenant_id = :tenant_id
+   AND created_at >= CAST(:win_start AS DATE)
+   AND created_at <  CAST(:win_end AS DATE)
+   AND knowledge_base_id = ANY(:kb_ids)
+"""
+
+
+def _nl2sql_where(data_source_id, include_synthetic) -> tuple[str, dict]:
+    """拼出数据问答聚合的 WHERE 片段（不含 `WHERE` 关键字），返回 (sql, 额外参数)。
+
+    基础三段（租户 / 半开窗口 / kb 范围）写死在这里，调用方负责提供
+    `tenant_id` / `kb_ids` / `win_start` / `win_end` 四个绑定参数。
+
+    `data_source_id`：
+    * `None` → 不过滤；
+    * `__unassigned__` → 过滤 `data_source_id = ''`（**必须保留**，见设计 §3.4-2）；
+    * 其他值 → 按真实源 id 过滤。
+    `include_synthetic=False` 时统一排除演化基准流量（`scene.evolution_bench=true`），
+    与失败诊断/点踩读取器同口径（设计 §3.4-1）。
+    """
+    sql = _NL2SQL_BASE_WHERE
+    params: dict = {}
+    if data_source_id == _UNASSIGNED_SOURCE:
+        sql += "   AND data_source_id = ''\n"
+    elif data_source_id:
+        sql += "   AND data_source_id = CAST(:data_source_id AS VARCHAR(64))\n"
+        # 显式 str：asyncpg 的绑定参数按值推断类型，传非字符串会给 varchar 比较
+        # 撞类型错误（上游已经 str 化过，这里再兜一次）
+        params["data_source_id"] = str(data_source_id)
+    if not include_synthetic:
+        sql += f"   AND {_SYNTHETIC_FALSE}\n"
+    return sql, params
 
 
 # ── 请求级 CTE（检索分析的核心：空间过滤 / searched_kbs / kb_usage /
@@ -768,6 +889,77 @@ def _local_naive_to_iso(value):
     return value.astimezone().isoformat() if value else None
 
 
+def _ms_or_none(value):
+    """`percentile_cont` 的毫秒值 → 保留 1 位小数的 float（NULL → None）。
+
+    保留小数是因为插值 P95 天然不是整数；不取整成 int 以免前端显示 8123 而实际
+    8123.6 —— 「样本不足显示 —」的判断在 Python 侧只认 `None`，不看精度。
+    """
+    return round(float(value), 1) if value is not None else None
+
+
+def _nl2sql_row_item(row) -> dict:
+    """一条 `nl2sql_observations` 行 → 列表/榜单 item（设计 §4.2 字段集）。
+
+    空源 `data_source_id = ''` 在这里统一映射成展示哨兵 `__unassigned__`
+    （与 `by_source` 桶同一口径）；`source_name` 由服务层用 `KnowledgeDataSource`
+    富化，这里先留空串（**不是** None —— 前端那一列是字符串）。
+    """
+    return {
+        "id": row.id,
+        # `created_at` 是 009 的 **naive TIMESTAMP**（DB 默认 CURRENT_TIMESTAMP），
+        # 必须过 `_local_naive_to_iso` 补回本地偏移（见该函数注释），否则浏览器
+        # 按自己的时区解析裸串，时间会显示错且不报错。
+        # ⚠️ 这一列是**DB 写**的 naive 墙钟（跟 PG 会话时区），与 `_local_naive_to_iso`
+        # 注释里那些「应用进程写」的列略有不同；能在本文件这样用，前提是部署约定
+        # 「PG 会话时区 == 应用进程时区」（deploy compose 两侧都设了 TZ）。若该前提
+        # 被打破，这里会整小时偏移 —— 与 `_UNUSED_ASSETS_SQL` 注释登记的是同一类前提。
+        "created_at": _local_naive_to_iso(row.created_at),
+        "knowledge_base_id": row.knowledge_base_id,
+        "kb_name": None,
+        "data_source_id": row.data_source_id or _UNASSIGNED_SOURCE,
+        "source_name": "",
+        "entity_name": row.entity_name,
+        "question": row.question,
+        "sql": row.sql,
+        "elapsed_ms": int(row.elapsed_ms) if row.elapsed_ms is not None else None,
+        "total_ms": int(row.total_ms) if row.total_ms is not None else None,
+        "row_count": int(row.row_count) if row.row_count is not None else None,
+        "outcome": row.outcome,
+        "reason_code": row.reason_code,
+        # 失败行的人读原因（设计 §4.3）：DB 列本身就是 varchar(500)，这里再截一次
+        # 是防历史/外部写入超长——前端那一列是定宽文本，超长会撑破布局。
+        # 非失败行保留 `None`（键必须在，列表/失败榜/详情共享同一行构造器）。
+        "reason": (row.reason or "")[:_NL2SQL_REASON_MAX] or None,
+        "precompile_violation": row.precompile_violation,
+        "precompile_retried": bool(row.precompile_retried),
+        "synthetic": bool(row.synthetic),
+    }
+
+
+def _nl2sql_source_label(data_source_id, source_names: dict) -> str:
+    """数据源 id → 展示名。空源（哨兵）固定空串；富化不到回落 id。
+
+    空源不编假名字：前端用 i18n 文案「未识别源」渲染。富化不到（源已软删）回落
+    id —— 非空 id 也比空白列强（与 `_enrich_cited` 同口径）。
+    """
+    if data_source_id == _UNASSIGNED_SOURCE:
+        return ""
+    return source_names.get(data_source_id) or data_source_id
+
+
+def _nl2sql_enrich_row(item: dict, kb_map: dict, source_names: dict) -> dict:
+    """列表行 / 榜单 / 详情的统一富化：补 `kb_name` 与 `source_name`。
+
+    抽成模块级函数供 overview、慢查询、失败列表、详情四处共用 —— 任何一处漏富化
+    都会让同一行在不同块里长得不一样（前端复用一个行组件时会静默缺列）。
+    """
+    kb = kb_map.get(item["knowledge_base_id"])
+    item["kb_name"] = kb.name if kb is not None else item["knowledge_base_id"]
+    item["source_name"] = _nl2sql_source_label(item["data_source_id"], source_names)
+    return item
+
+
 # ══════════════════════════════════════════════════════════════
 # 降级保护层（非预期异常 → 等结构空壳，绝不 5xx）
 # ══════════════════════════════════════════════════════════════
@@ -913,6 +1105,119 @@ def _empty_quality_anomalies(data: dict) -> dict:
     return {"items": [], "total": 0}
 
 
+def _nl2sql_window_payload(win_start: date, win_end: date) -> dict:
+    """响应里的 `window` 块：`end` 是**闭区间末日**（`win_end` 是半开右界，减一天）。"""
+    return {
+        "start": win_start.isoformat(),
+        "end": (win_end - timedelta(days=1)).isoformat(),
+    }
+
+
+def _empty_nl2sql_trend_point(day: str) -> dict:
+    """趋势的空日补点：量/失败补 0，P95 补 `null` + 样本 0（设计 §5：样本不足不画实线）。"""
+    return {
+        "date": day,
+        "requests": 0,
+        "failed": 0,
+        "sql_p95_ms": None,
+        "sql_samples": 0,
+        "total_p95_ms": None,
+        "total_samples": 0,
+    }
+
+
+def _empty_nl2sql_overview(scope: dict) -> dict:
+    """数据问答总览的降级/空范围空壳（结构 = 设计 §4.1，逐字段与正常路径一致）。
+
+    `scope` 可能来自降级层的 `_parse_scope`（没有 `slow_ms`），故一律 `.get`
+    带默认值 —— 空壳必须永远构造得出来。
+    """
+    scope = scope or {}
+    win_start, win_end, window_dates = _resolve_window(
+        date.today(),
+        scope.get("days", _DAYS_DEFAULT),
+        scope.get("start_date"),
+        scope.get("end_date"),
+    )
+    slow_ms = scope.get("slow_ms", _SLOW_MS_DEFAULT)
+    return {
+        "window": _nl2sql_window_payload(win_start, win_end),
+        "totals": {
+            "requests": 0,
+            "success": 0,
+            "failed": 0,
+            # 分母 0 → null（设计 §5：「没有问答」不等于「成功率 0%」）
+            "success_rate": None,
+            "synthetic": 0,
+        },
+        "latency": {
+            "sql_p50_ms": None, "sql_p95_ms": None, "sql_p99_ms": None, "sql_samples": 0,
+            "total_p50_ms": None, "total_p95_ms": None, "total_p99_ms": None,
+            "total_samples": 0,
+        },
+        "slow": {
+            "threshold_ms": slow_ms,
+            "sql_count": 0, "sql_rate": 0.0,
+            "total_count": 0, "total_rate": 0.0,
+        },
+        "precompile": {
+            "retried": 0,
+            "retry_rate": 0.0,
+            "by_code": [{"code": code, "count": 0} for code in _PRECOMPILE_CODES],
+        },
+        "trend": [_empty_nl2sql_trend_point(day) for day in window_dates],
+        "by_source": [],
+        "reason_codes": [],
+        "top_slow": [],
+        "top_failures": [],
+    }
+
+
+def _empty_nl2sql_rows(scope: dict) -> dict:
+    """慢查询 / 失败列表的降级空壳（分页键原样回显，前端不必为降级写分支）。"""
+    scope = scope or {}
+    return {
+        "items": [],
+        "total": 0,
+        "page": scope.get("page", _PAGE_DEFAULT),
+        "page_size": scope.get("page_size", _PAGE_SIZE_DEFAULT),
+    }
+
+
+def _empty_nl2sql_detail(data: dict) -> dict:
+    """数据问答详情的降级空壳（`{"item": …}`，字段与正常路径逐键对齐）。
+
+    ⚠️ 只有**非预期异常**会走到这里；「记录不存在 / 越范围」走 404
+    （`JonexException` 不被 `_resilient` 吞掉）。`id` 由 `_resilient` 传入的
+    降级 scope 里通常没有（它来自 `_parse_scope`），故允许为空串。
+    """
+    data = data or {}
+    return {
+        "item": {
+            "id": data.get("id") or "",
+            "created_at": None,
+            "knowledge_base_id": None,
+            "kb_name": None,
+            "data_source_id": None,
+            "source_name": "",
+            "entity_name": None,
+            "question": None,
+            "sql": None,
+            "rejected_sql": None,
+            "elapsed_ms": None,
+            "total_ms": None,
+            "row_count": None,
+            "outcome": None,
+            "reason_code": None,
+            "reason": None,
+            "precompile_violation": None,
+            "precompile_retried": False,
+            "synthetic": False,
+            "scene": {},
+        },
+    }
+
+
 # 三期三个钻取空壳：**定位键原样回显**（`asset_id` / `kb_id` + 三元组），
 # 名称为空串而不是 `None` —— 前端拿到的是「结构完整但内容为空」，
 # 与其它空壳一样不必为降级单写分支。⚠️ 只有「非预期异常」会走到这里；
@@ -1046,6 +1351,405 @@ class AnalyticsService:
         `UndefinedFunctionError`（一期踩过）。
         """
         return {"win_start": win_start, "win_end": win_end}
+
+    # ── 数据问答聚合（nl2sql_observations 口径）─────────────────
+    #
+    # 本块的三个硬约定（设计 §3.4，改之前先读）：
+    # ① 演化基准流量默认排除，且**所有块**共用同一 `include_synthetic`；
+    # ② `data_source_id = ''` 必须保留并映射成哨兵 `__unassigned__`，
+    #    保证 `sum(by_source.requests) == totals.requests`；
+    # ③ `elapsed_ms`（SQL 执行）与 `total_ms`（端到端）分别算 P95，样本数
+    #    只数 `IS NOT NULL` —— 失败行的延迟常为 NULL，不能拿它拉低 P95。
+
+    async def _nl2sql_source_names(self, session, tenant_id: str, kb_ids: list) -> dict:
+        """数据源 id → 展示名（数据源可被停用，但历史观测仍要显示当时的名字）。
+
+        只取未软删行；软删源回落 id（与 `_search_agg` 的服务归因同姿势），
+        **不留空白列**。范围与 `by_source` 行同源（`knowledge_base_id ∈ kb_ids`）。
+        """
+        if not kb_ids:
+            return {}
+        rows = (
+            await session.execute(
+                select(KnowledgeDataSource.id, KnowledgeDataSource.name).where(
+                    KnowledgeDataSource.tenant_id == tenant_id,
+                    KnowledgeDataSource.is_deleted == 0,
+                    KnowledgeDataSource.knowledge_base_id.in_(kb_ids),
+                )
+            )
+        ).all()
+        return {r.id: r.name for r in rows}
+
+    async def _nl2sql_overview_agg(self, session, *, tenant_id: str, kb_ids: list,
+                                   win_start: date, win_end: date, data_source_id,
+                                   include_synthetic: bool, slow_ms: int) -> dict:
+        """数据问答总览的原始聚合（设计 §4.1 的 counts / P95 / 分组）。
+
+        返回的 `trend` 是 `{日期串: 点}` 的 dict，空日补零由调用方按 `window_dates`
+        做（本方法拿不到日期轴；日期轴来自 `_scope_window`，只在公开方法里算一次）。
+
+        窗口、kb 范围、源过滤、合成流量过滤全部走 `_nl2sql_where` —— 四个块共用
+        同一份谓词，避免「KPI 按 7 天、趋势按 30 天」这类静默错位。
+        """
+        where, extra = _nl2sql_where(data_source_id, include_synthetic)
+        params = {
+            "tenant_id": tenant_id,
+            "kb_ids": list(kb_ids),
+            **self._window_params(win_start, win_end),
+            **extra,
+        }
+        slow_params = {**params, "slow_ms": slow_ms}
+        table = "knowledge_base.nl2sql_observations"
+
+        # ① 总量。`synthetic` 统计的是**本条件下被计入的**合成行：默认口径下
+        #    页面看不到它们，计数自然为 0；打开开关后才与 `requests` 同增。
+        totals = (
+            await session.execute(
+                text(f"""
+SELECT count(*) AS requests,
+       count(*) FILTER (WHERE outcome = 'success') AS success,
+       count(*) FILTER (WHERE outcome = 'failed') AS failed,
+       count(*) FILTER (WHERE coalesce((scene->>'evolution_bench')::boolean, false)) AS synthetic
+  FROM {table}
+ WHERE {where}
+"""),
+                params,
+            )
+        ).first()
+        requests = int(totals.requests or 0) if totals else 0
+        success = int(totals.success or 0) if totals else 0
+        failed = int(totals.failed or 0) if totals else 0
+        synthetic = int(totals.synthetic or 0) if totals else 0
+
+        # ② 延迟分位。`percentile_cont` 的 FILTER 与样本数同一个判据
+        #    （`IS NOT NULL`）—— 两处写成不同条件时 P95 与样本量会互相矛盾。
+        latency = (
+            await session.execute(
+                text(f"""
+SELECT percentile_cont(0.5)  WITHIN GROUP (ORDER BY elapsed_ms)
+           FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY elapsed_ms)
+           FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_p95,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY elapsed_ms)
+           FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_p99,
+       count(*) FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_samples,
+       percentile_cont(0.5)  WITHIN GROUP (ORDER BY total_ms)
+           FILTER (WHERE total_ms IS NOT NULL) AS total_p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY total_ms)
+           FILTER (WHERE total_ms IS NOT NULL) AS total_p95,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY total_ms)
+           FILTER (WHERE total_ms IS NOT NULL) AS total_p99,
+       count(*) FILTER (WHERE total_ms IS NOT NULL) AS total_samples
+  FROM {table}
+ WHERE {where}
+"""),
+                params,
+            )
+        ).first()
+
+        # ③ 慢阈值：`>=`（边界值算慢，与前端「≥ 阈值」文案一致）。
+        slow = (
+            await session.execute(
+                text(f"""
+SELECT count(*) FILTER (WHERE elapsed_ms >= CAST(:slow_ms AS INTEGER)) AS sql_count,
+       count(*) FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_samples,
+       count(*) FILTER (WHERE total_ms >= CAST(:slow_ms AS INTEGER)) AS total_count,
+       count(*) FILTER (WHERE total_ms IS NOT NULL) AS total_samples
+  FROM {table}
+ WHERE {where}
+"""),
+                slow_params,
+            )
+        ).first()
+        sql_samples = int(slow.sql_samples or 0) if slow else 0
+        total_samples = int(slow.total_samples or 0) if slow else 0
+        sql_slow = int(slow.sql_count or 0) if slow else 0
+        total_slow = int(slow.total_count or 0) if slow else 0
+
+        # ④ A1b 预编译重试。分母是**全部请求**（不是重试行），与设计 §5 的
+        #    「count(precompile_retried) / count(*)」一致。
+        pv = (
+            await session.execute(
+                text(f"""
+SELECT count(*) FILTER (WHERE precompile_retried) AS retried,
+       count(*) AS requests
+  FROM {table}
+ WHERE {where}
+"""),
+                params,
+            )
+        ).first()
+        retried = int(pv.retried or 0) if pv else 0
+        pv_requests = int(pv.requests or 0) if pv else 0
+        code_rows = (
+            await session.execute(
+                text(f"""
+SELECT precompile_violation AS code, count(*) AS cnt
+  FROM {table}
+ WHERE {where}
+   AND precompile_violation IS NOT NULL
+ GROUP BY precompile_violation
+ ORDER BY count(*) DESC, precompile_violation ASC
+"""),
+                params,
+            )
+        ).all()
+        code_counts = {r.code: int(r.cnt) for r in code_rows}
+        by_code = [
+            {"code": code, "count": code_counts.pop(code, 0)}
+            for code in _PRECOMPILE_CODES
+        ]
+        # 库里出现新码时追加在后面（不吞）：前端标签列是开放的，漏掉等于静默少数据
+        by_code += [
+            {"code": code, "count": count}
+            for code, count in sorted(code_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+        # ⑤ 按天趋势。`date_trunc` 的对象是 naive TIMESTAMP，按库内墙钟分日；
+        #    日期轴与 `_scope_window` 的 `window_dates` 同一天粒度，键可直接对齐。
+        trend_rows = (
+            await session.execute(
+                text(f"""
+SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
+       count(*) AS requests,
+       count(*) FILTER (WHERE outcome = 'failed') AS failed,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY elapsed_ms)
+           FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_p95,
+       count(*) FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_samples,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY total_ms)
+           FILTER (WHERE total_ms IS NOT NULL) AS total_p95,
+       count(*) FILTER (WHERE total_ms IS NOT NULL) AS total_samples
+  FROM {table}
+ WHERE {where}
+ GROUP BY 1
+ ORDER BY 1
+"""),
+                params,
+            )
+        ).all()
+        trend = {
+            r.day: {
+                "requests": int(r.requests),
+                "failed": int(r.failed),
+                "sql_p95_ms": _ms_or_none(r.sql_p95),
+                "sql_samples": int(r.sql_samples),
+                "total_p95_ms": _ms_or_none(r.total_p95),
+                "total_samples": int(r.total_samples),
+            }
+            for r in trend_rows
+        }
+
+        # ⑥ 按源分组。**不做 LIMIT**：截断会让 `sum(requests) != totals.requests`，
+        #    而设计把这条等式当硬约束（空源那一档尤其不能丢）。
+        source_rows = (
+            await session.execute(
+                text(f"""
+SELECT data_source_id,
+       count(*) AS requests,
+       count(*) FILTER (WHERE outcome = 'failed') AS failed,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY elapsed_ms)
+           FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_p95,
+       count(*) FILTER (WHERE elapsed_ms IS NOT NULL) AS sql_samples,
+       count(*) FILTER (WHERE elapsed_ms >= CAST(:slow_ms AS INTEGER)) AS slow_count
+  FROM {table}
+ WHERE {where}
+ GROUP BY data_source_id
+ ORDER BY count(*) DESC, data_source_id ASC
+"""),
+                slow_params,
+            )
+        ).all()
+        by_source = [
+            {
+                # 空串 → 展示哨兵；`source_name` 由公开方法富化（这里是空串）
+                "data_source_id": r.data_source_id or _UNASSIGNED_SOURCE,
+                "source_name": "",
+                "requests": int(r.requests),
+                "failed": int(r.failed),
+                "sql_p95_ms": _ms_or_none(r.sql_p95),
+                "sql_samples": int(r.sql_samples),
+                "slow_count": int(r.slow_count),
+            }
+            for r in source_rows
+        ]
+
+        # ⑦ 失败码分布（空码保留为 null，前端显示「未分类」）
+        reason_rows = (
+            await session.execute(
+                text(f"""
+SELECT reason_code, count(*) AS cnt
+  FROM {table}
+ WHERE {where}
+   AND outcome = 'failed'
+ GROUP BY reason_code
+ ORDER BY count(*) DESC, reason_code ASC NULLS LAST
+"""),
+                params,
+            )
+        ).all()
+
+        async def _top_items(extra_where: str, order_by: str) -> list:
+            """榜单取数（最多 `_TOP_LIST_LIMIT` 条）：与列表 item 同形。
+
+            榜单是「打开总览时顺手给的 10 条」，与列表共用同一份字段集，
+            前端可以把同一个行组件/抽屉用在两处。
+            """
+            rows = (
+                await session.execute(
+                    text(f"""
+SELECT id, created_at, knowledge_base_id, data_source_id, entity_name,
+       question, sql, elapsed_ms, total_ms, row_count, outcome, reason_code,
+       reason, precompile_violation, precompile_retried,
+       coalesce((scene->>'evolution_bench')::boolean, false) AS synthetic
+  FROM {table}
+ WHERE {where}
+   AND {extra_where}
+ ORDER BY {order_by}
+ LIMIT {_TOP_LIST_LIMIT}
+"""),
+                    params,
+                )
+            ).all()
+            return [_nl2sql_row_item(r) for r in rows]
+
+        # 慢榜只认有 SQL 耗时的行（NULLS LAST 在 LIMIT 下仍可能被 NULL 占位，
+        # 而「没有延迟数据」不构成慢查询）；失败榜按时间倒序。
+        top_slow = await _top_items(
+            extra_where="elapsed_ms IS NOT NULL",
+            order_by="elapsed_ms DESC, created_at DESC, id ASC",
+        )
+        top_failures = await _top_items(
+            extra_where="outcome = 'failed'",
+            order_by="created_at DESC, id ASC",
+        )
+
+        return {
+            "totals": {
+                "requests": requests,
+                "success": success,
+                "failed": failed,
+                # 分母 0 → null（设计 §5：没有问答 ≠ 成功率 0%）
+                "success_rate": round(success / requests, 4) if requests else None,
+                "synthetic": synthetic,
+            },
+            "latency": {
+                "sql_p50_ms": _ms_or_none(latency.sql_p50) if latency else None,
+                "sql_p95_ms": _ms_or_none(latency.sql_p95) if latency else None,
+                "sql_p99_ms": _ms_or_none(latency.sql_p99) if latency else None,
+                "sql_samples": int(latency.sql_samples or 0) if latency else 0,
+                "total_p50_ms": _ms_or_none(latency.total_p50) if latency else None,
+                "total_p95_ms": _ms_or_none(latency.total_p95) if latency else None,
+                "total_p99_ms": _ms_or_none(latency.total_p99) if latency else None,
+                "total_samples": int(latency.total_samples or 0) if latency else 0,
+            },
+            "slow": {
+                "threshold_ms": slow_ms,
+                "sql_count": sql_slow,
+                "sql_rate": round(sql_slow / sql_samples, 4) if sql_samples else 0.0,
+                "total_count": total_slow,
+                "total_rate": round(total_slow / total_samples, 4) if total_samples else 0.0,
+            },
+            "precompile": {
+                "retried": retried,
+                "retry_rate": round(retried / pv_requests, 4) if pv_requests else 0.0,
+                "by_code": by_code,
+            },
+            "trend": trend,
+            "by_source": by_source,
+            "reason_codes": [
+                {"reason_code": r.reason_code, "count": int(r.cnt)}
+                for r in reason_rows
+            ],
+            "top_slow": top_slow,
+            "top_failures": top_failures,
+        }
+
+    async def _nl2sql_rows_agg(self, session, *, tenant_id: str, kb_ids: list,
+                               win_start: date, win_end: date, data_source_id,
+                               include_synthetic: bool, kind: str, reason_code,
+                               min_ms: int, sort: str, limit: int,
+                               offset: int) -> tuple[list, int]:
+        """慢查询 / 失败列表的分页取数（设计 §4.2 / §4.3）。
+
+        返回 `(items, total)`：`total` 是**同一筛选条件**下的全量条数，不能用
+        `len(items)` 充数（分页组件拿它算页数，用当前页条数会永远只有一页）。
+
+        两种 kind 的差异只有两处（其余范围谓词与总览共用 `_nl2sql_where`）：
+
+        * **slow**：`COALESCE(metric, 0) >= :min_ms`，`metric` 由 `sort` 决定
+          （`sql` → `elapsed_ms`，`total` → `total_ms`），排序同列倒序。
+          用 `COALESCE` 而不是 `metric >= :min_ms`：NULL 行无论如何都不该算慢查询，
+          而 `NULL >= x` 求值为 NULL 会被过滤掉 —— 两者结果相同，但 COALESCE 让
+          「没有延迟数据 = 0ms」这层意图显式可见。
+        * **failures**：只含 `outcome = 'failed'`，按 `created_at DESC`；
+          `reason_code` 可选过滤（空码在库里是 NULL，传空串时不过滤，
+          传 `__unclassified__` 时翻译成 `reason_code IS NULL` —— 等值比较
+          永远匹配不到 NULL，不能让「未分类」退化回「全部」）。
+        * 稳定兜底键：慢查询 `created_at DESC, id ASC`；失败 `created_at DESC, id ASC`
+          —— 并列行的次序不能依赖 PG 的物理顺序（同 `_top_hits` 的顾虑）。
+        """
+        if not kb_ids:
+            return [], 0
+
+        where, extra = _nl2sql_where(data_source_id, include_synthetic)
+        params = {
+            "tenant_id": tenant_id,
+            "kb_ids": list(kb_ids),
+            **self._window_params(win_start, win_end),
+            **extra,
+        }
+        table = "knowledge_base.nl2sql_observations"
+
+        filters = []
+        if kind == _NL2SQL_KIND_FAILURES:
+            filters.append("outcome = 'failed'")
+            if reason_code == _UNCLASSIFIED_REASON:
+                # 空码桶：**不能**用等值比较（`= '__unclassified__'` 永远匹配不到
+                # 库里的 NULL），也不加绑定参数，直接写 IS NULL。
+                filters.append("reason_code IS NULL")
+            elif reason_code:
+                # 显式 str + CAST：asyncpg 按值推断类型，不 CAST 时 varchar 比较
+                # 在部分驱动/PG 版本上会撞类型推断错误（同 `_nl2sql_where`）。
+                filters.append("reason_code = CAST(:reason_code AS VARCHAR(64))")
+                params["reason_code"] = str(reason_code)
+            order_by = "created_at DESC, id ASC"
+        else:
+            metric = "total_ms" if sort == "total" else "elapsed_ms"
+            filters.append(f"COALESCE({metric}, 0) >= CAST(:min_ms AS INTEGER)")
+            params["min_ms"] = int(min_ms)
+            order_by = f"{metric} DESC NULLS LAST, created_at DESC, id ASC"
+        extra_where = "".join(f"   AND {clause}\n" for clause in filters)
+
+        total = int(
+            (
+                await session.execute(
+                    text(f"""
+SELECT count(*) AS cnt
+  FROM {table}
+ WHERE {where}{extra_where}
+"""),
+                    params,
+                )
+            ).scalar_one()
+            or 0
+        )
+
+        rows = (
+            await session.execute(
+                text(f"""
+SELECT id, created_at, knowledge_base_id, data_source_id, entity_name,
+       question, sql, elapsed_ms, total_ms, row_count, outcome, reason_code,
+       reason, precompile_violation, precompile_retried,
+       coalesce((scene->>'evolution_bench')::boolean, false) AS synthetic
+  FROM {table}
+ WHERE {where}{extra_where}
+ ORDER BY {order_by}
+ LIMIT :limit OFFSET :offset
+"""),
+                {**params, "limit": limit, "offset": offset},
+            )
+        ).all()
+        return [_nl2sql_row_item(r) for r in rows], total
 
     # ── 检索线聚合（事件表口径）────────────────────────
 
@@ -2151,6 +2855,179 @@ SELECT s.kb_id, s.entity_type, s.canonical_name, max(s.hit_at) AS last_hit_at
             "kb_usage": kb_usage,
             "service_usage": service_usage,
         }
+
+    @_resilient(_empty_nl2sql_overview)
+    async def nl2sql_overview(self, tenant_id: str, user_id, data: dict) -> dict:
+        """数据运营 ·「数据问答」总览（设计 §4.1）。
+
+        范围/窗口与其余数据运营页签同源：`domain_space_id` / `kb_id` 只能收窄，
+        窗口用 `_scope_window`（`win_end` 是最后一天 +1 天的半开右界）。
+        `kb_ids` 为空时**直接返回空壳**，不拿空 `ANY` 去查库（与现有聚合方法一致）。
+
+        降级路径：`_resilient(_empty_nl2sql_overview)` —— 非预期异常绝不 5xx；
+        `JonexException`（租户非法 / 权限不足）照常向上抛。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_nl2sql_scope(data)
+        async with get_db_session() as session:
+            kb_ids, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], scope["kb_id"]
+            )
+            if not kb_ids:
+                return _empty_nl2sql_overview(scope)
+            win_start, win_end, window_dates = await self._scope_window(session, scope)
+            raw = await self._nl2sql_overview_agg(
+                session,
+                tenant_id=tenant_id,
+                kb_ids=kb_ids,
+                win_start=win_start,
+                win_end=win_end,
+                data_source_id=scope["data_source_id"],
+                include_synthetic=scope["include_synthetic"],
+                slow_ms=scope["slow_ms"],
+            )
+            source_names = await self._nl2sql_source_names(session, tenant_id, kb_ids)
+
+        for row in raw["by_source"]:
+            row["source_name"] = _nl2sql_source_label(
+                row["data_source_id"], source_names
+            )
+
+        def _enrich_item(item: dict) -> dict:
+            return _nl2sql_enrich_row(item, kb_map, source_names)
+
+        # 趋势按日期轴补零（空日 requests/failed=0、P95=null、样本=0）：
+        # 点数必须与 `window_dates` 一致，前端不为降级/空日单写分支。
+        trend = [
+            {**_empty_nl2sql_trend_point(day), **raw["trend"].get(day, {})}
+            for day in window_dates
+        ]
+
+        return {
+            "window": _nl2sql_window_payload(win_start, win_end),
+            "totals": raw["totals"],
+            "latency": raw["latency"],
+            "slow": raw["slow"],
+            "precompile": raw["precompile"],
+            "trend": trend,
+            "by_source": raw["by_source"],
+            "reason_codes": raw["reason_codes"],
+            "top_slow": [_enrich_item(item) for item in raw["top_slow"]],
+            "top_failures": [_enrich_item(item) for item in raw["top_failures"]],
+        }
+
+    async def _nl2sql_list_page(self, tenant_id: str, data: dict, kind: str) -> dict:
+        """慢查询 / 失败列表的公共流程（两个公开方法只在 kind 上不同）。
+
+        范围、窗口、源过滤、合成流量开关全部与总览同源（`_nl2sql_where` +
+        `_scope_window`）—— 否则「总览说失败 3 条、失败列表只有 2 条」这类
+        静默口径分裂就会出现。`kb_ids` 为空时直接给空壳，不拿空 `ANY` 查库。
+        """
+        tenant_id = require_tenant(tenant_id)
+        scope = _parse_nl2sql_scope(data)
+        async with get_db_session() as session:
+            kb_ids, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], scope["kb_id"]
+            )
+            if not kb_ids:
+                return _empty_nl2sql_rows(scope)
+            win_start, win_end, _ = await self._scope_window(session, scope)
+            items, total = await self._nl2sql_rows_agg(
+                session,
+                tenant_id=tenant_id,
+                kb_ids=kb_ids,
+                win_start=win_start,
+                win_end=win_end,
+                data_source_id=scope["data_source_id"],
+                include_synthetic=scope["include_synthetic"],
+                kind=kind,
+                reason_code=scope["reason_code"],
+                min_ms=scope["min_ms"],
+                sort=scope["sort"],
+                limit=scope["page_size"],
+                offset=(scope["page"] - 1) * scope["page_size"],
+            )
+            source_names = await self._nl2sql_source_names(session, tenant_id, kb_ids)
+        items = [_nl2sql_enrich_row(item, kb_map, source_names) for item in items]
+        return {
+            "items": items,
+            "total": total,
+            "page": scope["page"],
+            "page_size": scope["page_size"],
+        }
+
+    @_resilient(_empty_nl2sql_rows)
+    async def nl2sql_slow(self, tenant_id: str, user_id, data: dict) -> dict:
+        """数据运营 ·「慢查询」列表（设计 §4.2）。
+
+        `min_ms` 默认等于 `slow_ms`（scope 里已按此回落）；`sort=sql` 按
+        `elapsed_ms` 倒序，`sort=total` 按端到端 `total_ms` 倒序。
+        """
+        return await self._nl2sql_list_page(tenant_id, data, _NL2SQL_KIND_SLOW)
+
+    @_resilient(_empty_nl2sql_rows)
+    async def nl2sql_failures(self, tenant_id: str, user_id, data: dict) -> dict:
+        """数据运营 ·「失败复盘」列表（设计 §4.3）。
+
+        只含 `outcome='failed'`；`reason_code` 可选过滤；按 `created_at DESC`。
+        行内额外带 `reason`（截断 500），详情抽屉与失败榜同形。
+        """
+        return await self._nl2sql_list_page(tenant_id, data, _NL2SQL_KIND_FAILURES)
+
+    @_resilient(_empty_nl2sql_detail)
+    async def nl2sql_detail(self, tenant_id: str, user_id, data: dict) -> dict:
+        """数据运营 · 数据问答详情（设计 §4.4）。
+
+        与列表**同 scope**：先 `_kb_scope` 解析本次范围内的库，再按
+        `id + tenant + kb ∈ kb_ids` 取行。「不存在 / 越租户 / 越空间 / 范围为空」
+        全部合并成同一个 404（`ResourceNotFoundError`）—— 区分它们等于确认
+        「有这条记录，只是不给你看」（与抽屉 A/B 的防探测同口径）。
+
+        返回单行完整现场：比列表多 `rejected_sql` 与完整 `scene`
+        （列表不返 `scene` 是为了避免大 payload）。
+        """
+        tenant_id = require_tenant(tenant_id)
+        obs_id = str((data or {}).get("id") or "").strip()
+        scope = _parse_nl2sql_scope(data)
+        async with get_db_session() as session:
+            kb_ids, kb_map = await self._kb_scope(
+                session, tenant_id, scope["domain_space_id"], scope["kb_id"]
+            )
+            row = None
+            if obs_id and kb_ids:
+                row = (
+                    await session.execute(
+                        text("""
+SELECT id, created_at, knowledge_base_id, data_source_id, entity_name,
+       question, sql, rejected_sql, reason, elapsed_ms, total_ms, row_count,
+       outcome, reason_code, precompile_violation, precompile_retried, scene,
+       coalesce((scene->>'evolution_bench')::boolean, false) AS synthetic
+  FROM knowledge_base.nl2sql_observations
+ WHERE id = CAST(:obs_id AS VARCHAR(64))
+   AND tenant_id = :tenant_id
+   AND knowledge_base_id = ANY(:kb_ids)
+"""),
+                        {
+                            "obs_id": obs_id,
+                            "tenant_id": tenant_id,
+                            "kb_ids": list(kb_ids),
+                        },
+                    )
+                ).first()
+            if row is None:
+                raise ResourceNotFoundError(
+                    message=translate(
+                        "err.kb.nl2sql_observation_not_found",
+                        params={"id": obs_id},
+                        fallback=f"数据问答记录不存在: {obs_id}",
+                    )
+                )
+            source_names = await self._nl2sql_source_names(session, tenant_id, kb_ids)
+
+        item = _nl2sql_row_item(row)
+        item["rejected_sql"] = row.rejected_sql
+        item["scene"] = row.scene or {}
+        return {"item": _nl2sql_enrich_row(item, kb_map, source_names)}
 
     @_resilient(_empty_abnormal_page)
     async def abnormal_assets(self, tenant_id: str, user_id, data: dict) -> dict:

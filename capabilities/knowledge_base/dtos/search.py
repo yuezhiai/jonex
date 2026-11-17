@@ -27,6 +27,8 @@ class SearchRequest(BaseModel):
     knowledge_base_id: str = Field(default="", min_length=0, max_length=128)
     save_history: bool = True
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
+    # 检索维度：选服务时下发，与 domain_space_id 二选一
+    service_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class SearchResponse(BaseModel):
@@ -66,6 +68,8 @@ class OntologySearchRequest(BaseModel):
     skip_enum_force_rag: bool = False
     with_reasoning: bool = False          # 是否返回编排推理链（P0 非流式）
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
+    # 检索维度：选服务时下发，与 domain_space_id 二选一
+    service_id: Optional[str] = Field(default=None, max_length=64)
     # ── [jonex] §9 严格模式字段（全部可选，默认关，向后兼容）──
     strict_mode: bool = False             # 开启严格模式
     strict_max_attempts: int = Field(3, ge=1, le=3)   # 循环上限
@@ -118,6 +122,8 @@ class LlmWikiSearchRequest(BaseModel):
     save_history: bool = True
     with_reasoning: bool = False
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
+    # 检索维度：选服务时下发，与 domain_space_id 二选一
+    service_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class JonexWikiSearchRequest(BaseModel):
@@ -133,6 +139,8 @@ class JonexWikiSearchRequest(BaseModel):
     save_history: bool = True
     with_reasoning: bool = False
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
+    # 检索维度：选服务时下发，与 domain_space_id 二选一
+    service_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class MixSearchRequest(BaseModel):
@@ -158,6 +166,8 @@ class MixSearchRequest(BaseModel):
     save_history: bool = True
     with_reasoning: bool = False
     domain_space_id: Optional[str] = Field(default=None, max_length=64)
+    # 检索维度：选服务时下发，与 domain_space_id 二选一
+    service_id: Optional[str] = Field(default=None, max_length=64)
     # ── [jonex] 严格模式字段（与 OntologySearchRequest 对齐，透传给 lightrag 侧）──
     strict_mode: bool = False
     strict_max_attempts: int = Field(3, ge=1, le=3)
