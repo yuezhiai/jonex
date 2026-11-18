@@ -1,0 +1,10 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Wiki 容器内的 Agent 沙箱（bwrap）需要用户命名空间。
+# 等同 apparmor=unconfined，只额外放行 userns，使容器不受
+# kernel.apparmor_restrict_unprivileged_userns 限制。
+profile jonex-wiki-sandbox flags=(unconfined) {
+  userns,
+  include if exists <local/jonex-wiki-sandbox>
+}
