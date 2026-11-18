@@ -1,7 +1,7 @@
 import os
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     media_keyframes_enabled: bool = True
     media_keyframes_max_frames: int = Field(default=32, ge=1, le=256)
     media_keyframes_interval_seconds: float = Field(default=5.0, ge=0.25, le=120)
+    pdf_table_repair_enabled: bool = True
     pdf_text_layer_enabled: bool = True
     pdf_text_layer_max_pages: int = Field(default=128, ge=1, le=2048)
     visual_inspection_enabled: bool = True
@@ -59,25 +60,25 @@ class Settings(BaseSettings):
     llm_timeout: float = Field(default=120.0, validation_alias="LLM_TIMEOUT")
     # query_tasks 终态行保留时长(秒)。done/failed/cancelled 且 finished_at 早于该窗口的
     # 行由启动 GC 清除,防 query_tasks 无界增长(方案 §6.4)。
-    query_task_ttl_seconds: int = 7 * 24 * 3600
+    query_task_ttl_seconds: int | None = Field(default=None, ge=0)
     # 成本闸门
     compile_max_documents: int = 1000
     compile_page_drop_threshold: float = 0.5   # 空产出守卫骤降阈值:page_count 较上一版下跌超此比例拒绝发布
     # ── 编译链路调度旋钮(唯一权威在本文件;经 ManifestBuilder 进 manifest.curation)──
     # 页面 passage 并发度。没有「不限」语义:要串行就显式写 1(0/负数非法)。
     # 这是部署默认值的唯一入口；由 manifest 传给分层编译器。
-    compile_concurrency: int = Field(default=20, ge=1)
+    compile_concurrency: int = Field(default=15, ge=1)
     # passage 永久失败率上限(0..1):超过即 fail closed;production 策略下按降级审计发布。
     compile_max_passage_failure_rate: float = 0.05
     # 并发
-    api_parse_concurrency: int = 2
-    api_compile_concurrency: int = 2
+    api_parse_concurrency: int = Field(default=15, ge=1)
+    api_compile_concurrency: int = Field(default=15, ge=1)
     api_query_concurrency: int = 4
     api_outline_concurrency: int = 2
-    blocking_pool_size: int = 8
+    blocking_pool_size: int = Field(default=15, ge=1)
     # 上传/解析
     max_upload_bytes: int = 104_857_600
-    keep_bundles: int = Field(default=2, ge=0)  # 历史版本数；当前 published 另行保留
+    keep_bundles: int | None = Field(default=1, ge=0)  # 当前版本另计；默认额外保留 1 个历史版本
     # MinerU(不带前缀,显式 alias)
     mineru_api_token: str = Field(default="", validation_alias="MINERU_API_TOKEN")
     mineru_api_base_url: str = Field(default="https://mineru.net", validation_alias="MINERU_API_BASE_URL")
@@ -106,37 +107,25 @@ class Settings(BaseSettings):
     compile_output_tokens: int = 16384
     semantic_review_output_tokens: int = 4096
     semantic_review: str = Field(default="off", validation_alias="LLM_WIKI_SEMANTIC_REVIEW")
-    # QUERY_* 开关 + 证据/检索预算(不带前缀,显式 alias)
-    query_snippet: bool = Field(default=True, validation_alias="QUERY_SNIPPET")
-    query_answer_style: str = Field(default="natural", validation_alias="QUERY_ANSWER_STYLE")
-    query_answer_target_hint: bool = Field(default=False, validation_alias="QUERY_ANSWER_TARGET_HINT")
-    query_max_tool_calls: int = Field(default=24, validation_alias="QUERY_MAX_TOOL_CALLS")
-    # 单次查询的模型(provider)调用预算，由 algorithm._query_budget_limits() 经
-    # current_env() 读取。**必须**是本 Settings 字段并进 runtime_env()：查询链路用
-    # runtime_environment(settings.runtime_env()) 包住执行，而 current_env() 在注入时
-    # 完全遮蔽 os.environ —— 没进注入映射的名字，env 文件里写多少都不会生效
-    # （这正是 tests/test_env_template_contract.py::KNOWN_UNREACHABLE 记录过的坑）。
-    query_max_logical_calls: int = Field(default=24, validation_alias="QUERY_MAX_LOGICAL_CALLS")
-    # Zero explicitly disables only the total-token cap, matching engine semantics.
-    query_max_total_tokens: int = Field(default=360000, ge=0, validation_alias="QUERY_MAX_TOTAL_TOKENS")
-    query_max_context_tokens: int = Field(default=400000, gt=0, validation_alias="QUERY_MAX_CONTEXT_TOKENS")
-    query_max_seconds: int = Field(default=180, gt=0, validation_alias="QUERY_MAX_SECONDS")
-    query_traversal_max_tokens: int = Field(default=4096, validation_alias="QUERY_TRAVERSAL_MAX_TOKENS")
-    query_max_search_hits: int = Field(default=10, validation_alias="QUERY_MAX_SEARCH_HITS")
-    query_evidence_excerpt_limit: int = Field(default=500, validation_alias="QUERY_EVIDENCE_EXCERPT_LIMIT")
-    query_evidence_units_max: int = Field(default=12, validation_alias="QUERY_EVIDENCE_UNITS_MAX")
-    query_evidence_per_doc_max: int = Field(default=6, validation_alias="QUERY_EVIDENCE_PER_DOC_MAX")
-    query_max_active_evidence: int = Field(default=32, validation_alias="QUERY_MAX_ACTIVE_EVIDENCE")
-    # model 超时重试
-    query_model_call_timeout_seconds: float = Field(default=75.0, validation_alias="QUERY_MODEL_CALL_TIMEOUT_SECONDS")
-    query_model_call_timeout_retries: int = Field(default=1, validation_alias="QUERY_MODEL_CALL_TIMEOUT_RETRIES")
+    # One file-reading agent route for both query and article compilation.
+    agent_reasoning_effort: Literal['off', 'high', 'xhigh'] = 'off'
+    agent_cli_path: str = ''
+    agent_model_catalog: str = ''
+    agent_query_search_seconds: float = Field(default=130.0, gt=0, allow_inf_nan=False)
+    agent_query_finish_seconds: float = Field(default=24.0, gt=0, allow_inf_nan=False)
+    # Limits for each article-writing attempt.
+    agent_compile_batch_max_calls: int = Field(default=200, ge=1, le=500)
+    agent_compile_batch_timeout_seconds: float = Field(default=900.0, gt=0, le=3600, allow_inf_nan=False)
+    agent_compile_batch_idle_seconds: float = Field(default=300.0, gt=0, le=3600, allow_inf_nan=False)
+    agent_compile_batch_max_input_bytes: int = Field(default=2 * 1024 * 1024, ge=64 * 1024, le=4 * 1024 * 1024)
+    agent_compile_max_input_tokens: int = Field(default=6_000_000, ge=100_000, le=100_000_000)
+    agent_compile_final_input_tokens: int = Field(default=240_000, ge=4_000, le=10_000_000)
+    agent_compile_turn_max_output_tokens: int = Field(default=16_384, ge=1024, le=65_536)
+    compile_input_max_restarts: int = Field(default=1, ge=0, le=10)
+    # Optional private diagnostic recording. Empty means no raw request log.
+    agent_record_root: str = ''
     # prepared cache
-    prepared_cache_bytes: int = 768 * 1024 * 1024
     query_material_cache_bytes: int = Field(default=16 * 1024 * 1024, ge=0)
-    # Deprecated configuration input: free-text condition inference is retired.
-    query_exact_identifier_lookup: bool = False
-    query_graph_discovery: bool = True
-    query_retrieval_strategy: Literal["tree", "direct", "structure", "semantic"] = "tree"
     # 解析杂项
     allow_private_urls: bool = False
     text_encoding: str = "utf-8"
@@ -157,18 +146,8 @@ class Settings(BaseSettings):
     # 旧语义。这里没有比例闸门:摘除判据只有一条,不需要阈值兜底(整体不可信该由编译侧
     # max_passage_failure_rate 负责)。
     inspect_enabled: bool = True
-    # ── 思考(thinking)总开关 ──
-    # 取值 off(默认)/on/scene_default。引擎侧**未显式声明** thinking 的模型调用
-    # 才走它；显式逐步设置优先。查询统一覆盖由 agent_thinking 控制，默认保留原链路。
-    # 默认 off 的原因:reasoning token **计入** max_tokens(遍历 4096~8192、合成 8192),
-    # 实测 30 次查询里 9 次因思考把预算吃光 → stop_reason=model_output_truncated,
-    # 并且是"预算花在不产出内容的 token 上"的直接浪费。
-    # scene_default = 不发该字段,交回 llm-gateway 按 X-Jonex-Scene 白名单决定
-    # (LLMGW_DISABLE_THINKING_SCENES)。
+    # Default for model calls which do not explicitly select thinking mode.
     thinking_default: str = "off"
-    # on preserves existing per-step choices; off disables all query-agent thinking.
-    agent_thinking: Literal["on", "off"] = "on"
-    query_synthesis_thinking: Literal["scene_default", "on", "off"] = "off"
     query_token_cache_bytes: int = Field(default=16 * 1024 * 1024, ge=0)
 
     @property
@@ -227,38 +206,17 @@ class Settings(BaseSettings):
             "JONEX_WIKI_PACK_PREVIOUS_TOKENS": str(self.pack_previous_tokens),
             # 编译输入体检
             "JONEX_WIKI_INSPECT_ENABLED": on_off(self.inspect_enabled),
-            # model 超时重试
-            "QUERY_MODEL_CALL_TIMEOUT_SECONDS": str(self.query_model_call_timeout_seconds),
-            "QUERY_MODEL_CALL_TIMEOUT_RETRIES": str(self.query_model_call_timeout_retries),
-            # query 检索/开关
-            "QUERY_SNIPPET": on_off(self.query_snippet),
-            "QUERY_EXACT_IDENTIFIER_LOOKUP": "off",
-            "QUERY_GRAPH_DISCOVERY": on_off(self.query_graph_discovery),
-            "QUERY_RETRIEVAL_STRATEGY": self.query_retrieval_strategy,
-            "QUERY_MAX_SEARCH_HITS": str(self.query_max_search_hits),
-            "QUERY_EVIDENCE_EXCERPT_LIMIT": str(self.query_evidence_excerpt_limit),
-            "QUERY_EVIDENCE_UNITS_MAX": str(self.query_evidence_units_max),
-            "QUERY_EVIDENCE_PER_DOC_MAX": str(self.query_evidence_per_doc_max),
-            "QUERY_MAX_ACTIVE_EVIDENCE": str(self.query_max_active_evidence),
-            "QUERY_MAX_TOOL_CALLS": str(self.query_max_tool_calls),
-            "QUERY_MAX_LOGICAL_CALLS": str(self.query_max_logical_calls),
-            "QUERY_MAX_TOTAL_TOKENS": str(self.query_max_total_tokens),
-            "QUERY_MAX_CONTEXT_TOKENS": str(self.query_max_context_tokens),
-            "QUERY_MAX_SECONDS": str(self.query_max_seconds),
-            "QUERY_TRAVERSAL_MAX_TOKENS": str(self.query_traversal_max_tokens),
-            "QUERY_ANSWER_TARGET_HINT": on_off(self.query_answer_target_hint),
-            "QUERY_ANSWER_STYLE": self.query_answer_style,
             # 模型名(编译与查询都按**当下**的 env 走,见 current_llm_model)。
             # ⚠ 必须在这里序列化:查询/编译链路把执行包在 runtime_environment(...) 里,
             # current_env() 会**完全遮蔽** os.environ —— 不进这张映射的名字,
             # env 文件里写多少都不生效(test_query_budget_env.py 记录过同一个坑)。
             "LLM_MODEL": current_llm_model() or self.llm_model,
             # prepared cache
-            "JONEX_WIKI_PREPARED_CACHE_BYTES": str(self.prepared_cache_bytes),
             "JONEX_WIKI_QUERY_MATERIAL_CACHE_BYTES": str(self.query_material_cache_bytes),
-            "JONEX_WIKI_AGENT_THINKING": self.agent_thinking,
-            "QUERY_SYNTHESIS_THINKING": self.query_synthesis_thinking,
             "JONEX_WIKI_QUERY_TOKEN_CACHE_BYTES": str(self.query_token_cache_bytes),
+            "JONEX_WIKI_AGENT_REASONING_EFFORT": self.agent_reasoning_effort,
+            "JONEX_WIKI_AGENT_CLI_PATH": self.agent_cli_path,
+            "JONEX_WIKI_AGENT_MODEL_CATALOG": self.agent_model_catalog,
             # 解析杂项
             "JONEX_WIKI_ALLOW_PRIVATE_URLS": on_off(self.allow_private_urls),
             "JONEX_WIKI_TEXT_ENCODING": self.text_encoding,

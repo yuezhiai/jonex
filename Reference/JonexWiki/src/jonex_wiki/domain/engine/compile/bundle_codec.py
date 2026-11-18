@@ -43,7 +43,6 @@ from jonex_wiki.domain.engine.models.compiler_state import (
 )
 from jonex_wiki.domain.engine.models.claim import SUPPORT_RULE_VERSION
 from jonex_wiki.domain.engine.compile.content_validation import ValidatedClaim
-from jonex_wiki.domain.engine.compile.digest import classify_changes
 from jonex_wiki.domain.engine.compile.bundle import DecodedBundle, decode_bundle, sha256_hex
 from jonex_wiki.domain.engine.compile.error_book import ErrorBook
 from jonex_wiki.domain.engine.compile.rendering import render_wiki_tree
@@ -56,7 +55,6 @@ from jonex_wiki.domain.engine.compile.pipeline import (
     resolve_claim_policy,
 )
 from jonex_wiki.domain.engine.query.retrieval import (
-    build_fts_index_bytes,
     lexical_preprocessing_identity,
     build_query_corpus,
 )
@@ -143,56 +141,6 @@ def _corpus_sha256_impl(corpus, *, legacy: bool = False, derived_placeholders: t
         digest.update(b'}')
     digest.update(b'}')
     return digest.hexdigest()
-
-
-def remove_sources(
-    state: CompilerState,
-    claims: List[ValidatedClaim],
-    source_ids: List[str],
-) -> None:
-    """Prune deleted/changed sources and anything that depends on them.
-
-    Mutates ``state`` and ``claims`` in place.  Removed passages are dropped
-    from the archive and processed list; every claim whose evidence references
-    a removed passage is dropped; every page whose ``source_ids`` are a subset
-    of the removed passages (i.e. depends exclusively on deleted evidence) is
-    dropped together with its index entry.
-    """
-    if not source_ids:
-        return
-    source_set = set(source_ids)
-    deleted_passage_ids = {
-        pid
-        for pid, passage in state.source_archive.items()
-        if passage.source_id in source_set
-    }
-    if not deleted_passage_ids:
-        return
-
-    for pid in deleted_passage_ids:
-        state.source_archive.pop(pid, None)
-        if pid in state.processed_passage_ids:
-            state.processed_passage_ids.remove(pid)
-
-    removed_pages = []
-    for path, snapshot in state.pages.items():
-        if snapshot.source_ids and set(snapshot.source_ids).issubset(
-            deleted_passage_ids
-        ):
-            removed_pages.append(path)
-    for path in removed_pages:
-        state.pages.pop(path, None)
-        state.index.pop(path, None)
-    removed_pages_set = set(removed_pages)
-
-    retained: List[ValidatedClaim] = []
-    for claim in claims:
-        if claim.page_path in removed_pages_set:
-            continue
-        if any(ref.passage_id in deleted_passage_ids for ref in claim.evidence):
-            continue
-        retained.append(claim)
-    claims[:] = retained
 
 
 # ──────────────────────────────────────────────
@@ -365,6 +313,7 @@ def iter_bundle_files(
     shard_artifacts: bool = False,
     previous: Any = None,
     prepared_contribution_payload: Any = None,
+    coherent_articles: Any = (),
 ) -> Iterator[Tuple[str, bytes | RevisionFileReference | RevisionFileArtifact]]:
     """Yield identical bundle artifacts one at a time, without retaining their bytes."""
     claim_audit = prepared_audit if prepared_audit is not None else enforce_claim_policy(
@@ -424,6 +373,7 @@ def iter_bundle_files(
         "tool_checksum": effective_runtime.tool_checksum,
         "source_inventory_digest": source_inventory.digest,
         "runtime_snapshot_checksum": runtime_snapshot_checksum,
+        "coherent_reading": {"schema":"coherent-catalog-v1", "catalog":"catalog.sqlite", "coverage":"coverage.json"},
         "digest_map": digest_map,
         "source_digests": {
             source_id: snap["content_sha256"]
@@ -455,6 +405,7 @@ def iter_bundle_files(
     del revision
 
     manifest_payload = {
+        "coherent_reading": {"schema":"coherent-catalog-v1", "catalog":"catalog.sqlite", "coverage":"coverage.json"},
         "revision_id": revision_id,
         "tenant_id": tenant_id,
         "context_id": context_id,
@@ -529,9 +480,9 @@ def iter_bundle_files(
     # Draft prose remains auditable in revision.compiler_state, never the
     # public Wiki. Snapshot has no per-query route or live readers.
     from jonex_wiki.domain.engine.compile.publication import disposition_ledger
-    snapshot = {"schema_version": 2, "rule_version": KEEP_AND_SEARCH_RULE_VERSION,
+    snapshot = {"schema_version": 3, "rule_version": KEEP_AND_SEARCH_RULE_VERSION,
                 "revision_id": revision_id,
-                "corpus_sha256": _corpus_sha256(corpus)}
+                "corpus_sha256": _corpus_sha256(corpus, legacy=True)}
     yield ("query/corpus.json", _canonical_bytes(snapshot))
     from jonex_wiki.domain.engine.compile.mention_index import (
         build_page_graph_and_links,
@@ -565,7 +516,7 @@ def iter_bundle_files(
         "revision_id": revision_id,
         "page_source_ids": {path: page_source_ids_from_markdown(corpus.files[path])
                             for path in corpus.page_index},
-        "fact_mentions": {name: identity.pages_for(name) for name in sorted(
+        "fact_mentions": {name: [path for path in identity.pages_for(name) if path in corpus.page_index] for name in sorted(
             set(identity.entity_to_pages) | set(identity.topic_to_pages))},
         "page_links": published_query_links,
         "page_index": {key: value.model_dump() for key, value in corpus.page_index.items()},
@@ -654,16 +605,28 @@ def iter_bundle_files(
         digests[source_id] = digest
         yield ("sources/digests/{}.json".format(slug), _canonical_bytes(digest))
 
+    # A separate source-grounded relation projection keeps occurrence identity
+    # explicit. Missing target pages no longer erase a literally stated edge,
+    # and a same-name global Wiki page cannot silently identify its endpoint.
+    from jonex_wiki.domain.engine.compile.source_relations import build_source_relations, FILE as SOURCE_RELATIONS_FILE
+    source_relation_payload = build_source_relations(
+        contributions, state.source_archive, snapshots, corpus.page_index,
+        article_paths={sid: 'sources/articles/'+source_slug(sid)+'.md' for sid in snapshots})
+    yield (SOURCE_RELATIONS_FILE, _canonical_bytes(source_relation_payload))
+
     # Attach the fixed original and source-level table grid once.  Local paths
     # are transport-only and were removed from compiler_state by
     # artifact_to_passage, so a moved Bundle never depends on the build host.
     attachments_seen = set()
-    attachment_registry: Dict[str, Dict[str, str]] = {}
+    attachment_registry: Dict[str, Dict[str, Any]] = {}
     table_ids_by_source: Dict[str, List[str]] = {}
     for artifact in artifacts:
         slug = source_slug(artifact.source_id)
         metadata = artifact.source_metadata or {}
+        if metadata.get('original_availability'):
+            attachment_registry.setdefault(artifact.source_id,{})['original_availability']=metadata['original_availability']
         for key, relative in (("original_local_path", "original" + Path(str(metadata.get("source_name") or "source")).suffix.lower()),
+                              ('declared_original_local_path','delivered-original'+Path(str(metadata.get('declared_original_local_path') or 'source')).suffix.lower()),
                               ("tables_sqlite_local_path", "tables.sqlite")):
             local = metadata.get(key)
             target = "sources/{}/{}".format(slug, relative)
@@ -673,16 +636,30 @@ def iter_bundle_files(
             if not path.is_file():
                 raise ValueError("bundle attachment is missing: " + str(path))
             data = path.read_bytes()
-            if key == "original_local_path" and sha256_hex(data) != artifact.sha256:
+            if key in {"original_local_path",'declared_original_local_path'} and sha256_hex(data) != artifact.sha256:
                 raise ValueError("original attachment checksum changed during compile")
             if key == "tables_sqlite_local_path":
                 # The grid is the authoritative list of published tables: a
                 # source may declare fewer handles than its artifact holds.
                 table_ids_by_source[artifact.source_id] = _registered_table_ids(path)
+                import sqlite3
+                from jonex_wiki.domain.engine.compile.table_navigation import read_inventory,full_table_path,full_table_file
+                with sqlite3.connect(path.resolve().as_uri()+'?mode=ro&immutable=1',uri=True) as grid:
+                    inventory=read_inventory(grid)
+                    for table in inventory:
+                        try:
+                            table_bytes=full_table_file(grid,artifact.source_id,table['table_id'],target)
+                        except (sqlite3.Error,KeyError,ValueError) as error:
+                            table['full_table_error']=type(error).__name__
+                        else:
+                            table['page_path']=full_table_path(artifact.source_id,table['table_id'])
+                            yield (table['page_path'],table_bytes)
+                attachment_registry.setdefault(artifact.source_id,{})['tables_inventory']=inventory
+                attachment_registry[artifact.source_id]['tables_sha256']=sha256_hex(data)
             yield (target, data)
             attachments_seen.add(target)
             attachment_registry.setdefault(artifact.source_id, {})[
-                "original" if key == "original_local_path" else "tables"
+                "original" if key == "original_local_path" else 'declared_original' if key=='declared_original_local_path' else "tables"
             ] = target
     _validate_skipped_table_claims(artifacts, table_ids_by_source)
     for source_id, digest in digests.items():
@@ -701,7 +678,7 @@ def iter_bundle_files(
                 sha256_hex(source_id.encode())[:16]
             ),
             "table_ids": table_ids_by_source.get(source_id, []),
-            **attachment_registry.get(source_id, {}),
+            **{key:value for key,value in attachment_registry.get(source_id, {}).items() if key!='tables_inventory'},
         } for source_id in sorted(snapshots)],
     }))
 
@@ -765,24 +742,69 @@ def iter_bundle_files(
     }
     yield ("provenance.json", _canonical_bytes(provenance))
 
-    lexical_bytes = lexical_index or build_fts_index_bytes(corpus)
-    if not isinstance(lexical_bytes,(bytes,RevisionFileReference,RevisionFileArtifact)) or not lexical_bytes:
-        raise ValueError("lexical index must be non-empty SQLite bytes")
-    yield ("indexes/lexical.sqlite", lexical_bytes)
-
     index_manifest = {
         "schema_version": 1,
         "revision_id": revision_id,
         "source_inventory_digest": source_inventory.digest,
         "runtime_snapshot_checksum": runtime_snapshot_checksum,
-        "lexical": {
+        "lexical": {"format": "none"},
+    }
+    if lexical_index is not None:
+        if not isinstance(lexical_index,(bytes,RevisionFileReference,RevisionFileArtifact)) or not lexical_index:
+            raise ValueError("lexical index must be non-empty SQLite bytes")
+        yield ("indexes/lexical.sqlite", lexical_index)
+        index_manifest["lexical"] = {
             "preprocessing": lexical_preprocessing_identity(),
             "format": "sqlite-fts5",
-            "sha256": lexical_bytes.sha256 if isinstance(lexical_bytes,(RevisionFileReference,RevisionFileArtifact)) else sha256_hex(lexical_bytes),
+            "sha256": lexical_index.sha256 if isinstance(lexical_index,(RevisionFileReference,RevisionFileArtifact)) else sha256_hex(lexical_index),
             "page_count": len(corpus.page_text),
-        },
-    }
+        }
     yield ("indexes/manifest.json", _canonical_bytes(index_manifest))
+    from jonex_wiki.domain.engine.compile.coherent_catalog import (
+        build_core, article_files, PATH as CATALOG_PATH, RULE as CATALOG_RULE, COVERAGE,
+    )
+    from jonex_wiki.domain.engine.compile.source_heading_references import attach_heading_references
+    from jonex_wiki.domain.engine.compile.table_navigation import prepare_table_navigation
+    source_paths={sid:'sources/articles/'+source_slug(sid)+'.md' for sid in snapshots}
+    coherent_articles=attach_heading_references(coherent_articles,snapshots,source_paths)
+    coherent_articles=prepare_table_navigation(coherent_articles,snapshots,attachment_registry)
+    catalog, coverage = build_core(
+        scope={'tenant':tenant_id or '__unscoped__','kb':context_id or '__unscoped__','publication':revision_id},
+        snapshots=snapshots, corpus=corpus, records=contributions.records,
+        relations=source_relation_payload,
+        source_paths=source_paths,
+        attachments=attachment_registry, articles=coherent_articles,
+        archive=state.source_archive,
+        producer={'rule':CATALOG_RULE,'runtime_snapshot_checksum':runtime_snapshot_checksum})
+    yield (CATALOG_PATH,catalog)
+    yield (COVERAGE,_canonical_bytes(coverage))
+    yield from article_files(coherent_articles,catalog)
+
+
+def authored_publication_overlays(view, revision_id, counts, summary):
+    """Change only revision headers and authored files after source staging."""
+    overlays = {}
+    for path in ("revision.json", "manifest.json", "query/corpus.json",
+                 "query/navigation.json", "sources/registry.json", "provenance.json"):
+        data = json.loads(view.read_bytes(path))
+        data["revision_id"] = revision_id
+        if path in ("revision.json", "manifest.json"):
+            data["coherent_reading"]["catalog_source_revision"] = view.revision_id
+        if path == "manifest.json":
+            data["counts"].update(counts)
+        overlays[path] = _canonical_bytes(data)
+    entries = set(view.list_entries("articles/"))
+    article_index = view.read_bytes("articles/index.md") if "articles/index.md" in entries else b"# Articles\n"
+    overlays["articles/index.md"] = article_index + b"\n\n- [Agent authored articles](authored/index.md)\n"
+    for path, content in summary["files"].items():
+        if not path.startswith("articles/authored/") or ".." in Path(path).parts:
+            raise ValueError("INVALID_AUTHORED_PUBLICATION_PATH")
+        overlays[path] = content
+    overlays["compile_agent.json"] = _canonical_bytes({k: v for k, v in summary.items() if k != "files"})
+    coverage = json.loads(view.read_bytes("coverage.json"))
+    coverage["articles"]["agent_authored"] = counts["synthesized_articles"]
+    overlays["coverage.json"] = _canonical_bytes(coverage)
+    return overlays
 
 
 def build_empty_bundle_files(
@@ -848,7 +870,7 @@ class PreviousBundle:
     source_inventory: SourceInventorySnapshot
     effective_runtime: EffectiveRuntimeSnapshot
     runtime_snapshot_checksum: str
-    lexical_index: bytes | RevisionFileReference
+    lexical_index: bytes | RevisionFileReference | None
     index_manifest: Dict[str, Any]
     corpus: Any = None
     render_signatures: Dict[str, str] | None = None
@@ -1217,11 +1239,16 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         lexical_meta = index_manifest.get("lexical")
         if not isinstance(lexical_meta, dict):
             raise ValueError("lexical index manifest must be an object")
-        lexical_index = (decoded.files.file_reference('indexes/lexical.sqlite')
-            if hasattr(decoded.files,'file_reference') else decoded.files['indexes/lexical.sqlite'])
-        lexical_sha = lexical_index.sha256 if isinstance(lexical_index,RevisionFileReference) else sha256_hex(lexical_index)
-        if lexical_meta.get("sha256") != lexical_sha:
-            raise ValueError("lexical index checksum does not match index manifest")
+        lexical_index = None
+        if lexical_meta == {"format": "none"}:
+            if "indexes/lexical.sqlite" in decoded.files:
+                raise ValueError("unexpected legacy lexical index")
+        else:
+            lexical_index = (decoded.files.file_reference('indexes/lexical.sqlite')
+                if hasattr(decoded.files,'file_reference') else decoded.files['indexes/lexical.sqlite'])
+            lexical_sha = lexical_index.sha256 if isinstance(lexical_index,RevisionFileReference) else sha256_hex(lexical_index)
+            if lexical_meta.get("sha256") != lexical_sha:
+                raise ValueError("lexical index checksum does not match index manifest")
         has_snapshot = "query/corpus.json" in decoded.files
         snapshot = json.loads(decoded.files["query/corpus.json"]) if has_snapshot else None
         from jonex_wiki.domain.engine.compile.publication import (
@@ -1312,14 +1339,16 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                                             claim_audit.get("support_rule") or "claim-support-v1"
                                         ))
         if has_snapshot:
-            if lexical_meta.get("preprocessing") != lexical_preprocessing_identity():
+            if lexical_index is not None and lexical_meta.get("preprocessing") != lexical_preprocessing_identity():
                 raise ValueError("LEXICAL_PREPROCESSING_CHANGED: rebuild the published index")
             expected_wiki = {"wiki/" + p for p in corpus.files}
             if {p for p in decoded.files if p.startswith("wiki/")} != expected_wiki:
                 raise ValueError("published Wiki file set differs from query snapshot")
-            if (snapshot.get("schema_version") not in (1, 2) or snapshot_rule not in (RULE_VERSION, LEGACY_RULE_VERSION, KEEP_AND_SEARCH_RULE_VERSION)
+            if (snapshot.get("schema_version") not in (1, 2, 3) or snapshot_rule not in (RULE_VERSION, LEGACY_RULE_VERSION, KEEP_AND_SEARCH_RULE_VERSION)
                     or snapshot.get("revision_id") != decoded.revision_id):
                 raise ValueError("unsupported query snapshot version")
+            if lexical_index is None and snapshot["schema_version"] != 3:
+                raise ValueError("legacy Bundle requires the lexical index")
             if snapshot["schema_version"] == 1:
                 corpus_material = corpus.model_dump()
                 legacy_corpus_material = {
@@ -1331,6 +1360,8 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
                     {**corpus_material, "page_vectors": None},
                     {**legacy_corpus_material, "page_vectors": None},
                 )
+            elif snapshot["schema_version"] == 3:
+                valid_snapshot = snapshot.get("corpus_sha256") == _corpus_sha256(corpus, legacy=True)
             else:
                 expected_digest = snapshot.get("corpus_sha256")
                 # These two projections are loaded only after verification and
@@ -1353,47 +1384,50 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
             for path, content in corpus.files.items():
                 if decoded.checksums.get("wiki/" + path) != sha256_hex(content.encode("utf-8")):
                     raise ValueError("published Wiki differs from query snapshot")
-        if lexical_meta.get("page_count") != len(corpus.page_text):
+        if lexical_index is None and not has_snapshot:
+            raise ValueError("missing query snapshot")
+        if lexical_index is not None and lexical_meta.get("page_count") != len(corpus.page_text):
             raise ValueError("lexical manifest page count does not match Wiki pages")
-        # Opening the frozen SQLite bytes proves the index is readable now,
-        # before any Revision can point at this bundle.
-        from jonex_wiki.domain.engine.query.algorithm import _open_fts_index
+        if lexical_index is not None:
+            # Opening the frozen SQLite bytes proves the index is readable now,
+            # before any Revision can point at this bundle.
+            from jonex_wiki.domain.engine.query.algorithm import _open_fts_index
 
-        lexical_connection = _open_fts_index(lexical_index)
-        try:
-            lexical_tables = {
-                row[0]
-                for row in lexical_connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            indexed_paths = {
-                row[0]
-                for row in lexical_connection.execute(
-                    "SELECT path FROM pages"
-                ).fetchall()
-            }
-            indexed_claims = (
-                sorted(
-                    (row[0], row[1])
+            lexical_connection = _open_fts_index(lexical_index)
+            try:
+                lexical_tables = {
+                    row[0]
                     for row in lexical_connection.execute(
-                        "SELECT page_path, claim_id FROM claims"
+                        "SELECT name FROM sqlite_master WHERE type='table'"
                     ).fetchall()
+                }
+                indexed_paths = {
+                    row[0]
+                    for row in lexical_connection.execute(
+                        "SELECT path FROM pages"
+                    ).fetchall()
+                }
+                indexed_claims = (
+                    sorted(
+                        (row[0], row[1])
+                        for row in lexical_connection.execute(
+                            "SELECT page_path, claim_id FROM claims"
+                        ).fetchall()
+                    )
+                    if "claims" in lexical_tables
+                    else None
                 )
-                if "claims" in lexical_tables
-                else None
+            finally:
+                lexical_connection.close()
+            expected_claims = sorted(
+                (path, claim.claim_id)
+                for path, page_claims in corpus.claims.items()
+                for claim in page_claims
             )
-        finally:
-            lexical_connection.close()
-        expected_claims = sorted(
-            (path, claim.claim_id)
-            for path, page_claims in corpus.claims.items()
-            for claim in page_claims
-        )
-        if indexed_paths != set(corpus.page_text):
-            raise ValueError("lexical index paths do not match published Wiki pages")
-        if indexed_claims is not None and indexed_claims != expected_claims:
-            raise ValueError("lexical index claims do not match published claims")
+            if indexed_paths != set(corpus.page_text):
+                raise ValueError("lexical index paths do not match published Wiki pages")
+            if indexed_claims is not None and indexed_claims != expected_claims:
+                raise ValueError("lexical index claims do not match published claims")
     except (KeyError, ValueError, TypeError) as exc:
         raise ValueError("malformed previous bundle content") from exc
     # S6.3: attach the audited links last - after every snapshot/digest check
@@ -1452,7 +1486,7 @@ def _decode_previous_decoded(decoded: DecodedBundle) -> PreviousBundle:
         json_shards=json_shards,
         navigation=navigation if navigation_raw else None,
         relation_payload=raw_relations,
-        source_unit_rule_version=snapshot_rule if lexical_index is not None else None,
+        source_unit_rule_version=snapshot_rule,
         render_signatures=(
             _string_map(json.loads(decoded.files["indexes/render_signatures.json"])["signatures"],
                         "render signatures")

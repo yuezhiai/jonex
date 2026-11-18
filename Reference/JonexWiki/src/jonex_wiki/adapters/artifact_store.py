@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
-from jonex_wiki.adapters.bundle_view import DirectoryBundleView, read_revision_header, remember_verified_file
+from jonex_wiki.adapters.bundle_view import DirectoryBundleView, bundle_sha_from_files, read_revision_header, remember_verified_file
 from jonex_wiki.kernel.ports import ArtifactStore, BundleView, RevisionFileReference,RevisionFileArtifact
 from jonex_wiki.storage.layout import Layout
 
@@ -31,6 +31,14 @@ _MANIFEST_EXCLUDED = "indexes/manifest.json"
 _REVISION_SCHEMA = "jonex_wiki.bundle_revision.v1"
 # Cache keys are sha256 hex digests produced by the engine, never user text.
 _CACHE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _detach_catalog(path: Path) -> None:
+    """Keep a private catalogue update off any published inode."""
+    if path.stat().st_nlink > 1:
+        detached = path.with_suffix(".enriching")
+        shutil.copyfile(path, detached)
+        os.replace(detached, path)
 
 
 def _bundle_sha_of(staging: Path) -> str:
@@ -49,18 +57,10 @@ def _bundle_sha_of(staging: Path) -> str:
     return h.hexdigest()
 
 
-def _bundle_sha_from_files(files: Mapping[str, str]) -> str:
-    digest = hashlib.sha256()
-    for path, checksum in sorted(files.items()):
-        digest.update(path.encode())
-        digest.update(b"\0")
-        digest.update(bytes.fromhex(checksum))
-    return digest.hexdigest()
-
-
 class ArtifactStoreAdapter(ArtifactStore):
     supports_file_references = True
     supports_json_shards = True
+    article_source_key = "article-source"
     def __init__(self, layout: Layout, *, tenant_id: str, kb_id: str) -> None:
         self._layout = layout
         self._tenant_id = tenant_id
@@ -83,6 +83,30 @@ class ArtifactStoreAdapter(ArtifactStore):
         directory.mkdir(parents=True,exist_ok=True)
         return directory
 
+    def open_staged_revision(self,key):
+        """Open a sealed PRIVATE candidate without advancing publication."""
+        return DirectoryBundleView(tenant_id=self._tenant_id,context_id=self._kb_id,
+            revision_dir=self._layout.staging_dir(self._tenant_id,self._kb_id,key))
+
+    async def resume_article_source(self, identity: str) -> DirectoryBundleView | None:
+        def load():
+            try:
+                view = self.open_staged_revision(self.article_source_key)
+                if (view.tenant_id, view.context_id) != (self._tenant_id, self._kb_id):
+                    return None
+                if (view.manifest["fingerprints"].get("article_source") != identity
+                        or json.loads(view.read_bytes(_MANIFEST_EXCLUDED)).get("private_source") is not True):
+                    return None
+                view.verify_integrity()
+            except (OSError, ValueError, TypeError, KeyError):
+                return None
+            return view
+        return await asyncio.to_thread(load)
+
+    async def clear_article_source(self) -> None:
+        path = self._layout.staging_dir(self._tenant_id, self._kb_id, self.article_source_key)
+        await asyncio.to_thread(shutil.rmtree, path, True)
+
     async def stage_revision(
         self,
         tenant_id: str,
@@ -93,14 +117,15 @@ class ArtifactStoreAdapter(ArtifactStore):
         attempt_id: str | None = None,
         parent_revision: str | None = None,
         fingerprints: Mapping[str, str] | None = None,
+        private_source: bool = False,
     ) -> str:
         return await asyncio.to_thread(
             self._stage_revision, tenant_id, context_id, revision_id, files,
-            attempt_id, parent_revision, fingerprints,
+            attempt_id, parent_revision, fingerprints, private_source,
         )
 
     def _stage_revision(self, tenant_id, context_id, revision_id, files,
-                        attempt_id, parent_revision, fingerprints) -> str:
+                        attempt_id, parent_revision, fingerprints, private_source=False) -> str:
         staging_key = attempt_id or revision_id
         staging = self._layout.staging_dir(tenant_id, context_id, staging_key)
         # A restarted compile has already decoded its completed prior stage.
@@ -240,12 +265,15 @@ class ArtifactStoreAdapter(ArtifactStore):
                 raise ValueError("MEDIA_ASSET_CHANGED_DURING_PUBLICATION")
             file_digests[target.relative_to(staging).as_posix()] = checksum
 
-        # Build the derived graph before hashing/sealing this new publication.
-        # Existing publications are immutable; pre-index bundles use a cache.
-        from jonex_wiki.domain.reading.knowledge_graph import INDEX_PATH, build_index
-        if (staging / "query/navigation.json").is_file():
-            build_index(staging, staging / INDEX_PATH, tenant_id, context_id)
-            file_digests[INDEX_PATH] = hashlib.sha256((staging / INDEX_PATH).read_bytes()).hexdigest()
+        # The common catalog is completed while this is still a private
+        # candidate. Native media and grids retain their original handlers.
+        from jonex_wiki.domain.engine.compile.coherent_catalog import enrich_resources, PATH as CATALOG_PATH, COVERAGE
+        if (staging / CATALOG_PATH).is_file():
+            catalog_path=staging/CATALOG_PATH
+            _detach_catalog(catalog_path)
+            enrich_resources(staging)
+            for relative in (CATALOG_PATH,COVERAGE):
+                file_digests[relative]=hashlib.sha256((staging/relative).read_bytes()).hexdigest()
 
         from jonex_wiki.kernel.telemetry import current_runtime_telemetry, telemetry_stage
         with telemetry_stage(current_runtime_telemetry(), "bundle_revision_enrich"):
@@ -254,10 +282,72 @@ class ArtifactStoreAdapter(ArtifactStore):
             )
         # bundle_sha 必须在 indexes/manifest.json 写入前计算（它排除自身）。
         file_digests["revision.json"] = hashlib.sha256((staging / "revision.json").read_bytes()).hexdigest()
-        sha = _bundle_sha_from_files(file_digests)
+        sha = bundle_sha_from_files(file_digests)
         with telemetry_stage(current_runtime_telemetry(), "bundle_manifest_write"):
+            if private_source:
+                header = json.loads(core_index_manifest or b"{}")
+                header["private_source"] = True
+                core_index_manifest = json.dumps(header).encode()
             self._write_index_manifest(staging, core_index_manifest, sha, file_digests=file_digests)
         return staging_key
+
+    async def finish_authored_revision(self, key, view, revision_id, overlays, *, fingerprints,
+                                       output_key=None):
+        """Seal authored files and new headers on the already staged source artifacts."""
+        return await asyncio.to_thread(
+            self._finish_authored_revision, key, view, revision_id, overlays, fingerprints, output_key
+        )
+
+    def _finish_authored_revision(self, key, view, revision_id, overlays, fingerprints, output_key):
+        staging = self._layout.staging_dir(self._tenant_id, self._kb_id, key)
+        header = json.loads((staging / _MANIFEST_EXCLUDED).read_bytes())
+        if (view._dir != staging or view.is_published_revision
+                or (view.tenant_id, view.context_id) != (self._tenant_id, self._kb_id)
+                or header.get("bundle_sha") != view.manifest_hash
+                or header.pop("private_source", None) is not True):
+            raise ValueError("EXPECTED_PRIVATE_SOURCE_CANDIDATE")
+        file_digests = header.pop("files")
+        if bundle_sha_from_files(file_digests) != view.manifest_hash:
+            raise ValueError("bundle manifest identity mismatch")
+        view.verify_integrity()
+        if output_key is not None and output_key != key:
+            output = self._layout.staging_dir(self._tenant_id, self._kb_id, output_key)
+            if output.exists():
+                shutil.rmtree(output)
+            shutil.copytree(staging, output, copy_function=os.link)
+            staging, key = output, output_key
+        # The source candidate is never exposed to published readers. Replacing
+        # a header atomically also detaches it from any parent hard link.
+        allowed = {
+            "revision.json", "manifest.json", "query/corpus.json", "query/navigation.json",
+            "sources/registry.json", "provenance.json", "articles/index.md",
+            "compile_agent.json", "coverage.json",
+        }
+        for path, data in overlays.items():
+            if (path not in allowed and (
+                    not path.startswith("articles/authored/") or ".." in Path(path).parts
+                    or not path.endswith(".md"))):
+                raise ValueError("INVALID_AUTHORED_PUBLICATION_PATH")
+            if path == "revision.json":
+                data = json.dumps({**json.loads(data), "fingerprints": dict(fingerprints)},
+                                  ensure_ascii=False, separators=(",", ":")).encode()
+            self._layout.atomic_write(staging / path, data)
+            checksum = hashlib.sha256(data).hexdigest()
+            file_digests[path] = checksum
+            remember_verified_file(DirectoryBundleView._file_identity((staging / path).stat()), checksum)
+        from jonex_wiki.domain.engine.compile.coherent_catalog import PATH as CATALOG_PATH, index_authored_articles
+        catalog = staging / CATALOG_PATH
+        if catalog.is_file():
+            _detach_catalog(catalog)
+            if index_authored_articles(catalog, file_digests, overlays):
+                with catalog.open("rb") as stream:
+                    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+                file_digests[CATALOG_PATH] = checksum
+                remember_verified_file(DirectoryBundleView._file_identity(catalog.stat()), checksum)
+        header["revision_id"] = revision_id
+        self._write_index_manifest(staging, json.dumps(header).encode(),
+                                   bundle_sha_from_files(file_digests), file_digests=file_digests)
+        return key
 
     async def publish_revision(
         self,
@@ -269,6 +359,8 @@ class ArtifactStoreAdapter(ArtifactStore):
     ) -> str:
         staging = self._layout.staging_dir(tenant_id, context_id, staging_key)
         manifest = json.loads((staging / _MANIFEST_EXCLUDED).read_text("utf-8"))
+        if manifest.get("private_source"):
+            raise ValueError("PRIVATE_SOURCE_CANDIDATE_CANNOT_PUBLISH")
         sha = manifest["bundle_sha"]
         existing = self._layout.versions_dir(tenant_id, context_id, sha)
         if existing.is_dir():
@@ -359,6 +451,11 @@ class ArtifactStoreAdapter(ArtifactStore):
         json.loads(data.decode("utf-8"))
         return data
 
+    async def remove_checkpoint_namespace(self, namespace: str) -> None:
+        directory = self._layout.checkpoint_dir(self._tenant_id, self._kb_id, namespace)
+        if directory.is_dir():
+            await asyncio.to_thread(shutil.rmtree, directory)
+
     # ── internals ──────────────────────────────────────────────────────
 
     def _enrich_revision(
@@ -434,6 +531,5 @@ class ArtifactStoreAdapter(ArtifactStore):
             ),
             "segmenter": {"lib": "jieba", "version": jieba.__version__},
         })
-        (idx_dir / "manifest.json").write_text(
-            json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        self._layout.atomic_write(idx_dir / "manifest.json",
+                                  json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8"))

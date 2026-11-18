@@ -133,11 +133,7 @@ class ManifestData(BaseModel):
         },
     )
     query: Dict[str, Any] = Field(
-        default_factory=lambda: {
-            "strategy": "browse-first",
-            "maxToolCalls": 32,
-            "emptySearchPatience": 3,
-        },
+        default_factory=lambda: {"strategy": "agent_direct"},
     )
 
     model_config = ConfigDict(extra="ignore")
@@ -154,11 +150,7 @@ class ManifestData(BaseModel):
                 "finalRepairRounds": 3,
                 "allowPartialSources": False,
             },
-            query={
-                "strategy": "browse-first",
-                "maxToolCalls": 32,
-                "emptySearchPatience": 3,
-            },
+            query={"strategy": "agent_direct"},
         )
 
 
@@ -482,7 +474,7 @@ class WikiRevision(BaseModel):
 
 
 class QueryStrategy(str, Enum):
-    BROWSE_FIRST = "browse-first"
+    AGENT_DIRECT = "agent_direct"
 
 
 class QueryEventType(str, Enum):
@@ -603,9 +595,9 @@ class EvidenceSpan(BaseModel):
 
 
 class ToolCall(BaseModel):
-    """A single tool invocation record in the trace."""
+    """Historical tool-invocation record kept for saved data compatibility."""
 
-    tool_name: str = Field(..., description="wiki_search | wiki_read")
+    tool_name: str = Field(..., description="Recorded tool or command name")
     tool_input: Dict[str, Any] = Field(default_factory=dict)
     result_summary: str = Field(default="", description="Summary of tool output (no chain-of-thought)")
     evidence_ids: List[str] = Field(default_factory=list, description="EvidenceRef IDs collected")
@@ -621,7 +613,7 @@ class SearchHit(BaseModel):
 
 
 class ReadResult(BaseModel):
-    """Result of a wiki_read tool call."""
+    """Historical page-read shape kept for saved data compatibility."""
 
     path: str = Field(...)
     title: str = Field(default="")
@@ -632,7 +624,7 @@ class ReadResult(BaseModel):
 class QueryMetrics(BaseModel):
     """Aggregate metrics produced at the end of a Query Run."""
 
-    strategy: QueryStrategy = Field(default=QueryStrategy.BROWSE_FIRST)
+    strategy: QueryStrategy = Field(default=QueryStrategy.AGENT_DIRECT)
     tool_calls: int = Field(default=0)
     search_calls: int = Field(default=0)
     read_calls: int = Field(default=0)

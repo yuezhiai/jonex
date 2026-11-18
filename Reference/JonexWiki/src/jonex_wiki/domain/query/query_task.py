@@ -45,6 +45,7 @@ _PUBLIC_TRACE_FIELDS = {
     'query_images_used': ('count',),
     "image_tool_result": ("tool", "status", "total", "query", "asset_id", "read_id", "delivered_sha256", "actual_image_delivered"),
     "retrieval_policy": ("strategy",),
+    "search_progress": ("replans", "stopped_after_repeat"),
     "retrieval_entry": ("strategy", "paths", "navigation_paths", "semantic", "graph_used",
         "named_document_ids", "named_source_paths", "semantic_applied_paths"),
     "source_read_alias": ("requested_path", "resolved_path", "basis", "support"),
@@ -53,7 +54,7 @@ _PUBLIC_TRACE_FIELDS = {
         "tool", "query", "paths", "candidate_paths", "frontier_paths",
         "count", "success", "cached", "table_id", "status", "cells", "has_more",
         "operation", "matched_count",
-        "graph_candidate_paths", "graph_revision", "graph_backend",
+        "graph_candidate_paths", "graph_revision", "graph_backend", "table_candidate_paths",
     ),
     "reading_material_delivered": ("path", "source_id", "unit_id", "unit_kind",
         "selected_level", "pages", "page_count", "truncated", "whole_unit", "body_bytes"),
@@ -65,6 +66,8 @@ _PUBLIC_TRACE_FIELDS = {
     "table_tool_normalized_to_workbook": ("tool", "source_id", "table_id", "body_bytes", "citation_count"),
     "search_rewritten": ("from", "to"),
     "search_constraints_preserved": ("terms", "query"),
+    "unread_frontier_recovery": ("reason", "paths", "limit"),
+    "located_rows_recovery": ("reason", "scopes", "coverage", "match_limit"),
     "source_evidence_read": ("paths", "kind"),
     # keep-and-search-v1：claim 未准入的生成页读取时，回挂其原始来源区间
     "evidence_fallback_read": ("paths", "kind", "generated_claim", "spans"),
@@ -141,7 +144,7 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
         if published is None or not published.is_dir():
             raise NotFoundError(f"知识库 {kb_id} 无已发布 bundle")
         bundle_sha = published.name
-        from jonex_wiki.domain.source_visibility import ensure_sources_visible
+        from jonex_wiki.domain.source_visibility import bundle_document_ids, ensure_sources_visible
         async with session_factory() as session:
             await ensure_sources_visible(session, tenant_id, kb_id, published)
 
@@ -167,44 +170,41 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
         }
         request = {"question": row.question}
 
-        # 4) 核心查询算法；运行时旋钮经 Settings 注入
+        # 4) Agent reads the pinned publication directly.
         environment = settings.runtime_env()
-        environment["QUERY_IMAGE_INSPECTION_ENABLED"] = "1" if settings.visual_inspection_enabled else "0"
-        environment["QUERY_IMAGE_MODEL"] = settings.visual_inspection_model or settings.llm_model
         options_path = layout.kb_dir(tenant_id,kb_id) / "query-options" / (row.query_id+".json")
         if options_path.is_file():
             import json
             query_options = json.loads(options_path.read_text())
-            strategy = query_options.get("retrieval_strategy")
-            if strategy is not None and strategy not in {"tree", "direct", "structure", "semantic"}:
-                raise ValueError("QUERY_RETRIEVAL_STRATEGY_INVALID")
-            if strategy is not None:
-                environment["QUERY_RETRIEVAL_STRATEGY"] = strategy
             if query_options.get('query_context'):
                 request['query_context'] = query_options['query_context']
-        if thinking_mode is not None:
-            from jonex_wiki.domain.query.thinking import thinking_overrides
-            environment.update(thinking_overrides(thinking_mode))
         from jonex_wiki.adapters.query_progress import QueryProgressAdapter
         from jonex_wiki.kernel.query_progress import query_progress
+        ports = {"store": store, "model": model}
+        from jonex_wiki.adapters.agent_direct import AgentDirectExecutor
+        request['run_id'] = row.query_id
+        # Older clients may still send thinking_mode.  It is accepted for
+        # compatibility but cannot override the deployment's single policy.
+        ports['agent_direct'] = AgentDirectExecutor(gw, settings)
         async with QueryProgressAdapter(session_factory, tenant_id, row.query_id) as progress:
             with runtime_environment(environment), query_progress(progress.record):
                 result = await engine.query(
-                    request, revision, {"store": store, "model": model}, cancel=cancel,
-                    trace_id=trace_id,
+                    request, revision, ports, cancel=cancel,
+                    **({"trace_id": trace_id} if trace_id else {})
                 )
-        if thinking_mode is not None:
-            result.config["thinking_mode"] = thinking_mode
-        result.config["retrieval_strategy"] = environment.get("QUERY_RETRIEVAL_STRATEGY", "tree")
+        result.config["retrieval_strategy"] = 'agent_direct'
 
         from jonex_wiki.adapters.bundle_view import DirectoryBundleView
-        from jonex_wiki.domain.engine.query.media import attach_media
+        from jonex_wiki.domain.engine.query.media import attach_media, present_selected_images
         citations = attach_media(_dump_citations(result.citations), DirectoryBundleView(
             tenant_id=tenant_id, context_id=kb_id, revision_dir=published), row.question, result.answer)
         out = {
-            "answer": result.answer,
+            "answer": present_selected_images(result.answer, citations),
             "citations": citations,
+            "unverified_citations": list(result.unverified_citations),
             "incomplete": result.incomplete,
+            "incomplete_reason": result.incomplete_reason,
+            "recovery_notes": result.recovery_notes,
             "search_calls": result.search_calls,
             "read_calls": result.read_calls,
             "tool_calls": result.tool_calls,
@@ -218,6 +218,12 @@ def create_query_runner(session_factory, settings, layout: Layout, gw, executor=
             "spans": _dump_spans(getattr(result, "spans", None)),
             "request_id": row.query_id,
             "bundle_sha": bundle_sha,
+            # Conservative scope for replaying an answer after source removal:
+            # an Agent can inspect any source in its pinned Bundle, even when
+            # it does not emit a successfully verified citation. Avoid silently
+            # truncating this set, which would make replay checks unsound.
+            "source_document_ids": (sorted(bundle_document_ids(published))
+                                    if len(bundle_document_ids(published)) <= 10000 else None),
             "latency_ms": int((time.monotonic() - start) * 1000),
         }
         log.info("query done kb=%s sha=%s latency_ms=%d", kb_id, bundle_sha, out["latency_ms"])

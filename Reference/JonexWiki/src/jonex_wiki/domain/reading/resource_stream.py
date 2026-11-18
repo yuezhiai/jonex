@@ -16,12 +16,14 @@ _PROOFS = OrderedDict()
 _LOCK = RLock()
 
 
-async def media_response(layout, tenant_id, kb_id, revision, object_id, headers):
+async def media_response(layout, tenant_id, kb_id, revision, object_id, headers, *, visibility_guard=None):
     if not re.fullmatch(r"[0-9a-f]{64}", revision or ""):
         raise ValidationError("RESOURCE_REVISION_INVALID")
     async with layout.version_lock(tenant_id, kb_id):
         pub = layout.versions_dir(tenant_id, kb_id, revision)
         if not pub.is_dir():raise NotFoundError("RESOURCE_PUBLICATION_NOT_FOUND")
+        if visibility_guard:
+            await visibility_guard(pub)
         view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
         resources = json.loads(view.read_bytes("query/resources.json"))
         obj = next((o for o in resources["objects"] if o["object_id"] == object_id), None)

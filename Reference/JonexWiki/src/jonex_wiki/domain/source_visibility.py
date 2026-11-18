@@ -20,4 +20,4 @@ async def ensure_sources_visible(session, tenant_id, kb_id, published):
         DocumentRow.tenant_id == tenant_id, DocumentRow.kb_id == kb_id,
         DocumentRow.deleted_at.isnot(None)))).scalars())
     if deleted and deleted.intersection(bundle_document_ids(published)):
-        raise ConflictError("已发布版本包含已删除来源；请等待增量编译完成后检索")
+        raise ConflictError("已发布版本包含已删除来源；请等待增量编译完成后阅读或检索")

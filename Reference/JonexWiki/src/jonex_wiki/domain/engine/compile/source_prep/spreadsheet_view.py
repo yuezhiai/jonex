@@ -17,7 +17,7 @@ import zipfile
 from datetime import datetime, timedelta
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict
 from xml.etree import ElementTree as ET
 
 from jonex_wiki.domain.engine.compile.source_prep.blocks import InputRoute, ParseBlock, ParseResult, sha256_file
@@ -25,7 +25,8 @@ from jonex_wiki.domain.engine.compile.source_prep.blocks import InputRoute, Pars
 # parsed-table artifact path; it is re-exported here for the existing import
 # sites and tests that name it in this module.
 from jonex_wiki.domain.engine.compile.source_prep.header_interpretation import (
-    _PLACEHOLDER_LABEL,
+    interpret_table, interpretation_identity,
+    relocate_interpretation, instruction_header_decision,
     qualify_repeating_labels as _qualify_repeating_labels,
 )
 
@@ -52,21 +53,6 @@ def _identity_id(prefix: str, length: int, source_id: str, document_id: str,
     return prefix + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:length]
 
 
-_INSTRUCTION_MARKERS = ("填写", "逐条累加")
-_SEQUENCE_FIELD_NAMES = ("序号", "编号")
-
-
-def _merge_bounds_for_cell(merges: Iterable[str], row: int, column: int) -> tuple[int, int, int, int] | None:
-    """Return (row_start, column_start, row_end, column_end) covering a cell."""
-    for merge in merges:
-        left, right = merge.split(":") if ":" in merge else (merge, merge)
-        r1, c1 = _coordinates(left)
-        r2, c2 = _coordinates(right)
-        if r1 <= row <= r2 and c1 <= column <= c2:
-            return (r1, c1, r2, c2)
-    return None
-
-
 def _instruction_header_decision(cells: Dict[tuple[int, int], Dict[str, Any]],
                                  merges: list[str], r1: int, c1: int, r2: int,
                                  c2: int) -> tuple[int, str | None]:
@@ -79,37 +65,15 @@ def _instruction_header_decision(cells: Dict[tuple[int, int], Dict[str, Any]],
     instruction with a conflicting candidate is reported as an ambiguity rather
     than silently guessed.
     """
-    if r2 < r1 + 2 or c2 < c1:
-        return 1, None
-    first_values = [_display(cells.get((r1, column), {})) for column in range(c1, c2 + 1)]
-    if not any(any(marker in value for marker in _INSTRUCTION_MARKERS) for value in first_values):
-        return 1, None
-    second_values = [_display(cells.get((r1 + 1, column), {})) for column in range(c1, c2 + 1)]
-    if any(not value for value in second_values):
-        return 1, "instruction_header_conflict_field_row_incomplete"
-    if len(set(second_values)) != len(second_values):
-        return 1, "instruction_header_conflict_duplicate_fields"
-    sequence_columns = [column for column in range(c1, c2 + 1)
-                        if second_values[column - c1] in _SEQUENCE_FIELD_NAMES]
-    if len(sequence_columns) != 1:
-        return 1, "instruction_header_conflict_sequence_label"
-    sequence_column = sequence_columns[0]
-    if _merge_bounds_for_cell(merges, r1 + 1, sequence_column) is not None:
-        return 1, "instruction_header_conflict_sequence_header_merged"
-    sequence_values = []
-    for row in range(r1 + 2, r2 + 1):
-        if _merge_bounds_for_cell(merges, row, sequence_column) is not None:
-            return 1, "instruction_header_conflict_sequence_data_merged"
-        sequence_values.append(_display(cells.get((row, sequence_column), {})))
-    if len(sequence_values) < 2:
-        return 1, "instruction_header_conflict_too_few_data_rows"
-    if any(not value for value in sequence_values):
-        return 1, "instruction_header_conflict_sequence_empty"
-    if any(re.fullmatch(r"[0-9]+", value) is None for value in sequence_values):
-        return 1, "instruction_header_conflict_sequence_not_integer"
-    if len(set(sequence_values)) != len(sequence_values):
-        return 1, "instruction_header_conflict_sequence_duplicate"
-    return 2, None
+    rows = [[_display(cells.get((row, column), {})) for column in range(c1, c2 + 1)]
+            for row in range(r1, r2 + 1)]
+    regions = []
+    for merge in merges:
+        left, right = merge.split(":") if ":" in merge else (merge, merge)
+        mr1, mc1 = _coordinates(left)
+        mr2, mc2 = _coordinates(right)
+        regions.append((mr1 - r1 + 1, mc1 - c1 + 1, mr2 - r1 + 1, mc2 - c1 + 1))
+    return instruction_header_decision(rows, regions)
 
 
 def _column_number(cell_ref: str) -> int:
@@ -158,9 +122,10 @@ def _styles(archive: zipfile.ZipFile) -> tuple[list[str], set[int]]:
     xfs = root.findall("m:cellXfs/m:xf", NS)
     style_formats = [formats.get(int(xf.attrib.get("numFmtId", 0)), builtins.get(int(xf.attrib.get("numFmtId", 0)),
                          "builtin:" + xf.attrib.get("numFmtId", "0"))) for xf in xfs]
+    date_ids = {14,15,16,17,22,27,28,29,30,31,36,50,51,52,53,54,57,58}
     date_styles = {index for index, value in enumerate(style_formats)
-                   if not value.startswith("builtin:")
-                   and re.search(r"(?<!\\)[ymdhis]", re.sub(r'"[^"]*"', "", value), re.I)}
+                   if int(xfs[index].attrib.get("numFmtId",0)) in date_ids or (not value.startswith("builtin:")
+                   and re.search(r"(?<!\\)[ymdhis]", re.sub(r'"[^"]*"', "", value), re.I))}
     return style_formats or ["General"], date_styles
 
 
@@ -188,8 +153,11 @@ def _regions(cells: Dict[tuple[int, int], Dict[str, Any]], merges: list[str]) ->
     return sorted(output)
 
 
-def _display(cell: Dict[str, Any]) -> str:
+def _display(cell: Dict[str, Any], epoch=None) -> str:
     value = cell.get("cached_value") if cell.get("formula") and cell.get("cached_value") is not None else cell.get("raw_value")
+    if epoch and cell.get("date_candidate"):
+        normalized=excel_serial_iso(value,epoch)
+        if normalized:return normalized
     return "" if value is None else str(value)
 
 
@@ -284,77 +252,43 @@ def parse_spreadsheet(path: Path, *, output_dir: Path, source_id: str,
                     r1, c1, r2, c2 = bounds
                     table_id = _identity_id("table-", 20, source_id, document_id, source_hash,
                                             {"sheet": name, "bounds": list(bounds)})
-                    first_row = [_display(cells.get((r1, column), {})) for column in range(c1, c2 + 1)]
-                    horizontal_header_merges = []
+                    first_row = [_display(cells.get((r1, column), {}), epoch) for column in range(c1, c2 + 1)]
+                    # One header rule for native spreadsheets and parsed PDF/Word
+                    # grids. The native file defines absent OOXML cells as blank;
+                    # it does not require physically storing an empty rectangle.
+                    last = r2 if (r2 - r1 + 1) * (c2 - c1 + 1) <= 40000 else min(r2, r1 + 2)
+                    rows = [[_display(cells.get((row, column), {}), epoch) for column in range(c1, c2 + 1)]
+                            for row in range(r1, last + 1)]
+                    regions = []
                     for merge in merges:
                         left, right = merge.split(":") if ":" in merge else (merge, merge)
                         mr1, mc1 = _coordinates(left)
                         mr2, mc2 = _coordinates(right)
-                        if mr1 == r1 == mr2 and mc2 > mc1 and c1 <= mc1 <= c2:
-                            horizontal_header_merges.append((mr1, mc1, mr2, mc2))
-                    instruction_header = False
-                    header_ambiguity = None
-                    header_depth = 2 if horizontal_header_merges and r2 > r1 else 1
-                    if not horizontal_header_merges:
-                        decision = _instruction_header_decision(cells, merges, r1, c1, r2, c2)
-                        header_depth, header_ambiguity = decision
-                        instruction_header = header_depth == 2 and header_ambiguity is None
-                    header_row = r1 + header_depth - 1
-                    # The instruction row is a whole-width caption, not a
-                    # per-column label: it is retained in ``header_rows`` for
-                    # context but never folded into the field names.
-                    label_start_row = header_row if instruction_header else r1
-                    labels = []
-                    for column in range(c1, c2 + 1):
-                        levels = []
-                        for row in range(label_start_row, header_row + 1):
-                            value = _display(cells.get((row, column), {}))
-                            if not value:
-                                anchor = next((item for item in horizontal_header_merges
-                                               if item[0] == row and item[1] <= column <= item[3]), None)
-                                if anchor:
-                                    value = _display(cells.get((anchor[0], anchor[1]), {}))
-                            if value and value not in levels:
-                                levels.append(value)
-                        labels.append(" / ".join(levels) or "column_{}".format(column))
-                    nonempty_headers = [value for value in labels if value]
-                    status = "accepted" if nonempty_headers and len(set(nonempty_headers)) == len(nonempty_headers) else "ambiguous"
-                    header_disambiguation = None
-                    if status != "accepted" and header_ambiguity is None:
-                        # A repeated label is only ambiguous while it stands
-                        # alone; under a regular block layout its group head
-                        # identifies the column, so qualify instead of discard.
-                        qualified, header_disambiguation = _qualify_repeating_labels(labels)
-                        if header_disambiguation is not None:
-                            labels = qualified
-                            status = "accepted"
-                    if header_ambiguity:
-                        status = "ambiguous"
-                        header_disambiguation = None
-                    title = next((value for value in first_row if value), "{} 区域 {}".format(name, ordinal))
-                    if re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", title):
-                        # A serial date/year/amount is a cell value, not a
-                        # useful standalone table title. Do not guess its type.
-                        title = "{} · 表 {}".format(name, ordinal)
-                    interpretation_id = "interpretation-" + hashlib.sha256((table_id + ":v1").encode()).hexdigest()[:16]
+                        regions.append((mr1 - r1 + 1, mc1 - c1 + 1,
+                                        mr2 - r1 + 1, mc2 - c1 + 1))
+                    interpretation = relocate_interpretation(interpret_table(
+                        rows, merges=regions, table_id=table_id,
+                        grid_rows_total=r2 - r1 + 1, grid_complete=True), r1, c1)
+                    status = interpretation.status
+                    from .table_identity import spreadsheet_title
+                    caption = None
+                    for merge in merges:
+                        left,right=merge.split(":") if ":" in merge else (merge,merge)
+                        if _coordinates(left)==(r1,c1) and _coordinates(right)==(r1,c2):
+                            caption=first_row[0] or None
+                    title=spreadsheet_title(path.name,name,bounds,caption=caption)
+                    interpretation_id = interpretation_identity(table_id)
                     connection.execute("INSERT INTO logical_tables VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (table_id, sheet_id, ordinal, title, r1, c1, r2, c2, status,
                          "exclude", hashlib.sha256((sheet_id + repr(bounds)).encode()).hexdigest()))
-                    fields = [{"field_id": "c{}".format(column), "column": column,
-                               "label": labels[column - c1],
-                               "header_row": header_row} for column in range(c1, c2 + 1)]
-                    ambiguities = [header_ambiguity] if header_ambiguity else (
-                        [] if status == "accepted" else ["header_not_unique_or_missing"])
-                    payload = {"fields": fields,
-                               "header_rows": list(range(r1, header_row + 1)),
-                               "ambiguities": ambiguities}
-                    if header_disambiguation is not None:
-                        # Record that the header was rewritten, so an admitted
-                        # table can be told apart from one that never needed it.
-                        payload["header_disambiguation"] = header_disambiguation
+                    fields = [field.payload() for field in interpretation.header.fields]
+                    payload = {**interpretation.payload(), "source_name":path.name,"title_origin":"caption" if caption else "source_sheet_range", "fields": fields,
+                               "header_rows": list(interpretation.header.header_rows),
+                               "ambiguities": list(interpretation.header.ambiguities)}
+                    if interpretation.header.disambiguation:
+                        payload["header_disambiguation"] = dict(interpretation.header.disambiguation)
                     connection.execute("INSERT INTO interpretations VALUES (?,?,?,?,?)",
-                        (interpretation_id, table_id, 1, status, json.dumps(payload,
-                         ensure_ascii=False)))
+                        (interpretation_id, table_id, 1, status, json.dumps(payload, ensure_ascii=False)))
                     for field in fields:
                         connection.execute("INSERT INTO field_map VALUES (?,?,?,?,?)",
                                            (interpretation_id, field["field_id"], field["column"], field["header_row"], field["label"]))

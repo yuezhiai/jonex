@@ -28,7 +28,7 @@ _WEEKDAYS = {"星期一": 0, "周一": 0, "星期二": 1, "周二": 1, "星期�
 def _value(cell: dict) -> str:
     if cell.get("formula") and cell.get("cached_value") is None:
         return ""
-    value = cell.get("effective_value", cell.get("raw_value"))
+    value = cell.get("normalized_value",cell.get("effective_value", cell.get("raw_value")))
     return "" if value is None else str(value)
 
 

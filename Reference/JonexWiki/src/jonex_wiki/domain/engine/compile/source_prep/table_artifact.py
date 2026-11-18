@@ -77,7 +77,8 @@ def persist_table_observations(result: ParseResult, output_dir: Path) -> Path | 
             "bbox_json TEXT,caption_json TEXT,footnote_json TEXT,raw_item_json TEXT,status TEXT)")
         for ordinal, block in enumerate(observations, start=1):
             table_id, sheet_id = _table_ids(result, block)
-            title = _first_text(block.metadata.get("caption")) or "PDF table {}".format(ordinal)
+            default_title = "PDF table" if Path(result.source_name).suffix.casefold() == ".pdf" else "Table"
+            title = _first_text(block.metadata.get("caption")) or "{} {}".format(default_title, ordinal)
             rows, structure = _table_rows(block.text)
             decision = {"table_id": table_id, "sheet_id": sheet_id,
                         "interpretation_id": _interpretation_id(table_id),
@@ -248,6 +249,13 @@ def _write_table(connection: sqlite3.Connection, *, table_id: str, sheet_id: str
                    "raw_observation_text": block.text, "page_number": block.page_number,
                    "bbox": block.metadata.get("bbox"),
                    **interpretation.payload()}
+        repair=block.metadata.get("pdf_native_repair") or {}
+        if repair.get("status")=="accepted":
+            payload["pdf_native_repair"]={k:v for k,v in repair.items() if k not in {"original_observation","cell_locations"}}
+            payload["cell_bbox_available"]=True
+            connection.execute("CREATE TABLE IF NOT EXISTS table_source_cells(table_id TEXT,row_index INTEGER,column_index INTEGER,page_number INTEGER,bbox_json TEXT,word_ids_json TEXT,PRIMARY KEY(table_id,row_index,column_index))")
+            for cell in repair.get("cell_locations",[]):
+                connection.execute("INSERT INTO table_source_cells VALUES(?,?,?,?,?,?)",(table_id,cell["row"],cell["column"],block.page_number,json.dumps(cell["bbox"]),json.dumps(cell["word_ids"])))
         if omitted:
             payload["structure_reason"] = omitted
         connection.execute("INSERT INTO interpretations VALUES (?,?,?,?,?)",

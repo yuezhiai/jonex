@@ -136,6 +136,9 @@ class SourceContributionRecord(BaseModel):
     normalized_proposition: str
     evidence: List[EvidenceRef] = Field(default_factory=list, max_length=20)
     source_spans: List[SourceSpan] = Field(default_factory=list, max_length=20)
+    # Each alternative is independently sufficient; all_of members within one
+    # alternative are joint requirements. Missing means conservative joint spans.
+    support_alternatives: Optional[List[Dict[str, Any]]] = None
     unresolved_evidence: List[EvidenceRef] = Field(default_factory=list, max_length=20)
     # 限定信息 / 实体提及 / 可选主题提示: hints for merging, never identity.
     qualifiers: List[Dict[str, str]] = Field(default_factory=list)

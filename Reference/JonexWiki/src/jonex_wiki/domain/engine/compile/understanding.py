@@ -61,14 +61,15 @@ from jonex_wiki.domain.engine.models.compiler_state import (
     CompilerState,
 )
 from jonex_wiki.kernel.contracts import SourceArtifact
+from jonex_wiki.kernel.errors import CompileModelUnavailable
 from jonex_wiki.kernel.ports import ArtifactStore, CancelPort, ModelPort
 from jonex_wiki.kernel.telemetry import count_work, telemetry_stage
 
 logger = logging.getLogger(__name__)
 
-UNDERSTANDING_RULE_VERSION = "source-understanding-v5-source-excerpts-merged-hints"
-UNDERSTANDING_PROMPT_VERSION = "understand-source-prompt-v4-source-excerpts"
-UNDERSTANDING_SCHEMA_VERSION = "understand-source-schema-v2-tolerant"
+UNDERSTANDING_RULE_VERSION = "source-understanding-v7-explicit-alias-subject"
+UNDERSTANDING_PROMPT_VERSION = "understand-source-prompt-v6-explicit-alias-subject"
+UNDERSTANDING_SCHEMA_VERSION = "understand-source-schema-v3-alias-pairs"
 UNDERSTANDING_NAMESPACE = "source-understanding"
 #: Identity format of the understanding cache.  Bumped when the material below
 #: changes shape, so checkpoints written under an older, *insufficient*
@@ -139,6 +140,15 @@ class UnderstandingRelation(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class UnderstandingAlias(BaseModel):
+    """A proposed pair of names, not a confirmed identity."""
+
+    subject: str
+    alias: str
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class UnderstandingFact(BaseModel):
     """One page-free fact proposal from one source passage."""
 
@@ -155,6 +165,7 @@ class UnderstandingFact(BaseModel):
     topic_hint: str = ""
     original_names: List[str] = Field(default_factory=list)
     aliases: List[str] = Field(default_factory=list)
+    alias_pairs: List[UnderstandingAlias] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
     mentions: List[str] = Field(default_factory=list)
     relations: List[UnderstandingRelation] = Field(
@@ -162,6 +173,18 @@ class UnderstandingFact(BaseModel):
     unbound: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore")
+
+    @field_validator("alias_pairs", mode="before")
+    def _readable_alias_pairs(cls, value):
+        pairs = []
+        for item in value if isinstance(value, list) else ():
+            try:
+                pair = UnderstandingAlias.model_validate(item)
+            except (ValueError, TypeError):
+                continue
+            if pair.subject.strip() and pair.alias.strip():
+                pairs.append(pair)
+        return pairs
 
     @field_validator("relations", mode="before")
     def _readable_relations(cls, value):
@@ -398,9 +421,10 @@ def understanding_schema_checksum() -> str:
     """Digest of the response schema this stage actually sends.
 
     Computed from the pydantic model itself, so adding a bound, renaming a
-    field invalidates stored understanding. Python validator-body changes are
-    not represented in JSON schema: bump UNDERSTANDING_RULE_VERSION for those
-    changes and for changes in how a response becomes a contribution.
+    field invalidates stored understanding. Python validator-body or factual
+    conversion changes are not represented in JSON schema and must bump
+    UNDERSTANDING_RULE_VERSION. Additive, unconfirmed discovery hints remain
+    backward compatible: organization rechecks them before any identity use.
     """
     return sha256_hex(canonical_json_bytes(SourceUnderstandingResponse.model_json_schema()))
 
@@ -499,8 +523,11 @@ def _instructions() -> str:
         "context together in one excerpt instead of splitting away that context. "
         "`topic_hint` (what the fact is about, as the material names it), "
         "`original_names` (the names exactly as the material writes them, "
-        "including Chinese names), `aliases` (only aliases the passage states "
-        "explicitly for topic_hint; co-occurring entities are not aliases), "
+        "including Chinese names), `alias_pairs` (each object has `subject` and `alias`: "
+        "the two specific names explicitly referring to the same object in this passage; "
+        "do not use a collective topic as the subject of a member's name), "
+        "`aliases` (legacy: only aliases explicitly for topic_hint; prefer alias_pairs; "
+        "co-occurring entities are not aliases), "
         "`notes` (period, unit, negation or condition that changes "
         "how the fact reads), `mentions` (names that deserve their own page "
         "later; never a page id), and `relations` (only relations the passage "
@@ -513,6 +540,19 @@ def _instructions() -> str:
         "guess is worse than an empty list. "
         "Navigation and relations are optional reading hints. Keep substantive facts "
         "and their conditions even when no useful navigation can be extracted."
+        " For discovery, include source-named entities, events, concepts, rules, "
+        "metrics and resources when useful; they need not each become a page. "
+        "Record distinct explicit subject–relation–target links in their correct "
+        "direction and retain their period, scope, conditions, negation or uncertainty. "
+        "Treat same names, co-occurrence and cross-sentence hints only as leads; "
+        "do not assert identity or a relation without source support. "
+        "Preserve important context when selecting separate neighboring facts."
+        " Make a separate relation for each distinct assertion inside one clause. "
+        "For example, if a passage says 'Aster is a service operated by Lin', "
+        "preserve both Aster/is a/service and Aster/operated by/Lin using the same excerpt. "
+        "A common category or a phrase in a definition can be a literal endpoint. "
+        "When a definition is tentative or attributed, copy the contiguous context that "
+        "expresses the limitation and capture it in notes."
     )
 
 
@@ -672,24 +712,25 @@ def build_understanding(
             "topic_hint": "model_topic_hint" if fact.topic_hint else "none",
             "understanding_rule": UNDERSTANDING_RULE_VERSION,
         })
-        # The name forms the material itself used win over regex guesses, and
-        # aliases the passage states explicitly are kept as names too.
+        # Preserve model-proposed names for discovery; their appearance here
+        # alone does not establish an alias or an entity identity.
         names: Dict[str, str] = {}
-        for value in list(fact.original_names) + list(fact.aliases):
+        pair_names = [name for pair in fact.alias_pairs for name in (pair.subject, pair.alias)]
+        for value in list(fact.original_names) + list(fact.aliases) + pair_names:
             text = _normalized(value)
             if text:
                 names.setdefault(source_contribution.normalize_proposition(text), text)
         for key, value in record.original_names.items():
             names.setdefault(key, value)
-        # Names found in the same fact are entity mentions, not aliases.
-        # Preserve the model's explicit alias channel in the existing typed
-        # qualifier metadata; older codecs accept this dictionary shape too.
+        # A model's alias channel is a discovery lead, not identity evidence.
+        # Older checkpoints may call these declared_alias; organization
+        # rechecks both forms against the current original passage.
         alias_subject = _normalized(fact.topic_hint)
-        aliases = [{"kind": "declared_alias", "subject": alias_subject,
-                    "value": _normalized(value)} for value in fact.aliases
-                   if alias_subject and _normalized(value)
-                   and alias_subject in _normalized(passage.text)
-                   and _normalized(value) in _normalized(passage.text)]
+        aliases = [{"kind": "alias_candidate", "subject": alias_subject,
+                    "value": _normalized(value)}
+                   for value in fact.aliases if _normalized(value)]
+        aliases.extend({"kind": "alias_candidate", "subject": _normalized(pair.subject),
+                        "value": _normalized(pair.alias)} for pair in fact.alias_pairs)
         notes = [{"kind": "material_note", "value": _normalized(note)}
                  for note in fact.notes if _normalized(note)]
         unbound = sorted({_normalized(value) for value in
@@ -788,15 +829,19 @@ def _link_proposals(fact: UnderstandingFact, reference: EvidenceRef) -> List[Dic
         target = _normalized(relation.target)
         if not target:
             continue
-        key = "{}:{}".format(relation.kind, target.casefold())
+        subject = _normalized(relation.subject)
+        kind = _normalized(relation.kind)
+        # Different subjects can share a predicate and target. Collapsing on
+        # target alone silently removed those independent discovery leads.
+        key = (subject.casefold(), kind.casefold(), target.casefold())
         if key in seen:
             continue
         seen.add(key)
         proposals.append({
             "target_mention": target,
-            "why_visit": _normalized(relation.kind) or "source states this relation",
-            "relation": relation.kind,
-            "subject_mention": _normalized(relation.subject),
+            "why_visit": kind or "source states this relation",
+            "relation": kind,
+            "subject_mention": subject,
             "evidence_refs": [reference.model_dump()],
         })
     return proposals
@@ -988,7 +1033,6 @@ async def _understand_attempt(
         trace_id=routing.get("trace_id", ""),
         thinking={"type": "disabled"},
         scene=UNDERSTANDING_SCENE,
-        # 逐 passage 调用，passage 自带来源文档 —— 带上它，入库计量才能按文档归集。
         doc_id=str(getattr(passage, "document_id", "") or ""),
     )
     payload, dropped_identity = strip_model_identity(raw)
@@ -1071,6 +1115,8 @@ async def understand_one_passage(
             last_error = exc
             if attempt_sink is not None:
                 attempt_sink("error", attempt + 1, _elapsed_ms(started), exc)
+            if isinstance(exc, CompileModelUnavailable):
+                raise
             if attempt == 0:
                 extra = ((TRUNCATION_CONSTRAINT,) if getattr(exc, "output_truncated", False)
                          else (pipeline._compile_retry_constraint(exc),))
@@ -1151,6 +1197,7 @@ class UnderstandingStage:
         self.result = LayeredUnderstanding(order=list(self.order))
         self.semaphore = asyncio.Semaphore(max(1, int(concurrency)))
         self.lock = asyncio.Lock()
+        self.model_error: CompileModelUnavailable | None = None
 
     def cache_key(self, pid: str) -> str:
         _passage, artifact = self.by_passage[pid]
@@ -1270,11 +1317,17 @@ class UnderstandingStage:
                     # the model then produced a usable checkpoint.
                     async with self.lock:
                         self.result.cache_misses += 1
-                    response, error = await understand_one_passage(
-                        self.state, passage, model=self.model, model_name=self.model_name,
-                        routing=self.routing, max_tokens=self.max_tokens,
-                        compile_main_prompt=self.compile_main_prompt, cancel=self.cancel,
-                        attempt_sink=self._record_attempt)
+                    if self.model_error is not None:
+                        raise self.model_error
+                    try:
+                        response, error = await understand_one_passage(
+                            self.state, passage, model=self.model, model_name=self.model_name,
+                            routing=self.routing, max_tokens=self.max_tokens,
+                            compile_main_prompt=self.compile_main_prompt, cancel=self.cancel,
+                            attempt_sink=self._record_attempt)
+                    except CompileModelUnavailable as exc:
+                        self.model_error = exc
+                        raise
                     if response is None:
                         failure = understanding_failure(passage, error)
                         async with self.lock:

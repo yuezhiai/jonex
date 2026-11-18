@@ -148,6 +148,10 @@ def create_parse_runner(session_factory, settings, layout: Layout, mineru, execu
                         cancel_check=cancel_check)
                 await asyncio.to_thread((raw_dir / CONTENT_LIST_FILE).write_text,
                                         json.dumps(items, ensure_ascii=False), "utf-8")
+                if settings.pdf_table_repair_enabled and source_path.suffix.lower()==".pdf":
+                    from jonex_wiki.domain.parsing.pdf_tables import supplement_pdf
+                    items, _ = await asyncio.to_thread(supplement_pdf,items,source_path,raw_dir,
+                        max_pages=settings.pdf_text_layer_max_pages)
                 parser_id = "mineru.cloud.v1"
                 result = await asyncio.to_thread(
                     normalize_inline_content_list, items, output_dir=raw_dir,

@@ -179,25 +179,37 @@ def _rewrite_query_for_search(question: str) -> str:
     Pure and deterministic; never calls a model.  Returns the input unchanged
     when there is no meaningful rewrite.
     """
-    if _segmenter_available():
-        terms = [
-            t for t in _segment_for_search(question).split(" ") if t and t.isalnum()
-        ]
-        kept = [t for t in terms if t.casefold() not in _QUERY_STOPWORDS]
-        if not kept:
-            return question
-        rewritten = " ".join(kept)
-        if rewritten == " ".join(terms):
-            return question
-        return rewritten
-    tokens = _TOKEN_RE.findall(question.casefold())
-    kept = [t for t in tokens if t not in _QUERY_STOPWORDS]
+    terms = _query_terms(question)
+    kept = [t for t in terms if t.casefold() not in _QUERY_STOPWORDS]
     if not kept:
         return question
     rewritten = " ".join(kept)
-    if rewritten == question.casefold():
+    if rewritten == " ".join(terms):
         return question
     return rewritten
+
+
+_SEARCH_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"[A-Za-z][A-Za-z0-9_]*(?:[./:-][A-Za-z0-9_]+)+|"
+    r"[+-]?\d+(?:[.,/:-]\d+)*(?:[eE][+-]?\d+)?[%％]?"
+    r")(?![\d.])"
+)
+
+
+def _query_terms(query: str) -> List[str]:
+    """Keep literal values intact without deciding their semantic type.
+
+    FTS still tokenizes punctuation inside a quoted phrase, but it must receive
+    the whole phrase: dropping 4.7 merely because it contains a dot loses the
+    only discriminating value. Original literals also anchor ranking and
+    snippets. This does not equate dates, decimals, versions or identifiers.
+    """
+    literals = [match.group() for match in _SEARCH_LITERAL_RE.finditer(query)]
+    remainder = _SEARCH_LITERAL_RE.sub(" ", query)
+    terms = ([t for t in _segment_for_search(remainder).split(" ") if t and t.isalnum()]
+             if _segmenter_available() else _TOKEN_RE.findall(remainder.casefold()))
+    return list(dict.fromkeys([*literals, *terms]))
 
 
 def _fts_query(query: str) -> str:
@@ -210,16 +222,10 @@ def _fts_query(query: str) -> str:
     alphanumeric runs and single CJK characters.  In both cases punctuation can
     therefore never become FTS syntax or SQL.
     """
-    if _segmenter_available():
-        terms = [
-            t for t in _segment_for_search(query).split(" ") if t and t.isalnum()
-        ]
-        if terms:
-            return " OR ".join('"{}"'.format(term) for term in terms)
-    terms = _TOKEN_RE.findall(query.casefold())
+    terms = _query_terms(query)
     if not terms:
         return ""
-    return " OR ".join('"{}"'.format(term) for term in terms)
+    return " OR ".join('"{}"'.format(term.replace('"', '""')) for term in terms)
 
 
 def _fts_rows(corpus: QueryCorpus, paths: Iterable[str]):
@@ -517,10 +523,7 @@ def _search_terms(query: str) -> List[str]:
     anchors on a content-bearing term (e.g. an entity) instead of a generic
     function word that appears everywhere.
     """
-    if _segmenter_available():
-        terms = [t for t in _segment_for_search(query).split(" ") if t and t.isalnum()]
-    else:
-        terms = [t for t in _TOKEN_RE.findall(query.casefold()) if t]
+    terms = _query_terms(query)
     kept = [t for t in terms if t.casefold() not in _QUERY_STOPWORDS]
     return kept or terms
 
@@ -726,12 +729,57 @@ class _SearchMaterialCache:
         return self.corpus.page_text.get(path, "")
 
 
+def _source_filename_hints(corpus, query):
+    """Generic filename tokens supply a candidate pool, never a source policy."""
+    names={}
+    for path,entry in corpus.page_index.items():
+        metadata=(corpus.source_locations.get(path) or {}).get("metadata") or {}
+        values=[metadata.get("source_name", ""),*entry.aliases]
+        values+=re.findall(r"[^:/\\]+?\.(?:pdf|docx|xlsx|xlsm|md|txt|csv)",entry.title,re.I)
+        for name in values:
+            name=str(name).strip()
+            if not re.search(r"\.(pdf|docx|xlsx|xlsm|md|txt|csv)$",name,re.I):continue
+            tokens=set(re.findall(r"[a-z]{3,}|[0-9]+|[\u4e00-\u9fff]{2,}",name.rsplit(".",1)[0].casefold()))
+            names.setdefault(name,tokens)
+    counts=defaultdict(int)
+    for tokens in names.values():
+        for token in tokens:counts[token]+=1
+    terms=set(re.findall(r"[a-z]{3,}|[0-9]+|[\u4e00-\u9fff]{2,}",query.casefold()))
+    scored=[]
+    for name,tokens in names.items():
+        overlap=terms&tokens
+        rare=[t for t in overlap if not t.isdigit() and counts[t]<=max(2,len(names)//4)]
+        if rare:scored.append((len(rare)*3+len(overlap),name))
+    best=max((score for score,_ in scored),default=0)
+    return [name for score,name in scored if score==best][:4]
+
+
+def source_scoped_paths(corpus, source_ids):
+    """Published ownership only; never infer scope from question words."""
+    wanted=set(source_ids)
+    known=set()
+    owned={}
+    for path,entry in corpus.page_index.items():
+        scope=entry.scope or {}
+        owners=set(scope.get('source_ids') or [])
+        if scope.get('source_id'):owners.add(scope['source_id'])
+        owners.update(record.get('source_id') for record in corpus.source_records.get(path,[]) if record.get('source_id'))
+        for claim in corpus.claims.get(path,[]):
+            owners.update(ref.source_id for ref in claim.evidence)
+        known.update(owners)
+        if owners and owners <= wanted:owned[path]=True
+    if wanted-known:
+        raise ValueError('QUERY_SOURCE_SCOPE_UNKNOWN')
+    return set(owned)
+
+
 def _fts_search(
     conn: "sqlite3.Connection",
     corpus: QueryCorpus,
     query: str,
     *,
     material_cache: _SearchMaterialCache | None = None,
+    source_ids: Sequence[str] = (),
 ) -> List[SearchHit]:
     """Run a ranked FTS search, ordered by BM25 then canonical path.
 
@@ -743,16 +791,24 @@ def _fts_search(
     if material_cache is not None and material_cache.max_bytes == 0:
         material_cache = None
     bm25_ranked: List[tuple[str, float]] = []
+    hint_paths=set()
+    allowed=source_scoped_paths(corpus,source_ids) if source_ids else None
+    if allowed is not None and not allowed:return []
+    # Filter before candidate truncation, including on immutable old indexes.
+    # Bound source_ids at the tool boundary. JSON carries paths as data; it
+    # neither interpolates SQL nor changes the persisted FTS schema.
+    scope_sql=' AND path IN (SELECT value FROM json_each(?))' if allowed is not None else ''
+    scope_params=[json.dumps(sorted(allowed))] if allowed is not None else []
     try:
         with telemetry_stage(current_runtime_telemetry(), "bm25"):
             fts = _fts_query(query)
             if fts:
                 cur = conn.execute(
                     "SELECT path, bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0) AS rank "
-                    "FROM pages WHERE pages MATCH ? "
+                    "FROM pages WHERE pages MATCH ? " + scope_sql + " "
                     "ORDER BY bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0) ASC, path ASC "
                     "LIMIT ?",
-                    (fts, _max_search_hits() * 8),
+                    (fts, *scope_params, _max_search_hits() * 8),
                 )
                 bm25_ranked = [(r[0], float(r[1])) for r in cur.fetchall()]
                 # Numeric OR terms can fill the whole pool with unrelated
@@ -762,11 +818,19 @@ def _fts_search(
                 if topic_terms:
                     topic_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in topic_terms)
                     extra = conn.execute(
-                        "SELECT path, bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0) FROM pages WHERE pages MATCH ? ORDER BY bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0), path LIMIT ?",
-                        (topic_query, _max_search_hits() * 8)).fetchall()
+                        "SELECT path, bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0) FROM pages WHERE pages MATCH ?"+scope_sql+" ORDER BY bm25(pages, 8.0, 6.0, 4.0, 3.0, 1.0), path LIMIT ?",
+                        (topic_query, *scope_params, _max_search_hits() * 8)).fetchall()
                     seen = {p for p, _ in bm25_ranked}
                     bm25_ranked.extend((p, float(rank)) for p, rank in extra if p not in seen)
 
+                names=_source_filename_hints(corpus,query)
+                if names:
+                    names_query=" OR ".join('(title:"'+name.replace('"','""')+'" OR alias:"'+name.replace('"','""')+'")' for name in names)
+                    rows=conn.execute("SELECT path,bm25(pages,8.0,6.0,4.0,3.0,1.0) FROM pages WHERE pages MATCH ?"+scope_sql+" ORDER BY bm25(pages,8.0,6.0,4.0,3.0,1.0),path LIMIT ?",
+                        ('('+names_query+') AND ('+fts+')',*scope_params,_max_search_hits()*8)).fetchall()
+                    hint_paths={row[0] for row in rows}
+                    seen={path for path,_ in bm25_ranked}
+                    bm25_ranked.extend((path,float(rank)) for path,rank in rows if path not in seen)
     except Exception:
         raise ValueError(FTS5_UNAVAILABLE)
 
@@ -781,12 +845,44 @@ def _fts_search(
             material_cache.get(path) if material_cache is not None
             else _search_material(corpus, path)
         )
-        score = sum(1 for term in set(terms) if term.casefold() in segmented)
+        score = sum(1 for term in set(terms) if (
+            bool(re.search(r"(?<![A-Za-z0-9_.])" + re.escape(term.casefold())
+                           + r"(?![A-Za-z0-9_.])", haystack))
+            if _SEARCH_LITERAL_RE.fullmatch(term) else term.casefold() in segmented))
         return score
-    ordered = sorted(
-        bm25_ranked,
-        key=lambda item: (-lexical_coverage(item[0]), item[1], item[0]),
-    )[:_max_search_hits()]
+    phrase_terms=[t.casefold() for t in terms if len(t)>2 and not t.isdigit()]
+    phrases={re.sub(r"\W+","",a+b) for a,b in zip(phrase_terms,phrase_terms[1:]) if len(a+b)>=7}
+    def phrase_coverage(path):
+        compact=re.sub(r"\W+","",corpus.page_text.get(path,"").casefold())
+        return sum(phrase in compact for phrase in phrases)
+    rank=lambda item:(-phrase_coverage(item[0]),-lexical_coverage(item[0]),item[1],item[0])
+    if hint_paths:
+        preferred=sorted((item for item in bm25_ranked if item[0] in hint_paths),key=rank)[:max(1,_max_search_hits()-2)]
+        chosen={p for p,_ in preferred}
+        ordered=preferred+sorted((item for item in bm25_ranked if item[0] not in chosen),key=rank)[:_max_search_hits()-len(preferred)]
+    else:
+        ordered=sorted(bm25_ranked,key=rank)[:_max_search_hits()]
+
+    # New publications expose continuous articles as the read target of a
+    # fine-grained fact hit. Preserve its discovery identity, but do not ask
+    # the model to read several tiny pages from the same article.
+    discovery_indexes={}
+    if any(corpus.page_index[path].scope.get('reading_targets') for path,_ in ordered if path in corpus.page_index):
+        pool=sorted(bm25_ranked,key=rank)
+        if hint_paths:
+            pool=[item for item in pool if item[0] in hint_paths]+[item for item in pool if item[0] not in hint_paths]
+        projected=[];seen=set()
+        for original,score in pool:
+            if original not in corpus.page_index:continue
+            entry=corpus.page_index[original]
+            targets=entry.scope.get('reading_targets') or [original]
+            for target in targets:
+                if target not in corpus.page_index or target in seen or (allowed is not None and target not in allowed):continue
+                seen.add(target);projected.append((target,score))
+                if target!=original:discovery_indexes[target]=original
+                if len(projected)>=_max_search_hits():break
+            if len(projected)>=_max_search_hits():break
+        ordered=projected
 
     bm25_score_map = {path: score for path, score in bm25_ranked}
 
@@ -819,16 +915,27 @@ def _fts_search(
             continue
         body = (material_cache.body(path) if material_cache is not None
                 else corpus.page_text.get(path, ""))
-        best_claim = claim_by_page.get(path)
-        evidence_units = claim_units.get(path) or passage_units.get(path, [])[:3]
+        discovery = discovery_indexes.get(path, path)
+        best_claim = claim_by_page.get(discovery) or claim_by_page.get(path)
+        evidence_units = claim_units.get(discovery) or passage_units.get(discovery, [])[:3]
         if best_claim is not None:
             snippet = _make_snippet(best_claim, terms)
         else:
-            best_passage = passage_by_page.get(path)
+            best_passage = passage_by_page.get(discovery) or passage_by_page.get(path)
             if best_passage is not None:
                 snippet = _make_snippet(best_passage[1], terms)
             else:
                 snippet = _make_snippet(body, terms) if enabled else ""
+        scope = dict(entry.scope)
+        if scope.get('reading_role') == 'article':
+            # Full integrity/reference metadata stays in the Bundle. Search
+            # returns a bounded locator, never a second copy of its outline.
+            references = scope.pop('reference_targets', [])
+            scope.pop('article_sha256', None)
+            scope.pop('body_sha256', None)
+            scope['reference_count'] = len(references)
+            scope['heading_path'] = scope.get('heading_path', [])[-8:]
+            scope['section_titles'] = scope.get('section_titles', [])[:8]
         hits.append(
             SearchHit(
                 path=path,
@@ -840,7 +947,7 @@ def _fts_search(
                 bm25_score=bm25_score_map.get(path),
                 snippet=snippet,
                 evidence_units=[_make_snippet(u, terms) for u in evidence_units],
-                scope={**entry.scope, 'source_context': [{
+                scope={**scope, **({'discovery_index_path':discovery_indexes[path]} if path in discovery_indexes else {}), 'source_context': [{
                     key: corpus.source_scopes[sid].get(key) for key in (
                         'source_name', 'source_sha256', 'source_version',
                         'source_period_labels', 'period_basis', 'subject_mentions')}
@@ -848,6 +955,73 @@ def _fts_search(
             )
         )
     return hits
+
+
+def with_table_navigation_context(corpus: QueryCorpus, hits: Sequence[SearchHit],
+                                  cache: Dict[str, Any]) -> List[SearchHit]:
+    """Expose same-source worksheet regions and their source overview as clues.
+
+    This uses saved scope metadata, never a date/meal vocabulary or an inferred
+    entity identity. A tiny region can match a heading while the requested cells
+    live elsewhere in the worksheet. Context paths remain candidates only.
+    The metadata index is built once per query; no grid or body is scanned.
+    """
+    def single_row(scope):
+        bounds = scope.get("bounds") or scope.get("row_bounds") or scope
+        return (isinstance(bounds, dict) and bounds.get("row_start") is not None
+                and bounds.get("row_start") == bounds.get("row_end"))
+
+    # Raw fragments name their table but may omit its worksheet. Resolve only
+    # through the published table identity, with matching source ownership.
+    resolved_hits = []
+    for hit in hits:
+        table_id = hit.scope.get("table_id")
+        parent = corpus.page_index.get(f"tables/{table_id}.md") if table_id else None
+        if (not hit.scope.get("sheet") and parent is not None
+                and set(hit.scope.get("source_ids") or [])
+                & set(parent.scope.get("source_ids") or [])):
+            hit = hit.model_copy(update={"scope": {
+                **hit.scope, "sheet": parent.scope.get("sheet")}})
+        resolved_hits.append(hit)
+    hits = resolved_hits
+    anchors = [hit for hit in hits if hit.scope.get("sheet")
+               and hit.scope.get("source_ids") and single_row(hit.scope)]
+    if not anchors:
+        return list(hits)
+    if "tables" not in cache:
+        tables, overviews = defaultdict(list), {}
+        for path, entry in corpus.page_index.items():
+            ids = entry.scope.get("source_ids") or []
+            for source in ids:
+                if path.startswith("tables/") and entry.scope.get("sheet"):
+                    tables[(source, entry.scope["sheet"])].append((path, entry))
+                elif path.startswith("workbooks/"):
+                    overviews[source] = path
+        cache.update(tables=tables, overviews=overviews)
+    enriched = []
+    for hit in hits:
+        if hit not in anchors:
+            enriched.append(hit)
+            continue
+        related, seen = [], {hit.path}
+        for source in hit.scope.get("source_ids") or []:
+            candidates = cache["tables"].get((source, hit.scope.get("sheet")), [])
+            for path, entry in sorted(candidates, key=lambda item: item[0]):
+                if (path in seen or entry.object_id == hit.scope.get("table_id")
+                        or len(related) >= 3):
+                    continue
+                seen.add(path)
+                related.append({"path": path, "table_id": entry.object_id,
+                    "title": entry.title, "sheet": entry.scope.get("sheet"),
+                    "bounds": {key: entry.scope.get(key) for key in (
+                        "row_start", "row_end", "column_start", "column_end")},
+                    "description": entry.description[:350]})
+            overview = cache["overviews"].get(source)
+            if overview and len(related) < 4:
+                related.append({"path": overview, "kind": "source_overview"})
+        enriched.append(hit.model_copy(update={"scope": {
+            **hit.scope, **({"table_context": related[:4]} if related else {})}}))
+    return enriched
 
 
 def derive_page_number_map(
@@ -1027,8 +1201,8 @@ def validate_query_claims(
 
 
 _TABLE_GUIDANCE_SEARCH = (
-    "未知 `table_id` 时，可用问题中的明确业务词或值调用 `table_locate`（省略 `table_id`）"
-    "跨已授权表定位；零命中不证明业务不存在。"
+    "表格身份不明时，可在 `articles/tables/index.md` 和 `full-tables/` 中搜索标题、表头或相关文字；"
+    "零命中不证明业务不存在。"
 )
 
 
@@ -1095,11 +1269,9 @@ def _table_candidate_lines(siblings: Sequence[Mapping[str, Any]],
         title = str(item.get("title") or "")
         title_note = "（标题 `{}`）".format(title) if title else ""
         lines.append(
-            "- 候选 table_id `{}`{} — status `{}`；{}。候选不是本表：先用 "
-            "`table_inspect(table_id=\"{}\")` 按 document/sheet/范围确认身份，"
+            "- 候选 table_id `{}`{} — status `{}`；{}。候选不是本表：先按来源、工作表和范围确认身份，"
             "确认前不得据此取值，也不得用它替代本页的表。".format(
-                item.get("table_id"), title_note, item.get("status"), scope_note,
-                item.get("table_id")))
+                item.get("table_id"), title_note, item.get("status"), scope_note))
     omitted = len(candidates) - TABLE_CANDIDATE_LIMIT
     if omitted > 0:
         lines.append("- 另有 {} 张同来源表未列出（本页只列前 {} 张候选）。".format(
@@ -1123,13 +1295,12 @@ def build_table_navigation_page(
     table_path: str,
     title_aliases: Sequence[str] = (),
     siblings: Sequence[Mapping[str, Any]] = (),
+    complete_table: Optional[str] = None,
 ) -> tuple[PageIndexEntry, WikiPageSnapshot, str]:
     """One deterministic navigation page for a logical table.
 
-    ``raw_text`` is published only as a bounded structural preview inside a
-    code fence: it is a locator, never the data and never an answer.  Accepted
-    tables advertise the existing ``inspect`` / ``table_locate`` / ``table_read``
-    tools; unconfirmed tables stay raw-observation-only.
+    ``raw_text`` is a bounded locator. The complete saved logical table is a
+    separate ordinary file; unconfirmed structures stay explicitly marked.
 
     ``title_aliases`` keeps the flattened header line this page used to be
     titled with, so loosening the title for readers does not lose the column
@@ -1145,6 +1316,21 @@ def build_table_navigation_page(
     """
     status = str(interpretation_status or "unknown")
     grid = parse_grid(raw_text)
+    bounds = scope.get("bounds") or scope.get("row_bounds") or scope
+    rows = (bounds["row_end"] - bounds["row_start"] + 1
+            if isinstance(bounds, dict) and isinstance(bounds.get("row_start"), int)
+            and isinstance(bounds.get("row_end"), int) else None)
+    columns = (bounds["column_end"] - bounds["column_start"] + 1
+               if isinstance(bounds, dict) and isinstance(bounds.get("column_start"), int)
+               and isinstance(bounds.get("column_end"), int) else None)
+    from jonex_wiki.domain.engine.compile.table_navigation import full_table_path
+    full_path=full_table_path(source_id,table_id)
+    prefix = "../" * (table_path.count("/") + 1)
+    full_link = "[读取完整逻辑表](" + prefix + complete_table + ")\n\n" if complete_table else ""
+    size = "保存范围 {} 行 × {} 列（含表头）".format(rows, columns) if rows and columns else "行列范围见完整逻辑表"
+    card = "来源：{}；工作表/位置：{}；{}。\n字段：{}。\n\n".format(
+        source_name, scope.get("sheet") or scope.get("page_number") or title,
+        size, "、".join(fields[:12]) or "尚未确认")
     preview_text, preview_truncated = _bounded_preview(raw_text)
     preview = "```markdown\n" + preview_text.rstrip("\n") + "\n```\n"
     # A reader lands on this page before any agent does: open with one plain
@@ -1154,19 +1340,16 @@ def build_table_navigation_page(
         shape = "下面是结构预览（{} 行 × {} 列）。\n\n".format(len(grid[1]), len(grid[0]))
     if preview_truncated:
         preview += (
-            "\n本页只是结构预览，已按 {} 字节截断；完整数据必须通过 "
-            "`table_inspect` / `table_locate` / `table_read` 获取。\n"
+            "\n本页只是结构预览，已按 {} 字节截断；请直接读取完整逻辑表文件。\n"
         ).format(TABLE_PREVIEW_LIMIT)
     if status == "accepted":
         table_body = (
-            shape
+            full_link + shape
             + preview
-            + "\n完整数据入口：`table_id={}`；先 inspect，再 locate/read。已知表先 "
-              "`table_inspect` 确认字段；需要定位具体字面值时用 `table_locate`；"
-              "计数或枚举可以直接 `table_read` 读取完整必要范围，不强制每次 locate。"
-              "{}\n".format(table_id, _TABLE_GUIDANCE_SEARCH)
+            + ("" if complete_table else "\n完整逻辑表候选路径：`{}`。若文件存在，请直接读取整表，核对表头、单位、期间与附注；若不存在，请在 `articles/tables/index.md` 按来源和表格 ID 查找，或回查原文。".format(full_path))
+            + "本页预览仅供定位。{}\n".format(_TABLE_GUIDANCE_SEARCH)
         )
-        table_capabilities = ["inspect", "locate_text", "read_range"]
+        table_capabilities = ["read_file"]
         table_limitations = [
             "navigation_only",
             "preview_is_not_complete_table",
@@ -1180,14 +1363,13 @@ def build_table_navigation_page(
     else:
         article_path = "sources/articles/{}.md".format(source_id)
         table_body = (
-            preview
-            + "\n结构未确认（interpretation_status=`{}`）。上面的 preview 是原文片段，"
-              "不是可读的表结构：不要 `table_read` / `table_locate`，也不要据此汇总或"
-              "计算。需要完整原文时优先 `wiki_read(path=\"{}\")` 读来源原始全文"
-              "（含日期/星期/空白原样），或 `wiki_read(path=\"{}\")` 读来源导航页，"
-              "或用 `wiki_search` 定位原文片段。\n".format(status, article_path, source_path)
+            full_link + preview
+            + "\n编译时结构未确认（interpretation_status=`{}`）。preview 是定位线索。"
+              .format(status)
+            + ("" if complete_table else "若完整逻辑表文件 `{}` 存在，请直接读取并核对其结构；否则在 `articles/tables/index.md` 查找或回查原文。".format(full_path))
+            + "未确认的字段不可用于统计。来源全文为 `{}`，来源导航为 `{}`。\n".format(article_path, source_path)
         )
-        table_capabilities = ["inspect"]
+        table_capabilities = ["read_file"]
         table_limitations = [
             "navigation_only",
             "preview_is_not_complete_table",
@@ -1202,7 +1384,7 @@ def build_table_navigation_page(
         table_path=table_path)
     candidates = _table_candidate_lines(siblings, table_id=str(table_id))
     if identity:
-        table_body += "\n## 本表身份\n" + "\n".join(identity) + "\n"
+        table_body = card + "\n".join(identity) + "\n\n" + table_body
     if candidates:
         table_body += ("\n## 同来源候选表（候选，不是本表，不得替代）\n"
                        + "\n".join(candidates) + "\n")
@@ -1211,13 +1393,8 @@ def build_table_navigation_page(
         title=title[:200],
         aliases=[str(table_id)] + [value for value in title_aliases if value],
         tags=["table", "navigation-only"],
-        description=(
-            "这张表共 {} 行 × {} 列：{}。本页是结构预览与读取入口，完整数据由表格读取工具按需提供。"
-            .format(len(grid[1]), len(grid[0]), "、".join(grid[0][:8]))
-            if grid is not None else
-            "结构未确认（interpretation_status={}）：本页只是原文片段，不能据此汇总或计算。"
-            .format(status)
-        ),
+        description="{}；{}；字段：{}；编译解释 {}。预览仅用于定位，直接读取本表可获得完整交付或明确缺口。".format(
+            source_name, size, "、".join(fields[:8]), status),
         object_id=str(table_id),
         scope=dict(scope),
         fields=list(fields),
@@ -1280,6 +1457,7 @@ def build_workbook_concept_page(
     second and staler source of truth beside the grid it describes.
     """
     tables = list(getattr(outline, "tables", ()) or ())
+    from jonex_wiki.domain.engine.compile.table_navigation import full_table_path
     described = [table for table in tables if table.table_id in table_paths]
     linked_paths = [table_paths[table.table_id] for table in described]
 
@@ -1288,7 +1466,7 @@ def build_workbook_concept_page(
         "## Summary",
         "",
         "{} 个工作表、{} 张逻辑表。**本页只给骨架与取数入口，不含单元格取值**；"
-        "逐格取值见下列表格页，或一次性读取完整工作簿。".format(
+        "逐格取值请读取下列完整逻辑表文件。".format(
             getattr(outline, "sheet_count", 0) or len({
                 table.sheet for table in described}),
             len(described),
@@ -1343,8 +1521,9 @@ def build_workbook_concept_page(
             columns = table.column_end - table.column_start + 1
             lines.append(
                 "- table_id `{}` — 工作表 `{}`，{}×{}，status `{}`，"
-                "导航页 `wiki_read(path=\"{}\")`。".format(
-                    table.table_id, table.sheet, rows, columns, table.status, path))
+                "导航页 `{}`；完整逻辑表候选路径 `{}`，文件不存在时请查 `articles/tables/index.md` 或回查原文。".format(
+                    table.table_id, table.sheet, rows, columns, table.status, path,
+                    full_table_path(source_id,table.table_id)))
         lines.append("")
 
     lines += [
@@ -1353,18 +1532,14 @@ def build_workbook_concept_page(
         "| 需要什么 | 用什么 |",
         "|---|---|",
         "| 指定字段或位置的原始取值 | 打开对应表格页，核对表头路径、行列坐标与原始值；存在日期或行分组时再使用相应导航 |",
-        "| 整本工作簿原文 | `wiki_read` 本来源的 workbook 视图（一次交付完整工作簿） |",
-        "| 精确计数或求和 | 表格 status 为 `accepted` 时用 `table_read` + `table_compute` |",
+        "| 完整逻辑表 | 按表格清单直接读取对应文件，保留表头、单位和附注 |",
+        "| 精确计数或求和 | 先读取相关完整表，依据明确的范围和条件计算 |",
         "",
     ]
     body = "\n".join(lines) + "\n"
 
     accepted = [table for table in described if table.status == "accepted"]
-    if accepted:
-        capabilities = ["wiki_read", "wiki_search", "table_inspect", "table_locate",
-                        "table_read"]
-    else:
-        capabilities = ["wiki_read", "wiki_search", "table_inspect"]
+    capabilities = ["read_file", "search_files"]
     limitations = ["navigation_only", "skeleton_only", "no_cell_values", "no_aggregation"]
 
     entry = PageIndexEntry(
@@ -1372,8 +1547,13 @@ def build_workbook_concept_page(
         title=(source_name or source_id)[:200],
         aliases=[value for value in [document_id] if value],
         tags=["workbook", "spreadsheet", "navigation-only"],
-        description="Native workbook skeleton: sheet/table inventory, date-to-column "
-                    "alignment and row bands, with links to every table page.",
+        description=("本来源含 {} 个工作表或原文分区、{} 张逻辑表。分区：{}。{}"
+                     "进入后按来源区域、表头和坐标选择原表。").format(
+            getattr(outline, "sheet_count", 0) or len({table.sheet for table in described}), len(described),
+            "、".join(list(dict.fromkeys(table.sheet for table in described))[:6]) or "未记录",
+            ("原表分组：" + "、".join(list(dict.fromkeys(
+                group.label for table in described for group in table.groups if group.label))[:8]) + "。")
+            if any(table.groups for table in described) else ""),
         object_id="workbook-" + source_id,
         scope={
             "document_id": document_id,
@@ -1429,12 +1609,13 @@ def build_source_navigation_page(
     table_titles: Optional[Dict[str, str]] = None,
 ) -> tuple[PageIndexEntry, WikiPageSnapshot, str]:
     """One deterministic navigation page for a source and its table edges."""
+    from jonex_wiki.domain.engine.compile.table_navigation import full_table_path
     article_path = "sources/articles/{}.md".format(source_id)
     body = (
         "# {}\n\nSource ID: `{}`\n\nDocument: `{}`\n\n"
         "Source SHA256: `{}`\n\nParser: `{}`\n\nContent generation: `{}`\n\n"
-        "原文导航入口：`wiki_read(paths=[\"{}\"])`。继续读取导航列出的原文片段；来源摘要和目录本身不是答案证据。"
-        "也可用 `wiki_search` 定位片段，用下面列出的 table 工具读取已发布表格。\n\n"
+        "来源全文：`{}`。继续读取对应原文片段；来源摘要和目录本身不是答案证据。"
+        "涉及表格时请直接读取下面列出的完整逻辑表文件。\n\n"
     ).format(
         source_name, source_id, document_id, source_sha256, parser_id,
         content_generation, article_path,
@@ -1447,29 +1628,26 @@ def build_source_navigation_page(
             title_note = "（标题 `{}`）".format(title) if title else ""
             if status == "accepted":
                 rows.append(
-                    "- table_id `{}`{} — status `accepted`；调用 "
-                    "`table_inspect(table_id=\"{}\")` 查看字段，再 `table_read` 读取"
-                    "完整必要范围；导航页 `wiki_read(path=\"{}\")`。".format(
-                        value, title_note, value, path
+                    "- table_id `{}`{} — 编译状态 `accepted`；完整逻辑表候选路径 `{}`（存在时直接读，不存在时查 `articles/tables/index.md` 或回查原文）；"
+                    "表格导航页 `{}`。".format(
+                        value, title_note, full_table_path(source_id,value), path
                     )
                 )
             else:
                 rows.append(
-                    "- table_id `{}`{} — status `{}`；结构未确认：不要 table_read，"
-                    "用 `wiki_read(path=\"{}\")` 读原文片段。".format(
-                        value, title_note, status, path
+                    "- table_id `{}`{} — 编译状态 `{}`；完整逻辑表候选路径 `{}`（存在时直接读，不存在时查 `articles/tables/index.md` 或回查原文）；"
+                    "导航页 `{}`。字段未确认时不按字段名统计。".format(
+                        value, title_note, status, full_table_path(source_id,value), path
                     )
                 )
         body += "## Tables\n" + "\n".join(rows) + "\n"
-        capabilities = ["wiki_read", "open_original", "table_inspect"]
-        if any(value == "accepted" for value in table_status.values()):
-            capabilities += ["table_locate", "table_read"]
+        capabilities = ["read_file", "open_original"]
     else:
         body += (
-            "## Tables\n\n_本来源没有已发布的逻辑表。_ 原文证据用 `wiki_read` 读本页正文，"
-            "或用 `wiki_search` 定位原文片段；原件附件在 `sources/registry.json`。\n"
+            "## Tables\n\n_本来源没有已发布的逻辑表。_ 请直接读取来源文件；"
+            "原件附件在 `sources/registry.json`。\n"
         )
-        capabilities = ["wiki_read", "open_original"]
+        capabilities = ["read_file", "open_original"]
     entry = PageIndexEntry(
         path=source_path,
         title=source_name[:200],
@@ -1628,6 +1806,7 @@ def build_query_corpus(
         )
 
     count_work("query_corpus_build")
+    raw_pages = [raw if isinstance(raw, RawWikiPage) else RawWikiPage.model_validate(raw) for raw in raw_pages]
     if not validated:
         validate_query_claims(
             state,
@@ -1662,6 +1841,7 @@ def build_query_corpus(
     source_records: Dict[str, List[Dict[str, str]]] = {}
     source_locations: Dict[str, Dict[str, Any]] = {}
     raw_paths_by_table: Dict[tuple[str, str], List[str]] = defaultdict(list)
+    full_paths_by_table: Dict[tuple[str, str], str] = {}
 
     if include_sources:
         delta = getattr(state, '_compile_delta', None)
@@ -1707,6 +1887,7 @@ def build_query_corpus(
             if raw.path in pages:
                 raise ValueError("RAW_PAGE_PATH_COLLISION: " + raw.path)
             scope_payload: Dict[str, Any] = {
+                **raw.scope,
                 "content_kind": raw.content_kind,
                 "source_id": raw.source_id,
             }
@@ -1719,22 +1900,26 @@ def build_query_corpus(
                 title=raw.title or ("Raw table " + str(raw.table_id) if raw.table_id else raw.source_id),
                 aliases=list(raw.aliases),
                 tags=list(raw.tags),
-                description="",
+                description=(' / '.join(raw.scope.get('section_titles',[]))[:200]
+                             if raw.scope.get('reading_role')=='article' else ''),
                 object_id=raw.table_id or raw.source_id,
                 scope=scope_payload,
                 limitations=["raw_text_only", "not_a_validated_claim"],
-                capabilities=["wiki_read"],
+                capabilities=["read_file"],
                 interpretation_status=raw.structure_status,
             )
             index[raw.path] = entry
             pages[raw.path] = WikiPageSnapshot(
                 index=entry,
-                content=_literal_source_block(raw.body),
+                content=(raw.body if raw.scope.get('reading_role')=='article' else _literal_source_block(raw.body)),
                 source_ids=[raw.source_id],
                 related_pages=list(raw.related_pages),
             )
             if raw.content_kind == "table_raw" and raw.table_id is not None:
-                raw_paths_by_table[(raw.source_id, raw.table_id)].append(raw.path)
+                identity = (raw.source_id, raw.table_id)
+                raw_paths_by_table[identity].append(raw.path)
+                if raw.scope.get("full_table_path"):
+                    full_paths_by_table[identity] = raw.scope["full_table_path"]
 
         # Deterministic navigation pages are still built from parser identity.
         by_source: Dict[str, List[ArchivedPassage]] = defaultdict(list)
@@ -1874,7 +2059,8 @@ def build_query_corpus(
                         "bounds": passage.source_metadata.get("bounds", [])}),
                     raw_text=passage.text, source_path=source_path, table_path=table_path,
                     title_aliases=[raw_title] if raw_title else [],
-                    siblings=_siblings(str(table_id)))
+                    siblings=_siblings(str(table_id)),
+                    complete_table=full_paths_by_table.get((source_id, str(table_id))))
                 index[table_path] = table_entry
                 pages[table_path] = table_snapshot
                 view_inputs[table_path] = {
@@ -1900,7 +2086,8 @@ def build_query_corpus(
                     raw_text=str(spec.get("raw_text") or ""),
                     source_path=source_path, table_path=table_path,
                     title_aliases=[raw_title] if raw_title else [],
-                    siblings=_siblings(table_id))
+                    siblings=_siblings(table_id),
+                    complete_table=full_paths_by_table.get((source_id, table_id)))
                 index[table_path] = table_entry
                 pages[table_path] = table_snapshot
                 view_inputs[table_path] = {
@@ -2021,7 +2208,7 @@ def build_query_corpus(
                 },
                 why_visit="Use the complete Sources and Tables registries when semantic classification is unavailable.",
                 limitations=["navigation_only", "semantic_classification_unavailable"],
-                capabilities=["wiki_read", "wiki_search"],
+                capabilities=["read_file", "search_files"],
                 interpretation_status="unclassified",
             )
             registries = ["[[sources/index.md|All Sources]]"]
@@ -2048,6 +2235,9 @@ def build_query_corpus(
         pages[path] = WikiPageSnapshot(index=entry, content=(
             'Browse source-bound overview entry points and their versions. Read linked facts before answering.\n\n' + links))
     attach_origin_links(pages, state, claims, source_records, source_locations)
+    from jonex_wiki.domain.engine.compile.chapter_pages import attach_reading_targets, attach_article_catalog
+    attach_reading_targets(pages, claims, raw_pages, state.source_archive, source_records, source_locations)
+    attach_article_catalog(pages,raw_pages)
     index = {path: pages[path].index for path in pages}
 
     # Rendering a detached state keeps navigation/backlinks intact while
@@ -2251,7 +2441,7 @@ def _build_query_corpus_legacy(
                                           "source_sha256": first.sha256},
                                    why_visit="Browse every published object and exact evidence interval from this source.",
                                    limitations=["navigation_only", "read_original_evidence_before_answering"],
-                                   capabilities=["wiki_read", "open_original"])
+                                   capabilities=["read_file", "open_original"])
             grounded_index[source_path] = entry
             grounded_pages[source_path] = WikiPageSnapshot(
                 index=entry, content=body, source_ids=[source_id],
@@ -2281,7 +2471,7 @@ def _build_query_corpus_legacy(
                     why_visit="Inspect this logical table, locate exact values, then read the complete necessary range.",
                     limitations=["navigation_only", "preview_is_not_complete_table",
                                  "no_aggregation", "no_sort", "no_join", "no_formula_recalculation"],
-                    capabilities=["inspect", "locate_text", "read_range"],
+                    capabilities=["read_file"],
                     interpretation_status=str(passage.source_metadata.get("interpretation_status") or "unknown"))
                 grounded_index[table_path] = table_entry
                 grounded_pages[table_path] = WikiPageSnapshot(
@@ -2315,7 +2505,7 @@ def _build_query_corpus_legacy(
                 },
                 why_visit="Use the complete Sources and Tables registries when semantic classification is unavailable.",
                 limitations=["navigation_only", "semantic_classification_unavailable"],
-                capabilities=["wiki_read", "wiki_search"],
+                capabilities=["read_file", "search_files"],
                 interpretation_status="unclassified",
             )
             registries = ["[[sources/index.md|All Sources]]"]
@@ -2426,6 +2616,19 @@ def _existing_origin_targets(
                 if path not in pages or path in seen:
                     continue
                 location = source_locations.get(path, {})
+                # A passage may produce dozens of source fragments. Only
+                # intersections with validated claim spans are exact origins;
+                # legacy/unknown intervals retain document navigation below.
+                records = source_records.get(path, [])
+                start, end = location.get('start_char'), location.get('end_char')
+                spans = [span for span in claim.source_spans if span.passage_id==ref.passage_id]
+                if (not isinstance(start,int) or not isinstance(end,int) or not any(
+                    span.start_char < end and start < span.end_char
+                    and any(record.get('source_id')==span.source_id
+                            and record.get('document_id')==span.document_id
+                            and record.get('chunk_id')==span.chunk_id for record in records)
+                    for span in spans)):
+                    continue
                 suffix = "characters {}:{}".format(
                     location.get("start_char", "?"), location.get("end_char", "?"))
                 targets.append({"path": path, "label": ref.passage_id, "suffix": suffix})

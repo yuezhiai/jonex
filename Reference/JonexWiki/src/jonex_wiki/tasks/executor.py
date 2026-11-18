@@ -51,10 +51,7 @@ class TaskExecutor:
 
     def submit_query(self, row: QueryTaskRow, *, thinking_mode: str | None = None,
                      trace_id: str | None = None) -> None:
-        """提交后台查询任务（独立 query_tasks 表,不复用 tasks 生命周期）。
-
-        ``trace_id``：本次查询的计量 trace（平台检索 trace）；None = 引擎用 bundle 级标识。
-        """
+        """提交后台查询任务（独立 query_tasks 表,不复用 tasks 生命周期）。"""
         self._cancel_flags[row.query_id] = asyncio.Event()
         self._running_tasks[row.query_id] = asyncio.create_task(
             self._run_query(row, thinking_mode=thinking_mode, trace_id=trace_id))
@@ -178,8 +175,6 @@ class TaskExecutor:
         """后台查询生命周期(§6.3/§6.4):queued→running→done/failed/cancelled。
 
         query_tasks 只读高频、无 stage 恢复重放;不落 tasks 表。
-        ``trace_id`` 只在**本次进程内**随调用链传递（不落库）：重启后仍在队列里的
-        查询本来就依赖内存态 runner，语义一致。
         """
         try:
             if self.query_runner is None:
@@ -194,14 +189,12 @@ class TaskExecutor:
                                                  TaskStatus.running.value)
                     await s.commit()
                 try:
-                    # 只在有值时追加 kwarg：无 trace 的调用形状与旧版完全一致
-                    # （runner 可被替换成只认 thinking_mode 的实现）。
-                    runner_kwargs: dict = {}
+                    options = {}
                     if thinking_mode is not None:
-                        runner_kwargs["thinking_mode"] = thinking_mode
+                        options["thinking_mode"] = thinking_mode
                     if trace_id:
-                        runner_kwargs["trace_id"] = trace_id
-                    result = await self.query_runner(row, **runner_kwargs)
+                        options["trace_id"] = trace_id
+                    result = await self.query_runner(row, **options)
                 except asyncio.CancelledError:
                     async with self.session_factory() as s:
                         await self._transition_query(s, row.tenant_id, row.query_id,
@@ -377,8 +370,10 @@ class TaskExecutor:
                 row.finished_at = _now()
         await session.flush()
 
-    async def purge_expired_queries(self, session: AsyncSession, *, ttl_seconds: int) -> int:
-        """启动 GC:清除 done/failed/cancelled 且 finished_at 早于 TTL 窗口的 query_tasks 行。"""
+    async def purge_expired_queries(self, session: AsyncSession, *, ttl_seconds: int | None) -> int:
+        """Preserve query records by default; expire them only when configured."""
+        if ttl_seconds is None:
+            return 0
         from jonex_wiki.storage.repos import QueryTaskRepo
         before = _now() - timedelta(seconds=ttl_seconds)
         return await QueryTaskRepo().delete_expired(session, before=before)

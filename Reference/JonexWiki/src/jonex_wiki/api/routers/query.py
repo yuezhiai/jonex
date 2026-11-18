@@ -11,15 +11,15 @@ router = APIRouter(prefix="/api/v1/kbs/{kb_id}", tags=["query"])
 class QueryBody(BaseModel):
     model_config = {"extra": "forbid"}
     question: str
-    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
-    retrieval_strategy: Literal["tree", "direct", "structure", "semantic"] | None = None
+    thinking_mode: Literal["fast", "standard", "deep"] | None = None  # legacy, ignored by the runner
+    retrieval_strategy: Literal["agent_direct"] | None = None
     query_context: QueryImageContext | None = None
 
 
 @router.post("/query", status_code=202)
 async def query(kb_id: str, body: QueryBody, request: Request,
                 tenant_id: str = Depends(require_tenant)):
-    options = {"thinking_mode": body.thinking_mode}
+    options = {"thinking_mode": body.thinking_mode} if body.thinking_mode is not None else {}
     if body.retrieval_strategy is not None:
         options["retrieval_strategy"] = body.retrieval_strategy
     if body.query_context is not None:

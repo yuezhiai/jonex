@@ -31,7 +31,7 @@ _TASK_STATUS_ALIAS = {
 
 # [jonex] Wiki 页面树投影：引擎页面类型 → 前端(OpenKB 词汇) section。
 # 前端 WikiPageBrowser 只认 summaries/concepts/entities 三类 section。
-_SECTION_BY_TYPE = {"source": "summaries", "table": "entities", "concept": "concepts"}
+_SECTION_BY_TYPE = {"source": "summaries", "table": "entities", "concept": "concepts", "article": "concepts"}
 # section → 引擎页面目录前缀（concept 无固定目录前缀，留空）。
 _SECTION_PREFIX = {"summaries": "sources/", "entities": "tables/", "concepts": ""}
 # 链入本页（What links here）单次返回的反向链接条数上限。
@@ -234,7 +234,7 @@ def _compile_model(data: dict) -> str:
 
 
 _ACTIONS = {
-    "init_kb", "compile_parsed_document", "compile_parsed_documents", "query", "status", "list_contents",
+    "init_kb", "compile_parsed_document", "compile_parsed_documents", "query", "query_start", "query_status", "status", "list_contents",
     "recompile", "remove_document", "delete_kb", "list_graph", "list_page_graph", "read_page",
     "list_wiki_contents", "get_compile_status", "list_compile_tasks", "get_document_chunks",
     "apply_schema", "reparse", "cancel_task", "cancel_query", "resolve_evidence",
@@ -246,6 +246,55 @@ _ACTIONS = {
     # [jonex] 编译前预检：本库哪些产物需要重新解析（只读，供平台在派编译之前拦住）
     "parse_status", "query_graph", "query_resources", "scenario",
 }
+
+
+def _project_query_result(result: dict, task_id: str, want_trace: bool) -> dict:
+    out: dict = {
+        "answer": str(result.get("answer") or ""),
+        "citations": [dict(c, query_id=task_id, bundle_sha=result.get("bundle_sha"))
+                      for c in _normalize_citations(result.get("citations"))],
+    }
+    out.update({key: result[key] for key in
+                ("incomplete", "stop_reason", "failure_class") if key in result})
+    if 'source_document_ids' in result:
+        scope = result['source_document_ids']
+        # The Bundle scope is all-or-nothing: a malformed or oversized value
+        # must not become a partial list that history might mistake as complete.
+        out['source_document_ids'] = (scope if isinstance(scope, list) and len(scope) <= 10000
+            and all(isinstance(item, str) and 0 < len(item) <= 128 for item in scope) else None)
+    for key in ("incomplete_reason", "recovery_notes"):
+        if result.get(key):
+            out[key] = str(result[key])[:2000]
+    # Unverified model-reported locations are plain text only.
+    # Never expose or open the model's absolute filesystem path.
+    unverified = []
+    for item in (result.get("unverified_citations") or [])[:50]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("bundle_path") or "")
+        if path.startswith("/") or ".." in path.split("/") or "\\" in path:
+            path = ""
+        unverified.append({"bundle_path": path,
+            "locator": str(item.get("reported_locator") or "")[:300],
+            "status": "unverified"})
+    out["unverified_citations"] = unverified
+    usage = result.get("token_usage") or {}
+    out["token_usage"] = {str(k): v for k, v in usage.items()
+                          if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    config = result.get("config") or {}
+    out["full_table_ids"] = [str(v)[:200] for v in
+                              (config.get("full_table_ids") or [])[:100]]
+    if want_trace:
+        out["trace"] = list(result.get("trace") or [])
+        out["spans"] = list(result.get("spans") or [])
+        out["counts"] = {
+            "search_calls": _as_int(result.get("search_calls")),
+            "read_calls": _as_int(result.get("read_calls")),
+            "tool_calls": _as_int(result.get("tool_calls")),
+            "model_calls": _as_int(result.get("model_calls")),
+        }
+        out["latency_ms"] = _as_int(result.get("latency_ms"))
+    return out
 
 
 class JonexWikiCapability(BaseCapability):
@@ -308,8 +357,10 @@ class JonexWikiCapability(BaseCapability):
                 and d.get("document_id") for d in documents))
         if action == "compile_parsed_document":
             return bool(data.get("source_path") and data.get("source_name"))
-        if action == "query":
+        if action in ("query", "query_start"):
             return bool(str(data.get("question") or "").strip())
+        if action == "query_status":
+            return bool(str(data.get("query_id") or "").strip())
         if action in ("remove_document", "reparse", "recompile", "get_document_chunks"):
             return bool(data.get("document_id"))
         if action == "read_page":
@@ -367,6 +418,23 @@ class JonexWikiCapability(BaseCapability):
             return await app.ingest_parsed_document(tenant_id, kb_id, data["source_path"],
                                                     data["source_name"], data.get("document_id"),
                                                     compile_model=_compile_model(data))
+        if action == "query_start":
+            options = {}
+            for key in ("thinking_mode", "query_context", "trace_id"):
+                if data.get(key) is not None:
+                    options[key] = data[key]
+            return await app.query(tenant_id, kb_id, str(data.get("question") or ""), **options)
+        if action == "query_status":
+            query_id = str(data.get("query_id") or "")
+            state = await app.get_task(tenant_id, query_id)
+            if state.get("kind") != "query" or state.get("kb_id") != kb_id:
+                raise ValueError("Query does not belong to this knowledge base")
+            status = str(state.get("status") or "")
+            return {"status": status, "progress": state.get("progress") or {},
+                    "error": state.get("error") if status in ("failed", "cancelled") else None,
+                    "result": _project_query_result(state.get("result") or {}, query_id,
+                                                    bool(data.get("return_trace")))
+                              if status == "done" else None}
         if action == "query":
             return await self._query_sync(app, tenant_id, kb_id,
                                           str(data.get("question") or ""),
@@ -485,6 +553,8 @@ class JonexWikiCapability(BaseCapability):
           · answer    —— 始终透出；
           · citations —— 引擎已核验的引用（六字段 + page_path），是平台 references 的
                         唯一来源。**不受 want_trace 影响**：引用是答案的证据，不是调试信息；
+          · incomplete / stop_reason / failure_class —— 若引擎提供，始终透出；
+                        有部分正文不代表问题已经完成，也不能依赖调试开关保留终态。
           · trace / spans / counts / latency_ms —— 仅 want_trace 时透出。trace 是引擎侧
                         已做白名单投影的检索/阅读轨迹（检索词、候选页、实读页），
                         spans 是 CR-TRACE-002 公开时间线（工具/模型/证据/合成 + 耗时）。
@@ -526,23 +596,7 @@ class JonexWikiCapability(BaseCapability):
                         await redis.hset(key, f"progress:{kb_id}", json.dumps(progress, ensure_ascii=False))
                         last_progress = progress.get("seq")
                 if status == "done":
-                    result = st.get("result") or {}
-                    out: dict = {
-                        "answer": str(result.get("answer") or ""),
-                        "citations": [dict(c, query_id=task_id, bundle_sha=result.get("bundle_sha"))
-                                      for c in _normalize_citations(result.get("citations"))],
-                    }
-                    if want_trace:
-                        out["trace"] = list(result.get("trace") or [])
-                        out["spans"] = list(result.get("spans") or [])
-                        out["counts"] = {
-                            "search_calls": _as_int(result.get("search_calls")),
-                            "read_calls": _as_int(result.get("read_calls")),
-                            "tool_calls": _as_int(result.get("tool_calls")),
-                            "model_calls": _as_int(result.get("model_calls")),
-                        }
-                        out["latency_ms"] = _as_int(result.get("latency_ms"))
-                    return out
+                    return _project_query_result(st.get("result") or {}, task_id, want_trace)
                 if status in ("failed", "cancelled"):
                     # 任务失败是可诊断错误，抛异常走 execute→error response→client→
                     # search_jonex_wiki 的 except 分支，避免被静默吞成「无答案」。
@@ -552,10 +606,9 @@ class JonexWikiCapability(BaseCapability):
                 await asyncio.sleep(_QUERY_POLL_INTERVAL_S)
         except BaseException:
             # A stopped/disconnected streaming search must not leave model work running.
-            if progress_session:
-                from contextlib import suppress
-                with suppress(Exception):
-                    await app.cancel_task(tenant_id, task_id)
+            from contextlib import suppress
+            with suppress(Exception):
+                await app.cancel_task(tenant_id, task_id)
             raise
 
     async def _list_wiki_contents(self, app, tenant_id: str, kb_id: str,

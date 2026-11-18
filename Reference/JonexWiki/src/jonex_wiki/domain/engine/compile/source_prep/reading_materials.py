@@ -59,6 +59,7 @@ def _heading_scan(text: str) -> List[Dict[str, Any]]:
     offset = 0
     in_fence = False
     fence = ""
+    previous = None
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
@@ -67,26 +68,20 @@ def _heading_scan(text: str) -> List[Dict[str, Any]]:
                 in_fence, fence = True, marker
             elif stripped.startswith(fence):
                 in_fence = False
+            previous = None
             offset += len(line)
             continue
         if not in_fence:
             match = atx.match(stripped)
             if match and match.group(2).strip():
                 headings.append((offset, len(match.group(1)), match.group(2).strip()))
+            elif previous and setext.fullmatch(stripped):
+                prior_offset, prior_title = previous
+                headings.append((prior_offset, 1 if stripped.startswith('=') else 2, prior_title))
+            previous = (offset, stripped) if stripped and not match and not setext.fullmatch(stripped) else None
+        else:
+            previous = None
         offset += len(line)
-    non_empty = [(idx, line) for idx, line in enumerate(lines) if line.strip()]
-    for pos, (index, line) in enumerate(non_empty):
-        if pos + 1 >= len(non_empty):
-            continue
-        nxt = non_empty[pos + 1][1]
-        if not setext.match(nxt.strip()):
-            continue
-        title = line.strip()
-        if not title or atx.match(title):
-            continue
-        level = 1 if nxt.strip().startswith("=") else 2
-        start = sum(len(lines[j]) for j in range(index))
-        headings.append((start, level, title))
     headings.sort(key=lambda item: item[0])
 
     sections: List[Dict[str, Any]] = []
@@ -98,8 +93,6 @@ def _heading_scan(text: str) -> List[Dict[str, Any]]:
         parent = stack[-1]["start"] if stack else None
         node = {"title": title, "level": level, "parent": parent,
                 "start": start, "end": len(text)}
-        if stack:
-            stack[-1]["end"] = start
         sections.append(node)
         stack.append(node)
     while stack:

@@ -31,7 +31,7 @@ def pinned_view(layout, tenant_id, kb_id, revision=""):
     return view
 
 
-async def query_images(layout, tenant_id, kb_id, operation, options):
+async def query_images(layout, tenant_id, kb_id, operation, options, *, visibility_guard=None):
     revision = options.get("revision", "")
     if not isinstance(revision, str):
         raise ValidationError("IMAGE_REVISION_INVALID")
@@ -39,6 +39,8 @@ async def query_images(layout, tenant_id, kb_id, operation, options):
         raise ValidationError("IMAGE_REVISION_REQUIRED")
     async with layout.version_lock(tenant_id, kb_id):
         view = pinned_view(layout, tenant_id, kb_id, revision)
+        if visibility_guard:
+            await visibility_guard(layout.versions_dir(tenant_id, kb_id, view.manifest_hash))
         if operation == "find_images":
             return await asyncio.to_thread(find_images, view, options)
         if operation != "get_image" or set(options) - {

@@ -30,10 +30,11 @@ class GwOutputTooLong(RuntimeError):
        不产出内容的地方"的直接证据——这是判断该不该做章节化输出的关键判据
     """
 
-    def __init__(self, message: str, *, usage: dict | None = None, content_chars: int = 0):
+    def __init__(self, message: str, *, usage: dict | None = None, content_chars: int = 0,raw_content: str | None=None):
         super().__init__(message)
         self.usage = usage
         self.content_chars = content_chars
+        self.raw_content=raw_content
 
 
 # 值得重发的 HTTP 状态：限流、超时、以及一切 5xx。其余 4xx 都是"重发同一个请求
@@ -79,6 +80,21 @@ class GwUpstreamRejected(RuntimeError):
         self.model = model
         self.status_code = status
         self.reason = reason
+
+    @property
+    def model_unavailable(self) -> bool:
+        return self.status_code in {401, 402, 403, 404}
+
+    @property
+    def context_too_large(self) -> bool:
+        reason = self.reason.casefold()
+        return self.status_code == 413 or (
+            self.status_code in {400, 422} and any(marker in reason for marker in (
+                "context_length_exceeded", "context length", "context window",
+                "maximum context", "input is too long", "too many input tokens",
+                "prompt is too long", "上下文长度",
+            ))
+        )
 
 
 def _upstream_reason(exc: BaseException, limit: int = 300) -> str:
@@ -152,6 +168,9 @@ def thinking_payload(value: str | None) -> dict | None:
     raise ValueError(f"thinking 取值非法: {value!r}(仅支持 on/off/scene_default)")
 
 
+_DEFAULT_REQUEST_TIMEOUT = object()
+
+
 class GwClient:
     """spec §12:所有模型调用走 llm-gateway;计量头强制注入。"""
 
@@ -177,7 +196,8 @@ class GwClient:
 
     async def complete(self, messages, *, scene, tenant_id, kb_id, trace_id,
                        schema=None, json_mode=False, max_tokens=4096, model=None,
-                       doc_id=None, tools=None, thinking=None) -> dict:
+                       doc_id=None, tools=None, thinking=None, reasoning_effort=None,
+                       request_timeout=_DEFAULT_REQUEST_TIMEOUT, max_attempts=3) -> dict:
         """契约:返回 dict 且 content 恒为 str(JSON 文本或原始文本);调用方经 parse_json_content 解析。
 
         json_mode=True 时请求 response_format=json_object(强制模型输出 JSON);
@@ -203,7 +223,8 @@ class GwClient:
             )
         kwargs = dict(model=resolved_model, messages=messages,
                       max_tokens=max_tokens, temperature=0,
-                      timeout=self.settings.llm_timeout,   # 挂起要快失败,交给下面的重试预算
+                      timeout=(self.settings.llm_timeout if request_timeout is _DEFAULT_REQUEST_TIMEOUT
+                               else request_timeout),
                       extra_headers=self._headers(scene=scene, tenant_id=tenant_id,
                                                   kb_id=kb_id, trace_id=trace_id, doc_id=doc_id))
         if schema is not None:
@@ -222,8 +243,12 @@ class GwClient:
             kwargs["tools"] = tools
         if thinking is not None:
             kwargs["extra_body"] = {"thinking": thinking}
+        if reasoning_effort is not None:
+            kwargs.setdefault("extra_body", {})["reasoning_effort"] = reasoning_effort
         last: Exception | None = None
-        for attempt in range(3):  # 重试 2 次,共 3 尝试
+        if not 1 <= max_attempts <= 3:
+            raise ValueError("max_attempts must be between 1 and 3")
+        for attempt in range(max_attempts):
             try:
                 resp = await self.llm.chat.completions.create(**kwargs)
                 choice = resp.choices[0]
@@ -240,7 +265,7 @@ class GwClient:
                         f"(completion_tokens={(usage or {}).get('completion_tokens')},"
                         f" content_chars={len(content)});"
                         f"需要缩小单次输出规模,而不是重试",
-                        usage=usage, content_chars=len(content))
+                        usage=usage, content_chars=len(content),raw_content=content)
                 if not content and json_mode and "response_format" in kwargs:
                     # 未截断的空输出才可能是 json_object 模式不兼容 → 去掉参数重试
                     log.warning("json_object 下空输出(未截断),降级自由输出重试")
@@ -256,6 +281,7 @@ class GwClient:
             except GwOutputTooLong:
                 raise            # 不可重试:绕过下面的 json_mode 降级与网络重试
             except Exception as e:  # noqa: BLE001 —— 网络/5xx 重试
+                last = e
                 status = _status_of(e)
                 # 「参数不被支持」才值得去掉参数重发。402/401/403 与参数无关，
                 # 放它们进降级分支只会白多打一次上游（实测 402 因此多发一次请求）。
@@ -276,12 +302,11 @@ class GwClient:
                     # 明确拒绝：重发同一个请求只会拿到同一个错。立刻上抛并把模型名
                     # 与上游错因带出去，而不是空转 2 次再报一句"重试耗尽"。
                     raise _rejection(e, status=status, model=resolved_model) from e
-                last = e
                 log.warning("llm complete attempt %d failed: %s", attempt + 1, e)
-                if attempt < 2:
+                if attempt + 1 < max_attempts:
                     await asyncio.sleep(self._backoff[attempt])
         raise RuntimeError(
-            "llm complete 重试耗尽(model={}, 尝试 3 次): {}".format(resolved_model, last)
+            "llm complete 重试耗尽(model={}, 尝试 {} 次): {}".format(resolved_model, max_attempts, last)
         ) from last
 
 

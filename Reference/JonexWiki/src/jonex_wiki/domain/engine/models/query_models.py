@@ -76,6 +76,7 @@ class RawWikiPage(BaseModel):
     structure_status: Optional[str] = None
     row_bounds: Optional[Dict[str, int]] = None
     related_pages: List[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")
     @field_validator("path")

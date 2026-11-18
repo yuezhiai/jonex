@@ -4,23 +4,11 @@ The layered chain separates two questions the legacy chain asked in one model
 call: *what does this source say* (``understanding.py``) and *where does it
 belong in the wiki*.  This module answers the second question.
 
-Its bias is deliberate: **pages are projected from validated contributions**.
-Assignment is program-determined wherever it can be: a source's own page
-continues for its own name, a name that resolves to exactly one still-empty
-page may adopt it, and the S6 identity rules (``identity.decide_identity`` on
-the source's own name forms, aliases, qualifier context and stated relations)
-decide explicit alias/identifier identity or stated difference without asking a
-model; a cross-source name plus matching qualifiers remains undetermined.  A predecessor/successor,
-parent/subsidiary or brand relation is *different* by rule, so a name-only
-merge is never authorized by resemblance.
-
-What the rules leave **undetermined** (a shared name whose own context does not
-confirm it) is resolved by at most one *bounded* model judgment per
-organization batch, over at most ``MAX_ORGANIZATION_JUDGMENT_CANDIDATES``
-candidate pages, capped per run.  The answer only counts when it names one of
-the offered candidates; anything else - no model, an invalid answer, the cap -
-keeps the material independent and counts a pending identity decision.  Nothing
-is merged on resemblance alone.
+Pages are source-scoped reading projections of validated contributions. Within
+one source, an explicitly supported alias can join related passages. A name or
+alias appearing in different sources does not automatically merge their pages:
+the claims and original passages remain searchable, and the article-writing
+agent can examine the identity and context before connecting them in prose.
 
 Scheduling (S7.2):
 
@@ -41,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
 import time
@@ -56,12 +43,9 @@ from jonex_wiki.domain.engine.compile.content_validation import (
     validate_claim_evidence,
 )
 from jonex_wiki.domain.engine.compile.identity import (
-    DIFFERENT,
     KIND_ENTITY,
     RELATION_KINDS,
-    SAME,
     NameForm,
-    decide_identity,
     normalize_name,
 )
 from jonex_wiki.domain.engine.models.compiler_state import (
@@ -77,89 +61,116 @@ from jonex_wiki.kernel.telemetry import count_work, telemetry_stage, timed_async
 
 logger = logging.getLogger(__name__)
 
-ORGANIZATION_RULE_VERSION = "layered-organization-v1"
+ORGANIZATION_RULE_VERSION = "source-scoped-organization-v2"
+# Source-understanding aliases are proposals; this rule is applied when they
+# enter organization, including when an older understanding is reused.
+ALIAS_EVIDENCE_RULE = "source-alias-evidence-v3-acronym-variants"
 #: Page namespace for material projected from a source's own understanding.
 PAGE_PREFIX = "pages/"
-#: Bound on candidates taken from the existing index for one name.
-MAX_ORGANIZATION_CANDIDATES = 8
-#: Per-source-output link ceiling, same rule as the legacy chain (R2.1).
-MAX_SOURCE_LINK_TARGETS = 4
-#: Reason marker recorded when a name matches several pages and the projection
-#: therefore keeps the material independent instead of merging it.
-IDENTITY_UNRESOLVED = "LAYERED_IDENTITY_UNRESOLVED"
-#: Bounded identity judgment (S7-A): candidate pages offered per ambiguous case,
-#: ambiguous cases per call, and calls per compile.  The bound is what keeps
-#: "semantic organization" from becoming an unbounded classification pass.
-MAX_ORGANIZATION_JUDGMENT_CANDIDATES = 4
-MAX_ORGANIZATION_JUDGMENT_CASES = 8
-MAX_ORGANIZATION_JUDGMENTS = 8
-IDENTITY_JUDGMENT_RULE_VERSION = "layered-identity-judgment-v1"
-ORGANIZATION_JUDGMENT_SCENE = "jonex_wiki_compile_organization_identity"
-ORGANIZATION_JUDGMENT_MAX_TOKENS = 1200
-#: Facts quoted back to the judgment are bounded: this decides a page
-#: assignment, not a reading of the material.
-_JUDGMENT_FACTS = 2
-_JUDGMENT_FACT_CHARS = 160
-
-_ORGANIZATION_JUDGMENT_SCHEMA: Dict[str, Any] = {
-    "title": "OrganizationIdentity",
-    "type": "object",
-    "properties": {
-        "assignments": {
-            "type": "array",
-            "maxItems": MAX_ORGANIZATION_JUDGMENT_CASES,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "case_id": {"type": "string"},
-                    "decision": {"type": "string",
-                                 "enum": ["same", "different", "undetermined"]},
-                    "page_path": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["case_id", "decision"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["assignments"],
-    "additionalProperties": False,
-}
-
-_ORGANIZATION_JUDGMENT_SYSTEM = (
-    "You decide whether material belongs to a page that already exists. "
-    "Answer per case_id. Use decision=same only when the material is about the "
-    "same entity/topic as that candidate page, and then name its page_path "
-    "exactly as offered; decision=different when the names denote different "
-    "things; decision=undetermined when the material does not say. Never invent "
-    "a page_path and never merge two pages that are already separate."
-)
 
 
-class _IdentityCase(BaseModel):
-    """One deferred name assignment: records that wait for the same decision."""
+def _alias_name_pattern(value: str) -> str:
+    """Match the name itself, not a prefix of another Latin name."""
+    text = value.strip()
+    escaped = re.sub(r"\\\s+", r"\\s+", re.escape(text))
+    left = r"(?<![A-Za-z0-9_])" if text and text[0].isascii() and text[0].isalnum() else ""
+    right = r"(?![A-Za-z0-9_])" if text and text[-1].isascii() and text[-1].isalnum() else ""
+    return left + escaped + right
 
-    model_config = ConfigDict(extra="forbid")
 
-    name: str
-    source_id: str
-    records: List[Any] = Field(default_factory=list)
+def _in_order(needle: str, text: str) -> bool:
+    characters = iter(text.casefold())
+    return all(character in characters for character in needle.casefold())
+
+
+def _alias_evidence(text: str, subject: str, alias: str) -> str:
+    """Return an explicit source wording, or leave the proposed alias open.
+
+    Supported forms are direct naming statements, quoted parenthetical names
+    and conventional initialisms. Other forms remain candidates for an agent.
+    """
+    subject, alias = subject.strip(), alias.strip()
+    if not text or not subject or not alias or normalize_name(subject) == normalize_name(alias):
+        return ""
+    marker = (r"(?:以下简称|下称|简称(?:为)?|又称(?:为)?|亦称(?:为)?|"
+              r"也称(?:为)?|别名(?:为)?|also\s+known\s+as|better\s+known\s+as|"
+              r"known\s+officially\s+as|known\s+also\s+by\s+the\s+acronym|also\s+called|"
+              r"also\s+referred\s+to\s+as|known\s+as|short\s+for|stands\s+for|"
+              r"abbreviated\s+(?:as|to)|hereinafter\s+(?:referred\s+to\s+as|called))")
+    quotes = r"(?:\\?[\"'“”‘’])*"
+    for name, other in ((subject, alias), (alias, subject)):
+        # A topic may already include its parenthesized abbreviation.
+        name = re.sub(r"\s*[（(]\s*" + re.escape(other) + r"\s*[）)]$", "", name,
+                      flags=re.IGNORECASE).strip()
+        if not name:
+            continue
+        a, b = _alias_name_pattern(name), _alias_name_pattern(other)
+        patterns = [
+            a + r"\s*[（(]\s*" + marker + r"\s*[:：]?\s*" + quotes + b + quotes + r"\s*[）)]",
+            a + r"\s*[（(]\s*(?:\\?\"" + b + r"\\?\"|“" + b + r"”|‘" + b + r"’)\s*[）)]",
+            a + r"(?:\s*[（(][^()（）\n]{0,100}[）)])?\s*[,，]?\s*(?:(?:is|was)\s+)?" + marker
+            + r"\s*[:：]?\s*" + quotes + b + quotes
+            + r"(?=\s*(?:[,，。.;；：:!！?？)）]|$))",
+        ]
+        words = [word for word in re.findall(r"[A-Za-z][A-Za-z0-9]*", name)
+                 if word.casefold() not in {"a", "an", "and", "for", "of", "the"}]
+        initials = "".join(word[0] for word in words)
+        if (len(words) >= 2 and 2 <= len(other) <= 10 and other.isascii() and other.isalpha()
+                and (_in_order(other, initials)
+                     or (other[0].casefold() == initials[0].casefold()
+                         and _in_order(initials, other) and _in_order(other, "".join(words))))):
+            patterns.append(a + r"\s*[（(]\s*" + quotes + b + quotes + r"\s*[）)]")
+            patterns.append(b + r"\s*[（(]\s*" + quotes + a + quotes + r"\s*[）)]")
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                start = max((text.rfind(mark, 0, match.start())
+                             for mark in ".。!?！？;；\n"), default=-1) + 1
+                ends = [text.find(mark, match.end()) for mark in ".。!?！？;；\n"]
+                end = min((position for position in ends if position >= 0), default=len(text))
+                clause = text[start:end]
+                if end < len(text) and text[end] in "?？":
+                    continue
+                if not re.search(r"\b(?:falsely|incorrectly|mistakenly|misidentified|false|incorrect|disputed|hypothetically)\b"
+                                 r"|\bnot\s+(?:an?\s+alias|the\s+same|correct|true)\b"
+                                 r"|误称|误认|并非|不是同一|不等同|不正确|错误|假设", clause, re.IGNORECASE):
+                    return match.group(0)
+    return ""
+
+
+def _review_aliases(record: Any, *, source_text: str, passage_id: str) -> Any:
+    """Keep unverified model aliases as leads, including old cache entries."""
+    qualifiers = []
+    changed = False
+    for item in getattr(record, "qualifiers", ()) or ():
+        if not isinstance(item, Mapping) or item.get("kind") not in {"declared_alias", "alias_candidate"}:
+            qualifiers.append(item)
+            continue
+        subject, alias = str(item.get("subject") or ""), str(item.get("value") or "")
+        changed = True
+        evidence = _alias_evidence(source_text, subject, alias)
+        # Recompute rather than trust a stored flag or a prior model claim.
+        reviewed = {"kind": "declared_alias" if evidence else "alias_candidate",
+                    "subject": subject, "value": alias}
+        if evidence:
+            reviewed.update({"source_evidence": evidence, "evidence_passage_id": passage_id,
+                             "alias_evidence_rule": ALIAS_EVIDENCE_RULE})
+        qualifiers.append(reviewed)
+    return record.model_copy(update={"qualifiers": qualifiers}) if changed else record
 
 
 def name_form(record: Any, name: str) -> NameForm:
     """The record's own identity vocabulary, in the S6 ``NameForm`` shape.
 
-    Only what the source itself stated is used: its name forms, the qualifier
-    context the deterministic extractor found in the span, and the directed
-    relations the passage stated.  Nothing is inferred from the proposition's
-    wording, so a name is never "probably" another name.
+    Aliases count only after the current organization rule has checked their
+    source wording; an unchecked name is not identity evidence.
     """
     wanted = normalize_name(name)
     aliases = []
-    # Co-occurring names (including regex-extracted mentions) never assert
-    # identity. Only source understanding's explicit, subject-bound aliases do.
+    # Co-occurring names never assert identity. Old and new model suggestions
+    # must first be reviewed against the current source passage.
     for item in getattr(record, "qualifiers", ()) or ():
-        if not isinstance(item, Mapping) or item.get("kind") != "declared_alias":
+        if (not isinstance(item, Mapping) or item.get("kind") != "declared_alias"
+                or item.get("alias_evidence_rule") != ALIAS_EVIDENCE_RULE):
             continue
         subject, alias = str(item.get("subject") or ""), str(item.get("value") or "")
         if subject and alias and wanted in {normalize_name(subject), normalize_name(alias)}:
@@ -175,16 +186,11 @@ def name_form(record: Any, name: str) -> NameForm:
     context = " | ".join(sorted({
         "{}={}".format(str(item.get("kind") or ""), str(item.get("value") or ""))
         for item in (getattr(record, "qualifiers", ()) or ())
-        if isinstance(item, Mapping) and item.get("kind") != "declared_alias"
+        if isinstance(item, Mapping) and item.get("kind") not in {"declared_alias", "alias_candidate"}
         and (item.get("value") or item.get("kind"))
     }))
     return NameForm(name=name, kind=KIND_ENTITY, context=context,
                     aliases=aliases, relations=relations)
-
-
-def _facts_of(record: Any) -> List[str]:
-    proposition = " ".join(str(getattr(record, "proposition", "") or "").split())
-    return [proposition[:_JUDGMENT_FACT_CHARS]] if proposition else []
 
 
 class LayeredCompilation(BaseModel):
@@ -208,9 +214,8 @@ class LayeredCompilation(BaseModel):
     pages_reused: int = 0
     organization_batches: int = 0
     organization_model_calls: int = 0
-    #: Bounded identity judgments (S7-A): calls, cases judged, merges applied
-    #: because of an answer, answers that named something not offered, and
-    #: cases left to the independent fallback by the per-run cap.
+    #: Compatibility counters retained for existing callers. The source-scoped
+    #: organizer no longer performs model identity judgments, so these are zero.
     identity_judgments: int = 0
     identity_judgment_cases: int = 0
     identity_judgment_applied: int = 0
@@ -304,12 +309,17 @@ def dominant_name(record: Any) -> str:
     hint = str(getattr(record, "topic_hint", "") or "").strip()
     if hint:
         return hint
+    # Alias suggestions also occur in original_names for discovery. Without a
+    # topic hint they must not silently become the page identity themselves.
+    candidates = {normalize_name(str(item.get("value") or ""))
+                  for item in (getattr(record, "qualifiers", ()) or ())
+                  if isinstance(item, Mapping) and item.get("kind") == "alias_candidate"}
     names = [str(value).strip() for value in (getattr(record, "original_names", {}) or {}).values()
-             if str(value).strip()]
+             if str(value).strip() and normalize_name(str(value)) not in candidates]
     if names:
         return sorted(names, key=lambda value: (-len(value), value))[0]
     mentions = [str(value).strip() for value in (getattr(record, "entity_mentions", []) or [])
-                if str(value).strip()]
+                if str(value).strip() and normalize_name(str(value)) not in candidates]
     if mentions:
         return sorted(mentions, key=lambda value: (-len(value), value))[0]
     proposition = " ".join(str(getattr(record, "proposition", "") or "").split())
@@ -420,9 +430,8 @@ class Organizer:
     is why concurrency cannot change the published fact set.
     """
 
-    def __init__(self, *, identity_store=None, identity_source_versions=None) -> None:
-        self.identity_store = identity_store
-        self.identity_source_versions = identity_source_versions or {}
+    def __init__(self) -> None:
+        # Retain zero-valued counters in the result contract for old consumers.
         self.identity_model_calls = 0
         self.records: Dict[str, List[Any]] = {}
         self._record_ids: Dict[str, set[str]] = {}
@@ -432,7 +441,8 @@ class Organizer:
         self.bound: Dict[str, List[Tuple[Any, str]]] = {}
         self.titles: Dict[str, str] = {}
         self.unresolved = 0
-        self._names: Dict[str, List[str]] = {}
+        self._names: set[str] = set()
+        self._source_names: Dict[Tuple[str, str], List[str]] = {}
         #: (page, record, evidence, source version, support rule) -> validated
         #: claim or None.  Validation is a pure function of the record, the
         #: page it is shown on and the archived passage text, so an unchanged
@@ -443,157 +453,66 @@ class Organizer:
         #: instead of re-joining every line it ever carried.
         self._body_lines: Dict[str, Tuple[str, ...]] = {}
         self._body_content: Dict[str, str] = {}
-        #: Assignments the deterministic rules left undetermined, in stable
-        #: insertion order: (normalized name, source id) -> waiting records.
-        self._deferred: Dict[Tuple[str, str], _IdentityCase] = {}
         self.identity_judgments = 0
         self.identity_judgment_cases = 0
         self.identity_judgment_applied = 0
         self.identity_judgment_invalid = 0
         self.identity_judgment_limited = 0
 
-    @property
-    def has_deferred_identity(self) -> bool:
-        return bool(self._deferred)
+    # -- source-scoped name index -------------------------------------------
 
-    # -- name index ---------------------------------------------------------
-
-    def _candidates(self, name: str) -> List[str]:
-        found = list(self._names.get(normalize_name(name), ()))
-        if len(found) > MAX_ORGANIZATION_CANDIDATES:
-            count_work("compile_organization_candidates_capped",
-                       len(found) - MAX_ORGANIZATION_CANDIDATES)
-            found = found[:MAX_ORGANIZATION_CANDIDATES]
-        return found
-
-    def _register(self, path: str, name: str) -> None:
-        for value in {name, self.titles.get(path, "")}:
+    def _register(self, path: str, name: str, record: Any, source_id: str) -> None:
+        form = name_form(record, name)
+        for value in [name, self.titles.get(path, ""), *form.aliases]:
             key = normalize_name(value)
             if not key:
                 continue
-            bucket = self._names.setdefault(key, [])
+            self._names.add(key)
+            bucket = self._source_names.setdefault((str(source_id), key), [])
             if path not in bucket:
                 bucket.append(path)
 
-    def _sources_of(self, path: str) -> List[str]:
-        return sorted({str(span.source_id) for record in self.records.get(path, ())
-                       for span in getattr(record, "source_spans", ()) or ()})
-
-    def _page_forms(self, path: str, name: str) -> List[NameForm]:
-        """The identity vocabulary of one candidate page, one form per record."""
-        forms = [name_form(record, self.titles.get(path, name) or name)
-                 for record in self.records.get(path, ())]
-        return forms or [NameForm(name=self.titles.get(path, name) or name)]
-
-    def _candidate_paths(self, name: str, form: NameForm) -> List[str]:
-        """Pages to consider: the name's own candidates plus each alias's.
-
-        An alias the source declared is a name for the same thing, so a page
-        registered under it is a candidate even when the incoming name is the
-        alias.  Both lookups are bounded and de-duplicated in a stable order.
-        """
-        paths: List[str] = []
-        for key in [name] + list(form.aliases):
-            for path in self._candidates(key):
-                if path not in paths:
-                    paths.append(path)
-        if len(paths) > MAX_ORGANIZATION_CANDIDATES:
-            count_work("compile_organization_identity_candidates_capped",
-                       len(paths) - MAX_ORGANIZATION_CANDIDATES)
-            paths = paths[:MAX_ORGANIZATION_CANDIDATES]
-        return paths
-
-    def _determined_target(self, record: Any, name: str, *,
-                           source_id: str) -> Optional[str]:
-        """The page path the *rules* decide, or ``None`` when undetermined."""
+    def _target_for(self, record: Any, name: str, source_id: str) -> str:
         form = name_form(record, name)
-        candidates = self._candidate_paths(name, form)
-        same_source = [path for path in candidates if source_id in self._sources_of(path)]
-        if len(same_source) == 1:
-            # A source continuing its own page for its own name: continuity,
-            # not a cross-source identity claim.
-            return same_source[0]
-        if len(candidates) == 1 and not same_source and not self.records.get(candidates[0]):
-            # The index knows exactly one page under this name and nothing has
-            # been projected onto it yet: adopting it is a rename-free reuse.
+        keys = {normalize_name(value) for value in [name, *form.aliases] if value}
+        candidates = []
+        for key in sorted(keys):
+            for path in self._source_names.get((str(source_id), key), []):
+                if path not in candidates:
+                    candidates.append(path)
+        if len(candidates) == 1:
             return candidates[0]
-        if not candidates:
-            return page_path_for(source_id, name)
-        identical, undetermined = [], []
-        for path in candidates:
-            decisions = set()
-            for page_form in self._page_forms(path, name):
-                decision = decide_identity(form, page_form)
-                # Matching source qualifiers may be only a year or a unit.
-                # They do not establish that two cross-source entities are one.
-                # Reuse the existing bounded judgment instead of inventing an
-                # identifier from shared context. Explicit alias/ID and stated
-                # different-entity relations retain their deterministic rules.
-                decisions.add("undetermined" if decision.basis == "name_and_context"
-                              else decision.decision)
-            if SAME in decisions:
-                identical.append(path)
-            elif DIFFERENT not in decisions:
-                # Every pairing with this page's material is undetermined: the
-                # name does not prove identity, so the decision stays open.
-                undetermined.append(path)
-        if len(identical) == 1:
-            return identical[0]
-        if not identical and not undetermined:
-            # Every candidate is provably another entity: its own page.
-            return page_path_for(source_id, name)
-        return None
-
-    def target_for(self, record: Any, name: str, *, source_id: str,
-                   defer: bool = False) -> Optional[str]:
-        """Assign one record to a page path.
-
-        Reuse requires proof, not resemblance: ``None`` means the rules left the
-        assignment undetermined and (with ``defer``) the record waits for the
-        bounded judgment.  Without ``defer`` the material stays independent and
-        the pending decision is counted - the same fallback the judgment uses
-        when it has no answer.
-        """
-        path = self._determined_target(record, name, source_id=source_id)
-        if path is not None:
-            return path
-        if defer:
-            return None
-        self._keep_independent(name)
-        return page_path_for(source_id, name)
+        if len(candidates) > 1:
+            # Ambiguous aliases within one source are leads, not an arbitrary
+            # choice between already independent pages.
+            self._keep_independent(name)
+            return page_path_for(str(source_id) + ":" + str(record.record_id), name)
+        if any(key in self._names for key in keys):
+            # A matching name in another source is a discoverable candidate,
+            # not enough evidence to assign its material to that page.
+            self._keep_independent(name)
+        return page_path_for(str(source_id), name)
 
     def _keep_independent(self, name: str) -> None:
         self.unresolved += 1
         count_work("compile_organization_identity_unresolved")
-        logger.info("layered organization keeps %r independent: identity undetermined",
-                    name)
+        logger.info("layered organization keeps %r independent: identity undetermined", name)
 
-    # -- batch API ----------------------------------------------------------
-
-    def add(self, checkpoint: Any, *, source_id: str) -> List[str]:
-        """Assign every record of one understood passage; returns touched paths.
-
-        A record whose identity the rules leave undetermined is *held*, not
-        guessed: the driver resolves the whole batch's undetermined cases with
-        one bounded judgment before materializing anything.
-        """
+    def add(self, checkpoint: Any, *, source_id: str, source_text: str = "") -> List[str]:
+        """Project source facts without a cross-source identity judgment."""
         touched: List[str] = []
-        for record in getattr(checkpoint, "records", ()) or ():
+        for original in getattr(checkpoint, "records", ()) or ():
+            text = source_text or "\n".join(str(span.text) for span in original.source_spans
+                                            if str(span.source_id) == str(source_id))
+            record = _review_aliases(original, source_text=text,
+                                     passage_id=str(getattr(checkpoint, "passage_id", "")))
             name = dominant_name(record)
-            path = self.target_for(record, name, source_id=source_id, defer=True)
-            if path is None:
-                key = (normalize_name(name), str(source_id))
-                case = self._deferred.get(key)
-                if case is None:
-                    case = _IdentityCase(name=name, source_id=str(source_id))
-                    self._deferred[key] = case
-                case.records.append(record)
-                continue
-            if self._assign(path, name, record):
+            path = self._target_for(record, name, source_id)
+            if self._assign(path, name, record, source_id):
                 touched.append(path)
         return touched
 
-    def _assign(self, path: str, name: str, record: Any) -> bool:
+    def _assign(self, path: str, name: str, record: Any, source_id: str) -> bool:
         """Place one record on a page; ``False`` when it is already there."""
         bucket = self.records.setdefault(path, [])
         ids = self._record_ids.setdefault(path, set())
@@ -602,206 +521,8 @@ class Organizer:
         ids.add(str(record.record_id))
         bucket.append(record)
         self.titles.setdefault(path, name)
-        self._register(path, name)
+        self._register(path, name, record, source_id)
         return True
-
-    async def resolve_identity(self, *, model: Any = None, routing: Any = None) -> List[str]:
-        """Resolve the batch's undetermined assignments; returns touched paths.
-
-        One bounded model call covers every case in the batch (the plan's
-        "one organization decision per batch"); the rules are re-checked first,
-        because earlier assignments in the same batch may already have decided
-        a case.  Anything the judgment does not answer within its bounds keeps
-        the material independent.
-        """
-        if not self._deferred:
-            return []
-        cases = list(self._deferred.values())
-        pending: List[_IdentityCase] = []
-        resolved: Dict[Tuple[str, str], str] = {}
-        for case in cases:
-            path = None
-            records = case.records
-            if records:
-                path = self._determined_target(records[0], case.name,
-                                               source_id=case.source_id)
-            if path is None:
-                pending.append(case)
-            else:
-                resolved[(normalize_name(case.name), case.source_id)] = path
-        judged: Dict[Tuple[str, str], bool] = {}
-        if pending and model is not None:
-            for start in range(0, len(pending), MAX_ORGANIZATION_JUDGMENT_CASES):
-                if self.identity_judgments >= MAX_ORGANIZATION_JUDGMENTS:
-                    limited = len(pending) - start
-                    self.identity_judgment_limited += limited
-                    count_work("compile_organization_identity_judgment_limited", limited)
-                    break
-                chunk = pending[start:start + MAX_ORGANIZATION_JUDGMENT_CASES]
-                for key, (path, merged) in (await self._judge_identity(
-                        chunk, model=model, routing=routing)).items():
-                    resolved[key] = path
-                    judged[key] = merged
-        elif pending:
-            self.identity_judgment_limited += len(pending)
-            count_work("compile_organization_identity_judgment_limited", len(pending))
-        touched: List[str] = []
-        for case in cases:
-            key = (normalize_name(case.name), case.source_id)
-            path = resolved.get(key)
-            if path is None:
-                # No answer inside the bound: the material stays on its own
-                # page and the pending decision is counted, never guessed.
-                self._keep_independent(case.name)
-                path = page_path_for(case.source_id, case.name)
-            elif judged.get(key):
-                self.identity_judgment_applied += 1
-                count_work("compile_organization_identity_judgment_applied")
-                logger.info("layered identity judgment merges %r into %s",
-                            case.name, path)
-            for record in case.records:
-                if self._assign(path, case.name, record) and path not in touched:
-                    touched.append(path)
-        self._deferred.clear()
-        return touched
-
-    def _judgment_candidates(self, case: _IdentityCase) -> List[str]:
-        record = case.records[0] if case.records else None
-        form = (name_form(record, case.name) if record is not None
-                else NameForm(name=case.name))
-        paths = self._candidate_paths(case.name, form)
-        if len(paths) > MAX_ORGANIZATION_JUDGMENT_CANDIDATES:
-            count_work("compile_organization_identity_judgment_candidates_capped",
-                       len(paths) - MAX_ORGANIZATION_JUDGMENT_CANDIDATES)
-        return paths[:MAX_ORGANIZATION_JUDGMENT_CANDIDATES]
-
-    async def _judge_identity(self, cases: Sequence[_IdentityCase], *, model: Any,
-                              routing: Any) -> Dict[Tuple[str, str], Tuple[str, bool]]:
-        """One bounded call for one batch of undetermined assignments."""
-        offered: Dict[str, List[str]] = {}
-        payload: List[Dict[str, Any]] = []
-        for index, case in enumerate(cases):
-            case_id = "c{}".format(index)
-            candidates = self._judgment_candidates(case)
-            offered[case_id] = candidates
-            record = case.records[0] if case.records else None
-            payload.append({
-                "case_id": case_id,
-                "name": case.name,
-                "source_id": case.source_id,
-                "aliases": (name_form(record, case.name).aliases
-                            if record is not None else []),
-                "context": name_form(record, case.name).context if record is not None else "",
-                "facts": (_facts_of(record)[:_JUDGMENT_FACTS]
-                          if record is not None else []),
-                "candidates": [
-                    {"page_path": path,
-                     "names": sorted(name for name in
-                                     (self.titles.get(path, ""),) + tuple(
-                                         str(key) for key in self._names
-                                         if path in self._names.get(key, ()))
-                                     if name),
-                     "facts": [fact for existing in self.records.get(path, ())[:1]
-                               for fact in _facts_of(existing)[:_JUDGMENT_FACTS]],
-                     "context": " | ".join(sorted(
-                         {name_form(existing, self.titles.get(path, case.name)).context
-                          for existing in self.records.get(path, ())[:2]} - {""}))}
-                    for path in candidates],
-            })
-        self.identity_judgments += 1
-        self.identity_judgment_cases += len(cases)
-        count_work("compile_organization_identity_judgments")
-        count_work("compile_organization_identity_judgment_cases", len(cases))
-        from jonex_wiki.domain.engine.compile.error_book import _messages
-
-        routing = dict(routing or {})
-        messages = _messages({"stage": "identity_assignment", "task": ORGANIZATION_JUDGMENT_SCENE,
-                              "cases": payload})
-        dependencies = []
-        for case in cases:
-            records = list(case.records)
-            for path in self._judgment_candidates(case):
-                records.extend(self.records.get(path, ()))
-            dependencies.append([(record.record_id, sorted(
-                (span.source_id, self.identity_source_versions.get(span.source_id, span.source_sha256))
-                for span in record.source_spans)) for record in records])
-        cache_key = hashlib.sha256(pipeline.canonical_json({
-            'rule':IDENTITY_JUDGMENT_RULE_VERSION, 'organization_rule':ORGANIZATION_RULE_VERSION,
-            'support_rule':SUPPORT_RULE_VERSION, 'messages':messages, 'schema':_ORGANIZATION_JUDGMENT_SCHEMA,
-            'model':routing.get('model_name',''), 'max_tokens':ORGANIZATION_JUDGMENT_MAX_TOKENS,
-            'dependencies':dependencies}).encode()).hexdigest()
-        response = None
-        if self.identity_store is not None:
-            try:
-                cached = json.loads(await self.identity_store.get_checkpoint('organization-identity', cache_key))
-                if (cached.get('cache_key') == cache_key and cached.get('response_sha256') ==
-                        hashlib.sha256(pipeline.canonical_json(cached['response']).encode()).hexdigest()):
-                    response = cached['response']
-                    count_work('compile_organization_identity_cache_hits')
-            except (OSError, ValueError, KeyError, TypeError, NotImplementedError):
-                pass
-        cache_hit = response is not None
-        try:
-            if response is None:
-                self.identity_model_calls += 1
-                response = await model.complete(
-                    messages,
-                    _ORGANIZATION_JUDGMENT_SCHEMA,
-                    max_tokens=ORGANIZATION_JUDGMENT_MAX_TOKENS,
-                    model=routing.get("model_name", ""),
-                    tenant_id=routing.get("tenant_id", ""),
-                    context_id=routing.get("context_id", ""),
-                    trace_id=routing.get("trace_id", ""),
-                    thinking={"type": "disabled"},
-                    scene=ORGANIZATION_JUDGMENT_SCENE,
-                )
-        except (ValueError, RuntimeError) as exc:
-            # A malformed structured answer is a missing judgment, not a
-            # failed compile: the material stays independent and is counted.
-            invalid = len(cases)
-            self.identity_judgment_invalid += invalid
-            count_work("compile_organization_identity_judgment_invalid", invalid)
-            logger.warning("layered identity judgment unusable: %s", exc)
-            return {}
-        assignments = response.get("assignments") if isinstance(response, Mapping) else None
-        answers: Dict[Tuple[str, str], Tuple[str, bool]] = {}
-        invalid = 0
-        for item in assignments or ():
-            if not isinstance(item, Mapping):
-                invalid += 1
-                continue
-            case_id = str(item.get("case_id") or "")
-            candidates = offered.get(case_id)
-            decision = str(item.get("decision") or "")
-            if candidates is None or decision not in (SAME, DIFFERENT, "undetermined"):
-                invalid += 1
-                continue
-            case = cases[int(case_id[1:])]
-            key = (normalize_name(case.name), case.source_id)
-            if decision != SAME:
-                # "different" and "undetermined" both mean: do not merge.  The
-                # answer is applied (it decided the case), it just decided
-                # against a merge.
-                answers[key] = (page_path_for(case.source_id, case.name), False)
-                continue
-            page_path = str(item.get("page_path") or "")
-            if page_path not in candidates or key in answers:
-                invalid += 1
-                continue
-            answers[key] = (page_path, True)
-        if invalid:
-            self.identity_judgment_invalid += invalid
-            count_work("compile_organization_identity_judgment_invalid", invalid)
-        if self.identity_store is not None and not cache_hit and not invalid and len(answers) == len(cases):
-            cached_response = {'assignments':response.get('assignments')}
-            encoded = pipeline.canonical_json(cached_response).encode()
-            try:
-                await self.identity_store.put_checkpoint('organization-identity', cache_key,
-                    pipeline.canonical_json({'cache_key':cache_key, 'response':cached_response,
-                        'response_sha256':hashlib.sha256(encoded).hexdigest()}).encode())
-            except (OSError, ValueError, NotImplementedError):
-                count_work('compile_organization_identity_cache_write_failed')
-        return answers
 
     def materialize(self, path: str, *, state: CompilerState) -> Tuple[WikiPageSnapshot, List[Any]]:
         """Validate and project one page's accumulated records.
@@ -1052,14 +773,10 @@ async def organize_sources(
     claim_policy: object = "production",
     telemetry: Any = None,
     cancel: Optional[CancelPort] = None,
-    model: Any = None,
-    routing: Any = None,
     reusable_pages: Any = None,
     previous_pages: Any = None,
     previous_records: Any = None,
     previous_claims: Any = None,
-    identity_store: Any = None,
-    identity_source_versions: Any = None,
 ) -> LayeredCompilation:
     """Understand and organize the corpus inside one bounded window.
 
@@ -1083,7 +800,7 @@ async def organize_sources(
     previous_claims = dict(previous_claims or {})
     concurrency = max(1, int(concurrency))
     window = 2 * concurrency
-    organizer = Organizer(identity_store=identity_store, identity_source_versions=identity_source_versions)
+    organizer = Organizer()
     result = LayeredCompilation(state=state, understanding=stage.result)
     commit_lock = asyncio.Lock()
     tasks: Dict[int, "asyncio.Task[Any]"] = {}
@@ -1140,20 +857,12 @@ async def organize_sources(
                 for pending in group:
                     for path in organizer.add(
                             pending.checkpoint,
-                            source_id=_source_of(pending.passage_id)):
+                            source_id=_source_of(pending.passage_id),
+                            source_text=stage.state.source_archive[pending.passage_id].text):
                         if path not in touched:
                             touched.append(path)
                     organized.append(pending.passage_id)
                     result.passages_organized += 1
-                # One bounded organization decision per batch, before anything
-                # is materialized: the assignments the rules left undetermined
-                # are decided together (or the material stays independent when
-                # there is no answer inside the bound).
-                if organizer.has_deferred_identity:
-                    for path in await organizer.resolve_identity(
-                            model=model, routing=routing):
-                        if path not in touched:
-                            touched.append(path)
                 # The expensive half -- evidence validation and page projection
                 # -- happens here, outside the lock.  The lock below only
                 # re-checks the page versions the projection was based on and
@@ -1259,9 +968,6 @@ async def organize_sources(
     count_work("compile_organization_commit_lock_ms", result.commit_lock_ms)
     count_work("compile_organization_organized_passages", result.passages_organized)
     count_work("compile_organization_model_calls", result.organization_model_calls)
-    # The judgment counters are emitted where the calls happen (one per call and
-    # one per limited case); reporting the totals here as well would double
-    # every number a report reads.
     if result.peak_uncommitted:
         count_work("compile_organization_peak_uncommitted", result.peak_uncommitted)
     pipeline.check_passage_failure_rate(

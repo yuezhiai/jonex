@@ -104,7 +104,7 @@ class ManifestBuilder:
                 "compile_mode": "layered",
             },
             "query": {
-                "strategy": "browse-first",
+                "strategy": "agent_direct",
             },
             "prompt_shas": prompt_shas,
         }

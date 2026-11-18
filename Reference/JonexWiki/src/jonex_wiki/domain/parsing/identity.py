@@ -67,7 +67,9 @@ PARSE_RULE_SOURCES: tuple[str, ...] = (
     "domain/parsing/consumer_input.py",
     "domain/parsing/media_timeline.py",
     "domain/parsing/pdf_text_layer.py",
+    "domain/parsing/pdf_tables.py",
     "domain/engine/compile/source_prep/docx_native.py",
+    "domain/engine/compile/source_prep/table_identity.py",
     # 解析入口：原始文件 → block
     "domain/parsing/direct.py",
     "domain/parsing/mineru/common.py",
@@ -120,6 +122,7 @@ def parse_identity_payload(settings) -> dict:
         "media_keyframes": {"enabled": getattr(settings, "media_keyframes_enabled", True),
             "max_frames": getattr(settings, "media_keyframes_max_frames", 32),
             "interval_seconds": getattr(settings, "media_keyframes_interval_seconds", 5.0)},
+        "pdf_native_tables": {"enabled": getattr(settings,"pdf_table_repair_enabled",True)},
         "pdf_text_layer": {"enabled": getattr(settings, "pdf_text_layer_enabled", True),
             "max_pages": getattr(settings, "pdf_text_layer_max_pages", 128)},
     }

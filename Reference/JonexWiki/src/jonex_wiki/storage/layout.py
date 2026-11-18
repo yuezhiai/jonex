@@ -141,9 +141,11 @@ class Layout:
         os.replace(tmp_link, link)
         os.utime(target, None)
 
-    def prune_versions(self, tenant_id: str, kb_id: str, keep_history: int,
+    def prune_versions(self, tenant_id: str, kb_id: str, keep_history: int | None,
                        protected_refs: set[str] | None = None) -> list[str]:
-        """Keep the active version, newest history, and pinned query versions."""
+        """Retain the active version, requested history and all protected pins."""
+        if keep_history is None:
+            return []
         versions = self.kb_dir(tenant_id, kb_id) / "compile" / "versions"
         if not versions.is_dir():
             return []
@@ -162,10 +164,15 @@ class Layout:
         keep = {active.name, *(protected_refs or set()), *durable_pins.values()}
         keep.update(path.name for path in history[:max(0, keep_history)])
         removed = []
+        graph_cache = versions.parent / "graph-cache"
         for path in history:
             if path.name not in keep:
                 shutil.rmtree(path)
                 removed.append(path.name)
+                if graph_cache.is_dir():
+                    for schema in graph_cache.iterdir():
+                        if schema.is_dir() and not schema.is_symlink():
+                            (schema / (path.name + ".sqlite")).unlink(missing_ok=True)
         return removed
 
     def version_pins(self, tenant_id: str, kb_id: str) -> dict[str, str]:

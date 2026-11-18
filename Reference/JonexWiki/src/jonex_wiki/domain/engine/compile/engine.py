@@ -20,7 +20,6 @@ from typing import Any, List, Mapping
 from jonex_wiki.kernel.contracts import (
     EffectiveRuntimeSnapshot,
     EngineDescriptor,
-    QueryStrategy,
     SourceInventorySnapshot,
     default_models_from_env,
 )
@@ -40,19 +39,30 @@ logger = logging.getLogger(__name__)
 from jonex_wiki.domain.engine.compile.digest import (source_fingerprint)
 from . import bundle_codec
 from . import pipeline
-from jonex_wiki.domain.engine.query import orchestration
 from jonex_wiki.domain.engine.compile.error_book import ErrorBook
 from jonex_wiki.domain.engine.query.algorithm import (
     TOOL_CHECKSUM,
     QueryRunResult,
-    build_fts_index_bytes,
     build_query_corpus,
 )
 
 
-# curation 里只影响「怎么调度」、不影响「编译出什么」的旋钮。它们不参与身份比较:
-# 调并发/调度器/失败率容忍/修复间隔都不该让上一版 bundle 作废(那会把一次配置调整
-# 变成全量重编),也不该让复用短路失效。
+def _article_work_pending(view, curation):
+    """A source-unchanged Bundle may still need the direct-file writer."""
+    return bool(curation.get('agent_article_rule')) and (
+        view is None or 'articles/authored/index.md' not in view.list_entries()
+    )
+
+
+# eab1e58 left sealed private candidates when bounded article turns failed.
+# The execution-policy upgrade keeps the prepared material format and rules.
+_LEGACY_ARTICLE_SOURCE_CODE = {
+    "source_tree_sha256": "aafdc5b7f8d7c857d48ed7807bb2e71dc35f3037c961ccb6bb2b590fbf1733e2",
+    "compiler_sha256": "fc3a12d05f1c4da0c06bda6853056262f31d77398a4f3d70e3b7220afe268cb2",
+}
+
+
+# 来源缓存的身份排除只影响调度的参数。整包复用另检查发布内容和路由。
 _RUNTIME_ONLY_CURATION_KEYS = frozenset({
     "compile_concurrency",
     "compile_scheduler",
@@ -178,6 +188,27 @@ def _compilation_manifest(manifest: dict) -> dict:
     return relevant
 
 
+def _publication_manifest_matches(previous, current: dict) -> bool:
+    """Reuse a completed publication across a change in scheduling width."""
+    if previous == current:
+        return True
+    if not isinstance(previous, dict):
+        return False
+    before = previous.get("curation") or {}
+    after = current.get("curation") or {}
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    # ManifestBuilder's checksum includes concurrency, so compare the actual
+    # settings when that is the only changed field.
+    return (
+        before.get("compile_concurrency") != after.get("compile_concurrency")
+        and {k: v for k, v in before.items() if k != "compile_concurrency"}
+        == {k: v for k, v in after.items() if k != "compile_concurrency"}
+        and {k: v for k, v in previous.items() if k not in {"curation", "checksum"}}
+        == {k: v for k, v in current.items() if k not in {"curation", "checksum"}}
+    )
+
+
 def _compilation_runtime_matches(old, current) -> bool:
     """Compare the effective compiler runtime inputs."""
     return (
@@ -291,10 +322,6 @@ class LLMWikiV1Engine:
     ENGINE_VERSION = "1.0.0"
     SCHEMA_VERSION = 1
 
-    def __init__(self):
-        from jonex_wiki.domain.engine.query.prepared_revision import DEFAULT_PREPARED_REVISIONS
-        self._prepared_revisions = DEFAULT_PREPARED_REVISIONS
-
     @staticmethod
     def describe() -> EngineDescriptor:
         return EngineDescriptor(
@@ -308,11 +335,7 @@ class LLMWikiV1Engine:
                 "finalRepairRounds": 3,
                 "allowPartialSources": False,
             },
-            query_config={
-                "strategy": "browse-first",
-                "maxToolCalls": 32,
-                "emptySearchPatience": 3,
-            },
+            query_config={"strategy": "agent_direct"},
             schema={
                 "type": "object",
                 "properties": {
@@ -365,16 +388,14 @@ class LLMWikiV1Engine:
         telemetry: RuntimeTelemetryRecorder | None = None,
         cancel: CancelPort | None = None,
         compile_main_prompt: str = "",
+        article_preference: str = "",
         omission_confirmations: "Sequence[Mapping[str, Any]]" = (),
+        agent_compiler=None,
     ) -> tuple[RevisionArtifacts, str]:
-        """Run the production Algorithm 1 compilation pipeline.
+        """Compile source records and, when configured, agent-authored articles.
 
-        Returns the in-memory ``RevisionArtifacts`` and the bundle object key.
-        When ``previous_bundle`` is supplied and verifies, unchanged input
-        restores its compiler state/claims and makes zero compile-side model
-        calls; changed input compiles only the changed passages; deleted
-        sources never leave claims or pages depending exclusively on deleted
-        evidence.
+        A fully unchanged publication may be reused. Source changes can require
+        article writing again even when unchanged source records are reused.
         """
         # Resolve the mode before fingerprints and previous-Bundle reuse.  New
         # calls always carry an explicit mode, including hand-written manifests
@@ -384,6 +405,35 @@ class LLMWikiV1Engine:
         if curation.get("compile_mode", "layered") != "layered":
             raise ValueError("only layered compilation is supported")
         curation["compile_mode"] = "layered"
+        curation["publication_layout"] = "agent-files-v2"
+        # Organization changes must create a new publication even when source
+        # understanding can be reused. Historical Bundles cold-open unchanged.
+        from jonex_wiki.domain.engine.compile.rendering import READING_RENDER_VERSION
+        from jonex_wiki.domain.engine.compile.source_relations import RULE as SOURCE_RELATION_RULE
+        from jonex_wiki.domain.engine.compile.organization import ALIAS_EVIDENCE_RULE, ORGANIZATION_RULE_VERSION
+        from jonex_wiki.domain.engine.compile.relation_reading_projection import RULE as CLAIM_READING_RULE
+        from jonex_wiki.domain.engine.compile.relation_increment import RELATION_RULE_VERSION as PAGE_RELATION_RULE
+        curation['reading_organization_rule']=READING_RENDER_VERSION
+        curation['source_relation_rule']=SOURCE_RELATION_RULE
+        curation['alias_evidence_rule']=ALIAS_EVIDENCE_RULE
+        curation['source_organization_rule']=ORGANIZATION_RULE_VERSION
+        curation['claim_reading_rule']=CLAIM_READING_RULE
+        curation['page_relation_rule']=PAGE_RELATION_RULE
+        from jonex_wiki.domain.engine.compile.coherent_catalog import RULE as COHERENT_RULE, CONTEXT_RULE
+        from jonex_wiki.domain.engine.compile.source_heading_references import RULE as HEADING_REFERENCE_RULE
+        curation['coherent_reading_rule']=COHERENT_RULE
+        curation['coherent_context_rule']=CONTEXT_RULE
+        curation['source_heading_reference_rule']=HEADING_REFERENCE_RULE
+        # The production task supplies the direct-file writer. Remove the old
+        # material-tool writer switch so it cannot silently start a second route.
+        curation.pop('coherent_article_compilation', None)
+        if agent_compiler is not None:
+            curation['agent_article_rule'] = agent_compiler.RULE
+            curation['agent_article_skill'] = getattr(agent_compiler, 'skill_sha', '')
+            curation['agent_article_implementation'] = getattr(agent_compiler, 'implementation_sha', '')
+            if article_preference:
+                import hashlib
+                curation['agent_article_preference_sha256'] = hashlib.sha256(article_preference.encode()).hexdigest()
         manifest = {**manifest, "curation": curation}
 
         if cancel:
@@ -393,6 +443,11 @@ class LLMWikiV1Engine:
 
         with telemetry_stage(telemetry, "source_read"):
             all_artifacts = await sources.get_artifacts(context_id, tenant_id)
+
+        if any(a.source_metadata.get('original_structure') for a in all_artifacts):
+            from .source_identity import RULE as IDENTITY_RULE
+            curation['source_identity_rule']=IDENTITY_RULE
+            manifest={**manifest,'curation':curation}
 
         manifest_checksum = manifest.get("checksum", "")
 
@@ -411,24 +466,27 @@ class LLMWikiV1Engine:
             runtime_snapshot_checksum = bundle.snapshot_checksum(
                 effective_runtime
             )
-            revision_id = pipeline.derive_revision_id(
-                curr_digests,
+        def revision_for(config, digests, inventory, runtime_checksum):
+            return pipeline.derive_revision_id(
+                digests,
                 manifest_checksum=manifest_checksum,
                 manifest_payload_checksum=bundle.sha256_hex(
-                    pipeline.canonical_json(manifest).encode("utf-8")
+                    pipeline.canonical_json(config).encode("utf-8")
                 ),
                 context_id=context_id,
                 tenant_id=tenant_id,
                 prompt_checksum=pipeline.PROMPT_CHECKSUM,
                 engine_id=self.ENGINE_ID,
                 engine_version=self.ENGINE_VERSION,
-                source_inventory_digest=source_inventory.digest,
-                runtime_snapshot_checksum=runtime_snapshot_checksum,
+                source_inventory_digest=inventory.digest,
+                runtime_snapshot_checksum=runtime_checksum,
                 # LWP-CURATE-RECOVERY (P1-1): scope the revision id to the
                 # exact bundle codec version so a schema upgrade can never
                 # re-derive a legacy revision's id (primary-key collision).
                 bundle_schema_version=bundle.SCHEMA_VERSION,
             )
+
+        revision_id = revision_for(manifest, curr_digests, source_inventory, runtime_snapshot_checksum)
 
         if not all_artifacts:
             return await self._empty_compile(
@@ -443,6 +501,91 @@ class LLMWikiV1Engine:
                 artifact_attempt_id=artifact_attempt_id,
                 telemetry=telemetry,
             )
+
+        fingerprints = {"source_inventory": source_inventory.digest,
+                        "runtime": runtime_snapshot_checksum, "query_policy": "wiki-agent-v1"}
+        article_source_key = getattr(store, "article_source_key", None)
+        resume_parent = publication_parent_revision
+        if article_source_key and agent_compiler is not None and resume_parent is None:
+            resume_parent = await self._published_revision_id(store, tenant_id, context_id)
+        def source_identity(revision):
+            return bundle_codec.canonical_checksum([revision, resume_parent, compile_main_prompt])
+
+        article_source_identity = source_identity(revision_id) if (
+            article_source_key and agent_compiler is not None and not omission_confirmations) else ""
+
+        async def finish_articles(candidate, view, counts):
+            from hashlib import sha256
+            from jonex_wiki.domain.engine.compile.coherent_catalog import digest
+            from jonex_wiki.domain.reading.authored_articles import check_authored_table_links
+
+            if progress:
+                await progress.update("", "authoring", 88, "Writing source-grounded articles")
+            with telemetry_stage(telemetry, "agent_article_compilation"):
+                summary = await agent_compiler.compile(
+                    view=view, model=(manifest.get("models") or {}).get("curation") or "",
+                    tenant_id=tenant_id, context_id=context_id,
+                    run_id=artifact_attempt_id or view.revision_id, cancel=cancel,
+                    **({"article_preference": article_preference} if article_preference else {}),
+                )
+            if cancel:
+                cancel.raise_if_cancelled()
+            if progress:
+                await progress.update("", "validate", 95, "Validating authored articles")
+            summary["files"], issues = check_authored_table_links(view, summary["files"])
+            if issues:
+                summary["table_link_issues"] = issues
+            files_digest = [(path, sha256(data).hexdigest()) for path, data in sorted(summary["files"].items())]
+            authored_revision = digest([view.revision_id, agent_compiler.RULE, files_digest])
+            counts["synthesized_articles"] = sum(
+                path.rsplit("/", 1)[-1] != "index.md" for path, _ in files_digest)
+            counts["article_model_calls"] = summary.get("gateway_calls", summary["model_calls"])
+            with telemetry_stage(telemetry, "bundle_render_and_persist"):
+                overlays = await asyncio.to_thread(bundle_codec.authored_publication_overlays,
+                                                    view, authored_revision, counts, summary)
+                options = {"output_key": artifact_attempt_id or view.revision_id} if (
+                    article_source_key and candidate == article_source_key
+                ) else {}
+                key = await store.finish_authored_revision(candidate, view, authored_revision, overlays,
+                                                           fingerprints=fingerprints, **options)
+            return authored_revision, key
+
+        if article_source_identity:
+            with telemetry_stage(telemetry, "article_source_resume"):
+                cached_source = await store.resume_article_source(article_source_identity)
+                prior_writer = getattr(agent_compiler, "legacy_checkpoint_implementation", "")
+                if cached_source is None and prior_writer:
+                    prior_manifest = {**manifest, "curation": {
+                        **curation, "agent_article_implementation": prior_writer}}
+                    prior_digests, prior_inventory = self.freeze_source_inventory(all_artifacts, prior_manifest)
+                    prior_code = effective_runtime.code.model_copy(update=_LEGACY_ARTICLE_SOURCE_CODE)
+                    prior_runtime = effective_runtime.model_copy(update={"code": prior_code})
+                    prior_checksum = bundle.snapshot_checksum(prior_runtime)
+                    prior_revision = revision_for(prior_manifest, prior_digests, prior_inventory, prior_checksum)
+                    cached_source = await store.resume_article_source(source_identity(prior_revision))
+                    if cached_source is not None:
+                        # Preserve the prepared sources' actual provenance. The
+                        # new writer fingerprint is stored in compile_agent.json.
+                        curr_digests, source_inventory = prior_digests, prior_inventory
+                        runtime_snapshot_checksum = prior_checksum
+                        fingerprints.update(source_inventory=prior_inventory.digest, runtime=prior_checksum)
+            if cached_source is not None:
+                from jonex_wiki.kernel.telemetry import count_work
+                count_work("article_source_candidate_reused")
+                headers = await asyncio.to_thread(lambda: json.loads(cached_source.read_text("manifest.json")))
+                counts = headers["counts"]
+                revision_id, key = await finish_articles(article_source_key, cached_source, counts)
+                head = await self._published_revision_id(store, tenant_id, context_id)
+                if head != resume_parent:
+                    raise ValueError(f"PUBLICATION_PARENT_CHANGED:{resume_parent}:{head}")
+                if progress:
+                    await progress.update("", "publish", 100, "Compilation complete")
+                return RevisionArtifacts(
+                    revision_id=revision_id, pages={}, claims=[], graph=[], ledger=[], errors=[],
+                    checksums={}, digest_map=curr_digests, source_inventory_digest=source_inventory.digest,
+                    runtime_snapshot_checksum=runtime_snapshot_checksum, source_count=counts["sources"],
+                    page_count=counts["pages"], claim_count=counts["claims"], error_count=counts["open_errors"],
+                ), key
 
         routing = {
             "model_name": manifest.get("models", {}).get("curation", ""),
@@ -480,7 +623,8 @@ class LLMWikiV1Engine:
                             and view.context_id == context_id
                             and fingerprints.get("source_inventory") == source_inventory.digest
                             and fingerprints.get("runtime") == runtime_snapshot_checksum
-                            and published_manifest.get("manifest") == manifest
+                            and _publication_manifest_matches(published_manifest.get("manifest"), manifest)
+                            and not _article_work_pending(view,curation)
                             and not ((published_manifest.get("claim_audit") or {})
                                      .get("summary") or {}).get("failed_passage_count", 0)
                         ):
@@ -594,9 +738,10 @@ class LLMWikiV1Engine:
             parent_revision = previous.revision_id
 
         if (not omission_confirmations and previous is not None and previous_key is not None
+                and not _article_work_pending(previous_view,curation)
                 and not previous.state.passage_failures
                 and curr_digests == previous.digest_map
-                and previous.manifest == manifest):
+                and _publication_manifest_matches(previous.manifest, manifest)):
             from jonex_wiki.kernel.telemetry import count_work
             # ── pre-publication recheck on the reuse path (S7-B) ─────────
             # "Unchanged" is a claim about the input this run read.  Returning
@@ -778,9 +923,6 @@ class LLMWikiV1Engine:
             return corpus, claim_audit, render_signatures, rendered_pages, validated_errors
 
         corpus, claim_audit, render_signatures, rendered_pages, error_book = await asyncio.to_thread(prepare_publication)
-        with telemetry_stage(telemetry, "bm25_index"):
-            directory=store.private_index_directory() if hasattr(store,'private_index_directory') else None
-            lexical_index = await asyncio.to_thread(build_fts_index_bytes, corpus, previous=previous,output_directory=directory)
         runtime_snapshot_checksum = bundle.snapshot_checksum(
             effective_runtime
         )
@@ -834,6 +976,7 @@ class LLMWikiV1Engine:
             revision_id = hashlib.sha256((revision_id + json.dumps(repaired_entries)).encode()).hexdigest()
         file_references = None
         if (previous is not None and previous_view is not None
+                and getattr(previous_view, "is_published_revision", True)
                 and getattr(store, "supports_file_references", False)):
             from jonex_wiki.kernel.ports import RevisionFileReference
             file_references = {entry["path"]: RevisionFileReference(
@@ -841,7 +984,8 @@ class LLMWikiV1Engine:
                 read_bytes=lambda path=entry["path"]: previous_view.read_bytes(path))
                 for entry in previous_view.manifest["files"]
                 if entry["path"].startswith(("wiki/", "json-shards/"))}
-        files = bundle_codec.iter_bundle_files(
+        def publication_files(revision_id):
+            return bundle_codec.iter_bundle_files(
             revision_id=revision_id,
             artifacts=all_artifacts,
             state=state,
@@ -854,7 +998,6 @@ class LLMWikiV1Engine:
             context_id=context_id,
             source_inventory=source_inventory,
             effective_runtime=effective_runtime,
-            lexical_index=lexical_index,
             rendered_wiki_files=getattr(state, "_rendered_wiki_files", None),
             prepared_corpus=corpus,
             prepared_audit=claim_audit,
@@ -869,6 +1012,19 @@ class LLMWikiV1Engine:
             previous=previous,
             prepared_contribution_payload=contribution_payload,
         )
+        key = None
+        if agent_compiler is not None:
+            if not hasattr(store,'finish_authored_revision') or not hasattr(store,'open_staged_revision'):
+                raise ValueError('AGENT_COMPILER_REQUIRES_PRIVATE_CANDIDATE_VIEW')
+            keep_source = bool(article_source_identity and not counts.get("failed_passage_count"))
+            source_options = {"fingerprints": {"article_source": article_source_identity}} if keep_source else {}
+            with telemetry_stage(telemetry, "article_source_staging"):
+                candidate = await store.stage_revision(tenant_id, context_id, revision_id,
+                    publication_files(revision_id), attempt_id=(article_source_key if keep_source else artifact_attempt_id),
+                    parent_revision=parent_revision if previous is not None else None,
+                    private_source=True, **source_options)
+            view = store.open_staged_revision(candidate)
+            revision_id, key = await finish_articles(candidate, view, counts)
         # ── pre-publication parent recheck (S7-B) ────────────────────────
         # Publishing on top of a parent that is no longer the published head
         # would silently overwrite a publication that landed while this compile
@@ -883,15 +1039,14 @@ class LLMWikiV1Engine:
                 parent_revision, head))
         if previous is None and head:
             count_work("publication_parent_recheck_skipped")
-        with telemetry_stage(telemetry, "bundle_render_and_persist"):
-            key = await store.stage_revision(
-                tenant_id, context_id, revision_id, files,
-                attempt_id=artifact_attempt_id,
-                parent_revision=(parent_revision if previous is not None else None),
-                fingerprints={"source_inventory": source_inventory.digest,
-                              "runtime": runtime_snapshot_checksum,
-                              "query_policy": "wiki-agent-v1"},
-            )
+        if key is None:
+            with telemetry_stage(telemetry, "bundle_render_and_persist"):
+                key = await store.stage_revision(
+                    tenant_id, context_id, revision_id, publication_files(revision_id),
+                    attempt_id=artifact_attempt_id,
+                    parent_revision=parent_revision if previous is not None else None,
+                    fingerprints=fingerprints,
+                )
 
         # File generation is lazy: recheck again after the private stage is drained.
         if parent_revision is not None:
@@ -1036,8 +1191,8 @@ class LLMWikiV1Engine:
         live_sources = {str(artifact.source_id) for artifact in all_artifacts}
         previous_state = getattr(previous, "state", None)
         # ``digest_map`` is the frozen *artifact* fingerprint per logical
-        # source -- the same vocabulary ``curr_digests`` uses and the same one
-        # ``classify_changes`` reads.  ``source_digests`` is the raw-content
+        # source -- the same vocabulary ``current_digests`` uses.
+        # ``source_digests`` is the raw-content
         # vocabulary of the Bundle and is not comparable with it.
         previous_versions = dict(
             getattr(previous, "digest_map", None)
@@ -1103,19 +1258,12 @@ class LLMWikiV1Engine:
             claim_policy=claim_policy,
             telemetry=telemetry,
             cancel=cancel,
-            # The bounded identity judgment (S7-A) is the only organization
-            # model call; it reuses this compile's model and routing, not a
-            # second port or a second scene configuration.
-            model=model,
-            routing=routing,
             reusable_pages=reusable_pages,
             previous_pages=({path: previous_state.pages[path]
                              for path in reusable_pages}
                             if previous_state is not None else None),
             previous_records=previous_records,
             previous_claims=previous_claims,
-            identity_store=store,
-            identity_source_versions=live_versions,
         )
         understanding = result.understanding
         count_work("layered_understanding_passages", len(stage.order))
@@ -1327,24 +1475,10 @@ class LLMWikiV1Engine:
 
     async def query(self, request, revision, ports, *, cancel: CancelPort | None = None,
                     trace_id: str | None = None) -> QueryRunResult:
-        """Query a published revision via the accepted strict query algorithm.
-
-        ``request`` is a ``QueryRequest`` (or dict) with ``question``,
-        ``strategy`` and an optional ``model`` override; ``revision`` is a
-        ``WikiRevision`` (or dict) exposing ``bundle_key``/``context_id``/
-        ``tenant_id``; ``ports`` exposes the ``ArtifactStore`` and ``ModelPort``.
-
-        ``trace_id`` (optional) is the **per-query** metering trace supplied by
-        the embedding platform (one search request → one trace); every model
-        call of this run carries it as ``X-Jonex-Trace-Id``. ``None`` keeps the
-        legacy bundle-level identity (``query:<bundle_key>``).
-        """
+        """Bind the Agent to an immutable publication and its model snapshot."""
         if cancel:
             cancel.raise_if_cancelled()
         store = ports["store"] if isinstance(ports, dict) else ports.store
-        model = ports["model"] if isinstance(ports, dict) else ports.model
-
-        # scene 改为每调用点传 kwarg（阶段 5）；这里不再 set_scene。
 
         bundle_key = (
             revision["bundle_key"]
@@ -1366,7 +1500,6 @@ class LLMWikiV1Engine:
         query_request = QueryRequest.model_validate(request)
         question = query_request.question
         run_id = query_request.run_id
-        strategy = QueryStrategy.BROWSE_FIRST
 
         revision_id = (
             revision.get("id") or revision.get("revision_id")
@@ -1382,85 +1515,47 @@ class LLMWikiV1Engine:
         if revision_status is not None and str(revision_status) != "active":
             raise ValueError("query requires an active published Revision")
         checksum = revision.get("bundle_checksum") if isinstance(revision, dict) else getattr(revision, "bundle_checksum", None)
-        directory_view = None
-        if hasattr(store, "open_revision"):
+        direct = (ports.get('agent_direct') if isinstance(ports, dict)
+                  else getattr(ports, 'agent_direct', None))
+        if direct is None:
+            raise ValueError('AGENT_DIRECT_EXECUTOR_REQUIRED')
+
+        def open_snapshot():
+            from jonex_wiki.adapters.bundle_view import DirectoryBundleView
+
+            opener = getattr(store, "open_revision", None)
             try:
-                directory_view = store.open_revision(bundle_key)
-            except (ValueError, FileNotFoundError, NotADirectoryError):
-                directory_view = None
-        prepared = None if directory_view is not None else (
-            self._prepared_revisions.find(tenant_id, context_id, revision_id, checksum) if checksum else None
-        )
-        if prepared is None:
-            if directory_view is not None:
-                if checksum and directory_view.manifest_hash != checksum:
-                    raise ValueError("bundle checksum does not match the published Revision")
-                if (directory_view.tenant_id, directory_view.context_id) != (tenant_id, context_id):
-                    raise ValueError("bundle owner does not match the published Revision")
-                prepared = self._prepared_revisions.load_view(
-                    directory_view, tenant_id, context_id, revision_id
-                )
-            else:
-                bundle_bytes = await store.get_bundle(bundle_key)
-                try:
-                    remote_manifest = json.loads(bundle_bytes.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    remote_manifest = {}
-                if remote_manifest.get("format") == "jonex-wiki-directory":
-                    if not hasattr(store, "get_revision_files"):
-                        raise ValueError("DIRECTORY_BUNDLE_STORE_CONTRACT_MISMATCH")
-                    from ...storage.directory_bundle import MemoryBundleView
-                    files = await store.get_revision_files(remote_manifest)
-                    directory_view = MemoryBundleView(remote_manifest, files)
-                    if checksum and directory_view.manifest_hash != checksum:
-                        raise ValueError("bundle checksum does not match the published Revision")
-                    prepared = self._prepared_revisions.load_view(directory_view, tenant_id, context_id, revision_id)
-                else:
-                    if checksum and bundle.sha256_hex(bundle_bytes) != checksum:
-                        raise ValueError("bundle checksum does not match the published Revision")
-                    prepared = self._prepared_revisions.load(bundle_bytes, tenant_id, context_id, revision_id)
-        previous = prepared.previous
-        if revision_id is not None and revision_id != previous.revision_id:
-            raise ValueError("bundle revision does not match the published Revision")
-        # ``decode_previous_bundle`` always supplies owner/index fields.  The
-        # fallbacks only keep focused unit-test doubles source-compatible; no
-        # stored bytes can bypass the production decoder's mandatory checks.
-        previous_tenant = getattr(previous, "tenant_id", tenant_id)
-        previous_context = getattr(previous, "context_id", context_id)
-        if previous_tenant != tenant_id or previous_context != context_id:
-            raise ValueError("bundle owner does not match the published Revision")
-        # Query routing uses the model configured **now** (env), not the one the
-        # restored Manifest recorded at compile time; the snapshot is only the
-        # fallback for deployments that configure no model in the env at all.
-        query_model = _resolve_query_model(
-            previous.manifest.get("models", {}).get("query"))
-        # [jonex] trace 归属：``trace_id`` = **本次查询**的计量 trace（平台一次检索
-        # 的 request_id，经适配器传入），同一次检索里的所有模型调用因此归到同一条
-        # trace。未传时保持旧的 bundle 级标识（``query:<bundle_key>``）——既有部署/直
-        # 连引擎调用行为不变。
-        # bundle 级标识**保留**（不删）：它仍是「这次查询读的是哪一版已发布 bundle」
-        # 的诊断锚点，经 routing 交给 run_query 记录（不会进模型调用头）。
-        bundle_trace_id = ("query:" + bundle_key)[:64]
-        query_trace_id = (trace_id or bundle_trace_id)[:64]
-        routing = {
-            "model_name": query_model,
-            "tenant_id": tenant_id,
-            "context_id": context_id,
-            "trace_id": query_trace_id,
-            "bundle_trace_id": bundle_trace_id,
-            "run_id": run_id,
-            "_published_lexical_index": getattr(previous, "lexical_index", None),
-            "_prepared_corpus": previous.corpus,
-        }
-        if directory_view is not None:
-            routing["bundle_view"] = directory_view
-            routing["table_registry"] = build_table_registry(directory_view)
-        if query_request.query_context is not None:
-            routing['query_context'] = query_request.query_context.model_dump(mode='json')
-        return await orchestration.run_query(
-            model, previous.state, previous.claims, question, strategy, routing,
-            cancel=cancel,
-        )
+                view = opener(bundle_key) if opener is not None else None
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                raise ValueError("AGENT_DIRECT_REQUIRES_LOCAL_DIRECTORY_BUNDLE") from exc
+            if not isinstance(view, DirectoryBundleView) or not view.is_published_revision:
+                raise ValueError("AGENT_DIRECT_REQUIRES_LOCAL_DIRECTORY_BUNDLE")
+            if view.manifest_hash != bundle_key or (checksum and view.manifest_hash != checksum):
+                raise ValueError("bundle checksum does not match the published Revision")
+            if (view.tenant_id, view.context_id) != (tenant_id, context_id):
+                raise ValueError("bundle owner does not match the published Revision")
+            if revision_id is not None and view.revision_id != revision_id:
+                raise ValueError("bundle revision does not match the published Revision")
+            view.verify_manifest_identity()
+            view.verified_file_path("revision.json")
+            view.verified_file_path("provenance.json")
+            provenance = json.loads(view.read_bytes("provenance.json"))
+            if (provenance.get("tenant_id"), provenance.get("context_id"), provenance.get("revision_id")) != (
+                tenant_id, context_id, view.revision_id
+            ):
+                raise ValueError("bundle provenance owner or revision mismatch")
+            return view, provenance["effective_runtime"]["models"].get("query")
+
+        directory_view, snapshot_model = await asyncio.to_thread(open_snapshot)
+        if cancel:
+            cancel.raise_if_cancelled()
+        query_model = _resolve_query_model(snapshot_model)
+        image_options = ({'query_context': query_request.query_context.model_dump(mode='json')}
+                         if query_request.query_context is not None else {})
+        return await direct.query(view=directory_view,
+            question=question, model=query_model, tenant_id=tenant_id,
+            context_id=context_id, run_id=run_id, revision_id=directory_view.revision_id, cancel=cancel,
+            **image_options, **({'trace_id': trace_id} if trace_id else {}))
 
     async def inspect(self, revision, ports=None) -> dict[str, str]:
         """Inspect a published revision's decoded bundle content tree.
@@ -1497,4 +1592,11 @@ class LLMWikiV1Engine:
         else:
             raise ValueError("inspect requires a store or embedded bundle_bytes")
 
-        return orchestration.inspect_bundle(bundle_bytes)
+        decoded = bundle.decode_bundle(bundle_bytes)
+        tree = {}
+        for path, data in sorted(decoded.files.items()):
+            try:
+                tree[path] = data.decode('utf-8')
+            except UnicodeDecodeError:
+                tree[path] = '<binary bytes={} sha256={}>'.format(len(data), bundle.sha256_hex(data))
+        return tree

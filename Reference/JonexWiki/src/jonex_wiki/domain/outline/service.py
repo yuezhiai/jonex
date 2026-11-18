@@ -115,9 +115,11 @@ class OutlineService:
     def _belongs_to_doc(doc_pages: dict, path: str, ptype: str,
                         document_id: str, doc_slug: Optional[str]) -> bool:
         """文档级过滤：source 页按 slug 匹配；table/concept 页查 claims 归属映射。"""
+        if document_id in (doc_pages.get(path) or ()):
+            return True
         if ptype == "source":
             return path == f"sources/source-{doc_slug}.md"
-        return document_id in (doc_pages.get(path) or ())
+        return False
 
     # ────────────────────────────────────────────────────────────
     # 对外三个入口：读 / 起草 / 调整
@@ -132,6 +134,13 @@ class OutlineService:
         if self.layout.resolve_published(tenant_id, kb_id) is None:
             return self._view_payload(kb_id, [], None)
         pages = await self._load_catalog(tenant_id, kb_id, document_id)
+        if not pages:
+            # An empty published Bundle has no readable entries. Preserve the
+            # saved outline in storage, but do not expose stale deleted titles.
+            payload = self._view_payload(kb_id, [], None)
+            if document_id:
+                payload["document_id"] = document_id
+            return payload
         async with self.session_factory() as s:
             row = await self._repo.get_active(s, tenant_id, kb_id)
         payload = await asyncio.to_thread(self._project, tenant_id, kb_id, pages, row)
@@ -268,6 +277,25 @@ class OutlineService:
         from jonex_wiki.domain.reading import remap_outline_paths
 
         payload = self._view_payload(kb_id, pages, row)
+        # Existing saved outlines predate Agent-authored articles. Add a
+        # read-only group without rewriting the user's saved outline.
+        outline = payload.get("outline")
+        if outline:
+            from copy import deepcopy
+            missing = [p for p in pages if p.get("type") == "article"
+                       and p["path"] not in _covered_paths(outline)]
+            if missing:
+                outline = deepcopy(outline)
+                outline.setdefault("topics", []).insert(0, {
+                    "id": "agent-authored-articles", "kind": "section",
+                    "title": "综合文章", "description": "基于来源编写的综合文章",
+                    "order": -1, "children": [],
+                    "entries": [{"path": p["path"], "title": p["title"],
+                                 "role": "article", "category": p.get("category", ""),
+                                 "note": "", "order": i} for i, p in enumerate(missing)],
+                })
+                payload["outline"] = outline
+                payload["topic_edges"] = build_topic_edges(outline, pages)
         merge = self._merge_map(tenant_id, kb_id)
         if merge.is_identity():
             return payload

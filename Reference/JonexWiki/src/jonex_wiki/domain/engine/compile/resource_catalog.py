@@ -20,6 +20,8 @@ def identity(prefix, *parts):
 
 def build_resources(pub: Path, resolve_asset=None) -> dict:
     result = {"schema": SCHEMA, "objects": [], "relations": [], "evidence": [], "gaps": [], "auxiliary_files": []}
+    registry_path=pub/'sources/registry.json'
+    registered={row['source_id']:row for row in json.loads(registry_path.read_text()).get('sources',[])} if registry_path.is_file() else {}
     for file in sorted((pub / "sources/digests").glob("*.json")):
         digest = json.loads(file.read_text("utf-8"))
         doc = str(digest["document_id"])
@@ -27,7 +29,7 @@ def build_resources(pub: Path, resolve_asset=None) -> dict:
         metadata = digest.get("source_metadata") or {}
         receipt = metadata.get("consumer_receipt") or {}
         original_sha = receipt.get("original_sha256") or digest.get("content_sha256")
-        source_path = f"sources/articles/{doc}.md"
+        source_path = f"sources/articles/{file.stem}.md"
         article = pub / source_path
         if not article.is_file():
             continue
@@ -80,7 +82,7 @@ def build_resources(pub: Path, resolve_asset=None) -> dict:
                 result["gaps"].extend({"document_id": doc, "reason": gap} for gap in layer["gaps"])
         for table_id in digest.get("table_ids", []):
             label = table_id
-            database = pub / "sources" / doc / "tables.sqlite"
+            database = pub / (registered.get(digest.get('source_id',doc),{}).get('tables') or f'sources/{doc}/tables.sqlite')
             if database.is_file():
                 with sqlite3.connect(database.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as connection:
                     row = connection.execute("SELECT title FROM logical_tables WHERE table_id=?", (table_id,)).fetchone()

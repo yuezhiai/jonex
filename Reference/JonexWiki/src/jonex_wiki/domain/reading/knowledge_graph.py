@@ -26,7 +26,7 @@ from jonex_wiki.kernel.errors import NotFoundError, ValidationError
 
 INDEX_PATH = "indexes/knowledge_graph.sqlite"
 SCHEMA_VERSION = "wiki-knowledge-graph-v1"
-NODE_TYPES = ("image", "knowledge_topic", "table", "page", "document", "claim", "section", "media_segment", "video_frame")
+NODE_TYPES = ("image", "knowledge_topic", "table", "page", "document", "claim", "section", "media_segment", "video_frame", "source_mention", "source_entity")
 _TYPE_ID=re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 FAMILIES = ("semantic", "navigation", "provenance")
 _KINDS = {"sources": "page", "tables": "table"}
@@ -232,6 +232,90 @@ def build_index(pub: Path, destination: Path, tenant_id: str, kb_id: str) -> Non
         if refutations:
             edges[eid]["conflict"] = True
 
+    # Literal source relations use occurrence-scoped nodes. They must never
+    # resolve a director to a namesake ruler simply because one page exists.
+    source_relations = _optional_artifact(pub, "query/source_relations.json")
+    if source_relations and source_relations.get('rule') not in {'source-clause-relations-v3','source-clause-relations-v4','source-clause-relations-v5','source-clause-relations-v6','source-clause-relations-v7'}:
+        raise ValueError('SOURCE_RELATION_RULE_UNSUPPORTED')
+    occurrence_nodes = {}
+    for item in source_relations.get('entities', []):
+        occurrence_nodes[item['entity_id']] = node('source_mention', item['entity_id'], item['label'],
+            **{key: value for key,value in item.items() if key != 'label'})
+    identity_nodes={}; identity_bindings={}; identity_refs={}
+    if source_relations.get('identity_rule'):
+        from jonex_wiki.domain.engine.compile.source_identity import RULE as IDENTITY_RULE, bind_article_identities
+        if source_relations['identity_rule'] not in {IDENTITY_RULE,'original-article-role-identity-v3','original-article-role-identity-v2','original-article-role-identity-v1'}:raise ValueError('SOURCE_IDENTITY_RULE_UNSUPPORTED')
+        snapshots={};article_paths={}
+        for digest_path in sorted((pub/'sources/digests').glob('*.json')):
+            digest=json.loads(digest_path.read_text('utf-8'));sid=digest['source_id']
+            article_path='sources/articles/'+digest_path.stem+'.md'
+            snapshots[sid]={**digest,'text':(pub/article_path).read_text('utf-8')};article_paths[sid]=article_path
+        checked=bind_article_identities(source_relations,snapshots,page_index,article_paths,rule=source_relations['identity_rule'])
+        for key in ('article_entities','identity_bindings','identity_ambiguities_unbound'):
+            if checked.get(key)!=source_relations.get(key):raise ValueError('SOURCE_IDENTITY_EVIDENCE_MISMATCH')
+        for item in checked['article_entities']:
+            identity_nodes[item['entity_id']]=node('source_entity',item['entity_id'],item['label'],
+                **{k:v for k,v in item.items() if k!='label'})
+            # A disambiguated original title may own its shorter literal name.
+            aliases.add((identity_nodes[item['entity_id']],_fold(re.sub(r'\s*\([^()]*\)\s*$','',item['label']))))
+        for binding in checked['identity_bindings']:
+            oid=binding['occurrence_id'];nid=identity_nodes[binding['entity_id']];ref=binding['evidence']
+            evid=_id('ev','original_article_identity',ref)
+            evidence[evid]={**ref,'evidence_id':evid,'support_status':'SUPPORTED',
+                'support_kind':'original_article_identity','claim_text':ref['excerpt'],'page_path':ref['path']}
+            identity_bindings[oid]=nid;identity_refs[oid]=evid
+            edge(occurrence_nodes[oid],nid,'provenance','article_identity',refs=[evid],
+                docs=[nodes[nid]['document_id']],status='SUPPORTED',qualifiers={'method':binding['method']})
+        del snapshots
+    from collections import OrderedDict
+    from jonex_wiki.domain.engine.compile.source_relations import clause_relations
+    source_bodies = OrderedDict()
+    for item in source_relations.get('relations', []):
+        ref=item['evidence'];name=str(ref['path'])
+        source_file=(pub/name).resolve()
+        if not source_file.is_relative_to(pub.resolve()) or not name.startswith('sources/articles/'):
+            raise ValueError('SOURCE_RELATION_PATH_INVALID')
+        if name not in source_bodies:
+            source_bodies[name]=source_file.read_text('utf-8')
+            if len(source_bodies)>4:source_bodies.popitem(last=False)
+        else:source_bodies.move_to_end(name)
+        body=source_bodies[name]
+        if (hashlib.sha256(body.encode()).hexdigest()!=ref['body_sha256']
+                or body[ref['start_char']:ref['end_char']]!=ref['excerpt']):
+            raise ValueError('SOURCE_RELATION_EVIDENCE_MISMATCH')
+        source=occurrence_nodes[item['source']];target=occurrence_nodes[item['target']]
+        for nid in (source,target):
+            entity=nodes[nid]
+            if body[entity['start_char']:entity['end_char']]!=entity['label']:
+                raise ValueError('SOURCE_RELATION_ENDPOINT_MISMATCH')
+        proposal = item.get('support_status') == 'LOCATED_PROPOSAL'
+        if not proposal or item.get('origin_kind') == 'named_clause_pattern':
+            statement_relations=clause_relations(ref['excerpt'],[nodes[source]['label'],nodes[target]['label']])
+            if not any(predicate==item['predicate']
+                       and left[0]+ref['start_char']==nodes[source]['start_char']
+                       and right[0]+ref['start_char']==nodes[target]['start_char']
+                       for left,predicate,right in statement_relations):
+                raise ValueError('SOURCE_RELATION_PREDICATE_UNSUPPORTED')
+        if proposal or source_relations.get('rule') == 'source-clause-relations-v7':
+            evid=_id('ev','located_source_proposal',ref)
+            evidence[evid]={**ref,'evidence_id':evid,'support_status':'NOT_ENOUGH_INFO',
+                'support_kind':'located_source_proposal','claim_text':ref['excerpt'],
+                'document_id':item['document_id'],'source_id':item['source_id'],'page_path':nodes[source].get('page_path','')}
+            edge(identity_bindings.get(item['source'],source),identity_bindings.get(item['target'],target),
+                'navigation',item['predicate'],refs=[evid],docs=[item['document_id']],status='NOT_ENOUGH_INFO',
+                qualifiers={**item['qualifiers'],'semantic_verification':'not_assessed'})
+            continue
+        evid=_id('ev','source_clause',ref)
+        evidence[evid]={**ref,'evidence_id':evid,'support_status':'SUPPORTED',
+            'support_kind':'explicit_source_clause','claim_text':ref['excerpt'],
+            'document_id':item['document_id'],'source_id':item['source_id'],
+            'page_path':nodes[source].get('page_path','')}
+        source=identity_bindings.get(item['source'],source);target=identity_bindings.get(item['target'],target)
+        refs=[evid]+[identity_refs[oid] for oid in (item['source'],item['target']) if oid in identity_refs]
+        edge(source,target,'semantic',item['predicate'],refs=refs,docs=[item['document_id']],status='SUPPORTED',
+             qualifiers={**item['qualifiers'],'origin_page_paths':item.get('origin_page_paths',[]),
+                         'identity_status':'article_identity_with_occurrence_evidence' if refs[1:] else item['identity_status']})
+
     # Independently identified source entities do not have to be Wiki pages.
     # Catalog evidence is admitted separately from model-proposed page links.
     catalog = _optional_artifact(pub, "query/media_catalog.json")
@@ -349,6 +433,7 @@ def build_index(pub: Path, destination: Path, tenant_id: str, kb_id: str) -> Non
                 CREATE TABLE nodes (node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, label TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE INDEX nodes_label ON nodes(label,node_type);
                 CREATE TABLE aliases (node_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(node_id,name));
+                CREATE INDEX aliases_name ON aliases(name,node_id);
                 CREATE TABLE node_docs (node_id TEXT NOT NULL, document_id TEXT NOT NULL, PRIMARY KEY(node_id,document_id));
                 CREATE TABLE edges (edge_id TEXT PRIMARY KEY, source TEXT NOT NULL, target TEXT NOT NULL, family TEXT NOT NULL, predicate TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE INDEX edges_out ON edges(source,family,edge_id);

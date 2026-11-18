@@ -518,7 +518,7 @@ class CompilerState(BaseModel):
     def _validate_directory_shards(cls, value: Dict[str, List[str]]) -> Dict[str, List[str]]:
         normalized: Dict[str, List[str]] = {}
         for directory, prefixes in value.items():
-            if directory not in {"sources", "tables"}:
+            if directory not in {"sources", "tables", "table-views", "raw-tables", "pages", "source-evidence", "articles"}:
                 raise ValueError("directory shards are restricted to complete type directories")
             unique = sorted(set(prefixes))
             if any(not re.fullmatch(r"[0-9a-f]{1,16}", prefix) for prefix in unique):

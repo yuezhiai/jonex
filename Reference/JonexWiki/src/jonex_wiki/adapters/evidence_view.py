@@ -136,14 +136,14 @@ def _read(base, citation):
     ref = citation.get("evidence_ref") or {}
     if ref.get("kind") in ("table_cell", "table_range", "table_note"):
         return _table(base, citation, ref)
-    if ref.get("kind") == "source_span":
+    if ref.get("kind") in ("source_span", "compiled_passage"):
         text = _path(base, ref["path"]).read_text("utf-8")
         spans = ref.get("spans") or []
         segments, truncated = _segments(text, spans)
         body = "\n".join(text[a:b] for a, b in spans)
         if ref.get("body_sha256") and hashlib.sha256(body.encode()).hexdigest() != ref["body_sha256"]:
             raise ConflictError("引用的原文校验失败")
-        return {"kind": "source_span", "exact_location": True, "segments": segments,
+        return {"kind": ref.get("kind"), "exact_location": True, "segments": segments,
                 "spans": spans, "truncated": truncated}
     snapshot = _legacy_snapshot(base, citation)
     if snapshot:

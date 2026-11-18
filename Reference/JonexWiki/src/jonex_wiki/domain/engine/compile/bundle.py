@@ -60,7 +60,6 @@ REQUIRED_FILES: List[str] = [
     "error_book.yaml",
     "provenance.json",
     "indexes/manifest.json",
-    "indexes/lexical.sqlite",
 ]
 
 # Only compilation and published-index inputs belong to the Bundle identity.

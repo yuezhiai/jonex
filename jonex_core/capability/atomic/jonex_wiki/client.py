@@ -32,7 +32,16 @@ class JonexWikiClient(ABC):
 
     @abstractmethod
     async def remove_document(self, kb_name: str, document_id: str,
-                              tenant_id: str, kb_id: str) -> dict: ...
+                              tenant_id: str, kb_id: str,
+                              *, model: str = "") -> dict:
+        """删除文档（引擎侧顺带排一次重编）；`model` = 这次重编该用的模型。
+
+        ⚠️ `model` 是 2026-10-21 起「编译模型走任务快照透传」的一部分：服务层
+        `JonexWikiService.remove_document` 会传它，引擎适配器读 `data["model"]`
+        写进任务快照。**契约两侧必须同时有它** —— 之前服务层加了、远端 client
+        没加，每次删除都 `TypeError`，引擎侧文档永远删不掉（同名重传还会撞
+        「已存在同名文档」）。
+        """
 
     async def get_document_chunks(self, document_id: str, tenant_id: str, kb_id: str) -> dict:
         raise NotImplementedError
@@ -198,9 +207,13 @@ class RemoteJonexWikiClient(JonexWikiClient):
             "config": config, "agents_md": agents_md,
         }, tenant_id, kb_id)
 
-    async def remove_document(self, kb_name, document_id, tenant_id, kb_id):
-        return await self._invoke("remove_document", {"kb": kb_name, "document_id": document_id},
-                                  tenant_id, kb_id)
+    async def remove_document(self, kb_name, document_id, tenant_id, kb_id, *, model: str = ""):
+        """删除文档。`model` 只在非空时下发（空 = 引擎回落部署默认，与
+        `compile_parsed_document` 同一条口径）。"""
+        data = {"kb": kb_name, "document_id": document_id}
+        if model:
+            data["model"] = model
+        return await self._invoke("remove_document", data, tenant_id, kb_id)
 
     async def get_document_chunks(self, document_id, tenant_id, kb_id):
         return await self._invoke("get_document_chunks", {"document_id": document_id}, tenant_id, kb_id)
@@ -211,12 +224,63 @@ class RemoteJonexWikiClient(JonexWikiClient):
     async def query(self, kb_name, question, tenant_id, kb_id, return_trace: bool = False,
                     thinking_mode: str | None = None, progress_session: str | None = None, query_context: dict | None = None,
                     trace_id: str | None = None):
-        return await self._invoke("query", {
-            "kb": kb_name, "question": question, "return_trace": return_trace,
-            **({"progress_session": progress_session} if progress_session else {}),
+        # Start once, then poll with short Sidecar calls. A multi-step Agent
+        # query must not hold a single HTTP request open for its whole run.
+        import asyncio
+        import json
+        from contextlib import suppress
+        start = await self._invoke("query_start", {
+            "kb": kb_name, "question": question,
             **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
-            **({'query_context':query_context} if query_context is not None else {}),
+            **({'query_context': query_context} if query_context is not None else {}),
+            **({"trace_id": trace_id} if trace_id else {}),
         }, tenant_id, kb_id, trace_id=trace_id)
+        task_id = str(start.get("task_id") or "")
+        if not task_id:
+            raise RuntimeError("jonex_wiki query: missing task_id")
+        redis = key = None
+        try:
+            if progress_session:
+                from jonex_core.common.cache import get_redis_client
+                from jonex_core.common.wiki_search_session import SESSION_TTL, session_key
+                redis = get_redis_client()
+                key = session_key(tenant_id, progress_session)
+                bound = await redis.eval("""
+                    if redis.call('HGET', KEYS[1], 'status') ~= 'running' then return 0 end
+                    redis.call('HSET', KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+                    redis.call('EXPIRE', KEYS[1], ARGV[5])
+                    return 1
+                """, 1, key, f"query:{kb_id}", task_id, f"scope:{kb_id}",
+                    json.dumps(start.get('source_document_ids')), SESSION_TTL)
+                if not bound:
+                    raise RuntimeError("Wiki search cancelled")
+            last_progress = None
+            while True:
+                if redis is not None:
+                    session_status = await redis.hget(key, "status")
+                    if session_status not in ("running", b"running"):
+                        raise RuntimeError("Wiki search cancelled")
+                    await redis.expire(key, SESSION_TTL)
+                state = await self._invoke("query_status", {"query_id": task_id,
+                    "return_trace": return_trace}, tenant_id, kb_id, trace_id=trace_id)
+                status = state.get("status")
+                progress = state.get("progress") or {}
+                if redis is not None and progress.get("seq") != last_progress:
+                    await redis.hset(key, f"progress:{kb_id}", json.dumps(progress, ensure_ascii=False))
+                    last_progress = progress.get("seq")
+                if status == "done":
+                    return state.get("result") or {}
+                if status in ("failed", "cancelled"):
+                    raise RuntimeError(f"jonex_wiki query {status}: {state.get('error') or 'no detail'}")
+                if status not in ("queued", "running"):
+                    raise RuntimeError("jonex_wiki query: invalid task state")
+                await asyncio.sleep(1)
+        except BaseException:
+            # Stop/disconnect/error must not leave a worker running in the background.
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(self._invoke("cancel_query", {"query_id": task_id},
+                                                  tenant_id, kb_id, trace_id=trace_id))
+            raise
 
     async def status(self, kb_name, tenant_id, kb_id):
         return await self._invoke("status", {"kb": kb_name}, tenant_id, kb_id)

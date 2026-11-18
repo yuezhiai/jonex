@@ -99,6 +99,7 @@ class ModelPort(ABC):
         context_id: str = "",
         trace_id: str = "",
         thinking: Dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         scene: str | None = None,
         doc_id: str = "",
     ) -> Dict[str, Any]:
@@ -121,12 +122,6 @@ class ModelPort(ABC):
         gateway's scene default in effect.  Implementations MUST forward it
         verbatim in the request body when supported, and MUST ignore it safely
         when the provider/upstream does not accept a ``thinking`` field.
-
-        ``doc_id`` labels the source document this call belongs to (empty =
-        "no single document", e.g. library-level outline/identity stages).
-        It travels to the gateway as ``X-Jonex-Doc-Id`` so ingest metering can
-        be aggregated per document by the task center; without it a wiki
-        compile's tokens cannot be attributed to any document row.
         """
         ...
 

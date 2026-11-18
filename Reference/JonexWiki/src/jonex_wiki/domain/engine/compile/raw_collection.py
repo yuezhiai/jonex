@@ -3,12 +3,12 @@
 The compile path builds pages from ``SourceArtifact`` local attachment handles;
 the migration path builds the same pages from an already-published directory
 Bundle (``sources/registry.json`` + ``sources/articles`` + ``sources/**/tables.sqlite``).
-Both call the same ``iter_raw_table_pages`` exporter and ``_source_intervals``
-splitter, so the two never drift.
+Both call the same complete-table exporter and source-chapter reading
+projection, so the two never drift. Fine evidence units remain separate.
 """
 from __future__ import annotations
 
-import hashlib
+from bisect import bisect_left, bisect_right
 import json
 import re
 import sqlite3
@@ -16,7 +16,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from jonex_wiki.domain.engine.compile.publication import _source_intervals
 from jonex_wiki.domain.engine.models.query_models import (
     RawWikiPage,
     WorkbookOutline,
@@ -25,36 +24,12 @@ from jonex_wiki.domain.engine.models.query_models import (
     WorkbookOutlineTable,
 )
 from jonex_wiki.kernel.contracts import SourceArtifact
+from jonex_wiki.domain.engine.compile.table_navigation import full_table_path
 
-ARTICLE_ROW_COUNT = 6000
-
-
-def _slug(value: str) -> str:
-    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
-
-
-def _article_pages(source_id: str, text: str) -> List[RawWikiPage]:
-    """Split one full article into source-kind raw pages with prev/next links."""
-    pages: List[RawWikiPage] = []
-    intervals = list(_source_intervals(text, ARTICLE_ROW_COUNT))
-    for part, (start, end, _kind) in enumerate(intervals):
-        body = text[start:end]
-        if not body.strip():
-            continue
-        pages.append(RawWikiPage(
-            path="source-articles/{}/{:04d}.md".format(_slug(source_id), part),
-            body=body,
-            content_kind="source",
-            source_id=source_id,
-            title="Article {} part {}".format(source_id, part),
-            aliases=["article-{}".format(source_id)],
-            tags=["article", "source"],
-        ))
-    for index, page in enumerate(pages):
-        related = [pages[index - 1].path] if index > 0 else []
-        if index + 1 < len(pages):
-            related.append(pages[index + 1].path)
-        yield page.model_copy(update={"related_pages": related})
+def _article_pages(source_id: str, text: str, source_name: str = '', *, original_structure=None) -> List[RawWikiPage]:
+    """Project original chapters as continuous, source-bound reading pages."""
+    from jonex_wiki.domain.engine.compile.chapter_pages import article_pages
+    yield from article_pages(source_id, text, source_name,original_structure=original_structure)
 
 
 def _table_pages_from_path(source_id: str, path: str, source_name: str = "") -> List[RawWikiPage]:
@@ -75,6 +50,28 @@ def _table_pages_from_path(source_id: str, path: str, source_name: str = "") -> 
         connection.close()
 
 
+def _attach_chapter_table_links(chapters, artifacts, tables):
+    """Keep the original chapter body intact and attach links by parser identity."""
+    if not chapters or not tables:
+        return
+    starts = [chapter.scope["article_start"] for chapter in chapters]
+    ends = [chapter.scope["article_end"] for chapter in chapters]
+    start = 0
+    for artifact in artifacts:
+        metadata = artifact.source_metadata
+        text = metadata.get("snapshot_text", artifact.text)
+        end = start + len(text)
+        table = tables.get(metadata.get("table_id"))
+        if table is not None and text.strip():
+            link = {"table_id": table.table_id, "title": table.title,
+                    "page_path": table.scope["full_table_path"]}
+            for chapter in chapters[bisect_right(ends, start):bisect_left(starts, end)]:
+                links = chapter.scope.setdefault("preview_table_links", [])
+                if link not in links:
+                    links.append(link)
+        start = end
+
+
 def collect_article_and_table_pages(artifacts: List[SourceArtifact]) -> List[RawWikiPage]:
     """Collect raw pages for a fresh/incremental compile from parser artifacts."""
     by_source: Dict[str, List[SourceArtifact]] = {}
@@ -86,14 +83,22 @@ def collect_article_and_table_pages(artifacts: List[SourceArtifact]) -> List[Raw
     for source_id, items in sorted(by_source.items()):
         ordered = sorted(items, key=lambda a: (a.position if a.position is not None else 0, a.chunk_id))
         article_text = "".join(
-            (a.source_metadata.get("snapshot_text") or a.text) for a in ordered
+            a.source_metadata.get("snapshot_text", a.text) for a in ordered
         )
-        pages.extend(_article_pages(source_id, article_text))
-        # 名称只用于 raw-tables 目录段的可读前缀；同一来源的多个 artifact 里
+        # 名称用于文章及 raw-tables 的阅读标签；同一来源的多个 artifact 里
         # 取第一个非空值（与 collect_workbook_outlines 同一套取法）。
         source_name = next(
             (str((a.source_metadata or {}).get("source_name")) for a in ordered
              if (a.source_metadata or {}).get("source_name")), "")
+        structure=next(((a.source_metadata or {}).get('original_structure') for a in ordered
+                        if (a.source_metadata or {}).get('original_structure')),None)
+        chapters = list(_article_pages(source_id, article_text, source_name, original_structure=structure))
+        # Bundle publication registers the first grid for a source. Preview
+        # links must use identities from that same grid.
+        published_grid = next((str(path) for item in items
+                               if (path := item.source_metadata.get("tables_sqlite_local_path"))), None)
+        table_pages = []
+        registered_tables = {}
         for artifact in ordered:
             metadata = artifact.source_metadata or {}
             table_path = metadata.get("tables_sqlite_local_path")
@@ -102,7 +107,15 @@ def collect_article_and_table_pages(artifacts: List[SourceArtifact]) -> List[Raw
             if (source_id, str(table_path)) in seen_tables:
                 continue
             seen_tables.add((source_id, str(table_path)))
-            pages.extend(_table_pages_from_path(source_id, str(table_path), source_name))
+            attached = _table_pages_from_path(source_id, str(table_path), source_name)
+            if str(table_path) == published_grid:
+                for page in attached:
+                    page.scope["full_table_path"] = full_table_path(source_id, page.table_id)
+                    registered_tables[page.table_id] = page
+            table_pages.extend(attached)
+        _attach_chapter_table_links(chapters, ordered, registered_tables)
+        pages.extend(chapters)
+        pages.extend(table_pages)
     return pages
 
 
@@ -113,11 +126,13 @@ def collect_raw_pages_from_bundle(files: Dict[str, bytes]) -> List[RawWikiPage]:
         str(entry["source_id"]): entry for entry in registry["sources"]
     }
     article_by_source: Dict[str, str] = {}
+    original_structures = {}
     for path in files:
         if not path.startswith("sources/digests/") or not path.endswith(".json"):
             continue
         digest = json.loads(files[path].decode("utf-8"))
         source_id = str(digest.get("source_id"))
+        original_structures[source_id]=(digest.get('source_metadata') or {}).get('original_structure')
         if not source_id or source_id in article_by_source:
             continue
         slug = path[len("sources/digests/"):-len(".json")]
@@ -129,7 +144,9 @@ def collect_raw_pages_from_bundle(files: Dict[str, bytes]) -> List[RawWikiPage]:
     for source_id, entry in sorted(source_by_id.items()):
         article_path = article_by_source.get(source_id)
         if article_path:
-            pages.extend(_article_pages(source_id, files[article_path].decode("utf-8")))
+            pages.extend(_article_pages(source_id, files[article_path].decode("utf-8"),
+                str(entry.get('source_name') or entry.get('name') or source_id),
+                original_structure=original_structures.get(source_id)))
         table_path = entry.get("tables")
         if table_path and table_path in files:
             pages.extend(_table_pages_from_bundle_bytes(source_id, files[table_path]))

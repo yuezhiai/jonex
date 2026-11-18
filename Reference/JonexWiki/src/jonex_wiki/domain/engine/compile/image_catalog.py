@@ -85,7 +85,7 @@ def build_catalog(pub: Path, resolve_asset, reuse_assets=None):
             or digest["document_id"]
         )
         doc, generation = str(digest["document_id"]), int(digest["content_generation"])
-        source_path = f"sources/articles/{doc}.md"
+        source_path = f"sources/articles/{file.stem}.md"
         body = (
             (pub / source_path).read_text("utf-8")
             if (pub / source_path).is_file()

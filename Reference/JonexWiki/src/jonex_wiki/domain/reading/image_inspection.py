@@ -97,7 +97,7 @@ def validate_observation(result):
 
 
 async def inspect_image(
-    layout, settings, gateway, tenant_id, kb_id, options, semaphore
+    layout, settings, gateway, tenant_id, kb_id, options, semaphore, *, visibility_guard=None
 ):
     if not settings.visual_inspection_enabled:
         raise ValidationError("VISUAL_INSPECTION_DISABLED")
@@ -107,6 +107,8 @@ async def inspect_image(
         raise ValidationError("IMAGE_REVISION_REQUIRED")
     async with layout.version_lock(tenant_id, kb_id):
         view = pinned_view(layout, tenant_id, kb_id, options["revision"])
+        if visibility_guard:
+            await visibility_guard(layout.versions_dir(tenant_id, kb_id, view.manifest_hash))
         receipt, messages = await asyncio.to_thread(
             prepare_image,
             view,

@@ -14,7 +14,7 @@ QUERY_FIELDS = {
     "evidence": ("graph_revision", "document_id", "node_id", "edge_id", "evidence_id", "limit", "cursor"),
 }
 
-async def query_graph(layout, tenant_id: str, kb_id: str, operation: str, options: dict) -> dict:
+async def query_graph(layout, tenant_id: str, kb_id: str, operation: str, options: dict, *, visibility_guard=None) -> dict:
     options = dict(options)
     revision = str(options.pop("graph_revision", "") or "")
     include_content = options.pop("include_content", False)
@@ -31,30 +31,32 @@ async def query_graph(layout, tenant_id: str, kb_id: str, operation: str, option
         if pub is None or not pub.is_dir() or pub.resolve().parent != versions:
             raise NotFoundError("图发布版本不存在或已过期，请重新搜索")
         pub = pub.resolve()
+        if visibility_guard:
+            await visibility_guard(pub)
         revision = pub.name
-        if operation == "media":
+        view = None
+        if (pub / "indexes/manifest.json").is_file():
             from jonex_wiki.adapters.bundle_view import DirectoryBundleView
-            from jonex_wiki.domain.reading.media_service import read_media
             view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
             if (view.manifest_hash != revision or view.tenant_id != tenant_id or view.context_id != kb_id):
-                raise ValidationError("图片发布版本身份不匹配")
+                raise ValidationError("发布版本身份不匹配")
+        if operation == "media":
+            from jonex_wiki.domain.reading.media_service import read_media
+            if view is None:
+                raise ValidationError("图片发布版本清单缺失")
             return await asyncio.to_thread(read_media, view, options.get("asset_id"), options.get("document_id"), include_content)
         index_path = pub / INDEX_PATH
-        if index_path.is_file() and (pub / "indexes/manifest.json").is_file():
-            from jonex_wiki.adapters.bundle_view import DirectoryBundleView
-            view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
-            if view.tenant_id != tenant_id or view.context_id != kb_id or view.manifest_hash != revision:
-                raise ValidationError("图发布版本身份不匹配")
+        if index_path.is_file() and view is not None:
             expected = next((entry["sha256"] for entry in view.manifest["files"] if entry["path"] == INDEX_PATH), None)
             if not expected:
                 raise ValidationError("图索引不在发布清单中")
-            if not view.has_verified_file(INDEX_PATH, expected, index_path.stat()):
-                await asyncio.to_thread(view.read_bytes, INDEX_PATH)
+            await asyncio.to_thread(view.verified_file_path, INDEX_PATH)
         if not index_path.is_file():
-            # Older immutable bundles are never edited. Each version has its own
-            # rebuildable cache, with schema changes occupying a new directory.
+            # Build the optional index on the first graph request for this revision.
             index_path = layout.kb_dir(tenant_id, kb_id) / "compile" / "graph-cache" / SCHEMA_VERSION / (revision + ".sqlite")
             if not index_path.is_file():
+                if view is not None:
+                    await asyncio.to_thread(view.verify_integrity)
                 await asyncio.to_thread(build_index, pub, index_path, tenant_id, kb_id)
         index = GraphIndex(index_path, revision, tenant_id, kb_id)
         try:
@@ -64,10 +66,8 @@ async def query_graph(layout, tenant_id: str, kb_id: str, operation: str, option
                 target = (pub / "wiki" / result["node"]["page_path"]).resolve()
                 if not target.is_relative_to((pub / "wiki").resolve()) or not target.is_file():
                     raise NotFoundError("该版本的 Wiki 页面不存在")
-                if (pub / "indexes/manifest.json").is_file():
-                    from jonex_wiki.adapters.bundle_view import DirectoryBundleView
-                    page_view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
-                    body = (await asyncio.to_thread(page_view.read_bytes, "wiki/" + result["node"]["page_path"])).decode("utf-8")
+                if view is not None:
+                    body = (await asyncio.to_thread(view.read_bytes, "wiki/" + result["node"]["page_path"])).decode("utf-8")
                 else:
                     body = await asyncio.to_thread(target.read_text, "utf-8")
                 result["node"]["content"] = _strip_frontmatter(body)

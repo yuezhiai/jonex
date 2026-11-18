@@ -8,7 +8,7 @@ compiler consumes its ordered :class:`ParseBlock` projections.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -242,10 +242,26 @@ def blocks_from_items(
     """
     from jonex_wiki.domain.engine.compile.source_prep.chunking import pack_text
     normalized, locations, cursor = [], [], 0
+    text_runs = []
     table_blocks: List[ParseBlock] = []
     opaque = []
+
+    def flush_text_run():
+        # Never pack text across a media or table item: sorting the resulting
+        # blocks by their first source position would move later text before it.
+        if normalized:
+            text_runs.append(("".join(normalized), list(locations)))
+            normalized.clear()
+            locations.clear()
+    # Anything's plain-text parser emits page_idx=0 for its MinerU-shaped
+    # payload, but text and Markdown files have no physical page 1.  Keep the
+    # original field in raw_item while exposing only meaningful page numbers.
+    unpaginated = Path(source_name).suffix.casefold() in {
+        ".txt", ".md", ".markdown", ".json", ".jsonl",
+    }
     for position, original in enumerate(items):
         raw = dict(original) if isinstance(original, dict) else {"value": original}
+        page_number = None if unpaginated else _page_number(raw)
         # MinerU-HTML 把表格正文嵌在 content.html（type=complex_table/table），
         # caption/footnote 也一并下移;先提到顶层,便于 _item_text 与元数据统一读取。
         content = raw.get("content")
@@ -271,20 +287,21 @@ def blocks_from_items(
             opaque.append({"position": position, "raw_item": raw})
             continue
         if str(raw.get("type") or raw.get("original_type") or "").casefold() in {"table", "complex_table"}:
+            flush_text_run()
             table_blocks.append(ParseBlock(
                 block_id="{}-table-{}".format(Path(source_name).stem, position),
                 position=position,
                 text=text,
                 block_type="table_observation",
-                page_number=_page_number(raw),
+                page_number=page_number,
                 metadata={"source_name": source_name, "parser_id": parser_id,
                           "route": route.value, "source_position": position,
-                          "page_number": _page_number(raw), "bbox": raw.get("bbox"),
+                          "page_number": page_number, "bbox": raw.get("bbox"),
                           "caption": raw.get("table_caption") or raw.get("caption"),
                           "footnote": raw.get("table_footnote") or raw.get("footnote"),
                           "native_locator": raw.get("native_locator"),
                           "evidence_kind": raw.get("evidence_kind", "parsed_table_observation"),
-                          "quality": raw.get("quality"), "parent_object": raw.get("parent_object"),
+                          "quality": raw.get("quality"), "pdf_native_repair":raw.get("pdf_native_repair"), "parent_object": raw.get("parent_object"),
                           "raw_item": raw, "compile_table_values": False},
             ))
             continue
@@ -292,41 +309,71 @@ def blocks_from_items(
             # Media anchors must not be collapsed into a packed paragraph spanning
             # unrelated scenes. Keep the original payload and its evidence kind.
             kind = str(raw["type"])
+            flush_text_run()
+            if kind in {"image", "chart"}:
+                # Snapshot assembly concatenates source blocks verbatim. Keep
+                # the image marker separated from both neighbouring blocks so
+                # the following caption cannot be mistaken for this image.
+                text = "\n\n" + text + "\n\n"
             table_blocks.append(ParseBlock(
                 block_id="{}-{}-{}".format(Path(source_name).stem, kind, position),
-                position=position, text=text, block_type=kind, page_number=_page_number(raw),
+                position=position, text=text, block_type=kind, page_number=page_number,
                 metadata={"source_name": source_name, "parser_id": parser_id,
                     "route": route.value, "source_position": position, "raw_item": raw,
                     "evidence_kind": raw.get("evidence_kind", "generated_description" if raw.get("description") else "observed_text"),
                     "time_start": raw.get("time_start"), "time_end": raw.get("time_end"),
                     "spans": raw.get("spans", []), "parent_object": raw.get("parent_object"),
                     "native_locator": raw.get("native_locator"), "bbox": raw.get("bbox"),
-                    "source_locations": [{"position": position, "page_number": _page_number(raw),
+                    "source_locations": [{"position": position, "page_number": page_number,
                         "bbox": raw.get("bbox"), "time_start": raw.get("time_start"),
                         "time_end": raw.get("time_end"), "raw_item": raw}]}))
             continue
         piece = text + ("\n\n" if not text.endswith("\n\n") else "")
         normalized.append(piece)
-        locations.append({"position": position, "page_number": _page_number(raw),
+        locations.append({"position": position, "page_number": page_number,
             "char_start": cursor, "char_end": cursor + len(piece), "bbox": raw.get("bbox"), "raw_item": raw})
         cursor += len(piece)
-    if not normalized and not table_blocks and opaque:
+    flush_text_run()
+    if not text_runs and not table_blocks and opaque:
         raise ValueError("MinerU produced no recognized evidence fields; raw content_list retained")
-    blocks = pack_text("".join(normalized), prefix=Path(source_name).stem, options=packing,
-                      inspection=inspection, report=report) if normalized else []
-    for block in blocks:
-        start, end = block.metadata["char_start"], block.metadata["char_end"]
-        refs = [item for item in locations if item["char_end"] > start and item["char_start"] < end]
-        block.metadata.update(source_name=source_name, parser_id=parser_id, route=route.value,
-            source_locations=refs)
-        pages = {item["page_number"] for item in refs}
-        block.page_number = next(iter(pages)) if len(pages) == 1 else None
-        if opaque and block is blocks[0]:
-            block.metadata["unrepresented_items"] = opaque
-        block.metadata["source_position"] = min((item["position"] for item in refs), default=block.position)
+    blocks = []
+    report_total_was_unset = report is not None and not report.total_chars
+    for run, refs_in_run in text_runs:
+        base = refs_in_run[0]["char_start"]
+        previous_defects = len(report.defects) if report is not None else 0
+        packed = pack_text(run, prefix=Path(source_name).stem, options=packing,
+                           inspection=inspection, report=report)
+        if report is not None and base:
+            for index in range(previous_defects, len(report.defects)):
+                defect = report.defects[index]
+                report.defects[index] = replace(
+                    defect, char_start=defect.char_start + base, char_end=defect.char_end + base)
+        for block in packed:
+            start = base + block.metadata["char_start"]
+            end = base + block.metadata["char_end"]
+            refs = [item for item in refs_in_run if item["char_end"] > start and item["char_start"] < end]
+            block.block_id = f"{Path(source_name).stem}:block:{len(blocks):08d}"
+            block.metadata.update(source_name=source_name, parser_id=parser_id, route=route.value,
+                source_locations=refs)
+            pages = {item["page_number"] for item in refs}
+            block.page_number = next(iter(pages)) if len(pages) == 1 else None
+            if opaque and not blocks:
+                block.metadata["unrepresented_items"] = opaque
+            block.metadata["source_position"] = min((item["position"] for item in refs), default=block.position)
+            blocks.append(block)
+    if report_total_was_unset and report.total_chars:
+        report.total_chars = cursor
     combined = sorted([*blocks, *table_blocks], key=lambda block: (block.metadata.get("source_position", block.position), block.block_type != "table_observation"))
+    article_cursor = 0
     for position, block in enumerate(combined):
         block.position = position
+        projected = block.metadata.get("snapshot_text", block.text)
+        if "char_start" in block.metadata and "char_end" in block.metadata:
+            # These offsets are consumed against the published article, which
+            # includes intervening media and excludes screened source units.
+            block.metadata["char_start"] = article_cursor
+            block.metadata["char_end"] = article_cursor + len(projected)
+        article_cursor += len(projected)
     return combined
 
 

@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from zipfile import BadZipFile
 
 from sqlalchemy import delete, select, text
 
@@ -50,6 +51,30 @@ _LOCK_KEY = 730203
 _WIKI_PREFIX = "wiki/"
 
 _IMAGES_DIR = "images"  # 共享卷解析产物的图片子目录(content.md 同级)
+
+
+def _failed_compile_contains_document(task, doc) -> bool:
+    """A failed snapshot may be resumed only for this exact document version."""
+    if task is None or task.status != TaskStatus.failed.value:
+        return False
+    summary = task.summary or {}
+    snapshot = summary.get("source_snapshot") if isinstance(summary, dict) else None
+    if not isinstance(snapshot, (list, tuple)):
+        return False
+    current = (doc.document_id, doc.content_generation, doc.recompile_generation,
+               doc.source_name, doc.source_sha256, doc.parser_id, doc.parser_version)
+    return any(isinstance(item, (list, tuple)) and tuple(item) == current for item in snapshot)
+
+
+async def _resume_failed_document(session, tenant_id, kb_id, doc) -> bool:
+    """Check the latest terminal compile; queued siblings are the same retry."""
+    last = (await session.execute(select(TaskRow).where(
+        TaskRow.tenant_id == tenant_id, TaskRow.kb_id == kb_id,
+        TaskRow.kind == TaskKind.compile.value,
+        TaskRow.status.in_([TaskStatus.done.value, TaskStatus.failed.value,
+                            TaskStatus.cancelled.value]),
+    ).order_by(TaskRow.created_at.desc(), TaskRow.task_id.desc()).limit(1))).scalars().first()
+    return _failed_compile_contains_document(last, doc)
 
 
 def _contract_warnings(artifact: str, source_name: str, route: InputRoute) -> list[str]:
@@ -89,6 +114,7 @@ class WikiApplication:
         self._lock_conn = None
         self._engine = None
         self._outline = None
+        self._article_workers = None
 
     # ── 生命周期（自 main.lifespan 提取）──
 
@@ -151,8 +177,16 @@ class WikiApplication:
         from jonex_wiki.domain.outline.task import build_outline_runner
         self.executor.parse_runner = self.executor.parse_runner or create_parse_runner(
             self.session_factory, settings, self.layout, mineru, executor=self.executor)
-        self.executor.compile_runner = self.executor.compile_runner or create_compile_runner(
-            self.session_factory, settings, self.layout, self.gw, executor=self.executor)
+        if self.executor.compile_runner is None:
+            # Native writers wait for the CLI and model for the entire batch.
+            # Keep these waits out of the pool used by queries and artifact I/O.
+            self._article_workers = ThreadPoolExecutor(
+                max_workers=settings.compile_concurrency, thread_name_prefix="wiki-articles",
+            )
+            self.executor.compile_runner = create_compile_runner(
+                self.session_factory, settings, self.layout, self.gw, executor=self.executor,
+                article_workers=self._article_workers,
+            )
         self.executor.query_runner = self.executor.query_runner or create_query_runner(
             self.session_factory, settings, self.layout, self.gw, executor=self.executor)
         self.executor.outline_runner = self.executor.outline_runner or build_outline_runner(
@@ -165,7 +199,8 @@ class WikiApplication:
             await s.commit()
         # 孤儿 staging 清理 + bundle GC
         for orphan in self.layout.root.rglob("compile/staging/*"):
-            if orphan.is_dir() and not (orphan.parent.parent / "PAUSED").is_file():
+            if (orphan.is_dir() and not orphan.name.startswith(".")
+                    and not (orphan.parent.parent / "PAUSED").is_file()):
                 shutil.rmtree(orphan, ignore_errors=True)
         for kb_compile in self.layout.root.rglob("compile"):
             if not kb_compile.is_dir():
@@ -192,6 +227,8 @@ class WikiApplication:
     async def stop(self) -> None:
         if hasattr(self, "_scenarios"):
             await self._scenarios.stop()
+        if self._article_workers is not None:
+            await asyncio.to_thread(self._article_workers.shutdown, cancel_futures=True)
         if self.gw is not None:
             await self.gw.aclose()
         if self._lock_conn is not None:
@@ -223,22 +260,39 @@ class WikiApplication:
             raise ValidationError("入库批次为空或超过文档上限")
         if len({d.get("document_id") for d in documents}) != len(documents):
             raise ValidationError("入库批次 document_id 必须非空且唯一")
-        for d in documents:
-            if not d.get("document_id") or not d.get("source_path") or not d.get("source_name"):
-                raise ValidationError("入库批次缺少文档标识或来源")
-            rel = Path(d["source_path"])
-            if rel.is_absolute() or ".." in rel.parts or not (Path(self.settings.input_root) / rel).is_file():
-                raise ValidationError(f"入库批次来源路径不可用: {rel}")
+        if any(not d.get("document_id") or not d.get("source_path") or not d.get("source_name")
+               for d in documents):
+            raise ValidationError("入库批次缺少文档标识或来源")
+        results, errors = [], []
+        task = None
         async with self.layout.version_lock(tenant_id, kb_id):
-            results = []
-            for d in documents:
-                results.append(await self._ingest_parsed_document_locked(
-                    tenant_id, kb_id, d["source_path"], d["source_name"], d["document_id"],
-                    submit=False, compile_model=compile_model))
-            async with self.session_factory() as session:
-                task = await TaskRepo().get(session, tenant_id, results[-1]["task_id"])
-            self.executor.submit(task)
-        return {"task_id": task.task_id, "status": task.status, "documents": results}
+            try:
+                for index, d in enumerate(documents):
+                    try:
+                        results.append(await self._ingest_parsed_document_locked(
+                            tenant_id, kb_id, d["source_path"], d["source_name"], d["document_id"],
+                            submit=False, compile_model=compile_model))
+                    except (DomainError, BadZipFile, ValueError) as exc:
+                        errors.append({
+                            "document_id": d["document_id"],
+                            "error_code": exc.code if isinstance(exc, DomainError) else "validation_failed",
+                            "error": str(exc)[:512],
+                        })
+                    except Exception:
+                        log.exception("Wiki batch intake interrupted kb=%s doc=%s", kb_id, d["document_id"])
+                        errors.extend({
+                            "document_id": item["document_id"],
+                            "error_code": "intake_interrupted",
+                            "error": "Wiki 入库中断，请重试这份文档",
+                        } for item in documents[index:])
+                        break
+            finally:
+                if results:
+                    async with self.session_factory() as session:
+                        task = await TaskRepo().get(session, tenant_id, results[-1]["task_id"])
+                    self.executor.submit(task)
+        return {"task_id": task.task_id if task else None, "status": task.status if task else "failed",
+                "documents": results, "errors": errors}
 
     async def _ingest_parsed_document_locked(self, tenant_id: str, kb_id: str,
                                              source_path: str, source_name: str,
@@ -321,15 +375,21 @@ class WikiApplication:
                     if (previous_receipt.get("receipt_sha256") == receipt.get("receipt_sha256")
                             and dup.status == "parsed"
                             and (first.get("source_metadata") or {}).get("parse_input_signature") == parse_input_signature(settings)):
-                        dup.recompile_generation += 1
                         task = (await s.execute(select(TaskRow).where(TaskRow.tenant_id == tenant_id,
                             TaskRow.kb_id == kb_id, TaskRow.kind == TaskKind.compile.value,
                             TaskRow.status == TaskStatus.queued.value))).scalars().first()
                         fresh_task = task is None
-                        if fresh_task:task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile, compile_model=compile_model)
-                        else:TaskRepo.restamp_compile_model(task, compile_model)
+                        if fresh_task:
+                            if not await _resume_failed_document(s, tenant_id, kb_id, dup):
+                                dup.recompile_generation += 1
+                            task = await TaskRepo().create(
+                                s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.compile,
+                                compile_model=compile_model)
+                        else:
+                            TaskRepo.restamp_compile_model(task, compile_model)
                         await s.commit()
-                        if fresh_task and submit:self.executor.submit(task)
+                        if submit:
+                            self.executor.submit(task)
                         return {"task_id": task.task_id, "document_id": dup.document_id,
                             "status": task.status, "content_generation": dup.content_generation,
                             "reused_parse": True, "warnings": [], "contract": {"route": route.value}}
@@ -406,6 +466,10 @@ class WikiApplication:
                     from jonex_wiki.domain.engine.compile.source_prep.docx_native import supplement_docx
                     items, native_inventory = await asyncio.to_thread(supplement_docx, items,
                         full.parent / receipt["original_path"], raw_dir)
+                if receipt and settings.pdf_table_repair_enabled and Path(receipt["original_path"]).suffix.lower()==".pdf":
+                    from jonex_wiki.domain.parsing.pdf_tables import supplement_pdf
+                    items, _ = await asyncio.to_thread(supplement_pdf,items,raw_dir/receipt["original_path"],raw_dir,
+                        max_pages=settings.pdf_text_layer_max_pages)
                 result = await asyncio.to_thread(
                     normalize_inline_content_list, items, output_dir=raw_dir,
                     source_name=source_name, parser_id=parser_id,
@@ -444,6 +508,8 @@ class WikiApplication:
                             report.isolated_ratio * 100, archive_path)
             result.reading_materials = await asyncio.to_thread(prepare_reading_materials, result)
             artifacts = result.to_source_artifacts(content_generation=new_gen)
+            if not artifacts:
+                raise ValidationError("JONEX_WIKI_SOURCE_EMPTY: 未生成可编译的文本、表格或媒体")
             from jonex_wiki.domain.parsing.identity import (
                 parse_input_components, parse_input_signature)
             parse_signature = parse_input_signature(settings)
@@ -487,7 +553,7 @@ class WikiApplication:
             else:
                 TaskRepo.restamp_compile_model(task, compile_model)
             await s.commit()
-            if new_task and submit:
+            if submit:
                 self.executor.submit(task)
             unrepresented = sum(len(block.metadata.get("unrepresented_items") or [])
                                 for block in result.blocks)
@@ -517,8 +583,12 @@ class WikiApplication:
         async with self.session_factory() as s:
             repo = DocumentRepo()
             doc = await repo.get(s, tenant_id, kb_id, document_id)
-            if doc is None or doc.deleted_at is not None:
+            if doc is None:
                 raise NotFoundError(f"文档 {document_id} 不存在")
+            if doc.deleted_at is not None:
+                # The platform may retry after the engine committed but its own
+                # state transition failed. Do not strand that retry on a 404.
+                return {"document_id": document_id, "status": "already_removed"}
             parsing = (await s.execute(select(TaskRow).where(
                 TaskRow.tenant_id == tenant_id, TaskRow.kb_id == kb_id,
                 TaskRow.document_id == document_id, TaskRow.kind == TaskKind.parse.value,
@@ -674,7 +744,8 @@ class WikiApplication:
                 TaskRow.tenant_id == tenant_id, TaskRow.kb_id == kb_id,
                 TaskRow.kind == TaskKind.compile.value,
                 TaskRow.status == TaskStatus.queued.value))).scalars().first()
-            doc.recompile_generation += 1
+            if not await _resume_failed_document(s, tenant_id, kb_id, doc):
+                doc.recompile_generation += 1
             if compile_task is None:
                 compile_task = await TaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
                                                        kind=TaskKind.compile,
@@ -753,30 +824,26 @@ class WikiApplication:
 
     async def query(self, tenant_id: str, kb_id: str, question: str,
                     *, thinking_mode: str | None = None, retrieval_strategy: str | None = None,
-                    query_context: dict | None = None,
-                    trace_id: str | None = None) -> dict:
-        """提交查询任务(异步,返回 task_id)。
-
-        ``trace_id`` 是**本次查询**的计量 trace（平台检索 trace，经适配器传入）；
-        None/空 = 引擎用 bundle 级标识（``query:<bundle_key>``），与旧行为一致。
-        """
+                    query_context: dict | None = None, trace_id: str | None = None) -> dict:
+        """提交查询任务；trace_id 可关联平台本次查询的计量记录。"""
         question = (question or "").strip()
         from jonex_wiki.kernel.query_images import normalized_context
         query_context = normalized_context(query_context)
         if not question or len(question) > 4096:
             raise ValidationError("question 必须为 1-4096 字符")
         if thinking_mode is not None:
-            from jonex_wiki.domain.query.thinking import thinking_overrides
-            thinking_overrides(thinking_mode)
-        if retrieval_strategy is not None and retrieval_strategy not in {"tree", "direct", "structure", "semantic"}:
+            from jonex_wiki.domain.query.thinking import agent_effort
+            agent_effort(thinking_mode)
+        if retrieval_strategy is not None and retrieval_strategy != "agent_direct":
             raise ValidationError("QUERY_RETRIEVAL_STRATEGY_INVALID")
         async with self.layout.version_lock(tenant_id, kb_id):
             published = self.layout.resolve_published(tenant_id, kb_id)
             if published is None or not published.is_dir():
                 raise NotFoundError(f"知识库 {kb_id} 不存在或无可查询的已发布 bundle")
             async with self.session_factory() as s:
-                from jonex_wiki.domain.source_visibility import ensure_sources_visible
+                from jonex_wiki.domain.source_visibility import bundle_document_ids, ensure_sources_visible
                 await ensure_sources_visible(s, tenant_id, kb_id, published)
+                source_ids = bundle_document_ids(published)
                 row = await QueryTaskRepo().create(s, tenant_id=tenant_id, kb_id=kb_id,
                                                    question=question, bundle_sha=published.name)
                 query_id = row.query_id
@@ -785,11 +852,14 @@ class WikiApplication:
                         json.dumps({**({'retrieval_strategy':retrieval_strategy} if retrieval_strategy else {}),
                             **({'query_context':query_context} if query_context else {})}, ensure_ascii=False).encode())
                 await s.commit()
-        if thinking_mode is None:
-            self.executor.submit_query(row, trace_id=trace_id)
-        else:
-            self.executor.submit_query(row, thinking_mode=thinking_mode, trace_id=trace_id)
-        return {"task_id": query_id, "kind": "query"}
+        options = {}
+        if thinking_mode is not None:
+            options["thinking_mode"] = thinking_mode
+        if trace_id:
+            options["trace_id"] = trace_id
+        self.executor.submit_query(row, **options)
+        return {"task_id": query_id, "kind": "query",
+                "source_document_ids": sorted(source_ids) if len(source_ids) <= 10000 else None}
 
     async def get_task(self, tenant_id: str, task_id: str) -> dict:
         """读任务状态(compile/parse 或 query)。"""
@@ -890,12 +960,19 @@ class WikiApplication:
             raise NotFoundError(f"知识库 {kb_id} 尚未编译发布")
         return d
 
+    async def _ensure_read_visible(self, tenant_id: str, kb_id: str, pub: Path) -> None:
+        from jonex_wiki.domain.source_visibility import ensure_sources_visible
+        async with self.session_factory() as session:
+            await ensure_sources_visible(session, tenant_id, kb_id, pub)
+
     async def list_pages(self, tenant_id: str, kb_id: str) -> dict:
         from jonex_wiki.domain.reading import list_pages as _list_pages
-        pub = self.layout.resolve_published(tenant_id, kb_id)
-        if pub is None:
-            return {"kb_id": kb_id, "pages": [], "published": False}
-        return {"kb_id": kb_id, "pages": await asyncio.to_thread(_list_pages, pub)}
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self.layout.resolve_published(tenant_id, kb_id)
+            if pub is None:
+                return {"kb_id": kb_id, "pages": [], "published": False}
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+            return {"kb_id": kb_id, "pages": await asyncio.to_thread(_list_pages, pub)}
 
     async def count_pages(self, tenant_id: str, kb_id: str) -> dict:
         """[jonex] 只要页面数量（按引擎 page_type 分桶），不构造页面对象。
@@ -904,8 +981,10 @@ class WikiApplication:
         口径与 ``list_pages`` 完全一致（同样剔除 raw 页、同样做同名归并）。
         """
         from jonex_wiki.domain.reading import count_pages as _count_pages
-        pub = self._published_dir(tenant_id, kb_id)
-        return {"kb_id": kb_id, "counts": await asyncio.to_thread(_count_pages, pub)}
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self._published_dir(tenant_id, kb_id)
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+            return {"kb_id": kb_id, "counts": await asyncio.to_thread(_count_pages, pub)}
 
     async def read_page(self, tenant_id: str, kb_id: str, page_id: str) -> dict:
         async with self.layout.version_lock(tenant_id, kb_id):
@@ -914,24 +993,34 @@ class WikiApplication:
     async def _read_page_content(self, tenant_id: str, kb_id: str, page_id: str) -> dict:
         from jonex_wiki.domain.reading import read_page as _read_page
         pub = self._published_dir(tenant_id, kb_id)
+        await self._ensure_read_visible(tenant_id, kb_id, pub)
         result = await asyncio.to_thread(_read_page, pub, page_id)
         from jonex_wiki.adapters.bundle_view import DirectoryBundleView
         from jonex_wiki.domain.reading.image_service import page_images
         image_view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
         try:
-            body, images, total = await asyncio.to_thread(page_images, image_view,
-                result.get("merged_paths") or [result["path"]], result["body"])
+            if result.get("type") == "article":
+                from jonex_wiki.domain.reading.authored_articles import bind_article_images
+                body, images, total = await asyncio.to_thread(
+                    bind_article_images, image_view, result["path"], result["body"],
+                    [ref["document_id"] for ref in result.get("references", [])])
+            else:
+                body, images, total = await asyncio.to_thread(page_images, image_view,
+                    result.get("merged_paths") or [result["path"]], result["body"])
             result.update(body=body, content=body, images=images, images_total=total,
                           bundle_sha=image_view.manifest_hash)
         except (OSError, ValueError, sqlite3.Error, DomainError) as exc:
             result.update(images=[], image_error=type(exc).__name__)
         result["kb_id"] = kb_id
+        result["bundle_sha"] = pub.name
         return result
 
     async def get_page_backlinks(self, tenant_id: str, kb_id: str, path: str) -> dict:
         from jonex_wiki.domain.reading import get_backlinks as _get_backlinks
-        pub = self._published_dir(tenant_id, kb_id)
-        result = await asyncio.to_thread(_get_backlinks, pub, path)
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self._published_dir(tenant_id, kb_id)
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+            result = await asyncio.to_thread(_get_backlinks, pub, path)
         result["kb_id"] = kb_id
         return result
 
@@ -939,20 +1028,26 @@ class WikiApplication:
                               path: str = "", document_id: str = "",
                               limit: int = 500) -> dict:
         from jonex_wiki.domain.reading import get_claims as _get_claims
-        pub = self._published_dir(tenant_id, kb_id)
-        return await asyncio.to_thread(_get_claims, pub, page_path=path, document_id=document_id, limit=limit)
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self._published_dir(tenant_id, kb_id)
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+            return await asyncio.to_thread(_get_claims, pub, page_path=path, document_id=document_id, limit=limit)
 
     async def list_page_documents(self, tenant_id: str, kb_id: str) -> dict:
         from jonex_wiki.domain.reading import list_page_documents as _list_page_documents
-        pub = self.layout.resolve_published(tenant_id, kb_id)
-        if pub is None:
-            return {"kb_id": kb_id, "documents": {}}
-        return {"kb_id": kb_id, "documents": await asyncio.to_thread(_list_page_documents, pub)}
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self.layout.resolve_published(tenant_id, kb_id)
+            if pub is None:
+                return {"kb_id": kb_id, "documents": {}}
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+            return {"kb_id": kb_id, "documents": await asyncio.to_thread(_list_page_documents, pub)}
 
     async def query_graph(self, tenant_id: str, kb_id: str, operation: str, **options) -> dict:
         """Graph reads share the same immutable publication across UI and MCP."""
         from jonex_wiki.domain.reading.graph_service import query_graph
-        return await query_graph(self.layout, tenant_id, kb_id, operation, options)
+        async def guard(pub):
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+        return await query_graph(self.layout, tenant_id, kb_id, operation, options, visibility_guard=guard)
 
     def scenario_service(self):
         if not hasattr(self, "_scenarios"):
@@ -962,15 +1057,20 @@ class WikiApplication:
 
     async def query_resources(self, tenant_id: str, kb_id: str, operation: str,
                               options: dict, *, actor: str = "") -> dict:
+        async def guard(pub):
+            await self._ensure_read_visible(tenant_id, kb_id, pub)
+        if operation == "search_authored_articles":
+            from jonex_wiki.domain.reading.article_search import query_articles
+            return await query_articles(self.layout, tenant_id, kb_id, options, visibility_guard=guard)
         if operation in {"find_images", "get_image"}:
             from jonex_wiki.domain.reading.image_requests import query_images
-            return await query_images(self.layout, tenant_id, kb_id, operation, options)
+            return await query_images(self.layout, tenant_id, kb_id, operation, options, visibility_guard=guard)
         if operation == "inspect_image":
             from jonex_wiki.domain.reading.image_inspection import inspect_image
             if not hasattr(self, "_visual_inspection_semaphore"):
                 self._visual_inspection_semaphore = asyncio.Semaphore(2)
             return await inspect_image(self.layout, self.settings, self.gw, tenant_id, kb_id,
-                options, self._visual_inspection_semaphore)
+                options, self._visual_inspection_semaphore, visibility_guard=guard)
         if operation == "get_question":
             # Old frozen publications remain readable. New bases never build
             # these objects; their replacements are gated by the scene host.
@@ -982,9 +1082,9 @@ class WikiApplication:
             if not hasattr(self, "_visual_inspection_semaphore"):
                 self._visual_inspection_semaphore = asyncio.Semaphore(2)
             return await inspect_visual(self.layout, self.settings, self.gw, tenant_id, kb_id,
-                options, self._visual_inspection_semaphore)
+                options, self._visual_inspection_semaphore, visibility_guard=guard)
         from jonex_wiki.domain.reading.resource_service import query_resources
-        return await query_resources(self.layout, tenant_id, kb_id, operation, options, actor=actor)
+        return await query_resources(self.layout, tenant_id, kb_id, operation, options, actor=actor, visibility_guard=guard)
 
     # ── Wiki 阅读目录(目录功能下沉)──
 
@@ -998,7 +1098,13 @@ class WikiApplication:
 
     async def get_outline(self, tenant_id: str, kb_id: str, document_id: str = "") -> dict:
         """读目录 + 页面清单（阅读页首屏一次拿全；document_id 非空 = 文档级投影）。"""
-        return await self._outline_service().get_view(tenant_id, kb_id, document_id)
+        async with self.layout.version_lock(tenant_id, kb_id):
+            pub = self.layout.resolve_published(tenant_id, kb_id)
+            if pub is not None:
+                await self._ensure_read_visible(tenant_id, kb_id, pub)
+            result = await self._outline_service().get_view(tenant_id, kb_id, document_id)
+            result["bundle_sha"] = pub.name if pub is not None else None
+            return result
 
     async def draft_outline(self, tenant_id: str, kb_id: str, request: dict,
                             *, user_id=None) -> dict:

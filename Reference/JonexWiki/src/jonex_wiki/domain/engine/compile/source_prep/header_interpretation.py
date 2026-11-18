@@ -3,7 +3,7 @@
 One implementation serves both ends of the chain:
 
 * the compile side, when a parsed table observation is persisted
-  (``compile/source_prep/table_artifact.py``);
+  (``compile/source_prep/table_artifact.py`` and ``spreadsheet_view.py``);
 * the read side, when a frozen Bundle that predates this rule is opened and the
   stored interpretation can only be *read*, never rewritten
   (``query/table_reader.py``).
@@ -25,15 +25,19 @@ delivery
     Whether *this request* was delivered completely is decided by the reader's
     paging layer, not here.
 
-Only two multi-level structures are promoted, and both must have original
-merge evidence:
+Multi-level structures require original merge evidence:
 
 1. a whole-width unit note whose next row carries the item and period labels
    (``| 单位：万元 |  |  |`` over ``| 项目 | 2023年 | 2022年 |``);
 2. an upper period/group row over a lower field-title row, where the merge
    ranges state the subordination (``2023年`` spanning ``收入``/``成本``).
+   Nested groups and vertically spanning labels can prove additional levels;
+   repeated text by itself cannot. The scan is bounded, not fixed at two rows.
 
-A row is never skipped just because it looks like a title, the first unique row
+The preserved form-instruction rule may select row two only when the explicit
+instructions, unique field names and every independent sequence ID agree.
+A bounded sample cannot prove that rule. A row is never skipped just because
+it looks like a title, the first unique row
 is never promoted to header, and the duplicate-label check is kept -- it is
 evaluated on the *composed* field path, so a label that repeats under different
 groups (``2023年 / % Change`` vs ``2024年 / % Change``) is confirmed while a
@@ -51,11 +55,65 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # The identity of this rule.  It travels with every interpretation written by
 # the compile side, and a stored interpretation is only trusted - and compared
 # field by field - when its marker equals this value.
-HEADER_RULE_VERSION = "table-header-v3"
+HEADER_RULE_VERSION = "table-header-v5"
 
-# A header is at most two levels: the supported structures are "one label row"
-# and "group row over field-title row".  Deeper nesting is not guessed.
-MAX_HEADER_ROWS = 2
+# A scan bound, never an assumed depth. Each extra level needs original merge
+# geometry, with at least one observed body row left beneath it.
+MAX_HEADER_ROWS = 8
+
+
+def instruction_header_candidate(rows: Sequence[Sequence[Any]]) -> bool:
+    # Reuse the native spreadsheet rule across formats. These are explicit
+    # form instructions, not business-domain keywords or query-time routing.
+    return bool(rows) and any(any(marker in str(value) for marker in ("填写", "逐条累加"))
+                              for value in rows[0])
+
+
+def instruction_header_decision(rows, merges, *, rows_total=None):
+    """Preserved form rule: instructions + unique fields + independent IDs.
+
+    Every data ID must be observed. A bounded header sample cannot prove this
+    rule, nor may a merge turn repeated IDs into distinct records.
+    """
+    if not instruction_header_candidate(rows):
+        return 1, None
+    if rows_total is not None and len(rows) != rows_total:
+        return 1, "instruction_header_full_sequence_required"
+    if len(rows) < 4:
+        return 1, "instruction_header_conflict_too_few_data_rows"
+    labels = [str(value).strip() for value in rows[1]]
+    if any(not value for value in labels):
+        return 1, "instruction_header_conflict_field_row_incomplete"
+    if len(set(labels)) != len(labels):
+        return 1, "instruction_header_conflict_duplicate_fields"
+    columns = [index + 1 for index, label in enumerate(labels) if label in {"序号", "编号"}]
+    if len(columns) != 1:
+        return 1, "instruction_header_conflict_sequence_label"
+    column = columns[0]
+    for r1, c1, r2, c2 in merges:
+        if c1 <= column <= c2 and r1 <= len(rows) and r2 >= 2:
+            return 1, ("instruction_header_conflict_sequence_header_merged" if r1 <= 2
+                       else "instruction_header_conflict_sequence_data_merged")
+    values = [str(row[column - 1]).strip() for row in rows[2:]]
+    if any(not value for value in values):
+        return 1, "instruction_header_conflict_sequence_empty"
+    if any(re.fullmatch(r"[0-9]+", value) is None for value in values):
+        return 1, "instruction_header_conflict_sequence_not_integer"
+    if len(set(values)) != len(values):
+        return 1, "instruction_header_conflict_sequence_duplicate"
+    return 2, None
+
+
+def relocate_interpretation(interpretation, row_start=1, column_start=1):
+    """Convert region-local coordinates to physical source coordinates once."""
+    row_delta, column_delta = row_start - 1, column_start - 1
+    header = interpretation.header
+    fields = tuple(replace(field, field_id="c{}".format(field.column + column_delta),
+        column=field.column + column_delta, header_row=field.header_row + row_delta,
+        header_rows=tuple(row + row_delta for row in field.header_rows)) for field in header.fields)
+    return replace(interpretation, header=replace(header, fields=fields,
+        header_rows=tuple(row + row_delta for row in header.header_rows),
+        unit_row=header.unit_row + row_delta if header.unit_row is not None else None))
 
 _UNIT_NOTE = re.compile(
     r"^[（(]?\s*单位\s*[:：]\s*(?P<unit>[^（）()]+?)\s*[）)]?$")
@@ -311,7 +369,7 @@ def interpret_table(rows: Sequence[Sequence[Any]], *, merges: Iterable[Sequence[
     caller verified.  Both are reporting inputs only -- the interpretation
     itself is derived from the rows it was given.
     """
-    grid_rows: List[List[str]] = [[str(value) for value in row] for row in rows]
+    grid_rows: List[List[str]] = [["" if value is None else str(value) for value in row] for row in rows]
     width = max((len(row) for row in grid_rows), default=0)
     present = bool(grid_rows) and width > 0
     complete = present and all(len(row) == width for row in grid_rows)
@@ -386,18 +444,41 @@ def interpret_table(rows: Sequence[Sequence[Any]], *, merges: Iterable[Sequence[
             unit, unit_row, unit_evidence = token, 1, "single_filled_cell"
             structure_prefix, header_start = "unit_note_", 2
 
+    if header_start == 1 and not any(r1 == 1 and c2 > c1 for r1, c1, r2, c2 in regions):
+        instruction_depth, conflict = instruction_header_decision(
+            grid_rows, regions, rows_total=grid_rows_total)
+        if conflict:
+            return _unconfirmed(table_id, rule_version, grid, conflict, "instruction_conflict",
+                                stored_interpretation_id=stored_interpretation_id, source=source)
+        if instruction_depth == 2:
+            structure_prefix, header_start = "instruction_", 2
+
     if header_start > len(grid_rows):
         return _unconfirmed(table_id, rule_version, grid, "HEADER_ROW_MISSING",
                             structure_prefix + "unconfirmed",
                             stored_interpretation_id=stored_interpretation_id, source=source)
 
-    # A row below the first header row is only a second header level when the
-    # source says so: a merge range anchored in the first header row that spans
-    # columns (grouping) or rows (a label covering both levels).  At least one
-    # row must remain underneath for the second level to be a header, not data.
-    grouping = [region for region in regions
-                if region[0] == header_start and (region[3] > region[1] or region[2] > region[0])]
-    depth = MAX_HEADER_ROWS if grouping and header_start + MAX_HEADER_ROWS <= len(grid_rows) else 1
+    # Follow the native header hierarchy. A vertical header label proves the
+    # covered levels; a horizontal group proves one child level. Deeper
+    # horizontal groups must be strictly nested within an earlier group.
+    # Ordinary body labels and duplicate field text alone prove no new level.
+    last_header = header_start
+    while last_header < min(len(grid_rows) - 1, header_start + MAX_HEADER_ROWS - 1):
+        vertical = any(header_start <= r1 <= last_header < r2
+                       for r1, c1, r2, c2 in regions)
+        horizontal = any(r1 == last_header and c2 > c1 and (
+            r1 == header_start or any(
+                header_start <= parent[0] < r1 and parent[1] <= c1 <= c2 <= parent[3]
+                and c2-c1 < parent[3]-parent[1] for parent in regions))
+            for r1, c1, r2, c2 in regions)
+        if not (vertical or horizontal):
+            break
+        last_header += 1
+    depth = last_header - header_start + 1
+    if any(header_start <= r1 <= last_header < r2 for r1, c1, r2, c2 in regions):
+        return _unconfirmed(table_id, rule_version, grid, "HEADER_DEPTH_UNRESOLVED",
+                            "nested_merge", stored_interpretation_id=stored_interpretation_id,
+                            source=source)
     header_rows = tuple(range(header_start, header_start + depth))
 
     fields: List[FieldSpec] = []
@@ -441,11 +522,22 @@ def interpret_table(rows: Sequence[Sequence[Any]], *, merges: Iterable[Sequence[
             labels = qualified
             disambiguation = record
             fields = [replace(field, label=label) for field, label in zip(fields, labels)]
+            # Preserve native row-label columns before a proven repeated block.
+            # Their positional names stay positional; no business meaning is
+            # invented. Empty period/value headings elsewhere remain unknown.
+            for index in range(record["offset"]):
+                values = [row[index].strip() for row in grid_rows[header_rows[-1]:]
+                          if row[index].strip()]
+                if (fields[index].label_source == "position" and values
+                        and all(re.search(r"[A-Za-z\u3400-\u9fff]", value) for value in values)):
+                    fields[index] = replace(fields[index], label_source="row_stub")
+            if all(field.label_source != "position" for field in fields):
+                ambiguities = [reason for reason in ambiguities if reason != "HEADER_LABEL_MISSING"]
         else:
             ambiguities.append("HEADER_LABEL_DUPLICATE")
 
     confirmed = not ambiguities
-    structure = structure_prefix + ("grouped_periods" if depth == MAX_HEADER_ROWS else "single_row")
+    structure = structure_prefix + ("grouped_periods" if depth > 1 else "single_row")
     header = HeaderState(
         confirmed=confirmed,
         reason=None if confirmed else ";".join(dict.fromkeys(ambiguities)),

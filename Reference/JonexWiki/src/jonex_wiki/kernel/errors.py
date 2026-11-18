@@ -20,3 +20,7 @@ class ConflictError(DomainError):
 class ValidationError(DomainError):
     def __init__(self, message: str):
         super().__init__("validation_failed", message, 422)
+
+
+class CompileModelUnavailable(RuntimeError):
+    """The configured model or gateway credentials rejected the compile."""

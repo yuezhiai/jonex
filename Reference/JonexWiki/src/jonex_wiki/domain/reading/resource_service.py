@@ -9,10 +9,34 @@ import sqlite3
 from collections import OrderedDict
 from threading import RLock
 from datetime import datetime, timezone
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from jonex_wiki.adapters.bundle_view import DirectoryBundleView
 from jonex_wiki.domain.engine.compile.resource_catalog import PATH
 from jonex_wiki.kernel.errors import NotFoundError, ValidationError, ConflictError
+
+class TableFilter(BaseModel):
+    """Validate explicit filters for the retained resource-record API."""
+
+    column: str
+    operator: Literal['equals', 'contains', 'in', 'not_empty']
+    value: str | list[str] | None = None
+    model_config = ConfigDict(extra='forbid')
+
+    @model_validator(mode='after')
+    def _operator_value(self):
+        if self.operator == 'not_empty':
+            if self.value not in (None, ''):
+                raise ValueError('TABLE_PLAN_NOT_EMPTY_TAKES_NO_VALUE')
+        elif self.operator == 'in':
+            if not isinstance(self.value, list) or not self.value:
+                raise ValueError('TABLE_PLAN_IN_REQUIRES_VALUES')
+        elif not isinstance(self.value, str):
+            raise ValueError('TABLE_PLAN_FILTER_VALUE_REQUIRED')
+        return self
+
 
 OPERATIONS = {"find_resources", "get_question", "get_evidence", "get_media_segment", "lookup_records", "review_resources"}
 _TABLE_STATS = OrderedDict()
@@ -61,36 +85,53 @@ def lookup_records(view, *, table_id, filters=None, filter_groups=None, limit=10
     if any(not isinstance(g, list) for g in groups):raise ValidationError("RESOURCE_FILTER_INVALID")
     if len(filters) > 32 or len(groups) > 32 or any(not g or len(g) > 32 for g in groups):
         raise ValidationError("RESOURCE_FILTER_LIMIT")
-    from jonex_wiki.domain.engine.query.table_query import TableFilter
     try:
         filters = [TableFilter.model_validate(f) for f in filters]
         groups = [[TableFilter.model_validate(f) for f in group] for group in groups]
     except ValueError as exc:
         raise ValidationError("RESOURCE_FILTER_INVALID") from exc
-    identity = hashlib.sha256(json.dumps([view.manifest_hash, table_id,
+    from jonex_wiki.domain.engine.query.table_reader import TableReader, project_saved_cell_semantics, read_merge_ranges
+    inspection = TableReader(view, revision_id=getattr(view, "revision_id", view.manifest_hash),
+                             bundle_path=source["tables"]).inspect(table_id, bounded=False)
+    header = inspection["header_state"]
+    if not inspection["grid_state"].get("complete") or not inspection["fields"]:
+        raise ValidationError("RESOURCE_TABLE_STRUCTURE_UNCONFIRMED")
+    if not header.get("confirmed") and not set(header.get("ambiguities") or []).issubset(
+            {"HEADER_LABEL_MISSING", "HEADER_LABEL_DUPLICATE"}):
+        raise ValidationError("RESOURCE_TABLE_STRUCTURE_UNCONFIRMED")
+    identity = hashlib.sha256(json.dumps([view.manifest_hash, table_id, inspection["interpretation_id"],
         [f.model_dump() for f in filters], [[f.model_dump() for f in g] for g in groups], include_hidden], sort_keys=True).encode()).hexdigest()
     position = _position(cursor, identity)
     with view.open_sqlite(source["tables"]) as connection:
         connection.row_factory = sqlite3.Row
         table = connection.execute("SELECT * FROM logical_tables WHERE table_id=?", (table_id,)).fetchone()
         interpretation = connection.execute("SELECT * FROM interpretations WHERE table_id=? ORDER BY version DESC LIMIT 1", (table_id,)).fetchone()
-        if not table or not interpretation or interpretation["status"] != "accepted":
+        if not table or not interpretation:
             raise ValidationError("RESOURCE_TABLE_STRUCTURE_UNCONFIRMED")
-        fields = [dict(r) for r in connection.execute("SELECT * FROM field_map WHERE interpretation_id=? ORDER BY column_index", (interpretation["interpretation_id"],))]
+        fields = inspection["fields"]
         known = {}
         for field in fields:
-            known[field["field_id"]] = field
             labels = [f for f in fields if f["label"] == field["label"]]
-            if len(labels) == 1:
-                known[field["label"]] = field
+            if field.get("label_source") == "position" or len(labels) != 1:
+                continue
+            known[field["field_id"]] = field
+            known[field["label"]] = field
+        for old in inspection["stored_fields"]:
+            current = next((field for field in fields if field["column_index"] == old["column_index"]
+                            and field["header_row"] == old["header_row"] and field["label"] == old["label"]), None)
+            if current and current["field_id"] in known:
+                known.setdefault(old["field_id"], current)
 
         def predicate(item):
             field = known.get(item.column)
             if field is None:
                 raise ValidationError("RESOURCE_FIELD_UNKNOWN_OR_AMBIGUOUS")
             # Only explicit merges carry an anchor's value across a blank.
-            actual = "CASE WHEN c.formula IS NOT NULL THEN c.cached_value WHEN c.empty_kind='merged_covered' THEN a.raw_value ELSE c.raw_value END"
-            expression = "EXISTS (SELECT 1 FROM cells c LEFT JOIN merges m ON m.sheet_id=c.sheet_id AND c.row_index BETWEEN m.row_start AND m.row_end AND c.column_index BETWEEN m.column_start AND m.column_end LEFT JOIN cells a ON a.sheet_id=m.sheet_id AND a.row_index=m.row_start AND a.column_index=m.column_start WHERE c.sheet_id=r.sheet_id AND c.row_index=r.row_index AND c.column_index=? AND "
+            # The same saved-merge rule as project_saved_cell_semantics:
+            # inherit only an absent raw value, never an ordinary empty string.
+            # A native OOXML covered cell may not have a physical SQLite row.
+            actual = "CASE WHEN c.formula IS NOT NULL THEN c.cached_value WHEN c.raw_value IS NULL THEN CASE WHEN a.formula IS NOT NULL THEN a.cached_value ELSE a.raw_value END ELSE c.raw_value END"
+            expression = "EXISTS (SELECT 1 FROM (SELECT ? AS col) p LEFT JOIN cells c ON c.sheet_id=r.sheet_id AND c.row_index=r.row_index AND c.column_index=p.col LEFT JOIN merges m ON m.sheet_id=r.sheet_id AND r.row_index BETWEEN m.row_start AND m.row_end AND p.col BETWEEN m.column_start AND m.column_end LEFT JOIN cells a ON a.sheet_id=m.sheet_id AND a.row_index=m.row_start AND a.column_index=m.column_start WHERE "
             values = [field["column_index"]]
             if item.operator == "not_empty":
                 expression += f"{actual} IS NOT NULL AND {actual}!='')"
@@ -104,7 +145,8 @@ def lookup_records(view, *, table_id, filters=None, filter_groups=None, limit=10
             return expression, values
 
         header_end = max(f["header_row"] for f in fields)
-        stats_key = (view.manifest_hash, table_id)
+        stats_key = (getattr(view, "tenant_id", ""), getattr(view, "context_id", ""),
+                     view.manifest_hash, table_id, inspection["interpretation_id"])
         with _TABLE_STATS_LOCK:
             stats = _TABLE_STATS.get(stats_key)
         if stats is None:
@@ -149,16 +191,34 @@ def lookup_records(view, *, table_id, filters=None, filter_groups=None, limit=10
         if narrowed and all(narrowed):
             where.append("r.row_index IN (" + " UNION ".join(c[0] for c in narrowed) + ")")
             for _, values in narrowed:params += values
-        base = " FROM cells r WHERE " + " AND ".join(where)
+        # Logical rows include native blank/merge-covered positions that OOXML
+        # need not store as physical cells. This matches the compute executor.
+        base = (" FROM (WITH RECURSIVE positions(n) AS (SELECT ? WHERE ?<=? "
+                "UNION ALL SELECT n+1 FROM positions WHERE n<?) "
+                "SELECT ? AS sheet_id,n AS row_index,? AS column_index FROM positions) r WHERE "
+                + " AND ".join(where))
+        params = [header_end + 1, header_end + 1, table["row_end"], table["row_end"],
+                  table["sheet_id"], table["column_start"], *params]
         total = connection.execute("SELECT COUNT(DISTINCT r.row_index)" + base, params).fetchone()[0]
         selected = connection.execute("SELECT DISTINCT r.row_index" + base + " AND r.row_index>? ORDER BY r.row_index LIMIT ?", [*params, position, limit + 1]).fetchall()
         has_more = len(selected) > limit
         ids = [r[0] for r in selected[:limit]]
         records = []
+        merges = [dict(item) for item in read_merge_ranges(connection, table)]
         for row in ids:
             cells = [dict(c) for c in connection.execute("SELECT * FROM cells WHERE sheet_id=? AND row_index=? AND column_index BETWEEN ? AND ? ORDER BY column_index", (table["sheet_id"], row, table["column_start"], table["column_end"]))]
+            present = {cell["column_index"] for cell in cells}
+            cells.extend({"row_index": row, "column_index": field["column_index"], "raw_value": None,
+                          "coordinate": "R{}C{}".format(row, field["column_index"]), "empty_kind": "not_stored"}
+                         for field in fields if field["column_index"] not in present)
+            anchors = [dict(item) for merge in merges if merge["row_start"] <= row <= merge["row_end"]
+                       for item in connection.execute("SELECT * FROM cells WHERE sheet_id=? AND row_index=? AND column_index=?",
+                           (table["sheet_id"], merge["row_start"], merge["column_start"]))
+                       if merge["row_start"] != row]
+            cells = [cell for cell in project_saved_cell_semantics(cells + anchors, merges) if cell["row_index"] == row]
             records.append({"row_id": row, "document_id": source["document_id"], "table_id": table_id, "cells": cells})
-        context = json.loads(interpretation["payload_json"])
+        context = {"header_rule": inspection["header_rule"], "interpretation_id": inspection["interpretation_id"],
+                   "header": header, "grid": inspection["grid_state"]}
         observations = None
         if connection.execute("SELECT 1 FROM sqlite_master WHERE name='table_observations'").fetchone():
             obs = connection.execute("SELECT caption_json,footnote_json,raw_item_json,page_number,bbox_json FROM table_observations WHERE table_id=?", (table_id,)).fetchone()
@@ -170,6 +230,7 @@ def lookup_records(view, *, table_id, filters=None, filter_groups=None, limit=10
     return {"records": records, "fields": fields, "context": context, "observations": observations,
         "total": total, "has_more": has_more, "next_cursor": _cursor({"identity": identity, "position": ids[-1]}) if has_more and ids else None,
         "coverage": {"scope": "selected_table_and_predicates", "returned_rows": ids,
+            "interpretation_id": inspection["interpretation_id"], "header_rule": inspection["header_rule"],
             "total_matches": total, "page_complete": not has_more, "started_at_beginning": not cursor,
             "unresolved_formulas": unresolved, "exact_values_available": not unresolved,
             "numeric_coercion": False, "branches": len(groups),
@@ -179,7 +240,7 @@ def lookup_records(view, *, table_id, filters=None, filter_groups=None, limit=10
             "natural_language_conditions": "not_verified"}}
 
 
-async def query_resources(layout, tenant_id, kb_id, operation, options, *, actor=""):
+async def query_resources(layout, tenant_id, kb_id, operation, options, *, actor="", visibility_guard=None):
     if operation not in OPERATIONS:
         raise ValidationError("RESOURCE_OPERATION_UNKNOWN")
     options = dict(options)
@@ -207,6 +268,8 @@ async def query_resources(layout, tenant_id, kb_id, operation, options, *, actor
         versions = (layout.kb_dir(tenant_id, kb_id) / "compile/versions").resolve()
         if not pub or not pub.is_dir() or pub.resolve().parent != versions:
             raise NotFoundError("RESOURCE_PUBLICATION_NOT_FOUND")
+        if visibility_guard:
+            await visibility_guard(pub)
         view = DirectoryBundleView(tenant_id=tenant_id, context_id=kb_id, revision_dir=pub)
         if PATH not in view.list_entries():
             raise NotFoundError("RESOURCE_INDEX_UNAVAILABLE; recompile this knowledge base")

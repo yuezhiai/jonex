@@ -231,11 +231,19 @@ def reconcile_claim_issues(state, claims, book):
         if pid in admitted_pids:
             continue
         issue_id = "error_" + digest([RULE_VERSION, "source-disposition", pid])[:24]
-        code = "COMPILE_PASSAGE_FAILED" if pid not in processed else "NO_ADMITTED_CLAIM"
+        table_reference = (passage.source_metadata.get("block_type") == "table_reference"
+                           and passage.source_metadata.get("compile_table_values") is False
+                           and pid not in state.passage_failures)
+        code = ("TABLE_REFERENCE_SOURCE_ONLY" if table_reference else
+                "COMPILE_PASSAGE_FAILED" if pid not in processed else "NO_ADMITTED_CLAIM")
+        root_cause = ("Table reference intentionally retained as source material without generated value claims"
+                      if table_reference else "No generated claim admitted for this passage")
+        verification = ("Read the registered full logical table and verify its structure and source."
+                        if table_reference else "Recompile or review this passage and revalidate resulting claims.")
         current[issue_id] = ErrorBookEntry(id=issue_id, category="incomplete_page", code=code,
-            phenomenon=code, error_class="Advisory", root_cause="No generated claim admitted for this passage",
+            phenomenon=code, error_class="Advisory", root_cause=root_cause,
             constraint="Preserve exact source evidence; do not assert semantic coverage.",
-            verification="Recompile or review this passage and revalidate resulting claims.",
+            verification=verification,
             affected_passage_ids=[pid], affected_source_ids=[passage.source_id], rule_version=RULE_VERSION,
             source_versions={passage.source_id: passage.sha256},
             first_seen_batch=max(1, state.batch_number), last_seen_batch=max(1, state.batch_number))

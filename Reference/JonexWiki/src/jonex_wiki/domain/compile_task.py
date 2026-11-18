@@ -92,9 +92,11 @@ def _query_page_count(revision_dir) -> int:
         return 0
 
 
-def create_compile_runner(session_factory, settings, layout: Layout, gw, executor=None):
+def create_compile_runner(session_factory, settings, layout: Layout, gw, executor=None, *,
+                          article_workers=None):
     engine = LLMWikiV1Engine()
     manifest_builder = ManifestBuilder(settings)
+    model_slots = asyncio.Semaphore(settings.compile_concurrency)
 
     async def runner(row, *, start: float, input_restart_count: int,
                      previous_candidate=None) -> None:
@@ -144,7 +146,7 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
             if executor is not None:
                 await executor.wait_compile_resume(row.task_id, tenant_id, kb_id)
         model = ModelPortAdapter(gw, scene=None, tenant_id=tenant_id, kb_id=kb_id,
-                                 before_call=wait_resume)
+                                 before_call=wait_resume, model_slots=model_slots)
         store = ArtifactStoreAdapter(layout, tenant_id=tenant_id, kb_id=kb_id)
         progress = ProgressSinkAdapter(executor, row.task_id) if executor else None
         prev_dir = layout.resolve_published(tenant_id, kb_id)
@@ -153,15 +155,21 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
         recorder = RuntimeTelemetryRecorder()
 
         # 3) core 引擎编译（context_id = kb_id）；运行时旋钮经 Settings 注入
+        from jonex_wiki.adapters.agent_compile import AgentArticleCompiler
+        agent_compiler = AgentArticleCompiler(
+            gw, settings, checkpoint_store=store, workers=article_workers, model_slots=model_slots,
+        )
         with runtime_environment(settings.runtime_env()), bind_runtime_telemetry(recorder):
             artifacts, staging_key = await engine.compile(
                 kb_id, tenant_id, manifest,
                 sources=sources, model=model, store=store, progress=progress,
                 artifact_attempt_id=row.task_id, cancel=cancel,
                 compile_main_prompt=compile_main_prompt,
+                article_preference=suffix,
                 previous_bundle=previous_candidate or prev_ref,
                 publication_parent_revision=publication_parent,
                 telemetry=recorder,
+                agent_compiler=agent_compiler,
             )
 
         # Generated knowledge pages can be absent for native tables or source-only
@@ -217,27 +225,36 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
                 sha = await store.publish_revision(
                     staging_key, tenant_id=tenant_id, context_id=kb_id,
                     revision_id=artifacts.revision_id)
-                async with session_factory() as s:
-                    pins = set((await s.execute(select(QueryTaskRow.bundle_sha).where(
-                        QueryTaskRow.tenant_id == tenant_id, QueryTaskRow.kb_id == kb_id,
-                        QueryTaskRow.status.in_([TaskStatus.queued.value, TaskStatus.running.value]),
-                        QueryTaskRow.bundle_sha.isnot(None),
-                    ))).scalars())
                 try:
+                    async with session_factory() as s:
+                        pins = set((await s.execute(select(QueryTaskRow.bundle_sha).where(
+                            QueryTaskRow.tenant_id == tenant_id, QueryTaskRow.kb_id == kb_id,
+                            QueryTaskRow.status.in_([TaskStatus.queued.value, TaskStatus.running.value]),
+                            QueryTaskRow.bundle_sha.isnot(None),
+                        ))).scalars())
                     await asyncio.to_thread(layout.prune_versions, tenant_id, kb_id,
                                             settings.keep_bundles, pins)
-                except OSError:
+                except Exception:
                     log.exception("bundle retention cleanup failed kb=%s", kb_id)
+
+        try:
+            await agent_compiler.discard_checkpoints(row.task_id)
+            await store.clear_article_source()
+        except OSError:
+            log.warning("article checkpoint cleanup failed kb=%s", kb_id, exc_info=True)
 
         # 5.5) 发布后投递独立 outline task（§6）：目录起草 LLM 可达几十秒，同步等会
         # 占编译并发槽 + 拖长编译时长；独立 task 让编译时长不变、失败可单独重试。
-        if executor is not None and not reused_unchanged:
-            async with session_factory() as s:
-                outline_task = await TaskRepo().create(
-                    s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.outline,
-                    compile_model=compile_model)
-                await s.commit()
-            executor.submit(outline_task)
+        if executor is not None and not reused_unchanged and has_sources:
+            try:
+                async with session_factory() as s:
+                    outline_task = await TaskRepo().create(
+                        s, tenant_id=tenant_id, kb_id=kb_id, kind=TaskKind.outline,
+                        compile_model=compile_model)
+                    await s.commit()
+                executor.submit(outline_task)
+            except Exception:
+                log.exception("outline submission after publication failed kb=%s sha=%s", kb_id, sha)
 
         # 6) 结果写 TaskRow.summary
         async with session_factory() as s:
@@ -306,6 +323,10 @@ def create_compile_runner(session_factory, settings, layout: Layout, gw, executo
                         # A parse or prompt edit can commit while the model is
                         # working. Keep the task alive and compile the latest
                         # inventory; the publication check remains mandatory.
+                        if input_restart_count >= settings.compile_input_max_restarts:
+                            raise ConflictError(
+                                "COMPILE_INPUT_CHANGED: 编译期间来源或设置持续变化，已保留已发布版本，请在变更完成后重试"
+                            ) from exc
                         log.info("compile input changed; restarting task_id=%s", row.task_id)
                         input_restart_count += 1
                         # The candidate is complete but unpublished. Reuse its

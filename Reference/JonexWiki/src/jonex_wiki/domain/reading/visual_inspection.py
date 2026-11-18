@@ -27,7 +27,7 @@ OUTPUT_SCHEMA = {
 
 
 async def inspect_visual(
-    layout, settings, gateway, tenant_id, kb_id, options, semaphore
+    layout, settings, gateway, tenant_id, kb_id, options, semaphore, *, visibility_guard=None
 ):
     if not settings.visual_inspection_enabled:
         raise ValidationError("VISUAL_INSPECTION_DISABLED")
@@ -46,6 +46,8 @@ async def inspect_visual(
         pub = layout.versions_dir(tenant_id, kb_id, revision)
         if not pub.is_dir():
             raise NotFoundError("RESOURCE_PUBLICATION_NOT_FOUND")
+        if visibility_guard:
+            await visibility_guard(pub)
         view = DirectoryBundleView(
             tenant_id=tenant_id, context_id=kb_id, revision_dir=pub
         )

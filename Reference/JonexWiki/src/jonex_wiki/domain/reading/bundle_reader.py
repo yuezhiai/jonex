@@ -229,6 +229,10 @@ def list_pages(pub: Path) -> List[Dict[str, Any]]:
             item["merged_paths"] = list(cluster)
             item["merged_count"] = len(cluster)
         pages.append(item)
+    from jonex_wiki.domain.reading.authored_articles import authored_articles
+    for article in authored_articles(pub):
+        pages.append({**article, "page": {"version": 0, "related_pages": [], "links": article.get("links", []),
+                                          "source_ids": article["source_ids"]}})
     return pages
 
 
@@ -255,6 +259,10 @@ def count_pages(pub: Path) -> Dict[str, int]:
             continue
         page_type = _page_type(path)
         counts[page_type] = counts.get(page_type, 0) + 1
+    from jonex_wiki.domain.reading.authored_articles import authored_articles
+    authored_count = len(authored_articles(pub))
+    if authored_count:
+        counts["article"] = authored_count
     return counts
 
 
@@ -264,6 +272,12 @@ def read_page(pub: Path, page_id: str) -> Dict[str, Any]:
     ``page_id`` 允许是已被归并的 loser：直接返回 winner 的内容，并附带
     ``requested_path`` / ``redirected_from``，让旧链接与收藏继续可用。
     """
+    if page_id.startswith("articles/authored/"):
+        from jonex_wiki.domain.reading.authored_articles import read_authored
+        article = read_authored(pub, page_id)
+        if article is None:
+            raise NotFoundError(f"页面 {page_id} 不存在")
+        return article
     nav = load_navigation(pub)
     page_index = nav.get("page_index", {})
     if page_id not in page_index:
@@ -410,8 +424,14 @@ def list_page_documents(pub: Path) -> Dict[str, List[str]]:
     归并后归属取簇内并集并记在 winner 上：否则被并入的页面会把文档归属带走,
     「按文档过滤页面清单」会漏页。
     """
-    merge = _merge_map(pub, load_navigation(pub))
+    navigation = load_navigation(pub)
+    merge = _merge_map(pub, navigation)
     documents: Dict[str, set] = {}
+    # Native table/workbook navigation can have no semantic claims. Resolve
+    # its declared source IDs through the published registry instead of making
+    # claim generation a prerequisite for document-scoped reading.
+    for path, ids in _page_source_documents(pub, navigation).items():
+        documents.setdefault(merge.resolve(path), set()).update(ids)
     for claim in iter_claims(pub):
         page_path = str(claim.get("page_path") or "")
         if not page_path:
@@ -424,7 +444,40 @@ def list_page_documents(pub: Path) -> Dict[str, List[str]]:
         for span in (claim.get("source_spans") or []):
             if isinstance(span, dict) and span.get("document_id"):
                 docs.add(str(span["document_id"]))
+    from jonex_wiki.domain.reading.authored_articles import authored_articles
+    for article in authored_articles(pub):
+        if article["document_ids"]:
+            documents.setdefault(article["path"], set()).update(article["document_ids"])
     return {p: sorted(d) for p, d in documents.items()}
+
+
+def _page_source_documents(pub: Path, navigation: dict,
+                           paths: Iterable[str] | None = None) -> Dict[str, set]:
+    registry_path = pub / "sources" / "registry.json"
+    if not registry_path.is_file():
+        return {}
+    registry = json.loads(registry_path.read_text("utf-8"))
+    owners = {str(item["source_id"]): str(item["document_id"])
+              for item in registry.get("sources") or []
+              if item.get("source_id") and item.get("document_id")}
+    graph = navigation.get("page_graph") or {}
+    result = {}
+    page_index = navigation.get("page_index") or {}
+    entries = page_index.items() if paths is None else (
+        (path, page_index[path]) for path in paths if path in page_index)
+    for path, entry in entries:
+        scope = entry.get("scope") or {}
+        source_ids = set(scope.get("source_ids") or [])
+        source_ids.update((graph.get(path) or {}).get("source_ids") or [])
+        if scope.get("source_id"):
+            source_ids.add(scope["source_id"])
+        docs = {owners[source] for source in source_ids if source in owners}
+        # A contradictory explicit document identity is not repaired by a
+        # coincidental source ID. Keep it unassociated for review.
+        declared = scope.get("document_id")
+        if docs and (not declared or docs == {declared}):
+            result[path] = docs
+    return result
 
 
 def _references_for(pub: Path, cluster: Iterable[str]) -> List[Dict[str, Any]]:
@@ -482,6 +535,12 @@ def _references_for(pub: Path, cluster: Iterable[str]) -> List[Dict[str, Any]]:
                 entry["start_char"] = span["start_char"]
             if entry.get("end_char") is None and span.get("end_char") is not None:
                 entry["end_char"] = span["end_char"]
+    for documents in _page_source_documents(pub, load_navigation(pub), wanted).values():
+        for document in documents:
+            refs.setdefault(document, {"document_id": document, "excerpts": [],
+                                      "claim_count": 0, "chunk_id": "",
+                                      "start_char": None, "end_char": None,
+                                      "basis": "published_source_identity"})
     references = sorted(
         refs.values(),
         key=lambda r: (-int(r.get("claim_count") or 0), str(r.get("document_id"))),

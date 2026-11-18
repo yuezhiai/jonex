@@ -25,7 +25,10 @@ from pydantic import (BaseModel, Field, ConfigDict, field_validator,
 
 from jonex_wiki.domain.engine.compile.source_prep.header_interpretation import (
     HEADER_RULE_VERSION,
+    MAX_HEADER_ROWS,
     interpret_table,
+    instruction_header_candidate,
+    relocate_interpretation,
 )
 from jonex_wiki.domain.engine.compile.source_prep.spreadsheet_view import excel_serial_iso
 
@@ -257,6 +260,28 @@ def _decode_cursor(value: str) -> Dict[str, Any]:
         raise ValueError("TABLE_CURSOR_INVALID") from exc
 
 
+def table_display_title(connection, table, *, payload=None, source_name=None):
+    """One title policy for saved tables, readers and review projections.
+
+    Legacy spreadsheet titles may be the first column label. Their immutable
+    bytes remain intact; the current display uses proven identity instead.
+    """
+    sheet = connection.execute(
+        "SELECT name,date_epoch FROM sheets WHERE sheet_id=?", (table["sheet_id"],)).fetchone()
+    title = str(table["title"] or "").strip()
+    if sheet is None or sheet["date_epoch"] not in {"1900", "1904"}:
+        return title or (str(sheet["name"] or "") if sheet else "")
+    if payload is None:
+        stored = connection.execute(
+            "SELECT payload_json FROM interpretations WHERE table_id=? ORDER BY version DESC LIMIT 1",
+            (table["table_id"],)).fetchone()
+        payload = json.loads(stored["payload_json"] or "{}") if stored else {}
+    from jonex_wiki.domain.engine.compile.source_prep.table_identity import spreadsheet_title
+    return spreadsheet_title(source_name or payload.get("source_name"), sheet["name"],
+        [table["row_start"], table["column_start"], table["row_end"], table["column_end"]],
+        caption=title if payload.get("title_origin") == "caption" else None)
+
+
 class TableReader:
     def __init__(self, source: Path | str | Any, *, revision_id: str,
                  bundle_path: str | None = None) -> None:
@@ -270,6 +295,11 @@ class TableReader:
             if not self.bundle_path:
                 raise ValueError("bundle_path is required for BundleView table reads")
             connection = self.source.open_sqlite(self.bundle_path)
+            if not isinstance(connection, sqlite3.Connection):
+                with connection as opened:
+                    opened.row_factory = sqlite3.Row
+                    yield opened
+                return
         else:
             path = Path(self.source).expanduser().resolve()
             connection = sqlite3.connect("file:{}?mode=ro&immutable=1".format(path), uri=True)
@@ -283,12 +313,11 @@ class TableReader:
     # caller gets an explicitly marked excerpt instead of an unbounded string.
     RAW_OBSERVATION_LIMIT = 32 * 1024
 
-    # A read-time header interpretation reads the header region only: the
-    # header and its unit note live in the first rows, and scanning a whole
-    # large grid to name its columns would make every inspection cost grow with
-    # the table.  The rules the interpretation applies are bounded by
-    # ``header_interpretation.MAX_HEADER_ROWS`` anyway.
-    RUNTIME_HEADER_ROWS = 3
+    # Full evidence is read within EXHAUSTIVE_MAX_CELLS so compile/runtime use
+    # the same instruction and row-stub checks. Larger grids use these first
+    # rows; rules requiring every data row remain explicitly unconfirmed.
+    # Include one body row after the bounded native header hierarchy.
+    RUNTIME_HEADER_ROWS = MAX_HEADER_ROWS + 1
     # Verifying a legacy grid's rectangle by counting cells is bounded as well;
     # above this the stored interpretation status is the only evidence there is
     # and the grid completeness stays unverified rather than assumed.
@@ -323,8 +352,9 @@ class TableReader:
         counts = {int(row["row_index"]): int(row["cells"])
                   for row in connection.execute(
                       "SELECT row_index, COUNT(*) AS cells FROM cells WHERE sheet_id=? "
-                      "AND row_index BETWEEN ? AND ? GROUP BY row_index",
-                      (table["sheet_id"], table["row_start"], table["row_end"])).fetchall()}
+                      "AND row_index BETWEEN ? AND ? AND column_index BETWEEN ? AND ? GROUP BY row_index",
+                      (table["sheet_id"], table["row_start"], table["row_end"],
+                       table["column_start"], table["column_end"])).fetchall()}
         complete = all(counts.get(row_index) == width
                        for row_index in range(int(table["row_start"]), int(table["row_end"]) + 1))
         return complete, "cell_counts"
@@ -340,11 +370,33 @@ class TableReader:
         """
         if payload.get("header_rule") == HEADER_RULE_VERSION:
             return None
+        if payload.get("grid", {}).get("present") is False:
+            return interpret_table([], table_id=table["table_id"], grid_complete=False,
+                grid_rows_total=0, stored_interpretation_id=stored_interpretation_id, source="runtime")
         row_start, column_start = int(table["row_start"]), int(table["column_start"])
         last_scanned = min(int(table["row_end"]), row_start + self.RUNTIME_HEADER_ROWS - 1)
         rows = [[self._cell_text(connection, table["sheet_id"], row_index, column_index)
                  for column_index in range(column_start, int(table["column_end"]) + 1)]
                 for row_index in range(row_start, last_scanned + 1)]
+        # Full evidence within the existing cell budget keeps compile/runtime
+        # row-label and instruction rules identical. A larger table still gets
+        # a bounded header sample; it cannot prove a full sequence-ID rule.
+        cell_count = (int(table["row_end"]) - row_start + 1) * (int(table["column_end"]) - column_start + 1)
+        if cell_count <= EXHAUSTIVE_MAX_CELLS:
+            last_scanned = int(table["row_end"])
+            saved = {(int(item["row_index"]), int(item["column_index"])): dict(item)
+                     for item in connection.execute(
+                         "SELECT row_index,column_index,raw_value,formula,cached_value FROM cells "
+                         "WHERE sheet_id=? AND row_index BETWEEN ? AND ? AND column_index BETWEEN ? AND ?",
+                         (table["sheet_id"], row_start, last_scanned, column_start, table["column_end"]))}
+            rows = []
+            for row in range(row_start, last_scanned + 1):
+                values = []
+                for column in range(column_start, int(table["column_end"]) + 1):
+                    item = saved.get((row, column), {})
+                    value = item.get("cached_value") if item.get("formula") else item.get("raw_value")
+                    values.append("" if value is None else str(value))
+                rows.append(values)
         localized = []
         if rows:
             for merge in connection.execute(
@@ -356,13 +408,20 @@ class TableReader:
                                   int(merge["row_end"]) - row_start + 1,
                                   int(merge["column_end"]) - column_start + 1))
         complete, evidence = self._grid_completeness(connection, table, table["status"])
+        if payload.get("grid", {}).get("complete") is False:
+            # A rectangular SQLite projection may contain placeholders for
+            # source cells that the parser never supplied. Recounting stored
+            # positions cannot repair that explicit ingestion quality gap.
+            complete, evidence = False, "stored_grid_quality_gap"
         interpretation = interpret_table(
             rows, merges=localized, table_id=table["table_id"],
             grid_complete=complete, grid_rows_total=int(table["row_end"]) - row_start + 1,
             stored_interpretation_id=stored_interpretation_id, source="runtime")
-        return replace(interpretation, grid=replace(interpretation.grid, evidence=evidence))
+        return relocate_interpretation(
+            replace(interpretation, grid=replace(interpretation.grid, evidence=evidence)),
+            row_start, column_start)
 
-    def inspect(self, table_id: str) -> Dict[str, Any]:
+    def inspect(self, table_id: str, *, bounded: bool = True) -> Dict[str, Any]:
         with self._connection() as connection:
             table = connection.execute("SELECT * FROM logical_tables WHERE table_id=?", (table_id,)).fetchone()
             if table is None:
@@ -414,6 +473,17 @@ class TableReader:
                            "path": list(field.path), "header_rows": list(field.header_rows),
                            "unit": field.unit, "label_source": field.label_source}
                           for field in runtime.header.fields]
+            if not grid_state.get('present'):
+                # An old failed structure reading can coexist with a real,
+                # sparse native grid. Raw coordinates remain readable; this
+                # does NOT upgrade completeness or header interpretation.
+                stored_cell=connection.execute('SELECT 1 FROM cells WHERE sheet_id=? AND row_index BETWEEN ? AND ? '
+                    'AND column_index BETWEEN ? AND ? LIMIT 1',
+                    (table['sheet_id'],table['row_start'],table['row_end'],table['column_start'],table['column_end'])).fetchone()
+                if stored_cell is not None:
+                    grid_state={**grid_state,'present':True,'complete':False,
+                        'presence_evidence':'stored_native_cell','reading_reason':grid_state.get('reason'),
+                        'reason':'stored_coordinates_available_structure_unconfirmed'}
             grid_complete = bool(grid_state.get("complete"))
             header_confirmed = bool(header_state.get("confirmed"))
             # The three questions are answered separately: a complete grid makes
@@ -439,6 +509,9 @@ class TableReader:
                 (table["sheet_id"], header_row, table["row_start"]),
             ).fetchall()
             sample_cells = [dict(row) for row in sample]
+            from jonex_wiki.domain.engine.compile.source_prep.table_quality import cell_quality_warnings
+            quality_warnings = cell_quality_warnings(sample_cells)
+            quality_checked_cells = len(sample_cells)
             raw_text = payload.get("raw_observation_text") or ""
             if readable:
                 # The grid is readable, so the preview is a locator, not the
@@ -451,18 +524,18 @@ class TableReader:
                 raw_text, raw_truncated = _excerpt(raw_text, self.RAW_OBSERVATION_LIMIT)
                 sample_cut = False
             if readable:
-                note = ("结构已确认；用 table_read 读取回答问题所需的完整范围，sample 仅用于定位。")
+                note = ("结构已确认；在完整逻辑表目录找到本表并直接读取整表，sample 仅用于定位。")
             elif not grid_complete:
-                note = ("原始网格不存在或不完整，禁止按字段名取值；用 wiki_read 读取 "
+                note = ("原始网格不存在或不完整，禁止按字段名取值；直接打开 "
                         "wiki_page_path 的导航预览，预览可能截断，缺失内容不代表原文不存在。")
             else:
-                note = ("原始网格完整但表头/单位未确认，禁止按字段名 table_read；"
-                        "可按原始坐标读取，或用 wiki_read 读取导航预览。")
-            return _fit_inspection({
+                note = ("原始网格完整但表头/单位未确认，不可按字段名直接取值；"
+                        "可按原始坐标读取，并核对来源与导航预览。")
+            result = {
                 "revision_id": self.revision_id,
                 "table_id": table_id,
                 "sheet_id": table["sheet_id"],
-                "title": table["title"],
+                "title": table_display_title(connection, table, payload=payload),
                 "bounds": {"row_start": table["row_start"], "column_start": table["column_start"],
                            "row_end": table["row_end"], "column_end": table["column_end"]},
                 "interpretation_id": interpretation_id,
@@ -478,6 +551,9 @@ class TableReader:
                 # ...and whether this request was delivered completely is decided
                 # by the paging layer of each read, never here.
                 "fields": fields,
+                "quality": {"warnings": quality_warnings, "source_fidelity": (payload.get("pdf_native_repair") or {}).get("source_fidelity","not_verified"),
+                            "native_repair":payload.get("pdf_native_repair"),
+                            "checked_cells": quality_checked_cells, "scope": "bounded_sample"},
                 "stored_fields": [dict(row) for row in stored_fields],
                 # The source's own captions for this table, already stored in
                 # table_observations.  They are the table's name in the
@@ -493,14 +569,20 @@ class TableReader:
                 "region": payload.get("bbox"),
                 "header_merges": [dict(row) for row in header_merges],
                 "hidden_policy": table["hidden_policy"],
+                "has_hidden_cells": connection.execute(
+                    "SELECT 1 FROM cells WHERE sheet_id=? AND row_index BETWEEN ? AND ? "
+                    "AND column_index BETWEEN ? AND ? AND (hidden_row=1 OR hidden_column=1) LIMIT 1",
+                    (table["sheet_id"], table["row_start"], table["row_end"],
+                     table["column_start"], table["column_end"])).fetchone() is not None,
                 # A table whose structure is not confirmed exposes inspection
                 # only: its raw text is readable, its grid is not claimable.
                 "capabilities": capabilities,
                 "wiki_page_path": "tables/{}.md".format(table_id),
-                "next_step": {"tool": "table_read" if readable else "wiki_read", "note": note},
+                "next_step": {"tool": "read_file", "note": note},
                 "sample": sample_cells,
                 "limitations": ["no_aggregation", "no_sort", "no_join", "no_formula_recalculation"],
-            }, READ_RESPONSE_LIMIT)
+            }
+            return _fit_inspection(result, READ_RESPONSE_LIMIT) if bounded else result
 
     # A raw page carries the same per-cell payload as a structured page, so it
     # keeps the same cell and page budgets: raw mode must not become the way to
@@ -512,8 +594,8 @@ class TableReader:
                  page_bytes: int | None = None) -> Dict[str, Any]:
         """Read explicit coordinates as raw content, never as confirmed semantics.
 
-        This is the same ``table_read`` tool in its raw mode, not a second table
-        reader: it resolves no field name, applies no filter and aggregates
+        This reads stored raw coordinates: it resolves no field name,
+        applies no filter and aggregates
         nothing.  Every delivery states what it proves (the stored content at
         the delivered coordinates, plus which of them inherit a merge anchor)
         and what it does not (that a value belongs to a period, that it is the
@@ -525,7 +607,7 @@ class TableReader:
         are reported, never implied.
         """
         scope = scope if isinstance(scope, RawScopeSpec) else RawScopeSpec.model_validate(scope)
-        inspect = self.inspect(scope.table_id)
+        inspect = self.inspect(scope.table_id,bounded=False)
         bounds = inspect["bounds"]
         row_start, row_end = int(scope.row_start), int(scope.row_end)
         column_start = int(scope.column_start or bounds["column_start"])
@@ -592,24 +674,23 @@ class TableReader:
             notes = self._table_notes(connection, table, max(header_rows))
             hidden_rows = self._hidden_rows(connection, table["sheet_id"])
             hidden_columns = self._hidden_columns(connection, table["sheet_id"])
-            readable_columns = [column for column in range(column_start, column_end + 1)
-                                if scope.include_hidden or column not in hidden_columns]
-            candidate_rows = [row for row in range(row_start, row_end + 1)
-                              if scope.include_hidden or row not in hidden_rows]
-            candidates = [(row, column) for row in candidate_rows
-                          for column in readable_columns]
-            total_cells = len(candidates)
+            readable_columns = (range(column_start,column_end+1) if scope.include_hidden else
+                [column for column in range(column_start,column_end+1) if column not in hidden_columns])
+            candidate_rows = (range(row_start,row_end+1) if scope.include_hidden else
+                [row for row in range(row_start,row_end+1) if row not in hidden_rows])
+            total_cells = len(candidate_rows)*len(readable_columns)
             if start_index > total_cells:
                 raise ValueError("TABLE_CURSOR_OUT_OF_RANGE")
             limit = page_bytes or READ_RESPONSE_LIMIT
 
             def assemble(count: int) -> Dict[str, Any]:
-                window = candidates[start_index:start_index + max(0, count)]
+                width=len(readable_columns)
+                window=[(candidate_rows[index//width],readable_columns[index%width])
+                    for index in range(start_index,min(total_cells,start_index+max(0,count)))] if width else []
                 cells = [self._raw_cell(connection, table, row, column)
                          for row, column in window]
                 next_index = start_index + len(window)
-                pending = candidates[next_index:]
-                missing_ranges, missing_truncated = _missing_ranges(pending, MISSING_RANGE_LIMIT)
+                missing_ranges, missing_truncated = _raw_remaining_ranges(candidate_rows,readable_columns,next_index,MISSING_RANGE_LIMIT)
                 complete = page_index == 0 and next_index >= total_cells
                 return {**base, "page_index": page_index, "start_cell_index": start_index,
                         "cells": cells, "context_items": [],
@@ -651,7 +732,7 @@ class TableReader:
                             "complete_for_read_request": complete,
                             "logical_unit_complete": complete}}
 
-            if not candidates:
+            if not total_cells:
                 return assemble(0)
             # Assembling a page is the expensive part (one query per cell), so
             # the largest window that fits is found by bisection, and a fallback
@@ -799,8 +880,8 @@ class TableReader:
             "unit_row": header.get("unit_row"),
             "out_of_bounds": bool(out_of_bounds),
             "cell_count": len(cells),
-            "note": ("raw coordinates are evidence of content, not of semantics; a completed "
-                     "structured table_read is still required before table_compute"),
+            "note": ("raw coordinates are evidence of content, not of semantics; read the "
+                     "complete table and verify headers, units and scope before calculation"),
         }
 
     def locate(self, literal: str, *, table_id: str | None = None,
@@ -861,7 +942,7 @@ class TableReader:
         scope = scope if isinstance(scope, ScopeSpec) else ScopeSpec.model_validate(scope)
         scope, row_window = normalize_row_window(scope)
         page_limit = int(page_bytes) if page_bytes else PAGE_BYTES_LIMIT
-        inspect = self.inspect(scope.table_id)
+        inspect = self.inspect(scope.table_id,bounded=False)
         interpretation_id = inspect["interpretation_id"]
         normalized_scope = scope.model_dump()
         # One request identity for every page of the same scope.  It never
@@ -1399,7 +1480,7 @@ def _bounded_preview_cells(cells: List[Dict[str, Any]]) -> tuple[List[Dict[str, 
     """Keep one data row of a readable grid as a shape example.
 
     Header cells are already described by ``fields`` and ``header_merges``, and
-    the payload is a locator for ``table_read`` rather than the data itself, so
+    the payload is a locator rather than the complete table, so
     a single row is enough to show the coordinate convention.  The trim is
     reported, never silent.
     """
@@ -1457,20 +1538,20 @@ def _fit_inspection(payload: Dict[str, Any], limit: int) -> Dict[str, Any]:
     """
     fitted = dict(payload)
     fitted["inspect_truncated"] = False
-    if _encoded_size(fitted) <= limit:
+    if _encoded_size(fitted) <= limit-256:
         return fitted
     reasons: List[str] = []
     sample = list(fitted.get("sample") or [])
     # 1. Drop trailing sample rows: they are a preview, never the request.
     kept = sample
-    while kept and _encoded_size({**fitted, "sample": kept}) > limit:
+    while kept and _encoded_size({**fitted, "sample": kept}) > limit-256:
         kept = kept[: max(0, len(kept) - 5)]
     if len(kept) != len(sample):
         fitted["sample"] = kept
         reasons.append("sample_rows_dropped")
     # 2. Then shorten the raw observation, always flagged as an excerpt.
     raw = fitted.get("raw_observation_text") or ""
-    while raw and _encoded_size({**fitted, "raw_observation_text": raw}) > limit:
+    while raw and _encoded_size({**fitted, "raw_observation_text": raw}) > limit-256:
         raw = raw[: int(len(raw) * 0.8)]
         fitted["raw_observation_text"] = raw
     if raw != (payload.get("raw_observation_text") or ""):
@@ -1485,7 +1566,7 @@ def _fit_inspection(payload: Dict[str, Any], limit: int) -> Dict[str, Any]:
             "revision_id", "table_id", "sheet_id", "title", "captions", "bounds",
             "interpretation_id",
             "interpretation_status", "capabilities", "limitations", "structure_reason",
-            "page_number", "region")} | {
+            "page_number", "region", "grid_state")} | {
             "inspect_truncated": True, "inspect_truncation": reasons + ["identity_only"],
             "sample": [], "raw_observation_text": ""}
     return fitted
@@ -1525,6 +1606,31 @@ def _text_list(value: Any) -> list[str]:
 def missing_ranges_context(limit: int, ranges: list, truncated: bool) -> bool:
     """True when the bounded summary cannot be treated as the whole picture."""
     return bool(truncated) or (limit == 0 and bool(ranges))
+
+
+def _raw_remaining_ranges(rows,columns,position,limit):
+    """Describe a row-major tail without allocating its Cartesian product."""
+    total=len(rows)*len(columns)
+    if position>=total or not columns:return [],False
+    row_index,column_index=divmod(position,len(columns));result=[]
+    def runs(values,start=0):
+        if start>=len(values):return
+        if isinstance(values,range) and values.step==1:
+            yield values[start],values[-1];return
+        first=previous=values[start]
+        for index in range(start+1,len(values)):
+            value=values[index]
+            if value!=previous+1:yield first,previous;first=value
+            previous=value
+        yield first,previous
+    if column_index:
+        for a,b in runs(columns,column_index):result.append({'row_start':rows[row_index],'row_end':rows[row_index],'column_start':a,'column_end':b})
+        row_index+=1
+    for a,b in runs(rows,row_index):
+        for c,d in runs(columns):
+            result.append({'row_start':a,'row_end':b,'column_start':c,'column_end':d})
+            if len(result)>limit:return result[:limit],True
+    return result[:limit],len(result)>limit
 
 
 def _missing_ranges(missing: Iterable[tuple[int, int]],
@@ -1630,43 +1736,6 @@ def _markdown_scalar(value: Any) -> str:
     return "`{}`".format(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
-def _render_cell(cell: Mapping[str, Any]) -> str:
-    coordinate = str(cell.get("coordinate") or "R{}C{}".format(
-        cell.get("row_index"), cell.get("column_index")))
-    parts = [
-        "`{}`".format(coordinate),
-        "row={}".format(cell.get("row_index")),
-        "column={}".format(cell.get("column_index")),
-        "type=" + _markdown_scalar(cell.get("raw_type")),
-        ("raw=<EMPTY>" if cell.get("raw_value") is None
-         else "raw=" + _markdown_scalar(cell.get("raw_value"))),
-    ]
-    # READING-REPAIR §5.8: null formula/cached/empty_kind are noise, not data.
-    # Only emit them when they carry semantics; 0, False, "0012", units and real
-    # empty markers stay on the ``raw``/``type``/``empty_kind`` fields.
-    formula = cell.get("formula")
-    if formula is not None:
-        parts.append("formula=" + _markdown_scalar(formula))
-    cached_value = cell.get("cached_value")
-    if cached_value is not None:
-        parts.append("cached=" + _markdown_scalar(cached_value))
-    empty_kind = cell.get("empty_kind")
-    if empty_kind is not None:
-        parts.append("empty_kind=" + _markdown_scalar(empty_kind))
-    if "effective_value" in cell:
-        parts.append("effective=" + _markdown_scalar(cell["effective_value"]))
-        parts.append("merge_anchor=" + _markdown_scalar(cell.get("merge_anchor")))
-    if cell.get("normalized_value") is not None:
-        parts.append("normalized=" + _markdown_scalar(cell["normalized_value"]))
-    if cell.get("column_date_header"):
-        parts.append("column_date_header=" + _markdown_scalar(cell["column_date_header"]))
-    if cell.get("hidden_row"):
-        parts.append("hidden_row")
-    if cell.get("hidden_column"):
-        parts.append("hidden_column")
-    return "- " + " ".join(parts)
-
-
 def project_saved_cell_semantics(cells: List[Mapping[str, Any]],
                                  merges: List[Mapping[str, Any]],
                                  *, epoch: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1694,7 +1763,7 @@ def project_saved_cell_semantics(cells: List[Mapping[str, Any]],
                     cell["merge_anchor"] = merge["anchor"]
     if epoch is not None:
         for cell in projected:
-            if cell.get("date_candidate") and not str(cell.get("number_format") or "").startswith("builtin:"):
+            if cell.get("date_candidate") :
                 value = cell.get("cached_value") if cell.get("formula") else cell.get("raw_value")
                 normalized = excel_serial_iso(value, epoch)
                 if normalized is not None:
@@ -1764,11 +1833,6 @@ def _carries_no_own_value(cell: Mapping[str, Any]) -> bool:
     return True
 
 
-def render_coordinate_records(cells: List[Mapping[str, Any]]) -> str:
-    """One explicit Markdown record per saved cell."""
-    return "\n".join(_render_cell(cell) for cell in cells) + ("\n" if cells else "")
-
-
 def render_intersecting_merges(merges: List[Mapping[str, Any]],
                                rows: List[Mapping[str, Any]]) -> str:
     """List the merge ranges that intersect the rows serialized on this page."""
@@ -1790,7 +1854,7 @@ def render_intersecting_merges(merges: List[Mapping[str, Any]],
     return "\n".join(lines) + "\n"
 
 
-def _compact_grid(cells, merges, *, epoch=None):
+def _compact_grid(cells, merges, *, epoch=None,unread_marker=False):
     """One row per source row; cell provenance stays in the SQLite asset."""
     cells = project_saved_cell_semantics(cells, merges, epoch=epoch)
     if not cells:
@@ -1806,11 +1870,13 @@ def _compact_grid(cells, merges, *, epoch=None):
             if value is None:
                 value = str(cell["formula"]) + " (未计算)"
         text = "" if value is None else str(value)
+        if cell.get('absent'):
+            text='[未保存坐标]'
         rows.setdefault(int(cell["row_index"]), {})[int(cell["column_index"])] = (
             text.replace("|", "\\|").replace("\n", "<br>").replace("\r", ""))
     lines = ["| 行 | " + " | ".join("C{}".format(c) for c in columns) + " |",
              "| --- | " + " | ".join("---" for _ in columns) + " |"]
-    lines.extend("| {} | {} |".format(row, " | ".join(values.get(c, "") for c in columns))
+    lines.extend("| {} | {} |".format(row, " | ".join(values.get(c, "[本页未读]" if unread_marker else "") for c in columns))
                  for row, values in sorted(rows.items()))
     # Formatting can carry units (0.00%) or identifier padding (000000).
     # Group contiguous coordinates so that preserving it does not require a
@@ -1837,6 +1903,11 @@ def _compact_grid(cells, merges, *, epoch=None):
 
 def render_full_table_markdown(source_id, table, cells, merges, sheet_name=None, epoch=None):
     title = table.get("title") or table.get("table_id") or ""
+    if epoch in {"1900","1904"}:
+        from jonex_wiki.domain.engine.compile.source_prep.table_identity import spreadsheet_title
+        title=spreadsheet_title(table.get("source_name"),sheet_name,
+            [table["row_start"],table["column_start"],table["row_end"],table["column_end"]],
+            caption=title if table.get("title_origin")=="caption" else None)
     header = "# {}\n\nsource_id=`{}` table_id=`{}`\n".format(
         title, source_id, table.get("table_id"))
     if sheet_name:
@@ -1858,7 +1929,12 @@ def full_table_body(connection, source_id: str, table_id: str) -> str:
     sheet_row = connection.execute(
         "SELECT name,date_epoch FROM sheets WHERE sheet_id=?", (table["sheet_id"],)).fetchone()
     sheet_name = str(sheet_row["name"]) if sheet_row is not None else None
-    body = render_full_table_markdown(source_id, dict(table), cells, merges, sheet_name=sheet_name,
+    table_info=dict(table)
+    stored=connection.execute("SELECT payload_json FROM interpretations WHERE table_id=? ORDER BY version DESC LIMIT 1",(table_id,)).fetchone()
+    if stored:
+        for key,value in json.loads(stored["payload_json"] or "{}").items():
+            if key in {"title_origin","source_name"}:table_info[key]=value
+    body = render_full_table_markdown(source_id, table_info, cells, merges, sheet_name=sheet_name,
         epoch=sheet_row["date_epoch"] if sheet_row is not None else None)
     exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_observations'").fetchone()
@@ -1902,36 +1978,6 @@ def full_sheet_body(connection, source_id: str, sheet_id: str) -> str:
     return render_full_sheet_markdown(source_id, dict(sheet), cells, merges)
 
 
-def batch_by_row(cells: List[Mapping[str, Any]], row_count: int = 100):
-    """Yield cells grouped by row, bounded to ``row_count`` rows per page."""
-    by_row: Dict[int, List[Mapping[str, Any]]] = {}
-    for cell in cells:
-        by_row.setdefault(int(cell["row_index"]), []).append(cell)
-    ordered_rows = sorted(by_row)
-    for start in range(0, len(ordered_rows), max(1, int(row_count))):
-        chunk = ordered_rows[start:start + max(1, int(row_count))]
-        yield [cell for row_index in chunk for cell in by_row[row_index]]
-
-
-def _table_observation_text(connection, table_id: str) -> str:
-    """Return this table's retained raw observation text, if any."""
-    exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_observations'").fetchone()
-    if exists is None:
-        return ""
-    row = connection.execute(
-        "SELECT raw_item_json FROM table_observations WHERE table_id=?", (table_id,)).fetchone()
-    if row is None:
-        return ""
-    try:
-        payload = json.loads(row["raw_item_json"] or "{}")
-    except (TypeError, ValueError):
-        return ""
-    if isinstance(payload, dict):
-        return str(payload.get("text") or "")
-    return ""
-
-
 # ──────────────────────────────────────────────
 #  Engine-owned artifact paths (``raw-tables/…``)
 # ──────────────────────────────────────────────
@@ -1965,19 +2011,11 @@ def artifact_slug(value: str, *, fallback: str = "") -> str:
 
 
 def raw_table_label(connection, table) -> str:
-    """Human-readable label for one logical table: its title, else sheet name."""
-    title = str(table["title"] or "").strip()
-    if title:
-        return title
-    try:
-        row = connection.execute(
-            "SELECT name FROM sheets WHERE sheet_id=?", (str(table["sheet_id"]),)).fetchone()
-    except sqlite3.Error:
-        return ""
-    return str(row["name"] or "").strip() if row is not None else ""
+    """Use the same source-backed identity as inspection and full delivery."""
+    return table_display_title(connection, table)
 
 
-def raw_table_title(table_id: str, label: str, *, part: Optional[int] = None) -> str:
+def raw_table_title(table_id: str, label: str) -> str:
     """Page title for a raw-table page: readable label first, id always kept.
 
     ``Raw table table-…``（旧标题）对读者毫无信息；表自己的标题/工作表名在
@@ -1985,15 +2023,11 @@ def raw_table_title(table_id: str, label: str, *, part: Optional[int] = None) ->
     table_id 留在标题末尾，保证页面上永远能拿到可操作的表标识。
     """
     name = str(label or "").strip() or "Raw table"
-    title = "{} · {}".format(name, table_id)
-    if part:
-        title += " · part {}".format(int(part))
-    return title
+    return "{} · {}".format(name, table_id)
 
 
-def raw_table_page_path(source_id: str, table_id: str, *, title: str = "",
-                        part: Optional[int] = None, source_name: str = "") -> str:
-    """``raw-tables/<doc-slug>-<source16>/<table-slug>-<table_id>/<part>.md``.
+def raw_table_page_path(source_id: str, table_id: str, *, title: str = "", source_name: str = "") -> str:
+    """``raw-tables/<doc-slug>-<source16>/<table-slug>-<table_id>/0000.md``.
 
     两段都带「可读前缀 + 可回查的身份后缀」：
 
@@ -2006,7 +2040,7 @@ def raw_table_page_path(source_id: str, table_id: str, *, title: str = "",
     doc_dir = "{}-{}".format(artifact_slug(source_name, fallback="doc"), source_digest)
     table_slug = artifact_slug(title, fallback="")
     table_dir = "{}-{}".format(table_slug, table_id) if table_slug else str(table_id)
-    return "{}/{}/{}/{:04d}.md".format(_RAW_TABLES_DIR, doc_dir, table_dir, int(part or 0))
+    return "{}/{}/{}/0000.md".format(_RAW_TABLES_DIR, doc_dir, table_dir)
 
 
 def iter_full_table_page(table_id: str, source_id: str, connection,
@@ -2035,68 +2069,7 @@ def iter_full_table_page(table_id: str, source_id: str, connection,
     )
 
 
-def iter_raw_table_pages(table_id: str, source_id: str, connection,
-                         source_name: str = ""):
-    """Yield complete raw-table pages for one logical table.
-
-    ``connection`` is any read-only SQLite connection to a published grid; the
-    compile and migration paths open it identically.  Every page is emitted and
-    linked to its neighbours, never just the first preview page.
-    """
-    from jonex_wiki.domain.engine.models.query_models import RawWikiPage
-
-    table = read_logical_table(connection, table_id)
-    cells = [dict(row) for row in stream_cells(connection, table)]
-    merges = [dict(row) for row in read_merge_ranges(connection, table)]
-    status = str(table["status"])
-    label = raw_table_label(connection, table)
-
-    def make_page(part: int, rows: List[Mapping[str, Any]], body_prefix: str) -> RawWikiPage:
-        row_indices = [int(cell.get("row_index")) for cell in rows if cell.get("row_index") is not None]
-        row_bounds = {"row_start": min(row_indices), "row_end": max(row_indices)} if row_indices else None
-        title = raw_table_title(table_id, label, part=part)
-        body = (
-            "# {}\n\n".format(title)
-            + "source_id=`{}`\n\ntable_id=`{}`\n\n".format(source_id, table_id)
-            + "structure_status=`{}`\n\n".format(status)
-            + body_prefix
-            + render_coordinate_records(rows)
-            + render_intersecting_merges(merges, rows)
-        )
-        return RawWikiPage(
-            path=raw_table_page_path(source_id, table_id, title=label, part=part,
-                                     source_name=source_name),
-            body=body,
-            content_kind="table_raw",
-            source_id=str(source_id),
-            table_id=str(table_id),
-            title=title[:200],
-            structure_status=status,
-            row_bounds=row_bounds,
-        )
-
-    pages: List[RawWikiPage] = []
-    if cells:
-        pages = [make_page(part, rows, "") for part, rows in enumerate(batch_by_row(cells, row_count=100))]
-    else:
-        observation = _table_observation_text(connection, table_id)
-        if observation:
-            pages = [make_page(0, [], "```markdown\n" + observation.rstrip("\n") + "\n```\n")]
-        else:
-            # Keep a directory/index entry for the empty artifact without
-            # fabricating any content.
-            pages = [make_page(0, [], "")]
-
-    for index, page in enumerate(pages):
-        related = [pages[index - 1].path] if index > 0 else []
-        if index + 1 < len(pages):
-            related.append(pages[index + 1].path)
-        yield page.model_copy(update={"related_pages": related})
-
-
 __all__ = ["ScopeSpec", "TableReader", "READ_RESPONSE_LIMIT", "MAX_MERGED_PAGES",
-           "MISSING_RANGE_LIMIT", "iter_raw_table_pages", "iter_full_table_page",
-           "batch_by_row",
-           "render_coordinate_records", "render_intersecting_merges",
+           "MISSING_RANGE_LIMIT", "iter_full_table_page", "render_intersecting_merges",
            "render_full_table_markdown", "render_full_sheet_markdown",
            "full_table_body", "full_sheet_body"]

@@ -47,6 +47,19 @@ __all__ = [
 _GLOBAL_INDEX_ARTIFACT = "wiki/index.md"
 _DIR_INDEX_SUFFIX = "/index.md"
 _DIRECTORY_PAGE_LIMIT = 200
+READING_RENDER_VERSION = 'agent-file-reading-v1'
+_DIRECTORY_READING_HINTS = {
+    "pages": "事实与主题索引；连续阅读优先进入原文章节，再核对精确证据。",
+    "workbooks": "按来源查看表格导读、工作表或原文分区、日期列与行分组。",
+    "tables": "逻辑表的字段、区域与读取入口；先核对来源及工作表。",
+    "raw-tables": "按来源组织的表格原文；保留行列与分片位置。",
+    "table-views": "同一张表的分组阅读视图；完整范围和计算以原表为准。",
+    "source-articles": "连续阅读来源正文，查看章节、上下文与原表。",
+    "articles": "按原文章标题阅读；段落保持来源、版本和位置，细事实仍可检索。",
+    "source-evidence": "精确来源片段，可回查其原件与位置。",
+    "sources": "来源清单、版本及该来源的原文和表格入口。",
+    "topics": "主题总览与导航；主题说明不代替原文证据。",
+}
 
 # JSON encoding used as deterministic YAML 1.2-compatible scalar/list syntax.
 def _json(value) -> str:
@@ -84,7 +97,7 @@ def stabilize_directory_shards(
     # ``raw-tables`` 的**扁平**目录同样可能超过 200 个直接对象：前者一张表就有
     # ≤3 页，后者每个 ``<doc>/<table>/`` 目录只有 1 页、不会在这里触发，但把名字
     # 登记进来可以让将来压平或增量的形态自动获得分片。
-    for directory in ("sources", "tables", "table-views", "raw-tables"):
+    for directory in ("sources", "tables", "table-views", "raw-tables", "pages", "source-evidence", "articles"):
         pages = sorted(render_index.direct_pages(directory))
         leaves = set(shards.get(directory, ()))
         if not leaves and len(pages) > _DIRECTORY_PAGE_LIMIT:
@@ -160,6 +173,10 @@ def _directory_title(
     del index
     segment = dir_path.rsplit("/", 1)[-1]
     derived = _directory_display(segment)
+    if dir_path.startswith('source-articles/'):
+        source_page = state.pages.get('sources/source-' + segment + '.md')
+        if source_page is not None:
+            return _safe_display(source_page.index.title) or derived
     if not dir_path.startswith("raw-tables/"):
         return derived
     table_match = _TABLE_ID_TAIL_RE.search(segment)
@@ -238,6 +255,9 @@ def _render_global_index(
         if isinstance(index, WikiRenderIndex)
         else index.top_level_dirs()
     )
+    if 'source-articles' in top_level:
+        order={'articles':0,'source-articles':1,'sources':2,'workbooks':3,'tables':4,'topics':5,'pages':8,'source-evidence':9}
+        top_level.sort(key=lambda path:(order.get(path,5),path))
     lines = [
         "---",
         "kind: " + _json("index"),
@@ -260,6 +280,7 @@ def _render_global_index(
         lines.append(
             "\n".join(
                 "- [[" + d + "/index.md|" + _directory_display(d) + "]]"
+                + (" — " + _DIRECTORY_READING_HINTS[d] if d in _DIRECTORY_READING_HINTS else "")
                 for d in top_level
             )
         )
@@ -405,7 +426,8 @@ def _render_page(
     safe_title = _safe_display(entry.title)
     summary = _normalize_block(entry.description) or "_No summary._"
     content = _normalize_block(snapshot.content) or "_No content._"
-    page_type = "source" if page_path.startswith("sources/") else (
+    article = entry.scope.get('reading_role') == 'article'
+    page_type = "source" if article or page_path.startswith("sources/") else (
         "table" if page_path.startswith("tables/") else "concept"
     )
 
@@ -455,6 +477,45 @@ def _render_page(
         "",
         _render_sources(snapshot.source_ids),
     ]
+    if article:
+        # A reading projection opens on original content. Repeating a long
+        # synthetic title, a list of headings as Summary, and a Content heading
+        # would bury the useful text. Identity remains in frontmatter and the
+        # reader's source panel; navigation follows the original body.
+        header_end = lines.index('---', 1)
+        tables = entry.scope.get("preview_table_links") or []
+        prefix = "../" * (page_path.count("/") + 1)
+        table_links = [
+            "- [" + _safe_display(table["title"]) + "](" + prefix + table["page_path"] + ")"
+            for table in tables
+        ]
+        return '\n'.join([
+            *lines[:header_end+2],
+            *(['# '+_safe_display(entry.scope['original_article_title']), '']
+              if entry.scope.get('original_article_title') else []),
+            '> 来源：' + _safe_display(str(entry.scope.get('source_name') or entry.title)),
+            '', *(['## 完整逻辑表', '', *table_links, ''] if table_links else []),
+            content, '', '## Related pages', '',
+            _render_related(state, snapshot, page_path), '', '## Sources', '',
+            _render_sources(snapshot.source_ids), '',
+        ])
+    if entry.scope.get('reading_role') == 'fact_index':
+        # Fine facts remain addressable/indexable. Their reading projection
+        # carries the statement once; continuous source targets precede it.
+        # Full index metadata, claims and provenance are still published.
+        header_end=lines.index('---',1)
+        required={'kind','type','page_id','path','title','version','source_ids'}
+        header=[line for line in lines[1:header_end]
+                if line.partition(':')[0] in required or (
+                    line.partition(':')[0] not in {'description','why_visit'}
+                    and line.partition(':')[2].strip() not in {'[]','{}','null','""'})]
+        targets=[p for p in entry.scope.get('reading_targets',[]) if p in state.pages]
+        links='\n'.join('- [['+p+'|'+_safe_display(state.pages[p].index.title)+']]' for p in targets)
+        return '\n'.join(['---',*header,'---','', '# '+safe_title,'',
+            *(['## Read source context','',links,''] if links else []),
+            content,'','## Related pages','',_render_related(state,snapshot,page_path),
+            '','## Backlinks','',_render_backlinks(state,page_path,index),
+            *(['','## Sources','',_render_sources(snapshot.source_ids)] if '## Sources' not in content else []),''])
     return "\n".join(lines) + "\n"
 
 
@@ -519,7 +580,7 @@ def render_wiki_tree_incremental(
 
     def emit(path: str, material: object, render) -> None:
         signature = hashlib.sha256(json.dumps(
-            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            {'renderer':READING_RENDER_VERSION,'material':material}, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
         signatures[path] = signature
         old = old_files.get(path.removeprefix("wiki/"))

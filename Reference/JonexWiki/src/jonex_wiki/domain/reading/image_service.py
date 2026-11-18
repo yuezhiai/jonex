@@ -67,6 +67,7 @@ def find_images(view, options):
         "revision",
         "query",
         "document_id",
+        "document_ids",
         "page_path",
         "limit",
         "cursor",
@@ -75,6 +76,9 @@ def find_images(view, options):
     query, doc, page = (
         options.get(k, "") for k in ("query", "document_id", "page_path")
     )
+    documents=options.get('document_ids')
+    if documents is not None and (not isinstance(documents,(list,tuple)) or any(not isinstance(d,str) for d in documents)):
+        raise ValidationError('IMAGE_SOURCE_SCOPE_INVALID')
     limit, cursor = options.get("limit", 20), options.get("cursor", "")
     if (
         any(not isinstance(v, str) for v in (query, doc, page, cursor))
@@ -84,7 +88,7 @@ def find_images(view, options):
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValidationError("IMAGE_SEARCH_LIMIT_INVALID")
     scope = hashlib.sha256(
-        json.dumps([_stamp(view), query, doc, page], sort_keys=True).encode()
+        json.dumps([_stamp(view), query, doc, page, documents], sort_keys=True).encode()
     ).hexdigest()
     offset = 0
     if cursor:
@@ -130,6 +134,9 @@ def find_images(view, options):
         if doc:
             where.append("i.document_id=?")
             params.append(doc)
+        if documents is not None:
+            where.append('i.document_id IN (SELECT value FROM json_each(?))')
+            params.append(json.dumps(sorted(set(documents))))
         if page:
             where.append(
                 "EXISTS(SELECT 1 FROM page_images p WHERE p.asset_id=i.asset_id AND p.page=?)"

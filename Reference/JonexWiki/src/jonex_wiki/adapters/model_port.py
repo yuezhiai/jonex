@@ -26,9 +26,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import nullcontext
 from typing import Any, Dict, List
 
-from jonex_wiki.infra.gateway import GwOutputTooLong, parse_json_content
+from jonex_wiki.infra.gateway import (
+    GwModelNotConfigured, GwOutputTooLong, GwUpstreamRejected, parse_json_content,
+)
+from jonex_wiki.kernel.errors import CompileModelUnavailable
 from jonex_wiki.kernel.ports import ModelPort
 
 log = logging.getLogger(__name__)
@@ -62,6 +66,7 @@ def _truncation_error(exc: GwOutputTooLong) -> RuntimeError:
     err.output_truncated = True  # type: ignore[attr-defined]
     err.usage = exc.usage        # type: ignore[attr-defined]
     err.content_chars = exc.content_chars  # type: ignore[attr-defined]
+    err.raw_content = exc.raw_content  # type: ignore[attr-defined]
     return err
 
 
@@ -146,61 +151,6 @@ def _append_feedback(messages: List[Dict[str, Any]], exc: Exception) -> List[Dic
     return out
 
 
-def _parse_traversal_tool_content(content: str, *, allow_tool_recovery: bool = True) -> dict:
-    """Recover known traversal formatting errors without inventing values.
-
-    A complete answer may contain unescaped quotes; only those literal quotes
-    are escaped. For a missing root brace the decoder must reach EOF after a
-    complete value. Both recoveries retain response validation.
-    """
-    try:
-        return parse_json_content(content)
-    except json.JSONDecodeError as exc:
-        # Some providers leave literal quotation marks inside an otherwise
-        # complete answer string. Escape only that root string, preserving its
-        # text and the complete citations/tail; never fill in a missing value.
-        answer = re.fullmatch(r'(\s*\{\s*"answer"\s*:\s*")(.*)("\s*,\s*"citations"\s*:.*\}\s*)',
-                              exc.doc, re.S)
-        if answer is None:
-            bare = re.fullmatch(r'(\s*\{\s*"answer"\s*:\s*")(.*)("\s*\}\s*)', exc.doc, re.S)
-            # A root answer-only response already supports inline E citations.
-            # Refuse ambiguous additional fields; do not invent an array.
-            if bare and not re.search(r'"\s*,\s*"[^"\n]+"\s*:', bare[2]):
-                answer = bare
-        if (exc.msg == "Expecting ',' delimiter" and answer
-                and answer.start(2) <= exc.pos <= answer.end(2)):
-            body, slashes = [], 0
-            for char in answer[2]:
-                if char == '"' and slashes % 2 == 0:
-                    body.append("\\")
-                body.append(char)
-                slashes = slashes + 1 if char == "\\" else 0
-            try:
-                candidate = json.loads(answer[1] + "".join(body) + answer[3], strict=False)
-                from jonex_wiki.domain.engine.query.algorithm import TraversalResponse
-                if set(candidate) - set(TraversalResponse.model_fields):
-                    raise ValueError("unknown answer field")
-                response = TraversalResponse.model_validate(candidate)
-                if response.tool_calls:
-                    raise ValueError("answer recovery is tool-free")
-            except ValueError:
-                raise exc
-            return candidate
-        if (not allow_tool_recovery or exc.pos != len(exc.doc)
-                or exc.msg != "Expecting ',' delimiter"):
-            raise
-        try:
-            candidate = json.loads(exc.doc + "}", strict=False)
-            # Only this rare recovery needs the query response type; ordinary
-            # parsing and all compilation responses keep their current path.
-            from jonex_wiki.domain.engine.query.algorithm import TraversalResponse
-            response = TraversalResponse.model_validate(candidate)
-            if not response.tool_calls:
-                raise ValueError("no complete traversal tool calls")
-        except ValueError:
-            raise exc
-        log.info("Recovered a traversal tool response missing its final root brace")
-        return candidate
 
 
 class ModelPortAdapter(ModelPort):
@@ -211,12 +161,13 @@ class ModelPortAdapter(ModelPort):
     """
 
     def __init__(self, gw, *, scene: str | None = None, tenant_id: str = "", kb_id: str = "",
-                 before_call=None) -> None:
+                 before_call=None, model_slots=None) -> None:
         self._gw = gw
         self._scene = scene
         self._tenant_id = tenant_id
         self._kb_id = kb_id
         self._before_call = before_call
+        self._model_slots = model_slots
 
     async def complete(
         self,
@@ -230,6 +181,7 @@ class ModelPortAdapter(ModelPort):
         context_id: str = "",
         trace_id: str = "",
         thinking: Dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         scene: str | None = None,
         doc_id: str = "",
     ) -> Dict[str, Any]:
@@ -246,25 +198,30 @@ class ModelPortAdapter(ModelPort):
             "schema": schema,
             "max_tokens": max_tokens,
             "model": model,
-            # 文档级归因（2026-11-12）：不传时网关不写 doc_id，入库计量就归不到
-            # 任何文档行，任务中心的 Token 对 wiki 文档恒为「-」。
-            "doc_id": doc_id,
         }
+        if doc_id:
+            gw_kwargs["doc_id"] = doc_id
         if tools is not None:
             gw_kwargs["tools"] = tools
         if thinking is not None:
             gw_kwargs["thinking"] = thinking
+        if reasoning_effort is not None:
+            gw_kwargs["reasoning_effort"] = reasoning_effort
 
-        # The query loop owns one shared repair allowance. Retrying here as
-        # well would hide extra provider calls from that allowance/accounting.
-        is_traversal = bool(schema and schema.get("title") == "TraversalResponse")
-        attempts = 1 if is_traversal else (TRAVERSAL_STRUCTURE_ATTEMPTS if tools is not None else 1)
+        attempts = TRAVERSAL_STRUCTURE_ATTEMPTS if tools is not None else 1
         turn_messages = messages
         for attempt in range(attempts):
             try:
-                out = await self._gw.complete(turn_messages, **gw_kwargs)
+                async with self._model_slots or nullcontext():
+                    out = await self._gw.complete(turn_messages, **gw_kwargs)
             except GwOutputTooLong as exc:
                 raise _truncation_error(exc) from exc
+            except (GwModelNotConfigured, GwUpstreamRejected) as exc:
+                if gw_kwargs["scene"] == "jonex_wiki_source_understanding" and (
+                    isinstance(exc, GwModelNotConfigured) or exc.model_unavailable
+                ):
+                    raise CompileModelUnavailable(str(exc)) from exc
+                raise
 
             tool_calls = out.get("tool_calls")
             if tool_calls:
@@ -275,10 +232,8 @@ class ModelPortAdapter(ModelPort):
                     usage=out.get("usage"),
                 )
             try:
-                parsed = (_parse_traversal_tool_content(out["content"], allow_tool_recovery=tools is not None)
-                          if is_traversal
-                          else parse_json_content(out["content"]))
-                if tools is not None and schema is not None and not is_traversal:
+                parsed = parse_json_content(out["content"])
+                if tools is not None and schema is not None:
                     _check_schema_structure(parsed, schema)
                 return _UsageDict(parsed, usage=out.get("usage"))
             except ValueError as exc:
@@ -296,7 +251,7 @@ class ModelPortAdapter(ModelPort):
                 )
                 # 遍历轮：抛引擎认识的协议错误，让 query 的协议重试/优雅降级接住，
                 # 而不是漏成 500。编译轮保持可解析失败语义，交给引擎自身重试。
-                if tools is not None or is_traversal:
+                if tools is not None:
                     err: Exception = RuntimeError(
                         f"MODEL_INVALID_JSON: 模型输出不可解析/不符合 schema: {exc}"
                     )

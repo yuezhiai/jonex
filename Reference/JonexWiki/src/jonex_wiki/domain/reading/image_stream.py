@@ -14,12 +14,14 @@ from .image_service import get_image, image_file
 
 
 async def image_response(
-    layout, tenant_id, kb_id, revision, asset_id, document_id, variant, headers
+    layout, tenant_id, kb_id, revision, asset_id, document_id, variant, headers, *, visibility_guard=None
 ):
     if not revision:
         raise ValidationError("IMAGE_REVISION_REQUIRED")
     async with layout.version_lock(tenant_id, kb_id):
         view = pinned_view(layout, tenant_id, kb_id, revision)
+        if visibility_guard:
+            await visibility_guard(layout.versions_dir(tenant_id, kb_id, view.manifest_hash))
         asset = await asyncio.to_thread(get_image, view, asset_id, document_id)
         path, rendition = await asyncio.to_thread(
             image_file,

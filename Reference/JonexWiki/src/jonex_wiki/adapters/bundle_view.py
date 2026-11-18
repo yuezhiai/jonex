@@ -16,13 +16,25 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 from threading import RLock
 from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Tuple
 
 from jonex_wiki.kernel.ports import BundleView,RevisionFileReference
+
+
+def bundle_sha_from_files(files: Mapping[str, str]) -> str:
+    digest = hashlib.sha256()
+    for path, checksum in sorted(files.items()):
+        digest.update(path.encode())
+        digest.update(b"\0")
+        decoded = bytes.fromhex(checksum)
+        if len(decoded) != digest.digest_size:
+            raise ValueError("invalid bundle file checksum")
+        digest.update(decoded)
+    return digest.hexdigest()
 
 
 def _media_type(path: str) -> str:
@@ -102,7 +114,8 @@ class DirectoryBundleView(BundleView):
         self.is_published_revision = self._dir.parent.name != "staging"
         self._verified_files: Dict[str, tuple] = {}
         manifest_path = self._dir / "indexes" / "manifest.json"
-        self._manifest_raw: Dict[str, Any] = json.loads(manifest_path.read_text("utf-8"))
+        index = json.loads(manifest_path.read_text("utf-8"))
+        self._manifest_raw = {key: index[key] for key in ("bundle_sha", "files") if key in index}
         self._revision_raw = read_revision_header(self._dir)
 
         bundle_sha = self._manifest_raw.get("bundle_sha") or self._dir.name
@@ -115,6 +128,9 @@ class DirectoryBundleView(BundleView):
         self.revision_id = self._revision_raw.get("revision_id") or bundle_sha
         self.manifest_hash = bundle_sha
 
+    @cached_property
+    def manifest(self) -> Dict[str, Any]:
+        """Build the compatibility projection when a caller requests it."""
         files_raw = self._manifest_raw.get("files", {})
         counts = {
             "sources": self._revision_raw.get("source_count", 0),
@@ -122,8 +138,7 @@ class DirectoryBundleView(BundleView):
             "claims": self._revision_raw.get("claim_count", 0),
             "open_errors": self._revision_raw.get("open_errors", 0),
         }
-        # core-compatible container-manifest shape (engine reads view.manifest).
-        self.manifest: Dict[str, Any] = {
+        return {
             "format": "jonex-wiki-directory",
             "schema_version": 1,
             "revision_id": self.revision_id,
@@ -187,6 +202,12 @@ class DirectoryBundleView(BundleView):
             remember_verified_file(self._file_identity(after),checksum)
         return str(target)
 
+    def verify_manifest_identity(self) -> None:
+        """Verify the content address using the pinned file list, without reading bodies."""
+        files = self._manifest_raw.get("files")
+        if not isinstance(files, dict) or bundle_sha_from_files(files) != self.manifest_hash:
+            raise ValueError("bundle manifest identity mismatch")
+
     def file_reference(self,path):
         return RevisionFileReference(path,self._manifest_raw['files'][path],lambda:self.read_bytes(path),
             str(self._dir/path),lambda:self.verified_file_path(path))
@@ -224,7 +245,9 @@ class DirectoryBundleView(BundleView):
             digest.update(path.encode())
             digest.update(b"\0")
             digest.update(data_hash)
-        if digest.hexdigest() != self.manifest_hash or self.manifest_hash != self._dir.name:
+        if digest.hexdigest() != self.manifest_hash or (
+            self.is_published_revision and self.manifest_hash != self._dir.name
+        ):
             raise ValueError("bundle directory identity mismatch")
 
     def open_sqlite(self, path: str):

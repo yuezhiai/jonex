@@ -130,44 +130,6 @@ def source_fingerprint(
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def classify_changes(
-    prev_digests: dict[str, str],  # source_id → fingerprint
-    curr_digests: dict[str, str],
-    curr_artifacts: list[Any],
-) -> dict[str, list[Any]]:
-    """Classify each source as new, replay, changed, or removed.
-
-    ``new``, ``replay`` and ``changed`` contain *every* ordered artifact for
-    the sources they classify, so a multi-chunk source is never collapsed to a
-    single passage.  ``removed_ids`` lists source ids that disappeared.
-    """
-    new: list[Any] = []
-    replay: list[Any] = []
-    changed: list[Any] = []
-    removed_ids: list[str] = [
-        aid for aid in prev_digests if aid not in curr_digests
-    ]
-
-    by_source: dict[str, list[Any]] = {}
-    for artifact in curr_artifacts:
-        by_source.setdefault(artifact.source_id, []).append(artifact)
-
-    for source_id, artifacts in by_source.items():
-        if source_id not in prev_digests:
-            new.extend(artifacts)
-        elif prev_digests[source_id] == curr_digests[source_id]:
-            replay.extend(artifacts)
-        else:
-            changed.extend(artifacts)
-
-    return {
-        "new": new,
-        "replay": replay,
-        "changed": changed,
-        "removed_ids": removed_ids,
-    }
-
-
 def semantic_metadata(value):
     if isinstance(value, dict):
         return {key: semantic_metadata(item) for key, item in value.items()
