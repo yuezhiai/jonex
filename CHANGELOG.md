@@ -4,6 +4,29 @@ All notable changes to Jonex Platform will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to follow [Semantic Versioning](https://semver.org/). Release sections are dated by public release; version tags have not yet been adopted.
 
+## [2026-11-20]
+
+### Added
+
+- Ontology reasoning: axioms and reasoning rules with YAML contracts, rule authoring, conflict detection and reasoning views.
+- Task center: unified knowledge-base parse/compile definition (three-stage `start`/`steps`/`end`), task definition editor, execution list, run and settings dialogs.
+- Jonex Wiki engine: agent compile adapters, authoring batches, coherent catalog, reading projection, source identity and heading references, table quality and navigation, PDF table parsing and direct-file evidence.
+- Wiki agent runtime deployment: runtime setup and preflight scripts, seccomp profile, AppArmor policy and `make wiki-check`.
+- Knowledge search: no-answer detection, wiki trace model, presentation helpers and session runtime store.
+- Gateway and MCP server wiki page read regression coverage and ontology degradation handling.
+
+### Changed
+
+- Knowledge-base document parsing, reconciliation, wiki delivery and ingest backend dispatch refreshed.
+- LightRAG: connection pool rebuild, retry policy, health probe, chunk limit and document anchor index.
+- PostgreSQL updates: task step concurrency, ontology axioms and reasoning rules, task definition management, last-step tristate and LightRAG chunk index.
+- Deployment service wiring, environment templates and wiki runtime configuration refreshed.
+
+### Fixed
+
+- Document archive and delete alignment, provenance degradation, Neo4j unavailability and sidecar invoke status handling.
+- Monitor acceptance, schema generation backend and search history classification fixes.
+
 ## [2026-11-17]
 
 ### Added
