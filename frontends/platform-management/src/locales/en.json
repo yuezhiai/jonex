@@ -56,7 +56,9 @@
     "disconnect": "Disconnect",
     "searchLabel": "Search",
     "loadFailed": "Load failed",
+    "operationFailed": "Operation failed",
     "refresh": "Refresh",
+    "reset": "Reset",
     "noPermission": "No permission",
     "readOnlyHint": "You have view-only access. Contact an administrator to make changes.",
     "view": "View"
@@ -332,6 +334,100 @@
   },
   "taskCenter": {
     "title": "Task Center",
+    "definition": {
+      "subtitle": "Task definitions. Click a task name to view its executions",
+      "searchPlaceholder": "Search task name",
+      "statusPlaceholder": "All statuses",
+      "status": {
+        "draft": "Draft",
+        "published": "Published",
+        "disabled": "Disabled"
+      },
+      "scope": {
+        "system": "System"
+      },
+      "result": {
+        "pending": "Queued",
+        "running": "Running",
+        "completed": "Success",
+        "failed": "Failed",
+        "stopped": "Stopped"
+      },
+      "column": {
+        "name": "Task name",
+        "executionCount": "Executions",
+        "lastExecutedAt": "Last executed",
+        "lastResult": "Last result",
+        "createdBy": "Created by"
+      },
+      "action": {
+        "create": "Create task",
+        "run": "Run",
+        "edit": "Edit",
+        "more": "More",
+        "enable": "Enable",
+        "disable": "Disable",
+        "delete": "Delete",
+        "copy": "Duplicate",
+        "runSuccess": "Execution triggered",
+        "runUnavailable": "Only published tasks can be run",
+        "statusSuccess": "Status updated",
+        "publishSuccess": "Task published",
+        "deleteConfirm": "Delete task \"{{name}}\"?",
+        "deleteSuccess": "Deleted",
+        "deleteFailed": "Delete failed: only draft or disabled tasks can be deleted",
+        "copySuccess": "Task duplicated"
+      },
+      "create": {
+        "title": "Create task",
+        "success": "Task created",
+        "spaceRequired": "Select a space in the workspace switcher before creating a task",
+        "hint": "The task is created as a draft in the current space. Add its inputs and steps in the editor next."
+      },
+      "basicInfo": {
+        "title": "Edit basic info",
+        "nameRequired": "Please enter a task name",
+        "nameTooLong": "Task name cannot exceed 128 characters",
+        "namePlaceholder": "Enter a task name",
+        "descriptionLabel": "Description",
+        "descriptionPlaceholder": "Enter a description",
+        "saveSuccess": "Basic info saved",
+        "saveFailed": "Save failed, the task may have been deleted"
+      },
+      "settings": {
+        "title": "Task settings",
+        "basicSection": "Basic info",
+        "triggerSection": "Triggers",
+        "triggerHint": "Only published tasks accept runs. Changes take effect immediately; running tasks are unaffected.",
+        "manual": "Manual run",
+        "manualDefault": "Enabled",
+        "manualDesc": "Available to authorized workspace members on published tasks.",
+        "saveSuccess": "Task settings saved"
+      },
+      "header": {
+        "edit": "Edit task",
+        "run": "Run task"
+      }
+    },
+    "executions": {
+      "title": "Task executions",
+      "pickTaskTitle": "Pick a task from the list",
+      "pickTaskDesc": "Executions are viewed per task: open a task in the list to see all of its executions.",
+      "backToList": "Back to task list"
+    },
+    "run": {
+      "title": "Run task",
+      "noInputs": "This task takes no inputs",
+      "documentId": "Document ID",
+      "documentIdPlaceholder": "Enter the document ID to process",
+      "fileName": "File name",
+      "fileNamePlaceholder": "Optional, helps identify the run",
+      "json": "Value (JSON)",
+      "invalidJson": "Enter a valid JSON value",
+      "required": "{{name}} is required",
+      "success": "Execution triggered",
+      "loadFailed": "Failed to load task inputs"
+    },
     "filter": {
       "keyword": "Task name",
       "keywordPlaceholder": "Search task name or ID",
@@ -356,7 +452,8 @@
       "success": "Completed",
       "failed": "Failed",
       "timeout": "Timed out",
-      "stopped": "Stopped"
+      "stopped": "Stopped",
+      "skipped": "Skipped"
     },
     "column": {
       "name": "Task name",
@@ -441,6 +538,93 @@
         "chunks": "Document parse result",
         "ontology": "Knowledge graph",
         "wiki": "Wiki pages"
+      }
+    },
+    "editor": {
+      "title": "Task editor",
+      "empty": "No variables",
+      "end": {
+        "hint": "The end node only declares outputs; actual values come from each step's input bindings"
+      },
+      "loadFailed": "Failed to load the task",
+      "notFound": "Task not found",
+      "systemReadOnly": "System tasks are read-only",
+      "draftHint": "This task has no draft yet. Saving creates a new draft version; the published version is untouched until you publish again.",
+      "node": {
+        "start": "Start",
+        "parse": "Document parsing",
+        "compile": "Knowledge compile",
+        "end": "End"
+      },
+      "section": {
+        "input": "Input variables",
+        "output": "Output variables",
+        "advanced": "Advanced",
+        "outputShort": "Output",
+        "nodes": "Business nodes"
+      },
+      "field": {
+        "upstreamPlaceholder": "Select upstream variable",
+        "noUpstream": "No upstream variable available: add a matching input on the start node, or add a previous business node first",
+        "derived": "Filled from Document parsing",
+        "maxRuns": "Max retries",
+        "timeout": "Timeout (s)",
+        "retryInterval": "When retries run out",
+        "varName": "Variable name",
+        "varType": "Type",
+        "required": "Required",
+        "nameRequired": "Variable name is required",
+        "varNamePlaceholder": "Enter variable name",
+        "upstream": "Upstream variable",
+        "dataType": "Type",
+        "bindRequired": "Required input {{field}} of \"{{step}}\" has no source selected",
+        "nameDuplicate": "Variable names must be unique",
+        "nameInvalid": "Start with a letter or underscore; only letters, digits, underscores and hyphens are allowed"
+      },
+      "options": {
+        "noRetry": "No retry",
+        "retry1": "1 time",
+        "retry2": "2 times",
+        "retry3": "3 times",
+        "stopFlow": "Stop workflow",
+        "continueFlow": "Continue"
+      },
+      "action": {
+        "publish": "Publish",
+        "addStep": "Add business node",
+        "remove": "Remove step",
+        "addInput": "Add input",
+        "removeInput": "Remove input",
+        "deleteNode": "Delete node",
+        "addOutput": "Add output variable",
+        "removeOutput": "Remove output variable",
+        "saveSuccess": "Saved as draft",
+        "saveFailed": "Save failed",
+        "publishSuccess": "Published",
+        "publishFailed": "Publish failed",
+        "noChanges": "No unsaved changes"
+      },
+      "nodeDesc": {
+        "parse": "Parse the document and split it into retrievable chunks",
+        "compile": "Compile chunks into the ontology graph and wiki pages"
+      },
+      "group": {
+        "document": "Document processing",
+        "knowledge": "Knowledge processing"
+      },
+      "nodeStatus": {
+        "configured": "Configured",
+        "startHint": "Workflow entry",
+        "endHint": "Workflow exit",
+        "varCount": "{{inputs}} inputs · {{outputs}} outputs"
+      },
+      "output": {
+        "readonly": "Read only"
+      },
+      "step": {
+        "added": "Added",
+        "needParse": "Add Document parsing first",
+        "required": "Add at least one business node before saving"
       }
     }
   },
