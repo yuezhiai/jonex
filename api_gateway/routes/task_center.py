@@ -29,7 +29,7 @@ import random
 from typing import Any, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 from api_gateway.deps import raise_from_capability_result, require_auth_header
 from api_gateway.identity import identity_fields
@@ -51,7 +51,11 @@ router = APIRouter(dependencies=[Depends(require_auth_header)])
 
 
 async def _call_tc_capability(
-    request: Request, action: str, payload: dict[str, Any]
+    request: Request,
+    action: str,
+    payload: dict[str, Any],
+    *,
+    retry_transport: bool = True,
 ) -> Any:
     """把一次调用转成 Sidecar `/invoke`。
 
@@ -135,7 +139,7 @@ async def _call_tc_capability(
                 )
             except httpx.TransportError as e:
                 att.fail(error_code=502, error_message=e)
-                if attempt < max_retries:
+                if attempt < max_retries and retry_transport:
                     # 还会重试 ⇒ 本次不是最后一次尝试。is_final 无 setter，就地降级快照。
                     att.mark_final(False)
                     delay = min(base_delay * (2**attempt), max_delay)
@@ -184,9 +188,189 @@ async def _call_tc_capability(
 # 这两个深度不同、其实撞不上，但顺序摆对，以后加 `/tasks/stats` 之类才不会踩。
 
 
+# ============================================================
+# 任务定义管理（2026-11-18 加，需求 3~8 / 11~15）
+# ============================================================
+#
+# 全部经 Sidecar `/invoke` 走 `def.*` action；能力入口已登记权限码
+# （读 `task_center:read`、写 `task_center:write`），服务层再判空间身份。
+# 写操作要求「空间管理员 且 task_center:write」，两者缺一只能看。
+
+
+@router.get("/steps", summary="编排步骤清单")
+async def list_steps(request: Request):
+    """需求 15：无入参，返回 `id / step_code / name / input_schema / output_schema`。"""
+    result = await _call_tc_capability(request, "def.steps", {})
+    return success_response(data=result)
+
+
+@router.get("/definitions", summary="任务定义分页列表")
+async def list_definitions(
+    request: Request,
+    keyword: Optional[str] = Query(None, description="任务定义名称模糊搜索"),
+    status: Optional[str] = Query(
+        None, description="定义状态：draft / published / disabled"
+    ),
+    scope: Optional[str] = Query(None, description="system / space"),
+    space_id: Optional[str] = Query(None, max_length=64, description="空间 ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1),
+):
+    """需求 3：系统级定义也会返回（前端按 `scope` 标记为只读）。"""
+    payload: dict[str, Any] = {"page": page, "page_size": page_size}
+    if keyword:
+        payload["keyword"] = keyword
+    if status:
+        payload["status"] = status
+    if scope:
+        payload["scope"] = scope
+    if space_id:
+        payload["space_id"] = space_id
+    result = await _call_tc_capability(request, "def.list", payload)
+    return success_response(data=result)
+
+
+@router.post("/definitions", summary="创建任务定义")
+async def create_definition(request: Request, body: dict[str, Any]):
+    """需求 4：`space_id` + `name` 必填，`description` 可选；创建为草稿状态。"""
+    result = await _call_tc_capability(request, "def.create", body)
+    return success_response(data=result)
+
+
+@router.get("/definitions/{definition_id}", summary="任务定义详情")
+async def get_definition(request: Request, definition_id: str):
+    """定义详情：定义本身 + 版本概览 + 当前草稿版本号（前端编辑回显用）。"""
+    result = await _call_tc_capability(
+        request, "def.get", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
+@router.patch("/definitions/{definition_id}", summary="编辑任务定义")
+async def update_definition(
+    request: Request, definition_id: str, body: dict[str, Any]
+):
+    """需求 5：名称必填（判重排除自己）、描述可选。"""
+    payload = {**body, "definition_id": definition_id}
+    result = await _call_tc_capability(request, "def.update", payload)
+    return success_response(data=result)
+
+
+@router.delete("/definitions/{definition_id}", summary="删除任务定义")
+async def delete_definition(request: Request, definition_id: str):
+    """需求 8：仅草稿 / 已停用可删；软删定义 + 版本 + 触发器。"""
+    result = await _call_tc_capability(
+        request, "def.delete", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
+@router.get(
+    "/definitions/{definition_id}/input-schema",
+    summary="查询执行所需的开始节点参数定义",
+)
+async def definition_input_schema(request: Request, definition_id: str):
+    """执行前置：返回**最新已发布编排**的开始节点参数（字段名 → 规格，含 file 类型）。
+
+    前端「执行」弹窗按它渲染表单；没有已发布版本时返回空 `input_schema`。
+    """
+    result = await _call_tc_capability(
+        request, "def.input_schema", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
+@router.post("/definitions/{definition_id}/run", summary="执行任务定义")
+async def run_definition(
+    request: Request,
+    definition_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+):
+    """需求 6：仅已发布可执行；`inputs` 按开始节点变量校验。"""
+    # body 里的同名字段**不得覆盖路径参数**（2026-11-20 审计：否则
+    # POST /definitions/A/run + body.definition_id=B 会去执行 B，审计也指错对象）。
+    payload = {**(body or {}), "definition_id": definition_id}
+    result = await _call_tc_capability(
+        request, "def.run", payload, retry_transport=False
+    )
+    return success_response(data=result)
+
+
+@router.post("/definitions/{definition_id}/copy", summary="复制任务定义")
+async def copy_definition(request: Request, definition_id: str):
+    """需求 7：同空间、新定义草稿、编排与全部历史版本原样复制。"""
+    # copy 非幂等：瞬断重试会复制出第二份定义（2026-11-20 审计）
+    result = await _call_tc_capability(
+        request, "def.copy", {"definition_id": definition_id}, retry_transport=False
+    )
+    return success_response(data=result)
+
+
+@router.get("/definitions/{definition_id}/versions", summary="编排版本查询")
+async def list_definition_versions(request: Request, definition_id: str):
+    """需求 11：全部版本号+状态、最新版本号+状态、执行用版本号。"""
+    result = await _call_tc_capability(
+        request, "def.version_list", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
+@router.get(
+    "/definitions/{definition_id}/versions/{version_no}", summary="编排版本详情"
+)
+async def get_definition_version(
+    request: Request, definition_id: str, version_no: int
+):
+    """取某版编排详情（草稿、已发布都能取）。"""
+    result = await _call_tc_capability(
+        request,
+        "def.version_get",
+        {"definition_id": definition_id, "version_no": version_no},
+    )
+    return success_response(data=result)
+
+
+@router.put(
+    "/definitions/{definition_id}/orchestration", summary="保存编排（草稿 / 发布）"
+)
+async def save_orchestration(
+    request: Request, definition_id: str, body: dict[str, Any]
+):
+    """需求 12：`config` + `status`（draft / published）；四分支见设计文档。"""
+    payload = {**body, "definition_id": definition_id}
+    result = await _call_tc_capability(request, "def.orchestration_save", payload)
+    return success_response(data=result)
+
+
+@router.post("/definitions/{definition_id}/publish", summary="发布任务定义")
+async def publish_definition(request: Request, definition_id: str):
+    """需求 13：草稿 / 已停用 → 已发布，前提是有已发布版本。"""
+    result = await _call_tc_capability(
+        request, "def.publish", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
+@router.post("/definitions/{definition_id}/disable", summary="停用任务定义")
+async def disable_definition(request: Request, definition_id: str):
+    """需求 14：已发布 → 已停用；调度扫描会跳过停用定义。"""
+    result = await _call_tc_capability(
+        request, "def.disable", {"definition_id": definition_id}
+    )
+    return success_response(data=result)
+
+
 @router.get("/tasks", summary="任务分页列表")
 async def list_tasks(
     request: Request,
+    # `definition_id` **可选**（2026-11-20 放宽）：传了就精确筛该定义下的任务；
+    # 不传 = 不按定义筛，可见范围由能力侧的空间权限收敛
+    # （`visible_space_ids_for`，见 `page_tasks` 的空间维度那段）。
+    # 先前写成必填（`Query(...)`）会让所有没有定义上下文的口子直接 422 ——
+    # 平台管理「任务中心」列表页就只传 space_id / 分页。
+    definition_id: Optional[str] = Query(
+        None, min_length=1, description="任务定义 ID（可选；不传 = 不按定义筛）"
+    ),
     keyword: Optional[str] = Query(None, description="模糊匹配任务名或任务 id"),
     start_time: Optional[str] = Query(
         None, description="按建任务时间筛的起始（ISO 8601，含）"
@@ -226,7 +410,12 @@ async def list_tasks(
     `status_counts` 里的数字**只受「除 status 外」的筛选条件影响**（§4.4）——
     前端切状态页签时它们不变，是给页签角标用的。
     """
-    payload: dict[str, Any] = {"page": page, "page_size": page_size}
+    payload: dict[str, Any] = {
+        "page": page,
+        "page_size": page_size,
+    }
+    if definition_id:
+        payload["definition_id"] = definition_id
     if keyword:
         payload["keyword"] = keyword
     if start_time:

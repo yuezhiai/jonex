@@ -265,7 +265,9 @@ async def _call_kb_capability_mcp(
 
     last_exc: BaseException | None = None
     wait_before_ms: Optional[int] = None
-    async with httpx.AsyncClient(timeout=_SIDECAR_TIMEOUT) as client:
+    timeout = (float(os.getenv("GATEWAY_WIKI_SEARCH_TIMEOUT_SEC", "330"))
+               if action in {"search_jonex_wiki", "search_mix", "deep_query"} else _SIDECAR_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(_SIDECAR_MAX_RETRIES + 1):
             # N2 物理 Attempt 埋点（监控旁路，采不到不影响主链路）。
             with attempt_span(

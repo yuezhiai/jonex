@@ -465,6 +465,80 @@ async def upload_document(
     return success_response(data=result)
 
 
+@router.post("/documents/upload-only", summary="上传知识文档（只落文件、不触发处理）")
+async def upload_document_only(
+    request: Request,
+    file: UploadFile = File(None, description="上传的文件（COS 直传模式可不传）"),
+    knowledge_base_id: str = Form(..., min_length=1, max_length=128, description="知识库 ID"),
+    storage_key: Optional[str] = Form(None, description="COS 预上传后的对象键（COS 直传模式）"),
+    storage_backend: Optional[str] = Form(None, description="存储后端，cos 或 local"),
+    doc_id: Optional[str] = Form(None, description="文档 ID（COS 直传模式）"),
+    file_name: Optional[str] = Form(None, description="文件名（COS 直传模式必传）"),
+    mime_type: Optional[str] = Form(None, description="文件 MIME 类型"),
+    folder_id: Optional[str] = Form(None, description="文件夹 ID"),
+    metadata: Optional[str] = Form(None, description="额外元数据（JSON 字符串）"),
+):
+    """**只落文件、不触发解析/编译**（2026-11-18 加，需求 16 的配套）。
+
+    与 `/documents/upload` 的唯一区别：能力层收到 `trigger_processing=false`，
+    文档行停在 `PENDING`，不建接管行、不提交任务。任务定义执行时，前端先调本接口
+    拿到 `{document_id, file_name}`，再作为 `inputs.document` 传给执行接口。
+
+    ⚠️ 不能复用 `/documents/upload`：那条会在上传时立刻提交系统定义的处理任务，
+    同一份文件会被处理两遍。
+    """
+    tenant_id = extract_tenant_id(request)
+    parsed_metadata = _parse_upload_metadata(metadata)
+
+    payload: dict[str, Any] = {"knowledge_base_id": knowledge_base_id}
+    if folder_id:
+        payload["folder_id"] = folder_id
+
+    if storage_key:
+        if doc_id:
+            payload["doc_id"] = doc_id
+        payload["file_name"] = file_name or storage_key.rsplit("/", 1)[-1]
+        payload["file_path"] = storage_key
+        payload["storage_key"] = storage_key
+        _env_backend = (os.getenv("OBJECT_STORAGE_BACKEND", "local") or "local").strip().lower()
+        payload["storage_backend"] = storage_backend or (
+            _env_backend if _env_backend in ("cos", "s3") else "local"
+        )
+        if mime_type:
+            payload["mime_type"] = mime_type
+    else:
+        if file is None:
+            raise InvalidParameterError(message=translate("err.kb.cos_upload_or_storage_key", fallback="传统模式必须上传文件，或 COS 直传模式请传入 storage_key"))
+        content = await file.read()
+        if not content:
+            raise InvalidParameterError(message=translate("err.kb.upload_file_required", fallback="上传文件不能为空"))
+
+        backend = os.getenv("OBJECT_STORAGE_BACKEND", "local").strip().lower()
+        doc_id = str(uuid4())
+        new_key = build_object_key(tenant_id, knowledge_base_id, doc_id, file.filename)
+        await get_object_storage().put_bytes(
+            new_key, content, content_type=_media_type_with_charset(file.content_type)
+        )
+        payload["doc_id"] = doc_id
+        payload["file_name"] = file.filename or "unnamed"
+        payload["mime_type"] = file.content_type
+        payload["file_size"] = len(content)
+        payload["storage_key"] = new_key
+        payload["storage_backend"] = backend
+
+    if parsed_metadata:
+        payload["metadata"] = parsed_metadata
+
+    result = await _call_kb_capability(request, "upload_document_only", payload)
+    # 对外契约用 `document_id`（执行接口的 `inputs.document` 就取这个键）；
+    # 能力层返回的是文档行 `to_dict()`，主键叫 `id` —— 审计发现两处不一致，
+    # 前端照文档取 `document_id` 会拿到 undefined。
+    data = dict(result or {})
+    if "document_id" not in data and data.get("id"):
+        data["document_id"] = data["id"]
+    return success_response(data=data)
+
+
 @router.post("/documents/generate-upload-url", summary="生成预签名上传 URL（COS 直传）")
 async def generate_upload_url(
     request: Request,
@@ -1295,13 +1369,75 @@ async def search_jonex_wiki(request: Request, payload: JonexWikiSearchRequest):
         "search_jonex_wiki",
         _schema_payload(payload),
         user_id=_extract_user_id(request),
+        timeout=float(os.getenv("GATEWAY_WIKI_SEARCH_TIMEOUT_SEC", "330")),
     )
     return success_response(data=result)
 
 
+_WIKI_SESSION_ID_RE = re.compile(r"[a-f0-9]{32}")
+
+
+def _wiki_progress_frame(events: list, status: str, session_id: Optional[str] = None) -> str:
+    payload: dict[str, Any] = {"events": events, "status": status}
+    if session_id:
+        payload["session_id"] = session_id
+    return "event: progress\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+async def _wiki_session_frames(request: Request, session_id: str, user_id: Optional[str],
+                               client: httpx.AsyncClient):
+    """把一个 Wiki 检索会话的公开进度转成 SSE 帧。
+
+    连接只代表「谁在看」，不代表任务本身：客户端断开只是停止观看，任务继续在能力
+    服务后台执行（Redis 里有进度与结果，最多 SESSION_TTL 后自然过期）。**终止只走
+    用户显式调用的 `/search/jonex_wiki/cancel`**，这里任何路径都不取消任务。
+    """
+    session_data = {"session_id": session_id}
+    previous = None
+    for _ in range(2400):  # 与 SESSION_TTL（1200s）对齐
+        if await request.is_disconnected():
+            return
+        try:
+            state = await _call_kb_capability(request, "poll_jonex_wiki_search", session_data,
+                                              user_id=user_id, http_client=client)
+        except Exception:
+            # 会话不存在 / 已过期 / 无权访问：对前端是「恢复不了」，不是服务异常。
+            # code 供前端区分「会话过期」与真正的检索失败（后者显示错误卡片）。
+            yield 'event: error\ndata: ' + json.dumps(
+                {"message": "Wiki search session expired", "code": "session_expired"}) + "\n\n"
+            return
+        status = state["status"]
+        if status == "done":
+            public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
+            if public != previous:
+                yield "event: progress\ndata: " + public + "\n\n"
+            yield "event: complete\ndata: " + json.dumps(state["result"], ensure_ascii=False) + "\n\n"
+            return
+        if status in ("failed", "cancelled"):
+            yield "event: error\ndata: " + json.dumps({"message": state.get("error") or status}) + "\n\n"
+            return
+        public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
+        if public != previous:
+            yield "event: progress\ndata: " + public + "\n\n"
+            previous = public
+        else:
+            yield ": heartbeat\n\n"
+        await asyncio.sleep(0.5)
+    yield 'event: error\ndata: {"message":"Wiki search timed out"}\n\n'
+
+
+async def _close_quietly(client: httpx.AsyncClient) -> None:
+    """关闭轮询客户端：即使当前协程已被取消也要把连接放掉。"""
+    try:
+        await asyncio.shield(client.aclose())
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
 @router.post("/search/jonex_wiki/stream", summary="Wiki 检索实时进度")
 async def stream_jonex_wiki(request: Request, payload: JonexWikiSearchRequest):
-    import json
     user_id = _extract_user_id(request)
     client = httpx.AsyncClient(timeout=180)
     try:
@@ -1310,52 +1446,38 @@ async def stream_jonex_wiki(request: Request, payload: JonexWikiSearchRequest):
     except BaseException:
         await client.aclose()
         raise
-    session_data = {"session_id": started["session_id"]}
+    session_id = started["session_id"]
 
     async def events():
-        terminal = False
-        previous = None
         try:
-            yield "event: progress\ndata: " + json.dumps({"events": [], "status": "running",
-                                                                     "session_id": started["session_id"]}) + "\n\n"
-            for _ in range(1200):
-                if await request.is_disconnected():
-                    break
-                state = await _call_kb_capability(request, "poll_jonex_wiki_search", session_data, user_id=user_id, http_client=client)
-                status = state["status"]
-                if status == "done":
-                    terminal = True
-                    public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
-                    if public != previous:
-                        yield "event: progress\ndata: " + public + "\n\n"
-                    yield "event: complete\ndata: " + json.dumps(state["result"], ensure_ascii=False) + "\n\n"
-                    return
-                if status in ("failed", "cancelled"):
-                    terminal = True
-                    yield "event: error\ndata: " + json.dumps({"message": state.get("error") or status}) + "\n\n"
-                    return
-                public = json.dumps({"events": state["events"], "status": status}, ensure_ascii=False)
-                if public != previous:
-                    yield "event: progress\ndata: " + public + "\n\n"
-                    previous = public
-                else:
-                    yield ": heartbeat\n\n"
-                await asyncio.sleep(0.5)
-            yield 'event: error\ndata: {"message":"Wiki search timed out"}\n\n'
+            yield _wiki_progress_frame([], "running", session_id=session_id)
+            async for frame in _wiki_session_frames(request, session_id, user_id, client):
+                yield frame
         finally:
-            async def cleanup():
-                try:
-                    if not terminal:
-                        await _call_kb_capability(request, "cancel_jonex_wiki_search", session_data,
-                                                  user_id=user_id, http_client=client)
-                finally:
-                    await client.aclose()
-            # Both native cancellation and socket cleanup outlive the browser disconnect.
-            pending = asyncio.create_task(cleanup())
-            try:
-                await asyncio.shield(pending)
-            except asyncio.CancelledError:
-                pass
+            await _close_quietly(client)
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.post("/search/jonex_wiki/sessions/{session_id}/stream", summary="恢复 Wiki 检索实时进度")
+async def resume_jonex_wiki_stream(request: Request, session_id: str):
+    """按 session_id 重新订阅一次检索：刷新 / 离开页面回来后接着看，不重新发起检索。
+
+    与首次订阅共用轮询逻辑；会话归属由能力层 `poll` 的 owner 校验把关，别人的
+    session_id 与不存在的会话一样只会拿到 `event: error`。
+    """
+    if not _WIKI_SESSION_ID_RE.fullmatch(session_id):
+        raise InvalidParameterError(message="无效的检索会话")
+    user_id = _extract_user_id(request)
+    client = httpx.AsyncClient(timeout=180)
+
+    async def events():
+        try:
+            async for frame in _wiki_session_frames(request, session_id, user_id, client):
+                yield frame
+        finally:
+            await _close_quietly(client)
 
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1415,6 +1537,7 @@ async def search_mix(request: Request, payload: MixSearchRequest):
         "search_mix",
         _schema_payload(payload),
         user_id=_extract_user_id(request),
+        timeout=float(os.getenv("GATEWAY_WIKI_SEARCH_TIMEOUT_SEC", "330")),
     )
     return success_response(data=result)
 
@@ -1427,6 +1550,7 @@ async def search_deep(request: Request, payload: DeepSearchRequest):
         "deep_query",
         _schema_payload(payload),
         user_id=_extract_user_id(request),
+        timeout=float(os.getenv("GATEWAY_WIKI_SEARCH_TIMEOUT_SEC", "330")),
     )
     return success_response(data=result)
 
@@ -4618,6 +4742,190 @@ async def restore_abstract_schema_snapshot(
     return success_response(data=result)
 
 
+# ════════════════════════════════════════════════════════════
+# 本体公理（T4）
+#
+# 公理表是 KB 级唯一权威（D8）；抽象 schema 的 axioms 只作 Studio 往返镜像。
+# ════════════════════════════════════════════════════════════
+
+@router.get("/ontology/reasoning/contract", summary="推理契约版本与公理白名单")
+async def get_reasoning_contract(request: Request):
+    result = await _call_kb_capability(request, "get_reasoning_contract", {})
+    return success_response(data=result)
+
+
+@router.get("/ontology/axioms", summary="列出知识库公理")
+async def list_ontology_axioms(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "list_ontology_axioms", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/axioms/export", summary="导出公理 YAML")
+async def export_ontology_axioms(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "export_ontology_axioms", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/axioms/{axiom_key}", summary="读取单条公理")
+async def get_ontology_axiom(
+    request: Request,
+    axiom_key: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "get_ontology_axiom",
+        {"knowledge_base_id": knowledge_base_id, "axiom_key": axiom_key},
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/axioms/validate", summary="校验公理（不落库）")
+async def validate_ontology_axioms(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "validate_ontology_axioms", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/axioms/import", summary="导入公理 YAML")
+async def import_ontology_axioms(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "import_ontology_axioms", payload)
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/axioms/{axiom_key}/status/preview",
+    summary="公理启停影响面预览（不落库）",
+)
+async def preview_axiom_status(
+    request: Request, axiom_key: str, payload: dict = Body(...),
+):
+    body = dict(payload or {})
+    body["axiom_key"] = axiom_key
+    result = await _call_kb_capability(request, "preview_axiom_status", body)
+    return success_response(data=result)
+
+
+@router.put(
+    "/ontology/axioms/{axiom_key}/status",
+    summary="启用 / 停用公理（状态切换）",
+)
+async def set_axiom_status(
+    request: Request, axiom_key: str, payload: dict = Body(...),
+):
+    body = dict(payload or {})
+    body["axiom_key"] = axiom_key
+    result = await _call_kb_capability(request, "set_axiom_status", body)
+    return success_response(data=result)
+
+
+# ════════════════════════════════════════════════════════════
+# 推理规则（T6）
+# ════════════════════════════════════════════════════════════
+
+@router.get("/ontology/reasoning-rules", summary="列出推理规则")
+async def list_reasoning_rules(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "list_reasoning_rules", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/reasoning-rules/export", summary="导出规则 YAML")
+async def export_reasoning_rules(
+    request: Request,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "export_reasoning_rules", {"knowledge_base_id": knowledge_base_id},
+    )
+    return success_response(data=result)
+
+
+@router.get("/ontology/reasoning-rules/{rule_key}", summary="读取单条规则")
+async def get_reasoning_rule(
+    request: Request,
+    rule_key: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "get_reasoning_rule",
+        {"knowledge_base_id": knowledge_base_id, "rule_key": rule_key},
+    )
+    return success_response(data=result)
+
+
+@router.post("/ontology/reasoning-rules/validate", summary="校验规则（不落库）")
+async def validate_reasoning_rules(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "validate_reasoning_rules", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/reasoning-rules", summary="新建推理规则")
+async def create_reasoning_rule(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "create_reasoning_rule", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/reasoning-rules/import", summary="导入规则 YAML")
+async def import_reasoning_rules(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "import_reasoning_rules", payload)
+    return success_response(data=result)
+
+
+@router.post("/ontology/reasoning-rules/preview", summary="规则试跑（不进作答）")
+async def preview_reasoning(request: Request, payload: dict = Body(...)):
+    result = await _call_kb_capability(request, "preview_reasoning", payload)
+    return success_response(data=result)
+
+
+@router.put("/ontology/reasoning-rules/{rule_key}", summary="更新推理规则")
+async def update_reasoning_rule(
+    request: Request, rule_key: str, payload: dict = Body(...),
+):
+    body = dict(payload or {})
+    body["rule_key"] = rule_key
+    result = await _call_kb_capability(request, "update_reasoning_rule", body)
+    return success_response(data=result)
+
+
+@router.delete("/ontology/reasoning-rules/{rule_key}", summary="删除推理规则")
+async def delete_reasoning_rule(
+    request: Request,
+    rule_key: str,
+    knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
+):
+    result = await _call_kb_capability(
+        request, "delete_reasoning_rule",
+        {"knowledge_base_id": knowledge_base_id, "rule_key": rule_key},
+    )
+    return success_response(data=result)
+
+
+@router.post(
+    "/ontology/reasoning-rules/{rule_key}/enabled",
+    summary="启用 / 停用推理规则",
+)
+async def set_reasoning_rule_enabled(
+    request: Request, rule_key: str, payload: dict = Body(...),
+):
+    body = dict(payload or {})
+    body["rule_key"] = rule_key
+    result = await _call_kb_capability(request, "set_reasoning_rule_enabled", body)
+    return success_response(data=result)
+
+
 @router.post("/ontology/kb-tools", summary="新建本库工具")
 async def create_kb_tool(request: Request, payload: dict = Body(...)):
     result = await _call_kb_capability(request, "create_kb_tool", payload)
@@ -4916,18 +5224,38 @@ async def update_ontology_instance(
     entity_type: str,
     canonical_name: str,
     knowledge_base_id: str = Query(..., min_length=1, max_length=128, description="知识库 ID"),
-    updates: dict = Body(..., embed=True, description="待更新字段（name/aliases/description/attributes）"),
+    updates: dict = Body(
+        ...,
+        embed=True,
+        description=(
+            "待更新字段，允许的键：entity_type（目标实体类型，1-128 字符）、"
+            "name、aliases、description、attributes"
+        ),
+    ),
+    merge_target: bool = Body(
+        False,
+        embed=True,
+        description=(
+            "目标键 (类型, 名称) 已存在时是否合并到已有实例；默认 false 返回 1003 "
+            "冲突，由前端确认后再以 true 重发"
+        ),
+    ),
 ):
-    """更新本体实例的名称/别名/描述/属性。
+    """更新本体实例的名称/别名/描述/属性，或修改实体类型。
 
-    entity_type 和 canonical_name 从 URL 路径获取，knowledge_base_id 从查询参数获取，
-    请求体只接收 ``updates`` 字典。
+    路径中的 entity_type 和 canonical_name 是变更前的定位键，knowledge_base_id 从
+    查询参数获取，请求体接收 ``updates`` 字典与可选的 ``merge_target``。
+    ``updates.entity_type`` / ``updates.name`` 改变定位键：新键不存在时节点原地迁移
+    （关系边保留）；新键已存在时默认返回 1003 冲突，``merge_target=true`` 才合并到
+    已有实例（合并不可逆，源节点原名会并入目标别名）。响应 data 中的 ``merged``
+    表示是否发生了合并。
     """
     payload = {
         "knowledge_base_id": knowledge_base_id,
         "entity_type": entity_type,
         "canonical_name": canonical_name,
         "updates": updates,
+        "merge_target": merge_target,
     }
     result = await _call_kb_capability(request, "update_ontology_instance", payload)
     return success_response(data=result, message="本体实例已更新")

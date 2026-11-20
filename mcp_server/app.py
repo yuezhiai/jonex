@@ -188,7 +188,7 @@ async def list_wiki_pages(
     """分页浏览 Jonex Wiki 知识库的页面列表，是 Jonex Wiki 列式浏览的第二列。
 
     仅支持 Jonex Wiki 知识库。可按 list_wiki_topics 返回的主题 id 过滤（含其子节点），
-    也可用 type 做内部过滤（source / table / concept，仅作过滤、不作为第一列暴露）。
+    也可用 type 做内部过滤（source / table / concept / article，仅作过滤、不作为第一列暴露）。
     想浏览本体（lightrag）知识库请用 list_ontology_entity_types / list_ontology_instances。
     知识库选择（二选一）：
     - knowledge_base_id：指定单个知识库。
@@ -207,6 +207,17 @@ async def list_wiki_pages(
         service_id, knowledge_base_id, knowledge_base_ids,
         topic, type, page, page_size,
     )
+
+
+@mcp.tool()
+async def read_wiki_page(service_id: str, knowledge_base_id: str, path: str,
+                         offset: int = 0, max_chars: int = 12000) -> dict:
+    """按页读取已授权的 Wiki 文章正文；长正文通过 next_offset 继续读取。
+
+    先用 list_wiki_pages 取得 canonical path；返回的引用只表示文章链接的来源，
+    不表示每句话都已核验。每次最多 12000 个字符。
+    """
+    return await tools.read_wiki_page(service_id, knowledge_base_id, path, offset, max_chars)
 
 
 @mcp.tool()

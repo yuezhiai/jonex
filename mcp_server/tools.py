@@ -217,6 +217,7 @@ async def call_gateway_ext(
     data: dict | None = None,
     *,
     report_tool: bool = True,
+    degraded_as_error: bool = False,
 ) -> tuple[dict, str | None]:
     """向 Gateway /internal/kb/invoke 发送请求，返回 (capability 响应 data, request_id)。
 
@@ -239,12 +240,19 @@ async def call_gateway_ext(
             只是 belt-and-braces 双保险，任一层回归都不会让同名记录复发。
             真实业务 action 调用保持默认 True，同一工具的多 action / 多 KB
             循环仍归属该工具。
+        degraded_as_error: 是否把响应 ``data.degraded`` 为真的结果翻译成
+            失败（默认 False，完全保持既有行为）。本体只读工具（实体类型 /
+            实例）启用它：服务端在 Neo4j 不可用时返回 200 + ``degraded=true``，
+            而 MCP 的调用方是 AI agent，会把「空列表 + total=0」误判成
+            「这个知识库没有数据」，所以对外必须仍表现为 ``-32000``。
+            邻居展开不启用（契约允许它透传 degraded）。
 
     Returns:
         tuple: (capability 响应数据, 能力信封 request_id 或 None)
 
     Raises:
-        McpToolError(code=-32000): 知识库服务不可用（HTTP 错误 / 超时 / 传输错误 / 业务失败）
+        McpToolError(code=-32000): 知识库服务不可用（HTTP 错误 / 超时 / 传输错误 /
+            业务失败 / ``degraded=true`` 且启用 ``degraded_as_error``）
         McpToolError(code=-32003): 内容重复（409 + 业务码 1003），调用方应按「已存在」处理而非重试
     """
     client = await get_http_client()
@@ -268,6 +276,8 @@ async def call_gateway_ext(
                 "X-Internal-API-Key": settings.INTERNAL_API_KEY,
                 "X-Tenant-ID": tenant_id,
             },
+            **({"timeout": float(os.getenv("MCP_WIKI_SEARCH_TIMEOUT_SEC", "360"))}
+               if action in {"search_jonex_wiki", "search_mix", "deep_query"} else {}),
         )
         resp.raise_for_status()
         result = resp.json()
@@ -374,8 +384,27 @@ async def call_gateway_ext(
 
     # 提取 data 字段（标准 success_response 格式），否则返回原始结果
     if isinstance(result, dict) and "data" in result:
-        return result["data"], request_id
-    return result, request_id
+        payload = result["data"]
+    else:
+        payload = result
+
+    # 降级信号对 AI 调用方有毒：空列表 + total=0 会被读成「库里没有数据」。
+    # 启用了 degraded_as_error 的工具必须把它翻译回失败，对外行为与
+    # Neo4j 异常直接返回 5xx 时一致。
+    if (
+        degraded_as_error
+        and isinstance(payload, dict)
+        and payload.get("degraded")
+    ):
+        logger.error(
+            "Gateway degraded result: action=%s tenant_id=%s reason=%s",
+            action,
+            tenant_id,
+            payload.get("degraded_reason"),
+        )
+        raise McpToolError(code=_ERROR_INTERNAL, message="知识库服务暂不可用")
+
+    return payload, request_id
 
 
 async def call_gateway(
@@ -385,15 +414,23 @@ async def call_gateway(
     data: dict | None = None,
     *,
     report_tool: bool = True,
+    degraded_as_error: bool = False,
 ) -> dict:
     """向 Gateway /internal/kb/invoke 发送请求，只返回 capability 响应 data 部分。
 
     需要能力信封 `request_id` 时用 `call_gateway_ext`。错误映射与
-    `call_gateway_ext` 完全一致。``report_tool`` 语义见 `call_gateway_ext`：
-    工具内部前置校验调用传 False，避免被当成一次真实 MCP 工具调用。
+    `call_gateway_ext` 完全一致。``report_tool`` / ``degraded_as_error`` 语义
+    见 `call_gateway_ext`：工具内部前置校验调用传 ``report_tool=False``，避免
+    被当成一次真实 MCP 工具调用；本体只读工具传 ``degraded_as_error=True``，
+    把 ``degraded=true`` 翻译成 ``-32000``。
     """
     result, _ = await call_gateway_ext(
-        action, tenant_id, mcp_key_id, data, report_tool=report_tool
+        action,
+        tenant_id,
+        mcp_key_id,
+        data,
+        report_tool=report_tool,
+        degraded_as_error=degraded_as_error,
     )
     return result
 
@@ -1244,11 +1281,16 @@ async def _fanout_ontology_action(
     build_payload,
     *,
     deadline_seconds: float | None = None,
+    degraded_as_error: bool = False,
 ) -> list[dict]:
     """逐 KB 串行调用目标 action，独立捕获单库失败。
 
     ``deadline_seconds`` 非空时对整轮扇出设总预算（D11 多跳 × 多 KB）：每库只用
     「剩余时间」等待，超时库按失败组处理，已完成库照常返回。
+
+    ``degraded_as_error`` 透传给 ``call_gateway``：单库返回 ``degraded=true``
+    时按失败组处理。全部库降级 → 复用 ``_raise_if_all_ontology_groups_failed``
+    归一为 ``-32000``；部分库降级 → 该组进 ``errors``，其余组数据照常返回。
 
     Returns:
         与 ``kb_ids`` 同序的 outcomes；成功项 ``{"knowledge_base_id", "data"}``，
@@ -1262,7 +1304,11 @@ async def _fanout_ontology_action(
     for kb_id in kb_ids:
         try:
             coro = call_gateway(
-                action, auth.tenant_id, auth.key_id, build_payload(kb_id)
+                action,
+                auth.tenant_id,
+                auth.key_id,
+                build_payload(kb_id),
+                degraded_as_error=degraded_as_error,
             )
             if deadline is None:
                 data = await coro
@@ -1389,10 +1435,15 @@ async def list_ontology_entity_types(
             auth.tenant_id,
             auth.key_id,
             build_payload(kb_ids[0]),
+            degraded_as_error=True,
         )
 
     outcomes = await _fanout_ontology_action(
-        "list_ontology_entity_types", auth, kb_ids, build_payload
+        "list_ontology_entity_types",
+        auth,
+        kb_ids,
+        build_payload,
+        degraded_as_error=True,
     )
     _raise_if_all_ontology_groups_failed(outcomes)
 
@@ -1499,10 +1550,15 @@ async def list_ontology_instances(
             auth.tenant_id,
             auth.key_id,
             build_payload(kb_ids[0]),
+            degraded_as_error=True,
         )
 
     outcomes = await _fanout_ontology_action(
-        "list_ontology_instances", auth, kb_ids, build_payload
+        "list_ontology_instances",
+        auth,
+        kb_ids,
+        build_payload,
+        degraded_as_error=True,
     )
     _raise_if_all_ontology_groups_failed(outcomes)
 
@@ -2624,7 +2680,7 @@ async def list_wiki_pages(
         knowledge_base_id: 单个 Jonex Wiki 知识库 ID（与 knowledge_base_ids 互斥）
         knowledge_base_ids: Jonex Wiki 知识库 ID 列表（显式列表一律返回 groups）
         topic: 目录节点 id（来自 list_wiki_topics，含其子节点）
-        type: 内部过滤 source / table / concept；空 = 不限
+        type: 内部过滤 source / table / concept / article；空 = 不限
         page: 页码（1-1000，默认 1；多库时每库独立）
         page_size: 每页条数（1-100，默认 20；多库时每库独立）
 
@@ -2645,10 +2701,10 @@ async def list_wiki_pages(
     )
     topic = _ontology_optional_str(topic, "topic", 128)
     page_type = _ontology_optional_str(type, "type", 16)
-    if page_type not in ("", "source", "table", "concept"):
+    if page_type not in ("", "source", "table", "concept", "article"):
         raise McpToolError(
             code=_ERROR_INVALID_PARAMS,
-            message="type 必须为 source / table / concept 之一",
+            message="type 必须为 source / table / concept / article 之一",
         )
     page = _ontology_int_param(page, "page", 1, 1000)
     page_size = _ontology_int_param(page_size, "page_size", 1, 100)
@@ -2771,6 +2827,38 @@ async def list_wiki_pages(
     total = sum(group.get("total", 0) for group in groups)
     # 多 KB：不提供顶层 items / page / page_size（全局分页语义失真）。
     return {"total": total, "groups": groups}
+
+
+@_inject_mcp_tool("read_wiki_page")
+async def read_wiki_page(service_id: str, knowledge_base_id: str, path: str,
+                         offset: int = 0, max_chars: int = 12000) -> dict:
+    """Read one authorized Wiki article or page in bounded character windows.
+
+    References identify linked source documents; they do not independently
+    verify every statement in an authored article.
+    """
+    service_id = _ontology_required_str(service_id, "service_id", 128)
+    kb_id = _ontology_required_str(knowledge_base_id, "knowledge_base_id", 128)
+    path = _ontology_required_str(path, "path", 512)
+    offset = _ontology_int_param(offset, "offset", 0, 4000000)
+    max_chars = _ontology_int_param(max_chars, "max_chars", 1, 12000)
+    auth = require_mcp_auth("view")
+    await _check_service_scope(auth, service_id, required_permission="view")
+    await _resolve_wiki_kb_ids(auth, service_id, kb_id, None)
+    if not _WIKI_BROWSE_ENABLED:
+        raise McpToolError(code=_ERROR_INTERNAL, message="Wiki 浏览暂未开放")
+    touch_service_call_async(auth.tenant_id, service_id)
+    page = await _call_wiki_action_single("get_wiki_page", auth, kb_id,
+                                          {"knowledge_base_id": kb_id, "path": path})
+    body = str(page.get("content") or "")
+    end = min(len(body), offset + max_chars)
+    refs = [{k: ref[k] for k in ("document_id", "file_name", "mime_type") if k in ref}
+            for ref in (page.get("references") or []) if isinstance(ref, dict)][:100]
+    return {"knowledge_base_id": kb_id, "path": page.get("engine_path") or path,
+            "title": page.get("title") or "", "type": page.get("type") or "",
+            "bundle_sha": page.get("bundle_sha"), "content": body[offset:end],
+            "offset": offset, "total_chars": len(body), "next_offset": end if end < len(body) else None,
+            "references": refs, "references_truncated": len(page.get("references") or []) > len(refs)}
 
 
 @_inject_mcp_tool("expand_wiki_links")
@@ -4086,6 +4174,7 @@ __all__ = [
     "expand_ontology_neighbors",
     "list_wiki_topics",
     "list_wiki_pages",
+    "read_wiki_page",
     "expand_wiki_links",
     "list_wiki_claims",
     "read_source",
