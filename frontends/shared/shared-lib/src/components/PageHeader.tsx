@@ -106,7 +106,9 @@ const PageHeader: React.FC<PageHeaderProps> = ({ title, subtitle, extra, backTo,
   );
 
   if (!hasSubtitle) {
-    return <div style={{ ...ROW_STYLE, marginBottom }}>{row}</div>;
+    // 外层只负责下边距，**不能再套一层 flex**：套了之后内层行会收缩成内容宽度，
+    // extra 的 marginLeft:auto 只能推到「标题右边」而不是页头最右侧
+    return <div style={{ marginBottom }}>{row}</div>;
   }
 
   return (
