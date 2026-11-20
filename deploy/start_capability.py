@@ -229,7 +229,10 @@ async def invoke_capability(
     """
     capability_id = request.get("capability_id")
     payload = request.get("payload", {})
-    tenant_id = request.get("tenant_id", "default")
+    # ⚠️ **不要**给 `"default"` 兜底：那是被明令禁止的业务租户值，会让「本来就没有
+    # 租户」的平台动作（如任务中心 `def.create(scope='system')`）在下游被误判成
+    # 「带了一个非法租户」。缺租户就原样传 None，由能力层按 action 决定要不要。
+    tenant_id = request.get("tenant_id") or None
 
     from jonex_core.capability.models import CapabilityRequest
     req = CapabilityRequest(

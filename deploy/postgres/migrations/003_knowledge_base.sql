@@ -485,6 +485,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.knowledge_info (
     similarity_check_threshold numeric(4,3),
     procedural_extract boolean,
     structured_enabled boolean DEFAULT false NOT NULL,
+    ontology_enabled boolean DEFAULT true NOT NULL,
+    reasoning_enabled boolean DEFAULT false NOT NULL,
     extract_tool_calls boolean,
     CONSTRAINT ck_kb_similarity_threshold CHECK (((similarity_check_threshold IS NULL) OR ((similarity_check_threshold >= 0.500) AND (similarity_check_threshold <= 0.999)))),
     CONSTRAINT ck_knowledge_info_kb_type CHECK (((kb_type)::text = ANY ((ARRAY['lightrag'::character varying, 'openkb'::character varying, 'jonex_wiki'::character varying])::text[])))
@@ -1105,6 +1107,8 @@ CREATE TABLE IF NOT EXISTS knowledge_base.task_center_documents (
     execution_id character varying(64),
     handled_execution_id character varying(64),
     rag_task_id character varying(128),
+    -- 三态：NULL = 未知（升级前老行 / 老运行方），看门狗回落「compile 才算最后一步」
+    last_step boolean DEFAULT NULL,
     step_started_at timestamp without time zone,
     submit_attempts integer DEFAULT 0 NOT NULL,
     error_message text,
@@ -1771,3 +1775,122 @@ CREATE INDEX IF NOT EXISTS idx_join_proposals_kb
 
 CREATE INDEX IF NOT EXISTS idx_join_proposals_status
     ON knowledge_base.join_proposals (tenant_id, knowledge_base_id, status);
+
+-- ============================================================
+-- 任务中心清理补偿 outbox（2026-11-17）
+-- 与 update/20261117160000_kb_schema_and_task_cleanup.sql 同源：
+-- **新表必须同时进 migrations/**，否则只用 initdb 建出的新库缺表，
+-- 删文档/删库时 enqueue 会整笔回滚（接口 500）。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS knowledge_base.task_center_cleanup_outbox (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       varchar(64)  NOT NULL,
+    task_id         varchar(64)  NOT NULL,
+    attempts        integer      NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz  NOT NULL DEFAULT now(),
+    last_error      text,
+    created_at      timestamptz  NOT NULL DEFAULT now(),
+    updated_at      timestamptz  NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tc_cleanup_outbox_tenant_task
+    ON knowledge_base.task_center_cleanup_outbox (tenant_id, task_id);
+
+CREATE INDEX IF NOT EXISTS ix_tc_cleanup_outbox_due
+    ON knowledge_base.task_center_cleanup_outbox (next_attempt_at);
+
+-- compiled schema 的数据源维度索引（与 update/ 同源）。
+CREATE INDEX IF NOT EXISTS ix_ontology_compiled_schemas_data_source_id
+    ON knowledge_base.ontology_compiled_schemas (data_source_id);
+
+-- ============================================================
+-- 本体公理（T2，2026-11-17）
+--   · KB 级唯一权威（D8）；抽象 schema 的 axioms 只作 Studio 往返镜像。
+--   · 表只存声明，不存闭包/继承等派生内容。
+--   · axiom_key 是业务键；唯一性按 (tenant, kb, key) + is_deleted = 0。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS knowledge_base.ontology_axioms (
+    id varchar(64) PRIMARY KEY,
+    tenant_id varchar(64) NOT NULL,
+    knowledge_base_id varchar(128) NOT NULL,
+    axiom_key varchar(64) NOT NULL,
+    kind varchar(32) NOT NULL,
+    subject jsonb NOT NULL DEFAULT '{}'::jsonb,
+    object jsonb,
+    chain jsonb NOT NULL DEFAULT '[]'::jsonb,
+    facets jsonb NOT NULL DEFAULT '[]'::jsonb,
+    status varchar(16) NOT NULL DEFAULT 'active',
+    source varchar(16) NOT NULL DEFAULT 'imported',
+    origin varchar(16) NOT NULL DEFAULT 'imported',
+    module varchar(64),
+    content_revision integer NOT NULL DEFAULT 1,
+    content_hash varchar(64),
+    description text,
+    created_by varchar(64),
+    updated_by varchar(64),
+    is_deleted smallint NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ontology_axioms_status
+        CHECK (status IN ('proposed', 'active', 'rejected')),
+    CONSTRAINT ck_ontology_axioms_source
+        CHECK (source IN ('manual', 'imported', 'extracted')),
+    CONSTRAINT ck_ontology_axioms_origin
+        CHECK (origin IN ('studio', 'platform', 'imported'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ontology_axioms_key
+    ON knowledge_base.ontology_axioms (tenant_id, knowledge_base_id, axiom_key)
+    WHERE is_deleted = 0;
+
+CREATE INDEX IF NOT EXISTS idx_ontology_axioms_kb
+    ON knowledge_base.ontology_axioms (tenant_id, knowledge_base_id, status);
+
+-- ============================================================
+-- 推理规则（T2，2026-11-17）
+--   · AST 为权威；text 只作展示。
+--   · content_revision 只随内容变化；启停单独留痕。
+--   · rule_key / name 各自在 KB 内唯一（is_deleted = 0）。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS knowledge_base.ontology_reasoning_rules (
+    id varchar(64) PRIMARY KEY,
+    tenant_id varchar(64) NOT NULL,
+    knowledge_base_id varchar(128) NOT NULL,
+    rule_key varchar(64) NOT NULL,
+    name varchar(128) NOT NULL,
+    text text NOT NULL,
+    premises jsonb NOT NULL DEFAULT '[]'::jsonb,
+    conclusion jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status varchar(16) NOT NULL DEFAULT 'active',
+    enabled boolean NOT NULL DEFAULT true,
+    enabled_changed_at timestamptz,
+    enabled_changed_by varchar(128),
+    origin varchar(16) NOT NULL DEFAULT 'imported',
+    module varchar(64),
+    content_revision integer NOT NULL DEFAULT 1,
+    content_hash varchar(64),
+    description text,
+    created_by varchar(64),
+    updated_by varchar(64),
+    is_deleted smallint NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_ontology_reasoning_rules_status
+        CHECK (status IN ('proposed', 'active', 'rejected')),
+    CONSTRAINT ck_ontology_reasoning_rules_origin
+        CHECK (origin IN ('studio', 'platform', 'imported'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ontology_reasoning_rules_key
+    ON knowledge_base.ontology_reasoning_rules (tenant_id, knowledge_base_id, rule_key)
+    WHERE is_deleted = 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ontology_reasoning_rules_name
+    ON knowledge_base.ontology_reasoning_rules (tenant_id, knowledge_base_id, name)
+    WHERE is_deleted = 0;
+
+CREATE INDEX IF NOT EXISTS idx_ontology_reasoning_rules_kb
+    ON knowledge_base.ontology_reasoning_rules
+       (tenant_id, knowledge_base_id, enabled, status);

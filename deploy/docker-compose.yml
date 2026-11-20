@@ -257,6 +257,9 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-change-me}
       DB_NAME: ${DB_NAME:-jonex}
       REDIS_URL: redis://redis:6379/0
+      # 后台落点任务（start_abstract_landing_run / 前端进度弹层）总开关。
+      # 默认关：关闭时前端回退旧同步生成，构造进度链路不启用。
+      ABSTRACT_LANDING_AGENT_ENABLED: ${ABSTRACT_LANDING_AGENT_ENABLED:-false}
       # RAG 调用通过 Sidecar 反代到 atomic-rag
       SIDECAR_URL: http://sidecar:8000
       # 内部 X-API-Key：须与 sidecar/gateway 镜像内 GATEWAY_API_KEY 默认值一致。
@@ -714,6 +717,10 @@ services:
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       # 本地开发显式豁免默认 JWT_SECRET 的启动拦截；生产不要设置（见 security_guards.py）
       ALLOW_INSECURE_JWT_SECRET: ${ALLOW_INSECURE_JWT_SECRET:-}
+      # Wiki 图片/音视频流由网关在重新校验用户权限后直连 Wiki 阅读接口。
+      # 只传所需 key；其值必须与 .env.jonex_wiki 中的同名项一致，不能把整份文件注入网关。
+      JONEX_WIKI_URL: http://jonex-wiki:8007
+      JONEX_WIKI_API_KEY: ${JONEX_WIKI_API_KEY:-jonex_wiki_engine_key}
       KB_INPUT_DIR: /app/inputs               # 与 atomic-rag 容器共享路径
       # 本体多跳邻域深度硬上限：与 knowledge-base-service（deploy/.env）/
       # mcp-server（deploy/.env.mcp）同名同值。gateway 无 env_file，必须在此显式透传，
@@ -918,6 +925,7 @@ services:
       dockerfile: frontends/core-business/Dockerfile
       args:
         USE_OVERSEAS_MIRROR: ${USE_OVERSEAS_MIRROR:-false}
+        VITE_WIKI_IMAGE_INSPECTION_TIMEOUT_MS: ${VITE_WIKI_IMAGE_INSPECTION_TIMEOUT_MS:-180000}
     image: jonex-core-business-frontend
     container_name: jonex-core-business-frontend
     hostname: core-business-frontend

@@ -42,7 +42,14 @@ RUN if [ "$USE_OVERSEAS_MIRROR" != "true" ]; then \
             /etc/apt/sources.list.d/debian.sources; \
     fi
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg poppler-utils \
+# Agent direct reading needs the pinned CLI and ordinary file/sandbox tools.
+# The container still fails closed if its runtime cannot pass the sandbox preflight.
+ARG JONEX_CODEX_CLI_VERSION=0.149.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg poppler-utils nodejs npm ripgrep bubblewrap \
+    && npm install --global "@openai/codex@${JONEX_CODEX_CLI_VERSION}" \
+    && npm cache clean --force \
+    && codex --version \
     && rm -rf /var/lib/apt/lists/*
 
 # 引擎依赖（pydantic v2 生态；含 alembic 迁移 src/jonex_wiki/storage/migrations）

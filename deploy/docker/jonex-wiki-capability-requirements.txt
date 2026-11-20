@@ -1,7 +1,9 @@
 # [jonex] Jonex Wiki 单容器（B1）:Jonex Atomic Capability 运行时最小依赖
-# 引擎 jonex_wiki 用 pydantic v2(>=2.0) + fastapi>=0.115,故此处**不 pin pydantic/fastapi**,
-# 避免与引擎依赖冲突降级(对齐 openkb-capability-requirements.txt 的同一约束)。
-fastapi
+# 引擎 jonex_wiki 用 pydantic v2(>=2.0) + fastapi>=0.115。
+# 固定本次目标环境验收过的 FastAPI 版本，避免两次镜像构建自动漂移；pydantic 跟随引擎约束。
+fastapi==0.162.5
+# Keep the gateway SDK aligned with the validated local Wiki runtime.
+openai==3.52.0
 uvicorn[standard]
 PyJWT>=2.8.0
 python-dotenv>=1.0.0

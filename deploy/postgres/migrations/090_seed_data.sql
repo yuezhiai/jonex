@@ -2897,16 +2897,16 @@ INSERT INTO knowledge_base.knowledge_parser_settings (id, tenant_id, knowledge_b
 -- jonex_wiki 是 `JONEX_WIKI_COMPILE_TIMEOUT_SEC`，都回落到 1800，到点**直接判死**，
 -- `patrol_openkb_compile` / `patrol_jonex_wiki_compile` 都不探活），同样早于这里的 25200。
 --
--- max_concurrency：两类步骤统一取 10。
+-- max_concurrency：两类步骤默认 15；现有库中手工调整过的上限不由种子覆盖。
 --
 -- 这个上限是**全局按 `runner_code + step_code` 统计**的（全平台共用同一份额度，见
--- 设计文档 §6.3）—— 不是「每个库各 10」。原来的 parse=5 / ingest=2 / compile=2 是按
+-- 设计文档 §6.3）—— 不是「每个库各 15」。原来的 parse=5 / ingest=2 / compile=2 是按
 -- 「单份文档走到这一步有多重」定的（ingest 逐 chunk 抽实体关系 + 写图/向量库，最重所以
 -- 最保守），但会让人看见的瓶颈不在单份有多重，而在名额太少让批次走不动：「整库重抽」
 -- 这类场景里一批文档会卡在同一个相位上排队，前端上就是十几份一起长时间停在「解析中」/
 -- 「知识抽取入库中」/「待编译」，看着像卡死其实只是没轮到。
 --
--- 10 是让「一次重抽十几份」这种批次能整体推进的量级。代价是同一时刻最多有 10 份文档
+-- 15 是让「一次重抽十几份」这种批次能整体推进的量级。代价是同一时刻最多有 15 份文档
 -- 一起压 LLM 与图库；真要回退，这三个数是并发调优的第一顺位。
 --
 -- 步骤名**全平台只有两个字面量**：文件解析 / 知识编译。同一件事叫不同名字会让用户
@@ -2922,12 +2922,12 @@ INSERT INTO knowledge_base.knowledge_parser_settings (id, tenant_id, knowledge_b
 -- （见下方「数据怎么传」）：运行方上报成功时把它带回来。
 INSERT INTO task_center.task_catalog_steps
   (id, step_code, name, runner_code, max_concurrency, timeout_seconds, input_schema, output_schema) VALUES
-  ('step-parse', 'parse', '文件解析', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{"document_id":{"type":"string","required":true}}'),
-  ('step-compile', 'compile', '知识编译', 'knowledge_base', 10, 25200,
-   '{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}}',
-   '{}')
+  ('step-parse', 'parse', '文件解析', 'knowledge_base', 15, 25200,
+   '{"document":{"type":"file","required":true},"knowledge_id":{"type":"string","required":true}}',
+   '{"chunks":{"type":"object","abstract":true},"document_id":{"type":"string","required":true}}'),
+  ('step-compile', 'compile', '知识编译', 'knowledge_base', 15, 25200,
+   '{"chunks":{"type":"object","abstract":true,"required":true},"knowledge_id":{"type":"string","required":true},"document_id":{"type":"string","required":true}}',
+   '{"ontology":{"type":"object","abstract":true},"wiki":{"type":"object","abstract":true}}')
 ON CONFLICT DO NOTHING;
 
 
@@ -2937,49 +2937,32 @@ ON CONFLICT DO NOTHING;
 
 
 -- ------------------------------------------------------------
--- 平台级任务定义：知识库上传后的处理链路（**三条，都是两步串行**）
---   definition-file-processing-ontology                    file_processing_ontology                    第一步 atomic-rag `full`（上传）/ `reparse_strict`（重新解析）—— 解析 + 推切片一趟
---   definition-file-processing-ontology-wiki               file_processing_ontology_wiki               第一步 atomic-rag `parse_only`（只解析）
---   definition-file-processing-jonex-wiki                  file_processing_jonex_wiki                  第一步 atomic-rag `parse_only`（只解析）
--- 三条链的**第二步都是 `compile`**（atomic-rag `ontology_only`：不读原文件，按 document_id
--- 从 LightRAG 读实体做本体归类、写 Neo4j）。
--- ⚠️ Ontology 那条 2026-09-29 由**三步**（文件解析 → 知识抽取 → 知识编译）改成两步 ——
--- 理由见上一段 `ingest` 那几行；另外两条 wiki 链本来就是两步。
--- 定义名就是任务中心页面上的「这条任务属于哪类库」，所以带上库类型后缀；步骤名不带。
--- 上传时按 kb_type 挑一个（知识库侧用固定 definition_id 映射，见
--- `task_runner_service.definition_for_kb_type`）。
--- scope=system，所以 tenant_id / space_id 都为 NULL（ck_tc_def_scope_fields 强制）
+-- 平台级任务定义：知识库上传后的处理链路（**一条，两步串行**）
 --
--- 数据怎么传：**优先从上游产出取**（`@<节点>.outputs.<字段>`），哪一步都不产出它
--- 才回落到任务入参（`@task.inputs.<字段>`）。于是：
---   · 源头那一步 parse_1 没有上游，两个入参只能取任务入参 —— 文档 id 在上传时就
---     已生成落库（「一个文件一条任务」）；
---   · 下游各步的 document_id 一律取**上一步的产出**；
---   · knowledge_base_id 没有任何一步会产出它（它是任务级入参），所以全程取任务入参。
--- 为什么下游不图省事重复写 @task.inputs.document_id：两者取值相同，但取上游产出能让
--- 编排自己表达出「谁喂谁」，而且一版编排里如果出现多个 parse 节点（解析两个不同文件、
--- 各推各的切片），**只有这种写法能让每份产物喂对下游** —— 都用任务入参的话，两个
--- parse 节点会把同一个文档推两遍。串行顺序另由 depends_on 保证（跟数据传递是两回事）。
--- 代价：运行方上报时必须带回 outputs.document_id；漏报不静默 —— 下游拿到空值就失败。
+-- ⚠️ 2026-11-18：原来按库类型/引擎分成 4 条，现**合并为 1 条**
+-- （`definition-kb-document-parse-compile` / 「知识库文档解析与编译」）。
+-- 4 条的编排内容本来就完全一样；真正的类型分流在运行方内部按文档行上的
+-- `kb_type` / `ingest_backend` 做（选哪个引擎、编译走哪条入口），与 definition_id 无关。
+--
+-- 编排结构是 2026-11-18 的新三段式：`start`（只定义输入变量）/ `steps` / `end`
+-- （只定义输出变量）。`entry` 已退场，入口由「depends_on 为空的节点」推导。
+-- 变量契约：`document`（file，值为文档 ID）+ `knowledge_id`（string）。
+-- scope=system，所以 tenant_id / space_id 都为 NULL（ck_tc_def_scope_fields 强制）。
+--
+-- 数据怎么传：`document` 从任务入参取（开始节点的文件变量，派活前已收成文档 ID），
+-- 下游的 `document_id` 取上一步产出；`knowledge_id` 全程取任务入参。
 -- ------------------------------------------------------------
 INSERT INTO task_center.task_definitions
-  (id, scope, tenant_id, space_id, name, description, current_version_no) VALUES
-  ('definition-file-processing-ontology', 'system', NULL, NULL, '文件处理（Ontology）', '上传文件后自动解析并编译本体知识', 1),
-  ('definition-file-processing-ontology-wiki', 'system', NULL, NULL, '文件处理（Ontology Wiki）', '上传文件后自动解析并编译 Ontology Wiki', 1),
-  ('definition-file-processing-jonex-wiki', 'system', NULL, NULL, '文件处理（Jonex Wiki）', '上传文件后自动解析并编译 Jonex Wiki', 1)
+  (id, scope, tenant_id, space_id, name, description, status, current_version_no) VALUES
+  ('definition-kb-document-parse-compile', 'system', NULL, NULL,
+   '知识库文档解析与编译', '知识库上传文件后自动解析，并按库类型完成编译', 'published', 3)
 ON CONFLICT DO NOTHING;
 
 
 INSERT INTO task_center.task_definition_versions
   (id, scope, tenant_id, definition_id, space_id, version_no, status, config, published_at) VALUES
-  ('version-file-processing-ontology-v1', 'system', NULL, 'definition-file-processing-ontology', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
-   CURRENT_TIMESTAMP),
-  ('version-file-processing-ontology-wiki-v1', 'system', NULL, 'definition-file-processing-ontology-wiki', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
-   CURRENT_TIMESTAMP),
-  ('version-file-processing-jonex-wiki-v1', 'system', NULL, 'definition-file-processing-jonex-wiki', NULL, 1, 'published',
-   '{"input_schema":{"document_id":{"type":"string","required":true},"knowledge_base_id":{"type":"string","required":true}},"output_schema":{},"entry":"parse_1","steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"bind_inputs":{"document_id":"@task.inputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"bind_inputs":{"document_id":"@parse_1.outputs.document_id","knowledge_base_id":"@task.inputs.knowledge_base_id"}}]}',
+  ('version-kb-document-parse-compile-v3', 'system', NULL, 'definition-kb-document-parse-compile', NULL, 3, 'published',
+   '{"start":{"node_id":"start","inputs":{"document":{"type":"file","required":true},"knowledge_id":{"type":"string","required":true}}},"steps":[{"node_id":"parse_1","step_code":"parse","depends_on":[],"next_steps":["compile_1"],"sort":1,"timeout_seconds":25200,"max_retries":0,"on_retry_exhausted":"terminate","bind_inputs":{"document":"@task.inputs.document","knowledge_id":"@task.inputs.knowledge_id"}},{"node_id":"compile_1","step_code":"compile","depends_on":["parse_1"],"next_steps":[],"sort":2,"timeout_seconds":25200,"max_retries":0,"on_retry_exhausted":"terminate","bind_inputs":{"chunks":"@parse_1.outputs.chunks","knowledge_id":"@task.inputs.knowledge_id","document_id":"@parse_1.outputs.document_id"}}],"end":{"node_id":"end","outputs":{}}}',
    CURRENT_TIMESTAMP)
 ON CONFLICT DO NOTHING;
 
@@ -3442,64 +3425,10 @@ COMMIT;
 -- 逐条取自 deploy/postgres/update/000_baseline.sql 的 `-- >>> SECTION: 052_task_stopped_status.sql` 段。
 -- ------------------------------------------------------------------
 -- >>> 并入 update/052_task_stopped_status.sql
-BEGIN;
+-- 2026-11-18：系统定义合并为一条、种子版本直接停在 v3；
+-- 原来这段「从 v1 派生 v2」只服务旧的 4 条定义，已随合并删除。
 
 
--- ── 预置编排：开 v2，把两个下游联动开关显式写进每个节点 ──
---
--- 内容从 v1 **派生**（`jsonb_set` 只替换 `steps`，每个 step 用 `||` 补两个键，
--- 其余一字不动）；新 id 由 v1 的 id 换尾号得来。`ORDER BY ord` 保住步骤顺序 ——
--- 顺序在这里是有意义的（同层 `sort` 与拓扑序都靠它）。
-INSERT INTO task_center.task_definition_versions
-  (id, scope, tenant_id, definition_id, space_id, version_no, status, config, published_at)
-SELECT
-  replace(v.id, '-v1', '-v2'),
-  v.scope, v.tenant_id, v.definition_id, v.space_id,
-  2,
-  'published',
-  jsonb_set(
-    v.config,
-    '{steps}',
-    coalesce(
-      (
-        SELECT jsonb_agg(
-                 step || '{"downstream_on_retry": true, "downstream_on_stop": true}'::jsonb
-                 ORDER BY ord
-               )
-        FROM jsonb_array_elements(v.config -> 'steps') WITH ORDINALITY AS t(step, ord)
-      ),
-      '[]'::jsonb
-    )
-  ),
-  CURRENT_TIMESTAMP
-FROM task_center.task_definition_versions v
-WHERE v.version_no = 1
-  AND v.status = 'published'
-  AND v.definition_id IN (
-    'definition-file-processing-ontology',
-    'definition-file-processing-ontology-wiki',
-    'definition-file-processing-jonex-wiki'
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM task_center.task_definition_versions x
-    WHERE x.definition_id = v.definition_id AND x.version_no = 2
-  );
-
--- 定义指向新版本（`EXISTS` 保证只有 v2 真落库了才推）
-UPDATE task_center.task_definitions d
-SET current_version_no = 2, updated_at = CURRENT_TIMESTAMP
-WHERE d.id IN (
-    'definition-file-processing-ontology',
-    'definition-file-processing-ontology-wiki',
-    'definition-file-processing-jonex-wiki'
-  )
-  AND d.current_version_no < 2
-  AND EXISTS (
-    SELECT 1 FROM task_center.task_definition_versions x
-    WHERE x.definition_id = d.id AND x.version_no = 2 AND x.status = 'published'
-  );
-
-COMMIT;
 
 
 -- ------------------------------------------------------------------
