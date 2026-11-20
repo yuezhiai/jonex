@@ -557,7 +557,7 @@ class AppSettings(BaseSettings):
     AUDIT_KEY_ACTION_KEYWORDS: str = (
         "create,update,delete,remove,save,publish,modify,edit,import,"
         "review,retry,cancel,approve,reject,bind,unbind,enable,disable,reset,upload,"
-        "recompile,reseed"
+        "recompile,reseed,ontology_axiom,reasoning_rule"
     )
 
     # Sidecar 服务地址
@@ -799,12 +799,12 @@ class TaskCenterSettings(BaseSettings):
     # （`_run_settled`）。所以调大只是少查几次、调小只是多查几次，**两种都不会判错**。
     TASK_CENTER_SETTLE_STALE_SEC: int = 60
     # 一轮里各扫多少条，防止一个副本一口气把整库的活都揽下。
-    # ⓪ 触发抢占 / ① 派活 / ② 消化上报各自用这个上限、各算各的 10 条（不是加起来 10 条）；
+    # ⓪ 触发抢占 / ① 派活 / ② 消化上报各自用这个上限，默认各 15 条（不是三者相加）；
     # ① 里的「防僵尸」和 ③ 超时巡检**都不受它约束**（一次全清）。
     #
     # ⚠️ 对 ① 派活，这个数是**一轮真派出去几条**，**不是「一轮扫几条候选」**：扫描按
     # `TASK_CENTER_SCHEDULER_SCAN_FACTOR` 放宽，派满这个数就停。理由见那条配置。
-    TASK_CENTER_SCHEDULER_BATCH: int = 10
+    TASK_CENTER_SCHEDULER_BATCH: int = 15
     # ① 派活**扫描面**相对 `TASK_CENTER_SCHEDULER_BATCH` 的放大倍数：一轮扫
     # `BATCH × 这个数` 条候选，其中**真派出去的**够 `BATCH` 条就提前收工。
     #
@@ -1487,6 +1487,14 @@ class AbstractConstructSettings(BaseSettings):
     #: 不再按 `probe_distinct` 默认的 60s 跑满 —— 只挡「起新探」时阶段能超到 30+60s。
     ABSTRACT_CONSTRUCT_PROBE_BUDGET_S: float = 30.0
     ABSTRACT_CONSTRUCT_MAX_PROBE_QUERIES: int = 40
+
+    #: 抽象 schema 确认（active）时是否镜像回填 KB 级 compiled schema。
+    #: **默认关**：这条回填会占用「文档本体」那一行，而重新生成的
+    #: `seed=document` 又直读同一行 → 抽象被当成文档本体再喂回去（自引用闭环，
+    #: 表现为「重新生成实体越来越多、回不到原对齐」）。投影由
+    #: `OntologyCompiler._abstract_projection` 现算，读路径本来就不依赖这行镜像。
+    #: 仅在需要把抽象内容写进 compiled 行的特殊场景下临时打开。
+    ABSTRACT_MIRROR_TO_KB_COMPILED: bool = False
 
     #: 落点 provenance 的保存侧开关（landing-agent 线）。**关闭时公开保存不得
     #: 新增任何 provenance 键**（G5 逐字节回归：老行为的下游字节完全一致）；

@@ -211,7 +211,9 @@ class TaskCenterClient(ABC):
         （`TaskRef.from_payload` 就是这么做的）。
 
         **`status` 就是这一步的当前状态**：`pending` / `running` / `success` / `failed` /
-        `timeout`。**看到后三个就说明管理方那边它已经定局了** —— 运行方据此可以停止等待。
+        `timeout` / `stopped`。**看到后四个就说明管理方那边它已经定局了**（`stopped`
+        = 用户停止 / 连带停止），运行方据此可以停止等待。⚠️ 早先这份列表漏了
+        `stopped`，照文档实现的运行方会把「已停止」当成还在跑、一直等到自己的硬超时。
 
         ⚠️ **读接口不判权**（与 §4.3 其余读函数一致）：租户与身份由 Sidecar 保证，
         越权按「找不到」（1002）处理。
@@ -1005,6 +1007,16 @@ class RemoteTaskCenterClient(_TaskCenterActions, TaskCenterClient):
             # 重试子任务三处，都只判成功档），`REJECTED` 与 `RETRYABLE_UNKNOWN` 一样会重发
             # 满 3 次。码改的是**回给调用方的结论标签**，不是发不发。
             status = exc.response.status_code
+            if status == 408:
+                # 408 同「超时」：请求可能已送达，只是回包没赶上 —— 可重试，
+                # 不能落进 3006「明确拒绝」被调用方判死。
+                logger.warning(
+                    "任务中心调用超时(408) action=%s：%s", action, exc
+                )
+                return ApiResponse.fail(
+                    f"调用任务中心 {action} 超时（HTTP 408）：{exc}",
+                    code=ServiceTimeoutError.code,
+                )
             code = (
                 RateLimitExceededError.code
                 if status == 429
@@ -1205,6 +1217,22 @@ class MockTaskCenterClient(_TaskCenterActions, TaskCenterClient):
                     node_id=data.get("node_id") or "mock_node",
                     attempt=data.get("attempt") or 1,
                 )
+            )
+        if action == _ACTION_TASK_DELETE:
+            # 删除必须回**形状对得上**的壳：真实实现的 `ApiResponse[None]` 就是
+            # `data=None`，这一档保持一致。
+            return await self._ack()
+        if action == _ACTION_TASK_DELETE_BATCH:
+            # 契约要求 `{deleted, skipped, failed, cleanup_failed}`。回 `data=None`
+            # 会让离线联调把「没验证」当成「全成功」，级联删除的形状永远验不出来。
+            ids = list(data.get("task_ids") or [])
+            return await self._ack(
+                {
+                    "deleted": ids,
+                    "skipped": [],
+                    "failed": [],
+                    "cleanup_failed": [],
+                }
             )
         return await self._ack()
 

@@ -70,6 +70,17 @@ from jonex_core.security.user_auth import extract_bearer_token, get_user_auth
 logger = logging.getLogger(__name__)
 
 
+def _trusted_body_identity(auth: dict) -> bool:
+    """invoke 报文里的身份字段（user_id / perms / impersonated）能不能采信。
+
+    ⚠️ 只对**内部受信调用方**（API Key / 测试 token）开放。用户 JWT 直连
+    Sidecar 时，报文里写的 `user_id` / `perms` / `impersonated` 一律忽略 ——
+    否则任何持普通用户 token 的调用方都能在 body 里冒充任意用户、伪造
+    `tenant:admin` 等权限码，架空空下游所有权限守卫（2026-11-19 审计确认）。
+    """
+    return (auth or {}).get("auth_type") in ("apikey", "test")
+
+
 class CapabilityInvokeRequest(BaseModel):
     """能力调用请求"""
     capability_id: str
@@ -413,6 +424,13 @@ def _resolve_invoke_tenant(
 # 这些 action 自身做强校验（如 ingest_push 校验 per-数据源 ingest key）。
 _SYSTEM_INVOKE_ACTIONS = {"ingest_push", "ingest_lineage_event"}
 
+# 「**没有租户是合法状态**」的能力动作（2026-11-17 补）：
+# `def.create` 是平台建 `scope='system'` 定义的口子（§3.1），那种定义本来就没有
+# 租户；而它同时还要支持带租户建 tenant/space 级定义，所以这里**解析得到什么就用
+# 什么**、解析不到才留 None（由能力层按 scope 决定要不要租户）。
+# ⚠️ 必须连 capability_id 一起比对：别的能力也完全可能定义一个同名 action。
+_TENANTLESS_INVOKE_TARGETS = {("business.task_center.v1", "def.create")}
+
 
 def _resolve_invoke_tenant_optional(
     invoke_request: CapabilityInvokeRequest,
@@ -462,7 +480,7 @@ def _derive_invoke_status_code(result: dict) -> int:
     ⚠️ 失败态下的 2xx/3xx `code` 属矛盾数据，**不**按 HTTP 语义原样返回，
     一律落到第 3 条（查不到即 500），避免把失败记成成功。
     """
-    if result.get("success", True):
+    if result.get("success", False):
         return 200
     code = result.get("code")
     if isinstance(code, int):
@@ -1202,19 +1220,59 @@ class SidecarApp:
                 tenant_id = invoke_request.tenant_id or _resolve_invoke_tenant_optional(invoke_request, auth, x_tenant_id)
                 if not tenant_id:
                     raise CapabilityInvokeError(message=translate("err.ingest.cannot_resolve_tenant", fallback="ingest key 无效，无法解析租户信息，请重新生成 API Key"))
+                # **系统动作也要过租户归一化**：这个分支直接采信报文里的 tenant，
+                # 不校验的话 `default` / `system` / 非法字符都能往下游走。租户来源
+                # （ingest key）本身由白名单动作决定，这里只收口格式与禁用值。
+                tenant_id = require_tenant(tenant_id)
+                # 2026-11-19 第二轮审计：用户 JWT 调用系统动作时，报文 tenant 必须与
+                # token 租户一致（否则可拿自己的合法 ingest key 往别的租户写数据 /
+                # 借租户是否 active 的报错差异探测租户状态）。
+                if (
+                    auth.get("auth_type") == "user"
+                    and auth.get("tenant_id")
+                    and tenant_id != auth.get("tenant_id")
+                ):
+                    raise TenantIsolationError(
+                        message=translate(
+                            "err.auth.tenant_mismatch",
+                            params={"expected": auth.get("tenant_id"), "got": tenant_id},
+                            fallback="报文中的租户与当前登录身份不一致",
+                        )
+                    )
+            elif (invoke_request.capability_id, _action) in _TENANTLESS_INVOKE_TARGETS:
+                # 平台建系统级定义：没有租户**是正常状态**，不能按「必须携带租户」拒掉。
+                # 解析到租户就照常归一化（tenant/space 级定义要用），解析不到留 None。
+                tenant_id = _resolve_invoke_tenant_optional(
+                    invoke_request, auth, x_tenant_id,
+                )
+                if tenant_id is not None:
+                    tenant_id = require_tenant(tenant_id)
             else:
                 tenant_id = _resolve_invoke_tenant(invoke_request, auth, x_tenant_id)
-            user_id = invoke_request.user_id or str(auth.get("user_id", ""))
-            username = invoke_request.username or auth.get("username", "")
-            impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
-            original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
-            perms = invoke_request.perms or auth.get("perms") or []
+            if _trusted_body_identity(auth):
+                user_id = invoke_request.user_id or str(auth.get("user_id", ""))
+                username = invoke_request.username or auth.get("username", "")
+                impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
+                original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
+                perms = invoke_request.perms or auth.get("perms") or []
+            else:
+                # 用户 JWT：身份只认 token 解析结果（见 _trusted_body_identity）
+                user_id = str(auth.get("user_id", ""))
+                username = auth.get("username", "")
+                impersonated = bool(auth.get("impersonated", False))
+                original_tenant_id = auth.get("original_tenant_id")
+                perms = auth.get("perms") or []
             # 提取客户端 IP（优先 X-Forwarded-For）
             client_ip = request.headers.get(
                 "X-Forwarded-For",
                 request.client.host if request.client else "",
             ).split(",")[0].strip()
-            ip = invoke_request.ip or client_ip
+            # 2026-11-20 审计：body.ip 是调用方可写的，只对内部受信调用方采信；
+            # 用户 JWT 直连时用真实 client IP（否则审计/监控里的来源可被伪造）。
+            ip = (
+                (invoke_request.ip if _trusted_body_identity(auth) else None)
+                or client_ip
+            )
             # 本次调用的身份 + 全链路追踪号，**两个不同的 ID**（见 _resolve_call_ids）：
             # 入站 X-Request-ID 是上游的追踪号，嵌套调用不再拿它当身份。
             request_id, trace_id = _resolve_call_ids(request.headers)
@@ -1282,7 +1340,10 @@ class SidecarApp:
                         impersonated=impersonated,
                         perms=perms,
                         original_tenant_id=original_tenant_id,
-                        context=invoke_request.context,
+                        # 2026-11-19 第二轮审计：报文里的 context 是**调用方可写**的
+                        # （其中 `mcp_key_id` 会让 KB 跳过空间权限检查）——用户 JWT
+                        # 直连时一律不采信，只保留内部受信调用方的值。
+                        context=(invoke_request.context if _trusted_body_identity(auth) else None),
                     )
 
                     latency = (time.time() - start_time) * 1000
@@ -1291,7 +1352,7 @@ class SidecarApp:
                     record_status = _derive_invoke_status_code(result)
                     # HTTP 200 + success=false 也是失败：call_attempt 与 call_log
                     # 必须同口径，否则两条记录会一个说成功、一个说失败。
-                    if not result.get("success", True):
+                    if not result.get("success", False):
                         att.fail(
                             error_code=result.get("code"),
                             error_message=result.get("message"),
@@ -1345,7 +1406,7 @@ class SidecarApp:
 
                     return InvokeResult(
                         request_id=result.get("request_id", ""),
-                        success=result.get("success", True),
+                        success=result.get("success", False),
                         code=result.get("code", 0),
                         message=result.get("message", "success"),
                         data=result.get("data"),
@@ -1418,10 +1479,16 @@ class SidecarApp:
 
             start_time = time.time()
             tenant_id = _resolve_invoke_tenant(invoke_request, auth, x_tenant_id)
-            user_id = invoke_request.user_id or str(auth.get("user_id", ""))
-            impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
-            original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
-            perms = invoke_request.perms or auth.get("perms") or []
+            if _trusted_body_identity(auth):
+                user_id = invoke_request.user_id or str(auth.get("user_id", ""))
+                impersonated = bool(invoke_request.impersonated or auth.get("impersonated", False))
+                original_tenant_id = invoke_request.original_tenant_id or auth.get("original_tenant_id")
+                perms = invoke_request.perms or auth.get("perms") or []
+            else:
+                user_id = str(auth.get("user_id", ""))
+                impersonated = bool(auth.get("impersonated", False))
+                original_tenant_id = auth.get("original_tenant_id")
+                perms = auth.get("perms") or []
             # 身份与追踪号分离，取法同 /invoke（见 _resolve_call_ids）。
             request_id, trace_id = _resolve_call_ids(request.headers)
             # call_attempt 归属同非流式：嵌套调用由 Sidecar 补（见 _owns_inbound_attempt）。

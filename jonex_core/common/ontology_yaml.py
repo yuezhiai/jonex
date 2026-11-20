@@ -92,6 +92,8 @@ class YamlEntity:
     attributes: list[YamlAttribute] = dataclasses.field(default_factory=list)
     # [jonex] P1：TBox 构建技能声明（refine/constrain 两组），缺省 None
     extraction_skills: Optional[dict[str, Any]] = None
+    # [jonex] T3：active / inactive / deprecated；缺省 = active（导出时省略）
+    status: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -106,6 +108,8 @@ class YamlRelation:
     inverse_of: Optional[str] = None  # [jonex] P1：逆关系名（纯声明，不建反向边）
     source_types: list[str] = dataclasses.field(default_factory=list)  # 为空回落 source 单值
     target_types: list[str] = dataclasses.field(default_factory=list)  # 为空回落 target 单值
+    # [jonex] T3：active / inactive / deprecated；缺省 = active（导出时省略）
+    status: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -117,6 +121,8 @@ class YamlConstraint:
     severity: Optional[str] = None
     expression: Optional[str] = None
     suggestion: Optional[str] = None
+    # [jonex] T3/D12：只有显式 false 算停用；缺键 = 启用。
+    enabled: Optional[bool] = None
     raw: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
@@ -131,6 +137,8 @@ class OntologyYamlDocument:
         "case_insensitive": True,
         "alias_merge": True,
     })
+    # [jonex] T4：顶层 axioms 段（公理形状由 axiom_checks 校验，这里只透传）。
+    axioms: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
 
 # ── Validation result ──────────────────────────────────────────────────
@@ -220,6 +228,16 @@ def parse_yaml(yaml_text: str) -> tuple[Optional[OntologyYamlDocument], YamlVali
     else:
         disambiguation = {"case_insensitive": True, "alias_merge": True}
 
+    # 8. axioms：形状透传；具体校验交给 ontology_reasoning.axiom_checks。
+    raw_axioms = raw.get("axioms")
+    if raw_axioms is None:
+        axioms: list[dict[str, Any]] = []
+    elif isinstance(raw_axioms, list):
+        axioms = raw_axioms
+    else:
+        validation.errors.append("axioms 必须是列表")
+        axioms = []
+
     doc = OntologyYamlDocument(
         version=version,
         domain=domain,
@@ -227,8 +245,27 @@ def parse_yaml(yaml_text: str) -> tuple[Optional[OntologyYamlDocument], YamlVali
         relation_types=relations,
         constraints=constraints,
         disambiguation=disambiguation,
+        axioms=axioms,
     )
     return doc, validation
+
+
+_ENTRY_STATUS_VALUES = frozenset({"active", "inactive", "deprecated"})
+
+
+def _parse_entry_status(
+    raw: Any, label: str, validation: YamlValidation,
+) -> Optional[str]:
+    """解析条目 status：缺省 None（= active）；非法值告警后忽略。"""
+    value = (_str_or(raw, "") or "").strip().lower()
+    if not value:
+        return None
+    if value not in _ENTRY_STATUS_VALUES:
+        validation.warnings.append(
+            f"{label}.status={value} 不合法，已忽略（可选 active / inactive / deprecated）"
+        )
+        return None
+    return value
 
 
 def _parse_entities(raw: list[dict], validation: YamlValidation) -> list[YamlEntity]:
@@ -254,6 +291,7 @@ def _parse_entities(raw: list[dict], validation: YamlValidation) -> list[YamlEnt
             aliases=_normalize_string_list(item.get("aliases")),
             attributes=attrs,
             extraction_skills=raw_skills,
+            status=_parse_entry_status(item.get("status"), f"entity_types[{i}]", validation),
         ))
     return entities
 
@@ -335,6 +373,7 @@ def _parse_relations(
             inverse_of=_str_or(item.get("inverse_of"), None),
             source_types=_normalize_string_list(item.get("source_types")),
             target_types=_normalize_string_list(item.get("target_types")),
+            status=_parse_entry_status(item.get("status"), f"relation_types[{i}]", validation),
         ))
     return relations
 
@@ -372,6 +411,17 @@ def _parse_constraints(
             if attr_code_set and target not in attr_code_set:
                 validation.warnings.append(f"constraint[{i}] 引用 {target} 不匹配已知 entity.attribute")
 
+        raw_enabled = item.get("enabled")
+        if raw_enabled is None:
+            enabled = None
+        elif isinstance(raw_enabled, bool):
+            enabled = raw_enabled
+        else:
+            validation.warnings.append(
+                f"constraint[{i}].enabled 必须是布尔值，已按缺省（启用）处理"
+            )
+            enabled = None
+
         constraints.append(YamlConstraint(
             type=ctype,
             entity=entity,
@@ -380,6 +430,7 @@ def _parse_constraints(
             severity=_str_or(item.get("severity"), None),
             expression=_str_or(item.get("expression"), None),
             suggestion=_str_or(item.get("suggestion"), None),
+            enabled=enabled,
             raw=item,
         ))
     return constraints
@@ -421,6 +472,9 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             d["aliases"] = [a for a in e.aliases]
         if e.extraction_skills:
             d["extraction_skills"] = e.extraction_skills
+        # 只在非 active 时输出，保持存量导出逐字节不变；active 是解析默认值。
+        if e.status and e.status != "active":
+            d["status"] = e.status
         return d
 
     def _rel_to_dict(r: YamlRelation) -> dict:
@@ -440,6 +494,9 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             d["source_types"] = [s for s in r.source_types]
         if r.target_types:
             d["target_types"] = [t for t in r.target_types]
+        # 同上：active 不输出，避免改变存量导出。
+        if r.status and r.status != "active":
+            d["status"] = r.status
         return d
 
     def _constraint_to_dict(c: YamlConstraint) -> dict:
@@ -456,6 +513,9 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             d["expression"] = c.expression  # [jonex] P1：导出不再丢约束表达式
         if c.suggestion:
             d["suggestion"] = c.suggestion
+        # 缺键 = 启用；显式 true/false 原样导出。
+        if c.enabled is not None:
+            d["enabled"] = bool(c.enabled)
         return d
 
     # 四个集合键始终输出（即使是空数组）：ontology builder 的 Schema v1 契约
@@ -471,6 +531,8 @@ def dump_yaml(doc: OntologyYamlDocument) -> str:
             "alias_merge": doc.disambiguation.get("alias_merge", True),
         },
     }
+    if doc.axioms:
+        data["axioms"] = doc.axioms
 
     buf = io.StringIO()
     class _IndentDumper(yaml.Dumper):

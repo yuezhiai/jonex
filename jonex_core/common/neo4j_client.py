@@ -10,11 +10,23 @@ import os
 from typing import Optional
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
+from neo4j.exceptions import (
+    AuthError,
+    ClientError,
+    Neo4jError,
+    ServiceUnavailable,
+    SessionExpired,
+)
 
 logger = logging.getLogger(__name__)
 
 # 进程内驱动单例
 _driver: Optional[AsyncDriver] = None
+
+# 连接层「不可用」：进程在、端口拒/超时、会话过期。
+# 只认这两个而不认整个 DriverError 族 —— ResultConsumedError / ResultNotSingleError
+# 这类是调用方代码 bug（结果读两次、single 命中多条），必须 500 暴露。
+_CONNECTION_DOWN_ERRORS = (ServiceUnavailable, SessionExpired)
 
 
 def get_neo4j_driver() -> AsyncDriver:
@@ -27,6 +39,42 @@ def get_neo4j_driver() -> AsyncDriver:
         _driver = AsyncGraphDatabase.driver(uri, auth=(username, password))
         logger.info("Neo4j 驱动已创建: %s", uri)
     return _driver
+
+
+def is_neo4j_unavailable(exc: BaseException) -> bool:
+    """异常（含 ``cause`` / ``context`` 链）是否表示「Neo4j 不可用」。
+
+    读接口据此决定「降级返回空值 + degraded 标记」还是「上抛 500」。
+    判据是**黑名单式**的：只要不是调用方自己能修的查询错误，就算不可用。
+
+    - ``AuthError``（``ClientError`` 子类）：认证/配置失效，沿用既有行为按不可用处理；
+    - ``ServiceUnavailable`` / ``SessionExpired``：连接层故障；
+    - ``Neo4jError`` 但**不是** ``ClientError``：``DatabaseError``（存储层 critical，
+      如 ``Neo.DatabaseError.Transaction.TransactionStartFailed``）与 ``TransientError``；
+    - ``OSError``（含 ``TimeoutError`` / ``socket.gaierror``）；
+    - 驱动在主机名消失时抛的 ``ValueError("Cannot resolve address ...")``，
+      其 ``__cause__`` 为 ``socket.gaierror``。
+
+    其余 ``ClientError``（``CypherSyntaxError`` / ``ConstraintError`` / ``Forbidden``）
+    与 ``ResultConsumedError`` 这类驱动使用错误**不算**不可用 —— 静默降级会把 bug
+    藏成「库里没数据」。
+    """
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, AuthError):
+            return True
+        if isinstance(cur, _CONNECTION_DOWN_ERRORS):
+            return True
+        if isinstance(cur, Neo4jError) and not isinstance(cur, ClientError):
+            return True
+        if isinstance(cur, OSError):
+            return True
+        if isinstance(cur, ValueError) and "Cannot resolve address" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 async def close_neo4j_driver() -> None:

@@ -14,10 +14,13 @@
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import Request
+
+logger = logging.getLogger("llm_gateway")
 
 
 # 用户名头（``X-Jonex-Username``）校验上限，与 ``monitor.call_log.source``
@@ -65,6 +68,50 @@ class MeteringContext:
     request_id: Optional[str] = None
 
 
+def _token_fingerprint(request: Request) -> str:
+    """调用方内部 token 的短指纹（sha256 前 10 位）。
+
+    ``LLMGW_INTERNAL_TOKENS`` 是按调用方分配的逗号分隔白名单，因此指纹可以
+    直接与部署配置对号。只记指纹不记原文 —— 日志会被多方读取，凭据不能落盘。
+    """
+    token = getattr(getattr(request, "state", None), "token_id", "") or ""
+    if not token:
+        return "-"
+    return hashlib.sha256(token.encode()).hexdigest()[:10]
+
+
+def _log_unattributed(request: Request, ctx: "MeteringContext") -> None:
+    """归因失败（tenant 或 scene 落 unknown）时记录调用方特征。
+
+    这是定位「谁没带 X-Jonex-* 头」的唯一线索：网关的 uvicorn access log 在
+    ``--workers`` 模式下不落地，而普通路由日志不带来源，计量表也没有可扩展列。
+    只在异常时打，正常流量零额外日志。
+    """
+    tenant = (ctx.tenant_id or "").strip()
+    scene = (ctx.scene or "").strip()
+    if tenant not in ("", "unknown") and scene not in ("", "unknown"):
+        return
+
+    client = getattr(request, "client", None)
+    headers = getattr(request, "headers", None) or {}
+    forward = headers.get("x-forwarded-for") or "-"
+    raw_ua = headers.get("user-agent") or "-"
+    ua = "".join(ch if ch.isprintable() else " " for ch in raw_ua[:80])
+    jonex_headers = sorted(
+        name for name in headers.keys() if name.lower().startswith("x-jonex-")
+    )
+    logger.warning(
+        "未归因调用 | client=%s xff=%s token_fp=%s ua=%r headers=%s tenant=%r scene=%r",
+        f"{client.host}:{client.port}" if client else "-",
+        forward,
+        _token_fingerprint(request),
+        ua,
+        jonex_headers or "[]",
+        tenant,
+        scene,
+    )
+
+
 def parse_ctx(request: Request) -> MeteringContext:
     """FastAPI 依赖：从请求头解析 MeteringContext
 
@@ -77,7 +124,7 @@ def parse_ctx(request: Request) -> MeteringContext:
     """
     user_id = request.headers.get("X-Jonex-User-Id")
     has_user = bool((user_id or "").strip())
-    return MeteringContext(
+    ctx = MeteringContext(
         tenant_id=request.headers.get("X-Jonex-Tenant-Id", "unknown"),
         user_id=user_id,
         username=(
@@ -94,6 +141,8 @@ def parse_ctx(request: Request) -> MeteringContext:
         ),
         request_id=request.headers.get("X-Jonex-Request-Id"),
     )
+    _log_unattributed(request, ctx)
+    return ctx
 
 
 def derive_request_id(ctx: MeteringContext, body: dict) -> str:

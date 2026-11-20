@@ -58,6 +58,8 @@ class ResourceType(str, Enum):
     ONTOLOGY_GRAPH = "ontology_graph"
     ONTOLOGY_STATISTICS = "ontology_statistics"
     ONTOLOGY_QUERY = "ontology_query"
+    ONTOLOGY_AXIOM = "ontology_axiom"
+    REASONING_RULE = "reasoning_rule"
 
     # ---- 解析/编译 ----
     PARSER_SETTING = "parser_setting"
@@ -178,6 +180,8 @@ _RESOURCE_LABEL_ZH: dict[str, str] = {
     "ontology_graph": "本体图",
     "ontology_statistics": "本体统计",
     "ontology_query": "本体查询",
+    "ontology_axiom": "本体公理",
+    "reasoning_rule": "推理规则",
     # ---- 解析/编译 ----
     "parser_setting": "解析器设置",
     "chunk": "切片",
@@ -255,6 +259,8 @@ _RESOURCE_LABEL_EN: dict[str, str] = {
     "ontology_graph": "Ontology Graph",
     "ontology_statistics": "Ontology Statistics",
     "ontology_query": "Ontology Query",
+    "ontology_axiom": "Ontology Axiom",
+    "reasoning_rule": "Reasoning Rule",
     # ---- 解析/编译 ----
     "parser_setting": "Parser Setting",
     "chunk": "Chunk",
@@ -536,6 +542,24 @@ _ACTION_TO_RESOURCE: dict[str, str] = {
     "get_knowledge_info": "knowledge_info",
     "get_ontology_graph": "ontology_graph",
     "get_ontology_statistics": "ontology_statistics",
+    # ---- 公理 / 推理规则（T4 起）----
+    "list_ontology_axioms": "ontology_axiom",
+    "get_ontology_axiom": "ontology_axiom",
+    "validate_ontology_axioms": "ontology_axiom",
+    "import_ontology_axioms": "ontology_axiom",
+    "export_ontology_axioms": "ontology_axiom",
+    "preview_axiom_status": "ontology_axiom",
+    "set_axiom_status": "ontology_axiom",
+    "list_reasoning_rules": "reasoning_rule",
+    "get_reasoning_rule": "reasoning_rule",
+    "validate_reasoning_rules": "reasoning_rule",
+    "create_reasoning_rule": "reasoning_rule",
+    "update_reasoning_rule": "reasoning_rule",
+    "delete_reasoning_rule": "reasoning_rule",
+    "set_reasoning_rule_enabled": "reasoning_rule",
+    "export_reasoning_rules": "reasoning_rule",
+    "import_reasoning_rules": "reasoning_rule",
+    "preview_reasoning": "reasoning_rule",
     "get_parse_result_documents": "document",
     "get_parse_result_entities": "document",
     "get_parse_result_graph": "document",
@@ -745,6 +769,8 @@ _RESOURCE_TO_ID_FIELD: dict[str, str] = {
     "ontology_graph": "graph_id",
     "ontology_statistics": "stats_id",
     "ontology_query": "query_id",
+    "ontology_axiom": "axiom_key",
+    "reasoning_rule": "rule_key",
 }
 
 # ============ ResourceType → DB 名称查询映射 ============
@@ -771,6 +797,8 @@ _RESOURCE_NAME_LOOKUP: dict[str, tuple[str, str, str, str]] = {
     "synonym": ("knowledge_base", "ontology_synonyms", "id", "canonical"),
     "ontology_tool_binding": ("knowledge_base", "ontology_tool_bindings", "id", "canonical_name"),
     "kb_tool": ("knowledge_base", "kb_tools", "id", "name"),
+    "ontology_axiom": ("knowledge_base", "ontology_axioms", "id", "axiom_key"),
+    "reasoning_rule": ("knowledge_base", "ontology_reasoning_rules", "id", "name"),
     "service": ("knowledge_base", "services", "id", "name"),
     "service_api_key": ("knowledge_base", "service_api_keys", "id", "key_prefix"),
     "parser_setting": ("knowledge_base", "knowledge_parser_settings", "id", "parser_type"),
