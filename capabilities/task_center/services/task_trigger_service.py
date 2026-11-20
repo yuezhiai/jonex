@@ -74,6 +74,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
+from ..dtos.definition import upgrade_flow_config
 from ..dtos.execution import TaskList
 from ..dtos.trigger import TaskTriggerCreate, TaskTriggerItem, TaskTriggerList
 from ..models import (
@@ -349,6 +350,14 @@ class TaskTriggerService:
             fixed_version = fields["fixed_version"]
             await self._require_fixed_version(row.definition_id, fixed_version)
             values["fixed_version"] = fixed_version
+            # 只改锁定版本、没同时给 inputs：**库里那份入参必须按新版本重新收口**。
+            # 不重收的话它带着旧版本的键留在行上（接口回 code=0），界面看着配好了，
+            # 到点 fire 才因字段对不上起不来 —— 那时已经没人记得是这次改版埋的。
+            # 空入参不用重收（`{}` 对任何 schema 都合法），别为了它多写一条同值 UPDATE。
+            if fields.get("inputs") is None and row.inputs:
+                values["inputs"] = await self._normalize_inputs(
+                    tenant_id, row.definition_id, fixed_version, row.inputs
+                )
         else:
             fixed_version = row.fixed_version  # 不动（下面归一化 inputs 时要用）
 
@@ -780,7 +789,9 @@ class TaskTriggerService:
                 ),
                 details={"definition_id": definition_id, "version_no": version_no},
             )
-        schema = (version.config or {}).get("input_schema") or {}
+        # 旧编排结构先升级：触发入参按开始节点的 inputs 收口（与 `fire` 同口径）
+        _config = upgrade_flow_config(version.config or {})
+        schema = (_config.get("start") or {}).get("inputs") or {}
         # ⚠️ **schema 里没声明的键当场拒**（2026-10-13 补）：`normalize_by_schema` 对这类键是
         # **静默丢弃**（既不报错、也不保留）—— 触发入参多写一个字段名（拼错、或定义改版后
         # 字段被删）时接口会回 `code=0`，那个键被**无声删掉**，到点触发时下游

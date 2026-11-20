@@ -39,7 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from jonex_core.common.repository import BaseRepository
 
-from ..models import TaskTrigger, TriggerStatus
+from ..models import (
+    DefinitionStatus,
+    TaskDefinition,
+    TaskTrigger,
+    TriggerStatus,
+)
 
 
 class TaskTriggerRepository(BaseRepository[TaskTrigger]):
@@ -286,11 +291,18 @@ class TaskTriggerRepository(BaseRepository[TaskTrigger]):
         后续动作按行内的租户显式走。
         """
         now = now or datetime.now()
+        # 2026-11-18：**停用 / 已删的定义不扫** —— 停在 fire 里拦会把「定义已停用」
+        # 误判成配置类失败、被 `pause_on_cron_failure` 永久暂停（见 §13 R5）。
+        published_definitions = select(TaskDefinition.id).where(
+            TaskDefinition.is_deleted == 0,
+            TaskDefinition.status == DefinitionStatus.PUBLISHED.value,
+        )
         stmt = (
             select(TaskTrigger)
             .where(
                 TaskTrigger.status == TriggerStatus.ACTIVE.value,
                 TaskTrigger.next_fire_at <= now,
+                TaskTrigger.definition_id.in_(published_definitions),
             )
             .order_by(TaskTrigger.next_fire_at)
             .limit(limit)

@@ -51,25 +51,53 @@ from jonex_core.common.repository import BaseRepository
 from ..models import DefinitionScope, TaskDefinition, TaskDefinitionVersion, VersionStatus
 
 
-def _visible_conditions(tenant_id: str, scope: str | None = None) -> list:
-    """「这个租户能看到哪些定义」的条件（§4 权限规则）。
+def _visible_conditions(
+    tenant_id: str,
+    scope: str | None = None,
+    allowed_space_ids: list[str] | None = None,
+) -> list:
+    """「这个租户能看到哪些定义」的条件（§4 权限规则，2026-11-18 改）。
 
-    不带 `scope`：系统级（对所有租户可见）**或**本租户的（租户级 / 空间级）。
-    带了 `scope`：只看指定的那一级，且租户级 / 空间级仍要卡在本租户名下。
+    不带 `scope`：系统级（对所有租户可见）**或**本租户的空间级。
+    带了 `scope`：只看指定的那一级，空间级仍要卡在本租户名下。
+
+    `allowed_space_ids` 是**权限收敛**（不是筛选）：`None` = 不过滤（管理员 / 内部链路）；
+    `[]` = 一个都看不到（恒假）；非空 = 只能看这些空间 + 系统级。
     """
     if scope == DefinitionScope.SYSTEM.value:
-        return [TaskDefinition.scope == DefinitionScope.SYSTEM.value]
-    if scope in (DefinitionScope.TENANT.value, DefinitionScope.SPACE.value):
-        return [
-            TaskDefinition.scope == scope,
+        conditions = [TaskDefinition.scope == DefinitionScope.SYSTEM.value]
+    elif scope == DefinitionScope.SPACE.value:
+        conditions = [
+            TaskDefinition.scope == DefinitionScope.SPACE.value,
             TaskDefinition.tenant_id == tenant_id,
         ]
-    return [
-        or_(
-            TaskDefinition.scope == DefinitionScope.SYSTEM.value,
-            TaskDefinition.tenant_id == tenant_id,
+    else:
+        conditions = [
+            or_(
+                TaskDefinition.scope == DefinitionScope.SYSTEM.value,
+                TaskDefinition.tenant_id == tenant_id,
+            )
+        ]
+    if allowed_space_ids is not None:
+        conditions.append(
+            or_(
+                TaskDefinition.scope == DefinitionScope.SYSTEM.value,
+                TaskDefinition.space_id.in_(allowed_space_ids),
+            )
         )
-    ]
+    return conditions
+
+
+def _space_filter(space_id: str):
+    """按空间筛选时**系统级仍要返回** —— 它不属于任何空间，是公共模板。
+
+    写成 `space_id == X` 会把 `scope='system'`（`space_id IS NULL`）整批筛掉：
+    主应用选了空间之后，列表里就再也看不到预置定义了。
+    """
+    return or_(
+        TaskDefinition.space_id == space_id,
+        TaskDefinition.scope == DefinitionScope.SYSTEM.value,
+    )
 
 
 class TaskDefinitionRepository(BaseRepository[TaskDefinition]):
@@ -86,32 +114,88 @@ class TaskDefinitionRepository(BaseRepository[TaskDefinition]):
         scope: str | None = None,
         offset: int = 0,
         limit: int = 20,
+        *,
+        keyword: str | None = None,
+        status: str | None = None,
+        space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
     ) -> list[TaskDefinition]:
-        """分页列某租户可见的定义（系统级 + 本租户；可加 `scope` 只看某一级）。"""
+        """分页列某租户可见的定义（系统级 + 本租户空间级；可加筛选）。"""
+        conditions = [
+            TaskDefinition.is_deleted == 0,
+            *_visible_conditions(tenant_id, scope, allowed_space_ids),
+        ]
+        if keyword:
+            conditions.append(TaskDefinition.name.ilike(f"%{keyword}%"))
+        if status:
+            conditions.append(TaskDefinition.status == status)
+        if space_id:
+            conditions.append(_space_filter(space_id))
         stmt = (
             select(TaskDefinition)
-            .where(
-                TaskDefinition.is_deleted == 0,
-                *_visible_conditions(tenant_id, scope),
-            )
-            .order_by(TaskDefinition.created_at.desc())
+            .where(*conditions)
+            .order_by(TaskDefinition.created_at.desc(), TaskDefinition.id.desc())
             .offset(offset)
             .limit(limit)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars())
 
-    async def count_visible(self, tenant_id: str, scope: str | None = None) -> int:
+    async def count_visible(
+        self,
+        tenant_id: str,
+        scope: str | None = None,
+        *,
+        keyword: str | None = None,
+        status: str | None = None,
+        space_id: str | None = None,
+        allowed_space_ids: list[str] | None = None,
+    ) -> int:
+        conditions = [
+            TaskDefinition.is_deleted == 0,
+            *_visible_conditions(tenant_id, scope, allowed_space_ids),
+        ]
+        if keyword:
+            conditions.append(TaskDefinition.name.ilike(f"%{keyword}%"))
+        if status:
+            conditions.append(TaskDefinition.status == status)
+        if space_id:
+            conditions.append(_space_filter(space_id))
         stmt = (
             select(func.count())
             .select_from(TaskDefinition)
-            .where(
-                TaskDefinition.is_deleted == 0,
-                *_visible_conditions(tenant_id, scope),
-            )
+            .where(*conditions)
         )
         result = await self.session.execute(stmt)
         return result.scalar_one()
+
+    async def get_by_name(
+        self, tenant_id: str, space_id: str, name: str
+    ) -> TaskDefinition | None:
+        """同租户同空间下的同名定义（名称判重用；软删的不算）。"""
+        stmt = select(TaskDefinition).where(
+            TaskDefinition.tenant_id == tenant_id,
+            TaskDefinition.space_id == space_id,
+            TaskDefinition.name == name,
+            TaskDefinition.is_deleted == 0,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def update_fields(self, definition_id: str, **values) -> bool:
+        """按主键更新定义字段（名称 / 描述 / 状态 / 操作人）。"""
+        values.setdefault("updated_at", datetime.now())
+        stmt = (
+            update(TaskDefinition)
+            .where(
+                TaskDefinition.id == definition_id,
+                TaskDefinition.is_deleted == 0,
+            )
+            .values(**values)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return result.rowcount > 0
 
     async def get_visible(
         self, definition_id: str, tenant_id: str
@@ -136,9 +220,7 @@ class TaskDefinitionRepository(BaseRepository[TaskDefinition]):
         stmt = select(TaskDefinition).where(
             TaskDefinition.id == definition_id,
             TaskDefinition.is_deleted == 0,
-            TaskDefinition.scope.in_(
-                [DefinitionScope.TENANT.value, DefinitionScope.SPACE.value]
-            ),
+            TaskDefinition.scope == DefinitionScope.SPACE.value,
             TaskDefinition.tenant_id == tenant_id,
         )
         result = await self.session.execute(stmt)
@@ -234,6 +316,26 @@ class TaskDefinitionVersionRepository(BaseRepository[TaskDefinitionVersion]):
             TaskDefinitionVersion.definition_id == definition_id,
             TaskDefinitionVersion.status == VersionStatus.DRAFT.value,
             TaskDefinitionVersion.is_deleted == 0,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_latest(
+        self, definition_id: str
+    ) -> TaskDefinitionVersion | None:
+        """取**最新版本**（max(version_no)，含草稿；被定义带删的版本不算）。
+
+        ⚠️ 与 `next_version_no` 口径不同：那里**故意不过滤** `is_deleted`（防撞唯一键），
+        这里要的是「编辑者看到的最新一版」，必须排除已删版本。
+        """
+        stmt = (
+            select(TaskDefinitionVersion)
+            .where(
+                TaskDefinitionVersion.definition_id == definition_id,
+                TaskDefinitionVersion.is_deleted == 0,
+            )
+            .order_by(TaskDefinitionVersion.version_no.desc())
+            .limit(1)
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()

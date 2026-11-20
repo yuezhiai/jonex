@@ -8,7 +8,7 @@
 只存 `current_version_no` 指向最新已发布版本；`TaskDefinitionVersion` 才是真正存编排
 的地方，走 draft → published 单向状态机。
 
-两张表都按 `scope` 分三级（§3.1）：`system` 无租户无空间、`tenant` 有租户无空间、
+两张表都按 `scope` 分两级（§3.1，2026-11-18 起删除 `tenant`）：`system` 无租户无空间、
 `space` 两个都有；所以 **不能用 `TenantMixin`**（那会把 `tenant_id` 钉成 NOT NULL），
 租户/空间列在这里显式声明为可空，配套 `CHECK` 约束由 DDL 兜住。
 """
@@ -32,29 +32,41 @@ from jonex_core.common.database import Base
 from jonex_core.common.entity import TimestampMixin
 
 from .base import iso
-from .enums import DefinitionScope, VersionStatus
+from .enums import DefinitionScope, DefinitionStatus, VersionStatus
 
 
 class TaskDefinition(Base, TimestampMixin):
-    """任务定义：一类任务的身份证（按 scope 分系统级 / 租户级 / 空间级）。"""
+    """任务定义：一类任务的身份证（按 scope 分系统级 / 空间级）。"""
 
     __tablename__ = "task_definitions"
     __table_args__ = (
         # 按租户查定义（def.list）用；索引名与 DDL 一致
         Index("idx_tc_def_tenant", "tenant_id"),
-        # 下面两条 CHECK 的出处是 DDL（`deploy/postgres/migrations/005_task_center.sql`）：
+        # 空间级定义在「同租户同空间」内不能重名（需求 4/5 的名称判重）；
+        # 软删后允许重名；系统级 space_id 为 NULL，不参与（PostgreSQL 唯一索引允许多个 NULL）
+        Index(
+            "uq_tc_def_space_name",
+            "tenant_id",
+            "space_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_deleted = 0 AND scope = 'space'"),
+        ),
+        # 下面三条 CHECK 的出处是 DDL（`deploy/postgres/migrations/005_task_center.sql`）：
         # 这里重复声明一遍，是为了 `Base.metadata.create_all` 建出来的表**跟 DDL 一样**
         # （本模块的规矩，见 `catalog.py` 里"唯一约束必须跟着走"那句）。生产建表只走 DDL，
-        # 这两条不参与；但少了它们，本地 `create_all` 出的库会**少一道生产有的闸**，
+        # 这三条不参与；但少了它们，本地 `create_all` 出的库会**少一道生产有的闸**，
         # 于是本地能过、线上一插就炸。
-        CheckConstraint("scope IN ('system','tenant','space')", name="ck_tc_def_scope"),
+        CheckConstraint("scope IN ('system','space')", name="ck_tc_def_scope"),
         CheckConstraint(
             # scope 与 tenant_id / space_id 必须配套（§3.1）：
-            # 系统级两个都空、租户级只有租户、空间级两个都有
+            # 系统级两个都空、空间级两个都有
             "(scope = 'system' AND tenant_id IS NULL     AND space_id IS NULL)"
-            " OR (scope = 'tenant' AND tenant_id IS NOT NULL AND space_id IS NULL)"
             " OR (scope = 'space'  AND tenant_id IS NOT NULL AND space_id IS NOT NULL)",
             name="ck_tc_def_scope_fields",
+        ),
+        CheckConstraint(
+            "status IN ('draft','published','disabled')", name="ck_tc_def_status"
         ),
         # ⚠️ 本类**不走 `SoftDeleteMixin`**：它带的 `index=True` 会让 `create_all` 多建
         # 一条 `ix_task_center_task_definitions_is_deleted`，而 DDL 不给软删列单独建索引
@@ -65,17 +77,24 @@ class TaskDefinition(Base, TimestampMixin):
     )
 
     id = Column(String(64), primary_key=True, default=lambda: str(uuid4()))
-    # system(系统级) / tenant(租户级) / space(空间级)
+    # system(系统级) / space(空间级)
     scope = Column(String(16), nullable=False, default=DefinitionScope.SPACE.value)
-    # scope=tenant / space 时必有；scope=system 时为空
+    # scope=space 时必有；scope=system 时为空
     # （索引走上面的 idx_tc_def_tenant，不另开 `index=True`，免得 `create_all` 建出两条重复的）
     tenant_id = Column(String(64), nullable=True)
     # scope=space 时必有；其余为空
     space_id = Column(String(64), nullable=True)
     name = Column(String(128), nullable=False)
     description = Column(String(512), nullable=True)
+    # 定义状态（需求 1）：draft / published / disabled
+    status = Column(
+        String(16), nullable=False, default=DefinitionStatus.DRAFT.value
+    )
     # 最新已发布版本号；0 = 还没发过版
     current_version_no = Column(Integer, nullable=False, default=0)
+    # 创建人 / 最后操作人（存 user_id 字符串；展示时跨 schema 查 platform.users）
+    created_by = Column(String(64), nullable=True)
+    updated_by = Column(String(64), nullable=True)
     # 见上面 `__table_args__` 里那段：这一列**不走 mixin**（DDL 不给软删列单独建索引），
     # 声明照抄 `SoftDeleteMixin` 的定义。
     is_deleted = Column(SmallInteger, default=0, nullable=False)
@@ -88,7 +107,10 @@ class TaskDefinition(Base, TimestampMixin):
             "space_id": self.space_id,
             "name": self.name,
             "description": self.description,
+            "status": self.status,
             "current_version_no": self.current_version_no,
+            "created_by": self.created_by,
+            "updated_by": self.updated_by,
             "created_at": iso(self.created_at),
             "updated_at": iso(self.updated_at),
         }
@@ -116,12 +138,11 @@ class TaskDefinitionVersion(Base):
             "status IN ('draft','published')", name="ck_tc_ver_status"
         ),
         CheckConstraint(
-            "scope IN ('system','tenant','space')", name="ck_tc_ver_scope"
+            "scope IN ('system','space')", name="ck_tc_ver_scope"
         ),
         CheckConstraint(
             # 版本的 scope / tenant_id / space_id 必须跟所属定义一致（§3.2）
             "(scope = 'system' AND tenant_id IS NULL     AND space_id IS NULL)"
-            " OR (scope = 'tenant' AND tenant_id IS NOT NULL AND space_id IS NULL)"
             " OR (scope = 'space'  AND tenant_id IS NOT NULL AND space_id IS NOT NULL)",
             name="ck_tc_ver_scope_fields",
         ),

@@ -87,6 +87,7 @@ from jonex_core.common.exceptions import (
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
+from .dtos.definition import TaskDefinitionCreate, TaskDefinitionUpdate
 from .dtos.execution import ReportStatusRequest
 from .dtos.trigger import TaskTriggerCreate, TaskTriggerUpdate
 from .flows.registry import RunnerRegistry
@@ -109,6 +110,34 @@ logger = logging.getLogger(__name__)
 #: ⚠️ 加新的**写**接口时，这里必须同步登记 —— 漏登记的后果是「悄悄放行」（与网关侧
 #: 漏传 `user_id` 是同一类问题，见 `CLAUDE.md` 那条纪律）。
 _ACTION_PERMISSIONS: Dict[str, str] = {
+    # ── 任务定义管理（2026-11-18 加）：前端口子，读/写分开 ──
+    # 读：列表 / 详情 / 版本 / 步骤清单；
+    # 写：创建 / 编辑 / 编排保存 / 发布 / 停用 / 删除 / 复制 / 执行。
+    # ⚠️ 写操作还有第二道：服务层的空间管理员身份（两者都要满足）。
+    "def.list": "task_center:read",
+    "def.get": "task_center:read",
+    # 执行前置：开始节点参数定义（只读；与 def.get 同口径）
+    "def.input_schema": "task_center:read",
+    "def.version_get": "task_center:read",
+    "def.version_list": "task_center:read",
+    "def.catalog_steps": "task_center:read",
+    "def.steps": "task_center:read",
+    "def.create": "task_center:write",
+    # `def.update` 改定义本身 → 写码；
+    # `def.run` **故意不登记**（2026-11-18 审计）：执行权限按设计是「空间可见即可」
+    # （member 也能跑），而 `task_center:write` 在种子里只授管理员 —— 登记它等于
+    # 把 member 挡在门外。未登记的 action 在 `_check_action_permission` 里直接放行，
+    # 服务层 `run_definition` 仍会做 `require_space_visible`（空间角色是真正的闸）。
+    "def.update": "task_center:write",
+    "def.copy": "task_center:write",
+    "def.delete": "task_center:write",
+    "def.orchestration_save": "task_center:write",
+    "def.publish": "task_center:write",
+    "def.disable": "task_center:write",
+    # 旧版本动作（内部调用为主，保留并同样登记）
+    "def.version_create": "task_center:write",
+    "def.version_update": "task_center:write",
+    "def.version_publish": "task_center:write",
     # 两个只读接口（租户内只读视图）
     "task.console_page": "task_center:read",
     "task.console_subtask_list": "task_center:read",
@@ -159,7 +188,10 @@ def _force_param(request, data) -> bool:
     force = _strict_bool(data.get("force"), "force")
     if force and request.user_id:
         raise PermissionDeniedError(
-            message="强制删除只允许内部级联调用（源头已删除时）",
+            message=translate(
+                "err.task_center.force.internal_only",
+                fallback="强制删除只允许内部级联调用（源头已删除时）",
+            ),
             details={"action": request.payload.get("action")},
         )
     return force
@@ -238,9 +270,20 @@ class TaskCenterCapability(BaseCapability):
     # 「缺少必填参数 cron_expr」有用得多。
     _REQUIRED_KEYS: Dict[str, tuple] = {
         # ── 定义 def.* ──
-        # `def.catalog_steps` 无必填参数（列全局步骤清单）；`def.create` 不再要任务类型。
-        "def.create": ("scope", "name"),
+        # `def.create`（需求 4）：只钉死 name。`space_id` **不在这里无条件必填** ——
+        # 它按 scope 分叉：scope=space 缺它由 `_resolve_scope` 回 1001（文案更具体），
+        # scope=system 则本来就不该有它。挡在入口会把平台内部建系统定义的路径打死
+        # （`_PLATFORM_ACTIONS` 名单与 Sidecar 白名单都还保留着那条路径）。
+        "def.create": ("name",),
         "def.get": ("definition_id",),
+        "def.input_schema": ("definition_id",),
+        "def.update": ("definition_id", "name"),
+        "def.run": ("definition_id",),
+        "def.copy": ("definition_id",),
+        "def.orchestration_save": ("definition_id", "config", "status"),
+        "def.publish": ("definition_id",),
+        "def.disable": ("definition_id",),
+        "def.version_list": ("definition_id",),
         "def.version_create": ("definition_id",),
         "def.version_update": ("definition_id", "version_no", "config"),
         "def.version_get": ("definition_id", "version_no"),
@@ -488,27 +531,78 @@ class TaskCenterCapability(BaseCapability):
             "def.catalog_steps": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).list_catalog_steps()
             ),
-            "def.create": lambda r, d: self._execute(
-                lambda s: TaskDefinitionService(s).create_definition(
-                    d["scope"],
-                    d["name"],
-                    tenant_id=r.tenant_id,
-                    space_id=d.get("space_id"),
-                    description=d.get("description"),
-                    initial_config=d.get("initial_config"),
-                )
-            ),
+            # 报文先过 DTO（字段白名单 + 列宽）：`name` 超长 / 空串在**落库之前**就回
+            # 1001。不挡的话 INSERT 抛 `DataError`（22001，不是 service 认领的
+            # `IntegrityError`），最终被兜成「执行失败」+ 内部码 —— 真因明明是参数。
+            "def.create": lambda r, d: self._create_definition_action(r, d),
             "def.list": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).list_definitions(
                     r.tenant_id,
                     d.get("scope"),
                     **_page_params(d),
+                    keyword=d.get("keyword"),
+                    status=d.get("status"),
+                    space_id=d.get("space_id"),
+                    user_id=r.user_id,
                 )
             ),
             "def.get": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).get_definition(
-                    d["definition_id"], r.tenant_id
+                    d["definition_id"], r.tenant_id, user_id=r.user_id
                 )
+            ),
+            # 执行前置：最新已发布编排的开始节点参数定义（2026-11-20）
+            "def.input_schema": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).get_input_schema(
+                    d["definition_id"], r.tenant_id, user_id=r.user_id
+                )
+            ),
+            "def.update": lambda r, d: self._update_definition_action(r, d),
+            "def.run": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).run_definition(
+                    d["definition_id"],
+                    d.get("inputs") or {},
+                    tenant_id=r.tenant_id,
+                    user_id=r.user_id,
+                )
+            ),
+            "def.copy": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).copy_definition(
+                    d["definition_id"],
+                    tenant_id=r.tenant_id,
+                    user_id=r.user_id,
+                )
+            ),
+            "def.orchestration_save": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).save_orchestration(
+                    d["definition_id"],
+                    d["config"],
+                    d["status"],
+                    tenant_id=r.tenant_id,
+                    user_id=r.user_id,
+                )
+            ),
+            "def.publish": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).publish_definition(
+                    d["definition_id"],
+                    tenant_id=r.tenant_id,
+                    user_id=r.user_id,
+                )
+            ),
+            "def.disable": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).disable_definition(
+                    d["definition_id"],
+                    tenant_id=r.tenant_id,
+                    user_id=r.user_id,
+                )
+            ),
+            "def.version_list": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).list_versions(
+                    d["definition_id"], r.tenant_id, user_id=r.user_id
+                )
+            ),
+            "def.steps": lambda r, d: self._execute(
+                lambda s: TaskDefinitionService(s).list_catalog_steps()
             ),
             "def.version_create": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).create_version(
@@ -517,26 +611,37 @@ class TaskCenterCapability(BaseCapability):
                     base_version_no=d.get("base_version_no"),
                     config=d.get("config"),
                     tenant_id=r.tenant_id,
+                    user_id=r.user_id,
                 )
             ),
             "def.version_update": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).update_version(
-                    d["definition_id"], d["version_no"], d["config"], r.tenant_id
+                    d["definition_id"],
+                    d["version_no"],
+                    d["config"],
+                    r.tenant_id,
+                    user_id=r.user_id,
                 )
             ),
             "def.version_get": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).get_version(
-                    d["definition_id"], d["version_no"], r.tenant_id
+                    d["definition_id"],
+                    d["version_no"],
+                    r.tenant_id,
+                    user_id=r.user_id,
                 )
             ),
             "def.version_publish": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).publish_version(
-                    d["definition_id"], d["version_no"], r.tenant_id
+                    d["definition_id"],
+                    d["version_no"],
+                    r.tenant_id,
+                    user_id=r.user_id,
                 )
             ),
             "def.delete": lambda r, d: self._execute(
                 lambda s: TaskDefinitionService(s).delete_definition(
-                    d["definition_id"], r.tenant_id
+                    d["definition_id"], r.tenant_id, user_id=r.user_id
                 )
             ),
             # ── 触发 trig.* ──
@@ -669,7 +774,12 @@ class TaskCenterCapability(BaseCapability):
                 )
             ),
             "task.retry": lambda r, d: self._execute(
-                lambda s: self._task_service(s).retry_task(d["task_id"], r.tenant_id)
+                lambda s: self._task_service(s).retry_task(
+                    d["task_id"], r.tenant_id,
+                    # 与 `task.console_task_retry` 同一道空间可见性：不传 user_id
+                    # 会让同租户无权限调用方绕过 403 重跑别人的任务。
+                    user_id=r.user_id,
+                )
             ),
             # 重试单个子任务：**按 `node_id` 寻址**（同一个 `step_code` 允许在编排里
             # 出现多次，唯一的是 `node_id`）；`space_id` 是一道一致性核对（对不上按
@@ -758,6 +868,9 @@ class TaskCenterCapability(BaseCapability):
             "task.console_page": lambda r, d: self._execute(
                 lambda s: self._task_service(s).page_tasks(
                     r.tenant_id,
+                    # 按任务定义筛：**可选**（2026-11-20 放宽，原先缺失由 service
+                    # 回 1001）。不传 = 不按定义筛，范围由空间权限收敛。
+                    definition_id=d.get("definition_id"),
                     keyword=d.get("keyword"),
                     start_time=_parse_iso_time(d.get("start_time"), "start_time"),
                     end_time=_parse_iso_time(d.get("end_time"), "end_time"),
@@ -858,6 +971,53 @@ class TaskCenterCapability(BaseCapability):
         async with get_db_session() as session:
             result = await factory(session)
         return _plain(result)
+
+    async def _create_definition_action(
+        self, request: CapabilityRequest, data: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """`def.create` 的动作体：报文先过 `TaskDefinitionCreate`（字段白名单 + 列宽）。
+
+        `scope` / `space_id` 的**搭配**仍由服务层 `_resolve_scope` 判（它的文案更直白），
+        这里只负责「名字空/超长、描述超长」这类纯形状问题在落库前变成 1001。
+        """
+        dto = _from_request(TaskDefinitionCreate, data)
+        return await self._execute(
+            lambda s: TaskDefinitionService(s).create_definition(
+                dto.scope or "space",
+                dto.name,
+                tenant_id=request.tenant_id,
+                space_id=dto.space_id,
+                description=dto.description,
+                initial_config=dto.initial_config,
+                user_id=request.user_id,
+            )
+        )
+
+    async def _update_definition_action(
+        self, request: CapabilityRequest, data: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """`def.update` 的动作体：与 `def.create` 同口径，报文先过 `TaskDefinitionUpdate`。
+
+        原先直接吃 `d["name"]`：给数字时服务层 `(name or "").strip()` 抛
+        `AttributeError` → 500（乱点实测）。形状问题归 DTO 回 1001；
+        「名称空/超长」的业务文案仍由服务层兜一道（两处判据一致，互不冲突）。
+
+        `description` 必须按 `exclude_unset` 透传：**没传 ≠ 清空**。用 DTO 的默认
+        `None` 无条件传下去，改个名字就会顺手把已有描述 SET 成 NULL（审计发现）。
+        """
+        dto = _from_request(TaskDefinitionUpdate, data)
+        fields = dto.dict(exclude_unset=True)
+        kwargs: Dict[str, Any] = {"name": fields["name"]}
+        if "description" in fields:  # 只有报文里显式给了（含显式 null）才动它
+            kwargs["description"] = fields["description"]
+        return await self._execute(
+            lambda s: TaskDefinitionService(s).update_definition(
+                data["definition_id"],
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                **kwargs,
+            )
+        )
 
     async def _report_status_action(
         self, session: Any, request: CapabilityRequest, data: Dict[str, Any]

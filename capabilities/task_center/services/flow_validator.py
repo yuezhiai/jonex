@@ -12,7 +12,7 @@
 | 分组 | 编号 | 查什么 |
 |---|---|---|
 | 结构 | N0 / N1 / N2 / N3 / N4 | `node_id` 唯一 / 无死循环 / 引用存在（结构）/ 同层 `sort` / 对偶 |
-| 入口 | N5 / N6 / N7 | `entry` 必填且存在 / `entry` 无依赖 / 没有孤儿节点 |
+| 入口 | N5 / N6 / N7 | **N5/N6 已作废**（`entry` 退场）；N7 = 至少一个无依赖入口 + 所有节点可达 |
 | 引用 | N8 / N8b / N9 / N10 | 引用的节点存在 / `@task.inputs` 的键存在 / 字段已声明 / 无自引用 |
 | 绑定 | N11 / N12 | `bind_inputs` 对得上 `input_schema` / 类型对得上 |
 | 字段定义 | N13 / N14 / N15 / N16 / N17 | `type` / `required` / `default` / `enum` / object·array 子结构 |
@@ -28,8 +28,9 @@
   （`normalize_by_schema`）和触发入参校验（§3.3.1）里起作用。
   N18 说明 `fail_policy` 已从编排里删掉、不再校验它，这条留给将来新增的枚举字段。
 
-一期**没有自动重试**（§十二「待规划」）：`on_timeout` / `on_failure` 这两个字段既不认、
-也不校验——写进编排里会被忽略，不会因为"配了重试"而影响发版或运行。
+**自动重试（2026-11-18 加，需求 19）**：节点级 `max_retries`（0~3，N19 查范围）与
+`on_retry_exhausted`（`terminate` / `skip`，N18 查枚举）。执行超时复用
+`timeout_seconds`，不新增字段。旧的 `on_timeout` / `on_failure` 仍不认。
 
 另外这里还提供两件运行期也要用的工具（校验和运行共用同一份 schema 语义，
 不许出现"发版时说行、跑起来说不通"）：
@@ -51,7 +52,7 @@ try:  # pydantic>=1.10 的 v1 兼容命名空间优先（与各 DTO 的引入口
 except ImportError:  # pragma: no cover
     from pydantic import ValidationError
 
-from ..dtos.definition import FlowConfig
+from ..dtos.definition import FlowConfig, upgrade_flow_config
 from ..models import RunnerDefinition, TaskCatalogStep
 from .expressions import (
     Binding,
@@ -95,6 +96,91 @@ def _type_bucket(field_type: Optional[str]) -> str:
     return "scalar"
 
 
+def validate_file_inputs(
+    schema: Any, values: Any, path: str, issues: List[str]
+) -> None:
+    """校验 `file` 类型的运行期取值（2026-11-18 加）。
+
+    文件变量的值有两种合法形态：
+
+    - 对象 `{document_id, file_name}`（执行接口 / 触发器传进来的上传结果）；
+    - 字符串（已经是文档 ID）。
+
+    ⚠️ **缺 `document_id` 的对象当场拒**：不拒的话它会被原样派给运行方，
+    运行方拿不到文档 ID、只能空跑或超时 —— 把「参数错」包装成「执行失败」。
+    """
+    if not isinstance(schema, dict) or not isinstance(values, dict):
+        return
+    for name, spec in schema.items():
+        if not isinstance(spec, dict):
+            continue
+        value = values.get(name)
+        if value is None:
+            continue
+        if spec.get("type") == "file":
+            if isinstance(value, dict):
+                if not value.get("document_id"):
+                    issues.append(
+                        f"{path}.{name} 是文件引用对象，但缺少 document_id——"
+                        "不知道要处理哪份文档"
+                    )
+            elif not isinstance(value, str):
+                issues.append(
+                    f"{path}.{name} 的类型是 file，取值必须是 "
+                    "{{document_id, file_name}} 或文档 ID 字符串"
+                )
+        elif spec.get("type") == "object" and isinstance(value, dict):
+            validate_file_inputs(
+                spec.get("properties"), value, f"{path}.{name}", issues
+            )
+        elif spec.get("type") == "array" and isinstance(value, (list, tuple)):
+            items = spec.get("items")
+            if isinstance(items, dict) and items.get("type") == "file":
+                for index, item in enumerate(value):
+                    if isinstance(item, dict) and not item.get("document_id"):
+                        issues.append(
+                            f"{path}.{name}[{index}] 是文件引用对象，但缺少 document_id"
+                        )
+
+
+def _coerce_file_value(spec: Any, value: Any) -> Any:
+    """把 `file` 字段的对象引用转成文档 ID（对象 → id；字符串原样）。"""
+    if not isinstance(spec, dict):
+        return value
+    field_type = spec.get("type")
+    if field_type == "file":
+        if isinstance(value, dict):
+            return value.get("document_id")
+        return value
+    if field_type == "object" and isinstance(value, dict):
+        properties = spec.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: _coerce_file_value(properties.get(key), item)
+                for key, item in value.items()
+            }
+    if field_type == "array" and isinstance(value, (list, tuple)):
+        items = spec.get("items")
+        if isinstance(items, dict):
+            return [_coerce_file_value(items, item) for item in value]
+    return value
+
+
+def coerce_file_values(schema: Any, values: Any) -> Any:
+    """按步骤 `input_schema` 把 `file` 字段统一收成文档 ID（派活前调用）。
+
+    「开始节点上传文件、下游拿到文档 ID」这条转换**只在这里**发生：任务入参是
+    上传结果对象，节点间传递与派活报文一律是 ID 字符串（`document` 的说明见
+    `dtos/definition.py` 的 `FieldSpec`）。
+    """
+    if not isinstance(schema, dict) or not isinstance(values, dict):
+        return values
+    return {
+        name: _coerce_file_value(schema.get(name), value)
+        for name, value in values.items()
+    }
+
+
 def empty_value_for(field_type: Optional[str]) -> Any:
     """按字段类型给「空值」（§6.2 末尾的填空规则）。
 
@@ -123,7 +209,11 @@ def type_matches(value: Any, field_type: str) -> bool:
     if field_type == "boolean":
         return isinstance(value, bool)
     if field_type == "file":
-        return isinstance(value, dict)
+        # 2026-11-18：文件引用的合法取值有两种 —— `{document_id, file_name}` 对象
+        # （上传结果）与**文档 ID 字符串**（开始节点输出/节点间传递的形态）。
+        # 这里只认 dict 的话，`validate_file_inputs` 放行的字符串会在 fire 的收口里
+        # 被判类型不符（真机审计发现的自相矛盾），随后按空值/1001 处理。
+        return isinstance(value, (dict, str))
     if field_type == "object":
         return isinstance(value, dict)
     if field_type == "array":
@@ -163,6 +253,10 @@ def validate_field_spec(spec: Any, path: str, issues: List[str]) -> None:
         if not type_matches(spec["default"], field_type):
             issues.append(f"{path}.default 的类型跟 type={field_type} 对不上（N15）")
     if field_type == "object":
+        # 抽象对象（`abstract=true`）只表达形状、不展开子字段（需求 16/17：
+        # `result` / `chunks` 的元素类型）。非抽象对象仍必须给出 properties。
+        if spec.get("abstract") is True:
+            return
         properties = spec.get("properties")
         if not isinstance(properties, dict) or not properties:
             issues.append(f"{path} 是 object，必须给出 properties（N17）")
@@ -237,6 +331,12 @@ def normalize_by_schema(
             )
             continue
         if field_type == "object":
+            # 抽象对象（`abstract=true`）**原样保留**：它没有 `properties`，
+            # 再往下递归只会得到 `{}` —— 等于把调用方传的值静默清空
+            # （2026-11-18 审计发现：`result` / `chunks` 这类抽象字段会被清成空）。
+            if spec.get("abstract") is True:
+                normalized[name] = value
+                continue
             nested, nested_issues = normalize_by_schema(
                 spec.get("properties"), value, path=f"{path}.{name}"
             )
@@ -246,6 +346,10 @@ def normalize_by_schema(
         if field_type == "array":
             items_spec = spec.get("items")
             if isinstance(items_spec, dict) and items_spec.get("type") == "object":
+                # 抽象元素（`Array<Object>`）同理：保留元素原值，不按空 properties 清空。
+                if items_spec.get("abstract") is True:
+                    normalized[name] = list(value)
+                    continue
                 collected = []
                 for index, item in enumerate(value):
                     nested, nested_issues = normalize_by_schema(
@@ -308,7 +412,7 @@ def _check_ref(
         if root not in (task_schema or {}):
             issues.append(
                 f"{where} 引用了任务级入参 {ref.text()}，"
-                f"但 config.input_schema 里没声明 {root!r}（N8b）"
+                f"但 config.start.inputs 里没声明 {root!r}（N8b）"
             )
         return
     if ref.kind == "step":
@@ -360,6 +464,9 @@ def validate_flow_config(
     issues: List[str] = []
     if not isinstance(config, dict):
         return ["config 必须是一个对象"]
+    # 旧结构（input_schema / output_schema / entry）先升级成 start/steps/end；
+    # 校验与运行期共用这一份规范化，避免两处判结构。
+    config = upgrade_flow_config(config)
 
     # ---- N22 + N13~N17：内置步骤侧 ----
     for step_code, row in (catalog_steps or {}).items():
@@ -374,9 +481,15 @@ def validate_flow_config(
             row.output_schema, f"内置步骤 {step_code!r} 的 output_schema", issues
         )
 
-    # ---- N13~N17：任务级 input_schema ----
-    task_schema = config.get("input_schema") or {}
-    validate_schema(task_schema, "config.input_schema", issues)
+    # ---- N13~N17：开始节点的输入变量（原 input_schema） ----
+    start_cfg = config.get("start")
+    if start_cfg is not None and not isinstance(start_cfg, dict):
+        # 非对象时先记一条 issue 再降级成 `{}`：不让 `.get` 抛 AttributeError
+        # （那会被能力入口兜成 1000「未知、可原样重发」，而不是 1001）。
+        issues.append("config.start 必须是对象（N0）")
+        start_cfg = {}
+    task_schema = (start_cfg or {}).get("inputs") or {}
+    validate_schema(task_schema, "config.start.inputs", issues)
     # `validate_schema` 对非 dict 只记一条 issue、**不中止**，而下面 `_check_ref` 要拿
     # 它当字典查（`root not in task_schema`）—— 不降级就是 `TypeError`，直接破掉本函数
     # 「返回 List[str]、不抛异常」的契约，调用方拿到的是「执行失败」而不是校验问题清单。
@@ -384,11 +497,17 @@ def validate_flow_config(
     if not isinstance(task_schema, dict):
         task_schema = {}
 
-    # ---- N24：任务级 output_schema（画布结束节点的参数面板）----
+    # ---- N24：结束节点的输出变量（原 output_schema）----
     # 一期只校验字段定义合法，**不校验「声明的字段有没有节点产出」** —— 任务级产出
     # 的运行期汇总还没做（口径 A），此时做来源校验会把「先声明、后接产出」的路堵死。
+    end_cfg = config.get("end")
+    if end_cfg is not None and not isinstance(end_cfg, dict):
+        issues.append("config.end 必须是对象（N0）")
+        end_cfg = {}
     validate_schema(
-        config.get("output_schema") or {}, "config.output_schema", issues
+        (end_cfg or {}).get("outputs") or {},
+        "config.end.outputs",
+        issues,
     )
 
     steps = config.get("steps")
@@ -433,6 +552,26 @@ def validate_flow_config(
                 "不在平台内置步骤清单里（N21）"
             )
 
+    # ---- N25： parse 节点数量（2026-11-18 加，需求 18）----
+    # 编排可以没有 compile（「只有解析」是合法链），但不能没有解析：
+    # 没有 parse 时 compile 的 `chunks` 输入也无处可取，整条链跑不起来。
+    #
+    # ⚠️ **当前运行方只支持一个 parse**（2026-11-18 审计）：知识库接管行按
+    # `document_id` 一行、`task_id` 唯一，`_prepare_step` 用 `read_by_task_id` 单行
+    # 定位 —— 两个 parse 并行会互相覆盖 `execution_id`（后派覆盖先派），先派的引擎
+    # 任务永远没人认领，任务必失败。发版放行「多解析」等于制造一条注定跑不通的编排。
+    # 等运行方把接管模型改成按 (task_id, node_id) 维护后再放开这条限制。
+    parse_nodes = [n for n, code in node_step_code.items() if code == "parse"]
+    if not parse_nodes:
+        issues.append(
+            "编排至少要有一个 parse（解析）节点——编译可以没有，解析不能没有（N25）"
+        )
+    elif len(parse_nodes) > 1:
+        issues.append(
+            "当前版本只支持一个 parse（解析）节点，收到 "
+            f"{sorted(parse_nodes)}（N25）"
+        )
+
     # ---- 逐节点：N2 / N3 / N4 / N11 / N12 / N19 ----
     depends_by_node: Dict[str, List[str]] = {}
     next_by_node: Dict[str, List[str]] = {}
@@ -472,7 +611,7 @@ def validate_flow_config(
                 if target == node_id:
                     issues.append(f"{where}.{name} 里引用了自己（N2）")
 
-        # ---- N19：超时时间必填、且必须是正整数 ----
+        # ---- N19：超时时间必填正整数 + 自动重试次数范围 ----
         timeout = item.get("timeout_seconds")
         if timeout is None:
             issues.append(
@@ -482,8 +621,16 @@ def validate_flow_config(
         elif not _is_int(timeout) or timeout <= 0:
             issues.append(f"{where}.timeout_seconds 必须是正整数（N19）")
 
-        # 一期不做自动重试（§十二「待规划」）：编排里若出现 on_timeout / on_failure，
-        # 既不看也不校验——发版不受它影响，运行期也不认这两个字段。
+        max_retries = item.get("max_retries", 0)
+        if not _is_int(max_retries) or max_retries < 0 or max_retries > 3:
+            issues.append(f"{where}.max_retries 只能是 0 / 1 / 2 / 3（N19）")
+
+        # ---- N18：重试耗尽策略枚举合法 ----
+        on_exhausted = item.get("on_retry_exhausted", "terminate")
+        if on_exhausted not in ("terminate", "skip"):
+            issues.append(
+                f"{where}.on_retry_exhausted 只能是 terminate / skip（N18）"
+            )
 
         # ---- N11 / N12：bind_inputs 字段对得上、来源能解析、类型对得上 ----
         bind_inputs = item.get("bind_inputs")
@@ -594,34 +741,45 @@ def validate_flow_config(
                     )
 
     # ---- N18：枚举合法 ----
-    # `config` 里**现在没有枚举型字段**（`fail_policy` 已从编排里删掉、不再校验它）。
-    # 这条留给"将来新增的枚举字段"，以及 `steps[].step_code` 这类取值约束的兜底 ——
-    # 后者的取值约束由 N21 查（在不在内置步骤清单里）。
+    # 节点级枚举（`on_retry_exhausted`）已在上面逐个节点校验；`step_code` 的取值
+    # 约束由 N21 查（在不在内置步骤清单里）。
 
-    # ---- N5 / N6 / N7：入口合法 ----
-    # `entry` 是**单个 `node_id` 字符串**（§6.1），不是列表。
-    entry = config.get("entry")
-    if not isinstance(entry, str) or not entry:
+    # ---- N7：入口与可达性（N5 / N6 已随 `entry` 退场作废，2026-11-18）----
+    # 入口 = `depends_on` 为空的节点，**允许多个**（例如两个 parse 并行）。
+    entry_nodes = [
+        node_id for node_id in steps_by_node if not depends_by_node.get(node_id)
+    ]
+    if not entry_nodes:
         issues.append(
-            "config.entry 必填、且必须是单个节点 id（node_id）字符串（N5）"
+            "编排至少要有一个没有 depends_on 的入口节点——否则没有任何节点能开始跑（N7）"
         )
-        entry = None
-    elif entry not in steps_by_node:
-        issues.append(f"config.entry 里的 {entry!r} 不在 steps[] 里（N5）")
-
-    if entry in steps_by_node:
-        if depends_by_node.get(entry):
-            issues.append(
-                f"入口节点 {entry!r} 不该有 depends_on——入口就是没上游的那一个（N6）"
-            )
-        # ---- N7：没有孤儿节点：depends_on 为空的节点有且只有 entry 一个 ----
+    elif len(entry_nodes) > 1:
+        # 与 N25 的多 parse 限制同源：运行方的接管行/执行编号是单份的，并行入口
+        # 会互相覆盖。当前版本只支持线性（单入口）编排。
+        issues.append(
+            "当前版本只支持单个入口节点（线性编排），收到多个无依赖入口 "
+            f"{sorted(entry_nodes)}（N7）"
+        )
+    else:
+        # 可达性沿 depends_on **正向**建图（B 依赖 A ⇒ A → B），不依赖 `next_steps`
+        # 是否写对（对偶由 N4 单独查），避免同一个问题报两遍。
+        children: Dict[str, List[str]] = {node_id: [] for node_id in steps_by_node}
+        for node_id, upstreams in depends_by_node.items():
+            for upstream in upstreams:
+                if upstream in steps_by_node:
+                    children[upstream].append(node_id)
+        reachable = set(entry_nodes)
+        queue = list(entry_nodes)
+        while queue:
+            current = queue.pop()
+            for child in children.get(current, []):
+                if child not in reachable:
+                    reachable.add(child)
+                    queue.append(child)
         for node_id in steps_by_node:
-            if node_id == entry:
-                continue
-            if not depends_by_node.get(node_id):
+            if node_id not in reachable:
                 issues.append(
-                    f"节点 {node_id!r} 没有上游、但又不是 config.entry({entry!r})"
-                    "——它永远不会被跑到（N7）"
+                    f"节点 {node_id!r} 从任何入口都到不了——它永远不会被跑到（N7）"
                 )
 
     # ---- N4：next_steps 与 depends_on 互为对偶 ----

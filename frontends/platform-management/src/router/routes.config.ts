@@ -12,6 +12,10 @@ const UserManagement = loadableComponent(() => import('@/pages/UserManagement'))
 const RolePermission = loadableComponent(() => import('@/pages/RolePermission'));
 const TaskSchedule = loadableComponent(() => import('@/pages/TaskSchedule'));
 const TaskCenter = loadableComponent(() => import('@/pages/TaskCenter'));
+// 任务中心的二级页，与一级列表同目录、同权限码
+const TaskExecutionList = loadableComponent(() => import('@/pages/TaskCenter/TaskExecutionList'));
+// 任务编辑（编排）页：二级页头「编辑任务」进来的静态展示页，数据来自假数据
+const TaskEditor = loadableComponent(() => import('@/pages/TaskCenter/TaskEditor'));
 const SystemConfig = loadableComponent(() => import('@/pages/SystemConfig'));
 const OperationLog = loadableComponent(() => import('@/pages/OperationLog'));
 const PlatformMonitor = loadableComponent(() => import('@/pages/PlatformMonitor'));
@@ -81,7 +85,8 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           menu: { icon: 'ScheduleOutlined', order: 9, permissionCode: 'platform:task:read' },
         },
         {
-          // 任务中心：任务执行实例的列表（一条 = 一次文档入库的执行记录），
+          // 任务中心一级页：任务定义列表。点某一行进下面的二级页看它的执行记录。
+          // 一级页本轮用假数据（`pages/TaskCenter/mockTaskDefinitions.ts`）。
           // 与上面的「任务调度」（cron 调度计划配置）是两回事，故并存
           path: 'task-center',
           element: TaskCenter,
@@ -98,6 +103,30 @@ export function getRoutes(mode: 'standalone' | 'hosted' = 'standalone', t?: (key
           // `_ACTION_PERMISSIONS` 按 read / write 判权），所以路由守卫只是第一道；
           // 两壳的守卫本来也不等价（standalone 的 basename 带尾斜杠，拦不住）。
           menu: { icon: 'ScheduleOutlined', order: 10, permissionCode: 'task_center:read' },
+        },
+        {
+          // 任务中心二级页（全部执行记录）。平台监控的「前往任务中心」深链落这里：
+          // 那是「一批失败任务」的视角，不属于某一个任务定义，所以走静态段而不是 :definitionId。
+          // react-router 静态段优先于动态段，两条不会互相吞掉。
+          path: 'task-center/executions',
+          element: TaskExecutionList,
+          title: T('navigation.taskCenter'),
+        },
+        {
+          // 任务编辑页：二级执行记录页头的「编辑任务」进来。`edit` 是静态段，
+          // 优先级高于下面的 `:definitionId`，不会被当成任务 id。
+          // 无 menu 元数据 → 不进侧栏，也不进路由守卫的精确 path 匹配。
+          path: 'task-center/:definitionId/edit',
+          element: TaskEditor,
+          title: T('navigation.taskCenter'),
+        },
+        {
+          // 任务中心二级页（某个任务定义的执行记录）。由一级列表点某一行进来，
+          // 任务名走 route state 带过来（`TaskExecutionList` 里读，兜底查假数据）。
+          // 无 menu 元数据 → 不进侧栏，也不进路由守卫的精确 path 匹配。
+          path: 'task-center/:definitionId',
+          element: TaskExecutionList,
+          title: T('navigation.taskCenter'),
         },
         {
           path: 'system-config',

@@ -15,8 +15,17 @@ export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopp
  *
  * `stopped` 是**管理方置的终态**（2026-10-15）：用户停整条任务时判给还没开始的那些步骤，
  * 或停某一步时按 `downstream_on_stop` 连带判给下游 —— 运行方报不了它。
+ * `skipped`（2026-11-18）同样是管理方置的终态：节点重试耗尽后按
+ * `on_retry_exhausted=skip` 跳过并继续，下游把它当「依赖已满足」。
  */
-export type SubtaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'timeout' | 'stopped';
+export type SubtaskStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'timeout'
+  | 'stopped'
+  | 'skipped';
 
 export interface TaskConsoleItem {
   id: string;
@@ -111,6 +120,13 @@ export interface TaskWriteResult {
 }
 
 export interface TaskListParams {
+  /**
+   * 任务定义 ID，**必填**（需求 9：执行记录按定义查看）。
+   *
+   * 网关 `GET /tasks` 把它声明成必填 query 参数，能力侧 `page_tasks` 再判一次空值，
+   * 缺了当场拒 —— 静默当成「全量」会让页面在忘传参时展示整个租户的任务。
+   */
+  definition_id: string;
   /** 模糊匹配任务名或任务 id。 */
   keyword?: string;
   /**
@@ -123,12 +139,12 @@ export interface TaskListParams {
   /**
    * 领域空间（取值是**主应用当前选中的空间**，不是页面上的下拉）。
    *
-   * ⚠️ 后端 `page_tasks` 目前**不接收** —— 它只取 keyword / start_time / end_time /
-   * statuses / page / page_size，多传的键被 dispatch 那层逐个取值时静默忽略。
-   * 照发是既定决定：前端一次接好，后端补齐后自动生效。
+   * 后端 `page_tasks` 已接收并处理：传了就先判归属与可见性（任一项不过直接拒），
+   * 再精确筛；不传则收敛到 `visible_space_ids_for` 给出的可见空间集合 ——
+   * 「不传 = 不过滤」在这里是错的（非管理员不会看到别的空间）。
    *
-   * 注意任务**确实有空间归属**（`retry_subtask` 的 `space_id` 是必传的归属凭据，
-   * 见 `_require_space_match`），所以这个参数不是凭空加的维度，只是列表口还没开。
+   * 任务**确实有空间归属**（`retry_subtask` 的 `space_id` 是必传的归属凭据，
+   * 见 `_require_space_match`），所以这个参数不是凭空加的维度。
    */
   space_id?: string;
   /** 按**建任务时间**筛（含两端）。 */

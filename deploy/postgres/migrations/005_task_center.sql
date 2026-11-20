@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS task_center.subtask_attempts (
     input_refs jsonb,
     inputs jsonb,
     output_refs jsonb,
-    CONSTRAINT ck_tc_sa_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'running'::character varying, 'success'::character varying, 'failed'::character varying, 'timeout'::character varying, 'stopped'::character varying])::text[])))
+    CONSTRAINT ck_tc_sa_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'running'::character varying, 'success'::character varying, 'failed'::character varying, 'timeout'::character varying, 'stopped'::character varying, 'skipped'::character varying])::text[])))
 );
 
 CREATE TABLE IF NOT EXISTS task_center.subtask_reports (
@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS task_center.subtasks (
     next_steps jsonb,
     sort integer,
     timeout_seconds integer DEFAULT 300 NOT NULL,
+    max_retries integer DEFAULT 0 NOT NULL,
+    auto_retries_used integer DEFAULT 0 NOT NULL,
+    on_retry_exhausted character varying(16) DEFAULT 'terminate'::character varying NOT NULL,
     inputs jsonb,
     outputs jsonb,
     output_refs jsonb,
@@ -86,7 +89,7 @@ CREATE TABLE IF NOT EXISTS task_center.subtasks (
     error_code character varying(128),
     error_params jsonb,
     input_refs jsonb,
-    CONSTRAINT ck_tc_sub_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'running'::character varying, 'success'::character varying, 'failed'::character varying, 'timeout'::character varying, 'stopped'::character varying])::text[])))
+    CONSTRAINT ck_tc_sub_status CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'running'::character varying, 'success'::character varying, 'failed'::character varying, 'timeout'::character varying, 'stopped'::character varying, 'skipped'::character varying])::text[])))
 );
 
 CREATE TABLE IF NOT EXISTS task_center.task_attempts (
@@ -130,8 +133,8 @@ CREATE TABLE IF NOT EXISTS task_center.task_definition_versions (
     published_at timestamp without time zone,
     is_deleted smallint DEFAULT 0 NOT NULL,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT ck_tc_ver_scope CHECK (((scope)::text = ANY ((ARRAY['system'::character varying, 'tenant'::character varying, 'space'::character varying])::text[]))),
-    CONSTRAINT ck_tc_ver_scope_fields CHECK (((((scope)::text = 'system'::text) AND (tenant_id IS NULL) AND (space_id IS NULL)) OR (((scope)::text = 'tenant'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NULL)) OR (((scope)::text = 'space'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NOT NULL)))),
+    CONSTRAINT ck_tc_ver_scope CHECK (((scope)::text = ANY ((ARRAY['system'::character varying, 'space'::character varying])::text[]))),
+    CONSTRAINT ck_tc_ver_scope_fields CHECK (((((scope)::text = 'system'::text) AND (tenant_id IS NULL) AND (space_id IS NULL)) OR (((scope)::text = 'space'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NOT NULL)))),
     CONSTRAINT ck_tc_ver_status CHECK (((status)::text = ANY ((ARRAY['draft'::character varying, 'published'::character varying])::text[])))
 );
 
@@ -142,12 +145,16 @@ CREATE TABLE IF NOT EXISTS task_center.task_definitions (
     space_id character varying(64),
     name character varying(128) NOT NULL,
     description character varying(512),
+    status character varying(16) DEFAULT 'draft'::character varying NOT NULL,
     current_version_no integer DEFAULT 0 NOT NULL,
+    created_by character varying(64),
+    updated_by character varying(64),
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     is_deleted smallint DEFAULT 0 NOT NULL,
-    CONSTRAINT ck_tc_def_scope CHECK (((scope)::text = ANY ((ARRAY['system'::character varying, 'tenant'::character varying, 'space'::character varying])::text[]))),
-    CONSTRAINT ck_tc_def_scope_fields CHECK (((((scope)::text = 'system'::text) AND (tenant_id IS NULL) AND (space_id IS NULL)) OR (((scope)::text = 'tenant'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NULL)) OR (((scope)::text = 'space'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NOT NULL))))
+    CONSTRAINT ck_tc_def_scope CHECK (((scope)::text = ANY ((ARRAY['system'::character varying, 'space'::character varying])::text[]))),
+    CONSTRAINT ck_tc_def_scope_fields CHECK (((((scope)::text = 'system'::text) AND (tenant_id IS NULL) AND (space_id IS NULL)) OR (((scope)::text = 'space'::text) AND (tenant_id IS NOT NULL) AND (space_id IS NOT NULL)))),
+    CONSTRAINT ck_tc_def_status CHECK (((status)::text = ANY ((ARRAY['draft'::character varying, 'published'::character varying, 'disabled'::character varying])::text[])))
 );
 
 CREATE TABLE IF NOT EXISTS task_center.task_triggers (
@@ -231,6 +238,8 @@ ALTER TABLE ONLY task_center.tasks
     ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
 
 CREATE INDEX IF NOT EXISTS idx_tc_def_tenant ON task_center.task_definitions USING btree (tenant_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tc_def_space_name ON task_center.task_definitions USING btree (tenant_id, space_id, name) WHERE ((is_deleted = 0) AND ((scope)::text = 'space'::text));
 
 CREATE INDEX IF NOT EXISTS idx_tc_report_exec ON task_center.subtask_reports USING btree (tenant_id, space_id, execution_id, is_deleted);
 

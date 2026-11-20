@@ -90,6 +90,7 @@ from ..dtos.console import (
     TaskTokenUsageItem,
     TaskTokenUsagePage,
 )
+from ..dtos.definition import upgrade_flow_config
 from ..dtos.execution import (
     SubtaskAttemptItem,
     SubtaskAttemptList,
@@ -109,6 +110,7 @@ from ..flows.runner_adapter import (
 from ..models import (
     AttemptStatus,
     DefinitionScope,
+    DefinitionStatus,
     Subtask,
     SubtaskAttemptStatus,
     SubtaskStatus,
@@ -138,7 +140,14 @@ from ..repository.execution_repository import (
 )
 from ..repository.report_repository import SubtaskReportRepository
 from ..repository.token_usage_repository import TaskTokenUsageRepository
-from .flow_validator import _detect_cycles, evaluate_bindings, normalize_by_schema
+from ..repository.user_repository import user_names_by_ids
+from .flow_validator import (
+    _detect_cycles,
+    coerce_file_values,
+    evaluate_bindings,
+    normalize_by_schema,
+    validate_file_inputs,
+)
 from .error_reason import (
     TASK_AGGREGATE_FAILED,
     build_fail_reason,
@@ -707,7 +716,25 @@ class TaskService:
         # 自带 id 能不能用：**必须在任何写库动作之前判**（下面还有版本校验、入参校验、
         # 算运行方名单一堆事）—— id 被占是「前提不成立」，没必要往下做无用功。
         if task_id:
-            if await self._tasks.exists_by_id(task_id):
+            occupied = await self._tasks.get_any_by_id(task_id)
+            if occupied is not None and (
+                occupied.tenant_id != tenant_id or occupied.is_deleted
+            ):
+                # **别人的 / 已删的 id 不能回 1006**：SDK 把 1006 一律当
+                # `REUSED`（「上次其实建成了」），运行方会认为任务已在、
+                # 后续上报全部落空；同时也堵掉跨租户 id 探测。
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.task_center.task.id_occupied",
+                        params={"task_id": task_id},
+                        fallback=(
+                            f"任务 id {task_id} 已被占用（不属于当前租户或已删除），"
+                            "请换一个新的 id"
+                        ),
+                    ),
+                    details={"task_id": task_id},
+                )
+            if occupied is not None:
                 raise ResourceAlreadyExistsError(
                     message=translate(
                         "err.task_center.task.id_taken",
@@ -726,6 +753,28 @@ class TaskService:
                     fallback=f"任务定义 {definition_id} 不存在",
                 ),
                 details={"definition_id": definition_id},
+            )
+        # 统一闸（需求 6/13/14）：草稿 / 已停用的定义不能起任务。
+        # 所有 fire 入口（task.fire / init_task / trig.fire / 调度）都汇聚到这里；
+        # 调度扫描另有一条「停用定义不扫」的 SQL 闸（见 trigger_repository.list_due_cron）。
+        if definition.status != DefinitionStatus.PUBLISHED.value:
+            # 用 **1003（冲突）而不是 1001**：调度器把 1001/1002 当「配置类失败」
+            # 去 `pause_on_cron_failure` **永久暂停**触发器；而「定义刚被停用」是
+            # 可恢复的状态变化（重新发布即可），不该触发熔断（审计发现）。
+            raise ResourceConflictError(
+                message=translate(
+                    "err.task_center.def.not_runnable",
+                    params={"definition_id": definition_id, "status": definition.status},
+                    fallback=(
+                        f"定义 {definition_id} 当前是 {definition.status}，"
+                        "只有已发布的任务定义才能执行"
+                    ),
+                ),
+                details={
+                    "definition_id": definition_id,
+                    "status": definition.status,
+                    "reason": "definition_not_runnable",
+                },
             )
 
         locked_no = version_no if version_no is not None else definition.current_version_no
@@ -760,12 +809,20 @@ class TaskService:
 
         task_space_id = self._resolve_task_space(definition_id, version, space_id)
 
-        config = version.config or {}
-        # 任务级入参按这版编排的 input_schema 收口：必填补齐 / 可选值卡过 / 默认值填过。
+        # 旧编排结构（input_schema / entry）在这里升级成 start/steps/end：
+        # 存量已发布版本仍是旧结构，运行期与校验器共用同一份规范化。
+        config = upgrade_flow_config(version.config or {})
+        # 任务级入参按开始节点的 inputs 收口：必填补齐 / 可选值卡过 / 默认值填过。
+        start_schema = (config.get("start") or {}).get("inputs") or {}
         normalized, issues = normalize_by_schema(
-            config.get("input_schema") or {},
+            start_schema,
             inputs or {},
             path=f"任务 {definition_id} 的入参",
+        )
+        # 文件变量必须是「含 document_id 的对象」或「文档 ID 字符串」——缺 id 当场拒，
+        # 不让一条注定空跑的任务建出来。
+        validate_file_inputs(
+            start_schema, normalized, f"任务 {definition_id} 的入参", issues
         )
         if issues:
             raise InvalidParameterError(
@@ -1324,11 +1381,21 @@ class TaskService:
             values["error_code"] = error_code
             values["error_params"] = error_params
 
+        # 2026-11-18（需求 19）：预算耗尽且策略是 skip 时，终态直接写 `skipped`。
+        # 预算还有的不用在这里改 —— 先按原终态收口，收口后再 re-arm（见下面的分支），
+        # 这样本次失败的尝试历史是完整的。
+        final_status = status
+        if (
+            status in (SubtaskStatus.FAILED.value, SubtaskStatus.TIMEOUT.value)
+            and _skip_ready(subtask)
+        ):
+            final_status = SubtaskStatus.SKIPPED.value
+
         changed = await self._subtasks.transition_cas(
             subtask.tenant_id,
             subtask.id,
             expect_statuses=[SubtaskStatus.RUNNING.value],
-            next_status=status,
+            next_status=final_status,
             expect_version=subtask.state_version,
             expect_execution_id=subtask.execution_id,
             **values,
@@ -1344,17 +1411,32 @@ class TaskService:
             )
             return
 
-        _apply_local(subtask, status=status, **values)
+        _apply_local(subtask, status=final_status, **values)
         # 历史行同一次尝试跟着收口，`finished_at` 与 `subtasks.finished_at` 同值（§7.2）。
         await self._sync_attempt_row(
             subtask,
-            status,
-            outputs=outputs if status == SubtaskStatus.SUCCESS.value else None,
-            error_message=error_message if status == SubtaskStatus.FAILED.value else None,
+            final_status,
+            outputs=outputs if final_status == SubtaskStatus.SUCCESS.value else None,
+            error_message=(
+                error_message
+                if final_status
+                in (SubtaskStatus.FAILED.value, SubtaskStatus.SKIPPED.value)
+                else None
+            ),
             # 历史行也要带上代号 + 参数（失败时），否则「尝试历史」里只有冻结的文本，
             # 而它恰恰是最该能跟着语言走的那一份。
-            error_code=error_code if status == SubtaskStatus.FAILED.value else None,
-            error_params=error_params if status == SubtaskStatus.FAILED.value else None,
+            error_code=(
+                error_code
+                if final_status
+                in (SubtaskStatus.FAILED.value, SubtaskStatus.SKIPPED.value)
+                else None
+            ),
+            error_params=(
+                error_params
+                if final_status
+                in (SubtaskStatus.FAILED.value, SubtaskStatus.SKIPPED.value)
+                else None
+            ),
             # 入参快照与输入引用**成功失败都往历史行上写**（与运行方那侧「两条路径都带」
             # 同口径）：失败那次尝试吃的是什么，恰恰是最该查得到的。
             inputs=subtask.inputs or {},
@@ -1363,7 +1445,10 @@ class TaskService:
             finished_at=now,
         )
 
-        if status == SubtaskStatus.SUCCESS.value:
+        if final_status in (
+            SubtaskStatus.SUCCESS.value,
+            SubtaskStatus.SKIPPED.value,
+        ):
             # ⓪ **旧运行不填下游**（判据与 `_aggregate` 开头那道闸同一句：本行运行是不是
             #    当前运行）。`_fill_downstream` 写的是**这一整套**子任务的 `inputs` —— 旧运行
             #    那一套是冻结的历史，往里写等于事后改掉「当时这条下游到底拿什么跑的」。
@@ -1371,6 +1456,9 @@ class TaskService:
             #    的报文不拒」，`_absorb` 放行、只收它自己那一行）。
             #    本行自己的 CAS 照做（上面那段）—— 被闸住的只有**跨行**的这两处写入
             #    （下游 inputs 与任务快照），任务快照那处由 `_aggregate` 自己挡。
+            #
+            #    `skipped` 与 `success` 同一支：跳过意味着「本步没有产出、但下游继续跑」，
+            #    所以也要给下游填值（下游引用的产出为空，按缺值走 default / 空值）。
             if ctx.attempt.attempt == ctx.task.current_attempt:
                 await self._fill_downstream(ctx, subtask)
             else:
@@ -1382,6 +1470,14 @@ class TaskService:
                     ctx.task.current_attempt,
                 )
         else:
+            # 自动重试（需求 19）：失败 / 超时且还有预算 → 原地排回 `pending`，
+            # 本次失败的尝试已经收进历史（上面 `_sync_attempt_row`），下次派活是新尝试。
+            if status in (
+                SubtaskStatus.FAILED.value,
+                SubtaskStatus.TIMEOUT.value,
+            ) and _can_auto_retry(subtask):
+                if await self._try_auto_retry(ctx, subtask, created_at=now):
+                    return
             # 失败**不处置下游**（§6.3）：下游原地 hold —— 既不改状态、也不会被派活，
             # 一直 `pending`，由 `_aggregate` 把任务收成 `failed` 兜住。
             # 早先那版会按 `fail_policy` 把下游整片置失败 / 置跳过，已随 `fail_policy` 一起删掉。
@@ -1469,9 +1565,11 @@ class TaskService:
             # 校验过了才拼进等值条件（仓库那层只认 `filters`）
             filters["space_id"] = space_id
         if filters.get("status") is not None:
-            # 复用管理端那条筛选规则（同一套合法值、同一句文案）。单值筛选取回来的
-            # 归一化结果就是它本身，这里要的只是它「非法值当场拒」这一步。
-            _normalize_status_filter([filters["status"]])
+            # 复用管理端那条筛选规则（同一套合法值、同一句文案）。**归一化结果要写回**
+            # —— 只校验不写回的话，带首尾空白的合法值会静默筛出空列表。
+            _normalized = _normalize_status_filter([filters["status"]])
+            if _normalized:
+                filters["status"] = _normalized[0]
         if filters.get("task_source"):
             # 2026-10-13 加：第四道闸。来源是**写死枚举**，域外值一律拒（1001）——
             # 与 status 同一条口径：静默筛出空列表比报错难查得多，而拼错的来源码
@@ -1520,6 +1618,7 @@ class TaskService:
         self,
         tenant_id: str,
         *,
+        definition_id: Optional[str] = None,
         keyword: Optional[str] = None,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
@@ -1561,6 +1660,12 @@ class TaskService:
         —— 页签角标才跟着它变。
         """
         tenant_id = require_tenant(tenant_id)
+        # `definition_id` **可选**（2026-11-20 放宽，原先是必填回 1001）：
+        #   · 传了 = 精确筛该定义下的任务（定义详情页「任务记录」用）；
+        #   · 不传 = 不按定义筛，可见范围由下面的空间权限收敛给出。
+        # 「不传就能看到整个租户」的担心由空间收敛兜住 —— 非管理员只会拿到
+        # `visible_space_ids_for` 里那些空间的任务，管理员本来就该看全。
+        definition_id = (definition_id or "").strip() or None
         # ⚠️ **时间范围倒挂当场拒**（2026-10-13 补）：两个边界是**各自独立**拼进 WHERE 的
         # （`_console_conditions`），从不比较先后 —— 传反了（复制粘贴、或前端两个选择器
         # 各选各的）查询**恒为空、而且不报错**，用户会以为「这段时间确实没有任务」。
@@ -1581,10 +1686,15 @@ class TaskService:
                 details={"start_time": str(start_time), "end_time": str(end_time)},
             )
         statuses = _normalize_status_filter(statuses)
+        # 需求 9：「平台自建」用哨兵值 `platform` 表达（task_source IS NULL）；
+        # 它不是协议层的来源码，所以不走 `_check_task_source`。
+        task_source_is_null = False
         if task_source is not None:
-            # 只判「在不在册」。空串 / 空白当没传 —— `None` 也是「没传」。
             task_source = task_source.strip() or None
-            if task_source is not None:
+            if task_source == "platform":
+                task_source = None
+                task_source_is_null = True
+            elif task_source is not None:
                 _check_task_source(task_source)
 
         # ── 空间：归属 / 权限 / 可见范围，判完才拼进查询条件 ──
@@ -1599,12 +1709,14 @@ class TaskService:
 
         offset = max(page - 1, 0) * page_size
         common: Dict[str, Any] = {
+            "definition_id": definition_id,
             "keyword": keyword,
             "start_time": start_time,
             "end_time": end_time,
             "space_id": space_id,
             "allowed_space_ids": allowed_space_ids,
             "task_source": task_source,
+            "task_source_is_null": task_source_is_null,
         }
         rows = await self._tasks.page_console_tasks(
             tenant_id, **common, statuses=statuses, offset=offset, limit=page_size
@@ -1613,14 +1725,56 @@ class TaskService:
             tenant_id, **common, statuses=statuses
         )
         raw_counts = await self._tasks.count_console_by_status(tenant_id, **common)
-        return TaskConsolePage(
-            items=[
+
+        # 需求 9：发起人名字 + Token（当页批量，各一次查询，不做 N+1）
+        names = await user_names_by_ids(
+            self.session,
+            tenant_id,
+            [getattr(row, "created_by", None) for row in rows],
+        )
+        tokens: Dict[str, Optional[int]] = {}
+        task_ids = [row.id for row in rows]
+        if task_ids:
+            # Token 是**展示性字段**：聚合失败降级成 null（前端显示「-」），
+            # 不让一条辅助查询把整个列表打成 500。
+            # ⚠️ `get_token_usage` 单次上限 100 条（超过直接 1001），而本列表的
+            # `page_size` 不设上限 —— 不分批的话 page_size>100 会整列变 null（审计发现）。
+            try:
+                for start in range(0, len(task_ids), _MAX_TOKEN_TASK_IDS):
+                    usage = await self.get_token_usage(
+                        tenant_id,
+                        task_ids[start : start + _MAX_TOKEN_TASK_IDS],
+                        user_id=user_id,
+                    )
+                    tokens.update(
+                        {item.task_id: item.total_tokens for item in usage.items}
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[TaskCenter] 任务列表 Token 聚合失败，按 null 展示: task_count=%s",
+                    len(task_ids),
+                    exc_info=True,
+                )
+
+        items: List[TaskConsoleItem] = []
+        for row in rows:
+            if getattr(row, "trigger_id", None):
+                trigger_type = "scheduled"
+            elif getattr(row, "task_source", None):
+                trigger_type = "api"
+            else:
+                trigger_type = "manual"
+            items.append(
                 TaskConsoleItem(
                     **_localized_console_row(row),
                     duration_seconds=_duration_seconds(row.started_at, row.finished_at),
+                    trigger_type=trigger_type,
+                    operator_name=names.get(getattr(row, "created_by", None) or ""),
+                    total_tokens=tokens.get(row.id),
                 )
-                for row in rows
-            ],
+            )
+        return TaskConsolePage(
+            items=items,
             page=page,
             page_size=page_size,
             total=total,
@@ -1686,9 +1840,34 @@ class TaskService:
         tenant_id = require_tenant(tenant_id)
         row = await self._require_task(tenant_id, task_id)
         await require_space_visible(self.session, tenant_id, row.space_id, user_id)
+        # 需求 9 的三个派生字段：详情**必须与列表行一致**（既有契约），所以这里也补上。
+        names = await user_names_by_ids(
+            self.session, tenant_id, [getattr(row, "created_by", None)]
+        )
+        if getattr(row, "trigger_id", None):
+            trigger_type = "scheduled"
+        elif getattr(row, "task_source", None):
+            trigger_type = "api"
+        else:
+            trigger_type = "manual"
+        total_tokens: Optional[int] = None
+        try:
+            usage = await self.get_token_usage(
+                tenant_id, [row.id], user_id=user_id
+            )
+            total_tokens = usage.items[0].total_tokens if usage.items else None
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[TaskCenter] 任务详情 Token 聚合失败，按 null 展示: task=%s",
+                task_id,
+                exc_info=True,
+            )
         return TaskConsoleItem(
             **_localized_console_row(row),
             duration_seconds=_duration_seconds(row.started_at, row.finished_at),
+            trigger_type=trigger_type,
+            operator_name=names.get(getattr(row, "created_by", None) or ""),
+            total_tokens=total_tokens,
         )
 
     async def get_token_usage(
@@ -2165,10 +2344,14 @@ class TaskService:
         #   `_do_retry_subtasks` 会**按这个顺序把「先后」写进依赖**（第 i 个等第 i-1 个
         #   成功），顺序一错就**必然成环** → 一次合法的「重跑某步」被误报成
         #   1001「名单连成了环」，而名单是**系统自己排的**、用户根本没给。
+        # **分层只看「名单内」的上游**：某个下游若还有名单外的父节点（菱形编排里
+        # 很常见），`deps[n] <= set(order)` 永远不成立，会掉进 fallback 按名字排序
+        # —— 下游排到上游前面，`_do_retry_subtasks` 据此写出反向边，被判成环拒绝。
+        deps_in_scope = {n: (deps[n] & wanted) for n in wanted}
         order = [node_id]
         rest = wanted - {node_id}
         while rest:
-            layer = sorted(n for n in rest if deps[n] <= set(order))
+            layer = sorted(n for n in rest if deps_in_scope[n] <= set(order))
             if not layer:
                 # 剩下的互相依赖（数据里本来就有环）—— 原样收进来，交给下游的
                 # `_detect_cycles` 去拒（那边能指出是哪些节点连成了环，信息更准）。
@@ -2248,8 +2431,10 @@ class TaskService:
 
         **前提三条**：① **任务已到终态**（`completed` / `failed` / `stopped`）——任务跑着的时候一律
         不许重试子任务（**有意为之**：运行期靠「这批子任务的状态」判断能不能收尾，中途动
-        其中一个会把收尾判定搅乱）；② **那个子任务也已终态**（`success` / `failed` /
-        `timeout` / `stopped`）—— `pending` / `running` 还没结束，没什么可重试的；③ **它的上游全都
+        其中一个会把收尾判定搅乱）；② **那个子任务没在跑**（`success` / `failed` /
+        `timeout` / `stopped`，或 `pending`）—— `pending` 也放行：上游一失败，下游全被
+        **hold 成 pending（从未起跑）**，不放行的话「重试失败的上游」会被它的下游拖成
+        1001；`running` 仍然拒（正在跑的活不能原地重置）；③ **它的上游全都
         `success`**（`depends_on` 里每个节点都 `success`）—— 上游没成功时这步要的输入
         根本拿不到，重试也是白跑，所以**直接拒绝**，让调用方先去解决上游（§4.3）。
 
@@ -2305,14 +2490,20 @@ class TaskService:
         task_attempt = await self._attempt_of(tenant_id, task, None)
         subtask = await self._subtasks.get_subtask(tenant_id, task_attempt.id, node_id)
         self._require_subtask_row(subtask, task_id, node_id)
-        if subtask.status not in SUBTASK_TERMINAL_STATUSES:
+        if (
+            subtask.status not in SUBTASK_TERMINAL_STATUSES
+            # **`pending` 也允许**：上游失败后下游会被 hold 成 pending（从未在跑）。
+            # 只拒 `running` —— 正在跑的活不能原地重置。少了这一档，
+            # 「重试失败的 parse」在默认编排里必被它的 pending 下游拖成 1001。
+            and subtask.status != SubtaskStatus.PENDING.value
+        ):
             raise InvalidParameterError(
                 message=translate(
                     "err.task_center.subtask.retry_status_invalid",
                     params={"node_id": node_id, "status": subtask.status},
                     fallback=(
                         f"节点 {node_id} 当前是 {subtask.status}，"
-                        "只有已结束（success/failed/timeout/stopped）的能重试"
+                        "只有已结束或尚未开始（pending）的能重试"
                     ),
                 ),
                 details={"task_id": task_id, "node_id": node_id, "status": subtask.status},
@@ -2403,7 +2594,11 @@ class TaskService:
         # ② `subtasks` 行重置回排队（`current_attempt`+1、清产出与旧凭证）。
         new_attempt = subtask.current_attempt + 1
         reset = await self._subtasks.reset_for_retry(
-            tenant_id, subtask.id, subtask.state_version
+            tenant_id,
+            subtask.id,
+            subtask.state_version,
+            # 人工重来 = 新预算（设计 §9.1）
+            reset_auto_retries=True,
         )
         if not reset:
             # **CAS 命中 0 行 = 并发冲突（1003），不是参数错（1001）** —— 与同一个函数
@@ -2424,6 +2619,8 @@ class TaskService:
             subtask,
             status=SubtaskStatus.PENDING.value,
             current_attempt=new_attempt,
+            # 人工重来 = 新预算（设计 §9.1；库侧由 `reset_auto_retries` 同一条 UPDATE 写）
+            auto_retries_used=0,
             execution_id=None,
             outputs=None,
             error_message=None,
@@ -2549,14 +2746,18 @@ class TaskService:
         self._require_terminal(task, "subtask_retry_task_not_terminal")
 
         for row in rows:
-            if row.status not in SUBTASK_TERMINAL_STATUSES:
+            if (
+                row.status not in SUBTASK_TERMINAL_STATUSES
+                # 同单步口：`pending` 允许（被 hold 的下游从未在跑），只拒 `running`。
+                and row.status != SubtaskStatus.PENDING.value
+            ):
                 raise InvalidParameterError(
                     message=translate(
                         "err.task_center.subtask.retry_status_invalid",
                         params={"node_id": row.node_id, "status": row.status},
                         fallback=(
                             f"节点 {row.node_id} 当前是 {row.status}，"
-                            "只有已结束（success/failed/timeout/stopped）的能重试"
+                            "只有已结束或尚未开始（pending）的能重试"
                         ),
                     ),
                     details={
@@ -2675,6 +2876,8 @@ class TaskService:
                 # 对偶边（给上游补下游）—— 只对**本批里被加了新下游**的那些行有值。
                 # 两张图必须一起改，理由见上面构造 `added` / `added_next` 那段。
                 next_steps=added_next.get(node_id),
+                # 人工重来 = 新预算（设计 §9.1）
+                reset_auto_retries=True,
             )
             if not reset:
                 # CAS 命中 0 行 = 并发冲突（1003），与单步那处同一档、同一理由。
@@ -2690,6 +2893,8 @@ class TaskService:
                 row,
                 status=SubtaskStatus.PENDING.value,
                 current_attempt=new_attempt,
+                # 人工重来 = 新预算（设计 §9.1）
+                auto_retries_used=0,
                 execution_id=None,
                 outputs=None,
                 error_message=None,
@@ -2977,15 +3182,6 @@ class TaskService:
         只能是**锁提前释放**或**有人绕过 service 改库** —— 两处都打 `warning`
         （见各自分支上的注释）。
         """
-        await self._attempts.finish_attempt_cas(
-            ctx.tenant_id,
-            ctx.attempt.id,
-            # 运行行与任务快照写**同一个终态**（`AttemptStatus.STOPPED` 与
-            # `TaskStatus.STOPPED` 逐字相同）—— 排障时不会撞见「任务说已停止、
-            # 运行记录说已失败」。三个原因字段一律不写，理由见 docstring。
-            AttemptStatus.STOPPED.value,
-            finished_at=now,
-        )
         task = await self._tasks.get_task_fresh(ctx.tenant_id, ctx.task.id)
         if task is None:
             # ⚠️ **正常路径到不了这里，真到了就是锁没兜住。**
@@ -3012,13 +3208,77 @@ class TaskService:
             )
             return ctx.task
         if task.status in TASK_TERMINAL_STATUSES:
+            # 后台那一趟是权威：**任务快照一个字都不动**，但运行行仍按幂等收一遍
+            # —— 见 docstring「运行那一行必须一起收」那两段。`finish_attempt_cas`
+            # 只认 `pending` / `running` 前驱，后台已经收过的行不会被改写；
+            # 漏收的那一行若留着，迟到的上报会带着旧运行搅乱下一轮。
+            # 终态与原因**取任务行的实况**（与下面两条写路径同一口径）。
+            values: Dict[str, Any] = {"finished_at": task.finished_at or now}
+            if task.status == TaskStatus.FAILED.value:
+                values.update(
+                    error_message=task.error_message,
+                    error_code=task.error_code,
+                    error_params=task.error_params,
+                )
+            await self._attempts.finish_attempt_cas(
+                ctx.tenant_id, ctx.attempt.id, task.status, **values
+            )
             return task
-        snapshot: Dict[str, Any] = {
-            "status": TaskStatus.STOPPED.value,
-            "finished_at": now,
-        }
+        # **有失败就是失败**（与 `_aggregate` 的优先级一致）：用户点停止不能把
+        # 已经发生的失败改写成「已停止」，否则真实失败原因会被吞掉。停止只把
+        # `pending` 置停，`failed` / `timeout` 是之前就存在的事实。
+        failed_subtasks = [
+            s
+            for s in await self._subtasks.list_by_attempt_run(
+                ctx.tenant_id, ctx.task.id, ctx.attempt.id, refresh=True
+            )
+            if s.status in SUBTASK_FAILED_STATUSES
+        ]
+        if failed_subtasks:
+            snapshot: Dict[str, Any] = {
+                "status": TaskStatus.FAILED.value,
+                "finished_at": now,
+                "error_message": "; ".join(
+                    f"{s.node_id}: {s.error_message or s.status}"
+                    for s in failed_subtasks
+                ),
+                "error_code": TASK_AGGREGATE_FAILED,
+                "error_params": {
+                    "parts": [
+                        {
+                            "node_id": s.node_id,
+                            "code": s.error_code,
+                            "params": s.error_params or {},
+                            "message": s.error_message or s.status,
+                        }
+                        for s in failed_subtasks
+                    ]
+                },
+            }
+        else:
+            snapshot = {
+                "status": TaskStatus.STOPPED.value,
+                "finished_at": now,
+            }
         if operator_id:
             snapshot["updated_by"] = operator_id
+        # **运行行与任务快照写同一个终态、同一份原因**（`AttemptStatus` 与
+        # `TaskStatus` 的 `stopped` / `failed` 字面量相同）—— 排障时不会撞见
+        # 「任务说失败、运行记录说已停止且没有原因」。
+        attempt_values: Dict[str, Any] = {"finished_at": now}
+        if snapshot["status"] == TaskStatus.FAILED.value:
+            # 只有失败才写原因；「已停止」三件一律不写（既有口径）。
+            attempt_values.update(
+                error_message=snapshot.get("error_message"),
+                error_code=snapshot.get("error_code"),
+                error_params=snapshot.get("error_params"),
+            )
+        await self._attempts.finish_attempt_cas(
+            ctx.tenant_id,
+            ctx.attempt.id,
+            snapshot["status"],
+            **attempt_values,
+        )
         # 同上：闸门必须写进 `WHERE`（`task` 是刚 `get_task_fresh` 读的最新版本号，
         # 而「该不该收口」判的是手上那份上下文）。
         changed = await self._update_task_snapshot(
@@ -3834,6 +4094,9 @@ class TaskService:
                 node_id=subtask.node_id,
                 execution_id=execution_id,
                 inputs=subtask.inputs or {},
+                # 叶子节点 = 本次编排的最后一步（需求 18/19 的「只有解析」链要它）：
+                # 运行方据此把接管行收成 `released`，不再按 `step_code == "compile"` 猜。
+                is_last_step=not (subtask.next_steps or []),
             ),
         )
 
@@ -4026,18 +4289,36 @@ class TaskService:
         `_close_subtask_row` + `_aggregate`，因为它要一次置停**多行**）—— 所以本方法
         不再收 `operator_id`。那条路上的操作人由 `_do_stop_subtask` 自己带进 `_aggregate`。
         """
+        now = datetime.now()
+        # 需求 19（2026-11-19 审计补齐）：派活失败与「上报失败 / 超时」走同一套收口语义。
+        # 原来这里无条件落 failed：配了 `max_retries` 一次都不用、配了
+        # `on_retry_exhausted=skip` 也不会跳——同一编排的配置语义随失败发生在哪一步而变。
+        next_status = (
+            SubtaskStatus.SKIPPED.value
+            if _skip_ready(subtask)
+            else SubtaskStatus.FAILED.value
+        )
         failed = await self._close_subtask_row(
-            subtask, error_message, error_code=error_code, error_params=error_params
+            subtask, error_message, error_code=error_code, error_params=error_params,
+            now=now, next_status=next_status,
         )
         if not failed:
             return
         logger.info(
-            "[TaskCenter] 子任务判死 task=%s node=%s attempt=%s: %s",
+            "[TaskCenter] 子任务判死 task=%s node=%s attempt=%s final=%s: %s",
             ctx.task.id,
             subtask.node_id,
             subtask.current_attempt,
+            next_status,
             error_message,
         )
+        if next_status == SubtaskStatus.FAILED.value and _can_auto_retry(subtask):
+            # 还有预算 → 排回 pending，不下游 hold、不汇总。
+            if await self._try_auto_retry(ctx, subtask, created_at=now):
+                return
+        if next_status == SubtaskStatus.SKIPPED.value:
+            # 跳过并继续：给下游填值（产出为空，按缺值走），再汇总。
+            await self._fill_downstream(ctx, subtask)
         # 下游 hold（**什么都不做**，§6.3）：直接汇总任务终态。
         await self._aggregate(ctx)
 
@@ -4140,7 +4421,13 @@ class TaskService:
         )
         return True
 
-    async def handle_timeout(self, subtask: Subtask, now: Optional[datetime] = None) -> bool:
+    async def handle_timeout(
+        self,
+        subtask: Subtask,
+        now: Optional[datetime] = None,
+        *,
+        allow_auto_retry: bool = True,
+    ) -> bool:
         """跑超时了：置 `timeout`（终态）并收敛（§7.4）。返回是否处理了本次。
 
         超时判定读的是 `subtask.started_at` + `subtask.timeout_seconds`（扫描侧已筛过），
@@ -4205,11 +4492,17 @@ class TaskService:
             {"seconds": subtask.timeout_seconds},
             f"跑了超过 {subtask.timeout_seconds} 秒还没结果，判定超时",
         )
+        # 需求 19：预算耗尽且策略 skip → 终态写 skipped（下游当依赖已满足继续跑）
+        final_status = (
+            SubtaskStatus.SKIPPED.value
+            if _skip_ready(subtask)
+            else SubtaskStatus.TIMEOUT.value
+        )
         changed = await self._subtasks.transition_cas(
             subtask.tenant_id,
             subtask.id,
             expect_statuses=[SubtaskStatus.RUNNING.value],
-            next_status=SubtaskStatus.TIMEOUT.value,
+            next_status=final_status,
             expect_version=subtask.state_version,
             finished_at=now,
             **reason_args,
@@ -4218,21 +4511,33 @@ class TaskService:
             return False  # 别的副本已经判过了，重复巡检不致错（§7.5 ③）
         _apply_local(
             subtask,
-            status=SubtaskStatus.TIMEOUT.value,
+            status=final_status,
             finished_at=now,
             **reason_args,
         )
         await self._sync_attempt_row(
-            subtask, SubtaskStatus.TIMEOUT.value, finished_at=now, **reason_args
+            subtask, final_status, finished_at=now, **reason_args
         )
         logger.info(
-            "[TaskCenter] 子任务超时 task=%s node=%s attempt=%s",
+            "[TaskCenter] 子任务超时 task=%s node=%s attempt=%s final=%s",
             ctx.task.id,
             subtask.node_id,
             subtask.current_attempt,
+            final_status,
         )
 
-        # 下游 hold（§6.3 固定「保持原样」），直接汇总。
+        # 自动重试（需求 19）：超时且还有预算 → 重新排队，不收尾。
+        if (
+            final_status == SubtaskStatus.TIMEOUT.value
+            and allow_auto_retry
+            and _can_auto_retry(subtask)
+        ):
+            if await self._try_auto_retry(ctx, subtask, created_at=now):
+                return True
+        if final_status == SubtaskStatus.SKIPPED.value:
+            # 跳过并继续：给下游填值（产出为空，按缺值走），再汇总。
+            await self._fill_downstream(ctx, subtask)
+        # 终止策略下：下游 hold（§6.3 固定「保持原样」），直接汇总。
         await self._aggregate(ctx)
         return True
 
@@ -4274,16 +4579,33 @@ class TaskService:
         # 否则会出现「扫出来了、对不上话」或者反过来漏判。
         multiplier = get_config().TASK_CENTER_PENDING_STUCK_TIMEOUT
         stuck_after = subtask.timeout_seconds * multiplier
+        # 2026-11-19 第二轮审计：扫描→判死之间可能发生「派活失败 → 自动重试 re-arm」
+        # （reset_for_retry + _fill_inputs 会把 updated_at 刷成现在）。旧快照不能再判死
+        # 刚重新排队的行，否则派活失败自动重试对最长排队的节点完全失效。
+        fresh_updated = getattr(subtask, "updated_at", None)
+        if fresh_updated is not None:
+            if fresh_updated.tzinfo is not None:
+                fresh_updated = fresh_updated.astimezone().replace(tzinfo=None)
+            if (now - fresh_updated).total_seconds() < stuck_after:
+                return False
         reason_args = build_fail_reason(
             "err.task_center.subtask.pending_stuck",
             {"seconds": stuck_after},
             f"就绪后超过 {stuck_after} 秒一直没派出去，判定超时",
         )
+        # 2026-11-18 审计：预算耗尽 + skip 策略时，卡死同样按「跳过并继续」收口 ——
+        # 否则同一节点「running 超时」会 skipped、而「排队卡死」会 timeout，
+        # 两条终态入口对同一种「没跑成」给出相反结论（任务 failed vs completed）。
+        final_status = (
+            SubtaskStatus.SKIPPED.value
+            if _skip_ready(subtask)
+            else SubtaskStatus.TIMEOUT.value
+        )
         changed = await self._subtasks.transition_cas(
             subtask.tenant_id,
             subtask.id,
             expect_statuses=[SubtaskStatus.PENDING.value],
-            next_status=SubtaskStatus.TIMEOUT.value,
+            next_status=final_status,
             expect_version=subtask.state_version,
             finished_at=now,
             **reason_args,
@@ -4292,7 +4614,7 @@ class TaskService:
             return False  # 别的副本 / 派活刚好动过它，本轮作废（§7.5 ①）
         _apply_local(
             subtask,
-            status=SubtaskStatus.TIMEOUT.value,
+            status=final_status,
             finished_at=now,
             **reason_args,
         )
@@ -4307,7 +4629,7 @@ class TaskService:
         # 两个都是非终态前驱，收成都不会盖掉真实结果。
         await self._sync_attempt_row(
             subtask,
-            SubtaskStatus.TIMEOUT.value,
+            final_status,
             from_statuses=[
                 SubtaskAttemptStatus.PENDING.value,
                 SubtaskAttemptStatus.RUNNING.value,
@@ -4321,6 +4643,10 @@ class TaskService:
             subtask.node_id,
             subtask.current_attempt,
         )
+
+        # 跳过并继续：给下游填值（产出为空，按缺值走），再收尾。
+        if final_status == SubtaskStatus.SKIPPED.value:
+            await self._fill_downstream(ctx, subtask)
 
         # 立刻重判一次收尾（D2b：`running` 分支回到 D2、`pending` 分支走 C7 —— 也就是
         # 「一到终态就走一次收尾」这条总则，跟它原本的触发原因无关）。
@@ -4398,6 +4724,10 @@ class TaskService:
                     "next_steps": step.get("next_steps") or [],
                     "sort": step.get("sort"),
                     "timeout_seconds": _timeout_of(step, catalog_step),
+                    # 自动重试配置在诞生时固化（需求 19）：此后改编排不影响在跑的任务。
+                    "max_retries": _max_retries_of(step),
+                    "auto_retries_used": 0,
+                    "on_retry_exhausted": _on_retry_exhausted_of(step),
                     "inputs": {},
                     "current_attempt": 1,
                     "state_version": 0,
@@ -4467,14 +4797,26 @@ class TaskService:
                 subtask.node_id,
                 ctx.task.id,
             )
-        inputs = evaluate_bindings(
+        # 旧契约（`document_id` / `knowledge_base_id`）→ 新契约（`document` /
+        # `knowledge_id`）：旧已发布版本与历史任务的编排快照里仍是旧键，而 catalog
+        # schema 只认新键；不归一化的话，这些任务起跑/重试会拿到一份空入参。
+        normalized_step, task_inputs = _upgrade_legacy_bindings(
             step,
-            task_inputs=ctx.task.inputs or {},
+            getattr(catalog_step, "input_schema", None),
+            ctx.task.inputs or {},
+        )
+        inputs = evaluate_bindings(
+            normalized_step,
+            task_inputs=task_inputs,
             upstream_outputs=ctx.upstream_outputs(subtask),
             step_sort=ctx.step_sort(),
             input_schema=getattr(catalog_step, "input_schema", None),
         )
-        subtask.inputs = inputs
+        # `file` 字段统一收成文档 ID：任务入参里是上传结果对象，派给运行方前转成 id。
+        # 转换只发生在这一处（见 `flow_validator.coerce_file_values`）。
+        subtask.inputs = coerce_file_values(
+            getattr(catalog_step, "input_schema", None), inputs
+        )
         # 显式推一次时间。`inputs` 算出来跟库里**完全相同**时（典型是两边都是 `{}`：该步
         # 既没有 `bind_inputs` 也不引用上游产出），SQLAlchemy 判定属性无变化、不会发
         # UPDATE，`TimestampMixin.updated_at` 的 `onupdate` 也就不触发。而防僵尸
@@ -4618,7 +4960,9 @@ class TaskService:
                 capability_id = await self._runners.resolve_capability_id(
                     catalog_step.runner_code
                 )
-            except Exception as exc:
+            except InvalidParameterError as exc:
+                # **只认「不在册」**：DB/连接错也吞的话，残缺名单会被钉进
+                # `tasks.runner_capability_ids` 快照，日后删除任务永远漏清该运行方。
                 logger.warning(
                     "[TaskCenter] 运行方 %s 不在册: %s", catalog_step.runner_code, exc
                 )
@@ -5144,6 +5488,78 @@ class TaskService:
             **values,
         )
 
+    async def _try_auto_retry(
+        self, ctx: RunContext, subtask: Subtask, *, created_at: datetime
+    ) -> bool:
+        """自动重试（需求 19）：把刚收成 `failed` / `timeout` 的子任务排回 `pending`。
+
+        返回 True = 已重新排队（调用方**不要**再 `_aggregate` 收尾）；False = 没排上
+        （并发冲突），调用方按原终态收尾。
+
+        ⚠️ `expect_version` **直接用 `subtask.state_version`，不要再 +1**：调用方刚做的
+        那次终态 `transition_cas` 走的是 ORM `update`，SQLAlchemy 的
+        `synchronize_session='auto'` **已经把内存对象的 `state_version` 同步成新值**。
+        再 +1 就比库大 1，这条 CAS 永远命中 0 行 —— 自动重试会静默失效（2026-11-18
+        真机踩过：parse 超时后直接收成 timeout，`auto_retries_used` 一直是 0）。
+        `_apply_local` 的 docstring 写着同一条纪律（「绝不在这里动 `state_version`」）。
+        """
+        # 2026-11-18 审计：**停止后的迟到失败不能把子任务复活**。
+        # 用户停止一条任务后，正在 running 的节点按设计不动、任务快照已 stopped；
+        # 运行方随后上报 failed（或超时巡检判死）如果无脑 re-arm，就会把这条行
+        # 排回 pending —— 而派活扫描要求任务活跃，这条 pending 永远不会再被派活，
+        # 控制台在一条已停止的任务里永远显示「有一个未开始的步骤」。
+        # 旧运行（retry_task 之前那次）同理：它的失败不该改写已冻结的运行。
+        if ctx.attempt.attempt != ctx.task.current_attempt:
+            return False
+        if ctx.task.status not in (
+            TaskStatus.PENDING.value,
+            TaskStatus.RUNNING.value,
+        ):
+            return False
+        # ⚠️ `current_attempt` 要在 reset **之前**取：`reset_for_retry` 的 SQL 自己
+        # 做了 `current_attempt + 1`，ORM 的 `synchronize_session='auto'` 会把内存
+        # 一起改掉；之后再加 1 就会跳号（真机踩过：attempt 2 凭空消失、直接写 3）。
+        prev_attempt = subtask.current_attempt
+        reset = await self._subtasks.reset_for_retry(
+            ctx.task.tenant_id, subtask.id, subtask.state_version
+        )
+        if not reset:
+            return False
+        new_attempt = prev_attempt + 1
+        _apply_local(
+            subtask,
+            status=SubtaskStatus.PENDING.value,
+            current_attempt=new_attempt,
+            execution_id=None,
+            outputs=None,
+            output_refs=None,
+            input_refs=None,
+            error_message=None,
+            error_code=None,
+            error_params=None,
+            started_at=None,
+            finished_at=None,
+        )
+        subtask.auto_retries_used = (subtask.auto_retries_used or 0) + 1
+        # 入参按上游现在的产出重算（与人工重试同口径）。
+        await self._fill_inputs(ctx, subtask)
+        await self._open_attempt_row(
+            ctx.task.tenant_id,
+            ctx.task.space_id,
+            ctx.task.id,
+            subtask,
+            created_at=created_at,
+        )
+        logger.info(
+            "[TaskCenter] 子任务自动重试 task=%s node=%s 第 %s 次（预算 %s/%s）",
+            ctx.task.id,
+            subtask.node_id,
+            new_attempt,
+            subtask.auto_retries_used,
+            subtask.max_retries,
+        )
+        return True
+
     async def _open_attempt_row(
         self,
         tenant_id: str,
@@ -5512,6 +5928,78 @@ class TaskService:
 # ============================================================
 # 模块级小工具
 # ============================================================
+
+
+def _max_retries_of(step: Dict[str, Any]) -> int:
+    """自动重试次数（0~3）；非法值按 0（发版校验已拦住，这里只是兜底）。"""
+    value = step.get("max_retries", 0)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 3:
+        return value
+    return 0
+
+
+def _on_retry_exhausted_of(step: Dict[str, Any]) -> str:
+    """重试耗尽策略：terminate（默认）/ skip。"""
+    value = step.get("on_retry_exhausted", "terminate")
+    return value if value in ("terminate", "skip") else "terminate"
+
+
+#: 旧契约 → 新契约的字段名映射（2026-11-18 合并后的变量改名）。
+_LEGACY_INPUT_ALIASES = {
+    "document_id": "document",
+    "knowledge_base_id": "knowledge_id",
+}
+
+
+def _upgrade_legacy_bindings(
+    step: Dict[str, Any],
+    input_schema: Optional[Dict[str, Any]],
+    task_inputs: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """把旧编排绑定的字段名归一化到新契约（只在内存副本上改）。
+
+    旧已发布版本 / 历史任务的 `definition_config` 快照里，`bind_inputs` 的**目标字段**
+    与 `@task.inputs.*` 的键都是 `document_id` / `knowledge_base_id`；而新
+    `task_catalog_steps` 的 schema 只认 `document` / `knowledge_id`。
+    不归一化的话，`normalize_by_schema` 会把旧键当「未声明」丢掉，派给运行方的
+    入参变成空值（真机审计发现：旧版本起新任务必失败）。
+
+    只改**目标 schema 里只有新键、没有旧键**的字段，其余原样保留（用户自建的
+    变量名不受影响）。
+    """
+    schema = input_schema if isinstance(input_schema, dict) else {}
+    bindings = step.get("bind_inputs")
+    if not schema or not isinstance(bindings, dict):
+        return step, task_inputs
+    upgraded: Dict[str, Any] = {}
+    changed = False
+    for key, expr in bindings.items():
+        alias = _LEGACY_INPUT_ALIASES.get(key)
+        if alias and alias in schema and key not in schema:
+            upgraded[alias] = expr
+            changed = True
+        else:
+            upgraded[key] = expr
+    if not changed:
+        return step, task_inputs
+    values = dict(task_inputs) if isinstance(task_inputs, dict) else {}
+    for old, new in _LEGACY_INPUT_ALIASES.items():
+        if new in schema and new not in values and old in values:
+            values[new] = values[old]
+    return {**step, "bind_inputs": upgraded}, values
+
+
+def _can_auto_retry(subtask: Subtask) -> bool:
+    """这一步还有自动重试预算吗（需求 19）。"""
+    return (subtask.auto_retries_used or 0) < (subtask.max_retries or 0)
+
+
+def _skip_ready(subtask: Subtask) -> bool:
+    """预算已耗尽、且策略是「跳过并继续」。"""
+    return (
+        (subtask.on_retry_exhausted or "terminate") == "skip"
+        and not _can_auto_retry(subtask)
+    )
 
 
 def _timeout_of(step: Dict[str, Any], catalog_step: Any) -> int:

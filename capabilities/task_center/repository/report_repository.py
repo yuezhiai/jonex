@@ -20,7 +20,7 @@
 from datetime import datetime
 from typing import Any, Dict
 
-from sqlalchemy import literal, select, update
+from sqlalchemy import exists, literal, select, update
 
 from jonex_core.common.repository import BaseRepository
 
@@ -102,6 +102,26 @@ class SubtaskReportRepository(BaseRepository[SubtaskReport]):
         )
         result = await self.session.execute(stmt)
         return list(result.scalars())
+
+    async def has_unconsumed(
+        self, tenant_id: str, execution_id: str
+    ) -> bool:
+        """这次执行有没有**任何**尚未消化的上报（不看到达时间）。
+
+        超时巡检判死前用它：只要收件箱里还压着这条执行的上报（例如上一拍
+        「判死前先问」入队的那条），本轮就不该再问一次、更不该判死。原让路判据
+        带 `reported_at <= 超时点`，而合成上报的到达时间恒晚于超时点 —— 于是一边
+        不判死、一边每拍重问再入队，队列越积越多、`running` 永远收不掉。
+        """
+        stmt = select(
+            exists().where(
+                SubtaskReport.tenant_id == tenant_id,
+                SubtaskReport.execution_id == execution_id,
+                # 「未消化 ⟺ is_deleted = 0」（消化与死信都会置 1）。
+                SubtaskReport.is_deleted == 0,
+            )
+        )
+        return bool((await self.session.execute(stmt)).scalar())
 
     async def has_pending_before(
         self,

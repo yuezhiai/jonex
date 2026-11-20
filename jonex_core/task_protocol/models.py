@@ -83,6 +83,17 @@ class ExecutionDispatch(ExecutionEnvelope):
     inputs: Dict[str, Any] = Field(
         default_factory=dict, description="已经填好的真实入参；没有入参就是空对象"
     )
+    #: `None` = 老运行方没带这个字段（看门狗回落「compile 才算最后一步」）；
+    #: `True/False` = 任务中心明确告知（本轮修复：三态才能区分「明确不是最后一步」）。
+    is_last_step: Optional[bool] = Field(
+        default=None,
+        description=(
+            "这一步是不是本次编排的最后一步（2026-11-18 加）。"
+            "运行方据此决定收口时要不要把接管行置 `released` —— 从前写死"
+            "「`compile` 才是最后一步」，自建定义「只有解析、没有编译」时永远收不了口。"
+            "老运行方没有这个字段：按「有 compile 才是最后一步」回落，保持兼容。"
+        ),
+    )
 
 
 class RemoveTaskDispatch(BaseModel):
@@ -433,6 +444,9 @@ ERROR_REASON_CODES: Tuple[str, ...] = (
     "err.kb.task_center.compile_failed",
     "err.kb.task_center.wiki_compile_failed",
     "err.kb.task_center.master_settled",
+    # 下游提交失败（接入方自己产出的结论，2026-11-19 补登：此前不在枚举里，
+    # 拉式对账会以 code_unknown 拒收，子任务只能等超时）
+    "err.kb.task_center.downstream_submit_failed",
 )
 
 
@@ -651,7 +665,8 @@ class TaskItemResponse(BaseModel):
     )
     current_attempt: int = Field(default=1, description="当前跑到第几次运行（指针，首次=1）")
     status: str = Field(
-        default="pending", description="pending / running / completed / failed"
+        default="pending",
+        description="pending / running / completed / failed / stopped",
     )
     error_message: Optional[str] = Field(default=None, description="失败原因")
     state_version: int = Field(default=0, description="每行版本号（防重复改）")

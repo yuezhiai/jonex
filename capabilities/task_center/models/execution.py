@@ -266,9 +266,9 @@ class Subtask(Base, TimestampMixin):
         # ⚠️ 本类同样**不走 `TenantMixin` / `SoftDeleteMixin`** —— 原因、以及
         # `ix_task_center_subtasks_tenant_id` / `ix_task_center_subtasks_is_deleted`
         # 那两条为什么不建，见 `Task.__table_args__` 那段（同一条规矩）。
-        # 下面这条 CHECK 同样出自 DDL。
+        # 下面这条 CHECK 同样出自 DDL（2026-11-18 加 `skipped`）。
         CheckConstraint(
-            "status IN ('pending','running','success','failed','timeout','stopped')",
+            "status IN ('pending','running','success','failed','timeout','stopped','skipped')",
             name="ck_tc_sub_status",
         ),
         {"schema": "task_center"},
@@ -299,6 +299,16 @@ class Subtask(Base, TimestampMixin):
     sort = Column(Integer, nullable=True)
     # 取编排里 config.steps[].timeout_seconds（必填）的值，诞生时固化
     timeout_seconds = Column(Integer, nullable=False, default=300)
+    # 自动重试配置（2026-11-18 加，需求 19）：诞生时从编排节点固化。
+    # `max_retries` 是「失败/超时后还能自动重跑几次」（0~3）；`auto_retries_used`
+    # 是已经用掉的自动重试次数 —— **独立计数**，不复用 `current_attempt`：
+    # 人工重试也会让 `current_attempt +1`，混用会吃掉自动预算。
+    max_retries = Column(Integer, nullable=False, default=0)
+    auto_retries_used = Column(Integer, nullable=False, default=0)
+    # 重试耗尽后的策略：terminate（终止流程，现状） / skip（跳过并继续）
+    on_retry_exhausted = Column(
+        String(16), nullable=False, default="terminate"
+    )
     # bind_inputs 解析填值后的真实入参
     inputs = Column(JSONB, nullable=True)
     outputs = Column(JSONB, nullable=True)
@@ -355,6 +365,9 @@ class Subtask(Base, TimestampMixin):
             "next_steps": self.next_steps or [],
             "sort": self.sort,
             "timeout_seconds": self.timeout_seconds,
+            "max_retries": self.max_retries or 0,
+            "auto_retries_used": self.auto_retries_used or 0,
+            "on_retry_exhausted": self.on_retry_exhausted or "terminate",
             "inputs": self.inputs or {},
             "outputs": self.outputs,
             "output_refs": self.output_refs,
@@ -396,7 +409,7 @@ class SubtaskAttempt(Base):
         Index("idx_tc_sa_created", "created_at"),
         # 同 `Task`：出处是 DDL，重复一份只为让 `create_all` 跟它对齐
         CheckConstraint(
-            "status IN ('pending','running','success','failed','timeout','stopped')",
+            "status IN ('pending','running','success','failed','timeout','stopped','skipped')",
             name="ck_tc_sa_status",
         ),
         {"schema": "task_center"},

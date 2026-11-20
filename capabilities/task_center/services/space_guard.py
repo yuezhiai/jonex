@@ -28,13 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jonex_core.common.exceptions import InvalidParameterError, PermissionDeniedError
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
+from jonex_core.common.tenant_admin import is_tenant_admin
 
 from ..repository.space_repository import SpaceRepository
-
-#: 「租户/平台管理员」的判据码 —— 与知识库 `space_permission_service.is_tenant_admin`
-#: **同一口径**（那边也是这两个码，经 `has_permission` 查）。两处都写死是有意的：
-#: 跨 capability 不能互相 import，而这两个码是平台级约定，改动应当两边一起改。
-_ADMIN_PERMISSION_CODES = ("tenant:admin", "platform:admin")
 
 
 async def require_owned_space(
@@ -55,13 +51,8 @@ async def require_owned_space(
 
 
 async def _is_tenant_admin(tenant_id: str, user_id: str) -> bool:
-    """是不是租户/平台管理员（口径见 `_ADMIN_PERMISSION_CODES`）。"""
-    from jonex_core.security.permission import has_permission
-
-    for code in _ADMIN_PERMISSION_CODES:
-        if await has_permission(tenant_id, int(user_id), code):
-            return True
-    return False
+    """是不是租户/平台管理员 —— 转发内核唯一实现（`jonex_core.common.tenant_admin`）。"""
+    return await is_tenant_admin(tenant_id, user_id)
 
 
 async def require_space_visible(
@@ -97,6 +88,38 @@ async def require_space_visible(
     )
 
 
+async def require_space_manager(
+    session: AsyncSession, tenant_id: str, space_id: str, user_id: str | None
+) -> str:
+    """用户对空间有**管理**身份：`space_manager` 或租户/平台管理员。
+
+    任务定义的写操作（创建 / 编辑 / 编排 / 发布 / 停用 / 删除 / 复制）用这道守卫；
+    它与能力入口的 `task_center:write` **两个条件都要满足** —— 码在入口判、
+    空间身份在这里判（2026-11-18 定）。
+
+    `user_id` 为空（内部链路 / 测试 token）按既有口径放行 —— 与
+    `require_space_visible` / `_check_action_permission` 同源；**不要**在这里收紧。
+    """
+    if not user_id:
+        return space_id
+    tenant_id = require_tenant(tenant_id)
+    if await _is_tenant_admin(tenant_id, user_id):
+        return space_id
+    roles = await SpaceRepository(session).user_space_roles(
+        tenant_id, space_id, user_id
+    )
+    if "space_manager" in roles:
+        return space_id
+    raise PermissionDeniedError(
+        message=translate(
+            "err.task_center.space.not_manager",
+            params={"space_id": space_id},
+            fallback=f"你不是空间 {space_id} 的管理员，不能修改该空间的任务定义",
+        ),
+        details={"space_id": space_id},
+    )
+
+
 async def visible_space_ids_for(
     session: AsyncSession, tenant_id: str, user_id: str | None
 ) -> list[str] | None:
@@ -115,6 +138,7 @@ async def visible_space_ids_for(
 
 __all__ = [
     "require_owned_space",
+    "require_space_manager",
     "require_space_visible",
     "visible_space_ids_for",
 ]

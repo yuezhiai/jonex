@@ -774,6 +774,23 @@ class RunnerAdapter:
                         f"调用 {capability_id} 的 {action} 被限流：HTTP 429"
                     ),
                 )
+            if exc.response.status_code == 408:
+                # **408 是「结果未知」，不是明确拒绝**：代理层回超时时，请求很可能
+                # 已经送到运行方、只是回包没赶上。判 `REJECTED` 会把一个可能正在跑
+                # 的活直接判死（产出无人认领）；这里按 `DELIVERY_UNKNOWN` 并**不加
+                # `dead_after_retry`** —— 重发由幂等闸兜住，试满仍不确定就留 running
+                # 交给超时巡检，而不是当场杀。
+                logger.warning(
+                    "[TaskCenter] %s 超时(408) capability=%s %s：%s",
+                    action, capability_id, identity, exc,
+                )
+                return DispatchResult(
+                    disposition=DispatchDisposition.DELIVERY_UNKNOWN,
+                    message=(
+                        f"调用 {capability_id} 的 {action} 超时（HTTP 408，"
+                        "请求可能已送达）"
+                    ),
+                )
             if exc.response.status_code < 500:
                 logger.error(
                     "[TaskCenter] %s 被拒 HTTP %s capability=%s %s：%s",

@@ -101,6 +101,14 @@ logger = logging.getLogger(__name__)
 # 锁的键前缀：带业务前缀，避免跟别的模块撞（§7.2 ①）
 LOCK_KEY_PREFIX = "task_center:lock:task:"
 
+#: 定义锁前缀（2026-11-18 加，需求 12）：编排保存 / 发布 / 停用 / 删除按定义串行。
+DEFINITION_LOCK_KEY_PREFIX = "task_center:lock:definition:"
+
+
+def definition_lock_key(definition_id: str) -> str:
+    """`task_center:lock:definition:{definition_id}`（需求 12/13/14）。"""
+    return f"{DEFINITION_LOCK_KEY_PREFIX}{definition_id}"
+
 
 def lock_key(task_id: str) -> str:
     """`task_center:lock:task:{task_id}`（§7.2 ①）。"""
@@ -185,6 +193,70 @@ async def release_task_lock(task_id: str, lock_id: str) -> bool:
         return False
 
 
+async def _acquire_definition_lock(definition_id: str) -> str:
+    try:
+        return await CacheUtil.acquire_lock(
+            definition_lock_key(definition_id), get_config().TASK_CENTER_LOCK_TIMEOUT
+        )
+    except (RedisError, ConnectionError, TimeoutError, OSError) as exc:
+        raise CacheError(f"定义锁获取失败（Redis 不可用）：{exc}") from exc
+
+
+@asynccontextmanager
+async def definition_lock(
+    definition_id: str, *, patient: bool = True
+) -> AsyncIterator[None]:
+    """定义锁的上下文管理器（编排保存 / 发布 / 停用 / 删除共用）。
+
+    **默认 `patient=True`**：这些动作都是人点出来的、绝不能静默跳过 —— 拿不到锁就抛
+    `TaskLockBusy`（3007，可重试），让调用方自己重来。窗口与任务锁同一个
+    `TASK_CENTER_LOCK_*` 配置。
+
+    ⚠️ 锁只护「读—改—写」这段数据库操作；不要在块内 `await` 出站调用
+    （与任务锁同一条纪律，见模块 docstring）。
+    """
+    lock_id = await acquire_definition_lock(definition_id, patient=patient)
+    if not lock_id:
+        raise TaskLockBusy(f"任务定义 {definition_id} 正在被修改，没拿到锁")
+    try:
+        yield
+    finally:
+        await release_definition_lock(definition_id, lock_id)
+
+
+async def acquire_definition_lock(definition_id: str, *, patient: bool = True) -> str:
+    """抢定义锁；`patient` 的窗口语义与 `acquire_task_lock` 完全一致。"""
+    config = get_config()
+    token = await _acquire_definition_lock(definition_id)
+    if token:
+        return token
+    for _ in range(max(0, config.TASK_CENTER_LOCK_RETRY)):
+        await asyncio.sleep(config.TASK_CENTER_LOCK_RETRY_INTERVAL)
+        token = await _acquire_definition_lock(definition_id)
+        if token:
+            return token
+    if not patient:
+        return ""
+    for _ in range(max(0, config.TASK_CENTER_LOCK_WAIT)):
+        await asyncio.sleep(config.TASK_CENTER_LOCK_WAIT_INTERVAL)
+        token = await _acquire_definition_lock(definition_id)
+        if token:
+            return token
+    return ""
+
+
+async def release_definition_lock(definition_id: str, lock_id: str) -> bool:
+    try:
+        return await CacheUtil.release_lock(definition_lock_key(definition_id), lock_id)
+    except (RedisError, ConnectionError, TimeoutError, OSError) as exc:
+        logger.warning(
+            "[TaskCenter] 定义 %s 的锁释放失败（会等 PX 自然过期）：%s",
+            definition_id,
+            exc,
+        )
+        return False
+
+
 @asynccontextmanager
 async def task_lock(task_id: str, *, patient: bool = False) -> AsyncIterator[None]:
     """任务锁的上下文管理器。没抢到就抛 `TaskLockBusy`（调用方按类别处置）。
@@ -212,10 +284,15 @@ async def task_lock(task_id: str, *, patient: bool = False) -> AsyncIterator[Non
 
 
 __all__ = [
+    "DEFINITION_LOCK_KEY_PREFIX",
     "LOCK_KEY_PREFIX",
     "TaskLockBusy",
+    "acquire_definition_lock",
     "acquire_task_lock",
+    "definition_lock",
+    "definition_lock_key",
     "lock_key",
+    "release_definition_lock",
     "release_task_lock",
     "task_lock",
 ]

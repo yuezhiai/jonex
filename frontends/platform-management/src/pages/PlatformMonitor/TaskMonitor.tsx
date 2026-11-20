@@ -12,6 +12,7 @@ import {
   pmWindowBounds,
 } from '../../api/platformMonitor';
 import useAsyncData from '@/hooks/useAsyncData';
+import { TASK_EXECUTIONS_ALL_PATH } from '@/pages/TaskCenter/paths';
 import useMetaFilters from './useMetaFilters';
 import { PM_ALL } from '../../constants/platformMonitor';
 import { fmtCompact, fmtCount, fmtDurationOrDash, fmtPercent, fmtPercent1, fmtPercentOrDash } from './format';
@@ -167,13 +168,16 @@ export default function TaskMonitor({ window, refreshKey, manualRefreshKey }: Pm
   /**
    * 深链到任务中心：带上当前窗口与「失败」状态，落地就是同一批失败任务。
    *
+   * 落在**二级页** `/task-center/executions` 而不是一级任务列表：这里是「一批失败任务」的
+   * 视角，不属于某一个任务定义，直接进执行记录列表少一次点击（一级列表也带不动这组筛选）。
+   *
    * 不传任务类型 —— 任务中心的列表接口没有 `task_type` 入参，传了会被静默忽略，
    * 用户会以为筛过了（跳过去看到的是全部类型）。
    */
   const goTaskCenter = () => {
     const { from, to } = pmWindowBounds(window);
     const params = new URLSearchParams({ status: 'failed', from, to });
-    navigate(`/task-center?${params.toString()}`);
+    navigate(`${TASK_EXECUTIONS_ALL_PATH}?${params.toString()}`);
   };
 
   const taskTypeOptions = useMemo(

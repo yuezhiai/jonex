@@ -119,6 +119,40 @@ class TaskRepository(BaseRepository[Task]):
         )
         return result.scalar_one_or_none() is not None
 
+    async def task_still_active(self, tenant_id: str, task_id: str) -> bool:
+        """任务还在跑（未假删、快照不是终态）。
+
+        给「上报凭证定位不到」的丢弃判据用：定位不到**不等于任务已删** ——
+        也可能是执行号被改写的数据异常；那种情况静默丢弃会把一次真实完成吞掉。
+        判据取**任务快照**而不是某个节点的子任务行：上报报文里根本没有 `node_id`
+        （`SubtaskReport` 也没有这一列），且按节点跨运行匹配会把「重试后 pending」
+        误当成「任务还在跑」而永远保留。
+        """
+        stmt = select(
+            exists().where(
+                Task.tenant_id == tenant_id,
+                Task.id == task_id,
+                Task.is_deleted == 0,
+                Task.status.in_(
+                    [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
+                ),
+            )
+        )
+        return bool((await self.session.execute(stmt)).scalar())
+
+    async def get_any_by_id(self, task_id: str) -> Task | None:
+        """按主键取任务，**不带租户、不带软删** —— 判「自带 id 还能不能用」。
+
+        与 `exists_by_id` 同口径，但把行取回来：`init_task` 要区分两种情况——
+        同租户且未删 = 上次其实建成了（1006 / SDK 判 REUSED）；别人的或已删 =
+        id 被占但不是你的，必须让调用方换 id（1001 明确拒绝），不能让它误以为
+        任务已建成。
+        """
+        result = await self.session.execute(
+            select(Task).where(Task.id == task_id).limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def list_tasks(
         self,
         tenant_id: str,
@@ -149,6 +183,7 @@ class TaskRepository(BaseRepository[Task]):
     def _console_conditions(
         self,
         *,
+        definition_id: str | None = None,
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
@@ -156,6 +191,7 @@ class TaskRepository(BaseRepository[Task]):
         space_id: str | None = None,
         allowed_space_ids: list[str] | None = None,
         task_source: str | None = None,
+        task_source_is_null: bool = False,
     ) -> list:
         """管理端列表的筛选条件（**不含租户与软删**，那两个由调用方补）。
 
@@ -172,6 +208,10 @@ class TaskRepository(BaseRepository[Task]):
         两者都跟着用户的筛选走，所以**三个查询都要带**（角标也得跟着变）。
         """
         conditions = []
+        if definition_id:
+            # 按任务定义筛：**可选**（2026-11-20 起列表接口不再强制），
+            # 传了才加这个条件。
+            conditions.append(Task.definition_id == definition_id)
         if keyword:
             like = f"%{keyword}%"
             # 任务名或任务 id，命中一个就算。`task_name` 允许为空（发起时没给），
@@ -189,7 +229,10 @@ class TaskRepository(BaseRepository[Task]):
             conditions.append(Task.space_id == space_id)
         if allowed_space_ids is not None:
             conditions.append(Task.space_id.in_(allowed_space_ids))
-        if task_source:
+        if task_source_is_null:
+            # 「平台自建」哨兵（需求 9）：task_source 为 NULL = 定时 / 手动触发。
+            conditions.append(Task.task_source.is_(None))
+        elif task_source:
             # 任务来源（2026-10-13 加）。**可空列**，所以「筛某个来源」永远筛不到
             # 平台侧自己发起的任务（它们的值为 NULL）—— 那是刻意的：来源是「运行方
             # 从哪个入口提交的」，NULL 表示「不是运行方提交的」，不是一个来源。
@@ -209,6 +252,7 @@ class TaskRepository(BaseRepository[Task]):
         self,
         tenant_id: str,
         *,
+        definition_id: str | None = None,
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
@@ -216,6 +260,7 @@ class TaskRepository(BaseRepository[Task]):
         space_id: str | None = None,
         allowed_space_ids: list[str] | None = None,
         task_source: str | None = None,
+        task_source_is_null: bool = False,
         offset: int = 0,
         limit: int = 20,
     ) -> list[Task]:
@@ -227,6 +272,7 @@ class TaskRepository(BaseRepository[Task]):
         conditions = self._console_base_conditions(
             tenant_id,
             {
+                "definition_id": definition_id,
                 "keyword": keyword,
                 "start_time": start_time,
                 "end_time": end_time,
@@ -234,6 +280,7 @@ class TaskRepository(BaseRepository[Task]):
                 "space_id": space_id,
                 "allowed_space_ids": allowed_space_ids,
                 "task_source": task_source,
+                "task_source_is_null": task_source_is_null,
             },
         )
         stmt = (
@@ -250,6 +297,7 @@ class TaskRepository(BaseRepository[Task]):
         self,
         tenant_id: str,
         *,
+        definition_id: str | None = None,
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
@@ -257,11 +305,13 @@ class TaskRepository(BaseRepository[Task]):
         space_id: str | None = None,
         allowed_space_ids: list[str] | None = None,
         task_source: str | None = None,
+        task_source_is_null: bool = False,
     ) -> int:
         """总数 —— 条件跟 `page_console_tasks` **完全一致**（含 status），否则对不上页数。"""
         conditions = self._console_base_conditions(
             tenant_id,
             {
+                "definition_id": definition_id,
                 "keyword": keyword,
                 "start_time": start_time,
                 "end_time": end_time,
@@ -269,6 +319,7 @@ class TaskRepository(BaseRepository[Task]):
                 "space_id": space_id,
                 "allowed_space_ids": allowed_space_ids,
                 "task_source": task_source,
+                "task_source_is_null": task_source_is_null,
             },
         )
         result = await self.session.execute(
@@ -280,12 +331,14 @@ class TaskRepository(BaseRepository[Task]):
         self,
         tenant_id: str,
         *,
+        definition_id: str | None = None,
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         space_id: str | None = None,
         allowed_space_ids: list[str] | None = None,
         task_source: str | None = None,
+        task_source_is_null: bool = False,
     ) -> dict[str, int]:
         """各状态各多少条（§4.4）。
 
@@ -297,12 +350,14 @@ class TaskRepository(BaseRepository[Task]):
         conditions = self._console_base_conditions(
             tenant_id,
             {
+                "definition_id": definition_id,
                 "keyword": keyword,
                 "start_time": start_time,
                 "end_time": end_time,
                 "space_id": space_id,
                 "allowed_space_ids": allowed_space_ids,
                 "task_source": task_source,
+                "task_source_is_null": task_source_is_null,
             },
         )
         result = await self.session.execute(
@@ -312,6 +367,49 @@ class TaskRepository(BaseRepository[Task]):
             .group_by(Task.status)
         )
         return {row[0]: row[1] for row in result}
+
+    async def stats_by_definition_ids(
+        self, tenant_id: str, definition_ids: list[str]
+    ) -> dict[str, dict]:
+        """按定义批量聚合任务统计（定义列表用，2026-11-18 加）。
+
+        返回 `{definition_id: {count, last_at, last_status}}`：
+        - `count`：该定义下的任务总数（不含假删）；
+        - `last_at`：最近一条任务的创建时间；
+        - `last_status`：最近一条任务的状态（`DISTINCT ON` 取最新）。
+        """
+        if not definition_ids:
+            return {}
+        base = [
+            Task.tenant_id == tenant_id,
+            Task.is_deleted == 0,
+            Task.definition_id.in_(definition_ids),
+        ]
+        aggregated = await self.session.execute(
+            select(
+                Task.definition_id,
+                func.count(),
+                func.max(Task.created_at),
+            )
+            .where(*base)
+            .group_by(Task.definition_id)
+        )
+        stats: dict[str, dict] = {
+            row[0]: {"count": row[1], "last_at": row[2], "last_status": None}
+            for row in aggregated
+        }
+        latest = await self.session.execute(
+            select(Task.definition_id, Task.status)
+            .where(*base)
+            .distinct(Task.definition_id)
+            .order_by(Task.definition_id, Task.created_at.desc(), Task.id.desc())
+        )
+        for definition_id, status in latest:
+            stats.setdefault(
+                definition_id,
+                {"count": 0, "last_at": None, "last_status": None},
+            )["last_status"] = status
+        return stats
 
     async def get_task(self, tenant_id: str, task_id: str) -> Task | None:
         """按 id 取任务：已假删的按「找不到」处理（`get_by_id` 默认过滤 is_deleted）。"""
@@ -1137,6 +1235,7 @@ class SubtaskRepository(BaseRepository[Subtask]):
         *,
         depends_on: list[str] | None = None,
         next_steps: list[str] | None = None,
+        reset_auto_retries: bool = False,
     ) -> bool:
         """子任务重试：`subtasks` 行重置回「排队中」（`current_attempt`+1、清产出与凭证）。
 
@@ -1202,6 +1301,11 @@ class SubtaskRepository(BaseRepository[Subtask]):
             values["depends_on"] = depends_on
         if next_steps is not None:
             values["next_steps"] = next_steps
+        if reset_auto_retries:
+            # 人工重试（retry_subtask / retry_subtasks）：用户主动重来视为**新预算**
+            # （设计 §9.1）。不重置的话，一个已经耗尽 max_retries 的节点被人工重跑后，
+            # 再失败一次会立刻按 skip/terminate 收口，一次自动重试都不给。
+            values["auto_retries_used"] = 0
         return await self.transition_cas(
             tenant_id,
             subtask_id,
@@ -1213,6 +1317,15 @@ class SubtaskRepository(BaseRepository[Subtask]):
                 # 「把这一步重新排队」—— 与重跑一个失败步骤没有任何区别。
                 # 少了它，用户停错一步就再也点不动「重跑」（CAS 命中 0 行 → 报状态冲突）。
                 SubtaskStatus.STOPPED.value,
+                # `skipped` 同理（2026-11-18）：被跳过的节点可能事后需要单独重跑，
+                # 不收它的话「重试子任务」对这一行永远报状态冲突。
+                SubtaskStatus.SKIPPED.value,
+                # `pending`（2026-11-18 审计补）：**批量重跑**会把「失败上游 hold 住的
+                # 下游」一起带进名单（预检就允许 pending），而它们本来就在队列里。
+                # 旧前驱集合不含 pending → 逐行 reset 命中 0 → 整次重试报 1003，
+                # 「重试失败的上游」这条最常用的路直接不可用。这里接受它：重置后仍是
+                # pending、`current_attempt+1`、同一条 UPDATE 里写入新的 depends_on。
+                SubtaskStatus.PENDING.value,
             ],
             next_status=SubtaskStatus.PENDING.value,
             expect_version=expect_version,

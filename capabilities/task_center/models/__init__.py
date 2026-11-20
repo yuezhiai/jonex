@@ -40,6 +40,7 @@ from .definition import TaskDefinition, TaskDefinitionVersion
 from .enums import (
     AttemptStatus,
     DefinitionScope,
+    DefinitionStatus,
     MisfirePolicy,
     RUNTIME_REPORTABLE_STATUSES,
     SUBTASK_FAILED_STATUSES,
@@ -59,6 +60,7 @@ from .trigger import TaskTrigger
 __all__ = [
     "AttemptStatus",
     "DefinitionScope",
+    "DefinitionStatus",
     "MisfirePolicy",
     "RUNTIME_REPORTABLE_STATUSES",
     "RunnerDefinition",

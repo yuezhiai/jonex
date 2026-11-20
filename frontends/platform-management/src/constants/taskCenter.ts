@@ -44,6 +44,7 @@ export const SUBTASK_STATUS_LABEL_KEY: Record<SubtaskStatus, string> = {
   failed: 'taskCenter.subtaskStatus.failed',
   timeout: 'taskCenter.subtaskStatus.timeout',
   stopped: 'taskCenter.subtaskStatus.stopped',
+  skipped: 'taskCenter.subtaskStatus.skipped',
 };
 
 export const SUBTASK_STATUS_COLORS: Record<SubtaskStatus, string> = {
@@ -53,6 +54,8 @@ export const SUBTASK_STATUS_COLORS: Record<SubtaskStatus, string> = {
   failed: 'error',
   timeout: 'warning',
   stopped: 'warning',
+  // 跳过不是失败：它是「重试耗尽后按配置放过」，用中性色，不抢失败的红色
+  skipped: 'default',
 };
 
 /**
@@ -76,6 +79,8 @@ export const SUBTASK_STATUS_DOT_COLORS: Record<SubtaskStatus, string> = {
   timeout: 'red',
   // 「已停止」用中性灰：它既不是成功也不是失败，红蓝两档都读错了意思
   stopped: 'gray',
+  // 「已跳过」同理：重试耗尽后主动放过，不是异常结局
+  skipped: 'gray',
 };
 
 /**
@@ -113,7 +118,8 @@ export function subtaskAction(taskStatus: TaskStatus, subtaskStatus: SubtaskStat
   return subtaskStatus === 'success' ||
     subtaskStatus === 'failed' ||
     subtaskStatus === 'timeout' ||
-    subtaskStatus === 'stopped'
+    subtaskStatus === 'stopped' ||
+    subtaskStatus === 'skipped'
     ? 'retry'
     : null;
 }
@@ -126,7 +132,13 @@ export function subtaskAction(taskStatus: TaskStatus, subtaskStatus: SubtaskStat
  * 还在等上报或超时，那时任务行不动、子任务行还得刷，所以两处各判各的。
  */
 export function isSubtaskTerminal(status: SubtaskStatus): boolean {
-  return status === 'success' || status === 'failed' || status === 'timeout' || status === 'stopped';
+  return (
+    status === 'success' ||
+    status === 'failed' ||
+    status === 'timeout' ||
+    status === 'stopped' ||
+    status === 'skipped'
+  );
 }
 
 /**

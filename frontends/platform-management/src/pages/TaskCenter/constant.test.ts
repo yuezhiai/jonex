@@ -108,3 +108,26 @@ describe('「已停止」状态（stopped）', () => {
     }
   });
 });
+
+/**
+ * 「已跳过」（skipped）是 2026-11-18 新增的子任务终态：节点重试耗尽后按
+ * `on_retry_exhausted=skip` 放过、下游继续。它**不是失败**，配色与卡片动作都要跟着分。
+ */
+describe('「已跳过」子任务状态（skipped）', () => {
+  it('四张映射表都覆盖 skipped', () => {
+    expect(SUBTASK_STATUS_LABEL_KEY.skipped).toBe('taskCenter.subtaskStatus.skipped');
+    expect(SUBTASK_STATUS_COLORS.skipped).toBe('default');
+    expect(SUBTASK_STATUS_DOT_COLORS.skipped).toBe('gray');
+  });
+
+  it('它是终态，任务收口后可以重跑', () => {
+    expect(isSubtaskTerminal('skipped')).toBe(true);
+    expect(subtaskAction('completed', 'skipped')).toBe('retry');
+  });
+
+  it('文案在 zh / en 两份里都在', () => {
+    for (const locale of [zh, en]) {
+      expect(locale.taskCenter.subtaskStatus.skipped).toBeTruthy();
+    }
+  });
+});

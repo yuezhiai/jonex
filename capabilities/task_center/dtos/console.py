@@ -19,10 +19,33 @@ except ImportError:  # pragma: no cover
 
 
 class TaskConsoleItem(BaseModel):
-    """任务列表里的一行。"""
+    """任务列表里的一行（需求 9）。"""
 
     id: str = Field(description="任务 ID")
+    definition_id: Optional[str] = Field(
+        default=None, description="所属任务定义 ID（列表按定义筛选时回显）"
+    )
     task_name: Optional[str] = Field(default=None, description="任务名；发起时没给就为空")
+    trigger_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "触发方式（派生）：scheduled=定时触发（trigger_id 非空）/ "
+            "api=运行方提交（task_source 非空）/ manual=任务中心手动或内部触发"
+        ),
+    )
+    created_by: Optional[str] = Field(default=None, description="发起人 user_id")
+    operator_name: Optional[str] = Field(
+        default=None, description="发起人展示名（display_name 优先，空则 username）"
+    )
+    created_at: Optional[str] = Field(default=None, description="创建时间（ISO 8601）")
+    updated_at: Optional[str] = Field(default=None, description="更新时间（ISO 8601）")
+    total_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Token 消耗（当页批量聚合，口径同 `task.console_token_usage`）；"
+            "无精确计量为 null（前端显示「-」），不是 0"
+        ),
+    )
     space_id: str = Field(
         description=(
             "这条任务落在哪个空间（任务行的 `space_id`，**NOT NULL**）。"
