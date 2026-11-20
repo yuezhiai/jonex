@@ -3910,16 +3910,25 @@ def create_document_routes(
     )
     async def list_document_chunks(
         doc_id: str = Query(..., description="KB 文档 id，匹配 file_path 的 doc= 锚点"),
+        limit: int | None = Query(
+            None,
+            ge=1,
+            description=(
+                "[jonex] 可选：最多返回的 chunk 数（按 chunk_order_index 升序取前 N 条）。"
+                "不传则全量返回。"
+            ),
+        ),
         http_request: Request = None,  # [jonex] workspace 解析
     ):  # [jonex]
         """[jonex] 按 ``file_path`` 中的 ``doc=<doc_id>`` 锚点枚举 text_chunks。
 
         用于「查看文档 Chunk 列表」接口。每个 chunk 携带完整的 file_source
         字符串（含 tstart=/tend= 视频/音频时间轴），下游可解析为时间戳定位。
+        ``limit`` 可选，不传时保持原有全量行为。
         """
         try:
             rag = await _resolve_rag(http_request)
-            chunks = await rag.text_chunks.get_chunks_by_doc_id(doc_id)
+            chunks = await rag.text_chunks.get_chunks_by_doc_id(doc_id, limit=limit)
             # 清理 content 里的 <!--yx:HASH--> 标记
             clean_chunks = []
             for c in chunks:
@@ -3928,11 +3937,19 @@ def create_document_routes(
                     r"\s*<!--yx:[0-9a-f]+-->\s*", "", clean.get("content") or "",
                 )
                 clean_chunks.append(clean)
-            return {
+            # [jonex] total 仅在未截断时才是「该文档的真实 chunk 数」。
+            # 传了 limit 时不能再把它当真总数用（否则前端「共 N 段」会显示成页大小），
+            # 改为给出 returned 与 truncated，由调用方决定是否继续翻页。
+            result = {
                 "doc_id": doc_id,
-                "total": len(clean_chunks),
                 "chunks": clean_chunks,
+                "returned": len(clean_chunks),
             }
+            if limit is None:
+                result["total"] = len(clean_chunks)
+            else:
+                result["truncated"] = len(clean_chunks) >= limit
+            return result
         except Exception as e:
             logger.error(f"Error GET /documents/chunks?doc_id={doc_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))

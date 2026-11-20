@@ -20,11 +20,25 @@ from tenacity import (
     RetryCallState,
     retry,
     retry_if_exception,
-    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
     wait_fixed,
 )
+
+from .retry_policy import is_retryable, is_timeout
+
+# [jonex] 运行时守护：超时**不得**被判为可重试。
+#
+# 为什么放在模块级：判据是否正确完全取决于 retry_policy 被正确使用。上游升级
+# 或有人把 tenacity 的 `retry=` 改回 retry_if_exception_type(_transient_exceptions)
+# 时，代码照常能跑，只会让一次语句超时被放大成 10 次重试 + 9 次拆池 ——
+# 直到某次 PG 挂死才暴露。这里用 import 期检查把这个不变量变成「启动即失败」。
+# 不用 assert：python -O 会把它优化掉。
+if is_retryable(TimeoutError()):
+    raise RuntimeError(
+        "[jonex] retry policy regression: TimeoutError must not be retried "
+        "(see lightrag/kg/retry_policy.py and JONEX_PATCHES.md)"
+    )
 
 from ..base import (
     BaseGraphStorage,
@@ -48,6 +62,11 @@ if not pm.is_installed("pgvector"):
 
 import asyncpg  # type: ignore
 from asyncpg import Pool  # type: ignore
+
+# [jonex] 启动期 DDL 的单次调用超时（秒）。等效于「不超时」，但必须是一个真实数值：
+# asyncpg 0.31 的 per-call timeout 路径会对传入值做 float()，传 NO_TIMEOUT 这个
+# sentinel 会在 protocol.pyx 的 _get_timeout 里炸 TypeError（实测）。
+_STARTUP_DDL_CALL_TIMEOUT = 86400.0
 from pgvector.asyncpg import register_vector  # type: ignore
 
 from dotenv import load_dotenv
@@ -186,9 +205,11 @@ class PostgreSQLDB:
         # Guard concurrent pool resets
         self._pool_reconnect_lock = asyncio.Lock()
 
+        # [jonex] 可重试的瞬时连接故障白名单。
+        # 不再把 asyncio.TimeoutError / TimeoutError 列进来：Python 3.10+
+        # 二者同名同类，且 TimeoutError 是 OSError 的子类，单删元组成员无效。
+        # 超时由 retry_policy.is_retryable() 先行排除，既不重试也不拆池。
         self._transient_exceptions = (
-            asyncio.TimeoutError,
-            TimeoutError,
             ConnectionError,
             OSError,
             asyncpg.exceptions.InterfaceError,
@@ -197,6 +218,10 @@ class PostgreSQLDB:
             asyncpg.exceptions.PostgresConnectionError,
             asyncpg.exceptions.ConnectionDoesNotExistError,
             asyncpg.exceptions.ConnectionFailureError,
+        )
+        # tenacity 重试判据：超时短路 False，其余沿用白名单语义。
+        self._retry_predicate = retry_if_exception(
+            lambda exc: is_retryable(exc, self._transient_exceptions)
         )
 
         # Connection retry configuration
@@ -207,6 +232,37 @@ class PostgreSQLDB:
             config["connection_retry_backoff_max"],
         )
         self.pool_close_timeout = config["pool_close_timeout"]
+
+        # [jonex] 取连接 / 建池 / 单条语句的超时。
+        # 原实现三者皆无：池耗尽时 acquire() 无限等待、建池重试路径可自锁死、
+        # 单条 SQL 在客户端与服务端都没有上限。
+        self.pool_acquire_timeout = float(config.get("pool_acquire_timeout") or 30.0)
+        self.pool_init_timeout = float(config.get("pool_init_timeout") or 120.0)
+        # [jonex] 池耗尽时的短宽限重试（秒）。取连接超时说明 25 条连接全忙，
+        # 不代表数据库坏了 —— 抖动性占用过一会儿就会释放。旧逻辑会把它当瞬时
+        # 故障重试并拆池，但拆池帮不上忙（close 也要等持有者），反而制造重连风暴。
+        # 这里只给一个短窗口再试一次，仍失败才上抛；绝不拆池。
+        self.pool_acquire_retry_grace = float(
+            config.get("pool_acquire_retry_grace") or 5.0
+        )
+        # [jonex] 归还连接时的取消等待预算。asyncpg 的 Pool.release 在未显式传
+        # timeout 时会沿用 acquire 时记下的 timeout（PoolConnectionHolder._timeout），
+        # 于是「语句超时 30s」之后还要再等 30s 做取消握手与连接 reset，请求实际
+        # 耗时变成 2 倍。显式传一个小预算即可把第二段压到 1s 以内。
+        self.pool_release_timeout = float(
+            config.get("pool_release_timeout") or 1.0
+        )
+        self.command_timeout = config.get("command_timeout") or None
+        # 建池单飞：并发请求共享同一个建池任务，避免重复建池与锁内长阻塞。
+        self._pool_init_task: asyncio.Task | None = None
+        # [jonex] 启动期 DDL 豁免标记。check_tables() 里的建表 / ALTER COLUMN
+        # TYPE / CREATE INDEX CONCURRENTLY 在 12 万行的表上可能远超交互超时；
+        # 一旦被客户端 command_timeout 取消，CIC 会留下 INVALID 索引、ALTER 会
+        # 回滚且异常被吞，表现为「迁移没做但服务正常起来」。开启此标记后：
+        #   · 该连接临时 SET statement_timeout = 0（连接归还时 RESET ALL 复原）
+        #   · query/execute 对单次调用传 NO_TIMEOUT，绕开 command_timeout
+        self._startup_ddl = False
+
         logger.info(
             "PostgreSQL, Retry config: attempts=%s, backoff=%.1fs, backoff_max=%.1fs, pool_close_timeout=%.1fs",
             self.connection_retry_attempts,
@@ -296,6 +352,10 @@ class PostgreSQLDB:
             "min_size": 1,
             "max_size": self.max,
         }
+
+        # [jonex] 单条语句超时。None 表示不限制（保持向后兼容）。
+        if self.command_timeout:
+            connection_params["command_timeout"] = float(self.command_timeout)
 
         # Only add statement_cache_size if it's configured
         if self.statement_cache_size is not None:
@@ -449,7 +509,7 @@ class PostgreSQLDB:
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self.connection_retry_attempts),
-                retry=retry_if_exception_type(self._transient_exceptions),
+                retry=self._retry_predicate,
                 wait=wait_strategy,
                 before_sleep=self._before_sleep,
                 reraise=True,
@@ -468,40 +528,119 @@ class PostgreSQLDB:
             raise
 
     async def _ensure_pool(self) -> None:
-        """Ensure the connection pool is initialised."""
-        if self.pool is None:
-            async with self._pool_reconnect_lock:
-                if self.pool is None:
-                    await self.initdb()
+        """Ensure the connection pool is initialised.
+
+        [jonex] 建池在锁外执行（单飞）。
+
+        原实现在锁内跑完整个 ``initdb()``，而 initdb 的 tenacity
+        ``before_sleep`` 回调（``_before_sleep`` → ``_reset_pool``）会再次
+        申请同一把 ``_pool_reconnect_lock``；``asyncio.Lock`` 不可重入，
+        一旦池被置空后首轮建连失败，进程就永久死锁在锁上：不抛错、
+        不超时、无日志，只能重启容器。
+
+        现在锁只负责选出唯一的建池者，等待发生在锁外；并加建池超时兜底。
+        """
+        if self.pool is not None:
+            return
+
+        async with self._pool_reconnect_lock:
+            if self.pool is None:
+                if self._pool_init_task is None:
+                    self._pool_init_task = asyncio.ensure_future(self.initdb())
+                init_task = self._pool_init_task
+
+        try:
+            # shield：等待者超时不取消正在建池的协程，让它继续完成；
+            # 否则一次慢建池会被放大成全体请求失败。
+            await asyncio.wait_for(
+                asyncio.shield(init_task), timeout=self.pool_init_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "PostgreSQL, pool initialization exceeded %.1fs (workspace=%s); "
+                "aborting wait to avoid an unbounded hang",
+                self.pool_init_timeout,
+                self.workspace,
+            )
+            raise
+        finally:
+            if init_task.done():
+                async with self._pool_reconnect_lock:
+                    if self._pool_init_task is init_task:
+                        self._pool_init_task = None
+
+    async def _discard_pool(self) -> None:
+        """丢弃当前连接池，且**不**获取 ``_pool_reconnect_lock``。
+
+        [jonex] 该逻辑运行在 tenacity 的 ``before_sleep`` 回调里，
+        而回调可能在 ``_ensure_pool`` 持锁的建池路径上触发（此时 ``self.pool``
+        必为 None）。任何对 ``_pool_reconnect_lock`` 的重入都会自锁死，
+        因此这里只做同步摘引用，关闭动作尽力而为。
+        """
+        pool, self.pool = self.pool, None
+        if pool is None:
+            return
+        try:
+            await asyncio.wait_for(pool.close(), timeout=self.pool_close_timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                "PostgreSQL, Timed out closing connection pool after %.2fs",
+                self.pool_close_timeout,
+            )
+        except Exception as close_error:  # pragma: no cover - defensive logging
+            logger.warning(
+                f"PostgreSQL, Failed to close existing connection pool cleanly: {close_error!r}"
+            )
 
     async def _reset_pool(self) -> None:
-        async with self._pool_reconnect_lock:
-            if self.pool is not None:
-                try:
-                    await asyncio.wait_for(
-                        self.pool.close(), timeout=self.pool_close_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "PostgreSQL, Timed out closing connection pool after %.2fs",
-                        self.pool_close_timeout,
-                    )
-                except Exception as close_error:  # pragma: no cover - defensive logging
-                    logger.warning(
-                        f"PostgreSQL, Failed to close existing connection pool cleanly: {close_error!r}"
-                    )
-            self.pool = None
+        """兼容入口：显式重置连接池（无锁实现，见 ``_discard_pool``）。"""
+        await self._discard_pool()
 
     async def _before_sleep(self, retry_state: RetryCallState) -> None:
         """Hook invoked by tenacity before sleeping between retries."""
         exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if is_timeout(exc):
+            # 兜底：重试判据已把超时短路，正常不会走到这里。
+            # 万一上游改动让超时进入重试路径，也不要在超时后丢弃连接池。
+            logger.warning(
+                "PostgreSQL timeout on attempt %s/%s (%r); preserving connection pool",
+                retry_state.attempt_number,
+                self.connection_retry_attempts,
+                exc,
+            )
+            return
         logger.warning(
             "PostgreSQL transient connection issue on attempt %s/%s: %r",
             retry_state.attempt_number,
             self.connection_retry_attempts,
             exc,
         )
-        await self._reset_pool()
+        # [jonex] 必须无锁丢弃，否则在建池路径上自锁死。
+        await self._discard_pool()
+
+    async def _acquire_connection(self) -> asyncpg.Connection:
+        """Acquire a pooled connection, with one short grace retry on exhaustion.
+
+        [jonex] 取连接超时（池里 25 条全忙）与语句超时是两回事：前者不代表连接
+        坏了，抖动性占用过一会儿就会释放，重试是安全的；后者已经在
+        ``_retry_predicate`` 里被短路成不可重试。旧逻辑把两者都当瞬时故障，
+        会重试并拆池 —— 但拆池对池耗尽没有帮助（close 要等持有者释放），反而
+        制造重连风暴。这里只给一个短宽限窗口再试一次，仍失败才上抛。
+        """
+        assert self.pool is not None
+        try:
+            return await self.pool.acquire(timeout=self.pool_acquire_timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "PostgreSQL, pool.acquire timed out after %.1fs (workspace=%s); "
+                "retrying once with a %.1fs grace window (pool preserved)",
+                self.pool_acquire_timeout,
+                self.workspace,
+                self.pool_acquire_retry_grace,
+            )
+            return await self.pool.acquire(
+                timeout=self.pool_acquire_retry_grace
+            )
 
     async def _run_with_retry(
         self,
@@ -537,7 +676,7 @@ class PostgreSQLDB:
 
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(self.connection_retry_attempts),
-            retry=retry_if_exception_type(self._transient_exceptions),
+            retry=self._retry_predicate,
             wait=wait_strategy,
             before_sleep=self._before_sleep,
             reraise=True,
@@ -553,7 +692,25 @@ class PostgreSQLDB:
                         pool_snapshot_before,
                     )
                 acquire_start = time.perf_counter()
-                async with self.pool.acquire() as connection:  # type: ignore[arg-type]
+                # [jonex] 带超时取连接，池耗尽时抛错而不是无限等待。
+                #
+                # 这里刻意不用 ``async with pool.acquire(...)``：asyncpg 的
+                # ``PoolAcquireContext.__aexit__`` 在归还连接时如果连接处于
+                # 「取消中」状态，会按 ``PoolConnectionHolder._timeout``（也就是
+                # acquire 时传进来的超时）再等一整轮取消握手，而且外层还有
+                # ``asyncio.shield``，任何外部 ``wait_for`` 都跳不过这一轮。
+                # 结果就是一次 30s 的语句超时实际耗时约 60s（实测 60.25s）。
+                #
+                # 改成手动 acquire/release 并给 release 一个独立的小预算，
+                # 超时场景从 2x 降到 1x + ≤1s。release 自身抛的超时必须吞掉，
+                # 否则会覆盖 operation 抛出的原始异常（日志里就看不到是哪条
+                # 语句超时了）。pool 内部在 release 超时后会 terminate 该连接。
+                connection = await self._acquire_connection()
+                try:
+                    # [jonex] 启动期 DDL 豁免服务端 statement_timeout。
+                    # 连接归还时 _reset_connection 的 RESET ALL 会复原。
+                    if self._startup_ddl:
+                        await connection.execute("SET statement_timeout = 0")
                     acquire_elapsed = time.perf_counter() - acquire_start
                     if timing_label:
                         pool_snapshot_after = self._get_pool_snapshot()
@@ -568,6 +725,19 @@ class PostgreSQLDB:
                     elif with_age and not graph_name:
                         raise ValueError("Graph name is required when with_age is True")
                     return await operation(connection)
+                finally:
+                    try:
+                        await self.pool.release(
+                            connection, timeout=self.pool_release_timeout
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        # 连接已被 pool terminate；保留原始异常。
+                        logger.warning(
+                            "PostgreSQL, pool.release exceeded %.1fs during "
+                            "cancellation; connection was terminated (workspace=%s)",
+                            self.pool_release_timeout,
+                            self.workspace,
+                        )
 
     def _get_pool_snapshot(self) -> str:
         """Best-effort snapshot of asyncpg pool state for diagnostics.
@@ -1416,6 +1586,21 @@ class PostgreSQLDB:
             logger.error(f"Failed to batch check field lengths: {e}")
 
     async def check_tables(self):
+        """Run startup schema work with interactive timeouts disabled.
+
+        [jonex] check_tables() 里的建表 / ALTER COLUMN TYPE / CREATE INDEX
+        CONCURRENTLY 在存量大表上可能远超交互超时。若被 command_timeout 取消，
+        CONCURRENTLY 会留下 INVALID 索引且不会被重建、ALTER 会回滚而异常被吞。
+        因此整个启动期迁移期间打开 ``_startup_ddl``，不设客户端与服务端语句超时；
+        finally 里立即复位，业务请求仍走正常超时。
+        """
+        self._startup_ddl = True
+        try:
+            await self._check_tables_impl()
+        finally:
+            self._startup_ddl = False
+
+    async def _check_tables_impl(self):
         # Vector tables that should be skipped - they are created by PGVectorStorage.setup_table()
         # with proper embedding model and dimension suffix for data isolation
         vector_tables_to_skip = {
@@ -1682,21 +1867,48 @@ class PostgreSQLDB:
         ]
 
         # Fetch all existing index names in one query instead of N separate checks.
+        # [jonex] 同时取 indisvalid：CREATE INDEX CONCURRENTLY 被中断（客户端超时、
+        # 进程被杀）会留下 INVALID 索引，而 IF NOT EXISTS 看到同名索引就直接跳过，
+        # 于是这个索引**永远不会被重建**，只在启动日志里留一行 error。
+        # 必须显式识别并先 DROP，否则「加超时」反而会制造静默缺索引。
         index_names = [idx["name"] for idx in indexes]
         check_sql = """
-            SELECT indexname FROM pg_indexes
-            WHERE tablename = 'lightrag_doc_status'
-            AND indexname = ANY($1)
+            SELECT c.relname AS indexname, i.indisvalid
+              FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              JOIN pg_class t ON t.oid = i.indrelid
+             WHERE t.relname = 'lightrag_doc_status'
+               AND c.relname = ANY($1)
         """
         try:
             rows = await self.query(check_sql, [index_names], multirows=True)
-            existing_names = {row["indexname"] for row in (rows or [])}
-        except asyncpg.PostgresError as e:
+            existing_names = {
+                row["indexname"] for row in (rows or []) if row.get("indisvalid")
+            }
+            invalid_names = [
+                row["indexname"]
+                for row in (rows or [])
+                if not row.get("indisvalid")
+            ]
+        except Exception as e:  # noqa: BLE001 - startup best-effort
             logger.warning(
                 f"[{self.workspace}] Failed to query existing pagination indexes "
                 f"({type(e).__name__}), will attempt to create all: {e}"
             )
             existing_names = set()
+            invalid_names = []
+
+        for name in invalid_names:
+            try:
+                logger.warning(
+                    f"[{self.workspace}] Dropping INVALID index {name} before rebuild"
+                )
+                await self.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+            except Exception as e:  # noqa: BLE001 - startup best-effort
+                logger.warning(
+                    f"[{self.workspace}] Failed to drop INVALID index {name} "
+                    f"({type(e).__name__}): {e}"
+                )
 
         for index in indexes:
             if index["name"] in existing_names:
@@ -1706,7 +1918,7 @@ class PostgreSQLDB:
                 logger.info(f"Creating pagination index: {index['description']}")
                 await self.execute(index["sql"])
                 logger.info(f"Successfully created index: {index['name']}")
-            except asyncpg.PostgresError as e:
+            except Exception as e:  # noqa: BLE001 - startup best-effort
                 logger.warning(
                     f"Failed to create index {index['name']} ({type(e).__name__}): {e}"
                 )
@@ -1804,11 +2016,15 @@ class PostgreSQLDB:
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_params = tuple(params) if params else ()
+            # [jonex] 启动期 DDL 豁免客户端 command_timeout；None = 沿用连接默认。
+            call_timeout = _STARTUP_DDL_CALL_TIMEOUT if self._startup_ddl else None
             fetch_start = time.perf_counter()
             if prepared_params:
-                rows = await connection.fetch(sql, *prepared_params)
+                rows = await connection.fetch(
+                    sql, *prepared_params, timeout=call_timeout
+                )
             else:
-                rows = await connection.fetch(sql)
+                rows = await connection.fetch(sql, timeout=call_timeout)
             fetch_elapsed = time.perf_counter() - fetch_start
 
             if timing_label:
@@ -1897,12 +2113,16 @@ class PostgreSQLDB:
     ):
         async def _operation(connection: asyncpg.Connection) -> Any:
             prepared_values = tuple(data.values()) if data else ()
+            # [jonex] 启动期 DDL 豁免客户端 command_timeout；None = 沿用连接默认。
+            call_timeout = _STARTUP_DDL_CALL_TIMEOUT if self._startup_ddl else None
             execute_start = time.perf_counter()
             try:
                 if not data:
-                    result = await connection.execute(sql)
+                    result = await connection.execute(sql, timeout=call_timeout)
                 else:
-                    result = await connection.execute(sql, *prepared_values)
+                    result = await connection.execute(
+                        sql, *prepared_values, timeout=call_timeout
+                    )
             except (
                 asyncpg.exceptions.UniqueViolationError,
                 asyncpg.exceptions.DuplicateTableError,
@@ -2109,6 +2329,31 @@ class ClientManager:
                         config.get("postgres", "pool_close_timeout", fallback=5.0),
                     )
                 ),
+            ),
+            # [jonex] 取连接 / 建池 / 单条语句超时
+            "pool_acquire_timeout": min(
+                600.0,
+                float(
+                    os.environ.get(
+                        "POSTGRES_POOL_ACQUIRE_TIMEOUT",
+                        config.get(
+                            "postgres", "pool_acquire_timeout", fallback=30.0
+                        ),
+                    )
+                ),
+            ),
+            "pool_init_timeout": min(
+                600.0,
+                float(
+                    os.environ.get(
+                        "POSTGRES_POOL_INIT_TIMEOUT",
+                        config.get("postgres", "pool_init_timeout", fallback=120.0),
+                    )
+                ),
+            ),
+            "command_timeout": os.environ.get(
+                "POSTGRES_COMMAND_TIMEOUT",
+                config.get("postgres", "command_timeout", fallback=None),
             ),
         }
 
@@ -2507,15 +2752,31 @@ class PGKVStorage(BaseKVStorage):
 
         [jonex] limit 默认 None = 不设上限（原硬编码 500 会截断超长文档的
         chunk 读回，本体抽取 Stage4 拿不到完整输入，§5.6 代价②）。
+
+        显式传入 limit 时由 SQL 层 ``LIMIT`` 控制返回量，避免把整篇文档
+        （实测可达数万行）先读进内存再截断。排序键在 ``chunk_order_index``
+        之外补 ``id``，保证重复序号下「取前 N 条」仍然稳定。
+
+        [jonex] doc_id 以**等值**匹配 file_path 里的 `doc=` 锚点（不是 LIKE
+        模式）。配合表达式索引后走 Index Scan，不再全表扫。
         """
         if not doc_id:
             return []
-        sql = SQL_TEMPLATES["get_chunks_by_doc_id"]
-        params = {
-            "workspace": self.workspace,
-            "pattern": f"%doc={doc_id}%",
-        }
-        rows = await self.db.query(sql, list(params.values()), multirows=True)
+        if limit is not None and limit <= 0:
+            return []
+        params: list[Any] = [self.workspace, doc_id]
+        if limit is None:
+            sql = SQL_TEMPLATES["get_chunks_by_doc_id"].format(
+                order_suffix="",
+                limit_clause="",
+            )
+        else:
+            sql = SQL_TEMPLATES["get_chunks_by_doc_id"].format(
+                order_suffix=", id",
+                limit_clause=" LIMIT $3",
+            )
+            params.append(int(limit))
+        rows = await self.db.query(sql, params, multirows=True)
         if not rows:
             return []
 
@@ -2542,8 +2803,6 @@ class PGKVStorage(BaseKVStorage):
                 "create_time": create_time,
                 "update_time": create_time if update_time == 0 else update_time,
             })
-            if limit is not None and len(out) >= limit:
-                break
         return out
 
     ################ INSERT METHODS ################
@@ -6834,6 +7093,20 @@ SQL_TEMPLATES = {
               """,
     # DROP tables
     # ── [jonex] 按 doc= 锚点枚举 text_chunks ──
+    # order_suffix / limit_clause 由 get_chunks_by_doc_id() 按需填：
+    # 默认两者皆空（与旧 SQL 完全一致，全量返回）；显式 limit 时才加
+    # ", id" 稳定排序键与 " LIMIT $3"。
+    #
+    # $2 是文档 uuid 的**等值**参数，不是 LIKE 模式。原先的
+    # `file_path LIKE '%doc=<uuid>%'` 前导通配用不上索引，只能全表扫；改成
+    # `substring(file_path from 'doc=([^|]+)') = $2` 后可走表达式索引
+    # (workspace, substring(...), chunk_order_index)（迁移
+    # 20261120184137_lightrag_doc_chunks_doc_anchor_index.sql）。
+    # 表达式必须与索引定义逐字一致，改动时两处同步。
+    #
+    # 不加 OR 回落：OR 会让两个分支都必须能走同一索引，LIKE 分支走不了，
+    # 优化器只能把 doc 条件退化成 Filter。等值本身不丢数据 —— 无锚点的行
+    # substring 为 NULL，等值与旧的 LIKE 都不会命中。
     "get_chunks_by_doc_id": """SELECT id AS chunk_id, tokens,
                                 COALESCE(content, '') as content,
                                 chunk_order_index, full_doc_id, file_path,
@@ -6841,8 +7114,9 @@ SQL_TEMPLATES = {
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                 FROM LIGHTRAG_DOC_CHUNKS
-                                WHERE workspace=$1 AND file_path LIKE $2
-                                ORDER BY chunk_order_index
+                                WHERE workspace=$1
+                                  AND substring(file_path from 'doc=([^|]+)') = $2
+                                ORDER BY chunk_order_index{order_suffix}{limit_clause}
                             """,
     "drop_specifiy_table_workspace": """
         DELETE FROM {table_name} WHERE workspace=$1

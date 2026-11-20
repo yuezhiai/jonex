@@ -59,6 +59,10 @@ from lightrag.api.workspace_manager import (
     WorkspaceRAGManager,
     get_workspace_from_request,  # [jonex] extracted from create_application()
 )
+from lightrag.api.health_probe import (  # [jonex] dependency probes for /health
+    apply_probe,
+    get_dependencies,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1349,7 +1353,20 @@ def create_app(args):
                         }
                     }
                 },
-            }
+            },
+            503: {
+                "description": "A backing dependency is unreachable (PostgreSQL / Milvus / Neo4j); the service is degraded",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "status": "degraded",
+                            "dependencies": {
+                                "postgres": {"state": "unavailable", "ms": 1002.4}
+                            },
+                        }
+                    }
+                },
+            },
         },
     )
     async def get_status(request: Request):
@@ -1371,7 +1388,7 @@ def create_app(args):
             # Cleanup expired keyed locks and get status
             keyed_lock_info = cleanup_keyed_lock()
 
-            return {
+            payload = {
                 "status": "healthy",
                 "webui_available": webui_assets_exist,
                 "working_directory": str(args.working_dir),
@@ -1421,6 +1438,17 @@ def create_app(args):
                 "webui_title": webui_title,
                 "webui_description": webui_description,
             }
+
+            # [jonex] Dependency probes. /health used to report only in-process
+            # state, so a dead data layer still returned 200 and the compose
+            # healthcheck stayed green for the whole outage. Every configured
+            # backend (PG / Milvus / Neo4j) is probed concurrently with a 1s
+            # bound, cached for a few seconds, and any degradation becomes 503.
+            dependencies = await get_dependencies(manager, args)
+            payload, status_code = apply_probe(payload, dependencies)
+            if status_code != 200:
+                return JSONResponse(status_code=status_code, content=payload)
+            return payload
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
