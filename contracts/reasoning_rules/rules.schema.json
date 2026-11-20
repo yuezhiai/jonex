@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jonex.local/contracts/reasoning_rules/rules.schema.json",
+  "title": "Reasoning Rules File",
+  "description": "推理规则导入/导出文件。引用写名称或别名；变量在 AST 中写裸名。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "kind", "contract_version", "rules"],
+  "properties": {
+    "version": { "const": 2 },
+    "kind": { "const": "reasoning_rules" },
+    "contract_version": { "const": 1 },
+    "knowledge_base": {
+      "type": "string",
+      "description": "只说明来源，导入时不用来定位"
+    },
+    "removed_rule_keys": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64 },
+      "default": []
+    },
+    "rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    }
+  },
+  "$defs": {
+    "variable": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "maxLength": 64,
+      "description": "裸变量名；文本中写 ?name"
+    },
+    "atomRel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "s", "p", "o"],
+      "properties": {
+        "kind": { "const": "rel" },
+        "s": { "$ref": "#/$defs/variable" },
+        "p": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "o": { "$ref": "#/$defs/variable" }
+      }
+    },
+    "atomType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "s", "cls"],
+      "properties": {
+        "kind": { "const": "type" },
+        "s": { "$ref": "#/$defs/variable" },
+        "cls": { "type": "string", "minLength": 1, "maxLength": 255 }
+      }
+    },
+    "atom": {
+      "oneOf": [
+        { "$ref": "#/$defs/atomRel" },
+        { "$ref": "#/$defs/atomType" }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_key", "name", "text", "status", "enabled", "origin"],
+      "properties": {
+        "rule_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Studio 发布沿用其规则 id；平台新建生成 r_<uuid>"
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "作者编写的规则文本；AST 为权威"
+        },
+        "premises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/atom" }
+        },
+        "conclusion": { "$ref": "#/$defs/atom" },
+        "status": { "enum": ["proposed", "active", "rejected"] },
+        "enabled": {
+          "type": "boolean",
+          "description": "只有显式 false 算停用，与平台约束口径一致"
+        },
+        "origin": { "enum": ["studio", "platform", "imported"] },
+        "module": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "归属模块；只决定归属，不参与更新匹配"
+        },
+        "content_revision": { "type": "integer", "minimum": 0 },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "上次从平台拉取/发布成功时的 content_revision；缺省 = 无基线"
+        },
+        "description": { "type": "string", "maxLength": 2000 }
+      },
+      "dependentRequired": {
+        "premises": ["conclusion"],
+        "conclusion": ["premises"]
+      }
+    }
+  }
+}

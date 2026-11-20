@@ -1,0 +1,279 @@
+version: 2
+kind: reasoning_rules
+contract_version: 1
+rules:
+- rule_key: r_hf_subsidiary_transitive
+  name: 子公司传递
+  text: IF ?a COMPANY_HAS_SUBSIDIARY ?b AND ?b COMPANY_HAS_SUBSIDIARY ?c THEN ?a COMPANY_HAS_SUBSIDIARY
+    ?c
+  premises:
+  - kind: rel
+    s: a
+    p: COMPANY_HAS_SUBSIDIARY
+    o: b
+  - kind: rel
+    s: b
+    p: COMPANY_HAS_SUBSIDIARY
+    o: c
+  conclusion:
+    kind: rel
+    s: a
+    p: COMPANY_HAS_SUBSIDIARY
+    o: c
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 子公司的子公司仍纳入上市公司合并范围。
+- rule_key: r_hf_company_line
+  name: 公司产品线归集
+  text: IF ?c HAS_SEGMENT ?s AND ?s SEGMENT_INCLUDES_LINE ?l THEN ?c HAS_PART ?l
+  premises:
+  - kind: rel
+    s: c
+    p: HAS_SEGMENT
+    o: s
+  - kind: rel
+    s: s
+    p: SEGMENT_INCLUDES_LINE
+    o: l
+  conclusion:
+    kind: rel
+    s: c
+    p: HAS_PART
+    o: l
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 公司含分部、分部含产品线，则公司包含该产品线。
+- rule_key: r_hf_segment_product
+  name: 分部产品归集
+  text: IF ?s SEGMENT_INCLUDES_LINE ?l AND ?l LINE_PRODUCES_PRODUCT ?p THEN ?s HAS_PART
+    ?p
+  premises:
+  - kind: rel
+    s: s
+    p: SEGMENT_INCLUDES_LINE
+    o: l
+  - kind: rel
+    s: l
+    p: LINE_PRODUCES_PRODUCT
+    o: p
+  conclusion:
+    kind: rel
+    s: s
+    p: HAS_PART
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 分部含产品线、产品线生产产品，则分部包含该产品。
+- rule_key: r_hf_report_segment_metric
+  name: 报告分部指标归集
+  text: IF ?r HAS_SEGMENT ?s AND ?s SEGMENT_HAS_METRIC ?m THEN ?r REPORT_HAS_FINANCIAL_METRIC
+    ?m
+  premises:
+  - kind: rel
+    s: r
+    p: HAS_SEGMENT
+    o: s
+  - kind: rel
+    s: s
+    p: SEGMENT_HAS_METRIC
+    o: m
+  conclusion:
+    kind: rel
+    s: r
+    p: REPORT_HAS_FINANCIAL_METRIC
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 财报含分部、分部含财务指标，则财报汇总该指标。
+- rule_key: r_hf_report_segment_cost
+  name: 报告分部成本归集
+  text: IF ?r HAS_SEGMENT ?s AND ?s SEGMENT_HAS_COST_EXPENSE ?e THEN ?r REPORT_HAS_COST_EXPENSE
+    ?e
+  premises:
+  - kind: rel
+    s: r
+    p: HAS_SEGMENT
+    o: s
+  - kind: rel
+    s: s
+    p: SEGMENT_HAS_COST_EXPENSE
+    o: e
+  conclusion:
+    kind: rel
+    s: r
+    p: REPORT_HAS_COST_EXPENSE
+    o: e
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 财报含分部、分部含成本项，则财报汇总该成本项。
+- rule_key: r_hf_subsidiary_market
+  name: 子公司市场归集
+  text: IF ?c COMPANY_HAS_SUBSIDIARY ?s AND ?s SUBSIDIARY_LOCATED_IN_MARKET ?m THEN
+    ?c COMPANY_OPERATES_IN_MARKET ?m
+  premises:
+  - kind: rel
+    s: c
+    p: COMPANY_HAS_SUBSIDIARY
+    o: s
+  - kind: rel
+    s: s
+    p: SUBSIDIARY_LOCATED_IN_MARKET
+    o: m
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPANY_OPERATES_IN_MARKET
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 上市公司子公司在某市场经营，则上市公司经营该市场。
+- rule_key: r_hf_initiative_esg
+  name: 可持续举措指标
+  text: IF ?c COMPANY_UNDERTAKES_INITIATIVE ?i AND ?i INITIATIVE_IMPROVES_ESG ?m THEN
+    ?c COMPANY_HAS_ESG_METRIC ?m
+  premises:
+  - kind: rel
+    s: c
+    p: COMPANY_UNDERTAKES_INITIATIVE
+    o: i
+  - kind: rel
+    s: i
+    p: INITIATIVE_IMPROVES_ESG
+    o: m
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPANY_HAS_ESG_METRIC
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 公司开展可持续举措且举措改善某 ESG 指标，则公司拥有该指标。
+- rule_key: r_hf_channel_market
+  name: 渠道市场覆盖
+  text: IF ?c COMPANY_USES_CHANNEL ?ch AND ?ch CHANNEL_COVERS_MARKET ?m THEN ?c COMPANY_OPERATES_IN_MARKET
+    ?m
+  premises:
+  - kind: rel
+    s: c
+    p: COMPANY_USES_CHANNEL
+    o: ch
+  - kind: rel
+    s: ch
+    p: CHANNEL_COVERS_MARKET
+    o: m
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPANY_OPERATES_IN_MARKET
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 公司使用覆盖某市场的渠道，则公司经营该市场。
+- rule_key: r_hf_report_market
+  name: 报告市场覆盖
+  text: IF ?r HAS_SEGMENT ?s AND ?s SEGMENT_SELLS_IN_MARKET ?m THEN ?r REPORT_COVERS_MARKET
+    ?m
+  premises:
+  - kind: rel
+    s: r
+    p: HAS_SEGMENT
+    o: s
+  - kind: rel
+    s: s
+    p: SEGMENT_SELLS_IN_MARKET
+    o: m
+  conclusion:
+    kind: rel
+    s: r
+    p: REPORT_COVERS_MARKET
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 财报含分部、分部在某市场销售，则财报覆盖该市场。
+- rule_key: r_hf_line_metric
+  name: 产品线运营指标
+  text: IF ?l LINE_PRODUCES_PRODUCT ?p AND ?p PRODUCT_HAS_OPERATIONAL_METRIC ?m THEN
+    ?l LINE_HAS_OPERATIONAL_METRIC ?m
+  premises:
+  - kind: rel
+    s: l
+    p: LINE_PRODUCES_PRODUCT
+    o: p
+  - kind: rel
+    s: p
+    p: PRODUCT_HAS_OPERATIONAL_METRIC
+    o: m
+  conclusion:
+    kind: rel
+    s: l
+    p: LINE_HAS_OPERATIONAL_METRIC
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 产品线生产产品、产品有运营指标，则产品线拥有该运营指标。
+- rule_key: r_hf_subsidiary_risk
+  name: 子公司风险传导
+  text: IF ?c COMPANY_HAS_SUBSIDIARY ?s AND ?s SUBSIDIARY_FACES_RISK ?r THEN ?c COMPANY_FACES_RISK
+    ?r
+  premises:
+  - kind: rel
+    s: c
+    p: COMPANY_HAS_SUBSIDIARY
+    o: s
+  - kind: rel
+    s: s
+    p: SUBSIDIARY_FACES_RISK
+    o: r
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPANY_FACES_RISK
+    o: r
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 子公司面临风险，则上市公司面临该风险。
+- rule_key: r_hf_subsidiary_proceeding
+  name: 子公司诉讼传导
+  text: IF ?c COMPANY_HAS_SUBSIDIARY ?s AND ?s SUBSIDIARY_INVOLVED_IN_PROCEEDING ?p
+    THEN ?c COMPANY_INVOLVED_IN_PROCEEDING ?p
+  premises:
+  - kind: rel
+    s: c
+    p: COMPANY_HAS_SUBSIDIARY
+    o: s
+  - kind: rel
+    s: s
+    p: SUBSIDIARY_INVOLVED_IN_PROCEEDING
+    o: p
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPANY_INVOLVED_IN_PROCEEDING
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: hardware_internet_finance
+  description: 子公司涉及法律诉讼，则上市公司涉及该诉讼。

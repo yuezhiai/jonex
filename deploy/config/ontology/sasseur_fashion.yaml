@@ -841,6 +841,49 @@ relation_types:
     target: Concept
     description: "活动面向某客群标签（如亲子家庭、Z 世代、通勤白领）"
 
+  # ── 层级补充关系：部分-整体（商场 / 楼层 / 门店 / 穿搭） ──────
+  - name: HAS_PART
+    source: Mall
+    target: Store
+    source_types: [Mall, Outfit]
+    target_types: [Zone, Store, ApparelItem, Accessory]
+    description: "整体包含部分（商场含楼层/门店、穿搭含单品/配饰）"
+
+  - name: PART_OF
+    source: Store
+    target: Mall
+    source_types: [Zone, Store, ApparelItem, Accessory]
+    target_types: [Mall, Zone, Outfit]
+    description: "部分属于整体（与 HAS_PART 构成方向相反的一对关系）"
+
+  # ── 推理补充关系（可导入 TBox 的显式派生口径） ──────────────
+  - name: RECOMMENDS_ITEM
+    source: Outfit
+    target: ApparelItem
+    target_types: [ApparelItem, Accessory]
+    description: "穿搭推荐的单品（经搭配关系推导）"
+
+  - name: RECOMMENDS_ACCESSORY
+    source: Outfit
+    target: Accessory
+    target_types: [Accessory]
+    description: "穿搭推荐的配饰（经搭配关系推导）"
+
+  - name: BRAND_PRESENT_AT
+    source: Brand
+    target: Mall
+    description: "品牌在商场有门店（经门店归属推导）"
+
+  - name: MALL_OFFERS_PROMOTION
+    source: Mall
+    target: Promotion
+    description: "商场提供某促销（经会员层级/活动推导）"
+
+  - name: ZONE_HAS_BRAND
+    source: Zone
+    target: Brand
+    description: "楼层/区域包含某品牌（经门店归属推导）"
+
     # ↓ 通用关联：同时是抽取的兜底降级目标（ONTOLOGY_KEEP_UNTYPED_EDGES=true 时，
     #    TBox 未约束但两端类型都在 TBox 内的关系落成此类型）——故端点声明为全类型，
     #    保证图谱里的 RELATES_TO 边始终能在编译 schema 中解析。
@@ -960,6 +1003,855 @@ constraints:
     entity: Metric
     attribute: value
     severity: warning
+
+# ============================================================
+# 公理：类层次 / 关系层次 / 数据属性层次 / 特征 / 规则链 / 值域
+# ============================================================
+axioms:
+  # ── 类层次：零售主体 ──────────────────────────────────
+  - axiom_key: ax_sf_accessory_apparel
+    kind: subClassOf
+    subject: { kind: entity, ref: Accessory }
+    object: { kind: entity, ref: ApparelItem }
+    status: active
+    source: manual
+    origin: platform
+    description: "配饰是服装单品的一种"
+
+  - axiom_key: ax_sf_brand_org
+    kind: subClassOf
+    subject: { kind: entity, ref: Brand }
+    object: { kind: entity, ref: Organization }
+    status: active
+    source: manual
+    origin: platform
+    description: "品牌是组织的一种"
+
+  - axiom_key: ax_sf_mall_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Mall }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "商场是地点"
+
+  - axiom_key: ax_sf_zone_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Zone }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "楼层/区域是地点"
+
+  - axiom_key: ax_sf_store_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Store }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "门店是地点"
+
+  - axiom_key: ax_sf_campaign_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Campaign }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "营销活动是事件"
+
+  # ── 类层次：概念型对象 ────────────────────────────────
+  - axiom_key: ax_sf_promotion_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Promotion }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_material_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Material }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_color_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Color }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_pattern_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Pattern }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_style_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: StyleGenre }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_occasion_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Occasion }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_bodytype_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: BodyType }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_skintone_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: SkinTone }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_stylingrule_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: StylingRule }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_sizespec_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: SizeSpec }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_season_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Season }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_trend_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Trend }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_metric_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Metric }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_award_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Award }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_membership_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: MembershipTier }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 互斥类 ────────────────────────────────────────────
+  - axiom_key: ax_sf_disjoint_org_person
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_org_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_org_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_org_apparel
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: ApparelItem }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_person_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_person_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_person_apparel
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: ApparelItem }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_location_apparel
+    kind: disjointWith
+    subject: { kind: entity, ref: Location }
+    object: { kind: entity, ref: ApparelItem }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_event_apparel
+    kind: disjointWith
+    subject: { kind: entity, ref: Event }
+    object: { kind: entity, ref: ApparelItem }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_concept_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_concept_person
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_disjoint_concept_org
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Organization }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 关系层次：部分-整体 ───────────────────────────────
+  - axiom_key: ax_sf_has_zone_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_ZONE }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "商场含楼层是整体-部分关系"
+
+  - axiom_key: ax_sf_has_store_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_STORE }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "商场含门店是整体-部分关系"
+
+  - axiom_key: ax_sf_store_zone_part_of
+    kind: subPropertyOf
+    subject: { kind: relation, ref: STORE_IN_ZONE }
+    object: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "门店属于楼层是部分-整体关系"
+
+  - axiom_key: ax_sf_includes_item_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: INCLUDES_ITEM }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "穿搭含单品是整体-部分关系"
+
+  - axiom_key: ax_sf_includes_accessory_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: INCLUDES_ACCESSORY }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "穿搭含配饰是整体-部分关系"
+
+  - axiom_key: ax_sf_has_part_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_PART }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_part_of_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PART_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 关系层次：推理补充关系 ────────────────────────────
+  - axiom_key: ax_sf_recommends_item_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: RECOMMENDS_ITEM }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_recommends_accessory_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: RECOMMENDS_ACCESSORY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_brand_present_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: BRAND_PRESENT_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_mall_promotion_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MALL_OFFERS_PROMOTION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_zone_brand_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ZONE_HAS_BRAND }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 关系层次：存量关系 ────────────────────────────────
+  - axiom_key: ax_sf_operates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: OPERATES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_store_brand_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: STORE_OF_BRAND }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_brand_owned_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: BRAND_OWNED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_competes_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPETES_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_held_at_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HELD_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_sub_event_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_SUB_EVENT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_hosts_event_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HOSTS_EVENT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_offers_promotion_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: OFFERS_PROMOTION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_brand_promotion_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: BRAND_OFFERS_PROMOTION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_promo_applies_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PROMOTION_APPLIES_TO }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_membership_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_MEMBERSHIP_TIER }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_succeeds_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUCCEEDS_EDITION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_sold_by_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SOLD_BY_BRAND }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_available_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: AVAILABLE_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_substitute_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUBSTITUTE_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_matches_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MATCHES_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_pairs_accessory_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PAIRS_WITH_ACCESSORY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_has_style_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_STYLE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_item_style_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ITEM_FITS_STYLE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_outfit_occasion_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUITABLE_FOR_OCCASION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_item_occasion_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ITEM_SUITABLE_FOR_OCCASION }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_outfit_body_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUITABLE_FOR_BODY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_item_body_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ITEM_SUITABLE_FOR_BODY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_color_pairs_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COLOR_PAIRS_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_follows_rule_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: FOLLOWS_RULE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_for_season_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: FOR_SEASON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_item_season_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ITEM_FOR_SEASON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_reflects_trend_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: REFLECTS_TREND }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_item_trend_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ITEM_REFLECTS_TREND }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_trend_season_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: TREND_IN_SEASON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_styled_campaign_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: STYLED_FROM_CAMPAIGN }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 数据属性层次 ──────────────────────────────────────
+  - axiom_key: ax_sf_accessory_original_price
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Accessory, ref: original_price }
+    object: { kind: attribute, owner: ApparelItem, ref: original_price }
+    status: active
+    source: manual
+    origin: platform
+    description: "配饰原价是单品原价的一种"
+
+  - axiom_key: ax_sf_accessory_outlet_price
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Accessory, ref: outlet_price }
+    object: { kind: attribute, owner: ApparelItem, ref: outlet_price }
+    status: active
+    source: manual
+    origin: platform
+    description: "配饰奥莱价是单品奥莱价的一种"
+
+  - axiom_key: ax_sf_accessory_discount
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Accessory, ref: discount }
+    object: { kind: attribute, owner: ApparelItem, ref: discount }
+    status: active
+    source: manual
+    origin: platform
+    description: "配饰折扣是单品折扣的一种"
+
+  - axiom_key: ax_sf_final_outlet_price
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: ApparelItem, ref: final_price }
+    object: { kind: attribute, owner: ApparelItem, ref: outlet_price }
+    status: active
+    source: manual
+    origin: platform
+    description: "最终价是奥莱价的一种"
+
+  - axiom_key: ax_sf_outlet_original_price
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: ApparelItem, ref: outlet_price }
+    object: { kind: attribute, owner: ApparelItem, ref: original_price }
+    status: active
+    source: manual
+    origin: platform
+    description: "奥莱价是原价的一种"
+
+  # ── 关系特征 ──────────────────────────────────────────
+  - axiom_key: ax_sf_competes_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: COMPETES_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_color_pairs_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: COLOR_PAIRS_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_matches_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: MATCHES_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_substitute_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: SUBSTITUTE_OF }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_succeeds_transitive
+    kind: transitive
+    subject: { kind: relation, ref: SUCCEEDS_EDITION }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_succeeds_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: SUCCEEDS_EDITION }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_has_part_transitive
+    kind: transitive
+    subject: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_has_part_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_part_of_transitive
+    kind: transitive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_part_of_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_sf_next_step_transitive
+    kind: transitive
+    subject: { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── propertyChain（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_sf_chain_mall_zone
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_ZONE }
+    chain:
+      - { kind: relation, ref: HAS_STORE }
+      - { kind: relation, ref: STORE_IN_ZONE }
+    status: active
+    source: manual
+    origin: platform
+    description: "商场含门店、门店在楼层 → 商场含该楼层"
+
+  - axiom_key: ax_sf_chain_has_part
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_PART }
+    chain:
+      - { kind: relation, ref: HAS_PART }
+      - { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "整体-部分关系的传递闭包"
+
+  - axiom_key: ax_sf_chain_succeeds
+    kind: propertyChain
+    subject: { kind: relation, ref: SUCCEEDS_EDITION }
+    chain:
+      - { kind: relation, ref: SUCCEEDS_EDITION }
+      - { kind: relation, ref: SUCCEEDS_EDITION }
+    status: active
+    source: manual
+    origin: platform
+    description: "活动届次的传递闭包"
+
+  - axiom_key: ax_sf_chain_step
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_STEP }
+    chain:
+      - { kind: relation, ref: HAS_STEP }
+      - { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+    description: "技能后续步骤仍属于该技能"
+
+  # ── datatypeFacet（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_sf_facet_original_price
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: ApparelItem, ref: original_price }
+    facets:
+      - { kind: pattern, value: "^[¥￥]?[0-9.,]+$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "原价按金额记录"
+
+  - axiom_key: ax_sf_facet_outlet_price
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: ApparelItem, ref: outlet_price }
+    facets:
+      - { kind: pattern, value: "^[¥￥]?[0-9.,]+$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "奥莱价按金额记录"
+
+  - axiom_key: ax_sf_facet_discount
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: ApparelItem, ref: discount }
+    facets:
+      - { kind: pattern, value: "^[0-9.]+\\s*折?$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "折扣按数字或 X折 记录"
+
+  - axiom_key: ax_sf_facet_accessory_discount
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Accessory, ref: discount }
+    facets:
+      - { kind: pattern, value: "^[0-9.]+\\s*折?$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "配饰折扣按数字或 X折 记录"
+
+  - axiom_key: ax_sf_facet_occupancy
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Mall, ref: occupancy_rate }
+    facets:
+      - { kind: pattern, value: "^[0-9.]+%?$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "出租率按百分比记录"
 
 disambiguation:
   case_insensitive: true

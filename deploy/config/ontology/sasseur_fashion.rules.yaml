@@ -1,0 +1,319 @@
+version: 2
+kind: reasoning_rules
+contract_version: 1
+rules:
+- rule_key: r_sf_mall_zone
+  name: 门店归入楼层
+  text: IF ?m HAS_STORE ?s AND ?s STORE_IN_ZONE ?z THEN ?m HAS_ZONE ?z
+  premises:
+  - kind: rel
+    s: m
+    p: HAS_STORE
+    o: s
+  - kind: rel
+    s: s
+    p: STORE_IN_ZONE
+    o: z
+  conclusion:
+    kind: rel
+    s: m
+    p: HAS_ZONE
+    o: z
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 商场含门店、门店在某楼层，则商场含该楼层。
+- rule_key: r_sf_event_host
+  name: 子活动主办方
+  text: IF ?c HAS_SUB_EVENT ?e AND ?c HELD_AT ?m THEN ?m HOSTS_EVENT ?e
+  premises:
+  - kind: rel
+    s: c
+    p: HAS_SUB_EVENT
+    o: e
+  - kind: rel
+    s: c
+    p: HELD_AT
+    o: m
+  conclusion:
+    kind: rel
+    s: m
+    p: HOSTS_EVENT
+    o: e
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 活动含子活动且活动在商场举办，则商场主办该子活动。
+- rule_key: r_sf_outfit_occasion
+  name: 穿搭场合推导
+  text: IF ?o INCLUDES_ITEM ?i AND ?i ITEM_SUITABLE_FOR_OCCASION ?oc THEN ?o SUITABLE_FOR_OCCASION
+    ?oc
+  premises:
+  - kind: rel
+    s: o
+    p: INCLUDES_ITEM
+    o: i
+  - kind: rel
+    s: i
+    p: ITEM_SUITABLE_FOR_OCCASION
+    o: oc
+  conclusion:
+    kind: rel
+    s: o
+    p: SUITABLE_FOR_OCCASION
+    o: oc
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭含适合某场合的单品，则穿搭适合该场合。
+- rule_key: r_sf_outfit_body
+  name: 穿搭体型推导
+  text: IF ?o INCLUDES_ITEM ?i AND ?i ITEM_SUITABLE_FOR_BODY ?b THEN ?o SUITABLE_FOR_BODY
+    ?b
+  premises:
+  - kind: rel
+    s: o
+    p: INCLUDES_ITEM
+    o: i
+  - kind: rel
+    s: i
+    p: ITEM_SUITABLE_FOR_BODY
+    o: b
+  conclusion:
+    kind: rel
+    s: o
+    p: SUITABLE_FOR_BODY
+    o: b
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭含适合某体型的单品，则穿搭适合该体型。
+- rule_key: r_sf_outfit_season
+  name: 穿搭季节推导
+  text: IF ?o INCLUDES_ITEM ?i AND ?i ITEM_FOR_SEASON ?s THEN ?o FOR_SEASON ?s
+  premises:
+  - kind: rel
+    s: o
+    p: INCLUDES_ITEM
+    o: i
+  - kind: rel
+    s: i
+    p: ITEM_FOR_SEASON
+    o: s
+  conclusion:
+    kind: rel
+    s: o
+    p: FOR_SEASON
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭含适合某季节的单品，则穿搭适合该季节。
+- rule_key: r_sf_brand_promotion
+  name: 品牌促销推导
+  text: IF ?p PROMOTION_APPLIES_TO ?i AND ?i SOLD_BY_BRAND ?b THEN ?b BRAND_OFFERS_PROMOTION
+    ?p
+  premises:
+  - kind: rel
+    s: p
+    p: PROMOTION_APPLIES_TO
+    o: i
+  - kind: rel
+    s: i
+    p: SOLD_BY_BRAND
+    o: b
+  conclusion:
+    kind: rel
+    s: b
+    p: BRAND_OFFERS_PROMOTION
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 促销适用于某单品且单品由品牌销售，则品牌提供该促销。
+- rule_key: r_sf_outfit_trend_season
+  name: 穿搭趋势季节
+  text: IF ?o REFLECTS_TREND ?t AND ?t TREND_IN_SEASON ?s THEN ?o FOR_SEASON ?s
+  premises:
+  - kind: rel
+    s: o
+    p: REFLECTS_TREND
+    o: t
+  - kind: rel
+    s: t
+    p: TREND_IN_SEASON
+    o: s
+  conclusion:
+    kind: rel
+    s: o
+    p: FOR_SEASON
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭体现某趋势且趋势属于某季节，则穿搭适合该季节。
+- rule_key: r_sf_item_trend_season
+  name: 单品趋势季节
+  text: IF ?i ITEM_REFLECTS_TREND ?t AND ?t TREND_IN_SEASON ?s THEN ?i ITEM_FOR_SEASON
+    ?s
+  premises:
+  - kind: rel
+    s: i
+    p: ITEM_REFLECTS_TREND
+    o: t
+  - kind: rel
+    s: t
+    p: TREND_IN_SEASON
+    o: s
+  conclusion:
+    kind: rel
+    s: i
+    p: ITEM_FOR_SEASON
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 单品体现某趋势且趋势属于某季节，则单品适合该季节。
+- rule_key: r_sf_succeeds_transitive
+  name: 活动届次传递
+  text: IF ?a SUCCEEDS_EDITION ?b AND ?b SUCCEEDS_EDITION ?c THEN ?a SUCCEEDS_EDITION
+    ?c
+  premises:
+  - kind: rel
+    s: a
+    p: SUCCEEDS_EDITION
+    o: b
+  - kind: rel
+    s: b
+    p: SUCCEEDS_EDITION
+    o: c
+  conclusion:
+    kind: rel
+    s: a
+    p: SUCCEEDS_EDITION
+    o: c
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 活动届次的承接关系可传递。
+- rule_key: r_sf_recommend_item
+  name: 单品搭配推荐
+  text: IF ?o INCLUDES_ITEM ?i AND ?i MATCHES_WITH ?i2 THEN ?o RECOMMENDS_ITEM ?i2
+  premises:
+  - kind: rel
+    s: o
+    p: INCLUDES_ITEM
+    o: i
+  - kind: rel
+    s: i
+    p: MATCHES_WITH
+    o: i2
+  conclusion:
+    kind: rel
+    s: o
+    p: RECOMMENDS_ITEM
+    o: i2
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭含某单品且该单品与另一单品相配，则推荐另一单品。
+- rule_key: r_sf_recommend_accessory
+  name: 配饰搭配推荐
+  text: IF ?o INCLUDES_ITEM ?i AND ?i PAIRS_WITH_ACCESSORY ?a THEN ?o RECOMMENDS_ACCESSORY
+    ?a
+  premises:
+  - kind: rel
+    s: o
+    p: INCLUDES_ITEM
+    o: i
+  - kind: rel
+    s: i
+    p: PAIRS_WITH_ACCESSORY
+    o: a
+  conclusion:
+    kind: rel
+    s: o
+    p: RECOMMENDS_ACCESSORY
+    o: a
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 穿搭含某单品且该单品与配饰相配，则推荐该配饰。
+- rule_key: r_sf_brand_present
+  name: 品牌入驻推导
+  text: IF ?m HAS_STORE ?s AND ?s STORE_OF_BRAND ?b THEN ?b BRAND_PRESENT_AT ?m
+  premises:
+  - kind: rel
+    s: m
+    p: HAS_STORE
+    o: s
+  - kind: rel
+    s: s
+    p: STORE_OF_BRAND
+    o: b
+  conclusion:
+    kind: rel
+    s: b
+    p: BRAND_PRESENT_AT
+    o: m
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 商场含某品牌门店，则该品牌入驻该商场。
+- rule_key: r_sf_mall_promotion
+  name: 商场促销推导
+  text: IF ?m HAS_MEMBERSHIP_TIER ?t AND ?p PROMOTION_EXCLUSIVE_TO ?t THEN ?m MALL_OFFERS_PROMOTION
+    ?p
+  premises:
+  - kind: rel
+    s: m
+    p: HAS_MEMBERSHIP_TIER
+    o: t
+  - kind: rel
+    s: p
+    p: PROMOTION_EXCLUSIVE_TO
+    o: t
+  conclusion:
+    kind: rel
+    s: m
+    p: MALL_OFFERS_PROMOTION
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 商场设某会员层级且促销专享该层级，则商场提供该促销。
+- rule_key: r_sf_zone_brand
+  name: 楼层品牌推导
+  text: IF ?s STORE_IN_ZONE ?z AND ?s STORE_OF_BRAND ?b THEN ?z ZONE_HAS_BRAND ?b
+  premises:
+  - kind: rel
+    s: s
+    p: STORE_IN_ZONE
+    o: z
+  - kind: rel
+    s: s
+    p: STORE_OF_BRAND
+    o: b
+  conclusion:
+    kind: rel
+    s: z
+    p: ZONE_HAS_BRAND
+    o: b
+  status: active
+  enabled: true
+  origin: imported
+  module: sasseur_fashion
+  description: 门店在某楼层且属于某品牌，则该楼层包含该品牌。

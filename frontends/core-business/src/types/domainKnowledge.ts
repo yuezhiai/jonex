@@ -364,6 +364,26 @@ export interface RelationInstanceSummary {
   instance_count: number;
 }
 
+/** 实体类型列表响应（ontology/entity-types） */
+export interface OntologyEntityTypesResponse {
+  items: OntologyInstanceSummary[];
+  total: number;
+  /** Neo4j 不可用时为 true：仍返回 compiled schema 类型，但 instance_count 降级为 0 */
+  degraded?: boolean;
+  /** 降级原因（后端固定文案，不含原始错误信息） */
+  degraded_reason?: string;
+}
+
+/** 关系类型列表响应（ontology/relation-types） */
+export interface OntologyRelationTypesResponse {
+  items: RelationInstanceSummary[];
+  total: number;
+  /** Neo4j 不可用时为 true：仍返回 compiled schema 类型，但 instance_count 降级为 0 */
+  degraded?: boolean;
+  /** 降级原因（后端固定文案，不含原始错误信息） */
+  degraded_reason?: string;
+}
+
 /** 本体实例行（Neo4j 实体） */
 export interface OntologyInstanceRow {
   name: string;
@@ -430,6 +450,8 @@ export interface UpdateOntologyInstanceRequest {
 /** 更新本体实例响应 */
 export interface UpdateOntologyInstanceResponse {
   updated: boolean;
+  /** 本次更新是否因目标键已存在而合并到同名实体（仅改类型时可能为 true） */
+  merged?: boolean;
 }
 
 /** 删除本体实例响应 */
@@ -1457,6 +1479,7 @@ export interface WikiOutline {
 /** 目录视图（GET /knowledge-base/wiki/outline） */
 export interface WikiOutlineView {
   knowledgeBaseId: string;
+  bundleSha?: string | null;
   pageCount: number;
   pages: WikiReaderPage[];
   /** 未生成过目录时为 null（前端引导「生成目录」） */

@@ -71,15 +71,28 @@ class OntologyService:
 
         # 第二段：让任务中心把这条任务里的「知识编译」重跑一次。指认用的是节点名
         # （`compile_1`），由 `retry_subtask_for_step` 在那里翻 —— 本方法不需要知道它。
-        retry_result = await retry_subtask_for_step(
-            tenant_id=tenant_id,
-            space_id=plan["space_id"],
-            task_id=plan["task_id"],
-            step_code=STEP_COMPILE,
-            # 只用于任务中心的 `updated_by`（「最后是谁动的」）。可选：漏传不报错，
-            # 只会静默记成空值。
-            operator_id=operator_id,
-        )
+        try:
+            retry_result = await retry_subtask_for_step(
+                tenant_id=tenant_id,
+                space_id=plan["space_id"],
+                task_id=plan["task_id"],
+                step_code=STEP_COMPILE,
+                # 只用于任务中心的 `updated_by`（「最后是谁动的」）。可选：漏传不报错，
+                # 只会静默记成空值。
+                operator_id=operator_id,
+            )
+        except Exception:
+            # **出站抛异常也必须交还**：武装那一步已经提交了，不交还的话行停在
+            # `managed`、任务中心却没收到重跑请求 —— 用户被 `exists_active` 锁
+            # 满 `TC_NO_DISPATCH_SEC`（30 分钟），期间什么按钮都点不了。
+            async with get_db_session() as session:
+                await TaskCenterDocumentRepository(session).mark_released(
+                    document_id,
+                    error_message="任务中心重跑请求发送失败",
+                    only_if_idle=True,
+                )
+                await session.commit()
+            raise
         if not retry_accepted(retry_result):
             # 没被受理 → **交还接管行 + 显式报错**。
             # 交还是必须的：留着那条在途行，用户会被「正在由任务中心处理」那道闸一直
@@ -431,7 +444,13 @@ class OntologyService:
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_required(document_id, tenant_id)
-            await repo.set_ontology_status(doc, OntologyStatus.EXTRACTING, increment_retry=True)
+            # **必须清掉上一轮的 `ontology_error`**：新一轮已经开跑，看门狗的
+            # 「EXTRACTING + error + 120 秒」止损会把它当成本轮失败 —— 重新编译
+            # 刚发起 120 秒就被判死，而且上报的是上一轮的原因。口径与对账的
+            # 重抽一致（那边显式传 `error=""`）。
+            await repo.set_ontology_status(
+                doc, OntologyStatus.EXTRACTING, error="", increment_retry=True
+            )
             await repo.set_status(doc, doc.status, rag_task_id=task_id)
             # [jonex] 手动重抽 = 换任务：写图状态一并清零。这是
             # ontology_auto_retry_disabled 的两条人工解除入口之一（另一条是

@@ -1,0 +1,482 @@
+{
+  "contract_version": 1,
+  "cases": [
+    {
+      "name": "rule_parse_transitive",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          { "name": "隶属于", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a 隶属于 ?b AND ?b 隶属于 ?c THEN ?a 隶属于 ?c"
+      },
+      "expect": {
+        "ast": {
+          "premises": [
+            { "kind": "rel", "s": "a", "p": "隶属于", "o": "b" },
+            { "kind": "rel", "s": "b", "p": "隶属于", "o": "c" }
+          ],
+          "conclusion": { "kind": "rel", "s": "a", "p": "隶属于", "o": "c" }
+        },
+        "issues": []
+      }
+    },
+    {
+      "name": "rule_parse_inverse_normalization",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          {
+            "name": "隶属于",
+            "source": "Equipment",
+            "target": "Equipment",
+            "inverse_of": "下属"
+          }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a 下属 ?b AND ?b 下属 ?c THEN ?a 下属 ?c"
+      },
+      "expect": {
+        "ast": {
+          "premises": [
+            { "kind": "rel", "s": "b", "p": "隶属于", "o": "a" },
+            { "kind": "rel", "s": "c", "p": "隶属于", "o": "b" }
+          ],
+          "conclusion": { "kind": "rel", "s": "c", "p": "隶属于", "o": "a" }
+        },
+        "issues": []
+      }
+    },
+    {
+      "name": "rule_syntax_unsupported_constant",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Boiler" }],
+        "relations": [
+          { "name": "隶属于", "source": "Boiler", "target": "Boiler" }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a 功率 > 850 THEN ?a 是 Boiler"
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.syntax", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "rule_unsafe_variable",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Boiler" }, { "name": "Equipment" }],
+        "relations": [
+          { "name": "隶属于", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a 是 Boiler THEN ?b 隶属于 ?b"
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.unsafe_variable", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "rule_ref_unknown_relation",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          { "name": "隶属于", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a 不存在 ?b THEN ?a 是 Equipment"
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.ref_unknown", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "rule_limits_five_premises",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          { "name": "P", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rule_text": "IF ?a P ?b AND ?b P ?c AND ?c P ?d AND ?d P ?e AND ?e P ?a THEN ?a P ?b"
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.limits", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_cycle",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }],
+        "relations": []
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subClassOf",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "subClassOf",
+            "subject": { "kind": "entity", "ref": "B" },
+            "object": { "kind": "entity", "ref": "A" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.hierarchy.cycle", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_self_reference",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }],
+        "relations": [{ "name": "R", "source": "A", "target": "A" }]
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subPropertyOf",
+            "subject": { "kind": "relation", "ref": "R" },
+            "object": { "kind": "relation", "ref": "R" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.axiom.selfReference", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_disjoint_equivalent_conflict",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }],
+        "relations": []
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "disjointWith",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "equivalentClass",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.axiom.conflict", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_property_domain_range",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }, { "name": "C" }],
+        "relations": [
+          {
+            "name": "parent",
+            "source": "A",
+            "target": "B",
+            "source_types": ["A"],
+            "target_types": ["B"]
+          },
+          {
+            "name": "child",
+            "source": "C",
+            "target": "B",
+            "source_types": ["C"],
+            "target_types": ["B"]
+          }
+        ]
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subPropertyOf",
+            "subject": { "kind": "relation", "ref": "child" },
+            "object": { "kind": "relation", "ref": "parent" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "disjointWith",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "C" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [
+          { "code": "checks.hierarchy.property_domain_range", "severity": "Violation" }
+        ]
+      }
+    },
+    {
+      "name": "axiom_property_datatype",
+      "kind": "axiom",
+      "model": {
+        "entities": [
+          {
+            "name": "A",
+            "attributes": [
+              { "name": "x", "type": "number" },
+              { "name": "y", "type": "string" }
+            ]
+          }
+        ],
+        "relations": []
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subPropertyOf",
+            "subject": { "kind": "attribute", "ref": "x", "owner": "A" },
+            "object": { "kind": "attribute", "ref": "y", "owner": "A" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.hierarchy.property_datatype", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_unsatisfiable",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }, { "name": "C" }],
+        "relations": []
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subClassOf",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "subClassOf",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "C" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "disjointWith",
+            "subject": { "kind": "entity", "ref": "B" },
+            "object": { "kind": "entity", "ref": "C" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.hierarchy.unsatisfiable", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "axiom_characteristic_risk",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }],
+        "relations": [{ "name": "R", "source": "A", "target": "A" }]
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "transitive",
+            "subject": { "kind": "relation", "ref": "R" },
+            "status": "active",
+            "source": "manual"
+          },
+          {
+            "kind": "functional",
+            "subject": { "kind": "relation", "ref": "R" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.axiom.characteristic_risk", "severity": "Warning" }]
+      }
+    },
+    {
+      "name": "axiom_sub_of_inverse",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }],
+        "relations": [
+          { "name": "parent", "source": "A", "target": "A", "inverse_of": "child" }
+        ]
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subPropertyOf",
+            "subject": { "kind": "relation", "ref": "parent" },
+            "object": { "kind": "relation", "ref": "child" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.hierarchy.sub_of_inverse", "severity": "Warning" }]
+      }
+    },
+    {
+      "name": "axiom_overlaps_relation",
+      "kind": "axiom",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }],
+        "relations": [{ "name": "PART_OF", "source": "A", "target": "B" }]
+      },
+      "input": {
+        "axioms": [
+          {
+            "kind": "subClassOf",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.hierarchy.overlaps_relation", "severity": "Warning" }]
+      }
+    },
+    {
+      "name": "rule_disjoint_conflict",
+      "kind": "conflict",
+      "model": {
+        "entities": [{ "name": "A" }, { "name": "B" }],
+        "relations": []
+      },
+      "input": {
+        "rules": [
+          {
+            "rule_key": "r_disjoint",
+            "name": "A 推出 B",
+            "text": "IF ?a 是 A THEN ?a 是 B",
+            "premises": [{ "kind": "type", "s": "a", "cls": "A" }],
+            "conclusion": { "kind": "type", "s": "a", "cls": "B" },
+            "status": "active",
+            "enabled": true,
+            "origin": "platform"
+          }
+        ],
+        "axioms": [
+          {
+            "kind": "disjointWith",
+            "subject": { "kind": "entity", "ref": "A" },
+            "object": { "kind": "entity", "ref": "B" },
+            "status": "active",
+            "source": "manual"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.disjoint_conflict", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "rule_recursion",
+      "kind": "conflict",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          { "name": "P", "source": "Equipment", "target": "Equipment" },
+          { "name": "Q", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rules": [
+          {
+            "rule_key": "r_rec_1",
+            "name": "P 推 Q",
+            "text": "IF ?a P ?b THEN ?a Q ?b",
+            "premises": [{ "kind": "rel", "s": "a", "p": "P", "o": "b" }],
+            "conclusion": { "kind": "rel", "s": "a", "p": "Q", "o": "b" },
+            "status": "active",
+            "enabled": true,
+            "origin": "platform"
+          },
+          {
+            "rule_key": "r_rec_2",
+            "name": "Q 推 P",
+            "text": "IF ?a Q ?b THEN ?a P ?b",
+            "premises": [{ "kind": "rel", "s": "a", "p": "Q", "o": "b" }],
+            "conclusion": { "kind": "rel", "s": "a", "p": "P", "o": "b" },
+            "status": "active",
+            "enabled": true,
+            "origin": "platform"
+          }
+        ]
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.recursion", "severity": "Violation" }]
+      }
+    },
+    {
+      "name": "rule_text_ast_drift",
+      "kind": "rule",
+      "model": {
+        "entities": [{ "name": "Equipment" }],
+        "relations": [
+          { "name": "P", "source": "Equipment", "target": "Equipment" }
+        ]
+      },
+      "input": {
+        "rule": {
+          "rule_key": "r_drift",
+          "name": "文本与 AST 不一致",
+          "text": "IF ?a P ?b THEN ?a P ?b",
+          "premises": [{ "kind": "rel", "s": "a", "p": "P", "o": "b" }],
+          "conclusion": { "kind": "rel", "s": "b", "p": "P", "o": "a" },
+          "status": "active",
+          "enabled": true,
+          "origin": "platform"
+        }
+      },
+      "expect": {
+        "issues": [{ "code": "checks.rule.text_ast_drift", "severity": "Warning" }]
+      }
+    }
+  ]
+}

@@ -1,0 +1,1579 @@
+# ============================================================
+# 通用企业知识本体定义（TBox）
+# ============================================================
+# 领域：跨行业的企业/组织/人/产品/事件/地点/文档/概念/方法通用建模。
+# 适用语料：企业介绍、产品资料、项目文档、制度合同、事故报告、经营分析等。
+#
+# 与 default.yaml 的关系：
+#   - default.yaml 是抽取兜底本体，保持轻量，不承载层级；
+#   - 本文件是「可导入的通用建模层」，带完整类层次、关系层次、数据属性层次，
+#     通过编译 YAML 导入或 Studio 发布进入 KB，不改默认兜底。
+#
+# 结构：
+#   - entity_types：实体类型（name / aliases / attributes / status）
+#   - relation_types：关系类型（name / source / target / source_types / target_types）
+#   - constraints：抽取后校验约束
+#   - axioms：类层次 / 关系层次 / 数据属性层次 / 特征 / propertyChain / datatypeFacet
+#   - disambiguation：名称解析口径
+#
+# 配套推理规则：generic_enterprise.rules.yaml
+#   （先导入本 TBox，再导入规则；规则引用本文件的类型与关系名）
+
+version: 1
+domain: generic_enterprise
+
+entity_types:
+  # ── 组织 ───────────────────────────────────────────────
+  - name: Organization
+    display_name: 组织
+    description: "泛指各类组织，Company / GovernmentAgency / ResearchInstitution 是其子类"
+    aliases: ["组织", "机构", "单位"]
+    attributes:
+      - { name: legal_name, type: string, required: false, description: "法定全称或官方名称（原文有值才填）" }
+      - { name: identifier, type: string, required: false, description: "组织统一标识（统一社会信用代码/注册号等）" }
+      - { name: org_type, type: enum, required: false, description: "组织类型：company/government/research/ngo/other" }
+      - { name: industry, type: string, required: false, description: "所属行业（原文有值才填）" }
+      - { name: country, type: string, required: false, description: "所属国家/地区" }
+      - { name: website, type: string, required: false, description: "官方网站" }
+      - { name: employee_count, type: number, required: false, description: "员工人数（纯数字）" }
+      - { name: founded_date, type: date, required: false, description: "成立日期" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: Company
+    display_name: 公司
+    description: "以营利为目的的企业法人，Organization 的子类"
+    aliases: ["公司", "企业", "厂商", "集团", "品牌方"]
+    attributes:
+      - { name: stock_code, type: string, required: false, description: "证券代码（如 1810.HK）" }
+      - { name: company_type, type: enum, required: false, description: "listed/unlisted/state_owned/private" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: GovernmentAgency
+    display_name: 政府机构
+    description: "政府部门、监管机构或事业单位，Organization 的子类"
+    aliases: ["政府", "部门", "监管机构", "委员会", "事业单位"]
+    attributes:
+      - { name: jurisdiction, type: string, required: false, description: "管辖范围（国家/省/市/行业）" }
+      - { name: agency_level, type: enum, required: false, description: "national/provincial/municipal/industry" }
+
+  - name: ResearchInstitution
+    display_name: 研究机构
+    description: "高校、研究院、实验室等，Organization 的子类"
+    aliases: ["研究院", "研究所", "高校", "大学", "实验室", "研究中心"]
+    attributes:
+      - { name: research_field, type: string, required: false, description: "研究领域" }
+      - { name: institution_type, type: enum, required: false, description: "university/institute/lab/center" }
+
+  # ── 人 ─────────────────────────────────────────────────
+  - name: Person
+    display_name: 人员
+    description: "泛指自然人，Employee / Expert 是其子类"
+    aliases: ["人", "人员", "个人"]
+    attributes:
+      - { name: title, type: string, required: false, description: "职务/头衔" }
+      - { name: role, type: string, required: false, description: "在当前语境中的角色" }
+      - { name: email, type: string, required: false, description: "电子邮箱" }
+      - { name: nationality, type: string, required: false, description: "国籍" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: Employee
+    display_name: 员工
+    description: "与组织存在劳动/任职关系的个人，Person 的子类"
+    aliases: ["员工", "职员", "职工", "任职人员"]
+    attributes:
+      - { name: employee_no, type: string, required: false, description: "工号/员工编号" }
+      - { name: department, type: string, required: false, description: "所属部门" }
+      - { name: position, type: string, required: false, description: "岗位" }
+
+  - name: Expert
+    display_name: 专家
+    description: "在某一领域具备专业能力的人，Person 的子类"
+    aliases: ["专家", "学者", "顾问", "研究员"]
+    attributes:
+      - { name: expertise, type: string, required: false, description: "专业领域" }
+      - { name: affiliation, type: string, required: false, description: "所属机构" }
+      - { name: years_experience, type: number, required: false, description: "从业年限（纯数字）" }
+
+  # ── 产品 ───────────────────────────────────────────────
+  - name: Product
+    display_name: 产品
+    description: "组织提供的产品/服务，HardwareProduct / SoftwareProduct / ServiceOffering 是其子类"
+    aliases: ["产品", "商品", "解决方案"]
+    attributes:
+      - { name: model, type: string, required: false, description: "型号/规格标识" }
+      - { name: version, type: string, required: false, description: "产品版本号" }
+      - { name: category, type: string, required: false, description: "产品品类" }
+      - { name: brand, type: string, required: false, description: "品牌名称" }
+      - { name: price, type: number, required: false, description: "标准价格（纯数字，币种见 currency）" }
+      - { name: currency, type: string, required: false, description: "价格币种，如 CNY/USD" }
+      - { name: release_date, type: date, required: false, description: "发布/上市日期" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: HardwareProduct
+    display_name: 硬件产品
+    description: "有物理形态的产品，Product 的子类"
+    aliases: ["硬件", "设备", "终端", "机器", "部件"]
+    attributes:
+      - { name: serial_no, type: string, required: false, description: "序列号/出厂编号" }
+      - { name: weight, type: string, required: false, description: "重量（含单位）" }
+      - { name: power_rating, type: string, required: false, description: "额定功率（含单位）" }
+
+  - name: SoftwareProduct
+    display_name: 软件产品
+    description: "软件、平台或应用，Product 的子类"
+    aliases: ["软件", "系统", "平台", "应用", "App", "工具"]
+    attributes:
+      - { name: version, type: string, required: false, description: "软件版本号（原文有值才填）" }
+      - { name: platform, type: string, required: false, description: "运行平台" }
+      - { name: license_model, type: enum, required: false, description: "proprietary/open_source/freemium/subscription" }
+
+  - name: ServiceOffering
+    display_name: 服务
+    description: "组织提供的服务型产品，Product 的子类"
+    aliases: ["服务", "咨询", "运维", "外包"]
+    attributes:
+      - { name: service_level, type: string, required: false, description: "服务等级/SLA" }
+      - { name: delivery_mode, type: enum, required: false, description: "onsite/remote/hybrid/self_service" }
+
+  # ── 事件 ───────────────────────────────────────────────
+  - name: Event
+    display_name: 事件
+    description: "在特定时间发生的事项，Meeting / Incident / Campaign 是其子类"
+    aliases: ["事件", "活动", "事项"]
+    attributes:
+      - { name: date, type: date, required: false, description: "发生日期" }
+      - { name: event_type, type: enum, required: false, description: "事件类型" }
+      - { name: description, type: text, required: false, description: "事件描述" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: Meeting
+    display_name: 会议
+    description: "有议程的集会/评审/例会，Event 的子类"
+    aliases: ["会议", "评审会", "例会", "研讨会"]
+    attributes:
+      - { name: agenda, type: text, required: false, description: "会议议程" }
+      - { name: location_text, type: string, required: false, description: "会议地点（原文写法）" }
+
+  - name: Incident
+    display_name: 事故
+    description: "造成损失或异常的突发事件，Event 的子类"
+    aliases: ["事故", "故障", "异常", "安全事件"]
+    attributes:
+      - { name: severity, type: enum, required: false, description: "low/medium/high/critical" }
+      - { name: impact_scope, type: text, required: false, description: "影响范围" }
+
+  - name: Campaign
+    display_name: 活动
+    description: "有明确目标的营销/推广活动，Event 的子类"
+    aliases: ["营销活动", "推广活动", "促销活动", "专项活动"]
+    attributes:
+      - { name: budget, type: number, required: false, description: "活动预算（纯数字）" }
+      - { name: channel, type: string, required: false, description: "投放/执行渠道" }
+
+  # ── 地点 ───────────────────────────────────────────────
+  - name: Location
+    display_name: 地点
+    description: "地理或物理位置，Facility / Region 是其子类"
+    aliases: ["地点", "位置", "场所"]
+    attributes:
+      - { name: address, type: string, required: false, description: "详细地址" }
+      - { name: region_code, type: string, required: false, description: "行政区划代码" }
+      - { name: country, type: string, required: false, description: "国家/地区" }
+
+  - name: Facility
+    display_name: 设施
+    description: "工厂、园区、门店、机房等物理设施，Location 的子类"
+    aliases: ["工厂", "园区", "门店", "机房", "设施", "基地"]
+    attributes:
+      - { name: facility_type, type: enum, required: false, description: "factory/office/store/data_center/warehouse" }
+      - { name: capacity, type: string, required: false, description: "产能/容量（含单位）" }
+
+  - name: Region
+    display_name: 区域
+    description: "国家、省、市等行政或市场区域，Location 的子类"
+    aliases: ["地区", "城市", "国家", "省", "区域市场"]
+    attributes:
+      - { name: region_level, type: enum, required: false, description: "country/province/city/district" }
+      - { name: parent_region, type: string, required: false, description: "上级区域名称" }
+
+  # ── 文档 ───────────────────────────────────────────────
+  - name: Document
+    display_name: 文档
+    description: "结构化或半结构化文件，Contract / Policy / Report 是其子类"
+    aliases: ["文档", "文件", "资料"]
+    attributes:
+      - { name: doc_no, type: string, required: false, description: "文档编号" }
+      - { name: doc_type, type: enum, required: false, description: "contract/policy/report/notice/manual" }
+      - { name: version, type: string, required: false, description: "文档版本" }
+      - { name: publish_date, type: date, required: false, description: "发布日期" }
+      - { name: source_url, type: string, required: false, description: "来源链接" }
+    extraction_skills:
+      constrain:
+        - { skill: builtin:no_fabrication, description: "属性值必须可在 chunk 原文摘句，不在原文置空（宁缺毋假）" }
+
+  - name: Contract
+    display_name: 合同
+    description: "双方或多方约定权利义务的文件，Document 的子类"
+    aliases: ["合同", "协议", "合约"]
+    attributes:
+      - { name: contract_no, type: string, required: false, description: "合同编号" }
+      - { name: effective_date, type: date, required: false, description: "生效日期" }
+      - { name: expiry_date, type: date, required: false, description: "到期日期" }
+      - { name: amount, type: number, required: false, description: "合同金额（纯数字）" }
+
+  - name: Policy
+    display_name: 制度
+    description: "组织内部制度、政策或管理规定，Document 的子类"
+    aliases: ["制度", "政策", "规定", "管理办法"]
+    attributes:
+      - { name: policy_no, type: string, required: false, description: "制度编号" }
+      - { name: issuing_authority, type: string, required: false, description: "发布机构" }
+
+  - name: Report
+    display_name: 报告
+    description: "经营、审计、调研等报告，Document 的子类"
+    aliases: ["报告", "报表", "调研报告", "审计报告"]
+    attributes:
+      - { name: report_no, type: string, required: false, description: "报告编号" }
+      - { name: reporting_period, type: string, required: false, description: "报告期间" }
+
+  # ── 概念 ───────────────────────────────────────────────
+  - name: Concept
+    display_name: 概念
+    description: "业务概念/术语，Metric / Standard 是其子类"
+    aliases: ["概念", "术语", "定义"]
+    attributes:
+      - { name: definition, type: text, required: false, description: "概念定义" }
+      - { name: category, type: string, required: false, description: "概念分类" }
+
+  - name: Metric
+    display_name: 指标
+    description: "可度量的业务指标，Concept 的子类"
+    aliases: ["指标", "度量", "KPI"]
+    attributes:
+      - { name: metric_unit, type: string, required: false, description: "指标单位" }
+      - { name: metric_value, type: number, required: false, description: "指标值（纯数字）" }
+      - { name: period, type: string, required: false, description: "统计周期" }
+
+  - name: Standard
+    display_name: 标准
+    description: "行业/国家/国际标准或规范，Concept 的子类"
+    aliases: ["标准", "规范", "准则"]
+    attributes:
+      - { name: standard_code, type: string, required: false, description: "标准编号" }
+      - { name: issuing_body, type: string, required: false, description: "发布机构" }
+      - { name: edition, type: string, required: false, description: "版本/版次" }
+
+  # ── 方法 ───────────────────────────────────────────────
+  - name: Method
+    display_name: 方法
+    description: "做事的方法/技术/流程，Process / Technology 是其子类"
+    aliases: ["方法", "手段", "做法"]
+    attributes:
+      - { name: definition, type: text, required: false, description: "方法定义" }
+      - { name: method_type, type: enum, required: false, description: "process/technology/algorithm/policy_measure" }
+
+  - name: Process
+    display_name: 流程
+    description: "有步骤和角色的业务流程，Method 的子类"
+    aliases: ["流程", "过程", "工序", "作业流程"]
+    attributes:
+      - { name: owner_role, type: string, required: false, description: "流程负责人角色" }
+      - { name: cycle_time, type: string, required: false, description: "流程周期（含单位）" }
+
+  - name: Technology
+    display_name: 技术
+    description: "可复用的技术/工艺/算法，Method 的子类"
+    aliases: ["技术", "科技", "工艺", "算法"]
+    attributes:
+      - { name: maturity_level, type: enum, required: false, description: "research/pilot/production/deprecated" }
+      - { name: vendor, type: string, required: false, description: "技术提供方" }
+
+  # ── 规程 ───────────────────────────────────────────────
+  - name: Skill
+    display_name: 技能
+    description: "可执行的业务能力项/作业项"
+    aliases: ["技能", "能力项", "作业项", "规程"]
+    attributes:
+      - { name: definition, type: text, required: false, description: "技能语义定义" }
+      - { name: skill_domain, type: string, required: false, description: "所属领域" }
+      - { name: goal, type: text, required: false, description: "技能目标" }
+      - { name: prerequisites, type: text, required: false, description: "技能级前置条件（换行分隔）" }
+
+  - name: Action
+    display_name: 动作
+    description: "技能中的具体执行步骤"
+    aliases: ["动作", "操作", "步骤", "处置"]
+    attributes:
+      - { name: definition, type: text, required: false, description: "动作语义定义" }
+      - { name: action_type, type: enum, required: false, description: "operation/decision/interaction/validation" }
+      - { name: step_no, type: number, required: false, description: "步骤序号" }
+      - { name: authorization, type: text, required: false, description: "权限要求" }
+      - { name: prerequisites, type: text, required: false, description: "前置条件" }
+      - { name: audit_required, type: boolean, required: false, description: "是否需要审计留痕" }
+
+relation_types:
+  - name: RELATES_TO
+    source: Concept
+    target: Concept
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Person, Employee, Expert, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Event, Meeting, Incident, Campaign, Location, Facility, Region, Document, Contract, Policy, Report, Concept, Metric, Standard, Method, Process, Technology, Skill, Action]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Person, Employee, Expert, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Event, Meeting, Incident, Campaign, Location, Facility, Region, Document, Contract, Policy, Report, Concept, Metric, Standard, Method, Process, Technology, Skill, Action]
+    description: "通用关联（无更精确关系时的兜底类型）"
+
+  - name: BELONGS_TO
+    source: Person
+    target: Organization
+    source_types: [Person, Employee, Expert]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "人员隶属于某个组织"
+
+  - name: EMPLOYS
+    source: Organization
+    target: Person
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Person, Employee, Expert]
+    description: "组织雇佣/任职人员"
+
+  - name: WORKS_AT
+    source: Person
+    target: Organization
+    source_types: [Person, Employee, Expert]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "人员在某组织工作"
+
+  - name: WORKS_WITH
+    source: Person
+    target: Person
+    source_types: [Person, Employee, Expert]
+    target_types: [Person, Employee, Expert]
+    description: "人员之间的协作关系"
+
+  - name: SUBSIDIARY_OF
+    source: Company
+    target: Company
+    source_types: [Company]
+    target_types: [Company]
+    description: "子公司/分支机构隶属于母公司"
+
+  - name: PARTNER_OF
+    source: Organization
+    target: Organization
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "组织之间的合作关系"
+
+  - name: CONTRACTS_WITH
+    source: Organization
+    target: Organization
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "组织之间的合同关系"
+
+  - name: PART_OF
+    source: Product
+    target: Product
+    source_types: [Organization, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Facility, Document, Contract, Policy, Report, Concept, Metric, Standard]
+    target_types: [Organization, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Facility, Document, Contract, Policy, Report, Concept, Metric, Standard]
+    description: "部分-整体关系（部件属于整体）"
+
+  - name: HAS_PART
+    source: Product
+    target: Product
+    source_types: [Organization, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Facility, Document, Contract, Policy, Report, Concept, Metric, Standard]
+    target_types: [Organization, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Facility, Document, Contract, Policy, Report, Concept, Metric, Standard]
+    description: "整体包含部分"
+
+  - name: PRODUCES
+    source: Organization
+    target: Product
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    description: "组织生产/提供产品"
+
+  - name: PROVIDES
+    source: Organization
+    target: ServiceOffering
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [ServiceOffering]
+    description: "组织提供服务型产品"
+
+  - name: MANUFACTURES
+    source: Organization
+    target: HardwareProduct
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [HardwareProduct]
+    description: "组织制造硬件产品"
+
+  - name: HAS_PRODUCT_FEATURE
+    source: Organization
+    target: Concept
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Concept, Metric, Standard]
+    description: "组织的产品具备某功能/特性（经产品间接推导）"
+
+  - name: HAS_FEATURE
+    source: Product
+    target: Concept
+    source_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    target_types: [Concept, Metric, Standard]
+    description: "产品包含某功能/特性"
+
+  - name: USES
+    source: Organization
+    target: Method
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Method, Process, Technology]
+    description: "组织采用某方法/技术/流程"
+
+  - name: USES_TOOL
+    source: Organization
+    target: Product
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Action]
+    target_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    inverse_of: USED_IN
+    description: "组织/动作使用的工具或产品"
+
+  - name: IMPLEMENTS
+    source: Product
+    target: Method
+    source_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    target_types: [Method, Process, Technology]
+    description: "产品实现/采用某方法或技术"
+
+  - name: APPLIED_TO
+    source: Method
+    target: Product
+    source_types: [Method, Process, Technology]
+    target_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    description: "方法应用于某产品/领域"
+
+  - name: BASED_ON
+    source: Method
+    target: Method
+    source_types: [Method, Process, Technology]
+    target_types: [Method, Process, Technology, Concept]
+    description: "方法基于/改进自另一方法"
+
+  - name: LOCATED_AT
+    source: Organization
+    target: Location
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Location, Facility, Region]
+    description: "组织位于某地"
+
+  - name: OPERATES
+    source: Organization
+    target: Facility
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Facility]
+    description: "组织运营某设施"
+
+  - name: OPERATED_BY
+    source: Facility
+    target: Organization
+    source_types: [Facility]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "设施由某组织运营（与 OPERATES 构成方向相反的一对关系）"
+
+  - name: OCCURRED_AT
+    source: Event
+    target: Location
+    source_types: [Event, Meeting, Incident, Campaign]
+    target_types: [Location, Facility, Region]
+    description: "事件发生地点"
+
+  - name: PARTICIPATES_IN
+    source: Organization
+    target: Event
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Person, Employee, Expert]
+    target_types: [Event, Meeting, Incident, Campaign]
+    inverse_of: PARTICIPATED_IN_BY
+    description: "组织/人员参与某事件"
+
+  - name: PARTICIPATES_AT
+    source: Organization
+    target: Location
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Person, Employee, Expert]
+    target_types: [Location, Facility, Region]
+    description: "组织/人员在某地参与事件（经事件地点推导）"
+
+  - name: AUTHORED
+    source: Person
+    target: Document
+    source_types: [Person, Employee, Expert]
+    target_types: [Document, Contract, Policy, Report]
+    inverse_of: AUTHORED_BY
+    description: "人员编写/签发文档"
+
+  - name: MENTIONS
+    source: Document
+    target: Concept
+    source_types: [Document, Contract, Policy, Report]
+    target_types: [Concept, Metric, Standard]
+    description: "文档提及某概念/指标/标准"
+
+  - name: MENTIONS_SECTION
+    source: Document
+    target: Concept
+    source_types: [Document, Contract, Policy, Report]
+    target_types: [Concept, Metric, Standard]
+    description: "文档提及概念的部分/章节（经 PART_OF 推导）"
+
+  - name: GOVERNS
+    source: Policy
+    target: Concept
+    source_types: [Policy]
+    target_types: [Concept, Standard]
+    description: "制度约束某概念/标准"
+
+  - name: REGULATES
+    source: GovernmentAgency
+    target: Organization
+    source_types: [GovernmentAgency]
+    target_types: [Organization, Company, ResearchInstitution]
+    description: "监管机构监管某组织"
+
+  - name: COMPLIES_WITH
+    source: Organization
+    target: Standard
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    target_types: [Standard, Policy]
+    description: "组织遵循某标准/制度"
+
+  - name: SUBSIDIARY_COMPLIES_WITH
+    source: Company
+    target: Standard
+    source_types: [Company]
+    target_types: [Standard, Policy]
+    description: "子公司继承母公司的合规要求"
+
+  - name: CONTRACT_PARTY
+    source: Contract
+    target: Organization
+    source_types: [Contract]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution]
+    description: "合同签约方"
+
+  - name: CONTRACT_GOVERNED_BY
+    source: Contract
+    target: Standard
+    source_types: [Contract]
+    target_types: [Standard, Policy]
+    description: "合同受某标准/制度约束"
+
+  - name: HAS_METRIC
+    source: Organization
+    target: Metric
+    source_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    target_types: [Metric]
+    description: "组织/产品拥有某指标"
+
+  - name: PRODUCT_HAS_METRIC
+    source: Product
+    target: Metric
+    source_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering]
+    target_types: [Metric]
+    description: "产品拥有某指标"
+
+  - name: IMPACTS
+    source: Incident
+    target: Organization
+    source_types: [Incident]
+    target_types: [Organization, Company, GovernmentAgency, ResearchInstitution, Product, HardwareProduct, SoftwareProduct, ServiceOffering, Location, Facility]
+    description: "事故影响某组织/产品/地点"
+
+  - name: MITIGATES
+    source: Policy
+    target: Incident
+    source_types: [Policy]
+    target_types: [Incident]
+    description: "制度/措施缓解某事故风险"
+
+  - name: REQUIRES
+    source: Action
+    target: Concept
+    source_types: [Action]
+    target_types: [Concept, Metric, Standard]
+    inverse_of: REQUIRED_BY
+    description: "动作的前置条件/依据"
+
+  - name: RESULTS_IN
+    source: Action
+    target: Event
+    source_types: [Action]
+    target_types: [Event, Meeting, Incident, Campaign]
+    inverse_of: RESULT_OF
+    description: "动作产出的事件/结果"
+
+  - name: HAS_STEP
+    source: Skill
+    target: Action
+    source_types: [Skill]
+    target_types: [Action]
+    cardinality: one_to_many
+    inverse_of: STEP_OF
+    description: "技能包含的步骤"
+
+  - name: NEXT_STEP
+    source: Action
+    target: Action
+    source_types: [Action]
+    target_types: [Action]
+    cardinality: one_to_one
+    inverse_of: PREV_STEP
+    description: "动作的下一步"
+
+  - name: PERFORMED_BY
+    source: Action
+    target: Person
+    source_types: [Action]
+    target_types: [Person, Employee, Expert]
+    inverse_of: PERFORMS
+    description: "动作由谁执行"
+
+  - name: ACTS_ON
+    source: Action
+    target: Product
+    source_types: [Action]
+    target_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering, Location, Facility]
+    inverse_of: ACTED_ON_BY
+    description: "动作作用于什么"
+
+  - name: HAS_SKILL
+    source: Person
+    target: Skill
+    source_types: [Person, Employee, Expert]
+    target_types: [Skill]
+    inverse_of: SKILL_OF
+    description: "人员具备的技能"
+
+  - name: SKILL_FOR
+    source: Skill
+    target: Product
+    source_types: [Skill]
+    target_types: [Product, HardwareProduct, SoftwareProduct, ServiceOffering, Concept]
+    inverse_of: HAS_SKILL_ITEM
+    description: "技能服务的产品/对象"
+
+constraints:
+  - type: required_attribute
+    entity: Organization
+    attribute: legal_name
+    severity: warning
+  - type: required_attribute
+    entity: Product
+    attribute: model
+    severity: warning
+  - type: required_attribute
+    entity: Document
+    attribute: doc_no
+    severity: warning
+
+# ============================================================
+# 公理：类层次 / 关系层次 / 数据属性层次 / 特征 / 规则链 / 值域
+# ============================================================
+axioms:
+  # ── 类层次：组织 ──────────────────────────────────────
+  - axiom_key: ax_generic_company_org
+    kind: subClassOf
+    subject: { kind: entity, ref: Company }
+    object: { kind: entity, ref: Organization }
+    status: active
+    source: manual
+    origin: platform
+    description: "公司是组织的一种"
+
+  - axiom_key: ax_generic_gov_org
+    kind: subClassOf
+    subject: { kind: entity, ref: GovernmentAgency }
+    object: { kind: entity, ref: Organization }
+    status: active
+    source: manual
+    origin: platform
+    description: "政府机构是组织的一种"
+
+  - axiom_key: ax_generic_research_org
+    kind: subClassOf
+    subject: { kind: entity, ref: ResearchInstitution }
+    object: { kind: entity, ref: Organization }
+    status: active
+    source: manual
+    origin: platform
+    description: "研究机构是组织的一种"
+
+  # ── 类层次：人 ────────────────────────────────────────
+  - axiom_key: ax_generic_employee_person
+    kind: subClassOf
+    subject: { kind: entity, ref: Employee }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+    description: "员工是人"
+
+  - axiom_key: ax_generic_expert_person
+    kind: subClassOf
+    subject: { kind: entity, ref: Expert }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+    description: "专家是人"
+
+  # ── 类层次：产品 ──────────────────────────────────────
+  - axiom_key: ax_generic_hw_product
+    kind: subClassOf
+    subject: { kind: entity, ref: HardwareProduct }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "硬件产品是产品"
+
+  - axiom_key: ax_generic_sw_product
+    kind: subClassOf
+    subject: { kind: entity, ref: SoftwareProduct }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件产品是产品"
+
+  - axiom_key: ax_generic_service_product
+    kind: subClassOf
+    subject: { kind: entity, ref: ServiceOffering }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "服务是产品的一种形态"
+
+  # ── 类层次：事件 ──────────────────────────────────────
+  - axiom_key: ax_generic_meeting_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Meeting }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "会议是事件"
+
+  - axiom_key: ax_generic_incident_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Incident }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "事故是事件"
+
+  - axiom_key: ax_generic_campaign_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Campaign }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "营销活动是事件"
+
+  # ── 类层次：地点 ──────────────────────────────────────
+  - axiom_key: ax_generic_facility_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Facility }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "设施是地点"
+
+  - axiom_key: ax_generic_region_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Region }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "区域是地点"
+
+  # ── 类层次：文档 ──────────────────────────────────────
+  - axiom_key: ax_generic_contract_document
+    kind: subClassOf
+    subject: { kind: entity, ref: Contract }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同是文档"
+
+  - axiom_key: ax_generic_policy_document
+    kind: subClassOf
+    subject: { kind: entity, ref: Policy }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "制度是文档"
+
+  - axiom_key: ax_generic_report_document
+    kind: subClassOf
+    subject: { kind: entity, ref: Report }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "报告是文档"
+
+  # ── 类层次：概念 ──────────────────────────────────────
+  - axiom_key: ax_generic_metric_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Metric }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "指标是概念"
+
+  - axiom_key: ax_generic_standard_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Standard }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "标准是概念"
+
+  # ── 类层次：方法 ──────────────────────────────────────
+  - axiom_key: ax_generic_process_method
+    kind: subClassOf
+    subject: { kind: entity, ref: Process }
+    object: { kind: entity, ref: Method }
+    status: active
+    source: manual
+    origin: platform
+    description: "流程是方法"
+
+  - axiom_key: ax_generic_technology_method
+    kind: subClassOf
+    subject: { kind: entity, ref: Technology }
+    object: { kind: entity, ref: Method }
+    status: active
+    source: manual
+    origin: platform
+    description: "技术是方法"
+
+  # ── 互斥类 ────────────────────────────────────────────
+  - axiom_key: ax_generic_disjoint_org_person
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织与人互斥"
+
+  - axiom_key: ax_generic_disjoint_org_product
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织与产品互斥"
+
+  - axiom_key: ax_generic_disjoint_org_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织与事件互斥"
+
+  - axiom_key: ax_generic_disjoint_org_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织与地点互斥"
+
+  - axiom_key: ax_generic_disjoint_org_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织与文档互斥"
+
+  - axiom_key: ax_generic_disjoint_person_product
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "人与产品互斥"
+
+  - axiom_key: ax_generic_disjoint_person_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "人与事件互斥"
+
+  - axiom_key: ax_generic_disjoint_person_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "人与文档互斥"
+
+  - axiom_key: ax_generic_disjoint_product_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Product }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品与事件互斥"
+
+  - axiom_key: ax_generic_disjoint_product_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Product }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品与文档互斥"
+
+  - axiom_key: ax_generic_disjoint_location_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Location }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "地点与事件互斥"
+
+  - axiom_key: ax_generic_disjoint_location_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Location }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "地点与文档互斥"
+
+  - axiom_key: ax_generic_disjoint_event_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Event }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "事件与文档互斥"
+
+  - axiom_key: ax_generic_disjoint_concept_document
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Document }
+    status: active
+    source: manual
+    origin: platform
+    description: "概念与文档互斥"
+
+  # ── 关系层次 ──────────────────────────────────────────
+  - axiom_key: ax_generic_subsidiary_part_of
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUBSIDIARY_OF }
+    object: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司关系是部分-整体关系"
+
+  - axiom_key: ax_generic_provides_produces
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PROVIDES }
+    object: { kind: relation, ref: PRODUCES }
+    status: active
+    source: manual
+    origin: platform
+    description: "提供服务是生产产品的一种"
+
+  - axiom_key: ax_generic_manufactures_produces
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MANUFACTURES }
+    object: { kind: relation, ref: PRODUCES }
+    status: active
+    source: manual
+    origin: platform
+    description: "制造硬件是生产产品的一种"
+
+  - axiom_key: ax_generic_part_of_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PART_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "部分-整体是一种通用关联"
+
+  - axiom_key: ax_generic_has_part_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_PART }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "整体-部分是一种通用关联"
+
+  - axiom_key: ax_generic_produces_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PRODUCES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "生产关系是一种通用关联"
+
+  - axiom_key: ax_generic_uses_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: USES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "使用关系是一种通用关联"
+
+  - axiom_key: ax_generic_uses_tool_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: USES_TOOL }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "工具使用是一种通用关联"
+
+  - axiom_key: ax_generic_implements_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: IMPLEMENTS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "实现关系是一种通用关联"
+
+  - axiom_key: ax_generic_applied_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: APPLIED_TO }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "应用关系是一种通用关联"
+
+  - axiom_key: ax_generic_based_on_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: BASED_ON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "基于关系是一种通用关联"
+
+  - axiom_key: ax_generic_has_feature_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_FEATURE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "功能属性是一种通用关联"
+
+  - axiom_key: ax_generic_located_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: LOCATED_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "位置关系是一种通用关联"
+
+  - axiom_key: ax_generic_operates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: OPERATES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "运营关系是一种通用关联"
+
+  - axiom_key: ax_generic_occurred_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: OCCURRED_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "事件地点是一种通用关联"
+
+  - axiom_key: ax_generic_participates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PARTICIPATES_IN }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "参与关系是一种通用关联"
+
+  - axiom_key: ax_generic_participates_at_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PARTICIPATES_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "参与地点是一种通用关联"
+
+  - axiom_key: ax_generic_authored_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: AUTHORED }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "编写关系是一种通用关联"
+
+  - axiom_key: ax_generic_mentions_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MENTIONS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "提及关系是一种通用关联"
+
+  - axiom_key: ax_generic_mentions_section_mentions
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MENTIONS_SECTION }
+    object: { kind: relation, ref: MENTIONS }
+    status: active
+    source: manual
+    origin: platform
+    description: "章节提及是文档提及的一种"
+
+  - axiom_key: ax_generic_governs_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: GOVERNS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "治理关系是一种通用关联"
+
+  - axiom_key: ax_generic_regulates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: REGULATES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "监管关系是一种通用关联"
+
+  - axiom_key: ax_generic_complies_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPLIES_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "合规关系是一种通用关联"
+
+  - axiom_key: ax_generic_subsidiary_complies_complies
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUBSIDIARY_COMPLIES_WITH }
+    object: { kind: relation, ref: COMPLIES_WITH }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司合规是合规关系的一种"
+
+  - axiom_key: ax_generic_contract_party_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: CONTRACT_PARTY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同签约方是一种通用关联"
+
+  - axiom_key: ax_generic_contract_gov_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: CONTRACT_GOVERNED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同受约束是一种通用关联"
+
+  - axiom_key: ax_generic_has_metric_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_METRIC }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "指标关系是一种通用关联"
+
+  - axiom_key: ax_generic_product_metric_has_metric
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PRODUCT_HAS_METRIC }
+    object: { kind: relation, ref: HAS_METRIC }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品指标是组织指标的一种"
+
+  - axiom_key: ax_generic_impacts_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: IMPACTS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "影响关系是一种通用关联"
+
+  - axiom_key: ax_generic_mitigates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MITIGATES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "缓解关系是一种通用关联"
+
+  - axiom_key: ax_generic_requires_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: REQUIRES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "前置条件是一种通用关联"
+
+  - axiom_key: ax_generic_results_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: RESULTS_IN }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "结果关系是一种通用关联"
+
+  - axiom_key: ax_generic_has_step_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_STEP }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "步骤包含是一种通用关联"
+
+  - axiom_key: ax_generic_next_step_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: NEXT_STEP }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "步骤顺序是一种通用关联"
+
+  - axiom_key: ax_generic_performed_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PERFORMED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "执行关系是一种通用关联"
+
+  - axiom_key: ax_generic_acts_on_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ACTS_ON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "作用对象是一种通用关联"
+
+  - axiom_key: ax_generic_has_skill_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_SKILL }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "技能具备是一种通用关联"
+
+  - axiom_key: ax_generic_skill_for_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SKILL_FOR }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "技能服务对象是一种通用关联"
+
+  # ── 数据属性层次 ──────────────────────────────────────
+  - axiom_key: ax_generic_company_stock_id
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Company, ref: stock_code }
+    object: { kind: attribute, owner: Organization, ref: identifier }
+    status: active
+    source: manual
+    origin: platform
+    description: "股票代码是组织标识的一种"
+
+  - axiom_key: ax_generic_hw_serial_model
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: HardwareProduct, ref: serial_no }
+    object: { kind: attribute, owner: Product, ref: model }
+    status: active
+    source: manual
+    origin: platform
+    description: "序列号是产品型号标识的一种"
+
+  - axiom_key: ax_generic_sw_version_model
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: SoftwareProduct, ref: version }
+    object: { kind: attribute, owner: Product, ref: version }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件版本是产品版本的一种"
+
+  - axiom_key: ax_generic_contract_no_doc
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Contract, ref: contract_no }
+    object: { kind: attribute, owner: Document, ref: doc_no }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同编号是文档编号的一种"
+
+  - axiom_key: ax_generic_policy_no_doc
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Policy, ref: policy_no }
+    object: { kind: attribute, owner: Document, ref: doc_no }
+    status: active
+    source: manual
+    origin: platform
+    description: "制度编号是文档编号的一种"
+
+  - axiom_key: ax_generic_report_no_doc
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Report, ref: report_no }
+    object: { kind: attribute, owner: Document, ref: doc_no }
+    status: active
+    source: manual
+    origin: platform
+    description: "报告编号是文档编号的一种"
+
+  # ── 关系特征 ──────────────────────────────────────────
+  - axiom_key: ax_generic_subsidiary_transitive
+    kind: transitive
+    subject: { kind: relation, ref: SUBSIDIARY_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司的子公司仍是子公司"
+
+  - axiom_key: ax_generic_subsidiary_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: SUBSIDIARY_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织不能是自己的子公司"
+
+  - axiom_key: ax_generic_subsidiary_asymmetric
+    kind: asymmetric
+    subject: { kind: relation, ref: SUBSIDIARY_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司关系不可反向同时成立"
+
+  - axiom_key: ax_generic_part_of_transitive
+    kind: transitive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "部分的部分仍是部分"
+
+  - axiom_key: ax_generic_part_of_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "对象不能是自己的部分"
+
+  - axiom_key: ax_generic_has_part_transitive
+    kind: transitive
+    subject: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "整体的部分的部分仍是整体的部分"
+
+  - axiom_key: ax_generic_partner_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: PARTNER_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "合作关系是对称的"
+
+  - axiom_key: ax_generic_contracts_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: CONTRACTS_WITH }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同关系是对称的"
+
+  - axiom_key: ax_generic_works_with_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: WORKS_WITH }
+    status: active
+    source: manual
+    origin: platform
+    description: "人员协作关系是对称的"
+
+  - axiom_key: ax_generic_next_step_transitive
+    kind: transitive
+    subject: { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+    description: "步骤顺序可传递"
+
+  # ── propertyChain（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_generic_chain_subsidiary
+    kind: propertyChain
+    subject: { kind: relation, ref: SUBSIDIARY_OF }
+    chain:
+      - { kind: relation, ref: SUBSIDIARY_OF }
+      - { kind: relation, ref: SUBSIDIARY_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司关系的传递闭包"
+
+  - axiom_key: ax_generic_chain_step
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_STEP }
+    chain:
+      - { kind: relation, ref: HAS_STEP }
+      - { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+    description: "技能的后续步骤仍是该技能的步骤"
+
+  - axiom_key: ax_generic_chain_produce_feature
+    kind: propertyChain
+    subject: { kind: relation, ref: RELATES_TO }
+    chain:
+      - { kind: relation, ref: PRODUCES }
+      - { kind: relation, ref: HAS_FEATURE }
+    status: active
+    source: manual
+    origin: platform
+    description: "组织生产产品、产品具备功能 → 组织关联该功能"
+
+  - axiom_key: ax_generic_chain_mentions_part
+    kind: propertyChain
+    subject: { kind: relation, ref: MENTIONS_SECTION }
+    chain:
+      - { kind: relation, ref: MENTIONS }
+      - { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+    description: "文档提及概念、概念属于另一概念 → 文档提及该部分概念"
+
+  - axiom_key: ax_generic_chain_has_part
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_PART }
+    chain:
+      - { kind: relation, ref: HAS_PART }
+      - { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "整体包含关系的传递闭包"
+
+  # ── datatypeFacet（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_generic_facet_employee_count
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Organization, ref: employee_count }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+    description: "员工人数不能为负"
+
+  - axiom_key: ax_generic_facet_product_price
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Product, ref: price }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品价格不能为负"
+
+  - axiom_key: ax_generic_facet_contract_amount
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Contract, ref: amount }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+    description: "合同金额不能为负"
+
+  - axiom_key: ax_generic_facet_publish_date
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Document, ref: publish_date }
+    facets:
+      - { kind: pattern, value: "^\\d{4}(-\\d{2}(-\\d{2})?)?$" }
+    status: active
+    source: manual
+    origin: platform
+    description: "发布日期按 YYYY / YYYY-MM / YYYY-MM-DD 记录"
+
+disambiguation:
+  case_insensitive: true
+  alias_merge: true

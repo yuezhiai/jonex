@@ -511,19 +511,46 @@ class OntologyToolSession:
 
     # ── 实体解析 ──
 
+    async def _expanded_tool_types(self, etype: str) -> list[str]:
+        """工具定位的类型也按层级展开（T7）；失败退回单类型。"""
+        try:
+            from .ontology_reasoning.expand import (
+                expand_entity_types, hierarchy_expansion_enabled,
+            )
+            from .ontology_reasoning.context import resolve_reasoning_context
+            from .ontology_reasoning.view import build_reasoning_view
+
+            if not hierarchy_expansion_enabled():
+                return [etype]
+            values = [etype]
+            for kb_id in self.kb_ids:
+                ctx = await resolve_reasoning_context(self.tenant_id, kb_id)
+                key = ctx.schema_context.resolve_entity(etype)
+                canonical = (
+                    ctx.schema_context.entities.get(key) or {}
+                ).get("name") or etype
+                values.extend(expand_entity_types(
+                    build_reasoning_view(ctx), [canonical],
+                ).values)
+            return list(dict.fromkeys(values))
+        except Exception:  # noqa: BLE001
+            return [etype]
+
     async def _resolve(self, name: str, etype: Optional[str] = None) -> Optional[dict]:
         """按名定位实体：精确 → 前缀 → 混合召回；类型不符、KB 越界的一律丢弃。"""
         name = (name or "").strip()
         if not name:
             return None
+        expected_types = set(await self._expanded_tool_types(etype)) if etype else None
 
         def _ok(rows: list[dict]) -> list[dict]:
             return [
                 r for r in rows or []
-                if r.get("kb_id") in self._kb_set and (not etype or r.get("type") == etype)
+                if r.get("kb_id") in self._kb_set
+                and (not expected_types or r.get("type") in expected_types)
             ]
 
-        wanted = [etype] if etype else None
+        wanted = sorted(expected_types) if expected_types else None
         rows = _ok(await self.gdao.exact_match_entities(
             self.tenant_id, self.kb_ids, name, entity_types=wanted,
         ))
@@ -697,6 +724,23 @@ class OntologyToolSession:
                 facts = self.expand_inverse_fn(facts, inv)
         wanted = {str(t) for t in (relation_types or []) if t}
         if wanted:
+            try:
+                from .ontology_reasoning.expand import (
+                    expand_relation_types, hierarchy_expansion_enabled,
+                )
+                from .ontology_reasoning.context import resolve_reasoning_context
+                from .ontology_reasoning.view import build_reasoning_view
+
+                if hierarchy_expansion_enabled() and ent.get("kb_id"):
+                    ctx = await resolve_reasoning_context(
+                        self.tenant_id, ent["kb_id"],
+                    )
+                    view = build_reasoning_view(ctx)
+                    wanted = set(
+                        expand_relation_types(view, sorted(wanted)).values
+                    )
+            except Exception:  # noqa: BLE001 — 扩展失败按原过滤
+                pass
             facts = [f for f in facts if f.get("relation_type") in wanted]
         return self._facts_payload(facts, {"entity": ent.get("name"), "entity_type": ent.get("type")})
 
@@ -705,13 +749,38 @@ class OntologyToolSession:
         if ent is None:
             return json.dumps({"status": "unknown", "reason": "entity_not_found"}, ensure_ascii=False), 0
         attrs = ent.get("attributes") or {}
+        actual_attribute = attribute
         if attribute not in attrs or _is_empty(attrs.get(attribute)):
+            # T7：父属性 → 子属性扩展（例如「功率」→「额定功率」）。
+            try:
+                from .ontology_reasoning.expand import (
+                    expand_attribute_names, hierarchy_expansion_enabled,
+                )
+                from .ontology_reasoning.context import resolve_reasoning_context
+                from .ontology_reasoning.view import build_reasoning_view
+
+                if hierarchy_expansion_enabled() and ent.get("type"):
+                    ctx = await resolve_reasoning_context(
+                        self.tenant_id, ent.get("kb_id") or "",
+                    )
+                    view = build_reasoning_view(ctx)
+                    expansion = expand_attribute_names(
+                        view, ent.get("type"), [attribute],
+                    )
+                    for candidate in expansion.values:
+                        if candidate in attrs and not _is_empty(attrs.get(candidate)):
+                            actual_attribute = candidate
+                            break
+            except Exception:  # noqa: BLE001 — 扩展失败按原查询处理
+                actual_attribute = attribute
+        if actual_attribute not in attrs or _is_empty(attrs.get(actual_attribute)):
             return json.dumps({"status": "unknown", "entity": ent.get("name"), "attribute": attribute},
                               ensure_ascii=False), 0
         no, new = self._register_fact(_synthetic_fact(ent, "ENTITY_ATTRIBUTE"))
         payload = {
             "_no": no, "status": "present", "entity": ent.get("name"),
-            "entity_type": ent.get("type"), "attribute": attribute, "value": attrs.get(attribute),
+            "entity_type": ent.get("type"), "attribute": actual_attribute,
+            "value": attrs.get(actual_attribute),
         }
         return json.dumps(payload, ensure_ascii=False), int(new)
 

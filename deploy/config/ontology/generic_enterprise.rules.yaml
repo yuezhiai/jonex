@@ -1,0 +1,278 @@
+version: 2
+kind: reasoning_rules
+contract_version: 1
+rules:
+- rule_key: r_generic_subsidiary_transitive
+  name: 子公司传递
+  text: IF ?a SUBSIDIARY_OF ?b AND ?b SUBSIDIARY_OF ?c THEN ?a SUBSIDIARY_OF ?c
+  premises:
+  - kind: rel
+    s: a
+    p: SUBSIDIARY_OF
+    o: b
+  - kind: rel
+    s: b
+    p: SUBSIDIARY_OF
+    o: c
+  conclusion:
+    kind: rel
+    s: a
+    p: SUBSIDIARY_OF
+    o: c
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 子公司的子公司仍是子公司。
+- rule_key: r_generic_subsidiary_employee
+  name: 子公司任职归类
+  text: IF ?p BELONGS_TO ?sub AND ?sub SUBSIDIARY_OF ?parent THEN ?p 是 Employee
+  premises:
+  - kind: rel
+    s: p
+    p: BELONGS_TO
+    o: sub
+  - kind: rel
+    s: sub
+    p: SUBSIDIARY_OF
+    o: parent
+  conclusion:
+    kind: type
+    s: p
+    cls: Employee
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 隶属于子公司的个人归为员工。
+- rule_key: r_generic_product_feature
+  name: 组织产品功能
+  text: IF ?o PRODUCES ?p AND ?p HAS_FEATURE ?f THEN ?o HAS_PRODUCT_FEATURE ?f
+  premises:
+  - kind: rel
+    s: o
+    p: PRODUCES
+    o: p
+  - kind: rel
+    s: p
+    p: HAS_FEATURE
+    o: f
+  conclusion:
+    kind: rel
+    s: o
+    p: HAS_PRODUCT_FEATURE
+    o: f
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 组织生产的产品具备某功能，则组织整体具备该产品功能。
+- rule_key: r_generic_method_inheritance
+  name: 方法继承应用
+  text: IF ?p IMPLEMENTS ?m AND ?m BASED_ON ?n AND ?n 是 Method THEN ?n APPLIED_TO
+    ?p
+  premises:
+  - kind: rel
+    s: p
+    p: IMPLEMENTS
+    o: m
+  - kind: rel
+    s: m
+    p: BASED_ON
+    o: n
+  - kind: type
+    s: n
+    cls: Method
+  conclusion:
+    kind: rel
+    s: n
+    p: APPLIED_TO
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 产品实现方法 m，m 基于 n，则 n 应用于该产品。
+- rule_key: r_generic_method_related
+  name: 方法关联产品
+  text: IF ?m BASED_ON ?n AND ?n APPLIED_TO ?p THEN ?m RELATES_TO ?p
+  premises:
+  - kind: rel
+    s: m
+    p: BASED_ON
+    o: n
+  - kind: rel
+    s: n
+    p: APPLIED_TO
+    o: p
+  conclusion:
+    kind: rel
+    s: m
+    p: RELATES_TO
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 方法基于另一方法且后者应用于产品，则两方法与该产品关联。
+- rule_key: r_generic_document_section
+  name: 文档章节提及
+  text: IF ?d MENTIONS ?c AND ?c PART_OF ?p THEN ?d MENTIONS_SECTION ?p
+  premises:
+  - kind: rel
+    s: d
+    p: MENTIONS
+    o: c
+  - kind: rel
+    s: c
+    p: PART_OF
+    o: p
+  conclusion:
+    kind: rel
+    s: d
+    p: MENTIONS_SECTION
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 文档提及概念，概念属于另一概念，则文档提及该部分概念。
+- rule_key: r_generic_subsidiary_compliance
+  name: 子公司合规继承
+  text: IF ?o COMPLIES_WITH ?std AND ?sub SUBSIDIARY_OF ?o THEN ?sub SUBSIDIARY_COMPLIES_WITH
+    ?std
+  premises:
+  - kind: rel
+    s: o
+    p: COMPLIES_WITH
+    o: std
+  - kind: rel
+    s: sub
+    p: SUBSIDIARY_OF
+    o: o
+  conclusion:
+    kind: rel
+    s: sub
+    p: SUBSIDIARY_COMPLIES_WITH
+    o: std
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 母公司遵循标准，子公司继承该合规要求。
+- rule_key: r_generic_incident_impact
+  name: 事故影响运营方
+  text: IF ?i OCCURRED_AT ?f AND ?f OPERATED_BY ?o THEN ?i IMPACTS ?o
+  premises:
+  - kind: rel
+    s: i
+    p: OCCURRED_AT
+    o: f
+  - kind: rel
+    s: f
+    p: OPERATED_BY
+    o: o
+  conclusion:
+    kind: rel
+    s: i
+    p: IMPACTS
+    o: o
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 事故发生在某设施，设施由某组织运营，则事故影响该组织。
+- rule_key: r_generic_action_standard
+  name: 动作合规前置
+  text: IF ?a PERFORMED_BY ?p AND ?p BELONGS_TO ?o AND ?o COMPLIES_WITH ?std THEN
+    ?a REQUIRES ?std
+  premises:
+  - kind: rel
+    s: a
+    p: PERFORMED_BY
+    o: p
+  - kind: rel
+    s: p
+    p: BELONGS_TO
+    o: o
+  - kind: rel
+    s: o
+    p: COMPLIES_WITH
+    o: std
+  conclusion:
+    kind: rel
+    s: a
+    p: REQUIRES
+    o: std
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 执行人所属组织遵循标准，则动作以该标准为前置依据。
+- rule_key: r_generic_event_location
+  name: 参与事件地点
+  text: IF ?p PARTICIPATES_IN ?e AND ?e OCCURRED_AT ?l THEN ?p PARTICIPATES_AT ?l
+  premises:
+  - kind: rel
+    s: p
+    p: PARTICIPATES_IN
+    o: e
+  - kind: rel
+    s: e
+    p: OCCURRED_AT
+    o: l
+  conclusion:
+    kind: rel
+    s: p
+    p: PARTICIPATES_AT
+    o: l
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 参与某事件且事件发生在某地，则参与该地点。
+- rule_key: r_generic_skill_product
+  name: 技能服务产品
+  text: IF ?p HAS_SKILL ?sk AND ?sk SKILL_FOR ?prod THEN ?p RELATES_TO ?prod
+  premises:
+  - kind: rel
+    s: p
+    p: HAS_SKILL
+    o: sk
+  - kind: rel
+    s: sk
+    p: SKILL_FOR
+    o: prod
+  conclusion:
+    kind: rel
+    s: p
+    p: RELATES_TO
+    o: prod
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 人员具备服务某产品的技能，则人员与该产品关联。
+- rule_key: r_generic_contract_standard
+  name: 合同受标准约束
+  text: IF ?c CONTRACT_PARTY ?o AND ?o COMPLIES_WITH ?std THEN ?c CONTRACT_GOVERNED_BY
+    ?std
+  premises:
+  - kind: rel
+    s: c
+    p: CONTRACT_PARTY
+    o: o
+  - kind: rel
+    s: o
+    p: COMPLIES_WITH
+    o: std
+  conclusion:
+    kind: rel
+    s: c
+    p: CONTRACT_GOVERNED_BY
+    o: std
+  status: active
+  enabled: true
+  origin: imported
+  module: generic_enterprise
+  description: 合同签约方遵循标准，则合同受该标准约束。

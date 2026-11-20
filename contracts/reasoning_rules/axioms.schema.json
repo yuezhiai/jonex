@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jonex.local/contracts/reasoning_rules/axioms.schema.json",
+  "title": "Ontology Axioms File",
+  "description": "公理导入/导出文件。引用写名称；属性引用用 owner 消歧。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "kind", "contract_version", "axioms"],
+  "properties": {
+    "version": { "const": 2 },
+    "kind": { "const": "ontology_axioms" },
+    "contract_version": { "const": 1 },
+    "knowledge_base": {
+      "type": "string",
+      "description": "只说明来源，导入时不用来定位"
+    },
+    "removed_axiom_keys": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64 },
+      "default": []
+    },
+    "axioms": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/axiom" }
+    }
+  },
+  "$defs": {
+    "ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "enum": ["entity", "relation", "attribute"] },
+        "ref": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "owner": {
+          "type": "string",
+          "maxLength": 255,
+          "description": "属性引用必填：属性名只在实体内唯一"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "attribute" } }, "required": ["kind"] },
+          "then": { "required": ["owner"] }
+        }
+      ]
+    },
+    "chainRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "const": "relation" },
+        "ref": { "type": "string", "minLength": 1, "maxLength": 255 }
+      }
+    },
+    "facet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "pattern",
+            "minLength",
+            "maxLength",
+            "totalDigits",
+            "fractionDigits",
+            "minInclusive",
+            "maxInclusive"
+          ]
+        },
+        "value": { "type": ["string", "number"] }
+      }
+    },
+    "axiom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "status", "source"],
+      "properties": {
+        "axiom_key": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "平台业务键；Studio 导出可省略，导入时生成"
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Studio 内部 id 的兼容别名；与 axiom_key 二选一"
+        },
+        "kind": {
+          "enum": [
+            "subClassOf",
+            "disjointWith",
+            "equivalentClass",
+            "subPropertyOf",
+            "transitive",
+            "symmetric",
+            "functional",
+            "inverseFunctional",
+            "reflexive",
+            "irreflexive",
+            "asymmetric",
+            "propertyChain",
+            "datatypeFacet"
+          ]
+        },
+        "subject": { "$ref": "#/$defs/ref" },
+        "object": { "$ref": "#/$defs/ref" },
+        "chain": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/chainRef" },
+          "minItems": 2
+        },
+        "facets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/facet" }
+        },
+        "status": { "enum": ["proposed", "active", "rejected"] },
+        "source": { "enum": ["manual", "imported", "extracted"] },
+        "origin": { "enum": ["studio", "platform", "imported"] },
+        "module": { "type": "string", "maxLength": 64 },
+        "content_revision": { "type": "integer", "minimum": 0 },
+        "base_revision": { "type": "integer", "minimum": 0 },
+        "description": { "type": "string", "maxLength": 2000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "propertyChain" } }, "required": ["kind"] },
+          "then": { "required": ["chain"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "datatypeFacet" } }, "required": ["kind"] },
+          "then": { "required": ["facets"] }
+        }
+      ]
+    }
+  }
+}

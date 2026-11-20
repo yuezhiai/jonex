@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jonex.local/contracts/reasoning_rules/issues.schema.json",
+  "title": "Reasoning Validation Issues",
+  "description": "校验/冲突问题列表。severity 用中性词；Studio 映射 mustFix/confirm/info。",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["code", "severity"],
+    "properties": {
+      "code": {
+        "type": "string",
+        "pattern": "^checks\\.(axiom|hierarchy|rule|classification)\\.[A-Za-z0-9_]+$"
+      },
+      "severity": { "enum": ["Violation", "Warning", "Info"] },
+      "target": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": {
+            "enum": ["axiom", "rule", "entity", "attribute", "relation", "classification"]
+          },
+          "id": { "type": "string", "maxLength": 255 },
+          "field": { "type": "string", "maxLength": 64 }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": { "type": ["string", "number", "boolean"] }
+      },
+      "message": {
+        "type": "string",
+        "description": "可读文案；两侧按 locale 生成，不参与一致性比较"
+      }
+    }
+  }
+}

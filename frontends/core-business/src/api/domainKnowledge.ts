@@ -49,8 +49,8 @@ import type {
   SaveOntologyConstraintPayload,
   ConstraintTargetType,
   CompiledSchemaConstraint,
-  OntologyInstanceSummary,
-  RelationInstanceSummary,
+  OntologyEntityTypesResponse,
+  OntologyRelationTypesResponse,
   OntologyInstanceRow,
   OntologyInstanceListParams,
   RelationInstanceRow,
@@ -2226,11 +2226,11 @@ export function getOntologyEntityTypes(
   kbId: string,
   keyword?: string,
   documentId?: string,
-): Promise<{ items: OntologyInstanceSummary[]; total: number }> {
+): Promise<OntologyEntityTypesResponse> {
   const params: Record<string, string> = { knowledge_base_id: kbId };
   if (keyword) params.keyword = keyword;
   if (documentId) params.document_id = documentId;
-  return getData<{ items: OntologyInstanceSummary[]; total: number }>(
+  return getData<OntologyEntityTypesResponse>(
     request.get('/knowledge-base/ontology/entity-types', {
       params,
     }),
@@ -2241,10 +2241,10 @@ export function getOntologyEntityTypes(
 export function getOntologyRelationTypes(
   kbId: string,
   documentId?: string,
-): Promise<{ items: RelationInstanceSummary[]; total: number }> {
+): Promise<OntologyRelationTypesResponse> {
   const params: Record<string, string> = { knowledge_base_id: kbId };
   if (documentId) params.document_id = documentId;
-  return getData<{ items: RelationInstanceSummary[]; total: number }>(
+  return getData<OntologyRelationTypesResponse>(
     request.get('/knowledge-base/ontology/relation-types', {
       params,
     }),
@@ -2257,6 +2257,9 @@ export function getOntologyInstances(params: OntologyInstanceListParams): Promis
   total: number;
   page: number;
   page_size: number;
+  /** Neo4j 不可用时为 true：items/total 是降级占位值，不能当真实数据展示 */
+  degraded?: boolean;
+  degraded_reason?: string;
 }> {
   const query: Record<string, string | number | undefined> = {
     knowledge_base_id: params.kbId,
@@ -2320,6 +2323,9 @@ export function getOntologyRelationInstances(params: RelationInstanceListParams)
   total: number;
   page: number;
   page_size: number;
+  /** Neo4j 不可用时为 true：items/total 是降级占位值，不能当真实数据展示 */
+  degraded?: boolean;
+  degraded_reason?: string;
 }> {
   const query: Record<string, string | number | undefined> = {
     knowledge_base_id: params.kbId,
@@ -2394,16 +2400,24 @@ export async function createOntologyInstance(
   return postData<CreateOntologyInstanceResponse>('/knowledge-base/ontology/instances', data);
 }
 
-/** 更新本体实例 */
+/**
+ * 更新本体实例。
+ *
+ * 路径上的类型与名称是**变更前**的定位键；`updates` 可携带 `entity_type` 表示修改实体类型，
+ * 类型变更原地完成，关系边不受影响。响应中的 `merged` 表示目标键已存在、已合并到同名实体。
+ */
 export async function updateOntologyInstance(
   knowledgeBaseId: string,
   entityType: string,
   canonicalName: string,
   updates: Record<string, unknown>,
+  mergeTarget?: boolean,
 ): Promise<UpdateOntologyInstanceResponse> {
+  const body: Record<string, unknown> = { updates };
+  if (mergeTarget !== undefined) body.merge_target = mergeTarget;
   return putData<UpdateOntologyInstanceResponse>(
     `/knowledge-base/ontology/instances/${entityType}/${encodeURIComponent(canonicalName)}?knowledge_base_id=${knowledgeBaseId}`,
-    { updates },
+    body,
   );
 }
 

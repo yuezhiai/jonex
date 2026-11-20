@@ -65,6 +65,7 @@ from .abstract_construct import (
     collect_edge_scores,
     cross_source_candidates,
     document_seed_from_compiled,
+    drop_conflicting_agent_sources,
     lifted_relations,
     merge_duplicate_source_entities,
     merged_attributes_for_entity,
@@ -815,7 +816,8 @@ class AbstractSchemaService:
                         mode: str = "append",
                         focus_seeds: Optional[list] = None,
                         alias_hints: str = "",
-                        landing_mode: str = "") -> dict:
+                        landing_mode: str = "",
+                        progress_cb=None) -> dict:
         """补齐式构造：源结构 + 证据 → 完整草稿（`proposed`），返回构造摘要。
 
         `seed="document"` 时先以**文档本体**（KB 级 compiled schema）为种子，
@@ -894,7 +896,7 @@ class AbstractSchemaService:
                 tenant_id, kb_id, user_id, existing,
                 llm_names=llm_names, seed=seed, auto_landings=auto_landings,
                 mode=mode, focus_seeds=focus_seeds, alias_hints=alias_hints,
-                landing_mode=landing_mode,
+                landing_mode=landing_mode, progress_cb=progress_cb,
             )
         finally:
             await _stop_guard_heartbeat(heartbeat)
@@ -962,10 +964,39 @@ class AbstractSchemaService:
                                 mode: str = "append",
                                 focus_seeds: Optional[list] = None,
                                 alias_hints: str = "",
-                                landing_mode: str = "off") -> dict:
-        """守卫已在手的构造主体（读取 → 补齐 → 名字档 → 一次 upsert → 摘要）。"""
+                                landing_mode: str = "off",
+                                progress_cb=None) -> dict:
+        """守卫已在手的构造主体（读取 → 补齐 → 名字档 → 一次 upsert → 摘要）。
+
+        `progress_cb`：可选的阶段进度回调（payload 形如
+        `{"phase": "<stage>", "concepts_total": n, ...}`）。后台 run 用它把
+        「当前在做什么」写进轮询面；同步调用方不传 = 零行为变化。回调抛错只
+        记 warning —— 观测通道不许反噬构造。
+        """
+        stage_state: dict = {}
+        current_phase: Optional[str] = None
+
+        async def emit(phase: str, **detail) -> None:
+            nonlocal current_phase
+            if progress_cb is None:
+                return
+            # 阶段切换时清掉上一阶段的累积字段：否则 landing 的 sub_phase /
+            # concepts_* 会一直挂到后续 fill/relations/save 上，前端显示
+            # 「补齐属性 · 判定落点」这类错位文案。同阶段内多次 emit 仍累加。
+            if phase != current_phase:
+                stage_state.clear()
+                current_phase = phase
+            stage_state.update(detail)
+            try:
+                emitted = progress_cb({"phase": phase, **stage_state})
+                if inspect.isawaitable(emitted):
+                    await emitted
+            except Exception as exc:  # noqa: BLE001 —— 进度失败不打断构造
+                logger.warning("构造阶段进度回调失败: phase=%s err=%s", phase, exc)
+
         rows, ds_names = await self._load_source_schemas(tenant_id, kb_id)
         all_source_entities = self._source_entities(rows, ds_names)
+        await emit("load_source", sources=len(all_source_entities))
         source_entities = all_source_entities
         focus_meta = None
         if focus_seeds:
@@ -1022,11 +1053,14 @@ class AbstractSchemaService:
                 tenant_id, kb_id,
             )
             warnings.extend(doc_warnings)
-            if doc_entities and landing_mode != "agent":
+            await emit("load_seed", doc_entities=len(doc_entities))
+            if doc_entities:
                 # 先按名称/别名挂上同名数据源落点，后面的属性补齐与关系提升才有依据。
-                # **agent 档不调它**：它写出的是「无 origin」的历史形状，Task 9 的
-                # 规则 7 会把这种落点当受保护历史数据、永远升不成 agent/name；
-                # 名字命中改由 runner 生成 A 档 decision（origin="name"）。
+                # **agent 档也要跑**：attach 现在写 `origin="name"`（确定性命中），
+                # 本轮 agent 判定可以把它升级。不跑的话文档实体在「同源合并」时
+                # 还没有落点，聚类实体就合不掉 —— 实测的「产线主数据」/
+                # 「厂站生产日报汇总」正是这样多出来的；同时 agent 逐概念独立判定，
+                # 没有全局唯一性，会把同一张表同时挂给两个文档概念。
                 attach_landings_by_name(doc_entities, bundles)
             # 只增不删：已有草稿在前（先到者胜），文档种子追加；同名由 normalize 合并。
             base_entities = [*base_entities, *doc_entities]
@@ -1101,6 +1135,7 @@ class AbstractSchemaService:
             structured_entities, dropped = await self._propose_entities(
                 tenant_id, kb_id, user_id, source_entities,
             )
+            await emit("cluster", clusters=len(structured_entities))
             base_entities = [*base_entities, *structured_entities]
             dropped_total += max(dropped, 0)
             if dropped:
@@ -1112,6 +1147,28 @@ class AbstractSchemaService:
             )
             if merged_dupes:
                 warnings.append(f"已合并 {merged_dupes} 个与文档实体同源的重复聚类实体")
+            # 落点对不上的（文档实体没有源落点、或两端源集合不相交）再按
+            # **身份键/别名**做一次确定性聚类：实测中的
+            # `incineration_line`(别名「产线」) 与聚类出的「产线主数据」就是这种。
+            # 只在「全部重新构造 + 复用了文档种子」时做：append 模式里 base 是
+            # 人已有的东西（可能含合法的自环关系），不该被这条聚类规则动。
+            alias_merges = []
+            if mode == "replace" and seed == "document" and not focus_seeds:
+                base_entities, base_relations, base_metrics, alias_merges = (
+                    merge_duplicate_concepts(base_entities, base_relations, base_metrics)
+                )
+            if alias_merges:
+                warnings.append(
+                    "按身份键/别名合并 %d 组：%s" % (
+                        len(alias_merges),
+                        "；".join(
+                            f"{merge['kept']}←{'/'.join(merge['merged'])}"
+                            for merge in alias_merges if merge.get("merged")
+                        ),
+                    )
+                )
+            await emit("merge", merged=merged_dupes + len(alias_merges),
+                       entities=len(base_entities))
 
         # 业务词表：给实体挂别名；目标在数据源 schema 里但抽象层没有 → 自动补建实体。
         # 必须在 `filled` 之前 —— 新建实体也要按落点补齐属性。
@@ -1120,6 +1177,7 @@ class AbstractSchemaService:
                 base_entities, alias_hints, bundles,
             )
             warnings.extend(hint_warnings)
+            await emit("hints", hinted=hinted, created_entities=created)
             if created:
                 warnings.append(f"业务词表补建了 {created} 个实体")
             if hinted or created:
@@ -1147,11 +1205,34 @@ class AbstractSchemaService:
         # 看过）。同时必须在 `landing_map` 之前 —— 关系提升要看得见 agent 写下的落点。
         if landing_mode == "agent":
             if bundles and base_entities:
+                await emit("landing", concepts_total=len(base_entities),
+                           concepts_done=0, landed=0, unresolved=0, sub_phase="recall")
+
+                async def _on_landing_progress(p: dict) -> None:
+                    await emit(
+                        "landing",
+                        concepts_total=int(p.get("concepts_total") or 0),
+                        concepts_done=int(p.get("concepts_done") or 0),
+                        landed=int(p.get("landed") or 0),
+                        unresolved=int(p.get("unresolved") or 0),
+                        sub_phase=str(p.get("phase") or ""),
+                    )
+
                 result = await self._run_landing_agent(
                     tenant_id, kb_id, user_id, base_entities, bundles,
                     warnings=warnings,
+                    on_progress=_progress_cb_adapter(_on_landing_progress)
+                    if progress_cb is not None else None,
                 )
                 warnings.extend(result.get("warnings") or [])
+                # agent 逐概念判定没有全局唯一性：同一 (数据源, 表) 可能同时挂到
+                # 两个概念上（实测：DwdM12PlantDaily → m12_daily 与
+                # m12_plant_daily）。name/manual 落点是更强证据，冲突时丢掉 agent 那条。
+                conflict_dropped = drop_conflicting_agent_sources(base_entities)
+                if conflict_dropped:
+                    warnings.append(
+                        f"已丢弃 {conflict_dropped} 条与确定性命中/人工落点冲突的 agent 落点"
+                    )
                 stats = result.get("stats") or {}
                 landing_stats = {
                     "entities": int(stats.get("entities", 0) or 0),
@@ -1175,10 +1256,12 @@ class AbstractSchemaService:
             merged = merged_attributes_for_entity(ent, bundles)
             if merged:
                 filled.append({"name": ent["name"], "attributes": merged})
+        await emit("fill", filled=len(filled))
 
         lifted, lift_stats = lifted_relations(bundles, landing_map, reserved=base_relations)
 
         candidates = cross_source_candidates(base_entities, base_relations, bundles, landing_map)
+        await emit("probe", candidates=len(candidates))
         probes = self._make_probe(
             tenant_id, warnings,
             budget_s=float(config.ABSTRACT_CONSTRUCT_PROBE_BUDGET_S),
@@ -1199,6 +1282,8 @@ class AbstractSchemaService:
             if suggestion is None or suggestion["name"] in existing_rel_names:
                 continue
             suggestions.append(suggestion)
+        await emit("relations", suggestions=len(suggestions),
+                   lifted=int(lift_stats.get("lifted", 0) or 0))
 
         # 「只增不删」靠这一行的顺序：base 在前、raw 在后（同名合并先到者胜）。
         schema = normalize_schema({
@@ -1225,6 +1310,7 @@ class AbstractSchemaService:
         names_stats: dict = {"patched": 0, "rejected": 0, "batches_done": 0,
                              "batches_skipped": 0, "error": None, "enabled": False}
         if names_enabled:
+            await emit("names", entities=len(schema["entities"]))
             names_stats = await run_name_stage(
                 schema["entities"],
                 lambda batch: suggest_attribute_display_names(
@@ -1250,6 +1336,8 @@ class AbstractSchemaService:
             if isinstance(attr, dict) and needs_display_name(attr)
         )
 
+        await emit("save", entities=len(schema["entities"]),
+                   relations=len(schema["relations"]))
         async with get_db_session() as session:
             row = await OntologyAbstractSchemaRepository(session).upsert(
                 tenant_id=tenant_id,
@@ -2084,11 +2172,13 @@ class AbstractSchemaService:
             "抽象 schema 保存: kb=%s entities=%d status=%s v=%s by=%s",
             kb_id, len(normalized["entities"]), status, row.schema_version, edited_by or "-",
         )
-        # P2：确认（active）才把抽象模型镜像回 KB 级 compiled schema。
-        # proposed 是草稿，不参与检索，也不该改文档抽取用的那一份。
-        # 镜像失败不回滚已提交的抽象行，但把失败如实带回（ok=false）。
+        # 确认（active）时**默认不**镜像回 KB 级 compiled schema：
+        # 那一行是「文档本体」的存放处，而重新生成（seed=document）会直读它 ——
+        # 回填等于让抽象自我循环（实体越滚越多、回不到原对齐）。读路径需要的
+        # 「KB 级 = 抽象投影」由 `_abstract_projection` 现算，不依赖这行。
+        # 开关保留给确实需要写 compiled 行的特殊场景，默认关。
         mirror: Optional[dict] = None
-        if status == "active":
+        if status == "active" and config.ABSTRACT_MIRROR_TO_KB_COMPILED:
             mirror = await self._mirror_to_kb_compiled_schema(
                 tenant_id, kb_id, normalized, edited_by=edited_by,
             )
@@ -2264,6 +2354,8 @@ class AbstractSchemaService:
         tenant_id = require_tenant(tenant_id)
         raw = tbox_import.parse_tbox_yaml(yaml_text)
         imported, warnings, ignored = tbox_import.map_tbox_to_schema(raw)
+        # T4：公理不写抽象 schema（D8），导入完成后写公理表。
+        axioms = imported.pop("axioms", [])
         if not imported["entities"]:
             raise InvalidParameterError(message=translate(
                 "err.abstract_schema.import_no_entities",
@@ -2282,10 +2374,47 @@ class AbstractSchemaService:
         summary = {
             **tbox_import.build_diff_summary(existing_schema, imported),
             "ignored_sections": ignored,
+            "axioms_count": len(axioms),
         }
         warnings = [*warnings, *merge_warnings]
+
+        # T4：先按「合并后的抽象 schema 投影」校验公理，再决定是否写库。
+        axiom_override = None
+        axiom_dry = None
+        if axioms:
+            from .ontology_compiler import abstract_to_compiled_types
+            from .ontology_reasoning.axiom_service import AxiomService
+
+            entity_types, relation_types = abstract_to_compiled_types(merged)
+            axiom_override = {
+                "entity_types": entity_types,
+                "relation_types": relation_types,
+                "disambiguation": merged.get("disambiguation") or {
+                    "case_insensitive": True, "alias_merge": True,
+                },
+            }
+            axiom_dry = await AxiomService().import_axiom_list(
+                tenant_id, kb_id, axioms, dry_run=True, mode="merge",
+                schema_override=axiom_override,
+            )
+            violations = [
+                item for item in (axiom_dry.get("issues") or [])
+                if item.get("severity") == "Violation"
+            ]
+            if violations:
+                raise InvalidParameterError(
+                    message=translate(
+                        "err.ontology_axiom.validation_failed",
+                        fallback="公理校验失败，未写入",
+                    ),
+                    details={"issues": violations[:50]},
+                )
+
         if dry_run:
-            return {"dry_run": True, "summary": summary, "warnings": warnings}
+            return {
+                "dry_run": True, "summary": summary, "warnings": warnings,
+                **({"axioms": axiom_dry} if axiom_dry else {}),
+            }
         if expected_version is None:
             # 复用 save 的既有一课：漏带版本 = 静默盖掉别人。首次导入由前端传 0
             #（upsert 对「行不存在」走 INSERT、不看该值；行已存在时 0 会被 CAS 判 1003）。
@@ -2302,13 +2431,24 @@ class AbstractSchemaService:
             tenant_id, kb_id, merged, status=status,
             edited_by=user_id, expected_version=expected_version,
         )
+        axiom_saved = None
+        if axioms:
+            axiom_saved = await AxiomService().import_axiom_list(
+                tenant_id, kb_id, axioms, dry_run=False, mode="merge",
+                schema_override=axiom_override,
+            )
         logger.info(
-            "TBox 导入: kb=%s entities=%d(新增 %d/更新 %d) attrs+=%d ignored=%s v=%s by=%s",
+            "TBox 导入: kb=%s entities=%d(新增 %d/更新 %d) attrs+=%d axioms=%d ignored=%s v=%s by=%s",
             kb_id, len(merged["entities"]), summary["entities_added"],
             summary["entities_updated"], summary["attributes_added"],
-            ",".join(ignored) or "-", saved.get("schema_version"), user_id or "-",
+            len(axioms), ",".join(ignored) or "-",
+            saved.get("schema_version"), user_id or "-",
         )
-        return {"dry_run": False, "summary": summary, "warnings": warnings, **saved}
+        return {
+            "dry_run": False, "summary": summary, "warnings": warnings,
+            **saved,
+            **({"axioms": axiom_saved} if axiom_saved else {}),
+        }
 
     # ── 标脏（纯计算）─────────────────────────────────────────────
 
@@ -2542,6 +2682,23 @@ class AbstractSchemaService:
         schema = stored.to_dict() if hasattr(stored, "to_dict") else stored
         if not isinstance(schema, dict):
             return [], [], ["文档本体 schema 形状异常，已跳过复用"]
+        # ⚠️ 自引用护栏：这一行可能不是文档本体，而是**抽象 schema
+        # 的镜像**（历史版本的 active 保存会把它写回 KB 级行）。拿镜像当种子
+        # 等于把上一版抽象再喂回去，实体只会越滚越多。镜像内容可由抽象投影现算，
+        # 不需要也不应该走「文档种子」这条路。
+        # 判据以 **schema_mode** 为准：镜像写会把两者都置为 abstract_mirror；
+        # 而手工编辑/导入只改 schema_mode=manual_edited，`source_type` 会沿用历史值
+        # （`save_compiled_schema` 的非镜像分支保留 current.source_type）——
+        # 只看 source_type 会把「导入后的真正文档本体」误杀（实测）。
+        schema_mode = str(schema.get("schema_mode") or "")
+        source_type = str(schema.get("source_type") or "")
+        is_mirror = (schema_mode == "abstract_mirror"
+                     or (not schema_mode and source_type == "abstract_mirror"))
+        if is_mirror:
+            return [], [], [
+                "KB 级 compiled schema 是抽象 schema 的镜像（abstract_mirror），"
+                "不作为文档本体复用；本次只用结构化数据源重建"
+            ]
         return document_seed_from_compiled(schema)
 
     async def _load_source_schemas(self, tenant_id: str, kb_id: str):

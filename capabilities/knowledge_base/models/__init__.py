@@ -36,7 +36,9 @@ from .domain_service import (
 from .knowledge_info import KnowledgeInfo
 from .kb_permission import KbPermission
 from .ontology_abstract_schema import AbstractSchemaSaveHistory
+from .ontology_axiom import OntologyAxiom
 from .ontology_data_alignment import OntologyDataAlignment
+from .ontology_reasoning_rule import OntologyReasoningRule
 from .ontology_synonym import OntologySynonym
 from .metric_call_approval import MetricCallApproval
 from .nl2sql_metric_shadow import Nl2SqlMetricShadow
@@ -113,7 +115,9 @@ __all__ = [
     "MetricCallApproval",
     "Nl2SqlMetricShadow",
     "Nl2SqlObservation",
+    "OntologyAxiom",
     "OntologyDataAlignment",
+    "OntologyReasoningRule",
     "OntologyStatus",
     "OntologySynonym",
     "OntologyToolBinding",

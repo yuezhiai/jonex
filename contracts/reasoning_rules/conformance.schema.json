@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jonex.local/contracts/reasoning_rules/conformance.schema.json",
+  "title": "Reasoning Conformance Cases",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "cases"],
+  "properties": {
+    "contract_version": { "const": 1 },
+    "cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "enum": ["entity", "relation", "attribute"] },
+        "ref": { "type": "string" },
+        "owner": { "type": "string" }
+      }
+    },
+    "axiom": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind", "subject", "status", "source"],
+      "properties": {
+        "kind": { "type": "string" },
+        "subject": { "$ref": "#/$defs/ref" },
+        "object": { "$ref": "#/$defs/ref" },
+        "chain": { "type": "array" },
+        "facets": { "type": "array" },
+        "status": { "enum": ["proposed", "active", "rejected"] },
+        "source": { "enum": ["manual", "imported", "extracted"] }
+      }
+    },
+    "atom": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["rel", "type"] },
+        "s": { "type": "string" },
+        "o": { "type": "string" },
+        "p": { "type": "string" },
+        "cls": { "type": "string" }
+      },
+      "required": ["kind", "s"]
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity"],
+      "properties": {
+        "code": { "type": "string" },
+        "severity": { "enum": ["Violation", "Warning", "Info"] },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "type": "string" },
+            "id": { "type": "string" },
+            "field": { "type": "string" }
+          }
+        },
+        "params": { "type": "object" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entities", "relations"],
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "aliases": { "type": "array", "items": { "type": "string" } },
+              "status": { "enum": ["active", "inactive", "deprecated"] },
+              "attributes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "type"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "type": { "type": "string" },
+                    "status": { "enum": ["active", "inactive", "deprecated"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "source", "target"],
+            "properties": {
+              "name": { "type": "string" },
+              "source": { "type": "string" },
+              "target": { "type": "string" },
+              "aliases": { "type": "array", "items": { "type": "string" } },
+              "status": { "enum": ["active", "inactive", "deprecated"] },
+              "inverse_of": { "type": "string" },
+              "source_types": { "type": "array", "items": { "type": "string" } },
+              "target_types": { "type": "array", "items": { "type": "string" } },
+              "cardinality": { "type": "string" }
+            }
+          }
+        },
+        "axioms": { "type": "array", "items": { "$ref": "#/$defs/axiom" } }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "model", "expect"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["rule", "axiom", "conflict"] },
+        "model": { "$ref": "#/$defs/model" },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rule_text": { "type": "string" },
+            "rule": { "type": "object" },
+            "rules": { "type": "array", "items": { "type": "object" } },
+            "axioms": { "type": "array", "items": { "$ref": "#/$defs/axiom" } }
+          }
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ast": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "premises": { "type": "array", "items": { "$ref": "#/$defs/atom" } },
+                "conclusion": { "$ref": "#/$defs/atom" }
+              }
+            },
+            "issues": { "type": "array", "items": { "$ref": "#/$defs/issue" } }
+          }
+        }
+      }
+    }
+  }
+}

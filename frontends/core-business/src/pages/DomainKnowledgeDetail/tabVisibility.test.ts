@@ -5,14 +5,16 @@ const TABS = [
   { key: 'datasource' }, { key: 'parse' }, { key: 'schema' },
   { key: 'synonym' }, { key: 'lineage' }, { key: 'etl' },
   { key: 'governance' }, { key: 'verifiedQuery' }, { key: 'abstractSchema' },
-  { key: 'permission' },
+  { key: 'reasoningRules' }, { key: 'permission' },
 ];
 
 describe('visibleTabs', () => {
   it('hides structured tabs when disabled', () => {
     const keys = visibleTabs(TABS, false).map((t) => t.key);
     // datasource 不受结构化开关控制（数据源接入是基础知识库能力），恒展示。
-    expect(keys).toEqual(['datasource', 'parse', 'synonym', 'permission']);
+    expect(keys).toEqual([
+      'datasource', 'parse', 'synonym', 'reasoningRules', 'permission',
+    ]);
   });
   it('keeps all tabs when enabled', () => {
     expect(visibleTabs(TABS, true).map((t) => t.key)).toEqual(TABS.map((t) => t.key));

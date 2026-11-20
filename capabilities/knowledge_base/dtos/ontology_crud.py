@@ -38,12 +38,29 @@ class CreateOntologyInstanceRequest(BaseModel):
 
 
 class UpdateOntologyInstanceRequest(BaseModel):
-    """更新本体实例请求。"""
+    """更新本体实例请求。
+
+    `entity_type` 与 `canonical_name` 是**变更前**的定位键；`updates` 中的
+    `entity_type`（可选）是**变更后**的目标类型。
+    """
 
     knowledge_base_id: str = Field(..., min_length=1, description="知识库 ID")
     entity_type: str = Field(..., min_length=1, description="实体类型")
     canonical_name: str = Field(..., min_length=1, description="当前规范名称")
-    updates: dict = Field(..., description="待更新字段（name/aliases/description/attributes）")
+    updates: dict = Field(
+        ...,
+        description=(
+            "待更新字段，允许的键：entity_type（目标实体类型，1-128 字符）、"
+            "name、aliases、description、attributes"
+        ),
+    )
+    merge_target: bool = Field(
+        False,
+        description=(
+            "目标键 (类型, 名称) 已存在时是否合并到已有实例。默认 false：返回 1003 "
+            "冲突由前端向用户确认；合并不可逆（源节点被删除、关系改挂、属性取并集）"
+        ),
+    )
 
 
 class DeleteOntologyInstanceRequest(BaseModel):

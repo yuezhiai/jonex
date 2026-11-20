@@ -21,7 +21,9 @@ from .domain_service_repository import (
 from .folder_repository import FolderRepository
 from .tag_repository import TagRepository
 from .ontology_abstract_schema_repository import OntologyAbstractSchemaRepository
+from .ontology_axiom_repository import OntologyAxiomRepository
 from .ontology_graph_repository import OntologyGraphRepository
+from .ontology_reasoning_rule_repository import OntologyReasoningRuleRepository
 from .ontology_schema_repository import OntologySchemaRepository
 from .ontology_synonym_repository import OntologySynonymRepository
 from .metric_call_approval_repository import MetricCallApprovalRepository
@@ -82,8 +84,10 @@ __all__ = [
     "KnowledgeQueryImageRepository",
     "KnowledgeSearchFeedbackRepository",
     "OntologyAbstractSchemaRepository",
+    "OntologyAxiomRepository",
     "KnowledgeSimilarityRepository",
     "OntologyGraphRepository",
+    "OntologyReasoningRuleRepository",
     "OntologySchemaRepository",
     "OntologySynonymRepository",
     "OntologyToolBindingRepository",

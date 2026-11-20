@@ -721,43 +721,103 @@ def document_seed_from_compiled(
     return entities, relations, warnings
 
 
-def attach_landings_by_name(entities, bundles: dict) -> int:
-    """给**没有落点**的抽象实体按名称/别名匹配数据源实体并挂上落点。
+#: 列形状兜底：共享列数下限与 Jaccard 下限（见 `attach_landings_by_name`）。
+SHAPE_MIN_SHARED = 2
+SHAPE_MIN_JACCARD = 0.6
 
-    匹配口径：`name` / `display_name` / `aliases` 与源实体名大小写不敏感精确相等；
-    同一实体可能命中多个源的同一名称（跨源概念），全部挂上。已有落点的实体不动。
+
+def _attribute_names(entity: dict) -> set[str]:
+    return {
+        str(attr.get("name") or "").strip().casefold()
+        for attr in _as_list((entity or {}).get("attributes"))
+        if isinstance(attr, dict) and str(attr.get("name") or "").strip()
+    }
+
+
+def _entity_keys(entity: dict) -> set[str]:
+    """实体的可匹配键：name / display_name / aliases（大小写不敏感）。"""
+    keys = {
+        str(key or "").strip().casefold()
+        for key in [entity.get("name"), entity.get("display_name")]
+        if str(key or "").strip()
+    }
+    keys.update(
+        str(alias or "").strip().casefold()
+        for alias in _as_list(entity.get("aliases"))
+        if str(alias or "").strip()
+    )
+    return keys
+
+
+def attach_landings_by_name(entities, bundles: dict) -> int:
+    """给**没有落点**的抽象实体按名称/别名/列形状匹配数据源实体并挂上落点。
+
+    匹配口径（按两轮实测修正后）：
+    - 两侧都看 `name` / `display_name` / `aliases`（文档实体常是
+      `garbage_weight_daily`，源实体是 `GarbageWeightDaily` + 别名 snake）；
+    - 名称接不上时用**列形状**兜底（共享列 ≥2 且 Jaccard ≥0.6）；
+    - **每个源实体只挂给一个文档实体**（取分数最高的那个）。同一张表同时挂给
+      两个文档概念，会让后续「按落点合并」按先到者选错归属——实测样例里
+      `DwdM12PlantDaily` 同时挂到 `m12_daily` 与 `m12_plant_daily`，
+      结果多出一个「厂站生产日报汇总」并留了一条错映射。
+
     返回匹配到落点的实体数。
     """
-    index: dict[str, list[tuple[str, str]]] = {}
-    for ds_id, bundle in (bundles or {}).items():
-        for source_name in (bundle.get("entities") or {}):
-            key = str(source_name).casefold()
-            if key:
-                index.setdefault(key, []).append((ds_id, str(source_name)))
+    docs = [ent for ent in _as_list(entities)
+            if isinstance(ent, dict) and not ent.get("sources")]
+    if not docs:
+        return 0
 
-    matched = 0
-    for entity in _as_list(entities):
-        if not isinstance(entity, dict) or entity.get("sources"):
+    sources: list[tuple[str, str, dict]] = []
+    for ds_id, bundle in (bundles or {}).items():
+        for source_name, source_entity in (bundle.get("entities") or {}).items():
+            if isinstance(source_entity, dict):
+                sources.append((ds_id, str(source_name), source_entity))
+
+    matched: set[int] = set()
+    for ds_id, source_name, source_entity in sources:
+        source_keys = _entity_keys({"name": source_name, **source_entity}) or set()
+        source_keys.add(str(source_name).casefold())
+        source_attrs = _attribute_names(source_entity)
+
+        best_score = 0
+        best_docs: list[dict] = []
+        for doc in docs:
+            score = 0
+            if source_keys & _entity_keys(doc):
+                score = 100
+            elif source_attrs:
+                doc_attrs = _attribute_names(doc)
+                shared = doc_attrs & source_attrs
+                if len(shared) >= SHAPE_MIN_SHARED:
+                    jaccard = len(shared) / max(1, len(doc_attrs | source_attrs))
+                    if jaccard >= SHAPE_MIN_JACCARD:
+                        score = 50 + int(jaccard * 10)
+            if score > best_score:
+                best_score, best_docs = score, [doc]
+            elif score == best_score and score > 0:
+                best_docs.append(doc)
+        if best_score <= 0:
             continue
-        keys = [entity.get("name"), entity.get("display_name")]
-        keys.extend(_as_list(entity.get("aliases")))
-        hits: list[dict] = []
-        seen: set[tuple[str, str]] = set()
-        for key in keys:
-            for ds_id, source_name in index.get(str(key or "").casefold(), []):
-                triple = (ds_id, source_name)
-                if triple in seen:
-                    continue
-                seen.add(triple)
-                hits.append({
+        for doc in best_docs:
+            sources_list = [s for s in _as_list(doc.get("sources"))
+                            if isinstance(s, dict)]
+            if not any(str(s.get("data_source_id") or "") == str(ds_id)
+                       and str(s.get("entity_name") or "") == source_name
+                       for s in sources_list):
+                sources_list.append({
                     "data_source_id": ds_id,
                     "entity_name": source_name,
                     "included": True,
+                    # 必须写 origin：没有来源标记的落点会被当成受保护的历史数据
+                    # （只补缺、不升级），确定性名字命中就永远升不到 agent 判定，
+                    # agent 也无法据此去重。写 `name` 后本轮 agent 判定可以把它
+                    # 升级；没判定时也仍是确定性命中，语义正确。
+                    "origin": "name",
                 })
-        if hits:
-            entity["sources"] = hits
-            matched += 1
-    return matched
+            doc["sources"] = sources_list
+            matched.add(id(doc))
+    return len(matched)
 
 
 def apply_llm_landings(entities, alignments, bundles: dict) -> dict:
@@ -988,23 +1048,27 @@ def merge_duplicate_source_entities(
         return entities, 0
     if split_index <= 0 or split_index >= len(entities):
         return entities, 0
-    prior: dict[frozenset, dict] = {}
+    # 按**单个落点**建索引，而不是「整份落点集合」：聚类实体通常比文档实体多出
+    # 几个源（同一概念在 PlantA/B 各有一份表），集合全等永远不成立，合并就失效
+    # （实测：7 条文档实体只合并掉 1 条）。
+    prior: dict[tuple[str, str], dict] = {}
     for ent in entities[:split_index]:
         if not isinstance(ent, dict):
             continue
-        key = _included_source_key(ent)
-        if key:
-            prior.setdefault(key, ent)
+        for pair in _included_source_key(ent) or ():
+            prior.setdefault(pair, ent)
 
     out: list[dict] = list(entities[:split_index])
     dropped = 0
     for ent in entities[split_index:]:
-        key = _included_source_key(ent) if isinstance(ent, dict) else None
-        target = prior.get(key) if key else None
+        pairs = _included_source_key(ent) if isinstance(ent, dict) else None
+        target = next((prior[pair] for pair in sorted(pairs or ())
+                       if pair in prior), None)
         if target is None:
             out.append(ent)
-            if key and isinstance(ent, dict):
-                prior.setdefault(key, ent)
+            if isinstance(ent, dict):
+                for pair in pairs or ():
+                    prior.setdefault(pair, ent)
             continue
         aliases = [str(a) for a in _as_list(target.get("aliases")) if str(a).strip()]
         for alias in _as_list(ent.get("aliases")):
@@ -1022,8 +1086,100 @@ def merge_duplicate_source_entities(
                 attrs.append(attr)
                 seen.add(name.casefold())
         target["attributes"] = attrs
+        # 落点并集：聚类实体常额外覆盖 PlantA/B 这类分厂表，丢了它们
+        # 等于把「跨源概念」降回单源（而且下次重算会更难合）。
+        merged_sources = [s for s in _as_list(target.get("sources"))
+                          if isinstance(s, dict)]
+        seen_sources = {
+            (str(s.get("data_source_id") or ""), str(s.get("entity_name") or ""))
+            for s in merged_sources
+        }
+        for source in _as_list(ent.get("sources")):
+            if not isinstance(source, dict):
+                continue
+            pair = (str(source.get("data_source_id") or ""),
+                    str(source.get("entity_name") or ""))
+            if pair in seen_sources:
+                continue
+            seen_sources.add(pair)
+            merged_sources.append(source)
+        if merged_sources:
+            target["sources"] = merged_sources
         dropped += 1
     return out, dropped
+
+
+def drop_conflicting_agent_sources(entities) -> int:
+    """同一（数据源, 表）已被 name/manual 落点占用时，丢掉其它实体上的 agent 落点。
+
+    为什么需要：落点 agent 逐概念独立判定，没有全局唯一性 —— 实测里
+    `DwdM12PlantDaily` 同时挂到 `m12_daily` 与 `m12_plant_daily`
+    （`LineMaster` 同时挂到 `incineration_line` 与聚类出的「产线主数据」）。
+    确定性名字匹配（`origin="name"`）与人工落点（`origin="manual"`）是更强的证据：
+    冲突时 agent 那条作废。只动 `agent` 行 —— manual/name/无 origin 的历史落点
+    一律不碰（与 apply.py 的守卫矩阵同口径）。
+
+    概念属性上指向同一 (数据源, 表) 的 agent 列来源一并丢弃，避免实体级落点没了
+    而列来源还指着它。
+
+    返回丢弃条数（实体级 + 属性级）。
+    """
+    claimed: set[tuple[str, str]] = set()
+    for ent in _as_list(entities):
+        if not isinstance(ent, dict):
+            continue
+        for src in _as_list(ent.get("sources")):
+            if not isinstance(src, dict) or src.get("included") is False:
+                continue
+            if str(src.get("origin") or "").casefold() not in ("name", "manual"):
+                continue
+            ds = str(src.get("data_source_id") or "").strip()
+            name = str(src.get("entity_name") or "").strip().casefold()
+            if ds and name:
+                claimed.add((ds, name))
+    if not claimed:
+        return 0
+
+    def _key(source) -> tuple[str, str]:
+        if not isinstance(source, dict):
+            return ("", "")
+        return (str(source.get("data_source_id") or "").strip(),
+                str(source.get("entity_name") or "").strip().casefold())
+
+    dropped = 0
+    for ent in _as_list(entities):
+        if not isinstance(ent, dict):
+            continue
+        sources = ent.get("sources")
+        if isinstance(sources, list):
+            kept = []
+            for src in sources:
+                if (isinstance(src, dict)
+                        and str(src.get("origin") or "").casefold() == "agent"
+                        and src.get("included") is not False
+                        and _key(src) in claimed):
+                    dropped += 1
+                    continue
+                kept.append(src)
+            if len(kept) != len(sources):
+                ent["sources"] = kept
+        for attr in _as_list(ent.get("attributes")):
+            if not isinstance(attr, dict):
+                continue
+            links = attr.get("sources")
+            if not isinstance(links, list):
+                continue
+            kept_links = []
+            for link in links:
+                if (isinstance(link, dict)
+                        and str(link.get("origin") or "").casefold() == "agent"
+                        and _key(link) in claimed):
+                    dropped += 1
+                    continue
+                kept_links.append(link)
+            if len(kept_links) != len(links):
+                attr["sources"] = kept_links
+    return dropped
 
 
 # ── 指标词表（[metric] 行）────────────────────────────────────────────

@@ -47,6 +47,39 @@ entity_types:
       - { name: headquarters, type: string, required: false, description: "总部：总部所在地" }
       - { name: company_description, type: text, required: false, description: "公司简介：主营业务与核心竞争力概述" }
 
+  # ── 层级补充超类（业务分部/成本指标等的通用父类） ──────────
+  - name: org_unit
+    display_name: 组织单元
+    description: "业务分部、产品线等经营单元的超类；抽取时优先使用具体子类"
+    aliases: ["组织单元", "业务单元", "经营单元"]
+    attributes:
+      - { name: unit_name, type: string, required: false, description: "单元名称：分部/产品线的通用名称槽位" }
+      - { name: unit_type, type: enum, required: false, description: "单元类型：segment/product_line/subsidiary" }
+      - { name: revenue, type: number, required: false, description: "收入：该单元报告期收入（万元）" }
+      - { name: gross_profit, type: number, required: false, description: "毛利：该单元报告期毛利（万元）" }
+
+  - name: metric
+    display_name: 指标
+    description: "财务/运营/研发/ESG 指标的超类；抽取时优先使用具体指标子类"
+    aliases: ["指标", "度量", "KPI", "Metric"]
+    attributes:
+      - { name: metric_code, type: string, required: false, description: "指标编码：指标唯一标识" }
+      - { name: metric_name, type: string, required: false, description: "指标名称：指标中文名称" }
+      - { name: metric_value, type: number, required: false, description: "指标值：指标数值" }
+      - { name: metric_unit, type: string, required: false, description: "指标单位：如万元、%、台、人" }
+      - { name: metric_yoy, type: number, required: false, description: "同比：指标同比变化（%）" }
+      - { name: metric_period, type: string, required: false, description: "指标期间：如 2025FY" }
+      - { name: metric_category, type: enum, required: false, description: "指标分类：financial/operational/rnd/esg" }
+
+  - name: person
+    display_name: 人员
+    description: "关键人员等自然人主体的超类；抽取时优先使用 key_person"
+    aliases: ["人员", "个人", "自然人"]
+    attributes:
+      - { name: person_name, type: string, required: false, description: "姓名：人员姓名" }
+      - { name: title, type: string, required: false, description: "职位：职级/头衔" }
+      - { name: role, type: enum, required: false, description: "角色：如董事长、CEO、总裁" }
+
   - name: financial_report
     display_name: 财务报告
     description: "年度/季度/中期财务报告"
@@ -475,6 +508,48 @@ relation_types:
     aliases: ["改善指标", "支撑ESG"]
     description: "改善指标：可持续举措改善的ESG指标"
 
+  # ── 层级补充关系：部分-整体（公司 / 报告 / 分部 / 产品线） ──
+  - name: HAS_PART
+    source: listed_company
+    target: business_segment
+    source_types: [listed_company, business_segment, product_line, financial_report, product]
+    target_types: [business_segment, product_line, product, financial_metric, operational_metric, rnd_metric, esg_metric, cost_expense, subsidiary]
+    cardinality: many_to_many
+    description: "整体包含部分（公司含分部、分部含产品线、报告含指标）"
+
+  - name: PART_OF
+    source: business_segment
+    target: listed_company
+    source_types: [business_segment, product_line, product, financial_metric, operational_metric, rnd_metric, esg_metric, cost_expense, subsidiary]
+    target_types: [listed_company, business_segment, product_line, financial_report, product]
+    cardinality: many_to_many
+    description: "部分属于整体（与 HAS_PART 构成方向相反的一对关系）"
+
+  # ── 推理补充关系（可导入 TBox 的显式派生口径） ──────────────
+  - name: REPORT_COVERS_MARKET
+    source: financial_report
+    target: geographic_market
+    cardinality: many_to_many
+    description: "财报覆盖某地区市场（经分部地区收入推导）"
+
+  - name: LINE_HAS_OPERATIONAL_METRIC
+    source: product_line
+    target: operational_metric
+    cardinality: one_to_many
+    description: "产品线拥有运营指标（经产品指标上卷推导）"
+
+  - name: SUBSIDIARY_FACES_RISK
+    source: subsidiary
+    target: risk_factor
+    cardinality: one_to_many
+    description: "子公司面临某风险（用于向上市公司风险传导）"
+
+  - name: COMPANY_INVOLVED_IN_PROCEEDING
+    source: listed_company
+    target: legal_proceeding
+    cardinality: one_to_many
+    description: "上市公司涉及某法律诉讼（经子公司诉讼上卷推导）"
+
 constraints:
   - { type: entity, severity: warning }
   - { type: relation, severity: warning, rule: relation_source_target_must_exist }
@@ -483,6 +558,460 @@ constraints:
     rule: currency_unit_consistency
     expected_unit: 万元
     fields: [total_revenue, gross_profit, operating_profit, net_profit, adjusted_net_profit, rnd_expense, cost_of_sales, selling_expense, admin_expense, income_tax_expense]
+
+# ============================================================
+# 公理：类层次 / 关系层次 / 数据属性层次 / 特征 / 规则链 / 值域
+# ============================================================
+axioms:
+  # ── 类层次 ────────────────────────────────────────────
+  - axiom_key: ax_hf_subsidiary_company
+    kind: subClassOf
+    subject: { kind: entity, ref: subsidiary }
+    object: { kind: entity, ref: listed_company }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司是公司的一种"
+
+  - axiom_key: ax_hf_segment_orgunit
+    kind: subClassOf
+    subject: { kind: entity, ref: business_segment }
+    object: { kind: entity, ref: org_unit }
+    status: active
+    source: manual
+    origin: platform
+    description: "业务分部是组织单元的一种"
+
+  - axiom_key: ax_hf_line_orgunit
+    kind: subClassOf
+    subject: { kind: entity, ref: product_line }
+    object: { kind: entity, ref: org_unit }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品线是组织单元的一种"
+
+  - axiom_key: ax_hf_fin_metric
+    kind: subClassOf
+    subject: { kind: entity, ref: financial_metric }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+    description: "财务指标是指标的一种"
+
+  - axiom_key: ax_hf_op_metric
+    kind: subClassOf
+    subject: { kind: entity, ref: operational_metric }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+    description: "运营指标是指标的一种"
+
+  - axiom_key: ax_hf_rnd_metric
+    kind: subClassOf
+    subject: { kind: entity, ref: rnd_metric }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+    description: "研发指标是指标的一种"
+
+  - axiom_key: ax_hf_esg_metric
+    kind: subClassOf
+    subject: { kind: entity, ref: esg_metric }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+    description: "ESG 指标是指标的一种"
+
+  - axiom_key: ax_hf_keyperson_person
+    kind: subClassOf
+    subject: { kind: entity, ref: key_person }
+    object: { kind: entity, ref: person }
+    status: active
+    source: manual
+    origin: platform
+    description: "关键人员是人员的一种"
+
+  # ── 互斥类 ────────────────────────────────────────────
+  - axiom_key: ax_hf_disjoint_company_person
+    kind: disjointWith
+    subject: { kind: entity, ref: listed_company }
+    object: { kind: entity, ref: person }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_disjoint_company_metric
+    kind: disjointWith
+    subject: { kind: entity, ref: listed_company }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_disjoint_company_orgunit
+    kind: disjointWith
+    subject: { kind: entity, ref: listed_company }
+    object: { kind: entity, ref: org_unit }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_disjoint_person_metric
+    kind: disjointWith
+    subject: { kind: entity, ref: person }
+    object: { kind: entity, ref: metric }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_disjoint_person_orgunit
+    kind: disjointWith
+    subject: { kind: entity, ref: person }
+    object: { kind: entity, ref: org_unit }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_disjoint_metric_orgunit
+    kind: disjointWith
+    subject: { kind: entity, ref: metric }
+    object: { kind: entity, ref: org_unit }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 关系层次：部分-整体 ───────────────────────────────
+  - axiom_key: ax_hf_has_segment_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_SEGMENT }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_segment_line_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SEGMENT_INCLUDES_LINE }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_line_product_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: LINE_PRODUCES_PRODUCT }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_report_metric_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: REPORT_HAS_FINANCIAL_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_segment_metric_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SEGMENT_HAS_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_product_metric_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: PRODUCT_HAS_OPERATIONAL_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_company_rnd_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPANY_HAS_RND_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_company_op_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPANY_HAS_OPERATIONAL_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_line_metric_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: LINE_HAS_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_report_cost_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: REPORT_HAS_COST_EXPENSE }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_segment_cost_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SEGMENT_HAS_COST_EXPENSE }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_company_esg_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPANY_HAS_ESG_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_company_subsidiary_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPANY_HAS_SUBSIDIARY }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_line_op_metric_part
+    kind: subPropertyOf
+    subject: { kind: relation, ref: LINE_HAS_OPERATIONAL_METRIC }
+    object: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 数据属性层次 ──────────────────────────────────────
+  - axiom_key: ax_hf_fin_metric_value
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: financial_metric, ref: metric_value }
+    object: { kind: attribute, owner: metric, ref: metric_value }
+    status: active
+    source: manual
+    origin: platform
+    description: "财务指标值是指标值的一种"
+
+  - axiom_key: ax_hf_op_metric_value
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: operational_metric, ref: metric_value }
+    object: { kind: attribute, owner: metric, ref: metric_value }
+    status: active
+    source: manual
+    origin: platform
+    description: "运营指标值是指标值的一种"
+
+  - axiom_key: ax_hf_rnd_metric_value
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: rnd_metric, ref: metric_value }
+    object: { kind: attribute, owner: metric, ref: metric_value }
+    status: active
+    source: manual
+    origin: platform
+    description: "研发指标值是指标值的一种"
+
+  - axiom_key: ax_hf_esg_metric_value
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: esg_metric, ref: metric_value }
+    object: { kind: attribute, owner: metric, ref: metric_value }
+    status: active
+    source: manual
+    origin: platform
+    description: "ESG 指标值是指标值的一种"
+
+  - axiom_key: ax_hf_keyperson_name
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: key_person, ref: person_name }
+    object: { kind: attribute, owner: person, ref: person_name }
+    status: active
+    source: manual
+    origin: platform
+    description: "关键人员姓名是人员姓名的一种"
+
+  - axiom_key: ax_hf_segment_name_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: business_segment, ref: segment_name }
+    object: { kind: attribute, owner: org_unit, ref: unit_name }
+    status: active
+    source: manual
+    origin: platform
+    description: "分部名称是组织单元名称的一种"
+
+  - axiom_key: ax_hf_line_name_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: product_line, ref: line_name }
+    object: { kind: attribute, owner: org_unit, ref: unit_name }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品线名称是组织单元名称的一种"
+
+  - axiom_key: ax_hf_segment_revenue_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: business_segment, ref: revenue }
+    object: { kind: attribute, owner: org_unit, ref: revenue }
+    status: active
+    source: manual
+    origin: platform
+    description: "分部收入是组织单元收入的一种"
+
+  - axiom_key: ax_hf_line_revenue_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: product_line, ref: revenue }
+    object: { kind: attribute, owner: org_unit, ref: revenue }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品线收入是组织单元收入的一种"
+
+  - axiom_key: ax_hf_segment_gross_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: business_segment, ref: gross_profit }
+    object: { kind: attribute, owner: org_unit, ref: gross_profit }
+    status: active
+    source: manual
+    origin: platform
+    description: "分部毛利是组织单元毛利的一种"
+
+  - axiom_key: ax_hf_line_gross_unit
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: product_line, ref: gross_profit }
+    object: { kind: attribute, owner: org_unit, ref: gross_profit }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品线毛利是组织单元毛利的一种"
+
+  # ── 关系特征 ──────────────────────────────────────────
+  - axiom_key: ax_hf_has_part_transitive
+    kind: transitive
+    subject: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_has_part_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_part_of_transitive
+    kind: transitive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_part_of_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: PART_OF }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_hf_subsidiary_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: COMPANY_HAS_SUBSIDIARY }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── propertyChain（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_hf_chain_company_line
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_PART }
+    chain:
+      - { kind: relation, ref: HAS_SEGMENT }
+      - { kind: relation, ref: SEGMENT_INCLUDES_LINE }
+    status: active
+    source: manual
+    origin: platform
+    description: "公司含分部、分部含产品线 → 公司包含该产品线"
+
+  - axiom_key: ax_hf_chain_segment_product
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_PART }
+    chain:
+      - { kind: relation, ref: SEGMENT_INCLUDES_LINE }
+      - { kind: relation, ref: LINE_PRODUCES_PRODUCT }
+    status: active
+    source: manual
+    origin: platform
+    description: "分部含产品线、产品线生产产品 → 分部包含该产品"
+
+  - axiom_key: ax_hf_chain_has_part
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_PART }
+    chain:
+      - { kind: relation, ref: HAS_PART }
+      - { kind: relation, ref: HAS_PART }
+    status: active
+    source: manual
+    origin: platform
+    description: "整体-部分关系的传递闭包"
+
+  - axiom_key: ax_hf_chain_subsidiary
+    kind: propertyChain
+    subject: { kind: relation, ref: COMPANY_HAS_SUBSIDIARY }
+    chain:
+      - { kind: relation, ref: COMPANY_HAS_SUBSIDIARY }
+      - { kind: relation, ref: COMPANY_HAS_SUBSIDIARY }
+    status: active
+    source: manual
+    origin: platform
+    description: "子公司关系的传递闭包"
+
+  # ── datatypeFacet（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_hf_facet_ownership
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: subsidiary, ref: ownership }
+    facets:
+      - { kind: minInclusive, value: 0 }
+      - { kind: maxInclusive, value: 100 }
+    status: active
+    source: manual
+    origin: platform
+    description: "持股比例按 0–100 记录"
+
+  - axiom_key: ax_hf_facet_market_share
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: product, ref: market_share }
+    facets:
+      - { kind: minInclusive, value: 0 }
+      - { kind: maxInclusive, value: 100 }
+    status: active
+    source: manual
+    origin: platform
+    description: "市场份额按 0–100 记录"
+
+  - axiom_key: ax_hf_facet_fiscal_year
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: financial_report, ref: fiscal_year }
+    facets:
+      - { kind: minInclusive, value: 1900 }
+      - { kind: maxInclusive, value: 2100 }
+    status: active
+    source: manual
+    origin: platform
+    description: "财年按四位年份记录"
 
 disambiguation:
   case_insensitive: true

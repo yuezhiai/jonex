@@ -99,6 +99,8 @@ entity_types:
     aliases: ["产品", "设备", "型号", "机型", "整机", "硬件", "装置", "机器人", "手机", "滑板车", "控制器", "家电", "显卡", "开发板", "无人机", "车辆", "汽车", "飞机", "航空器", "航天器", "卫星", "火星车", "赤道仪", "光伏板", "储能电池"]
     attributes:
       - { name: model, type: string, required: false, description: "型号标识/产品编号，如 KS-1800、DDJ-400、Go2-W、Mavic 2 Pro" }
+      - { name: version, type: string, required: false, description: "产品/软件版本标识（与型号不同时才填）" }
+      - { name: context_length, type: string, required: false, description: "上下文窗口/支持长度（如 256K，适用于模型与软件类产品）" }
       - { name: brand, type: string, required: false, description: "品牌名称" }
       - { name: category, type: string, required: false, description: "产品品类，如电动滑板车/智能手机/四足机器人/DJ 控制器/无人机/汽车/飞机/航天器/光伏板/储能电池" }
       - { name: generation, type: string, required: false, description: "产品世代/代次" }
@@ -790,6 +792,28 @@ relation_types:
     inverse_of: HAS_SKILL_ITEM
     description: "某产品有哪些操作技能"
 
+  # ── 层级/推理补充关系（可导入 TBox 的显式派生口径） ──────────
+  - name: RELEASE_OF
+    source: SoftwareRelease
+    target: Software
+    source_types: [SoftwareRelease]
+    target_types: [Software, SoftwareToolkit]
+    description: "版本属于某软件（与 HAS_RELEASE 构成方向相反的一对关系）"
+
+  - name: COMPONENT_OF
+    source: Component
+    target: Product
+    source_types: [Component]
+    target_types: [Product, Software, AIModel]
+    description: "部件属于某产品（与 HAS_COMPONENT 构成方向相反的一对关系）"
+
+  - name: COMPONENT_COMPLIES_WITH
+    source: Component
+    target: Standard
+    source_types: [Component]
+    target_types: [Standard]
+    description: "部件遵循某标准（产品级合规向部件下推）"
+
 constraints:
   - type: required_attribute
     entity: SoftwareRelease
@@ -805,6 +829,671 @@ constraints:
     entity: Benchmark
     attribute: author_count
     severity: warning
+
+# ============================================================
+# 公理：类层次 / 关系层次 / 数据属性层次 / 特征 / 规则链 / 值域
+# ============================================================
+axioms:
+  # ── 类层次 ────────────────────────────────────────────
+  - axiom_key: ax_tech_software_product
+    kind: subClassOf
+    subject: { kind: entity, ref: Software }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件是产品的一种"
+
+  - axiom_key: ax_tech_aimodel_product
+    kind: subClassOf
+    subject: { kind: entity, ref: AIModel }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "AI 模型是产品的一种"
+
+  - axiom_key: ax_tech_component_product
+    kind: subClassOf
+    subject: { kind: entity, ref: Component }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+    description: "部件是产品的一种（可独立售卖的部件）"
+
+  - axiom_key: ax_tech_toolkit_software
+    kind: subClassOf
+    subject: { kind: entity, ref: SoftwareToolkit }
+    object: { kind: entity, ref: Software }
+    status: active
+    source: manual
+    origin: platform
+    description: "工具包是软件的一种"
+
+  - axiom_key: ax_tech_feature_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Feature }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "功能特性是概念的一种"
+
+  - axiom_key: ax_tech_spec_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Specification }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "规格说明是概念的一种"
+
+  - axiom_key: ax_tech_standard_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Standard }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "标准是概念的一种"
+
+  - axiom_key: ax_tech_protocol_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Protocol }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "协议是技术概念的一种"
+
+  - axiom_key: ax_tech_arch_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: HardwareArchitecture }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "硬件架构是概念的一种"
+
+  - axiom_key: ax_tech_series_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: ProductSeries }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "产品系列是概念的一种"
+
+  - axiom_key: ax_tech_benchmark_concept
+    kind: subClassOf
+    subject: { kind: entity, ref: Benchmark }
+    object: { kind: entity, ref: Concept }
+    status: active
+    source: manual
+    origin: platform
+    description: "评测基准是概念的一种"
+
+  - axiom_key: ax_tech_mission_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Mission }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "任务是事件的一种"
+
+  - axiom_key: ax_tech_incident_event
+    kind: subClassOf
+    subject: { kind: entity, ref: Incident }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+    description: "事故是事件的一种"
+
+  - axiom_key: ax_tech_facility_location
+    kind: subClassOf
+    subject: { kind: entity, ref: Facility }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+    description: "设施是地点的一种"
+
+  # ── 互斥类 ────────────────────────────────────────────
+  - axiom_key: ax_tech_disjoint_org_person
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Person }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_org_product
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_org_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Organization }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_person_product
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_person_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Person }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_product_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Product }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_product_location
+    kind: disjointWith
+    subject: { kind: entity, ref: Product }
+    object: { kind: entity, ref: Location }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_concept_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_concept_product
+    kind: disjointWith
+    subject: { kind: entity, ref: Concept }
+    object: { kind: entity, ref: Product }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_disjoint_location_event
+    kind: disjointWith
+    subject: { kind: entity, ref: Location }
+    object: { kind: entity, ref: Event }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 关系层次 ──────────────────────────────────────────
+  - axiom_key: ax_tech_supports_toolkit_supports
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUPPORTS_TOOLKIT }
+    object: { kind: relation, ref: SUPPORTS }
+    status: active
+    source: manual
+    origin: platform
+    description: "支持工具包是支持软件的一种"
+
+  - axiom_key: ax_tech_added_support_supports_hw
+    kind: subPropertyOf
+    subject: { kind: relation, ref: ADDED_SUPPORT_FOR }
+    object: { kind: relation, ref: SUPPORTS_HARDWARE }
+    status: active
+    source: manual
+    origin: platform
+    description: "新增硬件支持是硬件支持的一种"
+
+  - axiom_key: ax_tech_component_complies_complies
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPONENT_COMPLIES_WITH }
+    object: { kind: relation, ref: COMPLIES_WITH }
+    status: active
+    source: manual
+    origin: platform
+    description: "部件合规是产品合规的一种"
+
+  - axiom_key: ax_tech_release_of_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: RELEASE_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "版本归属是一种通用关联"
+
+  - axiom_key: ax_tech_component_of_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPONENT_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+    description: "部件归属是一种通用关联"
+
+  - axiom_key: ax_tech_has_component_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_COMPONENT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_has_feature_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_FEATURE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_has_spec_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_SPEC }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_manufactured_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MANUFACTURED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_developed_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: DEVELOPED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_affiliated_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: AFFILIATED_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_authored_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: AUTHORED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_complies_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPLIES_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_succeeds_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUCCEEDS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_compatible_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: COMPATIBLE_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_has_release_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: HAS_RELEASE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_supports_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUPPORTS }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_supersedes_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUPERSEDES }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_depends_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: DEPENDS_ON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_supports_hw_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: SUPPORTS_HARDWARE }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_built_on_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: BUILT_ON }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_integrates_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: INTEGRATES_WITH }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_crew_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: CREW_MEMBER_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_conducted_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: CONDUCTED_BY }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_installed_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: INSTALLED_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_occurred_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: OCCURRED_AT }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_member_relates
+    kind: subPropertyOf
+    subject: { kind: relation, ref: MEMBER_OF }
+    object: { kind: relation, ref: RELATES_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── 数据属性层次 ──────────────────────────────────────
+  - axiom_key: ax_tech_sw_vendor_brand
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Software, ref: vendor }
+    object: { kind: attribute, owner: Product, ref: brand }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件厂商是产品品牌的一种"
+
+  - axiom_key: ax_tech_toolkit_vendor_sw
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: SoftwareToolkit, ref: vendor }
+    object: { kind: attribute, owner: Software, ref: vendor }
+    status: active
+    source: manual
+    origin: platform
+    description: "工具包厂商是软件厂商的一种"
+
+  - axiom_key: ax_tech_toolkit_version_sw
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: SoftwareToolkit, ref: version }
+    object: { kind: attribute, owner: Software, ref: latest_version }
+    status: active
+    source: manual
+    origin: platform
+    description: "工具包版本是软件版本的一种"
+
+  - axiom_key: ax_tech_sw_version_product
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Software, ref: latest_version }
+    object: { kind: attribute, owner: Product, ref: version }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件版本是产品版本的一种"
+
+  - axiom_key: ax_tech_component_model_product
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: Component, ref: model }
+    object: { kind: attribute, owner: Product, ref: model }
+    status: active
+    source: manual
+    origin: platform
+    description: "部件型号是产品型号的一种"
+
+  - axiom_key: ax_tech_aimodel_dev_brand
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: AIModel, ref: developer }
+    object: { kind: attribute, owner: Product, ref: brand }
+    status: active
+    source: manual
+    origin: platform
+    description: "模型开发方是产品品牌的一种"
+
+  - axiom_key: ax_tech_aimodel_family_series
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: AIModel, ref: model_family }
+    object: { kind: attribute, owner: Product, ref: series }
+    status: active
+    source: manual
+    origin: platform
+    description: "模型系列是产品系列的一种"
+
+  - axiom_key: ax_tech_aimodel_context_product
+    kind: subPropertyOf
+    subject: { kind: attribute, owner: AIModel, ref: context_length }
+    object: { kind: attribute, owner: Product, ref: context_length }
+    status: active
+    source: manual
+    origin: platform
+    description: "模型上下文长度是产品上下文长度的一种"
+
+  # ── 关系特征 ──────────────────────────────────────────
+  - axiom_key: ax_tech_supersedes_transitive
+    kind: transitive
+    subject: { kind: relation, ref: SUPERSEDES }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_supersedes_irreflexive
+    kind: irreflexive
+    subject: { kind: relation, ref: SUPERSEDES }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_supersedes_asymmetric
+    kind: asymmetric
+    subject: { kind: relation, ref: SUPERSEDES }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_compatible_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: COMPATIBLE_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_integrates_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: INTEGRATES_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_connects_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: CONNECTS_TO }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_compared_symmetric
+    kind: symmetric
+    subject: { kind: relation, ref: COMPARED_WITH }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_next_step_transitive
+    kind: transitive
+    subject: { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+
+  # ── propertyChain（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_tech_chain_supersedes
+    kind: propertyChain
+    subject: { kind: relation, ref: SUPERSEDES }
+    chain:
+      - { kind: relation, ref: SUPERSEDES }
+      - { kind: relation, ref: SUPERSEDES }
+    status: active
+    source: manual
+    origin: platform
+    description: "版本替代关系的传递闭包"
+
+  - axiom_key: ax_tech_chain_release
+    kind: propertyChain
+    subject: { kind: relation, ref: RELEASE_OF }
+    chain:
+      - { kind: relation, ref: HAS_RELEASE }
+      - { kind: relation, ref: SUPERSEDES }
+    status: active
+    source: manual
+    origin: platform
+    description: "软件有旧版本、旧版本被新版本替代 → 新版本仍属于该软件"
+
+  - axiom_key: ax_tech_chain_component
+    kind: propertyChain
+    subject: { kind: relation, ref: COMPONENT_OF }
+    chain:
+      - { kind: relation, ref: HAS_COMPONENT }
+      - { kind: relation, ref: HAS_COMPONENT }
+    status: active
+    source: manual
+    origin: platform
+    description: "部件的部件仍属于整机"
+
+  - axiom_key: ax_tech_chain_step
+    kind: propertyChain
+    subject: { kind: relation, ref: HAS_STEP }
+    chain:
+      - { kind: relation, ref: HAS_STEP }
+      - { kind: relation, ref: NEXT_STEP }
+    status: active
+    source: manual
+    origin: platform
+    description: "技能后续步骤仍属于该技能"
+
+  # ── datatypeFacet（A 档声明，不执行） ─────────────────
+  - axiom_key: ax_tech_facet_product_price
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Product, ref: price }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_facet_component_qty
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Component, ref: quantity }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_facet_release_year
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: SoftwareRelease, ref: release_year }
+    facets:
+      - { kind: minInclusive, value: 1950 }
+      - { kind: maxInclusive, value: 2100 }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_facet_benchmark_problem
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Benchmark, ref: problem_count }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_facet_benchmark_author
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Benchmark, ref: author_count }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
+
+  - axiom_key: ax_tech_facet_mission_crew
+    kind: datatypeFacet
+    subject: { kind: attribute, owner: Mission, ref: crew_size }
+    facets:
+      - { kind: minInclusive, value: 0 }
+    status: active
+    source: manual
+    origin: platform
 
 disambiguation:
   case_insensitive: true

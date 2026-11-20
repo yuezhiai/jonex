@@ -22,6 +22,9 @@ export default function ResultTab({
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
 
+  // Neo4j 降级时后端把实例/关系数置 0：数字位显示「—」，不把降级值当真实数据。
+  // 源文件数来自 PG，不受影响；resultStats === null 时仍走原有 '--' 占位。
+  const degraded = resultStats?.ontology_degraded === true;
   const statItems = resultStats
     ? [
         {
@@ -31,12 +34,12 @@ export default function ResultTab({
         },
         {
           label: t('domainKnowledge.ontologyInstanceCount'),
-          value: resultStats.ontology_instance_count.toLocaleString(),
+          value: degraded ? '—' : resultStats.ontology_instance_count.toLocaleString(),
           color: 'var(--yx-accent)',
         },
         {
           label: t('domainKnowledge.ontologyRelationCount'),
-          value: resultStats.ontology_relation_count.toLocaleString(),
+          value: degraded ? '—' : resultStats.ontology_relation_count.toLocaleString(),
           color: '#10b981',
         },
       ]
@@ -56,6 +59,13 @@ export default function ResultTab({
           </div>
         ))}
       </div>
+
+      {/* 降级提示：与编译资产面板共用同一文案，不新增重复 key */}
+      {degraded && (
+        <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', marginBottom: 16 }}>
+          {t('compile.assets.graphUnavailable')}
+        </div>
+      )}
 
       <div className="yx-kb-section-card-mb">
         <h3 className="yx-kb-section-title-mb">

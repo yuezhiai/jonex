@@ -112,6 +112,9 @@ def abstract_to_compiled_types(schema: dict) -> tuple[list[dict], list[dict]]:
         }
         if e.get("display_name"):
             entity["display_name"] = e["display_name"]
+        # T3：状态词表透传（含 deprecated），供读时展开过滤/展示。
+        if e.get("status"):
+            entity["status"] = _normalize_editor_status(e.get("status"))
         entity_types.append(entity)
 
     relation_types: list[dict] = []
@@ -127,6 +130,9 @@ def abstract_to_compiled_types(schema: dict) -> tuple[list[dict], list[dict]]:
         }
         if r.get("cardinality"):
             relation["cardinality"] = r["cardinality"]
+        # T3：关系状态同样透传，避免 deprecated 关系继续参与抽取/检索。
+        if r.get("status"):
+            relation["status"] = _normalize_editor_status(r.get("status"))
         relation_types.append(relation)
     return entity_types, relation_types
 
@@ -175,7 +181,15 @@ def _normalize_cardinality(raw: str) -> str:
 
 
 def _normalize_editor_status(raw: Optional[str]) -> str:
+    """条目状态词表：active / inactive / deprecated。
+
+    - `deprecated` 是 P3-A 引入的新状态（T3），不能再被吞成 active；
+    - `inactive/disabled/draft/off` 维持原有语义，归为 inactive；
+    - 未知/空值仍回落 active（存量数据兼容）。
+    """
     value = (raw or "").strip().lower()
+    if value == "deprecated":
+        return "deprecated"
     if value in {"inactive", "disabled", "draft", "off"}:
         return "inactive"
     return "active"
@@ -192,6 +206,39 @@ def _dedupe_strings(items: list[str]) -> list[str]:
         result.append(value)
     return result
 
+
+
+def _strip_derived_entity_types(entity_types: list[dict]) -> list[dict]:
+    """剥离读时展开的派生字段（T5）：super_types / inherited_from / super_attributes。"""
+    out: list[dict] = []
+    for item in entity_types or []:
+        if not isinstance(item, dict):
+            continue
+        entity = {k: v for k, v in item.items() if k != "super_types"}
+        entity["attributes"] = [
+            {k: v for k, v in attr.items()
+             if k not in {"inherited_from", "super_attributes"}}
+            for attr in (item.get("attributes") or [])
+            if isinstance(attr, dict) and not attr.get("inherited_from")
+        ]
+        out.append(entity)
+    return out
+
+
+def _strip_derived_relation_types(relation_types: list[dict]) -> list[dict]:
+    return [
+        {k: v for k, v in item.items()
+         if k not in {"derived_source_types", "derived_target_types"}}
+        for item in relation_types or []
+        if isinstance(item, dict)
+    ]
+
+
+def _strip_derived_constraints(constraints: list[dict]) -> list[dict]:
+    return [
+        item for item in constraints or []
+        if isinstance(item, dict) and not item.get("inherited_from")
+    ]
 
 
 def _mark_manual_semantics(attr: dict) -> dict:
@@ -497,7 +544,23 @@ class OntologyCompiler:
         data_source_id: Optional[str] = None,
         auto_compile: bool = True,
     ) -> Optional[dict]:
-        """取一份编译 schema。
+        """取一份编译 schema（KB 级读取在返回前做读时展开，T5）。"""
+        schema = await self._get_compiled_schema_raw(
+            tenant_id, knowledge_base_id, data_source_id, auto_compile,
+        )
+        if not schema or data_source_id is not None:
+            # 数据源级那份是源映射，不是 KB 本体，不做层级展开。
+            return schema
+        return await self._expand_schema(tenant_id, knowledge_base_id, schema)
+
+    async def _get_compiled_schema_raw(
+        self,
+        tenant_id: str,
+        knowledge_base_id: str,
+        data_source_id: Optional[str] = None,
+        auto_compile: bool = True,
+    ) -> Optional[dict]:
+        """取一份编译 schema（未展开的声明视图）。
 
         `data_source_id=None` → **知识库级**（与改造前完全一致，既有调用方零改动）；
         给了 id → 该数据源自己的那份。
@@ -544,6 +607,40 @@ class OntologyCompiler:
                 e,
             )
             return None
+
+    async def _expand_schema(
+        self, tenant_id: str, knowledge_base_id: str, schema: dict,
+    ) -> dict:
+        """T5：读时展开（属性/约束继承、端点扩展、过滤 deprecated）。"""
+        from .ontology_reasoning.context import resolve_reasoning_context
+        from .ontology_reasoning.expand_schema import expand_compiled_schema
+        from .ontology_reasoning.view import build_reasoning_view
+
+        ctx = await resolve_reasoning_context(tenant_id, knowledge_base_id)
+        expanded = expand_compiled_schema(schema, build_reasoning_view(ctx))
+        if isinstance(expanded, dict):
+            # 落库的 prompt_schema 是保存时预计算的旧值；读时用展开结果重算，
+            # 抽取链路（document_service 直接传 schema）才能看到继承属性和子类端点。
+            expanded["prompt_schema"] = self.build_extraction_prompt_schema(expanded)
+        return expanded
+
+    def build_extraction_prompt_schema(self, schema: dict) -> dict:
+        """抽取入口专用：用展开后的实体/关系重新生成 prompt_schema。
+
+        关系端点在 prompt_schema 里直接写 `derived_source_types / derived_target_types`，
+        让 `_post_validate` 接受子类端点；存储里的声明字段不变。
+        """
+        relations: list[dict] = []
+        for relation in schema.get("relation_types") or []:
+            item = dict(relation)
+            if item.get("derived_source_types"):
+                item["source_types"] = list(item["derived_source_types"])
+            if item.get("derived_target_types"):
+                item["target_types"] = list(item["derived_target_types"])
+            relations.append(item)
+        return self._build_prompt_schema(
+            schema.get("entity_types") or [], relations,
+        )
 
     async def _expected_source_hash(
         self, session, tenant_id: str, binding,
@@ -863,7 +960,14 @@ class OntologyCompiler:
         }
 
     async def get_merged_schema(self, tenant_id: str, knowledge_base_id: str) -> Optional[dict]:
-        """把该知识库下的**全部** schema 合成一份视图。
+        """合并视图（返回前做读时展开，T5）。"""
+        schema = await self._get_merged_schema_raw(tenant_id, knowledge_base_id)
+        if not schema:
+            return schema
+        return await self._expand_schema(tenant_id, knowledge_base_id, schema)
+
+    async def _get_merged_schema_raw(self, tenant_id: str, knowledge_base_id: str) -> Optional[dict]:
+        """把该知识库下的**全部** schema 合成一份视图（未展开）。
 
         检索侧（`_build_inverse_map`）要用这个。schema 粒度改成「按数据源」之后，
         仍按知识库级取一份会漏掉各数据源里声明的关系——inverse 映射会静默变小，
@@ -982,6 +1086,11 @@ class OntologyCompiler:
                     },
                 )
 
+        # T5：先把读时展开的派生字段剥掉，再走白名单归一化。
+        entity_types = _strip_derived_entity_types(entity_types)
+        relation_types = _strip_derived_relation_types(relation_types)
+        if constraints is not None:
+            constraints = _strip_derived_constraints(constraints)
         normalized_entities = self._normalize_entity_types(entity_types)
         normalized_relations = self._normalize_relation_types(relation_types, normalized_entities)
         prompt_schema = self._build_prompt_schema(normalized_entities, normalized_relations)
@@ -1037,6 +1146,11 @@ class OntologyCompiler:
             #   而这份内容其实是抽象层确认后的派生结果）。
             if _mirror_from_abstract:
                 source_type = "abstract_mirror"
+            elif source_type == "abstract_mirror":
+                # 上一版是镜像时，人工编辑/导入必须把标签洗掉：否则
+                # `source_type` 永远停在 abstract_mirror，读取侧无法区分
+                # 「真文档本体」和「抽象派生」（实测踩到）。
+                source_type = "manual"
 
             compiled = await repo.upsert_compiled_schema(
                 tenant_id=tenant_id,
@@ -1154,7 +1268,11 @@ class OntologyCompiler:
 
         tenant_id = require_tenant(tenant_id)
 
-        schema = await self.get_compiled_schema(tenant_id, knowledge_base_id, auto_compile=False)
+        # 读展开视图后立即剥离派生字段：导出只导出声明，同时保留
+        # `get_compiled_schema` 的可替换点（测试/适配层会 monkeypatch 它）。
+        schema = await self.get_compiled_schema(
+            tenant_id, knowledge_base_id, auto_compile=False,
+        )
         if not schema:
             raise ResourceNotFoundError(
                 message=translate(
@@ -1164,6 +1282,18 @@ class OntologyCompiler:
             )
 
         warnings: list[str] = []
+
+        # 导出只导出声明；即使存量行里混入了派生字段也在这里剥掉。
+        schema = dict(schema)
+        schema["entity_types"] = _strip_derived_entity_types(
+            schema.get("entity_types") or [],
+        )
+        schema["relation_types"] = _strip_derived_relation_types(
+            schema.get("relation_types") or [],
+        )
+        schema["constraints"] = _strip_derived_constraints(
+            schema.get("constraints") or [],
+        )
 
         # [jonex] Map entity_types → YamlEntity, strip source_object_id and source_attribute_id
         entities: list[YamlEntity] = []
@@ -1193,6 +1323,8 @@ class OntologyCompiler:
                 attributes=attrs,
                 # TBox 构建技能声明：漏传会让「导出 → 导入」往返清空库里的技能链
                 extraction_skills=et.get("extraction_skills") or None,
+                # T3：deprecated/inactive 需要在导出里保留
+                status=et.get("status") or None,
             ))
 
         # [jonex] Map relation_types → YamlRelation, strip source_relation_id
@@ -1209,6 +1341,8 @@ class OntologyCompiler:
                 inverse_of=rt.get("inverse_of") or None,
                 source_types=list(rt.get("source_types") or []),
                 target_types=list(rt.get("target_types") or []),
+                # T3：关系状态同上
+                status=rt.get("status") or None,
             ))
 
         # [jonex] Map constraints → YamlConstraint, decompose target_code.
@@ -1240,10 +1374,30 @@ class OntologyCompiler:
                 relation=relation,
                 expression=ct.get("expression"),
                 suggestion=ct.get("suggestion"),
+                # T3/D12：把编译 schema 的约束启停带进 YAML。
+                enabled=ct.get("enabled") if "enabled" in ct else None,
             ))
 
         disambiguation = schema.get("disambiguation") or {"case_insensitive": True, "alias_merge": True}
         domain = schema.get("template_domain_id") or schema.get("source_type") or "default"
+
+        # T4：编译 YAML 带上公理表（只导出声明；派生字段不落 YAML）。
+        from ..repository.ontology_axiom_repository import OntologyAxiomRepository
+        from .ontology_reasoning.axiom_yaml import axiom_to_export_dict
+
+        axioms: list[dict] = []
+        try:
+            async with get_db_session() as session:
+                axiom_rows = await OntologyAxiomRepository(session).list_by_kb(
+                    tenant_id, knowledge_base_id, limit=10_000,
+                )
+            axioms = [axiom_to_export_dict(row.to_dict()) for row in axiom_rows]
+        except Exception as exc:  # noqa: BLE001 — 公理表读取失败不阻断 schema 导出
+            logger.warning(
+                "Compiled YAML export: axiom table unavailable kb=%s err=%s",
+                knowledge_base_id, exc,
+            )
+            warnings.append("公理表读取失败，导出文件不含 axioms 段")
 
         doc = OntologyYamlDocument(
             # YAML 格式版本固定为 1；schema["schema_version"] 是乐观锁版本（每次编辑自增），
@@ -1254,6 +1408,7 @@ class OntologyCompiler:
             relation_types=relations,
             constraints=constraints,
             disambiguation=disambiguation,
+            axioms=axioms,
         )
 
         yaml_text = dump_yaml(doc)
@@ -1331,7 +1486,7 @@ class OntologyCompiler:
                 "display_name": ye.display_name or ye.name,
                 "description": ye.description or "",
                 "requirement": "",  # [jonex] default
-                "status": "active",  # [jonex] default
+                "status": ye.status or "active",  # T3：保留 YAML 显式状态
                 "aliases": ye.aliases,
                 "source_object_id": None,  # [jonex] strip tracking field
                 "attributes": attrs,
@@ -1346,7 +1501,7 @@ class OntologyCompiler:
                 "name": yr.name,
                 "display_name": yr.display_name or yr.name,
                 "description": yr.description or "",
-                "status": "active",  # [jonex] default
+                "status": yr.status or "active",  # T3：保留 YAML 显式状态
                 "aliases": yr.aliases,
                 "source": yr.source,
                 "target": yr.target,
@@ -1383,6 +1538,9 @@ class OntologyCompiler:
                 "constraint_type": yc.type,
                 "expression": yc.expression or "",
                 "suggestion": yc.suggestion or "",
+                # T3/D12：YAML 缺键 = 启用。显式写 true，避免 save 的
+                # `_carry_over_constraint_enabled` 把同名的历史停用状态带回来。
+                "enabled": yc.enabled is not False,
             })
 
         # [jonex] Constraint handling: no section → keep existing; section present → replace
@@ -1401,16 +1559,35 @@ class OntologyCompiler:
             "relation_types_count": len(relation_types),
             "constraints_count": len(constraints),
             "constraints_mode": constraint_mode,
+            "axioms_count": len(doc.axioms or []),
             "schema_version": doc.version,
             "domain": doc.domain,
         }
 
+        # T4：编译 YAML 顶层 axioms 段 → 公理表（复用同一套校验/合并语义）。
+        axiom_override = {
+            "entity_types": entity_types,
+            "relation_types": relation_types,
+            "disambiguation": doc.disambiguation,
+        }
+
+        def _axiom_service():
+            from .ontology_reasoning.axiom_service import AxiomService
+            return AxiomService()
+
         if dry_run:
+            axiom_result = None
+            if doc.axioms:
+                axiom_result = await _axiom_service().import_axiom_list(
+                    tenant_id, knowledge_base_id, doc.axioms,
+                    dry_run=True, mode="merge", schema_override=axiom_override,
+                )
             return {
                 "dry_run": True,
                 "summary": summary,
                 "warnings": warnings,
                 "errors": errors,
+                **({"axioms": axiom_result} if axiom_result else {}),
             }
 
         # 5. Persist via existing save_compiled_schema
@@ -1424,12 +1601,21 @@ class OntologyCompiler:
             edited_by=None,
         )
 
+        axiom_result = None
+        if doc.axioms:
+            # schema 已落库后再写公理：此时合并视图能解析到新实体/关系。
+            axiom_result = await _axiom_service().import_axiom_list(
+                tenant_id, knowledge_base_id, doc.axioms,
+                dry_run=False, mode="merge",
+            )
+
         return {
             "dry_run": False,
             "summary": summary,
             "warnings": warnings,
             "errors": errors,
             "schema_version": result.get("schema_version"),
+            **({"axioms": axiom_result} if axiom_result else {}),
         }
 
     async def reseed_from_template(
@@ -1952,7 +2138,7 @@ class OntologyCompiler:
                         {
                             "name": attr["name"],
                             "type": attr["type"],
-                            "required": attr["required"],
+                            "required": bool(attr.get("required", False)),
                             "description": attr.get("description") or "",
                         }
                         for attr in entity_type.get("attributes", [])

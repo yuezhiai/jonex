@@ -1,0 +1,269 @@
+version: 2
+kind: reasoning_rules
+contract_version: 1
+rules:
+- rule_key: r_tech_supersedes_transitive
+  name: 版本替代传递
+  text: IF ?a SUPERSEDES ?b AND ?b SUPERSEDES ?c THEN ?a SUPERSEDES ?c
+  premises:
+  - kind: rel
+    s: a
+    p: SUPERSEDES
+    o: b
+  - kind: rel
+    s: b
+    p: SUPERSEDES
+    o: c
+  conclusion:
+    kind: rel
+    s: a
+    p: SUPERSEDES
+    o: c
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 被替代链条可传递，用于判断跨多代的版本继承。
+- rule_key: r_tech_release_supersede
+  name: 替代版本归属
+  text: IF ?s HAS_RELEASE ?a AND ?a SUPERSEDES ?b THEN ?b RELEASE_OF ?s
+  premises:
+  - kind: rel
+    s: s
+    p: HAS_RELEASE
+    o: a
+  - kind: rel
+    s: a
+    p: SUPERSEDES
+    o: b
+  conclusion:
+    kind: rel
+    s: b
+    p: RELEASE_OF
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 软件有旧版本，旧版本被新版本替代，则新版本仍属于该软件。
+- rule_key: r_tech_release_support
+  name: 支持关系版本归属
+  text: IF ?r SUPERSEDES ?r2 AND ?r2 SUPPORTS ?s THEN ?r RELEASE_OF ?s
+  premises:
+  - kind: rel
+    s: r
+    p: SUPERSEDES
+    o: r2
+  - kind: rel
+    s: r2
+    p: SUPPORTS
+    o: s
+  conclusion:
+    kind: rel
+    s: r
+    p: RELEASE_OF
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 新版本替代了支持某软件的旧版本，则新版本属于该软件。
+- rule_key: r_tech_component_compliance
+  name: 部件合规下推
+  text: IF ?p COMPLIES_WITH ?s AND ?p HAS_COMPONENT ?c THEN ?c COMPONENT_COMPLIES_WITH
+    ?s
+  premises:
+  - kind: rel
+    s: p
+    p: COMPLIES_WITH
+    o: s
+  - kind: rel
+    s: p
+    p: HAS_COMPONENT
+    o: c
+  conclusion:
+    kind: rel
+    s: c
+    p: COMPONENT_COMPLIES_WITH
+    o: s
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 产品遵循标准，其部件继承该标准约束。
+- rule_key: r_tech_component_nesting
+  name: 部件嵌套归属
+  text: IF ?p HAS_COMPONENT ?c AND ?c HAS_COMPONENT ?c2 THEN ?c2 COMPONENT_OF ?p
+  premises:
+  - kind: rel
+    s: p
+    p: HAS_COMPONENT
+    o: c
+  - kind: rel
+    s: c
+    p: HAS_COMPONENT
+    o: c2
+  conclusion:
+    kind: rel
+    s: c2
+    p: COMPONENT_OF
+    o: p
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 部件的部件属于整机。
+- rule_key: r_tech_crew_affiliation
+  name: 任务乘员隶属
+  text: IF ?p CREW_MEMBER_OF ?m AND ?m CONDUCTED_BY ?o THEN ?p AFFILIATED_WITH ?o
+  premises:
+  - kind: rel
+    s: p
+    p: CREW_MEMBER_OF
+    o: m
+  - kind: rel
+    s: m
+    p: CONDUCTED_BY
+    o: o
+  conclusion:
+    kind: rel
+    s: p
+    p: AFFILIATED_WITH
+    o: o
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 任务乘员隶属于执行该任务的组织。
+- rule_key: r_tech_built_on_related
+  name: 构建依赖关联
+  text: IF ?p BUILT_ON ?h AND ?r SUPPORTS_HARDWARE ?h THEN ?p RELATES_TO ?r
+  premises:
+  - kind: rel
+    s: p
+    p: BUILT_ON
+    o: h
+  - kind: rel
+    s: r
+    p: SUPPORTS_HARDWARE
+    o: h
+  conclusion:
+    kind: rel
+    s: p
+    p: RELATES_TO
+    o: r
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 产品基于某硬件架构，且某版本支持该架构，则产品与该版本关联。
+- rule_key: r_tech_component_feature
+  name: 部件功能上卷
+  text: IF ?p HAS_COMPONENT ?c AND ?c HAS_FEATURE ?f THEN ?p RELATES_TO ?f
+  premises:
+  - kind: rel
+    s: p
+    p: HAS_COMPONENT
+    o: c
+  - kind: rel
+    s: c
+    p: HAS_FEATURE
+    o: f
+  conclusion:
+    kind: rel
+    s: p
+    p: RELATES_TO
+    o: f
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 产品部件具备的功能，产品整体与之关联。
+- rule_key: r_tech_series_compliance
+  name: 系列合规关联
+  text: IF ?p MEMBER_OF ?s AND ?p COMPLIES_WITH ?std THEN ?s RELATES_TO ?std
+  premises:
+  - kind: rel
+    s: p
+    p: MEMBER_OF
+    o: s
+  - kind: rel
+    s: p
+    p: COMPLIES_WITH
+    o: std
+  conclusion:
+    kind: rel
+    s: s
+    p: RELATES_TO
+    o: std
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 产品属于某系列且遵循标准，则系列与该标准关联。
+- rule_key: r_tech_installed_operator
+  name: 安装运营关联
+  text: IF ?p INSTALLED_AT ?f AND ?f OPERATED_BY ?o THEN ?p RELATES_TO ?o
+  premises:
+  - kind: rel
+    s: p
+    p: INSTALLED_AT
+    o: f
+  - kind: rel
+    s: f
+    p: OPERATED_BY
+    o: o
+  conclusion:
+    kind: rel
+    s: p
+    p: RELATES_TO
+    o: o
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 产品安装于某设施，设施由某组织运营，则产品与该组织关联。
+- rule_key: r_tech_tool_requirement
+  name: 工具需求关联
+  text: IF ?a REQUIRES ?c AND ?a USES_TOOL ?t THEN ?t RELATES_TO ?c
+  premises:
+  - kind: rel
+    s: a
+    p: REQUIRES
+    o: c
+  - kind: rel
+    s: a
+    p: USES_TOOL
+    o: t
+  conclusion:
+    kind: rel
+    s: t
+    p: RELATES_TO
+    o: c
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 动作依赖某条件且使用某工具，则工具与该条件关联。
+- rule_key: r_tech_toolkit_hardware
+  name: 工具包硬件关联
+  text: IF ?r ADDED_SUPPORT_FOR ?h AND ?r SUPPORTS_TOOLKIT ?t THEN ?t RELATES_TO ?h
+  premises:
+  - kind: rel
+    s: r
+    p: ADDED_SUPPORT_FOR
+    o: h
+  - kind: rel
+    s: r
+    p: SUPPORTS_TOOLKIT
+    o: t
+  conclusion:
+    kind: rel
+    s: t
+    p: RELATES_TO
+    o: h
+  status: active
+  enabled: true
+  origin: imported
+  module: technology
+  description: 版本新增硬件支持且支持某工具包，则工具包与该硬件关联。

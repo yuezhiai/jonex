@@ -3,13 +3,14 @@
 import asyncio
 import logging
 import os
-import socket
+from typing import Optional
 
-from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired, TransientError
-
+from jonex_core.common.audit import schedule_emit
+from jonex_core.common.audit_enums import ResourceType
 from jonex_core.common.database import get_db_session
 from jonex_core.common.exceptions import InvalidParameterError
-from jonex_core.common.neo4j_client import get_neo4j_driver
+from jonex_core.common.i18n import translate
+from jonex_core.common.neo4j_client import get_neo4j_driver, is_neo4j_unavailable
 
 from jonex_core.common.tenant import require_tenant
 
@@ -32,13 +33,57 @@ from ..dtos.ontology_crud import (
 from ..models import KnowledgeDocument, KnowledgeInfo
 from ..repository import KnowledgeDocumentRepository, OntologyGraphRepository
 from ..repository.knowledge_info_repository import KnowledgeInfoRepository
-from .document_service import _payload
+from .document_service import _audit_user_id, _payload
 from .reconciliation_service import _stub_ratio_alert  # [jonex] 改动 52（S2）
 
 logger = logging.getLogger(__name__)
 
-# Neo4j 不可用类异常：触发图谱查询优雅降级（不抛 500，返回空图 + degraded 标记）
-_NEO4J_DOWN_ERRORS = (ServiceUnavailable, SessionExpired, TransientError, AuthError, OSError)
+# 更新实例时允许出现的键。超出白名单一律按参数错误拒绝，不静默忽略。
+_ALLOWED_INSTANCE_UPDATE_KEYS = frozenset(
+    {"entity_type", "name", "aliases", "description", "attributes"}
+)
+
+# 实体类型长度上限（与契约一致）
+_MAX_ENTITY_TYPE_LENGTH = 128
+
+def _emit_ontology_audit(
+    action: str,
+    *,
+    tenant_id: str,
+    user_id: Optional[str],
+    resource: str,
+    resource_id: str,
+    knowledge_base_id: str,
+    changed_fields: list,
+    entity_type_from: Optional[str] = None,
+    entity_type_to: Optional[str] = None,
+) -> None:
+    """写出本体写动作的审计条目。
+
+    审计是 best-effort：任何失败只记日志，不影响已经完成的业务写入。
+    `request_params` 只记录定位键与变更字段名，不写入描述、属性等字段的值。
+    """
+    try:
+        request_params = {
+            "knowledge_base_id": knowledge_base_id,
+            "changed_fields": list(changed_fields),
+        }
+        if entity_type_from is not None and entity_type_to is not None:
+            request_params["entity_type_from"] = entity_type_from
+            request_params["entity_type_to"] = entity_type_to
+        schedule_emit({
+            "tenant_id": tenant_id,
+            "user_id": _audit_user_id(user_id),
+            "log_type": "OPERATION",
+            "action": action,
+            "outcome": "SUCCESS",
+            "service_name": "knowledge_base",
+            "resource": resource,
+            "resource_id": resource_id,
+            "request_params": request_params,
+        })
+    except Exception:
+        logger.warning("ontology audit emit failed: action=%s", action, exc_info=True)
 
 
 def _is_neo4j_down(exc: BaseException) -> bool:
@@ -47,24 +92,15 @@ def _is_neo4j_down(exc: BaseException) -> bool:
     neo4j 驱动对不同故障形态抛的异常并不统一：
 
     - 进程在、端口拒绝/超时 → ``ServiceUnavailable`` 等 DriverError；
+    - 存储层 critical（如事务无法启动）→ ``DatabaseError``；
     - 容器停止、主机名从网络消失 → ``ValueError("Cannot resolve address ...")``，
       ``__cause__`` 为 ``socket.gaierror``。
 
-    后者不在 ``_NEO4J_DOWN_ERRORS`` 里，只按最外层类型捕获会漏掉、冒成 500。
-    这里沿链判定，但只认 DNS 解析失败链，避免把真正的业务 ``ValueError`` 误降级。
+    具体判据统一收在内核 ``is_neo4j_unavailable``：黑名单式，只把基础设施故障
+    （连接层 / 存储层 critical / 认证失效 / DNS）当作不可用，语法错误、约束
+    冲突、权限拒绝这类调用方自己能修的错误仍上抛 500。
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, _NEO4J_DOWN_ERRORS):
-            return True
-        if isinstance(cur, socket.gaierror):
-            return True
-        if isinstance(cur, ValueError) and "Cannot resolve address" in str(cur):
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
+    return is_neo4j_unavailable(exc)
 
 
 _DEGRADED_REASON = "图数据库（Neo4j）暂不可用，知识图谱无法展示，基础知识库能力不受影响"
@@ -167,21 +203,57 @@ class OntologyQueryService:
         }
 
     async def list_instances(self, tenant_id: str, request) -> dict:
-        """分页查询 kb 内本体实例列表。"""
+        """分页查询 kb 内本体实例列表。Neo4j 不可用时降级为空页，不抛 500。"""
         tenant_id = require_tenant(tenant_id)
         req = OntologyInstanceListRequest(**_payload(request))
         offset = (req.page - 1) * req.page_size
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        items, total = await gdao.list_entities(
-            tenant_id,
-            req.knowledge_base_id,
-            offset,
-            req.page_size,
-            entity_type=req.entity_type,
-            keyword=req.keyword,
-            include_unknown=req.include_unknown,
-            document_id=req.document_id,
-        )
+        entity_types = None
+        entity_type = req.entity_type
+        if entity_type:
+            from .ontology_reasoning.expand import (
+                expand_entity_types, hierarchy_expansion_enabled,
+            )
+            if hierarchy_expansion_enabled():
+                try:
+                    from .ontology_reasoning.context import resolve_reasoning_context
+                    from .ontology_reasoning.view import build_reasoning_view
+                    ctx = await resolve_reasoning_context(
+                        tenant_id, req.knowledge_base_id,
+                    )
+                    view = build_reasoning_view(ctx)
+                    key = ctx.schema_context.resolve_entity(entity_type)
+                    canonical = (
+                        ctx.schema_context.entities.get(key) or {}
+                    ).get("name") or entity_type
+                    entity_types = expand_entity_types(view, [canonical]).values
+                    entity_type = None
+                except Exception:  # noqa: BLE001 — 扩展失败退回单类型
+                    entity_types = None
+        try:
+            items, total = await gdao.list_entities(
+                tenant_id,
+                req.knowledge_base_id,
+                offset,
+                req.page_size,
+                entity_type=entity_type,
+                entity_types=entity_types,
+                keyword=req.keyword,
+                include_unknown=req.include_unknown,
+                document_id=req.document_id,
+            )
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 实例列表降级：Neo4j 不可用 kb=%s err=%s",
+                req.knowledge_base_id, e,
+            )
+            return {
+                "items": [], "total": 0,
+                "page": req.page, "page_size": req.page_size,
+                "degraded": True, "degraded_reason": _DEGRADED_REASON,
+            }
         return {
             "items": items,
             "total": total,
@@ -190,24 +262,60 @@ class OntologyQueryService:
         }
 
     async def list_relations(self, tenant_id: str, request) -> dict:
-        """分页查询 kb 内本体关系列表。"""
+        """分页查询 kb 内本体关系列表。Neo4j 不可用时降级为空页，不抛 500。"""
         tenant_id = require_tenant(tenant_id)
         req = OntologyRelationListRequest(**_payload(request))
         offset = (req.page - 1) * req.page_size
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        items, total = await gdao.list_relations(
-            tenant_id,
-            req.knowledge_base_id,
-            offset,
-            req.page_size,
-            relation_type=req.relation_type,
-            source_name=req.source_name,
-            target_name=req.target_name,
-            source_type=req.source_type,
-            target_type=req.target_type,
-            keyword=req.keyword,
-            document_id=req.document_id,
-        )
+        relation_types = None
+        relation_type = req.relation_type
+        if relation_type:
+            from .ontology_reasoning.expand import (
+                expand_relation_types, hierarchy_expansion_enabled,
+            )
+            if hierarchy_expansion_enabled():
+                try:
+                    from .ontology_reasoning.context import resolve_reasoning_context
+                    from .ontology_reasoning.view import build_reasoning_view
+                    ctx = await resolve_reasoning_context(
+                        tenant_id, req.knowledge_base_id,
+                    )
+                    view = build_reasoning_view(ctx)
+                    key = ctx.schema_context.resolve_relation(relation_type)
+                    canonical = (
+                        ctx.schema_context.relations.get(key) or {}
+                    ).get("name") or relation_type
+                    relation_types = expand_relation_types(view, [canonical]).values
+                    relation_type = None
+                except Exception:  # noqa: BLE001
+                    relation_types = None
+        try:
+            items, total = await gdao.list_relations(
+                tenant_id,
+                req.knowledge_base_id,
+                offset,
+                req.page_size,
+                relation_type=relation_type,
+                relation_types=relation_types,
+                source_name=req.source_name,
+                target_name=req.target_name,
+                source_type=req.source_type,
+                target_type=req.target_type,
+                keyword=req.keyword,
+                document_id=req.document_id,
+            )
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 关系列表降级：Neo4j 不可用 kb=%s err=%s",
+                req.knowledge_base_id, e,
+            )
+            return {
+                "items": [], "total": 0,
+                "page": req.page, "page_size": req.page_size,
+                "degraded": True, "degraded_reason": _DEGRADED_REASON,
+            }
         return {
             "items": items,
             "total": total,
@@ -216,20 +324,49 @@ class OntologyQueryService:
         }
 
     async def list_entity_types(self, tenant_id: str, request) -> dict:
-        """实体类型列表 = compiled schema 类型定义 × Neo4j 实例数聚合。"""
+        """实体类型列表 = compiled schema 类型定义 × Neo4j 实例数聚合。
+
+        Neo4j 不可用时仍返回 compiled schema 里的类型定义（实例计数置 0、
+        ``build_status="empty"``）并标记 degraded；schema 自身读取失败时
+        返回空列表 + degraded，均不抛 500。
+        """
         tenant_id = require_tenant(tenant_id)
         req = OntologyStatsRequest(**_payload(request))
         kb_id = req.knowledge_base_id
 
         from .ontology_compiler import OntologyCompiler
 
-        schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id) or {}
+        try:
+            schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id) or {}
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 实体类型列表降级：compiled schema 读取失败 kb=%s err=%s",
+                kb_id, e,
+            )
+            return {
+                "items": [], "total": 0,
+                "degraded": True, "degraded_reason": _DEGRADED_REASON,
+            }
+
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        counts = (
-            await gdao._count_entities_by_type_doc(tenant_id, kb_id, req.document_id)
-            if req.document_id
-            else await gdao.count_entities_by_type(tenant_id, kb_id)
-        )
+        try:
+            counts = (
+                await gdao._count_entities_by_type_doc(tenant_id, kb_id, req.document_id)
+                if req.document_id
+                else await gdao.count_entities_by_type(tenant_id, kb_id)
+            )
+            degraded = False
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 实体类型列表降级：Neo4j 不可用 kb=%s err=%s", kb_id, e,
+            )
+            counts = {}
+            degraded = True
+
         if not req.include_unknown:
             counts.pop("unknown", None)
 
@@ -239,7 +376,8 @@ class OntologyQueryService:
             name = et["name"]
             known.add(name)
             cnt = counts.get(name, 0)
-            if req.document_id and cnt == 0:
+            # 降级时计数不可信，文档级过滤会把类型目录清空，故跳过该过滤
+            if not degraded and req.document_id and cnt == 0:
                 continue
             items.append({
                 "name": name,
@@ -259,7 +397,11 @@ class OntologyQueryService:
                     "status": "unschematized", "build_status": "built",
                     "instance_count": c, "attributes": [], "source_object_id": None,
                 })
-        return {"items": items, "total": len(items)}
+        result = {"items": items, "total": len(items)}
+        if degraded:
+            result["degraded"] = True
+            result["degraded_reason"] = _DEGRADED_REASON
+        return result
 
     async def get_kb_graph(self, tenant_id: str, request) -> dict:
         """获取 KB 图谱数据（nodes + edges + 统计），用于前端力导向图渲染。
@@ -269,12 +411,34 @@ class OntologyQueryService:
         tenant_id = require_tenant(tenant_id)
         req = OntologyGraphRequest(**_payload(request))
         gdao = OntologyGraphRepository(get_neo4j_driver())
+        entity_types = req.entity_types
+        if entity_types:
+            from .ontology_reasoning.expand import (
+                expand_entity_types, hierarchy_expansion_enabled,
+            )
+            if hierarchy_expansion_enabled():
+                try:
+                    from .ontology_reasoning.context import resolve_reasoning_context
+                    from .ontology_reasoning.view import build_reasoning_view
+                    ctx = await resolve_reasoning_context(
+                        tenant_id, req.knowledge_base_id,
+                    )
+                    view = build_reasoning_view(ctx)
+                    canonical = []
+                    for name in entity_types:
+                        key = ctx.schema_context.resolve_entity(name)
+                        canonical.append(
+                            (ctx.schema_context.entities.get(key) or {}).get("name") or name
+                        )
+                    entity_types = expand_entity_types(view, canonical).values
+                except Exception:  # noqa: BLE001
+                    entity_types = req.entity_types
         try:
             result = await gdao.get_kb_graph(
                 tenant_id,
                 req.knowledge_base_id,
                 limit=req.limit,
-                entity_types=req.entity_types,
+                entity_types=entity_types,
                 document_id=req.document_id,
             )
             result["degraded"] = False
@@ -309,7 +473,7 @@ class OntologyQueryService:
             if req.document_id:
                 raise InvalidParameterError("document_id 与 depth>1 不能同时使用")
             try:
-                # 先于 _NEO4J_DOWN_ERRORS 捕获：TimeoutError 也是 OSError 子类。
+                # 先于降级判据捕获：TimeoutError 也是 OSError 子类。
                 raw = await asyncio.wait_for(
                     gdao.expand_neighbors_multihop(
                         tenant_id,
@@ -366,20 +530,48 @@ class OntologyQueryService:
             return {"nodes": [], "edges": [], "degraded": True, "degraded_reason": _DEGRADED_REASON}
 
     async def list_relation_types(self, tenant_id: str, request) -> dict:
-        """关系类型列表 = compiled schema 关系定义 × Neo4j 关系数聚合。"""
+        """关系类型列表 = compiled schema 关系定义 × Neo4j 关系数聚合。
+
+        Neo4j 不可用时仍返回 compiled schema 里的关系定义（实例计数置 0、
+        ``build_status="empty"``）并标记 degraded；schema 自身读取失败时
+        返回空列表 + degraded，均不抛 500。
+        """
         tenant_id = require_tenant(tenant_id)
         req = OntologyStatsRequest(**_payload(request))
         kb_id = req.knowledge_base_id
 
         from .ontology_compiler import OntologyCompiler
 
-        schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id) or {}
+        try:
+            schema = await OntologyCompiler().get_compiled_schema(tenant_id, kb_id) or {}
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 关系类型列表降级：compiled schema 读取失败 kb=%s err=%s",
+                kb_id, e,
+            )
+            return {
+                "items": [], "total": 0,
+                "degraded": True, "degraded_reason": _DEGRADED_REASON,
+            }
+
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        counts = (
-            await gdao.count_relations_by_type_doc(tenant_id, kb_id, req.document_id)
-            if req.document_id
-            else await gdao.count_relations_by_type(tenant_id, kb_id)
-        )
+        try:
+            counts = (
+                await gdao.count_relations_by_type_doc(tenant_id, kb_id, req.document_id)
+                if req.document_id
+                else await gdao.count_relations_by_type(tenant_id, kb_id)
+            )
+            degraded = False
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 关系类型列表降级：Neo4j 不可用 kb=%s err=%s", kb_id, e,
+            )
+            counts = {}
+            degraded = True
 
         entity_display = {
             et["name"]: (et.get("display_name") or et["name"])
@@ -392,7 +584,8 @@ class OntologyQueryService:
             name = rt["name"]
             known.add(name)
             cnt = counts.get(name, 0)
-            if req.document_id and cnt == 0:
+            # 降级时计数不可信，文档级过滤会把类型目录清空，故跳过该过滤
+            if not degraded and req.document_id and cnt == 0:
                 continue
             src, tgt = rt.get("source"), rt.get("target")
             items.append({
@@ -419,13 +612,22 @@ class OntologyQueryService:
                     "status": "unschematized", "build_status": "built",
                     "instance_count": c, "source_relation_id": None,
                 })
-        return {"items": items, "total": len(items)}
+        result = {"items": items, "total": len(items)}
+        if degraded:
+            result["degraded"] = True
+            result["degraded_reason"] = _DEGRADED_REASON
+        return result
 
     # ══════════════════════════════════════════════════════════════════
     # 本体实例/关系 创建、编辑与删除
     # ══════════════════════════════════════════════════════════════════
 
-    async def create_instance(self, tenant_id: str, req: CreateOntologyInstanceRequest) -> dict:
+    async def create_instance(
+        self,
+        tenant_id: str,
+        req: CreateOntologyInstanceRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
         """创建本体实例（实体节点）。
 
         `req.document_id` 有值（从文档结果页创建）→ 写进 `doc_ids`，该文档的本体视图可见；
@@ -433,7 +635,7 @@ class OntologyQueryService:
         """
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        return await gdao.create_entity(
+        result = await gdao.create_entity(
             tenant_id,
             kb_id=req.knowledge_base_id,
             entity_type=req.entity_type,
@@ -443,12 +645,34 @@ class OntologyQueryService:
             attributes=req.attributes,
             doc_id=req.document_id,
         )
+        changed_fields = ["entity_type", "name"]
+        if req.aliases is not None:
+            changed_fields.append("aliases")
+        if req.description is not None:
+            changed_fields.append("description")
+        if req.attributes is not None:
+            changed_fields.append("attributes")
+        _emit_ontology_audit(
+            "create_ontology_instance",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_INSTANCE.value,
+            resource_id=f"{req.entity_type}/{req.name}",
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=changed_fields,
+        )
+        return result
 
-    async def create_relation(self, tenant_id: str, req: CreateOntologyRelationRequest) -> dict:
+    async def create_relation(
+        self,
+        tenant_id: str,
+        req: CreateOntologyRelationRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
         """创建本体关系（实体间关系边）。`req.document_id` 口径同 `create_instance`。"""
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        return await gdao.create_relation(
+        result = await gdao.create_relation(
             tenant_id,
             kb_id=req.knowledge_base_id,
             source_entity_type=req.source_entity_type,
@@ -459,21 +683,133 @@ class OntologyQueryService:
             attributes=req.attributes,
             doc_id=req.document_id,
         )
+        changed_fields = ["relation_type"]
+        if req.attributes is not None:
+            changed_fields.append("attributes")
+        _emit_ontology_audit(
+            "create_ontology_relation",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_RELATION.value,
+            resource_id=(
+                f"{req.source_entity_type}/{req.source_canonical_name}"
+                f":{req.relation_type}:"
+                f"{req.target_entity_type}/{req.target_canonical_name}"
+            ),
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=changed_fields,
+        )
+        return result
 
-    async def update_instance(self, tenant_id: str, req: UpdateOntologyInstanceRequest) -> dict:
-        """更新本体实例（实体）的字段。"""
+    async def update_instance(
+        self,
+        tenant_id: str,
+        req: UpdateOntologyInstanceRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """更新本体实例（实体）的字段。
+
+        `updates` 只接受白名单内的键；其中 `entity_type` 允许原地修改实体类型，
+        仓储层在目标键已存在时完成撞名合并，并通过返回值里的 `merged` 告知调用方。
+        """
         tenant_id = require_tenant(tenant_id)
+        if not (req.canonical_name or "").strip():
+            raise InvalidParameterError(
+                message=translate("err.ontology.empty_canonical_name")
+            )
+
+        unknown_keys = sorted(set(req.updates) - _ALLOWED_INSTANCE_UPDATE_KEYS)
+        if unknown_keys:
+            raise InvalidParameterError(
+                message=translate(
+                    "err.ontology.unknown_update_field",
+                    params={"fields": ", ".join(unknown_keys)},
+                )
+            )
+
+        updates = dict(req.updates)
+        new_type: Optional[str] = None
+        if "entity_type" in updates:
+            raw_type = updates["entity_type"]
+            if (
+                not isinstance(raw_type, str)
+                or not raw_type.strip()
+                or len(raw_type.strip()) > _MAX_ENTITY_TYPE_LENGTH
+            ):
+                raise InvalidParameterError(
+                    message=translate("err.ontology.invalid_entity_type")
+                )
+            new_type = raw_type.strip()
+            updates["entity_type"] = new_type
+            if new_type != req.entity_type:
+                await self._warn_type_outside_schema(
+                    tenant_id, req.knowledge_base_id, req.entity_type, new_type
+                )
+
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        await gdao.update_entity(
+        result = await gdao.update_entity(
             tenant_id,
             req.knowledge_base_id,
             req.entity_type,
             req.canonical_name,
-            req.updates,
+            updates,
+            merge_target=req.merge_target,
         )
-        return {"updated": True}
 
-    async def delete_instance(self, tenant_id: str, req: DeleteOntologyInstanceRequest) -> dict:
+        final_type = new_type or req.entity_type
+        final_name = updates.get("name", req.canonical_name)
+        type_changed = new_type is not None and new_type != req.entity_type
+        _emit_ontology_audit(
+            "update_ontology_instance",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_INSTANCE.value,
+            resource_id=f"{final_type}/{final_name}",
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=sorted(updates.keys()),
+            entity_type_from=req.entity_type if type_changed else None,
+            entity_type_to=new_type if type_changed else None,
+        )
+
+        merged = bool(result.get("merged")) if isinstance(result, dict) else False
+        return {"updated": True, "merged": merged}
+
+    async def _warn_type_outside_schema(
+        self, tenant_id: str, kb_id: str, old_type: str, new_type: str
+    ) -> None:
+        """目标类型不在该知识库编译模式中时记录警告，不拒绝请求。
+
+        编译模式取不到（不存在或查询失败）时无法判断，跳过警告，不影响写入。
+        """
+        try:
+            from .ontology_compiler import OntologyCompiler
+
+            schema = await OntologyCompiler().get_compiled_schema(
+                tenant_id, kb_id, auto_compile=False
+            ) or {}
+            defined_types = {
+                et.get("name")
+                for et in (schema.get("entity_types") or [])
+                if isinstance(et, dict) and et.get("name")
+            }
+            if defined_types and new_type not in defined_types:
+                logger.warning(
+                    "ontology entity type outside compiled schema: "
+                    "tenant_id=%s kb_id=%s old_type=%s new_type=%s",
+                    tenant_id, kb_id, old_type, new_type,
+                )
+        except Exception as exc:
+            logger.warning(
+                "compiled schema lookup failed while checking entity type: "
+                "tenant_id=%s kb_id=%s error=%s", tenant_id, kb_id, exc,
+            )
+
+    async def delete_instance(
+        self,
+        tenant_id: str,
+        req: DeleteOntologyInstanceRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
         """删除本体实例（实体）及其关联关系。"""
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
@@ -482,6 +818,15 @@ class OntologyQueryService:
             req.knowledge_base_id,
             req.entity_type,
             req.canonical_name,
+        )
+        _emit_ontology_audit(
+            "delete_ontology_instance",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_INSTANCE.value,
+            resource_id=f"{req.entity_type}/{req.canonical_name}",
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=[],
         )
         return {"deleted": True}
 
@@ -498,28 +843,48 @@ class OntologyQueryService:
 
         Returns:
             dict: {"items": list[dict]} — items 为匹配/默认的实体列表
+
+        Neo4j 不可用时降级为空候选 + degraded 标记，不抛 500。
         """
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
-        if not req.keyword.strip():
-            items, _ = await gdao.list_entities(
+        try:
+            if not req.keyword.strip():
+                items, _ = await gdao.list_entities(
+                    tenant_id,
+                    kb_id=req.knowledge_base_id,
+                    offset=0,
+                    limit=req.limit,
+                    document_id=req.document_id,
+                )
+                return {"items": items}
+            items = await gdao.search_entities(
                 tenant_id,
-                kb_id=req.knowledge_base_id,
-                offset=0,
+                kb_ids=[req.knowledge_base_id],
+                query=req.keyword,
                 limit=req.limit,
-                document_id=req.document_id,
+                doc_id=req.document_id,
             )
             return {"items": items}
-        items = await gdao.search_entities(
-            tenant_id,
-            kb_ids=[req.knowledge_base_id],
-            query=req.keyword,
-            limit=req.limit,
-            doc_id=req.document_id,
-        )
-        return {"items": items}
+        except Exception as e:
+            if not _is_neo4j_down(e):
+                raise
+            logger.warning(
+                "[ontology] 实体搜索降级：Neo4j 不可用 kb=%s err=%s",
+                req.knowledge_base_id, e,
+            )
+            return {
+                "items": [],
+                "degraded": True,
+                "degraded_reason": _DEGRADED_REASON,
+            }
 
-    async def update_relation(self, tenant_id: str, req: UpdateOntologyRelationRequest) -> dict:
+    async def update_relation(
+        self,
+        tenant_id: str,
+        req: UpdateOntologyRelationRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
         """更新本体关系的类型或属性。"""
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
@@ -533,9 +898,31 @@ class OntologyQueryService:
             req.target_canonical_name,
             req.updates,
         )
+        final_relation_type = req.updates.get("relation_type", req.relation_type)
+        changed_fields = sorted(
+            set(req.updates) & {"relation_type", "attributes"}
+        )
+        _emit_ontology_audit(
+            "update_ontology_relation",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_RELATION.value,
+            resource_id=(
+                f"{req.source_entity_type}/{req.source_canonical_name}"
+                f":{final_relation_type}:"
+                f"{req.target_entity_type}/{req.target_canonical_name}"
+            ),
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=changed_fields,
+        )
         return {"updated": True}
 
-    async def delete_relation(self, tenant_id: str, req: DeleteOntologyRelationRequest) -> dict:
+    async def delete_relation(
+        self,
+        tenant_id: str,
+        req: DeleteOntologyRelationRequest,
+        user_id: Optional[str] = None,
+    ) -> dict:
         """删除本体关系（不删除两端实体）。"""
         tenant_id = require_tenant(tenant_id)
         gdao = OntologyGraphRepository(get_neo4j_driver())
@@ -547,5 +934,18 @@ class OntologyQueryService:
             req.relation_type,
             req.target_entity_type,
             req.target_canonical_name,
+        )
+        _emit_ontology_audit(
+            "delete_ontology_relation",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource=ResourceType.ONTOLOGY_RELATION.value,
+            resource_id=(
+                f"{req.source_entity_type}/{req.source_canonical_name}"
+                f":{req.relation_type}:"
+                f"{req.target_entity_type}/{req.target_canonical_name}"
+            ),
+            knowledge_base_id=req.knowledge_base_id,
+            changed_fields=[],
         )
         return {"deleted": True}
