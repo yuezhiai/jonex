@@ -89,7 +89,7 @@ PostgreSQL / Redis / Neo4j / Milvus / etcd / MinIO / Keycloak（SSO，独立仓�
 | `knowledge-base-service` | `8003` | 知识库、文档状态机、RAG 接入、Neo4j 本体图、增强搜索、数据源接入、血缘边（手工 / 文件 / OpenLineage）、结构化数据资产投影与跨模态对齐。 |
 | `atomic-rag` | `8004` | 多模态解析、RAG 任务、LightRAG 调用、`ontology_data` 产出。 |
 | `business-domain-service` | `8005` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
-| `task-center-service` | `8007` | 任务编排（定义 / 版本 / 发版）、触发、任务与子任务调度。**自己不监听任何 HTTP 业务端点**：只收发对内的函数调用，并出站派活给运行方。对前端唯一的入口是 Gateway 的 `/api/v1/task-center/**`（经 Sidecar `/invoke`），共八个：四个只读（任务列表 / 子任务列表 / 任务详情 / 子任务详情，两个详情与各自的列表行同形）加四个写接口（停止任务 / 停止子任务 / 重试任务 / 重试子任务，统一判 `task_center:write`）；删除 / 详情不开。 |
+| `task-center-service` | `8007` | 任务编排（定义 / 版本 / 发版）、触发、任务与子任务调度。**自己不监听任何 HTTP 业务端点**：只收发对内的函数调用，并出站派活给运行方。对前端唯一的入口是 Gateway 的 `/api/v1/task-center/**`（经 Sidecar `/invoke`）：① 任务记录八个 —— 四个只读（任务列表 / 子任务列表 / 任务详情 / 子任务详情，两个详情与各自的列表行同形）加四个写（停止任务 / 停止子任务 / 重试任务 / 重试子任务）；② 任务定义管理（2026-11-18 加）—— `GET/POST /definitions`、`PATCH/DELETE /definitions/{id}`、`POST .../run|copy|publish|disable`、`GET .../versions[/{no}]`、`PUT .../orchestration`、`GET /steps`。所有写接口判 `task_center:write`；定义管理另要求空间管理员（`space_manager` 或租户管理员）。`GET /tasks` 的 `definition_id` 已成**必填**。 |
 | `platform-service` | `8006` | 登录、RBAC、菜单、应用注册、审计、任务。 |
 | `lightrag` | `9621` | 文档索引、RAG 检索、生成、WebUI。 |
 | `neo4j` | `7474`/`7687` dev | 本体 ABox 图存储，承载 `:OntologyEntity` 节点和 `[:ONT_REL]` 边。 |
@@ -258,7 +258,7 @@ capabilities/{capability_name}/
 | `platform` | 登录、用户、角色、权限、菜单、应用、审计、任务调度。 |
 | `business_domain` | 领域空间、领域服务、引擎、适配器、技能、模板。 |
 | `knowledge_base` | 知识库、文档状态机、检索历史、RAG 接入、Neo4j 本体图、增强搜索、数据源接入、血缘边（手工 / 文件 / OpenLineage）、结构化数据资产投影与跨模态对齐。 |
-| `task_center` | 任务编排定义与版本（草稿→发布，发布后不可变）、触发、任务 / 子任务 / 尝试记录（任务的**来源**记在 `tasks.task_source`，取值是协议层 `TASK_SOURCES` 写死枚举 —— 运行方经 `init_task` 发起时必传，平台侧自己触发的任务留空），以及后台派活与超时巡检。是**管理方**：自己不执行任何一步业务动作、自己不监听 HTTP 端点；对浏览器**只经 Gateway `/api/v1/task-center/**` 开八个口子**（四个只读 + 四个写，见上表 `task-center-service` 那一行）。 |
+| `task_center` | 任务编排定义与版本（草稿→发布，发布后不可变；定义本身另有 draft/published/disabled 状态）、触发、任务 / 子任务 / 尝试记录（任务的**来源**记在 `tasks.task_source`，取值是协议层 `TASK_SOURCES` 写死枚举 —— 运行方经 `init_task` 发起时必传，平台侧自己触发的任务留空），以及后台派活、自动重试、超时巡检。是**管理方**：自己不执行任何一步业务动作、自己不监听 HTTP 端点；对浏览器**只经 Gateway `/api/v1/task-center/**` 开口子**（任务记录八个 + 任务定义管理一组，见上表 `task-center-service` 那一行）。 |
 
 ### 4.4 服务间请求头契约（X-Jonex-*）
 
@@ -309,7 +309,7 @@ capabilities/{capability_name}/
 |---|---|
 | `business.knowledge_base.v1` | 知识库业务能力。 |
 | `business.business_domain.v1` | 业务领域能力。 |
-| `business.task_center.v1` | 任务中心能力（编排 / 触发 / 调度）；自己不监听 HTTP 端点，前端只经 Gateway `/api/v1/task-center/**` 的**八条路**（四个只读 —— 任务列表 / 子任务列表 / 任务详情 / 子任务详情，加四个写 —— 停止任务 / 停止子任务 / 重试任务 / 重试子任务）进来。 |
+| `business.task_center.v1` | 任务中心能力（编排 / 触发 / 调度）；自己不监听 HTTP 端点，前端只经 Gateway `/api/v1/task-center/**` 进来：**任务记录八条路**（四个只读 —— 任务列表 / 子任务列表 / 任务详情 / 子任务详情，加四个写 —— 停止任务 / 停止子任务 / 重试任务 / 重试子任务），**加任务定义管理一组**（列表/创建/编辑/删除/执行/复制/版本查询/版本详情/编排保存/发布/停用/步骤清单，2026-11-18 加）。 |
 | `atomic.rag.lightrag.v1` | 基于 LightRAG 的 RAG 原子能力。 |
 
 ### 5.2 能力 SDK
@@ -338,6 +338,10 @@ capabilities/{capability_name}/
 - Neo4j 中使用 `:OntologyEntity` 节点和 `[:ONT_REL]` 关系表达 ABox。
 - 本体图按 `tenant_id`、`knowledge_base_id`、实体类型和规范名称进行隔离与合并。
 - Neo4j 不可用时，知识库能力应降级到普通 RAG，不阻塞文档基础流程和检索能力。
+- 公理（`subClassOf / subPropertyOf` 等）与推理规则分别存 KB 级表 `knowledge_base.ontology_axioms` / `ontology_reasoning_rules`；抽象 schema 的 `axioms` 只作 Studio 往返镜像，读取以公理表为准。
+- 本体动作（抽象 schema get/save/import/merge/快照、公理、规则）由库级 `knowledge_info.ontology_enabled` 控制，独立于 `structured_enabled`；规则推理链另受进程开关 `ONTOLOGY_REASONING_ENABLED` 与库级 `reasoning_enabled` 双重控制。
+- 编译 schema 只存声明；属性继承、`super_types`、端点扩展和约束下放由 `resolve_reasoning_context()` / `expand_compiled_schema()` 在读取时展开，不落库。检索侧层级扩展由 `ONTOLOGY_HIERARCHY_EXPANSION_ENABLED` 控制（默认关）。
+- A 档公理只展示和参与冲突检测，不执行；规则推导只进试跑/推理链，不写回 Neo4j、不进入问答作答。
 
 知识库文档状态机由 `capabilities/knowledge_base/models/document.py` 中的 `DocStatus` 管理：
 

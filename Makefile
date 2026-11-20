@@ -48,6 +48,11 @@ PERF_TAIL ?= 1000
 METERING_RETENTION_DAYS ?= 90
 
 -include $(ENV_FILE)
+# A host-local Wiki runtime file keeps the gateway key out of Git.
+ifneq ($(wildcard deploy/.wiki-runtime/compose.yml),)
+include deploy/.wiki-runtime/settings.env
+include deploy/.wiki-runtime/gateway.env
+endif
 export
 
 DB_HOST ?= 127.0.0.1
@@ -71,11 +76,13 @@ COMPOSE_LOCAL_FILES := $(COMPOSE_FILES)
 ifeq ($(UNAME_S),Darwin)
 COMPOSE_LOCAL_FILES := $(COMPOSE_MAC_FILES)
 endif
-COMPOSE_OVERRIDE_FILES := $(COMPOSE_LOCAL_FILES) -f docker-compose.override.yml
-COMPOSE_DEV_FILES := $(COMPOSE_LOCAL_FILES) -f docker-compose.debug.yml
+WIKI_RUNTIME_FILES := $(if $(wildcard deploy/.wiki-runtime/compose.yml),-f .wiki-runtime/compose.yml,) \
+                     $(if $(wildcard deploy/.wiki-runtime/compile-limits.yml),-f .wiki-runtime/compile-limits.yml,)
+COMPOSE_OVERRIDE_FILES := $(COMPOSE_LOCAL_FILES) -f docker-compose.override.yml $(WIKI_RUNTIME_FILES)
+COMPOSE_DEV_FILES := $(COMPOSE_LOCAL_FILES) -f docker-compose.debug.yml $(WIKI_RUNTIME_FILES)
 
-DOCKER_GPU := cd deploy && $(COMPOSE) $(COMPOSE_GPU_FILES)
-DOCKER_BASE := cd deploy && $(COMPOSE) $(COMPOSE_LOCAL_FILES)
+DOCKER_GPU := cd deploy && $(COMPOSE) $(COMPOSE_GPU_FILES) $(WIKI_RUNTIME_FILES)
+DOCKER_BASE := cd deploy && $(COMPOSE) $(COMPOSE_LOCAL_FILES) $(WIKI_RUNTIME_FILES)
 DOCKER_OVERRIDE := cd deploy && $(COMPOSE) $(COMPOSE_OVERRIDE_FILES)
 DOCKER_DEV := cd deploy && $(COMPOSE) $(COMPOSE_DEV_FILES)
 
@@ -479,7 +486,14 @@ restore-images: ## 用运行中容器找回 <image>:latest 标签（误删 tag �
 # ------------------------------------------------------------
 # Docker 启动/停止
 # ------------------------------------------------------------
-up: ## 启动本地 Docker 部署（加载 override，暴露调试端口）
+.PHONY: wiki-runtime-auto wiki-runtime-setup wiki-check _wiki-up-local _wiki-up-server _wiki-up-gpu _wiki-up-service
+wiki-runtime-auto:
+	@$(PYTHON) deploy/wiki-runtime-ensure.py --prepare-up
+
+up: wiki-runtime-auto ## 启动本地 Docker 部署（加载 override，暴露调试端口）
+	@$(MAKE) --no-print-directory _wiki-up-local
+
+_wiki-up-local:
 	@echo "=== 本地 Docker 部署 ==="
 	$(DOCKER_OVERRIDE) up -d
 	@echo "服务启动中: make ps / make logs"
@@ -487,11 +501,24 @@ up: ## 启动本地 Docker 部署（加载 override，暴露调试端口）
 up-local: up ## 别名: 本地 Docker 部署
 up-detached: up ## 兼容旧命令: 后台启动本地 Docker 部署
 
-up-gpu: ## GPU Docker 部署（Windows/Linux/服务器，需 NVIDIA GPU）
+wiki-runtime-setup: ## 管理员首次准备 Linux Wiki Agent 环境
+	@$(PYTHON) deploy/wiki-runtime-ensure.py --prepare-up --configure-host
+
+wiki-check: ## 检查运行中的 Wiki Agent 沙箱和解析分流
+	docker exec -i jonex-wiki python - < deploy/wiki-agent-preflight.py
+	docker exec jonex-knowledge-base python -c 'from capabilities.knowledge_base.services.ingest_backend import resolve_backend; assert resolve_backend("jonex_wiki", "cos") == "rag"; print("Wiki 解析分流：rag")'
+
+up-gpu: wiki-runtime-auto ## GPU Docker 部署（Windows/Linux/服务器，需 NVIDIA GPU）
+	@$(MAKE) --no-print-directory _wiki-up-gpu
+
+_wiki-up-gpu:
 	@echo "=== GPU Docker 部署 ==="
 	$(DOCKER_GPU) up -d
 
-up-server: ## 服务器/生产部署（不含 GPU，仅 docker-compose.yml）
+up-server: wiki-runtime-auto ## 服务器/生产部署（不含 GPU，仅 docker-compose.yml）
+	@$(MAKE) --no-print-directory _wiki-up-server
+
+_wiki-up-server:
 	@echo "=== 生产 Docker 部署 ==="
 	$(DOCKER_BASE) up -d
 
@@ -650,7 +677,10 @@ rebuild-openkb: ## 重建 openkb 镜像
 	cd deploy && DOCKER_BUILDKIT=1 COMPOSE_BAKE=1 BUILDX_BAKE_ENTITLEMENTS_FS=0 $(COMPOSE) $(COMPOSE_LOCAL_FILES) build --no-cache openkb
 
 # ── jonex-wiki（B1 单容器：引擎 + 能力同进程）──
-up-jonex-wiki: ## 启动 jonex-wiki（引擎 + 能力同容器）
+up-jonex-wiki: wiki-runtime-auto ## 启动 jonex-wiki（引擎 + 能力同容器）
+	@$(MAKE) --no-print-directory _wiki-up-service
+
+_wiki-up-service:
 	$(DOCKER_OVERRIDE) up -d jonex-wiki
 
 logs-jonex-wiki: ## 查看 jonex-wiki 日志

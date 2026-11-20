@@ -18,6 +18,7 @@ uv.lock
 .env
 .env.backup.*
 deploy/.env.rag
+deploy/.wiki-runtime/
 .env.local
 
 # Generated Docker Compose files (output of setup wizard)
@@ -333,3 +334,51 @@ certs/
 /frontends/i18n-status.md
 # —— 发布台账（记录每次同步/发布的改动与 dev 基线，本地保留，不入库）——
 /.release-log/
+# 本机联调临时目录（缓存/日志/pid，不入库）
+.tmp-setup/
+.tmp-swift-cache/
+.tmp*
+
+# workbuddy
+.workbuddy/
+.codebuddy/
+
+# ===== 本地参考克隆（第三方仓库，非平台代码，不打包） =====
+/elasticsearch-fs/
+/flexible-graphrag/
+/sage-wiki/
+
+# ===== Playwright CLI 运行产物 =====
+.playwright-cli/
+**/.playwright-cli/
+
+# ===== 抓包/截图等临时产物 =====
+/_tmp_*.json
+/observe-failures*.png
+/frontends/core-business/nul
+
+# ===== Rag-anything 大体积解析产物（保留 README 与过程文档） =====
+Reference/Rag-anything/mineru_storage/
+Reference/Rag-anything/docs/process/result/document/chunks_response.json
+Reference/Rag-anything/docs/process/result/document/export_response.json
+
+# Local Wiki evaluation artifacts and historical run records
+/financebench-eval/
+/.venv-jw/
+/deploy/vendor/jonex-wiki/
+/docs/engineering/jonex-wiki-financebench-baseline-20261008.md
+/docs/engineering/wiki-baseline-20261007/
+/docs/engineering/wiki-trace-rootfix-20261008/
+
+# reasoner Java runner 构建产物（本地构建，不入库；Docker 构建上下文仍会带上）
+/reasoner/runners/*/target/
+# runner 依赖 jar / Konclude 发行版（构建时由管理员放入，不入库）
+/reasoner/runners/elk-runner/lib/*.jar
+/reasoner/runners/elk-runner/lib/elk-distribution-owlapi-0.6.0/
+# 实验室准备 ELK 依赖时 touch 的“已完成”哨兵（0 字节，无程序依赖）；
+# 从 ontology-reasoner-lab 拷 lib 时会一起带过来，不该出现在 git status 里。
+/reasoner/runners/elk-runner/lib/.done
+/reasoner/runners/konclude/Konclude
+/reasoner/runners/konclude/lib/
+/reasoner/runners/konclude/Configs/
+/reasoner/runners/konclude/Tests/
