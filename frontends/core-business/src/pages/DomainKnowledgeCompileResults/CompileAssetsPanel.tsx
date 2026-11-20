@@ -27,13 +27,27 @@ import WikiColumnBoard from './wiki/WikiColumnBoard';
 import LikeTab from './LikeTab';
 import DislikeTab from './DislikeTab';
 
-const renderTabLabel = (item: TabConfig) => (
-  <Space size={6}>
-    {item.icon}
-    <span>{item.label}</span>
-    {item.count > 0 && <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>{item.count}</span>}
-  </Space>
-);
+// 计数类 tab：Neo4j 降级时后端把这两个数字降为 0，不能当真实值渲染
+const COUNT_TAB_KEYS = ['ontology', 'relation'];
+
+/**
+ * tab 标签。degraded 时计数类 tab 的数字位显示「—」而不是 0——
+ * 布局保持不变，只替换数值本身。
+ */
+const renderTabLabel = (item: TabConfig, degraded = false) => {
+  const showDash = degraded && COUNT_TAB_KEYS.includes(item.key);
+  return (
+    <Space size={6}>
+      {item.icon}
+      <span>{item.label}</span>
+      {showDash ? (
+        <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>—</span>
+      ) : (
+        item.count > 0 && <span style={{ color: 'var(--yx-text-muted)', fontSize: 12 }}>{item.count}</span>
+      )}
+    </Space>
+  );
+};
 
 // 骨架占位数量要对齐真实内容，否则加载完成时会跳变：
 // 子 tab lightrag 4 个、openkb 2 个，占位取 4 覆盖两种
@@ -82,6 +96,9 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
   const [statsError, setStatsError] = useState<string | null>(null);
   // 次要请求（实体类型 / 关系类型）失败：tab 仍可渲染，只降级类型标签与建实例下拉，用横幅提示
   const [typesError, setTypesError] = useState<string | null>(null);
+  // 实体类型 / 关系类型接口返回 degraded=true：Neo4j 不可用，类型仍来自 compiled schema，
+  // 但实例计数不可信。与请求失败共用顶部横幅，文案换成「图谱暂时不可用」。
+  const [typesDegraded, setTypesDegraded] = useState(false);
   const [entityTypes, setEntityTypes] = useState<OntologyInstanceSummary[] | null>(null);
   const [relationTypes, setRelationTypes] = useState<RelationInstanceSummary[] | null>(null);
   const [feedbackStats, setFeedbackStats] = useState<SearchFeedbackStats | null>(null);
@@ -121,6 +138,7 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
     setStatsLoading(true);
     setStatsError(null);
     setTypesError(null);
+    setTypesDegraded(false);
 
     getOntologyStatistics(kbId)
       .then((data) => {
@@ -135,7 +153,10 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
 
     getOntologyEntityTypes(kbId)
       .then((res) => {
-        if (alive) setEntityTypes(res.items.map((item) => ({ ...item, type: item.name })));
+        if (!alive) return;
+        setEntityTypes(res.items.map((item) => ({ ...item, type: item.name })));
+        // 任一类型接口降级即提示；两个请求并发，用 OR 累积避免互相覆盖
+        if (res.degraded) setTypesDegraded(true);
       })
       .catch((err) => {
         if (alive) setTypesError(getErrorMessage(err, t('compile.assets.partialError')));
@@ -143,7 +164,9 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
 
     getOntologyRelationTypes(kbId)
       .then((res) => {
-        if (alive) setRelationTypes(res.items);
+        if (!alive) return;
+        setRelationTypes(res.items);
+        if (res.degraded) setTypesDegraded(true);
       })
       .catch((err) => {
         // 两个次要请求只留第一条错误文案，避免横幅内容来回跳
@@ -177,8 +200,12 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
   // lightrag 的 tab 构建依赖本体统计，统计 404/失败 ⇒ 整页错误态（含重试）。
   // llm-wiki 的 tab 用 wikiStats，统计失败不影响它们，交给子视图各自报错。
   const loadError = !isLlmWiki && !!statsError;
-  // 次要错误横幅：只在 tab 能正常渲染时出现，避免与整页错误叠加
-  const showTypesWarning = !loadError && !isLlmWiki && !!typesError;
+  // 统计接口降级：实例数 / 关系数已被后端置 0，不能当真实值渲染（llm-wiki 不读本体统计）
+  const statsDegraded = !isLlmWiki && statsData?.ontology_degraded === true;
+  // 次要提示横幅：请求失败与 Neo4j 降级共用，只在 tab 能正常渲染时出现，避免与整页错误叠加
+  const showTypesWarning = !loadError && !isLlmWiki && (!!typesError || statsDegraded || typesDegraded);
+  const typesWarningText =
+    statsDegraded || typesDegraded ? t('compile.assets.graphUnavailable') : t('compile.assets.partialError');
   // 一律走「撑满」布局：子视图（表格 / 图谱 / 页面树）都要跟着容器高度自适应，
   // 内容超出时各自内部滚动。原先只有 llm-wiki 撑满、lightrag 依赖外层滚动，
   // 于是同一批子视图在文档级和知识库级两处呈现不一致——现在两边统一走这条链。
@@ -270,7 +297,7 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
                 type="warning"
                 showIcon
                 style={{ marginBottom: 12 }}
-                message={t('compile.assets.partialError')}
+                message={typesWarningText}
                 action={
                   <Button size="small" onClick={retry}>
                     {t('common.retry')}
@@ -286,7 +313,7 @@ export default function CompileAssetsPanel({ kbId, kbType = 'lightrag', wikiStat
               onChange={setActiveTab}
               items={tabs.map((t) => ({
                 key: t.key,
-                label: renderTabLabel(t),
+                label: renderTabLabel(t, statsDegraded),
               }))}
               style={{ flexShrink: 0, ...(isJonexWiki ? { position: 'sticky', top: 0, zIndex: 2, background: '#fff' } as CSSProperties : {}) }}
             />

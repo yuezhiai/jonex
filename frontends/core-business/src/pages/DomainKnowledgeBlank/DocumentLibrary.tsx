@@ -605,7 +605,7 @@ export default function DocumentLibrary({
         <div className="doc-library-table-host" ref={tableHostRef}>
           <CommonTable<ManualDocItem, DocQuery>
             ref={tableRef}
-            className="doc-library-table"
+            className="doc-library-table yx-table-fill"
             filters={[
               {
                 key: 'keyword',

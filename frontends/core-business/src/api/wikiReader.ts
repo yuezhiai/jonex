@@ -24,6 +24,21 @@ import type {
   WikiTopicEdge,
 } from '@/types/domainKnowledge';
 
+export interface WikiArticleBodySearch {
+  revision: string;
+  items: { path: string }[];
+  scanned: number;
+  has_more: boolean;
+  cursor: string | null;
+}
+
+export function searchWikiArticleBodies(kbId: string, options: {
+  query: string; revision?: string; document_id?: string; cursor?: string;
+}): Promise<WikiArticleBodySearch> {
+  return getData(request.post('/knowledge-base/wiki/resources/search_authored_articles', options,
+    { params: { knowledge_base_id: kbId } }));
+}
+
 // ── 后端原始结构（snake_case，不出本文件）──
 
 interface BackendOutlineEntry {
@@ -76,6 +91,7 @@ interface BackendTopicEdge {
 
 interface BackendOutlineView {
   knowledge_base_id: string;
+  bundle_sha?: string | null;
   page_count: number;
   pages: BackendReaderPage[];
   outline: BackendOutline | null;
@@ -183,6 +199,7 @@ function mapReferences(refs: BackendReference[] | undefined): WikiPageReference[
 function mapView(res: BackendOutlineView): WikiOutlineView {
   return {
     knowledgeBaseId: res.knowledge_base_id,
+    bundleSha: res.bundle_sha,
     pageCount: res.page_count || 0,
     pages: mapPages(res.pages),
     outline: mapOutline(res.outline),

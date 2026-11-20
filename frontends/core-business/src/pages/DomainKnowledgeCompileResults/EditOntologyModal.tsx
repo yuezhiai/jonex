@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Form, Modal, Button, Input, Select, message } from 'antd';
+import { Form, Modal, Button, Input, Select, Alert, message } from 'antd';
 import { SaveOutlined, CloseOutlined } from '@ant-design/icons';
 
 interface EditOntologyModalProps {
@@ -25,6 +25,9 @@ interface EditOntologyModalProps {
   onCancel: () => void;
 }
 
+/** 类型下拉里「自定义类型」项的取值，与真实类型名区分 */
+const CUSTOM_TYPE_VALUE = '__custom_type__';
+
 export default function EditOntologyModal({
   open,
   mode = 'edit',
@@ -42,6 +45,9 @@ export default function EditOntologyModal({
   const [attributes, setAttributes] = useState<Record<string, string>>({});
   const [attrKey, setAttrKey] = useState('');
   const [attrValue, setAttrValue] = useState('');
+  // 类型下拉选「自定义类型」后展开的文本输入
+  const [isCustomType, setIsCustomType] = useState(false);
+  const [customType, setCustomType] = useState('');
 
   useEffect(() => {
     if (open) {
@@ -49,12 +55,18 @@ export default function EditOntologyModal({
         form.setFieldsValue({ type: undefined, name: '', description: '' });
         setAliases([]);
         setAttributes({});
+        setIsCustomType(false);
+        setCustomType('');
       } else if (record) {
+        // 当前类型不在编译模式内时直接以自定义类型呈现，便于用户看到覆盖提示
+        const knownType = ontologyOptions.some((opt) => opt.value === record.type);
         form.setFieldsValue({
-          type: record.type,
+          type: knownType ? record.type : CUSTOM_TYPE_VALUE,
           name: record.name,
           description: record.description ?? '',
         });
+        setIsCustomType(!knownType);
+        setCustomType(knownType ? '' : record.type);
         setAliases(record.aliases ?? []);
         setAttributes(
           record.attributes
@@ -68,14 +80,20 @@ export default function EditOntologyModal({
       setAttrKey('');
       setAttrValue('');
     }
+    // ontologyOptions 不进依赖：打开期间异步补全会重置用户已填内容
   }, [open, record, isCreate, form]);
 
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      const type = values.type === CUSTOM_TYPE_VALUE ? customType.trim() : values.type;
+      if (!type) {
+        message.warning(t('common.required'));
+        return;
+      }
       const payload = {
         name: values.name.trim(),
-        type: values.type,
+        type,
         aliases: aliases.length > 0 ? aliases : undefined,
         description: values.description?.trim() || undefined,
         attributes:
@@ -140,14 +158,53 @@ export default function EditOntologyModal({
       styles={{ body: { padding: '24px 24px 12px' } }}
       closeIcon={<CloseOutlined style={{ color: 'var(--yx-text-secondary)' }} />}
     >
-      <Form form={form} layout="vertical">
+      <Form
+        form={form}
+        layout="vertical"
+        onValuesChange={(changed) => {
+          if ('type' in changed) {
+            const nextIsCustom = changed.type === CUSTOM_TYPE_VALUE;
+            setIsCustomType(nextIsCustom);
+            if (!nextIsCustom) setCustomType('');
+          }
+        }}
+      >
+        {!isCreate && (
+          <Alert
+            type="info"
+            showIcon
+            message={t('compile.manualEditScopeHint')}
+            style={{ marginBottom: 16 }}
+          />
+        )}
+
         <Form.Item
           name="type"
           label={t('domainKnowledge.entityType')}
           rules={[{ required: true, message: t('common.required') }]}
         >
-          <Select options={ontologyOptions} placeholder={t('compile.ontologyDefPlaceholder')} size="middle" />
+          <Select
+            options={[...ontologyOptions, { value: CUSTOM_TYPE_VALUE, label: t('compile.customTypeOption') }]}
+            placeholder={t('compile.ontologyDefPlaceholder')}
+            size="middle"
+          />
         </Form.Item>
+
+        {isCustomType && (
+          <div style={{ marginTop: -16, marginBottom: 16 }}>
+            <Input
+              placeholder={t('compile.customTypePlaceholder')}
+              value={customType}
+              onChange={(e) => setCustomType(e.target.value)}
+              size="middle"
+            />
+            {customType.trim() && !ontologyOptions.some((opt) => opt.value === customType.trim()) && (
+              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--yx-warning, #d97706)' }}>
+                {t('compile.customTypeOutsideSchemaHint')}
+              </div>
+            )}
+          </div>
+        )}
 
         <Form.Item
           name="name"

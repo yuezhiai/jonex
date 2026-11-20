@@ -1,6 +1,10 @@
 import { getData, request } from './request';
 import type { WikiSourceImage } from '@/types/domainKnowledge';
 
+const configuredImageTimeout = Number(import.meta.env.VITE_WIKI_IMAGE_INSPECTION_TIMEOUT_MS);
+const imageInspectionTimeout = Number.isFinite(configuredImageTimeout) && configuredImageTimeout > 0
+  ? configuredImageTimeout : 180_000;
+
 export interface WikiImageSearch {
   items: WikiSourceImage[];
   total: number;
@@ -22,10 +26,9 @@ export function findWikiImages(
   },
 ): Promise<WikiImageSearch> {
   return getData(
-    request.post('/knowledge-base/wiki/resources/find_images', {
-      knowledge_base_id: kbId,
-      options: { ...options, limit: options.limit || 12 },
-    }),
+    request.post('/knowledge-base/wiki/resources/find_images',
+      { ...options, limit: options.limit || 12 },
+      { params: { knowledge_base_id: kbId } }),
   );
 }
 
@@ -40,9 +43,8 @@ export function inspectWikiImage(
   result: { observations: string; visible_text: string; uncertainties: string[] };
 }> {
   return getData(
-    request.post('/knowledge-base/wiki/resources/inspect_image', {
-      knowledge_base_id: kbId,
-      options: { revision: image.bundle_sha, document_id: image.document_id, asset_id: image.asset_id, question },
-    }),
+    request.post('/knowledge-base/wiki/resources/inspect_image',
+      { revision: image.bundle_sha, document_id: image.document_id, asset_id: image.asset_id, question },
+      { params: { knowledge_base_id: kbId }, timeout: imageInspectionTimeout }),
   );
 }

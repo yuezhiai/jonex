@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, Button, Popconfirm, Radio, Input, Spin, message, Image, Typography } from 'antd';
+import { Alert, Card, Button, Popconfirm, Radio, Input, Spin, message, Image, Typography } from 'antd';
 import {
   SearchOutlined,
   StopOutlined,
@@ -38,6 +38,7 @@ import RagRecallDrawer, { type RagRecallItem } from './RagRecallDrawer';
 import CitationDrawer from './CitationDrawer';
 import AnswerMarkdown from './AnswerMarkdown';
 import DataBlocksView from './DataBlocksView';
+import { chooseWikiTraceView } from './wikiPresentation';
 import DataLineageView from './DataLineageView';
 import ToolResultsView from './ToolResultsView';
 import PendingActionCard from './PendingActionCard';
@@ -147,7 +148,7 @@ function ImageAssetThumb({
     let alive = true;
     setFailed(false);
     const imageIdx = asset.imageIdx;
-    if (!asset.docId || imageIdx == null) {
+    if (asset.assetId || !asset.docId || imageIdx == null) {
       setSrc(asset.assetUrl);
       return undefined;
     }
@@ -164,7 +165,7 @@ function ImageAssetThumb({
     return () => {
       alive = false;
     };
-  }, [asset.docId, asset.imageIdx, asset.assetExt, asset.assetUrl]);
+  }, [asset.docId, asset.imageIdx, asset.assetId, asset.assetExt, asset.assetUrl]);
   const size = compact ? 72 : 96;
   return (
     <div
@@ -1109,7 +1110,6 @@ export default function SessionCard({
   // 真表格（SQL 折叠可见），正文再贴一遍就是重复 —— 切掉，只留总结。
   const responseBody = stripDataReference(parsedBody, Boolean(session.dataBlocks?.length));
   const running = isSearchRunning(session.status);
-  const isWiki = session.wiki || session.source === 'jonex_wiki' || session.references?.some((ref) => !!ref.query_id);
   const wikiKbNames = [...new Set((session.references ?? []).map((ref) => ref.kb_name || ref.kb_id).filter(Boolean))].join('、');
   const hasThink = parsedAnswer.think.length > 0;
   const hasAnswerContent = responseBody.length > 0;
@@ -1130,6 +1130,14 @@ export default function SessionCard({
       Array.isArray(detail.calls) ? (detail.calls as WikiChainCall[]) : []);
     return buildWikiTrace(session.wikiProgress?.length ? session.wikiProgress : storedEvents, calls);
   }, [session.wikiProgress, session.reasoning]);
+  // 是否用 WikiTrace 替代通用推理链（判定规则见 chooseWikiTraceView）：
+  // 混合检索即使引用里带 wiki 的 query_id，也必须展示完整 reasoning.steps。
+  const isWiki = chooseWikiTraceView({
+    wikiSession: session.wiki,
+    source: session.source,
+    hasWikiEvidence: (session.references ?? []).some((ref) => !!ref.query_id),
+    wikiTraceStepCount: wikiTraceSteps.length,
+  });
   // 轨迹里的页面路径如果命中某条引用的 wiki_path，点它就能直接打开原文
   const openWikiPath = React.useCallback((path: string) => {
     const ref = (session.references ?? []).find((item) => item.wiki_path === path);
@@ -1593,6 +1601,16 @@ export default function SessionCard({
                 {isWiki ? wikiKbNames : t('knowledgeSearch.knowledgeAnalysis', { domain: domainName })}
               </span>
             </div>
+            {session.queryOutcomes?.some((item) => item.incomplete) && (
+              <Alert type="warning" showIcon style={{ marginBottom: 12 }}
+                message={t('knowledgeSearch.wikiIncomplete')}
+                description={<div>{(session.queryOutcomes || []).filter((item) => item.incomplete).map((item) => (
+                  <div key={item.kb_id}>
+                    {item.incomplete_reason && <div>{item.incomplete_reason}</div>}
+                    {item.recovery_notes && <div>{item.recovery_notes}</div>}
+                  </div>
+                ))}</div>} />
+            )}
             {isWiki ? <WikiAnswerContent content={responseBody} referenceCount={referenceCount}
               activeIndex={activeCitationIndex} onCitation={setActiveCitationIndex} />
             : <div style={{ fontSize: 15, color: 'var(--yx-text-body)', lineHeight: 1.85 }}>

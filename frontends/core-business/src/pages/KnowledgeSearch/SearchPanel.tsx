@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Select, Button, Switch, InputNumber, Divider, Dropdown, Modal, Radio, Tooltip, Upload } from 'antd';
+import { Select, Button, Switch, InputNumber, Divider, Dropdown, Modal, Tooltip, Upload } from 'antd';
 import { SettingOutlined, DownOutlined, PictureOutlined, CloseOutlined } from '@ant-design/icons';
 import TelegramFilled from '@/components/TelegramFilled';
 import { Sender } from '@ant-design/x';
 import classNames from 'classnames';
-import type { AttachedImage, KnowledgeSearchDomain, KnowledgeSearchStrictConfig, KnowledgeSearchUiMode, WikiThinkingMode } from '@/types/knowledgeSearch';
+import type { AttachedImage, KnowledgeSearchDomain, KnowledgeSearchStrictConfig, KnowledgeSearchUiMode } from '@/types/knowledgeSearch';
 import { DEFAULT_FAST_STRICT_CONFIG, DEFAULT_DEEP_STRICT_CONFIG } from '@/api/knowledgeSearch';
 import { canSubmitSearch } from './searchPanelUtils';
 import styles from './SearchPanel.module.scss';
@@ -14,13 +14,10 @@ import styles from './SearchPanel.module.scss';
 export const MODE_META: { mode: KnowledgeSearchUiMode; labelKey: string; descKey: string; configurable: boolean }[] = [
   { mode: 'fast', labelKey: 'knowledgeSearch.fastSearch', descKey: 'knowledgeSearch.fastSearchDesc', configurable: true },
   { mode: 'deep', labelKey: 'knowledgeSearch.deepSearch', descKey: 'knowledgeSearch.deepSearchDesc', configurable: true },
-  { mode: 'wiki', labelKey: 'knowledgeSearch.wikiSearch', descKey: 'knowledgeSearch.wikiSearchDesc', configurable: true },
+  { mode: 'wiki', labelKey: 'knowledgeSearch.wikiSearch', descKey: 'knowledgeSearch.wikiSearchDesc', configurable: false },
   { mode: 'ontologyData', labelKey: 'knowledgeSearch.ontologyDataSearch', descKey: 'knowledgeSearch.ontologyDataSearchDesc', configurable: true },
   { mode: 'data', labelKey: 'knowledgeSearch.dataSearch', descKey: 'knowledgeSearch.dataSearchDesc', configurable: true },
 ];
-
-const WIKI_THINKING_ICONS: Record<WikiThinkingMode, string> = { fast: '⚡', standard: '◐', deep: '✦' };
-const WIKI_THINKING_MODES: WikiThinkingMode[] = ['fast', 'standard', 'deep'];
 
 export const DEFAULT_CONFIG_BY_MODE: Record<Exclude<KnowledgeSearchUiMode, 'wiki'>, KnowledgeSearchStrictConfig> = {
   fast: DEFAULT_FAST_STRICT_CONFIG,
@@ -37,8 +34,6 @@ interface SearchPanelProps {
   /** 检索模式：快速 / 深度 / Wiki / 本体 + 数据 / 数据检索（Wiki 走 /search/jonex_wiki 专用端点） */
   searchMode: KnowledgeSearchUiMode;
   onSearchModeChange: (mode: KnowledgeSearchUiMode) => void;
-  wikiThinkingMode: WikiThinkingMode;
-  onWikiThinkingModeChange: (mode: WikiThinkingMode) => void;
   /** 严格模式配置 */
   strictConfig: KnowledgeSearchStrictConfig;
   onStrictConfigChange: (config: KnowledgeSearchStrictConfig) => void;
@@ -82,8 +77,6 @@ export default function SearchPanel({
   isSearching,
   searchMode,
   onSearchModeChange,
-  wikiThinkingMode,
-  onWikiThinkingModeChange,
   onStrictConfigChange,
   onDomainChange,
   onQueryChange,
@@ -103,13 +96,12 @@ export default function SearchPanel({
   const [modeConfigs, setModeConfigs] =
     useState<Record<Exclude<KnowledgeSearchUiMode, 'wiki'>, KnowledgeSearchStrictConfig>>(DEFAULT_CONFIG_BY_MODE);
   const [modalOpen, setModalOpen] = useState(false);
-  const [editingMode, setEditingMode] = useState<KnowledgeSearchUiMode>('fast');
+  const [editingMode, setEditingMode] = useState<Exclude<KnowledgeSearchUiMode, 'wiki'>>('fast');
   const [draftConfig, setDraftConfig] = useState<KnowledgeSearchStrictConfig>(DEFAULT_FAST_STRICT_CONFIG);
   const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [draftWikiThinking, setDraftWikiThinking] = useState<WikiThinkingMode>(wikiThinkingMode);
 
   const activeMeta = MODE_META.find((m) => m.mode === searchMode) ?? MODE_META[0];
-  const activeModeLabel = t(activeMeta.labelKey) + (searchMode === 'wiki' ? ` ${WIKI_THINKING_ICONS[wikiThinkingMode]}` : '');
+  const activeModeLabel = t(activeMeta.labelKey);
   const editingMeta = MODE_META.find((m) => m.mode === editingMode) ?? MODE_META[0];
   const editingModeLabel = t(editingMeta.labelKey);
 
@@ -123,20 +115,14 @@ export default function SearchPanel({
     setDropdownOpen(false);
   };
 
-  const openConfigModal = (mode: KnowledgeSearchUiMode) => {
+  const openConfigModal = (mode: Exclude<KnowledgeSearchUiMode, 'wiki'>) => {
     setEditingMode(mode);
-    if (mode !== 'wiki') setDraftConfig(modeConfigs[mode]);
-    setDraftWikiThinking(wikiThinkingMode);
+    setDraftConfig(modeConfigs[mode]);
     setModalOpen(true);
     setDropdownOpen(false);
   };
 
   const saveConfig = () => {
-    if (editingMode === 'wiki') {
-      onWikiThinkingModeChange(draftWikiThinking);
-      setModalOpen(false);
-      return;
-    }
     setModeConfigs((prev) => ({ ...prev, [editingMode]: draftConfig }));
     if (editingMode === searchMode) {
       onStrictConfigChange(draftConfig);
@@ -161,7 +147,7 @@ export default function SearchPanel({
               onClick={() => switchMode(item.mode)}
             >
               <div className={styles.modeOptionContent}>
-                <div className={styles.modeOptionTitle}>{t(item.labelKey)}{item.mode === 'wiki' && ` ${WIKI_THINKING_ICONS[wikiThinkingMode]}`}</div>
+                <div className={styles.modeOptionTitle}>{t(item.labelKey)}</div>
                 <div className={styles.modeOptionDesc}>{t(item.descKey)}</div>
               </div>
             </Button>
@@ -173,9 +159,9 @@ export default function SearchPanel({
                 className={styles.modeOptionSetting}
                 onClick={(e) => {
                   e.stopPropagation();
-                  openConfigModal(item.mode);
+                  if (item.mode !== 'wiki') openConfigModal(item.mode);
                 }}
-                title={t(item.mode === 'wiki' ? 'knowledgeSearch.wikiThinkingTitle' : 'knowledgeSearch.strictConfigTitle')}
+                title={t('knowledgeSearch.strictConfigTitle')}
               />
             )}
           </div>
@@ -319,7 +305,7 @@ export default function SearchPanel({
       />
 
       <Modal
-        title={`${editingModeLabel} · ${t(editingMode === 'wiki' ? 'knowledgeSearch.wikiThinkingTitle' : 'knowledgeSearch.strictConfigTitle')}`}
+        title={`${editingModeLabel} · ${t('knowledgeSearch.strictConfigTitle')}`}
         open={modalOpen}
         onOk={saveConfig}
         onCancel={() => setModalOpen(false)}
@@ -327,16 +313,6 @@ export default function SearchPanel({
         cancelText={t('knowledgeSearch.cancel')}
         width={560}
       >
-        {editingMode === 'wiki' ? (
-          <Radio.Group value={draftWikiThinking} onChange={(event) => setDraftWikiThinking(event.target.value)} style={{ width: '100%' }}>
-            {WIKI_THINKING_MODES.map((mode) => (
-              <div key={mode} style={{ padding: '12px 0' }}>
-                <Radio value={mode}>{WIKI_THINKING_ICONS[mode]} {mode === 'fast' ? 'Fast' : mode === 'standard' ? 'Standard' : 'Deep'}</Radio>
-                <div className={styles.configFieldDesc} style={{ marginLeft: 24, marginTop: 6 }}>{t(`knowledgeSearch.wikiThinking${mode[0].toUpperCase()}${mode.slice(1)}Desc`)}</div>
-              </div>
-            ))}
-          </Radio.Group>
-        ) : (<>
         <div className={styles.configIntro}>{t('knowledgeSearch.strictConfigDescription')}</div>
         <div className={styles.configForm}>
           <ConfigField
@@ -418,7 +394,6 @@ export default function SearchPanel({
             </>
           )}
         </div>
-        </>)}
       </Modal>
       </div>
     </div>

@@ -96,6 +96,8 @@ interface RawKnowledgeSearchHistoryItem {
     domain_id?: string;
     domainId?: string;
     strict_config?: KnowledgeSearchStrictConfig | null;
+    query_outcomes?: KnowledgeSearchHistoryItem['queryOutcomes'];
+    thinking_mode?: KnowledgeSearchHistoryItem['wikiThinkingMode'];
     /** [jonex] 以图问知识：用户原话（`query` 存的是识别产出的检索文本） */
     image_question?: string;
     /** 动作提案卡片 / 工具摘要 / 服务端回写的执行结果 */
@@ -175,6 +177,9 @@ function normalizeHistoryItem(item: RawKnowledgeSearchHistoryItem): KnowledgeSea
     answer: item.answer,
     references: item.references,
     reasoning: item.reasoning,
+    queryOutcomes: metadata.query_outcomes,
+    wikiThinkingMode: metadata.thinking_mode,
+    wiki: metadata.pipeline === 'jonex_wiki',
     strictConfig: metadata.pipeline === 'jonex_wiki' ? undefined : item.strictConfig ?? (metadata.strict_config as KnowledgeSearchStrictConfig | null | undefined),
     // [jonex] 以图问知识：缺字段时给空数组（调用方不必判 undefined）
     queryImages: (item.query_images ?? []).map((image) => ({
@@ -588,9 +593,6 @@ export async function streamKnowledgeSearch(
     ...(!wikiStream ? { mode: normalized.mode, top_k: normalized.topK } : {}),
     with_reasoning: true,
   };
-  if (endpoint === '/knowledge-base/search/jonex_wiki') {
-    body.thinking_mode = params.wikiThinkingMode ?? 'fast';
-  }
   if (params.queryImageIds?.length && (wikiStream || endpoint === '/knowledge-base/search/mix')) {
     body.query_image_ids = params.queryImageIds;
     body.image_question = params.imageQuestion || undefined;
@@ -646,27 +648,10 @@ export async function streamKnowledgeSearch(
 
   try {
     if (wikiStream) {
-      let sessionId = '';
-      let completed = false;
-      let cancellation: Promise<unknown> | undefined;
-      const stop = () => {
-        if (!sessionId) return;
-        cancellation ??= fetch(new URL(`${baseUrl}${endpoint}/cancel`, window.location.origin).toString(), {
-          method: 'POST', keepalive: true,
-          headers: { ...fetchHeaders(token), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId }),
-        }).catch(() => undefined);
-        return cancellation;
-      };
-      signal?.addEventListener('abort', stop, { once: true });
-      try {
-        await consumeWikiSearchStream(response, { ...handlers,
-          onDone: (meta) => { completed = true; handlers.onDone?.(meta); },
-        }, (id) => { sessionId = id; if (signal?.aborted) void stop(); });
-      } finally {
-        signal?.removeEventListener('abort', stop);
-        if (!completed) await stop();
-      }
+      // [jonex] 断开连接 ≠ 取消检索：这里被 abort 只表示「本地不再读流」，后台任务由
+      // 能力服务继续执行（进度/结果在 Redis，凭 session_id 可恢复）。真正的终止只由
+      // 用户点「停止」显式调用 cancelWikiSearch。
+      await consumeWikiSearchStream(response, handlers, (id) => handlers.onSession?.(id));
       return;
     }
     const result = await response.json();
@@ -681,6 +666,8 @@ export async function streamKnowledgeSearch(
     const meta = {
       source: result.data.source,
       references: result.data.references ?? [],
+      incomplete: result.data.incomplete ?? null,
+      query_outcomes: result.data.query_outcomes ?? [],
       reasoning: result.data.reasoning ?? null,
       rag_used: result.data.rag_used,
       // [jonex] answer-feedback 锚点：后端检索响应下发检索历史记录 id
@@ -725,6 +712,64 @@ export async function streamKnowledgeSearch(
   } catch (error) {
     if (signal?.aborted) return;
     handlers.onError?.(error instanceof Error ? error : new Error('Knowledge search failed, please retry'));
+  }
+}
+
+/**
+ * 用户主动停止一次 Wiki 检索。
+ *
+ * 这是**唯一**会终止后台任务的入口：离开页面、刷新、连接断开都只是停止本地读流。
+ */
+export async function cancelWikiSearch(sessionId: string): Promise<void> {
+  const token = readAccessToken();
+  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || '/api/v1';
+  await fetch(new URL(`${baseUrl}/knowledge-base/search/jonex_wiki/cancel`, window.location.origin).toString(), {
+    method: 'POST',
+    keepalive: true,
+    headers: { ...fetchHeaders(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId }),
+  }).catch(() => undefined);
+}
+
+/**
+ * 按 session_id 重新订阅一次 Wiki 检索。
+ *
+ * 用于刷新 / 离开页面回来后接着看进度与最终答案；不重新发起检索。
+ * 会话失效（过期或不属于本人）时后端下发 `event: error`，由 handlers.onError 收口。
+ */
+export async function resumeWikiSearchStream(
+  sessionId: string,
+  handlers: KnowledgeSearchStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = readAccessToken();
+  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || '/api/v1';
+  const url = new URL(
+    `${baseUrl}/knowledge-base/search/jonex_wiki/sessions/${encodeURIComponent(sessionId)}/stream`,
+    window.location.origin,
+  );
+  const response = await fetch(url.toString(), {
+    method: 'POST',
+    headers: { ...fetchHeaders(token), 'Content-Type': 'application/json' },
+    body: '{}',
+    signal,
+  });
+
+  if (response.status === 401) {
+    handlers.onError?.(new Error('Session expired, please log in again'));
+    return;
+  }
+
+  if (!response.ok) {
+    const failure = await response.json().catch(() => null);
+    throw new Error(failure?.message || failure?.detail || `Search resume failed: ${response.status}`);
+  }
+
+  try {
+    await consumeWikiSearchStream(response, handlers);
+  } catch (error) {
+    if (signal?.aborted) return;
+    handlers.onError?.(error instanceof Error ? error : new Error('Knowledge search resume failed'));
   }
 }
 

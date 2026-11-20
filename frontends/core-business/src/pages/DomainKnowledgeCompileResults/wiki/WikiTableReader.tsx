@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Empty, Select, Tabs } from 'antd';
+import { Alert, Button, Empty, Modal, Select, Spin, Tabs } from 'antd';
 import { useTranslation } from 'react-i18next';
+import { lookupWikiRecords } from '@/api/wikiResources';
 import type { WikiTableData, WikiTableRecord } from '@/types/domainKnowledge';
 import './WikiTableReader.scss';
 
@@ -8,8 +9,8 @@ type Entry = WikiTableRecord & { sheetId: string; sheetName: string; tableId: st
 type Mode = 'date' | 'group' | 'raw';
 
 /** The display angles never own a second copy of the facts. */
-export default function WikiTableReader({ data, fileName, onOpenSource }: {
-  data: WikiTableData; fileName: string; onOpenSource: () => void;
+export default function WikiTableReader({ kbId, data, fileName, onOpenSource }: {
+  kbId: string; data: WikiTableData; fileName: string; onOpenSource: () => void;
 }) {
   const { t } = useTranslation();
   const tr = (key: string) => t(`wikiTableReading.${key}`);
@@ -20,6 +21,13 @@ export default function WikiTableReader({ data, fileName, onOpenSource }: {
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<Entry | null>(null);
   const [coordinate, setCoordinate] = useState('');
+  const [pagedOpen, setPagedOpen] = useState(false);
+  const [pagedTable, setPagedTable] = useState(data.selected_table_id);
+  const [cursors, setCursors] = useState<string[]>(['']);
+  const [pageIndex, setPageIndex] = useState(0);
+  const [paged, setPaged] = useState<Awaited<ReturnType<typeof lookupWikiRecords>> | null>(null);
+  const [pagedLoading, setPagedLoading] = useState(false);
+  const [pagedError, setPagedError] = useState('');
   const container = useRef<HTMLDivElement>(null);
   const sheets = useMemo(() => data.sheets.filter(s => !sheetId || s.sheet_id === sheetId), [data, sheetId]);
   const tables = useMemo(() => sheets.flatMap(sheet => sheet.tables.map(table => ({ ...table, sheet }))), [sheets]);
@@ -59,6 +67,18 @@ export default function WikiTableReader({ data, fileName, onOpenSource }: {
     if (selected) { setSheetId(selected.sheetId); setCoordinate(selected.coordinate); }
     setMode('raw');
   };
+  useEffect(() => {
+    if (!pagedOpen || !pagedTable) return;
+    let active = true;
+    setPagedLoading(true);
+    setPagedError('');
+    lookupWikiRecords(kbId, { revision: data.revision, table_id: pagedTable,
+      cursor: cursors[pageIndex], limit: 50, include_hidden: true })
+      .then(result => { if (active) setPaged(result); })
+      .catch(error => { if (active) { setPaged(null); setPagedError(error instanceof Error ? error.message : tr('pageFailed')); } })
+      .finally(() => { if (active) setPagedLoading(false); });
+    return () => { active = false; };
+  }, [pagedOpen, pagedTable, cursors, pageIndex, kbId, data.revision]);
   const chooseSheet = (value: string) => { setSheetId(value); setFilters({}); setSelected(null); setCoordinate(''); };
   return <div className="wiki-table-reader" ref={container}>
     <Tabs activeKey={activeMode} onChange={key => setMode(key as Mode)} items={[
@@ -80,6 +100,7 @@ export default function WikiTableReader({ data, fileName, onOpenSource }: {
     {context.length > 0 && <Alert type="info" title={context.join(' · ')} />}
     {tables.some(table => table.date_inferred) && <Alert type="warning" showIcon title={tr('inferredDate')} />}
     {(!data.complete || tables.some(table => !table.complete)) && <Alert type="info" showIcon title={tr('partial')} />}
+    {(!data.complete || tables.some(table => !table.complete)) && <Button onClick={() => setPagedOpen(true)}>{tr('pagedTable')}</Button>}
     <div className="wiki-table-reader__layout">
       <div className="wiki-table-reader__content">
         {activeMode === 'raw' ? tables.map(table => <section key={table.table_id}>
@@ -117,5 +138,26 @@ export default function WikiTableReader({ data, fileName, onOpenSource }: {
         <p className="wiki-table-reader__hint">{tr('sourceLabels')}</p>
       </aside>
     </div>
+    <Modal open={pagedOpen} width="90%" title={tr('pagedTable')} onCancel={() => setPagedOpen(false)}
+      footer={<><Button disabled={pagedLoading || pageIndex === 0} onClick={() => setPageIndex(pageIndex - 1)}>{tr('previousPage')}</Button>
+        <span>{t('wikiTableReading.pageNumber', { page: pageIndex + 1 })}</span>
+        <Button disabled={pagedLoading || !paged?.has_more || !paged.next_cursor} onClick={() => {
+          setCursors([...cursors.slice(0, pageIndex + 1), paged!.next_cursor!]); setPageIndex(pageIndex + 1);
+        }}>{tr('nextPage')}</Button></>}>
+      <Select value={pagedTable} onChange={(id) => { setPagedTable(id); setCursors(['']); setPageIndex(0); setPaged(null); }}
+        options={[...new Set([data.selected_table_id, ...data.sheets.flatMap(sheet => sheet.tables.map(table => table.table_id))])]
+          .map(id => ({ value: id, label: data.sheets.flatMap(sheet => sheet.tables).find(table => table.table_id === id)?.title || id }))} />
+      {pagedError && <Alert type="warning" showIcon title={tr('pageFailed')} description={pagedError} />}
+      <Spin spinning={pagedLoading}>
+        {paged && <div className="wiki-table-reader__grid"><table><thead><tr><th>{tr('row')}</th>
+          {paged.fields.map((field, index) => <th key={index}>{String(field.label || field.field_id || index + 1)}</th>)}
+        </tr></thead><tbody>{paged.records.map(record => <tr key={record.row_id}><th>{record.row_id}</th>
+          {paged.fields.map((field, index) => { const cell = record.cells.find(c => c.column_index === Number(field.column_index));
+            const value = cell?.formula && cell.cached_value == null ? tr('unresolvedFormula')
+              : cell?.normalized_value ?? cell?.effective_value ?? cell?.raw_value ?? '';
+            return <td key={index} title={cell?.coordinate || ''}>{value || '—'}</td>; })}
+        </tr>)}</tbody></table></div>}
+      </Spin>
+    </Modal>
   </div>;
 }

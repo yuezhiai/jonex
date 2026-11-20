@@ -14,7 +14,7 @@
  */
 import type { WikiProgressEvent } from '@/types/knowledgeSearch';
 
-export type WikiTraceKind = 'search' | 'read' | 'table' | 'plan' | 'synthesis';
+export type WikiTraceKind = 'search' | 'read' | 'table' | 'plan' | 'synthesis' | 'command';
 
 export interface WikiTracePreview {
   title?: string;
@@ -35,6 +35,8 @@ export interface WikiTraceStep {
   /** 起始时刻（epoch ms）：运行中的步骤用它算自己的耗时，而不是整次检索的总时长 */
   startedAtMs?: number;
   /** 步骤输入 */
+  input?: string;
+  output?: string;
   query?: string;
   tableId?: string;
   operation?: string;
@@ -60,12 +62,15 @@ export interface WikiTraceStep {
   cached: boolean;
   /** 引擎原始 title（英文），动作名缺失时兜底展示 */
   title?: string;
+  lifecycle?: WikiProgressEvent['status'];
+  resourceKind?: 'article' | 'source' | 'table';
 }
 
 /** 只有这三种事件算「链路步骤」，其余是心跳/控制事件 */
 const STEP_TYPES = new Set(['tool', 'model', 'synthesis']);
 
 function kindOf(tool: string, type?: string): WikiTraceKind {
+  if (tool === 'agent_command') return 'command';
   if (tool === 'image_find') return 'search';
   if (tool.startsWith('table_')) return 'table';
   if (tool.includes('search')) return 'search';
@@ -158,9 +163,11 @@ export function traceFromEvents(events: readonly WikiProgressEvent[]): WikiTrace
   const ordered = [...libraries.values()].flatMap((group) => group.sort((a, b) => a.seq - b.seq));
   for (const event of ordered) {
     const tool = event.tool ?? '';
-    const key = `${event.kb_id ?? ''}:${tool || event.type}`;
+    const key = `${event.kb_id ?? ''}:${event.operation_id || tool || event.type}`;
     const details = event.details ?? {};
-    const finished = typeof event.duration_ms === 'number';
+    const finished = (event.status != null && event.status !== 'running') ||
+      typeof event.duration_ms === 'number' ||
+      (tool.startsWith('agent_') && typeof event.title === 'string' && event.title.endsWith('已结束'));
     const summary = parseResultSummary(typeof event.result_summary === 'string' ? event.result_summary : undefined);
     const step: WikiTraceStep = {
       id: `${key}:${event.seq}:${steps.length}`,
@@ -171,6 +178,8 @@ export function traceFromEvents(events: readonly WikiProgressEvent[]): WikiTrace
       done: finished,
       durationMs: finished ? (event.duration_ms as number) : undefined,
       startedAtMs: startedAtOf(event.started_at),
+      input: typeof details.input === 'string' ? details.input : undefined,
+      output: typeof details.output === 'string' ? details.output : undefined,
       query: typeof details.query === 'string' ? details.query : undefined,
       tableId: typeof details.table_id === 'string' ? details.table_id : undefined,
       operation: typeof details.operation === 'string' ? details.operation : undefined,
@@ -189,6 +198,8 @@ export function traceFromEvents(events: readonly WikiProgressEvent[]): WikiTrace
       succeeded: summary.success,
       cached: false,
       title: event.title,
+      lifecycle: event.status,
+      resourceKind: details.resource_kind,
     };
     const index = pending.get(key);
     if (finished && index != null && !steps[index].done) {
@@ -199,6 +210,8 @@ export function traceFromEvents(events: readonly WikiProgressEvent[]): WikiTrace
         done: true,
         durationMs: step.durationMs,
         startedAtMs: start.startedAtMs ?? step.startedAtMs,
+        input: step.input ?? start.input,
+        output: step.output ?? start.output,
         query: step.query ?? start.query,
         tableId: step.tableId ?? start.tableId,
         operation: step.operation ?? start.operation,
@@ -216,6 +229,8 @@ export function traceFromEvents(events: readonly WikiProgressEvent[]): WikiTrace
         hasMore: summary.hasMore ?? start.hasMore,
         status: summary.status ?? start.status,
         succeeded: summary.success ?? start.succeeded,
+        lifecycle: step.lifecycle ?? start.lifecycle,
+        resourceKind: step.resourceKind ?? start.resourceKind,
       };
       pending.delete(key);
     } else {
@@ -376,10 +391,6 @@ export function runningStep(steps: readonly WikiTraceStep[]): WikiTraceStep | un
     if (!steps[i].done) return steps[i];
   }
   return undefined;
-}
-
-export function totalDurationMs(steps: readonly WikiTraceStep[]): number {
-  return steps.reduce((sum, step) => sum + (step.durationMs ?? 0), 0);
 }
 
 // 耗时格式化只有一份实现：ReasoningCard.tsx 的 fmtTraceMs（两条链共用）。

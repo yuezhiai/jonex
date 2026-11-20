@@ -45,6 +45,7 @@ import { getAbstractSchema } from '@/api/abstractSchema';
 import OntologyObjectSection from './OntologyObjectSection';
 import OntologyRelationSection from './OntologyRelationSection';
 import OntologyConstraintSection from './OntologyConstraintSection';
+import AxiomTab from '../axioms/AxiomTab';
 import CompileStepSection from './CompileStepSection';
 import EngineBasicSection from './EngineBasicSection';
 import ObjectFormModal from './ObjectFormModal';
@@ -631,6 +632,13 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         />
       ),
     },
+    {
+      // 公理是 KB 级结构声明，不属于 compiled schema 行；放在编译配置的
+      // 子页签里只读展示 + 状态启停，与概念对齐模式无关。
+      key: 'axioms',
+      label: t('compile.tabAxioms'),
+      children: <AxiomTab kbId={kbId} canWrite={canWrite} />,
+    },
   ];
 
   return (
@@ -663,32 +671,36 @@ export default function CompileTab({ kbId, canWrite = false }: Props) {
         tabBarExtraContent={{
           right: (
             <div style={{ display: 'flex', gap: 8 }}>
-              <Button
-                type="primary"
-                icon={<PlusOutlined />}
-                style={{ fontSize: 13 }}
-                disabled={!canWrite}
-                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
-                onClick={activeActions.onCreate}
-              >
-                {activeActions.createLabel}
-              </Button>
-              <Button
-                icon={<ImportOutlined />}
-                style={{ fontSize: 13 }}
-                disabled={!canWrite}
-                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
-                onClick={activeActions.onImport}
-              >
-                {activeActions.importLabel}
-              </Button>
-              <Button
-                disabled={!canWrite}
-                title={canWrite ? undefined : t('domainSpace.noManagePermission')}
-                onClick={() => setBindModalOpen(true)}
-              >
-                {t('compile.binding.button')}
-              </Button>
+              {activeSubTab !== 'axioms' ? (
+                <>
+                  <Button
+                    type="primary"
+                    icon={<PlusOutlined />}
+                    style={{ fontSize: 13 }}
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                    onClick={activeActions.onCreate}
+                  >
+                    {activeActions.createLabel}
+                  </Button>
+                  <Button
+                    icon={<ImportOutlined />}
+                    style={{ fontSize: 13 }}
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                    onClick={activeActions.onImport}
+                  >
+                    {activeActions.importLabel}
+                  </Button>
+                  <Button
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : t('domainSpace.noManagePermission')}
+                    onClick={() => setBindModalOpen(true)}
+                  >
+                    {t('compile.binding.button')}
+                  </Button>
+                </>
+              ) : null}
               <Button icon={<span>&#x1F4E4;</span>} loading={yamlExporting} onClick={handleExportYaml}>
                 {t('compile.exportYaml')}
               </Button>

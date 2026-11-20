@@ -73,6 +73,9 @@ export interface KnowledgeSearchHistoryItem {
   references?: KnowledgeReference[];
   /** [jonex] 历史快照：推理链（ReasoningTrace），点击历史直接展示推理过程 */
   reasoning?: ReasoningTrace | null;
+  queryOutcomes?: KnowledgeSearchStreamMeta['query_outcomes'];
+  wikiThinkingMode?: 'fast' | 'standard' | 'deep';
+  wiki?: boolean;
   /** [jonex] 检索条件快照：严格模式配置（再次搜索时复用当时条件） */
   strictConfig?: KnowledgeSearchStrictConfig | null;
   /**
@@ -230,8 +233,6 @@ export interface KnowledgeSearchStrictConfig {
   allow_common_sense: boolean;
 }
 
-export type WikiThinkingMode = 'fast' | 'standard' | 'deep';
-
 export interface KnowledgeSearchStreamParams {
   query: string;
   queryImageIds?: string[];
@@ -261,7 +262,6 @@ export interface KnowledgeSearchStreamParams {
    * 该端点拒绝异管线知识库，调用方需先把 kbIds 收敛为 kb_type=jonex_wiki 的库。
    */
   wiki?: boolean;
-  wikiThinkingMode?: WikiThinkingMode;
   /** 严格模式配置（缺省时后端使用默认值） */
   strictConfig?: KnowledgeSearchStrictConfig;
   /**
@@ -455,6 +455,19 @@ export interface DataLineageBlock {
 
 export interface KnowledgeSearchStreamMeta {
   source?: string;
+  /** null/undefined means the engine did not report completion. */
+  incomplete?: boolean | null;
+  query_outcomes?: Array<{
+    kb_id: string;
+    incomplete?: boolean | null;
+    stop_reason?: string | null;
+    failure_class?: string | null;
+    incomplete_reason?: string | null;
+    recovery_notes?: string | null;
+    unverified_citations?: Array<{ bundle_path: string; locator: string; status: 'unverified' }>;
+    token_usage?: Record<string, number>;
+    full_table_ids?: string[];
+  }>;
   references?: KnowledgeReference[];
   reasoning?: ReasoningTrace | null;
   rag_used?: boolean;
@@ -501,6 +514,9 @@ export interface WikiProgressEvent {
   type?: string;
   title?: string;
   tool?: string;
+  /** Stable per-query operation identity; used to pair real start and finish events. */
+  operation_id?: string;
+  status?: 'running' | 'done' | 'nonzero' | 'ended' | 'failed';
   /** 起始时刻（ISO 8601）：运行中的步骤用它算自己的耗时 */
   started_at?: string;
   duration_ms?: number;
@@ -510,6 +526,9 @@ export interface WikiProgressEvent {
 }
 
 export interface WikiProgressDetails {
+  resource_kind?: 'article' | 'source' | 'table';
+  input?: string;
+  output?: string;
   query?: string;
   paths?: string[];
   table_id?: string;
@@ -528,6 +547,11 @@ export interface KnowledgeSearchStreamHandlers {
   onDelta: (content: string, meta?: KnowledgeSearchStreamMeta) => void;
   onDone?: (meta?: KnowledgeSearchStreamMeta) => void;
   onError?: (error: Error) => void;
+  /**
+   * Wiki 流建会话后下发的 session_id。
+   * 调用方据此持久化，用于刷新 / 离开页面回来后恢复订阅。
+   */
+  onSession?: (sessionId: string) => void;
 }
 
 export type KnowledgeSearchViewStatus = 'initial' | 'loading' | 'searching' | 'done' | 'empty' | 'error';
@@ -698,4 +722,79 @@ export interface AnswerFeedbackStats {
   total: number;
   like_count: number;
   dislike_count: number;
+}
+
+/**
+ * 一次检索在页面上的会话卡片状态。
+ *
+ * 定义放在 types 而不是页面里，是因为运行态（进行中的检索）由
+ * `store/knowledgeSearchRuntime.ts` 跨页面持有 —— 页面卸载不能把这次检索一起带走。
+ */
+export interface SearchSession {
+  id: string;
+  query: string;
+  domainId: string;
+  wiki?: boolean;
+  wikiProgress?: WikiProgressEvent[];
+  /** [jonex] 后端 Wiki 检索会话 id：刷新 / 离开页面回来后凭它恢复订阅 */
+  wikiSessionId?: string;
+  queryOutcomes?: KnowledgeSearchHistoryItem['queryOutcomes'];
+  /** 本次检索使用的档位（块头标签用；历史回放可为空） */
+  mode?: KnowledgeSearchUiMode;
+  startedAt?: number;
+  elapsedMs?: number;
+  rawAnswer: string;
+  status: KnowledgeSearchRunStatus;
+  errorMessage: string;
+  source?: string;
+  references?: KnowledgeReference[];
+  reasoning?: ReasoningTrace | null;
+  /** [jonex] 本次搜索实际使用的检索条件（再次搜索时复用） */
+  strictConfig?: KnowledgeSearchStrictConfig | null;
+  /** [jonex] answer-feedback 锚点：检索历史记录 id（检索响应下发 / 历史项 id），无则无法记录反馈 */
+  historyId?: string;
+  // ── [jonex] 以图问知识 ──
+  /**
+   * 本轮附带的图片。两个来源：
+   * - 当次检索：`localUrl`（本地 objectURL，用来即时预览原始附图）；
+   * - 历史回放：`viewUrl`（服务端短时票据）。
+   * 识别失败的张 `status='failed'`，卡片上标「未参与检索」。
+   */
+  queryImages?: SessionQueryImage[];
+  /** 用户原话（点检索时输入框里的文字）；历史回放时来自 `metadata.image_question` */
+  imageQuestion?: string;
+  /** 识别回包（会话卡片上「识别为：…」与每张图的描述 / OCR 都取自它） */
+  recognized?: ImageQueryResult;
+  /**
+   * 「重试」用的原图。只保留压缩后的 Blob —— **原图不出浏览器**（D4）。
+   * 识别成功或卡片被移除后即可丢弃。
+   */
+  retryFiles?: Blob[];
+  /** [①②] 数据路径结构化块（router 扇出路径下发；历史回放不带，无则 null）。 */
+  dataBlocks?: DataBlock[] | null;
+  /** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示）。 */
+  dataReferences?: DataReference[] | null;
+  /** [A] 血缘解释块（后端有内容才下发；历史回放不带，无则 null）。 */
+  dataLineage?: DataLineageBlock | null;
+  /** 实时数据：问答调用外部工具的摘要（调用过才下发；历史回放不带，无则 null）。 */
+  toolResults?: ToolCallResult[] | null;
+  /** 问答动作提案卡片（写操作/需确认动作，需用户确认后执行） */
+  pendingActions?: PendingActionView[] | null;
+  /** 动作执行结果（历史回放；由服务端回写） */
+  actionResults?: ActionExecutionRecord[] | null;
+  /**
+   * 本次检索消耗的 Token 总量。
+   * 只有新发起的检索会写入（历史回放不带、也不回填）；缺省 / 0 / 非有限值 ⇒ 不渲染。
+   */
+  totalTokens?: number;
+}
+
+export interface SessionQueryImage {
+  imageId?: string | null;
+  /** 本地预览（当次检索） */
+  localUrl?: string;
+  /** 服务端查看地址（历史回放） */
+  viewUrl?: string | null;
+  status?: 'ok' | 'failed';
+  errorCode?: number | null;
 }

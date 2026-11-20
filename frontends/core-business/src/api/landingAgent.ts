@@ -16,6 +16,8 @@ export type LandingRunStatus = 'queued' | 'running' | 'succeeded' | 'failed';
 /** `LandingProgress` 的前端形状（计数口径见后端 runner）。 */
 export interface LandingRunProgress {
   phase: string;
+  /** 落点阶段的子相位（runner 口径）：recall / judge / merge。 */
+  subPhase: string;
   /** 截断/过滤后实际参与的概念数（run 开始即确定）。 */
   conceptsTotal: number;
   /** 已处理完的概念数（含异常/放弃）。 */
@@ -56,6 +58,7 @@ export function mapLandingRun(raw: any): LandingRun {
     phase: raw?.phase ?? progress.phase ?? '',
     progress: {
       phase: progress.phase ?? raw?.phase ?? '',
+      subPhase: progress.sub_phase ?? '',
       conceptsTotal: progress.concepts_total ?? 0,
       conceptsDone: progress.concepts_done ?? 0,
       landed: progress.landed ?? 0,

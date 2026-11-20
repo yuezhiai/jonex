@@ -13,7 +13,7 @@
  */
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Tag, Tooltip, Empty } from 'antd';
+import { Tag, Tooltip } from 'antd';
 import { BookOutlined, FileTextOutlined, LinkOutlined, NumberOutlined } from '@ant-design/icons';
 import MarkdownContent from '@/components/MarkdownContent';
 import WikiSourcePicture from '@/components/WikiSourcePicture';
@@ -23,7 +23,7 @@ import WikiBacklinks from './WikiBacklinks';
 import WikiTableReader from './WikiTableReader';
 import WikiLinkGroups from './WikiLinkGroups';
 import { buildLinkGroups } from './wikiRelations';
-import { analyzePageLinks, isRepeatedWikiLead, roleLabelKey } from './wikiMarkdown';
+import { analyzePageLinks, hideFragmentLinks, isRepeatedWikiLead, roleLabelKey } from './wikiMarkdown';
 
 /** 「相关页面」至少给这么多（不足时用同分类页补齐，保证条目不是死胡同） */
 const SEE_ALSO_MIN = 5;
@@ -36,6 +36,7 @@ function sharedTagCount(page: WikiReaderPage, current?: WikiReaderPage): number 
 }
 
 interface WikiArticleViewProps {
+  kbId: string;
   page: WikiPageContent;
   pages: WikiReaderPage[];
   pagesByPath: Map<string, WikiReaderPage>;
@@ -52,6 +53,7 @@ const roleColor = (role: string) =>
   role === 'concept' ? 'blue' : role === 'table' ? 'purple' : role === 'source' ? 'green' : 'default';
 
 export default function WikiArticleView({
+  kbId,
   page,
   pages,
   pagesByPath,
@@ -68,11 +70,19 @@ export default function WikiArticleView({
   // 引擎 frontmatter 偶尔没有标题 → 回退目录清单里的标题，避免 h1 空白
   const catalogPage = pagesByPath.get(canonicalPath);
   const displayTitle = page.title || catalogPage?.title || canonicalPath;
+  const readingPagesByPath = useMemo(
+    () => new Map([...pagesByPath].filter(([, item]) => item.type === 'article' || item.type === 'table')),
+    [pagesByPath],
+  );
+  const readingPaths = useMemo(() => new Set(readingPagesByPath.keys()), [readingPagesByPath]);
+  const readingBacklinks = useMemo(() => backlinks ? {
+    ...backlinks, items: backlinks.items.filter((item) => readingPaths.has(item.path)),
+  } : null, [backlinks, readingPaths]);
 
   // 正文分段 + 链接解析 + 首次提及自动链接 + 页内目录（纯函数，见 wikiMarkdown.ts）
   const { leadMarkdown, bodyMarkdown, toc, mentionPaths } = useMemo(
-    () => analyzePageLinks(page.content || '', pages, canonicalPath),
-    [page.content, pages, canonicalPath],
+    () => analyzePageLinks(hideFragmentLinks(page.content || '', readingPaths), pages, canonicalPath),
+    [page.content, pages, canonicalPath, readingPaths],
   );
 
   // 相关页面：显式页间链接 → 正文提及 → 同分类补齐（保证任何条目都有横向出口）
@@ -84,12 +94,13 @@ export default function WikiArticleView({
       if (!path || path === canonicalPath || seen.has(path) || out.length >= 12) return;
       const target = pagesByPath.get(path);
       if (!target) return; // 目标不是可见页面（raw/evidence 等）→ 不展示，避免死链
+      if (target.type !== 'article' && target.type !== 'table') return;
       seen.add(path);
       out.push(target);
     };
     for (const raw of explicitCandidates) push(`${raw}`.replace(/^\//, ''));
     for (const path of mentionPaths) push(path);
-    if (out.length < SEE_ALSO_MIN) {
+    if (out.length < SEE_ALSO_MIN && page.type !== 'article') {
       const category = catalogPage?.category || '';
       const siblings = pages
         .filter((p) => p.path !== canonicalPath && p.category && p.category === category)
@@ -100,7 +111,7 @@ export default function WikiArticleView({
       }
     }
     return out;
-  }, [page.links, page.related, mentionPaths, pagesByPath, pages, canonicalPath, catalogPage]);
+  }, [page.links, page.related, page.type, mentionPaths, pagesByPath, pages, canonicalPath, catalogPage]);
 
   const references = page.references || [];
   const role = page.type || 'concept';
@@ -111,13 +122,13 @@ export default function WikiArticleView({
     () =>
       buildLinkGroups({
         page,
-        pagesByPath,
+        pagesByPath: readingPagesByPath,
         mentionPaths,
-        backlinks: backlinks?.items || [],
+        backlinks: readingBacklinks?.items || [],
         seeAlso,
         includeBacklinks: false,
       }),
-    [page, pagesByPath, mentionPaths, backlinks, seeAlso],
+    [page, readingPagesByPath, mentionPaths, readingBacklinks, seeAlso],
   );
 
   const openReference = (documentId: string, fileName: string, mimeType: string) => {
@@ -131,6 +142,10 @@ export default function WikiArticleView({
   const openPageReference = (ref: WikiPageReference) => openReference(ref.documentId, ref.fileName, ref.mimeType);
   const openImageSource = (image: NonNullable<WikiPageContent['images']>[number]) =>
     openReference(image.document_id, image.source_name, '');
+  const openSourceLink = (documentId: string) => {
+    const ref = references.find((item) => item.documentId === documentId);
+    if (ref) openPageReference(ref);
+  };
 
   return (
     <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start' }}>
@@ -153,7 +168,7 @@ export default function WikiArticleView({
         {/* 导语 */}
         {leadMarkdown ? (
           <div style={{ marginTop: 10, fontSize: 15, lineHeight: 1.9, color: 'var(--yx-text-body)' }}>
-            <MarkdownContent content={leadMarkdown} onInternalLink={onOpenPage} images={page.images} onOpenImageSource={openImageSource} />
+            <MarkdownContent content={leadMarkdown} onInternalLink={onOpenPage} onSourceLink={openSourceLink} images={page.images} onOpenImageSource={openImageSource} />
           </div>
         ) : (
           page.description && !isRepeatedWikiLead(page.description, bodyMarkdown) && <div style={{ marginTop: 10, fontSize: 15, color: '#475569' }}>{page.description}</div>
@@ -197,12 +212,12 @@ export default function WikiArticleView({
         {/* 正文 */}
         <div style={{ marginTop: 12 }}>
           {page.tableData ? <WikiTableReader key={`${page.tableData.revision}:${page.tableData.selected_table_id}`}
-            data={page.tableData} fileName={references.find(ref => ref.documentId === page.tableData?.document_id)?.fileName || ''}
+            kbId={kbId} data={page.tableData} fileName={references.find(ref => ref.documentId === page.tableData?.document_id)?.fileName || ''}
             onOpenSource={() => {
               const ref = references.find(item => item.documentId === page.tableData?.document_id);
               if (ref) openPageReference(ref);
               else openReference(page.tableData!.document_id, page.tableData!.document_id, '');
-            }} /> : <MarkdownContent content={bodyMarkdown} onInternalLink={onOpenPage} headingIds={toc.map((item) => item.id)} images={page.images} onOpenImageSource={openImageSource} />}
+            }} /> : <MarkdownContent content={bodyMarkdown} onInternalLink={onOpenPage} onSourceLink={openSourceLink} headingIds={toc.map((item) => item.id)} images={page.images} onOpenImageSource={openImageSource} />}
         </div>
 
         {(page.images || []).filter((image) => image.placement !== 'inline').map((image) =>
@@ -238,10 +253,11 @@ export default function WikiArticleView({
         )}
 
         {/* 链入本页（What links here）：谁引用了这一页 */}
-        <WikiBacklinks result={backlinks || null} loading={backlinksLoading} onOpenPage={onOpenPage} />
+        {(backlinksLoading || (readingBacklinks?.items.length || 0) > 0) &&
+          <WikiBacklinks result={readingBacklinks} loading={backlinksLoading} onOpenPage={onOpenPage} />}
 
         {/* 参考来源：页面级溯源 → 源文档 */}
-        <div style={{ marginTop: 26 }}>
+        {references.length > 0 && <div style={{ marginTop: 26 }}>
           <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--yx-brand-dark)', marginBottom: 8 }}>
             <FileTextOutlined /> {t('domainKnowledge.wikiReader.references')}
             {references.length > 0 && (
@@ -250,13 +266,6 @@ export default function WikiArticleView({
               </span>
             )}
           </div>
-          {references.length === 0 ? (
-            <Empty
-              image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={t('domainKnowledge.wikiReader.noReferences')}
-              style={{ margin: '8px 0' }}
-            />
-          ) : (
             <ol style={{ paddingLeft: 20, margin: 0, fontSize: 13, color: '#475569' }}>
               {references.map((ref) => (
                 <li key={ref.documentId} style={{ marginBottom: 10, lineHeight: 1.7 }}>
@@ -266,9 +275,9 @@ export default function WikiArticleView({
                   >
                     {ref.fileName || ref.documentId.slice(0, 12)}
                   </a>
-                  <span style={{ color: '#cbd5e1', marginLeft: 8 }}>
+                  {ref.claimCount > 0 && <span style={{ color: '#cbd5e1', marginLeft: 8 }}>
                     {t('domainKnowledge.wikiReader.claimCount', { count: ref.claimCount })}
-                  </span>
+                  </span>}
                   {ref.excerpts.slice(0, 1).map((excerpt) => (
                     <div
                       key={excerpt}
@@ -285,11 +294,10 @@ export default function WikiArticleView({
                 </li>
               ))}
             </ol>
-          )}
-        </div>
+        </div>}
 
         {/* 分类 / 标签 */}
-        <div
+        {((page.category && page.category !== 'articles') || (page.tags || []).length > 0) && <div
           style={{
             marginTop: 24,
             paddingTop: 12,
@@ -303,11 +311,11 @@ export default function WikiArticleView({
           }}
         >
           <span>{t('domainKnowledge.wikiReader.categories')}</span>
-          {page.category && <Tag color="blue">{page.category}</Tag>}
+          {page.category && page.category !== 'articles' && <Tag color="blue">{page.category}</Tag>}
           {(page.tags || []).map((tag) => (
             <Tag key={tag}>{tag}</Tag>
           ))}
-        </div>
+        </div>}
       </div>
 
       {/* 右栏：信息框（维基百科 infobox）+ 本页关系小地图（1-hop ego） */}
@@ -334,7 +342,7 @@ export default function WikiArticleView({
           </div>
           <div style={{ padding: '10px 12px', display: 'grid', gap: 8 }}>
             <InfoRow label={t('domainKnowledge.wikiReader.field.type')} value={t(roleLabelKey(role))} />
-            {page.category && <InfoRow label={t('domainKnowledge.wikiReader.field.category')} value={page.category} />}
+            {page.category && page.category !== 'articles' && <InfoRow label={t('domainKnowledge.wikiReader.field.category')} value={page.category} />}
             {(page.aliases || []).length > 0 && (
               <InfoRow label={t('domainKnowledge.wikiReader.field.aliases')} value={(page.aliases || []).join('、')} />
             )}

@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useKbPermission } from '@/hooks/useKbPermission';
 import debounce from 'lodash/debounce';
-import { Table, Button, Space, Popconfirm, message, Input } from 'antd';
+import { Table, Button, Space, Popconfirm, message, Input, Modal } from 'antd';
 import { EditOutlined, DeleteOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import type { OntologyInstanceSummary, OntologyInstanceRow } from '@/types/domainKnowledge';
@@ -34,6 +34,8 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
   // ── 实例列表 ──
   const [instances, setInstances] = useState<OntologyInstanceRow[]>([]);
   const [total, setTotal] = useState(0);
+  // Neo4j 不可用时后端把 items/total 降级为空与 0：标题里的计数改显示「—」
+  const [degraded, setDegraded] = useState(false);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [keyword, setKeyword] = useState('');
@@ -54,6 +56,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
           });
           setInstances(res.items);
           setTotal(res.total);
+          setDegraded(res.degraded === true);
         } catch (err: any) {
           message.error(err?.message || t('common.loadFailed'));
         } finally {
@@ -99,7 +102,8 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
 
   const ontologyOptions = useMemo(() => {
     return (typeSource ?? []).map((item) => ({
-      value: item.description || item.display_name || item.name,
+      // 提交给后端的必须是类型标识（item.name），显示用人类可读文案
+      value: item.name,
       label: item.description || item.display_name || item.name,
     }));
   }, [typeSource]);
@@ -173,44 +177,57 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
     description?: string;
     attributes?: Record<string, unknown>;
   }) => {
-    try {
-      const old = editingRecord;
-      if (!old?.name || !old?.type) return;
+    const old = editingRecord;
+    if (!old?.name || !old?.type) return;
 
-      const identityChanged = data.type !== old.type;
+    // 类型/名称变更与其余字段一样走一次 PUT：后端原地迁移定位键，
+    // 目标键已存在时改类型自动合并，改名则回 1003 要求前端先确认。
+    const updates: Record<string, unknown> = {};
+    if (data.type !== old.type) updates.entity_type = data.type;
+    if (data.name !== old.name) updates.name = data.name;
+    if (data.description !== old.description) updates.description = data.description;
+    if (JSON.stringify(data.aliases) !== JSON.stringify(old.aliases)) updates.aliases = data.aliases;
+    if (JSON.stringify(data.attributes) !== JSON.stringify(old.attributes)) updates.attributes = data.attributes;
 
-      if (identityChanged) {
-        // 实体类型变化 → 删除旧实例 + 创建新实例（重建时同样保留文档关联）
-        await deleteOntologyInstance(kbId, old.type, old.name);
-        await createOntologyInstance({
-          knowledge_base_id: kbId,
-          entity_type: data.type,
-          name: data.name,
-          aliases: data.aliases,
-          description: data.description,
-          attributes: data.attributes,
-          ...(docId ? { document_id: docId } : {}),
-        });
-      } else {
-        const updates: Record<string, unknown> = {};
-        if (data.name !== old.name) updates.name = data.name;
-        if (data.description !== old.description) updates.description = data.description;
-        if (JSON.stringify(data.aliases) !== JSON.stringify(old.aliases)) updates.aliases = data.aliases;
-        if (JSON.stringify(data.attributes) !== JSON.stringify(old.attributes)) updates.attributes = data.attributes;
+    if (Object.keys(updates).length === 0) {
+      message.info(t('common.noChanges'));
+      closeEditModal();
+      return;
+    }
 
-        if (Object.keys(updates).length === 0) {
-          message.info(t('common.noChanges'));
-          closeEditModal();
-          return;
-        }
-
-        await updateOntologyInstance(kbId, old.type, old.name, updates);
-      }
-
-      message.success(t('common.saveSuccess'));
+    const submit = async (mergeTarget?: boolean) => {
+      const res = await updateOntologyInstance(kbId, old.type, old.name, updates, mergeTarget);
+      message.success(res?.merged ? t('compile.instanceMerged') : t('common.saveSuccess'));
       closeEditModal();
       fetchData(page, keyword, kbId, docId);
+    };
+
+    try {
+      await submit();
+      return;
     } catch (e: unknown) {
+      const bizCode = (e as { bizCode?: number }).bizCode;
+      // 1003：改名撞上已存在的同名实例。合并不可逆，必须由用户显式确认后再重发。
+      if (bizCode === 1003 && typeof updates.name === 'string') {
+        Modal.confirm({
+          title: t('compile.instanceMergeConfirmTitle'),
+          content: t('compile.instanceMergeConfirmBody', {
+            name: updates.name,
+            from: old.name,
+          }),
+          okText: t('compile.instanceMergeConfirmOk'),
+          cancelText: t('compile.instanceMergeConfirmCancel'),
+          onOk: async () => {
+            try {
+              await submit(true);
+            } catch (err: unknown) {
+              const errMsg = err instanceof Error ? err.message : '';
+              message.error(`${t('common.saveFailed')}${errMsg ? `: ${errMsg}` : ''}`);
+            }
+          },
+        });
+        return;
+      }
       const errMsg = e instanceof Error ? e.message : '';
       message.error(`${t('common.saveFailed')}${errMsg ? `: ${errMsg}` : ''}`);
     }
@@ -339,7 +356,7 @@ export default function OntologyTab({ kbId, docId, data, title: propTitle }: Ont
               marginLeft: 8,
             }}
           >
-            {t('compile.totalInstances', { count: total })}
+            {degraded ? '—' : t('compile.totalInstances', { count: total })}
           </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>

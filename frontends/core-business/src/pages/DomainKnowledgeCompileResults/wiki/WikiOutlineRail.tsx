@@ -4,9 +4,9 @@
  * 目录树 = LLM 起草的 Topic → Section → Entry（后端 knowledge_base.wiki_outlines）。
  * 未生成目录时退化为「按分类浏览」（引擎分类目录），保证任何编译产物都能读。
  */
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Empty, Input, Tag, Tooltip } from 'antd';
+import { Button, Empty, Input, Tag, Tooltip } from 'antd';
 import {
   CaretDownOutlined,
   CaretRightOutlined,
@@ -29,6 +29,10 @@ interface WikiOutlineRailProps {
   query: string;
   onQueryChange: (value: string) => void;
   searchResults: WikiReaderPage[];
+  bodySearchLoading: boolean;
+  bodySearchHasMore: boolean;
+  bodySearchError: string;
+  onSearchMore: () => void;
   /** 目录生成信息（模型 / 时间），显示在栏底 */
   metaText?: string;
 }
@@ -68,10 +72,17 @@ export default function WikiOutlineRail({
   query,
   onQueryChange,
   searchResults,
+  bodySearchLoading,
+  bodySearchHasMore,
+  bodySearchError,
+  onSearchMore,
   metaText,
 }: WikiOutlineRailProps) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [searchLimit, setSearchLimit] = useState(50);
+  const [categoryLimits, setCategoryLimits] = useState<Record<string, number>>({});
+  useEffect(() => setSearchLimit(50), [query]);
 
   // 未生成目录时的分类兜底视图（引擎分类目录 → 页面清单）
   const categoryGroups = useMemo(() => {
@@ -185,26 +196,30 @@ export default function WikiOutlineRail({
         prefix={<SearchOutlined style={{ color: 'var(--yx-text-muted)' }} />}
         placeholder={t('domainKnowledge.wikiReader.searchPlaceholder')}
         value={query}
+        maxLength={256}
         onChange={(e) => onQueryChange(e.target.value)}
         style={{ margin: '6px 0 10px' }}
       />
+      <div style={{ fontSize: 11, color: 'var(--yx-text-muted)', padding: '0 6px 6px' }}>{t('wikiTableReading.articleSearchHint')}</div>
 
       {query.trim() ? (
         <div>
           <div style={{ fontSize: 12, color: 'var(--yx-text-muted)', padding: '0 6px 6px' }}>
             {t('domainKnowledge.wikiReader.searchResults', { count: searchResults.length })}
           </div>
-          {searchResults.length === 0 ? (
+          {searchResults.length === 0 && !bodySearchLoading ? (
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
               description={t('domainKnowledge.wikiReader.searchEmpty')}
               style={{ margin: '12px 0' }}
             />
           ) : (
-            searchResults
-              .slice(0, 50)
-              .map((page) => renderEntry(page.path, page.title, page.type))
+            <>{searchResults.slice(0, searchLimit).map((page) => renderEntry(page.path, page.title, page.type))}
+              {searchResults.length > searchLimit && <Button type="link" onClick={() => setSearchLimit(searchLimit + 50)}>{t('wikiTableReading.showMore')}</Button>}</>
           )}
+          {bodySearchError && <div style={{ color: 'var(--yx-warning-text, #ad6800)', fontSize: 11, padding: '4px 6px' }}>{t('wikiTableReading.articleSearchUnavailable')}</div>}
+          {bodySearchLoading && <div style={{ fontSize: 11, padding: '4px 6px' }}>{t('wikiTableReading.articleSearching')}</div>}
+          {bodySearchHasMore && <Button type="link" onClick={onSearchMore} loading={bodySearchLoading}>{t('wikiTableReading.searchMoreArticles')}</Button>}
         </div>
       ) : outline && outline.topics.length > 0 ? (
         (outline.topics || []).map((topic) => renderNode(topic, 0))
@@ -221,7 +236,8 @@ export default function WikiOutlineRail({
                 <span style={{ color: '#cbd5e1', fontWeight: 400 }}>{items.length}</span>
               </div>
               <div style={{ paddingLeft: 8 }}>
-                {items.slice(0, 100).map((page) => renderEntry(page.path, page.title, page.type))}
+                {items.slice(0, categoryLimits[category] || 100).map((page) => renderEntry(page.path, page.title, page.type))}
+                {items.length > (categoryLimits[category] || 100) && <Button type="link" onClick={() => setCategoryLimits(prev => ({ ...prev, [category]: (prev[category] || 100) + 100 }))}>{t('wikiTableReading.showMore')}</Button>}
               </div>
             </div>
           ))}

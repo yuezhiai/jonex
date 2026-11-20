@@ -33,6 +33,8 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
   // ── instance list ──
   const [instances, setInstances] = useState<RelationInstanceRow[]>([]);
   const [total, setTotal] = useState(0);
+  // Neo4j 不可用时后端把 items/total 降级为空与 0：标题里的计数改显示「—」
+  const [degraded, setDegraded] = useState(false);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [keyword, setKeyword] = useState('');
@@ -53,6 +55,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
           });
           setInstances(res.items);
           setTotal(res.total);
+          setDegraded(res.degraded === true);
         } catch (err: any) {
           message.error(err?.message || t('common.loadFailed'));
         } finally {
@@ -338,7 +341,7 @@ export default function RelationTab({ kbId, docId, data, title: propTitle }: Rel
         <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--yx-brand-dark)' }}>
           {title}
           <span style={{ fontSize: 13, color: 'var(--yx-text-muted)', fontWeight: 400, marginLeft: 8 }}>
-            {t('compile.totalInstances', { count: total })}
+            {degraded ? '—' : t('compile.totalInstances', { count: total })}
           </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>

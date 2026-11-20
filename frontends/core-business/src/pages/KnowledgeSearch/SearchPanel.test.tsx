@@ -35,6 +35,10 @@ describe('SearchPanel 模式列表', () => {
   it('ontologyData 档复用 fast 的默认严格配置', () => {
     expect(DEFAULT_CONFIG_BY_MODE.ontologyData).toBe(DEFAULT_FAST_STRICT_CONFIG);
   });
+
+  it('Wiki 搜索不再提供额外思考档位配置', () => {
+    expect(MODE_META.find((item) => item.mode === 'wiki')?.configurable).toBe(false);
+  });
 });
 
 describe('i18n：本体 + 数据文案', () => {

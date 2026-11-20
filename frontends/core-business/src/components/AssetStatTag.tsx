@@ -47,8 +47,11 @@ const iconStyle = (tone: 0 | 1 | 2): CSSProperties => ({
 export interface AssetStatTagItem {
   /** 标签文字，如「文档总数」 */
   label: string;
-  /** 统计值，渲染时按当前 locale 加千分位 */
-  value: number;
+  /**
+   * 统计值：number 按当前 locale 加千分位；string 原样输出
+   * （降级时传「—」，表示数据暂不可用而不是真实的 0）。
+   */
+  value: number | string;
   icon: ReactNode;
   /** 图标点缀色的位次，按标签在页头中自左向右的顺序传；缺省 0 */
   tone?: 0 | 1 | 2;
@@ -67,7 +70,7 @@ export default function AssetStatTag({ label, value, icon, tone = 0 }: AssetStat
       {/* 标签名与数值同处一个 flex 子项：数值要贴着标签名，只跟图标之间留 gap */}
       <span>
         {label}
-        <span style={VALUE_STYLE}> {value.toLocaleString()}</span>
+        <span style={VALUE_STYLE}> {typeof value === 'number' ? value.toLocaleString() : value}</span>
       </span>
     </Tag>
   );
@@ -92,22 +95,27 @@ export function buildAssetTags(
     tone: 0,
   };
   if (!isLlmWikiType(detail.kbType)) {
+    // Neo4j 降级时后端把实体/关系数置 0：这两个标签显示「—」而不是 0。
+    // 「文档总数」来自 PG，不受降级影响，照常显示。
+    const degraded = detail.ontologyDegraded === true;
     return [
       documents,
       {
         label: t('domainKnowledge.ontologyInstances'),
-        value: detail.entityCount,
+        value: degraded ? '—' : detail.entityCount,
         icon: <RobotOutlined />,
         tone: 1,
       },
       {
         label: t('domainKnowledge.relationInstances'),
-        value: detail.relationCount,
+        value: degraded ? '—' : detail.relationCount,
         icon: <ShareAltOutlined />,
         tone: 2,
       },
     ];
   }
+  // Jonex Wiki's reading view shows authored articles, not concept fragments.
+  if (detail.kbType === 'jonex_wiki') return [documents];
   return [
     documents,
     { label: t('compile.wikiEntities'), value: wikiStats?.entities || 0, icon: <ApartmentOutlined />, tone: 1 },

@@ -20,12 +20,18 @@ export async function consumeWikiSearchStream(response: Response, handlers: Know
       if (payload.session_id) onSession?.(payload.session_id);
       handlers.onProgress?.(payload.events ?? []);
     }
-    if (event === 'error') throw new Error(payload.message || 'Wiki search failed');
+    if (event === 'error') {
+      // code 用于区分「会话过期（恢复不了）」与真正的检索失败
+      const error = new Error(payload.message || 'Wiki search failed');
+      (error as Error & { code?: string }).code = payload.code;
+      throw error;
+    }
     if (event === 'complete') {
       completed = true;
       // ⚠️ 白名单显式搬运：new field 不加进来会被静默丢弃。
       // total_tokens 与 rag_used / history_id 同层由 complete 事件下发。
       const meta = { source: payload.source, references: payload.references ?? [],
+        incomplete: payload.incomplete ?? null, query_outcomes: payload.query_outcomes ?? [],
         reasoning: payload.reasoning ?? null, rag_used: payload.rag_used, history_id: payload.history_id,
         total_tokens: payload.total_tokens };
       // Deliver the verified answer immediately; no synthetic typing delay.

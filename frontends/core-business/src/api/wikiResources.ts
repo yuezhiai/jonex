@@ -29,6 +29,7 @@ export interface WikiRecordFilter {
 export interface WikiRecordCell {
   row_index: number; column_index: number; coordinate: string; raw_value: string | null;
   raw_type: string; formula: string | null; cached_value: string | null;
+  effective_value?: string | null; normalized_value?: string | null;
   number_format: string | null; empty_kind: string | null;
 }
 function read<T>(kbId: string, operation: string, options: object) {

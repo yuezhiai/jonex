@@ -32,6 +32,17 @@ export interface WikiLinkResolution {
   unresolved: string[];
 }
 
+/** Leave hidden fragment names as text, while keeping article/table and original-document links. */
+export function hideFragmentLinks(markdown: string, visiblePaths: Set<string>): string {
+  return markdown.replace(/\[([^\]\n]+)\]\(#wiki\/([^\s)]+)\)/g, (original, label: string, encoded: string) => {
+    try {
+      return visiblePaths.has(decodeURIComponent(encoded)) ? original : label;
+    } catch {
+      return label;
+    }
+  });
+}
+
 /** 归一化相对路径（`../a/b.md` + `menus/x.md` → `a/b.md`）。 */
 export function normalizeWikiPath(fromPath: string, target: string): string {
   if (!target.startsWith('./') && !target.startsWith('../')) return target;
@@ -178,12 +189,24 @@ export function autoLinkMentions(
 
   let inFence = false;
   const lines = (markdown || '').replace(/\r\n/g, '\n').split('\n');
-  const out = lines.map((line) => {
+  // A page alias may equal an entire table header. Wrapping that row in a
+  // link destroys GFM table syntax, so leave recognized table rows intact.
+  const tableLines = new Set<number>();
+  const divider = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (!lines[index].includes('|') || !divider.test(lines[index]) || !lines[index - 1].includes('|')) continue;
+    tableLines.add(index - 1);
+    tableLines.add(index);
+    for (let row = index + 1; row < lines.length && lines[row].includes('|') && lines[row].trim(); row += 1) {
+      tableLines.add(row);
+    }
+  }
+  const out = lines.map((line, index) => {
     if (/^\s*```/.test(line)) {
       inFence = !inFence;
       return line;
     }
-    if (inFence || /^\s*#{1,6}\s/.test(line)) return line;
+    if (inFence || tableLines.has(index) || /^\s*#{1,6}\s/.test(line)) return line;
     // 用捕获组 split：奇数位是「保护区」（已有链接 / 行内代码），不动
     return line
       .split(/(\[[^\]]*\]\([^)]*\)|`[^`]*`|!\[[^\]]*\]\([^)]*\))/)
@@ -261,7 +284,7 @@ export function splitWikiBody(content: string): WikiBodyParts {
   const bodyParts: string[] = [];
   const dropped: string[] = [];
 
-  let current: 'lead' | 'body' | 'dropped' | null = null;
+  let current: 'lead' | 'body' | 'dropped' | null = 'lead';
   const lines = text.split('\n');
   for (const line of lines) {
     const heading = /^##\s+(.+?)\s*$/.exec(line);
@@ -392,9 +415,9 @@ export function analyzePageLinks(content: string, pages: WikiReaderPage[], curre
 }
 
 /** 角色 → 展示文案 key（i18n 在组件里拼，这里只归一化角色）。 */
-export function normalizeRole(role: string): 'concept' | 'table' | 'source' | 'other' {
+export function normalizeRole(role: string): 'article' | 'concept' | 'table' | 'source' | 'other' {
   const value = (role || '').toLowerCase();
-  if (value === 'concept' || value === 'table' || value === 'source') return value;
+  if (value === 'article' || value === 'concept' || value === 'table' || value === 'source') return value;
   return 'other';
 }
 

@@ -152,6 +152,16 @@
     overflow: hidden;
   }
 
+  // 表格宿主要先拿到确定高度，里面的 .yx-table-fill 才能把表体压成「内部滚动」。
+  // 不给高度时宿主会随内容长高，而页面又按宿主高度去设表体 max-height，两边互相撑：
+  // 每页条数一大，整张表就溢出 -main 的 overflow:hidden，分页条被裁到视口外。
+  &-table-host {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
   // 拖拽迁移：拖拽中的表格行
   &-row--dragging {
     opacity: 0.6;

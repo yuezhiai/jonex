@@ -21,6 +21,8 @@ interface MarkdownContentProps {
    * 不传时行为与旧版一致（所有链接 target=_blank）。
    */
   onInternalLink?: (target: string) => void;
+  /** Open an explicitly linked, registered source document. */
+  onSourceLink?: (documentId: string) => void;
   /**
    * [jonex] 依次挂到 h2~h4 上的锚点 id（页内目录跳转用）。
    * 顺序须与正文 h2~h4 出现顺序一致（由 wikiMarkdown.extractToc 生成）。
@@ -130,6 +132,7 @@ interface ComponentsOptions {
    */
   headingIds?: string[];
   onInternalLink?: (target: string) => void;
+  onSourceLink?: (documentId: string) => void;
   imagePlaceholder: string;
 }
 
@@ -154,6 +157,7 @@ function buildComponents({
   markdownFence,
   headingIds,
   onInternalLink,
+  onSourceLink,
   imagePlaceholder,
   images,
   onOpenImageSource,
@@ -195,6 +199,15 @@ function buildComponents({
     ),
     a: ({ href, children }) => {
       const target = href || '';
+      if (onSourceLink && target.startsWith('#wiki-source/')) {
+        const raw = target.slice('#wiki-source/'.length);
+        let documentId = raw;
+        try { documentId = decodeURIComponent(raw); } catch { /* Keep original text. */ }
+        return <a href={target} onClick={(event) => {
+          event.preventDefault();
+          if (documentId) onSourceLink(documentId);
+        }} style={{ color: '#2563eb', cursor: 'pointer' }}>{children}</a>;
+      }
       if (onInternalLink && target.startsWith(WIKI_LINK_PREFIX)) {
         const raw = target.slice(WIKI_LINK_PREFIX.length);
         let decoded = raw;
@@ -241,7 +254,7 @@ function buildComponents({
             <div className="yx-md-embed" style={embedStyle}>
               <MarkdownBody
                 content={source}
-                components={buildComponents({ markdownFence: false, onInternalLink, imagePlaceholder, images, onOpenImageSource })}
+                components={buildComponents({ markdownFence: false, onInternalLink, onSourceLink, imagePlaceholder, images, onOpenImageSource })}
               />
             </div>
           );
@@ -278,6 +291,7 @@ export default function MarkdownContent({
   content,
   imagePlaceholder = '图片',
   onInternalLink,
+  onSourceLink,
   headingIds,
   images,
   onOpenImageSource,
@@ -286,7 +300,7 @@ export default function MarkdownContent({
     <div style={{ fontSize: 14, lineHeight: 1.8, color: 'var(--yx-text-body)', wordBreak: 'break-word' }}>
       <MarkdownBody
         content={content}
-        components={buildComponents({ markdownFence: true, headingIds, onInternalLink, imagePlaceholder, images, onOpenImageSource })}
+        components={buildComponents({ markdownFence: true, headingIds, onInternalLink, onSourceLink, imagePlaceholder, images, onOpenImageSource })}
       />
     </div>
   );

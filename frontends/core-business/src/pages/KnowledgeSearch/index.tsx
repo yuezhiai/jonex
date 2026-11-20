@@ -26,11 +26,19 @@ import {
   deleteKnowledgeSearchHistory,
   clearKnowledgeSearchHistory,
   streamKnowledgeSearch,
+  resumeWikiSearchStream,
+  cancelWikiSearch,
   submitAnswerFeedback as submitAnswerFeedbackApi,
   getAnswerFeedback,
   recognizeImageQuery,
   DEFAULT_FAST_STRICT_CONFIG,
 } from '@/api/knowledgeSearch';
+import {
+  useKnowledgeSearchSessionStore,
+  readPendingWikiSearchSession,
+  type PendingWikiSearchSession,
+} from '@/store/knowledgeSearchSession';
+import { useKnowledgeSearchRuntimeStore } from '@/store/knowledgeSearchRuntime';
 import {
   compressImage,
   formatBytes,
@@ -51,11 +59,11 @@ import type {
   KnowledgeSearchRunStatus,
   KnowledgeReference,
   KnowledgeReferenceLocation,
-  WikiProgressEvent,
   ReasoningTrace,
-  ReasoningStep,
   SearchFeedbackType,
   FeedbackReason,
+  SearchSession,
+  SessionQueryImage,
   DataBlock,
   DataReference,
   DataLineageBlock,
@@ -67,6 +75,7 @@ import { PageContent } from '@jonex/shared-lib';
 import SearchPanel from './SearchPanel';
 import SearchHistorySidebar from './SearchHistorySidebar';
 import { resolveDomainWarning } from './searchDomainAvailability';
+import { isNoAnswerResponse } from './noAnswerDetection';
 import { useStickyScroll } from './useStickyScroll';
 import SessionCard from './SessionCard';
 import WelcomeEmpty from './WelcomeEmpty';
@@ -109,71 +118,9 @@ const EMPTY_OVERVIEW: KnowledgeSearchOverview = {
   dataSources: 0,
 };
 
-export interface SearchSession {
-  id: string;
-  query: string;
-  domainId: string;
-  wiki?: boolean;
-  wikiProgress?: WikiProgressEvent[];
-  /** 本次检索使用的档位（块头标签用；历史回放可为空） */
-  mode?: KnowledgeSearchUiMode;
-  startedAt?: number;
-  elapsedMs?: number;
-  rawAnswer: string;
-  status: KnowledgeSearchRunStatus;
-  errorMessage: string;
-  source?: string;
-  references?: KnowledgeReference[];
-  reasoning?: ReasoningTrace | null;
-  /** [jonex] 本次搜索实际使用的检索条件（再次搜索时复用） */
-  strictConfig?: KnowledgeSearchStrictConfig | null;
-  /** [jonex] answer-feedback 锚点：检索历史记录 id（检索响应下发 / 历史项 id），无则无法记录反馈 */
-  historyId?: string;
-  // ── [jonex] 以图问知识 ──
-  /**
-   * 本轮附带的图片。两个来源：
-   * - 当次检索：`localUrl`（本地 objectURL，用来即时预览原始附图）；
-   * - 历史回放：`viewUrl`（服务端短时票据）。
-   * 识别失败的张 `status='failed'`，卡片上标「未参与检索」。
-   */
-  queryImages?: SessionQueryImage[];
-  /** 用户原话（点检索时输入框里的文字）；历史回放时来自 `metadata.image_question` */
-  imageQuestion?: string;
-  /** 识别回包（会话卡片上「识别为：…」与每张图的描述 / OCR 都取自它） */
-  recognized?: ImageQueryResult;
-  /**
-   * 「重试」用的原图。只保留压缩后的 Blob —— **原图不出浏览器**（D4）。
-   * 识别成功或卡片被移除后即可丢弃。
-   */
-  retryFiles?: Blob[];
-  /** [①②] 数据路径结构化块（router 扇出路径下发；历史回放不带，无则 null）。 */
-  dataBlocks?: DataBlock[] | null;
-  /** [①②] `/search/data` 路线的数据引用（SQL/表格单独展示）。 */
-  dataReferences?: DataReference[] | null;
-  /** [A] 血缘解释块（后端有内容才下发；历史回放不带，无则 null）。 */
-  dataLineage?: DataLineageBlock | null;
-  /** 实时数据：问答调用外部工具的摘要（调用过才下发；历史回放不带，无则 null）。 */
-  toolResults?: ToolCallResult[] | null;
-  /** 问答动作提案卡片（写操作/需确认动作，需用户确认后执行） */
-  pendingActions?: PendingActionView[] | null;
-  /** 动作执行结果（历史回放；由服务端回写） */
-  actionResults?: ActionExecutionRecord[] | null;
-  /**
-   * 本次检索消耗的 Token 总量。
-   * 只有新发起的检索会写入（历史回放不带、也不回填）；缺省 / 0 / 非有限值 ⇒ 不渲染。
-   */
-  totalTokens?: number;
-}
-
-export interface SessionQueryImage {
-  imageId?: string | null;
-  /** 本地预览（当次检索） */
-  localUrl?: string;
-  /** 服务端查看地址（历史回放） */
-  viewUrl?: string | null;
-  status?: 'ok' | 'failed';
-  errorCode?: number | null;
-}
+// 会话卡片状态由 `store/knowledgeSearchRuntime` 跨页面持有，类型定义随之下沉到 types。
+// 这里 re-export，保持既有 `import type { SearchSession } from './index'` 的引用不变。
+export type { SearchSession, SessionQueryImage };
 
 /** 内置默认上限（与后端默认值一致）；收到识别回包后改用回包里的 `limits` */
 const DEFAULT_IMAGE_LIMITS: ImageQueryLimits = {
@@ -442,7 +389,6 @@ const KnowledgeSearch = function KnowledgeSearch() {
   // [jonex] 检索模式（按钮组）：fast=快速检索 /search/mix，deep=深度检索 /search/deep，
   // wiki=Wiki 检索 /search/jonex_wiki（只落在 jonex_wiki 链路的库上）
   const [searchMode, setSearchMode] = useState<KnowledgeSearchUiMode>('fast');
-  const [wikiThinkingMode, setWikiThinkingMode] = useState<'fast' | 'standard' | 'deep'>('fast');
   const [strictConfig, setStrictConfig] = useState<KnowledgeSearchStrictConfig>(DEFAULT_FAST_STRICT_CONFIG);
 
   const [overview, setOverview] = useState<KnowledgeSearchOverview | null>(null);
@@ -460,7 +406,21 @@ const KnowledgeSearch = function KnowledgeSearch() {
   /** 点击序号：连续点击时丢弃先发后到的旧响应，避免 A 的结果盖掉 B 的会话 */
   const historyClickSeqRef = useRef(0);
 
-  const [activeSearch, setActiveSearch] = useState<SearchSession | null>(null);
+  /**
+   * 当前会话卡片状态放在**模块级运行态**里，而不是组件 state。
+   *
+   * 离开页面时组件会卸载：组件 state 一销毁，正在跑的检索回来的结果就无处可写，
+   * 用户回来只剩一张空页面。放进 store 后，请求与状态都不再随页面卸载而消失，
+   * 回到页面直接接着看（见 `store/knowledgeSearchRuntime.ts`）。
+   */
+  const activeSearch = useKnowledgeSearchRuntimeStore((s) => s.session);
+  const setActiveSearch = useKnowledgeSearchRuntimeStore((s) => s.setSession);
+  const beginSearchRun = useKnowledgeSearchRuntimeStore((s) => s.beginRun);
+  const setSearchContext = useKnowledgeSearchRuntimeStore((s) => s.setContext);
+  const setActiveController = useKnowledgeSearchRuntimeStore((s) => s.setController);
+  const releaseActiveController = useKnowledgeSearchRuntimeStore((s) => s.releaseController);
+  const abortActiveSearch = useKnowledgeSearchRuntimeStore((s) => s.abortRun);
+  const resetSearchRuntime = useKnowledgeSearchRuntimeStore((s) => s.reset);
   /** 同步 activeSearch 的 ref（异步回显 / 提交后判断会话是否仍为当前） */
   const activeSearchRef = useRef<SearchSession | null>(null);
   useEffect(() => {
@@ -514,8 +474,12 @@ const KnowledgeSearch = function KnowledgeSearch() {
   const [voteReason, setVoteReason] = useState<FeedbackReason | null>(null);
   const [voteComment, setVoteComment] = useState('');
 
-  const abortRef = useRef<AbortController | null>(null);
-  const reasoningRef = useRef<Record<string, unknown> | null>(null);
+  const reasoningRef = useRef<ReasoningTrace | null>(null);
+  // 未完成的 Wiki 会话（跨刷新 / 跨路由）：连接断了任务还在后台跑，凭 session_id 恢复
+  const savePendingWikiSearch = useKnowledgeSearchSessionStore((s) => s.save);
+  const clearPendingWikiSearch = useKnowledgeSearchSessionStore((s) => s.clear);
+  // 本次运行的 AbortController 由运行态 store 持有（页面卸载不丢，回来仍可停止）；
+  // 正常检索与恢复订阅互斥，共用同一个槽位。
   const isSearching = isSearchRunning(activeSearch?.status);
 
   // ── [jonex] 以图问知识：输入区待检索的图片 ──
@@ -746,8 +710,9 @@ const KnowledgeSearch = function KnowledgeSearch() {
    * 输入框文字与已附图片同理，它们是上一轮的输入，留着会让下一次检索带上错空间的问题和图。
    */
   const resetSearchState = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    // 换空间 / 换检索维度 = 主动放弃上一个上下文：终止后台任务并清空运行态
+    abortActiveSearch();
+    resetSearchRuntime();
     releaseSessionUrls();
     // 输入区那批的 objectURL 所有权没转进会话，得单独回收
     setAttachedImages((prev) => {
@@ -755,20 +720,30 @@ const KnowledgeSearch = function KnowledgeSearch() {
       return [];
     });
     attachEpochRef.current += 1;
-    setActiveSearch(null);
     setActiveHistoryIndex(null);
     setQuery('');
     setSessionVote(null);
     setDislikeOpen(false);
     setVoteReason(null);
     setVoteComment('');
-  }, [releaseSessionUrls]);
+  }, [abortActiveSearch, releaseSessionUrls, resetSearchRuntime]);
 
   // ── initial data load ──────────────────────────────────
   useEffect(() => {
     let mounted = true;
-    // 空间换了，先清空再拉新数据（见 resetSearchState）
-    resetSearchState();
+    // 同一空间内离开页面再回来：检索在后台继续跑、结果也还在运行态里，
+    // 直接接着看；这里 reset 会把那个仍在跑的请求 abort 掉，正中要修的问题。
+    const runtime = useKnowledgeSearchRuntimeStore.getState();
+    const sameSpace = (runtime.spaceId ?? null) === (global.currentSpaceId ?? null);
+    if (runtime.session && sameSpace) {
+      // 还原发起时的输入与面板：否则会出现「卡片有内容、输入框却是空的」
+      setQuery(runtime.query);
+      if (runtime.mode) setSearchMode(runtime.mode);
+      if (runtime.domainId) setSelectedDomain(runtime.domainId);
+    } else {
+      // 换空间 / 首次进入：先清空再拉新数据（见 resetSearchState）
+      resetSearchState();
+    }
 
     async function loadInitialData() {
       setPageLoading(true);
@@ -830,8 +805,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
     loadInitialData();
 
     return () => {
+      // 卸载只停止本组件的渲染；检索属于运行态，离开页面不终止（换空间会走 resetSearchState）
       mounted = false;
-      abortRef.current?.abort();
     };
   }, [global.currentSpaceId, resetSearchState]);
 
@@ -925,6 +900,162 @@ const KnowledgeSearch = function KnowledgeSearch() {
     if (ok) setDislikeOpen(false);
   }, [voteReason, voteComment, dislikeHistoryId, submitFeedback, t]);
 
+  /**
+   * [jonex] 检索完成后把 meta 落到会话卡片（首连与恢复共用）。
+   *
+   * 恢复路径拿到的 meta 与正常完成同源（后端 complete 事件），字段映射只该有一份 ——
+   * 否则刷新后的答案卡片会和离开前长得不一样。
+   */
+  const applySearchMeta = useCallback(
+    (sessionId: string, meta: any, isNoAnswer: boolean, elapsedMs: number) => {
+      if (meta?.source === 'jonex_wiki') {
+        setReasoningExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
+      }
+      reasoningRef.current = (meta?.reasoning as ReasoningTrace | null) ?? null;
+      const historyId: string | undefined = meta?.history_id;
+      const filteredRefs: KnowledgeReference[] = isNoAnswer ? [] : (meta?.references ?? []);
+
+      setActiveSearch((prev) =>
+        prev?.id === sessionId
+          ? {
+              ...prev,
+              references: filteredRefs,
+              reasoning: meta?.reasoning ?? null,
+              queryOutcomes: meta?.query_outcomes ?? [],
+              elapsedMs,
+              source: meta?.source || prev.source,
+              historyId,
+              // [①②] 数据路径结构化块（router 下发；无字段 ⇒ null，渲染零回归）
+              dataBlocks: (meta?.data_blocks as DataBlock[] | null) ?? null,
+              dataReferences: (meta?.data_references as DataReference[] | null) ?? null,
+              // [A] 血缘解释块（后端只在有内容时下发；无字段 ⇒ null，渲染零回归）
+              dataLineage: meta?.data_lineage ?? null,
+              // 实时数据（问答调用了外部工具才下发）
+              toolResults: meta?.tool_results ?? null,
+              // 动作提案卡片（写操作/需确认动作，用户确认后执行）
+              pendingActions: meta?.pending_actions ?? null,
+              // 本次检索 Token 总量；无键 / 非法值 ⇒ undefined，卡片整块不渲染
+              totalTokens:
+                typeof meta?.total_tokens === 'number' && Number.isFinite(meta.total_tokens)
+                  ? meta.total_tokens
+                  : undefined,
+            }
+          : prev,
+      );
+
+      // 恢复该 history_id 的本地投票缓存，再拉后端权威状态覆盖
+      if (historyId) {
+        const cached = voteCacheRef.current[historyId];
+        setSessionVote(cached ?? null);
+        void fetchAnswerFeedback(historyId, sessionId);
+      } else {
+        setSessionVote(null);
+      }
+      return { historyId, references: filteredRefs };
+    },
+    [fetchAnswerFeedback],
+  );
+
+  /**
+   * [jonex] 检索历史落库（首连与恢复共用）。
+   *
+   * 带 `historyId` 时更新同一条：恢复路径对应的那次检索后端多半已经写过历史，
+   * 前端补存只补卡片元数据，不新增一行。
+   */
+  const persistSearchResult = useCallback(
+    (params: {
+      sessionId: string;
+      historyId?: string;
+      domainId: string;
+      spaceIdAtStart: string | null;
+      query: string;
+      accumulatedAnswer: string;
+      references: KnowledgeReference[];
+      elapsedMs: number;
+      strictConfig?: KnowledgeSearchStrictConfig | null;
+      imageIds?: string[];
+      imageQuestion?: string;
+      keepHistoryActive?: boolean;
+    }) => {
+      const domain = visibleDomains.find((d) => d.id === params.domainId);
+      const refCount = params.references.length;
+      saveKnowledgeSearchHistory('', {
+        // 后端已经写过这条历史时更新同一条，避免重复行丢掉卡片元数据
+        historyId: params.historyId,
+        // 历史按空间过滤：空间项取自身，服务项取其所属空间
+        domainSpaceId: domain?.space_id,
+        // ⚠️ 存的是**实际用于检索的文本**（有图时是识别产出），不是用户原话 ——
+        // 历史「重新检索」要能复现这次检索。用户原话另走 imageQuestion。
+        query: params.query,
+        domainId: params.domainId,
+        domain: domain?.name ?? '',
+        answerPreview: buildAnswerPreview(params.accumulatedAnswer),
+        referenceCount: refCount,
+        resultCount: refCount,
+        status: 'done',
+        durationMs: params.elapsedMs,
+        // [jonex] 检索历史快照：完整答案 + 引用 + 推理链落库，点击历史直接展示（不重新检索）
+        answer: params.accumulatedAnswer,
+        references: params.references,
+        reasoning: reasoningRef.current as ReasoningTrace | null,
+        // [jonex] 检索条件快照：保存实际使用的 strictConfig，点击历史再次搜索时复用
+        strictConfig: params.strictConfig ?? undefined,
+        // [jonex] 以图问知识：图片在这一刻才由后端落盘（识别阶段只在 Redis 暂存）。
+        // 过期 / 没识别成功的图会被后端跳过，历史照常保存（D11）。
+        queryImageIds: params.imageIds?.length ? params.imageIds : undefined,
+        imageQuestion: params.imageQuestion || undefined,
+      })
+        .then((item) => {
+          // 等落库回包期间切了空间：这条是**上一个空间**的检索（落库本身是对的，
+          // 它带着当时的 domainSpaceId），但不能插进新空间的历史列表
+          const stillSameSpace = (params.spaceIdAtStart ?? undefined) === (currentSpaceIdRef.current ?? undefined);
+          if (!params.keepHistoryActive && stillSameSpace) {
+            setHistory((prev) => {
+              // 恢复路径落库前列表里可能已经有这条（离开期间任务已完成）→ 就地更新，不重复插
+              if (prev.some((entry) => entry.id === item.id)) {
+                return prev.map((entry) => (entry.id === item.id ? item : entry));
+              }
+              return [item, ...prev];
+            });
+            setActiveHistoryIndex(0);
+          }
+          // 回包里带的是**真正挂上的**图（可能比提交的少），据此刷新会话卡片。
+          //
+          // ⚠️ 必须**合并**而不是重建：原实现把整个列表重建成 `status:'ok'`，
+          // 于是识别失败那几张的 `status:'failed'`（卡片上的「未参与检索」置灰标记）
+          // 被抹掉、`localUrl` 也可能对不上 id 而丢失 —— 看起来像"图片都成功了"。
+          // 以会话现有列表为底，只给真的挂上的那张补 viewUrl / 真实 id。
+          if (item.queryImages?.length) {
+            setActiveSearch((prev) => {
+              if (prev?.id !== params.sessionId) return prev;
+              const existing = prev.queryImages ?? [];
+              const savedById = new Map(item.queryImages!.map((image) => [image.id, image]));
+              const merged = existing.map((image) => {
+                const saved = image.imageId ? savedById.get(image.imageId) : undefined;
+                return saved
+                  ? { ...image, imageId: saved.id, viewUrl: saved.viewUrl ?? image.viewUrl, status: 'ok' as const }
+                  : image;
+              });
+              // 回包里多出来的（例如「重新检索」沿用 imageIds 那条路）按顺序补在末尾
+              for (const saved of item.queryImages!) {
+                if (!merged.some((image) => image.imageId === saved.id)) {
+                  merged.push({ imageId: saved.id, viewUrl: saved.viewUrl, status: 'ok' as const });
+                }
+              }
+              return { ...prev, queryImages: merged };
+            });
+          }
+          // [jonex] 反馈锚回接：让反馈挂「最终答案快照」而非服务端「本体层快照」
+          // （2026-10-13 用户拍板；此前点踩恒挂服务端快照 → 反馈 answer 常为基座文案）
+          setActiveSearch((prev) => (prev?.id === params.sessionId ? { ...prev, historyId: item.id } : prev));
+        })
+        .catch(() => {
+          // save failed, silently ignore
+        });
+    },
+    [visibleDomains],
+  );
+
   const handleSearch = useCallback(
     async (
       nextQuery?: string,
@@ -932,6 +1063,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
         keepHistoryActive?: boolean;
         domainId?: string;
         strictConfig?: KnowledgeSearchStrictConfig | null;
+        wiki?: boolean;
         /** [jonex] 以图问知识：历史「重新检索」时沿用原来的图片 id（不重新识别） */
         imageIds?: string[];
         /** [jonex] 以图问知识：「重试」时复用会话里留着的那组压缩图（输入区已清空） */
@@ -967,9 +1099,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
       // 纯图检索的历史重新检索后还会**凭空多出一条原话**。
       const userQuestion = usingAttached ? trimmedQuery : (options?.imageQuestion ?? '');
 
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
+      // 新检索取代旧的未完成会话：旧任务继续跑只会白占资源，还会在历史里多一条无关结果
+      abortActiveSearch();
+      const superseded = readPendingWikiSearchSession();
+      if (superseded) {
+        void cancelWikiSearch(superseded.sessionId);
+        clearPendingWikiSearch(superseded.sessionId);
+      }
 
       // 发起时的空间：等落库回包时要拿它跟当时的空间比对（见下面 .then）
       const spaceIdAtStart = currentSpaceIdRef.current;
@@ -977,6 +1113,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
       const domainId = options?.domainId ?? selectedDomain;
       // [jonex] 复用历史检索条件：优先用历史快照的 strictConfig，否则用当前面板配置
       const effectiveStrictConfig = options?.strictConfig ?? strictConfig;
+      const effectiveSearchMode = options?.wiki ? 'wiki' : searchMode;
       // [jonex] 告警分流：历史 / 已选范围里的服务可能已停用而不在候选中（候选已由
       // 后端过滤），此时不能笼统说「没有可查询的知识库」，要提示范围已不可用。
       const domainWarning = resolveDomainWarning(domainId, visibleDomains);
@@ -1004,7 +1141,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
       // 提示用户而不是把 lightrag/openkb 的库送去被拒。
       let scopedKbIds = kbIds;
       let kbTypes = domainKbTypes;
-      if (searchMode === 'wiki') {
+      if (effectiveSearchMode === 'wiki') {
         if (domainKbTypes.length !== kbIds.length) {
           message.warning(t('knowledgeSearch.wikiKbTypeUnknown'));
           return;
@@ -1019,6 +1156,14 @@ const KnowledgeSearch = function KnowledgeSearch() {
         scopedKbIds = wikiPairs.map(([id]) => id);
         kbTypes = wikiPairs.map(([, kbType]) => kbType);
       }
+      // 与 API 层端点选择同口径：显式 Wiki 档，或快速档下整批库都落在 jonex_wiki 管线。
+      // 只有这类请求才有后端检索会话（可恢复），其余模式刷新后只能重新检索。
+      const isWikiSession =
+        effectiveSearchMode === 'wiki'
+        || (effectiveSearchMode === 'fast'
+          && kbTypes.length > 0
+          && kbTypes.length === scopedKbIds.length
+          && kbTypes.every((kbType) => kbType === 'jonex_wiki'));
       // ── [jonex] 以图问知识：先识别、再检索（两步式）────────────────
       // 会话与输入框的处理：
       // - 输入框文字**保持现状**（下面的 setQuery(trimmedQuery)，既不，也不回填识别结果）
@@ -1048,28 +1193,37 @@ const KnowledgeSearch = function KnowledgeSearch() {
       sessionUrlsRef.current = localImages
         .map((image) => image.localUrl)
         .filter((url): url is string => Boolean(url));
-      setActiveSearch({
-        id: sessionId,
+      // 整轮运行登记到模块级运行态：页面卸载不影响这次检索与它的结果
+      const controller = new AbortController();
+      beginSearchRun({
+        spaceId: spaceIdAtStart,
         query: trimmedQuery,
         domainId,
-        startedAt: Date.now(),
-        mode: searchMode,
-        wiki: searchMode === 'wiki' || (searchMode !== 'deep' && kbTypes.length > 0 && kbTypes.every((k) => k === 'jonex_wiki')),
-        rawAnswer: '',
-        // 有图时先进识别阶段，卡片上显示「识别图片中…」
-        status: usingAttached ? 'recognizing' : 'searching',
-        errorMessage: '',
-        // [jonex] 检索条件快照：随本次会话保存，再次搜索时复用当时条件
-        strictConfig: effectiveStrictConfig,
-        queryImages: localImages,
-        imageQuestion: userQuestion || undefined,
-        retryFiles: filesForRetry,
-        dataBlocks: null,
-        dataReferences: null,
-        dataLineage: null,
-        toolResults: null,
-        pendingActions: null,
-        actionResults: null,
+        mode: effectiveSearchMode,
+        controller,
+        session: {
+          id: sessionId,
+          query: trimmedQuery,
+          domainId,
+          startedAt: Date.now(),
+          mode: effectiveSearchMode,
+          wiki: isWikiSession,
+          rawAnswer: '',
+          // 有图时先进识别阶段，卡片上显示「识别图片中…」
+          status: usingAttached ? 'recognizing' : 'searching',
+          errorMessage: '',
+          // [jonex] 检索条件快照：随本次会话保存，再次搜索时复用当时条件
+          strictConfig: effectiveStrictConfig,
+          queryImages: localImages,
+          imageQuestion: userQuestion || undefined,
+          retryFiles: filesForRetry,
+          dataBlocks: null,
+          dataReferences: null,
+          dataLineage: null,
+          toolResults: null,
+          pendingActions: null,
+          actionResults: null,
+        },
       });
 
       // 最终交给检索接口的文本：有图时是识别产出，无图时就是用户输入
@@ -1116,11 +1270,10 @@ const KnowledgeSearch = function KnowledgeSearch() {
           domainSpaceId,
           kbIds: scopedKbIds,
           kbTypes,
-          deep: searchMode === 'deep',
-          wiki: searchMode === 'wiki',
-          ontologyData: searchMode === 'ontologyData',
-          data: searchMode === 'data',
-          wikiThinkingMode,
+          deep: effectiveSearchMode === 'deep',
+          wiki: effectiveSearchMode === 'wiki',
+          ontologyData: effectiveSearchMode === 'ontologyData',
+          data: effectiveSearchMode === 'data',
           queryImageIds: imageIdsForHistory,
           imageQuestion: userQuestion || undefined,
           strictConfig: effectiveStrictConfig,
@@ -1137,6 +1290,19 @@ const KnowledgeSearch = function KnowledgeSearch() {
         await streamKnowledgeSearch(
           searchParams,
           {
+            // [jonex] 拿到后端会话 id 立刻落盘：之后无论刷新还是路由切走，
+            // 回来都能凭它重新订阅（浏览器关标签页时 sessionStorage 随之清除）。
+            onSession: (id) => {
+              if (!isWikiSession) return;
+              savePendingWikiSearch({
+                sessionId: id,
+                query: trimmedQuery,
+                spaceId: currentSpaceIdRef.current,
+                domainId,
+                startedAt: Date.now(),
+              });
+              setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, wikiSessionId: id } : prev));
+            },
             onProgress: (events) => {
               setActiveSearch((prev) => prev?.id === sessionId ? { ...prev, wikiProgress: events } : prev);
             },
@@ -1173,6 +1339,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
             },
             onError: (error) => {
               streamError = error;
+              // 会话已经死了（超时 / 失败 / 过期）：留着只会让回来时白恢复一次
+              if (isWikiSession) clearPendingWikiSearch();
               setActiveSearch((prev) =>
                 prev?.id === sessionId
                   ? {
@@ -1184,64 +1352,16 @@ const KnowledgeSearch = function KnowledgeSearch() {
               );
             },
             onDone: (meta) => {
-              if (meta?.source === 'jonex_wiki') {
-                setReasoningExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
-              }
-              reasoningRef.current = (meta?.reasoning as any) ?? null;
+              // 无答案检测只认后端结构化信号（source === 'none' 且没有引用）。
+              // 不能扫描整段答案文本：混合检索的融合答案会解释「某个知识库未收录、
+              // 无法提供该数据」，而引用来自同一批里的其他知识库——文本正则会把
+              // 真实引用一起清空，表现为同一问题「有时有原文、有时没有」。
+              const isNoAnswer = isNoAnswerResponse(meta);
+              // 与恢复路径共用同一套 meta 映射（答案卡片的字段只能有一份来源）
+              const applied = applySearchMeta(sessionId, meta, isNoAnswer, Date.now() - startTime);
               // [jonex] answer-feedback 锚点：检索响应下发检索历史 id
-              const historyId = meta?.history_id;
-              if (historyId) backendHistoryId = historyId;
-
-              // 无答案检测：如果回答内容表示"无法回答"，清空引用
-              const noAnswerPatterns = [
-                /sorry/i,
-                /unable to answer/i,
-                /no answer/i,
-                /cannot provide/i,
-                /no relevant/i,
-                /\[no-context\]/i,
-                /无法回答/i,
-                /无法提供/i,
-                /未找到相关/i,
-              ];
-              const isNoAnswer = meta?.source === 'jonex_wiki' ? false : noAnswerPatterns.some((p) => p.test(accumulatedAnswer));
-              const filteredRefs = isNoAnswer ? [] : (meta?.references ?? []);
-
-              finalReferences = filteredRefs;
-              setActiveSearch((prev) =>
-                prev?.id === sessionId
-                  ? {
-                      ...prev,
-                      references: filteredRefs,
-                      reasoning: meta?.reasoning ?? null,
-                      elapsedMs: Date.now() - startTime,
-                      source: meta?.source || prev.source,
-                      historyId,
-                      // [①②] 数据路径结构化块（router 下发；无字段 ⇒ null，渲染零回归）
-                      dataBlocks: (meta?.data_blocks as DataBlock[] | null) ?? null,
-                      dataReferences: (meta?.data_references as DataReference[] | null) ?? null,
-                      // [A] 血缘解释块（后端只在有内容时下发；无字段 ⇒ null，渲染零回归）
-                      dataLineage: meta?.data_lineage ?? null,
-                      // 实时数据（问答调用了外部工具才下发）
-                      toolResults: meta?.tool_results ?? null,
-                      // 动作提案卡片（写操作/需确认动作，用户确认后执行）
-                      pendingActions: meta?.pending_actions ?? null,
-                      // 本次检索 Token 总量；无键 / 非法值 ⇒ undefined，卡片整块不渲染
-                      totalTokens:
-                        typeof meta?.total_tokens === 'number' && Number.isFinite(meta.total_tokens)
-                          ? meta.total_tokens
-                          : undefined,
-                    }
-                  : prev,
-              );
-              // 恢复该 history_id 的本地投票缓存，再拉后端权威状态覆盖
-              if (historyId) {
-                const cached = voteCacheRef.current[historyId];
-                setSessionVote(cached ?? null);
-                void fetchAnswerFeedback(historyId, sessionId);
-              } else {
-                setSessionVote(null);
-              }
+              if (applied.historyId) backendHistoryId = applied.historyId;
+              finalReferences = applied.references;
             },
           },
           controller.signal,
@@ -1250,82 +1370,29 @@ const KnowledgeSearch = function KnowledgeSearch() {
         if (streamError) throw streamError;
         if (controller.signal.aborted) return;
 
-        const domainName = getDomainName(domainId);
-        const preview = buildAnswerPreview(accumulatedAnswer);
-        const refCount = finalReferences.length;
-
+        const elapsedMs = Date.now() - startTime;
         setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, status: 'done' as const } : prev));
         setThinkExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
+        // 已落终态：不再需要跨刷新恢复
+        if (isWikiSession) clearPendingWikiSearch(sessionId);
 
-        saveKnowledgeSearchHistory('', {
-          // 后端已经写过这条历史时更新同一条，避免重复行丢掉卡片元数据
+        persistSearchResult({
+          sessionId,
           historyId: backendHistoryId,
-          // 历史按空间过滤：空间项取自身，服务项取其所属空间
-          domainSpaceId: visibleDomains.find((d) => d.id === domainId)?.space_id,
-          // ⚠️ 存的是**实际用于检索的文本**（有图时是识别产出），不是用户原话 ——
-          // 历史「重新检索」要能复现这次检索。用户原话另走 imageQuestion。
-          query: effectiveQuery,
           domainId,
-          domain: domainName,
-          answerPreview: preview,
-          referenceCount: refCount,
-          resultCount: refCount,
-          status: 'done',
-          durationMs: Date.now() - startTime,
-          // [jonex] 检索历史快照：完整答案 + 引用 + 推理链落库，点击历史直接展示（不重新检索）
-          answer: accumulatedAnswer,
+          spaceIdAtStart,
+          query: effectiveQuery,
+          accumulatedAnswer,
           references: finalReferences,
-          reasoning: reasoningRef.current as ReasoningTrace | null,
-          // [jonex] 检索条件快照：保存实际使用的 strictConfig，点击历史再次搜索时复用
+          elapsedMs,
           strictConfig: effectiveStrictConfig,
-          // [jonex] 以图问知识：图片在这一刻才由后端落盘（识别阶段只在 Redis 暂存）。
-          // 过期 / 没识别成功的图会被后端跳过，历史照常保存（D11）。
-          queryImageIds: imageIdsForHistory.length ? imageIdsForHistory : undefined,
+          imageIds: imageIdsForHistory,
           imageQuestion: userQuestion || undefined,
-        })
-          .then((item) => {
-            // 等落库回包期间切了空间：这条是**上一个空间**的检索（落库本身是对的，
-            // 它带着当时的 domainSpaceId），但不能插进新空间的历史列表
-            const stillSameSpace = (spaceIdAtStart ?? undefined) === (currentSpaceIdRef.current ?? undefined);
-            if (!options?.keepHistoryActive && stillSameSpace) {
-              setHistory((prev) => [item, ...prev]);
-              setActiveHistoryIndex(0);
-            }
-            // 回包里带的是**真正挂上的**图（可能比提交的少），据此刷新会话卡片。
-            //
-            // ⚠️ 必须**合并**而不是重建：原实现把整个列表重建成 `status:'ok'`，
-            // 于是识别失败那几张的 `status:'failed'`（卡片上的「未参与检索」置灰标记）
-            // 被抹掉、`localUrl` 也可能对不上 id 而丢失 —— 看起来像"图片都成功了"。
-            // 以会话现有列表为底，只给真的挂上的那张补 viewUrl / 真实 id。
-            if (item.queryImages?.length) {
-              setActiveSearch((prev) => {
-                if (prev?.id !== sessionId) return prev;
-                const existing = prev.queryImages ?? [];
-                const savedById = new Map(item.queryImages!.map((image) => [image.id, image]));
-                const merged = existing.map((image) => {
-                  const saved = image.imageId ? savedById.get(image.imageId) : undefined;
-                  return saved
-                    ? { ...image, imageId: saved.id, viewUrl: saved.viewUrl ?? image.viewUrl, status: 'ok' as const }
-                    : image;
-                });
-                // 回包里多出来的（例如「重新检索」沿用 imageIds 那条路）按顺序补在末尾
-                for (const saved of item.queryImages!) {
-                  if (!merged.some((image) => image.imageId === saved.id)) {
-                    merged.push({ imageId: saved.id, viewUrl: saved.viewUrl, status: 'ok' as const });
-                  }
-                }
-                return { ...prev, queryImages: merged };
-              });
-            }
-            // [jonex] 反馈锚回接：让反馈挂「最终答案快照」而非服务端「本体层快照」
-            // （2026-10-13 用户拍板；此前点踩恒挂服务端快照 → 反馈 answer 常为基座文案）
-            setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, historyId: item.id } : prev));
-          })
-          .catch(() => {
-            // save failed, silently ignore
-          });
+          keepHistoryActive: options?.keepHistoryActive,
+        });
       } catch (error) {
         if (controller.signal.aborted) return;
+        if (isWikiSession) clearPendingWikiSearch();
         // 超限类错误带回了后端生效中的上限，顺手刷新前端缓存（下次就不会再撞）
         syncLimitsFromError(error);
         const msg = error instanceof Error ? error.message : t('knowledgeSearch.searchFailed');
@@ -1337,11 +1404,175 @@ const KnowledgeSearch = function KnowledgeSearch() {
         );
         setThinkExpandedMap((prev) => ({ ...prev, [sessionId]: false }));
       } finally {
-        if (abortRef.current === controller) abortRef.current = null;
+        releaseActiveController(controller);
       }
     },
-    [query, attachedImages, imageLimits, syncLimitsFromError, selectedDomain, getSelectedKbIds, visibleDomains, searchMode, wikiThinkingMode, strictConfig, fetchAnswerFeedback, t],
+    [query, attachedImages, imageLimits, syncLimitsFromError, selectedDomain, getSelectedKbIds, visibleDomains, searchMode, strictConfig, fetchAnswerFeedback, t, applySearchMeta, persistSearchResult, clearPendingWikiSearch, savePendingWikiSearch, setActiveSearch, abortActiveSearch, beginSearchRun, releaseActiveController],
   );
+
+  /**
+   * [jonex] 恢复一次仍在后台执行的 Wiki 检索。
+   *
+   * 触发场景：路由切走又切回、页面刷新。连接断开只是「不再观看」，任务在能力服务里
+   * 继续跑；这里凭 session_id 重新订阅进度流，完成时走与正常检索同一套 meta 映射与
+   * 历史落库 —— 用户看到的卡片与没离开过一致。
+   *
+   * 会话已过期（超过 TTL / 已被取消 / 不属于本人）时回到空态并提示重新检索。
+   */
+  const resumeWikiSearch = useCallback(
+    async (pending: PendingWikiSearchSession) => {
+      const sessionId = pending.sessionId;
+      const controller = new AbortController();
+      setActiveController(controller);
+
+      let accumulatedAnswer = '';
+      let finalReferences: KnowledgeReference[] = [];
+      let backendHistoryId: string | undefined;
+      let failure: Error | null = null;
+      const resumedAt = Date.now();
+
+      setSearchMode('wiki');
+      setQuery(pending.query);
+      setActiveHistoryIndex(null);
+      // 恢复出来的会话同样登记上下文：再次离开页面时才能按「同空间」续接下去
+      setSearchContext({
+        spaceId: pending.spaceId,
+        query: pending.query,
+        domainId: pending.domainId,
+        mode: 'wiki',
+      });
+      setActiveSearch({
+        id: sessionId,
+        query: pending.query,
+        domainId: pending.domainId,
+        startedAt: pending.startedAt,
+        mode: 'wiki',
+        wiki: true,
+        wikiSessionId: sessionId,
+        rawAnswer: '',
+        status: 'searching',
+        errorMessage: '',
+        wikiProgress: [],
+        dataBlocks: null,
+        dataReferences: null,
+        dataLineage: null,
+        toolResults: null,
+        pendingActions: null,
+        actionResults: null,
+      });
+
+      try {
+        await resumeWikiSearchStream(
+          sessionId,
+          {
+            onProgress: (events) => {
+              setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, wikiProgress: events } : prev));
+            },
+            onDelta: (delta, meta) => {
+              accumulatedAnswer += delta;
+              if (meta?.history_id) backendHistoryId = meta.history_id;
+              setActiveSearch((prev) =>
+                prev?.id === sessionId
+                  ? { ...prev, rawAnswer: prev.rawAnswer + delta, source: meta?.source || prev.source }
+                  : prev,
+              );
+            },
+            onDone: (meta) => {
+              const applied = applySearchMeta(sessionId, meta, false, Date.now() - resumedAt);
+              if (applied.historyId) backendHistoryId = applied.historyId;
+              finalReferences = applied.references;
+            },
+            onError: (error) => {
+              failure = error;
+            },
+          },
+          controller.signal,
+        );
+
+        if (controller.signal.aborted) return;
+        if (failure) throw failure;
+
+        const elapsedMs = Date.now() - resumedAt;
+        setActiveSearch((prev) => (prev?.id === sessionId ? { ...prev, status: 'done' as const } : prev));
+        clearPendingWikiSearch(sessionId);
+        persistSearchResult({
+          sessionId,
+          historyId: backendHistoryId,
+          domainId: pending.domainId,
+          spaceIdAtStart: pending.spaceId,
+          query: pending.query,
+          accumulatedAnswer,
+          references: finalReferences,
+          elapsedMs,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        clearPendingWikiSearch(sessionId);
+        const expired = (error as Error & { code?: string })?.code === 'session_expired';
+        if (expired) {
+          // 会话已结束（超过 TTL / 已取消）：回到空态，别留一张假的错误卡片
+          setActiveSearch((prev) => (prev?.id === sessionId ? null : prev));
+          message.warning(t('knowledgeSearch.searchExpired'));
+        } else {
+          const msg = error instanceof Error ? error.message : t('knowledgeSearch.searchFailed');
+          setActiveSearch((prev) =>
+            prev?.id === sessionId ? { ...prev, status: 'error' as const, errorMessage: msg } : prev,
+          );
+        }
+      } finally {
+        releaseActiveController(controller);
+      }
+    },
+    [applySearchMeta, clearPendingWikiSearch, persistSearchResult, setActiveSearch, setActiveController, setSearchContext, releaseActiveController, t],
+  );
+
+  /**
+   * 恢复函数的最新引用。
+   *
+   * 恢复 effect 只在空间变化时该重跑；恢复函数本身依赖 domains（历史落库要用），
+   * 直接写进依赖数组会让每次领域列表刷新都重启一次恢复。
+   */
+  const resumeWikiSearchRef = useRef<(pending: PendingWikiSearchSession) => void>(() => undefined);
+  /** 上一次恢复 effect 看到的空间 id：区分「首次加载」与「用户换了空间」 */
+  const spaceIdAtResumeRef = useRef<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    resumeWikiSearchRef.current = (pending) => {
+      void resumeWikiSearch(pending);
+    };
+  }, [resumeWikiSearch]);
+
+  /**
+   * 刷新 / 路由切回来：把仍在后台执行的检索接上。
+   *
+   * 与初始化 effect 分开，是因为它必须在 `resumeWikiSearchRef` 赋值之后执行
+   * （初始化 effect 先清空并拉列表，这个 effect 再恢复会话）。
+   */
+  useEffect(() => {
+    const previousSpaceId = spaceIdAtResumeRef.current;
+    spaceIdAtResumeRef.current = global.currentSpaceId;
+    // 只有「从一个真实空间切到另一个空间」才算放弃；首次加载（null → id）不算
+    const spaceChanged = !!previousSpaceId && previousSpaceId !== global.currentSpaceId;
+
+    if (spaceChanged) {
+      // 换空间 = 主动放弃上一个空间的未完成检索（离开页面 / 刷新不会走到这里）
+      abortActiveSearch();
+      const abandoned = readPendingWikiSearchSession();
+      if (abandoned) {
+        void cancelWikiSearch(abandoned.sessionId);
+        clearPendingWikiSearch(abandoned.sessionId);
+      }
+      return;
+    }
+    // 本次进程内的检索还在跑（离开页面只是停止渲染，请求并没有断）：回来直接接着看，
+    // 不能重复订阅 —— 那会有两条流同时往同一张卡片里写。
+    const runtime = useKnowledgeSearchRuntimeStore.getState();
+    if (runtime.controller && isSearchRunning(runtime.session?.status)) return;
+    const pending = readPendingWikiSearchSession();
+    if (pending && (pending.spaceId ?? null) === (global.currentSpaceId ?? null)) {
+      resumeWikiSearchRef.current(pending);
+    }
+  }, [global.currentSpaceId, clearPendingWikiSearch, abortActiveSearch]);
 
   /**
    * [jonex] 以图问知识：「仅用文字检索」。
@@ -1383,6 +1614,7 @@ const KnowledgeSearch = function KnowledgeSearch() {
     async (item: KnowledgeSearchHistoryItem, index: number) => {
       setQuery(item.query);
       setActiveHistoryIndex(index);
+      if (item.wiki) setSearchMode('wiki');
       if (item.domainId && visibleDomains.some((d) => d.id === item.domainId)) setSelectedDomain(item.domainId);
 
       // [jonex] 列表**不再携带快照**（answer / references / reasoning 占响应体积 83%），
@@ -1403,8 +1635,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
       // 旧数据无快照则回退为重新检索
       const hasSnapshot = Boolean(snapshot?.answer) || (snapshot?.references?.length ?? 0) > 0;
       if (snapshot && hasSnapshot) {
-        abortRef.current?.abort();
-        abortRef.current = null;
+        abortActiveSearch();
+        // 切到历史回放 = 不再关心正在跑的检索：终止它的后台任务
+        if (activeSearchRef.current?.wikiSessionId) {
+          const running = activeSearchRef.current.wikiSessionId;
+          void cancelWikiSearch(running);
+          clearPendingWikiSearch(running);
+        }
         setSessionVote(null);
         // 回放的是历史快照，用的是服务端 viewUrl（不是 objectURL）→ 上一轮的本地 URL 可以收了
         releaseSessionUrls();
@@ -1418,6 +1655,8 @@ const KnowledgeSearch = function KnowledgeSearch() {
           errorMessage: '',
           references: snapshot.references ?? [],
           reasoning: snapshot.reasoning ?? null,
+          queryOutcomes: snapshot.queryOutcomes ?? [],
+          wiki: snapshot.wiki,
           elapsedMs: snapshot.durationMs ?? snapshot.reasoning?.total_ms ?? undefined,
           // [jonex] 检索条件快照：点击历史再次搜索时复用当时的 strictConfig（来自 metadata，列表已带）
           strictConfig: item.strictConfig ?? null,
@@ -1434,6 +1673,13 @@ const KnowledgeSearch = function KnowledgeSearch() {
           toolResults: item.toolResults ?? null,
           pendingActions: item.pendingActions ?? null,
           actionResults: item.actionResults ?? null,
+        });
+        // 历史回放也记进运行态：离开页面再回来时这张卡片仍要留着（不是被当成空态清掉）
+        setSearchContext({
+          spaceId: currentSpaceIdRef.current,
+          query: item.query,
+          domainId: item.domainId ?? selectedDomain,
+          mode: snapshot.wiki ? 'wiki' : null,
         });
         // 回显该历史的反馈状态（异步覆盖本地缓存与选中态）
         void fetchAnswerFeedback(item.id, sessionId);
@@ -1453,34 +1699,45 @@ const KnowledgeSearch = function KnowledgeSearch() {
         keepHistoryActive: true,
         domainId: item.domainId ?? selectedDomain,
         strictConfig: item.strictConfig ?? undefined,
+        wiki: item.wiki,
         // [jonex] 以图问知识：**不重新识别** —— 原图字节不在前端（存的是压缩后那份，
         // 且早就随会话丢弃了），而历史里的 `query` 已经是识别产出，直接拿它检索即可。
         // 图片只沿用 id，让新这条历史也挂上同一批图。
         imageIds: item.queryImages?.map((image) => image.id),
       });
     },
-    [handleSearch, releaseSessionUrls, selectedDomain, fetchAnswerFeedback, visibleDomains],
+    [handleSearch, releaseSessionUrls, selectedDomain, fetchAnswerFeedback, visibleDomains, clearPendingWikiSearch, setActiveSearch, abortActiveSearch, setSearchContext],
   );
 
   const handleStopSearch = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    // 用户主动停止 = 唯一会终止后台检索的入口（离开页面 / 刷新都只是断开订阅）
+    abortActiveSearch();
+    const wikiSessionId = activeSearchRef.current?.wikiSessionId;
+    if (wikiSessionId) {
+      void cancelWikiSearch(wikiSessionId);
+      clearPendingWikiSearch(wikiSessionId);
+    }
     setActiveSearch((prev) => {
       if (!prev || !isSearchRunning(prev.status)) return prev;
       setThinkExpandedMap((map) => ({ ...map, [prev.id]: false }));
       return { ...prev, status: 'stopped' as const };
     });
     message.info(t('knowledgeSearch.searchStopped'));
-  }, []);
+  }, [abortActiveSearch, clearPendingWikiSearch, setActiveSearch]);
 
   const handleClearSearch = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    // 清空 = 主动放弃当前检索：终止后台任务，别让它继续跑
+    abortActiveSearch();
+    const pending = activeSearchRef.current?.wikiSessionId;
+    if (pending) {
+      void cancelWikiSearch(pending);
+      clearPendingWikiSearch(pending);
+    }
     // 会话没了，它占的 objectURL 也一并回收
     releaseSessionUrls();
-    setActiveSearch(null);
+    resetSearchRuntime();
     setActiveHistoryIndex(null);
-  }, [releaseSessionUrls]);
+  }, [abortActiveSearch, releaseSessionUrls, clearPendingWikiSearch, resetSearchRuntime]);
 
   /** 对当前回答点击「有帮助」—— 点赞直接提交；点踩由 Popconfirm 受控打开（见 handleDislikeOpenChange） */
   const handleVoteAnswer = useCallback(
@@ -1794,8 +2051,6 @@ const KnowledgeSearch = function KnowledgeSearch() {
                   isSearching={isSearching}
                   searchMode={searchMode}
                   onSearchModeChange={setSearchMode}
-                  wikiThinkingMode={wikiThinkingMode}
-                  onWikiThinkingModeChange={setWikiThinkingMode}
                   strictConfig={strictConfig}
                   onStrictConfigChange={setStrictConfig}
                   onDomainChange={handleDomainChange}

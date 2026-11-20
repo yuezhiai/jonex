@@ -69,7 +69,8 @@ export function buildOpenkbTabs(
     {
       key: 'wikiPages',
       label: isJonexWiki ? t('compile.wikiReader') : t('compile.wikiPages'),
-      count: wiki.summaries + wiki.concepts + wiki.entities,
+      // The old count includes concept fragments, not authored articles.
+      count: isJonexWiki ? 0 : wiki.summaries + wiki.concepts + wiki.entities,
       icon: <ReadOutlined />,
     },
   ];

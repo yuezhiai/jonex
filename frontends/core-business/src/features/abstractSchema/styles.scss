@@ -55,3 +55,28 @@
   margin-left: 6px;
   opacity: 0.75;
 }
+
+// 执行进度：行内入口做按钮复位（弹层可收起后从行内再打开）。
+.ae-run-progress {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ant-color-primary, #1677ff);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+
+  &:hover { text-decoration: underline; }
+}
+
+// 进度弹层：阶段标题 + 进度条 + 计数 + 说明，纵向留白一致。
+.ae-run-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0 8px;
+
+  .ae-run-modal-head { line-height: 22px; }
+
+  .ae-run-modal-hint { display: block; }
+}

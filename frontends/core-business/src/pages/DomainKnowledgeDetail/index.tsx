@@ -65,6 +65,7 @@ import SynonymTab from './synonym/SynonymTab';
 import GovernanceTab from './governance/GovernanceTab';
 import ToolsTab from './toolBinding/ToolsTab';
 import VerifiedQueryTab from './verifiedQuery/VerifiedQueryTab';
+import ReasoningRulesTab from './reasoningRules/ReasoningRulesTab';
 import DataSourceTab from './DataSourceTab';
 import ResultTab from './ResultTab';
 import ActionTab from './ActionTab';
@@ -120,6 +121,12 @@ function getTabs(t: (key: string) => string, kbType?: KnowledgeBaseType) {
       icon: ApiOutlined,
     },
     {
+      // 推理规则（T8）：不受结构化开关影响；llm-wiki 型 KB 不显示。
+      key: 'reasoningRules',
+      label: t('domainKnowledge.tab.reasoningRules'),
+      icon: ThunderboltOutlined,
+    },
+    {
       // 数据治理控制面 P1（标签 / 策略 / 用户密级 / 审计）。取数在组件内自取。
       key: 'governance',
       label: t('domainKnowledge.tab.governance'),
@@ -142,7 +149,7 @@ function getTabs(t: (key: string) => string, kbType?: KnowledgeBaseType) {
   // 检索都不读 ontology_synonyms，tab 留着会让人以为建了就生效 —— 故对该类型隐藏。
   if (kbType === 'jonex_wiki') tabs.splice(4, 0, { key: 'scenarios', label: t('wikiScenarios.title'), icon: ControlOutlined });
   // 工具绑定的目标是本体实例，同理只对本体型 KB 显示。
-  const ontologyOnly = ['synonym', 'toolBinding'];
+  const ontologyOnly = ['synonym', 'toolBinding', 'reasoningRules'];
   return isLlmWikiType(kbType) ? tabs.filter((tab) => !ontologyOnly.includes(tab.key)) : tabs;
 
 }
@@ -514,6 +521,9 @@ const DomainKnowledgeDetail = function DomainKnowledgeDetail() {
         return <GovernanceTab kbId={id!} canWrite={detail?.can_write ?? false} />;
       case 'toolBinding':
         return <ToolsTab kbId={id!} canWrite={detail?.can_write ?? false} />;
+
+      case 'reasoningRules':
+        return <ReasoningRulesTab kbId={id!} canWrite={detail?.can_write ?? false} />;
 
       case 'verifiedQuery':
         return <VerifiedQueryTab kbId={id!} canWrite={detail?.can_write ?? false} />;

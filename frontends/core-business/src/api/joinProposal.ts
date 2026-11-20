@@ -86,11 +86,10 @@ export async function decideJoinProposal(
   decision: 'confirmed' | 'rejected',
   note = '',
 ): Promise<{ changed: boolean; proposal: JoinProposal }> {
-  const body = await getData<any>(
-    postData(
-      `/knowledge-base/ontology/join-proposals/${proposalId}/decision`,
-      { knowledge_base_id: kbId, decision, note },
-    ),
+  // postData 已解包，不要再套 getData。
+  const body = await postData<any>(
+    `/knowledge-base/ontology/join-proposals/${proposalId}/decision`,
+    { knowledge_base_id: kbId, decision, note },
   );
   return { changed: Boolean(body?.changed), proposal: mapProposal(body?.proposal) };
 }

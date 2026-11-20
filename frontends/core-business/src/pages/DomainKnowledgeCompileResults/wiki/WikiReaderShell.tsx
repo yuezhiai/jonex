@@ -31,12 +31,14 @@ import {
   getWikiBacklinks,
   getWikiOutline,
   getWikiReaderPage,
+  searchWikiArticleBodies,
 } from '@/api/wikiReader';
 import WikiOutlineRail from './WikiOutlineRail';
 import WikiHomeView from './WikiHomeView';
 import WikiTopicView from './WikiTopicView';
 import WikiArticleView from './WikiArticleView';
 import WikiImageBrowser from './WikiImageBrowser';
+import { projectArticleReading } from './wikiReadingProjection';
 
 type WikiView = { kind: 'home' } | { kind: 'topic'; nodeId: string } | { kind: 'article'; path: string };
 
@@ -76,6 +78,10 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
   const [adjustOpen, setAdjustOpen] = useState(false);
   const [adjustText, setAdjustText] = useState('');
   const [query, setQuery] = useState('');
+  const [bodySearch, setBodySearch] = useState<{ query: string; paths: string[]; cursor: string | null; hasMore: boolean } | null>(null);
+  const [bodySearchLoading, setBodySearchLoading] = useState(false);
+  const [bodySearchError, setBodySearchError] = useState('');
+  const bodySearchSequence = useRef(0);
 
   // 导航（带前进/后退栈；Wiki 是三段式阅读，读者会频繁来回跳）
   const [history, setHistory] = useState<WikiView[]>([{ kind: 'home' }]);
@@ -123,9 +129,64 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
     setBacklinks(null);
   }, [kbId, documentId]);
 
-  const pages = useMemo(() => data?.pages || [], [data]);
-  const outline = data?.outline || null;
-  const pagesByPath = useMemo(() => new Map(pages.map((p) => [p.path, p])), [pages]);
+  const allPages = useMemo(() => data?.pages || [], [data]);
+  const { pages, outline } = useMemo(
+    () => projectArticleReading(allPages, data?.outline || null, t('wikiTableReading.articleGroup')),
+    [allPages, data?.outline, t],
+  );
+  // Explicit article links can still open their registered sources and tables.
+  const pagesByPath = useMemo(() => new Map(allPages.map((p) => [p.path, p])), [allPages]);
+
+  useEffect(() => {
+    const token = ++bodySearchSequence.current;
+    const keyword = query.trim();
+    setBodySearch(null);
+    setBodySearchError('');
+    setBodySearchLoading(false);
+    if (!keyword || !kbId || !data) return;
+    const timer = window.setTimeout(async () => {
+      setBodySearchLoading(true);
+      try {
+        const result = await searchWikiArticleBodies(kbId, {
+          query: keyword,
+          ...(data.bundleSha ? { revision: data.bundleSha } : {}),
+          ...(documentId ? { document_id: documentId } : {}),
+        });
+        if (token !== bodySearchSequence.current) return;
+        if (data.bundleSha && result.revision !== data.bundleSha) throw new Error('revision changed');
+        setBodySearch({ query: keyword, paths: result.items.map((item) => item.path),
+          cursor: result.cursor, hasMore: result.has_more });
+      } catch (error) {
+        if (token === bodySearchSequence.current) setBodySearchError(String(error));
+      } finally {
+        if (token === bodySearchSequence.current) setBodySearchLoading(false);
+      }
+    }, 350);
+    return () => { window.clearTimeout(timer); ++bodySearchSequence.current; };
+  }, [kbId, documentId, data, query]);
+
+  const searchMoreArticles = useCallback(async () => {
+    if (!bodySearch?.cursor || bodySearch.query !== query.trim() || !data || bodySearchLoading) return;
+    const token = ++bodySearchSequence.current;
+    setBodySearchLoading(true);
+    setBodySearchError('');
+    try {
+      const result = await searchWikiArticleBodies(kbId, {
+        query: bodySearch.query, cursor: bodySearch.cursor,
+        ...(data.bundleSha ? { revision: data.bundleSha } : {}),
+        ...(documentId ? { document_id: documentId } : {}),
+      });
+      if (token !== bodySearchSequence.current) return;
+      if (data.bundleSha && result.revision !== data.bundleSha) throw new Error('revision changed');
+      setBodySearch((previous) => previous && previous.query === bodySearch.query
+        ? { query: previous.query, paths: [...new Set([...previous.paths, ...result.items.map((item) => item.path)])],
+          cursor: result.cursor, hasMore: result.has_more } : previous);
+    } catch (error) {
+      if (token === bodySearchSequence.current) setBodySearchError(String(error));
+    } finally {
+      if (token === bodySearchSequence.current) setBodySearchLoading(false);
+    }
+  }, [bodySearch, bodySearchLoading, data, documentId, kbId, query]);
 
   // 目录 → 页面位置索引（主题 / 小节链路）
   const pageLocations = useMemo(() => {
@@ -163,13 +224,14 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
   const searchResults = useMemo(() => {
     const keyword = query.trim().toLowerCase();
     if (!keyword) return [];
+    const bodyPaths = new Set(bodySearch?.query.toLowerCase() === keyword ? bodySearch.paths : []);
     return pages.filter((p) => {
       const haystack = [p.title, p.description, p.category, ...(p.aliases || []), ...(p.tags || [])]
         .join(' ')
         .toLowerCase();
-      return haystack.includes(keyword);
+      return haystack.includes(keyword) || bodyPaths.has(p.path);
     });
-  }, [pages, query]);
+  }, [pages, query, bodySearch]);
 
   // ── 导航 ──
   const navigate = useCallback(
@@ -202,7 +264,16 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
     setPageLoading(true);
     setPageError('');
     getWikiReaderPage(kbId, view.path)
-      .then((res) => {
+      .then(async (res) => {
+        if (!alive) return;
+        if (data?.bundleSha && res.bundleSha && data.bundleSha !== res.bundleSha) {
+          const refreshed = await getWikiOutline(kbId, documentId || undefined);
+          if (!alive) return;
+          if (refreshed.bundleSha !== res.bundleSha) {
+            throw new Error(t('wikiTableReading.versionChanged'));
+          }
+          setData(refreshed);
+        }
         if (alive) setPage(res);
       })
       .catch((err) => {
@@ -214,7 +285,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
     return () => {
       alive = false;
     };
-  }, [view, kbId, t]);
+  }, [view, kbId, documentId, data?.bundleSha, t]);
 
   // 链入本页（反向链接）：与正文并行取一次，条目页的列表与 ego 图共用
   useEffect(() => {
@@ -322,7 +393,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
 
   const railMeta = useMemo(() => {
     if (!data) return '';
-    const parts = [t('domainKnowledge.wikiReader.pageCount', { count: data.pageCount })];
+    const parts = [t('domainKnowledge.wikiReader.pageCount', { count: pages.length })];
     if (data.outlineVersion > 0) {
       parts.push(t('domainKnowledge.wikiReader.outlineVersion', { version: data.outlineVersion }));
     }
@@ -333,7 +404,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
     if (data.stale) parts.push(t('domainKnowledge.wikiReader.staleShort'));
     parts.push(t('domainKnowledge.wikiReader.outlineOnlyHint'));
     return parts.join(' · ');
-  }, [data, t]);
+  }, [data, pages.length, t]);
 
   if (loading) {
     return (
@@ -373,6 +444,10 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
         query={query}
         onQueryChange={setQuery}
         searchResults={searchResults}
+        bodySearchLoading={bodySearchLoading}
+        bodySearchHasMore={bodySearch?.query === query.trim() && bodySearch.hasMore || false}
+        bodySearchError={bodySearchError}
+        onSearchMore={() => { void searchMoreArticles(); }}
         metaText={railMeta}
         />
       </div>
@@ -450,7 +525,10 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
         )}
 
         {/* 主内容区 */}
-        {view.kind === 'home' && (
+        {view.kind === 'home' && pages.length === 0 && (
+          <Result status="info" title={t('wikiTableReading.noArticles')} />
+        )}
+        {view.kind === 'home' && pages.length > 0 && (
           <WikiHomeView
             pages={pages}
             outline={outline}
@@ -504,6 +582,7 @@ export default function WikiReaderShell({ kbId, documentId = '', scrollHeight }:
               />
             ) : page ? (
               <WikiArticleView
+                kbId={kbId}
                 page={page}
                 pages={pages}
                 pagesByPath={pagesByPath}

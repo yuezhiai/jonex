@@ -20,7 +20,6 @@ import {
 import {
   returnOf,
   runningStep,
-  totalDurationMs,
   type WikiReturn,
   type WikiTraceStep,
 } from './wikiTraceModel';
@@ -44,6 +43,7 @@ const KIND_ICON: Record<WikiTraceStep['kind'], React.ReactNode> = {
   table: <TableOutlined />,
   plan: <ToolOutlined />,
   synthesis: <FileTextOutlined />,
+  command: <ToolOutlined />,
 };
 
 /** 图标底色：与本体链的 stage 配色同一套 --k-*（semantic token） */
@@ -53,6 +53,7 @@ const KIND_TONE: Record<WikiTraceStep['kind'], TraceTone> = {
   table: 'table',
   plan: 'plan',
   synthesis: 'synth',
+  command: 'plan',
 };
 
 /** 原动作文案的键（wikiAction 是改造前就有的那套，不换词） */
@@ -62,6 +63,7 @@ const ACTION_KEY: Record<WikiTraceStep['kind'], string> = {
   table: 'table',
   plan: 'analyze',
   synthesis: 'answer',
+  command: 'command',
 };
 
 export interface WikiTraceProps {
@@ -110,9 +112,16 @@ export default function WikiTrace({
   const active = running ? runningStep(steps) : undefined;
   const elapsed = running && startedAt != null
     ? Math.max(0, now - startedAt)
-    : (durationMs ?? totalDurationMs(steps));
+    : durationMs;
 
-  const actionOf = (step: WikiTraceStep) => t(step.tool === 'image_find' ? 'knowledgeSearch.wikiImageFind' : step.tool === 'image_inspect' ? 'knowledgeSearch.wikiImageInspect' : `knowledgeSearch.wikiAction.${ACTION_KEY[step.kind]}`);
+  const actionOf = (step: WikiTraceStep) => t(
+    step.tool === 'agent_search' ? 'knowledgeSearch.wikiAction.fileSearch' :
+      step.tool === 'agent_read' ? 'knowledgeSearch.wikiAction.fileRead' :
+        step.tool === 'agent_command' ? 'knowledgeSearch.wikiAction.command' :
+          step.tool === 'image_find' ? 'knowledgeSearch.wikiImageFind' :
+            step.tool === 'image_inspect' ? 'knowledgeSearch.wikiImageInspect' :
+              `knowledgeSearch.wikiAction.${ACTION_KEY[step.kind]}`,
+  );
 
   /** 调用参数：照引擎真实字段加工，不拼假参数。 */
   const argsOf = (step: WikiTraceStep) => {
@@ -177,7 +186,7 @@ export default function WikiTrace({
     <span className={styles.live} title={active ? actionOf(active) : t('knowledgeSearch.reasoningProcess')}>
       <span className={styles.pulse} />
       <span className={styles.liveText}>
-        {active ? actionOf(active) : t('knowledgeSearch.wikiStarting')}
+        {active ? actionOf(active) : t(steps.length ? 'knowledgeSearch.wikiTrace.waiting' : 'knowledgeSearch.wikiStarting')}
       </span>
     </span>
   ) : undefined;
@@ -211,41 +220,47 @@ export default function WikiTrace({
         const extra = extraOf(step);
         const call = step.tool ? argsOf(step) : '';
         const ret = step.done ? returnOf(step) : undefined;
+        const activeStep = running && !step.done;
         // 运行中的那一行算**自己**的耗时；没有起始时刻就不显示，别拿总时长冒充
         const stepMs = step.done
           ? step.durationMs
-          : step.startedAtMs != null
+          : activeStep && step.startedAtMs != null
             ? Math.max(0, now - step.startedAtMs)
             : undefined;
         const previews = detailOpen ? step.previews : step.previews.slice(0, 1);
+        const stateLabel = step.lifecycle === 'failed' ? t('knowledgeSearch.wikiTrace.operationFailed') :
+          step.lifecycle === 'nonzero' ? t('knowledgeSearch.wikiTrace.nonzero') :
+            step.lifecycle === 'ended' || (!running && !step.done) ? t('knowledgeSearch.wikiTrace.stateUnknown') : undefined;
         return (
           <TraceCard
             key={step.id}
             index={index + 1}
             tone={KIND_TONE[step.kind]}
-            icon={step.done ? KIND_ICON[step.kind] : <LoadingOutlined />}
+            icon={activeStep ? <LoadingOutlined /> : KIND_ICON[step.kind]}
             title={actionOf(step)}
-            status={step.done ? 'done' : 'running'}
-            badges={step.cached ? <TraceChip tone="success">{t('knowledgeSearch.wikiTrace.cached')}</TraceChip> : undefined}
+            status={activeStep ? 'running' : step.lifecycle === 'failed' ? 'failed' : step.lifecycle === 'nonzero' ? 'degraded' : !step.done || step.lifecycle === 'ended' ? 'skipped' : 'done'}
+            badges={<>
+              {step.resourceKind && <TraceChip>{t(`knowledgeSearch.wikiTrace.resource.${step.resourceKind}`)}</TraceChip>}
+              {stateLabel && <TraceChip tone={step.lifecycle === 'failed' ? 'danger' : 'warn'}>{stateLabel}</TraceChip>}
+              {step.cached && <TraceChip tone="success">{t('knowledgeSearch.wikiTrace.cached')}</TraceChip>}
+            </>}
             duration={stepMs != null ? fmtTraceMs(stepMs) : undefined}
             onClick={extra.more ? () => setOpenDetail(detailOpen ? null : index) : undefined}
             expanded={detailOpen}
           >
-            {call && (
-              <TraceIO label={t('knowledgeSearch.wikiTrace.call')} hot={!step.done} mono>
-                <b>{step.tool}</b>
-                {step.done ? (
-                  <span> {call}</span>
-                ) : (
-                  <>
-                    <span className={styles.pending}> {t('knowledgeSearch.wikiTrace.toolRunning')}</span>
-                    {call && <span>（{call}）</span>}
-                  </>
-                )}
+            {(step.input || call) && (
+              <TraceIO label={t('knowledgeSearch.wikiTrace.call')} hot={activeStep} mono>
+                <span>{step.input || call}</span>
+                {activeStep && <span className={styles.pending}> {t('knowledgeSearch.wikiTrace.toolRunning')}</span>}
               </TraceIO>
             )}
 
-            {ret && (
+            {step.output && (
+              <TraceIO label={t('knowledgeSearch.wikiTrace.outputExcerpt')}>
+                <span className={styles.out} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{step.output}</span>
+              </TraceIO>
+            )}
+            {ret && !step.output && (
               <TraceIO label={t('knowledgeSearch.wikiTrace.return')}>
                 <span className={styles.out}>{returnText(ret)}</span>
               </TraceIO>

@@ -7,7 +7,7 @@
  * ——按钮 tooltip 里说清（设计决策）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Alert, Button, Checkbox, Drawer, Empty, Input, Modal, Space, Spin, Table, Tag, Tooltip, Typography, message } from 'antd';
+import { Alert, Button, Checkbox, Drawer, Empty, Input, Modal, Progress, Space, Spin, Table, Tag, Tooltip, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { PartitionOutlined, ReloadOutlined, SaveOutlined, CheckCircleOutlined, EditOutlined, UploadOutlined, ThunderboltOutlined, HistoryOutlined, LeftOutlined, RightOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
@@ -63,8 +63,13 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
   const [loading, setLoading] = useState(true);
   /** 生成概念候选（与「抽象 Schema」页签同一动作）：空态与有数据时都可触发 */
   const [generating, setGenerating] = useState(false);
-  /** 后台 run 的进度（仅生成中非空）：`已处理 n/总数` + 阶段。 */
-  const [runProgress, setRunProgress] = useState<{ done: number; total: number; phase: string } | null>(null);
+  /** 后台 run 的进度（仅生成中非空）：阶段 + 概念计数 + 落点/未决数。 */
+  const [runProgress, setRunProgress] = useState<{
+    done: number; total: number; phase: string; subPhase: string;
+    landed: number; unresolved: number;
+  } | null>(null);
+  /** 进度弹层：提交即打开；可「后台运行」收起，点行内进度重新打开。 */
+  const [progressOpen, setProgressOpen] = useState(false);
   /** 轮询定时器句柄：重生成与卸载都必须清掉，否则旧 run 的轮询会写进新状态。 */
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 生成代次：卸载/重新生成会自增，用来丢弃在途的 start / poll 响应（不能只清定时器）。 */
@@ -398,6 +403,8 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
     const token = ++runTokenRef.current;
     setGenerating(true);
     setRunProgress(null);
+    // 提交即弹层：用户第一眼就看见「正在做什么」，而不是等第一次轮询。
+    setProgressOpen(true);
     let polling = false;
     try {
       let started = await startLandingRun(kbId, runMode, {
@@ -431,12 +438,20 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
         try {
           const run = await getLandingRun(kbId, runId);
           if (stopped || token !== runTokenRef.current) return;
-          const { conceptsDone, conceptsTotal } = run.progress;
-          setRunProgress({ done: conceptsDone, total: conceptsTotal, phase: run.phase });
+          const { conceptsDone, conceptsTotal, subPhase, landed, unresolved } = run.progress;
+          setRunProgress({
+            done: conceptsDone,
+            total: conceptsTotal,
+            phase: run.phase,
+            subPhase,
+            landed,
+            unresolved,
+          });
           if (run.status === 'succeeded') {
             stopped = true;
             stopPolling();
             setRunProgress(null);
+            setProgressOpen(false);
             setGenerating(false);
             message.success(t('abstractSchema.landingAgent.succeeded'));
             await load();
@@ -444,6 +459,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
             stopped = true;
             stopPolling();
             setRunProgress(null);
+            setProgressOpen(false);
             setGenerating(false);
             message.error(run.error || t('abstractSchema.generateFailed'));
           } else {
@@ -456,6 +472,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
             stopped = true;
             stopPolling();
             setRunProgress(null);
+            setProgressOpen(false);
             setGenerating(false);
             message.error(e?.message || t('abstractSchema.generateFailed'));
           } else {
@@ -481,7 +498,10 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
     } finally {
       // 成功建单后由轮询收口；这里只负责「没进轮询」的分支复位按钮态。
       // 代次变了说明已被重新生成/卸载接管，不能再改当前状态。
-      if (!polling && token === runTokenRef.current) setGenerating(false);
+      if (!polling && token === runTokenRef.current) {
+        setGenerating(false);
+        setProgressOpen(false);
+      }
     }
   }, [kbId, load, readOnly, runLegacyGenerate, stopPolling, t]);
 
@@ -521,22 +541,67 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
   const draftMode: LandingRunMode = hasDraft && !restartAll ? 'landings' : 'full';
   // queued 阶段后端 phase 为空串；别把 `...phase.` 这种残缺 key 显示出来。
   const phaseLabel = (phase: string) => (phase ? t(`abstractSchema.landingAgent.phase.${phase}`) : '');
-  /** 生成进度：与生成按钮同一处显示（空态/有数据两分支共用）。 */
-  const runProgressNode = generating && runProgress ? (
-    <Text className="ae-run-progress">
-      {/* queued 阶段 phase 为空串：走无阶段文案，别渲染出「已处理 0/0 · 」的悬挂分隔符。 */}
-      {phaseLabel(runProgress.phase)
-        ? t('abstractSchema.landingAgent.progress', {
-            done: runProgress.done,
-            total: runProgress.total,
-            phase: phaseLabel(runProgress.phase),
-          })
-        : t('abstractSchema.landingAgent.progressOnly', {
-            done: runProgress.done,
-            total: runProgress.total,
-          })}
-    </Text>
+  /** 当前阶段：主阶段 +（落点阶段的）子相位，如「判定落点 · 判定落点」去重。 */
+  const currentPhaseText = runProgress
+    ? Array.from(new Set([
+        phaseLabel(runProgress.phase),
+        runProgress.subPhase ? phaseLabel(runProgress.subPhase) : '',
+      ].filter(Boolean))).join(' · ')
+    : '';
+  const runPercent = runProgress && runProgress.total > 0
+    ? Math.min(100, Math.round((runProgress.done / runProgress.total) * 100))
+    : null;
+  /** 行内进度：生成中常驻，点一下重新打开弹层（弹层可「后台运行」收起）。 */
+  const runProgressNode = generating ? (
+    <button type="button" className="ae-run-progress" onClick={() => setProgressOpen(true)}>
+      {t('abstractSchema.landingAgent.inline', {
+        phase: currentPhaseText || t('abstractSchema.landingAgent.queued'),
+        done: runProgress?.done ?? 0,
+        total: runProgress?.total ?? 0,
+      })}
+    </button>
   ) : null;
+  /**
+   * 执行进度弹层：生成在服务端后台跑，这里只负责「现在在做什么」。
+   * 不阻断操作：可收起成行内进度，完成后自动关闭并刷新草稿。
+   */
+  const runProgressModal = (
+    <Modal
+      open={generating && progressOpen}
+      title={t('abstractSchema.landingAgent.runningTitle')}
+      onCancel={() => setProgressOpen(false)}
+      maskClosable={false}
+      footer={(
+        <Button type="primary" onClick={() => setProgressOpen(false)}>
+          {t('abstractSchema.landingAgent.runInBackground')}
+        </Button>
+      )}
+      width={520}
+    >
+      <div className="ae-run-modal">
+        <Space align="center" size="small" className="ae-run-modal-head">
+          <Spin size="small" />
+          <Text strong>{currentPhaseText || t('abstractSchema.landingAgent.queued')}</Text>
+        </Space>
+        {runPercent !== null ? (
+          <Progress percent={runPercent} status="active" showInfo={false} />
+        ) : null}
+        {runProgress && runProgress.total > 0 ? (
+          <Text type="secondary">
+            {t('abstractSchema.landingAgent.counters', {
+              done: runProgress.done,
+              total: runProgress.total,
+              landed: runProgress.landed,
+              unresolved: runProgress.unresolved,
+            })}
+          </Text>
+        ) : null}
+        <Text type="secondary" className="ae-run-modal-hint">
+          {t('abstractSchema.landingAgent.runHint')}
+        </Text>
+      </div>
+    </Modal>
+  );
 
   /**
    * 生成前的小弹窗：业务词表可选。词表语法是「别名1,别名2 => 实体名或物理表名」，
@@ -618,6 +683,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
             || window.confirm(t('abstractEditor.importDirtyConfirm'))}
         />
         {generateModal}
+        {runProgressModal}
       </>
     );
   }
@@ -883,6 +949,7 @@ export function AbstractSchemaEditorPage({ kbId, canWrite }: Props): ReactNode {
           || window.confirm(t('abstractEditor.importDirtyConfirm'))}
       />
       {generateModal}
+      {runProgressModal}
     </div>
   );
 }
