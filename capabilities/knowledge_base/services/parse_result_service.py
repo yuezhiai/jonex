@@ -271,7 +271,7 @@ class ParseResultService:
     async def query_wiki_resources(self, tenant_id: str, request: dict, *, actor: str = "") -> dict:
         kb_id = str(request.get("knowledge_base_id") or "")
         operation = str(request.get("operation") or "")
-        if operation not in {"find_resources", "get_question", "lookup_records", "get_media_segment", "get_evidence", "inspect_visual", "find_images", "get_image", "inspect_image"}:
+        if operation not in {"find_resources", "get_question", "lookup_records", "get_media_segment", "get_evidence", "inspect_visual", "find_images", "get_image", "inspect_image", "search_authored_articles"}:
             raise InvalidParameterError(message="不支持的资源读取操作")
         if await self._get_kb_type(tenant_id, kb_id) != "jonex_wiki":
             raise InvalidParameterError(message="仅 Jonex Wiki 支持资源读取")

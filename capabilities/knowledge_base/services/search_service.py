@@ -1,6 +1,7 @@
 """Search service for Knowledge Base."""
 
 import asyncio
+from contextvars import ContextVar
 import hashlib
 import json
 import logging
@@ -127,6 +128,12 @@ ONTOLOGY_ROUTE_RERANK_ENABLED = os.getenv(
 ONTOLOGY_ROUTE_RERANK_MIN = float(os.getenv("ONTOLOGY_ROUTE_RERANK_MIN", "0.5"))
 # 送 rerank 的候选文本上限（description + attributes 拼接后截断），防超长拖慢路由。
 _ROUTE_DOC_MAX = int(os.getenv("ONTOLOGY_ROUTE_DOC_MAX", "800"))
+# [jonex] T7：问句意图 → 类型名候选。允许 1 个汉字的类型别名
+# （「有哪些人」的「人」），避免统一长度 ≥2 的过滤把 Person/Book 等短别名漏掉。
+_TYPE_QUERY_INTENT_RE = re.compile(
+    r"(?:有哪些|有那些|哪些|有什么|何种|列出|所有|全部)\s*([^\s，。！？?、；;：:]+)"
+)
+_TYPE_QUERY_TAIL_PARTICLES = "呢吗啊呀吧"
 # [jonex] S6（§4.3）：`extraction_method` 硬门开关。开启后 stub 实体不进 L1 候选
 # （纵深防御——四级匹配的 Cypher 已带 `coalesce(stub,false)=false` 过滤）。
 #
@@ -538,7 +545,10 @@ OPENKB_TRACE_MAX_CALLS = max(1, int(os.getenv("OPENKB_TRACE_MAX_CALLS", "80")))
 
 # ── [jonex] search_mix 中 jonex_wiki 侧超时降级（Phase 5）：最慢一路决定整体延迟，
 # 超时返回空 + 标记 source 降级，不拖垮 lightrag/openkb（留 30s 给 Gateway 缓冲）──
-JONEX_WIKI_SEARCH_TIMEOUT_SEC = float(os.getenv("JONEX_WIKI_SEARCH_TIMEOUT_SEC", "90"))
+JONEX_WIKI_SEARCH_TIMEOUT_SEC = float(os.getenv("JONEX_WIKI_SEARCH_TIMEOUT_SEC", "270"))
+# Request-local evidence of actual RAG errors, including errors swallowed by
+# the existing recall fallback. Empty successful recall is intentionally absent.
+_MIX_RAG_FAILED_KBS: ContextVar[set[str] | None] = ContextVar("mix_rag_failed_kbs", default=None)
 # ── §10 深度查询配置 ──
 _DEEP_QUERY_ENABLED = os.getenv("DEEP_QUERY_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 _DEEP_MAX_SUBQUERIES = max(1, min(10, int(os.getenv("DEEP_MAX_SUBQUERIES", "6"))))
@@ -1173,6 +1183,19 @@ _PROCEDURAL_PATTERNS: list[re.Pattern] = [
 ONTOLOGY_INVERSE_EXPAND_ENABLED = (
     os.getenv("ONTOLOGY_INVERSE_EXPAND_ENABLED", "true").lower()
     not in ("0", "false", "no", "off")
+)
+
+# [jonex] T7：层级检索扩展总开关（默认关）。控制类型召回分支、类型/关系/属性
+# 扩展和 deprecated 后置过滤。
+ONTOLOGY_HIERARCHY_EXPANSION_ENABLED = (
+    os.getenv("ONTOLOGY_HIERARCHY_EXPANSION_ENABLED", "false").lower()
+    not in ("0", "false", "no", "off", "")
+)
+
+# [jonex] T9：推理链总闸（默认关）；库级 knowledge_info.reasoning_enabled 再叠一层。
+ONTOLOGY_REASONING_ENABLED = (
+    os.getenv("ONTOLOGY_REASONING_ENABLED", "false").lower()
+    not in ("0", "false", "no", "off", "")
 )
 
 # [jonex] 抽象 schema 概念扩展（概念对齐层）：查询词 → 命中概念 → 带 data_source_id
@@ -2136,6 +2159,10 @@ class SearchService:
                     answer_preview=answer[:300],
                     answer=answer,
                     references=references,
+                    # 历史卡片按这两个计数渲染「N 条结果」；不传则恒为 0，
+                    # 与引用快照自相矛盾。
+                    reference_count=len(references or []),
+                    result_count=len(references or []),
                     duration_ms=duration_ms,
                 ),
             )
@@ -2694,6 +2721,239 @@ class SearchService:
             return await self._build_references_by_doc_ids(tenant_id, doc_ids)
         return []
 
+    @staticmethod
+    async def _reasoning_view_for_kb(tenant_id: str, kb_id: str):
+        from .ontology_reasoning.context import resolve_reasoning_context
+        from .ontology_reasoning.view import build_reasoning_view
+
+        return build_reasoning_view(
+            await resolve_reasoning_context(tenant_id, kb_id)
+        )
+
+    @staticmethod
+    def _match_type_query(query: str, context) -> set[str]:
+        """问题中最长的类型名/别名匹配（T7 类型作为查询）。
+
+        「有哪些人」这类问句允许命中 1 个汉字的别名（`Person.aliases` 含「人」）；
+        其余场景仍保持长度 ≥2，避免单字别名在普通问句里噪声召回。
+        """
+        q = str(query or "").lower()
+
+        def names_of(entity: dict) -> list[str]:
+            return [entity.get("name") or ""] + list(entity.get("aliases") or [])
+
+        def entity_name(entity: dict, fallback: str) -> str:
+            return entity.get("name") or fallback
+
+        # 1) 问句意图：「有哪些 / 哪些 / 列出 …」后的名词短语优先。
+        for match in _TYPE_QUERY_INTENT_RE.finditer(q):
+            phrase = match.group(1).strip().rstrip(_TYPE_QUERY_TAIL_PARTICLES)
+            if not phrase:
+                continue
+            exact: set[str] = set()
+            suffix_hits: list[tuple[int, str]] = []
+            for entity in context.entities.values():
+                for name in names_of(entity):
+                    term = str(name or "").strip().lower()
+                    if not term:
+                        continue
+                    if term == phrase:
+                        exact.add(entity_name(entity, name))
+                    elif len(term) >= 2 and phrase.endswith(term):
+                        suffix_hits.append((len(term), entity_name(entity, name)))
+            if exact:
+                return exact
+            if suffix_hits:
+                best_len = max(length for length, _ in suffix_hits)
+                return {
+                    name for length, name in suffix_hits if length == best_len
+                }
+
+        # 2) 原逻辑：全问题内最长类型名/别名（至少 2 字）。
+        best = 0
+        matched: set[str] = set()
+        for entity in context.entities.values():
+            for name in names_of(entity):
+                term = str(name or "").strip().lower()
+                if len(term) < 2 or term not in q:
+                    continue
+                if len(term) > best:
+                    best = len(term)
+                    matched = {entity_name(entity, name)}
+                elif len(term) == best:
+                    matched.add(entity_name(entity, name))
+        return matched
+
+    async def _type_query_candidates(
+        self, gdao: OntologyGraphRepository, tenant_id: str,
+        kb_ids: list[str], query: str,
+    ) -> tuple[list[dict], dict]:
+        """类型名命中 → 取该类型及后代类型的实例，作为召回候选。"""
+        from .ontology_reasoning.expand import expand_entity_types
+
+        candidates: list[dict] = []
+        seen: set[tuple] = set()
+        detail: dict = {"kbs": [], "matched_types": [], "truncated": False}
+        for kb_id in kb_ids:
+            try:
+                ctx = await self._reasoning_context_for_kb(tenant_id, kb_id)
+                view = self._view_from_context(ctx)
+                matched = self._match_type_query(query, ctx.schema_context)
+                if not matched:
+                    continue
+                expansion = expand_entity_types(view, sorted(matched))
+                detail["truncated"] = detail["truncated"] or expansion.truncated
+                detail["matched_types"].extend(sorted(matched))
+                rows = await gdao.list_entities_by_types(
+                    tenant_id, kb_id, expansion.values, limit=20,
+                )
+                for row in rows:
+                    key = (kb_id, row.get("name"), row.get("type"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append({
+                        **row,
+                        "kb_id": kb_id,
+                        "source": "type_query",
+                        "type_query_type": sorted(matched)[0],
+                        "vscore": 0.0,
+                        "ft_score": 0.0,
+                    })
+                detail["kbs"].append({
+                    "kb_id": kb_id,
+                    "types": sorted(matched),
+                    "expanded_types": expansion.values,
+                })
+            except Exception as exc:  # noqa: BLE001 — 类型召回失败不阻断检索
+                logger.warning(
+                    "[ontology] 类型召回失败 kb=%s query=%r: %s", kb_id, query, exc,
+                )
+        return candidates, detail
+
+    async def _reasoning_context_for_kb(self, tenant_id: str, kb_id: str):
+        from .ontology_reasoning.context import resolve_reasoning_context
+        return await resolve_reasoning_context(tenant_id, kb_id)
+
+    @staticmethod
+    def _view_from_context(ctx):
+        from .ontology_reasoning.view import build_reasoning_view
+        return build_reasoning_view(ctx)
+
+    async def _expand_entity_type_names(
+        self, tenant_id: str, kb_ids: list[str], names: list[str],
+    ) -> list[str]:
+        from .ontology_reasoning.expand import expand_entity_types
+
+        values: list[str] = list(names)
+        for kb_id in kb_ids:
+            try:
+                ctx = await self._reasoning_context_for_kb(tenant_id, kb_id)
+                view = self._view_from_context(ctx)
+                canonical = []
+                for name in names:
+                    key = ctx.schema_context.resolve_entity(name)
+                    canonical.append(
+                        (ctx.schema_context.entities.get(key) or {}).get("name") or name
+                    )
+                values.extend(expand_entity_types(view, canonical).values)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ontology] 类型扩展失败 kb=%s: %s", kb_id, exc)
+        from .ontology_reasoning.expand import _cap
+        return _cap(values).values
+
+    async def _filter_deprecated_instances(
+        self, tenant_id: str, kb_ids: list[str], instances: list[dict],
+    ) -> tuple[list[dict], int]:
+        views: dict[str, object] = {}
+        kept: list[dict] = []
+        dropped = 0
+        for inst in instances:
+            kb_id = str(inst.get("kb_id") or (kb_ids[0] if kb_ids else ""))
+            try:
+                if kb_id not in views:
+                    ctx = await self._reasoning_context_for_kb(tenant_id, kb_id)
+                    views[kb_id] = self._view_from_context(ctx)
+                view = views[kb_id]
+                if str(inst.get("type") or "") in (view.deprecated_types or set()):
+                    dropped += 1
+                    continue
+            except Exception:  # noqa: BLE001 — 视图失败按不过滤处理
+                pass
+            kept.append(inst)
+        return kept, dropped
+
+    async def _kb_reasoning_enabled(self, tenant_id: str, kb_id: str) -> bool:
+        try:
+            from sqlalchemy import text
+            from jonex_core.common.database import get_db_session
+
+            async with get_db_session() as session:
+                row = (await session.execute(
+                    text("SELECT reasoning_enabled FROM knowledge_base.knowledge_info "
+                         "WHERE id=:kb AND tenant_id=:t AND is_deleted=0"),
+                    {"kb": kb_id, "t": tenant_id},
+                )).first()
+            return bool(row and row[0] is True)
+        except Exception:  # noqa: BLE001 — 读不到开关按关闭处理
+            return False
+
+    async def _reasoning_chain_derive(
+        self, tenant_id: str, kb_id: str, anchor_entity: str,
+        collector: ReasoningCollector,
+    ) -> None:
+        """T9：推理链执行规则表；结果只进 collector，不进 facts/作答。"""
+        if not ONTOLOGY_REASONING_ENABLED or not anchor_entity:
+            return
+        if not await self._kb_reasoning_enabled(tenant_id, kb_id):
+            return
+        try:
+            from .ontology_reasoning.rule_service import RuleService
+
+            result = await asyncio.wait_for(
+                RuleService().preview_reasoning(
+                    tenant_id, kb_id, anchor_entity=anchor_entity,
+                    limit=50, timeout=0.4,
+                ),
+                timeout=0.6,
+            )
+            results = result.get("results") or []
+            derived = [
+                item for rule_result in results
+                for item in (rule_result.get("derived") or [])
+            ]
+            collector.step(
+                STAGE_FACT_LOOKUP, "规则推理链",
+                summary=f"规则推导 {len(derived)} 条（仅供参考，未参与作答）",
+                detail={
+                    "derived": derived[:50],
+                    "derived_count": len(derived),
+                    "skipped": result.get("skipped") or [],
+                    "note": "推导结果，仅供参考，未参与作答",
+                },
+            )
+        except asyncio.TimeoutError:
+            collector.step(
+                STAGE_FACT_LOOKUP, "规则推理链", status="skipped",
+                summary="推理超时，跳过（不影响检索）",
+            )
+        except Exception as exc:  # noqa: BLE001
+            collector.step(
+                STAGE_FACT_LOOKUP, "规则推理链", status="failed",
+                summary=f"推理失败，跳过: {str(exc)[:120]}",
+            )
+
+    async def _filter_deprecated_facts(
+        self, tenant_id: str, kb_id: str, facts: list[dict],
+    ) -> tuple[list[dict], int]:
+        try:
+            view = await self._reasoning_view_for_kb(tenant_id, kb_id)
+        except Exception:  # noqa: BLE001
+            return facts, 0
+        deprecated = view.deprecated_types or set()
+        kept = [f for f in facts if str(f.get("target_type") or "") not in deprecated]
+        return kept, len(facts) - len(kept)
+
     async def _match_ontology(
         self, gdao: OntologyGraphRepository, tenant_id: str, kb_ids: list[str],
         query: str, trace_id: str | None = None,
@@ -2705,6 +2965,10 @@ class SearchService:
         里过滤，避免同名的其它类型先命中就提前返回、把目标类型挤掉。
         """
         instances: list[dict] = []
+        if entity_types and ONTOLOGY_HIERARCHY_EXPANSION_ENABLED:
+            entity_types = await self._expand_entity_type_names(
+                tenant_id, kb_ids, list(entity_types),
+            )
         wanted = list(entity_types) if entity_types else None
 
         # 1a) 精确匹配旁路（canonical_name 或 alias 完全相等；名称完全相等优先）
@@ -4867,6 +5131,9 @@ class SearchService:
         for kid, res in zip(kb_ids, results):
             if isinstance(res, Exception):
                 logger.warning("[L0] KB 召回失败 kb=%s: %s", kid, res)
+                failures = _MIX_RAG_FAILED_KBS.get()
+                if failures is not None:
+                    failures.add(kid)
                 kb_failed.append(kid)
                 continue
             refs = (res or {}).get("references") or []
@@ -5749,6 +6016,8 @@ class SearchService:
             "answer": answer[:500],
             "ref_count": len(refs),
             "refs": refs,  # 子查询原始引用，供 deep 汇总
+            "incomplete": sub_result.get("incomplete"),
+            "query_outcomes": sub_result.get("query_outcomes") or [],
         }
 
     async def _synthesize(
@@ -5838,6 +6107,23 @@ class SearchService:
                 "facts_summary": [],
             }
         kb_ids = await self._resolve_kb_ids(tenant_id, req)
+        pipeline_map = await self._get_kb_types(tenant_id, kb_ids)
+        has_wiki = any(pipeline_map.get(kb_id) == "jonex_wiki" for kb_id in kb_ids)
+
+        async def retrieve(sub_request):
+            if has_wiki:
+                # Keep the normal deep planner, but route every subquestion by
+                # actual KB type and retain Wiki evidence and its uncertainty.
+                return await self.search_mix(tenant_id, user_id, MixSearchRequest(
+                    query=sub_request.query, mode=sub_request.mode, top_k=sub_request.top_k,
+                    knowledge_base_ids=kb_ids, save_history=sub_request.save_history,
+                    with_reasoning=sub_request.with_reasoning,
+                    domain_space_id=sub_request.domain_space_id, thinking_mode="deep",
+                ), trace_id=trace_id)
+            return await self.query_with_ontology(
+                tenant_id, user_id, sub_request, trace_id,
+                allow_action_proposals=False, expose_pending_actions=False)
+
         collector = ReasoningCollector(
             enabled=req.with_reasoning and _REASONING_ENABLED,
             context=await self._build_reasoning_context(
@@ -5862,10 +6148,7 @@ class SearchService:
                 "with_reasoning": req.with_reasoning,
                 "strict_mode": False,  # 防止复进入 strict 循环
             })
-            result = await self.query_with_ontology(
-                tenant_id, user_id, sub_req, trace_id,
-                allow_action_proposals=False, expose_pending_actions=False,
-            )
+            result = await retrieve(sub_req)
             # 合并 deep 分类步骤到内层 reasoning
             if result.get("reasoning") and isinstance(result["reasoning"], dict):
                 inner_steps = result["reasoning"].get("steps", [])
@@ -5897,10 +6180,7 @@ class SearchService:
 
         if not sub_questions:
             # 规划失败 → 降级到普通查询
-            fallback = await self.query_with_ontology(
-                tenant_id, user_id, req, trace_id,
-                allow_action_proposals=False, expose_pending_actions=False,
-            )
+            fallback = await retrieve(req)
             fallback["source"] = "deep_degraded"
             # 规划失败降级到普通查询，同样要带本次 Token
             await _attach_total_tokens(fallback, tenant_id, trace_id)
@@ -5920,10 +6200,7 @@ class SearchService:
                     strict_mode=False,
                 )
                 try:
-                    r = await self.query_with_ontology(
-                        tenant_id, user_id, sub, trace_id,
-                        allow_action_proposals=False, expose_pending_actions=False,
-                    )
+                    r = await retrieve(sub)
                     fact = self._extract_fact(r, sq)
                     collector.step(
                         STAGE_SUBQUERY, f"子查询·{sq.get('id', '?')}",
@@ -5950,6 +6227,21 @@ class SearchService:
         t_subq_ms = int((time.perf_counter() - t_subq) * 1000)
         logger.info("[deep] 子查询完成 count=%d ms=%d", len(facts), t_subq_ms)
 
+        all_refs: list[dict] = []
+        seen_refs: set[tuple] = set()
+        all_onto: list[dict] = []
+        for fact in facts:
+            if fact.get("source") == "ontology":
+                all_onto.append({"name": fact.get("value", ""), "source": "subquery"})
+            for ref in fact.get("refs", []):
+                key = (self._reference_key(ref) if ref.get("evidence_handle") else
+                       ("legacy", ref.get("doc_id", ""), ref.get("chunk_index", -1)))
+                if key not in seen_refs:
+                    seen_refs.add(key)
+                    all_refs.append(ref)
+        for fact in facts:
+            fact["answer"] = self._remap_mixed_citations(fact.get("answer", ""), fact.get("refs", []), all_refs)
+
         # ── 汇总 ──
         t_synth = time.perf_counter()
         answer = await self._synthesize(
@@ -5974,18 +6266,6 @@ class SearchService:
         # [jonex] §block-packing 改动 4：该 2 元组去重键与「按 chunk 收敛」
         # 决策一致（page_no 不参与判别，跨页打包 chunk 不同命中片段不产生
         # 重复引用），无需变更
-        all_refs: list[dict] = []
-        seen_refs: set[tuple] = set()
-        all_onto: list[dict] = []
-        for f in facts:
-            if f.get("source") == "ontology":
-                all_onto.append({"name": f.get("value", ""), "source": "subquery"})
-            for ref in f.get("refs", []):
-                key = (ref.get("doc_id", ""), ref.get("chunk_index", -1))
-                if key not in seen_refs:
-                    seen_refs.add(key)
-                    all_refs.append(ref)
-
         # ── [jonex] §10.4 deep 专用校验（要素级 grounded）──
         reliability = None
         if req.strict_mode and _STRICT_MODE_ENABLED:
@@ -6034,6 +6314,10 @@ class SearchService:
                 for f in facts
             ],
         }
+        outcomes = [item for fact in facts for item in fact.get("query_outcomes", [])]
+        if has_wiki:
+            result["query_outcomes"] = outcomes
+            result["incomplete"] = any(fact.get("incomplete") is True or fact.get("source") == "error" for fact in facts)
         if req.save_history:
             history = await self._history.save_history(
                 tenant_id, user_id,
@@ -6046,11 +6330,17 @@ class SearchService:
                     answer_preview=(answer or "")[:300],
                     answer=answer,
                     references=all_refs or [],
+                    # 历史卡片按这两个计数渲染「N 条结果」；不传则恒为 0，
+                    # 与引用快照自相矛盾。
+                    reference_count=len(all_refs or []),
+                    result_count=len(all_refs or []),
                     reasoning=result["reasoning"],
                     metadata={
                         "knowledge_base_ids": kb_ids,
                         "source": "deep",
                         "pipeline": "deep",
+                        "incomplete": result.get("incomplete"),
+                        "query_outcomes": result.get("query_outcomes", []),
                     },
                 ),
             )
@@ -6371,6 +6661,69 @@ class SearchService:
                            status="failed", summary="本体检索失败，降级 OntoRAG", t_start=t)
             logger.warning("[ontology] 本体检索失败，降级 RAG: %s", e)
 
+        # ── [jonex] T7：类型作为查询的召回分支 + deprecated 后置过滤 ──
+        if ONTOLOGY_HIERARCHY_EXPANSION_ENABLED:
+            try:
+                _type_extra, _type_detail = await self._type_query_candidates(
+                    gdao, tenant_id, kb_ids, req.query,
+                )
+                if _type_extra:
+                    _seen = {
+                        (i.get("kb_id"), i.get("name"), i.get("type"))
+                        for i in ontology_instances
+                    }
+                    _new_type_items = []
+                    for item in _type_extra:
+                        key = (item.get("kb_id"), item.get("name"), item.get("type"))
+                        if key in _seen:
+                            continue
+                        _seen.add(key)
+                        _new_type_items.append(item)
+                    if _new_type_items:
+                        # 类型候选排在精确实例命中之后、模糊命中之前：否则会被
+                        # `top_n[:5]` 截掉，路由永远看不到它们。
+                        _exact_prefix = [
+                            i for i in ontology_instances
+                            if i.get("source") in ("exact", "prefix")
+                        ]
+                        _rest = [
+                            i for i in ontology_instances
+                            if i.get("source") not in ("exact", "prefix")
+                        ]
+                        ontology_instances = (
+                            _exact_prefix + _new_type_items + _rest
+                        )
+                    collector.step(
+                        STAGE_ONTOLOGY_MATCH, "类型作为查询",
+                        summary=(f"类型命中 → 补充 {len(_type_extra)} 个实例候选"),
+                        detail=_type_detail,
+                    )
+                ontology_instances, _deprecated_dropped = (
+                    await self._filter_deprecated_instances(
+                        tenant_id, kb_ids, ontology_instances,
+                    )
+                )
+                if _deprecated_dropped:
+                    collector.step(
+                        STAGE_ONTOLOGY_MATCH, "deprecated 过滤",
+                        summary=f"丢弃 {_deprecated_dropped} 个 deprecated 类型实例",
+                        detail={"dropped": _deprecated_dropped},
+                    )
+                if _type_extra or _deprecated_dropped:
+                    collector.step(
+                        STAGE_ONTOLOGY_MATCH, "层级扩展（hierarchy_expand）",
+                        summary=(
+                            f"类型召回 {len(_type_extra)} 个候选；"
+                            f"deprecated 丢弃 {_deprecated_dropped} 个"
+                        ),
+                        detail={
+                            **_type_detail,
+                            "deprecated_dropped": _deprecated_dropped,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 — 扩展失败不阻断检索
+                logger.warning("[ontology] 层级扩展失败: %s", exc)
+
         # ── [jonex] 抽象 schema 概念扩展（概念对齐层）──
         # 位置在 `_match_ontology` 之后：一要拿实例做反向打源标，二要让采集器
         # 的顺序与推理链一致。**不改召回** —— 既不往 _match_ontology 塞候选，
@@ -6510,9 +6863,10 @@ class SearchService:
                 src = hit.get("source", "")
                 vs = hit.get("vscore", 0)
                 fs = hit.get("ft_score", hit.get("score", 0))
-                if src == "exact":
-                    # exact 语义明确，保留旁路（§4.3）。
-                    _pass, _why = True, "exact 旁路"
+                if src in ("exact", "type_query"):
+                    # exact 语义明确；type_query 是「问设备」这类类型查询的候选，
+                    # 同样直接放行（T7）。
+                    _pass, _why = True, f"{src} 旁路"
                 elif ONTOLOGY_ROUTE_RERANK_ENABLED and not _rr_failed:
                     # rerank 生效：prefix 与其余一视同仁，都要过 rerank 阈值
                     # （不再凭硬编码 1.0 直接过线）。
@@ -6760,6 +7114,24 @@ class SearchService:
                         collector.step(STAGE_FACT_LOOKUP, "邻域事实检索", status="failed",
                                        summary="邻域检索失败，降级 OntoRAG", t_start=t)
                         logger.warning("[ontology] 邻域检索失败，降级 RAG: %s", e)
+
+                # ── [jonex] T9：推理链（只进 collector，不进 facts/作答）──
+                if facts is not None and not _tool_done:
+                    await self._reasoning_chain_derive(
+                        tenant_id, top_kb_id, matched.get("name", ""), collector,
+                    )
+
+                # ── [jonex] T7：deprecated 类型事实后置过滤 ──
+                if ONTOLOGY_HIERARCHY_EXPANSION_ENABLED and facts:
+                    facts, _dep_facts = await self._filter_deprecated_facts(
+                        tenant_id, top_kb_id, facts,
+                    )
+                    if _dep_facts:
+                        collector.step(
+                            STAGE_FACT_LOOKUP, "deprecated 事实过滤",
+                            summary=f"丢弃 {_dep_facts} 条 deprecated 类型事实",
+                            detail={"dropped": _dep_facts},
+                        )
 
                 # ── [jonex] P8（M3-a）：inverse 语义翻译 ──
                 # incoming 边按 inverse_of 映射翻译 relation_type（作答 LLM 看到
@@ -7047,6 +7419,10 @@ class SearchService:
                     answer_preview=(answer or "")[:300],
                     answer=answer,
                     references=references,
+                    # 历史卡片按这两个计数渲染「N 条结果」；不传则恒为 0，
+                    # 与引用快照自相矛盾。
+                    reference_count=len(references or []),
+                    result_count=len(references or []),
                     reasoning=result["reasoning"],
                     metadata={
                         "knowledge_base_ids": kb_ids,
@@ -7998,27 +8374,49 @@ class SearchService:
     # ── [jonex] OpenKB 分流 — 批量管线查询、search_llmwiki、search_mix ──
 
     @staticmethod
-    def _merge_references(*groups: list[dict]) -> list[dict]:
-        """[jonex] 合并多侧引用，按 doc_id 去重保序。
+    def _reference_key(ref: dict) -> tuple | None:
+        """A Wiki evidence handle is narrower than the document containing it."""
+        doc_id = str(ref.get("doc_id") or "")
+        if ref.get("evidence_handle"):
+            return ("wiki", str(ref.get("kb_id") or ""), doc_id,
+                    str(ref.get("bundle_sha") or ""), str(ref.get("query_id") or ""),
+                    str(ref["evidence_handle"]))
+        if doc_id:
+            return ("doc", str(ref.get("kb_id") or ""), doc_id)
+        if ref.get("id"):
+            return ("id", str(ref["id"]))
+        return None
 
-        混合检索里 OntoRAG 与 llm-wiki 可能引用同一份文档（前者 chunk 级命中，
-        后者经 wiki 页溯源）。传入顺序即优先级——先到的保留，因此把证据更强的
-        一侧放前面（OntoRAG 的 chunk 级引用带 locations，信息比派生引用多）。
-        无 doc_id 的条目按原样保留，不参与去重。
-        """
+    @staticmethod
+    def _merge_references(*groups: list[dict]) -> list[dict]:
+        """Merge documents and distinct, query-scoped Wiki evidence in order."""
         out: list[dict] = []
-        seen: set[str] = set()
+        seen: set[tuple] = set()
         for group in groups:
             for ref in group or []:
-                doc_id = str((ref or {}).get("doc_id") or "")
-                if not doc_id:
-                    out.append(ref)
+                key = SearchService._reference_key(ref or {})
+                if key is not None and key in seen:
                     continue
-                if doc_id in seen:
-                    continue
-                seen.add(doc_id)
+                if key is not None:
+                    seen.add(key)
                 out.append(ref)
         return out
+
+    @staticmethod
+    def _remap_mixed_citations(answer: str, source_refs: list[dict], final_refs: list[dict]) -> str:
+        """Map side-local citation numbers to exact merged evidence cards."""
+        indexes = {SearchService._reference_key(ref): i for i, ref in reversed(list(enumerate(final_refs, 1)))
+                   if SearchService._reference_key(ref) is not None}
+        by_object = {id(ref): i for i, ref in enumerate(final_refs, 1)}
+        def replace(match):
+            number = int(match.group(2))
+            if not 1 <= number <= len(source_refs):
+                return "" if match.group(1) else match.group(0)
+            ref = source_refs[number - 1]
+            key = SearchService._reference_key(ref)
+            index = indexes.get(key) if key is not None else by_object.get(id(ref))
+            return f"[{index}]" if index is not None else ("" if match.group(1) else match.group(0))
+        return re.sub(r"\[(ref[-_]?)?(\d+)\]", replace, answer or "")
 
     async def _build_openkb_references(
         self, tenant_id: str, per_kb_traces: list[tuple[str, list[dict]]],
@@ -8339,7 +8737,9 @@ class SearchService:
             docs = await KnowledgeDocumentRepository(session).get_by_ids(
                 list(dict.fromkeys(c["document_id"] for _, c in entries)), tenant_id)
         allowed = set(allowed_kb_ids) if allowed_kb_ids is not None else None
-        doc_map = {d.id: d for d in docs if allowed is None or d.knowledge_base_id in allowed}
+        doc_map = {d.id: d for d in docs
+                   if (allowed is None or d.knowledge_base_id in allowed)
+                   and getattr(d, 'status', None) not in {'archived', 'deleting', 'deleted'}}
         kb_names = await self._get_kb_names(tenant_id, list(dict.fromkeys(k for k, _ in entries)))
         storage = get_object_storage()
         urls = {}
@@ -8642,6 +9042,19 @@ class SearchService:
                     detail={"kb_id": kid, "error": str(res)[:200], "duration_ms": kb_ms},
                 )
                 continue
+            if isinstance(res, dict) and isinstance(res.get('source_document_ids'), list):
+                # A source can enter deletion while the Agent is still running.
+                # Recheck the pinned Bundle's full scope before returning its
+                # answer, not just when the query was initially submitted.
+                source_ids = res['source_document_ids']
+                from .search_history_service import _active_history_documents
+                async with get_db_session() as _session:
+                    active_sources = await _active_history_documents(_session, tenant_id, [kid], source_ids)
+                if set(source_ids) != active_sources:
+                    kb_failed.append(kid)
+                    collector.step(STAGE_OPENKB_QUERY, f"LLM Wiki 检索 · {kid}",
+                                   status="failed", summary="检索期间来源不可用")
+                    continue
             answer = res.get("answer") if isinstance(res, dict) else str(res)
             trace_data = res.get("trace") if isinstance(res, dict) else None
             _turns = list((trace_data or {}).get("turns") or [])
@@ -8807,6 +9220,10 @@ class SearchService:
                     answer_preview=answer[:300],
                     answer=answer,
                     references=_references,
+                    # 历史卡片按这两个计数渲染「N 条结果」；不传则恒为 0，
+                    # 与引用快照自相矛盾。
+                    reference_count=len(_references or []),
+                    result_count=len(_references or []),
                     reasoning=collector.build(source),
                     duration_ms=total_ms,
                     metadata={
@@ -8911,7 +9328,6 @@ class SearchService:
                     _res = await compiler.search_compiled_knowledge(
                         kb_name=kid, tenant_id=tenant_id, kb_id=kid, question=req.query,
                         return_trace=_want_trace,
-                        thinking_mode=req.thinking_mode,
                         trace_id=trace_id,
                         **({'query_context':query_context} if query_context else {}),
                         **({"progress_session": progress_session} if progress_session else {}),
@@ -8926,6 +9342,7 @@ class SearchService:
         per_kb: list[dict] = []
         kb_failed: list[str] = []
         kb_no_answer: list[str] = []
+        query_outcomes: list[dict] = []
         # [jonex] 空库直接记「无答案」：不进引擎、不进 kb_failed，前端显示「未找到」而非「引擎异常」
         for _kid in _empty_ids:
             kb_no_answer.append(_kid)
@@ -8935,10 +9352,12 @@ class SearchService:
                 summary="知识库暂无文档",
                 detail={"kb_id": _kid, "reason": "empty_kb"},
             )
+            query_outcomes.append({"kb_id": _kid, "incomplete": True, "stop_reason": "empty_kb"})
         for kid, res, kb_ms in results:
             if isinstance(res, Exception):
                 logger.warning("[jonex_wiki] query 失败 kb=%s: %s", kid, res)
                 kb_failed.append(kid)
+                query_outcomes.append({"kb_id": kid, "incomplete": True, "stop_reason": "engine_error"})
                 collector.step(
                     STAGE_JONEX_WIKI_QUERY, f"jonex_wiki 检索 · {kid}",
                     status="failed",
@@ -8949,16 +9368,24 @@ class SearchService:
             answer = res.get("answer") if isinstance(res, dict) else str(res)
             # [jonex] 引擎返回三样东西：答案、已核验引用（六字段 + page_path）、
             # 公开检索轨迹（白名单后的 trace + CR-TRACE-002 span）。
+            outcome = {key: res[key] for key in ("incomplete", "stop_reason", "failure_class",
+                       "incomplete_reason", "recovery_notes", "unverified_citations", "token_usage",
+                       "full_table_ids", "source_document_ids") if isinstance(res, dict) and key in res}
+            query_outcomes.append({"kb_id": kid, **outcome})
             _citations = list(res.get("citations") or []) if isinstance(res, dict) else []
             _trace_events = list(res.get("trace") or []) if isinstance(res, dict) else []
             _spans = list(res.get("spans") or []) if isinstance(res, dict) else []
             _counts = (res.get("counts") or {}) if isinstance(res, dict) else {}
+            _agent_direct = any(isinstance(event, dict) and event.get("event") == "retrieval_policy"
+                                and (event.get("detail") or {}).get("strategy") == "agent_direct_files"
+                                for event in _trace_events)
             _calls_all = self._jonex_wiki_chain_calls(_trace_events)
             # [jonex] D8 截断：按调用数截断（保留前 N 次，链路顺序不变）
             _calls_total = len(_calls_all)
             _truncated = _calls_total > OPENKB_TRACE_MAX_CALLS
             _calls = _calls_all[:OPENKB_TRACE_MAX_CALLS] if _truncated else _calls_all
-            if not self._is_openkb_effective_answer(answer):
+            keep_partial = outcome.get("incomplete") is True and isinstance(answer, str) and bool(answer.strip())
+            if not self._is_openkb_effective_answer(answer) and not keep_partial:
                 logger.info("[jonex_wiki] 无效答案 kb=%s answer_preview=%r", kid, (answer or "")[:80])
                 kb_no_answer.append(kid)
                 collector.step(
@@ -8985,19 +9412,26 @@ class SearchService:
                 "calls": _calls,
                 "tool_calls_total": _calls_total,
                 "citation_count": len(_citations),
+                **outcome,
                 "duration_ms": kb_ms,
             }
             _chain_spans = self._jonex_wiki_chain_spans(_spans, OPENKB_TRACE_MAX_CALLS)
             if _chain_spans:
                 _detail["spans"] = _chain_spans
-            if _counts:
+            if _counts and not _agent_direct:
                 _detail["counts"] = _counts
             if _truncated:
                 _detail["tool_calls_truncated"] = True
+            if _agent_direct:
+                _detail.pop("tool_calls_total", None)
+                _detail["trace_basis"] = "agent_file_commands_not_full_trace"
+                summary = (f"{'返回部分答案' if outcome.get('incomplete') is True else '返回答案'}"
+                           f"（Agent 文件检索路线，{len(_citations)} 条引用；读取过程未完整记录）")
+            else:
+                summary = (f"{'返回部分答案' if outcome.get('incomplete') is True else '返回有效答案'}"
+                           f"（{_calls_total} 次检索/阅读调用，{len(_citations)} 条引用）")
             collector.step(
-                STAGE_JONEX_WIKI_QUERY, f"jonex_wiki 检索 · {kid}",
-                summary=f"返回有效答案（{_calls_total} 次检索/阅读调用，{len(_citations)} 条引用）",
-                detail=_detail,
+                STAGE_JONEX_WIKI_QUERY, f"jonex_wiki 检索 · {kid}", summary=summary, detail=_detail,
             )
 
         # 6a. 先构建平台 references + 各 KB 的 evidence handle 映射（[E#]→[n] 改写需要）。
@@ -9087,6 +9521,9 @@ class SearchService:
             except Exception as exc:  # pragma: no cover - collect_progress 自身已兜底
                 logger.warning("[jonex_wiki] 读取进度轨迹失败 session=%s: %s", progress_session, exc)
         reasoning = self._attach_jonex_wiki_trace(collector.build(source), _trace_events)
+        incomplete = (True if any(item.get("incomplete") is True for item in query_outcomes)
+                      else False if query_outcomes and all(item.get("incomplete") is False for item in query_outcomes)
+                      else None)
         result = {
             "answer": answer,
             "source": source,
@@ -9097,6 +9534,8 @@ class SearchService:
             "reasoning": reasoning,
             "references_available": bool(_references),
             "ontology_instances_available": False,
+            "incomplete": incomplete,
+            "query_outcomes": query_outcomes,
         }
         # 按 trace 汇总本次检索 Token（查不到则不写键）。
         # 该 dict 会被 WikiSearchSessionService 原样序列化，作为 SSE complete 事件透出。
@@ -9114,6 +9553,8 @@ class SearchService:
                     answer_preview=answer[:300],
                     answer=answer,
                     references=_references,
+                    reference_count=len(_references),
+                    result_count=len(_references),
                     reasoning=reasoning,
                     duration_ms=total_ms,
                     query_image_ids=req.query_image_ids,
@@ -9121,7 +9562,8 @@ class SearchService:
                         "knowledge_base_ids": kb_ids,
                         "source": source,
                         "pipeline": "jonex_wiki",
-                        "thinking_mode": req.thinking_mode,
+                        "incomplete": incomplete,
+                        "query_outcomes": query_outcomes,
                         **({'image_question':req.image_question} if req.image_question else {}),
                     },
                 ),
@@ -9253,6 +9695,7 @@ class SearchService:
             req_jw = JonexWikiSearchRequest(
                 query=req.query,
                 query_image_ids=req.query_image_ids, image_question=req.image_question,
+                thinking_mode=req.thinking_mode,
                 knowledge_base_ids=jonex_wiki_ids,
                 save_history=req.save_history,
                 with_reasoning=req.with_reasoning,
@@ -9262,6 +9705,8 @@ class SearchService:
 
         # 5. 混合 → 并行（只跑非空桶），子调用强制 save_history=False（D8.1）
         async def _run_lightrag() -> dict | Exception:
+            failed_kbs: set[str] = set()
+            failure_context = _MIX_RAG_FAILED_KBS.set(failed_kbs)
             try:
                 req_ont = OntologySearchRequest(
                     query=req.query, mode=req.mode, top_k=req.top_k,
@@ -9275,12 +9720,17 @@ class SearchService:
                     strict_require_reference=req.strict_require_reference,
                     strict_require_grounded=req.strict_require_grounded,
                 )
-                return await self.query_with_ontology(
+                result = await self.query_with_ontology(
                     tenant_id, user_id, req_ont, trace_id=trace_id,
                     allow_action_proposals=False, expose_pending_actions=False,
                 )
+                if failed_kbs:
+                    result = {**result, "degraded": True, "failed_kb_ids": sorted(failed_kbs)}
+                return result
             except Exception as e:
                 return e
+            finally:
+                _MIX_RAG_FAILED_KBS.reset(failure_context)
 
         async def _run_openkb() -> dict | Exception:
             try:
@@ -9298,7 +9748,7 @@ class SearchService:
             except Exception as e:
                 return e
 
-        # [jonex] Phase 5 降级：jonex_wiki 侧 90s 超时返回空 + 标记 source 降级，
+        # [jonex] Phase 5 降级：jonex_wiki 侧按配置超时返回空 + 标记 source 降级，
         # 不拖垮 lightrag/openkb。超时后 cancel 任务（asyncio.wait_for 内建取消），
         # 返回降级 dict，不阻塞整体。
         def _jw_degraded(reason: str) -> dict:
@@ -9318,6 +9768,7 @@ class SearchService:
             req_jw = JonexWikiSearchRequest(
                 query=req.query,
                 query_image_ids=req.query_image_ids, image_question=req.image_question,
+                thinking_mode=req.thinking_mode,
                 knowledge_base_ids=jonex_wiki_ids,
                 save_history=False,
                 with_reasoning=req.with_reasoning,
@@ -9337,7 +9788,7 @@ class SearchService:
                 return _jw_degraded("timeout")
             except Exception as exc:
                 logger.warning("[jonex_wiki] search_mix 失败降级 kb=%s: %s", jonex_wiki_ids, exc)
-                return _jw_degraded(f"error: {exc}"[:200])
+                return _jw_degraded("error")
 
         _coros: list[tuple[str, Any]] = []
         if lightrag_ids:
@@ -9446,30 +9897,10 @@ class SearchService:
             # 重写结果须回填进 per_kb（此前直接改局部 lr_answer，_effective 里的旧快照没更新，
             # 融合实际吃的是重写前 answer——OntoRAG 编号错位；jonex_wiki/openkb 侧同理）。
             _rewritten_answer = {"lr": lr_answer, "okb": okb_answer, "jw": jw_answer}
-            if lr_refs:
-                lr_number_to_doc = {
-                    str(i): (r.get("doc_id") or "")
-                    for i, r in enumerate(lr_refs, 1)
-                }
-                _rewritten_answer["lr"] = normalize_citations(
-                    lr_answer, lr_number_to_doc, references,
-                )
-            if okb_refs:
-                okb_number_to_doc = {
-                    str(i): (r.get("doc_id") or "")
-                    for i, r in enumerate(okb_refs, 1)
-                }
-                _rewritten_answer["okb"] = normalize_citations(
-                    okb_answer, okb_number_to_doc, references,
-                )
-            if jw_refs:
-                jw_number_to_doc = {
-                    str(i): (r.get("doc_id") or "")
-                    for i, r in enumerate(jw_refs, 1)
-                }
-                _rewritten_answer["jw"] = normalize_citations(
-                    jw_answer, jw_number_to_doc, references,
-                )
+            for side, refs in (("lr", lr_refs), ("okb", okb_refs), ("jw", jw_refs)):
+                if refs:
+                    _rewritten_answer[side] = self._remap_mixed_citations(
+                        _rewritten_answer[side], refs, references)
             # [jonex] 融合 prompt 用 KB 显示名标识来源（LLM 会照抄标识进答案；
             # 用 kb_id UUID / source 值会产出「知识库 `llm-wiki`」这类错误标注）。
             # 标签只列「该侧 references 实际命中的 KB」——请求中的无内容/无检索
@@ -9598,6 +10029,34 @@ class SearchService:
             "references_available": references_available,
             "ontology_instances_available": ontology_instances_available,
         }
+        wiki_degraded = bool(jw_ok and jw_result.get("degraded"))
+        wiki_outcomes = list((jw_result.get("query_outcomes") or [])) if jw_ok else []
+        if wiki_degraded:
+            reason = "Wiki 检索超时" if jw_result.get("degraded_reason") == "timeout" else "Wiki 检索失败"
+            wiki_outcomes.extend({"kb_id": kb_id, "incomplete": True,
+                                  "incomplete_reason": f"{reason}；本次结果未包含该知识库的回答。"}
+                                 for kb_id in jonex_wiki_ids)
+        # A successful Wiki answer must not conceal a different pipeline's
+        # actual exception. An empty but successful search is not a failure.
+        other_failed = [side for side in ("lr", "okb") if side in _by_side and (
+            isinstance(_by_side[side], Exception)
+            or (isinstance(_by_side[side], dict) and _by_side[side].get("degraded")))]
+        for side in other_failed:
+            failed_ids = (_by_side[side].get("failed_kb_ids") or _side_kb[side]
+                          if isinstance(_by_side[side], dict) else _side_kb[side])
+            wiki_outcomes.extend({"kb_id": kb_id, "incomplete": True,
+                                  "incomplete_reason": f"{_side_label[side]} 检索失败；本次结果未包含该知识库的回答。"}
+                                 for kb_id in failed_ids)
+        wiki_incomplete = jw_result.get("incomplete") if jw_ok else None
+        degraded = wiki_degraded or bool(other_failed)
+        if jonex_wiki_ids or other_failed:
+            result.update(
+                incomplete=True if degraded or wiki_incomplete is True else wiki_incomplete,
+                query_outcomes=wiki_outcomes,
+                degraded=degraded,
+                degraded_reason=(jw_result.get("degraded_reason") if wiki_degraded
+                                 else "pipeline_error" if other_failed else None),
+            )
         # 按 trace 汇总本次检索 Token（查不到则不写键）
         await _attach_total_tokens(result, tenant_id, trace_id)
         # A（解释块）：命中实体 → 物理表 → 上下游。fail-open；无内容不写键。
@@ -9627,6 +10086,10 @@ class SearchService:
                     answer_preview=answer[:300],
                     answer=answer,
                     references=references,
+                    # 历史卡片按这两个计数渲染「N 条结果」；不传则恒为 0，
+                    # 与引用快照自相矛盾。
+                    reference_count=len(references or []),
+                    result_count=len(references or []),
                     reasoning=_reasoning_trace,
                     duration_ms=total_ms,
                     metadata={
@@ -9637,6 +10100,11 @@ class SearchService:
                             "jonex-wiki": jonex_wiki_ids,
                         },
                         "source": source,
+                        "thinking_mode": req.thinking_mode,
+                        "incomplete": result.get("incomplete"),
+                        "query_outcomes": result.get("query_outcomes", []),
+                        "degraded": result.get("degraded", False),
+                        "degraded_reason": result.get("degraded_reason"),
                     },
                 ),
             )

@@ -101,6 +101,8 @@ class OntologySearchResponse(BaseModel):
     # [jonex] openkb 检索标记：references/ontology_instances 是否可用（D6）
     references_available: bool = True
     ontology_instances_available: bool = True
+    incomplete: Optional[bool] = None  # None: historical engine did not report completion.
+    query_outcomes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ── [jonex] openkb 分流 — 新增 DTO ──
@@ -134,7 +136,8 @@ class JonexWikiSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     query_image_ids: list[str] = Field(default_factory=list, max_items=8)
     image_question: Optional[str] = Field(default=None, max_length=500)
-    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
+    # Accepted for old callers; Wiki now uses the deployment's policy.
+    thinking_mode: Optional[Literal["fast", "standard", "deep"]] = None
     knowledge_base_ids: list[str] = Field(default_factory=list)
     save_history: bool = True
     with_reasoning: bool = False
@@ -152,6 +155,7 @@ class MixSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     query_image_ids: list[str] = Field(default_factory=list, max_items=8)
     image_question: Optional[str] = Field(default=None, max_length=500)
+    thinking_mode: Literal["fast", "standard", "deep"] = "fast"
     mode: str = Field(default="hybrid", min_length=1, max_length=32)
 
     @validator("mode")

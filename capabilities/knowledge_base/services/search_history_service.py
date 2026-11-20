@@ -47,6 +47,96 @@ def _reference_doc_ids(references: Any) -> list[str]:
     return out
 
 
+def _history_kb_ids(history: Any) -> list[str]:
+    """All KBs that contributed to a snapshot, including multi-KB searches."""
+    metadata = getattr(history, "extra_metadata", None)
+    scope = metadata.get("knowledge_base_ids", []) if isinstance(metadata, dict) else []
+    if not isinstance(scope, (list, tuple)):
+        scope = []
+    values = [getattr(history, "knowledge_base_id", ""), *scope]
+    return list(dict.fromkeys(str(value).strip() for value in values if value and str(value).strip()))
+
+
+async def _accessible_history_kbs(session, tenant_id: str, user_id: str, kb_ids: list[str]) -> set[str]:
+    """Check existing KB, active space, and membership or KB grant."""
+    if not kb_ids:
+        return set()
+    from sqlalchemy import text
+    from .space_permission_service import get_active_space_ids, get_visible_space_ids
+    from .kb_permission_service import get_granted_kb_ids
+
+    rows = (await session.execute(text(
+        "SELECT ki.id, ki.space_id FROM knowledge_base.knowledge_info ki "
+        "WHERE ki.id = ANY(:ids) AND ki.tenant_id=:t AND ki.is_deleted=0"
+    ), {"ids": kb_ids, "t": tenant_id})).all()
+    active = set(await get_active_space_ids(tenant_id))
+    visible = await get_visible_space_ids(tenant_id, user_id)
+    granted = set(await get_granted_kb_ids(tenant_id, user_id)) if visible is not None else set()
+    return {str(kb_id) for kb_id, space_id in rows
+            if space_id in active and (visible is None or space_id in visible or kb_id in granted)}
+
+
+async def _active_history_documents(session, tenant_id: str, kb_ids: list[str], doc_ids: list[str]) -> set[str]:
+    """A saved citation must still belong to an active document in its scope."""
+    if not doc_ids:
+        return set()
+    from sqlalchemy import text
+    rows = (await session.execute(text(
+        "SELECT id FROM knowledge_base.knowledge_documents "
+        "WHERE tenant_id=:t AND knowledge_base_id = ANY(:kb_ids) "
+        "AND id = ANY(:doc_ids) AND is_deleted=0 AND status NOT IN ('archived', 'deleting', 'deleted')"
+    ), {"t": tenant_id, "kb_ids": kb_ids, "doc_ids": doc_ids})).all()
+    return {str(row[0]) for row in rows}
+
+
+async def _wiki_history_kbs(session, tenant_id: str, kb_ids: list[str]) -> set[str]:
+    """Determine history types from the current tenant's KB rows, not client metadata."""
+    if not kb_ids:
+        return set()
+    from sqlalchemy import text
+    rows = (await session.execute(text(
+        "SELECT id FROM knowledge_base.knowledge_info WHERE tenant_id=:t "
+        "AND id = ANY(:ids) AND is_deleted=0 AND kb_type='jonex_wiki'"
+    ), {"t": tenant_id, "ids": kb_ids})).all()
+    return {str(row[0]) for row in rows}
+
+
+def _wiki_history_documents(history: Any, wiki_kbs: set[str], kb_ids: list[str]) -> list[str]:
+    """Return conservative Bundle source scopes, or reject unknowable old scope.
+
+    New histories include all document ids in the pinned Bundle, not only
+    successfully verified references. Old snapshots without any identifiable
+    Wiki reference cannot safely be rechecked and must be searched again.
+    """
+    metadata = getattr(history, 'extra_metadata', None)
+    outcomes = metadata.get('query_outcomes', []) if isinstance(metadata, dict) else []
+    outcomes = outcomes if isinstance(outcomes, list) else []
+    refs = getattr(history, 'references', None) or []
+    documents = set()
+    for kb_id in wiki_kbs:
+        wiki_outcomes = [item for item in outcomes if isinstance(item, dict) and item.get('kb_id') == kb_id]
+        relevant = [item for item in wiki_outcomes if item.get('stop_reason') not in ('empty_kb', 'engine_error')]
+        if relevant and all('source_document_ids' in item for item in relevant):
+            for item in relevant:
+                ids = item['source_document_ids']
+                if not isinstance(ids, list) or len(ids) > 10000 or any(not isinstance(v, str) or not v for v in ids):
+                    raise ResourceNotFoundError(message="历史来源范围无法核验，请重新检索")
+                documents.update(ids)
+            continue
+        if relevant and any('source_document_ids' in item for item in relevant):
+            raise ResourceNotFoundError(message="历史来源范围无法核验，请重新检索")
+        if wiki_outcomes and not relevant:
+            # This Wiki returned no answer (e.g. empty or unavailable); it did
+            # not contribute documents to the saved answer.
+            continue
+        legacy = {str(ref['doc_id']) for ref in refs if isinstance(ref, dict) and ref.get('doc_id')
+                  and (ref.get('kb_id') == kb_id or (len(kb_ids) == 1 and not ref.get('kb_id')))}
+        if not legacy:
+            raise ResourceNotFoundError(message="历史来源范围无法核验，请重新检索")
+        documents.update(legacy)
+    return sorted(documents)
+
+
 class SearchHistoryService:
     def __init__(self, query_image: Optional[QueryImageService] = None) -> None:
         # 图片服务由 `KnowledgeBaseService` 注入（与其它 service 的组装方式一致）；
@@ -90,43 +180,19 @@ class SearchHistoryService:
                 total = len(items)
             else:
                 user_rank = await self._user_max_rank(session, tenant_id, user_id)
-                if user_rank is None:
-                    # 管理员（或不限）走原有 SQL 分页
-                    items = await repo.list_by_user(
-                        tenant_id,
-                        user_id,
-                        knowledge_base_id=req.knowledge_base_id,
-                        offset=offset,
-                        limit=limit,
-                        domain_space_id=req.domain_space_id,
-                        history_id=req.history_id,
-                        with_snapshot=want_snapshot,
-                    )
-                    total = await repo.count_by_user(
-                        tenant_id,
-                        user_id,
-                        knowledge_base_id=req.knowledge_base_id,
-                        domain_space_id=req.domain_space_id,
-                    )
-                else:
-                    # 单用户历史上限 200 条（MAX_HISTORY_PER_USER），先轻量全取、
-                    # 按 KB 密级过滤后再在内存分页 —— 列表本来就不带快照列，
-                    # 这样能保证 total 与分页口径一致（SQL 层拿不到逐条 rank）。
-                    rows = await repo.list_by_user(
-                        tenant_id,
-                        user_id,
-                        knowledge_base_id=req.knowledge_base_id,
-                        offset=0,
-                        limit=MAX_HISTORY_PER_USER,
-                        domain_space_id=req.domain_space_id,
-                        history_id=req.history_id,
-                        with_snapshot=False,
-                    )
-                    visible = await self._filter_visible_history(
-                        session, tenant_id, rows, user_rank
-                    )
-                    total = len(visible)
-                    items = visible[offset:offset + limit]
+                # Even administrators must not see snapshots from disabled or
+                # deleted KBs. Apply all current scope checks before paging.
+                rows = await repo.list_by_user(
+                    tenant_id, user_id, knowledge_base_id=req.knowledge_base_id,
+                    offset=0, limit=MAX_HISTORY_PER_USER,
+                    domain_space_id=req.domain_space_id, history_id=req.history_id,
+                    with_snapshot=False,
+                )
+                visible = await self._filter_visible_history(
+                    session, tenant_id, rows, user_rank, user_id=user_id
+                )
+                total = len(visible)
+                items = visible[offset:offset + limit]
             # [jonex] 一次查出本页所有历史的图（`history_id IN (...)` join 图片表），
             # 不是逐条查 —— 否则 20 条历史就是 20 次往返。
             image_repo = KnowledgeQueryImageRepository(session)
@@ -170,19 +236,24 @@ class SearchHistoryService:
         )
 
     async def _filter_visible_history(
-        self, session, tenant_id: str, rows: list, user_rank: int,
+        self, session, tenant_id: str, rows: list, user_rank: int | None,
+        *, user_id: str | None = None,
     ) -> list:
-        """按 KB 最高生效 rank 过滤历史行（保持输入顺序）。"""
+        """Recheck every KB in each snapshot's scope before exposing its query."""
         from jonex_core.security import classification_access as policy
 
-        kb_ids = [r.knowledge_base_id for r in rows if r.knowledge_base_id]
+        kb_ids = list(dict.fromkeys(k for r in rows for k in _history_kb_ids(r)))
+        actor = user_id or (str(rows[0].user_id) if rows else "")
+        accessible = await _accessible_history_kbs(session, tenant_id, actor, kb_ids)
         max_ranks = (
             await policy.kb_max_level_rank(session, tenant_id, kb_ids)
-            if kb_ids else {}
+            if kb_ids and user_rank is not None else {}
         )
         visible = [
             r for r in rows
-            if max_ranks.get(r.knowledge_base_id, 0) <= user_rank
+            if _history_kb_ids(r)
+            and all(k in accessible and (user_rank is None or max_ranks.get(k, 0) <= user_rank)
+                    for k in _history_kb_ids(r))
         ]
         hidden = len(rows) - len(visible)
         if hidden:
@@ -197,17 +268,26 @@ class SearchHistoryService:
         """单条历史带快照：KB 或任一引用文档超密级 ⇒ 404（不泄露存在性）。"""
         from jonex_core.security import classification_access as policy
 
+        kb_ids = _history_kb_ids(history)
+        accessible = await _accessible_history_kbs(session, tenant_id, user_id, kb_ids)
+        if not kb_ids or any(k not in accessible for k in kb_ids):
+            raise ResourceNotFoundError(message="检索历史不存在")
+        wiki_kbs = await _wiki_history_kbs(session, tenant_id, kb_ids)
+        doc_ids = list(dict.fromkeys([
+            *_reference_doc_ids(getattr(history, "references", None)),
+            *_wiki_history_documents(history, wiki_kbs, kb_ids),
+        ]))
+        if doc_ids:
+            active_docs = await _active_history_documents(session, tenant_id, kb_ids, doc_ids)
+            if any(doc not in active_docs for doc in doc_ids):
+                raise ResourceNotFoundError(message="检索历史不存在")
         user_rank = await self._user_max_rank(session, tenant_id, user_id)
         if user_rank is None:
             return
+        max_ranks = await policy.kb_max_level_rank(session, tenant_id, kb_ids)
+        if any(max_ranks.get(k, 0) > user_rank for k in kb_ids):
+            raise ResourceNotFoundError(message="检索历史不存在")
 
-        kb_id = getattr(history, "knowledge_base_id", "") or ""
-        if kb_id:
-            max_ranks = await policy.kb_max_level_rank(session, tenant_id, [kb_id])
-            if max_ranks.get(kb_id, 0) > user_rank:
-                raise ResourceNotFoundError(message="检索历史不存在")
-
-        doc_ids = _reference_doc_ids(getattr(history, "references", None))
         if doc_ids:
             ranks = await policy.document_level_ranks(session, tenant_id, doc_ids)
             if any(rank > user_rank for rank in ranks.values()):
@@ -256,16 +336,27 @@ class SearchHistoryService:
             if existing is None:
                 history = await repo.upsert_for_user(tenant_id, user_id, data)
             else:
+                # Updating a snapshot returns its retained metadata. Recheck
+                # access first so this write path cannot bypass the read gate.
+                await self._assert_history_readable(session, tenant_id, user_id, existing)
                 # 前端补存：更新同一条历史，并保留后端写入的卡片/工具结果等元数据
                 old_meta = dict(existing.extra_metadata or {})
                 merged_meta = {**old_meta, **metadata}
-                for key in ("pending_actions", "tool_results", "action_results"):
+                # A later client-side update must not shrink the original scope
+                # and thereby bypass the current authorization checks.
+                old_scope = _history_kb_ids(existing)
+                new_scope = metadata.get("knowledge_base_ids")
+                if not isinstance(new_scope, (list, tuple)):
+                    new_scope = []
+                merged_meta["knowledge_base_ids"] = list(dict.fromkeys(
+                    [*old_scope, *(str(k) for k in new_scope if k)]))
+                for key in ("pending_actions", "tool_results", "action_results", "query_outcomes", "pipeline", "pipeline_groups"):
                     if key in old_meta:
                         merged_meta[key] = old_meta[key]
                 existing.extra_metadata = merged_meta
                 existing.query = data.get("query") or existing.query
                 existing.query_hash = build_query_hash(existing.query)
-                if data.get("knowledge_base_id"):
+                if data.get("knowledge_base_id") and not existing.knowledge_base_id:
                     existing.knowledge_base_id = data["knowledge_base_id"]
                 if data.get("domain_space_id") is not None:
                     existing.domain_space_id = data["domain_space_id"]

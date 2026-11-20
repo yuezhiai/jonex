@@ -136,6 +136,73 @@ _RAG_TASK_JSON_DISK_FIRST_MB = int(os.getenv("RAG_TASK_JSON_DISK_FIRST_MB", "8")
 # 路径段白名单：tenant/kb/task id 只允许安全字符，防路径穿越
 _PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 
+# openkb 编译巡检的 keyset 游标（上一轮最后一条 doc id）。`None` = 从队首开始 /
+# 上一轮已扫到队尾、本轮回卷。单副本假设与 `IndexCleanupScheduler` 相同：
+# 多副本各自推进只会重复巡检同一批行，回写本身幂等。
+_OPENKB_PATROL_AFTER_ID: Optional[str] = None
+
+# ── jonex_wiki「批量派发 stale 编译」的两条候选查询 ──
+# 抽成常量是为了**同一个判据用两次**：锁外探测（没活就别碰引擎）与锁内复核
+# （拿到 advisory 锁后再看一遍，防两副本同时扫到同一批）。两处一字不差，
+# 别各写一份 —— 一处改了另一处没改，就会出现「探测说有活、锁内说没有」的假象。
+_JONEX_WIKI_BUSY_SQL = """
+    SELECT 1 FROM knowledge_base.knowledge_documents
+     WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
+       AND ((status IN ('parsing', 'ingesting')
+             -- 2026-11-18 审计：`pending` 不能无条件算「上传窗口未关」——
+             -- upload-only 文档可能在队列里躺很久，会把整库批量编译永久饿死。
+             -- 只认「最近更新过」或「有在途接管行」的 pending。
+             OR (status = 'pending' AND (
+                    updated_at > :quiet_before
+                    OR EXISTS (
+                        SELECT 1 FROM knowledge_base.task_center_documents owner_p
+                         WHERE owner_p.document_id = knowledge_documents.id
+                           AND owner_p.tenant_id = :tenant
+                           AND owner_p.state = ANY(:active_states)))))
+            OR (status = 'ready'
+                AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
+                AND updated_at > :quiet_before)
+            OR (status != 'failed' AND EXISTS (
+                SELECT 1 FROM knowledge_base.task_center_documents owner
+                 WHERE owner.document_id = knowledge_documents.id AND owner.tenant_id = :tenant
+                   AND owner.state = ANY(:active_states)
+                   AND (owner.current_step IS DISTINCT FROM 'compile'
+                        OR owner.execution_id IS NULL
+                        OR (knowledge_documents.extra_metadata->>'jonex_wiki_compile_execution_id')
+                           IS DISTINCT FROM owner.execution_id)
+                  AND NOT (owner.current_step IS NOT DISTINCT FROM 'parse'
+                           AND owner.execution_id IS NULL
+                           AND owner.handled_execution_id IS NOT NULL))))
+     LIMIT 1
+"""
+
+_JONEX_WIKI_STALE_DOCS_SQL = """
+    SELECT id, file_name, storage_key, storage_backend, file_path
+      FROM knowledge_base.knowledge_documents d
+     WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
+       AND status = 'ready'
+       AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM knowledge_base.task_center_documents tcd
+            WHERE tcd.document_id = d.id AND tcd.tenant_id = :tenant
+              -- 2026-11-19 审计：排除条件从「有 released 行」改成「行仍归任务中心在管」。
+              -- released 只代表看门狗不盯了；任务一旦终态，再排除就等于「有过接管行
+              -- = 永久不补编译」，文档永远停在「待编译」。
+              AND (tcd.state = ANY(:active_states)
+                   OR (tcd.state = 'released' AND EXISTS (
+                        SELECT 1 FROM task_center.tasks tk
+                         WHERE tk.id = tcd.task_id
+                           AND tk.status IN ('pending', 'running'))))
+              AND (tcd.current_step IS DISTINCT FROM 'compile'
+                   OR tcd.execution_id IS NULL
+                   OR (d.extra_metadata->>'jonex_wiki_compile_execution_id')
+                      IS DISTINCT FROM tcd.execution_id)
+              AND NOT (tcd.state = ANY(:active_states)
+                       AND tcd.current_step IS NOT DISTINCT FROM 'parse'
+                       AND tcd.execution_id IS NULL
+                       AND tcd.handled_execution_id IS NOT NULL))
+     ORDER BY id
+"""
+
 
 def _task_json_candidates(tenant_id: str, kb_id: str, task_id: str) -> list:
     """任务 JSON 的候选路径（按命中概率排序）。"""
@@ -1085,7 +1152,13 @@ class ReconciliationService:
         """Scan ontology pending/failed docs and retry extraction.
 
         [jonex] P1-F：最大在途 ontology task 数限流（ONTOLOGY_MAX_INFLIGHT，默认 100）——
-        在途（EXTRACTING）过多时本轮少领/不领，避免打满上游 LLM。SKIP LOCKED 领取避免多实例重复。
+        在途（EXTRACTING）过多时本轮少领/不领，避免打满上游 LLM。
+
+        ⚠️ **`SKIP LOCKED` 只在本次查询/事务内避让，挡不住多副本重复**：行锁随
+        `get_db_session()` 退出就释放，而真正的处理在事务外。多副本之间靠的是
+        `claim_ontology_for_retry` 的 CAS 领取（提交新任务的唯一入口）；重复的
+        **轮询收尾**是幂等的（Neo4j 全 MERGE、状态写同一个值），代价只是白跑一趟，
+        不会产出重复数据。
         """
         max_inflight = int(os.getenv("ONTOLOGY_MAX_INFLIGHT", "100"))
         async with get_db_session() as session:
@@ -1495,12 +1568,72 @@ class ReconciliationService:
                     "Patrol re-insert failed for doc %s, left as FAILED: %s", doc.id, exc,
                 )
 
+        # ── released 兜底（2026-11-19 审计）：只判死、**不重投** ──
+        # 主扫描刻意排除「含 released 的 MANAGED_STATES」，防止 patrol 重投与任务中心链
+        # 分叉、产出重复向量。但看门狗交还（released）后若引擎任务挂死，文档会永久停在
+        # PARSING/INGESTING —— 重新解析与删除都被「解析中」拒。这里补一趟只判死的兜底：
+        # 超过 HARD 仍在解析、且接管行 released 且其任务已终态 → 置 FAILED（用户可重试）。
+        released_dead = 0
+        try:
+            from sqlalchemy import text as _sql_text
+
+            async with get_db_session() as session:
+                rows = (await session.execute(
+                    _sql_text(
+                        """
+                        SELECT d.id, d.tenant_id
+                          FROM knowledge_base.knowledge_documents d
+                         WHERE d.status IN ('parsing', 'ingesting')
+                           AND d.is_deleted = 0
+                           -- 2×HARD（与主巡检对 INGESTING 的宽限同口径）：一份
+                           -- 正常但很慢的 INGESTING 不应被 released 兜底提前判死
+                           -- （2026-11-19 第二轮审计）。
+                           AND COALESCE(d.updated_at, d.created_at)
+                               < now() - (:hard_secs * 2 * INTERVAL '1 second')
+                           AND EXISTS (
+                               SELECT 1 FROM knowledge_base.task_center_documents t
+                                WHERE t.document_id = d.id
+                                  AND t.state = 'released'
+                                  AND (t.task_id IS NULL OR NOT EXISTS (
+                                      SELECT 1 FROM task_center.tasks tk
+                                       WHERE tk.id = t.task_id
+                                         AND tk.status IN ('pending', 'running'))))
+                         LIMIT :limit
+                        """
+                    ),
+                    {"hard_secs": HARD, "limit": limit},
+                )).fetchall()
+            for row in rows:
+                async with get_db_session() as session:
+                    repo_s = KnowledgeDocumentRepository(session)
+                    doc = await repo_s.get_by_id(row.id, row.tenant_id)
+                    if doc is None or doc.status not in (
+                        DocStatus.PARSING.value, DocStatus.INGESTING.value,
+                    ):
+                        continue
+                    await repo_s.set_status(
+                        doc, DocStatus.FAILED,
+                        error_message=(
+                            "任务已交还且解析长期无进展（超过硬超时），判定失败；"
+                            "可重新解析或删除"
+                        ),
+                    )
+                released_dead += 1
+                logger.warning(
+                    "Patrol released-doc dead→FAILED: doc_id=%s waited>=%ss",
+                    row.id, HARD,
+                )
+        except Exception:
+            # 兜底扫描自身失败不影响主巡检结论
+            logger.warning("released 解析兜底扫描失败", exc_info=True)
+
         return {
             "checked": len(docs),
             "timed_out": timed_out,
             "retried": retried,
             "exhausted": exhausted,
             "waiting": waiting,
+            "released_dead": released_dead,
         }
 
     # ── per-doc reconciliation ─────────────────────────────────
@@ -3096,10 +3229,26 @@ class ReconciliationService:
              WHERE d.is_deleted = 0
                AND d.llm_wiki_compile_status = 'compiling'
                AND ki.kb_type = 'openkb'
+               -- keyset 游标：接着上一轮停下的位置往后扫
+               AND d.id > :after_id
+             -- ⚠️ 必须有**稳定且可续扫**的顺序：没有 ORDER BY 时 PG 每轮按堆序返回
+             --    同一批前 N 行，超过 limit 后后面的文档永远轮不到巡检（永不收敛、
+             --    也不报错）；只加 ORDER BY 而不续扫，卡在队首的那批同样会一直占满名额。
+             ORDER BY d.id
              LIMIT :limit
         """)
+        # 游标在模块级：单副本假设（与 `IndexCleanupScheduler` 相同），多副本各自
+        # 推进只是重复巡检同一批行，回写本身幂等。
+        global _OPENKB_PATROL_AFTER_ID
+        after_id = _OPENKB_PATROL_AFTER_ID or ""
         async with get_db_session() as session:
-            rows = (await session.execute(sql, {"limit": limit})).all()
+            rows = (
+                await session.execute(
+                    sql, {"limit": limit, "after_id": after_id},
+                )
+            ).all()
+        # 扫到队尾（返回不足 limit）→ 回卷，下一轮从队首重来。
+        _OPENKB_PATROL_AFTER_ID = rows[-1].id if len(rows) >= limit else None
 
         now = datetime.utcnow()
         compiled = failed = timed_out = 0
@@ -3175,7 +3324,17 @@ class ReconciliationService:
                             error="OPENKB_COMPILE_TIMEOUT: 编译超时，请重试",
                         )
                         timed_out += 1
-                # pending：排队中不判死（批量上传队尾任务，mutation 锁队列）
+                elif tstatus == "pending":
+                    # 排队也要有上限（2026-11-19 审计）：原来 pending 永不判死，
+                    # 引擎队列卡住时文档永久 compiling，而「重新编译」又被
+                    # claim 的 `status <> 'compiling'` 条件挡住 —— 没有出口。
+                    # 用 requested_at 起算，给 2×TIMEOUT 的排队宽限。
+                    if req_at and (now - req_at).total_seconds() > TIMEOUT * 2:
+                        await self._record_openkb_status_by_id(
+                            doc_id, tenant_id, status="failed",
+                            error="OPENKB_COMPILE_QUEUE_TIMEOUT: 编译排队超时，请重试",
+                        )
+                        timed_out += 1
 
         # ③ stale 且 ready 的文档补提交（reparse 停在 stale 的兜底）
         stale_submitted = await self._patrol_stale_recompile(limit=limit)
@@ -3184,12 +3343,7 @@ class ReconciliationService:
                 "timed_out": timed_out, "stale_submitted": stale_submitted}
 
     async def patrol_jonex_wiki_compile(self, limit: int = 50) -> dict:
-        """[jonex] 轮询 jonex_wiki 编译任务状态并回写 PG；超时判死（Phase 5）。
-
-        状态机与 patrol_openkb_compile 一致（completed→compiled / failed→failed /
-        running 按 started_at 超时判死 / task 丢失判死 / task_id 缺失只按 requested_at
-        超时），仅替换 client 为 JonexWikiService + kb_type 过滤为 jonex_wiki。
-        """
+        """Reflect engine terminal states; use a submit timeout only before task_id is known."""
         TIMEOUT = int(os.getenv("JONEX_WIKI_COMPILE_TIMEOUT_SEC",
                      os.getenv("OPENKB_COMPILE_TIMEOUT_SEC",
                      os.getenv("OPENKB_RECOMPILE_TIMEOUT_SEC", "1800"))))
@@ -3229,7 +3383,8 @@ class ReconciliationService:
         from .jonex_wiki_service import JonexWikiService
         compiler = JonexWikiService()
         for (tenant_id, kb_id), group in by_kb.items():
-            task_map: dict[str, dict] = {}
+            task_map: dict[str, dict | None] = {}
+            unavailable_tasks: set[str] = set()
             try:
                 res = await compiler.list_compile_tasks(
                     kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id)
@@ -3243,37 +3398,43 @@ class ReconciliationService:
             for r in group:
                 doc_id, task_id = r.id, r.llm_wiki_task_id
                 req_at = r.llm_wiki_compile_requested_at
+                fence = {"expected_compile": (task_id, req_at)}
                 if not task_id:
                     # claim 后 submit 尚未回写 task_id 的正常窗口：只按 requested_at 超时
                     if req_at and (now - req_at).total_seconds() > TIMEOUT:
-                        await self._record_openkb_status_by_id(
+                        applied = await self._record_openkb_status_by_id(
                             doc_id, tenant_id, status="failed",
                             error="JONEX_WIKI_COMPILE_TIMEOUT: 编译超时（submit 未回写 task_id），请重试",
+                            **fence,
                         )
-                        timed_out += 1
+                        timed_out += int(applied)
                     continue
-                task = task_map.get(task_id)
-                if task is None:
+                if task_id in unavailable_tasks:
+                    continue
+                if task_id not in task_map:
                     # list_compile_tasks 有分页上限；列表未命中不等于任务丢失。
                     try:
-                        task = await compiler.get_compile_status(
+                        task_map[task_id] = await compiler.get_compile_status(
                             kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id, task_id=task_id)
                     except ResourceNotFoundError:
-                        pass
+                        task_map[task_id] = None
                     except Exception:
+                        unavailable_tasks.add(task_id)
                         logger.warning("查询 jonex_wiki 编译任务失败 task=%s", task_id, exc_info=True)
                         continue
+                task = task_map[task_id]
                 if task is None:
                     # 单任务查询也确认任务丢失后才判死
-                    await self._record_openkb_status_by_id(
+                    applied = await self._record_openkb_status_by_id(
                         doc_id, tenant_id, status="failed",
                         error="JONEX_WIKI_TASK_LOST: 编译任务丢失（容器重启），请重新编译",
+                        **fence,
                     )
-                    failed += 1
+                    failed += int(applied)
                     continue
                 tstatus = task.get("status")
                 if tstatus == "completed":
-                    await self._record_openkb_status_by_id(
+                    applied = await self._record_openkb_status_by_id(
                         doc_id, tenant_id, status="compiled",
                         # [jonex] 引擎的 compile task 文件不带 warnings 字段 → 这里恒为
                         # 空。传 [] 会被 _record_openkb_status_by_id 判成"清空"
@@ -3285,31 +3446,28 @@ class ReconciliationService:
                         warnings=(task.get("warnings") or None),
                         # [jonex] §8.1：task 文件带出的版本 → applied 回写（fencing 闭环）
                         applied_schema_version=task.get("wiki_schema_version"),
+                        **fence,
                     )
-                    compiled += 1
-                elif tstatus == "failed":
-                    await self._record_openkb_status_by_id(
+                    compiled += int(applied)
+                elif tstatus in {"failed", "cancelled"}:
+                    applied = await self._record_openkb_status_by_id(
                         doc_id, tenant_id, status="failed",
-                        error=task.get("error") or "compile failed",
+                        error=task.get("error") or ("JONEX_WIKI_COMPILE_CANCELLED" if tstatus == "cancelled"
+                                                    else "JONEX_WIKI_COMPILE_FAILED"),
+                        **fence,
                     )
-                    failed += 1
-                elif tstatus == "running":
-                    # ⚠️ 排队时间不算超时：running 才从 started_at 起算
-                    started = task.get("started_at")
-                    try:
-                        started_dt = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
-                        if started_dt.tzinfo:
-                            started_dt = started_dt.replace(tzinfo=None)
-                        elapsed = (now - started_dt).total_seconds()
-                    except (ValueError, TypeError):
-                        elapsed = 0   # started_at 缺失不判死（保守）
-                    if elapsed > TIMEOUT:
-                        await self._record_openkb_status_by_id(
+                    failed += int(applied)
+                elif tstatus == "pending":
+                    # 排队也要有上限（2026-11-19 审计）：原来 pending 没有分支，
+                    # 引擎队列卡住时文档永久 compiling，而「重新编译」被 claim 的
+                    # `status <> 'compiling'` 条件挡住。给 2×TIMEOUT 的排队宽限。
+                    if req_at and (now - req_at).total_seconds() > TIMEOUT * 2:
+                        applied = await self._record_openkb_status_by_id(
                             doc_id, tenant_id, status="failed",
-                            error="JONEX_WIKI_COMPILE_TIMEOUT: 编译超时，请重试",
+                            error="JONEX_WIKI_COMPILE_QUEUE_TIMEOUT: 编译排队超时，请重试",
+                            **fence,
                         )
-                        timed_out += 1
-                # pending：排队中不判死（批量上传队尾任务，mutation 锁队列）
+                        timed_out += int(applied)
 
         # [jonex] ④ jonex_wiki 的 stale 补投：reparse 停在 stale、或编译撞「同 KB 已有
         # running compile」被回退成 stale 的文档都在这里自愈（与 openkb 同形但 artifact 不同）
@@ -3358,15 +3516,26 @@ class ReconciliationService:
                AND ki.tenant_id = d.tenant_id
                AND ki.is_deleted = 0
              WHERE d.is_deleted = 0
+               -- 2026-11-19 第二轮审计：NULL（编译步从未跑过）两类库都要补 ——
+               -- 原来只对 jonex_wiki 放开，openkb 文档在 compile 被停止后永远
+               -- 停在「待编译」，stale 巡检只认 'stale'，legacy 派发又被 released 挡。
                AND (d.llm_wiki_compile_status = 'stale'
-                    OR (:kb_type = 'jonex_wiki' AND d.llm_wiki_compile_status IS NULL))
+                    OR d.llm_wiki_compile_status IS NULL)
                AND d.status = 'ready'
                AND ki.kb_type = :kb_type
                AND (:kb_type != 'jonex_wiki' OR NOT EXISTS (
                    SELECT 1 FROM knowledge_base.knowledge_documents pending
                     WHERE pending.tenant_id = d.tenant_id
                       AND pending.knowledge_base_id = d.knowledge_base_id AND pending.is_deleted = 0
-                      AND (pending.status IN ('pending', 'parsing', 'ingesting')
+                      AND ((pending.status IN ('parsing', 'ingesting')
+                           -- 同 `_JONEX_WIKI_BUSY_SQL`：pending 只认最近更新或有在途行
+                           OR (pending.status = 'pending' AND (
+                                  pending.updated_at > :quiet_before
+                                  OR EXISTS (
+                                      SELECT 1 FROM knowledge_base.task_center_documents owner_q
+                                       WHERE owner_q.document_id = pending.id
+                                         AND owner_q.tenant_id = pending.tenant_id
+                                         AND owner_q.state = ANY(:active_states)))))
                            OR (pending.status = 'ready'
                                AND (pending.llm_wiki_compile_status = 'stale'
                                     OR pending.llm_wiki_compile_status IS NULL)
@@ -3386,7 +3555,13 @@ class ReconciliationService:
                AND NOT EXISTS (
                    SELECT 1 FROM knowledge_base.task_center_documents tcd
                     WHERE tcd.document_id = d.id
-                      AND tcd.state = ANY(:managed_states)
+                      -- 同 `_JONEX_WIKI_STALE_DOCS_SQL`：只有「仍归任务中心在管」
+                      -- 的行才排除；released + 任务终态必须允许自动补编译。
+                      AND (tcd.state = ANY(:active_states)
+                           OR (tcd.state = 'released' AND EXISTS (
+                                SELECT 1 FROM task_center.tasks tk
+                                 WHERE tk.id = tcd.task_id
+                                   AND tk.status IN ('pending', 'running'))))
                       AND (:kb_type != 'jonex_wiki'
                            OR tcd.current_step IS DISTINCT FROM 'compile'
                            OR tcd.execution_id IS NULL
@@ -3469,6 +3644,36 @@ class ReconciliationService:
                 return rel
         return ""
 
+    async def _jonex_wiki_dispatch_candidates(
+        self, session, tenant_id: str, kb_id: str,
+    ) -> tuple[bool, list]:
+        """`(整库是否忙, 可派发的 stale 文档)` —— 锁外探测与锁内复核共用的唯一判据。
+
+        两段 SQL 见模块级 `_JONEX_WIKI_BUSY_SQL` / `_JONEX_WIKI_STALE_DOCS_SQL`。
+        **`busy` 用 `ACTIVE_STATES`（整库忙不忙）、可派发集合用 `MANAGED_STATES`
+        （本文档归谁管，含 `released`）** —— 两个集合不同是刻意的，理由见
+        `_patrol_stale_recompile` 里那段注释，别顺手统一。
+        """
+        from sqlalchemy import text
+
+        base = {
+            "tenant": tenant_id,
+            "kb": kb_id,
+            # 与既有口径一致：5 秒内刚更新过的文档先不动（上传/解析正在写它）
+            "quiet_before": datetime.now() - timedelta(seconds=5),
+            "active_states": list(ACTIVE_STATES),
+        }
+        busy = (
+            await session.execute(text(_JONEX_WIKI_BUSY_SQL), dict(base))
+        ).first() is not None
+        if busy:
+            return True, []
+        # `managed_states` **只给第二条**：两条查询各收各的参数，别把不相干的绑定
+        # 一起塞过去 —— 守卫用例靠「参数里有没有 managed_states」认那条文档层查询。
+        params = dict(base, managed_states=list(MANAGED_STATES))
+        documents = (await session.execute(text(_JONEX_WIKI_STALE_DOCS_SQL), params)).all()
+        return False, list(documents)
+
     async def _resubmit_jonex_wiki_stale(self, rows) -> int:
         """Drain each ready KB in one engine invocation, independently of patrol limit."""
         from sqlalchemy import text
@@ -3477,6 +3682,25 @@ class ReconciliationService:
         compiler = JonexWikiService()
         submitted = 0
         for tenant_id, kb_id in dict.fromkeys((r.tenant_id, r.knowledge_base_id) for r in rows):
+            # 锁外探测：本库现在有没有可派发的活。没有就**不碰引擎**
+            # （`parse_status` 预检要逐份打开产物文件，空跑一轮纯浪费）。
+            async with get_db_session() as session:
+                busy, candidates = await self._jonex_wiki_dispatch_candidates(
+                    session, tenant_id, kb_id,
+                )
+            if busy or not candidates:
+                continue
+            # [jonex] 派发前的整库解析身份预检（与 `recompile_jonex_wiki` 同口径）：
+            # 一次 ingest 会触发整库编译，本库任一文档的解析产物硬门过期，引擎就在
+            # 「取源材料」阶段硬失败 —— 于是**别的**文档也被记成 failed，还吃一个跟
+            # 它们无关的引擎报错。所以先自愈，搬不动的回写 failed 并跳过本轮。
+            #
+            # ⚠️ **放在事务/锁之外**：这一步只改引擎侧（幂等多副本并发跑也无害），
+            # 而里面是多次 HTTP 往返。放进下面那个事务里，会把 DB 连接与
+            # `pg_try_advisory_xact_lock`（事务结束才释放）一起按在整段网络上，
+            # 其它副本/请求在这一整个往返序列里都拿不到这个 KB 的派发权。
+            if await self._ensure_jonex_parse_identity(compiler, tenant_id, kb_id) != "ok":
+                continue
             # The uploaded document rows exist before parser submission. Include
             # pending as well as parsing/ingesting; failures/deletions are terminal.
             # updated_at follows the platform's naive local timestamp convention.
@@ -3485,63 +3709,14 @@ class ReconciliationService:
                     {"key": f"jonex-upload-window:{tenant_id}:{kb_id}"})).scalar()
                 if not locked:
                     continue
-                waiting = (await session.execute(text("""
-                    SELECT 1 FROM knowledge_base.knowledge_documents
-                     WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
-                       AND (status IN ('pending', 'parsing', 'ingesting')
-                            OR (status = 'ready'
-                                AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
-                                AND updated_at > :quiet_before)
-                            OR (status != 'failed' AND EXISTS (
-                                SELECT 1 FROM knowledge_base.task_center_documents owner
-                                 WHERE owner.document_id = knowledge_documents.id AND owner.tenant_id = :tenant
-                                   AND owner.state = ANY(:active_states)
-                                   AND (owner.current_step IS DISTINCT FROM 'compile'
-                                        OR owner.execution_id IS NULL
-                                        OR (knowledge_documents.extra_metadata->>'jonex_wiki_compile_execution_id')
-                                           IS DISTINCT FROM owner.execution_id)
-                                  AND NOT (owner.current_step IS NOT DISTINCT FROM 'parse'
-                                           AND owner.execution_id IS NULL
-                                           AND owner.handled_execution_id IS NOT NULL))))
-                     LIMIT 1
-                """), {"tenant": tenant_id, "kb": kb_id,
-                        "quiet_before": datetime.now() - timedelta(seconds=5),
-                        "active_states": list(ACTIVE_STATES)})).first()
-                if waiting:
-                    continue
-                # 同 `_patrol_stale_recompile`：上面 `waiting`（整库忙不忙）留在
-                # `ACTIVE_STATES`，这里（本文档归谁管）用 `MANAGED_STATES`，豁免也只对
-                # 在途行生效 —— 理由见那一处的注释，别把两处置成同一个集合。
-                documents = (await session.execute(text("""
-                    SELECT id, file_name, storage_key, storage_backend, file_path
-                      FROM knowledge_base.knowledge_documents d
-                     WHERE tenant_id = :tenant AND knowledge_base_id = :kb AND is_deleted = 0
-                       AND status = 'ready'
-                       AND (llm_wiki_compile_status = 'stale' OR llm_wiki_compile_status IS NULL)
-                       AND NOT EXISTS (SELECT 1 FROM knowledge_base.task_center_documents tcd
-                            WHERE tcd.document_id = d.id AND tcd.tenant_id = :tenant
-                              AND tcd.state = ANY(:managed_states)
-                              AND (tcd.current_step IS DISTINCT FROM 'compile'
-                                   OR tcd.execution_id IS NULL
-                                   OR (d.extra_metadata->>'jonex_wiki_compile_execution_id')
-                                      IS DISTINCT FROM tcd.execution_id)
-                              AND NOT (tcd.state = ANY(:active_states)
-                                       AND tcd.current_step IS NOT DISTINCT FROM 'parse'
-                                       AND tcd.execution_id IS NULL
-                                       AND tcd.handled_execution_id IS NOT NULL))
-                     ORDER BY id
-                """), {"tenant": tenant_id, "kb": kb_id,
-                        "active_states": list(ACTIVE_STATES),
-                        "managed_states": list(MANAGED_STATES)})).all()
-                if not documents:
-                    continue
-                # [jonex] 派发前的整库解析身份预检（与 `recompile_jonex_wiki` 同口径）：
-                # 一次 ingest 会触发整库编译，本库任一文档的解析产物硬门过期，引擎就在
-                # 「取源材料」阶段硬失败 —— 于是**别的**文档也被记成 failed，还吃一个跟
-                # 它们无关的引擎报错。所以先自愈，搬不动的回写 failed 并跳过本轮。
-                if await self._ensure_jonex_parse_identity(compiler, tenant_id, kb_id) != "ok":
+                # 拿到锁后**复核一次**（锁外那次只是探测，期间可能已有别的副本开工）。
+                busy, documents = await self._jonex_wiki_dispatch_candidates(
+                    session, tenant_id, kb_id,
+                )
+                if busy or not documents:
                     continue
                 artifacts, claimed = [], []
+                settled = set()
                 target = await compiler.get_active_schema_version(tenant_id, kb_id)
                 try:
                     for d in documents:
@@ -3563,16 +3738,30 @@ class ReconciliationService:
                     if not artifacts:
                         continue
                     result = await compiler.compile_documents(kb_id, tenant_id, kb_id, artifacts)
-                    warnings = {d["document_id"]: list(d.get("warnings") or [])
-                                for d in result.get("documents", [])}
+                    accepted = {d["document_id"]: d for d in result.get("documents", [])}
+                    rejected = {d["document_id"]: d for d in result.get("errors", [])}
                     for doc_id in claimed:
-                        await compiler.set_task_id(tenant_id, doc_id, result["task_id"])
-                        if warnings.get(doc_id):
-                            await self._record_openkb_status_by_id(doc_id, tenant_id, status="compiling",
-                                                                   warnings=warnings[doc_id])
-                    submitted += len(claimed)
+                        if doc_id in rejected:
+                            error = rejected[doc_id].get("error") or "JONEX_WIKI_SOURCE_INGEST_FAILED"
+                            await self._record_openkb_status_by_id(doc_id, tenant_id, status="failed", error=error)
+                            settled.add(doc_id)
+                            continue
+                        document = accepted.get(doc_id, {})
+                        task_id = document.get("task_id") or result.get("task_id")
+                        if not task_id:
+                            await self._record_openkb_status_by_id(doc_id, tenant_id, status="failed",
+                                                                   error="JONEX_WIKI_SOURCE_INGEST_NO_TASK")
+                            settled.add(doc_id)
+                            continue
+                        warnings = document.get("warnings")
+                        await compiler.set_task_id(tenant_id, doc_id, task_id,
+                                                   **({"warnings": warnings} if warnings else {}))
+                        settled.add(doc_id)
+                        submitted += 1
                 except Exception as exc:
                     for doc_id in claimed:
+                        if doc_id in settled:
+                            continue
                         await self._record_openkb_status_by_id(doc_id, tenant_id,
                             status="stale" if _is_jonex_wiki_compile_slot_busy(exc) else "failed", error=str(exc)[:1000])
                     logger.exception("jonex_wiki upload-window dispatch failed kb=%s", kb_id)
@@ -3631,7 +3820,8 @@ class ReconciliationService:
 
     async def _record_openkb_status_by_id(self, document_id: str, tenant_id: str, *,
                                           status: str, error: str = "", warnings=None,
-                                          applied_schema_version: int | None = None) -> None:
+                                          applied_schema_version: int | None = None,
+                                          expected_compile: tuple[str | None, datetime | None] | None = None) -> bool:
         """[jonex] 按 id+tenant 回写 LLM-Wiki 编译状态（列化；巡检无 ORM 对象场景）。
 
         applied_schema_version：编译 completed 时回写 llm_wiki_applied_schema_version
@@ -3643,8 +3833,23 @@ class ReconciliationService:
         """
         try:
             async with get_db_session() as session:
-                repo = KnowledgeDocumentRepository(session)
-                fresh = await repo.get_required(document_id, tenant_id)
+                if expected_compile is None:
+                    fresh = await KnowledgeDocumentRepository(session).get_required(document_id, tenant_id)
+                else:
+                    from sqlalchemy import select
+                    from ..models import KnowledgeDocument
+                    task_id, requested_at = expected_compile
+                    row = await session.execute(select(KnowledgeDocument).where(
+                        KnowledgeDocument.id == document_id,
+                        KnowledgeDocument.tenant_id == tenant_id,
+                        KnowledgeDocument.is_deleted == 0,
+                        KnowledgeDocument.llm_wiki_compile_status == "compiling",
+                        KnowledgeDocument.llm_wiki_task_id == task_id,
+                        KnowledgeDocument.llm_wiki_compile_requested_at == requested_at,
+                    ).with_for_update())
+                    fresh = row.scalar_one_or_none()
+                    if fresh is None:
+                        return False
                 fresh.llm_wiki_compile_status = status
                 if status in ("compiling", "compiled", "stale"):
                     fresh.llm_wiki_compile_error = None
@@ -3666,8 +3871,10 @@ class ReconciliationService:
                     content_generation=fresh.content_generation, error=error or None,
                 )
                 await session.commit()
+                return True
         except Exception:
             logger.warning("[jonex] patrol 回写 LLM-Wiki 状态失败 doc=%s", document_id, exc_info=True)
+            return False
 
 
 __all__ = ["ReconciliationService"]

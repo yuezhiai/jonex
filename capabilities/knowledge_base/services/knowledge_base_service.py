@@ -8,6 +8,8 @@ from .folder_service import FolderService
 from .tag_service import TagService
 from .knowledge_info_service import KnowledgeInfoService
 from .ontology_compiler import OntologyCompiler
+from .ontology_reasoning.axiom_service import AxiomService
+from .ontology_reasoning.rule_service import RuleService
 from .ontology_query_service import OntologyQueryService
 from .ontology_service import OntologyService
 from .ontology_synonym_service import OntologySynonymService
@@ -58,6 +60,10 @@ class KnowledgeBaseService:
         self.ontology = OntologyService()
         self.reconciliation = ReconciliationService()
         self.compiler = OntologyCompiler()
+        # T4：公理表（KB 级唯一权威，D8）
+        self.axioms = AxiomService()
+        # T6：推理规则表
+        self.reasoning_rules = RuleService()
         self.llm_wiki_schemas = LlmWikiSchemaService()
         # [jonex] Wiki 阅读目录（LLM 起草 + LLM 调整，纯展示投影，不参与检索）
         self.wiki_outlines = WikiOutlineService()

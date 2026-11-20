@@ -121,6 +121,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "restore_document": ("document_id", "knowledge_base_id"),
     "destroy_document": ("document_id", "knowledge_base_id"),
     "upload_document": ("knowledge_base_id",),
+    # 2026-11-18 加（任务定义执行配套）：只落文件、不触发解析/编译。
+    "upload_document_only": ("knowledge_base_id",),
     "list_documents": ("knowledge_base_id",),
     "documents_stats": ("knowledge_base_id",),
     "search": ("query",),
@@ -387,6 +389,27 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "list_ontology_relation_types": ("knowledge_base_id",),
     # ── 跨数据源抽象 schema（概念对齐层）──
     "get_abstract_schema": ("knowledge_base_id",),
+    # ── 本体公理（T4）──
+    "list_ontology_axioms": ("knowledge_base_id",),
+    "get_ontology_axiom": ("knowledge_base_id", "axiom_key"),
+    "validate_ontology_axioms": ("knowledge_base_id",),
+    "import_ontology_axioms": ("knowledge_base_id", "yaml_text"),
+    "export_ontology_axioms": ("knowledge_base_id",),
+    "preview_axiom_status": ("knowledge_base_id", "axiom_key", "status"),
+    "set_axiom_status": ("knowledge_base_id", "axiom_key", "status"),
+    # 契约查询不依赖具体 KB
+    "get_reasoning_contract": (),
+    # ── 推理规则（T6）──
+    "list_reasoning_rules": ("knowledge_base_id",),
+    "get_reasoning_rule": ("knowledge_base_id", "rule_key"),
+    "validate_reasoning_rules": ("knowledge_base_id",),
+    "create_reasoning_rule": ("knowledge_base_id",),
+    "update_reasoning_rule": ("knowledge_base_id", "rule_key"),
+    "delete_reasoning_rule": ("knowledge_base_id", "rule_key"),
+    "set_reasoning_rule_enabled": ("knowledge_base_id", "rule_key", "enabled"),
+    "export_reasoning_rules": ("knowledge_base_id",),
+    "import_reasoning_rules": ("knowledge_base_id", "yaml_text"),
+    "preview_reasoning": ("knowledge_base_id",),
     "generate_abstract_schema": ("knowledge_base_id",),
     "preview_focus_abstract_schema": ("knowledge_base_id", "prompt"),
     "construct_abstract_schema": ("knowledge_base_id",),
@@ -630,12 +653,10 @@ _STRUCTURED_ACTIONS = frozenset({
     # 数据源的结构化派生能力（源连接本身不设闸）
     "import_lineage_file", "read_data_source_catalog", "generate_ds_schema",
     "ingest_lineage_event",
-    # 抽象 schema / 对齐 / 数据资产 / 路径
-    "get_abstract_schema", "generate_abstract_schema",
+    # 抽象 schema 的派生能力（生成/构造/聚焦）仍依赖结构化数据源。
+    # get/save/import/merge/快照是本体模型本身，已迁到 `_ONTOLOGY_ACTIONS`（D9）。
+    "generate_abstract_schema",
     "preview_focus_abstract_schema", "construct_abstract_schema",
-    "save_abstract_schema", "import_abstract_schema",
-    "list_abstract_schema_snapshots", "get_abstract_schema_snapshot",
-    "restore_abstract_schema_snapshot",
     # 落点后台 run 是抽象 schema 的派生能力（开关关闭时不存在可落点的概念库）；
     # 读取一并设闸，与 `get_abstract_schema` 同口径 —— 开关关了就没有这个页签。
     "start_abstract_landing_run", "get_abstract_landing_run",
@@ -667,6 +688,35 @@ _STRUCTURED_ACTIONS = frozenset({
     "activate_verified_query", "retire_verified_query", "delete_verified_query",
     "preview_verified_query_match",
 })
+
+
+#: 本体闸门（D9）：独立于 `structured_enabled`，由 `knowledge_info.ontology_enabled`
+#: 控制。覆盖抽象 schema 本体模型（get/save/import/merge/快照）与公理/规则动作。
+#: 结构性派生（generate/construct/focus）仍在 `_STRUCTURED_ACTIONS`。
+_ONTOLOGY_ACTIONS = frozenset({
+    "get_abstract_schema", "save_abstract_schema", "import_abstract_schema",
+    "list_abstract_schema_snapshots", "get_abstract_schema_snapshot",
+    "restore_abstract_schema_snapshot",
+    # 公理（T4）
+    "list_ontology_axioms", "get_ontology_axiom",
+    "validate_ontology_axioms", "import_ontology_axioms",
+    "export_ontology_axioms",
+    "preview_axiom_status", "set_axiom_status",
+    # 规则（T6）
+    "list_reasoning_rules", "get_reasoning_rule", "validate_reasoning_rules",
+    "create_reasoning_rule", "update_reasoning_rule", "delete_reasoning_rule",
+    "set_reasoning_rule_enabled", "export_reasoning_rules",
+    "import_reasoning_rules", "preview_reasoning",
+})
+
+
+async def _is_ontology_enabled(session, tenant_id: str, kb_id: str) -> bool:
+    row = (await session.execute(
+        text("SELECT ontology_enabled FROM knowledge_base.knowledge_info "
+             "WHERE id=:kb AND tenant_id=:t AND is_deleted=0"),
+        {"kb": kb_id, "t": tenant_id},
+    )).first()
+    return bool(row and row[0])
 
 
 async def _is_structured_enabled(session, tenant_id: str, kb_id: str) -> bool:
@@ -1047,6 +1097,8 @@ _SPACE_EXEMPT_ACTIONS = frozenset({
     # —— 与 get_quota_view 同款：部署级只读事实，与「是不是这个空间的成员」无关。
     # ⚠ 它不敏感（就是一张 UI 选项清单），所以不另设权限码；真正的闸门在 create 那一侧。
     "get_kb_type_options",
+    # 推理契约是部署级只读事实，与具体 KB/空间无关（T4）。
+    "get_reasoning_contract",
     # [jonex] 任务中心接入的两个入口：**空间成员判定对它们无意义，写死豁免**。
     # 派活/删除是**内部调用**（管理方发出、没有终端用户在场），`actor` 常常是空的 ——
     # 真跑一遍空间判定只会以「调用方不是这个空间的成员」把每一次派活 403 掉。
@@ -1107,7 +1159,7 @@ _KB_GRANT_EXCLUDED_ACTIONS = frozenset({
 _SPACE_WRITE_ACTIONS = frozenset({
     "configure_wiki_scenario", "run_wiki_scenario", "review_wiki_scenario", "annotate_wiki_scenario",
     "create_knowledge_info", "update_knowledge_info", "delete_knowledge_info",
-    "upload_document", "delete_document", "reparse_document",
+    "upload_document", "upload_document_only", "delete_document", "reparse_document",
     "upload_document_version", "activate_document_version",
     "discard_document_version_upload",
     # 相似建议：忽略 / 合并为新版本（按空间写口径）
@@ -1173,6 +1225,11 @@ _SPACE_WRITE_ACTIONS = frozenset({
     # KB 级模型配置：写与解析设置同口径（空间管理者/租户管理员/kb_manager 授权）
     "save_model_settings",
     "save_compiled_schema", "import_compiled_schema_yaml", "reseed_compiled_schema",
+    # 公理导入写公理表（T4）；状态启停改公理生命周期，同样按写口径
+    "import_ontology_axioms", "set_axiom_status",
+    # 规则写动作（T6）
+    "create_reasoning_rule", "update_reasoning_rule", "delete_reasoning_rule",
+    "set_reasoning_rule_enabled", "import_reasoning_rules",
     # 抽象 schema：生成与确认都写库，与 save_compiled_schema 同级
     "generate_abstract_schema", "save_abstract_schema", "construct_abstract_schema",
     "import_abstract_schema",
@@ -1263,6 +1320,14 @@ _SPACE_READ_ACTIONS = frozenset({
     "get_ontology_graph", "get_ontology_statistics",
     "expand_ontology_neighbors", "search_ontology_entities",
     "get_compiled_schema", "export_compiled_schema_yaml", "export_llm_wiki_schema_yaml",
+    # 公理读动作（T4）；状态变更预览只读、不写库
+    "list_ontology_axioms", "get_ontology_axiom",
+    "validate_ontology_axioms", "export_ontology_axioms",
+    "preview_axiom_status",
+    # 规则读动作（T6）
+    "list_reasoning_rules", "get_reasoning_rule",
+    "validate_reasoning_rules", "export_reasoning_rules",
+    "preview_reasoning",
     # 更新模型任务状态：只读远端任务（dry-run 也只算不写），与 schema 读同级
     "get_model_update_status",
     # KB 级 schema 生命周期读取与重编译预览（只读，不触发自动编译）：与
@@ -1478,6 +1543,16 @@ class KnowledgeBaseCapability(BaseCapability):
         # openkb → KnowledgeCompilerService.recompile_openkb（重新编译），
         # lightrag → 本体重抽。kb_type 路由在 ontology_service.retry_extract 内处理。
         "get_editor_state",
+        # 公理只对本体型 KB 有意义（T4）
+        "list_ontology_axioms", "get_ontology_axiom",
+        "validate_ontology_axioms", "import_ontology_axioms",
+        "export_ontology_axioms",
+        "preview_axiom_status", "set_axiom_status",
+        # 规则只对本体型 KB 有意义（T6）
+        "list_reasoning_rules", "get_reasoning_rule", "validate_reasoning_rules",
+        "create_reasoning_rule", "update_reasoning_rule", "delete_reasoning_rule",
+        "set_reasoning_rule_enabled", "export_reasoning_rules",
+        "import_reasoning_rules", "preview_reasoning",
     }
 
     def __init__(self):
@@ -1955,6 +2030,8 @@ class KnowledgeBaseCapability(BaseCapability):
         from .services.nl2sql import metric_call_approval as mca  # noqa: PLC0415
         ps = self.service.parser_settings
         abs_schema = self.service.abstract_schemas  # 跨数据源抽象 schema（概念对齐层）
+        ax = self.service.axioms  # T4：公理表（KB 级唯一权威）
+        rs = self.service.reasoning_rules  # T6：推理规则表
         ms = self.service.model_settings
         s = self._space
         sv = self._domain_service
@@ -2177,6 +2254,8 @@ class KnowledgeBaseCapability(BaseCapability):
         dispatch: dict[str, ActionHandler] = {
             # ── 文档管理 ──
             "upload_document": lambda r, d: docs.upload_document(r.tenant_id, d, user_id=r.user_id, username=r.username, ip=r.ip),
+            # 只落文件、不触发处理（任务定义执行时用）：文档行 PENDING，不建接管行、不提交任务。
+            "upload_document_only": lambda r, d: docs.upload_document(r.tenant_id, d, user_id=r.user_id, username=r.username, ip=r.ip, trigger_processing=False),
             "list_documents": lambda r, d: docs.list_documents(r.tenant_id, d),
             "documents_stats": lambda r, d: docs.documents_stats(r.tenant_id, d),
             "get_document": lambda r, d: docs.get_document(r.tenant_id, d["document_id"], d),
@@ -2507,6 +2586,84 @@ class KnowledgeBaseCapability(BaseCapability):
             "list_abstract_schema_snapshots": _history_list,
             "get_abstract_schema_snapshot": _history_get,
             "restore_abstract_schema_snapshot": _history_restore,
+            # ── 本体公理（T4）──
+            "list_ontology_axioms": lambda r, d: ax.list_axioms(
+                r.tenant_id, d["knowledge_base_id"],
+            ),
+            "get_ontology_axiom": lambda r, d: ax.get_axiom(
+                r.tenant_id, d["knowledge_base_id"], d["axiom_key"],
+            ),
+            "validate_ontology_axioms": lambda r, d: ax.validate_axioms(
+                r.tenant_id, d["knowledge_base_id"], d,
+            ),
+            "import_ontology_axioms": lambda r, d: ax.import_axioms(
+                r.tenant_id, d["knowledge_base_id"], d.get("yaml_text") or "",
+                user_id=r.user_id or "",
+                dry_run=d.get("dry_run") is True,
+                mode=d.get("mode") or "merge",
+                removed_axiom_keys=d.get("removed_axiom_keys"),
+            ),
+            "export_ontology_axioms": lambda r, d: ax.export_axioms(
+                r.tenant_id, d["knowledge_base_id"],
+            ),
+            "preview_axiom_status": lambda r, d: ax.preview_axiom_status(
+                r.tenant_id, d["knowledge_base_id"], d["axiom_key"],
+                d["status"],
+            ),
+            "set_axiom_status": lambda r, d: ax.set_axiom_status(
+                r.tenant_id, d["knowledge_base_id"], d["axiom_key"],
+                d["status"],
+                user_id=r.user_id or "",
+                force=d.get("force") is True,
+                expected_status=d.get("expected_status"),
+            ),
+            "get_reasoning_contract": lambda r, d: ax.contract(),
+            # ── 推理规则（T6）──
+            "list_reasoning_rules": lambda r, d: rs.list_rules(
+                r.tenant_id, d["knowledge_base_id"],
+            ),
+            "get_reasoning_rule": lambda r, d: rs.get_rule(
+                r.tenant_id, d["knowledge_base_id"], d["rule_key"],
+            ),
+            "validate_reasoning_rules": lambda r, d: rs.validate_rules(
+                r.tenant_id, d["knowledge_base_id"], d,
+            ),
+            "create_reasoning_rule": lambda r, d: rs.create_rule(
+                r.tenant_id, d["knowledge_base_id"], d,
+                user_id=r.user_id or "",
+            ),
+            "update_reasoning_rule": lambda r, d: rs.update_rule(
+                r.tenant_id, d["knowledge_base_id"], d["rule_key"], d,
+                user_id=r.user_id or "",
+            ),
+            "delete_reasoning_rule": lambda r, d: rs.delete_rule(
+                r.tenant_id, d["knowledge_base_id"], d["rule_key"],
+            ),
+            "set_reasoning_rule_enabled": lambda r, d: rs.set_enabled(
+                r.tenant_id, d["knowledge_base_id"], d["rule_key"],
+                d.get("enabled"),
+                user_id=r.user_id or "",
+            ),
+            "export_reasoning_rules": lambda r, d: rs.export_rules(
+                r.tenant_id, d["knowledge_base_id"],
+            ),
+            "import_reasoning_rules": lambda r, d: rs.import_rules(
+                r.tenant_id, d["knowledge_base_id"], d.get("yaml_text") or "",
+                user_id=r.user_id or "",
+                dry_run=d.get("dry_run") is True,
+                mode=d.get("mode") or "merge",
+                removed_rule_keys=d.get("removed_rule_keys"),
+                plan_hash=d.get("plan_hash"),
+                override_enabled=d.get("override_enabled") is True,
+            ),
+            "preview_reasoning": lambda r, d: rs.preview_reasoning(
+                r.tenant_id, d["knowledge_base_id"],
+                rule_keys=d.get("rule_keys"),
+                rule_ast=d.get("rule"),
+                anchor_entity=d.get("anchor_entity") or "",
+                limit=d.get("limit") or 200,
+                timeout=3.0,
+            ),
             # 落点后台 run（Task 12）：start 建单 + 调度，get 轮询进度。
             "start_abstract_landing_run": _start_landing_run,
             "get_abstract_landing_run": _get_landing_run,
@@ -3034,22 +3191,22 @@ class KnowledgeBaseCapability(BaseCapability):
             ),
             # ── 本体实例/关系 创建、编辑与删除 ──
             "create_ontology_instance": lambda r, d: oq.create_instance(
-                r.tenant_id, CreateOntologyInstanceRequest(**d),
+                r.tenant_id, CreateOntologyInstanceRequest(**d), user_id=r.user_id,
             ),
             "update_ontology_instance": lambda r, d: oq.update_instance(
-                r.tenant_id, UpdateOntologyInstanceRequest(**d),
+                r.tenant_id, UpdateOntologyInstanceRequest(**d), user_id=r.user_id,
             ),
             "delete_ontology_instance": lambda r, d: oq.delete_instance(
-                r.tenant_id, DeleteOntologyInstanceRequest(**d),
+                r.tenant_id, DeleteOntologyInstanceRequest(**d), user_id=r.user_id,
             ),
             "create_ontology_relation": lambda r, d: oq.create_relation(
-                r.tenant_id, CreateOntologyRelationRequest(**d),
+                r.tenant_id, CreateOntologyRelationRequest(**d), user_id=r.user_id,
             ),
             "update_ontology_relation": lambda r, d: oq.update_relation(
-                r.tenant_id, UpdateOntologyRelationRequest(**d),
+                r.tenant_id, UpdateOntologyRelationRequest(**d), user_id=r.user_id,
             ),
             "delete_ontology_relation": lambda r, d: oq.delete_relation(
-                r.tenant_id, DeleteOntologyRelationRequest(**d),
+                r.tenant_id, DeleteOntologyRelationRequest(**d), user_id=r.user_id,
             ),
             # ── 本体实体搜索（用于表单字段搜索选择） ──
             "search_ontology_entities": lambda r, d: oq.search_entities(
@@ -3756,6 +3913,21 @@ class KnowledgeBaseCapability(BaseCapability):
             raise OperationNotSupportedError(
                 message="该知识库未启用结构化数据支持")
 
+    async def _require_ontology_enabled(self, tenant_id: str, data: dict) -> None:
+        """KB 本体闸门关闭 → 1004；解析不出 KB 也拒绝（fail-closed）。"""
+        kb_id = str((data or {}).get("knowledge_base_id") or "").strip()
+        ds_id = str((data or {}).get("ds_id") or "").strip()
+        async with get_db_session() as session:
+            if not kb_id and ds_id:
+                kb_id = await _kb_id_for_data_source(session, tenant_id, ds_id)
+            if not kb_id:
+                raise OperationNotSupportedError(
+                    message="无法确定知识库，本体能力不可用")
+            enabled = await _is_ontology_enabled(session, tenant_id, kb_id)
+        if not enabled:
+            raise OperationNotSupportedError(
+                message="该知识库未启用本体能力")
+
     async def _require_evolution_admin(
         self, request: CapabilityRequest, action: str, data: dict | None
     ) -> None:
@@ -3857,6 +4029,12 @@ class KnowledgeBaseCapability(BaseCapability):
         )
         if not schema:
             return schema
+        # T5：prompt_schema 是落库列（保存时预计算），抽取侧必须用展开后的
+        # 实体/关系重新生成，否则看不到继承属性与子类端点。
+        schema = dict(schema)
+        schema["prompt_schema"] = self.service.compiler.build_extraction_prompt_schema(
+            schema
+        )
         return await self.service.compiler.inject_synonyms(
             tenant_id, knowledge_base_id, schema
         )
@@ -4160,6 +4338,9 @@ class KnowledgeBaseCapability(BaseCapability):
             # 放在 `skip_space_check` 块之外 —— 内部链路/无 actor 调用同样要拦。
             if action in _STRUCTURED_ACTIONS:
                 await self._require_structured_enabled(request.tenant_id, data)
+            # 本体闸门（D9）：独立于结构化开关；放在同一位置，内部链路同样要拦。
+            if action in _ONTOLOGY_ACTIONS:
+                await self._require_ontology_enabled(request.tenant_id, data)
             result = await handler(request, data)
             return CapabilityResponse.ok(request.request_id, result)
         # 能力信封不经 HTTP 异常处理器，文案必须在这里按 locale 本地化：

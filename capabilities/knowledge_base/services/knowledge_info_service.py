@@ -567,13 +567,15 @@ class KnowledgeInfoService:
         kb_granted = data.pop("_kb_granted", False)
         updatable = {
             "name", "description", "data_source_types", "status", "space_id", "owner_id",
-            "ingest_backend", "structured_enabled", "similarity_check_enabled",
+            "ingest_backend", "structured_enabled", "ontology_enabled",
+            "reasoning_enabled", "similarity_check_enabled",
             "similarity_check_threshold", "procedural_extract", "extract_tool_calls",
         }
         if kb_granted:
             updatable = {
                 "name", "description", "data_source_types", "status",
-                "structured_enabled", "similarity_check_enabled",
+                "structured_enabled", "ontology_enabled", "reasoning_enabled",
+                "similarity_check_enabled",
                 "similarity_check_threshold", "procedural_extract", "extract_tool_calls",
             }
         # [jonex] 本函数下方另有局部 import，会把这两个名字绑成局部变量；须先用先绑。
@@ -641,6 +643,18 @@ class KnowledgeInfoService:
                     fallback="抽取期调用工具开关必须是布尔值",
                 ),
             )
+        # 本体闸门 / 推理链开关：同上，必须是真布尔（None = 不更新）。
+        for field, error_key, fallback in (
+            ("ontology_enabled", "err.kb.ontology_enabled_invalid", "本体开关必须是布尔值"),
+            ("reasoning_enabled", "err.kb.reasoning_enabled_invalid", "推理链开关必须是布尔值"),
+        ):
+            if field not in updatable:
+                continue
+            value = data.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise InvalidParameterError(
+                    message=translate(error_key, fallback=fallback),
+                )
         # [jonex] 库级派单值取值校验：None = 撤销（回到跟随服务端开关），其余必须是
         # 本代码认识的值。只对「真要落的字段」校验 —— editor 的越权值照其它字段的
         # 口径静默丢弃，不在这里炸。

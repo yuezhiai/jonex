@@ -127,7 +127,13 @@ _ARCHIVE_CANDIDATES_SQL = text(
               SELECT 1 FROM knowledge_base.task_center_documents tc
               WHERE tc.document_id = d.id
                 AND tc.tenant_id = d.tenant_id
-                AND tc.state IN {_TASK_CENTER_IN_FLIGHT}
+                AND (tc.state IN {_TASK_CENTER_IN_FLIGHT}
+                     -- released 只是看门狗不盯了；它名下任务仍 pending/running 时
+                     -- 归档会与任务中心派活打架（2026-11-19 审计）。
+                     OR (tc.state = 'released' AND EXISTS (
+                          SELECT 1 FROM task_center.tasks tk
+                           WHERE tk.id = tc.task_id
+                             AND tk.status IN ('pending', 'running'))))
           )
           AND COALESCE(dp.retention_days, kp.retention_days, tp.retention_days, :default_days) > 0
           AND d.created_at + make_interval(days => COALESCE(dp.retention_days, kp.retention_days, tp.retention_days, :default_days)) <= LOCALTIMESTAMP
@@ -161,7 +167,11 @@ _DESTROY_CANDIDATES_SQL = text(
               SELECT 1 FROM knowledge_base.task_center_documents tc
               WHERE tc.document_id = d.id
                 AND tc.tenant_id = d.tenant_id
-                AND tc.state IN {_TASK_CENTER_IN_FLIGHT}
+                AND (tc.state IN {_TASK_CENTER_IN_FLIGHT}
+                     OR (tc.state = 'released' AND EXISTS (
+                          SELECT 1 FROM task_center.tasks tk
+                           WHERE tk.id = tc.task_id
+                             AND tk.status IN ('pending', 'running'))))
           )
           AND COALESCE(dp.grace_days, kp.grace_days, tp.grace_days, :default_grace) >= 0
           AND d.archived_at + make_interval(days => COALESCE(dp.grace_days, kp.grace_days, tp.grace_days, :default_grace)) <= LOCALTIMESTAMP

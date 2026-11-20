@@ -83,20 +83,30 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         result = await self.session.execute(select(TaskCenterDocument).where(*conditions))
         return result.scalar_one_or_none()
 
-    async def list_active(self, limit: int = 50) -> list[TaskCenterDocument]:
+    async def list_active(
+        self, limit: int = 50, after_document_id: str = ""
+    ) -> list[TaskCenterDocument]:
         """**跨租户**扫描在途接管行 —— 只给后台看门狗用（与
         `KnowledgeDocumentRepository.list_by_status_for_reconciliation` 同一类）。
 
         「在途」= `state IN ('submitting', 'managed')`，**不含 `released`**：release
         就是交接，交出去的文档归既有对账管，看门狗不再盯。
 
-        按 `updated_at` 升序：卡得最久的先被看。这同时也是**推进保证** ——
-        `limit` 不够时最旧的先处理，不会出现「一批新行永远挡在旧行前面」。
+        按 `updated_at` 升序：卡得最久的先被看。
+        ⚠️ 2026-11-20 第二轮审计：只看最旧的前 N 条会**饿死后来的行** ——
+        `waiting_*` 分支都不刷新 `updated_at`，50 条长任务可以把窗口占满几小时，
+        新上传的 submit 失败行永远排不进来（等 6h 后第一次被看到时已过补交期限）。
+        所以再加一个 **keyset 游标**（`after_document_id`）：调用方轮转扫描，
+        扫到队尾就回卷 —— 与巡检的 `_OPENKB_PATROL_AFTER_ID` 同一套机制。
         """
+        conditions = [TaskCenterDocument.state.in_(list(ACTIVE_STATES))]
+        if after_document_id:
+            conditions.append(TaskCenterDocument.document_id > after_document_id)
         stmt = (
             select(TaskCenterDocument)
-            .where(TaskCenterDocument.state.in_(list(ACTIVE_STATES)))
-            .order_by(TaskCenterDocument.updated_at.asc())
+            .where(*conditions)
+            # 游标按主键推进，排序也必须是主键（否则「接着上次的位置」不成立）
+            .order_by(TaskCenterDocument.document_id.asc())
             .limit(limit)
         )
         result = await self.session.execute(stmt)
@@ -239,15 +249,57 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         await self.session.flush()
         return (result.rowcount or 0) > 0
 
-    async def bump_submit_attempt(self, document_id: str, error_message: str) -> int:
+    async def exists_released_with_active_task(
+        self, document_id: str, tenant_id: str
+    ) -> bool:
+        """released 行名下任务仍 pending/running —— 归档/删除必须继续等它。
+
+        2026-11-19 第二轮审计：手动归档只查 `exists_active`（submitting/managed），
+        与保留策略的口径不一致；released 只代表看门狗交还，任务可能还在任务中心排队。
+        """
+        result = await self.session.execute(
+            text(
+                """
+                SELECT 1 FROM knowledge_base.task_center_documents t
+                 JOIN task_center.tasks tk ON tk.id = t.task_id
+                 WHERE t.document_id = :doc
+                   AND t.tenant_id = :tenant
+                   AND t.state = 'released'
+                   AND tk.is_deleted = 0
+                   AND tk.status IN ('pending', 'running')
+                 LIMIT 1
+                """
+            ),
+            {"doc": document_id, "tenant": tenant_id},
+        )
+        return result.first() is not None
+
+    async def bump_submit_attempt(
+        self,
+        document_id: str,
+        error_message: str,
+        *,
+        expect_attempts: int | None = None,
+        expect_updated_at: "datetime | None" = None,
+    ) -> int:
         """记一次提交失败（`submit_attempts += 1`），返回累加后的次数。
 
         失败原因截断到 2000 字符：`error_message` 是 `TEXT`、不拦长度，但异常串里
         带整段堆栈时它会变成难以阅读的一大坨，排障时反而看不清头几行。
+
+        `expect_attempts` / `expect_updated_at` 是**快照 CAS**（2026-11-19 审计）：
+        看门狗多副本会同时扫到同一条 `submitting` 行、各自补交并各自 +1，计数被重复
+        累加、提前到达放弃上限把本可自愈的抖动判死。带上扫描时的快照后，只有第一个
+        副本能命中，其余算本轮未记（下一轮按新快照再算）。
         """
+        conditions = [TaskCenterDocument.document_id == document_id]
+        if expect_attempts is not None:
+            conditions.append(TaskCenterDocument.submit_attempts == expect_attempts)
+        if expect_updated_at is not None:
+            conditions.append(TaskCenterDocument.updated_at == expect_updated_at)
         stmt = (
             update(TaskCenterDocument)
-            .where(TaskCenterDocument.document_id == document_id)
+            .where(*conditions)
             .values(
                 submit_attempts=TaskCenterDocument.submit_attempts + 1,
                 error_message=(error_message or "")[:2000],
@@ -258,6 +310,53 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         await self.session.flush()
         return int(result.scalar_one_or_none() or 0)
 
+    async def reattach_to_task(
+        self,
+        document_id: str,
+        *,
+        tenant_id: str,
+        old_task_id: str,
+        new_task_id: str,
+        knowledge_base_id: str,
+        space_id: str,
+    ) -> Optional[TaskCenterDocument]:
+        """把一条**已交还（非在途）**的接管行改挂到新任务上（2026-11-18 审计补）。
+
+        同一份文档可以被多次执行：上一次任务的接管行停在 `released`（历史），
+        新任务派活时如果还按「不同 task_id 一律拒」，第二次执行必然失败；而执行前
+        预检只把 `submitting/managed` 当占用、会放行 —— 两边判据冲突。
+        这里做 CAS（`state NOT IN 在途`），并把执行痕迹清零，等价于“重新接管”。
+        """
+        stmt = (
+            update(TaskCenterDocument)
+            .where(
+                TaskCenterDocument.document_id == document_id,
+                TaskCenterDocument.tenant_id == tenant_id,
+                TaskCenterDocument.task_id == old_task_id,
+                TaskCenterDocument.state.notin_(list(ACTIVE_STATES)),
+            )
+            .values(
+                task_id=new_task_id,
+                knowledge_base_id=knowledge_base_id,
+                space_id=space_id,
+                state=TaskCenterDocState.MANAGED.value,
+                current_step=None,
+                execution_id=None,
+                handled_execution_id=None,
+                rag_task_id=None,
+                last_step=None,
+                step_started_at=None,
+                last_report=None,
+                error_message=None,
+                updated_at=datetime.now(),
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        if not (result.rowcount or 0):
+            return None
+        return await self.read(document_id, tenant_id)
+
     async def begin_step(
         self,
         document_id: str,
@@ -266,6 +365,7 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         task_id: str,
         step_code: str,
         execution_id: str,
+        last_step: bool | None = None,
     ) -> bool:
         """本步开始：写 `current_step` / `execution_id` / `step_started_at`。
 
@@ -293,6 +393,10 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
             .values(
                 current_step=step_code,
                 execution_id=execution_id,
+                # 任务中心派活报文带来的「是不是最后一步」（2026-11-18）：
+                # 看门狗收口时据此决定要不要把接管行置 `released`，
+                # 不再写死「只有 compile 才是最后一步」。
+                last_step=last_step,
                 step_started_at=datetime.now(),
                 # **必须清掉上一轮的下游任务号**：`task_stopped` 通知丢失等情况下，
                 # 行仍带着旧 `execution_id + rag_task_id` 被新一次派活接手；不清的话，
@@ -498,7 +602,10 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         error_message: str | None = None,
         only_if_idle: bool = False,
         expect_execution_id: str | None = None,
+        keep_report: bool = False,
         report: dict | None = None,
+        expect_task_id: str | None = None,
+        expect_updated_at: "datetime | None" = None,
     ) -> bool:
         """判死 / 放弃接力：把接管行交还给既有对账（`state = released`）。
 
@@ -530,6 +637,13 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
         ]
         if only_if_idle:
             conditions.append(TaskCenterDocument.execution_id.is_(None))
+        if expect_task_id is not None:
+            # 快照 CAS（2026-11-19 审计）：看门狗拿着扫描时的旧快照放弃时，行可能
+            # 已经被「重新解析/重新编译」rearm 成 managed（execution 同样为 NULL，
+            # 与「没人在途」同形）；不比对 task_id/updated_at 就会把刚武装的行拆掉。
+            conditions.append(TaskCenterDocument.task_id == expect_task_id)
+        if expect_updated_at is not None:
+            conditions.append(TaskCenterDocument.updated_at == expect_updated_at)
         if expect_execution_id is not None:
             # **「我这一单」的 CAS**：调用方是在处置**自己这次的**执行痕迹
             # （发下游失败 / 看门狗判死）。出站可能耗时数十秒，期间任务被停止、
@@ -539,23 +653,28 @@ class TaskCenterDocumentRepository(BaseRepository[TaskCenterDocument]):
             conditions.append(
                 TaskCenterDocument.execution_id == expect_execution_id
             )
+        values: dict = {
+            "state": TaskCenterDocState.RELEASED.value,
+            "execution_id": None,
+            "rag_task_id": None,
+            "step_started_at": None,
+            "error_message": (error_message[:2000] if error_message else None),
+        }
+        if not keep_report:
+            # 「最后一次收口的那份上报报文」由调用方给（`report=`）。
+            # **带上 `_execution_id`**：报文是**哪一次执行**的结论，查询侧
+            # （`query_step_status`）据此只回对应那一次，补拉上一步时不会拿到
+            # 下一步的失败原因。
+            if report is not None and expect_execution_id:
+                report = {**report, "_execution_id": expect_execution_id}
+            values["last_report"] = report
+        # `keep_report=True` = **不动这一列**：中性交还（「上一步刚成功、正等下一步
+        # 派活时放弃」）不该把上一份成功报文抹成 NULL —— 那会让管理方补拉时得到
+        # `unknown`，把一次真实的成功永久丢掉。
         stmt = (
             update(TaskCenterDocument)
             .where(*conditions)
-            .values(
-                state=TaskCenterDocState.RELEASED.value,
-                execution_id=None,
-                rag_task_id=None,
-                step_started_at=None,
-                error_message=(error_message[:2000] if error_message else None),
-                # 「最后一次收口的那份上报报文」由**调用方给**（`report=`）：
-                #   判死（`_fail_step` / `_fail_document` / `_abandon`）传**失败报文**；
-                #   「任务被删除」那种中性收口**不传** —— 保持 NULL，于是管理方来问时
-                #   会得到「这活不归我」（既不算成、也不算败，与它的语义一致）。
-                # ⚠️ 不传就是**写 NULL**（不是「别动」）—— 中性收口确实该把上一次的
-                # 报文抹掉，否则一份旧的失败报文会一直挂在那儿骗后来的查询。
-                last_report=report,
-            )
+            .values(**values)
         )
         result = await self.session.execute(stmt)
         await self.session.flush()

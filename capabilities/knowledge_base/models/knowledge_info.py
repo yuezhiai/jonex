@@ -63,6 +63,11 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
     # 结构化数据支持（数据源 / schema / 抽象 schema / 血缘 / 治理 / ETL / ②）。
     # 新建默认关闭；存量由 015 迁移置为开启；关闭不删除任何数据。
     structured_enabled = Column(Boolean, nullable=False, default=False)
+    # 本体闸门（D9）：独立于 structured_enabled，默认开启。控制抽象 schema 的
+    # get/save/import/merge/快照，以及公理与规则动作；关闭不删除任何数据。
+    ontology_enabled = Column(Boolean, nullable=False, default=True)
+    # 推理链开关（D11）：只控制检索时的规则推导展示，默认关闭；只有 TRUE 算开。
+    reasoning_enabled = Column(Boolean, nullable=False, default=False)
 
     def to_dict(self, space_name: str = None):
         result = {
@@ -77,6 +82,10 @@ class KnowledgeInfo(TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
             "owner_id": self.owner_id,
             "kb_type": self.kb_type,  # [jonex]
             "structured_enabled": bool(self.structured_enabled),
+            # 本体闸门（D9）：独立于结构化开关
+            "ontology_enabled": bool(self.ontology_enabled),
+            # 推理链开关（D11）：只有 TRUE 算开
+            "reasoning_enabled": bool(self.reasoning_enabled),
             "ingest_backend": self.ingest_backend,  # [jonex] NULL = 跟随服务端开关
             # [jonex] 动态本体（技能 / 动作抽取）库级开关；NULL 与 FALSE 都是关
             "procedural_extract": self.procedural_extract is True,

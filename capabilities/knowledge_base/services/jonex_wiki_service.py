@@ -307,7 +307,7 @@ class JonexWikiService:
                                 parsed_artifacts: list[dict]) -> dict:
         model = await self._compile_model(tenant_id, kb_id)
         try:
-            return await self._client.compile_parsed_documents(
+            result = await self._client.compile_parsed_documents(
                 kb_name, parsed_artifacts, tenant_id, kb_id, model=model)
         except Exception as exc:
             if not is_engine_document_conflict(exc):
@@ -322,6 +322,39 @@ class JonexWikiService:
                 raise
             return await self._client.compile_parsed_documents(
                 kb_name, parsed_artifacts, tenant_id, kb_id, model=model)
+        errors = {d["document_id"]: d for d in result.get("errors", [])}
+        retry = []
+        for artifact in parsed_artifacts:
+            document_id = artifact["document_id"]
+            if errors.get(document_id, {}).get("error_code") != _ENGINE_CONFLICT_CODE:
+                continue
+            try:
+                stale_ids = await self._deleted_same_name_documents(
+                    tenant_id, kb_id, artifact["source_name"], exclude_id=document_id)
+                released = False
+                for stale_id in stale_ids:
+                    released |= await self._release_engine_orphan(kb_name, tenant_id, kb_id, stale_id)
+            except Exception:
+                logger.exception("Wiki conflict cleanup failed kb=%s doc=%s", kb_id, document_id)
+                continue
+            if released:
+                retry.append(artifact)
+        if not retry:
+            return result
+        try:
+            recovered = await self._client.compile_parsed_documents(
+                kb_name, retry, tenant_id, kb_id, model=model)
+        except Exception:
+            logger.exception("Wiki retry for conflicting sources failed kb=%s", kb_id)
+            return result
+        for document in recovered.get("documents", []):
+            errors.pop(document["document_id"], None)
+        errors.update((d["document_id"], d) for d in recovered.get("errors", []))
+        return {
+            **(result if result.get("task_id") else recovered),
+            "documents": result.get("documents", []) + recovered.get("documents", []),
+            "errors": list(errors.values()),
+        }
 
     async def _deleted_same_name_documents(
         self, tenant_id: str, kb_id: str, source_name: str, exclude_id: str,
@@ -624,8 +657,11 @@ class JonexWikiService:
             raise_unhealable_stale(kb_id, blocked)
         if not artifacts:
             return 0
-        await self.compile_documents(kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
-                                     parsed_artifacts=artifacts)
+        result = await self.compile_documents(kb_name=kb_id, tenant_id=tenant_id, kb_id=kb_id,
+                                              parsed_artifacts=artifacts)
+        rejected = {d["document_id"] for d in result.get("errors", [])}
+        if rejected:
+            raise_unhealable_stale(kb_id, [item for item in stale if item.get("document_id") in rejected])
         logger.info("[jonex] 解析产物自愈：已重新导入 %d 份过期文档 kb=%s", len(artifacts), kb_id)
         return len(artifacts)
 
@@ -884,9 +920,23 @@ class JonexWikiService:
             tenant_id, document_id, target_schema_version=target_schema_version,
         )
 
-    async def set_task_id(self, tenant_id: str, document_id: str, task_id: str) -> None:
-        """提交任务后把容器 task_id 写列（patrol 按它轮询）。"""
-        return await self._db.set_task_id(tenant_id, document_id, task_id)
+    async def set_task_id(self, tenant_id: str, document_id: str, task_id: str, *, warnings=None) -> None:
+        """Attach the engine task and its intake warnings in one update."""
+        from sqlalchemy import update
+        from ..models import KnowledgeDocument
+
+        values = {"llm_wiki_task_id": task_id}
+        if warnings:
+            values["llm_wiki_compile_warnings"] = warnings
+        async with get_db_session() as session:
+            await session.execute(update(KnowledgeDocument).where(
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.tenant_id == tenant_id,
+                KnowledgeDocument.is_deleted == 0,
+                KnowledgeDocument.llm_wiki_compile_status == "compiling",
+                KnowledgeDocument.llm_wiki_task_id.is_(None),
+            ).values(**values))
+            await session.commit()
 
     async def _record_openkb_status(self, tenant_id: str, document_id: str, *,
                                     status: str, error: str = "", warnings=None) -> None:

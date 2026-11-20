@@ -30,7 +30,7 @@
 
 from enum import Enum
 
-from sqlalchemy import Column, DateTime, Index, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jonex_core.common.database import Base
@@ -214,6 +214,14 @@ class TaskCenterDocument(Base, TenantMixin, TimestampMixin):
     #: 「任务被删除」那种中性收口**不写**（保持 NULL → 管理方问出「这活不归我」）。
     last_report = Column(JSONB, nullable=True)
 
+    #: 本步是不是**本次编排的最后一步**（2026-11-18 加，任务中心 `is_last_step`）。
+    #:
+    #: 从前看门狗写死「`compile` 才是最后一步」，自建定义「只有解析、没有编译」时
+    #: 永远收不了口。现在派活时把它落到这一列，看门狗按它决定是否 `released`；
+    #: 老行默认为 false，回落「compile 才算最后一步」，行为不变。
+    #: `None` = 未知（升级前的老行 / 老运行方），看门狗回落「compile 才算最后一步」。
+    last_step = Column(Boolean, nullable=True, default=None)
+
     #: 看门狗的计时基准。**不是 `created_at`** —— 那个是「接管开始」的时刻，
     #: 而每步的活是从「本步开始」算的，共用一个基准会把前一步的耗时算到后一步头上。
     #:
@@ -236,6 +244,7 @@ class TaskCenterDocument(Base, TenantMixin, TimestampMixin):
             "operator_id": self.operator_id,
             "state": self.state,
             "current_step": self.current_step,
+            "last_step": None if self.last_step is None else bool(self.last_step),
             "execution_id": self.execution_id,
             "handled_execution_id": self.handled_execution_id,
             "rag_task_id": self.rag_task_id,

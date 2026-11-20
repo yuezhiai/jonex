@@ -90,6 +90,13 @@ _KB_ACTIONS = frozenset({
     "get_wiki_compilation_state", "get_editor_state",
     # schema（compiled / LLM-Wiki）：由 KB 内文档抽取而来
     "get_compiled_schema", "get_llm_wiki_schema",
+    # 公理（T4）：引用与规则文本来自 KB schema/文档本体，按 KB 派生产物守卫。
+    "list_ontology_axioms", "get_ontology_axiom",
+    "validate_ontology_axioms", "export_ontology_axioms",
+    "preview_axiom_status", "set_axiom_status",
+    # 规则（T6）
+    "list_reasoning_rules", "get_reasoning_rule",
+    "validate_reasoning_rules", "export_reasoning_rules", "preview_reasoning",
     # 标签 / 文件夹（KB 组织元数据，属于该 KB 的读侧视图）
     "list_tags", "list_folders",
 })

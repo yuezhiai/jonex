@@ -29,6 +29,7 @@ import pathlib
 import symtable
 import unittest
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -152,6 +153,66 @@ class _RecordCompileStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(doc.extra_metadata["openkb_compile_status"], "failed")
         self.assertEqual(doc.extra_metadata["keep"], 1, "库行上的其它键必须被带过来")
         self.assertEqual(fresh.llm_wiki_compile_status, "failed")
+
+    async def test_wiki_patrol_polls_shared_task_once_and_keeps_live_compilation(self):
+        now = datetime.utcnow()
+        rows = [SimpleNamespace(id=str(i), tenant_id="tenant", knowledge_base_id="wiki",
+                                llm_wiki_task_id="engine-task",
+                                llm_wiki_compile_requested_at=now - timedelta(hours=1))
+                for i in range(20)]
+        session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)))
+        service = ReconciliationService()
+        service._patrol_stale_recompile = AsyncMock(return_value=0)
+        service._record_openkb_status_by_id = AsyncMock(return_value=True)
+        compiler = SimpleNamespace(
+            list_compile_tasks=AsyncMock(return_value={"tasks": []}),
+            get_compile_status=AsyncMock(return_value={
+                "status": "running", "started_at": (now - timedelta(hours=1)).isoformat(),
+            }),
+        )
+
+        @asynccontextmanager
+        async def session_ctx():
+            yield session
+
+        with patch(f"{_MODULE}.get_db_session", session_ctx), patch(
+            "capabilities.knowledge_base.services.jonex_wiki_service.JonexWikiService",
+            return_value=compiler,
+        ):
+            live = await service.patrol_jonex_wiki_compile()
+            self.assertEqual(live["timed_out"], 0)
+            compiler.get_compile_status.assert_awaited_once()
+            service._record_openkb_status_by_id.assert_not_awaited()
+            compiler.get_compile_status.return_value = {"status": "cancelled"}
+            stopped = await service.patrol_jonex_wiki_compile()
+
+        self.assertEqual(stopped["failed"], 20)
+        self.assertEqual(compiler.get_compile_status.await_count, 2)
+        for row, call in zip(rows, service._record_openkb_status_by_id.await_args_list):
+            self.assertEqual(call.kwargs["expected_compile"], ("engine-task", row.llm_wiki_compile_requested_at))
+            self.assertEqual(call.kwargs["error"], "JONEX_WIKI_COMPILE_CANCELLED")
+
+    async def test_wiki_late_terminal_state_does_not_overwrite_new_attempt(self):
+        session = SimpleNamespace(
+            execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+            commit=AsyncMock(),
+        )
+
+        @asynccontextmanager
+        async def session_ctx():
+            yield session
+
+        track = AsyncMock()
+        with patch(f"{_MODULE}.get_db_session", session_ctx), patch(f"{_MODULE}.record_compile_task", track):
+            applied = await ReconciliationService()._record_openkb_status_by_id(
+                "doc", "tenant", status="compiled", expected_compile=("old-task", datetime.utcnow()))
+
+        self.assertFalse(applied)
+        stmt = str(session.execute.await_args.args[0])
+        self.assertIn("llm_wiki_task_id", stmt.split("WHERE")[1])
+        self.assertIn("llm_wiki_compile_requested_at", stmt.split("WHERE")[1])
+        track.assert_not_awaited()
+        session.commit.assert_not_awaited()
 
 
 # ── 类级闸门：把「未定义名」这种静默失败变成红灯 ──────────────────────────

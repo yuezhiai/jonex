@@ -11,7 +11,6 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 from uuid import uuid4
 
-from neo4j.exceptions import DriverError, TransientError
 from sqlalchemy import and_, delete, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,9 +25,13 @@ from jonex_core.common.exceptions import (
     PermissionDeniedError,
     ResourceConflictError,
     ResourceNotFoundError,
+    ServiceUnavailableError,
 )
 from jonex_core.common.i18n import translate
-from jonex_core.common.neo4j_client import get_neo4j_driver
+from jonex_core.common.neo4j_client import (
+    get_neo4j_driver,
+    is_neo4j_unavailable,
+)
 from jonex_core.common.object_storage import (
     build_asset_key,  # [jonex] §image-refs P2-2: 图片资产对象键
     build_object_key,
@@ -40,7 +43,7 @@ from jonex_core.common.tenant import require_tenant
 
 from . import ingest_backend  # [jonex] 入库后端（提交时定 / 查询时读粘性值）
 from . import task_intent  # [jonex] 第二个粘性值：这次是哪种操作（upload / reparse）
-from .kb_type_service import LLM_WIKI_TYPES  # [jonex] llm-wiki 子集 {openkb, jonex_wiki}
+from .kb_type_service import LLM_WIKI_TYPES, get_kb_type_or_none  # [jonex] llm-wiki 子集 {openkb, jonex_wiki}
 
 from ..models import (
     DocStatus,
@@ -656,7 +659,7 @@ class DocumentService:
             preset, prompt_config_id, schema_ver,
         )
 
-    async def upload_document(self, tenant_id: str, request: DocumentUploadRequest | dict, *, user_id: Optional[str] = None, username: Optional[str] = None, ip: Optional[str] = None) -> dict:
+    async def upload_document(self, tenant_id: str, request: DocumentUploadRequest | dict, *, user_id: Optional[str] = None, username: Optional[str] = None, ip: Optional[str] = None, trigger_processing: bool = True) -> dict:
         tenant_id = require_tenant(tenant_id)
         data = _payload(request)
         req = DocumentUploadRequest(**data)
@@ -804,12 +807,15 @@ class DocumentService:
             # 不走 `set_status` —— 那里写成「仅状态变化才落」，而这里状态是
             # INSERT 时就带的 PARSING（没有「旧值」可比），必须显式落一次开工。
             # 与 INSERT 同事务，由 `record_processing_task` 内部吞异常。
-            await record_processing_task(
-                session, tenant_id,
-                asset_id=doc.id, task_type=TASK_TYPE_PARSE, status=TASK_STATUS_RUNNING,
-                doc_id=doc.id, kb_id=req.knowledge_base_id,
-                content_generation=doc.content_generation,
-            )
+            # upload-only（trigger_processing=False）**不写解析开工埋点**：
+            # 它没有提交任何解析，写一条 running 会永远没有终态（审计发现的僵尸指标）。
+            if trigger_processing:
+                await record_processing_task(
+                    session, tenant_id,
+                    asset_id=doc.id, task_type=TASK_TYPE_PARSE, status=TASK_STATUS_RUNNING,
+                    doc_id=doc.id, kb_id=req.knowledge_base_id,
+                    content_generation=doc.content_generation,
+                )
 
         uid = _audit_user_id(user_id)
         schedule_emit({
@@ -825,18 +831,20 @@ class DocumentService:
             "resource_id": str(doc_id),
             "request_params": {"file_name": req.file_name, "knowledge_base_id": req.knowledge_base_id},
         })
-        schedule_emit({
-            "tenant_id": tenant_id,
-            "user_id": uid,
-            "username": username,
-            "ip": ip,
-            "log_type": "TASK",
-            "action": "document.parse",
-            "outcome": "SUCCESS",
-            "service_name": "knowledge_base",
-            "resource": ResourceType.DOCUMENT.value,
-            "resource_id": str(doc_id),
-        })
+        # 同上：upload-only 没有触发解析，不该记一条「解析成功」审计。
+        if trigger_processing:
+            schedule_emit({
+                "tenant_id": tenant_id,
+                "user_id": uid,
+                "username": username,
+                "ip": ip,
+                "log_type": "TASK",
+                "action": "document.parse",
+                "outcome": "SUCCESS",
+                "service_name": "knowledge_base",
+                "resource": ResourceType.DOCUMENT.value,
+                "resource_id": str(doc_id),
+            })
 
         # 对象存储后端（cos/s3）：确认对象已存在后再入队解析，避免竞态（D9）
         if storage_backend in ("cos", "s3"):
@@ -913,6 +921,30 @@ class DocumentService:
                 SUPPORTED_KB_TYPES,
                 task_source_for_access_type,
             )
+
+            # ── 「只落文件、不触发处理」（2026-11-18 加，任务定义执行的配套）──
+            # 任务定义执行时，开始节点上传的文件先经这里落库，拿到 document_id 后再由
+            # 任务中心建任务。**不能走下面两条正常路径**：它们会立刻提交解析/编译，
+            # 同一份文件就会被系统定义处理一遍、再被自建定义处理一遍。
+            # 文档行置 `PENDING`（「等待被某个任务处理」），不建接管行、不提交任务。
+            if not trigger_processing:
+                async with get_db_session() as session:
+                    repo = KnowledgeDocumentRepository(session)
+                    doc = await repo.get_required(doc_id, tenant_id)
+                    meta = dict(doc.extra_metadata or {})
+                    # 清掉「已开始提交」锚点：看门狗据此判断要不要补交，这里没有提交。
+                    meta.pop("submit_started_at", None)
+                    # **粘性值**（审计发现）：不写的话，派活时 `backend_for_document`
+                    # 会回落 `rag` —— KB 级/全局配置被静默绕过。
+                    # 与 `_upload_via_task_center` 同口径：提交那一刻定死、跟文档走。
+                    meta["kb_type"] = kb_type
+                    meta["ingest_backend"] = ingest_backend.resolve_backend(
+                        kb_type, storage_backend, kb_backend
+                    )
+                    doc.extra_metadata = meta
+                    await repo.set_status(doc, DocStatus.PENDING)
+                    doc_dict = doc.to_dict()
+                return doc_dict
 
             if kb_type in SUPPORTED_KB_TYPES:
                 return await self._upload_via_task_center(
@@ -1216,7 +1248,12 @@ class DocumentService:
                 # auto_compile=True)` 凭空造一份 schema（正是本文件上面那段拼命避免的副作用）
                 # → 投一个本体任务 → 最终落到 `FAILED`，前端显示误导性的「知识抽取失败」。
                 if kb_type in LLM_WIKI_TYPES:
-                    await repo.set_ontology_status(doc, OntologyStatus.READY)
+                    # `emit_task=False`：wiki 文档**没有本体抽取**，这次
+                    # PENDING→READY 不是一次真实的 extract 任务，不该凭空写一条
+                    # extract/success 埋点（每份上传都会多一条）。
+                    await repo.set_ontology_status(
+                        doc, OntologyStatus.READY, emit_task=False
+                    )
 
         # ── 提交（自带 task_id；失败只留痕、不抛，见 docstring 第 3 条）──
         try:
@@ -1889,6 +1926,15 @@ class DocumentService:
                 raise ResourceConflictError(message=translate("err.doc.parsing_or_cleaning", fallback="文档正在解析/入库中，请等待完成后再重新解析")  )  # 原消息)
             if doc.status == DocStatus.DELETING.value:
                 raise ResourceConflictError(message=translate("err.doc.deleting_cannot_reparse", fallback="文档正在删除中，无法重新解析")  )  # 原消息)
+            if doc.status == DocStatus.ARCHIVED.value:
+                # 归档已清索引、archived_at 非空：直接重解析会绕过 restore 流程
+                # 把文档重置成 PARSING，archived_at 还留在行上。
+                raise ResourceConflictError(
+                    message=translate(
+                        "err.doc.archived_cannot_reparse",
+                        fallback="文档已归档，请先恢复归档后再重新解析",
+                    )
+                )
             # ── [jonex] 任务中心接管中：**拦住用户、让他等**（§3.7）──
             # 判据取**接管行**而不是文档状态：Ontology 库的文档在 `parsed` / `ready` 这些
             # 「看着能操作」的稳定态上也可能正被链子推着（等下一步派活 / 等本体编译），
@@ -2207,18 +2253,50 @@ class DocumentService:
                 # 发生」—— 那比一个指不清的报错难查得多。
                 raise InternalError(message="重新解析的步骤名单没有算出来（tc_step_codes 为空）")
 
-            retry_result = await retry_subtasks_for_steps(
-                tenant_id=tenant_id,
-                space_id=tc_plan["space_id"],
-                task_id=tc_plan["task_id"],
-                # ⚠️ **顺序就是执行顺序**（第 i 步等第 i-1 步成功）：先解析（重建切片）、
-                # 成功后再编译（按新切片抽本体）。写反了任务中心会**明确拒绝**（连成环），
-                # 不会静默跑错 —— 这正是「顺序有意义」的证明。
-                # ⚠️ 名单由 `reparse_step_codes` 按「那一步跑到哪了」定（只放已终态的节点），
-                # **不在这里写死两步** —— 理由见那里与 `tc_step_codes` 的注释。
-                step_codes=tc_step_codes,
-                operator_id=user_id,
-            )
+            try:
+                retry_result = await retry_subtasks_for_steps(
+                    tenant_id=tenant_id,
+                    space_id=tc_plan["space_id"],
+                    task_id=tc_plan["task_id"],
+                    # ⚠️ **顺序就是执行顺序**（第 i 步等第 i-1 步成功）：先解析（重建切片）、
+                    # 成功后再编译（按新切片抽本体）。写反了任务中心会**明确拒绝**（连成环），
+                    # 不会静默跑错 —— 这正是「顺序有意义」的证明。
+                    # ⚠️ 名单由 `reparse_step_codes` 按「那一步跑到哪了」定（只放已终态的节点），
+                    # **不在这里写死两步** —— 理由见那里与 `tc_step_codes` 的注释。
+                    step_codes=tc_step_codes,
+                    operator_id=user_id,
+                )
+            except Exception:
+                # **出站抛异常也要交还 + 回滚**：武装与文档改写已经提交了，不处理的话
+                # 用户被 `exists_active` / `parsing` 锁满 `TC_NO_DISPATCH_SEC`（30 分钟）。
+                async with get_db_session() as session:
+                    await TaskCenterDocumentRepository(session).mark_released(
+                        document_id,
+                        error_message="任务中心重跑请求发送失败",
+                        only_if_idle=True,
+                    )
+                    rolled = await KnowledgeDocumentRepository(session).get_by_id(
+                        document_id, tenant_id
+                    )
+                    if rolled is not None:
+                        for _col, _old in reparse_rollback.items():
+                            setattr(rolled, _col, _old)
+                        # **新代次的 running 埋点也要收口**：它在武装那次事务里
+                        # 已按 `new_generation` 落库，回滚文档不会回收它 —— 不收的话
+                        # `pipeline_task_stats.running` 永久多一行（与「未受理」分支同口径）。
+                        await record_processing_task(
+                            session,
+                            tenant_id,
+                            asset_id=document_id,
+                            task_type=TASK_TYPE_PARSE,
+                            status=TASK_STATUS_FAILED,
+                            doc_id=document_id,
+                            kb_id=rolled.knowledge_base_id,
+                            content_generation=new_generation,
+                            error="任务中心重跑请求发送失败",
+                        )
+                    await session.commit()
+                raise
             if not retry_accepted(retry_result):
                 err_msg = translate(
                     "err.kb.task_center.reparse_not_accepted",
@@ -2816,8 +2894,8 @@ class DocumentService:
 
         口径：
         - 归属先校验（跨租户 / 跨 KB 一律 404），**失败不被 Neo4j 降级吞掉**；
-        - 图库不可用（网络/驱动/瞬时可重试异常）→ 空列表 + warning，不阻塞调用方；
-          只降级 ``DriverError`` / ``TransientError`` / ``OSError`` / 超时，
+        - 图库不可用 → 空列表 + warning，不阻塞调用方；判据统一走内核
+          ``is_neo4j_unavailable``（连接层 / 存储层 critical / 认证失效 / DNS），
           ``ClientError``（如 ``CypherSyntaxError``）、``AttributeError``、
           ``TypeError`` 等查询或编程错误照常上抛（否则会被静默吞成「200 + 空血缘」）；
         - 按 ``limit + 1`` 拉取 → 归一/去重 → ``len(dedup) > limit`` 判截断 → 切片；
@@ -2851,7 +2929,10 @@ class DocumentService:
             entities, relations = await gdao.list_document_provenance(
                 tenant_id, knowledge_base_id, document_id, limit=limit + 1,
             )
-        except (DriverError, TransientError, OSError, asyncio.TimeoutError):
+        except Exception as exc:
+            # 读路径降级：只有「Neo4j 不可用」才降级为空血缘；查询/编程错误照常上抛。
+            if not is_neo4j_unavailable(exc):
+                raise
             logger.warning(
                 "Neo4j provenance unavailable for tenant=%s kb=%s doc=%s",
                 tenant_id, knowledge_base_id, document_id,
@@ -2882,6 +2963,7 @@ class DocumentService:
         ip: Optional[str] = None,
         allow_filename_fallback: bool = True,
         audit_action: str = "delete_document",
+        _resume_deleting: bool = False,
     ) -> dict:
         tenant_id = require_tenant(tenant_id)
         req = DocumentScopeRequest(**_payload(request))
@@ -2889,14 +2971,36 @@ class DocumentService:
         # 源头没了，任务再留着只会占列表、让历史脏数据牵着来。先记下 task_id，
         # 真正调用排在软删提交之后（出站不跨事务）。
         task_center_task_id: Optional[str] = None
+        cascade_task_id: Optional[str] = None
+        # Delete routing must not fall back to LightRAG when a KB disappears.
+        # Retain the actual type throughout this operation, including retries.
+        kb_type = await get_kb_type_or_none(tenant_id, req.knowledge_base_id)
+        if not kb_type:
+            raise ResourceNotFoundError(message="知识库不存在")
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_by_id(document_id, tenant_id)
             if doc is None or doc.knowledge_base_id != req.knowledge_base_id:
                 raise ResourceNotFoundError(message=translate("err.doc.not_found", fallback="知识文档不存在")  )  # 原消息)
-            if doc.status == DocStatus.DELETING.value:
+            if doc.status == DocStatus.DELETING.value and not _resume_deleting:
                 raise ResourceConflictError(message=translate("err.doc.deleting_in_progress", fallback="知识文档正在删除中")  )  # 原消息)
-            if doc.status in (DocStatus.PENDING.value, DocStatus.PARSING.value, DocStatus.INGESTING.value):
+            if _resume_deleting and (kb_type != "jonex_wiki" or doc.status != DocStatus.DELETING.value):
+                raise ResourceConflictError(message="文档已不处于可恢复的 Wiki 删除状态")
+            # 2026-11-18：**`PENDING` 不再无条件拦**。
+            #
+            # `upload-only`（任务定义执行配套）落库的文档就停在 `PENDING` ——
+            # 它的语义是「等待被某个任务定义执行」，此刻**没有接管行、没有任何人在
+            # 处理它**。沿用旧口径拦住删除，会让「上传后没执行」的文档永远占着配额、
+            # 用户也无法撤销（真机全场景测试发现）。
+            #
+            # 真正「在途」的判据由下面 `exists_active` 兜住：`PENDING` 但有在途接管行
+            # 的文档照样拦；`PARSING` / `INGESTING` 的引擎侧在途仍在这里无条件拦。
+            if doc.status in (DocStatus.PARSING.value, DocStatus.INGESTING.value):
+                raise ResourceConflictError(message=translate("err.doc.parsing_cannot_delete", fallback="知识文档正在解析/入库中，请等待完成后再删除")  )  # 原消息)
+            # `PENDING` + 有引擎任务号（`rag_task_id`）同样是引擎侧在途（典型：任务被
+            # 停止后接管行已交还、但引擎那趟还没结束）—— 这种仍要拦。
+            # `PENDING` + 无任务号 + 无在途接管行才是「upload-only 等人来执行」。
+            if doc.status == DocStatus.PENDING.value and doc.rag_task_id:
                 raise ResourceConflictError(message=translate("err.doc.parsing_cannot_delete", fallback="知识文档正在解析/入库中，请等待完成后再删除")  )  # 原消息)
             # ── [jonex] 2026-09-30（用户拍板）：**还有任务在跑就不许删** ──
             #
@@ -2928,33 +3032,61 @@ class DocumentService:
                 document_id, tenant_id
             )
             task_center_task_id = row.task_id if row is not None else None
-            await repo.set_status(doc, DocStatus.DELETING)
+            if not _resume_deleting:
+                await repo.set_status(doc, DocStatus.DELETING)
             rag_doc_ids = list(doc.rag_doc_ids or [])
             kb_id = doc.knowledge_base_id or ""
             file_name = doc.file_name or ""
             storage_key = doc.storage_key
             storage_backend = doc.storage_backend
 
-        rag_doc_ids = await self._resolve_rag_doc_ids(
-            tenant_id=tenant_id,
-            document_id=document_id,
-            kb_id=kb_id,
-            file_name=file_name,
-            rag_doc_ids=rag_doc_ids,
-            allow_filename_fallback=allow_filename_fallback,
-        )
-
-        # 索引清理链与归档共用（归档只跳过下面的对象存储 + 软删）
-        await self._remove_document_indexes(
-            tenant_id=tenant_id,
-            document_id=document_id,
-            kb_id=kb_id,
-            file_name=file_name,
-            rag_doc_ids=rag_doc_ids,
-        )
-        # 删除链已清索引：打标，避免删库补偿器重复清理同一文档。
-        # 归档不在这里打标（归档后还能恢复重建索引）。
-        await self.mark_indexes_cleaned(tenant_id, document_id)
+        try:
+            rag_doc_ids = await self._resolve_rag_doc_ids(
+                tenant_id=tenant_id, document_id=document_id, kb_id=kb_id,
+                file_name=file_name, rag_doc_ids=rag_doc_ids,
+                allow_filename_fallback=allow_filename_fallback,
+            )
+            # Wiki removal can be committed remotely even if the response is lost.
+            indexes_ok = await self._remove_document_indexes(
+                tenant_id=tenant_id, document_id=document_id, kb_id=kb_id,
+                file_name=file_name, rag_doc_ids=rag_doc_ids,
+                **({"kb_type": kb_type} if kb_type == "jonex_wiki" else {}),
+            )
+            # ⚠️ 打标 = 「索引已清干净，补偿器不用再管」。清理**部分/全部失败**时
+            # 不能打标（2026-11-19 审计）：否则残留切片永久留在检索侧可被召回，
+            # 而补偿器看到标就永不重试，`purge_stale_chunks` 也只能手工触发。
+            if indexes_ok:
+                await self.mark_indexes_cleaned(tenant_id, document_id)
+            else:
+                logger.warning(
+                    "索引清理未全部成功，暂不打 indexes_cleaned_at（补偿器会重试）: doc=%s kb=%s",
+                    document_id, kb_id,
+                )
+        except BaseException as exc:
+            if kb_type == "jonex_wiki":
+                # Preserve the deleting marker until the idempotent retry confirms
+                # the remote operation, including cancellation and lost responses.
+                if isinstance(exc, Exception):
+                    raise ServiceUnavailableError(
+                        message="Wiki 文档删除尚未确认，系统将自动重试，请稍后查看"
+                    ) from exc
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            # Other engines follow the latest platform failure-state contract.
+            logger.error(
+                "删除文档索引清理失败，回写为 FAILED: doc=%s", document_id,
+                exc_info=True,
+            )
+            async with get_db_session() as session:
+                repo = KnowledgeDocumentRepository(session)
+                doc = await repo.get_by_id(document_id, tenant_id)
+                if doc is not None and doc.status == DocStatus.DELETING.value:
+                    await repo.set_status(
+                        doc, DocStatus.FAILED,
+                        error_message=f"删除失败：{exc}"[:2000],
+                    )
+            raise
 
         # 清理对象存储中的原始上传文件（COS / Local）
         if storage_key:
@@ -2964,6 +3096,50 @@ class DocumentService:
                 logger.info("Deleted storage file %s for doc %s", storage_key, document_id)
             except Exception:
                 logger.warning("Failed to delete storage file for document %s", document_id, exc_info=True)
+
+        # 历史版本（`knowledge_document_versions`）：主对象删了，版本行与它们的
+        # 对象文件也要一起清（2026-11-19 审计：原来只删当前版 storage_key，
+        # 多版本文档的 v1/v2 对象永久留在桶里、版本行也全留下）。
+        try:
+            async with get_db_session() as session:
+                version_rows = (await session.execute(
+                    text(
+                        "SELECT storage_key, storage_backend "
+                        "FROM knowledge_base.knowledge_document_versions "
+                        "WHERE document_id = :doc AND tenant_id = :t"
+                    ),
+                    {"doc": document_id, "t": tenant_id},
+                )).fetchall()
+            for vrow in version_rows:
+                if not vrow.storage_key:
+                    continue
+                try:
+                    vstorage = (
+                        get_object_storage_for(vrow.storage_backend)
+                        if vrow.storage_backend else get_object_storage()
+                    )
+                    await vstorage.delete(vrow.storage_key)
+                except Exception:
+                    logger.warning(
+                        "Failed to delete version object %s for doc %s",
+                        vrow.storage_key, document_id, exc_info=True,
+                    )
+            async with get_db_session() as session:
+                await session.execute(
+                    text(
+                        "DELETE FROM knowledge_base.knowledge_document_versions "
+                        "WHERE document_id = :doc AND tenant_id = :t"
+                    ),
+                    {"doc": document_id, "t": tenant_id},
+                )
+            logger.info(
+                "Cleaned %d document version(s) for doc %s",
+                len(version_rows), document_id,
+            )
+        except Exception:
+            logger.warning(
+                "清理文档历史版本失败 doc=%s", document_id, exc_info=True,
+            )
 
         async with get_db_session() as session:
             # 显式清理文档-标签关联（软删除不触发外键 CASCADE）
@@ -2982,9 +3158,20 @@ class DocumentService:
             await repo.delete_soft(doc, tenant_id)
             # **与软删同一事务落 outbox**：下面那次出站删任务失败时，
             # task_id 不能只留在日志里（后台 30 秒循环按这张表补删）。
-            if task_center_task_id:
+            #
+            # ⚠️ 2026-11-19 第二轮审计：开头那次读接管行可能早于「懒建接管行」的
+            # 派活（upload-only 文档的接管行只在首次派活时才建）。那段窗口里任务
+            # 已经建好、接管行也写进去了，而这里还拿着旧的 None → 漏级联、无 outbox。
+            # 软删提交前**再读一次**，以最新值为准。
+            fresh_row = await TaskCenterDocumentRepository(session).read(
+                document_id, tenant_id
+            )
+            cascade_task_id = (
+                fresh_row.task_id if fresh_row is not None else task_center_task_id
+            )
+            if cascade_task_id:
                 await TaskCenterDocumentRepository(session).enqueue_cleanups(
-                    tenant_id, [task_center_task_id]
+                    tenant_id, [cascade_task_id]
                 )
             # 相似建议/签名随文档删除一并清理；savepoint 隔离，失败不影响删除主流程
             await safe_clear_document_similarity_state(
@@ -3011,8 +3198,8 @@ class DocumentService:
         # 文档（源头）已经删了：把任务中心那一行也清掉。best-effort —— 任务中心
         # 不可用不能反过来让删文档失败（残留只是一条列表记录，且它若已是终态就
         # 不再占并发名额；真正危险的是 running 孤儿，那条路由停用文档的闸挡着）。
-        if task_center_task_id:
-            await self._delete_task_center_task(tenant_id, task_center_task_id)
+        if cascade_task_id:
+            await self._delete_task_center_task(tenant_id, cascade_task_id)
 
         return {"id": document_id, "deleted": True}
 
@@ -3111,20 +3298,29 @@ class DocumentService:
         file_name: str,
         rag_doc_ids: list[str],
         kb_type: str | None = None,
-    ) -> None:
-        """从检索索引移除文档（不删对象存储、不软删文档行）。
+    ) -> bool:
+        """从检索索引移除文档（不删对象存储、不软删文档行），返回**是否全部清成功**。
 
         删除与归档共用的唯一索引清理链：LightRAG batch delete + 逐条兜底、
         openkb / jonex_wiki `remove_document`、非 LLM_WIKI 的 Neo4j 清理。
         归档复用它、跳过调用方的「对象存储删除 + 软删」两步即可恢复。
 
-        `kb_type` 可由调用方显式传入：删库后的补偿器面对的是**已软删**的文档与 KB 行，
-        KB 行已删 → kb_type 查不到，必须用删除前的快照值。
+        ⚠️ **返回值不是装饰**：删除链路（`delete_document` / 归档）照旧按
+        best-effort 忽略它 —— 索引删不掉不该把删除整体判失败。但**删库补偿器**
+        （`IndexCleanupScheduler`）必须靠它决定打不打 `indexes_cleaned_at`：
+        从前这里吞掉所有引擎异常、恒返回 None，补偿器照样打标，失败的引擎残留
+        就**永久留在检索侧**，再没有任何人重试。
+
+        `doc_backend` / `kb_type` 可由调用方显式传入：删库后的补偿器面对的是
+        **已软删**的文档与 KB 行，按行反查会拿到空值（文档行读不到 → 默认 rag；
+        KB 行已删 → kb_type 查不到），必须用删除前的快照值。
         """
 
         # [jonex] batch delete 失败的 doc 兜底重试清单；delete_batch 抛异常时
         # 全部 doc 视为失败（批量删除未发生）。默认空，避免后续循环误删。
         batch_failed: list[str] = []
+        # 所有引擎清理是否全部成功（见 docstring：补偿器靠它决定要不要打标）
+        ok = True
 
         if rag_doc_ids:
             logger.info(
@@ -3177,6 +3373,7 @@ class DocumentService:
                     tenant_id=tenant_id, kb_id=kb_id,
                 )
             except Exception:
+                ok = False
                 logger.warning("Failed to remove OpenKB document %s", document_id, exc_info=True)
         elif kb_type == "jonex_wiki":
             # [jonex] 删除必须按 kb_type 分流到 jonex_wiki client,否则 openkb client
@@ -3190,7 +3387,11 @@ class DocumentService:
                     tenant_id=tenant_id, kb_id=kb_id,
                 )
             except Exception:
+                ok = False
                 logger.warning("Failed to remove Jonex Wiki document %s", document_id, exc_info=True)
+                # The caller must not commit an uncertain removal. Deletions
+                # retain their unavailable marker for the recovery worker.
+                raise
         else:
             # [jonex] 仅对 batch delete 失败的 doc 逐条重试。此前无条件全量
             # 逐条 delete，与 batch delete 重复——batch 已删的 doc 全部命中
@@ -3201,6 +3402,7 @@ class DocumentService:
                         rag_doc_id, tenant_id=tenant_id, knowledge_base_id=kb_id
                     )
                 except Exception:
+                    ok = False
                     logger.warning("Failed to delete RAG document %s", rag_doc_id, exc_info=True)
 
         # 清理 Neo4j 本体图谱中该文档关联的实体节点和关系
@@ -3211,6 +3413,7 @@ class DocumentService:
                 gdao = OntologyGraphRepository(get_neo4j_driver())
                 await gdao.delete_by_document(tenant_id, kb_id, document_id)
             except Exception:
+                ok = False
                 logger.warning("Neo4j cleanup failed for document %s", document_id, exc_info=True)
             # 文档实体被删后，挂在它们身上的 `MAPS_TO` 不会自己消失（对齐行
             # 仍是 active，但文档侧节点已不在图里）。对账路径只在「图重写/
@@ -3218,6 +3421,8 @@ class DocumentService:
             # best-effort 收敛，失败不影响删除结果。
             from .ontology_data_projection import rebuild_alignments_best_effort
             await rebuild_alignments_best_effort(tenant_id, kb_id)
+
+        return ok
 
     async def mark_indexes_cleaned(
         self, tenant_id: str, document_id: str,
@@ -4020,9 +4225,12 @@ class DocumentService:
                 )
             # 与删除同一个判据：任务中心接管中的文档**看着能操作**（ready/parsed），
             # 底下可能还在抽本体 —— 必须在任何写库之前拦住。
-            if await TaskCenterDocumentRepository(session).exists_active(
-                document_id, tenant_id
+            tc_repo = TaskCenterDocumentRepository(session)
+            if await tc_repo.exists_active(document_id, tenant_id) or (
+                await tc_repo.exists_released_with_active_task(document_id, tenant_id)
             ):
+                # 2026-11-19 第二轮审计：released 只代表看门狗交还，名下任务可能仍在
+                # 任务中心排队（compile 等并发名额）。归档会把这条流转打断，必须继续等。
                 raise ResourceConflictError(
                     message=translate(
                         "err.doc.task_center_managed_archive",
@@ -4042,13 +4250,22 @@ class DocumentService:
             file_name=file_name,
             rag_doc_ids=rag_doc_ids,
         )
-        await self._remove_document_indexes(
+        # ⚠️ 归档也要看清理结果（2026-11-19 审计）：清理失败却把 rag_doc_ids 清空，
+        # 残留切片既仍可被检索、又失去后续清理的锚点，补偿器也不会再碰它。
+        # 失败时保留 rag_doc_ids，交给 `IndexCleanupScheduler` / `purge_stale_chunks`
+        # 继续收口；归档本身照常落（下线意图优先，不因引擎抖动失败）。
+        indexes_ok = await self._remove_document_indexes(
             tenant_id=tenant_id,
             document_id=document_id,
             kb_id=kb_id,
             file_name=file_name,
             rag_doc_ids=rag_doc_ids,
         )
+        if not indexes_ok:
+            logger.warning(
+                "归档时索引清理未全部成功，保留 rag_doc_ids 供后续重试: doc=%s kb=%s",
+                document_id, kb_id,
+            )
 
         async with get_db_session() as session:
             repo = KnowledgeDocumentRepository(session)
@@ -4059,7 +4276,9 @@ class DocumentService:
                 to_status=DocStatus.ARCHIVED,
                 reason=reason,
                 archived_at=datetime.now(),
-                clear_rag_doc_ids=True,
+                # `is not False`：`_remove_document_indexes` 的历史桩/异常路径会返回
+                # None，那种情况按「没明确失败」处理、保留原行为（审计 #43）。
+                clear_rag_doc_ids=(indexes_ok is not False),
                 kb_id=kb_id,
             )
             if not moved:
@@ -4298,6 +4517,17 @@ class DocumentService:
                         message=translate("err.doc.not_found", fallback="知识文档不存在"),
                     )
                 if meta[0] == DocStatus.DELETED.value:
+                    # **幂等出口也要补一次任务级联**：首次删除时任务中心可能不可用、
+                    # 只在日志里留了 task_id；用户再点销毁会直接走到这里，别让那次
+                    # 失败成为永久孤儿。入 outbox，由 30 秒循环补删（出站不跨事务）。
+                    tc_row = await TaskCenterDocumentRepository(session).read(
+                        document_id, tenant_id
+                    )
+                    if tc_row is not None and tc_row.task_id:
+                        await TaskCenterDocumentRepository(
+                            session
+                        ).enqueue_cleanups(tenant_id, [tc_row.task_id])
+                        await session.commit()
                     return {"id": document_id, "status": "deleted", "deleted": True}
                 raise ResourceNotFoundError(
                     message=translate("err.doc.not_found", fallback="知识文档不存在"),

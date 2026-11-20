@@ -617,6 +617,36 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
 
         from ..ontology_write_state import ONTOLOGY_WRITE_STATE_KEYS
 
+        # **接管中整批拒绝**：库内有任何文档仍在任务中心接管（submitting/managed）
+        # 时，不允许整库重置本体 —— 否则会把在途 compile 的 EXTRACTING 改回 PENDING，
+        # 对账从此扫不到它（结果无人轮询），compile 步空等 6 小时。
+        # 三个调用点（重编译/重播种/整库重抽）都从这一处过。
+        active_hit = (
+            await self.session.execute(
+                select(TaskCenterDocument.id)
+                .where(
+                    TaskCenterDocument.tenant_id == tenant_id,
+                    TaskCenterDocument.knowledge_base_id == knowledge_base_id,
+                    TaskCenterDocument.state.in_(list(ACTIVE_STATES)),
+                )
+                .limit(1)
+            )
+        ).first()
+        if active_hit is not None:
+            from jonex_core.common.exceptions import ResourceConflictError
+            from jonex_core.common.i18n import translate
+
+            raise ResourceConflictError(
+                message=translate(
+                    "err.ontology.reset_blocked_by_task_center",
+                    fallback=(
+                        "该知识库下仍有文档由任务中心接管中，"
+                        "请等待任务结束后再重置本体"
+                    ),
+                ),
+                details={"knowledge_base_id": knowledge_base_id},
+            )
+
         conditions = [
             KnowledgeDocument.tenant_id == tenant_id,
             KnowledgeDocument.knowledge_base_id == knowledge_base_id,

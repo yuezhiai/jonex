@@ -43,7 +43,7 @@ IMPORT_MAX_CHARS = 2_000_000
 
 #: 各层「已知键」——其余键一律「宽松忽略 + 告警」（与 nexonto 导入的宽容口径对称）。
 _TOP_KNOWN = frozenset({"version", "domain", "entity_types", "relation_types",
-                        "constraints", "disambiguation"})
+                        "constraints", "disambiguation", "axioms"})
 _ENTITY_KNOWN = frozenset({"name", "display_name", "description", "aliases", "attributes"})
 _ATTR_KNOWN = frozenset({"name", "display_name", "description", "type", "required",
                          "is_primary_key"})
@@ -271,7 +271,16 @@ def map_tbox_to_schema(raw: dict) -> tuple[dict, list[str], list[str]]:
             rel["target_types"] = tt
         relations.append(rel)
 
-    return {"entities": entities, "relations": relations}, _cap_warnings(warnings), ignored
+    out: dict = {"entities": entities, "relations": relations}
+    # T4：顶层 axioms 段只透传，由 ontology_reasoning.axiom_checks 校验；
+    # 不能被当成未知键静默丢掉。
+    raw_axioms = raw.get("axioms")
+    if raw_axioms is not None:
+        if isinstance(raw_axioms, list):
+            out["axioms"] = raw_axioms
+        else:
+            warnings.append("顶层 axioms 不是列表，已忽略")
+    return out, _cap_warnings(warnings), ignored
 
 
 def _check_merged_limits(imported: dict, existing: dict) -> None:

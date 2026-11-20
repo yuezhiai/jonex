@@ -118,7 +118,7 @@ from ..repository.task_center_repository import TaskCenterDocumentRepository
 from . import ingest_backend
 from .reconciliation_service import _fetch_task_status
 from .task_runner_service import (
-    ONTOLOGY_DEFINITION_ID,
+    KB_DOCUMENT_DEFINITION_ID,
     REF_KIND_PREFIX,
     # 整条任务的终态（`completed` / `failed` / `stopped`）：与子任务终态同一类拷贝，
     # 原因见 `task_runner_service.TASK_TERMINAL_STATUSES` 的注释。
@@ -243,9 +243,20 @@ class TaskWatchService:
     # 入口
     # ========================================================
 
+    #: 轮转游标（单副本假设，与 IndexCleanupScheduler 相同）：扫到队尾回卷。
+    _sweep_cursor: str = ""
+
     async def sweep(self, limit: int = 50) -> Dict[str, int]:
-        """扫一批在途接管行，逐条判定并处置。返回各档计数（只进日志）。"""
-        rows = await self._load_active(limit)
+        """扫一批在途接管行，逐条判定并处置。返回各档计数（只进日志）。
+
+        按 `document_id` 游标**轮转**（2026-11-20 第二轮审计）：固定只取最旧的前 N 条
+        会让 `waiting_*` 的行长期占满窗口、新行永远轮不到（见仓储 `list_active`）。
+        """
+        rows = await self._load_active(limit, after_document_id=self._sweep_cursor)
+        if len(rows) < limit:
+            TaskWatchService._sweep_cursor = ""   # 扫到队尾 → 下一轮从头发车
+        elif rows:
+            TaskWatchService._sweep_cursor = rows[-1]["document_id"]
         stats: Dict[str, int] = {}
         for row in rows:
             try:
@@ -258,11 +269,18 @@ class TaskWatchService:
                     "看门狗处理接管行失败（跳过本条）: doc=%s task=%s",
                     row.get("document_id"), row.get("task_id"),
                 )
+                # ⚠️ 2026-11-19 第二轮审计：这里曾加过「行太久没推进就强制交还」的兜底，
+                # 但它绕过了 `hand_over_in_flight_task_id` / `only_if_idle`，而且
+                # `updated_at` 在长任务（40 分钟以上的 parse/ingest）期间不会刷新 →
+                # 一次瞬时异常就会把正在跑的行判成 released，文档 90 秒后被对账判死、
+                # 引擎那份还在跑。异常只记日志（下次 sweep 自然重试）比误杀安全。
                 action = "error"
             stats[action] = stats.get(action, 0) + 1
         return stats
 
-    async def _load_active(self, limit: int) -> list[Dict[str, Any]]:
+    async def _load_active(
+        self, limit: int, after_document_id: str = ""
+    ) -> list[Dict[str, Any]]:
         """把 `state IN ('submitting','managed')` 的行读成普通 dict。
 
         读成 dict 而不是留着 ORM 对象：后面要跨好几段事务，会话一关对象就 detached，
@@ -270,7 +288,26 @@ class TaskWatchService:
         取出来**，后面全程只用值。
         """
         async with get_db_session() as session:
-            rows = await TaskCenterDocumentRepository(session).list_active(limit=limit)
+            rows = await TaskCenterDocumentRepository(session).list_active(
+                limit=limit, after_document_id=after_document_id,
+            )
+            # 一次批量带出文档代次（2026-11-19 审计）：`_finish_step` 上报窗口很长
+            # （最坏约 90 秒），窗口里文档可能已被重新解析/新执行接手 —— 收口写
+            # 文档前要拿这列做 fencing，不能拿旧执行的结论盖新代次的状态。
+            generations: dict[str, int] = {}
+            doc_ids = [r.document_id for r in rows]
+            if doc_ids:
+                from sqlalchemy import text as _text
+
+                gen_rows = await session.execute(
+                    _text(
+                        "SELECT id, content_generation "
+                        "FROM knowledge_base.knowledge_documents "
+                        "WHERE id = ANY(CAST(:ids AS varchar[]))"
+                    ),
+                    {"ids": doc_ids},
+                )
+                generations = {g.id: g.content_generation for g in gen_rows}
             return [
                 {
                     "document_id": r.document_id,
@@ -284,6 +321,11 @@ class TaskWatchService:
                     "execution_id": r.execution_id,
                     "handled_execution_id": r.handled_execution_id,
                     "rag_task_id": r.rag_task_id,
+                    # 2026-11-18 审计：这里漏了这一列，`_finish_step` 的
+                    # `row.get("last_step")` 恒为 None ——「只有解析、没有编译」的自建
+                    # 定义永远不按最后一步收口（接管行不释放、ontology_status 不置 READY）。
+                    "last_step": None if r.last_step is None else bool(r.last_step),
+                    "content_generation": generations.get(r.document_id),
                     "step_started_at": r.step_started_at,
                     "submit_attempts": r.submit_attempts or 0,
                     "created_at": r.created_at,
@@ -797,10 +839,14 @@ class TaskWatchService:
                     row["document_id"], error_message="文档已删除，接管中止"
                 )
                 return "doc_gone"
-            status_info = await _fetch_task_status(
-                row["tenant_id"], row["knowledge_base_id"], row["rag_task_id"],
-                doc_id=row["document_id"], doc=doc,
-            )
+        # ⚠️ 出站 HTTP **必须在会话关闭之后**：`get_db_session()` 退出才 commit。
+        # 放在 with 里面等于「拿着一个未提交的事务去等对端」，长耗时调用期间一直
+        # 占着连接与行锁，一批文档串行问下来会把连接池拖干。
+        # `expire_on_commit=False`，doc 关会后仍可读（`_fetch_task_status` 只读粘性值）。
+        status_info = await _fetch_task_status(
+            row["tenant_id"], row["knowledge_base_id"], row["rag_task_id"],
+            doc_id=row["document_id"], doc=doc,
+        )
 
         if status_info is None:
             return "waiting_status_unknown"
@@ -843,10 +889,9 @@ class TaskWatchService:
            拿我们记的那个旧号去问，会在对账还在重抽时报「失败」，把一次正常的重抽
            判成终局。
 
-        ⚠️ **两类 wiki 库的实际超时都比这里短**：各自的编译巡检默认 1800 秒（30 分钟）
-        到点**直接判死**（`OPENKB_COMPILE_TIMEOUT_SEC` / `JONEX_WIKI_COMPILE_TIMEOUT_SEC`），
-        而这一步的硬超时是 `TC_STEP_HARD_TIMEOUT_SEC`（21600）。也就是说实际有效超时是
-        巡检那个 30 分钟，链上这个 6 小时走不到 —— 这是刻意的（保持既有产品行为）。
+        OpenKB 巡检仍按既有墙钟门限处理。Jonex Wiki 提交成功后跟踪引擎终态；
+        巡检的 30 分钟门限只用于尚未绑定引擎任务的派发。任务中心仍有整步超时
+        `TC_STEP_HARD_TIMEOUT_SEC`（21600）。
         """
         async with get_db_session() as session:
             doc = await KnowledgeDocumentRepository(session).get_by_id(
@@ -997,7 +1042,15 @@ class TaskWatchService:
         """
         document_id = row["document_id"]
         execution_id = row["execution_id"]
-        is_last = step_code == "compile"
+        # 2026-11-18：**以任务中心派活报文带来的 `is_last_step` 为准**（`_prepare_step`
+        # 时落到接管行的 `last_step` 列）。老行 / 老运行方没有它时回落
+        # 「`compile` 才是最后一步」，与从前逐字一致。
+        # 不这么改的话，「只有解析、没有编译」的自建定义永远收不了口，接管行会一直
+        # 留在看门狗视野里。
+        # 三态（2026-11-19 第二轮审计）：None = 老行/老运行方，回落 compile；
+        # True/False = 任务中心明确告知（多 compile 节点时 compile_1 不再是最后一步）。
+        _ls = row.get("last_step")
+        is_last = (_ls if _ls is not None else (step_code == "compile"))
 
         # ── 先上报，**收口必须等它被持久受理** ──
         # 收口那次 UPDATE 会把 `execution_id` / `rag_task_id` / `step_started_at` 一起
@@ -1034,6 +1087,22 @@ class TaskWatchService:
             doc_repo = KnowledgeDocumentRepository(session)
 
             doc = await doc_repo.get_by_id(document_id, row["tenant_id"])
+
+            # 代次 fencing（2026-11-19 审计）：快照里的代次与当前文档不一致 ⇒ 文档已被
+            # 重新解析 / 新执行接手。这次（旧执行的）收口**不能改写文档状态**，否则
+            # 新代次的解析还在跑、旧结论已把文档写成 READY/FAILED。接管行记账照旧
+            # 走（execution CAS 会把过期的交还挡掉）。
+            if (
+                doc is not None
+                and row.get("content_generation") is not None
+                and doc.content_generation != row["content_generation"]
+            ):
+                logger.info(
+                    "看门狗收口跳过文档写回（代次已推进）: doc=%s snap_gen=%s cur_gen=%s execution=%s",
+                    document_id, row.get("content_generation"), doc.content_generation,
+                    execution_id,
+                )
+                doc = None
 
             # ── 哪一步把文档推到 `READY`：**这一步的产物已经就位** ──
             # 对 lightrag 是「切片进了 LightRAG 的那一刻」，对 openkb / jonex_wiki 是
@@ -1073,6 +1142,13 @@ class TaskWatchService:
                     await doc_repo.set_status(
                         doc, DocStatus.READY, rag_doc_ids=doc_ids or None,
                     )
+                    # 2026-11-18：这条链**没有 compile**（parse 就是最后一步）时，
+                    # 本体阶段不存在 —— 把这列标 READY，否则「READY + ontology=PENDING」
+                    # 恰好是本体对账的领取条件，会被捡去凭空抽一份 schema。
+                    if is_last and step_code in ("parse", "ingest"):
+                        await doc_repo.set_ontology_status(
+                            doc, OntologyStatus.READY, emit_task=False
+                        )
                     # [jonex] READY 后异步做相似检测（开关/阈值判断在扫描内部）。
                     # best-effort：调度本身失败只记日志，不阻断本步收口。
                     try:
@@ -1135,7 +1211,19 @@ class TaskWatchService:
                 doc = await KnowledgeDocumentRepository(session).get_by_id(
                     document_id, row["tenant_id"]
                 )
-                if doc is not None:
+                # 代次 fencing（2026-11-19 第二轮审计）：与 `_finish_step` 同口径。
+                # 旧执行（E1）的失败不能把新一代（E2 重试后 gen+1、正在 parsing）的
+                # 文档打成 FAILED —— 那会让用户在新解析进行中就能删除/归档。
+                if (
+                    doc is not None
+                    and row.get("content_generation") is not None
+                    and doc.content_generation != row["content_generation"]
+                ):
+                    logger.info(
+                        "看门狗失败收口跳过文档写回（代次已推进）: doc=%s snap_gen=%s cur_gen=%s",
+                        document_id, row.get("content_generation"), doc.content_generation,
+                    )
+                elif doc is not None:
                     await KnowledgeDocumentRepository(session).set_status(
                         doc, DocStatus.FAILED, error_message=error_message[:2000],
                     )
@@ -1250,6 +1338,16 @@ class TaskWatchService:
                 #     传 `False`：卡上挂的是**自己这次**的执行痕迹，本来就该释放；
                 #     加了这道闸反而释放不掉、要白等。
                 only_if_idle=not row.get("execution_id"),
+                # 只拆「我盯的这一单」；无在途时为空，不加条件。
+                expect_execution_id=row.get("execution_id"),
+                # 快照 CAS（2026-11-19 审计）：无在途那一档的行，可能与「刚被重新武装」
+                # 的行完全同形（managed + execution_id 为 NULL）。带上扫描时的
+                # task_id / updated_at，rearm 过的新行不会被旧快照拆掉。
+                expect_task_id=row.get("task_id"),
+                expect_updated_at=row.get("updated_at"),
+                # **无在途 = 中性交还，不动 `last_report`**：此前写 NULL 会把
+                # 「上一步刚成功」抹掉，管理方补拉变成 unknown。
+                keep_report=not row.get("execution_id"),
                 # ⚠️ **报文的取舍与上面那次上报同一个门**（`execution_id` 非空）——
                 # 这不是「顺手写的」，是两种情形本来就不同：
                 #   · **有 `execution_id`**（那一步在跑、管理方那边任务却已结束）→
@@ -1277,9 +1375,12 @@ class TaskWatchService:
         )
 
     async def _bump_attempt(self, row: Dict[str, Any], error_message: str) -> None:
+        # 带快照 CAS（见仓储注释）：多副本同扫一行时只有第一个计数，避免提前判死。
         async with get_db_session() as session:
             await TaskCenterDocumentRepository(session).bump_submit_attempt(
                 row["document_id"], error_message,
+                expect_attempts=row.get("submit_attempts"),
+                expect_updated_at=row.get("updated_at"),
             )
 
     # ========================================================
@@ -1370,6 +1471,10 @@ class TaskWatchService:
         # 是从 `outputs` 按 `bind_inputs` 填的）。
         report = {
             "status": "success",
+            # **成功报文也必须带执行号**：`_settled` 靠它判断「这份报文答的是哪一次
+            # 执行」。不带的话，中性交还保留下来的上一步成功报文会被下一步的查询
+            # 原样当成答案（parse 的成功被答给 compile）。
+            "_execution_id": row["execution_id"],
             "outputs": outputs,
             "output_refs": refs,
             "input_refs": in_refs,
@@ -1503,4 +1608,4 @@ class TaskWatchService:
         return (datetime.now() - since).total_seconds()
 
 
-__all__ = ["ONTOLOGY_DEFINITION_ID", "TaskWatchService"]
+__all__ = ["KB_DOCUMENT_DEFINITION_ID", "TaskWatchService"]

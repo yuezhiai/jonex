@@ -143,7 +143,11 @@ from jonex_core.task_runtime import (
 
 from . import ingest_backend, kb_model_config, task_intent
 from ..models import DocStatus
-from ..models.task_center import ACTIVE_STATES, TaskCenterDocState
+from ..models.task_center import (
+    ACTIVE_STATES,
+    TaskCenterDocState,
+    TaskCenterDocument,
+)
 from ..repository.document_repository import KnowledgeDocumentRepository
 from ..repository.model_setting_repository import KnowledgeModelSettingRepository
 from ..repository.processing_task_repository import (
@@ -356,80 +360,55 @@ _KB_TYPE_OPENKB = "openkb"
 _KB_TYPE_JONEX_WIKI = "jonex_wiki"
 SUPPORTED_KB_TYPES = (_KB_TYPE_LIGHTRAG, _KB_TYPE_OPENKB, _KB_TYPE_JONEX_WIKI)
 
-#: 本链用的平台级编排定义（`008_task_center.sql` 预置：`scope=system`、`space_id=NULL`，
-#: 现为两步 `parse → compile` —— 2026-09-29 由三步合回，定义原地改，见
-#: `008_task_center.sql` 的预置数据段）。上传路径与看门狗补交都要用它 ——
-#: **只能有一处字面量**：两处各写一遍的话，改定义 id 时漏掉的那一处会表现为
-#: 「任务建不上」，而错误信息是任务中心那句「找不到编排定义」，与本模块毫无关系。
-ONTOLOGY_DEFINITION_ID = "definition-file-processing-ontology"
+#: 本链用的平台级编排定义（2026-11-18 起 **多条合并为 1 条**）。
+#:
+#: 原来按库类型/引擎分成多条（Ontology / Ontology Wiki / Jonex Wiki），
+#: 但它们的编排内容完全相同（`parse_1 → compile_1`）；真正的类型分流在**运行方内部**
+#: 按文档行上的 `kb_type` / `ingest_backend` 做（选哪个引擎、编译走哪条入口），
+#: 与 `definition_id` 无关。合并后：
+#:
+#:   · 定义 id：`definition-kb-document-parse-compile`
+#:   · 定义名：「知识库文档解析与编译」
+#:
+#: 上传路径与看门狗补交都只认这一个常量 —— 两处各写一遍的话，改 id 时漏掉的那一处
+#: 会表现为「任务建不上」，而错误信息是任务中心那句「找不到编排定义」。
+KB_DOCUMENT_DEFINITION_ID = "definition-kb-document-parse-compile"
 
-#: openkb（Ontology Wiki）那条链的编排定义（`008_task_center.sql` 预置：两步
-#: `parse_1 → compile_1`）。它与另一条 wiki 链（`-jonex-wiki`）逐字同形 —— 差别全在
-#: 运行方内部按 `kb_type` 分流（openkb 落 `content.md`、jonex_wiki 落
-#: `content_list.json`；编译入口与巡检也各一个），**编排不承载这个差别**。
-ONTOLOGY_WIKI_DEFINITION_ID = "definition-file-processing-ontology-wiki"
-
-#: jonex_wiki（Jonex Wiki）那条链的编排定义（`008_task_center.sql` 预置：两步
-#: `parse_1 → compile_1`，与上面那条逐字同形）。它是**独立一份定义**而不是复用
-#: `-ontology-wiki`：定义名就是任务中心页面上「这条任务属于哪类库」，混用会让用户
-#: 分不出这条链跑的是哪一类库。
-ONTOLOGY_JONEX_WIKI_DEFINITION_ID = "definition-file-processing-jonex-wiki"
-
-#: 后端取值。**字面量与 `ingest_backend.VALID_BACKENDS` 一致**（那边是权威），
-#: 这里给常量只是为了调用点不出现裸字符串 —— 拼错一个字母的话，`_DEFINITION_BY_BACKEND`
-#: 会 `KeyError`（当场炸），而不是静默按 `rag` 发下游。
+#: 后端取值。**字面量与 `ingest_backend.VALID_BACKENDS` 一致**（那边是权威）。
 _BACKEND_RAG = "rag"
-
-#: 后端取值 → 走哪条编排。取值名说的是「用哪个引擎跑第一步」。
-#:
-#:   · `rag` → `definition-file-processing-ontology`（两步），第一步由
-#:     atomic-rag 干（`full` / `reparse_strict` —— 解析 + 推切片一趟）
-#:
-#: 用 `dict` 而不是 `if/else`：漏一个取值会 `KeyError` 当场炸，而不是静默落到默认那条
-#: （静默落错的定义 → 第一步按错误引擎发下游 → 两边都不认）。
-_DEFINITION_BY_BACKEND: Dict[str, str] = {
-    _BACKEND_RAG: ONTOLOGY_DEFINITION_ID,
-}
 
 
 def definition_for_kb_type(kb_type: str, backend: str) -> str:
-    """按**库类型**（+ lightrag 的后端取值）选编排定义 —— 提交那一刻的判据。
+    """按**库类型**（+ lightrag 的引擎开关）选编排定义 —— 现在只有一条。
 
-    `lightrag` 走 atomic-rag 那条（后端取值从 `backend` 传进来，当前恒为 `rag`）；
-    两类 wiki 库各只有一条（各自一条 wiki 链）。
-    域外取值（任何未知值）**抛** —— 提交侧不能依赖 `_prepare_step` 的闸门，
-    那一刻还没有人派活、闸门根本没跑到。
+    ⚠️ 仍保留 `kb_type` / `backend` 两个参数做**取值校验**：域外取值当场抛，
+    不能静默提交到唯一那条定义上（否则一个新的库类型会被错误地「接进任务中心」，
+    而运行方根本没有它的 handler）。合法取值全部返回同一份定义 id。
     """
-    if kb_type == _KB_TYPE_LIGHTRAG:
-        return definition_for_backend(backend)
-    if kb_type == _KB_TYPE_OPENKB:
-        return ONTOLOGY_WIKI_DEFINITION_ID
-    if kb_type == _KB_TYPE_JONEX_WIKI:
-        return ONTOLOGY_JONEX_WIKI_DEFINITION_ID
-    raise InternalError(
-        message=f"库类型 {kb_type!r} 还没接任务中心（可选 {sorted(SUPPORTED_KB_TYPES)}）",
-    )
+    if kb_type not in SUPPORTED_KB_TYPES:
+        raise InternalError(
+            message=f"库类型 {kb_type!r} 还没接任务中心（可选 {sorted(SUPPORTED_KB_TYPES)}）",
+        )
+    definition_for_backend(backend)
+    return KB_DOCUMENT_DEFINITION_ID
 
 
 def definition_for_backend(backend: str) -> str:
-    """把开关的取值翻成编排定义 id（`_DEFINITION_BY_BACKEND` 是唯一事实来源）。
+    """把开关的取值翻成编排定义 id —— 合并后所有合法取值都指向同一条定义。
 
-    调用点有两个（上传路径与看门狗补交），**都必须用它** —— 两处各写一份 `if` 的话，
-    开关多一个取值时漏掉的那一处会把任务提交到**另一条**编排上：任务照样建得起来
-    （定义都存在），只是第一步走了错的引擎，症状要到第一步派活才看得见。
+    保留这道取值校验：`ingest_backend.resolve_backend` 已经把过关，但看门狗补交
+    那一路也调它；多一道兜底只会在配置真正出错时响亮报错，不会改变正确的行为。
     """
-    try:
-        return _DEFINITION_BY_BACKEND[backend]
-    except KeyError:
-        # 走不到：`ingest_backend.resolve_backend` 已经把取值校验过了。留这一道是因为
-        # 静默落到某条默认编排的后果要到「第一步按错的引擎发下游」才看得见 ——
-        # 而且是**配置**问题（服务端取值），不是调用方参数问题。
+    if backend != _BACKEND_RAG:
+        # 走不到：`resolve_backend` 已经把取值校验过了。静默落到默认定义的后果要到
+        # 「第一步按错的引擎发下游」才看得见 —— 而且是**配置**问题，不是调用方参数问题。
         raise InternalError(
             message=(
                 f"KB_INGEST_BACKEND 取值 {backend!r} 没有对应的编排定义"
-                f"（可选 {sorted(_DEFINITION_BY_BACKEND)}）"
+                f"（可选 {(_BACKEND_RAG,)}）"
             ),
         ) from None
+    return KB_DOCUMENT_DEFINITION_ID
 
 
 #: 文档**来源方式**（`knowledge_documents.data_source_type` 的现役四值）→ **任务来源码**。
@@ -489,6 +468,28 @@ def _ensure_task_runtime() -> None:
         get_task_runtime()
     except TaskRuntimeNotBuiltError:
         build_task_runtime(service_name="knowledge_base")
+
+
+def _is_transient_engine_error(exc: BaseException) -> bool:
+    """下游引擎的瞬时故障（连接/超时）—— 这类失败**抛出**让任务中心重发。
+
+    2026-11-19 第二轮审计：原来所有提交失败都回 `ApiResponse.fail`，任务中心判
+    `REJECTED`（终态、不重派）—— atomic-rag 重启 10 秒就会把文档永久置 FAILED，
+    一次重试都没有。瞬时故障的正确处置是让传送层判 `DELIVERY_UNKNOWN`，
+    用**同一个 execution_id** 重发（引擎侧幂等键复用同一任务行）。
+    """
+    import httpx
+
+    if isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError, OSError)):
+        return True
+    text = str(exc).lower()
+    return any(
+        key in text
+        for key in (
+            "connection", "timed out", "timeout", "connection refused",
+            "connect error", "temporarily unavailable", "502", "503", "504",
+        )
+    )
 
 
 class TaskRunnerService(RunnerBase):
@@ -553,6 +554,13 @@ class TaskRunnerService(RunnerBase):
         try:
             rag_task_id = await self._submit_downstream(step_code, snapshot)
         except Exception as exc:  # noqa: BLE001
+            # 瞬时故障（连接/超时）→ 抛出让传送层判 DELIVERY_UNKNOWN 重发。
+            if _is_transient_engine_error(exc):
+                logger.warning(
+                    "任务中心 %s 步提交下游遇到瞬时故障，交给派活侧重发: doc=%s execution=%s err=%s",
+                    step_code, snapshot.document_id, ctx.execution_id, exc,
+                )
+                raise
             # 发失败 → **显式拒**（子任务直接终态 failed，不回退 pending 重试）。
             # 回退重试在这里没有意义：下游到底是「没建」还是「建了但响应丢了」我们
             # 分不清，重来一次分不清的还是分不清。
@@ -579,7 +587,32 @@ class TaskRunnerService(RunnerBase):
                 # （本体 / Wiki 编译失败时文档本身仍是可用的，缺的只是图或 Wiki）。
                 # 落库失败只告警、绝不拦住交还（交还是用户的解封点，与看门狗同一条纪律）。
                 err_text = f"{step_code} 步骤未能提交下游任务：{exc}"
-                if step_code != STEP_COMPILE:
+                # **先 CAS 交还，命中才写文档**：出站可能耗时数十秒，期间新执行
+                # 可能已经接手这张卡并重置了文档。旧执行的失败不能把新执行正在
+                # 解析的文档标成 FAILED —— 交还落空 = 这张卡已不属于我。
+                released = False
+                try:
+                    released = await TaskCenterDocumentRepository(session).mark_released(
+                        snapshot.document_id,
+                        # **只拆自己这一单**：出站可能耗时数十秒，期间任务可能被停止、
+                        # 用户重试、新一次派活以另一个 execution_id 接手这张卡。
+                        # 不比对的话，旧执行的失败会把新执行的接管行一起交还掉。
+                        expect_execution_id=ctx.execution_id,
+                        error_message=err_text[:2000],
+                        # 失败报文（代号 + 参数一并存，读侧按语言渲染）。
+                        report={
+                            "status": "failed",
+                            "error_message": err_text[:2000],
+                            "error_code": "err.kb.task_center.downstream_submit_failed",
+                            "error_params": {"step": step_code, "error": str(exc)[:500]},
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "任务中心 %s 步失败后交还接管行没成功: doc=%s",
+                        step_code, snapshot.document_id, exc_info=True,
+                    )
+                if released and step_code != STEP_COMPILE:
                     try:
                         doc = await KnowledgeDocumentRepository(session).get_by_id(
                             snapshot.document_id, snapshot.tenant_id,
@@ -593,29 +626,6 @@ class TaskRunnerService(RunnerBase):
                             "任务中心 %s 步失败后落文档状态没成功（不影响交还）: doc=%s",
                             step_code, snapshot.document_id, exc_info=True,
                         )
-                await TaskCenterDocumentRepository(session).mark_released(
-                    snapshot.document_id,
-                    # **只拆自己这一单**：出站可能耗时数十秒，期间任务可能被停止、
-                    # 用户重试、新一次派活以另一个 execution_id 接手这张卡。
-                    # 不比对的话，旧执行的失败会把新执行的接管行一起交还掉。
-                    expect_execution_id=ctx.execution_id,
-                    error_message=err_text[:2000],
-                    # ⚠️ **也得写失败报文**（2026-10-11 补）：上面那句注释说「口径与看门狗的
-                    # `_fail_step` 一致」，但在 `last_report` 这一维上原先并不一致 ——
-                    # 不写的话，管理方事后主动来问只会得到 `unknown`（「这活不归我」），
-                    # 把它当**配置错**处置，而其实这是一次**真实的业务失败**（下游压根没建出来）。
-                    # ⚠️ **代号与参数一并存**（2026-10-13 补）：另外两个判死点
-                    # （`_fail_step` / `task_stopped`）都存了 `error_code` + `error_params`，
-                    # 只有这一处漏了 —— 管理方 `query_step_status` 会把 `last_report`
-                    # **原样带回**，读的人按自己的语言渲染；缺了代号，这条链在这一处
-                    # **静默退化成一句冻死的中文文本**（「存代号+参数、读时渲染」断了一节）。
-                    report={
-                        "status": "failed",
-                        "error_message": err_text[:2000],
-                        "error_code": "err.kb.task_center.downstream_submit_failed",
-                        "error_params": {"step": step_code, "error": str(exc)[:500]},
-                    },
-                )
             return ApiResponse.fail(
                 translate(
                     "err.kb.task_center.downstream_submit_failed",
@@ -835,17 +845,140 @@ class TaskRunnerService(RunnerBase):
         async with get_db_session() as session:
             tc_repo = TaskCenterDocumentRepository(session)
 
+            # 2026-11-19 第二轮审计：文档已处理完（READY）时被「再执行一次」，
+            # 重挂接管行会把 handled_execution_id 清空 → 既不算 retrying 也不算
+            # console_retry_reparse → 按 upload 意图再跑一遍 full（不删旧切片），
+            # 检索侧出现重复命中。这里记下该形态，走重新解析重置。
+            reattached_doc_ready = False
+
             # ① 按 task_id 定位接管行 —— `task_id` 是这次派活里唯一**由我们自己写下**
             # 的定位键（`document_id` 是从 `inputs` 来的，见下面的交叉核对）。
             row = await tc_repo.read_by_task_id(execution.task_id, tenant_id)
             if row is None:
-                return ApiResponse.fail(
-                    translate(
-                        "err.kb.task_center.takeover_missing",
-                        params={"task_id": execution.task_id},
-                        fallback=f"没有找到任务 {execution.task_id} 的知识库接管记录",
-                    )
+                # 2026-11-18：**自建任务定义的任务没有预建接管行** —— 首次派活时懒建。
+                # 系统定义（知识库上传）仍在 `_upload_via_task_center` 里预建，不受影响。
+                # 取值：任务中心派活前已把 file 变量收成文档 ID，所以 `document`
+                # 可能是字符串（新契约）或对象（兼容旧写法）。
+                inputs = execution.inputs or {}
+                doc_ref = inputs.get("document")
+                if isinstance(doc_ref, dict):
+                    lazy_document_id = str(doc_ref.get("document_id") or "")
+                else:
+                    lazy_document_id = str(doc_ref or inputs.get("document_id") or "")
+                lazy_knowledge_id = str(
+                    inputs.get("knowledge_id")
+                    or inputs.get("knowledge_base_id")
+                    or ""
                 )
+                if lazy_document_id and lazy_knowledge_id:
+                    lazy_doc = await KnowledgeDocumentRepository(session).get_by_id(
+                        lazy_document_id, tenant_id
+                    )
+                    if lazy_doc is not None and not lazy_doc.is_deleted:
+                        # 文档必须真的属于传入的知识库（审计发现：不比对会把 A 库的
+                        # 文档记到 B 库名下，后续按库分流/清理全部错位）。
+                        if lazy_doc.knowledge_base_id != lazy_knowledge_id:
+                            return ApiResponse.fail(
+                                translate(
+                                    "err.kb.task_center.document_kb_mismatch",
+                                    params={
+                                        "document_id": lazy_document_id,
+                                        "knowledge_id": lazy_knowledge_id,
+                                    },
+                                    fallback=(
+                                        f"文档 {lazy_document_id} 不属于知识库 "
+                                        f"{lazy_knowledge_id}"
+                                    ),
+                                )
+                            )
+                        occupied = await tc_repo.read(lazy_document_id, tenant_id)
+                        if occupied is not None and occupied.task_id != execution.task_id:
+                            # 只有**在途**的旧行才算占用；`released` 是「上一次已交还」，
+                            # 同一文档再执行一次应当允许（审计发现：无条件拒会让第二次
+                            # 执行必失败，而执行前预检只拦在途 —— 两边判据冲突）。
+                            if occupied.state in ACTIVE_STATES:
+                                return ApiResponse.fail(
+                                    translate(
+                                        "err.kb.task_center.document_taken",
+                                        params={
+                                            "document_id": lazy_document_id,
+                                            "task_id": occupied.task_id,
+                                        },
+                                        fallback=(
+                                            f"文档 {lazy_document_id} 已被任务 "
+                                            f"{occupied.task_id} 接管，不能同时再处理"
+                                        ),
+                                    )
+                                )
+                            row = await tc_repo.reattach_to_task(
+                                lazy_document_id,
+                                tenant_id=tenant_id,
+                                old_task_id=occupied.task_id,
+                                new_task_id=execution.task_id,
+                                knowledge_base_id=lazy_knowledge_id,
+                                space_id=execution.space_id,
+                            )
+                            # 重挂前文档已经处理完 → 这次 parse 按「重新解析」重置
+                            # （代次 +1、清旧切片），否则旧切片与本次 full 叠加。
+                            reattached_doc_ready = (
+                                step_code == STEP_PARSE
+                                and lazy_doc is not None
+                                and lazy_doc.status == DocStatus.READY.value
+                            )
+                            if row is None:
+                                return ApiResponse.fail(
+                                    translate(
+                                        "err.kb.task_center.document_taken",
+                                        params={
+                                            "document_id": lazy_document_id,
+                                            "task_id": occupied.task_id,
+                                        },
+                                        fallback=(
+                                            f"文档 {lazy_document_id} 刚刚被别的任务接管，"
+                                            "这次派活没抢到"
+                                        ),
+                                    )
+                                )
+                        if occupied is None:
+                            row = await tc_repo.create(
+                                TaskCenterDocument(
+                                    document_id=lazy_document_id,
+                                    tenant_id=tenant_id,
+                                    knowledge_base_id=lazy_knowledge_id,
+                                    space_id=execution.space_id,
+                                    task_id=execution.task_id,
+                                    state=TaskCenterDocState.MANAGED.value,
+                                )
+                            )
+                        # **upload-only 文档的 PENDING → PARSING**（2026-11-18 审计
+                        # critical）：不提升的话，任务被停止/放弃、接管行交还之后，
+                        # 没有任何巡检会再扫 PENDING，而删除/重解析/归档三个入口都会
+                        # 以「正在解析」拒绝 —— 文档变成永久僵尸。
+                        if row is not None and lazy_doc.status == DocStatus.PENDING.value:
+                            await KnowledgeDocumentRepository(session).set_status(
+                                lazy_doc, DocStatus.PARSING
+                            )
+                        # wiki 类库不抽本体：与系统上传路径同口径，懒建时直接标
+                        # `ontology_status=READY`（否则自建定义处理 wiki 文档后会
+                        # 永久停在「待抽取」，审计发现）。
+                        if row is not None:
+                            from .kb_type_service import LLM_WIKI_TYPES
+
+                            lazy_kb_type = (lazy_doc.extra_metadata or {}).get("kb_type")
+                            if lazy_kb_type in LLM_WIKI_TYPES:
+                                await KnowledgeDocumentRepository(
+                                    session
+                                ).set_ontology_status(
+                                    lazy_doc, "ready", emit_task=False
+                                )
+                if row is None:
+                    return ApiResponse.fail(
+                        translate(
+                            "err.kb.task_center.takeover_missing",
+                            params={"task_id": execution.task_id},
+                            fallback=f"没有找到任务 {execution.task_id} 的知识库接管记录",
+                        )
+                    )
             retrying = row.state not in ACTIVE_STATES
             # **第二种「任务重试」形态**：行仍是 `managed`、`execution_id` 已清空、
             # 但 `handled_execution_id` 有值 —— 上一轮 `parse` 已经成功收口、正等
@@ -858,8 +991,20 @@ class TaskRunnerService(RunnerBase):
             console_retry_reparse = (
                 not retrying
                 and step_code == STEP_PARSE
-                and not (row.execution_id or "")
-                and bool(getattr(row, "handled_execution_id", None))
+                and (
+                    # 形态一：上一步已收口、卡已空（等 compile 派活时任务被重试）
+                    (
+                        not (row.execution_id or "")
+                        and bool(getattr(row, "handled_execution_id", None))
+                    )
+                    # 形态二：卡上还挂着**旧执行**、任务中心却派来了新执行 ——
+                    # 说明用户「停止后立刻重试」。旧执行杀不掉，必须把文档按
+                    # 重新解析重置（代次 +1、清旧切片），否则两份 full 解析并发。
+                    or (
+                        row.execution_id
+                        and row.execution_id != execution.execution_id
+                    )
+                )
             )
             if retrying:
                 # 已经被交还给既有对账（跑完了 / 判死了 / 用户停了 / 任务被删了）。
@@ -884,7 +1029,16 @@ class TaskRunnerService(RunnerBase):
             # `inputs` 由任务中心按上一步的 `outputs` 填好（`bind_inputs`），正常路径
             # 必然一致；不一致说明编排定义被改过或接管行被手工动过 —— 拒绝比「照
             # inputs 干」安全，后者会往一个不属于这条任务的文档上写东西。
-            claimed = str((execution.inputs or {}).get("document_id") or "")
+            # 新契约的键是 `document`（值已经是文档 ID 字符串）；旧契约是 `document_id`。
+            raw_claimed = (execution.inputs or {}).get("document_id")
+            if not raw_claimed:
+                _doc_ref = (execution.inputs or {}).get("document")
+                raw_claimed = (
+                    _doc_ref.get("document_id")
+                    if isinstance(_doc_ref, dict)
+                    else _doc_ref
+                )
+            claimed = str(raw_claimed or "")
             if claimed and claimed != row.document_id:
                 # ⚠️ **回绝之前先把接管行交还**（2026-09-30 加，见下面 `doc is None` 那段的
                 # 长注释）：不交还的话这份文档会被锁到看门狗那条 30 分钟的兜底才解开，
@@ -909,8 +1063,67 @@ class TaskRunnerService(RunnerBase):
                     )
                 )
 
+            # ②b 交叉核对 `knowledge_id`（2026-11-19 审计）：上面只核了文档。
+            # 手编定义可以把 compile 的 knowledge_id 绑到另一个库 —— 任务中心照常派活，
+            # 而 KB 只按接管行所属库继续跑，派活声明与真实操作对象不一致且无告警。
+            # 兼容两套键：新契约 `knowledge_id`，旧契约 `knowledge_base_id`。
+            raw_kb = (execution.inputs or {}).get("knowledge_id") or (
+                execution.inputs or {}
+            ).get("knowledge_base_id")
+            claimed_kb = str(raw_kb or "")
+            if claimed_kb and claimed_kb != (row.knowledge_base_id or ""):
+                await tc_repo.mark_released(
+                    row.document_id,
+                    error_message=(
+                        f"派活报文里的 knowledge_id（{claimed_kb}）与接管记录不一致"
+                    ),
+                    only_if_idle=True,
+                )
+                return ApiResponse.fail(
+                    translate(
+                        "err.kb.task_center.knowledge_mismatch",
+                        params={
+                            "expected": row.knowledge_base_id or "",
+                            "claimed": claimed_kb,
+                        },
+                        fallback=(
+                            f"派活报文里的 knowledge_id（{claimed_kb}）与接管记录"
+                            f"（{row.knowledge_base_id}）不一致"
+                        ),
+                    )
+                )
+
             repo = KnowledgeDocumentRepository(session)
             doc = await repo.get_by_id(row.document_id, tenant_id)
+            if doc is not None and doc.status == DocStatus.ARCHIVED.value:
+                # 归档文档别接活：`released` 行在归档后仍可能被任务重试/迟到派活
+                # 命中，重置会把 ARCHIVED 写成 PARSING、绕过 restore 流程。
+                await tc_repo.mark_released(
+                    row.document_id,
+                    error_message="知识文档已归档，不再受理派活",
+                    only_if_idle=True,
+                )
+                return ApiResponse.fail(
+                    translate(
+                        "err.doc.archived_cannot_parse",
+                        fallback="知识文档已归档，请先恢复归档",
+                    )
+                )
+            if doc is not None and doc.status == DocStatus.DELETING.value:
+                # **删除中与「不存在」同档**：删除链会先置 DELETING、提交后再清索引、
+                # 最后软删，中间有一段不短的窗口。这期间进来派活若被收下，下游会在
+                # 索引清理**之后**再推一遍切片 —— 产出孤儿向量，检索还可能命中。
+                await tc_repo.mark_released(
+                    row.document_id,
+                    error_message="知识文档正在删除中，不再受理派活",
+                    only_if_idle=True,
+                )
+                return ApiResponse.fail(
+                    translate(
+                        "err.doc.deleting_in_progress",
+                        fallback="知识文档正在删除中，不再受理这一步",
+                    )
+                )
             if doc is None:
                 # 文档被删了（软删也算）。拒掉，让子任务终态 failed —— 硬撑下去
                 # 只会往一个已经不存在的文档上写状态。
@@ -973,6 +1186,8 @@ class TaskRunnerService(RunnerBase):
                 task_id=execution.task_id,
                 step_code=step_code,
                 execution_id=execution.execution_id,
+                # 三态透传：None = 老运行方没带（看门狗回落 compile 判定）
+                last_step=getattr(execution, "is_last_step", None),
             )
             if not started:
                 # 从上面读到写之间接管行变了（被删任务 / 被看门狗交还）—— 这次派活
@@ -995,7 +1210,7 @@ class TaskRunnerService(RunnerBase):
             #     排在任何一条回绝路径之前的话，那份文档会停在
             #     「接管行在途 + 自己 `parsing` + 任务中心那边这一步失败」的假状态，
             #     要等满看门狗的 30 分钟兜底才解开。
-            if retrying or console_retry_reparse:
+            if retrying or console_retry_reparse or reattached_doc_ready:
                 await self._reset_document_after_console_retry(
                     session,
                     doc=doc,
@@ -1569,11 +1784,22 @@ class TaskRunnerService(RunnerBase):
                 # 失败只记 warning** 的 —— 如果那次上报丢了，本该由管理方的对账兜住；
                 # 不写报文的话对账只能问出 `unknown`，管理方按**配置错**处置、不塞收件箱，
                 # 那一步就要挂到硬超时（还占着本目录共用的并发名额）。
-                report={
-                    "status": "failed",
-                    "error_message": "任务被用户停止，接管交还给既有对账",
-                    "error_code": "err.kb.task_center.runner_abandoned",
-                },
+                # ⚠️ **CAS 用 phase① 的快照执行号，不是重读到的 `fresh`**：
+                # `fresh` 是出站之后才读的，上报那 90 秒里新执行可能已经接手
+                # （`begin_step` 会把 execution_id 换成新的）。拿 `fresh` 当期望值
+                # 等于「匹配我自己刚读到的行」，会把新执行的卡拆掉。
+                expect_execution_id=carrier.execution_id or None,
+                only_if_idle=not carrier.execution_id,
+                keep_report=not carrier.execution_id,
+                report=(
+                    {
+                        "status": "failed",
+                        "error_message": "任务被用户停止，接管交还给既有对账",
+                        "error_code": "err.kb.task_center.runner_abandoned",
+                    }
+                    if carrier.execution_id
+                    else None
+                ),
             )
             doc_id = fresh.document_id
         logger.info(
@@ -1639,9 +1865,21 @@ class TaskRunnerService(RunnerBase):
             **带着产出**（`outputs` / `output_refs`）—— 没有产出，管理方写了「成功」
             也派不出下一步。
             """
-            if isinstance(last_report, dict) and last_report.get("status") == "success":
+            if not isinstance(last_report, dict):
+                return None
+            # **报文必须属于你问的那一次执行**：`mark_released` 写入时带了
+            # `_execution_id`。不比对的话，补拉上一步（parse）会拿到下一步
+            # （compile）的失败原因，答非所问。老报文没有标记，按原口径兜底。
+            report_exec = last_report.get("_execution_id")
+            if (
+                report_exec
+                and envelope.execution_id
+                and report_exec != envelope.execution_id
+            ):
+                return None
+            if last_report.get("status") == "success":
                 return StepStatusQuery(status=STEP_STATUS_SUCCEEDED, report=last_report)
-            if isinstance(last_report, dict) and last_report.get("status") == "failed":
+            if last_report.get("status") == "failed":
                 return StepStatusQuery(
                     status=STEP_STATUS_FAILED, report=last_report,
                     detail=str(last_report.get("error_message") or "")[:500],
@@ -1785,6 +2023,7 @@ async def submit_ontology_task(
     task_source: str,
     task_name: Optional[str] = None,
     operator_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ) -> SubmissionResult:
     """把一份接入任务中心的文档提交给任务中心（§4.2 ②）。
 
@@ -1841,7 +2080,17 @@ async def submit_ontology_task(
             definition_id=definition_for_kb_type(kb_type, backend),
             space_id=space_id,
             task_id=task_id,
+            # 2026-11-18 过渡期：**新旧四个键同传**。
+            #   新契约（v3 起）：`document` = {document_id, file_name}、`knowledge_id`；
+            #   旧契约（v1/v2）：`document_id`、`knowledge_base_id`。
+            # `normalize_by_schema` 只装 schema 声明过的键，所以两套版本各取所需、
+            # 都能通过必填校验。等旧版本不再被指定后可摘掉旧键。
             inputs={
+                "document": {
+                    "document_id": document_id,
+                    "file_name": file_name or task_name or "",
+                },
+                "knowledge_id": knowledge_base_id,
                 "document_id": document_id,
                 "knowledge_base_id": knowledge_base_id,
             },
@@ -2010,6 +2259,11 @@ async def rearm_for_rerun(
         tenant_id=tenant_id,
         task_id=row.task_id,
         step_code=step_code,
+        # **按钮武装要清掉 `handled_execution_id`**：否则「managed + execution_id 空 +
+        # handled 非空」的形状与「任务重试」完全同形，派活时会被
+        # `console_retry_reparse` 再判一次重跑，导致文档二次重置、代次跳号、
+        # 多一条永远收不掉的 running 埋点。
+        clear_handled=True,
     )
     if not armed:
         raise ResourceConflictError(
@@ -2108,7 +2362,11 @@ async def retry_subtasks_for_steps(
 #: 同档 —— 它同样「跑完了、有明确结论」，重跑它就是「重新排队」。
 #: 少了它，KB 侧读到的 `stopped` 会被当成「还在跑」，保守侧会**只交解析**，
 #: 于是「用户停过的那一步」永远重跑不到编译那一段。
-SUBTASK_TERMINAL_STATUSES = frozenset({"success", "failed", "timeout", "stopped"})
+SUBTASK_TERMINAL_STATUSES = frozenset(
+    # 2026-11-18 加 `skipped`（任务中心「跳过并继续」）：被跳过的节点同样是终态，
+    # 运行方侧不能把它当「还在跑」。
+    {"success", "failed", "timeout", "stopped", "skipped"}
+)
 
 #: 任务中心那侧「整条任务**已经结束**」的三档（`TaskStatus` 的终态）。
 #:
@@ -2262,12 +2520,10 @@ def retry_accepted(result: SubtaskRetryResult) -> bool:
 
 
 __all__ = [
+    "KB_DOCUMENT_DEFINITION_ID",
     "NODE_COMPILE",
     "NODE_INGEST",
     "NODE_PARSE",
-    "ONTOLOGY_DEFINITION_ID",
-    "ONTOLOGY_JONEX_WIKI_DEFINITION_ID",
-    "ONTOLOGY_WIKI_DEFINITION_ID",
     "STEP_COMPILE",
     "STEP_INGEST",
     "STEP_PARSE",

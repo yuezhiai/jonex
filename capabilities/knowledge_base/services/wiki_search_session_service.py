@@ -36,7 +36,7 @@ def _bounded_preview(preview) -> dict | None:
 def _bounded_event(event: dict, kb_id: str) -> dict:
     """公开进度事件 → 可长期保存的轨迹条目（字段白名单 + 体积上限）。"""
     out: dict = {"kb_id": kb_id, "seq": event.get("seq")}
-    for key in ("type", "tool", "title"):
+    for key in ("type", "tool", "title", "operation_id", "status", "result_summary"):
         value = event.get(key)
         if isinstance(value, str) and value:
             out[key] = value[:_TRACE_MAX_FIELD_CHARS]
@@ -47,10 +47,12 @@ def _bounded_event(event: dict, kb_id: str) -> dict:
     details = event.get("details")
     if isinstance(details, dict):
         bounded = {}
-        for key in ("query", "table_id", "operation"):
+        for key in ("query", "table_id", "operation", "input", "output"):
             value = details.get(key)
             if isinstance(value, str) and value:
-                bounded[key] = value[:_TRACE_MAX_FIELD_CHARS]
+                bounded[key] = value[:1200 if key == 'output' else 500 if key == 'input' else _TRACE_MAX_FIELD_CHARS]
+        if details.get("resource_kind") in {"article", "source", "table"}:
+            bounded["resource_kind"] = details["resource_kind"]
         paths = details.get("paths")
         if isinstance(paths, list):
             paths = [p[:_TRACE_MAX_FIELD_CHARS] for p in paths[:_TRACE_MAX_PREVIEWS] if isinstance(p, str) and p]
@@ -153,13 +155,71 @@ class WikiSearchSessionService:
         return {"session_id": session_id}
 
     async def poll(self, tenant_id, user_id, session_id):
-        _, _, state = await self._owned(tenant_id, user_id, session_id)
+        redis, key, state = await self._owned(tenant_id, user_id, session_id)
+        # 有人还在看（首连或离开后重连）就续期：长检索不该在轮询中途被 TTL 清掉。
+        await redis.expire(key, SESSION_TTL)
         # 与 collect_progress 共用摊平/排序：轮询与落库看到的顺序必须一致，
         # 否则历史回放的步骤顺序会和当时流式看到的不一样。
         events = _flatten_progress(state)
+        # Tool previews and completed answers can contain source text. Recheck
+        # access against the pinned Bundle's complete document scope, including
+        # documents that were read but did not become final citations.
+        required_kbs = {event['kb_id'] for event in events
+                        if isinstance(event.get('details'), dict) and
+                        (event['details'].get('input') or event['details'].get('output'))}
+        if state['status'] == 'done':
+            try:
+                outcomes = json.loads(state.get('result') or '{}').get('query_outcomes') or []
+            except (TypeError, ValueError, AttributeError):
+                outcomes = []
+            required_kbs.update(item['kb_id'] for item in outcomes if isinstance(item, dict) and
+                                isinstance(item.get('kb_id'), str) and item['kb_id'] and
+                                item.get('stop_reason') not in ('empty_kb', 'engine_error'))
+        if required_kbs or state['status'] == 'done':
+            await self._assert_session_scopes(tenant_id, user_id, state, required_kbs)
         return {"status": state["status"], "events": events[-96:],
                 "result": json.loads(state["result"]) if state.get("result") else None,
                 "error": state.get("error")}
+
+    async def _assert_session_scopes(self, tenant_id, user_id, state, required_kbs=frozenset()):
+        from types import SimpleNamespace
+        from jonex_core.common.database import get_db_session
+        from .search_history_service import SearchHistoryService
+
+        scopes = []
+        for field in state:
+            if not field.startswith('query:'):
+                continue
+            kb_id = field[6:]
+            try:
+                source_ids = json.loads(state.get('scope:' + kb_id, 'null'))
+            except (TypeError, ValueError):
+                source_ids = None
+            if (not isinstance(source_ids, list) or len(source_ids) > 10000 or
+                    any(not isinstance(value, str) or not value for value in source_ids)):
+                raise ResourceNotFoundError(message='检索来源范围无法核验')
+            scopes.append((kb_id, source_ids))
+        if not required_kbs.issubset({kb_id for kb_id, _ in scopes}):
+            raise ResourceNotFoundError(message='检索来源范围无法核验')
+        if not scopes:
+            if state.get('status') == 'done':
+                try:
+                    outcomes = json.loads(state.get('result') or '{}').get('query_outcomes') or []
+                except (TypeError, ValueError, AttributeError):
+                    outcomes = []
+                if outcomes and all(isinstance(item, dict) and
+                                    item.get('stop_reason') in ('empty_kb', 'engine_error') for item in outcomes):
+                    return  # No source-bearing engine query was started.
+            raise ResourceNotFoundError(message='检索来源范围无法核验')
+        checker = SearchHistoryService()
+        async with get_db_session() as session:
+            for kb_id, source_ids in scopes:
+                snapshot = SimpleNamespace(
+                    knowledge_base_id=kb_id, references=[],
+                    extra_metadata={'knowledge_base_ids': [kb_id], 'query_outcomes': [
+                        {'kb_id': kb_id, 'source_document_ids': source_ids}]},
+                )
+                await checker._assert_history_readable(session, tenant_id, user_id, snapshot)
 
     async def cancel(self, tenant_id, user_id, session_id):
         redis, key, state = await self._owned(tenant_id, user_id, session_id)
@@ -191,7 +251,8 @@ async def resolve_wiki_evidence(tenant_id, data):
                                       tenant_id, data["knowledge_base_id"])
         async with get_db_session() as session:
             docs = await KnowledgeDocumentRepository(session).get_by_ids([result["document_id"]], tenant_id)
-        if not docs or docs[0].knowledge_base_id != data["knowledge_base_id"]:
+        if (not docs or docs[0].knowledge_base_id != data["knowledge_base_id"]
+                or getattr(docs[0], 'status', None) in {'archived', 'deleting', 'deleted'}):
             raise ResourceNotFoundError(message="Evidence source not found")
         return result
     finally:

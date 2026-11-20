@@ -512,7 +512,9 @@ class DomainServiceService:
         tasks = [_search_kb(kb_id) for kb_id in kb_ids]
         results = await asyncio.gather(*tasks)
 
-        all_refs: dict[str, dict] = {}
+        all_refs = SearchService._merge_references(*[
+            result.get("references", []) for result in results if isinstance(result, dict)
+        ])
         all_items: list = []
         total: int = 0
         answers: list[str] = []
@@ -520,26 +522,32 @@ class DomainServiceService:
         for result in results:
             if result is None:
                 continue
-            for ref in result.get("references", []):
-                ref_id = ref.get("id")
-                if ref_id and ref_id not in all_refs:
-                    all_refs[ref_id] = ref
             items = result.get("items", [])
             if items:
                 all_items.extend(items)
             total += result.get("total", 0)
             answer = result.get("answer")
             if answer:
-                answers.append(str(answer))
+                answers.append(SearchService._remap_mixed_citations(
+                    str(answer), result.get("references") or [], all_refs))
 
         result_dict: dict = {
             "service_id": service_id,
             "query": query,
-            "references": list(all_refs.values()),
+            "references": all_refs,
             "items": all_items,
             "total": total,
             "kb_count": len(kb_ids),
         }
+        outcomes = [item for result in results if isinstance(result, dict)
+                    for item in (result.get("query_outcomes") or [])]
+        if outcomes:
+            result_dict["query_outcomes"] = outcomes
+        if any(isinstance(result, dict) and result.get("incomplete") is True for result in results):
+            result_dict["incomplete"] = True
+        if kb_failed:
+            result_dict["degraded"] = True
+            result_dict["failed_knowledge_base_ids"] = kb_failed
         if answers:
             result_dict["answer"] = "\n\n".join(answers)
         elif kb_failed and len(kb_failed) == len(kb_ids):

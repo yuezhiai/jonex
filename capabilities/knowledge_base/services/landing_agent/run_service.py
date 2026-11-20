@@ -339,9 +339,8 @@ class LandingRunService:
 
         try:
             if run_mode == RUN_MODE_FULL:
-                # 构造没有逐阶段的 `on_progress`（Task 13 的接线只到 landing 阶段），
-                # 所以这里只写「开始 / 结束」两个粗粒度相位；细粒度进度由
-                # landings-only 模式提供。
+                # 先落一个粗粒度相位兜底：construct 内部会按阶段逐条回写
+                # （读取 → 聚类 → 合并 → 落点 → 关系 → 命名 → 写库），每条覆盖它。
                 await self.repo.update_progress(
                     tenant_id, run_id,
                     phase="construct", progress={"phase": "construct"},
@@ -358,6 +357,9 @@ class LandingRunService:
                     force=force,
                     alias_hints=alias_hints,
                     landing_mode="agent",
+                    # 阶段进度（读取 → 聚类 → 合并 → 落点 → 关系 → 命名 → 写库）：
+                    # 前端弹层靠它显示「目前在做什么」，构造内部逐阶段回写 run 行。
+                    progress_cb=_on_progress,
                 )
                 # construct 的摘要是 `row.to_dict()` 叠统计字段，里面有一份完整
                 # schema。run 的 summary 只留统计（get 的契约不许带正文）。

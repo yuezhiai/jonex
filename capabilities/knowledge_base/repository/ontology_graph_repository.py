@@ -10,7 +10,7 @@ import random
 from typing import Optional
 
 from neo4j import AsyncDriver
-from neo4j.exceptions import TransientError
+from neo4j.exceptions import ConstraintError, TransientError
 
 from jonex_core.common.ontology_embedding import (
     build_embed_text,
@@ -18,7 +18,11 @@ from jonex_core.common.ontology_embedding import (
     embed_hash,
     ingest_embed_timeout,
 )
-from jonex_core.common.exceptions import InvalidParameterError, ResourceNotFoundError
+from jonex_core.common.exceptions import (
+    InvalidParameterError,
+    ResourceConflictError,
+    ResourceNotFoundError,
+)
 from jonex_core.common.i18n import translate
 from jonex_core.common.tenant import require_tenant
 
@@ -98,6 +102,286 @@ async def _with_transient_retry(fn, *, what: str):
 def _endpoint_lock_key(entity_type: Optional[str], name: Optional[str]) -> tuple:
     """端点加锁排序键（见 merge_relation 死锁修复）。"""
     return (entity_type or "", name or "")
+
+
+# ── 实体手工编辑：类型变更与撞名合并 ────────────────────────────
+# 节点匹配键 (tenant_id, kb_id, entity_type, canonical_name) 上有唯一约束。
+# 关系边不存端点类型，读取侧的类型全部来自节点，因此类型变更只需改节点属性；
+# 目标键已存在时，在单个事务内把关系改挂到目标节点并合并属性。
+_ENTITY_UPDATE_FIELDS = ("name", "aliases", "description", "attributes")
+
+
+def _vector_enabled() -> bool:
+    return os.getenv("ONTOLOGY_VECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _dedupe_keep_order(items) -> list:
+    """按首次出现顺序去重（别名、doc_ids 等字符串列表）。"""
+    seen = set()
+    unique = []
+    for item in items or []:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def _json_list_union(first, second) -> str:
+    """合并两个以 JSON 字符串存储的列表属性，按结构去重后仍以 JSON 字符串返回。
+
+    `source_chunks` 是 list-of-map，Neo4j 不允许直接作为属性值，写入侧统一存 JSON
+    字符串（见 merge_entity / merge_relation），故合并也需要先解析再序列化。
+    """
+    merged: list = []
+    for raw in (first, second):
+        values = raw
+        if isinstance(values, str):
+            try:
+                values = json.loads(values)
+            except (TypeError, ValueError):
+                values = []
+        if isinstance(values, list):
+            merged.extend(values)
+
+    seen = set()
+    unique = []
+    for item in merged:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return json.dumps(unique, ensure_ascii=False)
+
+
+def _entity_field_set_clauses(updates: dict, params: dict) -> list[str]:
+    """把 name/aliases/description/attributes 转成 SET 子句并填充参数。"""
+    set_clauses = []
+    if "name" in updates:
+        set_clauses.append("e.canonical_name=$new_name")
+        params["new_name"] = updates["name"]
+    if "aliases" in updates:
+        set_clauses.append("e.aliases=$aliases")
+        set_clauses.append("e.aliases_text=$aliases_text")
+        params["aliases"] = updates["aliases"]
+        params["aliases_text"] = " ".join(updates["aliases"])
+    if "description" in updates:
+        set_clauses.append("e.description=$description")
+        params["description"] = updates["description"]
+    if "attributes" in updates:
+        set_clauses.append("e.attributes=$attributes")
+        params["attributes"] = json.dumps(updates["attributes"], ensure_ascii=False)
+    return set_clauses
+
+
+def _build_merged_entity_props(
+    source: dict, target: dict, canonical_name: str, updates: dict,
+) -> dict:
+    """按契约合并两个节点的属性：显式更新覆盖目标，文档关联字段取并集。
+
+    源节点的原名（``source["name"]``，缺省回落到 ``canonical_name``）会并入别名：
+    合并不丢旧名的可检索性 —— 把「麦瑞」合并进「迈瑞」后，检索「麦瑞」仍能命中。
+    与最终规范名相同的别名会被剔除，避免别名表里出现与名称重复的项。
+    """
+    target_stub = bool(target.get("stub"))
+    source_stub = bool(source.get("stub"))
+    source_name = source.get("name") or canonical_name
+
+    if "name" in updates:
+        name = updates["name"]
+    else:
+        name = target.get("name") or canonical_name
+
+    if "aliases" in updates:
+        aliases = list(updates["aliases"] or []) + list(source.get("aliases") or [])
+    else:
+        aliases = list(target.get("aliases") or []) + list(source.get("aliases") or [])
+    aliases = _dedupe_keep_order(
+        [alias for alias in aliases + [source_name] if alias and alias != name]
+    )
+
+    if "description" in updates:
+        description = updates["description"]
+    elif target_stub and not source_stub:
+        # 目标只是关系端点产生的 stub 时，它的空描述不能覆盖正式实体的内容。
+        description = source.get("description") or ""
+    else:
+        description = target.get("description") or ""
+
+    if "attributes" in updates:
+        attributes = json.dumps(updates["attributes"], ensure_ascii=False)
+    elif target_stub and not source_stub:
+        attributes = source.get("attributes") or "{}"
+    else:
+        attributes = target.get("attributes") or "{}"
+
+    doc_ids = _dedupe_keep_order(list(target.get("doc_ids") or []) + list(source.get("doc_ids") or []))
+    lightrag_doc_ids = _dedupe_keep_order(
+        list(target.get("lightrag_doc_ids") or []) + list(source.get("lightrag_doc_ids") or [])
+    )
+    source_chunks = _json_list_union(target.get("source_chunks"), source.get("source_chunks"))
+
+    if target_stub and not source_stub:
+        extraction_method = source.get("extraction_method")
+    else:
+        extraction_method = target.get("extraction_method")
+
+    return {
+        "name": name,
+        "aliases": aliases,
+        "aliases_text": " ".join(str(alias) for alias in aliases),
+        "description": description,
+        "attributes": attributes,
+        "doc_ids": doc_ids,
+        "lightrag_doc_ids": lightrag_doc_ids,
+        "source_chunks": source_chunks,
+        # 只要有一端是正式实体，合并结果就不是 stub，避免节点在列表查询中被过滤掉。
+        "stub": source_stub and target_stub,
+        "extraction_method": extraction_method,
+    }
+
+
+_ENTITY_PROPS_CYPHER = """
+MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$cn})
+RETURN e.canonical_name AS name, e.aliases AS aliases, e.description AS description,
+       e.attributes AS attributes, e.doc_ids AS doc_ids, e.source_chunks AS source_chunks,
+       e.lightrag_doc_ids AS lightrag_doc_ids, e.embedding_hash AS embedding_hash,
+       e.stub AS stub, e.extraction_method AS extraction_method
+"""
+
+_ENTITY_EXISTS_CYPHER = """
+MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$et, canonical_name:$cn})
+RETURN count(e) AS c
+"""
+
+_TYPE_MERGE_GUARD_CYPHER = """
+MATCH (s:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$old_type, canonical_name:$old_cn})
+OPTIONAL MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$new_type, canonical_name:$new_cn})
+RETURN count(s) AS s_count, count(t) AS t_count
+"""
+
+# 关系改挂：按「另一端」分情况，均以 MERGE 目标端边 + 复制属性 + 删除源端边实现，
+# 全程纯 Cypher（只复用既有 apoc.coll.toSet），不依赖 apoc.refactor。
+#
+# 先按（另一端, 关系类型）聚合再 MERGE：同一语句内逐行 MERGE 时，后一行看不到
+# 前一行刚创建的边，源节点自带重复边时会各自 CREATE，改挂后留下重复边。
+# 聚合后同一组只处理一次，并把组内所有边的文档关联合并到同一条上。
+# 同一对端点已存在同类型边时进入 ON MATCH：doc_ids/lightrag_doc_ids 取并集，
+# attributes 保留目标节点上已有边的值，不覆盖。
+_TYPE_MERGE_EDGE_GROUP = """
+WITH t, n, coalesce(r.relation_type, '') AS rt, collect(r) AS rels
+WITH t, n, rt, rels, rels[0] AS primary,
+     reduce(ds = [], x IN rels | ds + coalesce(x.doc_ids, [])) AS all_docs,
+     reduce(ls = [], x IN rels | ls + coalesce(x.lightrag_doc_ids, [])) AS all_lightrag
+"""
+
+# 全部折叠成 t -> t 的语句不能把另一端 n 当分组键：n 取 s 与 t 时会被分成两组，
+# 同一关系类型就会各建一条边。这里只按目标节点与关系类型分组。
+_TYPE_MERGE_SELF_GROUP = """
+WITH t, coalesce(r.relation_type, '') AS rt, collect(r) AS rels
+WITH t, rt, rels, rels[0] AS primary,
+     reduce(ds = [], x IN rels | ds + coalesce(x.doc_ids, [])) AS all_docs,
+     reduce(ls = [], x IN rels | ls + coalesce(x.lightrag_doc_ids, [])) AS all_lightrag
+"""
+
+_TYPE_MERGE_EDGE_ON_CREATE = """
+ON CREATE SET
+    nr.relation_type = rt,
+    nr.confidence = coalesce(primary.confidence, 1.0),
+    nr.attributes = coalesce(primary.attributes, '{}'),
+    nr.doc_ids = all_docs,
+    nr.lightrag_doc_ids = all_lightrag,
+    nr.source_chunks = primary.source_chunks,
+    nr.created_at = coalesce(primary.created_at, timestamp()),
+    nr.updated_at = timestamp()
+ON MATCH SET
+    nr.doc_ids = apoc.coll.toSet(coalesce(nr.doc_ids, []) + all_docs),
+    nr.lightrag_doc_ids = apoc.coll.toSet(coalesce(nr.lightrag_doc_ids, []) + all_lightrag),
+    nr.updated_at = timestamp()
+FOREACH (x IN rels | DELETE x)
+"""
+
+# 源与目标各自用自己的规范名：改类型时两者相同，改名时源名与目标名不同。
+_TYPE_MERGE_SOURCE_AND_TARGET_MATCH = """
+MATCH (s:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$old_type, canonical_name:$old_cn})
+MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$new_type, canonical_name:$new_cn})
+"""
+
+# 源节点出边，另一端不是源/目标节点：s -> n 变成 t -> n
+_TYPE_MERGE_OUT_EDGES_CYPHER = (
+    _TYPE_MERGE_SOURCE_AND_TARGET_MATCH
+    + """
+MATCH (s)-[r:ONT_REL]->(n)
+WHERE n <> s AND n <> t
+"""
+    + _TYPE_MERGE_EDGE_GROUP
+    + """
+MERGE (t)-[nr:ONT_REL {relation_type: rt}]->(n)
+"""
+    + _TYPE_MERGE_EDGE_ON_CREATE
+)
+
+# 源节点入边，另一端不是源/目标节点：m -> s 变成 m -> t
+_TYPE_MERGE_IN_EDGES_CYPHER = (
+    _TYPE_MERGE_SOURCE_AND_TARGET_MATCH
+    + """
+MATCH (m)-[r:ONT_REL]->(s)
+WHERE m <> s AND m <> t
+WITH m AS n, t, r
+"""
+    + _TYPE_MERGE_EDGE_GROUP
+    + """
+MERGE (n)-[nr:ONT_REL {relation_type: rt}]->(t)
+"""
+    + _TYPE_MERGE_EDGE_ON_CREATE
+)
+
+# 源节点与目标节点之间、以及源节点自环上的边：统一折叠为 t -> t
+_TYPE_MERGE_SELF_LOOP_CYPHER = (
+    _TYPE_MERGE_SOURCE_AND_TARGET_MATCH
+    + """
+MATCH (s)-[r:ONT_REL]->(n)
+WHERE n = s OR n = t
+"""
+    + _TYPE_MERGE_SELF_GROUP
+    + """
+MERGE (t)-[nr:ONT_REL {relation_type: rt}]->(t)
+"""
+    + _TYPE_MERGE_EDGE_ON_CREATE
+)
+
+_TYPE_MERGE_TARGET_LOOP_CYPHER = (
+    _TYPE_MERGE_SOURCE_AND_TARGET_MATCH
+    + """
+MATCH (m)-[r:ONT_REL]->(s)
+WHERE m = t
+"""
+    + _TYPE_MERGE_SELF_GROUP
+    + """
+MERGE (t)-[nr:ONT_REL {relation_type: rt}]->(t)
+"""
+    + _TYPE_MERGE_EDGE_ON_CREATE
+)
+
+_TYPE_MERGE_TARGET_SET_CYPHER = """
+MATCH (t:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$new_type, canonical_name:$new_cn})
+SET t.canonical_name=$merged_name,
+    t.aliases=$aliases, t.aliases_text=$aliases_text,
+    t.description=$description, t.attributes=$attributes,
+    t.doc_ids=$doc_ids, t.source_chunks=$source_chunks,
+    t.lightrag_doc_ids=$lightrag_doc_ids,
+    t.stub=$stub, t.extraction_method=$extraction_method,
+    t.embedding=CASE WHEN $embedding IS NULL THEN t.embedding ELSE $embedding END,
+    t.embedding_hash=CASE WHEN $embedding IS NULL THEN t.embedding_hash ELSE $embedding_hash END,
+    t.updated_at=timestamp()
+"""
+
+# 走到这一步时源节点的关系已全部改挂，普通 DELETE 即可，不使用连带删除关系的写法。
+_TYPE_MERGE_DELETE_SOURCE_CYPHER = """
+MATCH (s:OntologyEntity {tenant_id:$t, kb_id:$k, entity_type:$old_type, canonical_name:$old_cn})
+DELETE s
+"""
 
 
 class OntologyGraphRepository:
@@ -1279,6 +1563,7 @@ class OntologyGraphRepository:
         keyword: Optional[str] = None,
         include_unknown: bool = True,
         document_id: Optional[str] = None,
+        entity_types: Optional[list[str]] = None,
     ) -> tuple[list[dict], int]:
         """分页查询 kb 内本体实例列表，支持按类型、关键词和文档过滤。"""
         tenant_id = require_tenant(tenant_id)
@@ -1287,7 +1572,10 @@ class OntologyGraphRepository:
         if document_id:
             where.append("$doc_id IN e.doc_ids")
             params["doc_id"] = document_id
-        if entity_type:
+        if entity_types:
+            where.append("e.entity_type IN $etypes")
+            params["etypes"] = list(entity_types)
+        elif entity_type:
             where.append("e.entity_type=$etype")
             params["etype"] = entity_type
         elif not include_unknown:
@@ -1334,6 +1622,40 @@ class OntologyGraphRepository:
                     row["aliases"] = []
         return rows, total
 
+    async def list_entities_by_types(
+        self, tenant_id: str, kb_id: str, entity_types: list[str], limit: int = 20,
+    ) -> list[dict]:
+        """按类型集合取实例（类型召回分支/层级扩展用）。"""
+        tenant_id = require_tenant(tenant_id)
+        if not entity_types:
+            return []
+        cypher = """
+        MATCH (e:OntologyEntity {tenant_id:$t, kb_id:$k})
+        WHERE coalesce(e.stub,false)=false AND e.entity_type IN $types
+        RETURN e.canonical_name AS name, e.entity_type AS type,
+               e.aliases AS aliases, e.attributes AS attributes,
+               e.description AS description, e.confidence AS confidence,
+               e.extraction_method AS extraction_method,
+               e.kb_id AS kb_id, e.doc_ids AS doc_ids,
+               e.source_chunks AS source_chunks
+        ORDER BY coalesce(e.confidence,0) DESC, e.canonical_name ASC
+        LIMIT $limit
+        """
+        async with self._driver.session() as session:
+            result = await session.run(cypher, {
+                "t": tenant_id, "k": kb_id,
+                "types": list(entity_types), "limit": limit,
+            })
+            rows = [dict(record) async for record in result]
+        for row in rows:
+            for field in ("attributes", "aliases", "source_chunks"):
+                if isinstance(row.get(field), str):
+                    try:
+                        row[field] = json.loads(row[field])
+                    except (json.JSONDecodeError, TypeError):
+                        row[field] = {} if field == "attributes" else []
+        return rows
+
     async def list_relations(
         self,
         tenant_id: str,
@@ -1347,6 +1669,7 @@ class OntologyGraphRepository:
         target_type: Optional[str] = None,
         keyword: Optional[str] = None,
         document_id: Optional[str] = None,
+        relation_types: Optional[list[str]] = None,
     ) -> tuple[list[dict], int]:
         """分页查询 kb 内本体关系列表，两端节点均在 kb 内，支持按文档过滤。"""
         tenant_id = require_tenant(tenant_id)
@@ -1355,7 +1678,10 @@ class OntologyGraphRepository:
         if document_id:
             where.append("$doc_id IN r.doc_ids")
             params["doc_id"] = document_id
-        if relation_type:
+        if relation_types:
+            where.append("r.relation_type IN $rtypes")
+            params["rtypes"] = list(relation_types)
+        elif relation_type:
             where.append("r.relation_type=$rtype")
             params["rtype"] = relation_type
         if source_name:
@@ -2708,76 +3034,196 @@ class OntologyGraphRepository:
         entity_type: str,
         canonical_name: str,
         updates: dict,
-    ) -> None:
-        """更新本体实体实例的字段（名称/别名/描述/属性）。
+        merge_target: bool = False,
+    ) -> dict:
+        """更新本体实体实例的字段，支持原地修改实体类型与名称。
 
         Args:
             tenant_id: 租户 ID
             kb_id: 知识库 ID
-            entity_type: 实体类型
-            canonical_name: 当前规范名
+            entity_type: 实体类型（变更前的定位类型）
+            canonical_name: 当前规范名（变更前的定位名）
             updates: 待更新字段 dict，支持键：
+                - entity_type: 目标实体类型；与当前类型相同时视为无操作
                 - name: 新规范名（canonical_name）
                 - aliases: 别名列表
                 - description: 描述
                 - attributes: 属性 dict
+            merge_target: 目标键 ``(类型, 名称)`` 已存在时是否合并到已有实例。
+                仅**名称发生变更**时生效：此时默认抛 1003 冲突，必须由调用方先向
+                用户确认再显式开启（合并不可逆 —— 源节点被删除、关系改挂、属性取
+                并集）。只改类型不改名时沿用既有自动合并语义，不受此参数影响。
+
+        ``entity_type`` 与 ``name`` 共同构成定位键：任一改变都会让节点落到新键。
+        新键不存在时节点原地迁移（关系边全部保留）；新键已存在时按
+        ``merge_target`` 决定抛冲突还是合并。合并时源节点的原名并入目标别名。
+
+        Returns:
+            dict: ``{"merged": bool}`` —— 发生撞名合并时为 True，否则为 False
+
+        Raises:
+            InvalidParameterError: 没有任何可更新字段，或新名称为空白
+            ResourceNotFoundError: 定位的实体不存在（含跨租户）
+            ResourceConflictError: 目标键已存在且未开启合并；或合并撞唯一约束且重试后仍失败
         """
         tenant_id = require_tenant(tenant_id)
 
-        # 编辑触发向量重算：仅 name/aliases/description 影响 embedding 文本
-        # （attributes 不进 build_embed_text，与 merge_entity 口径一致）。
-        # 文本变化才调 embed；embed 失败返回 None 时不更新向量（保留旧值），不阻断编辑。
+        requested_type = updates.get("entity_type")
+        new_type = requested_type if isinstance(requested_type, str) else entity_type
+        if "name" in updates:
+            raw_name = updates["name"]
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise InvalidParameterError(
+                    message=translate("err.ontology.empty_canonical_name", fallback="实体名称不能为空"),
+                )
+            new_name = raw_name.strip()
+            updates = {**updates, "name": new_name}
+        else:
+            new_name = canonical_name
+
+        field_updates = {
+            key: value for key, value in updates.items() if key in _ENTITY_UPDATE_FIELDS
+        }
+        key_changed = (new_type != entity_type) or (new_name != canonical_name)
+
+        if not key_changed:
+            if "entity_type" in updates and not field_updates:
+                # 同类型写入是无操作：只校验定位存在，不写库、不刷新 updated_at。
+                if not await self._entity_exists(tenant_id, kb_id, entity_type, canonical_name):
+                    raise ResourceNotFoundError(
+                        message=translate("err.ontology.entity_not_found", params={"entity_type": entity_type, "name": canonical_name}, fallback=f"实体不存在: type={entity_type}, name={canonical_name}"),
+                    )
+                return {"merged": False}
+            if not field_updates:
+                raise InvalidParameterError(
+                    message=translate("err.ontology.field_required", params={"field_name": "updates"}, fallback="更新字段不能为空"),
+                )
+            return await self._apply_field_updates(
+                tenant_id, kb_id, entity_type, canonical_name, field_updates
+            )
+
+        # 只改类型（名称不变）沿用既有自动合并语义；改名撞名必须显式确认，
+        # 因为那是两个不同名称实体的合并，误合并后没有回滚手段。
+        allow_merge = merge_target or new_name == canonical_name
+        merged = await self._change_entity_key(
+            tenant_id,
+            kb_id,
+            source_type=entity_type,
+            source_name=canonical_name,
+            target_type=new_type,
+            target_name=new_name,
+            field_updates=field_updates,
+            merge_target=allow_merge,
+        )
+        return {"merged": merged}
+
+    async def _entity_exists(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str,
+    ) -> bool:
+        async with self._driver.session() as session:
+            result = await session.run(_ENTITY_EXISTS_CYPHER, {
+                "t": tenant_id, "k": kb_id, "et": entity_type, "cn": canonical_name,
+            })
+            record = await result.single()
+        return bool(record and record["c"])
+
+    async def _read_entity_props(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str,
+    ) -> Optional[dict]:
+        """读取合并所需的节点属性；节点不存在时返回 None。"""
+        async with self._driver.session() as session:
+            result = await session.run(_ENTITY_PROPS_CYPHER, {
+                "t": tenant_id, "k": kb_id, "et": entity_type, "cn": canonical_name,
+            })
+            record = await result.single()
+        if not record:
+            return None
+        return {key: record[key] for key in (
+            "name", "aliases", "description", "attributes", "doc_ids",
+            "source_chunks", "lightrag_doc_ids", "embedding_hash",
+            "stub", "extraction_method",
+        )}
+
+    async def _compute_update_embedding(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str,
+        updates: dict,
+    ) -> tuple[Optional[list], Optional[str]]:
+        """编辑触发向量重算：仅 name/aliases/description 影响 embedding 文本。
+
+        attributes 不进 build_embed_text，与 merge_entity 口径一致。文本变化才调
+        embed；embed 失败返回 None 时不更新向量（保留旧值），不阻断编辑。
+        """
         embedding = None
         embedding_hash_val = None
-        recompute_embedding = bool(
-            {"name", "aliases", "description"} & set(updates.keys())
-        )
-        if recompute_embedding and os.getenv("ONTOLOGY_VECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
-            cur = await self._get_entity_embedding_state(
-                tenant_id, kb_id, entity_type, canonical_name
-            )
-            if cur is not None:
-                new_name = updates.get("name", canonical_name)
-                new_aliases = updates.get("aliases", cur["aliases"])
-                new_description = updates.get("description", cur["description"])
-                text = build_embed_text(new_name, new_aliases, new_description)
-                if text:
-                    new_hash = embed_hash(text)
-                    if new_hash != cur.get("embedding_hash"):
-                        vec = await embed(
-                            text, tenant_id=tenant_id, kb_id=kb_id,
-                            trace_id=f"ontology_manual:{kb_id}",
-                        )
-                        if vec is not None:
-                            embedding = vec
-                            embedding_hash_val = new_hash
+        recompute_embedding = bool({"name", "aliases", "description"} & set(updates.keys()))
+        if not recompute_embedding or not _vector_enabled():
+            return embedding, embedding_hash_val
 
-        # 构建 SET 子句
-        set_clauses = []
+        cur = await self._get_entity_embedding_state(tenant_id, kb_id, entity_type, canonical_name)
+        if cur is None:
+            return embedding, embedding_hash_val
+
+        new_name = updates.get("name", canonical_name)
+        new_aliases = updates.get("aliases", cur["aliases"])
+        new_description = updates.get("description", cur["description"])
+        text = build_embed_text(new_name, new_aliases, new_description)
+        if not text:
+            return embedding, embedding_hash_val
+
+        new_hash = embed_hash(text)
+        if new_hash == cur.get("embedding_hash"):
+            return embedding, embedding_hash_val
+
+        vec = await embed(
+            text, tenant_id=tenant_id, kb_id=kb_id,
+            trace_id=f"ontology_manual:{kb_id}",
+        )
+        if vec is not None:
+            embedding = vec
+            embedding_hash_val = new_hash
+        return embedding, embedding_hash_val
+
+    async def _compute_merge_embedding(
+        self, tenant_id: str, kb_id: str, name: str, aliases: list,
+        description: str, target_embedding_hash: Optional[str],
+    ) -> tuple[Optional[list], Optional[str]]:
+        """合并后最终文本与目标节点原值不同时重算向量。"""
+        if not _vector_enabled():
+            return None, None
+        text = build_embed_text(name, aliases, description)
+        if not text:
+            return None, None
+        new_hash = embed_hash(text)
+        if new_hash == target_embedding_hash:
+            return None, None
+        vec = await embed(
+            text, tenant_id=tenant_id, kb_id=kb_id,
+            trace_id=f"ontology_manual:{kb_id}",
+        )
+        if vec is None:
+            return None, None
+        return vec, new_hash
+
+    async def _apply_field_updates(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str,
+        updates: dict,
+    ) -> dict:
+        """仅更新实体字段（不涉及类型变更）。"""
+        embedding, embedding_hash_val = await self._compute_update_embedding(
+            tenant_id, kb_id, entity_type, canonical_name, updates
+        )
+
         params = {
             "t": tenant_id, "k": kb_id,
             "entity_type": entity_type, "canonical_name": canonical_name,
         }
-
-        if "name" in updates:
-            set_clauses.append("e.canonical_name=$new_name")
-            params["new_name"] = updates["name"]
-        if "aliases" in updates:
-            set_clauses.append("e.aliases=$aliases")
-            set_clauses.append("e.aliases_text=$aliases_text")
-            params["aliases"] = updates["aliases"]
-            params["aliases_text"] = " ".join(updates["aliases"])
-        if "description" in updates:
-            set_clauses.append("e.description=$description")
-            params["description"] = updates["description"]
-        if "attributes" in updates:
-            set_clauses.append("e.attributes=$attributes")
-            params["attributes"] = json.dumps(updates["attributes"], ensure_ascii=False)
-
+        set_clauses = _entity_field_set_clauses(updates, params)
         if not set_clauses:
-            raise ValueError("update_entity: no valid fields to update")
+            raise InvalidParameterError(
+                message=translate("err.ontology.field_required", params={"field_name": "updates"}, fallback="更新字段不能为空"),
+            )
 
-        if recompute_embedding and embedding is not None:
+        if embedding is not None:
             set_clauses.append("e.embedding=$embedding")
             set_clauses.append("e.embedding_hash=$embedding_hash")
             params["embedding"] = embedding
@@ -2797,6 +3243,186 @@ class OntologyGraphRepository:
                 raise ResourceNotFoundError(
                     message=translate("err.ontology.entity_not_found", params={"entity_type": entity_type, "name": canonical_name}, fallback=f"实体不存在: type={entity_type}, name={canonical_name}"),
                 )
+        return {"merged": False}
+
+    async def _change_entity_key(
+        self, tenant_id: str, kb_id: str, *, source_type: str, source_name: str,
+        target_type: str, target_name: str, field_updates: dict, merge_target: bool,
+    ) -> bool:
+        """改变定位键（类型和/或名称）：新键不存在则原地迁移，存在则按需合并。
+
+        合并是不可逆操作（源节点被删除、关系改挂、属性取并集），因此默认只抛
+        1003 冲突，由调用方先向用户确认；``merge_target=True`` 才真正合并。
+        返回是否发生了合并。
+        """
+        target_props = await self._read_entity_props(
+            tenant_id, kb_id, target_type, target_name
+        )
+        if target_props is None:
+            try:
+                await self._relocate_entity(
+                    tenant_id, kb_id, source_type, source_name,
+                    target_type, target_name, field_updates,
+                )
+                return False
+            except ConstraintError:
+                # 目标节点在判定与写入之间被并发创建：回落为冲突/合并判定。
+                target_props = await self._read_entity_props(
+                    tenant_id, kb_id, target_type, target_name
+                )
+                if target_props is None:
+                    raise ResourceConflictError(
+                        message=translate("err.ontology.entity_name_duplicate", params={"name": target_name}, fallback=f"对象名称重复: {target_name}"),
+                    )
+
+        if not merge_target:
+            raise ResourceConflictError(
+                message=translate(
+                    "err.ontology.instance_target_exists",
+                    params={"entity_type": target_type, "name": target_name},
+                    fallback=f"目标实例已存在: {target_type}/{target_name}，确认合并后才能继续",
+                ),
+                details={
+                    "existing": {
+                        "entity_type": target_type,
+                        "canonical_name": target_name,
+                    },
+                    "merge_target": False,
+                },
+            )
+
+        return await self._merge_entity_into_target(
+            tenant_id, kb_id, source_type, source_name, target_type, target_name,
+            field_updates, target_props,
+        )
+
+    async def _relocate_entity(
+        self, tenant_id: str, kb_id: str, entity_type: str, canonical_name: str,
+        new_entity_type: str, new_canonical_name: str, field_updates: dict,
+    ) -> None:
+        """目标键不存在：单条 Cypher 原地改类型和/或名称，关系边原样保留。"""
+        embedding, embedding_hash_val = await self._compute_update_embedding(
+            tenant_id, kb_id, entity_type, canonical_name, field_updates
+        )
+
+        params = {
+            "t": tenant_id, "k": kb_id,
+            "entity_type": entity_type, "canonical_name": canonical_name,
+            "new_entity_type": new_entity_type,
+        }
+        set_clauses = []
+        if new_entity_type != entity_type:
+            set_clauses.append("e.entity_type=$new_entity_type")
+        if new_canonical_name != canonical_name and "name" not in field_updates:
+            set_clauses.append("e.canonical_name=$new_canonical_name")
+            params["new_canonical_name"] = new_canonical_name
+        # 其余字段（含常规的 name 变更）由 _entity_field_set_clauses 生成。
+        set_clauses.extend(_entity_field_set_clauses(field_updates, params))
+        if not set_clauses:
+            raise InvalidParameterError(
+                message=translate("err.ontology.field_required", params={"field_name": "updates"}, fallback="更新字段不能为空"),
+            )
+        if embedding is not None:
+            set_clauses.append("e.embedding=$embedding")
+            set_clauses.append("e.embedding_hash=$embedding_hash")
+            params["embedding"] = embedding
+            params["embedding_hash"] = embedding_hash_val
+        set_clauses.append("e.updated_at=timestamp()")
+
+        cypher = f"""
+        MATCH (e:OntologyEntity {{tenant_id:$t, kb_id:$k, entity_type:$entity_type, canonical_name:$canonical_name}})
+        SET {", ".join(set_clauses)}
+        """
+        async with self._driver.session() as session:
+            result = await session.run(cypher, params)
+            summary = await result.consume()
+            if not summary.counters.contains_updates:
+                raise ResourceNotFoundError(
+                    message=translate("err.ontology.entity_not_found", params={"entity_type": entity_type, "name": canonical_name}, fallback=f"实体不存在: type={entity_type}, name={canonical_name}"),
+                )
+
+    async def _merge_entity_into_target(
+        self, tenant_id: str, kb_id: str, source_type: str, source_name: str,
+        target_type: str, target_name: str, field_updates: dict, target_props: dict,
+    ) -> bool:
+        """撞名合并：把源节点的关系与属性合入目标节点，再用普通 DELETE 删源节点。"""
+        source_props = await self._read_entity_props(
+            tenant_id, kb_id, source_type, source_name
+        )
+        if source_props is None:
+            raise ResourceNotFoundError(
+                message=translate("err.ontology.entity_not_found", params={"entity_type": source_type, "name": source_name}, fallback=f"实体不存在: type={source_type}, name={source_name}"),
+            )
+
+        merged = _build_merged_entity_props(
+            source_props, target_props, source_name, field_updates
+        )
+        embedding, embedding_hash_val = await self._compute_merge_embedding(
+            tenant_id, kb_id, merged["name"], merged["aliases"], merged["description"],
+            target_props.get("embedding_hash"),
+        )
+
+        params = {
+            "t": tenant_id, "k": kb_id,
+            "old_type": source_type, "new_type": target_type,
+            "old_cn": source_name, "new_cn": target_name,
+            "merged_name": merged["name"],
+            "aliases": merged["aliases"], "aliases_text": merged["aliases_text"],
+            "description": merged["description"], "attributes": merged["attributes"],
+            "doc_ids": merged["doc_ids"], "source_chunks": merged["source_chunks"],
+            "lightrag_doc_ids": merged["lightrag_doc_ids"],
+            "stub": merged["stub"], "extraction_method": merged["extraction_method"],
+            "embedding": embedding, "embedding_hash": embedding_hash_val,
+        }
+
+        for attempt in range(2):
+            try:
+                await self._run_type_merge_transaction(params)
+                return True
+            except ConstraintError as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "实体合并撞唯一约束，重试一次：tenant=%s kb=%s type=%s name=%s err=%s",
+                        tenant_id, kb_id, target_type, target_name, exc,
+                    )
+
+        raise ResourceConflictError(
+            message=translate("err.ontology.entity_name_duplicate", params={"name": target_name}, fallback=f"对象名称重复: {target_name}"),
+        )
+
+    async def _run_type_merge_transaction(self, params: dict) -> None:
+        """在单个事务内完成关系改挂、节点属性合并与源节点删除。"""
+        async with self._driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                guard_result = await tx.run(_TYPE_MERGE_GUARD_CYPHER, params)
+                guard = await guard_result.single()
+                if not guard or not guard["s_count"]:
+                    raise ResourceNotFoundError(
+                        message=translate("err.ontology.entity_not_found", params={"entity_type": params["old_type"], "name": params["old_cn"]}, fallback=f"实体不存在: type={params['old_type']}, name={params['old_cn']}"),
+                    )
+                if not guard["t_count"]:
+                    raise ResourceConflictError(
+                        message=translate("err.ontology.entity_name_duplicate", params={"name": params["new_cn"]}, fallback=f"对象名称重复: {params['new_cn']}"),
+                    )
+
+                for cypher in (
+                    _TYPE_MERGE_OUT_EDGES_CYPHER,
+                    _TYPE_MERGE_IN_EDGES_CYPHER,
+                    _TYPE_MERGE_SELF_LOOP_CYPHER,
+                    _TYPE_MERGE_TARGET_LOOP_CYPHER,
+                    _TYPE_MERGE_TARGET_SET_CYPHER,
+                    _TYPE_MERGE_DELETE_SOURCE_CYPHER,
+                ):
+                    result = await tx.run(cypher, params)
+                    await result.consume()
+                await tx.commit()
+            except BaseException:
+                try:
+                    await tx.rollback()
+                except Exception:  # noqa: BLE001 — 回滚失败不覆盖原始异常
+                    pass
+                raise
 
     async def delete_entity(
         self,
